@@ -23,10 +23,17 @@ publish     = false
 # edge_outbound_queue table + Engine surface for send_durable.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
 ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.4.1", version = "0" }
+# Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
+# Edge::send and Edge::send_durable to sign outbound envelopes.
+# Pinned to the same v1.9.0 tag persist uses so the dep tree
+# stays single-versioned.
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.9.0", version = "1", features = ["pqc-ml-dsa"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.9.0", version = "1", features = ["ed25519", "pqc-ml-dsa"] }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 async-trait = "0.1"
+futures     = "0.3"
 
 # Wire format / serde. RawValue is required for canonical-bytes
 # preservation per FSD §3.4 — we sign canonical bytes and verify the
@@ -37,6 +44,7 @@ chrono      = { version = "0.4", features = ["serde"] }
 
 # Hashing — body_sha256 forensic join key + in_reply_to ACK matching.
 sha2        = "0.10"
+base64      = "0.22"
 
 # Errors / logs
 thiserror   = "1"
@@ -44,6 +52,12 @@ tracing     = "0.1"
 
 # IDs
 uuid        = { version = "1", features = ["v4", "serde"] }
+
+# HTTP transport — feature-gated below
+axum  = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true }
+hyper = { version = "1",   optional = true, features = ["client", "server", "http1"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
 
 # ─── Optional transports — gated per OQ-02, OQ-07, OQ-13 ────────────
 # Implementations land in subsequent commits; features declared now so
@@ -53,7 +67,7 @@ uuid        = { version = "1", features = ["v4", "serde"] }
 default = []
 
 # Phase 1 — HTTP/HTTPS fallback for Reticulum-unreachable deployments.
-transport-http        = []
+transport-http        = ["dep:axum", "dep:tower", "dep:hyper", "dep:reqwest"]
 
 # Phase 1 — Reticulum-rs canonical wire (OQ-07 first impl).
 # transport-reticulum-rs = []

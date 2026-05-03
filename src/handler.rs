@@ -135,25 +135,12 @@ pub trait Handler<M: Message>: Send + Sync + 'static {
 /// Returned by `Edge::send_durable`. Caller polls the handle to
 /// observe the outcome of an enqueued durable message. Backed by
 /// `Engine.outbound_status(queue_id)` (FSD/EDGE_OUTBOUND_QUEUE.md §4).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DurableHandle {
     /// `cirislens.edge_outbound_queue.queue_id` — primary key in the
-    /// substrate.
-    pub queue_id: uuid::Uuid,
-    // Owns no engine reference here; lookups go through Edge.
-}
-
-impl DurableHandle {
-    /// Block until the row reaches a terminal state (delivered or
-    /// abandoned) and return the outcome. Implementation pending.
-    pub async fn await_outcome(&self) -> Result<DurableOutcome, crate::EdgeError> {
-        todo!("poll Engine.outbound_status; reuse a watch channel if available")
-    }
-
-    /// Non-blocking peek at current outbound state.
-    pub async fn status(&self) -> Result<DurableStatus, crate::EdgeError> {
-        todo!("Engine.outbound_status snapshot")
-    }
+    /// substrate. Persist's `QueueId = String` (UUID-shaped); stored
+    /// as String to avoid a redundant UUID-string round-trip.
+    pub queue_id: String,
 }
 
 /// Terminal outcome of a durable send.

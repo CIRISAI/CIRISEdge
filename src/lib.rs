@@ -29,13 +29,24 @@ pub mod handler;
 pub mod identity;
 pub mod messages;
 pub mod observability;
+pub mod outbound;
 pub mod transport;
 pub mod verify;
 
 pub use edge::{Edge, EdgeBuilder, EdgeConfig, EdgeError};
 pub use handler::{
-    Delivery, DurableHandle, DurableOutcome, Handler, HandlerContext, HandlerError, Message,
+    AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, Handler, HandlerContext,
+    HandlerError, Message,
 };
-pub use messages::{EdgeEnvelope, MessageType, SchemaVersion};
+pub use identity::StewardSigner;
+pub use messages::{
+    AccordEventsBatch, AccordEventsResponse, AttestationGossip, BuildManifestPublication,
+    BuildManifestPublicationResponse, DSARRequest, DSARResponse, EdgeEnvelope,
+    FederationKeyDirectoryQuery, FederationKeyDirectoryQueryResponse, MessageType,
+    PublicKeyRegistration, PublicKeyRegistrationResponse, SchemaVersion,
+};
+pub use outbound::{DispatcherConfig, OutboundHandle};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
-pub use verify::{HybridPolicy, VerifiedEnvelope, VerifyError, VerifyOutcome, VerifyPipeline};
+pub use verify::{
+    HybridPolicy, VerifiedEnvelope, VerifyDirectory, VerifyError, VerifyOutcome, VerifyPipeline,
+};
