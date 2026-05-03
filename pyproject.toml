@@ -1,0 +1,56 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ciris-edge"
+description = "Reticulum-native federation transport for the CIRIS stack"
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "CIRIS AI", email = "hello@ciris.ai" }]
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Topic :: Communications",
+    "Topic :: System :: Networking",
+]
+# v0.1.0-pre1 — pip-install-time subsumption mirroring persist's
+# pattern. `pip install ciris-edge` pulls `ciris-persist` (which
+# transitively pulls `ciris-verify` and the `ciris-build-sign` /
+# `ciris-build-verify` console_scripts onto PATH). Lens / agent /
+# registry get one install command for the whole edge+persist+verify
+# stack.
+#
+# Pin to >=0.4.0 because that's the federation substrate cut
+# (CIRISPersist#14 + #16): verify_hybrid_via_directory + the
+# edge_outbound_queue table + Engine surface. Edge's verify pipeline
+# and send_durable BOTH require the v0.4.0 floor.
+#
+# Pin to <1 because we expect persist to follow semver-major on
+# breaking changes; v0.1.x edge consumes v0.x persist. Bump the
+# upper bound when v0.2.x edge coordinates with v1.x persist.
+dependencies = [
+    "ciris-persist>=0.4.0,<1",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://ciris.ai"
+Repository = "https://github.com/CIRISAI/CIRISEdge"
+Issues = "https://github.com/CIRISAI/CIRISEdge/issues"
+
+[tool.maturin]
+features = ["pyo3"]
+module-name = "ciris_edge"
+# abi3-py311 — one wheel covers Python 3.11+ per the same matrix
+# precedent persist + verify use. CIRISEdge ships three platform
+# wheels: linux-x86_64, linux-aarch64, darwin-aarch64 (darwin-x86_64
+# omitted per GitHub Actions Intel macOS runner capacity issues —
+# matches persist's matrix exactly).
+python-source = "python"
+strip = true

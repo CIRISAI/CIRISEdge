@@ -1,0 +1,99 @@
+[package]
+name        = "ciris-edge"
+version     = "0.1.0-pre1"
+edition     = "2021"
+rust-version = "1.75"
+authors     = ["Eric Moore <mooreericnyc@gmail.com>"]
+license     = "AGPL-3.0-or-later"
+description = "Reticulum-native federation transport for the CIRIS stack"
+repository  = "https://github.com/CIRISAI/CIRISEdge"
+readme      = "README.md"
+publish     = false
+
+# Status: Phase 1 in flight. Crate skeleton lands the public API and
+# typed-handler dispatch shape; transport implementations + verify
+# pipeline land in subsequent commits. See FSD/CIRIS_EDGE.md for the
+# architecture, MISSION.md for M-1 alignment per module,
+# docs/THREAT_MODEL.md for the v0.1.0 P0 invariants
+# (AV-9 + AV-13 + AV-14 + AV-17 + hybrid-verify-via-persist).
+
+[dependencies]
+# Substrate. Owns federation_keys directory, canonicalize_envelope,
+# steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
+# edge_outbound_queue table + Engine surface for send_durable.
+# See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.4.0" }
+
+# Async runtime
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+
+# Wire format / serde. RawValue is required for canonical-bytes
+# preservation per FSD §3.4 — we sign canonical bytes and verify the
+# exact same canonical bytes, never re-serializing a Value.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1", features = ["raw_value"] }
+chrono      = { version = "0.4", features = ["serde"] }
+
+# Hashing — body_sha256 forensic join key + in_reply_to ACK matching.
+sha2        = "0.10"
+
+# Errors / logs
+thiserror   = "1"
+tracing     = "0.1"
+
+# IDs
+uuid        = { version = "1", features = ["v4", "serde"] }
+
+# ─── Optional transports — gated per OQ-02, OQ-07, OQ-13 ────────────
+# Implementations land in subsequent commits; features declared now so
+# downstream pin contracts are stable from v0.1.0.
+
+[features]
+default = []
+
+# Phase 1 — HTTP/HTTPS fallback for Reticulum-unreachable deployments.
+transport-http        = []
+
+# Phase 1 — Reticulum-rs canonical wire (OQ-07 first impl).
+# transport-reticulum-rs = []
+
+# Phase 3 — additional transports, productionized when community uptake
+# justifies (OQ-13).
+# transport-leviculum   = []
+# transport-lora        = []
+# transport-serial      = []
+# transport-i2p         = []
+
+# pyo3 — Python bindings for the lens FastAPI cutover (Phase 1)
+# and the agent Python pipeline (Phase 2). Same FFI-shell discipline
+# persist uses (CIRISPersist src/ffi/pyo3.rs); abi3-py311 single-wheel
+# per-(os,arch) ships via maturin.
+pyo3                  = ["dep:pyo3"]
+
+[dependencies.pyo3]
+version  = "0.28"
+features = ["extension-module", "abi3-py311"]
+optional = true
+
+[lib]
+# v0.1.0-pre1 — explicit crate-type so maturin can build the PyO3
+# extension AND `cargo test` / downstream `cargo` consumers still
+# get the `rlib`. Mirrors CIRISPersist Cargo.toml.
+crate-type = ["cdylib", "rlib"]
+
+[dev-dependencies]
+tokio    = { version = "1", features = ["full"] }
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all     = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pragmatic relaxations:
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

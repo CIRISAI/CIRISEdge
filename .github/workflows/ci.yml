@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # Fire on v-prefixed release tags so the publish-pypi job (gated on
+    # `refs/tags/v*`) actually runs. Mirrors persist's v0.1.12 closure.
+    tags: ['v*']
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ─── linux-x86_64 — full features (transport-http + pyo3) ──────────
+  # Mission alignment: the lens cutover (Phase 1) consumes edge from
+  # Python via the pyo3 feature; this job covers that path.
+  linux-x86_64-test:
+    name: linux-x86_64 (full features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (transport-http + pyo3)
+        run: cargo test --features "transport-http pyo3" --all-targets
+
+  # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
+  # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
+  # build for darwin runs via the pyo3-wheel matrix entry below.
+  darwin-aarch64-test:
+    name: darwin-aarch64 (no pyo3)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (transport-http)
+        run: cargo test --features "transport-http"
+
+  # ─── iOS build is Phase 3 stretch (per FSD §3 Phase tier table) ─────
+  # Deferred until swift-bridge integration lands. Intentionally absent
+  # so the publish-pypi `needs:` list doesn't gate on a job that hasn't
+  # been written yet.
+
+  # ─── lint: clippy + fmt (mission rejection gate) ────────────────────
+  lint:
+    name: clippy + fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --features "transport-http pyo3" -- -D warnings
+
+  # ─── license-audit: cargo deny (license + advisories) ───────────────
+  license-audit:
+    name: cargo deny (license + advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # ─── pyo3-wheel: maturin abi3-py311 wheels ──────────────────────────
+  #
+  # Three wheels per release. Matrix mirrors CIRISPersist exactly
+  # (linux x86_64 + aarch64, darwin arm64). darwin-x86_64 omitted —
+  # GitHub Actions Intel macOS runners queue indefinitely due to
+  # capacity issues; persist's matrix dropped it for the same reason.
+  # Add back via manual upload if a real consumer materializes.
+  #
+  # Each matrix entry runs on a NATIVE runner for that target so we
+  # avoid cross-compile drama (sysroot, linkers, vendored crypto
+  # quirks).
+  pyo3-wheel:
+    name: maturin abi3-py311 wheel (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
+          - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install maturin
+        run: pip install maturin
+      - name: maturin build
+        run: maturin build --release --strip
+      - name: confirm wheel shape
+        # Reject anything that isn't cp311-abi3 — mixed-mode maturin can
+        # silently emit cp31N-cp31N wheels which break consumer install
+        # on other minors. Catching at build time, before PyPI.
+        # Same v0.1.10-regression closure persist uses.
+        run: |
+          ls -la target/wheels/
+          if ! ls target/wheels/*-cp311-abi3-*.whl >/dev/null 2>&1; then
+            echo "::error::Expected cp311-abi3 wheel for ${{ matrix.label }}; got:"
+            ls target/wheels/*.whl 2>/dev/null || echo "  (no wheels)"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris_edge-wheel-${{ matrix.label }}
+          path: target/wheels/*.whl
+
+  # ─── publish-pypi: tag-gated wheel upload via OIDC ──────────────────
+  #
+  # Trust posture: the BuildManifest round-trip is the cryptographic
+  # root of trust (OQ-12 closure; lands as a separate `build-manifest`
+  # job once `ciris-build-sign` integration is wired). PyPI is the
+  # fast distribution channel — peers verifying authenticity check the
+  # registry-side hybrid Ed25519 + ML-DSA-65 signature on the
+  # manifest, not the PyPI artifact itself. PEP 740 attestations
+  # compound the two.
+  #
+  # Auth: OIDC trusted publishing. NO API token in CI secrets — PyPI
+  # validates the workflow's GitHub identity directly. One-time setup
+  # on PyPI side is required (project owner reserves the name +
+  # configures the trusted publisher); see docs/PYPI_PUBLISH.md.
+  publish-pypi:
+    name: Publish wheels to PyPI (tag-gated)
+    runs-on: ubuntu-latest
+    # Gate publish on every quality job — presence-of-wheel alone is
+    # not a quality gate. Same v0.3.3 closure persist applied after
+    # v0.3.2 shipped wheels through a fmt-failure tag run.
+    needs:
+      - pyo3-wheel
+      - lint
+      - license-audit
+      - linux-x86_64-test
+      - darwin-aarch64-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ciris-edge/
+    permissions:
+      # OIDC token-issuance permission. Required for PyPI's trusted
+      # publishing. Scope is the workflow's GitHub-issued JWT only;
+      # no long-lived secret.
+      id-token: write
+    steps:
+      - name: download all multi-arch wheels
+        # `merge-multiple: true` flattens the per-artifact subdirs;
+        # the .whl filenames already encode the target tag (e.g.
+        # `-manylinux_2_34_aarch64`) so there's no collision.
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ciris_edge-wheel-*
+          merge-multiple: true
+          path: dist
+      - name: sanity-check wheel shapes before publish
+        run: |
+          ls -la dist/
+          COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
+          if [ "${COUNT}" -lt 3 ]; then
+            echo "::error::Expected 3 wheels (linux x86_64 + aarch64, darwin arm64); got ${COUNT}"
+            ls dist/*.whl 2>/dev/null || echo "  (no .whl files at all)"
+            exit 1
+          fi
+          for wheel in dist/*.whl; do
+            if ! [[ "${wheel}" =~ -cp311-abi3- ]]; then
+              echo "::error::Non-abi3 wheel detected: ${wheel}"
+              exit 1
+            fi
+            echo "✓ ${wheel}"
+          done
+          echo "✓ All ${COUNT} wheels conform to cp311-abi3."
+      - name: publish to PyPI via OIDC trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # No `password:` — OIDC trusted publishing handles auth.
+          packages-dir: dist
+          # skip-existing makes tag re-runs idempotent. PyPI rejects
+          # same-version re-uploads anyway; failing softly here keeps
+          # re-runs from blowing up.
+          skip-existing: true
+          # PEP 740 — sigstore-attested upload. Consumers verifying
+          # the manifest can also verify the PyPI artifact ties to
+          # this exact GH workflow identity.
+          attestations: true
+
+  # ─── build-manifest: hybrid-signed release provenance (TODO) ────────
+  #
+  # OQ-12 closure: every released CIRISEdge artifact publishes
+  # `EdgeExtras` JSON signed via `ciris-build-sign` (Ed25519 +
+  # ML-DSA-65 hybrid) and registered with CIRISRegistry. Round-trip
+  # verified before the release tarball publishes.
+  #
+  # Implementation pending: needs the `scripts/emit_edge_extras.py`
+  # generator (mirrors `lens/scripts/emit_lens_extras.py` and
+  # `persist/tools/emit_persist_extras.py`) plus the registry
+  # round-trip step (likely subject to the read-after-write race
+  # captured in memory/reference_registry_race.md — sleep + retry
+  # mitigation goes here when this lands).
+  #
+  # Once written, add `build-manifest` to publish-pypi `needs:`.
