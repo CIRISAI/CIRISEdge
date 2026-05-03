@@ -228,10 +228,22 @@ pub struct EdgeEnvelope {
     pub body: serde_json::value::RawValue,
     /// Ed25519 signature over canonical(envelope-without-signature).
     pub signature: String,  // base64
-    /// Reserved for ML-DSA-65 hybrid; None until persist's verifier
-    /// path supports PQC verify (post-v0.4.0).
+    /// ML-DSA-65 PQC signature (base64). Required when sender's
+    /// `federation_keys` row has `pubkey_ml_dsa_65_base64` populated
+    /// (hybrid-complete); MAY be None when the row is hybrid-pending
+    /// (`pqc_completed_at IS NULL`). Consumer-side acceptance policy
+    /// (strict-hybrid / soft-hybrid+freshness / Ed25519-fallback) is
+    /// per-peer config. Verify always calls
+    /// `Engine.verify_hybrid()` — never `ciris-crypto` directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature_pqc: Option<String>,
+    /// 32-byte body_sha256 of the original envelope this is a
+    /// response/ACK to. Set on response envelopes; None on first-touch
+    /// envelopes. Used by the sender's edge_outbound_queue to match
+    /// ACKs to originals (FSD/EDGE_OUTBOUND_QUEUE.md). Part of canonical
+    /// bytes; signed and verified along with everything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<[u8; 32]>,
 }
 ```
 

@@ -86,11 +86,14 @@ it protects:
 - **Operator UI surfaces**. Grafana, OAuth, admin console — explicitly
   out of scope per FSD §2. Each peer keeps its own operator-UI HTTP
   stack.
-- **Quantum compromise of Ed25519**. Phase 1 ships Ed25519-only verify;
-  the `signature_pqc` field is reserved for ML-DSA-65 hybrid (post
-  persist v0.4.0 per `OPEN_QUESTIONS.md` OQ-11). Phase 1 posture is
-  accept-not-verify on the PQC field; full hybrid verify lands in
-  Phase 2.
+- **Quantum compromise of Ed25519 *under Ed25519-fallback consumer
+  policy*.** Edge ships hybrid Ed25519 + ML-DSA-65 verify in v0.1.0
+  (OQ-11 closure: hybrid PQC is already in prod across CIRISVerify
+  v1.9.0 + CIRISPersist v0.2.0+). Three consumer policies are
+  selectable per peer: strict-hybrid, soft-hybrid+freshness, and
+  Ed25519-fallback. Quantum residual exists only under Ed25519-fallback;
+  strict-hybrid eliminates it modulo persist's eventual-consistency
+  trust contract for hybrid-pending rows.
 - **Reticulum-rs / Leviculum implementation bugs**. The transport-impl
   threat model is the upstream crate's; edge wraps the trait.
   Cross-implementation byte-equivalence is a regression test category
@@ -686,10 +689,15 @@ is a forward-looking concern. Phase 1 ships with reticulum-rs only.
 | AV-24 | Build-manifest forgery | P1 | Hybrid Ed25519 + ML-DSA-65 release sig | AGPL license-lock | ⚠ Same as lens, persist | — |
 | AV-25 | Cross-Reticulum-impl drift | P2 | Byte-equivalence regression test | — | ⚠ Forward-looking (Leviculum) | — |
 
-**Pre-Phase-1 P0 must-have bundle**: AV-9 + AV-13 + AV-14 + AV-17. These
-are the structural invariants that, if not in place at Phase 1 v0.1.0,
-break the threat-model claim. Implementation lands these together with
-the corresponding test categories.
+**Pre-Phase-1 P0 must-have bundle**: AV-9 + AV-13 + AV-14 + AV-17 +
+hybrid verify (OQ-11 closure). The first four are the structural
+invariants that, if not in place at Phase 1 v0.1.0, break the
+threat-model claim. Hybrid verify is the v0.1.0 PQC posture: edge
+calls `Engine.verify_hybrid()` on every inbound message whose sender's
+`federation_keys` row carries `pubkey_ml_dsa_65_base64`; consumer
+policy (strict / soft+freshness / fallback) is per-peer config.
+Pre-Phase-1 coordination: persist exposes the verify_hybrid FFI
+surface; the underlying primitive already exists in `ciris-crypto`.
 
 ---
 
@@ -741,6 +749,14 @@ breaks.
    the same hybrid (Ed25519 + ML-DSA-65) chain CIRISVerify v1.8
    defined; the build-signing key is hardware-protected per
    CIRISVerify's tier. AV-24 closure depends.
+10. **Persist exposes a hybrid verify primitive** for arbitrary
+    canonical bytes (`Engine.verify_hybrid(canonical, ed25519_sig,
+    ml_dsa_sig, ed25519_pubkey, ml_dsa_pubkey, policy) ->
+    VerifyOutcome`). **Available in CIRISPersist v0.3.6+
+    (CIRISPersist#14 closed 2026-05-03).** Phase 1 pin: `ciris-persist
+    >= 0.3.6`. Edge MUST NOT call `ciris-crypto` directly — that
+    breaks the verify-via-persist single-source-of-truth
+    (CIRISPersist#7).
 
 Critical: **Assumption 1 is load-bearing.** Edge's entire verify
 guarantee reduces to "lookup_public_key returns truthful answers."
@@ -787,10 +803,15 @@ Risks edge mitigates but cannot fully eliminate.
    forged-but-correctly-signed envelopes. Closure: agent-side key
    storage hardening (CIRISVerify), Phase 2 peer-replicate, federation
    N_eff drift detection (RATCHET).
-2. **Quantum compromise of Ed25519**. Phase 1 ships Ed25519-only;
-   `signature_pqc` field reserved. Closure: Phase 2+ ML-DSA-65 hybrid
-   verify per persist v0.4.0+. Until then, accept-not-verify on the
-   PQC field per OQ-11.
+2. **Quantum compromise of Ed25519 under Ed25519-fallback policy.**
+   Edge ships hybrid Ed25519 + ML-DSA-65 verify in v0.1.0 (OQ-11
+   closure). Strict-hybrid policy eliminates the residual against
+   hybrid-complete rows; against hybrid-pending rows, the residual is
+   bounded by the consumer's chosen policy (soft-hybrid+freshness or
+   strict-hybrid both give explicit control). Ed25519-fallback retains
+   the residual by design — it's the deployment-tier choice for
+   environments where PQC reach is incomplete (older agents, transport
+   bandwidth caps).
 3. **Cross-implementation drift** when Leviculum or other Reticulum
    forks emerge. Mitigation is regression test (AV-25); residual is
    any drift not caught by the test fixture set.
@@ -823,6 +844,7 @@ PRE-PHASE-1 P0 MUST-HAVE BUNDLE — must land with v0.1.0
   ⚠ AV-13  MAX_BODY_BYTES = 8 MiB at all transport entry points
   ⚠ AV-14  Typed envelope deserialize + MAX_DATA_DEPTH=32
   ⚠ AV-17  FFI boundary heap-scan property test
+  ⚠ OQ-11  Hybrid verify via Engine.verify_hybrid (CIRISPersist v0.3.6+; #14 closed)
 
 PHASE-1 P1 BUNDLE — must land for production cutover
   ⚠ AV-3   Replay LRU with 5-min window
@@ -852,16 +874,19 @@ ARCHITECTURALLY MITIGATED (no further action required)
 ```
 
 **Bottom line**: edge is a thin verify-and-dispatch substrate. The
-threat-model story reduces to four invariants:
+threat-model story reduces to five invariants:
 
 1. No unverified bytes reach handlers (AV-9).
 2. No untyped bytes pass parse (AV-14).
 3. No seed bytes enter edge's heap (AV-17).
 4. No body exceeds the size cap (AV-13).
+5. Hybrid (Ed25519 + ML-DSA-65) verify is the day-1 posture, with
+   consumer policy (strict / soft+freshness / fallback) selecting
+   acceptance against hybrid-pending rows (OQ-11).
 
-If those four hold at v0.1.0, the rest of the threat model is
+If those five hold at v0.1.0, the rest of the threat model is
 architecturally consistent with the federation meta. The pre-Phase-1
-implementation work is exactly: land those four invariants with the
+implementation work is exactly: land those five invariants with the
 tests that assert them, then build outward.
 
 Federation-primitive contribution: edge fills the N1 (cryptographic
