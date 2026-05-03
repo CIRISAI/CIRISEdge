@@ -1,14 +1,14 @@
 [package]
-name        = "ciris-edge"
-version     = "0.1.0"
-edition     = "2021"
+name = "ciris-edge"
+version = "0.1.0"
+edition = "2021"
 rust-version = "1.75"
-authors     = ["Eric Moore <mooreericnyc@gmail.com>"]
-license     = "AGPL-3.0-or-later"
+authors = ["Eric Moore <mooreericnyc@gmail.com>"]
+license = "AGPL-3.0-or-later"
 description = "Reticulum-native federation transport for the CIRIS stack"
-repository  = "https://github.com/CIRISAI/CIRISEdge"
-readme      = "README.md"
-publish     = false
+repository = "https://github.com/CIRISAI/CIRISEdge"
+readme = "README.md"
+publish = false
 
 # Status: Phase 1 in flight. Crate skeleton lands the public API and
 # typed-handler dispatch shape; transport implementations + verify

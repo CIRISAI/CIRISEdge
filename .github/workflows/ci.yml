@@ -142,7 +142,15 @@ jobs:
       - name: extract version from Cargo.toml
         id: version
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          # Grep pattern tolerates any whitespace between `version`
+          # and `=` so column-aligned Cargo.toml formatting works.
+          # Empty result fails fast — better than silently propagating
+          # an empty version through the registry round-trip.
+          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [ -z "${VERSION}" ]; then
+            echo "::error::Failed to extract version from Cargo.toml"
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ciris-edge version: $VERSION"
       - name: install ciris-build-sign (prebuilt from CIRISVerify v1.9.0)
