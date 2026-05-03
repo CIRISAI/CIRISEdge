@@ -1,7 +1,9 @@
 # FSD: edge_outbound_queue — Durable substrate for `send_durable()`
 
-**Status:** Proposed (spec frozen 2026-05-03; implementation lands in
-CIRISPersist; consumed by CIRISEdge v0.1.x).
+**Status:** Substrate landed in CIRISPersist v0.4.0 (issue #16 closed
+2026-05-03). CIRISEdge consumes from `ciris-persist >= 0.4.0`. Spec
+frozen; persist threat-model closures: AV-40 (queue disk exhaustion)
+and AV-41 (spoofed in_reply_to ACK matching).
 **Owner spec:** CIRISEdge (this repo, per OQ-05 — edge owns the
 wire-format and the contract; persist implements the substrate).
 **Implementer:** CIRISPersist (table + Engine FFI surface).
@@ -339,9 +341,9 @@ typed log; not a security issue.
 |---|---|---|
 | AV-2 | Compromised sender key inserts forged-but-correctly-signed durable rows | Out of scope; same as elsewhere — closure is hardware-backed key storage upstream (CIRISVerify) |
 | AV-9 | Re-verify on retry would self-verify | Dispatch loop does NOT re-verify on retry (envelope already verified at enqueue); ACK envelopes go through normal verify pipeline before `mark_ack_received` is called |
-| AV-12 | Adversary inflates queue | Disk-bounded; ops alarm at oldest-pending-age; enqueue requires our own host code so adversary must compromise the host (out of scope) |
+| AV-12 / **persist AV-40** | Adversary inflates queue (disk exhaustion) | Schema CHECK constraints (`body_size_bytes BETWEEN 1 AND 8388608`, `ttl_seconds > 0`, `max_attempts > 0`); operational discipline (`sweep_ttl_expired` cadence + ops dashboard alert on `oldest-pending-age`); FK constraint on sender/destination_key_id chains to persist's federation_keys trust boundary |
 | AV-13 | Body-size flood | `body_size_bytes BETWEEN 1 AND 8388608` CHECK constraint enforces 8 MiB cap on enqueue |
-| AV-X (new) | Spoofed `in_reply_to` to mark a row delivered prematurely | ACK envelope is signed by the destination peer's key; AV-1 closure (lookup_public_key gate) catches; no new AV needed |
+| **persist AV-41** | Spoofed `in_reply_to` to mark a row delivered prematurely | ACK envelopes go through persist's normal verify pipeline (AV-1 unknown-key gate + AV-39 verify_hybrid via persist) before `mark_ack_received` is called; bound-signature pattern (persist AV-33) closes Ed25519-alone forgery branch |
 
 ## 7. Operator surface
 

@@ -147,11 +147,11 @@ primitive shouldn't ship that as a first-class option.
   batches, heartbeats — anything where "next batch supersedes" or
   persist's AV-9 dedup recovers from drop.
 - **C — `send_durable()`** for messages that must eventually land
-  across restarts. Edge-owned persistent queue (new persist table —
-  coordinate with persist roadmap). Caller gets a `DurableHandle` to
-  observe outcome (poll, await, dlq inspect). Use cases: manifest
-  publications, DSAR responses, key registrations, attestation gossip
-  — rare, high-value, must-land messages.
+  across restarts. Edge-owned persistent queue
+  (`cirislens.edge_outbound_queue`). Caller gets a `DurableHandle`
+  to observe outcome (poll, await, dlq inspect). Use cases:
+  manifest publications, DSAR responses, key registrations,
+  attestation gossip — rare, high-value, must-land messages.
 
 **Delivery-class lives on the message type, not the call site:**
 `AccordEventsBatch::DELIVERY = Ephemeral`,
@@ -161,6 +161,16 @@ durable-queue surface only exists for message types that declared
 they need it (AV-12 / AV-13 gates can be type-specific). Spec for
 each message type names its contract; `register_handler` rejects
 mismatches at compile time via the `Delivery` associated type.
+
+**Persist dependency: SATISFIED in v0.4.0 (CIRISPersist#16 closed
+2026-05-03).** `cirislens.edge_outbound_queue` + Engine surface
+(`enqueue_outbound`, `claim_pending_outbound`,
+`mark_transport_delivered`, `mark_transport_failed`,
+`mark_replay_resolved`, `match_ack_to_outbound`,
+`mark_ack_received`, sweeps, operator commands) are the substrate.
+CIRISPersist threat-model AV-40 (queue disk exhaustion) and AV-41
+(spoofed in_reply_to ACK matching) closed. Spec lives at
+[`FSD/EDGE_OUTBOUND_QUEUE.md`](EDGE_OUTBOUND_QUEUE.md).
 
 ### OQ-10: Operator-UI HTTP integration — RESOLVED A (out of scope) — 2026-05-03
 
@@ -190,13 +200,22 @@ configurable consumer policies, picked per peer:
   assurance default for environments where PQC reach is incomplete).
 
 **Persist dependency: SATISFIED in v0.3.6 (CIRISPersist#14 closed
-2026-05-03).** `Engine.verify_hybrid(canonical_bytes, ed25519_sig,
-ml_dsa_65_sig, ed25519_pubkey, ml_dsa_65_pubkey, policy) ->
-VerifyOutcome` is now the substrate primitive. Edge MUST call this on
-every inbound message; never `ciris-crypto::HybridVerifier` directly
-— that violates the verify-via-persist single-source-of-truth
-(CIRISPersist#7 closure). Phase 1 implementation pin: `ciris-persist
->= 0.3.6`.
+2026-05-03), bumped to v0.4.0 floor for the federation substrate
+cut.** Two variants ship:
+
+- `Engine.verify_hybrid(canonical_bytes, ed25519_sig, ml_dsa_65_sig,
+  ed25519_pubkey, ml_dsa_65_pubkey, policy, soft_freshness_window,
+  row_age) -> VerifyOutcome` — raw-pubkey form.
+- `Engine.verify_hybrid_via_directory(canonical_bytes,
+  signature_key_id, ed25519_sig, ml_dsa_65_sig, policy,
+  soft_freshness_window, row_age) -> VerifyOutcome` — combines
+  `lookup_public_key` + verify in one call. **Edge's per-message hot
+  path uses this variant.**
+
+Edge MUST NOT call `ciris-crypto::HybridVerifier` directly — that
+violates the verify-via-persist single-source-of-truth
+(CIRISPersist#7 closure). Phase 1 implementation pin:
+`ciris-persist >= 0.4.0`.
 
 ### OQ-12: Build-manifest signing — RESOLVED A (yes, hybrid signed) — 2026-05-03
 

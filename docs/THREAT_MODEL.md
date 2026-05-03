@@ -749,14 +749,18 @@ breaks.
    the same hybrid (Ed25519 + ML-DSA-65) chain CIRISVerify v1.8
    defined; the build-signing key is hardware-protected per
    CIRISVerify's tier. AV-24 closure depends.
-10. **Persist exposes a hybrid verify primitive** for arbitrary
-    canonical bytes (`Engine.verify_hybrid(canonical, ed25519_sig,
-    ml_dsa_sig, ed25519_pubkey, ml_dsa_pubkey, policy) ->
-    VerifyOutcome`). **Available in CIRISPersist v0.3.6+
-    (CIRISPersist#14 closed 2026-05-03).** Phase 1 pin: `ciris-persist
-    >= 0.3.6`. Edge MUST NOT call `ciris-crypto` directly — that
-    breaks the verify-via-persist single-source-of-truth
-    (CIRISPersist#7).
+10. **Persist exposes hybrid verify + outbound-queue substrates.**
+    `Engine.verify_hybrid_via_directory()` (per-message hot path)
+    and `Engine.verify_hybrid()` (raw-pubkey form) for inbound;
+    `cirislens.edge_outbound_queue` table + the OQ-09 Engine surface
+    (`enqueue_outbound`, `claim_pending_outbound`, ACK matching,
+    sweeps) for outbound `send_durable()`. **Available in
+    CIRISPersist v0.4.0+ (CIRISPersist#14 + #16 closed 2026-05-03).**
+    Phase 1 pin: `ciris-persist >= 0.4.0`. Persist threat-model
+    closures: AV-39 (verify pipeline), AV-40 (queue disk exhaustion),
+    AV-41 (spoofed in_reply_to ACK matching). Edge MUST NOT call
+    `ciris-crypto` directly — that breaks the verify-via-persist
+    single-source-of-truth (CIRISPersist#7).
 
 Critical: **Assumption 1 is load-bearing.** Edge's entire verify
 guarantee reduces to "lookup_public_key returns truthful answers."
@@ -844,7 +848,7 @@ PRE-PHASE-1 P0 MUST-HAVE BUNDLE — must land with v0.1.0
   ⚠ AV-13  MAX_BODY_BYTES = 8 MiB at all transport entry points
   ⚠ AV-14  Typed envelope deserialize + MAX_DATA_DEPTH=32
   ⚠ AV-17  FFI boundary heap-scan property test
-  ⚠ OQ-11  Hybrid verify via Engine.verify_hybrid (CIRISPersist v0.3.6+; #14 closed)
+  ⚠ OQ-11  Hybrid verify via Engine.verify_hybrid_via_directory (CIRISPersist v0.4.0+; #14 closed)
 
 PHASE-1 P1 BUNDLE — must land for production cutover
   ⚠ AV-3   Replay LRU with 5-min window
