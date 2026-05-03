@@ -141,6 +141,18 @@ pub struct VerifiedEnvelope {
     pub transport: TransportId,
 }
 
+/// Trace-flavored alias for [`VerifiedEnvelope`]. CIRISLensCore's
+/// `LensCore::process(VerifiedTrace)` consumes this — the science-
+/// layer's input is "an envelope edge has fully verified" and the
+/// trace use-case is the dominant consumer at v0.1.0.
+///
+/// Identical type to [`VerifiedEnvelope`]; the alias exists so
+/// `use ciris_edge::VerifiedTrace` reads naturally on the lens-core
+/// side. Future Phase 2 work may promote this to a typed wrapper
+/// that pre-parses the `AccordEventsBatch` body — for now,
+/// consumers handle that themselves via `verified.envelope.body`.
+pub type VerifiedTrace = VerifiedEnvelope;
+
 /// The verify pipeline. Holds the federation directory handle, the
 /// configured hybrid policy, the self-steward key (for AV-8), and the
 /// replay window state.

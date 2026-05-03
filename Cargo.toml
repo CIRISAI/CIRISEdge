@@ -1,6 +1,6 @@
 [package]
 name        = "ciris-edge"
-version     = "0.1.0-pre1"
+version     = "0.1.0"
 edition     = "2021"
 rust-version = "1.75"
 authors     = ["Eric Moore <mooreericnyc@gmail.com>"]
