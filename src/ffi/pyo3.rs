@@ -28,7 +28,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[pymodule]
 fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", VERSION)?;
-    m.add("SUPPORTED_SCHEMA_VERSIONS", SUPPORTED_SCHEMA_VERSIONS.to_vec())?;
+    m.add(
+        "SUPPORTED_SCHEMA_VERSIONS",
+        SUPPORTED_SCHEMA_VERSIONS.to_vec(),
+    )?;
 
     // Edge — the top-level Python class. Wraps Rust `Edge`.
     // m.add_class::<Edge>()?;

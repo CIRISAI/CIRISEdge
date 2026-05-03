@@ -1,0 +1,78 @@
+# cargo-deny config — enforces MISSION.md §6 license-locked mission
+# preservation. Inherits the dep-tree concerns persist + verify
+# already curated; CIRISEdge transitively pulls the same trees.
+
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+    "OpenSSL",
+    "AGPL-3.0",
+    "AGPL-3.0-or-later",
+    "GPL-3.0",
+    "GPL-3.0-or-later",
+    "CC0-1.0",
+    # webpki-roots 0.26+ — CDLA-Permissive-2.0 (Linux Foundation's
+    # Community Data License Agreement, permissive variant). AGPL-
+    # compatible: distribution permitted, no patent-grant requirement,
+    # attribution preserved. Transitive via ciris-verify-core's
+    # reqwest/ureq stack — same finding persist v0.1.9 documented.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.85
+
+[bans]
+# v0.1.0-pre1 — `allow` not `warn` because cargo-deny's bans check
+# treats `warn` as a hard fail despite the docs. Edge's tree pulls
+# duplicate transitive deps via the secret-service / zbus / pyo3 /
+# axum stacks (mostly two-versions splits across async-io,
+# async-lock, base64, getrandom, hashbrown, etc.) — all transitive
+# through ciris-keyring + the web-stack additions, none on edge's
+# verify hot path. Dedup pass when the dep tree stabilizes.
+# TODO: flip back to "warn" or "deny" once the upstream stacks
+# converge on single versions of the common transitives.
+multiple-versions = "allow"
+wildcards         = "deny"
+
+[advisories]
+yanked = "warn"
+# Inherited ignores from CIRISPersist's deny.toml — same dep tree, same
+# transitive-only exposure. None of these advisories touch CIRISEdge's
+# verify-and-dispatch hot path (persist owns the DB / DNS / TLS
+# surfaces).
+ignore = [
+    "RUSTSEC-2024-0388",  # derivative unmaintained (via ciris-keyring TPM derive stack)
+    "RUSTSEC-2024-0384",  # instant unmaintained (Phase 3 Reticulum may obsolete)
+
+    # rustls / webpki / DNS branch — transitive via ciris-verify-core's
+    # verification stack. Persist's deny.toml documents the rationale;
+    # edge inherits.
+    "RUSTSEC-2026-0119",  # hickory-proto DNS encoding O(n²); edge has no DNS encode path
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained
+    "RUSTSEC-2026-0098",  # rustls-webpki URI-name constraint (no URI SAN validation here)
+    "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
+    "RUSTSEC-2026-0104",  # rustls-webpki CRL parse panic (no CRL parsing here)
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "warn"
+# v0.1.0-pre1 — persist + verify ship as `publish = false` Rust
+# crates pulled via git tag. allow-list explicitly until they're on
+# crates.io (or a private registry).
+allow-git = [
+    "https://github.com/CIRISAI/CIRISPersist",
+    "https://github.com/CIRISAI/CIRISVerify",
+]

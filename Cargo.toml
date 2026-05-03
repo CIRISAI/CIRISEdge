@@ -22,7 +22,7 @@ publish     = false
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.4.0" }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.4.1", version = "0" }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -93,7 +93,15 @@ unsafe_code = "forbid"
 all     = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Pragmatic relaxations:
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
 module_name_repetitions = "allow"
+# Skeleton-phase concessions — drop these when bodies fill in:
+#  - unused_async: skeleton fns are async because their final form will be;
+#    clippy can't see through todo!() to the eventual .await calls.
+#  - doc_markdown: pedantic complaint about identifiers in docs not having
+#    backticks. Not load-bearing for correctness; defer the cleanup pass
+#    until the doc surface stabilizes.
+unused_async = "allow"
+doc_markdown = "allow"
