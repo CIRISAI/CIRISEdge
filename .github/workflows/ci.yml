@@ -116,12 +116,277 @@ jobs:
           name: ciris_edge-wheel-${{ matrix.label }}
           path: target/wheels/*.whl
 
+  # ─── build-manifest: hybrid-signed release provenance ───────────────
+  #
+  # OQ-12 closure: every released CIRISEdge artifact publishes
+  # `EdgeExtras` JSON signed via `ciris-build-sign` (Ed25519 +
+  # ML-DSA-65 hybrid) and registers with CIRISRegistry. Round-trip
+  # verified before publish-pypi runs.
+  #
+  # Trust posture: this manifest is the cryptographic root of trust.
+  # PyPI is just a fast distribution channel — peers verifying
+  # authenticity check the registry-side hybrid signature here, not
+  # the PyPI artifact itself. PEP 740 attestations on the PyPI
+  # upload compound the two.
+  build-manifest:
+    name: Generate + sign build manifest (hybrid Ed25519 + ML-DSA-65)
+    runs-on: ubuntu-latest
+    needs: pyo3-wheel
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ciris-edge version: $VERSION"
+      - name: install ciris-build-sign (prebuilt from CIRISVerify v1.9.0)
+        # Same pattern persist + lens use. Prebuilt tarball avoids
+        # recompiling the upstream signing crate + dep tree (~5min).
+        # v1.9.0 matches our Cargo deps so the BuildManifest shape
+        # exactly matches what consumers expect.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP"
+          gh release download v1.9.0 --repo CIRISAI/CIRISVerify \
+            --pattern 'ciris-verify-v1.9.0-build-tool-linux-x86_64.tar.gz'
+          tar -xzf ciris-verify-v1.9.0-build-tool-linux-x86_64.tar.gz
+          sudo install -m755 build-tool/ciris-build-sign /usr/local/bin/ciris-build-sign
+          sudo install -m755 build-tool/ciris-build-verify /usr/local/bin/ciris-build-verify
+          ciris-build-sign --version
+      - name: emit EdgeExtras JSON
+        # Reads the source tree (Cargo.toml + Cargo.lock + spec docs +
+        # the SchemaVersion enum) and emits the typed extras blob.
+        # Deterministic per checkout. transport-http feature on so
+        # enabled_transports reflects the production Phase 1 build.
+        run: |
+          mkdir -p dist
+          cargo run --release --features "transport-http" --bin emit_edge_extras \
+            > "dist/edge-extras-${{ steps.version.outputs.version }}.json"
+          echo "EdgeExtras emitted:"
+          cat "dist/edge-extras-${{ steps.version.outputs.version }}.json"
+      - name: download wheel for BuildManifest signing (linux x86_64)
+        uses: actions/download-artifact@v4
+        with:
+          name: ciris_edge-wheel-linux-x86_64
+          path: dist/wheel
+      - name: download all multi-arch wheels for binary-manifest aggregation
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ciris_edge-wheel-*
+          path: dist/wheels
+      - name: sign manifest with hybrid Ed25519 + ML-DSA-65
+        # Two independent secrets per the bridge onboarding (CIRISEdge#1):
+        # ciris-build-sign generate-keys produces TWO unrelated 32-byte
+        # seeds (one Ed25519, one ML-DSA-65 / FIPS 204), not one with
+        # the second derived from the first.
+        env:
+          CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
+          CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
+        run: |
+          if [ -z "${CIRIS_BUILD_ED25519_SECRET}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET}" ]; then
+            echo "::error::Hybrid signing secrets not configured."
+            echo "::error::Set CIRIS_BUILD_ED25519_SECRET and CIRIS_BUILD_MLDSA_SECRET."
+            echo "::error::Bridge provisioned these per CIRISEdge#1; re-check repo secrets."
+            exit 1
+          fi
+          umask 077
+          ED_KEY_PATH=$(mktemp)
+          MLDSA_KEY_PATH=$(mktemp)
+          printf '%s' "${CIRIS_BUILD_ED25519_SECRET}" | base64 -d > "$ED_KEY_PATH"
+          printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
+          BINARY="$(ls dist/wheel/*.whl | head -1)"
+          ciris-build-sign sign \
+            --primitive edge \
+            --build-id "${{ steps.version.outputs.version }}" \
+            --target x86_64-unknown-linux-gnu \
+            --binary "$BINARY" \
+            --binary-version "${{ steps.version.outputs.version }}" \
+            --extras "dist/edge-extras-${{ steps.version.outputs.version }}.json" \
+            --ed25519-seed "$ED_KEY_PATH" \
+            --mldsa-secret "$MLDSA_KEY_PATH" \
+            --key-id ciris-edge-build-v1 \
+            --output "dist/ciris-edge-${{ steps.version.outputs.version }}.manifest.json"
+          shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
+          echo "Signed manifest:"
+          cat "dist/ciris-edge-${{ steps.version.outputs.version }}.manifest.json"
+      - name: pre-flight registry steward-key check
+        # Surfaces the registry's active steward key_id to the step
+        # summary. Persist + lens log this for human-visible
+        # confirmation that the registry isn't running in ephemeral
+        # mode (registry AV-28).
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+        run: |
+          if [ -z "${REGISTRY_URL}" ]; then
+            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
+            echo "::warning::REGISTRY_URL repo variable unset; defaulting to ${REGISTRY_URL}"
+          fi
+          echo "Registry steward-key snapshot for ${REGISTRY_URL}:"
+          curl -sf "${REGISTRY_URL}/v1/steward-key" | tee dist/steward-key.json | python3 -m json.tool
+          KID=$(python3 -c 'import json; print(json.load(open("dist/steward-key.json"))["classical"]["key_id"])')
+          echo "registry steward key_id=${KID}" >> "$GITHUB_STEP_SUMMARY"
+      - name: register binary manifest with CIRISRegistry
+        # POST the binary catalog to /v1/verify/binary-manifest with
+        # project=ciris-edge. Bridge provisioned the trusted-primitive
+        # entry per CIRISEdge#1 — both regions confirmed.
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+          REGISTRY_ADMIN_TOKEN: ${{ secrets.REGISTRY_ADMIN_TOKEN }}
+        run: |
+          if [ -z "${REGISTRY_URL}" ]; then
+            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
+          fi
+          if [ -z "${REGISTRY_ADMIN_TOKEN}" ]; then
+            echo "::error::REGISTRY_ADMIN_TOKEN secret not configured."
+            echo "::error::Bridge provisioned this per CIRISEdge#1; re-check repo secrets."
+            exit 1
+          fi
+
+          declare -A TARGET_FOR=(
+            ["ciris_edge-wheel-linux-x86_64"]="x86_64-unknown-linux-gnu"
+            ["ciris_edge-wheel-linux-aarch64"]="aarch64-unknown-linux-gnu"
+            ["ciris_edge-wheel-darwin-aarch64"]="aarch64-apple-darwin"
+          )
+
+          BINARIES_JSON="{}"
+          for ARTDIR in "${!TARGET_FOR[@]}"; do
+            TARGET="${TARGET_FOR[$ARTDIR]}"
+            WHEEL="$(ls dist/wheels/${ARTDIR}/*.whl 2>/dev/null | head -1)"
+            if [ -z "${WHEEL}" ]; then
+              echo "::warning::No wheel found for ${TARGET} (artifact ${ARTDIR}); skipping"
+              continue
+            fi
+            SHA="sha256:$(sha256sum "${WHEEL}" | cut -d' ' -f1)"
+            echo "  ${TARGET}: ${SHA} ($(basename ${WHEEL}))"
+            BINARIES_JSON=$(python3 -c "
+          import json, sys
+          d = json.loads(sys.argv[1])
+          d['${TARGET}'] = '${SHA}'
+          print(json.dumps(d))
+          " "${BINARIES_JSON}")
+          done
+
+          # Stash for the round-trip step.
+          echo "${BINARIES_JSON}" > dist/binaries-posted.json
+
+          GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PAYLOAD=$(python3 -c "
+          import json, sys
+          binaries = json.loads(sys.argv[1])
+          print(json.dumps({
+              'project': 'ciris-edge',
+              'version': '${{ steps.version.outputs.version }}',
+              'binaries': binaries,
+              'generated_at': '${GENERATED_AT}',
+              'notes': 'CIRIS federation transport substrate; manifest signed via ciris-build-sign --primitive edge (CIRISVerify v1.9.0). Multi-arch publish: linux x86_64 + aarch64, darwin arm64.',
+          }))
+          " "${BINARIES_JSON}")
+          echo "POST ${REGISTRY_URL}/v1/verify/binary-manifest"
+          echo "${PAYLOAD}" | python3 -m json.tool
+          HTTP_CODE=$(curl -sS -o dist/registry-response.json -w "%{http_code}" \
+            -X POST "${REGISTRY_URL}/v1/verify/binary-manifest" \
+            -H "Authorization: Bearer ${REGISTRY_ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}")
+          echo "HTTP ${HTTP_CODE}"
+          cat dist/registry-response.json | python3 -m json.tool
+          if [ "${HTTP_CODE}" != "200" ] && [ "${HTTP_CODE}" != "201" ]; then
+            echo "::error::Registration POST failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+      - name: round-trip verify GET /v1/verify/binary-manifest/{version}
+        # Persist v0.4.0's tag CI hit a transient 404 on the immediate
+        # GET after a successful POST registration — registry has a
+        # read-after-write window between POST settling and GET seeing
+        # the row. Sleep + retry with exponential backoff closes it.
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+        run: |
+          if [ -z "${REGISTRY_URL}" ]; then
+            REGISTRY_URL="https://api.registry.ciris-services-1.ai"
+          fi
+          VERSION="${{ steps.version.outputs.version }}"
+          GET_URL="${REGISTRY_URL}/v1/verify/binary-manifest/${VERSION}?project=ciris-edge"
+          echo "GET ${GET_URL}"
+
+          # Sleep + retry: initial 5s sleep, then exponential backoff
+          # to ~30s total. Closes the read-after-write race persist
+          # got bitten by on its v0.4.0 tag run.
+          ATTEMPT=1
+          MAX_ATTEMPTS=4
+          DELAY=5
+          while [ ${ATTEMPT} -le ${MAX_ATTEMPTS} ]; do
+            echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS} (sleeping ${DELAY}s first)..."
+            sleep ${DELAY}
+            HTTP_CODE=$(curl -sS -o dist/round-trip.json -w "%{http_code}" "${GET_URL}")
+            echo "HTTP ${HTTP_CODE}"
+            if [ "${HTTP_CODE}" = "200" ]; then
+              break
+            fi
+            if [ "${HTTP_CODE}" != "404" ]; then
+              echo "::error::Round-trip GET returned non-retryable ${HTTP_CODE}"
+              cat dist/round-trip.json
+              exit 1
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+            DELAY=$((DELAY * 2))
+          done
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "::error::Round-trip GET still 404 after ${MAX_ATTEMPTS} attempts; registry replication never settled"
+            exit 1
+          fi
+          cat dist/round-trip.json | python3 -m json.tool
+
+          # Verify every target hash we POSTed comes back unchanged.
+          python3 <<'PY'
+          import json, sys
+          posted = json.load(open('dist/binaries-posted.json'))
+          got_doc = json.load(open('dist/round-trip.json'))
+          got = got_doc.get('binaries') or got_doc.get('manifest', {}).get('binaries') or {}
+          mismatches = []
+          for target, posted_sha in posted.items():
+              got_sha = got.get(target, '<missing>')
+              if got_sha != posted_sha:
+                  mismatches.append(f"  {target}:\n    posted: {posted_sha}\n    got:    {got_sha}")
+          if mismatches:
+              print("::error::Round-trip hash mismatch on the following targets:")
+              for m in mismatches:
+                  print(m)
+              sys.exit(1)
+          print(f"✓ Round-trip verified: {len(posted)} target hashes match GET response:")
+          for target, sha in posted.items():
+              print(f"  {target}: {sha}")
+          PY
+          {
+            echo "## Registry round-trip"
+            echo ""
+            echo "- registry: \`${REGISTRY_URL}\`"
+            echo "- version: \`${VERSION}\`"
+            echo "- attempts to settle: ${ATTEMPT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-build-manifest-${{ steps.version.outputs.version }}
+          path: |
+            dist/edge-extras-*.json
+            dist/ciris-edge-*.manifest.json
+            dist/steward-key.json
+            dist/registry-response.json
+            dist/round-trip.json
+            dist/binaries-posted.json
+
   # ─── publish-pypi: tag-gated wheel upload via OIDC ──────────────────
   #
-  # Trust posture: the BuildManifest round-trip is the cryptographic
-  # root of trust (OQ-12 closure; lands as a separate `build-manifest`
-  # job once `ciris-build-sign` integration is wired). PyPI is the
-  # fast distribution channel — peers verifying authenticity check the
+  # Trust posture: the BuildManifest round-trip (build-manifest job
+  # above) is the cryptographic root of trust. PyPI is the fast
+  # distribution channel — peers verifying authenticity check the
   # registry-side hybrid Ed25519 + ML-DSA-65 signature on the
   # manifest, not the PyPI artifact itself. PEP 740 attestations
   # compound the two.
@@ -138,6 +403,7 @@ jobs:
     # v0.3.2 shipped wheels through a fmt-failure tag run.
     needs:
       - pyo3-wheel
+      - build-manifest
       - lint
       - license-audit
       - linux-x86_64-test
@@ -192,18 +458,3 @@ jobs:
           # this exact GH workflow identity.
           attestations: true
 
-  # ─── build-manifest: hybrid-signed release provenance (TODO) ────────
-  #
-  # OQ-12 closure: every released CIRISEdge artifact publishes
-  # `EdgeExtras` JSON signed via `ciris-build-sign` (Ed25519 +
-  # ML-DSA-65 hybrid) and registered with CIRISRegistry. Round-trip
-  # verified before the release tarball publishes.
-  #
-  # Implementation pending: needs the `scripts/emit_edge_extras.py`
-  # generator (mirrors `lens/scripts/emit_lens_extras.py` and
-  # `persist/tools/emit_persist_extras.py`) plus the registry
-  # round-trip step (likely subject to the read-after-write race
-  # captured in memory/reference_registry_race.md — sleep + retry
-  # mitigation goes here when this lands).
-  #
-  # Once written, add `build-manifest` to publish-pypi `needs:`.

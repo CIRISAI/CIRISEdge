@@ -27,6 +27,7 @@ mod edge;
 pub mod ffi;
 pub mod handler;
 pub mod identity;
+pub mod manifest;
 pub mod messages;
 pub mod observability;
 pub mod outbound;

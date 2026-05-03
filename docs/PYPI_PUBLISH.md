@@ -120,9 +120,10 @@ native packaging at Phase 3, not PyPI.
 
 ## How this compounds with the BuildManifest signature
 
-Once the `build-manifest` CI job lands (OQ-12 closure; pending
-`scripts/emit_edge_extras.py`), the edge build pipeline has **three
-layers** of provenance:
+The `build-manifest` CI job (OQ-12 closure) signs every release with
+hybrid Ed25519 + ML-DSA-65 via `ciris-build-sign --primitive edge`
+and registers with CIRISRegistry. The edge build pipeline has
+**three layers** of provenance:
 
 | Layer | What it proves | Where it lives |
 |---|---|---|

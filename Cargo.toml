@@ -96,6 +96,15 @@ optional = true
 # get the `rlib`. Mirrors CIRISPersist Cargo.toml.
 crate-type = ["cdylib", "rlib"]
 
+# Build-manifest extras emitter — mirrors CIRISPersist's
+# `emit_persist_extras` and CIRISLens's `emit_lens_extras.py`.
+# Invoked by `.github/workflows/ci.yml::build-manifest` to produce
+# the EdgeExtras JSON that ciris-build-sign embeds in the signed
+# BuildManifest (OQ-12 closure).
+[[bin]]
+name = "emit_edge_extras"
+path = "src/bin/emit_edge_extras.rs"
+
 [dev-dependencies]
 tokio    = { version = "1", features = ["full"] }
 proptest = "1"
