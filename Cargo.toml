@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -22,7 +22,7 @@ publish = false
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.4.1", version = "0" }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.4.2", version = "0" }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # Pinned to the same v1.9.0 tag persist uses so the dep tree
