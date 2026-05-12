@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -22,13 +22,14 @@ publish = false
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.4.2", version = "0" }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.6.0", version = "0" }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
-# Pinned to the same v1.9.0 tag persist uses so the dep tree
-# stays single-versioned.
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.9.0", version = "1", features = ["pqc-ml-dsa"] }
-ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v1.9.0", version = "1", features = ["ed25519", "pqc-ml-dsa"] }
+# Pinned to v2.0.2 — matches the verify version persist v0.6.0
+# transitively requires (ml-dsa =0.1.0-rc.8 resolution); keeps the
+# federation dep tree single-versioned. Closes CIRISEdge#5.
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.2", version = "2", features = ["pqc-ml-dsa"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.2", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

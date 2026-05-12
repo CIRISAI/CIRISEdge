@@ -24,6 +24,11 @@ pub enum SchemaVersion {
 
 /// Discriminator for the body union. Edge dispatches on this *after*
 /// verify; handlers receive the parsed body struct, not raw bytes.
+///
+/// Consumer crates (ciris-lens-core, ciris-node-core) own the body
+/// structs and implement [`Message`] for them, pointing back to the
+/// variant here. Edge stays domain-agnostic — the enum just
+/// discriminates dispatch.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageType {
     /// Trace batches from agent → lens. Ephemeral.
@@ -39,6 +44,34 @@ pub enum MessageType {
     PublicKeyRegistration,
     /// Directory query — "do you have this key_id?". Ephemeral request-response.
     FederationKeyDirectoryQuery,
+
+    // ─── CIRISNodeCore federation-consensus wire types ──────────────
+    // Body structs live in `ciris-node-core` (consumer crate) per
+    // CIRISNodeCore/SCHEMA.md §3–§9. Edge#6 closure.
+    /// Contribution submission. Durable, requires_ack.
+    /// Body: `ContributionEnvelope` per CIRISNodeCore/SCHEMA.md §3.
+    ContributionSubmit,
+    /// Vote on a Contribution. Durable, requires_ack.
+    /// Body: `VoteEnvelope` per CIRISNodeCore/SCHEMA.md §5.
+    VoteCast,
+    /// Expertise attestation. Durable, requires_ack.
+    /// Body: `ExpertiseAttestationEnvelope` per SCHEMA.md §7.
+    ExpertiseAttestationPublish,
+    /// Moderation event. Durable, requires_ack, witness-set-required.
+    /// Body: `ModerationEventEnvelope` per SCHEMA.md §8.
+    ModerationEventPublish,
+    /// Slashing attestation. Durable, requires_ack, witness-set-required.
+    /// Body: `SlashingAttestationEnvelope` per SCHEMA.md §8.
+    SlashingAttestationPublish,
+    /// Reconsideration request. Durable, requires_ack, witness-set-required.
+    /// Body: `ReconsiderationRequestEnvelope` per SCHEMA.md §9.
+    ReconsiderationRequest,
+    /// Deferral request (generalizes CIRISNode WBD submit). Durable,
+    /// requires_ack. Body: `DeferralRequestEnvelope` per SCHEMA.md §4.7.
+    DeferralRequest,
+    /// Deferral response (routed WA's signed response). Durable,
+    /// requires_ack. Body: `DeferralResponseEnvelope` per SCHEMA.md §4.8.
+    DeferralResponse,
 }
 
 /// The signed wire envelope. Carries one verified message + the
