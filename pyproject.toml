@@ -35,7 +35,7 @@ classifiers = [
 # breaking changes; v0.1.x edge consumes v0.x persist. Bump the
 # upper bound when v0.2.x edge coordinates with v1.x persist.
 dependencies = [
-    "ciris-persist>=0.6.0,<1",
+    "ciris-persist>=0.7.4,<1",
 ]
 dynamic = ["version"]
 
