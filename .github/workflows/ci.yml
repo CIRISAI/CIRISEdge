@@ -36,6 +36,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        # cache-bin: false — Swatinem/rust-cache's default cache-bin
+        # restores `.cargo/bin/cargo` from older runs on macos-aarch64,
+        # which surfaces as `error: unexpected argument 'test' found`
+        # right after rustup install completes (the cached shim doesn't
+        # match the fresh toolchain). Matches CIRISPersist's v0.7.3 fix.
+        # Closes CIRISEdge#9.
+        with:
+          cache-bin: false
       - name: cargo test (transport-http)
         run: cargo test --features "transport-http"
 
