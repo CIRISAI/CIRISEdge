@@ -5,8 +5,15 @@ the Python edge across CIRISLens (FastAPI), CIRISAgent (httpx),
 CIRISRegistry (HTTPS) with a single Rust crate that does signed
 message in/out, verify-via-persist, and typed handler dispatch.
 
-**Status:** Proposed. This repo currently contains the spec; code
-lands as Phase 1 starts.
+**Status:** v0.2.0 — Phase 1 substrate live. Verify pipeline (hybrid
+Ed25519 + ML-DSA-65 via persist's directory lookup), durable outbound
+queue + dispatcher, typed handler dispatch, HTTP transport, outbound
+inline-text pipeline integration (Classify + Scrub + EncryptAndStore
+via `ciris-persist` v1.1.2), and a sovereign-mode convenience
+constructor (`EdgeBuilder::from_keyring_seed_dir`) for Reticulum-style
+adoption with no persist Engine in-process. PyO3 surface (`Edge`
+class registration + `init_edge_runtime`) lands in v0.3.x; reticulum
++ multi-medium transports follow per Phase 3 of the FSD.
 
 ## Read in this order
 

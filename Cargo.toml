@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -10,27 +10,29 @@ repository = "https://github.com/CIRISAI/CIRISEdge"
 readme = "README.md"
 publish = false
 
-# Status: Phase 1 in flight. Crate skeleton lands the public API and
-# typed-handler dispatch shape; transport implementations + verify
-# pipeline land in subsequent commits. See FSD/CIRIS_EDGE.md for the
-# architecture, MISSION.md for M-1 alignment per module,
-# docs/THREAT_MODEL.md for the v0.1.0 P0 invariants
-# (AV-9 + AV-13 + AV-14 + AV-17 + hybrid-verify-via-persist).
+# Status: v0.2.0 Phase 1 substrate live. Verify pipeline, durable
+# outbound queue + dispatcher, typed handler dispatch, HTTP transport,
+# and outbound inline-text pipeline integration (Classify + Scrub +
+# EncryptAndStore via ciris-persist v1.1.2) all shipped. PyO3 surface
+# (Edge class registration + init_edge_runtime) lands in v0.3.x;
+# reticulum + multi-medium transports follow per Phase 3 of the FSD.
+# See FSD/CIRIS_EDGE.md for the architecture, MISSION.md for M-1
+# alignment per module, docs/THREAT_MODEL.md for the v0.1.0 P0
+# invariants (AV-9 + AV-13 + AV-14 + AV-17 + hybrid-verify-via-persist).
 
 [dependencies]
 # Substrate. Owns federation_keys directory, canonicalize_envelope,
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v0.9.1", version = "0" }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v1.1.2", version = "1", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
-# Pinned to v2.0.5 — matches the verify version persist v0.9.1
-# transitively requires (iOS hardware-marker self-heal + Mach-O hash
-# parity); keeps the federation dep tree single-versioned. Closes
-# CIRISEdge#8 (gated on CIRISPersist#41 sqlite-in-wheel).
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.5", version = "2", features = ["pqc-ml-dsa"] }
-ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.0.5", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
+# Pinned to v2.1.5 — matches the verify version persist v1.1.2
+# transitively requires; keeps the federation dep tree single-
+# versioned. Edge v0.2.0 pipeline integration cut.
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.1.5", version = "2", features = ["software", "pqc-ml-dsa"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.1.5", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

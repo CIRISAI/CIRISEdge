@@ -19,23 +19,27 @@ classifiers = [
     "Topic :: Communications",
     "Topic :: System :: Networking",
 ]
-# v0.1.0-pre1 — pip-install-time subsumption mirroring persist's
-# pattern. `pip install ciris-edge` pulls `ciris-persist` (which
-# transitively pulls `ciris-verify` and the `ciris-build-sign` /
+# v0.2.0 — pip-install-time subsumption mirroring persist's pattern.
+# `pip install ciris-edge` pulls `ciris-persist` (which transitively
+# pulls `ciris-verify` and the `ciris-build-sign` /
 # `ciris-build-verify` console_scripts onto PATH). Lens / agent /
 # registry get one install command for the whole edge+persist+verify
 # stack.
 #
-# Pin to >=0.4.0 because that's the federation substrate cut
-# (CIRISPersist#14 + #16): verify_hybrid_via_directory + the
-# edge_outbound_queue table + Engine surface. Edge's verify pipeline
-# and send_durable BOTH require the v0.4.0 floor.
+# Pin to >=1.1.2 because that's the polymorphic-Pipeline cut
+# (CIRISPersist#33 Path A bounded): `Pipeline<E: WireEnvelope>` +
+# `InlineTextEnvelope` + `default_speak_pipeline` factory — edge's
+# `send_inline` / `send_durable_inline` invoke this for outbound
+# SPEAK / LLM-prompt / WBD-body transit-touch. Also folds in the
+# substrate constructors (CIRISPersist#43) edge's
+# `EdgeBuilder::from_keyring_seed_dir` calls for sovereign-mode
+# Reticulum adoption.
 #
-# Pin to <1 because we expect persist to follow semver-major on
-# breaking changes; v0.1.x edge consumes v0.x persist. Bump the
-# upper bound when v0.2.x edge coordinates with v1.x persist.
+# Pin to <2 because we expect persist to follow semver-major on
+# breaking changes; v0.2.x edge consumes v1.x persist. Bump the
+# upper bound when v0.3.x edge coordinates with v2.x persist.
 dependencies = [
-    "ciris-persist>=0.9.1,<1",
+    "ciris-persist>=1.1.2,<2",
 ]
 dynamic = ["version"]
 

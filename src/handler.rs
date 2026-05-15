@@ -78,6 +78,24 @@ pub trait Message: DeserializeOwned + Serialize + Send + 'static {
     type Response: DeserializeOwned + Serialize + Send + 'static;
 }
 
+/// A [`Message`] whose body wraps a single inline-text payload —
+/// SPEAK responses, LLM prompts, WBD bodies, DSAR text. Implementors
+/// can be sent via [`crate::Edge::send_inline`] /
+/// [`crate::Edge::send_durable_inline`], which run the configured
+/// `speak_pipeline` (Classify + Scrub + EncryptAndStore) on the text
+/// before signing + shipping — the cleartext never leaves the
+/// process. Per FSD §1.4 "encryption boundary collapse" and
+/// CIRISAgent#756 Q1 (outbound SPEAK transit-touch).
+pub trait InlineTextMessage: Message {
+    /// The inline text body. Pipeline scrub stages mutate this in
+    /// place via [`Self::set_text`].
+    fn text(&self) -> &str;
+    /// Replace the inline text. Called by edge after the pipeline
+    /// has transformed the text (e.g., scrubbed PII spans,
+    /// substituted `{SECRET:uuid:description}` placeholders).
+    fn set_text(&mut self, text: String);
+}
+
 /// Per-message context delivered to the handler alongside the parsed
 /// body. Forensic-completeness invariant: every field surfaces a join
 /// key into persist's structured logs (AV's "forensic completeness"

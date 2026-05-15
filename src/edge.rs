@@ -8,6 +8,7 @@
 //! (`MISSION.md` §3 anti-pattern 6).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -16,7 +17,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, Handler, HandlerContext,
-    HandlerError, Message,
+    HandlerError, InlineTextMessage, Message,
 };
 use crate::identity::{build_envelope, envelope_body_sha256, sign_envelope, StewardSigner};
 use crate::messages::{EdgeEnvelope, MessageType};
@@ -101,6 +102,16 @@ pub struct Edge {
     signer: Arc<StewardSigner>,
     transports: Vec<Arc<dyn Transport>>,
     handlers: Arc<Mutex<HashMap<MessageType, RegisteredHandler>>>,
+    /// Optional pipeline run on outbound inline-text envelopes
+    /// (SPEAK responses, LLM prompts, WBD bodies, DSAR text). When
+    /// `Some`, `send_inline` / `send_durable_inline` invoke this
+    /// before signing — classify, scrub, encrypt-and-store secret
+    /// spans per FSD §1.4. When `None`, those methods skip the
+    /// pipeline and behave identically to `send` / `send_durable`.
+    /// Construct via `default_speak_pipeline(secrets, actor_id)` in
+    /// `ciris_persist::pipeline`. Closes CIRISAgent#756 Q1.
+    speak_pipeline:
+        Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
     config: EdgeConfig,
 }
 
@@ -110,6 +121,8 @@ pub struct EdgeBuilder {
     queue: Option<Arc<dyn OutboundHandle>>,
     signer: Option<Arc<StewardSigner>>,
     transports: Vec<Arc<dyn Transport>>,
+    speak_pipeline:
+        Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
     config: EdgeConfig,
 }
 
@@ -121,6 +134,7 @@ impl Edge {
             queue: None,
             signer: None,
             transports: Vec::new(),
+            speak_pipeline: None,
             config: EdgeConfig::default(),
         }
     }
@@ -257,6 +271,60 @@ impl Edge {
             .map_err(|e| EdgeError::Persist(format!("enqueue_outbound: {e}")))?;
 
         Ok(DurableHandle { queue_id })
+    }
+
+    /// Send an inline-text message — runs the configured
+    /// `speak_pipeline` on the text body (classify + scrub +
+    /// encrypt-and-store) before signing + shipping. When no
+    /// pipeline is configured, behaves identically to
+    /// [`Self::send`]. Cleartext secrets are substituted with
+    /// `{SECRET:uuid:description}` placeholders before the envelope
+    /// is signed, so the wire payload never carries unredacted
+    /// sensitive spans. Per FSD §1.4 and CIRISAgent#756 Q1.
+    pub async fn send_inline<M: InlineTextMessage>(
+        &self,
+        destination_key_id: &str,
+        mut msg: M,
+    ) -> Result<M::Response, EdgeError> {
+        self.run_speak_pipeline(&mut msg).await?;
+        self.send(destination_key_id, msg).await
+    }
+
+    /// Durable variant of [`Self::send_inline`] — same pipeline-then-
+    /// sign path, but enqueues to `cirislens.edge_outbound_queue` for
+    /// edge-owned retry. Returns a [`DurableHandle`] to observe the
+    /// eventual outcome.
+    pub async fn send_durable_inline<M: InlineTextMessage>(
+        &self,
+        destination_key_id: &str,
+        mut msg: M,
+    ) -> Result<DurableHandle, EdgeError> {
+        self.run_speak_pipeline(&mut msg).await?;
+        self.send_durable(destination_key_id, msg).await
+    }
+
+    /// Run the configured outbound `speak_pipeline` over the
+    /// message's text body. Mutates `msg` in place via
+    /// `InlineTextMessage::set_text`. No-op when no pipeline is
+    /// configured. Logs sidecar via tracing.
+    async fn run_speak_pipeline<M: InlineTextMessage>(&self, msg: &mut M) -> Result<(), EdgeError> {
+        let Some(pipeline) = self.speak_pipeline.as_ref() else {
+            return Ok(());
+        };
+        let mut env = ciris_persist::prelude::InlineTextEnvelope::new(msg.text().to_string());
+        let mut state = ciris_persist::pipeline::PipelineState::default();
+        pipeline
+            .run(&mut env, &mut state)
+            .await
+            .map_err(|e| EdgeError::Persist(format!("speak_pipeline: {e}")))?;
+        tracing::debug!(
+            stages = ?state.stages_executed,
+            fields_modified = state.fields_modified,
+            pii_scrubbed = state.pii_scrubbed,
+            "speak_pipeline ran"
+        );
+        msg.set_text(env.text);
+        Ok(())
     }
 
     /// Run the listeners + dispatch loops + outbound dispatcher.
@@ -454,6 +522,63 @@ async fn dispatch_inbound(
 // ─── Builder ────────────────────────────────────────────────────────
 
 impl EdgeBuilder {
+    /// Sovereign-mode convenience: load steward identity from
+    /// filesystem seeds via `ciris-keyring`, open persist's
+    /// SQLite-backed federation directory + edge outbound queue at
+    /// `db_path`, and return a fully-wired builder. Caller still
+    /// adds transports + (optionally) a `speak_pipeline` before
+    /// `build()`. Use this in deployments that have no
+    /// `ciris_persist::Engine` in-process (Reticulum-only sovereign
+    /// agents, Pi/iOS hosts). Closes the sovereign half of
+    /// CIRISLensCore#7 / CIRISPersist#43 / CIRISVerify#20.
+    ///
+    /// `key_id` is the steward identity advertised on outbound
+    /// envelopes (`federation_keys.key_id`). `seed_path` points at
+    /// the directory containing `ed25519.seed` (and optionally
+    /// `ml_dsa_65.seed`); the constructor reads both and produces
+    /// `Arc<dyn HardwareSigner>` + optional `Arc<dyn PqcSigner>` via
+    /// the keyring loader.
+    pub async fn from_keyring_seed_dir(
+        key_id: impl Into<String>,
+        seed_dir: PathBuf,
+        db_path: PathBuf,
+    ) -> Result<Self, EdgeError> {
+        let key_id = key_id.into();
+        let pqc_seed = seed_dir.join("ml_dsa_65.seed");
+        let pqc_pair = pqc_seed
+            .exists()
+            .then(|| (Some(format!("{key_id}-pqc")), Some(pqc_seed)));
+        let (pqc_key_id, pqc_key_path) = pqc_pair.unwrap_or((None, None));
+
+        let config = ciris_keyring::StewardSeedConfig {
+            key_id: key_id.clone(),
+            key_path: seed_dir.join("ed25519.seed"),
+            pqc_key_id,
+            pqc_key_path,
+        };
+        let (classical, pqc) = ciris_keyring::load_steward_seed(config)
+            .await
+            .map_err(|e| EdgeError::Config(format!("load_steward_seed: {e}")))?;
+
+        let directory = ciris_persist::prelude::FederationDirectorySqlite::open(&db_path)
+            .await
+            .map_err(|e| EdgeError::Persist(format!("FederationDirectorySqlite::open: {e}")))?;
+        let queue = ciris_persist::prelude::EdgeOutboundQueueSqlite::open(&db_path)
+            .await
+            .map_err(|e| EdgeError::Persist(format!("EdgeOutboundQueueSqlite::open: {e}")))?;
+
+        let signer = Arc::new(StewardSigner {
+            key_id,
+            classical,
+            pqc,
+        });
+
+        Ok(Edge::builder()
+            .directory(directory)
+            .queue(queue)
+            .signer(signer))
+    }
+
     #[must_use]
     pub fn directory(mut self, directory: Arc<dyn VerifyDirectory>) -> Self {
         self.directory = Some(directory);
@@ -475,6 +600,25 @@ impl EdgeBuilder {
     #[must_use]
     pub fn transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transports.push(transport);
+        self
+    }
+
+    /// Configure the outbound inline-text pipeline. When set, edge
+    /// runs it on every `send_inline` / `send_durable_inline` call
+    /// before signing + shipping. Construct via
+    /// `ciris_persist::pipeline::default_speak_pipeline(secrets,
+    /// actor_id)` for the canonical Classify + Scrub + EncryptAndStore
+    /// stage set, or compose stages directly. Optional — when unset,
+    /// `send_inline` falls through to the ephemeral `send` path
+    /// without transit-touch.
+    #[must_use]
+    pub fn speak_pipeline(
+        mut self,
+        pipeline: Arc<
+            ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>,
+        >,
+    ) -> Self {
+        self.speak_pipeline = Some(pipeline);
         self
     }
 
@@ -513,6 +657,7 @@ impl EdgeBuilder {
             signer,
             transports: self.transports,
             handlers: Arc::new(Mutex::new(HashMap::new())),
+            speak_pipeline: self.speak_pipeline,
             config: self.config,
         })
     }
