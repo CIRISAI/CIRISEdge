@@ -37,9 +37,9 @@ pub mod verify;
 pub use edge::{Edge, EdgeBuilder, EdgeConfig, EdgeError};
 pub use handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, Handler, HandlerContext,
-    HandlerError, Message,
+    HandlerError, InlineTextMessage, Message,
 };
-pub use identity::StewardSigner;
+pub use identity::LocalSigner;
 pub use messages::{
     AccordEventsBatch, AccordEventsResponse, AttestationGossip, BuildManifestPublication,
     BuildManifestPublicationResponse, DSARRequest, DSARResponse, EdgeEnvelope,

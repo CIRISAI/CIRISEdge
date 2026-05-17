@@ -24,10 +24,16 @@ use uuid::Uuid;
 
 use crate::messages::{EdgeEnvelope, MessageType, SchemaVersion};
 
-/// Edge's signing identity. Wraps the keyring's classical and
-/// (optional) PQC signers. Used by `Edge::send` and
-/// `Edge::send_durable` to assemble + sign outbound envelopes.
-pub struct StewardSigner {
+/// Edge's local signing identity — the process-bound wrapper around
+/// ciris-keyring's classical and (optional) PQC signers. Used by
+/// `Edge::send` and `Edge::send_durable` to assemble + sign outbound
+/// envelopes.
+///
+/// Naming: "local" describes the wrapper's process scope; the
+/// IDENTITY the keys represent (steward / agent / registry / edge per
+/// `federation_keys.identity_type`) is a separate concept. Matches
+/// persist v1.4.0's `steward_*→local_*` rename (CIRISPersist#51).
+pub struct LocalSigner {
     /// Edge's `federation_keys.key_id` — embedded as `signing_key_id`
     /// on outbound envelopes.
     pub key_id: String,
@@ -70,7 +76,7 @@ pub fn build_envelope<M: Serialize>(
 /// `canonicalize_envelope_for_signing` (CIRISPersist#7 closure),
 /// signs with Ed25519 (mandatory) and ML-DSA-65 (when available).
 pub async fn sign_envelope(
-    signer: &StewardSigner,
+    signer: &LocalSigner,
     envelope: &mut EdgeEnvelope,
 ) -> Result<(), crate::EdgeError> {
     let envelope_value = serde_json::to_value(&*envelope)

@@ -1,7 +1,7 @@
 //! Edge — top-level construct.
 //!
 //! Holds the persist directory + outbound queue handles, the
-//! steward signer, the registered transports, the verify pipeline,
+//! local signer, the registered transports, the verify pipeline,
 //! the typed handler dispatch table, and the durable-outbound
 //! dispatcher. Single shape across every CIRIS peer (lens, agent,
 //! registry); peers compose around edge, not into it
@@ -19,7 +19,7 @@ use crate::handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, Handler, HandlerContext,
     HandlerError, InlineTextMessage, Message,
 };
-use crate::identity::{build_envelope, envelope_body_sha256, sign_envelope, StewardSigner};
+use crate::identity::{build_envelope, envelope_body_sha256, sign_envelope, LocalSigner};
 use crate::messages::{EdgeEnvelope, MessageType};
 use crate::outbound::{run_dispatcher, run_sweeps, DispatcherConfig, OutboundHandle};
 use crate::transport::{InboundFrame, Transport, TransportSendOutcome};
@@ -99,7 +99,7 @@ struct RegisteredHandler {
 pub struct Edge {
     verify: Arc<VerifyPipeline>,
     queue: Arc<dyn OutboundHandle>,
-    signer: Arc<StewardSigner>,
+    signer: Arc<LocalSigner>,
     transports: Vec<Arc<dyn Transport>>,
     handlers: Arc<Mutex<HashMap<MessageType, RegisteredHandler>>>,
     /// Optional pipeline run on outbound inline-text envelopes
@@ -119,7 +119,7 @@ pub struct Edge {
 pub struct EdgeBuilder {
     directory: Option<Arc<dyn VerifyDirectory>>,
     queue: Option<Arc<dyn OutboundHandle>>,
-    signer: Option<Arc<StewardSigner>>,
+    signer: Option<Arc<LocalSigner>>,
     transports: Vec<Arc<dyn Transport>>,
     speak_pipeline:
         Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
@@ -567,7 +567,7 @@ impl EdgeBuilder {
             .await
             .map_err(|e| EdgeError::Persist(format!("EdgeOutboundQueueSqlite::open: {e}")))?;
 
-        let signer = Arc::new(StewardSigner {
+        let signer = Arc::new(LocalSigner {
             key_id,
             classical,
             pqc,
@@ -592,7 +592,7 @@ impl EdgeBuilder {
     }
 
     #[must_use]
-    pub fn signer(mut self, signer: Arc<StewardSigner>) -> Self {
+    pub fn signer(mut self, signer: Arc<LocalSigner>) -> Self {
         self.signer = Some(signer);
         self
     }
@@ -637,7 +637,7 @@ impl EdgeBuilder {
             .ok_or_else(|| EdgeError::Config("outbound queue not set".into()))?;
         let signer = self
             .signer
-            .ok_or_else(|| EdgeError::Config("steward signer not set".into()))?;
+            .ok_or_else(|| EdgeError::Config("local signer not set".into()))?;
         if self.transports.is_empty() {
             return Err(EdgeError::Config("no transport configured".into()));
         }
