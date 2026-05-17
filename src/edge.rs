@@ -550,15 +550,15 @@ impl EdgeBuilder {
             .then(|| (Some(format!("{key_id}-pqc")), Some(pqc_seed)));
         let (pqc_key_id, pqc_key_path) = pqc_pair.unwrap_or((None, None));
 
-        let config = ciris_keyring::StewardSeedConfig {
+        let config = ciris_keyring::LocalSeedConfig {
             key_id: key_id.clone(),
             key_path: seed_dir.join("ed25519.seed"),
             pqc_key_id,
             pqc_key_path,
         };
-        let (classical, pqc) = ciris_keyring::load_steward_seed(config)
+        let (classical, pqc) = ciris_keyring::load_local_seed(config)
             .await
-            .map_err(|e| EdgeError::Config(format!("load_steward_seed: {e}")))?;
+            .map_err(|e| EdgeError::Config(format!("load_local_seed: {e}")))?;
 
         let directory = ciris_persist::prelude::FederationDirectorySqlite::open(&db_path)
             .await

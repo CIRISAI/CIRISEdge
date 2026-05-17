@@ -38,8 +38,14 @@ classifiers = [
 # Pin to <2 because we expect persist to follow semver-major on
 # breaking changes; v0.2.x edge consumes v1.x persist. Bump the
 # upper bound when v0.3.x edge coordinates with v2.x persist.
+# v0.2.3 — pin floor bumped to >=1.5.2 because that's the parity-
+# complete, vocabulary-clean cut: trust grants on signed Merkle events
+# (RFC 6962 + STH), 100% no-panic SQLite parity, and verify pin lockstep
+# at v2.4.0 (steward_seed → local_seed rename folded into the same
+# release window). Pre-v1.5.2 persist pulls keyring v2.0.5/v2.1.5
+# transitively which dual-versions the federation tree; v1.5.2 cleans it.
 dependencies = [
-    "ciris-persist>=1.1.2,<2",
+    "ciris-persist>=1.5.2,<2",
 ]
 dynamic = ["version"]
 
