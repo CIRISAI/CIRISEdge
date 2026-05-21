@@ -21,6 +21,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # ciris-keyring's `tpm` feature (auto-enabled for Linux targets
+      # by ciris-persist v1.10.0+, CIRISPersist#87) builds tss-esapi,
+      # which links libtss2. Cargo unions the feature across the graph
+      # so edge inherits it even though edge only asks for `software`.
+      # Closes CIRISEdge#12.
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (transport-http + pyo3)
@@ -58,6 +65,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # libtss2 for the `tpm` keyring feature — clippy compiles the
+      # full graph. See linux-x86_64-test above; CIRISEdge#12.
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -99,6 +110,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # libtss2 for the `tpm` keyring feature on the Linux wheel
+      # builds. macOS wheels build the base keyring (no tss-esapi),
+      # so this step is Linux-only. See CIRISEdge#12.
+      - name: install libtss2-dev (TPM build dep)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -153,6 +170,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # libtss2 for the `tpm` keyring feature — build-manifest
+      # compiles the graph to emit EdgeExtras. See CIRISEdge#12.
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
