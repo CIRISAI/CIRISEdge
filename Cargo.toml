@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -28,7 +28,7 @@ publish = false
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v1.5.2", version = "1", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v1.8.1", version = "1", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # Pinned to v2.4.0 — picks up CIRISVerify#24's load_steward_seed →
