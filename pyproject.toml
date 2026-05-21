@@ -38,17 +38,16 @@ classifiers = [
 # Pin to <2 because we expect persist to follow semver-major on
 # breaking changes; v0.2.x edge consumes v1.x persist. Bump the
 # upper bound when v0.3.x edge coordinates with v2.x persist.
-# v0.2.4 — pin floor bumped to >=1.8.1, the CIRIS 3.0 in-process
-# cohabitation convergence pin (CIRISPersist#85 EPIC). All co-resident
-# consumers (agent + NodeCore + LensCore + edge) must link one
-# identical ciris-persist version to share the OnceLock-backed Engine
-# process-singleton; two crate versions = two Engine types = cannot
-# share the singleton. v1.6.8 shipped the singleton + deadlock fix
-# (CIRISPersist#75); v1.7.x added the consumer registry + occurrence
-# registration; v1.8.x continues the convergence set. Verify pin
-# unchanged at v2.4.0. Closes CIRISEdge#10.
+# v0.2.6 — pin floor bumped to >=1.10.2, currency catch-up to the
+# CIRIS 3.0 cohabitation convergence point. All co-resident consumers
+# (agent + NodeCore + LensCore + edge) must link one identical
+# ciris-persist version to share the OnceLock-backed Engine
+# process-singleton (CIRISPersist#85 EPIC). v1.10.2 pins CIRISVerify
+# v2.7.0; edge's keyring/crypto pins move v2.4.0 → v2.7.0 in lockstep.
+# Persist prelude surface unchanged — pure currency bump, zero API
+# drift on edge's consumed paths.
 dependencies = [
-    "ciris-persist>=1.8.1,<2",
+    "ciris-persist>=1.10.2,<2",
 ]
 dynamic = ["version"]
 
