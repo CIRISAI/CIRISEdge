@@ -18,10 +18,15 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "transport-http")]
 pub mod http;
 
-// Implementations land in subsequent commits; trait shape sealed Phase 1.
+/// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
+/// (`reticulum-core` + `reticulum-std`). Canonical wire per
+/// `MISSION.md` §2; HTTP is the documented fallback.
+#[cfg(feature = "transport-reticulum")]
+pub mod reticulum;
+
+// Remaining implementations land in subsequent commits; trait shape
+// sealed Phase 1.
 //
-// pub mod reticulum;  // OQ-07 first impl
-// pub mod leviculum;  // OQ-07 second impl, gated on AV-25 byte-equivalence
 // pub mod lora;       // Phase 3
 // pub mod serial;     // Phase 3
 // pub mod i2p;        // Phase 3

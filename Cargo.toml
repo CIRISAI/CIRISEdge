@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -10,18 +10,16 @@ repository = "https://github.com/CIRISAI/CIRISEdge"
 readme = "README.md"
 publish = false
 
-# Status: v0.2.3 Phase 1 substrate live. Verify pipeline, durable
-# outbound queue + dispatcher, typed handler dispatch, HTTP transport,
+# Status: v0.3.0 — Reticulum canonical wire live. Verify pipeline,
+# durable outbound queue + dispatcher, typed handler dispatch,
 # outbound inline-text pipeline integration (Classify + Scrub +
-# EncryptAndStore via ciris-persist v1.5.2 — trust grants, Merkle STH,
-# 100% no-panic SQLite parity). Federation vocabulary aligned:
-# StewardSigner/StewardSeedConfig → LocalSigner/LocalSeedConfig across
-# persist + keyring + edge. PyO3 surface (Edge class registration +
-# init_edge_runtime) lands in v0.3.x; reticulum + multi-medium
-# transports follow per Phase 3 of the FSD. See FSD/CIRIS_EDGE.md for
-# the architecture, MISSION.md for M-1 alignment per module,
-# docs/THREAT_MODEL.md for the v0.1.0 P0 invariants
-# (AV-9 + AV-13 + AV-14 + AV-17 + hybrid-verify-via-persist).
+# EncryptAndStore via ciris-persist v1.11.0), HTTP transport, and the
+# Reticulum transport (Leviculum-backed; OQ-07 first impl) all
+# shipped. PyO3 surface (Edge class registration + init_edge_runtime)
+# and Phase 3 multi-medium transports (LoRa / serial / I²P) follow.
+# See FSD/CIRIS_EDGE.md for the architecture, MISSION.md for M-1
+# alignment per module, docs/THREAT_MODEL.md for the v0.1.0 P0
+# invariants (AV-9 + AV-13 + AV-14 + AV-17 + hybrid-verify-via-persist).
 
 [dependencies]
 # Substrate. Owns federation_keys directory, canonicalize_envelope,
@@ -67,6 +65,22 @@ tower = { version = "0.5", optional = true }
 hyper = { version = "1",   optional = true, features = ["client", "server", "http1"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
 
+# Reticulum transport — feature-gated below. Backed by Leviculum
+# (reticulum-core + reticulum-std, workspace v0.6.3, AGPL-3.0), the
+# canonical Reticulum stack for edge (OQ-07 first impl; Beechat's
+# reticulum-rs was spiked and rejected — broken link data path).
+#
+# Pinned to the CIRISAI/leviculum fork rather than teranos/leviculum
+# upstream: upstream's tree references a `vendor/Reticulum` git
+# submodule at a SHA force-removed from markqvist/Reticulum, and cargo
+# fetches a git dependency's submodules recursively — so the upstream
+# repo cannot resolve as a cargo git dep. The fork strips the three
+# dead integ-harness submodules (commit a7e1102); reticulum-core +
+# reticulum-std build untouched. Fork tracks teranos/leviculum, whose
+# base carries the macOS-compat commits edge's darwin CI needs.
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", optional = true }
+
 # ─── Optional transports — gated per OQ-02, OQ-07, OQ-13 ────────────
 # Implementations land in subsequent commits; features declared now so
 # downstream pin contracts are stable from v0.1.0.
@@ -77,12 +91,13 @@ default = []
 # Phase 1 — HTTP/HTTPS fallback for Reticulum-unreachable deployments.
 transport-http        = ["dep:axum", "dep:tower", "dep:hyper", "dep:reqwest"]
 
-# Phase 1 — Reticulum-rs canonical wire (OQ-07 first impl).
-# transport-reticulum-rs = []
+# Phase 1 — Reticulum canonical wire (OQ-07 first impl). Backed by
+# Leviculum's reticulum-core + reticulum-std. `TransportId::RETICULUM_RS`
+# is the metrics tag; the impl lives in `src/transport/reticulum.rs`.
+transport-reticulum   = ["dep:reticulum-std", "dep:reticulum-core"]
 
 # Phase 3 — additional transports, productionized when community uptake
 # justifies (OQ-13).
-# transport-leviculum   = []
 # transport-lora        = []
 # transport-serial      = []
 # transport-i2p         = []
@@ -116,6 +131,9 @@ path = "src/bin/emit_edge_extras.rs"
 [dev-dependencies]
 tokio    = { version = "1", features = ["full"] }
 proptest = "1"
+# Reticulum loopback acceptance test (tests/reticulum_loopback.rs).
+tempfile           = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]
 unsafe_code = "forbid"
