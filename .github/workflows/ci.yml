@@ -30,8 +30,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test (transport-http + pyo3)
-        run: cargo test --features "transport-http pyo3" --all-targets
+      - name: cargo test (transport-http + transport-reticulum + pyo3)
+        # transport-reticulum included so the Leviculum-backed Reticulum
+        # transport + the reticulum_loopback acceptance test are exercised
+        # in CI — "full features" must mean all of them (CIRISEdge#14).
+        run: cargo test --features "transport-http transport-reticulum pyo3" --all-targets
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
@@ -51,8 +54,11 @@ jobs:
         # Closes CIRISEdge#9.
         with:
           cache-bin: false
-      - name: cargo test (transport-http)
-        run: cargo test --features "transport-http"
+      - name: cargo test (transport-http + transport-reticulum)
+        # transport-reticulum on darwin too — Leviculum's macOS path is
+        # load-bearing (edge ships darwin wheels; the teranos fork base
+        # exists for macOS compat). CIRISEdge#14.
+        run: cargo test --features "transport-http transport-reticulum"
 
   # ─── iOS build is Phase 3 stretch (per FSD §3 Phase tier table) ─────
   # Deferred until swift-bridge integration lands. Intentionally absent
@@ -76,7 +82,7 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --all-targets --features "transport-http pyo3" -- -D warnings
+        run: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3" -- -D warnings
 
   # ─── license-audit: cargo deny (license + advisories) ───────────────
   license-audit:

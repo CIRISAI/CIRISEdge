@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -78,8 +78,8 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 # dead integ-harness submodules (commit a7e1102); reticulum-core +
 # reticulum-std build untouched. Fork tracks teranos/leviculum, whose
 # base carries the macOS-compat commits edge's darwin CI needs.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", optional = true }
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", version = "0.6", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", version = "0.6", optional = true }
 
 # ─── Optional transports — gated per OQ-02, OQ-07, OQ-13 ────────────
 # Implementations land in subsequent commits; features declared now so

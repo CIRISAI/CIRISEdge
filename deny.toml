@@ -30,6 +30,11 @@ allow = [
     # attribution preserved. Transitive via ciris-verify-core's
     # reqwest/ureq stack — same finding persist v0.1.9 documented.
     "CDLA-Permissive-2.0",
+    # bzip2 — the bzip2/libbzip2 license (BSD-style, permissive: use,
+    # redistribution, and modification permitted with attribution; no
+    # copyleft). AGPL-compatible. Transitive via the Leviculum
+    # Reticulum stack (reticulum-core resource-layer compression).
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.85
 
