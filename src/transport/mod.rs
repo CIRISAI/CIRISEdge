@@ -18,6 +18,13 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "transport-http")]
 pub mod http;
 
+/// Announce attestation — the authenticated transport-identity ↔
+/// federation-key binding carried in Reticulum announce app-data
+/// (CIRISEdge#15 / AV-42). Feature-gated alongside the Reticulum
+/// transport, its only consumer.
+#[cfg(feature = "transport-reticulum")]
+pub mod attestation;
+
 /// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
 /// (`reticulum-core` + `reticulum-std`). Canonical wire per
 /// `MISSION.md` §2; HTTP is the documented fallback.

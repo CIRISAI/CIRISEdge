@@ -24,17 +24,40 @@
 //! envelope signatures `verify.rs` checks; Reticulum link encryption
 //! is transport hardening only.
 //!
-//! ## Peer resolution
+//! ## Peer resolution — the authenticated cold-start path (AV-42)
 //!
-//! [`Transport::send`] receives a `destination_key_id: &str`. The
-//! transport resolves it to a Reticulum destination in two ways:
+//! [`Transport::send`] receives a `destination_key_id: &str` and must
+//! resolve it to a Reticulum destination. v0.3.1 recorded
+//! `key_id → destination` straight off the announce app-data
+//! (trust-on-first-use); any peer could announce a `key_id` it does
+//! not own and intercept everything addressed to it. That is **AV-42**
+//! (`docs/THREAT_MODEL.md` §4). v0.4.0 replaces TOFU with an
+//! authenticated cold-start path (CIRISEdge#15 / CIRISVerify#28
+//! Phase 3).
 //!
-//! 1. **Directory-seeded** — an injected [`PeerResolver`] (typically a
-//!    `FederationDirectory` lookup) yields the peer's dual-key public
-//!    bytes → `Identity::from_public_keys`.
-//! 2. **Announce-driven** — peers announce their `key_id` as the
-//!    announce app-data. The listener populates an in-memory
-//!    `key_id → destination` map from received announces.
+//! Each announce carries an [`AnnounceAttestation`] in its app-data —
+//! a federation-key signature binding the announcer's transport
+//! identity to its `key_id` (see [`super::attestation`]). On receipt
+//! the listener:
+//!
+//! 1. Parses the [`AnnounceAttestation`] from the app-data.
+//! 2. **Roots the federation key** — `RootingDirectory::root_binding`
+//!    (CIRISPersist v1.12.0) against the persist `federation_keys`
+//!    directory. A `Rejected` verdict drops the announce; a
+//!    `DirectoryError` is retryable (the peer is not blacklisted),
+//!    the seven structural/crypto rejections are terminal and logged
+//!    as AV-42 events.
+//! 3. **Verifies the attestation signature** over
+//!    `{transport_identity_pubkey, key_id, epoch}` against the
+//!    now-directory-confirmed Ed25519 pubkey. A forgery fails here.
+//! 4. **Applies the consumer [`HybridPolicy`]** to the rooted
+//!    provenance chain (`Strict` rejects any hybrid-pending link).
+//! 5. Records `key_id → transport identity` as a **rooted**
+//!    resolution and caches the `ProvenanceChain`. `send` routes to
+//!    it.
+//!
+//! An optional out-of-band [`PeerResolver`] remains for deployments
+//! that seed peers from a directory query rather than announces.
 //!
 //! If the peer is not yet resolvable, `send` returns
 //! [`TransportError::Unreachable`] and edge's durable dispatcher
@@ -57,6 +80,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::Utc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -66,7 +90,12 @@ use reticulum_core::{Destination, DestinationHash, DestinationType, Direction, I
 use reticulum_std::driver::{ReticulumNode, ReticulumNodeBuilder};
 use reticulum_std::NodeEvent;
 
+use super::attestation::{AnnounceAttestation, AttestationError, AttestationPayload};
 use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
+use crate::identity::LocalSigner;
+use crate::verify::{
+    HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
+};
 
 /// Maximum envelope body size accepted on send. Mirrors AV-13
 /// (`MAX_BODY_BYTES = 8 MiB`); oversized payloads reject before any
@@ -113,6 +142,26 @@ struct ResolvedPeer {
     signing_key: [u8; 32],
 }
 
+/// A peer whose `key_id → transport-identity` binding has been
+/// **rooted** against the persist `federation_keys` directory and
+/// whose announce attestation signature verified — the authenticated
+/// cold-start outcome (CIRISEdge#15). `send` routes only to rooted
+/// peers (or out-of-band [`PeerResolver`] hits).
+#[derive(Debug, Clone)]
+struct RootedPeer {
+    /// The Reticulum destination + signing key `connect` needs.
+    peer: ResolvedPeer,
+    /// The transport-identity rotation epoch this binding was
+    /// attested at. A later announce with a strictly greater epoch
+    /// supersedes; an equal-or-lower epoch is a stale re-announce.
+    epoch: u64,
+    /// The verified recursive-provenance chain from the rooting
+    /// verdict — cached so a consumer can audit provenance without a
+    /// second directory round-trip (CIRISVerify WS-4 hand-off).
+    #[allow(dead_code)]
+    chain: ProvenanceChain,
+}
+
 // ─── Configuration ──────────────────────────────────────────────────
 
 /// Reticulum transport configuration. Deliberately small — the MVP
@@ -133,9 +182,14 @@ pub struct ReticulumTransportConfig {
     /// Interval between re-announces of edge's own destination. The
     /// destination is also announced once on startup.
     pub announce_interval: Duration,
-    /// Edge's own federation `key_id`, advertised as the announce
-    /// app-data so peers can map `key_id → destination`.
+    /// Edge's own federation `key_id`, advertised in the announce
+    /// attestation so peers can root + map `key_id → destination`.
     pub local_key_id: String,
+    /// Transport-identity rotation epoch carried in edge's own
+    /// announce attestation. Monotonic per `local_key_id` — bump it
+    /// when the transport identity rotates so peers supersede their
+    /// cached binding. `0` is a fine first-deployment value.
+    pub local_epoch: u64,
 }
 
 impl ReticulumTransportConfig {
@@ -150,6 +204,7 @@ impl ReticulumTransportConfig {
             identity_path,
             announce_interval: Duration::from_secs(300),
             local_key_id: local_key_id.into(),
+            local_epoch: 0,
         }
     }
 }
@@ -173,13 +228,22 @@ pub struct ReticulumTransport {
     /// Hash of edge's own registered destination — the thing we
     /// announce on startup and on the announce timer.
     local_dest_hash: DestinationHash,
+    /// Edge's own announce attestation app-data — built once in
+    /// `new` (sign with the federation `LocalSigner`) and emitted
+    /// verbatim on every announce. `None` when no signer was
+    /// supplied: the transport then cannot prove its own binding and
+    /// announces an empty app-data (peers with rooting enabled will
+    /// drop it — fail-honest).
+    local_attestation: Option<Vec<u8>>,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     events: Mutex<Option<mpsc::Receiver<NodeEvent>>>,
-    /// `key_id → resolved peer`, populated from received announces.
-    /// `send` consults this before falling back to the injected
+    /// `key_id → rooted peer`, populated by the authenticated
+    /// cold-start path from received announces. Every entry has been
+    /// rooted against the persist directory + had its attestation
+    /// signature verified. `send` consults this before the injected
     /// [`PeerResolver`].
-    peers: Arc<Mutex<HashMap<String, ResolvedPeer>>>,
+    peers: Arc<Mutex<HashMap<String, RootedPeer>>>,
     /// Link IDs the event loop has seen reach `LinkEstablished`.
     /// `send` waits on this set after `connect` — the link must be
     /// established on both ends before a resource transfer can start.
@@ -191,25 +255,115 @@ pub struct ReticulumTransport {
     /// waits on this set so it returns `Delivered` only once the
     /// transfer has actually drained, not merely enqueued.
     sent_resources: Arc<Mutex<HashSet<[u8; 32]>>>,
-    /// Optional directory-backed resolver. When `None`, only
-    /// announce-driven discovery is available.
+    /// Optional out-of-band directory-backed resolver. When `None`,
+    /// only the authenticated announce cold-start path is available.
     resolver: Option<Arc<dyn PeerResolver>>,
+    /// Persist `federation_keys` directory adapter for the
+    /// authenticated cold-start path. When `None`, announce
+    /// attestations cannot be rooted and announces are dropped — the
+    /// transport then resolves peers only via the out-of-band
+    /// [`PeerResolver`]. Required to close AV-42 on the announce path.
+    rooting: Option<Arc<dyn RootingDirectory>>,
+    /// Consumer-side hybrid PQC acceptance policy applied to a rooted
+    /// peer's provenance chain (CIRISEdge#15 step 4). Mirrors the
+    /// `HybridPolicy` edge's verify pipeline runs.
+    hybrid_policy: HybridPolicy,
+}
+
+/// Federation-authentication wiring for [`ReticulumTransport`] — the
+/// pieces the authenticated cold-start path (CIRISEdge#15) needs
+/// beyond the bare [`ReticulumTransportConfig`].
+///
+/// All three handle fields are optional so a transport can run in a
+/// reduced mode (e.g. a closed/trusted Reticulum network seeded
+/// purely from a [`PeerResolver`]). To close **AV-42** on the
+/// announce path, supply at least `signer` (so the transport can
+/// attest its own binding) and `rooting` (so it can root incoming
+/// announces). [`Default`] yields an all-`None` bundle with the
+/// [`HybridPolicy::Strict`] production posture.
+pub struct ReticulumAuth {
+    /// The federation `LocalSigner` — used once at construction to
+    /// sign edge's own announce attestation. The federation Ed25519
+    /// key; never fed to Leviculum (AV-17). `None` → the transport
+    /// announces empty app-data and rooting peers drop it.
+    pub signer: Option<Arc<LocalSigner>>,
+    /// The persist `federation_keys` directory adapter used to root
+    /// incoming announce attestations. `None` → announces cannot be
+    /// rooted and are dropped; peers resolve only via `resolver`.
+    pub rooting: Option<Arc<dyn RootingDirectory>>,
+    /// Out-of-band directory-seeded resolver (the v0.3.1 path).
+    /// Independent of `rooting`; consulted by `send` after the
+    /// rooted announce map.
+    pub resolver: Option<Arc<dyn PeerResolver>>,
+    /// Consumer-side hybrid PQC policy applied to a rooted peer's
+    /// provenance chain. [`Default`] is [`HybridPolicy::Strict`] —
+    /// the production posture, matching `EdgeConfig::default`.
+    pub hybrid_policy: HybridPolicy,
+}
+
+impl Default for ReticulumAuth {
+    fn default() -> Self {
+        Self {
+            signer: None,
+            rooting: None,
+            resolver: None,
+            hybrid_policy: HybridPolicy::Strict,
+        }
+    }
 }
 
 impl ReticulumTransport {
     /// Construct + start the transport: load-or-generate the
     /// transport identity, build the Leviculum node with the
     /// configured TCP interfaces, register edge's own federation
-    /// destination, take the node's event receiver, and start the
-    /// event loop.
+    /// destination, build edge's signed announce attestation, take
+    /// the node's event receiver, and start the event loop.
     ///
     /// The node is running once this returns. [`Transport::listen`]
     /// drains its events; [`Transport::send`] uses it to dial peers.
+    ///
+    /// `auth` carries the federation-authentication wiring for the
+    /// CIRISEdge#15 cold-start path — see [`ReticulumAuth`]. Pass
+    /// `ReticulumAuth::default()` for a transport with no
+    /// authenticated discovery (resolver-only / test loopback).
     pub async fn new(
         config: ReticulumTransportConfig,
-        resolver: Option<Arc<dyn PeerResolver>>,
+        auth: ReticulumAuth,
     ) -> Result<Self, TransportError> {
+        let ReticulumAuth {
+            signer,
+            rooting,
+            resolver,
+            hybrid_policy,
+        } = auth;
+
         let identity = load_or_generate_identity(&config.identity_path)?;
+
+        // Build edge's own announce attestation: a federation-key
+        // signature binding this transport identity to `local_key_id`
+        // at `local_epoch` (CIRISEdge#15 send side). The transport
+        // identity's Ed25519 public key is the ed25519 half (bytes
+        // 32..64) of the dual-key identity.
+        let mut transport_ed25519 = [0u8; 32];
+        transport_ed25519.copy_from_slice(&identity.public_key_bytes()[32..64]);
+        let local_attestation = if let Some(s) = &signer {
+            Some(
+                build_local_attestation(
+                    s,
+                    &transport_ed25519,
+                    &config.local_key_id,
+                    config.local_epoch,
+                )
+                .await?,
+            )
+        } else {
+            tracing::warn!(
+                "Reticulum transport built without a federation signer; \
+                 its announce carries no attestation and rooting peers \
+                 will drop it (AV-42 fail-honest)",
+            );
+            None
+        };
 
         // Build the node. The transport identity is the node identity;
         // a per-process storage dir alongside the identity file holds
@@ -266,28 +420,33 @@ impl ReticulumTransport {
             config,
             node: Arc::new(node),
             local_dest_hash,
+            local_attestation,
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resources: Arc::new(Mutex::new(HashSet::new())),
             resolver,
+            rooting,
+            hybrid_policy,
         })
     }
 
-    /// Whether `destination_key_id` has been resolved — either learnt
-    /// from a received announce or directory-resolvable. Primarily a
-    /// test + diagnostics hook for confirming announce-driven
-    /// discovery has converged before a `send`.
+    /// Whether `destination_key_id` has been resolved — either rooted
+    /// from a received announce (authenticated cold-start path) or
+    /// directory-resolvable via the out-of-band [`PeerResolver`].
+    /// Primarily a test + diagnostics hook for confirming the
+    /// authenticated discovery has converged before a `send`.
     pub async fn knows_peer(&self, destination_key_id: &str) -> bool {
         self.resolve_peer(destination_key_id).await.is_some()
     }
 
     /// Resolve a `destination_key_id` to a Reticulum peer. Consults
-    /// the announce-populated map first, then the injected
+    /// the **rooted** announce map first (every entry has cleared the
+    /// CIRISEdge#15 cold-start path), then the out-of-band injected
     /// [`PeerResolver`]. Returns `None` if neither yields the peer.
     async fn resolve_peer(&self, destination_key_id: &str) -> Option<ResolvedPeer> {
-        if let Some(peer) = self.peers.lock().await.get(destination_key_id).copied() {
-            return Some(peer);
+        if let Some(rooted) = self.peers.lock().await.get(destination_key_id) {
+            return Some(rooted.peer);
         }
         let pubkey = self.resolver.as_ref()?.resolve(destination_key_id)?;
         let mut x25519 = [0u8; 32];
@@ -406,10 +565,15 @@ impl Transport for ReticulumTransport {
         );
 
         // Announce edge's own destination on startup, then on a timer.
-        let app_data = self.config.local_key_id.clone().into_bytes();
+        // The app-data is edge's signed announce attestation
+        // (CIRISEdge#15 send side) — a federation-key signature
+        // binding this transport identity to `local_key_id`. When no
+        // signer was supplied the announce carries empty app-data and
+        // rooting peers drop it (fail-honest).
+        let app_data: &[u8] = self.local_attestation.as_deref().unwrap_or(&[]);
         if let Err(e) = self
             .node
-            .announce_destination(&self.local_dest_hash, Some(&app_data))
+            .announce_destination(&self.local_dest_hash, Some(app_data))
             .await
         {
             tracing::warn!(error = %e, "initial announce failed");
@@ -422,7 +586,7 @@ impl Transport for ReticulumTransport {
                 _ = announce_tick.tick() => {
                     if let Err(e) = self
                         .node
-                        .announce_destination(&self.local_dest_hash, Some(&app_data))
+                        .announce_destination(&self.local_dest_hash, Some(app_data))
                         .await
                     {
                         tracing::warn!(error = %e, "periodic announce failed");
@@ -439,6 +603,8 @@ impl Transport for ReticulumTransport {
                         established_links: &self.established_links,
                         sent_resources: &self.sent_resources,
                         sink: &sink,
+                        rooting: self.rooting.as_deref(),
+                        hybrid_policy: self.hybrid_policy,
                     };
                     handle_event(event, &ctx).await;
                 }
@@ -452,10 +618,15 @@ impl Transport for ReticulumTransport {
 /// Shared handles the event loop hands to [`handle_event`].
 struct EventCtx<'a> {
     node: &'a ReticulumNode,
-    peers: &'a Mutex<HashMap<String, ResolvedPeer>>,
+    peers: &'a Mutex<HashMap<String, RootedPeer>>,
     established_links: &'a Mutex<HashSet<LinkId>>,
     sent_resources: &'a Mutex<HashSet<[u8; 32]>>,
     sink: &'a mpsc::Sender<InboundFrame>,
+    /// Persist directory adapter for the authenticated cold-start
+    /// path; `None` → announces are dropped (no rooting possible).
+    rooting: Option<&'a dyn RootingDirectory>,
+    /// Consumer hybrid PQC policy applied to a rooted chain.
+    hybrid_policy: HybridPolicy,
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -465,21 +636,13 @@ struct EventCtx<'a> {
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
     match event {
         NodeEvent::AnnounceReceived { announce, .. } => {
-            // The announce app-data carries the peer's federation
-            // `key_id`; the public key's ed25519 half (bytes 32..64)
-            // is the `signing_key` `connect` needs.
-            let Some(key_id) = announce.app_data_string().map(str::to_owned) else {
-                return;
-            };
-            let pk = announce.public_key();
-            let mut signing_key = [0u8; 32];
-            signing_key.copy_from_slice(&pk[32..64]);
-            let resolved = ResolvedPeer {
-                dest_hash: *announce.destination_hash(),
-                signing_key,
-            };
-            tracing::debug!(key_id = %key_id, dest = %resolved.dest_hash, "peer discovered via announce");
-            ctx.peers.lock().await.insert(key_id, resolved);
+            // The announce app-data carries the peer's signed
+            // attestation. Run the authenticated cold-start path —
+            // root the federation key, verify the attestation
+            // signature, apply the hybrid policy — before the peer
+            // is recorded as resolvable. This replaces v0.3.1's
+            // trust-on-first-use (CIRISEdge#15, AV-42).
+            resolve_announce_cold_start(&announce, ctx).await;
         }
         NodeEvent::LinkRequest { link_id, .. } => {
             match ctx.node.accept_link(&link_id).await {
@@ -548,6 +711,269 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
     }
+}
+
+// ─── Authenticated cold-start path (CIRISEdge#15 / AV-42) ──────────
+
+/// Run the authenticated `PeerResolver` cold-start path on a received
+/// announce. This is the **AV-42 mitigation** — it replaces v0.3.1's
+/// trust-on-first-use announce-recording.
+///
+/// Steps (the locked CIRISEdge#15 design — persist v1.12.0
+/// `root_binding`):
+///
+/// 1. Parse the [`AnnounceAttestation`] from the announce app-data.
+///    A v0.3.1 bare-`key_id` announce, or any non-attestation
+///    app-data, fails to parse and is dropped.
+/// 2. `root_binding(directory, key_id, claimed_ed25519_pubkey)` —
+///    a `Rejected` verdict drops the announce. `DirectoryError` is
+///    retryable (the peer is *not* blacklisted — a transient backend
+///    fault is not a statement about the binding); the seven
+///    structural/crypto rejections are terminal and logged as AV-42
+///    events.
+/// 3. Verify the attestation signature over
+///    `{transport_identity_pubkey, key_id, epoch}` against the
+///    now-directory-confirmed Ed25519 pubkey. A forgery fails here.
+/// 4. Apply the consumer [`HybridPolicy`] to the rooted provenance
+///    chain — `Strict` rejects any hybrid-pending link.
+/// 5. Record `key_id → transport identity` as a [`RootedPeer`] and
+///    cache the [`ProvenanceChain`].
+///
+/// A drop at any step leaves the peer map untouched: `send` will
+/// surface [`TransportError::Unreachable`] for that `key_id` rather
+/// than route to an unauthenticated destination.
+async fn resolve_announce_cold_start(
+    announce: &reticulum_core::ReceivedAnnounce,
+    ctx: &EventCtx<'_>,
+) {
+    // Step 0 — the cold-start path needs the persist directory. With
+    // no rooting backend the announce cannot be authenticated; drop
+    // it (fail-honest — never fall back to TOFU).
+    let Some(rooting) = ctx.rooting else {
+        tracing::debug!("announce dropped: no rooting directory configured");
+        return;
+    };
+
+    // Step 1 — parse the attestation from the announce app-data.
+    let attestation = match AnnounceAttestation::from_app_data(announce.app_data()) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!(error = %e, "announce dropped: app-data is not a valid attestation");
+            return;
+        }
+    };
+    let key_id = attestation.federation_key_id.clone();
+
+    // Step 2 — root the federation key against the persist directory.
+    let verdict = rooting
+        .root_binding(&key_id, &attestation.federation_pubkey_ed25519_base64)
+        .await;
+    let chain = match verdict {
+        RootingVerdict::Confirmed { chain } => chain,
+        RootingVerdict::Rejected { rejection } => {
+            // DirectoryError is a transient substrate fault — retryable,
+            // not a verdict on the binding. The other seven variants
+            // are terminal structural/crypto rejections: AV-42 events.
+            if matches!(rejection, RootingRejection::DirectoryError { .. }) {
+                tracing::warn!(
+                    key_id = %key_id,
+                    kind = rejection.kind(),
+                    "announce rooting deferred: directory error (retryable, peer not blacklisted)",
+                );
+            } else {
+                tracing::warn!(
+                    av = "AV-42",
+                    key_id = %key_id,
+                    kind = rejection.kind(),
+                    "announce rejected: federation key did not root \
+                     (spoofed transport-identity ↔ federation-key binding)",
+                );
+            }
+            return;
+        }
+    };
+
+    // Step 3 — verify the attestation signature against the Ed25519
+    // pubkey the directory just confirmed (NOT the wire claim).
+    if !attestation_verifies_against_chain(&attestation, &chain, &key_id) {
+        return;
+    }
+
+    // Step 4 — apply the consumer hybrid PQC policy to the rooted
+    // chain. `Strict` rejects a chain with any hybrid-pending link;
+    // `Ed25519Fallback` accepts the Confirmed verdict as-is;
+    // `SoftFreshness` accepts it (the freshness window is a per-row
+    // age input the announce path does not carry — consistent with
+    // verify.rs's `row_age = None` treatment, which collapses
+    // `SoftFreshness` to "accept the rooted chain").
+    if !hybrid_policy_accepts(ctx.hybrid_policy, &chain) {
+        tracing::warn!(
+            key_id = %key_id,
+            policy = ?ctx.hybrid_policy,
+            "announce rejected: rooted provenance chain is hybrid-pending under Strict policy",
+        );
+        return;
+    }
+
+    // Step 5 — record the rooted resolution. A strictly-newer epoch
+    // supersedes a cached binding; an equal-or-older epoch is a stale
+    // re-announce and is ignored (keeps the cached chain).
+    let transport_pubkey = match attestation.transport_identity_pubkey_bytes() {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::warn!(av = "AV-42", key_id = %key_id, error = %e,
+                "announce rejected: transport-identity pubkey malformed");
+            return;
+        }
+    };
+    let resolved = ResolvedPeer {
+        dest_hash: *announce.destination_hash(),
+        signing_key: transport_pubkey,
+    };
+    let mut peers = ctx.peers.lock().await;
+    match peers.get(&key_id) {
+        Some(existing) if existing.epoch >= attestation.epoch => {
+            tracing::trace!(
+                key_id = %key_id,
+                cached_epoch = existing.epoch,
+                announce_epoch = attestation.epoch,
+                "stale re-announce ignored (epoch not newer)",
+            );
+        }
+        _ => {
+            tracing::info!(
+                key_id = %key_id,
+                dest = %resolved.dest_hash,
+                epoch = attestation.epoch,
+                "peer ROOTED via authenticated cold-start path",
+            );
+            peers.insert(
+                key_id,
+                RootedPeer {
+                    peer: resolved,
+                    epoch: attestation.epoch,
+                    chain,
+                },
+            );
+        }
+    }
+}
+
+/// Verify the announce attestation signature against the **Ed25519
+/// pubkey the persist directory confirmed** for `key_id` — the leaf
+/// of the rooted provenance `chain`, never the pubkey the announce
+/// claimed (CIRISEdge#15 step 3). Returns `false` (logging an AV-42
+/// event) on any failure; the caller drops the announce.
+fn attestation_verifies_against_chain(
+    attestation: &AnnounceAttestation,
+    chain: &ProvenanceChain,
+    key_id: &str,
+) -> bool {
+    // The rooted chain's leaf (`chain[0]`) is the queried row; its
+    // `pubkey_ed25519_base64` is the directory's confirmed pubkey.
+    // `root_binding` already proved this equals the claimed pubkey,
+    // so the chain leaf is always present and authoritative.
+    let Some(leaf) = chain.chain.first() else {
+        tracing::warn!(
+            av = "AV-42",
+            key_id,
+            "announce rejected: rooted chain has no leaf"
+        );
+        return false;
+    };
+    let confirmed_pubkey = base64::engine::general_purpose::STANDARD
+        .decode(&leaf.pubkey_ed25519_base64)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let Some(confirmed_pubkey) = confirmed_pubkey else {
+        tracing::warn!(
+            av = "AV-42",
+            key_id,
+            "announce rejected: directory-confirmed pubkey is not 32-byte base64",
+        );
+        return false;
+    };
+    if let Err(e) = attestation.verify_signature(&confirmed_pubkey) {
+        tracing::warn!(
+            av = "AV-42",
+            key_id,
+            error = %e,
+            "announce rejected: attestation signature did not verify \
+             against the directory-confirmed federation key",
+        );
+        return false;
+    }
+    true
+}
+
+/// Whether `policy` accepts a rooted provenance `chain` (CIRISEdge#15
+/// step 4).
+///
+/// - `Strict` — every [`ProvenanceLink`] must be hybrid-complete:
+///   reject if any link has `pubkey_ml_dsa_65_base64 == None` or
+///   `scrub_signature_pqc == None` (a hybrid-pending row).
+/// - `Ed25519Fallback` — accept the `Confirmed` verdict as-is; the
+///   Ed25519-rooted chain is sufficient.
+/// - `SoftFreshness { window }` — the freshness window is a per-row
+///   age input the announce path does not carry, so this collapses
+///   to "accept the rooted chain", consistent with `verify.rs`'s
+///   documented `row_age = None` treatment of `SoftFreshness`.
+///
+/// [`ProvenanceLink`]: crate::verify::ProvenanceLink
+fn hybrid_policy_accepts(policy: HybridPolicy, chain: &ProvenanceChain) -> bool {
+    match policy {
+        HybridPolicy::Strict => chain.chain.iter().all(|link| {
+            link.pubkey_ml_dsa_65_base64.is_some() && link.scrub_signature_pqc.is_some()
+        }),
+        HybridPolicy::Ed25519Fallback | HybridPolicy::SoftFreshness { .. } => true,
+    }
+}
+
+/// Build edge's own announce attestation app-data — the CIRISEdge#15
+/// send side. Signs `{transport_identity_pubkey, key_id, epoch}` with
+/// the federation [`LocalSigner`]'s Ed25519 (classical) key and packs
+/// the result as [`AnnounceAttestation`] JSON.
+///
+/// The federation Ed25519 public key is read from the signer's
+/// `HardwareSigner`; it never feeds Leviculum (AV-17). Returns the
+/// announce app-data bytes.
+async fn build_local_attestation(
+    signer: &LocalSigner,
+    transport_identity_pubkey: &[u8; 32],
+    federation_key_id: &str,
+    epoch: u64,
+) -> Result<Vec<u8>, TransportError> {
+    let fed_pubkey = signer
+        .classical
+        .public_key()
+        .await
+        .map_err(|e| TransportError::Config(format!("federation pubkey: {e}")))?;
+    if fed_pubkey.len() != 32 {
+        return Err(TransportError::Config(format!(
+            "federation Ed25519 pubkey must be 32 bytes, got {}",
+            fed_pubkey.len()
+        )));
+    }
+
+    let payload = AttestationPayload::new(transport_identity_pubkey, federation_key_id, epoch);
+    let signature = signer
+        .classical
+        .sign(&payload.canonical_bytes())
+        .await
+        .map_err(|e| TransportError::Config(format!("attestation sign: {e}")))?;
+
+    let attestation = AnnounceAttestation {
+        transport_identity_pubkey: base64::engine::general_purpose::STANDARD
+            .encode(transport_identity_pubkey),
+        federation_key_id: federation_key_id.to_string(),
+        federation_pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
+            .encode(&fed_pubkey),
+        epoch,
+        signature: base64::engine::general_purpose::STANDARD.encode(&signature),
+    };
+    attestation
+        .to_app_data()
+        .map_err(|e: AttestationError| TransportError::Config(format!("attestation encode: {e}")))
 }
 
 // ─── Identity persistence (AV-17) ───────────────────────────────────

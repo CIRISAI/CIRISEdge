@@ -33,6 +33,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
+use ciris_persist::federation::rooting::{
+    provenance_chain as persist_provenance_chain, root_binding as persist_root_binding,
+};
+pub use ciris_persist::federation::rooting::{
+    ProvenanceChain, ProvenanceLink, RootingRejection, RootingVerdict,
+};
 use ciris_persist::prelude::{
     body_sha256 as persist_body_sha256, canonicalize_envelope_for_signing,
     verify_hybrid_via_directory as persist_verify_hybrid_via_directory, FederationDirectory,
@@ -83,6 +89,54 @@ impl<F: FederationDirectory + Send + Sync + 'static> VerifyDirectory for F {
             row_age,
         )
         .await
+    }
+}
+
+/// Adapter trait that erases `FederationDirectory`'s generics for the
+/// cold-start binding-rooting primitive (`root_binding`,
+/// CIRISPersist#94 / v1.12.0).
+///
+/// `ciris_persist::federation::rooting::root_binding` is
+/// `root_binding<F: FederationDirectory>` — generic over a concrete
+/// directory. `FederationDirectory` itself uses `async fn in trait`
+/// (RPIT), so it is not dyn-compatible and edge cannot hold a
+/// `&dyn FederationDirectory`. This mirrors the [`VerifyDirectory`]
+/// pattern exactly: blanket-implemented for any `FederationDirectory`,
+/// `#[async_trait]`-erased so the Reticulum [`PeerResolver`] can hold
+/// an `Arc<dyn RootingDirectory>` without picking edge's generics.
+///
+/// See `src/transport/reticulum.rs` for the resolver's cold-start
+/// path; the `RootingVerdict` / `ProvenanceChain` types it returns
+/// are CIRISPersist#94's ratified cross-repo contract surface.
+#[async_trait]
+pub trait RootingDirectory: Send + Sync + 'static {
+    /// Root a claimed `(key_id, ed25519-pubkey)` binding against the
+    /// `federation_keys` directory — confirm the row exists, the
+    /// claimed pubkey matches it, and the recursive-provenance chain
+    /// verifies up to a steward bootstrap. Replaces TOFU.
+    async fn root_binding(
+        &self,
+        key_id: &str,
+        claimed_pubkey_ed25519_base64: &str,
+    ) -> RootingVerdict;
+
+    /// Assemble the recursive-provenance chain for `key_id` without
+    /// the verifying verdict — the verify-consumable read.
+    async fn provenance_chain(&self, key_id: &str) -> Result<ProvenanceChain, RootingRejection>;
+}
+
+#[async_trait]
+impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
+    async fn root_binding(
+        &self,
+        key_id: &str,
+        claimed_pubkey_ed25519_base64: &str,
+    ) -> RootingVerdict {
+        persist_root_binding(self, key_id, claimed_pubkey_ed25519_base64).await
+    }
+
+    async fn provenance_chain(&self, key_id: &str) -> Result<ProvenanceChain, RootingRejection> {
+        persist_provenance_chain(self, key_id).await
     }
 }
 

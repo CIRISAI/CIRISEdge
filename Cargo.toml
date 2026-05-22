@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -10,23 +10,32 @@ repository = "https://github.com/CIRISAI/CIRISEdge"
 readme = "README.md"
 publish = false
 
-# Status: v0.3.0 — Reticulum canonical wire live. Verify pipeline,
-# durable outbound queue + dispatcher, typed handler dispatch,
-# outbound inline-text pipeline integration (Classify + Scrub +
-# EncryptAndStore via ciris-persist v1.11.0), HTTP transport, and the
-# Reticulum transport (Leviculum-backed; OQ-07 first impl) all
-# shipped. PyO3 surface (Edge class registration + init_edge_runtime)
-# and Phase 3 multi-medium transports (LoRa / serial / I²P) follow.
+# Status: v0.4.0 — authenticated Reticulum peer resolution. The
+# PeerResolver cold-start path (CIRISEdge#15 / CIRISVerify#28 Phase 3)
+# replaces v0.3.1's trust-on-first-use announce-recording: an announce
+# carries a federation-key-signed transport-identity attestation that
+# the resolver roots against persist's federation_keys directory
+# (ciris-persist v1.12.0 `root_binding`) before verifying the
+# attestation signature — AV-42 closure. Verify pipeline, durable
+# outbound queue + dispatcher, typed handler dispatch, outbound
+# inline-text pipeline, HTTP transport, and the Reticulum transport
+# (Leviculum-backed; OQ-07) all shipped. PyO3 surface and Phase 3
+# multi-medium transports (LoRa / serial / I²P) follow.
 # See FSD/CIRIS_EDGE.md for the architecture, MISSION.md for M-1
 # alignment per module, docs/THREAT_MODEL.md for the v0.1.0 P0
-# invariants (AV-9 + AV-13 + AV-14 + AV-17 + hybrid-verify-via-persist).
+# invariants (AV-9 + AV-13 + AV-14 + AV-17 + hybrid-verify-via-persist)
+# and AV-42 for the authenticated-binding cold-start path.
 
 [dependencies]
 # Substrate. Owns federation_keys directory, canonicalize_envelope,
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
+# v1.12.0 adds the cold-start binding-rooting primitive
+# (federation::rooting::root_binding) the Reticulum PeerResolver
+# cold-start path consumes — CIRISEdge#15 / CIRISVerify#28 Phase 3.
+# Clean currency bump from v1.11.0; both pin verify v2.8.0.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v1.11.0", version = "1", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v1.12.0", version = "1", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # Pinned to v2.8.0 — lockstep with the verify version persist
@@ -131,9 +140,13 @@ path = "src/bin/emit_edge_extras.rs"
 [dev-dependencies]
 tokio    = { version = "1", features = ["full"] }
 proptest = "1"
-# Reticulum loopback acceptance test (tests/reticulum_loopback.rs).
+# Reticulum loopback + authenticated-resolution acceptance tests
+# (tests/reticulum_loopback.rs, tests/reticulum_av42.rs). `hex`
+# encodes the scrub-signed federation_keys rows the AV-42 cold-start
+# fixtures seed the persist directory with.
 tempfile           = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex                = "0.4"
 
 [lints.rust]
 unsafe_code = "forbid"

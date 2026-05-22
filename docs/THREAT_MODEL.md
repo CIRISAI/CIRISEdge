@@ -657,6 +657,71 @@ after byte-equivalence passes.
 **Residual**: until a sister Rust Reticulum impl actually ships, this
 is a forward-looking concern. Phase 1 ships with reticulum-rs only.
 
+#### AV-42: Spoofed transport-identity ↔ federation-key binding
+
+**Attack**: a Reticulum destination is a *dedicated dual-key transport
+identity* (`hash(x25519 ‖ ed25519)`), separate from the federation
+Ed25519 signing key — the federation seed never enters Leviculum
+(AV-17). The transport therefore needs a binding "Reticulum
+destination X belongs to federation key Y". v0.3.1's announce-driven
+discovery recorded `key_id → destination` straight off the announce
+app-data: trust-on-first-use. A Reticulum announce is signed, so it
+proves the announcer controls *that transport identity* — it does
+**not** prove the transport identity legitimately belongs to `key_id`.
+An adversary announces a federation `key_id` it does not own, paired
+with an adversary-controlled destination; a sender calling
+`send(key_id, ..)` routes the envelope to the adversary. The envelope
+is still signed by the sender's federation key (the adversary cannot
+forge a response the real recipient would accept), but Reticulum link
+encryption means the adversary *receives + decrypts* the envelope
+bytes, and legitimate delivery is denied — misrouting / DoS.
+
+**Mitigation**: the authenticated cold-start path (CIRISEdge#15 /
+CIRISVerify#28 Phase 3, v0.4.0). Each announce carries an
+`AnnounceAttestation` in its app-data — a federation-key signature
+over `{transport_identity_pubkey, federation_key_id, epoch}`
+(`src/transport/attestation.rs`). The `PeerResolver` cold-start path
+in `src/transport/reticulum.rs` is a **two-step root + verify**:
+
+1. **Root the federation key** — `root_binding(directory, key_id,
+   claimed_ed25519_pubkey)` (CIRISPersist v1.12.0
+   `federation::rooting`) confirms the `key_id` resolves to a
+   `federation_keys` directory row, the claimed pubkey matches it,
+   and the recursive-provenance chain verifies up to a steward
+   bootstrap. A spoofed `key_id` fails here with `PubkeyMismatch`
+   (the adversary's pubkey ≠ the directory row) or `UnknownKeyId`.
+   A `DirectoryError` is treated as retryable — a transient substrate
+   fault, not a verdict — so the peer is not blacklisted; the seven
+   structural/crypto rejections are terminal AV-42 events.
+2. **Verify the attestation signature** over
+   `{transport_identity_pubkey, key_id, epoch}` against the
+   now-directory-confirmed Ed25519 pubkey (never the wire claim). An
+   announcer that does not hold `key_id`'s federation seed cannot
+   forge this signature.
+
+The consumer `HybridPolicy` is then applied to the rooted provenance
+chain (`Strict` rejects any hybrid-pending link). Only an announce
+that clears all three is recorded as a rooted resolution; `send`
+routes only to rooted peers. This replaces trust-on-first-use
+entirely — there is no provisional-trust state.
+
+**Test**: `tests/reticulum_av42.rs` is the acceptance gate — a
+spoofed announce (wrong `key_id` → `root_binding` rejection; tampered
+/ adversary-signed attestation → signature mismatch) is rejected.
+`tests/reticulum_loopback.rs` covers the legitimate-rooted-resolution
+end-to-end path.
+
+**Residual**: a transport identity is routing-only and never a
+`federation_keys`-class row (CIRISPersist Finding G) — it is outside
+the recursive-provenance chain and is not itself rooted; the binding
+is authenticated solely by the announce attestation. A federation key
+whose seed is compromised (AV-2 class) can attest an
+adversary-controlled transport identity — that residual is the AV-2
+stolen-key surface, not AV-42, and closes upstream (peer-replicate
+audit chain). The `epoch` field gives transport-identity rotation a
+monotonic supersede signal; revocation of a stale binding before its
+epoch bumps is a v0.2.x freshness concern.
+
 ---
 
 ## 5. Mitigation Matrix
@@ -688,6 +753,7 @@ is a forward-looking concern. Phase 1 ships with reticulum-rs only.
 | AV-23 | Caller canonicalization drift | P3 | PR review + byte-equivalence test | — | ⚠ Discipline + CI | — |
 | AV-24 | Build-manifest forgery | P1 | Hybrid Ed25519 + ML-DSA-65 release sig | AGPL license-lock | ⚠ Same as lens, persist | — |
 | AV-25 | Cross-Reticulum-impl drift | P2 | Byte-equivalence regression test | — | ⚠ Forward-looking (Leviculum) | — |
+| AV-42 | Spoofed transport-identity ↔ federation-key binding | P1 | Two-step root + attestation-verify cold-start path (`root_binding` + announce attestation) | Consumer `HybridPolicy` over the rooted chain | ✓ Mitigated (CIRISEdge#15, v0.4.0) | `tests/reticulum_av42.rs` |
 
 **Pre-Phase-1 P0 must-have bundle**: AV-9 + AV-13 + AV-14 + AV-17 +
 hybrid verify (OQ-11 closure). The first four are the structural
@@ -850,6 +916,12 @@ PRE-PHASE-1 P0 MUST-HAVE BUNDLE — must land with v0.1.0
   ⚠ AV-17  FFI boundary heap-scan property test
   ⚠ OQ-11  Hybrid verify via Engine.verify_hybrid_via_directory (CIRISPersist v0.4.0+; #14 closed)
 
+V0.4.0 SHIPPED (CIRISEdge#15 / CIRISVerify#28 Phase 3)
+  ✓ AV-42  Authenticated transport-identity ↔ federation-key binding
+           (two-step root_binding + announce-attestation verify;
+           replaces v0.3.1 trust-on-first-use on the PeerResolver
+           cold-start path)
+
 PHASE-1 P1 BUNDLE — must land for production cutover
   ⚠ AV-3   Replay LRU with 5-min window
   ⚠ AV-5   Cross-impl byte-equivalence test for canonicalize_envelope
@@ -917,6 +989,7 @@ This document is updated:
   trace wire format): trust-boundary review + interaction matrix
   update.
 
-Last updated: 2026-05-03 (v0.0 baseline scaffold; pre-Phase-1
-implementation. AV catalog targets the implementation work to come;
-mitigation status is "design only" until v0.1.0 lands).
+Last updated: 2026-05-22 (v0.4.0 — AV-42 added + mitigated: the
+authenticated transport-identity ↔ federation-key binding cold-start
+path lands with CIRISEdge#15 / CIRISVerify#28 Phase 3. Prior baseline:
+2026-05-03 v0.0 scaffold).

@@ -49,6 +49,7 @@ pub use messages::{
 pub use outbound::{DispatcherConfig, OutboundHandle};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 pub use verify::{
-    HybridPolicy, VerifiedEnvelope, VerifiedTrace, VerifyDirectory, VerifyError, VerifyOutcome,
+    HybridPolicy, ProvenanceChain, ProvenanceLink, RootingDirectory, RootingRejection,
+    RootingVerdict, VerifiedEnvelope, VerifiedTrace, VerifyDirectory, VerifyError, VerifyOutcome,
     VerifyPipeline,
 };

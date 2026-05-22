@@ -1,27 +1,42 @@
-//! Loopback acceptance gate for the Reticulum transport (OQ-07).
+//! Loopback acceptance gate for the Reticulum transport (OQ-07) and
+//! the authenticated rooted-resolution cold-start path (CIRISEdge#15
+//! deliverable (a)).
 //!
 //! Stands up two [`ReticulumTransport`] instances over loopback TCP,
-//! lets them discover each other via announces, and asserts a single
-//! signed-shaped [`EdgeEnvelope`] round-trips **byte-exact** from one
-//! to the other. This is the acceptance gate for the Leviculum-backed
-//! transport: if the envelope bytes that arrive in the inbound sink
-//! differ by one byte from what was sent, the verify pipeline (which
-//! checks the signature over canonical bytes, AV-5) would reject it.
+//! each wired with a federation signer + a shared persist
+//! `federation_keys` directory. Node B discovers node A **only by
+//! rooting A's signed announce attestation** against the directory —
+//! the v0.4.0 cold-start path that replaces v0.3.1's
+//! trust-on-first-use. The test then asserts a single signed-shaped
+//! [`EdgeEnvelope`] round-trips **byte-exact** A ← B.
+//!
+//! This is the acceptance gate for the Leviculum-backed transport AND
+//! for the legitimate-rooted-resolution half of AV-42: if rooting or
+//! the attestation verify were broken, node B would never resolve
+//! node A and the send would fail.
 //!
 //! Requires the `transport-reticulum` feature:
 //! `cargo test --features transport-reticulum --test reticulum_loopback`
 
 #![cfg(feature = "transport-reticulum")]
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use ciris_edge::identity::LocalSigner;
 use ciris_edge::messages::{EdgeEnvelope, MessageType, SchemaVersion};
-use ciris_edge::transport::reticulum::{ReticulumTransport, ReticulumTransportConfig};
+use ciris_edge::transport::reticulum::{
+    ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
+};
 use ciris_edge::transport::{InboundFrame, Transport};
+use ciris_edge::verify::RootingDirectory;
 use serde_json::value::RawValue;
 use tokio::sync::mpsc;
+
+use common::{directory_with, signed_record, TestFedKey};
 
 /// Build a representative signed-shaped envelope. The signatures here
 /// are placeholder strings — the loopback test exercises *transport*
@@ -55,13 +70,63 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Load an edge `LocalSigner` (Ed25519-only) from a `TestFedKey`'s
+/// written seed directory.
+async fn signer_for(key: &TestFedKey, base: &std::path::Path) -> Arc<LocalSigner> {
+    let seed_dir = key.write_seed_dir(base);
+    let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
+        key_id: key.key_id.clone(),
+        key_path: seed_dir.join("ed25519.seed"),
+        pqc_key_id: None,
+        pqc_key_path: None,
+    })
+    .await
+    .expect("load_local_seed");
+    Arc::new(LocalSigner {
+        key_id: key.key_id.clone(),
+        classical,
+        pqc: None,
+    })
+}
+
+/// Build a `ReticulumAuth` for `key`, rooted against the shared
+/// `directory`. `Ed25519Fallback` policy — the test fixtures carry
+/// no PQC components (hybrid-pending rows).
+async fn auth_for(
+    key: &TestFedKey,
+    directory: Arc<ciris_persist::store::sqlite::SqliteBackend>,
+    base: &std::path::Path,
+) -> ReticulumAuth {
+    ReticulumAuth {
+        signer: Some(signer_for(key, base).await),
+        rooting: Some(directory as Arc<dyn RootingDirectory>),
+        resolver: None,
+        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn envelope_round_trips_byte_exact_over_loopback() {
+async fn rooted_resolution_round_trips_envelope_byte_exact() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,ciris_edge=debug")
         .try_init();
 
     let tmp = tempfile::tempdir().expect("tempdir");
+
+    // ─── Federation directory: steward → {edge-A, edge-B} ──────────
+    // Both edge keys are rooted directly under a self-signed steward
+    // bootstrap. The rows carry no PQC components (hybrid-pending),
+    // so the transports run the `Ed25519Fallback` policy.
+    let steward = TestFedKey::new("steward-loopback", 0x01);
+    let key_a = TestFedKey::new("edge-key-aaaa", 0x0a);
+    let key_b = TestFedKey::new("edge-key-bbbb", 0x0b);
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&key_a, &steward, "agent"),
+        signed_record(&key_b, &steward, "agent"),
+    ])
+    .await;
+
     let port_a = free_port();
 
     // Node A: the receiver. Listens on `port_a`; no bootstrap peers.
@@ -72,7 +137,6 @@ async fn envelope_round_trips_byte_exact_over_loopback() {
         c.announce_interval = Duration::from_secs(2);
         c
     };
-
     // Node B: the sender. Dials A as a bootstrap peer.
     let cfg_b = {
         let mut c =
@@ -83,13 +147,16 @@ async fn envelope_round_trips_byte_exact_over_loopback() {
         c
     };
 
+    let auth_a = auth_for(&key_a, directory.clone(), tmp.path()).await;
+    let auth_b = auth_for(&key_b, directory.clone(), tmp.path()).await;
+
     let transport_a = Arc::new(
-        ReticulumTransport::new(cfg_a, None)
+        ReticulumTransport::new(cfg_a, auth_a)
             .await
             .expect("build transport A"),
     );
     let transport_b = Arc::new(
-        ReticulumTransport::new(cfg_b, None)
+        ReticulumTransport::new(cfg_b, auth_b)
             .await
             .expect("build transport B"),
     );
@@ -103,8 +170,9 @@ async fn envelope_round_trips_byte_exact_over_loopback() {
     let listen_a = tokio::spawn(async move { la.listen(tx_a).await });
     let listen_b = tokio::spawn(async move { lb.listen(tx_b).await });
 
-    // Wait for B to discover A via announce — `send` on B resolves
-    // `destination_key_id` from B's announce-populated peer map.
+    // Wait for B to ROOT A's announce attestation — `knows_peer`
+    // returns true only once the cold-start path (root_binding +
+    // attestation verify + hybrid policy) has accepted the binding.
     let discovered = wait_for(Duration::from_secs(30), || {
         let t = transport_b.clone();
         async move { t.knows_peer("edge-key-aaaa").await }
@@ -112,7 +180,7 @@ async fn envelope_round_trips_byte_exact_over_loopback() {
     .await;
     assert!(
         discovered,
-        "node B did not discover node A's announce within 30s",
+        "node B did not root node A's announce attestation within 30s",
     );
 
     // Round-trip one envelope B → A.
@@ -150,7 +218,7 @@ async fn envelope_round_trips_byte_exact_over_loopback() {
     assert_eq!(received.signature, envelope.signature);
 
     println!(
-        "[loopback] OK — {} envelope bytes round-tripped byte-exact",
+        "[loopback] OK — rooted resolution + {} envelope bytes round-tripped byte-exact",
         sent_bytes.len(),
     );
 
