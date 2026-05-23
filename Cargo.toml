@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -125,7 +125,12 @@ transport-reticulum   = ["dep:reticulum-std", "dep:reticulum-core"]
 # feature also implies `postgres`; that is intentional — the
 # cohabiting agent's `PyEngine` may carry either backend variant of
 # `BackendDispatch` and edge must match both at runtime.
-pyo3                  = ["dep:pyo3", "ciris-persist/pyo3"]
+# `pyo3` implies `transport-reticulum` — the cohabitation `init_edge_runtime`
+# (and its module-private imports) is the whole point of the Python surface,
+# and Reticulum is the canonical cohabitation wire (MISSION §1.4). Without
+# this, the maturin wheel build (`features = ["pyo3"]` per pyproject) leaves
+# the reticulum-gated items unused and `-D warnings` fails the build.
+pyo3                  = ["dep:pyo3", "ciris-persist/pyo3", "transport-reticulum"]
 
 [dependencies.pyo3]
 version  = "0.28"
