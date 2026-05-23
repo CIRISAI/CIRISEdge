@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -30,20 +30,23 @@ publish = false
 # Substrate. Owns federation_keys directory, canonicalize_envelope,
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
-# v1.12.0 adds the cold-start binding-rooting primitive
-# (federation::rooting::root_binding) the Reticulum PeerResolver
-# cold-start path consumes — CIRISEdge#15 / CIRISVerify#28 Phase 3.
-# Clean currency bump from v1.11.0; both pin verify v2.8.0.
+# v2.0.2 is the CIRIS 3.0 cohabitation cut — `PyEngine` exposes the
+# Rust-level `federation_directory()` / `outbound_queue()` /
+# `keyring_signer()` accessors (CIRISPersist#95, Option-B mirroring
+# `node_core_service()`) that edge#16 consumes to construct an
+# `Edge` over the host's already-bootstrapped engine. NOT v2.0.1 —
+# that release shipped a pyproject Requires-Dist flaw; v2.0.2 is
+# the hotfix and the Cargo surface is identical between the two.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v1.12.0", version = "1", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.0.2", version = "2", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
-# Pinned to v2.8.0 — lockstep with the verify version persist
-# v1.11.0 transitively requires; keeps the federation dep tree
-# single-versioned. load_local_seed / LocalSeedConfig surface
-# unchanged.
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.8.0", version = "2", features = ["software", "pqc-ml-dsa"] }
-ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v2.8.0", version = "2", features = ["ed25519", "pqc-ml-dsa"] }
+# Pinned to v3.0.1 — major bump in lockstep with persist v2.0.2's
+# cohabitation cut. v3.0.1 drops the v2.1.x hardcoded-steward
+# fallback (#29 deferral); `load_local_seed` / `LocalSeedConfig`
+# surface unchanged on edge's consumed paths.
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.0.1", version = "3", features = ["software", "pqc-ml-dsa"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.0.1", version = "3", features = ["ed25519", "pqc-ml-dsa"] }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -115,7 +118,14 @@ transport-reticulum   = ["dep:reticulum-std", "dep:reticulum-core"]
 # and the agent Python pipeline (Phase 2). Same FFI-shell discipline
 # persist uses (CIRISPersist src/ffi/pyo3.rs); abi3-py311 single-wheel
 # per-(os,arch) ships via maturin.
-pyo3                  = ["dep:pyo3"]
+#
+# v0.5.0 — turns on `ciris-persist/pyo3` so `init_edge_runtime`
+# (the CIRIS 3.0 cohabitation constructor, CIRISEdge#16) can reach
+# `ciris_persist::ffi::pyo3::PyEngine` Rust-side. persist's `pyo3`
+# feature also implies `postgres`; that is intentional — the
+# cohabiting agent's `PyEngine` may carry either backend variant of
+# `BackendDispatch` and edge must match both at runtime.
+pyo3                  = ["dep:pyo3", "ciris-persist/pyo3"]
 
 [dependencies.pyo3]
 version  = "0.28"
