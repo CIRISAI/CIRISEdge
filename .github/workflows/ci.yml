@@ -480,8 +480,15 @@ jobs:
         # docblock above for the rationale); no transport-http
         # (cloud fallback, not mobile).
         run: |
+          # v0.7.1 — `--lib` so the bin target (`emit_edge_extras`,
+          # used only by the build-manifest emitter on the host) isn't
+          # also linked under this RUSTFLAGS. The `-install_name` flag
+          # is `-dynamiclib`-only; applying it to the bin target's
+          # `cc` invocation fails with `invalid argument` because the
+          # bin links as an executable, not a dylib. Verify's lane
+          # doesn't hit this because its repo has no `[[bin]]`.
           RUSTFLAGS="-C link-arg=-install_name -C link-arg=@rpath/CIRISEdge.framework/CIRISEdge" \
-            cargo build --release --target ${{ matrix.target }} \
+            cargo build --release --target ${{ matrix.target }} --lib \
               --features "transport-reticulum"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -713,6 +720,7 @@ jobs:
         run: >-
           cargo build --release
           --target ${{ matrix.target }}
+          --lib
           --features "$IOS_PYO3_FEATURES"
       - name: strip + rename + install_name fix
         # Mach-O rename: libciris_edge.dylib → ciris_edge.abi3.so
