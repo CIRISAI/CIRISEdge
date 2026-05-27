@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use chrono::Utc;
 use futures::future::BoxFuture;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -21,7 +22,10 @@ use crate::handler::{
 };
 use crate::identity::{build_envelope, envelope_body_sha256, sign_envelope, LocalSigner};
 use crate::messages::{EdgeEnvelope, MessageType};
-use crate::outbound::{run_dispatcher, run_sweeps, DispatcherConfig, OutboundHandle};
+use crate::outbound::{
+    run_dispatcher, run_sweeps, DispatcherConfig, OutboundHandle, PeerDirectory,
+    PeerSubscriptionFilter,
+};
 use crate::transport::{InboundFrame, Transport, TransportSendOutcome};
 use crate::verify::{HybridPolicy, VerifiedEnvelope, VerifyDirectory, VerifyError, VerifyPipeline};
 
@@ -112,6 +116,18 @@ pub struct Edge {
     /// `ciris_persist::pipeline`. Closes CIRISAgent#756 Q1.
     speak_pipeline:
         Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
+    /// Optional peer-enumeration adapter consumed by
+    /// [`Edge::send_mandatory`] to fan out a `Delivery::Mandatory`
+    /// envelope to every peer in the directory (CIRISEdge#18 / FSD
+    /// §3.2). When `None`, `send_mandatory` returns a typed config
+    /// error — the federation broadcast cannot pick recipients.
+    peer_directory: Option<Arc<dyn PeerDirectory>>,
+    /// Optional per-peer subscription filter. Consulted by
+    /// subscription-respecting code paths; **deliberately bypassed**
+    /// by `Delivery::Mandatory` (the load-bearing wire change of
+    /// CIRISEdge#18; the bypass is exercised in
+    /// `tests/federation_announcement_mandatory.rs`).
+    subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
     config: EdgeConfig,
 }
 
@@ -123,6 +139,8 @@ pub struct EdgeBuilder {
     transports: Vec<Arc<dyn Transport>>,
     speak_pipeline:
         Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
+    peer_directory: Option<Arc<dyn PeerDirectory>>,
+    subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
     config: EdgeConfig,
 }
 
@@ -135,6 +153,8 @@ impl Edge {
             signer: None,
             transports: Vec::new(),
             speak_pipeline: None,
+            peer_directory: None,
+            subscription_filter: None,
             config: EdgeConfig::default(),
         }
     }
@@ -174,9 +194,14 @@ impl Edge {
         msg: M,
     ) -> Result<M::Response, EdgeError> {
         if !matches!(M::DELIVERY, Delivery::Ephemeral) {
+            let declared = match M::DELIVERY {
+                Delivery::Ephemeral => "Ephemeral",
+                Delivery::Durable { .. } => "Durable",
+                Delivery::Mandatory { .. } => "Mandatory",
+            };
             return Err(EdgeError::DeliveryClassMismatch(
                 M::TYPE,
-                "Durable",
+                declared,
                 "Ephemeral",
             ));
         }
@@ -227,6 +252,13 @@ impl Edge {
                 return Err(EdgeError::DeliveryClassMismatch(
                     M::TYPE,
                     "Ephemeral",
+                    "Durable",
+                ));
+            }
+            Delivery::Mandatory { .. } => {
+                return Err(EdgeError::DeliveryClassMismatch(
+                    M::TYPE,
+                    "Mandatory",
                     "Durable",
                 ));
             }
@@ -303,6 +335,158 @@ impl Edge {
         self.send_durable(destination_key_id, msg).await
     }
 
+    /// Send a federation-tier authority-signed broadcast — fans the
+    /// signed envelope to **every peer** in the [`PeerDirectory`]
+    /// regardless of any subscription filter. Closes CIRISEdge#18
+    /// + CIRISNodeCore FSD §3.2 (substrate-tier Mandatory wire class).
+    ///
+    /// The load-bearing semantic is in
+    /// [`Delivery::Mandatory::bypass_subscription`]: even when a
+    /// [`PeerSubscriptionFilter`] is configured, this path does NOT
+    /// consult it. The federation's governance reach requires that
+    /// every node observe an authority-signed announcement; the
+    /// subscription model belongs to the application layer, not the
+    /// substrate.
+    ///
+    /// Returns one [`DurableHandle`] per peer the announcement was
+    /// enqueued to — callers may observe each independently. The
+    /// local steward's own `key_id` is filtered out (a Mandatory
+    /// fan-out does not loopback through edge).
+    ///
+    /// # Errors
+    ///
+    /// - [`EdgeError::DeliveryClassMismatch`] when `M::DELIVERY` is
+    ///   not `Delivery::Mandatory`.
+    /// - [`EdgeError::Config`] when no peer directory is configured
+    ///   on the [`EdgeBuilder`] — the substrate broadcast cannot pick
+    ///   recipients without it.
+    /// - [`EdgeError::Persist`] on enqueue failure.
+    pub async fn send_mandatory<M: Message>(
+        &self,
+        msg: M,
+    ) -> Result<Vec<DurableHandle>, EdgeError> {
+        let (max_attempts, ttl_seconds) = match M::DELIVERY {
+            Delivery::Ephemeral => {
+                return Err(EdgeError::DeliveryClassMismatch(
+                    M::TYPE,
+                    "Ephemeral",
+                    "Mandatory",
+                ));
+            }
+            Delivery::Durable { .. } => {
+                return Err(EdgeError::DeliveryClassMismatch(
+                    M::TYPE,
+                    "Durable",
+                    "Mandatory",
+                ));
+            }
+            Delivery::Mandatory {
+                authority_signed: _,
+                bypass_subscription,
+            } => {
+                // Edge does not gate on authority_signed (NodeCore's
+                // job per FSD §3.4); the flag is a wire contract
+                // marker. Refuse to fan out if a Mandatory variant
+                // somehow sets bypass_subscription=false — that is a
+                // programmer mistake that, if accepted, would silently
+                // turn a federation broadcast back into an opt-in.
+                if !bypass_subscription {
+                    return Err(EdgeError::Config(format!(
+                        "Mandatory message_type {:?} declared bypass_subscription=false; \
+                         refusing to fan out (FSD §3.2 wire contract)",
+                        M::TYPE
+                    )));
+                }
+                // FSD §3.2.1 dispatch contract on FederationAnnouncement
+                // itself (the only Mandatory consumer at v0.1) — the
+                // announcement is durable + fire-and-forget. The
+                // per-peer DeliveryAttestation IS the audit observable;
+                // no edge-level ACK is requested. v0.1 defaults: 14d
+                // TTL, 100 attempts (mirrors BuildManifestPublication's
+                // long-haul durability since announcements are
+                // similarly durable substrate-tier records).
+                (100i32, 14 * 24 * 60 * 60i64)
+            }
+        };
+
+        let peer_dir = self.peer_directory.as_ref().ok_or_else(|| {
+            EdgeError::Config(
+                "send_mandatory: no PeerDirectory configured on EdgeBuilder \
+                 (federation broadcast cannot enumerate recipients)"
+                    .into(),
+            )
+        })?;
+
+        let peers = peer_dir
+            .list_recipients()
+            .await
+            .map_err(|e| EdgeError::Persist(format!("PeerDirectory::list_recipients: {e}")))?;
+
+        let mut handles = Vec::with_capacity(peers.len());
+        for peer in peers {
+            // Local steward never gets its own Mandatory fan-out —
+            // sender == receiver would loopback through edge's verify
+            // (AV-8 self-destination is structurally a misroute) and
+            // waste a queue row.
+            if peer == self.signer.key_id {
+                continue;
+            }
+            // **Bypass-subscription invariant** — DO NOT consult
+            // `self.subscription_filter` here. Mandatory is the FSD
+            // §3.2 wire-level expression of "federation-wide push
+            // regardless of per-peer opt-in"; calling
+            // `is_subscribed(peer, M::TYPE)` here would re-introduce
+            // the opt-in gate this class exists to remove.
+            let envelope_bytes = self.build_signed_envelope(&peer, &msg, None).await?;
+            let envelope: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
+                .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
+            let body_sha256 = envelope_body_sha256(&envelope);
+            let body_size_bytes = i32::try_from(envelope_bytes.len()).unwrap_or(i32::MAX);
+
+            let queue_id = self
+                .queue
+                .enqueue_outbound(
+                    &self.signer.key_id,
+                    &peer,
+                    &message_type_str(&envelope.message_type),
+                    "1.0.0",
+                    &envelope_bytes,
+                    &body_sha256,
+                    body_size_bytes,
+                    false, // requires_ack: false — attestation IS observable
+                    None,  // ack_timeout_seconds: None
+                    max_attempts,
+                    ttl_seconds,
+                    Utc::now(),
+                )
+                .await
+                .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (mandatory): {e}")))?;
+            handles.push(DurableHandle { queue_id });
+        }
+        Ok(handles)
+    }
+
+    /// Test/diagnostics helper — `true` if `peer_key_id` would be
+    /// admitted by the configured [`PeerSubscriptionFilter`] for
+    /// `message_type`. When no filter is configured, returns `true`
+    /// (everything is "subscribed" in the default open posture).
+    ///
+    /// `Delivery::Mandatory` paths deliberately do NOT call this —
+    /// see [`Self::send_mandatory`]. Exposed so the
+    /// `tests/federation_announcement_mandatory.rs` round-trip can
+    /// assert the bypass property: a peer whose filter would reject
+    /// the MessageType MUST still receive the Mandatory broadcast.
+    pub async fn would_subscription_accept(
+        &self,
+        peer_key_id: &str,
+        message_type: &MessageType,
+    ) -> bool {
+        let Some(filter) = self.subscription_filter.as_ref() else {
+            return true;
+        };
+        filter.is_subscribed(peer_key_id, message_type).await
+    }
+
     /// Run the configured outbound `speak_pipeline` over the
     /// message's text body. Mutates `msg` in place via
     /// `InlineTextMessage::set_text`. No-op when no pipeline is
@@ -365,10 +549,13 @@ impl Edge {
         }
 
         // Inbound dispatch loop — verify + handler dispatch +
-        // ACK matching.
+        // ACK matching + FederationAnnouncement→DeliveryAttestation
+        // emission (FSD §3.2.1 v0.1 emission gate: post-verify,
+        // pre-application-layer-handler).
         let verify = self.verify.clone();
         let handlers = self.handlers.clone();
         let queue = self.queue.clone();
+        let signer = self.signer.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -380,8 +567,9 @@ impl Edge {
                     let v = verify.clone();
                     let h = handlers.clone();
                     let q = queue.clone();
+                    let s = signer.clone();
                     tokio::spawn(async move {
-                        dispatch_inbound(frame, &v, &h, &q).await;
+                        dispatch_inbound(frame, &v, &h, &q, &s).await;
                     });
                 }
                 else => break,
@@ -423,12 +611,14 @@ impl Edge {
     }
 }
 
-/// Inbound dispatch: verify → maybe-ACK-match → handler dispatch.
+/// Inbound dispatch: verify → maybe-ACK-match → FederationAnnouncement
+/// attestation-emission (FSD §3.2.1 v0.1 gate) → handler dispatch.
 async fn dispatch_inbound(
     frame: InboundFrame,
     verify: &VerifyPipeline,
     handlers: &Mutex<HashMap<MessageType, RegisteredHandler>>,
     queue: &Arc<dyn OutboundHandle>,
+    signer: &Arc<LocalSigner>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -446,6 +636,27 @@ async fn dispatch_inbound(
         verify_outcome,
         ..
     } = verified;
+
+    // FSD §3.2.1 v0.1 emission gate — post-verify-pipeline, the
+    // announcement has cleared edge's signature + freshness + replay
+    // gates. NodeCore's authority-class verifier runs at the consumer
+    // handler; for v0.1 edge emits at this point (per the FSD's
+    // pragmatic gate). Application-layer-acceptance tightening is a
+    // v0.2+ option per FSD §7 OQ-6.
+    if envelope.message_type == MessageType::FederationAnnouncement {
+        if let Err(e) =
+            emit_delivery_attestation(&envelope, body_sha256, transport, signer, queue).await
+        {
+            // The attestation is observability; a failure to emit
+            // does NOT block application-layer dispatch. Log and
+            // continue (FSD §3.2.1 — missing-attestation-as-
+            // delivery-gap is the legitimate observable).
+            tracing::warn!(
+                error = %e,
+                "FederationAnnouncement received but DeliveryAttestation emission failed",
+            );
+        }
+    }
 
     // ACK matching — if envelope.in_reply_to is set, this is a
     // response to one of our outbound durable rows. Look up + mark
@@ -622,6 +833,25 @@ impl EdgeBuilder {
         self
     }
 
+    /// Wire a [`PeerDirectory`] adapter for `Edge::send_mandatory`
+    /// fan-out (CIRISEdge#18). Without it `send_mandatory` returns
+    /// [`EdgeError::Config`] — the federation broadcast has no
+    /// recipient enumeration.
+    #[must_use]
+    pub fn peer_directory(mut self, dir: Arc<dyn PeerDirectory>) -> Self {
+        self.peer_directory = Some(dir);
+        self
+    }
+
+    /// Wire a [`PeerSubscriptionFilter`] for subscription-respecting
+    /// code paths. **Not consulted by `Delivery::Mandatory`** — the
+    /// bypass-subscription wire contract (FSD §3.2 + CIRISEdge#18).
+    #[must_use]
+    pub fn subscription_filter(mut self, filter: Arc<dyn PeerSubscriptionFilter>) -> Self {
+        self.subscription_filter = Some(filter);
+        self
+    }
+
     #[must_use]
     pub fn config(mut self, config: EdgeConfig) -> Self {
         self.config = config;
@@ -658,6 +888,8 @@ impl EdgeBuilder {
             transports: self.transports,
             handlers: Arc::new(Mutex::new(HashMap::new())),
             speak_pipeline: self.speak_pipeline,
+            peer_directory: self.peer_directory,
+            subscription_filter: self.subscription_filter,
             config: self.config,
         })
     }
@@ -727,4 +959,179 @@ fn message_type_str(mt: &MessageType) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{mt:?}"))
+}
+
+/// Derive a deterministic UUID `announcement_id` from the announcement
+/// envelope's `body_sha256` — the bytes the peer actually received.
+///
+/// Persist's `put_delivery_attestation` parses `announcement_id` as a
+/// UUID (`Uuid::parse_str`), so the wire field is constrained to that
+/// shape. In production NodeCore stamps the surrounding Contribution
+/// envelope with its `contribution_id` and the receiver propagates
+/// that; for edge's v0.1 emission gate we don't yet wrap the
+/// announcement in a NodeCore Contribution at the edge layer, so the
+/// pragmatic choice is to derive the id from the body bytes
+/// themselves.
+///
+/// Properties: same envelope bytes → same `announcement_id` at every
+/// peer (the persist PK `(announcement_id, peer_key_id)` correctly
+/// collates attestations from many peers to one announcement). Same
+/// envelope bytes at the same peer → same `(announcement_id,
+/// peer_key_id)` → persist's INSERT is idempotent on replay
+/// (FSD §3.2.1 "AV: replayed attestation collapsed").
+///
+/// The UUID layout uses the body_sha256's first 16 bytes verbatim
+/// with the v4 (random) variant + version bits set — wire-format
+/// valid UUID without dragging in `uuid::v5` (no extra dependency
+/// surface beyond the v4 feature already enabled).
+fn derive_announcement_id_from_body_hash(body_sha256: &[u8; 32]) -> String {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&body_sha256[..16]);
+    // Set RFC 4122 variant bits (top of byte 8 = 10xxxxxx).
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    // Set version 4 bits (top of byte 6 = 0100xxxx). Edge's emission
+    // is deterministic-from-hash but the wire constraint is "any
+    // RFC 4122 UUID" — the version bits just need to be syntactically
+    // valid; v4 keeps the surface compatible with persist's parse.
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+/// Build, sign, and enqueue a [`crate::DeliveryAttestation`] for a
+/// freshly-verified [`crate::FederationAnnouncement`] envelope. The
+/// attestation rides `Delivery::Durable { requires_ack: false }`
+/// (FSD §3.2.1 dispatch contract) — subscription-respecting fan-out
+/// (NOT Mandatory), per-peer queued for delivery to whichever
+/// federation collector is downstream of the local edge.
+///
+/// The peer's federation Ed25519 (and optional ML-DSA-65) key signs
+/// the canonical-bytes encoding from
+/// [`crate::DeliveryAttestation::canonical_bytes`] — byte-equal with
+/// persist v2.2.0's encoder so a federation collector can verify the
+/// attestation via `verify_hybrid_via_directory` against
+/// `federation_keys[peer_key_id]`.
+async fn emit_delivery_attestation(
+    envelope: &EdgeEnvelope,
+    body_sha256: [u8; 32],
+    transport: crate::transport::TransportId,
+    signer: &Arc<LocalSigner>,
+    queue: &Arc<dyn OutboundHandle>,
+) -> Result<(), EdgeError> {
+    use crate::messages::{
+        encode_canonical_hash_base64, encode_signature_base64, DeliveryAttestation, TransportMedium,
+    };
+
+    let announcement_id = derive_announcement_id_from_body_hash(&body_sha256);
+    let peer_pubkey_bytes = signer
+        .classical
+        .public_key()
+        .await
+        .map_err(|e| EdgeError::Persist(format!("local pubkey: {e}")))?;
+    let peer_pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(&peer_pubkey_bytes);
+
+    // Canonical hash = SHA-256 of the full envelope-as-received. The
+    // FSD §3.2.1 wire field is "SHA-256 of the full canonicalized
+    // Contribution envelope INCLUDING its authority signature" — at
+    // the edge layer the "full envelope" IS the EdgeEnvelope JSON,
+    // and `body_sha256` already covers the body (which carries the
+    // FederationAnnouncement payload). For v0.1, using body_sha256
+    // pins the announcement payload bytes the peer received; the
+    // surrounding signature is in the EdgeEnvelope and re-verified
+    // upstream against `federation_keys[envelope.signing_key_id]`.
+    let canonical_hash_b64 = encode_canonical_hash_base64(&body_sha256);
+
+    // Build the attestation with a placeholder signature first so we
+    // can produce canonical bytes (the signature itself is over
+    // canonical_bytes, not part of canonical_bytes).
+    let received_at = chrono::Utc::now();
+    let mut att = DeliveryAttestation {
+        announcement_id,
+        announcement_canonical_hash_base64: canonical_hash_b64,
+        peer_key_id: signer.key_id.clone(),
+        peer_pubkey_ed25519_base64: peer_pubkey_b64,
+        received_at,
+        transport_id: TransportMedium::from(transport),
+        signature_classical_base64: String::new(),
+        signature_pqc_base64: None,
+    };
+
+    let canonical = att
+        .canonical_bytes()
+        .map_err(|e| EdgeError::Config(format!("delivery_attestation canonical_bytes: {e}")))?;
+
+    // Mandatory classical Ed25519 sign.
+    let ed25519_sig = signer
+        .classical
+        .sign(&canonical)
+        .await
+        .map_err(|e| EdgeError::Persist(format!("attestation classical sign: {e}")))?;
+    att.signature_classical_base64 = encode_signature_base64(&ed25519_sig);
+
+    // Optional PQC ML-DSA-65 over `canonical || classical_sig` per
+    // persist's AV-33 bound-signature convention (FSD §3.2.1).
+    if let Some(pqc) = signer.pqc.as_ref() {
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&ed25519_sig);
+        let pqc_sig = pqc
+            .sign(&bound)
+            .await
+            .map_err(|e| EdgeError::Persist(format!("attestation pqc sign: {e}")))?;
+        att.signature_pqc_base64 = Some(encode_signature_base64(&pqc_sig));
+    }
+
+    // Wrap in a typed envelope. Destination is the **original
+    // announcement sender** (envelope.signing_key_id) — the federation
+    // steward / collector who'll aggregate the per-peer attestations.
+    // FSD §3.2 "missing-attestation-as-delivery-gap" is observable at
+    // the steward end.
+    let envelope_bytes = {
+        let mut env = build_envelope(
+            MessageType::DeliveryAttestation,
+            &signer.key_id,
+            &envelope.signing_key_id,
+            &att,
+            None,
+        )?;
+        sign_envelope(signer, &mut env).await?;
+        serde_json::to_vec(&env)
+            .map_err(|e| EdgeError::Config(format!("attestation envelope serialize: {e}")))?
+    };
+    let env: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
+        .map_err(|e| EdgeError::Config(format!("re-parse attestation envelope: {e}")))?;
+    let body_sha256_att = envelope_body_sha256(&env);
+    let body_size_bytes = i32::try_from(envelope_bytes.len()).unwrap_or(i32::MAX);
+
+    // Match DeliveryAttestation::DELIVERY exactly (FSD §3.2.1 dispatch
+    // table — fire-and-forget Durable).
+    let (max_attempts, ttl_seconds) = match crate::DeliveryAttestation::DELIVERY {
+        Delivery::Durable {
+            max_attempts,
+            ttl_seconds,
+            ..
+        } => (
+            i32::try_from(max_attempts).unwrap_or(i32::MAX),
+            i64::try_from(ttl_seconds).unwrap_or(i64::MAX),
+        ),
+        _ => (20, 24 * 60 * 60),
+    };
+
+    queue
+        .enqueue_outbound(
+            &signer.key_id,
+            &envelope.signing_key_id,
+            &message_type_str(&MessageType::DeliveryAttestation),
+            "1.0.0",
+            &envelope_bytes,
+            &body_sha256_att,
+            body_size_bytes,
+            false, // requires_ack: false (FSD §3.2.1)
+            None,
+            max_attempts,
+            ttl_seconds,
+            Utc::now(),
+        )
+        .await
+        .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (attestation): {e}")))?;
+
+    Ok(())
 }

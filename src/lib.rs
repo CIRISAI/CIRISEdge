@@ -41,12 +41,14 @@ pub use handler::{
 };
 pub use identity::LocalSigner;
 pub use messages::{
-    AccordEventsBatch, AccordEventsResponse, AttestationGossip, BuildManifestPublication,
-    BuildManifestPublicationResponse, DSARRequest, DSARResponse, EdgeEnvelope,
-    FederationKeyDirectoryQuery, FederationKeyDirectoryQueryResponse, MessageType,
-    PublicKeyRegistration, PublicKeyRegistrationResponse, SchemaVersion,
+    AccordCarrier, AccordEventsBatch, AccordEventsResponse, AnnouncementKind, AnnouncementPriority,
+    AttestationGossip, AuthorityClass, BuildManifestPublication, BuildManifestPublicationResponse,
+    DSARRequest, DSARResponse, DeliveryAttestation, DeliveryAttestationError, EdgeEnvelope,
+    FederationAnnouncement, FederationKeyDirectoryQuery, FederationKeyDirectoryQueryResponse,
+    MessageType, PublicKeyRegistration, PublicKeyRegistrationResponse, SchemaVersion,
+    TransportMedium, DELIVERY_ATTESTATION_DOMAIN,
 };
-pub use outbound::{DispatcherConfig, OutboundHandle};
+pub use outbound::{DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 pub use verify::{
     HybridPolicy, ProvenanceChain, ProvenanceLink, RootingDirectory, RootingRejection,

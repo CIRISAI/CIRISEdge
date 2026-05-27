@@ -51,6 +51,38 @@ pub enum Delivery {
         /// `None` here is rejected at enqueue when `requires_ack=true`.
         ack_timeout_seconds: Option<u64>,
     },
+    /// Ships over `Edge::send_mandatory`. Federation-tier broadcast
+    /// that bypasses any subscription / per-peer filter at the
+    /// dispatcher: the message fans out to **every peer** in the
+    /// federation directory regardless of subscription state.
+    ///
+    /// This is the substrate-side wire shape that makes a
+    /// `FederationAnnouncement` actually reach every node — without
+    /// the bypass, "Mandatory" would just be a name. Closes
+    /// CIRISEdge#18 + CIRISNodeCore FSD §3.2 (substrate contract).
+    ///
+    /// The trust gate (authority-class verify, witness-set check) is
+    /// applied by the **consumer** (CIRISNodeCore on receipt) per
+    /// FSD §3.1 — edge's job is reach, NodeCore's job is whether the
+    /// message is honored. Edge does NOT validate `authority_signed`
+    /// at the wire layer for v0.1; the flag is a contract marker so
+    /// consumer-side code can route based on it without re-parsing
+    /// the envelope body.
+    Mandatory {
+        /// Always `true` for the FSD §2.1 `FederationAnnouncement`
+        /// primitive — only authority-signed messages may ride the
+        /// Mandatory class. The flag is a wire-level contract marker
+        /// (not a verify gate at edge); CIRISNodeCore's admission
+        /// code is the authority-class checker per FSD §3.4.
+        authority_signed: bool,
+        /// Always `true` — the load-bearing semantics. The
+        /// dispatcher fans out regardless of any per-peer
+        /// subscription filter; receivers cannot opt out at the
+        /// transport layer (MISSION.md §1.1 Justice: independence
+        /// must not become silent suppression of a federation-wide
+        /// signal).
+        bypass_subscription: bool,
+    },
 }
 
 /// A typed message that can ride the federation wire. Each message

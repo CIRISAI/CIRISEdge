@@ -26,6 +26,57 @@ use ciris_persist::prelude::{
 
 use crate::transport::{Transport, TransportError, TransportSendOutcome};
 
+/// Adapter trait that erases `FederationDirectory`'s generics for the
+/// peer-enumeration use case driving `Edge::send_mandatory` fan-out
+/// (CIRISEdge#18 / FSD §3.2 substrate contract).
+///
+/// `Edge::send_mandatory` enqueues one durable row per peer returned
+/// by [`Self::list_recipients`], so the FederationAnnouncement reaches
+/// every peer in the directory **regardless of subscription state**
+/// (the load-bearing wire change — without it `Mandatory` is just a
+/// name).
+///
+/// The trait is intentionally narrow — one method, returning peer
+/// `key_id`s — so any directory shape (in-memory test fixture, persist
+/// `federation_keys` view, Reticulum-rooted-peer-map snapshot) can
+/// implement it. Production deployments wrap their
+/// `FederationDirectory` to surface the set of currently-reachable
+/// peers; tests stub it with a static `Vec`.
+#[async_trait]
+pub trait PeerDirectory: Send + Sync + 'static {
+    /// Enumerate the federation `key_id`s edge should fan out to for
+    /// `Delivery::Mandatory` messages. The returned set is
+    /// authoritative — a Mandatory enqueue produces one outbound row
+    /// per element. The local steward's own key_id MAY appear
+    /// (callers/tests decide); `Edge::send_mandatory` filters it out
+    /// before enqueue (self-delivery would create a loopback at the
+    /// dispatcher).
+    async fn list_recipients(&self) -> Result<Vec<String>, PersistOutboundError>;
+}
+
+/// Optional per-peer subscription filter applied by `send_durable` to
+/// produce the subset of peers that "subscribed" to receive a given
+/// `MessageType`. **Bypassed by `Delivery::Mandatory`** (FSD §3.2 —
+/// the wire-level expression of "federation-wide push regardless of
+/// per-peer opt-in").
+///
+/// When `None` on [`crate::Edge`], `send_durable` addresses the single
+/// `destination_key_id` argument as today (no broadcast). When `Some`,
+/// it is consulted only by code paths that elect to call into it —
+/// in v0.1 that is reserved to a future Phase 2 multi-cast `send_durable`
+/// shape; for now the filter exists primarily so the **bypass** of
+/// `Delivery::Mandatory` is observable in tests (a peer whose filter
+/// would drop a `MessageType::FederationAnnouncement` MUST still
+/// receive it via the Mandatory broadcast).
+#[async_trait]
+pub trait PeerSubscriptionFilter: Send + Sync + 'static {
+    /// Return `true` if `peer_key_id` is subscribed to messages of
+    /// `message_type`. The filter is consulted in subscription-
+    /// respecting code paths; `Mandatory` deliberately does NOT
+    /// consult it.
+    async fn is_subscribed(&self, peer_key_id: &str, message_type: &crate::MessageType) -> bool;
+}
+
 /// Adapter trait that erases `OutboundQueue`'s RPIT generics. Blanket
 /// impl over any `OutboundQueue`; edge holds `Arc<dyn OutboundHandle>`.
 #[async_trait]
