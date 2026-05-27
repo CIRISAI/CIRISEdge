@@ -57,12 +57,24 @@ Repository = "https://github.com/CIRISAI/CIRISEdge"
 Issues = "https://github.com/CIRISAI/CIRISEdge/issues"
 
 [tool.maturin]
-features = ["pyo3"]
+# v0.7.0 (CIRISEdge#17) — `extension-module` is a separate Cargo
+# feature now (CIRISPersist discipline; see Cargo.toml `[features]`
+# block). Wheel builds need both: `pyo3` lights up the FFI bindings
+# (pulls `dep:pyo3`, `ciris-persist/pyo3`, and `transport-reticulum`),
+# while `extension-module` flips `pyo3/extension-module` so the linker
+# doesn't search for a libpython — the host interpreter provides the
+# symbols when the wheel is imported. `cargo test --features pyo3`
+# (no `extension-module`) still works because tests need the libpython
+# link.
+features = ["pyo3", "extension-module"]
 module-name = "ciris_edge"
-# abi3-py311 — one wheel covers Python 3.11+ per the same matrix
-# precedent persist + verify use. CIRISEdge ships three platform
-# wheels: linux-x86_64, linux-aarch64, darwin-aarch64 (darwin-x86_64
-# omitted per GitHub Actions Intel macOS runner capacity issues —
-# matches persist's matrix exactly).
+# abi3-py310 — one wheel covers Python 3.10+. v0.7.0 (CIRISEdge#17)
+# dropped the py310/py311 minor-version pin so Chaquopy (bundles
+# Python 3.10) can consume the same wheel shape as the PyPI desktop
+# build path. abi3 is forward-compatible: py310-tagged wheels run on
+# 3.11 / 3.12 / 3.13 too. CIRISEdge ships three platform wheels:
+# linux-x86_64, linux-aarch64, darwin-aarch64 (darwin-x86_64 omitted
+# per GitHub Actions Intel macOS runner capacity issues — matches
+# persist's matrix exactly).
 python-source = "python"
 strip = true

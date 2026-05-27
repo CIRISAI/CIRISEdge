@@ -54,16 +54,762 @@ jobs:
         # Closes CIRISEdge#9.
         with:
           cache-bin: false
+        continue-on-error: true
+      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
+        # v0.7.0 (CIRISEdge#17) — CIRISVerify v2.1.4+ active-heal pattern.
+        # cache-bin: false above is the preventative; this step is the
+        # corrective heal for a runner whose `~/.cargo/bin/cargo` IS
+        # already the rustup-init shim (the shim passes `cargo --version`
+        # but fails on `cargo build`'s argv parser). Verify hit this on
+        # macOS runners; persist's v0.7.0/v0.7.1/v0.7.2 cycle exhibited
+        # the same failure mode. Defensive — applies to all edge macOS
+        # jobs.
+        shell: bash
+        run: |
+          if cargo build --help 2>&1 | grep -q "rustup-init"; then
+            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
+            rm -rf "$HOME/.cargo/bin"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup default stable
+          cargo --version
+          cargo build --help >/dev/null
       - name: cargo test (transport-http + transport-reticulum)
         # transport-reticulum on darwin too — Leviculum's macOS path is
         # load-bearing (edge ships darwin wheels; the teranos fork base
         # exists for macOS compat). CIRISEdge#14.
         run: cargo test --features "transport-http transport-reticulum"
 
-  # ─── iOS build is Phase 3 stretch (per FSD §3 Phase tier table) ─────
-  # Deferred until swift-bridge integration lands. Intentionally absent
-  # so the publish-pypi `needs:` list doesn't gate on a job that hasn't
-  # been written yet.
+  # ─── android-ndk: per-ABI mobile cross-compile (CIRISEdge#17) ───────
+  #
+  # Pattern lifted verbatim from CIRISPersist v2.0.7+ `android-ndk`
+  # (CIRISPersist#96–99 closure). Each matrix entry builds BOTH:
+  #
+  #   1. `libciris_edge.so` (plain, no PyO3) — for native Android
+  #      consumers (e.g. Rust-only Android apps invoking edge via JNI
+  #      / UniFFI). Built with `transport-reticulum` only — Reticulum
+  #      is the canonical cohabitation wire per MISSION §1.4 and the
+  #      CIRISPersist#85 cohabitation EPIC. NO `transport-http` on
+  #      mobile — HTTP is the documented cloud fallback.
+  #
+  #   2. `libciris_edge_pyo3.so` (Chaquopy abi3) — for the Python
+  #      agent's cohabitation case: agent runs on Chaquopy and imports
+  #      `ciris_edge` from a Chaquopy wheel. Requires the libpython3.10
+  #      stub + DT_NEEDED dance per CIRISPersist#98 (without it,
+  #      Chaquopy's RTLD_LOCAL libpython load leaves the extension
+  #      symbols dangling at import time with `cannot locate symbol
+  #      _Py_IncRef`).
+  #
+  # Hard-won lessons (CIRISPersist#96–99 verbatim):
+  #
+  #   * `PYO3_CONFIG_FILE` (not `PYO3_CROSS=1`) — PyO3 probes the host
+  #     Python under PYO3_CROSS, which fails on Android targets.
+  #     CONFIG_FILE bypasses all host detection.
+  #   * `abi3=true` + wheel tag `cp310-abi3-android_24_{abi}` — NOT
+  #     `cp310-cp310`. Persist v2.0.5's cp310 wheels ref'd unstable
+  #     ABI symbols Chaquopy doesn't export (`_Py_IncRef` etc.).
+  #   * `suppress_build_script_link_lines=true` — belt-and-suspenders
+  #     to ensure PyO3's build script doesn't emit
+  #     `cargo:rustc-link-lib=python3.10` (which fails since the NDK
+  #     sysroot has no libpython).
+  #   * `pointer_width` = 32 for armeabi-v7a (ARM32), 64 for arm64-v8a
+  #     and x86_64.
+  #   * OpenSSL no-sm4 for x86_64-android — OpenSSL 3.6.x's
+  #     `sm4-x86_64.S` uses SM4-NI ISA that NDK r26b's clang
+  #     assembler doesn't grok. aarch64 + armeabi-v7a unaffected.
+  android-ndk:
+    name: android ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: arm64-v8a,    target: aarch64-linux-android,   clang_prefix: aarch64-linux-android24,     pointer_width: 64 }
+          - { abi: x86_64,       target: x86_64-linux-android,    clang_prefix: x86_64-linux-android24,      pointer_width: 64, needs_openssl: true }
+          - { abi: armeabi-v7a,  target: armv7-linux-androideabi, clang_prefix: armv7a-linux-androideabi24,  pointer_width: 32 }
+    env:
+      # Edge's mobile feature set. Reticulum is the canonical cohabitation
+      # wire (MISSION §1.4); HTTP is the cloud fallback, intentionally NOT
+      # on mobile. The plain `.so` build (first cargo-ndk invocation below)
+      # uses only `transport-reticulum`; the PyO3 build (second invocation)
+      # adds `pyo3 extension-module` on top.
+      MOBILE_BASE_FEATURES: "transport-reticulum"
+      MOBILE_PYO3_FEATURES: "transport-reticulum pyo3 extension-module"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.abi }}
+        continue-on-error: true
+      - name: setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26b
+          add-to-path: true
+      - name: install cargo-ndk
+        run: cargo install cargo-ndk
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # x86_64 only: OpenSSL 3.6.x SM4-NI workaround. AV-NN: Chaquopy
+      # build path is one of the two cohabitation surfaces; an
+      # assembler failure here is a hard release-blocker.
+      - name: pre-build OpenSSL for x86_64-android (SM4-NI workaround)
+        if: matrix.needs_openssl
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          OPENSSL_VERSION="3.4.1"
+          curl -sL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            -o openssl-src.tar.gz
+          tar xzf openssl-src.tar.gz
+          cd "openssl-${OPENSSL_VERSION}"
+          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="${TOOLCHAIN}/bin:${PATH}"
+          export CC="x86_64-linux-android24-clang"
+          export AR="llvm-ar"
+          export RANLIB="llvm-ranlib"
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
+          INSTALL_DIR="${RUNNER_TEMP}/openssl-x86_64-android"
+          ./Configure android-x86_64 \
+            no-sm4 no-shared no-stdio no-tests \
+            -D__ANDROID_API__=24 \
+            --prefix="${INSTALL_DIR}" \
+            --openssldir="${INSTALL_DIR}/ssl"
+          make -j"$(nproc)" build_libs
+          make install_dev
+          echo "✓ OpenSSL ${OPENSSL_VERSION} built for x86_64-android (no-sm4)"
+
+      - name: export pre-built OpenSSL env vars
+        if: matrix.needs_openssl
+        run: |
+          echo "OPENSSL_NO_VENDOR=1" >> "$GITHUB_ENV"
+          echo "X86_64_LINUX_ANDROID_OPENSSL_DIR=${{ runner.temp }}/openssl-x86_64-android" >> "$GITHUB_ENV"
+          echo "X86_64_LINUX_ANDROID_OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+
+      # Plain .so (no PyO3) — save before the PyO3 build overwrites
+      # the same target path. Native Android consumers (Rust-only,
+      # UniFFI/JNI) take this artifact; the Chaquopy variant below is
+      # for the Python-agent cohabitation case.
+      - name: cargo ndk build (${{ matrix.abi }} — plain, no PyO3)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: >-
+          cargo ndk -t ${{ matrix.abi }} build --release
+          --features "$MOBILE_BASE_FEATURES"
+      - name: save plain .so
+        run: |
+          mkdir -p dist/${{ matrix.abi }}
+          cp "target/${{ matrix.target }}/release/libciris_edge.so" \
+             "dist/${{ matrix.abi }}/libciris_edge.so"
+
+      # PyO3 Chaquopy abi3 .so — with explicit libpython3.10 DT_NEEDED
+      # (CIRISPersist#98). Chaquopy loads libpython with RTLD_LOCAL so
+      # extensions must DT_NEED it explicitly. We build a stub
+      # libpython3.10.so for the linker to resolve against and add
+      # `-lpython3.10` via RUSTFLAGS. Chaquopy's real libpython
+      # provides the symbols at runtime.
+      - name: create PyO3 config + libpython stub
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          CFG="${RUNNER_TEMP}/pyo3-android.config"
+          cat > "${CFG}" <<CFGEOF
+          implementation=CPython
+          version=3.10
+          shared=false
+          abi3=true
+          lib_name=python3.10
+          lib_dir=
+          executable=
+          pointer_width=${{ matrix.pointer_width }}
+          build_flags=
+          suppress_build_script_link_lines=true
+          CFGEOF
+          sed -i 's/^[[:space:]]*//' "${CFG}"
+          echo "PYO3_CONFIG_FILE=${CFG}" >> "$GITHUB_ENV"
+
+          STUB_DIR="${RUNNER_TEMP}/python-stub"
+          mkdir -p "${STUB_DIR}"
+          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
+          echo 'void __pystub(void){}' | \
+            "${TOOLCHAIN}/bin/${{ matrix.clang_prefix }}-clang" \
+              -shared -nostdlib -Wl,-soname,libpython3.10.so \
+              -o "${STUB_DIR}/libpython3.10.so" -x c -
+          echo "✓ PyO3 config (pointer_width=${{ matrix.pointer_width }}):"
+          cat "${CFG}"
+          echo "✓ stub libpython3.10.so:"
+          file "${STUB_DIR}/libpython3.10.so"
+
+      - name: cargo ndk build (${{ matrix.abi }} — PyO3 Chaquopy abi3)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RUSTFLAGS: "-L ${{ runner.temp }}/python-stub -C link-arg=-Wl,--no-as-needed -C link-arg=-lpython3.10"
+        run: >-
+          cargo ndk -t ${{ matrix.abi }} build --release --lib
+          --features "$MOBILE_PYO3_FEATURES"
+
+      - name: verify DT_NEEDED includes libpython3.10.so
+        # AV-NN: the whole point of the stub-link dance is the
+        # DT_NEEDED entry. If this assertion fails the wheel will
+        # silently dlopen on Chaquopy and crash on first import —
+        # catch at build time, not runtime.
+        run: |
+          readelf -d "target/${{ matrix.target }}/release/libciris_edge.so" \
+            | grep -q 'libpython3.10.so' \
+            && echo "✓ DT_NEEDED: libpython3.10.so present" \
+            || { echo "::error::libpython3.10.so missing from DT_NEEDED"; exit 1; }
+
+      - name: strip + collect artifacts
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          # PyO3 .so (for Chaquopy wheels)
+          cp "target/${{ matrix.target }}/release/libciris_edge.so" \
+             "dist/${{ matrix.abi }}/libciris_edge_pyo3.so"
+          if [ -x "$STRIP" ]; then
+            "$STRIP" "dist/${{ matrix.abi }}/libciris_edge.so"
+            "$STRIP" "dist/${{ matrix.abi }}/libciris_edge_pyo3.so"
+          fi
+          echo "=== ${{ matrix.abi }} ==="
+          ls -la dist/${{ matrix.abi }}/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-android-${{ matrix.abi }}
+          path: dist/${{ matrix.abi }}/
+
+  # ─── android-package: collect per-ABI artifacts (CIRISEdge#17) ──────
+  #
+  # Pattern lifted verbatim from CIRISPersist v2.0.7+ `android-package`.
+  # Two output tarballs:
+  #
+  #   1. `ciris-edge-v{VERSION}-android.tar.gz` — raw `.so` per ABI for
+  #      native Android consumers.
+  #   2. `ciris-edge-v{VERSION}-android-wheels.tar.gz` — three Chaquopy
+  #      abi3 wheels (one per ABI), tagged `cp310-abi3-android_24_{abi}`.
+  android-package:
+    name: package android artifacts
+    runs-on: ubuntu-latest
+    needs: [android-ndk]
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: download all ABI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ciris-edge-android-*
+          path: artifacts/
+      - name: package raw android .so tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist/android/arm64-v8a dist/android/x86_64 dist/android/armeabi-v7a
+          cp artifacts/ciris-edge-android-arm64-v8a/libciris_edge.so    dist/android/arm64-v8a/
+          cp artifacts/ciris-edge-android-x86_64/libciris_edge.so       dist/android/x86_64/
+          cp artifacts/ciris-edge-android-armeabi-v7a/libciris_edge.so  dist/android/armeabi-v7a/
+          tar -czf "dist/ciris-edge-v${VERSION}-android.tar.gz" -C dist android
+          echo "✓ ciris-edge-v${VERSION}-android.tar.gz"
+      - name: package Chaquopy abi3 wheels
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          build_wheel() {
+            local ABI="$1"         # e.g. arm64_v8a (underscore for wheel tag)
+            local ABI_DIR="$2"     # e.g. arm64-v8a (hyphen for artifact dir)
+
+            local WHEEL_TAG="cp310-abi3-android_24_${ABI}"
+            local WHEEL_NAME="ciris_edge-${VERSION}-${WHEEL_TAG}.whl"
+            local WORK="dist/wheel-work/${ABI}"
+
+            mkdir -p "${WORK}/ciris_edge" "${WORK}/ciris_edge-${VERSION}.dist-info"
+
+            cp "artifacts/ciris-edge-android-${ABI_DIR}/libciris_edge_pyo3.so" \
+               "${WORK}/ciris_edge/ciris_edge.so"
+            cp python/ciris_edge/__init__.py "${WORK}/ciris_edge/"
+            # .pyi stubs are optional — copy only if present (edge has
+            # not shipped them yet; persist's wheel does). Resistant
+            # to future addition without a workflow tweak.
+            if [ -f python/ciris_edge/ciris_edge.pyi ]; then
+              cp python/ciris_edge/ciris_edge.pyi "${WORK}/ciris_edge/"
+            fi
+
+            cat > "${WORK}/ciris_edge-${VERSION}.dist-info/METADATA" <<METAEOF
+          Metadata-Version: 2.1
+          Name: ciris-edge
+          Version: ${VERSION}
+          Summary: Reticulum-native federation transport for the CIRIS stack
+          License: AGPL-3.0-or-later
+          Requires-Python: >=3.10
+          METAEOF
+
+            cat > "${WORK}/ciris_edge-${VERSION}.dist-info/WHEEL" <<WHEELEOF
+          Wheel-Version: 1.0
+          Generator: ciris-edge-ci
+          Root-Is-Purelib: false
+          Tag: ${WHEEL_TAG}
+          WHEELEOF
+
+            echo "ciris_edge" > "${WORK}/ciris_edge-${VERSION}.dist-info/top_level.txt"
+
+            cd "${WORK}"
+            local RECORD="ciris_edge-${VERSION}.dist-info/RECORD"
+            : > "${RECORD}"
+            find ciris_edge ciris_edge-${VERSION}.dist-info \
+              -type f ! -name RECORD | sort | while read -r f; do
+              local HASH
+              HASH=$(python3 -c "
+          import hashlib, base64
+          with open('${f}', 'rb') as fh:
+              d = hashlib.sha256(fh.read()).digest()
+          print('sha256=' + base64.urlsafe_b64encode(d).rstrip(b'=').decode())
+          ")
+              local SIZE
+              SIZE=$(stat -c%s "${f}")
+              echo "${f},${HASH},${SIZE}" >> "${RECORD}"
+            done
+            echo "${RECORD},," >> "${RECORD}"
+            cd - > /dev/null
+
+            (cd "${WORK}" && zip -r "../../${WHEEL_NAME}" ciris_edge ciris_edge-${VERSION}.dist-info)
+            echo "✓ ${WHEEL_NAME} ($(stat -c%s "dist/${WHEEL_NAME}") bytes)"
+          }
+
+          build_wheel arm64_v8a    arm64-v8a
+          build_wheel x86_64      x86_64
+          build_wheel armeabi_v7a armeabi-v7a
+
+          tar -czf "dist/ciris-edge-v${VERSION}-android-wheels.tar.gz" \
+            -C dist \
+            "ciris_edge-${VERSION}-cp310-abi3-android_24_arm64_v8a.whl" \
+            "ciris_edge-${VERSION}-cp310-abi3-android_24_x86_64.whl" \
+            "ciris_edge-${VERSION}-cp310-abi3-android_24_armeabi_v7a.whl"
+
+          echo "✓ ciris-edge-v${VERSION}-android-wheels.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-android
+          path: dist/ciris-edge-v*-android.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-android-wheels
+          path: dist/ciris-edge-v*-android-wheels.tar.gz
+
+  # ─── build-ios: device + simulator (CIRISEdge#17) ───────────────────
+  #
+  # Pattern lifted verbatim from CIRISVerify v3.1.0 `build-ios` (release.yml).
+  # Persist's `ios-build` job uses PyO3 cross-compile + maturin-bypass
+  # for a Python-import surface; verify ships a plain Rust cdylib +
+  # static archive for swift-bridge / XCFramework consumers. Edge here
+  # follows VERIFY'S pattern — plain `transport-reticulum` build, NO
+  # PyO3 on iOS. Rationale:
+  #
+  #   * BeeWare Python-Apple-support is the iOS PyO3 path persist uses,
+  #     and it's *load-bearing complexity* for a wheel-shipping crate.
+  #     Edge's iOS consumers are native (Swift-via-XCFramework agent
+  #     stacks, not a Chaquopy-equivalent Python-on-iOS Briefcase).
+  #   * If a Python-on-iOS consumer materializes, copy persist's
+  #     `ios-build` job verbatim — that lane is documented + green.
+  #     Until then, the simpler verify pattern is the right shape.
+  #
+  # Verify's RUSTFLAGS install_name bake — DO NOT replace with
+  # `install_name_tool` post-link. install_name_tool rewrites the
+  # Mach-O headers in place, which shifts code section offsets and
+  # breaks binary-hash integrity (CIRISVerify v2.0.5 closure). Baking
+  # the install_name at link-time via RUSTFLAGS leaves the binary hash
+  # stable.
+  build-ios:
+    name: ios ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-ios,     sdk: iphoneos }
+          - { target: aarch64-apple-ios-sim, sdk: iphonesimulator }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+        with:
+          cache-bin: false
+          key: ios-${{ matrix.target }}
+      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
+        # v0.7.0 (CIRISEdge#17) — verbatim CIRISVerify v2.1.4+ heal.
+        # See darwin-aarch64-test for the full rationale; macOS runners
+        # exhibit this poison-shim mode under cache restore.
+        shell: bash
+        run: |
+          if cargo build --help 2>&1 | grep -q "rustup-init"; then
+            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
+            rm -rf "$HOME/.cargo/bin"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup default stable
+          cargo --version
+          cargo build --help >/dev/null
+      - name: Build for iOS
+        # Bake the framework install name at build time so
+        # install_name_tool isn't needed post-build. install_name_tool
+        # rewrites Mach-O headers in place — that shifts code section
+        # offsets and breaks downstream binary-hash integrity
+        # verification (CIRISVerify v2.0.5+ invariant). RUSTFLAGS-link
+        # path leaves the binary hash stable from compile through
+        # ship.
+        #
+        # Features: transport-reticulum only — the canonical
+        # cohabitation wire (MISSION §1.4). No PyO3 here (see job
+        # docblock above for the rationale); no transport-http
+        # (cloud fallback, not mobile).
+        run: |
+          RUSTFLAGS="-C link-arg=-install_name -C link-arg=@rpath/CIRISEdge.framework/CIRISEdge" \
+            cargo build --release --target ${{ matrix.target }} \
+              --features "transport-reticulum"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-ios-${{ matrix.target }}
+          # Edge's [lib].crate-type is `["cdylib", "rlib"]`; the iOS
+          # build emits a .dylib (cdylib path). Static .a would
+          # require an explicit `staticlib` crate-type — not added
+          # here because the XCFramework downstream job consumes
+          # the dynamic library successfully (see xcframework job).
+          path: |
+            target/${{ matrix.target }}/release/libciris_edge.dylib
+            target/${{ matrix.target }}/release/libciris_edge.a
+          if-no-files-found: error
+
+  # ─── xcframework: CIRISEdge.xcframework (CIRISEdge#17) ──────────────
+  #
+  # Pattern lifted verbatim from CIRISVerify v3.1.0 `xcframework`.
+  # Bundles the device + simulator artifacts into one
+  # `CIRISEdge.xcframework` that Swift consumers drag into Xcode.
+  xcframework:
+    name: Create XCFramework
+    needs: build-ios
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download iOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ciris-edge-ios-*
+          path: ios-libs
+          merge-multiple: false
+      - name: Create XCFramework
+        run: |
+          mkdir -p xcframework-build/ios xcframework-build/ios-sim
+
+          # The dylib name matches the [lib].crate-type cdylib output;
+          # edge ships no separate FFI header (consumers use
+          # swift-bridge / UniFFI bindings generated from the Rust
+          # source, the same path persist's iOS consumers take).
+          DEVICE_LIB="ios-libs/ciris-edge-ios-aarch64-apple-ios/libciris_edge.dylib"
+          SIM_LIB="ios-libs/ciris-edge-ios-aarch64-apple-ios-sim/libciris_edge.dylib"
+
+          cp "${DEVICE_LIB}" xcframework-build/ios/
+          cp "${SIM_LIB}"    xcframework-build/ios-sim/
+
+          # Module map for Swift consumers. No header file because
+          # edge's surface comes from swift-bridge bindings, not a
+          # hand-rolled C header.
+          cat > xcframework-build/module.modulemap << 'EOF'
+          module CIRISEdge {
+              export *
+          }
+          EOF
+          cp xcframework-build/module.modulemap xcframework-build/ios/
+          cp xcframework-build/module.modulemap xcframework-build/ios-sim/
+
+          xcodebuild -create-xcframework \
+            -library xcframework-build/ios/libciris_edge.dylib \
+            -library xcframework-build/ios-sim/libciris_edge.dylib \
+            -output CIRISEdge.xcframework
+      - name: package XCFramework as release asset
+        # v0.7.0 (CIRISEdge#17) — pack the .xcframework directory into
+        # a single tar.gz for `gh release upload`. Verify's release.yml
+        # uses the same pattern (`ciris-verify-${TAG}-ios.tar.gz`
+        # bundles the XCFramework alongside the raw libs). Without
+        # this, `gh release upload` can't take a directory.
+        run: |
+          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
+          tar -czf "ciris-edge-v${VERSION}-xcframework.tar.gz" CIRISEdge.xcframework
+          echo "✓ ciris-edge-v${VERSION}-xcframework.tar.gz ($(stat -f%z "ciris-edge-v${VERSION}-xcframework.tar.gz" 2>/dev/null || stat -c%s "ciris-edge-v${VERSION}-xcframework.tar.gz") bytes)"
+      - name: Upload XCFramework (raw, for cross-job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CIRISEdge.xcframework
+          path: CIRISEdge.xcframework
+          if-no-files-found: error
+      - name: Upload XCFramework tarball (for release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-xcframework-tarball
+          path: ciris-edge-v*-xcframework.tar.gz
+          if-no-files-found: error
+
+  # ─── ios-pyo3: iOS Python-on-iOS cohabitation (CIRISEdge#17) ────────
+  #
+  # Pattern lifted verbatim from CIRISPersist v2.0.4+ `ios-build`
+  # (CIRISPersist .github/workflows/ci.yml job `ios-build`). This is
+  # the iOS parallel of `android-ndk`'s Chaquopy lane: cohabiting
+  # Python-on-iOS hosts (BeeWare Briefcase) need to `import ciris_edge`
+  # exactly the same way Chaquopy does on Android. Unblocks
+  # CIRISAgent v2.9.4 release.
+  #
+  # Coexists with `build-ios` + `xcframework` (those serve native
+  # Swift consumers via XCFramework). The two iOS lanes are
+  # orthogonal — one ships a Python extension `.abi3.so`, the other
+  # ships a Swift-importable framework.
+  #
+  # Hard-won lessons from persist's v2.0.4 closure (verbatim):
+  #
+  #   * `cargo build` directly, NOT `maturin build` — maturin 1.13's
+  #     platform check rejects darwin→iOS cross-compile.
+  #   * `PYO3_CROSS=1` + `PYO3_CROSS_LIB_DIR` pointing at a staged
+  #     dir containing both libpython3.10.dylib AND the matching
+  #     `_sysconfigdata__ios_*.py`. PyO3 PR #5605 requires libpython
+  #     linking on iOS (unlike Android where DT_NEEDED + stub does it).
+  #   * `Python-Apple-support` is BeeWare's prebuilt iOS Python.
+  #     Version pin: `3.10-b13` — matches persist's `PYTHON_IOS_VER`
+  #     `PYTHON_IOS_BUILD` exactly (CIRISPersist Cargo.toml's
+  #     [target.'cfg(target_os = "ios")'] table is built/tested
+  #     against this version, and edge's `pyo3` feature pulls
+  #     `ciris-persist/pyo3` which inherits persist's iOS dep table).
+  #     Cohabitation depends on substrate version-match.
+  #   * `install_name_tool -id @rpath/...` — cargo bakes the runner's
+  #     absolute path into the dylib's install name. Briefcase needs
+  #     an @rpath-relative name. Persist takes a binary-hash hit here
+  #     (the install_name_tool mutation shifts Mach-O headers), but
+  #     accepts it because Python wheel surfaces aren't subject to
+  #     the binary-hash-integrity invariant the way verify's native
+  #     framework is. Same trade-off applies to edge's iOS PyO3 path.
+  #     (Contrast: `build-ios` above bakes install_name at link-time
+  #     via RUSTFLAGS — that path IS hash-integrity-sensitive.)
+  #
+  # Features: full `pyo3 extension-module` set, like persist. Edge's
+  # `pyo3` feature already implies `transport-reticulum` (via the
+  # v0.5.1 lonely-pyo3 guard in Cargo.toml), so the Reticulum
+  # cohabitation wire is on. No `transport-http` (mobile = cloud
+  # fallback off, same as Android).
+  #
+  # Why matrix where persist uses sequential steps: edge's split
+  # mirrors the `android-ndk` → `android-package` pattern already in
+  # this file. Persist runs both targets in one job because its
+  # downstream `ios-build` is the terminal artifact-producer; edge
+  # splits build vs package so a future iOS-only refactor (e.g.
+  # adding iOS-sim-x86_64 for Intel Macs) drops in cleanly.
+  ios-pyo3:
+    name: ios PyO3 abi3 (${{ matrix.target }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-ios,     dir: ios-device,    sysconfig: _sysconfigdata__ios_arm64-iphoneos.py,       xcfw_dir: ios-arm64 }
+          - { target: aarch64-apple-ios-sim, dir: ios-simulator, sysconfig: _sysconfigdata__ios_arm64-iphonesimulator.py, xcfw_dir: ios-arm64_x86_64-simulator }
+    env:
+      # Persist's pin verbatim — see job docblock above for rationale.
+      PYTHON_IOS_VER: "3.10"
+      PYTHON_IOS_BUILD: "b13"
+      # Edge's mobile-PyO3 feature set. `pyo3` implies
+      # `transport-reticulum` (Cargo.toml v0.5.1 guard) so explicitly
+      # naming it would be redundant — but we name it anyway for the
+      # same self-documenting reason the wheel job does.
+      IOS_PYO3_FEATURES: "transport-reticulum pyo3 extension-module"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          key: ios-pyo3-${{ matrix.target }}
+        continue-on-error: true
+      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
+        # Same heal as `build-ios` + `darwin-aarch64-test`. macOS
+        # runners exhibit the rustup-init shim poison-restore under
+        # Swatinem/rust-cache; CIRISVerify v2.1.4+ active-heal pattern.
+        shell: bash
+        run: |
+          if cargo build --help 2>&1 | grep -q "rustup-init"; then
+            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
+            rm -rf "$HOME/.cargo/bin"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup default stable
+          cargo --version
+          cargo build --help >/dev/null
+      - uses: actions/setup-python@v5
+        with:
+          # Persist uses 3.13 here for the host runner Python (the
+          # target Python comes from Python-Apple-support); we match
+          # exactly to keep the cohabitation substrate aligned.
+          python-version: "3.13"
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: download Python-Apple-support (iOS)
+        id: python-ios
+        # Stage libpython + matching _sysconfigdata into one dir for
+        # PYO3_CROSS_LIB_DIR. Persist's exact recipe (CIRISPersist
+        # ci.yml lines 252-281), restricted to this matrix entry's
+        # target — the matrix split means each runner only stages
+        # ONE target's libpython, where persist's single-job version
+        # staged both. Halves the per-runner work + makes
+        # parallelism trivial.
+        run: |
+          SUPPORT_URL="https://github.com/beeware/Python-Apple-support/releases/download/${PYTHON_IOS_VER}-${PYTHON_IOS_BUILD}/Python-${PYTHON_IOS_VER}-iOS-support.${PYTHON_IOS_BUILD}.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/python-ios"
+          curl -sL "${SUPPORT_URL}" -o "${RUNNER_TEMP}/python-ios-support.tar.gz"
+          tar xzf "${RUNNER_TEMP}/python-ios-support.tar.gz" -C "${RUNNER_TEMP}/python-ios"
+
+          XCFW="${RUNNER_TEMP}/python-ios/Python.xcframework"
+
+          # PyO3 cross-compilation needs libpython + _sysconfigdata
+          # in one directory. Stage them from the xcframework subdir
+          # matching this matrix entry's target.
+          STAGE_DIR="${RUNNER_TEMP}/pyo3-ios-stage"
+          mkdir -p "$STAGE_DIR"
+          cp "$XCFW/${{ matrix.xcfw_dir }}/Python.framework/Python" \
+             "$STAGE_DIR/libpython${PYTHON_IOS_VER}.dylib"
+          cp "$XCFW/${{ matrix.xcfw_dir }}/lib-arm64/python${PYTHON_IOS_VER}/${{ matrix.sysconfig }}" \
+             "$STAGE_DIR/"
+          echo "lib_dir=${STAGE_DIR}" >> "$GITHUB_OUTPUT"
+
+          echo "✓ Python-Apple-support ${PYTHON_IOS_VER}-${PYTHON_IOS_BUILD} staged for ${{ matrix.target }}"
+          ls -la "$STAGE_DIR/"
+      - name: cargo build (ios PyO3 — ${{ matrix.target }})
+        env:
+          PYO3_CROSS: "1"
+          PYO3_CROSS_PYTHON_VERSION: "3.10"
+          PYO3_CROSS_LIB_DIR: ${{ steps.python-ios.outputs.lib_dir }}
+        # Direct `cargo build` — NOT `maturin build`. Maturin 1.13's
+        # platform check rejects darwin→iOS cross-compile; persist
+        # documented this in v2.0.4 and the constraint persists.
+        run: >-
+          cargo build --release
+          --target ${{ matrix.target }}
+          --features "$IOS_PYO3_FEATURES"
+      - name: strip + rename + install_name fix
+        # Mach-O rename: libciris_edge.dylib → ciris_edge.abi3.so
+        # (Python extension naming convention). install_name_tool
+        # rewrites the embedded path from /Users/runner/work/... to
+        # @rpath-relative for Briefcase consumption. The hash-integrity
+        # hit is intentional and accepted (see job docblock).
+        run: |
+          mkdir -p "dist/${{ matrix.dir }}"
+          SRC="target/${{ matrix.target }}/release/libciris_edge.dylib"
+          DST="dist/${{ matrix.dir }}/ciris_edge.abi3.so"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::$SRC not found"
+            ls -la "target/${{ matrix.target }}/release/" | grep ciris
+            exit 1
+          fi
+          strip -x "$SRC"
+          # @rpath name matches persist's pattern — Briefcase resolves
+          # @rpath at app-bundle load time via the embedded
+          # Python.framework search.
+          install_name_tool -id \
+            "@rpath/ciris_edge.ciris_edge.framework/ciris_edge.ciris_edge" \
+            "$SRC"
+          cp "$SRC" "$DST"
+          echo "✓ ${{ matrix.dir }}: $(stat -f%z "$DST" 2>/dev/null || stat -c%s "$DST") bytes"
+          otool -D "$DST"
+          file "$DST"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-ios-pyo3-${{ matrix.dir }}
+          path: dist/${{ matrix.dir }}/ciris_edge.abi3.so
+          if-no-files-found: error
+
+  # ─── ios-pyo3-package: collect device + simulator (CIRISEdge#17) ────
+  #
+  # Persist runs the equivalent of this step inline at the end of its
+  # `ios-build` job (one runner builds both targets sequentially, then
+  # tarballs them). Edge splits into matrix + downstream-package to
+  # mirror the `android-ndk` → `android-package` pattern already in
+  # this file. Output shape matches persist exactly:
+  #
+  #     ciris-edge-v{VERSION}-ios.tar.gz
+  #       ├── ios-device/ciris_edge.abi3.so
+  #       └── ios-simulator/ciris_edge.abi3.so
+  #
+  # This is NOT a Python wheel. Persist deliberately ships the raw
+  # `.abi3.so` files in a tarball, NOT as `cp310-abi3-ios_*` wheels —
+  # because BeeWare Briefcase consumes them via its own `iOS.pth`
+  # mechanism, not via pip install. The user's spec called for a
+  # `cp310-abi3-ios_*` wheel-naming pattern; we deliberately do NOT
+  # invent one — the instruction was "mirror exactly what persist's
+  # lane produces — don't invent." Persist produces tarballs. If
+  # CIRISAgent v2.9.4's host actually wants pip-installable wheels
+  # later, that's a follow-up adapter step — but the cohabitation
+  # primitive (a built `ciris_edge.abi3.so` matching Python-Apple-
+  # support's libpython) is what `import ciris_edge` needs, and the
+  # tarball delivers exactly that.
+  ios-pyo3-package:
+    name: package ios PyO3 artifacts
+    runs-on: ubuntu-latest
+    needs: [ios-pyo3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: download iOS PyO3 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ciris-edge-ios-pyo3-*
+          path: artifacts/
+      - name: package iOS PyO3 tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist/ios-device dist/ios-simulator
+          cp artifacts/ciris-edge-ios-pyo3-ios-device/ciris_edge.abi3.so       dist/ios-device/
+          cp artifacts/ciris-edge-ios-pyo3-ios-simulator/ciris_edge.abi3.so    dist/ios-simulator/
+
+          echo "=== ios-device ==="
+          ls -la dist/ios-device/
+          file dist/ios-device/ciris_edge.abi3.so
+          echo "=== ios-simulator ==="
+          ls -la dist/ios-simulator/
+          file dist/ios-simulator/ciris_edge.abi3.so
+
+          tar -czf "dist/ciris-edge-v${VERSION}-ios.tar.gz" \
+            -C dist ios-device ios-simulator
+
+          echo "✓ packaged ciris-edge-v${VERSION}-ios.tar.gz"
+          ls -la "dist/ciris-edge-v${VERSION}-ios.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-ios-pyo3
+          path: dist/ciris-edge-v*-ios.tar.gz
+          if-no-files-found: error
 
   # ─── lint: clippy + fmt (mission rejection gate) ────────────────────
   lint:
@@ -93,7 +839,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # ─── pyo3-wheel: maturin abi3-py311 wheels ──────────────────────────
+  # ─── pyo3-wheel: maturin abi3-py310 wheels ──────────────────────────
   #
   # Three wheels per release. Matrix mirrors CIRISPersist exactly
   # (linux x86_64 + aarch64, darwin arm64). darwin-x86_64 omitted —
@@ -105,7 +851,7 @@ jobs:
   # avoid cross-compile drama (sysroot, linkers, vendored crypto
   # quirks).
   pyo3-wheel:
-    name: maturin abi3-py311 wheel (${{ matrix.label }})
+    name: maturin abi3-py310 wheel (${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
@@ -123,22 +869,64 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
+      # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
+      # rustup-init shadow that the Repair-toolchain heal step below
+      # actively corrects. CIRISVerify v2.1.4+ pattern; persist v0.7.2's
+      # original work + verify's follow-up active-heal step.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+        continue-on-error: true
+      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
+        # v0.7.0 (CIRISEdge#17) — CIRISVerify v2.1.4+ pattern verbatim.
+        # macOS runners occasionally cache a `~/.cargo/bin/cargo` that IS
+        # the rustup-init shim binary. The shim passes `cargo --version`
+        # through (any CLI accepts --version), but `cargo build` triggers
+        # the shim's argv parser and fails with "unexpected argument
+        # 'build' found". Passive `rustup default stable` doesn't help
+        # because the rustup binary may share the same shim. Active heal:
+        # probe via `cargo build --help` output, nuke ~/.cargo/bin,
+        # reinstall toolchain. shell: bash forces Git Bash on Windows
+        # runners (default is pwsh, which can't parse if/then/fi).
+        shell: bash
+        run: |
+          if cargo build --help 2>&1 | grep -q "rustup-init"; then
+            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
+            rm -rf "$HOME/.cargo/bin"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup default stable
+          cargo --version
+          cargo build --help >/dev/null
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: install maturin
         run: pip install maturin
       - name: maturin build
-        run: maturin build --release --strip
+        # v0.7.0 (CIRISEdge#17) — explicit `--features "pyo3 extension-module"`.
+        # `extension-module` is a separate Cargo feature now (persist
+        # v1.13.0 discipline) — folding it into `pyo3` broke
+        # `cargo test --features pyo3` because tests must link libpython
+        # but the wheel must NOT (host interpreter provides the symbols).
+        # pyproject.toml's [tool.maturin].features list also names both;
+        # we pass --features here too so the CI invocation is
+        # self-documenting and resistant to pyproject drift.
+        run: maturin build --release --strip --features "pyo3 extension-module"
       - name: confirm wheel shape
-        # Reject anything that isn't cp311-abi3 — mixed-mode maturin can
-        # silently emit cp31N-cp31N wheels which break consumer install
-        # on other minors. Catching at build time, before PyPI.
-        # Same v0.1.10-regression closure persist uses.
+        # v0.7.0 (CIRISEdge#17) — abi3-py310 not cp311-abi3. Chaquopy
+        # bundles Python 3.10; abi3 is forward-compatible so the py310
+        # wheel runs on 3.11 / 3.12 / 3.13 too. Bumping the floor down
+        # is an expansion of compatibility, not a regression. Mixed-mode
+        # maturin can still silently emit cp31N-cp31N wheels; catch at
+        # build time, before PyPI. Same v0.1.10-regression closure
+        # persist uses.
         run: |
           ls -la target/wheels/
-          if ! ls target/wheels/*-cp311-abi3-*.whl >/dev/null 2>&1; then
-            echo "::error::Expected cp311-abi3 wheel for ${{ matrix.label }}; got:"
+          if ! ls target/wheels/*-cp310-abi3-*.whl >/dev/null 2>&1; then
+            echo "::error::Expected cp310-abi3 wheel for ${{ matrix.label }}; got:"
             ls target/wheels/*.whl 2>/dev/null || echo "  (no wheels)"
             exit 1
           fi
@@ -453,6 +1241,17 @@ jobs:
     # Gate publish on every quality job — presence-of-wheel alone is
     # not a quality gate. Same v0.3.3 closure persist applied after
     # v0.3.2 shipped wheels through a fmt-failure tag run.
+    #
+    # v0.7.0 (CIRISEdge#17) — added the four mobile lanes to the gate.
+    # publish-pypi still only ships the three desktop abi3 wheels
+    # (linux x86_64 + linux aarch64 + darwin aarch64) — Chaquopy wheels
+    # and iOS PyO3 tarballs go to GitHub Release via `mobile-release`,
+    # not PyPI. Mirrors persist's discipline exactly (persist's
+    # publish-pypi also gates on ios-build + android-package without
+    # consuming their artifacts). Rationale: a tag that builds a green
+    # desktop wheel but breaks the iOS/Android cohabitation paths
+    # should not ship to PyPI either — the cohabiting agent expects
+    # version-aligned substrate across all platforms.
     needs:
       - pyo3-wheel
       - build-manifest
@@ -460,6 +1259,9 @@ jobs:
       - license-audit
       - linux-x86_64-test
       - darwin-aarch64-test
+      - android-package
+      - ios-pyo3-package
+      - xcframework
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
@@ -489,13 +1291,14 @@ jobs:
             exit 1
           fi
           for wheel in dist/*.whl; do
-            if ! [[ "${wheel}" =~ -cp311-abi3- ]]; then
+            # v0.7.0 (CIRISEdge#17) — abi3-py310 floor (Chaquopy compat).
+            if ! [[ "${wheel}" =~ -cp310-abi3- ]]; then
               echo "::error::Non-abi3 wheel detected: ${wheel}"
               exit 1
             fi
             echo "✓ ${wheel}"
           done
-          echo "✓ All ${COUNT} wheels conform to cp311-abi3."
+          echo "✓ All ${COUNT} wheels conform to cp310-abi3."
       - name: publish to PyPI via OIDC trusted publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -509,4 +1312,204 @@ jobs:
           # the manifest can also verify the PyPI artifact ties to
           # this exact GH workflow identity.
           attestations: true
+
+  # ─── mobile-release: GitHub Release tarball publish (CIRISEdge#17) ──
+  #
+  # Pattern lifted verbatim from CIRISPersist v2.0.7+ `mobile-release`
+  # (CIRISPersist .github/workflows/ci.yml job `mobile-release`).
+  # Tag-gated GitHub Release artifact upload for ALL the mobile +
+  # native-Swift lanes that DON'T go through PyPI:
+  #
+  #   - `ciris-edge-v{VERSION}-ios.tar.gz`         — iOS PyO3 abi3.so
+  #     (BeeWare Briefcase consumes via iOS.pth)
+  #   - `ciris-edge-v{VERSION}-android.tar.gz`     — raw per-ABI .so
+  #     (native Android consumers, JNI/UniFFI)
+  #   - `ciris-edge-v{VERSION}-android-wheels.tar.gz`
+  #                                                — three Chaquopy
+  #     abi3 wheels (the Python-on-Android cohabitation surface)
+  #   - `ciris-edge-v{VERSION}-xcframework.tar.gz` — CIRISEdge.xcframework
+  #     (native Swift consumers)
+  #   - `SHA256SUMS`                                — release-attestable
+  #     hashes over all of the above
+  #
+  # `publish-pypi` ships the THREE desktop wheels to PyPI separately
+  # (linux-x86_64, linux-aarch64, darwin-aarch64). The two channels
+  # are complementary — PyPI for `pip install ciris-edge` on desktop,
+  # GitHub Release for `gh release download` on mobile/native.
+  #
+  # Persist's job: CIRISPersist ci.yml lines 1293-1426. Mirrored shape:
+  #   - Tag-gate: `if: startsWith(github.ref, 'refs/tags/v')`
+  #   - `gh run download` with 5-attempt retry (absorbs ListArtifacts
+  #     transient 403s — persist hit this on v1.5.24 tag run).
+  #   - `gh release create --verify-tag` if release doesn't exist yet
+  #     (publish-pypi may have created it).
+  #   - `gh release upload --clobber` for idempotent tag re-runs.
+  #
+  # Edge-specific additions: XCFramework asset (verify ships one too;
+  # persist doesn't have a native-Swift surface so its `mobile-release`
+  # doesn't carry an XCFramework).
+  mobile-release:
+    name: Upload mobile + native artifacts to GitHub Release (tag-gated)
+    runs-on: ubuntu-latest
+    needs:
+      - ios-pyo3-package
+      - android-package
+      - xcframework
+      - lint
+      - license-audit
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -E '^version[[:space:]]*=' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: download iOS PyO3 artifact (with retry)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `gh run download` (NOT actions/download-artifact@v4) — persist's
+        # v1.6.0 hardening absorbs the ListArtifacts 403 transient that
+        # the v4 action surfaces directly. 5-attempt retry verbatim.
+        run: |
+          mkdir -p dist
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name ciris-edge-ios-pyo3 \
+                --dir dist; then
+              echo "✓ iOS PyO3 artifact download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::iOS PyO3 artifact download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::iOS PyO3 download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+      - name: download Android raw .so artifact (with retry)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name ciris-edge-android \
+                --dir dist; then
+              echo "✓ Android raw .so artifact download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::Android artifact download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::Android download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+      - name: download Android Chaquopy wheels artifact (with retry)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name ciris-edge-android-wheels \
+                --dir dist; then
+              echo "✓ Android wheels download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::Android wheels download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::Android wheels download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+      - name: download XCFramework tarball artifact (with retry)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name ciris-edge-xcframework-tarball \
+                --dir dist; then
+              echo "✓ XCFramework tarball download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::XCFramework tarball download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::XCFramework download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+      - name: verify all four assets present
+        run: |
+          echo "=== dist/ ==="
+          ls -la dist/
+          VERSION="${{ steps.version.outputs.version }}"
+          for ASSET in "ciris-edge-v${VERSION}-ios.tar.gz" \
+                       "ciris-edge-v${VERSION}-android.tar.gz" \
+                       "ciris-edge-v${VERSION}-android-wheels.tar.gz" \
+                       "ciris-edge-v${VERSION}-xcframework.tar.gz"; do
+            if [ ! -f "dist/${ASSET}" ]; then
+              echo "::error::Missing expected asset: ${ASSET}"
+              exit 1
+            fi
+            echo "✓ ${ASSET} ($(stat -c%s "dist/${ASSET}" 2>/dev/null || stat -f%z "dist/${ASSET}") bytes)"
+          done
+      - name: generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum ciris-edge-v*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: create GitHub Release + upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # publish-pypi creates the GitHub Release in some flows; create
+          # here if it doesn't exist yet, otherwise just upload. --verify-tag
+          # ensures we don't accidentally create a release for a tag that
+          # doesn't exist (e.g. workflow_dispatch on main).
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "ciris-edge ${TAG}" \
+              --generate-notes \
+              --verify-tag
+            echo "✓ created release ${TAG}"
+          else
+            echo "✓ release ${TAG} already exists — uploading assets"
+          fi
+
+          # --clobber so tag re-runs are idempotent. PyPI is rejecting the
+          # re-upload separately via skip-existing; GH releases need
+          # --clobber explicitly.
+          gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            "dist/ciris-edge-v${VERSION}-ios.tar.gz" \
+            "dist/ciris-edge-v${VERSION}-android.tar.gz" \
+            "dist/ciris-edge-v${VERSION}-android-wheels.tar.gz" \
+            "dist/ciris-edge-v${VERSION}-xcframework.tar.gz" \
+            "dist/SHA256SUMS"
+
+          echo "✓ uploaded mobile + native assets to ${TAG}"
+          {
+            echo "## Mobile + native release assets"
+            echo ""
+            echo "- \`ciris-edge-v${VERSION}-ios.tar.gz\` (iOS PyO3: device + simulator .abi3.so)"
+            echo "- \`ciris-edge-v${VERSION}-android.tar.gz\` (raw per-ABI .so)"
+            echo "- \`ciris-edge-v${VERSION}-android-wheels.tar.gz\` (Chaquopy abi3 wheels: arm64, x86_64, armeabi-v7a)"
+            echo "- \`ciris-edge-v${VERSION}-xcframework.tar.gz\` (CIRISEdge.xcframework for native Swift consumers)"
+            echo "- \`SHA256SUMS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 

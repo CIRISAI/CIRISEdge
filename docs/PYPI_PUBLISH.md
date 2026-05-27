@@ -90,7 +90,7 @@ triggers `.github/workflows/ci.yml::publish-pypi`. The job:
 2. Downloads all three wheel artifacts (linux x86_64 + aarch64, darwin
    arm64) via the `ciris_edge-wheel-*` glob.
 3. Sanity-checks count + shape (rejects anything that isn't exactly
-   3 cp311-abi3 wheels — prevents v0.1.10-class regressions reaching
+   3 cp310-abi3 wheels — prevents v0.1.10-class regressions reaching
    consumers).
 4. Calls `pypa/gh-action-pypi-publish@release/v1` with
    `attestations: true`. One sigstore attestation bundle covers all
@@ -161,7 +161,7 @@ delivery channel; verifiable but not load-bearing on its own.
   silently. That's intentional for re-runs. To actually re-publish,
   bump to a fresh version.
 
-- **Non-cp311-abi3 wheel.** Sanity check rejects it before publish.
+- **Non-cp310-abi3 wheel.** Sanity check rejects it before publish.
   This is the v0.1.10-class regression — silently shipping a wrong
   shape would be worse than failing.
 

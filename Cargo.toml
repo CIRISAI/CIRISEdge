@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -116,7 +116,7 @@ transport-reticulum   = ["dep:reticulum-std", "dep:reticulum-core"]
 
 # pyo3 — Python bindings for the lens FastAPI cutover (Phase 1)
 # and the agent Python pipeline (Phase 2). Same FFI-shell discipline
-# persist uses (CIRISPersist src/ffi/pyo3.rs); abi3-py311 single-wheel
+# persist uses (CIRISPersist src/ffi/pyo3.rs); abi3 single-wheel
 # per-(os,arch) ships via maturin.
 #
 # v0.5.0 — turns on `ciris-persist/pyo3` so `init_edge_runtime`
@@ -132,9 +132,27 @@ transport-reticulum   = ["dep:reticulum-std", "dep:reticulum-core"]
 # the reticulum-gated items unused and `-D warnings` fails the build.
 pyo3                  = ["dep:pyo3", "ciris-persist/pyo3", "transport-reticulum"]
 
+# v0.7.0 (CIRISEdge#17) — `extension-module` split out of the `pyo3`
+# feature, mirroring CIRISPersist's discipline (persist v2.0.6+).
+# `pyo3/extension-module` tells PyO3 not to link libpython, which is
+# correct for wheel builds (the host interpreter provides the symbols
+# at import time) but breaks `cargo test --features pyo3` because tests
+# need to link libpython for in-process Python-from-Rust embedding.
+# Wheel builds invoke `--features "pyo3 extension-module"`; test +
+# lint builds invoke `--features pyo3` and link libpython normally.
+# pyproject.toml's `[tool.maturin]` features list adds the extra flag.
+extension-module      = ["pyo3?/extension-module"]
+
 [dependencies.pyo3]
 version  = "0.28"
-features = ["extension-module", "abi3-py311"]
+# v0.7.0 (CIRISEdge#17) — `abi3-py310`, not `abi3-py311`. Chaquopy
+# bundles Python 3.10 (Android mobile cohabitation, CIRISPersist#96–99
+# precedent); abi3 is forward-compatible so a py310-tagged wheel runs
+# on 3.11 / 3.12 / 3.13 too — bumping the floor down is purely an
+# expansion of compatibility, not a regression for the existing PyPI
+# consumers. `extension-module` removed from this list — it's now its
+# own top-level feature (see above).
+features = ["abi3-py310"]
 optional = true
 
 [lib]
