@@ -35,6 +35,11 @@ allow = [
     # copyleft). AGPL-compatible. Transitive via the Leviculum
     # Reticulum stack (reticulum-core resource-layer compression).
     "bzip2-1.0.6",
+    # MIT-0 — "MIT No Attribution" (OSI-approved, strictly more
+    # permissive than MIT: no attribution requirement). AGPL-compatible.
+    # Transitive via persist v2.7.0's jsonschema admission gates
+    # (CIRISEdge#20 persist bump) → fluent-uri → borrow-or-share.
+    "MIT-0",
 ]
 confidence-threshold = 0.85
 

@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::handler::{Delivery, Message};
+use crate::handler::{Delivery, FederationPriority, Message};
 
 /// Wire-format schema version. Pinned by edge release tag; downstream
 /// peers gate on a strict allowlist (AV-7).
@@ -132,6 +132,18 @@ pub enum MessageType {
     /// Required so the fetcher fails over to a different peer instead
     /// of hanging (edge#21 spec point 3). Body: [`ContentMiss`].
     ContentMiss,
+
+    // ─── CIRISEdge#20 (v0.10.0) — Federation steward class ──────────
+    /// Steward-class federation directive — rides
+    /// `Delivery::Federation { priority: StewardClass }`. Edge derives
+    /// the recipient set dynamically from persist's `federation_keys`
+    /// directory where `identity_type = "steward"` on every
+    /// [`crate::Edge::send_federation`] call. Body:
+    /// [`StewardDirective`]. The DeliveryAttestation emission hook
+    /// fires on this wire type the same way it fires on
+    /// [`Self::FederationAnnouncement`] (FSD §3.2.1 per-peer
+    /// attestation shape, reused — see CIRISEdge#20 ask #3).
+    StewardDirective,
 
     // ─── CIRISEdge#22 Tier 2 (v0.9.0) — inline-text family ──────────
     /// CommunicationBus-replacement inline-text payload. Body shape:
@@ -824,6 +836,77 @@ impl DeliveryAttestation {
         })?;
         Ok(arr)
     }
+}
+
+// ─── CIRISEdge#20 — StewardDirective (Federation class) ─────────────
+//
+// v0.10.0 — first concrete consumer of `Delivery::Federation { priority:
+// StewardClass }`. Edge ships the wire class so future cross-repo
+// federation traffic (cross-attestations / revocations / rule
+// amendments) can ride it; v0.10.0 itself only mints this one body
+// type as the canonical Federation-class wire shape. The receiver
+// identifies the class at the wire layer through this MessageType
+// (the `Delivery` enum is sender-side trait-level, not on the wire),
+// which gates the DeliveryAttestation emission hook
+// (`is_federation_attestation_emitting_type` in this module).
+
+/// Body for a steward-class federation directive. Minimal shape at
+/// v0.10.0 — title + body strings carrying the steward's signed
+/// statement; consumer-side routing branches on the title / body
+/// content. Future v0.x cuts may add structured fields (rotation
+/// payloads, revocation references) without a wire break — the wire
+/// shape ratchets only on serde-additive changes.
+///
+/// Ships as the canonical [`Delivery::Federation`] body type. Receivers
+/// (every steward in the federation directory at send time) auto-emit a
+/// per-peer [`DeliveryAttestation`] on verified receipt — same shape
+/// as the `FederationAnnouncement` path (FSD §3.2.1, CIRISEdge#20 ask
+/// #3 reused-attestation contract).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StewardDirective {
+    /// Short label for operator UIs and audit-chain summaries.
+    pub title: String,
+    /// Full directive body. Plain text or markdown
+    /// (renderer-defined).
+    pub body: String,
+}
+
+impl Message for StewardDirective {
+    const TYPE: MessageType = MessageType::StewardDirective;
+    /// Federation class, steward-priority routing. Defaults mirror
+    /// the `FederationAnnouncement` long-haul shape: 14d TTL, 100
+    /// attempts, no inline-response ACK (the per-peer
+    /// [`DeliveryAttestation`] emitted on verified receipt IS the
+    /// audit observable — same convention as the Mandatory class).
+    const DELIVERY: Delivery = Delivery::Federation {
+        priority: FederationPriority::StewardClass,
+        requires_ack: false,
+        max_attempts: 100,
+        ttl_seconds: 14 * 24 * 60 * 60,
+        ack_timeout_seconds: None,
+    };
+    type Response = ();
+}
+
+/// Wire-types that trigger the
+/// [`crate::messages::DeliveryAttestation`] emission hook in
+/// `dispatch_inbound`. v0.6.0 ratified the per-peer attestation for
+/// [`MessageType::FederationAnnouncement`] (FSD §3.2.1); CIRISEdge#20
+/// extends the same shape onto [`MessageType::StewardDirective`] —
+/// steward-class messages need the SAME audit observable as
+/// Mandatory-class so federation reach is verifiable across both
+/// push paths.
+///
+/// Free function (not a method on `MessageType`) so future Federation
+/// or attestation-emitting wire types can be appended without
+/// adjusting the receive-time match on the `MessageType` enum body —
+/// dispatch_inbound's single call site is the contract.
+#[must_use]
+pub fn is_federation_attestation_emitting_type(mt: &MessageType) -> bool {
+    matches!(
+        mt,
+        MessageType::FederationAnnouncement | MessageType::StewardDirective
+    )
 }
 
 // ─── CIRISEdge#21 — ContentFetch / ContentBody / ContentMiss ────────

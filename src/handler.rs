@@ -51,6 +51,45 @@ pub enum Delivery {
         /// `None` here is rejected at enqueue when `requires_ack=true`.
         ack_timeout_seconds: Option<u64>,
     },
+    /// Ships over `Edge::send_federation`. High-priority recipient
+    /// class — routed-with-preference fan-out to a dynamically-
+    /// derived subset of the directory (currently the steward set,
+    /// per CIRISEdge#20). DISTINCT from [`Self::Mandatory`]:
+    /// Federation routes with preference but **does NOT bypass**
+    /// per-peer subscription filters; it is the substrate's high-
+    /// priority class between best-effort gossip and the federation-
+    /// wide push of Mandatory. The recipient set is re-resolved on
+    /// every send (`Edge::send_federation` calls the configured
+    /// [`crate::outbound::StewardDirectory`] each invocation) so
+    /// steward rotation (Registry FSD-002 §2.1) propagates without
+    /// caching.
+    ///
+    /// Per-row durability config mirrors the [`Self::Durable`] class:
+    /// receiver SHOULD sign + return an ACK (per
+    /// [`crate::DeliveryAttestation`] per FSD §3.2.1 — the same
+    /// attestation shape `FederationAnnouncement` introduced) so the
+    /// audit observable is uniform across the federation push paths.
+    /// Closes CIRISEdge#20.
+    Federation {
+        /// High-priority recipient class. v0.10.0 ships ONE
+        /// ([`FederationPriority::StewardClass`]); future classes
+        /// (`AccordHolderClass` for #19-adjacent uses, etc.) extend
+        /// this enum without breaking the wire — the priority is a
+        /// routing hint, not a wire-format dimension.
+        priority: FederationPriority,
+        /// Same semantics as [`Self::Durable::requires_ack`]: receiver
+        /// MUST sign + return an ACK envelope ([`crate::DeliveryAttestation`]
+        /// per FSD §3.2.1) before the row transitions to `delivered`.
+        requires_ack: bool,
+        /// Hard cap on retry attempts before the row abandons with
+        /// `abandoned_reason='max_attempts'`.
+        max_attempts: u32,
+        /// Time-to-live; rows older than this abandon with
+        /// `abandoned_reason='ttl_expired'`.
+        ttl_seconds: u64,
+        /// Per-row ACK-timeout (only meaningful when `requires_ack=true`).
+        ack_timeout_seconds: Option<u64>,
+    },
     /// Ships over `Edge::send_mandatory`. Federation-tier broadcast
     /// that bypasses any subscription / per-peer filter at the
     /// dispatcher: the message fans out to **every peer** in the
@@ -83,6 +122,25 @@ pub enum Delivery {
         /// signal).
         bypass_subscription: bool,
     },
+}
+
+/// High-priority recipient class for [`Delivery::Federation`]
+/// (CIRISEdge#20). v0.10.0 ships ONE variant — `StewardClass`. Future
+/// classes (`AccordHolderClass` for the #19-adjacent verify set, etc.)
+/// extend this enum without breaking the wire — the priority is a
+/// substrate-routing hint, not a wire-format dimension, so no
+/// receiver-side `MessageType` discriminator changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FederationPriority {
+    /// Per-install regional stewards (US / EU / APAC) per Registry
+    /// FSD-002 §2.1. Edge derives the recipient set dynamically from
+    /// persist's `federation_keys` directory where
+    /// `identity_type = "steward"` (persist v2.7.0
+    /// [`FederationDirectory::list_keys_by_identity_type`](ciris_persist::federation::FederationDirectory::list_keys_by_identity_type)).
+    /// Recomputed on every [`crate::Edge::send_federation`] call — no
+    /// caching — so steward rotation (FSD-002 §2.1 rotation arc)
+    /// propagates immediately.
+    StewardClass,
 }
 
 /// A typed message that can ride the federation wire. Each message

@@ -38,7 +38,7 @@ publish = false
 # that release shipped a pyproject Requires-Dist flaw; v2.0.2 is
 # the hotfix and the Cargo surface is identical between the two.
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.2.0", version = "2", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.7.0", version = "2", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # Pinned to v3.0.1 — major bump in lockstep with persist v2.0.2's
@@ -187,7 +187,7 @@ sha2               = "0.10"
 # feature flag. Cargo merges dependency-feature sets, so adding the
 # flag here lights up the symbols for the test-build only without
 # changing edge's normal-build dependency surface.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.2.0", version = "2", features = ["sqlite", "cirisnode"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.7.0", version = "2", features = ["sqlite", "cirisnode"] }
 
 [lints.rust]
 unsafe_code = "forbid"

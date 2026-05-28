@@ -36,21 +36,24 @@ pub mod verify;
 
 pub use edge::{Edge, EdgeBuilder, EdgeConfig, EdgeError};
 pub use handler::{
-    AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, Handler, HandlerContext,
-    HandlerError, InlineTextMessage, Message,
+    AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, FederationPriority,
+    Handler, HandlerContext, HandlerError, InlineTextMessage, Message,
 };
 pub use identity::LocalSigner;
 pub use messages::{
-    AccordCarrier, AccordEventsBatch, AccordEventsResponse, AnnouncementKind, AnnouncementPriority,
-    AttestationGossip, AttestationRef, AuthorityClass, BuildManifestPublication,
-    BuildManifestPublicationResponse, ContentBody, ContentFetch, ContentMiss, DSARRequest,
-    DSARResponse, DeliveryAttestation, DeliveryAttestationError, EdgeEnvelope,
-    FederationAnnouncement, FederationKeyDirectoryQuery, FederationKeyDirectoryQueryResponse,
-    HintShape, InlineText, InlineTextDurable, MessageType, MissReason, PublicKeyRegistration,
-    PublicKeyRegistrationResponse, SchemaVersion, TransportMedium, DEFAULT_MAX_CONTENT_BODY_BYTES,
-    DELIVERY_ATTESTATION_DOMAIN,
+    is_federation_attestation_emitting_type, AccordCarrier, AccordEventsBatch,
+    AccordEventsResponse, AnnouncementKind, AnnouncementPriority, AttestationGossip,
+    AttestationRef, AuthorityClass, BuildManifestPublication, BuildManifestPublicationResponse,
+    ContentBody, ContentFetch, ContentMiss, DSARRequest, DSARResponse, DeliveryAttestation,
+    DeliveryAttestationError, EdgeEnvelope, FederationAnnouncement, FederationKeyDirectoryQuery,
+    FederationKeyDirectoryQueryResponse, HintShape, InlineText, InlineTextDurable, MessageType,
+    MissReason, PublicKeyRegistration, PublicKeyRegistrationResponse, SchemaVersion,
+    StewardDirective, TransportMedium, DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
 };
-pub use outbound::{DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter};
+pub use outbound::{
+    DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter, StewardDirectory,
+    StewardKey,
+};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 pub use verify::{
     HybridPolicy, ProvenanceChain, ProvenanceLink, RootingDirectory, RootingRejection,
