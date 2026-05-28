@@ -41,19 +41,21 @@ pub use handler::{
 };
 pub use identity::LocalSigner;
 pub use messages::{
-    AccordCarrier, AccordEventsBatch, AccordEventsResponse, AnnouncementKind, AnnouncementPriority,
-    AttestationGossip, AttestationRef, AuthorityClass, BuildManifestPublication,
-    BuildManifestPublicationResponse, ContentBody, ContentFetch, ContentMiss, DSARRequest,
-    DSARResponse, DeliveryAttestation, DeliveryAttestationError, EdgeEnvelope,
-    FederationAnnouncement, FederationKeyDirectoryQuery, FederationKeyDirectoryQueryResponse,
-    HintShape, InlineText, InlineTextDurable, MessageType, MissReason, PublicKeyRegistration,
-    PublicKeyRegistrationResponse, SchemaVersion, TransportMedium, DEFAULT_MAX_CONTENT_BODY_BYTES,
-    DELIVERY_ATTESTATION_DOMAIN,
+    AccordCarrier, AccordEventsBatch, AccordEventsResponse, AccordSignature, AnnouncementKind,
+    AnnouncementPriority, AttestationGossip, AttestationRef, AuthorityClass,
+    BuildManifestPublication, BuildManifestPublicationResponse, ContentBody, ContentFetch,
+    ContentMiss, DSARRequest, DSARResponse, DeliveryAttestation, DeliveryAttestationError,
+    DeliveryRefusalAttestation, EdgeEnvelope, FederationAnnouncement, FederationKeyDirectoryQuery,
+    FederationKeyDirectoryQueryResponse, HintShape, InlineText, InlineTextDurable, MessageType,
+    MissReason, PublicKeyRegistration, PublicKeyRegistrationResponse, RefusalReason, SchemaVersion,
+    TransportMedium, ACCORD_THRESHOLD_M_OF_N, DEFAULT_MAX_CONTENT_BODY_BYTES,
+    DELIVERY_ATTESTATION_DOMAIN, DELIVERY_REFUSAL_ATTESTATION_DOMAIN,
+    FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
 };
 pub use outbound::{DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 pub use verify::{
-    HybridPolicy, ProvenanceChain, ProvenanceLink, RootingDirectory, RootingRejection,
-    RootingVerdict, VerifiedEnvelope, VerifiedTrace, VerifyDirectory, VerifyError, VerifyOutcome,
-    VerifyPipeline,
+    AccordHolderKey, HybridPolicy, ProvenanceChain, ProvenanceLink, RootingDirectory,
+    RootingRejection, RootingVerdict, VerifiedEnvelope, VerifiedTrace, VerifyDirectory,
+    VerifyError, VerifyOutcome, VerifyPipeline,
 };

@@ -104,6 +104,16 @@ pub enum MessageType {
     /// 2026-05-27 + persist v2.2.0 `federation_delivery_attestations`
     /// row 1:1).
     DeliveryAttestation,
+    /// CIRISEdge#19 — per-peer refusal attestation emitted when edge
+    /// declines to propagate a `priority == AccordCarrier`
+    /// `FederationAnnouncement` because the 2-of-3 accord-holder
+    /// multi-sig threshold was not met (or no accord-holders are
+    /// configured in persist). Durable, fire-and-forget — the refusal
+    /// IS the observable; the steward end aggregates them and can
+    /// distinguish adversarial suppression of legitimate accords from
+    /// suppression of forged ones via the [`RefusalReason`] field.
+    /// Body: [`DeliveryRefusalAttestation`].
+    DeliveryRefusalAttestation,
 
     // ─── CIRISEdge#21 — content-addressable byte transport ──────────
     //
@@ -568,6 +578,20 @@ pub struct FederationAnnouncement {
     /// documents, prior Contributions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<String>,
+    /// CIRISEdge#19 — multi-sig set carrying the accord-holder
+    /// signatures over [`Self::canonical_bytes_for_accord_signatures`].
+    /// Empty for non-`AccordCarrier` priority (the field is
+    /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so
+    /// pre-v0.10 wire shapes deserialize unchanged).
+    ///
+    /// For `priority == AccordCarrier`, edge's wire-layer verify hook
+    /// (`src/edge.rs::dispatch_inbound`) enforces ≥ 2 valid signatures
+    /// from DISTINCT `identity_type = accord_holder` keys in persist's
+    /// federation directory before propagating. Failures emit a
+    /// [`DeliveryRefusalAttestation`] with the appropriate
+    /// [`RefusalReason`]. See [`ACCORD_THRESHOLD_M_OF_N`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accord_signatures: Vec<AccordSignature>,
 }
 
 impl Message for FederationAnnouncement {
@@ -588,6 +612,332 @@ impl Message for FederationAnnouncement {
     /// by each receiver IS the observable (FSD §3.2.1) — no inline
     /// response is requested.
     type Response = ();
+}
+
+// ─── CIRISEdge#19 — AccordCarrier 2-of-3 multi-sig ──────────────────
+//
+// Wire-layer authority verification for `priority == AccordCarrier`
+// federation announcements. The multi-sig set lives on the
+// `FederationAnnouncement` body (NOT on the surrounding `EdgeEnvelope`
+// — that envelope already carries exactly one classical Ed25519 + one
+// optional ML-DSA-65 signature from the originating sender). The
+// substrate verifies the multi-sig threshold at every hop, refusing
+// to propagate envelopes that fail it; refusal is OBSERVABLE via the
+// [`DeliveryRefusalAttestation`] sibling type so the steward end can
+// distinguish adversarial suppression of legitimate accords from
+// suppression of forged ones.
+
+/// CIRISEdge#19 — 2-of-3 multi-sig threshold for `AccordCarrier`
+/// envelopes (issue body §"Ask" point 3). The first element is
+/// `M` (threshold count of distinct valid signatures required); the
+/// second is `N` (canonical accord-holder set size — informational at
+/// the wire layer, the actual N comes from persist's
+/// `list_keys_by_identity_type("accord_holder")` result). Pinned as a
+/// constant so a future tuning (e.g. 3-of-5 if the human-held key set
+/// expands) is discoverable from a grep.
+pub const ACCORD_THRESHOLD_M_OF_N: (u32, u32) = (2, 3);
+
+/// Domain-separation tag for [`FederationAnnouncement::canonical_bytes_for_accord_signatures`].
+/// **LOCKED** wire constant — changing this is a coordinated
+/// NodeCore + Edge + Persist break. The accord-holder signers sign
+/// these canonical bytes; edge's wire-layer hook re-derives them and
+/// verifies each signature in [`FederationAnnouncement::accord_signatures`]
+/// against the corresponding accord-holder pubkey looked up in persist.
+pub const FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN: &[u8] =
+    b"ciris-edge-federation-announcement-accord-v1";
+
+/// One accord-holder signature over a [`FederationAnnouncement`]'s
+/// canonical bytes (per [`FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN`]).
+/// The wire-layer hook in `dispatch_inbound` enforces:
+///
+/// 1. `key_id` resolves to an `identity_type = accord_holder` row in
+///    persist's federation directory.
+/// 2. `signature_ed25519_base64` verifies against that row's pubkey
+///    over [`FederationAnnouncement::canonical_bytes_for_accord_signatures`].
+/// 3. Distinct `key_id`s across the [`FederationAnnouncement::accord_signatures`]
+///    vector — duplicate signatures from the same holder count once
+///    (CIRISEdge#19 distinct-holders invariant).
+///
+/// At least [`ACCORD_THRESHOLD_M_OF_N`].0 distinct + valid entries are
+/// required to pass; otherwise the announcement is REFUSED with a
+/// [`DeliveryRefusalAttestation`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AccordSignature {
+    /// The accord-holder's `federation_keys.key_id` — looked up in
+    /// persist (`identity_type = accord_holder`) for verification.
+    pub key_id: String,
+    /// Base64-standard Ed25519 signature (64 bytes raw, 88 chars b64)
+    /// over [`FederationAnnouncement::canonical_bytes_for_accord_signatures`].
+    pub signature_ed25519_base64: String,
+}
+
+impl FederationAnnouncement {
+    /// Canonical bytes the accord-holder set signs (and edge's
+    /// wire-layer hook re-derives + verifies). Length-prefixed
+    /// injective encoding, mirroring [`DeliveryAttestation::canonical_bytes`]
+    /// — distinct field tuples never share a byte string, so a
+    /// signature is bound to exactly one announcement payload.
+    ///
+    /// **Crucially excludes [`Self::accord_signatures`]** — the
+    /// signers are signing the *announcement*, not their own signature
+    /// set (which would be self-referential and prevent verification).
+    /// The signed bytes also exclude the `evidence_refs` ordering
+    /// stability would require — for v0.10 we include them
+    /// deterministically (sorted by string order is unnecessary; the
+    /// wire shape preserves order from the producer).
+    ///
+    /// Layout (all integer prefixes big-endian u64; `expires_at` is
+    /// fixed-width i64 ms big-endian):
+    ///
+    /// ```text
+    /// DOMAIN
+    ///   ‖ u64_be(priority_str.len())          ‖ priority_str
+    ///   ‖ u64_be(kind_json.len())             ‖ kind_json  (serde JSON repr)
+    ///   ‖ u64_be(title.len())                 ‖ title
+    ///   ‖ u64_be(body.len())                  ‖ body
+    ///   ‖ u64_be(authority_class_str.len())   ‖ authority_class_str
+    ///   ‖ u8(accord_payload.is_some() as u8)
+    ///   ‖ (when Some)  u64_be(payload_bytes.len()) ‖ payload_bytes
+    ///   ‖ u8(supersedes.is_some() as u8)
+    ///   ‖ (when Some)  u64_be(s.len())              ‖ s
+    ///   ‖ i64_be(expires_at.timestamp_millis())
+    ///   ‖ u64_be(evidence_refs.len() as u64)
+    ///   ‖ for each ref: u64_be(ref.len()) ‖ ref
+    /// ```
+    ///
+    /// `DOMAIN` is [`FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `serde_json::Error` if `kind` or
+    /// `accord_payload` cannot serialize — only possible for a
+    /// `Custom(String)` variant containing un-encodable bytes, which
+    /// the wire-level deserializer would have rejected upstream.
+    pub fn canonical_bytes_for_accord_signatures(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let priority_str = match self.priority {
+            AnnouncementPriority::Informational => "informational",
+            AnnouncementPriority::Advisory => "advisory",
+            AnnouncementPriority::Urgent => "urgent",
+            AnnouncementPriority::AccordCarrier => "accord_carrier",
+        };
+        let authority_class_str = match self.authority_class {
+            AuthorityClass::BootstrapSeed => "bootstrap_seed",
+            AuthorityClass::RootWa => "root_wa",
+            AuthorityClass::WaQuorum => "wa_quorum",
+            AuthorityClass::HumanityAccord => "humanity_accord",
+        };
+        // `kind` carries a `Custom(String)` variant — serde JSON repr
+        // is the most compact deterministic encoding. The wire shape
+        // is what the receiver re-derives, so this is byte-stable.
+        let kind_json = serde_json::to_string(&self.kind)?;
+        let payload_bytes_opt: Option<Vec<u8>> = match self.accord_payload.as_ref() {
+            Some(p) => Some(serde_json::to_vec(p)?),
+            None => None,
+        };
+
+        let mut out = Vec::new();
+        out.extend_from_slice(FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN);
+
+        write_len_prefixed(&mut out, priority_str.as_bytes());
+        write_len_prefixed(&mut out, kind_json.as_bytes());
+        write_len_prefixed(&mut out, self.title.as_bytes());
+        write_len_prefixed(&mut out, self.body.as_bytes());
+        write_len_prefixed(&mut out, authority_class_str.as_bytes());
+
+        match payload_bytes_opt.as_ref() {
+            Some(b) => {
+                out.push(1u8);
+                write_len_prefixed(&mut out, b);
+            }
+            None => out.push(0u8),
+        }
+
+        match self.supersedes.as_ref() {
+            Some(s) => {
+                out.push(1u8);
+                write_len_prefixed(&mut out, s.as_bytes());
+            }
+            None => out.push(0u8),
+        }
+
+        out.extend_from_slice(&self.expires_at.timestamp_millis().to_be_bytes());
+        out.extend_from_slice(&(self.evidence_refs.len() as u64).to_be_bytes());
+        for r in &self.evidence_refs {
+            write_len_prefixed(&mut out, r.as_bytes());
+        }
+
+        Ok(out)
+    }
+}
+
+fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// CIRISEdge#19 — why a [`DeliveryRefusalAttestation`] was emitted in
+/// place of normal propagation. Distinguishes adversarial suppression
+/// of legitimate accords (`NoAccordHoldersConfigured` — substrate isn't
+/// bootstrapped) from suppression of forged ones
+/// (`InsufficientAccordSignatures` / `InvalidAccordSignature` —
+/// envelope failed the threshold check).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RefusalReason {
+    /// Multi-sig threshold not met. `found` counts DISTINCT
+    /// accord-holders whose signatures verified; `required` is the
+    /// threshold from [`ACCORD_THRESHOLD_M_OF_N`].0.
+    InsufficientAccordSignatures { found: u32, required: u32 },
+    /// One or more sigs failed verification against the accord-holder
+    /// key set. Emitted when every signature in the
+    /// [`FederationAnnouncement::accord_signatures`] vector either
+    /// references an unknown key_id, references a non-accord-holder
+    /// key_id, or has a bad signature against the canonical bytes.
+    InvalidAccordSignature,
+    /// Persist's federation directory has NO `identity_type =
+    /// accord_holder` rows — the substrate is not bootstrapped for
+    /// constitutional traffic. This is the case the issue body calls
+    /// out as load-bearing: a missing accord-holder set means edge
+    /// CANNOT verify any AccordCarrier announcement; refusing is
+    /// correct even for a perfectly-signed envelope, because the
+    /// downstream trust chain has no root.
+    NoAccordHoldersConfigured,
+}
+
+/// Domain-separation tag for [`DeliveryRefusalAttestation::canonical_bytes`].
+/// **LOCKED** wire constant — mirrors the [`DELIVERY_ATTESTATION_DOMAIN`]
+/// pattern. Changing this is a coordinated NodeCore + Edge + Persist
+/// break (CIRISEdge#19).
+pub const DELIVERY_REFUSAL_ATTESTATION_DOMAIN: &[u8] =
+    b"ciris-edge-delivery-refusal-attestation-v1";
+
+/// Per-peer refusal attestation emitted when edge declines to
+/// propagate a `priority == AccordCarrier` `FederationAnnouncement`
+/// because the 2-of-3 accord-holder multi-sig threshold was not met
+/// (or because persist's federation directory holds no accord-holder
+/// rows). The refusal IS the observable — a federation collector
+/// aggregating these per peer can distinguish adversarial suppression
+/// of legitimate accords from suppression of forged ones via
+/// [`Self::refusal_reason`].
+///
+/// # Wire shape
+///
+/// Mirrors [`DeliveryAttestation`] exactly (same fields, same base64
+/// encoding rules, same hybrid-signature discipline) plus the
+/// [`Self::refusal_reason`] discriminator.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRefusalAttestation {
+    /// The refused announcement's id — UUID-shaped string. Derived
+    /// from the announcement envelope's `body_sha256` (deterministic
+    /// at the receiver, same convention as [`DeliveryAttestation::announcement_id`]).
+    pub announcement_id: String,
+    /// SHA-256 of the full canonicalized announcement envelope the
+    /// peer received and refused. 32 bytes raw, base64-standard on
+    /// the wire (44 chars).
+    pub announcement_canonical_hash_base64: String,
+    /// The peer that is refusing — `federation_keys.key_id`.
+    pub peer_key_id: String,
+    /// Base64 of the peer's Ed25519 pubkey (denormalized — see
+    /// [`DeliveryAttestation::peer_pubkey_ed25519_base64`]).
+    pub peer_pubkey_ed25519_base64: String,
+    /// When the peer's edge refused (the wire-layer verify gate fired).
+    pub refused_at: DateTime<Utc>,
+    /// Transport medium the announcement arrived over.
+    pub transport_id: TransportMedium,
+    /// Why the peer refused.
+    pub refusal_reason: RefusalReason,
+    /// MANDATORY classical Ed25519 signature (64 bytes raw) over
+    /// [`Self::canonical_bytes`]. Base64-standard on the wire.
+    pub signature_classical_base64: String,
+    /// OPTIONAL PQC ML-DSA-65 signature over `canonical_bytes ||
+    /// signature_classical` per the persist AV-33 bound-signature
+    /// convention. Base64-standard on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_pqc_base64: Option<String>,
+}
+
+impl Message for DeliveryRefusalAttestation {
+    const TYPE: MessageType = MessageType::DeliveryRefusalAttestation;
+    /// Same wire class as [`DeliveryAttestation`] (FSD §3.2.1
+    /// dispatch table — fire-and-forget Durable). The refusal IS the
+    /// observable; no second ACK.
+    const DELIVERY: Delivery = Delivery::Durable {
+        requires_ack: false,
+        max_attempts: 20,
+        ttl_seconds: 24 * 60 * 60, // 24 hours
+        ack_timeout_seconds: None,
+    };
+    type Response = ();
+}
+
+impl DeliveryRefusalAttestation {
+    /// The exact bytes the peer's federation key signs / a verifier
+    /// re-derives. Length-prefixed injective encoding mirroring
+    /// [`DeliveryAttestation::canonical_bytes`]; the
+    /// [`Self::refusal_reason`] field is serialized via its
+    /// `serde_json` representation (which is the wire shape the
+    /// receiver re-derives — byte-stable across implementations).
+    ///
+    /// # Errors
+    ///
+    /// [`DeliveryAttestationError::FieldDecode`] if
+    /// `announcement_canonical_hash_base64` is not base64 of exactly
+    /// 32 bytes; underlying `serde_json::Error` (re-mapped to
+    /// `FieldDecode`) on refusal-reason serialization failure
+    /// (structurally impossible at the type level — all
+    /// [`RefusalReason`] variants serialize).
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, DeliveryAttestationError> {
+        let announcement_id = self.announcement_id.as_bytes();
+        let peer_key_id = self.peer_key_id.as_bytes();
+        let peer_pubkey = self.peer_pubkey_ed25519_base64.as_bytes();
+        let transport = self.transport_id.as_str().as_bytes();
+        let canonical_hash = self.canonical_hash_bytes()?;
+        let reason_json = serde_json::to_string(&self.refusal_reason).map_err(|e| {
+            DeliveryAttestationError::FieldDecode(format!("refusal_reason serialize: {e}"))
+        })?;
+        let reason_bytes = reason_json.as_bytes();
+
+        let cap = DELIVERY_REFUSAL_ATTESTATION_DOMAIN.len()
+            + 8 + announcement_id.len()
+            + canonical_hash.len()
+            + 8 + peer_key_id.len()
+            + 8 + peer_pubkey.len()
+            + 8 // refused_at i64
+            + 8 + transport.len()
+            + 8 + reason_bytes.len();
+        let mut out = Vec::with_capacity(cap);
+
+        out.extend_from_slice(DELIVERY_REFUSAL_ATTESTATION_DOMAIN);
+        write_len_prefixed(&mut out, announcement_id);
+        out.extend_from_slice(&canonical_hash);
+        write_len_prefixed(&mut out, peer_key_id);
+        write_len_prefixed(&mut out, peer_pubkey);
+        out.extend_from_slice(&self.refused_at.timestamp_millis().to_be_bytes());
+        write_len_prefixed(&mut out, transport);
+        write_len_prefixed(&mut out, reason_bytes);
+
+        Ok(out)
+    }
+
+    /// Decode [`Self::announcement_canonical_hash_base64`] to raw 32
+    /// bytes. Returns [`DeliveryAttestationError::FieldDecode`] on
+    /// base64-decode failure or length mismatch.
+    pub fn canonical_hash_bytes(&self) -> Result<[u8; 32], DeliveryAttestationError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(self.announcement_canonical_hash_base64.as_bytes())
+            .map_err(|e| {
+                DeliveryAttestationError::FieldDecode(format!(
+                    "announcement_canonical_hash_base64 base64: {e}"
+                ))
+            })?;
+        let arr: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+            DeliveryAttestationError::FieldDecode(format!(
+                "announcement_canonical_hash_base64 must decode to 32 bytes (got {})",
+                raw.len()
+            ))
+        })?;
+        Ok(arr)
+    }
 }
 
 /// Transport medium tag per FSD §3.2.1 — medium only, sub-path /

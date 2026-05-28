@@ -22,13 +22,18 @@ use crate::handler::{
     HandlerError, InlineTextMessage, Message,
 };
 use crate::identity::{build_envelope, envelope_body_sha256, sign_envelope, LocalSigner};
-use crate::messages::{EdgeEnvelope, MessageType};
+use crate::messages::{
+    AnnouncementPriority, EdgeEnvelope, FederationAnnouncement, MessageType, RefusalReason,
+    ACCORD_THRESHOLD_M_OF_N,
+};
 use crate::outbound::{
     run_dispatcher, run_sweeps, DispatcherConfig, OutboundHandle, PeerDirectory,
     PeerSubscriptionFilter,
 };
 use crate::transport::{InboundFrame, Transport, TransportSendOutcome};
-use crate::verify::{HybridPolicy, VerifiedEnvelope, VerifyDirectory, VerifyError, VerifyPipeline};
+use crate::verify::{
+    AccordHolderKey, HybridPolicy, VerifiedEnvelope, VerifyDirectory, VerifyError, VerifyPipeline,
+};
 
 // ─── Public configuration ───────────────────────────────────────────
 
@@ -592,6 +597,31 @@ impl Edge {
         fan_out_inline_text(&self.inline_text_subscribers, sender_key_id, body_text);
     }
 
+    /// CIRISEdge#19 — synchronous one-shot driver for the inbound
+    /// dispatch pipeline. Test-only helper: lets integration suites
+    /// drive a single `InboundFrame` through the same code path
+    /// `Edge::run` invokes per inbound message, then observe outbound
+    /// queue state (refusal attestation, acceptance attestation, etc.)
+    /// without standing up the full listener / dispatcher topology.
+    ///
+    /// The production callers are the `Edge::run` listener loop; this
+    /// shares the same `dispatch_inbound` body, so a regression in
+    /// the wire-layer gate is caught from either entry point.
+    pub async fn dispatch_inbound_for_test(&self, frame: InboundFrame) {
+        let directory = self.verify.directory();
+        dispatch_inbound(
+            frame,
+            &self.verify,
+            &self.handlers,
+            &self.queue,
+            &self.signer,
+            &self.inline_text_subscribers,
+            self.config.max_content_body_bytes,
+            &directory,
+        )
+        .await;
+    }
+
     /// Rust-level accessor returning a clone of the outbound queue
     /// `Arc`. Used by [`crate::ffi::pyo3::PyDurableHandle`] to poll
     /// `outbound_status` for `await_ack` semantics independently of
@@ -725,13 +755,23 @@ impl Edge {
                     break;
                 }
                 Some(frame) = inbound_rx.recv() => {
-                    let v = verify.clone();
-                    let h = handlers.clone();
-                    let q = queue.clone();
-                    let s = signer.clone();
+                    let verify_clone = verify.clone();
+                    let handlers_clone = handlers.clone();
+                    let queue_clone = queue.clone();
+                    let signer_clone = signer.clone();
                     let its = inline_subs.clone();
+                    let directory_clone = verify_clone.directory();
                     tokio::spawn(async move {
-                        dispatch_inbound(frame, &v, &h, &q, &s, &its, max_content_body_bytes).await;
+                        dispatch_inbound(
+                            frame,
+                            &verify_clone,
+                            &handlers_clone,
+                            &queue_clone,
+                            &signer_clone,
+                            &its,
+                            max_content_body_bytes,
+                            &directory_clone,
+                        ).await;
                     });
                 }
                 else => break,
@@ -775,9 +815,12 @@ impl Edge {
 
 /// Inbound dispatch: verify → maybe-ACK-match → `ContentBody`
 /// AV-13/integrity gate (CIRISEdge#21 v0.8.0) → `FederationAnnouncement`
-/// attestation-emission (FSD §3.2.1 v0.1 gate) → `InlineText` fan-out
-/// (CIRISEdge#22 Tier 2 v0.9.0) → typed handler dispatch.
+/// `AccordCarrier` 2-of-3 multi-sig wire-layer gate (CIRISEdge#19,
+/// v0.10.0) → `FederationAnnouncement` attestation-emission (FSD §3.2.1
+/// v0.1 gate) → `InlineText` fan-out (CIRISEdge#22 Tier 2 v0.9.0) →
+/// typed handler dispatch.
 #[allow(clippy::too_many_lines)] // dispatch is the load-bearing pipeline composition site
+#[allow(clippy::too_many_arguments)] // composition site for all dispatch primitives
 async fn dispatch_inbound(
     frame: InboundFrame,
     verify: &VerifyPipeline,
@@ -786,6 +829,7 @@ async fn dispatch_inbound(
     signer: &Arc<LocalSigner>,
     inline_text_subscribers: &std::sync::Mutex<HashMap<u64, InlineTextSubscriber>>,
     max_content_body_bytes: usize,
+    directory: &Arc<dyn VerifyDirectory>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -829,6 +873,79 @@ async fn dispatch_inbound(
                     "ContentBody rejected at dispatch gate (AV-13 / integrity)",
                 );
                 return;
+            }
+        }
+    }
+
+    // CIRISEdge#19 v0.10.0 — wire-layer 2-of-3 multi-sig authority
+    // gate for `priority == AccordCarrier`. Defense in depth on the
+    // v0.6.0 application-tier `FederationAnnouncement` consumer check:
+    // a compromised peer can no longer propagate an invalid
+    // CONSTITUTIONAL envelope past the first hop running verified
+    // edge code. Failures REFUSE propagation and emit a substrate-
+    // signed `DeliveryRefusalAttestation` (so adversarial suppression
+    // of legitimate accords stays distinguishable from suppression of
+    // forged ones).
+    //
+    // The accord-multi-sig set lives on the `FederationAnnouncement`
+    // BODY (not on the surrounding `EdgeEnvelope`'s single sender
+    // signature) — re-parse the body once here for the gate. The
+    // existing `DeliveryAttestation` emission below stays bypassed on
+    // refusal (the refusal IS the observable for AccordCarrier; a
+    // refused envelope MUST NOT also emit an acceptance attestation).
+    if envelope.message_type == MessageType::FederationAnnouncement {
+        match serde_json::from_str::<FederationAnnouncement>(envelope.body.get()) {
+            Ok(ann) if ann.priority == AnnouncementPriority::AccordCarrier => {
+                match verify_accord_carrier(&ann, directory).await {
+                    Ok(()) => {
+                        // Threshold met — fall through to the normal
+                        // v0.6.0 acceptance attestation + handler
+                        // dispatch path.
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            announcement_id = ?derive_announcement_id_from_body_hash(&body_sha256),
+                            ?reason,
+                            "AccordCarrier FederationAnnouncement REFUSED at wire-layer multi-sig gate (CIRISEdge#19)",
+                        );
+                        if let Err(e) = emit_delivery_refusal_attestation(
+                            &envelope,
+                            body_sha256,
+                            transport,
+                            signer,
+                            queue,
+                            reason,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "DeliveryRefusalAttestation emission failed (CIRISEdge#19)",
+                            );
+                        }
+                        // Drop the announcement from edge's downstream
+                        // propagation — no handler dispatch, no
+                        // acceptance attestation.
+                        return;
+                    }
+                }
+            }
+            Ok(_) => {
+                // Non-AccordCarrier priority: the wire-layer gate is
+                // bypassed (FSD §4.5 reserves the multi-sig
+                // requirement to AccordCarrier; other priorities ride
+                // the single-signature envelope path).
+            }
+            Err(e) => {
+                // Body did not parse as FederationAnnouncement — let
+                // the existing acceptance attestation emit attempt
+                // continue and the typed-handler dispatch path
+                // discover the schema issue. The substrate is not
+                // additionally responsible for app-layer schema gates.
+                tracing::debug!(
+                    error = %e,
+                    "FederationAnnouncement body parse failed at AccordCarrier gate; downstream paths handle",
+                );
             }
         }
     }
@@ -1479,6 +1596,245 @@ async fn emit_delivery_attestation(
         )
         .await
         .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (attestation): {e}")))?;
+
+    Ok(())
+}
+
+/// CIRISEdge#19 — wire-layer accord-multi-sig gate. Returns `Ok(())`
+/// iff ≥ [`ACCORD_THRESHOLD_M_OF_N`].0 valid signatures from DISTINCT
+/// accord-holder keys cover the announcement's canonical bytes;
+/// returns the appropriate [`RefusalReason`] otherwise.
+///
+/// # Algorithm (CIRISEdge#19 issue body §"Ask")
+///
+/// 1. Query `directory.list_accord_holders()` — persist's `federation_keys`
+///    rows where `identity_type = 'accord_holder'`.
+/// 2. If the accord-holder set is empty → `NoAccordHoldersConfigured`
+///    (substrate isn't bootstrapped for constitutional traffic;
+///    refusal IS correct even for a perfectly-signed envelope, because
+///    the trust chain has no root).
+/// 3. Derive the canonical bytes the accord-holders sign via
+///    [`FederationAnnouncement::canonical_bytes_for_accord_signatures`].
+/// 4. For each `AccordSignature` in the announcement, verify it
+///    against the matching accord-holder pubkey. Track DISTINCT
+///    holders whose signatures verify (duplicate signatures from the
+///    same holder count once — CIRISEdge#19 distinct-holders
+///    invariant).
+/// 5. If at least `ACCORD_THRESHOLD_M_OF_N.0` distinct holders
+///    verified → `Ok(())`. Otherwise:
+///    - If at least one signature *did* verify (but threshold not
+///      met) → `InsufficientAccordSignatures { found, required }`.
+///    - If ZERO signatures verified AND there was at least one
+///      signature attempt → `InvalidAccordSignature`.
+///    - If ZERO signatures were provided at all → that collapses to
+///      `InsufficientAccordSignatures { found: 0, required }` —
+///      same forensic conclusion (the envelope didn't satisfy the
+///      threshold).
+async fn verify_accord_carrier(
+    ann: &FederationAnnouncement,
+    directory: &Arc<dyn VerifyDirectory>,
+) -> Result<(), RefusalReason> {
+    let required = ACCORD_THRESHOLD_M_OF_N.0;
+    let holders: Vec<AccordHolderKey> = match directory.list_accord_holders().await {
+        Ok(v) => v,
+        Err(e) => {
+            // Substrate fault: persist call failed. Treat as
+            // "not configured" — refusing is the conservative
+            // safe-default for the substrate-unavailable case (the
+            // alternative would be to silently propagate, defeating
+            // the wire-layer gate's defense-in-depth purpose).
+            tracing::warn!(
+                error = %e,
+                "list_accord_holders failed; treating as NoAccordHoldersConfigured",
+            );
+            return Err(RefusalReason::NoAccordHoldersConfigured);
+        }
+    };
+    if holders.is_empty() {
+        return Err(RefusalReason::NoAccordHoldersConfigured);
+    }
+
+    let canonical = ann
+        .canonical_bytes_for_accord_signatures()
+        .map_err(|_e| RefusalReason::InvalidAccordSignature)?;
+
+    // Build a key_id → pubkey map for O(1) per-sig lookup. The holder
+    // set is small (3 by FSD spec), so a Vec scan is fine; map is
+    // future-proofing if 3-of-5 ships.
+    let by_id: std::collections::HashMap<&str, &[u8; 32]> = holders
+        .iter()
+        .map(|h| (h.key_id.as_str(), &h.pubkey_ed25519))
+        .collect();
+
+    let mut verified_holders = std::collections::HashSet::<String>::new();
+    let mut any_attempted = false;
+    for sig in &ann.accord_signatures {
+        any_attempted = true;
+        // The presented key_id MUST appear in the accord-holder set;
+        // a sig from a non-accord-holder counts as zero verifications
+        // toward the threshold. We don't even attempt verification
+        // against a non-accord-holder pubkey.
+        let Some(pubkey_bytes) = by_id.get(sig.key_id.as_str()) else {
+            continue;
+        };
+        if verify_ed25519_signature(pubkey_bytes, &canonical, &sig.signature_ed25519_base64) {
+            verified_holders.insert(sig.key_id.clone());
+        }
+    }
+
+    let found = u32::try_from(verified_holders.len()).unwrap_or(u32::MAX);
+    if found >= required {
+        return Ok(());
+    }
+
+    // Forensic discrimination: at least one signature verified but
+    // threshold not met → `InsufficientAccordSignatures`. ZERO
+    // verified AND at least one signature was attempted →
+    // `InvalidAccordSignature` (every signature was either against a
+    // non-accord-holder key or had bad bytes). ZERO signatures at all
+    // → `InsufficientAccordSignatures { found: 0, required }` —
+    // same threshold-not-met forensic story.
+    if found == 0 && any_attempted {
+        Err(RefusalReason::InvalidAccordSignature)
+    } else {
+        Err(RefusalReason::InsufficientAccordSignatures { found, required })
+    }
+}
+
+/// Verify one Ed25519 signature against a 32-byte pubkey and the
+/// canonical bytes. Returns `false` on base64-decode failure, wrong
+/// signature length, or signature-verification failure (any error is
+/// "this signature does not pass"; the gate's job is to count
+/// confirming verifications, not surface error taxonomy).
+fn verify_ed25519_signature(pubkey: &[u8; 32], canonical: &[u8], sig_b64: &str) -> bool {
+    use ciris_crypto::ClassicalVerifier as _;
+
+    let Ok(sig_bytes) = base64::engine::general_purpose::STANDARD.decode(sig_b64.as_bytes()) else {
+        return false;
+    };
+    if sig_bytes.len() != 64 {
+        return false;
+    }
+    // Use ciris-crypto's verifier — the same primitive persist's
+    // verify_hybrid_via_directory composes (single-source-of-truth
+    // for Ed25519 verify across the federation).
+    matches!(
+        ciris_crypto::Ed25519Verifier::new().verify(pubkey, canonical, &sig_bytes),
+        Ok(true)
+    )
+}
+
+/// CIRISEdge#19 — build, sign, and enqueue a [`crate::DeliveryRefusalAttestation`]
+/// for a `priority == AccordCarrier` `FederationAnnouncement` envelope
+/// that failed the wire-layer multi-sig threshold check. Mirrors
+/// [`emit_delivery_attestation`] exactly (same Ed25519 + optional
+/// PQC bound-signature discipline, same UUID derivation, same
+/// Durable fire-and-forget queue contract); the refusal IS the
+/// observable that lets a steward end distinguish adversarial
+/// suppression of legitimate accords from suppression of forged ones.
+async fn emit_delivery_refusal_attestation(
+    envelope: &EdgeEnvelope,
+    body_sha256: [u8; 32],
+    transport: crate::transport::TransportId,
+    signer: &Arc<LocalSigner>,
+    queue: &Arc<dyn OutboundHandle>,
+    refusal_reason: RefusalReason,
+) -> Result<(), EdgeError> {
+    use crate::messages::{
+        encode_canonical_hash_base64, encode_signature_base64, DeliveryRefusalAttestation,
+        TransportMedium,
+    };
+
+    let announcement_id = derive_announcement_id_from_body_hash(&body_sha256);
+    let peer_pubkey_bytes = signer
+        .classical
+        .public_key()
+        .await
+        .map_err(|e| EdgeError::Persist(format!("local pubkey: {e}")))?;
+    let peer_pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(&peer_pubkey_bytes);
+    let canonical_hash_b64 = encode_canonical_hash_base64(&body_sha256);
+
+    let refused_at = chrono::Utc::now();
+    let mut refusal = DeliveryRefusalAttestation {
+        announcement_id,
+        announcement_canonical_hash_base64: canonical_hash_b64,
+        peer_key_id: signer.key_id.clone(),
+        peer_pubkey_ed25519_base64: peer_pubkey_b64,
+        refused_at,
+        transport_id: TransportMedium::from(transport),
+        refusal_reason,
+        signature_classical_base64: String::new(),
+        signature_pqc_base64: None,
+    };
+
+    let canonical = refusal.canonical_bytes().map_err(|e| {
+        EdgeError::Config(format!("delivery_refusal_attestation canonical_bytes: {e}"))
+    })?;
+
+    let ed25519_sig = signer
+        .classical
+        .sign(&canonical)
+        .await
+        .map_err(|e| EdgeError::Persist(format!("refusal classical sign: {e}")))?;
+    refusal.signature_classical_base64 = encode_signature_base64(&ed25519_sig);
+
+    if let Some(pqc) = signer.pqc.as_ref() {
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&ed25519_sig);
+        let pqc_sig = pqc
+            .sign(&bound)
+            .await
+            .map_err(|e| EdgeError::Persist(format!("refusal pqc sign: {e}")))?;
+        refusal.signature_pqc_base64 = Some(encode_signature_base64(&pqc_sig));
+    }
+
+    let envelope_bytes = {
+        let mut env = build_envelope(
+            MessageType::DeliveryRefusalAttestation,
+            &signer.key_id,
+            &envelope.signing_key_id,
+            &refusal,
+            None,
+        )?;
+        sign_envelope(signer, &mut env).await?;
+        serde_json::to_vec(&env)
+            .map_err(|e| EdgeError::Config(format!("refusal envelope serialize: {e}")))?
+    };
+    let env: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
+        .map_err(|e| EdgeError::Config(format!("re-parse refusal envelope: {e}")))?;
+    let body_sha256_refusal = envelope_body_sha256(&env);
+    let body_size_bytes = i32::try_from(envelope_bytes.len()).unwrap_or(i32::MAX);
+
+    // Same Durable fire-and-forget shape as DeliveryAttestation.
+    let (max_attempts, ttl_seconds) = match crate::DeliveryRefusalAttestation::DELIVERY {
+        Delivery::Durable {
+            max_attempts,
+            ttl_seconds,
+            ..
+        } => (
+            i32::try_from(max_attempts).unwrap_or(i32::MAX),
+            i64::try_from(ttl_seconds).unwrap_or(i64::MAX),
+        ),
+        _ => (20, 24 * 60 * 60),
+    };
+
+    queue
+        .enqueue_outbound(
+            &signer.key_id,
+            &envelope.signing_key_id,
+            &message_type_str(&MessageType::DeliveryRefusalAttestation),
+            "1.0.0",
+            &envelope_bytes,
+            &body_sha256_refusal,
+            body_size_bytes,
+            false, // requires_ack: false (refusal IS the observable)
+            None,
+            max_attempts,
+            ttl_seconds,
+            Utc::now(),
+        )
+        .await
+        .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (refusal): {e}")))?;
 
     Ok(())
 }

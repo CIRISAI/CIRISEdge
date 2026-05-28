@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
@@ -66,6 +67,18 @@ pub trait VerifyDirectory: Send + Sync + 'static {
         policy: HybridPolicy,
         row_age: Option<StdDuration>,
     ) -> Result<VerifyOutcome, HybridVerifyError>;
+
+    /// CIRISEdge#19 — enumerate accord-holder pubkeys for the 2-of-3
+    /// multi-sig threshold check at the wire layer. Returns the rows
+    /// from persist's `federation_keys` where `identity_type =
+    /// 'accord_holder'` (persist v2.6.0+
+    /// [`FederationDirectory::list_keys_by_identity_type`]), mapped to
+    /// the lightweight [`AccordHolderKey`] shape edge needs.
+    ///
+    /// Returns an empty `Vec` when persist holds no accord-holder
+    /// rows — edge's wire-layer hook distinguishes this case from
+    /// "threshold not met" via [`RefusalReason::NoAccordHoldersConfigured`].
+    async fn list_accord_holders(&self) -> Result<Vec<AccordHolderKey>, VerifyError>;
 }
 
 #[async_trait]
@@ -90,6 +103,56 @@ impl<F: FederationDirectory + Send + Sync + 'static> VerifyDirectory for F {
         )
         .await
     }
+
+    async fn list_accord_holders(&self) -> Result<Vec<AccordHolderKey>, VerifyError> {
+        let rows = FederationDirectory::list_keys_by_identity_type(
+            self,
+            ciris_persist::federation::types::identity_type::ACCORD_HOLDER,
+        )
+        .await
+        .map_err(|e| VerifyError::VerifyUnavailable(format!("list_keys_by_identity_type: {e}")))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            // Decode the base64 pubkey at adapter boundary so the
+            // verify hook gets ready-to-use [u8; 32] bytes — single
+            // decode per row, not once per signature check.
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(row.pubkey_ed25519_base64.as_bytes())
+                .map_err(|e| {
+                    VerifyError::VerifyUnavailable(format!(
+                        "accord-holder pubkey base64 decode for key_id={}: {e}",
+                        row.key_id
+                    ))
+                })?;
+            let pubkey: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+                VerifyError::VerifyUnavailable(format!(
+                    "accord-holder pubkey length != 32 for key_id={} (got {})",
+                    row.key_id,
+                    raw.len()
+                ))
+            })?;
+            out.push(AccordHolderKey {
+                key_id: row.key_id,
+                pubkey_ed25519: pubkey,
+                identity_ref: row.identity_ref,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// CIRISEdge#19 — one accord-holder key ready for wire-layer
+/// signature verification. Returned by
+/// [`VerifyDirectory::list_accord_holders`]. The `pubkey_ed25519`
+/// field is the 32-byte raw key (already base64-decoded at adapter
+/// boundary — see the blanket impl); `identity_ref` is preserved
+/// from persist for forensic logging on refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccordHolderKey {
+    pub key_id: String,
+    pub pubkey_ed25519: [u8; 32],
+    pub identity_ref: String,
 }
 
 /// Adapter trait that erases `FederationDirectory`'s generics for the
@@ -236,6 +299,18 @@ impl VerifyPipeline {
             max_body_bytes,
             replay_window: Mutex::new(ReplayWindow::new(replay_window_seconds, max_replay_entries)),
         }
+    }
+
+    /// CIRISEdge#19 — expose a clone of the directory `Arc` so
+    /// `dispatch_inbound`'s wire-layer accord-multi-sig hook can call
+    /// [`VerifyDirectory::list_accord_holders`] without rebuilding the
+    /// pipeline. The directory is already held inside the pipeline for
+    /// the canonical verify path; the hook borrows it through this
+    /// accessor for the same federation-key class lookup the
+    /// `AccordCarrier` verification needs.
+    #[must_use]
+    pub fn directory(&self) -> Arc<dyn VerifyDirectory> {
+        self.directory.clone()
     }
 
     /// Run the seven-step verify pipeline against an inbound frame's
