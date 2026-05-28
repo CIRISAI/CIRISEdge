@@ -42,11 +42,12 @@ pub use handler::{
 pub use identity::LocalSigner;
 pub use messages::{
     AccordCarrier, AccordEventsBatch, AccordEventsResponse, AnnouncementKind, AnnouncementPriority,
-    AttestationGossip, AuthorityClass, BuildManifestPublication, BuildManifestPublicationResponse,
-    DSARRequest, DSARResponse, DeliveryAttestation, DeliveryAttestationError, EdgeEnvelope,
+    AttestationGossip, AttestationRef, AuthorityClass, BuildManifestPublication,
+    BuildManifestPublicationResponse, ContentBody, ContentFetch, ContentMiss, DSARRequest,
+    DSARResponse, DeliveryAttestation, DeliveryAttestationError, EdgeEnvelope,
     FederationAnnouncement, FederationKeyDirectoryQuery, FederationKeyDirectoryQueryResponse,
-    MessageType, PublicKeyRegistration, PublicKeyRegistrationResponse, SchemaVersion,
-    TransportMedium, DELIVERY_ATTESTATION_DOMAIN,
+    HintShape, MessageType, MissReason, PublicKeyRegistration, PublicKeyRegistrationResponse,
+    SchemaVersion, TransportMedium, DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
 };
 pub use outbound::{DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};

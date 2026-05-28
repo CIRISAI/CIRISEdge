@@ -43,6 +43,20 @@ pub struct EdgeConfig {
     pub max_replay_entries: usize,
     /// Max envelope body size at the verify pipeline; AV-13 P0.
     pub max_body_bytes: usize,
+    /// Max [`crate::messages::ContentBody::bytes`] size accepted on
+    /// inbound dispatch (CIRISEdge#21 v0.8.0). Extends the AV-13 body-
+    /// size family with a separate cap for the content-addressable
+    /// byte-fetch path — `max_body_bytes` already gates the envelope
+    /// at verify-pipeline entry, but `ContentBody.bytes` may
+    /// reasonably exceed the envelope cap (a JSON envelope wrapping
+    /// 16 MiB of bytes serializes to ~21 MiB with base64), so the
+    /// content-fetch path lifts the envelope cap and re-applies a
+    /// content-specific cap on the bytes field after parse. Default
+    /// [`crate::messages::DEFAULT_MAX_CONTENT_BODY_BYTES`] = 16 MiB
+    /// (CIRISEdge#21 Phase 1 spec point 7). Oversized rejects with
+    /// the existing AV-13 family error
+    /// ([`crate::verify::VerifyError::BodyTooLarge`]).
+    pub max_content_body_bytes: usize,
     /// Outbound dispatcher tunables.
     pub dispatcher: DispatcherConfig,
 }
@@ -54,6 +68,17 @@ impl Default for EdgeConfig {
             replay_window_seconds: 300,
             max_replay_entries: 100_000,
             max_body_bytes: 8 * 1024 * 1024,
+            // CIRISEdge#21 v0.8.0 — separate AV-13 cap for
+            // `ContentBody.bytes`. A consumer that wants to actually
+            // receive 16 MiB `ContentBody` payloads must also raise
+            // `max_body_bytes` accordingly (`bytes: Vec<u8>`
+            // serializes to ~3x its raw size as JSON integer-array,
+            // so 16 MiB raw ≈ 48 MiB envelope-wire); the
+            // content-fetch path's `dispatch_inbound` enforces THIS
+            // field post-parse on the bytes vector itself. The
+            // envelope-level cap is the cheap pre-check; this is the
+            // body-level pin.
+            max_content_body_bytes: crate::messages::DEFAULT_MAX_CONTENT_BODY_BYTES,
             dispatcher: DispatcherConfig::default(),
         }
     }
@@ -556,6 +581,7 @@ impl Edge {
         let handlers = self.handlers.clone();
         let queue = self.queue.clone();
         let signer = self.signer.clone();
+        let max_content_body_bytes = self.config.max_content_body_bytes;
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -569,7 +595,7 @@ impl Edge {
                     let q = queue.clone();
                     let s = signer.clone();
                     tokio::spawn(async move {
-                        dispatch_inbound(frame, &v, &h, &q, &s).await;
+                        dispatch_inbound(frame, &v, &h, &q, &s, max_content_body_bytes).await;
                     });
                 }
                 else => break,
@@ -611,7 +637,8 @@ impl Edge {
     }
 }
 
-/// Inbound dispatch: verify → maybe-ACK-match → FederationAnnouncement
+/// Inbound dispatch: verify → maybe-ACK-match → `ContentBody`
+/// AV-13/integrity gate (CIRISEdge#21 v0.8.0) → `FederationAnnouncement`
 /// attestation-emission (FSD §3.2.1 v0.1 gate) → handler dispatch.
 async fn dispatch_inbound(
     frame: InboundFrame,
@@ -619,6 +646,7 @@ async fn dispatch_inbound(
     handlers: &Mutex<HashMap<MessageType, RegisteredHandler>>,
     queue: &Arc<dyn OutboundHandle>,
     signer: &Arc<LocalSigner>,
+    max_content_body_bytes: usize,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -636,6 +664,35 @@ async fn dispatch_inbound(
         verify_outcome,
         ..
     } = verified;
+
+    // CIRISEdge#21 v0.8.0 — `ContentBody` AV-13 size cap + content-
+    // addressed integrity check, applied post-verify and BEFORE
+    // handler dispatch. The signature on the envelope binds the
+    // (sha256, bytes) pair to the responder; this gate binds the
+    // bytes to the SHA. Without this re-hash the content-addressed
+    // invariant collapses to "trust whatever the responder said the
+    // SHA was" — which defeats the entire point of byte-fetch over a
+    // federation directory.
+    //
+    // Reject reasons map to the existing AV-13 family error
+    // (`VerifyError::BodyTooLarge`) and a typed integrity-mismatch
+    // log (handlers never see a bad ContentBody). Fail-loud at the
+    // `tracing::warn!` boundary — no silent drops (MISSION.md §3
+    // anti-pattern 6).
+    if envelope.message_type == MessageType::ContentBody {
+        match validate_content_body(&envelope, max_content_body_bytes) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    transport = ?transport,
+                    error = %e,
+                    body_sha256 = ?body_sha256,
+                    "ContentBody rejected at dispatch gate (AV-13 / integrity)",
+                );
+                return;
+            }
+        }
+    }
 
     // FSD §3.2.1 v0.1 emission gate — post-verify-pipeline, the
     // announcement has cleared edge's signature + freshness + replay
@@ -959,6 +1016,73 @@ fn message_type_str(mt: &MessageType) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{mt:?}"))
+}
+
+/// Validate a `ContentBody`-typed envelope against (a) the AV-13
+/// content-body cap and (b) the content-addressed integrity invariant
+/// (`sha256(bytes) == claimed_sha256`). CIRISEdge#21 v0.8.0 spec
+/// points 2 + 7.
+///
+/// Returns:
+///
+/// - `Ok(())` — the body parsed, `bytes.len() <=
+///   max_content_body_bytes`, and `sha256(bytes) == claimed_sha256`.
+/// - `Err(VerifyError::BodyTooLarge { .. })` — the AV-13 family error
+///   reused: oversized rejects look identical to envelope-tier AV-13
+///   rejects so a downstream metric collector sees one error category.
+/// - `Err(VerifyError::SchemaInvalid(_))` — body did not parse OR the
+///   integrity check failed. The integrity-mismatch case folds to
+///   `SchemaInvalid` (the envelope's typed `MessageType::ContentBody`
+///   was advertised but the body bytes don't match their own claimed
+///   SHA — a typed schema violation under the content-addressed
+///   contract).
+fn validate_content_body(
+    envelope: &EdgeEnvelope,
+    max_content_body_bytes: usize,
+) -> Result<(), VerifyError> {
+    use crate::messages::{sha256_of, ContentBody};
+
+    let body: ContentBody = serde_json::from_str(envelope.body.get())
+        .map_err(|e| VerifyError::SchemaInvalid(format!("ContentBody body parse: {e}")))?;
+
+    // AV-13 family — oversized rejects with the same error variant as
+    // the envelope-tier check (`VerifyError::BodyTooLarge`). One error
+    // category across the AV-13 surface.
+    if body.bytes.len() > max_content_body_bytes {
+        return Err(VerifyError::BodyTooLarge {
+            actual: body.bytes.len(),
+            limit: max_content_body_bytes,
+        });
+    }
+
+    // Content-addressed integrity gate (CIRISEdge#21 spec point 2).
+    // `sha256(bytes) == claimed_sha256` is the WHOLE POINT of the
+    // content-fetch primitive; a mismatch is a typed schema violation
+    // under the content-addressed contract.
+    let actual = sha256_of(&body.bytes);
+    if actual != body.sha256 {
+        return Err(VerifyError::SchemaInvalid(format!(
+            "ContentBody integrity check failed: claimed sha256={} \
+             but sha256(bytes)={}",
+            hex_encode(&body.sha256),
+            hex_encode(&actual),
+        )));
+    }
+
+    Ok(())
+}
+
+/// Cheap hex-encode helper for diagnostic log lines. Uses
+/// `std::fmt::Write` over the byte slice (clippy:
+/// `format_push_string` lints away a `format!`-append). Not
+/// security-critical; just makes mismatch errors actionable.
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Derive a deterministic UUID `announcement_id` from the announcement

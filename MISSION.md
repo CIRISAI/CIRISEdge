@@ -192,6 +192,13 @@ with deliberate cross-repo coordination.
   signed envelope every peer emits and verifies. Its shape is the
   cross-repo contract; a change is a coordinated `SchemaVersion` break
   (§3), never a casual edit.
+- **The content-fetch transport primitive** (`src/messages/mod.rs`:
+  `ContentFetch` / `ContentBody` / `ContentMiss`) — CIRISEdge#21
+  v0.8.0 content-addressable byte fetch over the federation wire. Not
+  a new architectural tier; just three typed message bodies that ride
+  the existing `Delivery::Ephemeral` class. The integrity primitive is
+  `sha256(bytes) == claimed_sha256` re-checked on receipt; trust rides
+  the attestation that named the SHA (out-of-band).
 - **The `AnnounceAttestation` binding contract** (`src/transport/attestation.rs`)
   — the federation-key-signed transport-identity ↔ federation-key
   binding carried in the Reticulum announce. CIRISEdge#15 / CIRISVerify#28

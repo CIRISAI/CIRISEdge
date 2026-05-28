@@ -88,6 +88,34 @@ pub enum MessageType {
     /// 2026-05-27 + persist v2.2.0 `federation_delivery_attestations`
     /// row 1:1).
     DeliveryAttestation,
+
+    // ─── CIRISEdge#21 — content-addressable byte transport ──────────
+    //
+    // Phase 1 (v0.8.0) whole-file flow. The chunked-large-file variant
+    // `ContentChunk` is intentionally NOT enumerated here; it lands in
+    // edge#21-phase2 once the Phase 1 surface has settled (S3-pointer
+    // flow + `{ sha256, offset, total, bytes, final }` shape are the
+    // open questions, FSD §1.4 batch). Phase 1 ships whole-file only
+    // and AV-13's 16 MiB ceiling on `ContentBody.bytes` is the hard cap.
+    /// Request to fetch the bytes that hash to `sha256`. Ephemeral
+    /// request/response — point-to-point, retryable (edge#21 spec
+    /// point 5; not `Mandatory`, byte fetch is on-demand pull). Body:
+    /// [`ContentFetch`]. Any peer holding the bytes may respond with
+    /// [`MessageType::ContentBody`]; a peer that does not hold them
+    /// (or refuses to serve) responds with [`MessageType::ContentMiss`].
+    ContentFetch,
+    /// Response carrying the bytes for a [`MessageType::ContentFetch`].
+    /// Receiver MUST verify `sha256(bytes) == claimed_sha256` on
+    /// receipt — content-addressed integrity is the trust primitive
+    /// (edge#21 spec point 2; the bytes themselves are unsigned, trust
+    /// rides the attestation that named the SHA). Body:
+    /// [`ContentBody`]. AV-13 ceiling (default 16 MiB) applies.
+    ContentBody,
+    /// Response indicating the responder will not serve the requested
+    /// SHA — `NotHeld` / `Withdrawn` / `Revoked` / `PolicyDenied`.
+    /// Required so the fetcher fails over to a different peer instead
+    /// of hanging (edge#21 spec point 3). Body: [`ContentMiss`].
+    ContentMiss,
 }
 
 /// The signed wire envelope. Carries one verified message + the
@@ -688,6 +716,235 @@ impl DeliveryAttestation {
     }
 }
 
+// ─── CIRISEdge#21 — ContentFetch / ContentBody / ContentMiss ────────
+//
+// Phase 1 (v0.8.0) content-addressable byte transport. The bytes
+// themselves are unsigned; integrity is the SHA-256 invariant
+// (`sha256(bytes) == claimed_sha256` re-checked on receipt). Trust
+// rides the attestation that named the SHA — `attestation_ref` is a
+// lightweight pointer to that attestation, not a full embedded copy.
+//
+// Phase 2 (`MessageType::ContentChunk` + `{ sha256, offset, total,
+// bytes, final }` shape + S3-pointer flow for >16 MiB) is a follow-up
+// (edge#21-phase2). Phase 1 ships whole-file `ContentBody` only;
+// AV-13's 16 MiB ceiling on `ContentBody.bytes` is the hard cap.
+
+/// Default AV-13 body-size ceiling for [`ContentBody::bytes`] —
+/// 16 MiB per CIRISEdge#21 Phase 1 spec point 7. Configurable per
+/// deployment via [`crate::EdgeConfig::max_content_body_bytes`]; the
+/// default const is exposed so consumers can pin their config to the
+/// canonical value rather than re-deriving it.
+///
+/// Bodies exceeding this size reject with the existing AV-13 family
+/// error ([`crate::verify::VerifyError::BodyTooLarge`]); larger files
+/// require the Phase 2 chunked path or the S3-pointer flow (bytes via
+/// `external_ref`, edge only carries the manifest).
+pub const DEFAULT_MAX_CONTENT_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Caller-supplied preferences accompanying a [`ContentFetch`]. The
+/// responder is free to ignore the hint (the wire shape is advisory),
+/// but production servers SHOULD honor `max_body_bytes` so fetchers
+/// can advertise low-memory ceilings.
+///
+/// `prefer_chunked` captures the request shape for Phase 2
+/// (edge#21-phase2 `MessageType::ContentChunk`) — Phase 1 responders
+/// always answer with whole-file [`ContentBody`] regardless of the
+/// flag. Capturing the field at v0.8.0 means a Phase 2 receiver can
+/// branch on it without a wire-format break.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HintShape {
+    /// Maximum `ContentBody.bytes.len()` the requester is willing to
+    /// accept on the response. `None` = no preference (responder
+    /// applies its own AV-13 ceiling). Responders MAY answer with
+    /// [`ContentMiss { reason: PolicyDenied }`](MissReason::PolicyDenied)
+    /// if the held body exceeds this hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<u64>,
+    /// If `true`, the requester prefers a chunked response (Phase 2
+    /// `ContentChunk`). Phase 1 responders ignore this — they always
+    /// answer with whole-file [`ContentBody`]. The field exists so
+    /// Phase 2 receivers can branch without a wire break.
+    #[serde(default)]
+    pub prefer_chunked: bool,
+}
+
+/// Lightweight pointer to the attestation that vouches for a
+/// [`ContentBody`]. Carried OPTIONALLY on the response — present when
+/// the responder wants to vouch via a specific federation attestation;
+/// absent when the responder is source-neutral (any peer holding the
+/// bytes may answer, per CIRISEdge#21 spec point 8).
+///
+/// NOT a full embedded attestation — the consumer fetches the
+/// attestation row out of band (persist's `federation_attestations`
+/// index, keyed by `attestation_id`) and re-verifies it against
+/// `federation_keys[signing_key_id]`. Edge is reach, not gate
+/// (`MISSION.md` §1.3).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AttestationRef {
+    /// The `federation_attestations.attestation_id` (UUID-shaped) the
+    /// caller should fetch out of band to verify the bytes' provenance.
+    pub attestation_id: String,
+    /// The `federation_keys.key_id` that signed the referenced
+    /// attestation. Denormalized so a consumer can route the
+    /// `federation_keys` lookup without first fetching the attestation
+    /// row — same convenience pattern as
+    /// [`DeliveryAttestation::peer_pubkey_ed25519_base64`].
+    pub signing_key_id: String,
+}
+
+/// Request to fetch the bytes that hash to `sha256`. Per CIRISEdge#21
+/// spec point 1.
+///
+/// Any peer holding the bytes may respond with [`ContentBody`]; a
+/// peer that does not (or refuses to serve under policy) responds
+/// with [`ContentMiss`] so the fetcher can fail over to another peer
+/// rather than hang (FSD §3.4 fail-loud invariant).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ContentFetch {
+    /// SHA-256 of the bytes the requester wants. Raw 32 bytes — JSON
+    /// wire shape rides as the standard `[u8; 32]` serde encoding (an
+    /// array of integers, matching `EdgeEnvelope::nonce`'s precedent).
+    pub sha256: [u8; 32],
+    /// Optional fetcher-side preference shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_hint: Option<HintShape>,
+}
+
+impl Message for ContentFetch {
+    const TYPE: MessageType = MessageType::ContentFetch;
+    /// Standard point-to-point, retryable — CIRISEdge#21 spec point 5
+    /// ("Standard (point-to-point, retryable). Not Mandatory").
+    /// Edge's existing `Delivery::Ephemeral` IS the request/response
+    /// class; no new variant is introduced (issue body item 4:
+    /// "do not add a new `Standard` variant unless the codebase
+    /// already uses that name").
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    /// The peer chooses ContentBody xor ContentMiss; both are typed
+    /// envelopes carrying their own bodies, NOT inline responses to
+    /// `ContentFetch`. `()` here marks the wire-level
+    /// "no inline response struct" property (mirrors `FederationAnnouncement`'s
+    /// `type Response = ()` — the observable is a separate envelope).
+    type Response = ();
+}
+
+/// Response carrying the bytes for a [`ContentFetch`].
+///
+/// # Integrity invariant (CIRISEdge#21 spec point 2)
+///
+/// The receiver MUST verify `sha256(bytes) == sha256` on receipt and
+/// reject mismatches; this is the content-addressed integrity gate.
+/// Edge's `dispatch_inbound` enforces it before handler dispatch (see
+/// `src/edge.rs::dispatch_inbound`). A consumer that bypasses
+/// `dispatch_inbound` MUST re-implement the check — the wire envelope
+/// signature only binds the (sha256, bytes) pair to the *responder*,
+/// not to the *content*; trust in the content rides the attestation
+/// named in `attestation_ref` (if present) or the originally-named
+/// attestation the fetcher was acting on.
+///
+/// # Size bound (AV-13)
+///
+/// `bytes.len()` is bounded by [`DEFAULT_MAX_CONTENT_BODY_BYTES`] at
+/// the default `EdgeConfig`. Phase 1 ships whole-file only; >16 MiB
+/// requires the Phase 2 chunked path (`MessageType::ContentChunk`,
+/// edge#21-phase2) or the S3-pointer flow.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ContentBody {
+    /// SHA-256 the responder claims the `bytes` field hashes to.
+    /// Verified on receipt against `sha256(bytes)` (the integrity
+    /// invariant; see type-level docs).
+    pub sha256: [u8; 32],
+    /// The bytes themselves. Bounded by
+    /// [`DEFAULT_MAX_CONTENT_BODY_BYTES`] (AV-13 family).
+    pub bytes: Vec<u8>,
+    /// Optional pointer to the federation attestation that vouches
+    /// for the bytes. Absent = source-neutral response (any peer
+    /// holding the bytes may answer, CIRISEdge#21 spec point 8); the
+    /// fetcher already has the attestation that named the SHA out of
+    /// band and is just resolving the bytes here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_ref: Option<AttestationRef>,
+}
+
+impl Message for ContentBody {
+    const TYPE: MessageType = MessageType::ContentBody;
+    /// Same wire class as the [`ContentFetch`] it responds to —
+    /// point-to-point, retryable.
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    type Response = ();
+}
+
+/// Reason a [`ContentMiss`] was returned instead of a [`ContentBody`].
+/// Mirrors CIRISEdge#21 spec point 3 — the reason discriminates
+/// "fetcher should try another peer" (`NotHeld`) vs "the bytes are
+/// gone federation-wide" (`Withdrawn` / `Revoked`) vs "this peer's
+/// policy denied" (`PolicyDenied`).
+///
+/// The serde rules MUST be `snake_case` — pinned by the cross-repo
+/// wire convention (`AnnouncementPriority` precedent, FSD §2.1).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum MissReason {
+    /// The responder does not hold the bytes for this SHA. Fetcher
+    /// SHOULD try another peer from
+    /// [`PeerResolver::resolve_holders`](crate::transport::reticulum::PeerResolver::resolve_holders).
+    NotHeld,
+    /// The bytes were withdrawn at the federation tier — the
+    /// originating attestation was retracted (FSD §3.2.1
+    /// `supersedes` / retraction chain). Trying another peer is
+    /// unlikely to help.
+    Withdrawn,
+    /// The originating signer's key was revoked (the
+    /// `federation_revocations` directory holds the row). Bytes the
+    /// revoked key vouched for are no longer trusted federation-wide.
+    Revoked,
+    /// This responder's local policy denied the fetch (e.g.
+    /// authorization tier, rate-limit, jurisdictional gate). Other
+    /// peers MAY still serve the bytes — the fetcher SHOULD retry
+    /// elsewhere.
+    PolicyDenied,
+}
+
+/// Response indicating the responder will not serve the requested
+/// SHA. Per CIRISEdge#21 spec point 3 — required so the fetcher can
+/// fail over instead of hanging on a peer that silently dropped the
+/// request.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ContentMiss {
+    /// SHA-256 the requester asked for — echoed back so the fetcher
+    /// can correlate the miss to the in-flight fetch even when many
+    /// are outstanding (the wire `in_reply_to` covers the envelope
+    /// correlation; this field covers the body-level correlation).
+    pub sha256: [u8; 32],
+    /// Why the responder is missing or refusing.
+    pub reason: MissReason,
+}
+
+impl Message for ContentMiss {
+    const TYPE: MessageType = MessageType::ContentMiss;
+    /// Same wire class as the [`ContentFetch`] it responds to —
+    /// point-to-point, retryable.
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    type Response = ();
+}
+
+/// Compute the SHA-256 of a byte slice. The receiver-side integrity
+/// check (`sha256(bytes) == ContentBody.sha256`) calls this; exposed
+/// pub so consumers building [`ContentBody`] can compute the field
+/// without re-importing `sha2` themselves.
+///
+/// Implementation uses the `sha2` crate directly (same dep edge
+/// already carries for `body_sha256`); no extra wrapper.
+#[must_use]
+pub fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
 /// Convenience: base64-encode a 32-byte canonical hash for callers
 /// that hold the raw bytes (e.g. fresh SHA-256 output). Mirrors
 /// persist v2.2.0's `encode_canonical_hash_base64`.
@@ -925,5 +1182,114 @@ mod tests {
             }
             other => panic!("DeliveryAttestation::DELIVERY must be Durable; got {other:?}"),
         }
+    }
+
+    // ─── CIRISEdge#21 unit tests ────────────────────────────────────
+
+    /// `ContentFetch` / `ContentBody` / `ContentMiss` MUST all declare
+    /// `Delivery::Ephemeral` — point-to-point, retryable per
+    /// CIRISEdge#21 spec point 5. A regression that promotes them to
+    /// `Mandatory` would silently broadcast content fetches across
+    /// the federation; promotion to `Durable` would persist large
+    /// payload bodies in the outbound queue. Both are wrong.
+    #[test]
+    fn content_fetch_family_declares_ephemeral() {
+        assert!(matches!(ContentFetch::DELIVERY, Delivery::Ephemeral));
+        assert!(matches!(ContentBody::DELIVERY, Delivery::Ephemeral));
+        assert!(matches!(ContentMiss::DELIVERY, Delivery::Ephemeral));
+        assert_eq!(ContentFetch::TYPE, MessageType::ContentFetch);
+        assert_eq!(ContentBody::TYPE, MessageType::ContentBody);
+        assert_eq!(ContentMiss::TYPE, MessageType::ContentMiss);
+    }
+
+    /// `MissReason` serde rules MUST be `snake_case` — pinned by the
+    /// cross-repo wire convention.
+    #[test]
+    fn miss_reason_serde_matches_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&MissReason::NotHeld).unwrap(),
+            r#""not_held""#
+        );
+        assert_eq!(
+            serde_json::to_string(&MissReason::Withdrawn).unwrap(),
+            r#""withdrawn""#
+        );
+        assert_eq!(
+            serde_json::to_string(&MissReason::Revoked).unwrap(),
+            r#""revoked""#
+        );
+        assert_eq!(
+            serde_json::to_string(&MissReason::PolicyDenied).unwrap(),
+            r#""policy_denied""#
+        );
+        // Round-trip every variant.
+        for reason in [
+            MissReason::NotHeld,
+            MissReason::Withdrawn,
+            MissReason::Revoked,
+            MissReason::PolicyDenied,
+        ] {
+            let s = serde_json::to_string(&reason).unwrap();
+            let back: MissReason = serde_json::from_str(&s).unwrap();
+            assert_eq!(reason, back);
+        }
+    }
+
+    /// `sha256_of` is the integrity-check helper; pin it against a
+    /// known vector so a regression in the digest path is caught.
+    /// `sha256("")` = the empty-string SHA-256 (RFC 6234 test vector).
+    #[test]
+    fn sha256_of_empty_matches_rfc_6234() {
+        let expected = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ];
+        assert_eq!(sha256_of(b""), expected);
+    }
+
+    /// `ContentBody` JSON round-trip preserves every field — the
+    /// integrity-check property `sha256(bytes) == sha256` must survive
+    /// the wire serialization.
+    #[test]
+    fn content_body_json_round_trip_preserves_integrity_invariant() {
+        let bytes: Vec<u8> = (0u8..64).collect();
+        let sha = sha256_of(&bytes);
+        let body = ContentBody {
+            sha256: sha,
+            bytes: bytes.clone(),
+            attestation_ref: Some(AttestationRef {
+                attestation_id: "11111111-1111-1111-1111-111111111111".into(),
+                signing_key_id: "edge-peer-01".into(),
+            }),
+        };
+        let s = serde_json::to_string(&body).unwrap();
+        let back: ContentBody = serde_json::from_str(&s).unwrap();
+        assert_eq!(body, back);
+        // Integrity invariant survives round-trip.
+        assert_eq!(sha256_of(&back.bytes), back.sha256);
+    }
+
+    /// `ContentFetch` JSON round-trip with and without a hint.
+    #[test]
+    fn content_fetch_json_round_trip_with_and_without_hint() {
+        let fetch_nohint = ContentFetch {
+            sha256: [0xAB; 32],
+            response_hint: None,
+        };
+        let s = serde_json::to_string(&fetch_nohint).unwrap();
+        let back: ContentFetch = serde_json::from_str(&s).unwrap();
+        assert_eq!(fetch_nohint, back);
+
+        let fetch_hint = ContentFetch {
+            sha256: [0xCD; 32],
+            response_hint: Some(HintShape {
+                max_body_bytes: Some(1024 * 1024),
+                prefer_chunked: true,
+            }),
+        };
+        let s = serde_json::to_string(&fetch_hint).unwrap();
+        let back: ContentFetch = serde_json::from_str(&s).unwrap();
+        assert_eq!(fetch_hint, back);
     }
 }

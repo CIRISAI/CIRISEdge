@@ -127,11 +127,57 @@ const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 /// directory carries Reticulum transport keys. When no resolver is
 /// injected, the transport relies solely on announce-driven
 /// discovery. The returned bytes feed `Identity::from_public_keys`.
+///
+/// # Holder resolution (CIRISEdge#21 v0.8.0)
+///
+/// [`PeerResolver::resolve_holders`] extends the trait with the
+/// "which peers hold the bytes for this SHA?" lookup that the
+/// `ContentFetch` family needs. The default impl returns an empty
+/// `Vec` so v0.7.x-era impls don't break; a production impl wraps
+/// persist's `BlobStorage::list_holders` (CIRISPersist#103 / v2.3+)
+/// which queries the `holds_bytes:sha256:<prefix>` attestation index
+/// and returns `Vec<key_id>`. Each returned `key_id` is then routable
+/// via the existing [`PeerResolver::resolve`] path — the holder list
+/// IS a list of `key_id` "transport identities" in the existing
+/// edge-layer sense (the federation_keys row's id is the addressing
+/// unit; the dual-key bytes are the substrate-tier address).
 pub trait PeerResolver: Send + Sync + 'static {
     /// Return the peer's 64-byte Reticulum public key (x25519 ‖
     /// ed25519), or `None` if the directory has no transport key for
     /// `key_id`.
     fn resolve(&self, destination_key_id: &str) -> Option<[u8; 64]>;
+
+    /// Return the `key_id`s of every peer that has advertised holding
+    /// the bytes for `sha256` — the CIRISEdge#21 v0.8.0 content-fetch
+    /// peer-discovery primitive. Default impl returns an empty `Vec`
+    /// (v0.7.x-era resolvers don't need to break; the fetcher falls
+    /// back to its own resolution path or fails with no candidate
+    /// peers).
+    ///
+    /// # Production wiring
+    ///
+    /// The CIRISPersist#103 (v2.3+) production impl maps onto
+    /// `BlobStorage::list_holders(&sha256_array) -> Vec<String>`
+    /// (returns `key_id`s pulled from the
+    /// `holds_bytes:sha256:<8-hex-prefix>` attestation index on the
+    /// `federation_attestations` table). The returned `key_id`s are
+    /// then routable through this trait's existing [`Self::resolve`].
+    ///
+    /// `BlobStorage` is NOT object-safe in persist v2.3 (uses
+    /// `async fn in trait` via `impl Future`), so a downstream adapter
+    /// crate erases it the same way edge's [`crate::verify::VerifyDirectory`]
+    /// adapter erases `FederationDirectory`. The trait surface here
+    /// is `fn -> Vec<String>` (sync return type with async-by-default
+    /// shape) so existing test impls don't need an async-trait crate
+    /// dependency; production impls that need to await persist can
+    /// hold a tokio runtime handle and `block_on` inside the resolver.
+    ///
+    /// Returns an empty `Vec` when no holders are known (the fetcher
+    /// treats this as "no candidate peers" — typed not-found, never a
+    /// silent hang per `MISSION.md` §3 anti-pattern 6).
+    fn resolve_holders(&self, _sha256: &[u8; 32]) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A resolved peer — its Reticulum destination hash plus the ed25519
