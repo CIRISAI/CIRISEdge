@@ -81,6 +81,18 @@ ignore = [
     "RUSTSEC-2026-0098",  # rustls-webpki URI-name constraint (no URI SAN validation here)
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
     "RUSTSEC-2026-0104",  # rustls-webpki CRL parse panic (no CRL parsing here)
+
+    # v0.11.0 — `unic-*` family unmaintained. Transitive via
+    # `pyo3-stub-gen` → `askama` → `unic-emoji-char` (Unicode emoji
+    # property tables). The crates are read-only Unicode data; the
+    # maintenance gap doesn't expose us to a vulnerability path. They
+    # ship in dev-deps (stub_gen bin) only, not the production wheel.
+    "RUSTSEC-2025-0075",  # unic-* unmaintained
+    "RUSTSEC-2025-0080",  # unic-* unmaintained
+    "RUSTSEC-2025-0081",  # unic-* unmaintained
+    "RUSTSEC-2025-0090",  # unic-* unmaintained
+    "RUSTSEC-2025-0098",  # unic-* unmaintained
+    "RUSTSEC-2025-0100",  # unic-* unmaintained
 ]
 
 [sources]
