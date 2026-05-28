@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -30,12 +30,21 @@ publish = false
 # Substrate. Owns federation_keys directory, canonicalize_envelope,
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
-# v2.7.0 (CIRISPersist#104/#105/#106/#108/#109) ships the PyCapsule
+# v2.7.0 (CIRISPersist#104/#105/#106/#108/#109) shipped the PyCapsule
 # cohabitation accessors — `federation_directory_capsule` /
 # `outbound_queue_capsule` / `keyring_signer_capsule` `#[pymethod]`s
 # on `PyEngine` — that v0.9.2 edge consumes to construct an `Edge`
 # over the host's already-bootstrapped engine WITHOUT relying on
 # cross-module PyClass identity (the v0.9.1 cohabitation regression).
+# v2.8.0 (CIRISPersist#111) adds `runtime_handle_capsule` — the
+# fourth capsule accessor that closes the cross-cdylib **statics**
+# regression v0.10.0 hit: persist's `ENGINE_SINGLETON` static is
+# duplicated per-`.so`, so the consumer's `current_runtime_handle()`
+# always returned `None` in cross-wheel production deployments
+# (CIRISConformance v0.10.0 init_handshake failure). The capsule
+# sources the runtime from `self.runtime.handle().clone()`,
+# sidestepping the static lookup entirely. v0.10.1 edge consumes
+# this — see [`extract_capsule`] in `src/ffi/pyo3.rs`.
 # Also exposes `list_keys_by_identity_type` on FederationDirectory
 # (v2.6.0) — consumed by CIRISEdge#19 AccordCarrier wire-layer
 # 2-of-3 verify (accord_holder enumeration) and #20 steward addressing
@@ -44,7 +53,7 @@ publish = false
 # persist's compiled-in PyTypeInfo; edge uses the capsule path
 # because we cross extension-module boundaries (separate wheels).
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.7.0", version = "2", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.8.0", version = "2", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # Pinned to v3.0.1 — major bump in lockstep with persist v2.0.2's
@@ -193,7 +202,7 @@ sha2               = "0.10"
 # feature flag. Cargo merges dependency-feature sets, so adding the
 # flag here lights up the symbols for the test-build only without
 # changing edge's normal-build dependency surface.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.7.0", version = "2", features = ["sqlite", "cirisnode"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.8.0", version = "2", features = ["sqlite", "cirisnode"] }
 
 [lints.rust]
 # v0.9.2 (CIRISEdge#22 cohabitation) — relaxed from `forbid` to `deny`.

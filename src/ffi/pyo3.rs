@@ -34,6 +34,37 @@
 //! involved at all on the cross-module path. See [`extract_capsule`]
 //! for the safety justification.
 //!
+//! # v0.10.1 — runtime_handle_capsule (CIRISPersist#111, CIRISEdge#22)
+//!
+//! v0.10.0 shipped with the v0.9.2 capsule pattern for the three
+//! substrate handles, but still called `ciris_persist::current_runtime_handle()`
+//! (a pure-Rust `pub fn` over persist's `ENGINE_SINGLETON` static) to
+//! acquire the tokio runtime. That static is duplicated per-cdylib at
+//! link time — when persist ships as `ciris_persist.abi3.so` AND is
+//! linked into `ciris_edge.abi3.so` as a Cargo rlib, edge's copy of
+//! the static is NEVER populated even after the persist `.so`'s copy
+//! is. The cross-cdylib production failure: CIRISConformance v0.10.0's
+//! cohabitation gate caught this with `'persist tokio runtime
+//! unavailable'` at `init_handshake` across all 6 (3 OS × 2 backend)
+//! cells.
+//!
+//! v0.10.1 consumes persist v2.8.0's `runtime_handle_capsule` — the
+//! same `PyCapsule`-opaque-pointer pattern that closes the cross-module
+//! PyClass-identity issue (#109), now applied to the **statics** layer.
+//! The capsule sources the handle from `self.runtime.handle().clone()`
+//! inside `PyEngine::runtime_handle_capsule_py`, so edge's view of
+//! `ENGINE_SINGLETON` is irrelevant — the handle hops the FFI via
+//! opaque pointer with a producer-set name tag, identical to the
+//! v0.9.2 contract for the three substrate handles. End-to-end
+//! cohabitation cohabitation contract closure: persist#109 + #111 +
+//! edge v0.10.1 = capsule-only handoff for every load-bearing
+//! cross-cdylib handle.
+//!
+//! Required floor: `ciris-persist >= 2.8.0` (Cargo `tag = "v2.8.0"`,
+//! pyproject `ciris-persist>=2.8.0,<3`). Older persist versions do not
+//! expose `runtime_handle_capsule`; init_edge_runtime emits a typed
+//! `PyRuntimeError` pointing at the upgrade path.
+//!
 //! # Unsafe carve-out
 //!
 //! WHY: `PyCapsule` extraction is inherently unsafe — `cap.reference::<T>()`
@@ -819,15 +850,18 @@ fn parse_hybrid_policy(s: &str, soft_freshness_window_seconds: u64) -> PyResult<
 /// 1. `method` is the name of a `#[pymethod]` on `engine` that returns
 ///    a `PyCapsule` whose wrapped type is exactly `T`. The valid
 ///    `(method, T)` pairs are pinned by `ciris-persist`'s
-///    `src/ffi/pyo3.rs` v2.7.0+ docblocks:
+///    `src/ffi/pyo3.rs` v2.7.0+ / v2.8.0+ docblocks:
 ///    - `"federation_directory_capsule"` wraps
-///      `Arc<dyn ciris_persist::federation::FederationDirectory>`
+///      `Arc<dyn ciris_persist::federation::FederationDirectory>` (v2.7.0)
 ///    - `"outbound_queue_capsule"` wraps
-///      `ciris_persist::BackendDispatch`
+///      `ciris_persist::BackendDispatch` (v2.7.0)
 ///    - `"keyring_signer_capsule"` wraps
-///      `ciris_persist::signing::KeyringSignerHandle`
-/// 2. Edge's `Cargo.toml` pins `ciris-persist = "2", tag = "v2.7.0"`
-///    and pyproject.toml pins `ciris-persist>=2.7.0,<3` — together,
+///      `ciris_persist::signing::KeyringSignerHandle` (v2.7.0)
+///    - `"runtime_handle_capsule"` wraps
+///      `tokio::runtime::Handle` (v2.8.0 — CIRISPersist#111
+///      cross-cdylib statics fix)
+/// 2. Edge's `Cargo.toml` pins `ciris-persist = "2", tag = "v2.8.0"`
+///    and pyproject.toml pins `ciris-persist>=2.8.0,<3` — together,
 ///    these enforce that the host engine's `*_capsule` pymethods exist,
 ///    return a `PyCapsule`, and carry the wrapped types persist's
 ///    docblocks document.
@@ -956,7 +990,11 @@ where
     hybrid_policy = "strict",
     soft_freshness_window_seconds = 60,
 ))]
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines
+)]
 fn init_edge_runtime(
     py: Python<'_>,
     engine: Bound<'_, PyAny>,
@@ -975,20 +1013,58 @@ fn init_edge_runtime(
     // capsules are opaque pointers with producer-set name tags, which
     // is the load-bearing primitive for cohabitation across separately-
     // built wheels (CIRISPersist#109 / CIRISEdge#22). The capsule name
-    // tag + crate-pin floor (>=2.7.0) is what enforces the wrapped-type
+    // tag + crate-pin floor (>=2.8.0) is what enforces the wrapped-type
     // invariant; see [`extract_capsule`] for the full safety argument.
     //
-    // SAFETY (all three call sites): `T` arguments below match exactly
-    // the wrapped types persist 2.7.0's `*_capsule` `#[pymethod]`s
-    // produce (`src/ffi/pyo3.rs` lines ~13955-14025 in the persist
+    // SAFETY (all four call sites — three substrate handles here +
+    // `runtime_handle_capsule` in Step 5): `T` arguments below match
+    // exactly the wrapped types persist's `*_capsule` `#[pymethod]`s
+    // produce (`src/ffi/pyo3.rs` lines ~13955-14075 in the persist
     // tree):
-    //   - federation_directory_capsule wraps Arc<dyn FederationDirectory>
-    //   - outbound_queue_capsule       wraps BackendDispatch
-    //   - keyring_signer_capsule       wraps KeyringSignerHandle
+    //   - federation_directory_capsule wraps Arc<dyn FederationDirectory>  (v2.7.0)
+    //   - outbound_queue_capsule       wraps BackendDispatch               (v2.7.0)
+    //   - keyring_signer_capsule       wraps KeyringSignerHandle           (v2.7.0)
+    //   - runtime_handle_capsule       wraps tokio::runtime::Handle        (v2.8.0)
     // The crate-level `#[deny(unsafe_code)]` is the default lint
-    // (relaxed from `forbid` in v0.9.2 specifically for these three
-    // calls); each call site below explicitly opts in via
-    // `#[allow(unsafe_code)]`.
+    // (relaxed from `forbid` in v0.9.2 specifically for these calls);
+    // each call site below explicitly opts in via `#[allow(unsafe_code)]`.
+    //
+    // Ordering rationale: `runtime_handle_capsule` (v2.8.0) is
+    // extracted FIRST so the persist-version-floor diagnostic surfaces
+    // before the v2.7.0 substrate-handle extractions. A pre-v2.8.0
+    // persist would still satisfy the three v2.7.0 capsule methods but
+    // miss the v0.10.1 fix entirely — without the early check, the
+    // operator would get a cryptic `"persist tokio runtime unavailable"`
+    // at the old `current_runtime_handle()` site (v0.10.0 production
+    // failure shape) instead of an actionable "upgrade ciris-persist"
+    // message. The pre-check is `hasattr`-based so we don't waste a
+    // method call on the missing path.
+    if !engine.hasattr("runtime_handle_capsule").unwrap_or(false) {
+        return Err(PyRuntimeError::new_err(
+            "persist v2.8.0+ required for cross-cdylib runtime sharing — \
+             your persist version doesn't expose runtime_handle_capsule. \
+             Either upgrade ciris-persist (Cargo `tag = \"v2.8.0\"`, \
+             pyproject `ciris-persist>=2.8.0,<3`) or run edge in \
+             same-extension-module mode (CIRISEdge#22 / CIRISPersist#111).",
+        ));
+    }
+    #[allow(unsafe_code)]
+    let runtime: tokio::runtime::Handle = unsafe {
+        extract_capsule::<tokio::runtime::Handle, _, _>(
+            &engine,
+            "runtime_handle_capsule",
+            tokio::runtime::Handle::clone,
+        )?
+    };
+    // Make the persist runtime current on this thread for the rest of
+    // the init body. `enter()` returns a guard that restores the
+    // previous runtime context (or absence thereof) on Drop. The
+    // explicit `block_on` in Step 5 below DOES NOT require `enter()`
+    // to schedule, but entering ensures any future refactor introducing
+    // an intermediate `.await` (e.g. registering a transport handler
+    // task) immediately has a current runtime and does not regress to
+    // a "no reactor running" panic.
+    let _runtime_guard = runtime.enter();
 
     #[allow(unsafe_code)]
     let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> = unsafe {
@@ -1099,13 +1175,16 @@ fn init_edge_runtime(
 
     // ── Step 5: build the transport + Edge under the host runtime.
     //
+    // The tokio runtime handle was extracted in Step 1 via the v2.8.0
+    // `runtime_handle_capsule` (CIRISPersist#111) — the **statics**-
+    // layer counterpart to #109's type-identity fix. `_runtime_guard`
+    // (from `runtime.enter()`) is live for the rest of this body.
+    //
     // Construction is async (Reticulum node start + identity load).
     // `Python::detach` (pyo3 0.28 rename of the older `allow_threads`)
     // releases the GIL while the persist runtime (held by the shared
     // `PyEngine`) drives the future to completion — the host's tokio
     // runtime owns the worker threads edge's transport schedules on.
-    let runtime = ciris_persist::current_runtime_handle()
-        .ok_or_else(|| PyRuntimeError::new_err("persist tokio runtime unavailable"))?;
     let transport: Arc<dyn Transport> = py.detach(|| {
         runtime
             .block_on(async {
@@ -1348,6 +1427,27 @@ mod pyo3_tier2_tests {
     fn init_python() {
         static INIT: OnceLock<()> = OnceLock::new();
         INIT.get_or_init(Python::initialize);
+    }
+
+    /// v0.10.1 — global serialization lock for tests that construct or
+    /// inspect persist's `ENGINE_SINGLETON`. Cargo's default
+    /// `--test-threads` is the host CPU count; without this lock, two
+    /// tests concurrently calling `ciris_persist.Engine(...)` deadlock
+    /// at the persist slot mutex × GIL × tokio-runtime-build interaction
+    /// (`PyEngine::new` builds a fresh `Runtime` inside `py.detach`;
+    /// concurrent tests racing for the GIL block each other's GIL
+    /// release inside `Runtime::new`'s thread spawns).
+    ///
+    /// Every test below that constructs `Engine(...)` MUST acquire
+    /// this lock for the duration of the engine-bearing critical
+    /// section. Tests that use stub fixtures only (no real engine)
+    /// don't need it.
+    fn engine_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENGINE_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        ENGINE_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Stub transport — accepts every outbound `send`, never listens.
@@ -2106,6 +2206,7 @@ mod pyo3_tier2_tests {
     #[test]
     fn py_init_edge_runtime_via_capsule_succeeds() {
         init_python();
+        let _engine_guard = engine_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let identity_path = tmp.path().join("transport.id");
         let local_seed_path = tmp.path().join("local.seed");
@@ -2189,18 +2290,20 @@ mod pyo3_tier2_tests {
         }
     }
 
-    /// CIRISEdge#22 v0.9.2 negative path — `init_edge_runtime` rejects
-    /// any object that doesn't expose persist's `*_capsule` pymethods.
-    /// The error is a typed `PyTypeError` ([`extract_capsule`]'s
-    /// `engine doesn't expose ... method` shape) rather than a panic,
-    /// so the cohabitation handshake fails cleanly with a
-    /// human-readable message.
+    /// CIRISEdge#22 v0.9.2 negative path (updated for v0.10.1) —
+    /// `init_edge_runtime` rejects any object that doesn't expose
+    /// persist's `*_capsule` pymethods with a typed error (not a panic).
     ///
-    /// We pass a plain Python `dict` — dicts don't carry the persist
-    /// 2.7.0 cohabitation surface, so the very first capsule call
-    /// (`federation_directory_capsule`) should raise. The error
-    /// message must mention the method name so an operator can
-    /// quickly diagnose "engine is wrong shape".
+    /// In v0.9.2 a plain `dict` tripped `extract_capsule` on
+    /// `federation_directory_capsule` and surfaced as a `PyTypeError`.
+    /// In v0.10.1 the runtime-floor pre-check runs FIRST (because
+    /// `runtime_handle_capsule` extraction moved to Step 1 — see the
+    /// ordering rationale in `init_edge_runtime`), so a dict trips the
+    /// `runtime_handle_capsule` hasattr-miss path and surfaces as a
+    /// `PyRuntimeError` naming the v2.8.0 version floor. Either
+    /// typed-error shape satisfies the "cleanly rejects" contract; the
+    /// test verifies the rejection is typed (not a panic) and the
+    /// message names a capsule method an operator can grep for.
     #[tokio::test(flavor = "multi_thread")]
     async fn py_init_edge_runtime_rejects_non_engine_object_cleanly() {
         init_python();
@@ -2225,16 +2328,245 @@ mod pyo3_tier2_tests {
         });
 
         Python::attach(|py| {
+            // v0.10.1: the first capsule check is `runtime_handle_capsule`,
+            // which surfaces as a `PyRuntimeError` (version-floor
+            // diagnostic). Pre-v0.10.1 binaries tripped the
+            // `federation_directory_capsule` `PyTypeError` first.
+            // Accept either typed shape — the contract is "no panic,
+            // typed error, names a capsule method".
             assert!(
-                err.is_instance_of::<PyTypeError>(py),
-                "init_edge_runtime must reject non-engine objects with TypeError \
-                 (not panic, not RuntimeError) — got {err}",
+                err.is_instance_of::<PyRuntimeError>(py) || err.is_instance_of::<PyTypeError>(py),
+                "init_edge_runtime must reject non-engine objects with \
+                 PyRuntimeError or PyTypeError (not panic) — got {err}",
             );
             let msg = err.to_string();
             assert!(
-                msg.contains("federation_directory_capsule"),
-                "TypeError message must name the missing method so operators can \
-                 diagnose; got: {msg}"
+                msg.contains("runtime_handle_capsule")
+                    || msg.contains("federation_directory_capsule"),
+                "error message must name the missing capsule method so operators \
+                 can diagnose; got: {msg}"
+            );
+        });
+    }
+
+    // ── v0.10.1 (CIRISEdge#22 cohabitation init-context regression) ──
+    //
+    // The v0.10.0 cohabitation-gate failed all 6 (3 OS × 2 backend)
+    // cells at `init_handshake` with `'persist tokio runtime
+    // unavailable'`. The root cause is the runtime-acquisition step in
+    // `init_edge_runtime` returning `None` from
+    // `ciris_persist::current_runtime_handle()` — meaning persist's
+    // process-singleton runtime hadn't been bootstrapped (the host
+    // hadn't yet constructed a `ciris_persist.Engine`, OR — the
+    // production reality the gate exercises — the cross-cdylib symbol
+    // resolution leaves edge's copy of the `ENGINE_SINGLETON` static
+    // empty even after the persist `.so`'s copy is populated).
+    //
+    // v0.10.1 closes this by consuming persist v2.8.0's
+    // `runtime_handle_capsule` (CIRISPersist#111) — the runtime handle
+    // hops the FFI as an opaque PyCapsule, sidestepping the duplicated
+    // static entirely. The two tests below pin the in-process contract:
+    // when the engine singleton IS populated, init_edge_runtime
+    // acquires the runtime via the capsule and reaches the
+    // transport-construction stage; when the engine has been closed
+    // (singleton cleared), init_edge_runtime raises a typed
+    // `PyRuntimeError` with an actionable message. The cross-cdylib
+    // path requires CIRISConformance's matrix to exercise (separately-
+    // built wheels) and is the regression-gate the production failure
+    // tripped — these in-process tests pin edge's contribution.
+
+    /// Fixed engine fingerprint shared between the two v0.10.1 init-
+    /// context tests so they can co-tenant the persist `ENGINE_SINGLETON`
+    /// (persist v1.6.8 anti-orphan invariant — a second `Engine(...)`
+    /// with the same config returns the existing handle; a different
+    /// config raises `EngineConfigMismatch`).
+    ///
+    /// `signing_key_id` is a process-stable string (no time suffix) so
+    /// any test in this module that runs after the first construction
+    /// can attach to the same singleton. The other capsule tests use
+    /// time-suffixed key_ids because they don't need to co-tenant.
+    fn shared_init_context_engine_config(
+        py: Python<'_>,
+    ) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("dsn", "sqlite::memory:")?;
+        kwargs.set_item("signing_key_id", "edge-init-ctx-shared-fixture")?;
+        kwargs.set_item("local_key_id", "edge-init-ctx-shared-local")?;
+        // local_key_path is per-test (temp path); caller sets it.
+        kwargs.set_item("pqc_sweep_on_init", false)?;
+        Ok(kwargs)
+    }
+
+    /// `init_edge_runtime` succeeds in acquiring persist's tokio
+    /// runtime handle when the host engine has been constructed. The
+    /// "would have caught v0.10.0 in CI" test: pins that the runtime
+    /// acquisition step does not error when the singleton is populated.
+    ///
+    /// Identical fixture shape to `py_init_edge_runtime_via_capsule_succeeds`
+    /// (Engine + capsule extraction); the differentiating assertion is
+    /// "no RuntimeError mentioning `persist tokio runtime`" or
+    /// `runtime_handle_capsule`. A downstream transport-config error
+    /// (TPM keyring P-256 mismatch on hosts without an Ed25519 platform
+    /// signer) IS allowed — that's strictly downstream of the runtime
+    /// acquisition.
+    ///
+    /// Uses [`shared_init_context_engine_config`] so the singleton can
+    /// be co-tenanted with [`py_init_edge_runtime_fails_typed_when_no_persist_runtime`].
+    /// This test runs first alphabetically (`acquires` < `fails`) and
+    /// constructs the engine; the no-runtime test runs second, attaches
+    /// to the same singleton via config-match, then closes it.
+    #[test]
+    fn py_init_edge_runtime_acquires_persist_runtime_context() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let identity_path = tmp.path().join("transport.id");
+        let local_seed_path = tmp.path().join("local.seed");
+        std::fs::write(&local_seed_path, [0xCC_u8; 32]).expect("write local seed");
+
+        let outcome: Result<(), PyErr> = Python::attach(|py| -> PyResult<()> {
+            install_ciris_persist_module(py)?;
+            let ciris_persist_mod = py.import("ciris_persist")?;
+            let engine_cls = ciris_persist_mod.getattr("Engine")?;
+            let kwargs = shared_init_context_engine_config(py)?;
+            kwargs.set_item("local_key_path", local_seed_path.to_string_lossy().as_ref())?;
+            let engine = engine_cls.call((), Some(&kwargs))?;
+
+            // Sanity: at this point the persist runtime singleton IS
+            // populated (the Engine constructor builds it, OR attached
+            // to an existing same-config singleton). This is the
+            // pre-condition the cohabitation contract relies on — the
+            // load-bearing assertion this test exists to gate.
+            assert!(
+                ciris_persist::current_runtime_handle().is_some(),
+                "persist must install its tokio runtime singleton when \
+                 Engine(...) constructs — pre-condition for init_edge_runtime; \
+                 this is the v0.10.0 cohabitation-gate regression CIRISEdge#22 \
+                 closes",
+            );
+
+            let _ = init_edge_runtime(
+                py,
+                engine,
+                identity_path.to_str().expect("identity path utf8"),
+                "127.0.0.1:0",
+                vec![],
+                300,
+                0,
+                "strict",
+                60,
+            )?;
+            Ok(())
+        });
+
+        match outcome {
+            Ok(()) => { /* end-to-end happy path on hosts with Ed25519 platform signer */ }
+            Err(e) => {
+                let msg = e.to_string();
+                // The exact v0.10.0 failure signature MUST NOT appear.
+                // Even partial matches indicate the runtime-acquire step
+                // tripped, which is the regression this test gates.
+                assert!(
+                    !msg.contains("persist tokio runtime")
+                        && !msg.contains("runtime_handle_capsule"),
+                    "init_edge_runtime must NOT fail at the runtime-acquire \
+                     step when the persist Engine singleton is populated \
+                     (the v0.10.0 cohabitation-gate regression — CIRISEdge#22); \
+                     got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// `init_edge_runtime` raises a typed `PyRuntimeError` (NOT a panic
+    /// or TypeError) when the engine object lacks
+    /// `runtime_handle_capsule` — i.e. when persist's version is
+    /// pre-v2.8.0. The error message must point the operator at the
+    /// upgrade path: pin `ciris-persist >= 2.8.0`.
+    ///
+    /// In v0.10.0 this same scenario surfaced as a cryptic
+    /// `"persist tokio runtime unavailable"` from
+    /// `current_runtime_handle()`'s `None` return. v0.10.1 pre-checks
+    /// the capsule method exists and emits the version-floor diagnostic
+    /// BEFORE attempting `extract_capsule`, so the operator sees a
+    /// direct "upgrade ciris-persist" message rather than a deferred
+    /// substrate-side error.
+    ///
+    /// We simulate the "no runtime capsule" condition by passing an
+    /// engine-shaped Python object that exposes the three substrate
+    /// `*_capsule` pymethods (the v0.9.2 / v2.7.0 surface) but NOT
+    /// `runtime_handle_capsule` (the v2.8.0 addition). A real
+    /// pre-v2.8.0 persist's `PyEngine` carries exactly this shape; we
+    /// build a stand-in via Python attribute-shim because constructing
+    /// an actual pre-v2.8.0 PyEngine in-tree would require a separate
+    /// linked copy of persist.
+    ///
+    /// Runs as plain `#[test]` (not `#[tokio::test]`) so the calling
+    /// thread carries no current tokio runtime — symmetric with the
+    /// `acquires` test above.
+    #[test]
+    fn py_init_edge_runtime_fails_typed_when_no_persist_runtime() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let identity_path = tmp.path().join("transport.id");
+
+        // Build a Python object shaped like a pre-v2.8.0 PyEngine: it
+        // responds to the three v2.7.0 substrate capsule methods
+        // (federation_directory_capsule / outbound_queue_capsule /
+        // keyring_signer_capsule — we stub them as raisers since we
+        // never reach them) but does NOT define `runtime_handle_capsule`.
+        // `hasattr(engine, "runtime_handle_capsule")` is False → the
+        // v0.10.1 pre-check in `init_edge_runtime` emits the
+        // version-floor PyRuntimeError before any capsule call.
+        let err = Python::attach(|py| -> PyErr {
+            let pre_v280_engine: Bound<'_, PyAny> = {
+                let locals = pyo3::types::PyDict::new(py);
+                py.run(
+                    c"class PreV280Engine:\n    def federation_directory_capsule(self):\n        raise RuntimeError('unreachable')\n    def outbound_queue_capsule(self):\n        raise RuntimeError('unreachable')\n    def keyring_signer_capsule(self):\n        raise RuntimeError('unreachable')\n_e = PreV280Engine()\n",
+                    Some(&locals),
+                    Some(&locals),
+                )
+                .expect("build pre-v2.8.0 stand-in");
+                locals.get_item("_e").expect("got _e").expect("not None")
+            };
+
+            init_edge_runtime(
+                py,
+                pre_v280_engine,
+                identity_path.to_str().expect("identity path utf8"),
+                "127.0.0.1:0",
+                vec![],
+                300,
+                0,
+                "strict",
+                60,
+            )
+            .err()
+            .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
+        });
+
+        Python::attach(|py| {
+            assert!(
+                err.is_instance_of::<PyRuntimeError>(py),
+                "missing-runtime-capsule failure must surface as PyRuntimeError \
+                 (not panic, not TypeError) so the Python-side handler treats it \
+                 as a typed init error; got {err}",
+            );
+            let msg = err.to_string();
+            // Pin the actionable parts of the diagnostic so future
+            // edits don't accidentally regress the operator-facing
+            // message:
+            //   - mention persist v2.8.0+ as the required floor
+            //   - name the missing method `runtime_handle_capsule`
+            assert!(
+                msg.contains("v2.8.0"),
+                "error message must name the persist version floor; got: {msg}"
+            );
+            assert!(
+                msg.contains("runtime_handle_capsule"),
+                "error message must name the missing capsule method so operators \
+                 can diagnose; got: {msg}"
             );
         });
     }
