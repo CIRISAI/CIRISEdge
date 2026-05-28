@@ -93,6 +93,10 @@ pub fn signed_record(subject: &TestFedKey, signer: &TestFedKey, identity_type: &
         pqc_completed_at: None,
         persist_row_hash: String::new(),
         roles: Vec::new(),
+        // v2.5.0 (CIRISPersist#102 Ask 8) — non-accord-holder rows
+        // carry None; the V048 CHECK admits None for any
+        // identity_type that isn't 'accord_holder'.
+        attestation_evidence: None,
     }
 }
 

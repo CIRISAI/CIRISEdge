@@ -123,6 +123,10 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
         pqc_completed_at: None,
         persist_row_hash: String::new(),
         roles: Vec::new(),
+        // v2.5.0 (CIRISPersist#102 Ask 8) — None for non-accord-holder
+        // rows; admission CHECK requires Some only when identity_type
+        // is 'accord_holder'.
+        attestation_evidence: None,
     }
 }
 
