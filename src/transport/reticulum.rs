@@ -314,6 +314,11 @@ pub struct ReticulumTransport {
     /// peer's provenance chain (CIRISEdge#15 step 4). Mirrors the
     /// `HybridPolicy` edge's verify pipeline runs.
     hybrid_policy: HybridPolicy,
+    /// CIRISEdge#34 — shared event bus. Drives the AsyncIterator
+    /// surface (`subscribe_announces` / `subscribe_interface_events`)
+    /// in `crate::ffi::pyo3`. `None` means a transport built with no
+    /// observability bus (the v0.10.x default; back-compat).
+    event_bus: Option<Arc<crate::events::EventBus>>,
 }
 
 /// Federation-authentication wiring for [`ReticulumTransport`] — the
@@ -345,6 +350,14 @@ pub struct ReticulumAuth {
     /// provenance chain. [`Default`] is [`HybridPolicy::Strict`] —
     /// the production posture, matching `EdgeConfig::default`.
     pub hybrid_policy: HybridPolicy,
+    /// CIRISEdge#34 — optional shared event bus. When supplied, the
+    /// transport emits `transport_up` / `transport_down` interface
+    /// events at `listen` entry/exit, and `announce_received`
+    /// (severity = info | warning per the cold-start verdict) for
+    /// every announce processed by [`resolve_announce_cold_start`].
+    /// `None` → no events emitted (back-compat for callers that don't
+    /// care about the AsyncIterator surface).
+    pub event_bus: Option<Arc<crate::events::EventBus>>,
 }
 
 impl Default for ReticulumAuth {
@@ -354,6 +367,7 @@ impl Default for ReticulumAuth {
             rooting: None,
             resolver: None,
             hybrid_policy: HybridPolicy::Strict,
+            event_bus: None,
         }
     }
 }
@@ -381,6 +395,7 @@ impl ReticulumTransport {
             rooting,
             resolver,
             hybrid_policy,
+            event_bus,
         } = auth;
 
         let identity = load_or_generate_identity(&config.identity_path)?;
@@ -474,6 +489,7 @@ impl ReticulumTransport {
             resolver,
             rooting,
             hybrid_policy,
+            event_bus,
         })
     }
 
@@ -610,6 +626,20 @@ impl Transport for ReticulumTransport {
             "Reticulum transport listening",
         );
 
+        // CIRISEdge#34 — emit `transport_up` interface event. Consumers
+        // subscribed via `PyEdge.subscribe_interface_events()` observe
+        // the moment the transport reaches listening state.
+        if let Some(bus) = self.event_bus.as_ref() {
+            bus.emit_interface(crate::events::NetworkEvent::interface(
+                crate::events::EventKind::TransportUp,
+                "reticulum-rs",
+                format!(
+                    "Reticulum transport listening on {} (dest {})",
+                    self.config.listen_addr, self.local_dest_hash
+                ),
+            ));
+        }
+
         // Announce edge's own destination on startup, then on a timer.
         // The app-data is edge's signed announce attestation
         // (CIRISEdge#15 send side) — a federation-key signature
@@ -651,10 +681,22 @@ impl Transport for ReticulumTransport {
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
                         hybrid_policy: self.hybrid_policy,
+                        event_bus: self.event_bus.as_deref(),
                     };
                     handle_event(event, &ctx).await;
                 }
             }
+        }
+
+        // CIRISEdge#34 — emit `transport_down` interface event on
+        // listener exit. Symmetric with the `transport_up` emission
+        // above; consumers observe shutdown via the same channel.
+        if let Some(bus) = self.event_bus.as_ref() {
+            bus.emit_interface(crate::events::NetworkEvent::interface(
+                crate::events::EventKind::TransportDown,
+                "reticulum-rs",
+                "Reticulum transport listen loop exited",
+            ));
         }
 
         Ok(())
@@ -673,6 +715,10 @@ struct EventCtx<'a> {
     rooting: Option<&'a dyn RootingDirectory>,
     /// Consumer hybrid PQC policy applied to a rooted chain.
     hybrid_policy: HybridPolicy,
+    /// CIRISEdge#34 — shared event bus for announce / interface
+    /// emissions. `None` → no events emitted (the transport was
+    /// constructed without `ReticulumAuth::event_bus`).
+    event_bus: Option<&'a crate::events::EventBus>,
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -805,6 +851,20 @@ async fn resolve_announce_cold_start(
         Ok(a) => a,
         Err(e) => {
             tracing::debug!(error = %e, "announce dropped: app-data is not a valid attestation");
+            // CIRISEdge#34 — surface the parse failure on the announce
+            // stream so operators can see malformed peers without
+            // tailing logs. Severity = warning (not error): this is
+            // commonly a v0.3.1 peer sending a bare-key_id announce,
+            // not a hostile event.
+            if let Some(bus) = ctx.event_bus {
+                bus.emit_announce(crate::events::NetworkEvent::announce(
+                    None,
+                    announce.destination_hash().to_vec(),
+                    announce.app_data().to_vec(),
+                    crate::events::EventSeverity::Warning,
+                    format!("announce dropped: app-data is not a valid attestation: {e}"),
+                ));
+            }
             return;
         }
     };
@@ -893,6 +953,22 @@ async fn resolve_announce_cold_start(
                 epoch = attestation.epoch,
                 "peer ROOTED via authenticated cold-start path",
             );
+            // CIRISEdge#34 — successful root → emit announce_received
+            // event with info severity. The peer key_id is now known
+            // to be authentic; surface it on the announce stream so
+            // the UI can render "peer X joined".
+            if let Some(bus) = ctx.event_bus {
+                bus.emit_announce(crate::events::NetworkEvent::announce(
+                    Some(key_id.clone()),
+                    announce.destination_hash().to_vec(),
+                    announce.app_data().to_vec(),
+                    crate::events::EventSeverity::Info,
+                    format!(
+                        "peer rooted via authenticated cold-start path (epoch {})",
+                        attestation.epoch
+                    ),
+                ));
+            }
             peers.insert(
                 key_id,
                 RootedPeer {

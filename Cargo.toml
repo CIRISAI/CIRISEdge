@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -148,6 +148,31 @@ x509-parser    = { version = "0.16", optional = true }
 reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", version = "0.6", optional = true }
 reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", version = "0.6", optional = true }
 
+# v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
+# canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
+# the data path). We use it ONLY for `export_qr_payload` byte
+# generation; the import side parses the structured envelope we
+# packed in via `serde_json` and does not require pixel decoding.
+qrcodegen = "1.8"
+
+# v0.11.0 (CIRISEdge#34) — Async iterator bridge. `pyo3-async-runtimes`
+# is the successor to `pyo3-asyncio` (renamed in 0.21+); pinned to
+# 0.28 to match the `pyo3` 0.28 pin. Provides the
+# `future_into_py` + `tokio::future_into_py` shims that turn a Rust
+# `Future` into a Python `asyncio.Future`. The `subscribe_*`
+# pymethods return a pyclass implementing `__aiter__` / `__anext__`;
+# `__anext__` constructs a Python awaitable from a
+# `tokio::sync::broadcast::Receiver::recv()` future via this crate.
+# Gated under `pyo3` (only the AsyncIterator surface needs it).
+pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-runtime"] }
+
+# v0.11.0 (CIRISEdge#35) — Stub generator dependency. Runtime-side
+# helpers used by `#[gen_stub_pyclass]` / `#[gen_stub_pymethods]` /
+# `#[gen_stub_pyfunction]`. The matching `pyo3-stub-gen-derive` proc-
+# macros are pulled transitively. We gate this under `pyo3` so a
+# non-pyo3 build doesn't pull the registry machinery.
+pyo3-stub-gen = { version = "0.22", optional = true, default-features = false }
+
 # ─── Optional transports — gated per OQ-02, OQ-07, OQ-13 ────────────
 # Implementations land in subsequent commits; features declared now so
 # downstream pin contracts are stable from v0.1.0.
@@ -202,7 +227,13 @@ transport-reticulum   = ["dep:reticulum-std", "dep:reticulum-core"]
 # and Reticulum is the canonical cohabitation wire (MISSION §1.4). Without
 # this, the maturin wheel build (`features = ["pyo3"]` per pyproject) leaves
 # the reticulum-gated items unused and `-D warnings` fails the build.
-pyo3                  = ["dep:pyo3", "ciris-persist/pyo3", "transport-reticulum"]
+pyo3                  = [
+    "dep:pyo3",
+    "dep:pyo3-async-runtimes",
+    "dep:pyo3-stub-gen",
+    "ciris-persist/pyo3",
+    "transport-reticulum",
+]
 
 # v0.7.0 (CIRISEdge#17) — `extension-module` split out of the `pyo3`
 # feature, mirroring CIRISPersist's discipline (persist v2.0.6+).
@@ -241,6 +272,16 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "emit_edge_extras"
 path = "src/bin/emit_edge_extras.rs"
+
+# v0.11.0 (CIRISEdge#35) — pyo3-stub-gen driver. Walks the inventory of
+# `#[gen_stub_pyclass]` / `#[gen_stub_pymethods]` / `#[gen_stub_pyfunction]`
+# items registered at link time and writes `python/ciris_edge/__init__.pyi`.
+# Required-features = ["pyo3"] so the stub-gen helpers are linked in.
+# CI gate: `cargo run --features pyo3 --bin stub_gen && git diff --exit-code python/ciris_edge/__init__.pyi`.
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
+required-features = ["pyo3"]
 
 # ─── Criterion benches (docs/BENCHMARKS.md) ─────────────────────────
 #

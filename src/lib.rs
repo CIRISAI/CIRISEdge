@@ -29,6 +29,7 @@
 #![doc(html_root_url = "https://docs.rs/ciris-edge/0.1.0-pre1")]
 
 mod edge;
+pub mod events;
 pub mod ffi;
 pub mod handler;
 pub mod identity;
@@ -40,6 +41,9 @@ pub mod transport;
 pub mod verify;
 
 pub use edge::{Edge, EdgeBuilder, EdgeConfig, EdgeError};
+pub use events::{
+    EventBus, EventKind, EventSeverity, NetworkEvent, DEFAULT_EVENT_CHANNEL_CAPACITY,
+};
 pub use handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, FederationPriority,
     Handler, HandlerContext, HandlerError, InlineTextMessage, Message,

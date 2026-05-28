@@ -65,6 +65,19 @@ pub struct EdgeConfig {
     pub max_content_body_bytes: usize,
     /// Outbound dispatcher tunables.
     pub dispatcher: DispatcherConfig,
+    /// CIRISEdge#31 — optional file path persisting the operator-set
+    /// local display name. `None` → display name lives only in-process
+    /// (lost on restart). `Some(path)` → the name is read from `path`
+    /// at `Edge::build` and written on every `set_local_display_name`
+    /// call. UTF-8 text file; whitespace-trimmed; max 256 bytes
+    /// enforced at the setter site. Read errors at build time are
+    /// non-fatal (no name set); write errors at setter time surface as
+    /// [`EdgeError::Config`].
+    pub display_name_path: Option<std::path::PathBuf>,
+    /// CIRISEdge#34 — per-channel capacity for the
+    /// [`crate::events::EventBus`] broadcast channels. Default
+    /// [`crate::events::DEFAULT_EVENT_CHANNEL_CAPACITY`] (1024).
+    pub event_channel_capacity: usize,
 }
 
 impl Default for EdgeConfig {
@@ -86,6 +99,8 @@ impl Default for EdgeConfig {
             // body-level pin.
             max_content_body_bytes: crate::messages::DEFAULT_MAX_CONTENT_BODY_BYTES,
             dispatcher: DispatcherConfig::default(),
+            display_name_path: None,
+            event_channel_capacity: crate::events::DEFAULT_EVENT_CHANNEL_CAPACITY,
         }
     }
 }
@@ -211,6 +226,19 @@ pub struct Edge {
     /// CIRISEdge#18; the bypass is exercised in
     /// `tests/federation_announcement_mandatory.rs`).
     subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
+    /// CIRISEdge#34 — per-category broadcast bus for AsyncIterator
+    /// subscribers. Construction is unconditional (`Arc<EventBus>`
+    /// always present); emission is fire-and-forget at the call site,
+    /// so a build without subscribers has zero overhead beyond the
+    /// `Arc` refcount.
+    events: Arc<crate::events::EventBus>,
+    /// CIRISEdge#31 — operator-set local display name. Backs
+    /// `local_display_name` / `set_local_display_name` on the
+    /// pyo3 surface. Persisted to disk if [`EdgeConfig::display_name_path`]
+    /// is set; otherwise lives only for the lifetime of the process.
+    /// `Arc<RwLock<_>>` so the read path (called from every UI render)
+    /// doesn't block writers; setter is rare (operator-initiated).
+    display_name: Arc<std::sync::RwLock<Option<String>>>,
     config: EdgeConfig,
 }
 
@@ -225,6 +253,7 @@ pub struct EdgeBuilder {
     peer_directory: Option<Arc<dyn PeerDirectory>>,
     steward_directory: Option<Arc<dyn StewardDirectory>>,
     subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
+    events: Option<Arc<crate::events::EventBus>>,
     config: EdgeConfig,
 }
 
@@ -240,8 +269,67 @@ impl Edge {
             peer_directory: None,
             steward_directory: None,
             subscription_filter: None,
+            events: None,
             config: EdgeConfig::default(),
         }
+    }
+
+    /// CIRISEdge#34 accessor — the shared [`crate::events::EventBus`].
+    /// Cheap Arc clone; consumers (the pyo3 surface, internal emission
+    /// helpers, tests) call `subscribe_*` to get a fresh receiver.
+    #[must_use]
+    pub fn events(&self) -> Arc<crate::events::EventBus> {
+        self.events.clone()
+    }
+
+    /// CIRISEdge#31 — read the operator-set local display name. Returns
+    /// `None` when no name was ever set, OR when the configured
+    /// `display_name_path` couldn't be read at `Edge::build` time.
+    /// O(1) — backed by an `Arc<RwLock<Option<String>>>`.
+    #[must_use]
+    pub fn local_display_name(&self) -> Option<String> {
+        self.display_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// CIRISEdge#31 — set the operator-set local display name. `name`
+    /// is whitespace-trimmed; empty after trim clears the name; longer
+    /// than 256 bytes after trim rejects with [`EdgeError::Config`].
+    /// When [`EdgeConfig::display_name_path`] is set, the trimmed
+    /// value (or empty file) is written atomically (`tempfile + rename`
+    /// would be ideal; for v0.11 we use a plain write — the file is a
+    /// single-process owner and a half-written name on crash means the
+    /// next build sees a partial UTF-8 sequence and falls back to
+    /// `None`, which is the right failure mode).
+    pub fn set_local_display_name(&self, name: &str) -> Result<(), EdgeError> {
+        let trimmed = name.trim();
+        if trimmed.len() > 256 {
+            return Err(EdgeError::Config(format!(
+                "display name must be <= 256 bytes after trim, got {}",
+                trimmed.len()
+            )));
+        }
+        let new_value = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        if let Some(path) = self.config.display_name_path.as_ref() {
+            let payload = new_value.as_deref().unwrap_or("");
+            std::fs::write(path, payload).map_err(|e| {
+                EdgeError::Config(format!("write display_name_path {path:?}: {e}"))
+            })?;
+        }
+        {
+            let mut guard = self
+                .display_name
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = new_value;
+        }
+        Ok(())
     }
 
     /// Register a typed handler for message type `M`. Compile-time
@@ -1384,6 +1472,18 @@ impl EdgeBuilder {
         self
     }
 
+    /// CIRISEdge#34 — supply a pre-built [`crate::events::EventBus`].
+    /// Optional; if omitted the builder constructs one at `build()`
+    /// time with [`EdgeConfig::event_channel_capacity`]. Useful when
+    /// a sibling cdylib (CIRISLensCore, CIRISNodeCore) wants to wire
+    /// edge's event emissions into the same bus the host already
+    /// owns — share the `Arc<EventBus>` across the construction.
+    #[must_use]
+    pub fn events(mut self, events: Arc<crate::events::EventBus>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
     /// Configure the outbound inline-text pipeline. When set, edge
     /// runs it on every `send_inline` / `send_durable_inline` call
     /// before signing + shipping. Construct via
@@ -1470,6 +1570,24 @@ impl EdgeBuilder {
             self.config.max_replay_entries,
         ));
 
+        let events = self.events.unwrap_or_else(|| {
+            Arc::new(crate::events::EventBus::with_capacity(
+                self.config.event_channel_capacity,
+            ))
+        });
+
+        // CIRISEdge#31 — load display_name from disk if configured.
+        // Best-effort: a missing/unreadable file leaves the name unset
+        // (operator hasn't set one yet, or filesystem hiccup); the
+        // setter path is the canonical source of truth going forward.
+        let display_name = self
+            .config
+            .display_name_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.len() <= 256);
+
         Ok(Edge {
             verify,
             queue,
@@ -1482,6 +1600,8 @@ impl EdgeBuilder {
             peer_directory: self.peer_directory,
             steward_directory: self.steward_directory,
             subscription_filter: self.subscription_filter,
+            events,
+            display_name: Arc::new(std::sync::RwLock::new(display_name)),
             config: self.config,
         })
     }

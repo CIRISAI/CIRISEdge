@@ -82,11 +82,7 @@ async fn signer_for(key: &TestFedKey, base: &std::path::Path) -> Arc<LocalSigner
     })
     .await
     .expect("load_local_seed");
-    Arc::new(LocalSigner {
-        key_id: key.key_id.clone(),
-        classical,
-        pqc: None,
-    })
+    Arc::new(LocalSigner::new(key.key_id.clone(), classical, None))
 }
 
 /// Build a `ReticulumAuth` for `key`, rooted against the shared

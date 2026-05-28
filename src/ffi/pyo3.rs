@@ -1141,11 +1141,11 @@ fn init_edge_runtime(
     // `Arc<dyn HardwareSigner>` + optional `Arc<dyn PqcSigner>` the
     // host loaded; wrap them in edge's local-signer struct without
     // re-bootstrapping the keyring (AV-17 / COHABITATION rule 1).
-    let signer = Arc::new(LocalSigner {
-        key_id: signer_handle.key_id.clone(),
-        classical: signer_handle.signer.clone(),
-        pqc: signer_handle.pqc_signer.clone(),
-    });
+    let signer = Arc::new(LocalSigner::new(
+        signer_handle.key_id.clone(),
+        signer_handle.signer.clone(),
+        signer_handle.pqc_signer.clone(),
+    ));
 
     // ── Step 4: parse the Reticulum transport config.
     let listen_addr = listen_addr
@@ -1358,11 +1358,11 @@ mod tests {
         // descriptor).
         let classical = Arc::new(Ed25519SoftwareSigner::new("test-edge-cohabitation"));
         let pqc = Arc::new(MlDsa65SoftwareSigner::new("test-edge-cohabitation-pqc"));
-        let signer = Arc::new(LocalSigner {
-            key_id: "test-edge-cohabitation".into(),
+        let signer = Arc::new(LocalSigner::new(
+            "test-edge-cohabitation",
             classical,
-            pqc: Some(pqc),
-        });
+            Some(pqc),
+        ));
 
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
 
@@ -1581,11 +1581,7 @@ mod pyo3_tier2_tests {
         }
 
         let queue: Arc<dyn OutboundHandle> = backend.clone();
-        let signer = Arc::new(LocalSigner {
-            key_id: "py-tier2-edge".into(),
-            classical,
-            pqc: None,
-        });
+        let signer = Arc::new(LocalSigner::new("py-tier2-edge", classical, None));
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let edge = Edge::builder()
             .directory(backend.clone() as Arc<dyn VerifyDirectory>)
@@ -2051,11 +2047,7 @@ mod pyo3_tier2_tests {
         })
         .await
         .expect("load_local_seed");
-        let signer = Arc::new(LocalSigner {
-            key_id: "py-tier2-pipeline-edge".into(),
-            classical,
-            pqc: None,
-        });
+        let signer = Arc::new(LocalSigner::new("py-tier2-pipeline-edge", classical, None));
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let pipeline: Arc<Pipeline<InlineTextEnvelope>> = Arc::new(
             PipelineBuilder::new()

@@ -87,11 +87,7 @@ impl FedKey {
         })
         .await
         .expect("load_local_seed");
-        Arc::new(LocalSigner {
-            key_id: self.key_id.clone(),
-            classical,
-            pqc: None,
-        })
+        Arc::new(LocalSigner::new(self.key_id.clone(), classical, None))
     }
 }
 
