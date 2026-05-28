@@ -169,6 +169,24 @@ pub enum MessageType {
     /// (Classify + Scrub + EncryptAndStore per FSD §1.4) runs on the
     /// `text` field before signing.
     InlineText,
+
+    // ─── CIRISEdge#41 (v0.11.1) — typed Goal federation transport ───
+    /// CIRISLensCore F-3 detector family input. Wraps the persist v2.10.0
+    /// (CIRISPersist#114) typed [`ciris_persist::federation::goal::Goal`]
+    /// primitive whose `MetaGoalAlignment` is a structural construction-
+    /// time invariant — every Goal that crosses the wire carries an M-1
+    /// alignment payload. Durable; lens-core's `Handler<GoalDeclaration>`
+    /// must land the row (cohabitation pattern). Body:
+    /// [`GoalDeclaration`].
+    GoalDeclaration,
+    /// CIRISEdge#41 (v0.11.1) — single-signer retirement of a previously-
+    /// declared Goal. Mirrors persist v2.10.0's `retire_goal` API
+    /// (`(goal_id, retired_at)` shape); the envelope's hybrid signature
+    /// IS the proof-of-authority (no body-internal signatures at v0.11.1).
+    /// Quorum-signed retirement for `GoalScope::Federation` goals deferred
+    /// to a future amendment per CIRISEdge#41 body §"Out of scope". Body:
+    /// [`GoalRetirement`].
+    GoalRetirement,
 }
 
 /// The signed wire envelope. Carries one verified message + the
@@ -1501,6 +1519,267 @@ pub fn encode_canonical_hash_base64(hash: &[u8; 32]) -> String {
 #[must_use]
 pub fn encode_signature_base64(sig: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sig)
+}
+
+// ─── CIRISEdge#41 (v0.11.1) — GoalDeclaration / GoalRetirement ──────
+//
+// Federation transport for the typed `Goal` primitive landed in
+// CIRISPersist#114 (persist v2.10.0). The F-3 detector family
+// (CIRISLensCore#23 / #24 / #26) aggregates goals across the
+// federation by `goal_id`; without these wire types the only
+// goal-shaped data crossing the federation was the agent's untyped
+// `deferred_goals: serde_json::Value` blob in the continuity-awareness
+// snapshot — not typed, not signed as a goal, not addressable by
+// `goal_id`. This module closes the transport gap.
+//
+// **Persist field-name note.** The CIRISEdge#41 issue body refers to
+// an `m1_rationale` field that the canonical bytes MUST include.
+// Persist v2.10.0's [`Goal`] structure carries that data on
+// `goal.meta_goal_alignment.rationale: String` (the M-1 rationale)
+// alongside `goal.meta_goal_alignment.dimension: M1Dimension` (which
+// M-1 dimension the goal serves). The canonical-bytes encoder below
+// includes BOTH — dimension + rationale — so the F-3 detector input
+// is byte-stably bound to both the dimensional claim and the
+// declarer's reasoning. Excluding the rationale would let a declarer
+// trivially route around F-3 (same dimension, different
+// reasoning-content, same canonical bytes — exactly the
+// attractor-capture failure mode MISSION.md §1 names).
+//
+// **Persist does NOT export `SignedGoalRetirement`.** The CIRISEdge#41
+// issue body sketches a `pub struct GoalRetirement(pub
+// ciris_persist::schema::SignedGoalRetirement)` shape, but persist
+// v2.10.0's `retire_goal` API takes only `(goal_id: Uuid, retired_at:
+// DateTime<Utc>)` — there is no `SignedGoalRetirement` type. The wire
+// shape below is a self-contained payload (goal_id, retired_at,
+// retired_by_key_id, optional reason); the envelope's hybrid Ed25519 +
+// ML-DSA-65 signature provides the cryptographic binding (same shape
+// every other federation primitive uses — edge does not double-sign
+// inside the body). Quorum-signed retirements for
+// `GoalScope::Federation` defer to a future amendment per the issue
+// body §"Out of scope".
+
+/// Domain-separation tag for [`GoalDeclaration::canonical_bytes`].
+/// **LOCKED** wire constant — mirrors [`DELIVERY_ATTESTATION_DOMAIN`]
+/// pattern. Changing this is a coordinated CIRISEdge + CIRISLensCore +
+/// CIRISPersist break.
+pub const GOAL_DECLARATION_DOMAIN: &[u8] = b"ciris-edge-goal-declaration-v1";
+
+/// Domain-separation tag for [`GoalRetirement::canonical_bytes`].
+/// **LOCKED** wire constant — mirrors [`DELIVERY_ATTESTATION_DOMAIN`]
+/// pattern. Changing this is a coordinated CIRISEdge + CIRISLensCore +
+/// CIRISPersist break.
+pub const GOAL_RETIREMENT_DOMAIN: &[u8] = b"ciris-edge-goal-retirement-v1";
+
+/// Federation transport wrapper for the persist v2.10.0 (CIRISPersist#114)
+/// typed [`ciris_persist::federation::goal::Goal`] primitive.
+///
+/// Transparent newtype — the wire body is the persist `Goal`'s
+/// `serde_json` form verbatim. Receivers deserialize into
+/// `ciris_persist::federation::goal::Goal` and hand to lens-core's
+/// `Handler<GoalDeclaration>` which calls
+/// `FederationDirectory::put_goal` per the cohabitation pattern.
+///
+/// # Wire-level invariants
+///
+/// 1. **M-1 alignment is structural.** Persist's `Goal::new` takes
+///    [`MetaGoalAlignment`](ciris_persist::federation::goal::MetaGoalAlignment)
+///    by value (not `Option`), so a `Goal` cannot deserialize without
+///    it — the receiver's deserializer rejects bodies missing the field.
+/// 2. **Canonical bytes include `meta_goal_alignment` (dimension +
+///    rationale).** See [`GoalDeclaration::canonical_bytes`] — required
+///    so a declarer cannot route around F-3 by varying rationale
+///    while keeping the same canonical bytes.
+/// 3. **Durable delivery.** Goals are federation evidence; F-3
+///    aggregation requires they reach every interested peer (not
+///    best-effort). Same shape as [`BuildManifestPublication`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(transparent)]
+pub struct GoalDeclaration(pub ciris_persist::federation::goal::Goal);
+
+/// Lens-core's response to a [`GoalDeclaration`]. Distinguishes accept
+/// (the goal landed in the `goals` table — `accepted = true`,
+/// `reason = None`) from reject (`accepted = false`,
+/// `reason = Some(...)` — e.g. duplicate `goal_id`, declared_by mismatch
+/// against envelope sender, scope-policy violation).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GoalDeclarationResponse {
+    /// `true` iff the goal landed in persist; `false` if lens-core
+    /// rejected (and `reason` is populated).
+    pub accepted: bool,
+    /// Echo of the declared goal's `goal_id` (correlation key for the
+    /// originating declarer; the envelope's `in_reply_to` covers the
+    /// envelope-level correlation, this field covers body-level).
+    pub goal_id: uuid::Uuid,
+    /// `None` on accept; populated on reject with a short human-readable
+    /// rationale. NOT a closed-vocabulary enum at v0.11.1 — lens-core
+    /// owns the rejection taxonomy; future cuts may type-narrow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Message for GoalDeclaration {
+    const TYPE: MessageType = MessageType::GoalDeclaration;
+    /// Durable, requires_ack — federation evidence for F-3
+    /// aggregation; the response carries accept/reject and lens-core
+    /// must observably succeed or fail. Same long-haul shape as
+    /// [`BuildManifestPublication`] (week-long TTL, 100 attempts,
+    /// 5-minute ack timeout) — goals are slow-cadence federation
+    /// state, not chat-tier.
+    const DELIVERY: Delivery = Delivery::Durable {
+        requires_ack: true,
+        max_attempts: 100,
+        ttl_seconds: 7 * 24 * 60 * 60, // 7 days
+        ack_timeout_seconds: Some(300),
+    };
+    type Response = GoalDeclarationResponse;
+}
+
+impl GoalDeclaration {
+    /// Canonical bytes for the GoalDeclaration body — length-prefixed
+    /// injective encoding, mirroring [`DeliveryAttestation::canonical_bytes`]
+    /// pattern. Includes:
+    ///
+    /// - `goal_id` (UUID string form, 36 bytes)
+    /// - `declared_by_key_id`
+    /// - `declared_at` (i64 ms big-endian, 8 bytes fixed)
+    /// - `goal_text`
+    /// - `scope_kind` (string token: `"single_declarer"` / `"cohort"` /
+    ///   `"federation"`)
+    /// - optional `cohort_id` (length-prefixed Option discriminant)
+    /// - `meta_goal_alignment.dimension` (string token)
+    /// - **`meta_goal_alignment.rationale`** — the load-bearing
+    ///   M-1 rationale field per CIRISEdge#41 + CIRISPersist#114
+    ///   §"Why M-1 is structural"
+    ///
+    /// Excludes `retired_at` (a declaration cannot carry a retirement
+    /// marker — the wire shape is pre-retirement by construction;
+    /// retirement rides [`GoalRetirement`]).
+    ///
+    /// `DOMAIN` is [`GOAL_DECLARATION_DOMAIN`]. Length prefixes make
+    /// the encoding injective — distinct field tuples never share a
+    /// byte string.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let g = &self.0;
+        let goal_id_str = g.goal_id.to_string();
+        let dimension_str = g.meta_goal_alignment.dimension.as_str();
+        let scope_kind_str = g.scope.scope_kind_str();
+        let cohort_id_opt = g.scope.cohort_id();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(GOAL_DECLARATION_DOMAIN);
+        write_len_prefixed(&mut out, goal_id_str.as_bytes());
+        write_len_prefixed(&mut out, g.declared_by_key_id.as_bytes());
+        out.extend_from_slice(&g.declared_at.timestamp_millis().to_be_bytes());
+        write_len_prefixed(&mut out, g.goal_text.as_bytes());
+        write_len_prefixed(&mut out, scope_kind_str.as_bytes());
+        match cohort_id_opt {
+            Some(c) => {
+                out.push(1u8);
+                write_len_prefixed(&mut out, c.as_bytes());
+            }
+            None => out.push(0u8),
+        }
+        write_len_prefixed(&mut out, dimension_str.as_bytes());
+        // **Load-bearing field.** The F-3 detector family is predicated
+        // on the declarer having claimed an M-1 rationale; binding the
+        // rationale bytes into the canonical-bytes domain prevents a
+        // declarer from holding the SAME canonical bytes while
+        // mutating the rationale (the trivial attractor-capture
+        // route-around). See module-level note + CIRISEdge#41.
+        write_len_prefixed(&mut out, g.meta_goal_alignment.rationale.as_bytes());
+
+        out
+    }
+}
+
+/// Federation transport of a single-signer goal retirement. The
+/// envelope's hybrid Ed25519 + ML-DSA-65 signature IS the
+/// proof-of-authority — there are no body-internal signatures at
+/// v0.11.1 (quorum-signed retirements deferred per CIRISEdge#41
+/// §"Out of scope").
+///
+/// Maps onto persist v2.10.0's `retire_goal(goal_id, retired_at)`
+/// API; receivers (lens-core's `Handler<GoalRetirement>`) call that
+/// directly per the cohabitation pattern. `retired_by_key_id` is
+/// cross-checked against the originating goal's `declared_by_key_id`
+/// at the consumer (lens-core enforcement; edge is reach, not gate
+/// per MISSION.md §1.3).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GoalRetirement {
+    /// The `goal_id` of the previously-declared [`Goal`] to retire.
+    pub goal_id: uuid::Uuid,
+    /// Wall-clock at retirement. Sealed into the signed envelope —
+    /// the receiver passes this through to `retire_goal`.
+    pub retired_at: DateTime<Utc>,
+    /// `federation_keys.key_id` of the party retiring the goal.
+    /// MUST match (lens-core enforcement) the originating
+    /// `declared_by_key_id` for `GoalScope::SingleDeclarer` and
+    /// `GoalScope::Cohort` goals; `GoalScope::Federation` retirement
+    /// requires quorum and is deferred at v0.11.1.
+    pub retired_by_key_id: String,
+    /// Optional human-readable rationale (audit-chain only; not used
+    /// for retirement enforcement at v0.11.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Receiver's response to a [`GoalRetirement`]. The `retired_at` is
+/// echoed back — lens-core MAY clamp / round (persist's `retire_goal`
+/// is idempotent, so the canonical timestamp is the first-write one),
+/// so the response carries the stored value rather than the sender's
+/// proposed value.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GoalRetirementResponse {
+    /// `true` iff the retirement landed (or was already retired —
+    /// persist's `retire_goal` is idempotent per CIRISPersist#114).
+    pub accepted: bool,
+    /// Canonical `retired_at` as stored in persist — the first-write
+    /// timestamp on idempotent re-retire; the sender's proposed value
+    /// otherwise.
+    pub retired_at: DateTime<Utc>,
+}
+
+impl Message for GoalRetirement {
+    const TYPE: MessageType = MessageType::GoalRetirement;
+    /// Durable, requires_ack — an unrecorded retirement looks the
+    /// same as a live goal to the F-3 detector (the false-positive
+    /// failure mode CIRISEdge#41 §"Delivery posture" calls out). Same
+    /// long-haul shape as [`GoalDeclaration`].
+    const DELIVERY: Delivery = Delivery::Durable {
+        requires_ack: true,
+        max_attempts: 100,
+        ttl_seconds: 7 * 24 * 60 * 60, // 7 days
+        ack_timeout_seconds: Some(300),
+    };
+    type Response = GoalRetirementResponse;
+}
+
+impl GoalRetirement {
+    /// Canonical bytes for the GoalRetirement body — length-prefixed
+    /// injective encoding, mirroring [`DeliveryAttestation::canonical_bytes`]
+    /// pattern. Includes goal_id, retired_at (i64 ms big-endian),
+    /// retired_by_key_id, and the optional reason (Option discriminant
+    /// + len-prefixed bytes when present).
+    ///
+    /// `DOMAIN` is [`GOAL_RETIREMENT_DOMAIN`].
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let goal_id_str = self.goal_id.to_string();
+        let mut out = Vec::new();
+        out.extend_from_slice(GOAL_RETIREMENT_DOMAIN);
+        write_len_prefixed(&mut out, goal_id_str.as_bytes());
+        out.extend_from_slice(&self.retired_at.timestamp_millis().to_be_bytes());
+        write_len_prefixed(&mut out, self.retired_by_key_id.as_bytes());
+        match self.reason.as_ref() {
+            Some(r) => {
+                out.push(1u8);
+                write_len_prefixed(&mut out, r.as_bytes());
+            }
+            None => out.push(0u8),
+        }
+        out
+    }
 }
 
 #[cfg(test)]
