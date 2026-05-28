@@ -1,0 +1,118 @@
+name: Bench
+
+# Runs the criterion benchmark suite (docs/BENCHMARKS.md) on every
+# push to main + on manual dispatch, and publishes the criterion HTML
+# report + a text summary as artifacts. NOT a pass/fail gate —
+# GitHub's shared runners are too noisy for pass/fail regression
+# detection. This job answers "what are our numbers" and surfaces
+# unexplained curve shapes (a step-function on `dispatch_inbound`'s
+# MessageType slope would be the AV-22 regression-shape the doc calls
+# out). The allocation-stability leak guarantee is a regular test
+# (`alloc_stability`) that DOES gate, in ci.yml.
+#
+# The ci.yml `benches` job stays as the fast per-PR compile gate
+# (`cargo bench --no-run`). This workflow is the slow, actually-run
+# pass — same cadence as CIRISVerify's bench.yml (push-to-main +
+# workflow_dispatch).
+
+on:
+  # Daily regression cadence — catches drift within 24h without
+  # burning CI minutes on every main-push. The fast inner-loop
+  # bit-rot check is the `cargo bench --no-run` gate in ci.yml.
+  schedule:
+    - cron: "23 5 * * *"
+  # On-demand: run the suite against an arbitrary commit (PR review,
+  # post-refactor curve check, etc.).
+  workflow_dispatch:
+  # Tag pushes always record numbers so each release's curves are
+  # captured in the GH Actions artifact set alongside the manifest.
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Criterion Benchmark Suite
+    runs-on: ubuntu-latest
+    # Benches are long; don't let a hung run burn the hour budget.
+    # The Reticulum loopback alone is ~30 s of cold-start discovery
+    # before the bench iter starts; plus all 11 benches × ~30 s
+    # measurement budget each ≈ ~10 min realistic, 45 min hard cap.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # libtss2 for the `tpm` keyring feature — auto-enabled by
+      # ciris-persist v1.10.0+ for Linux targets. Same dep edge's
+      # `linux-x86_64-test` job in ci.yml installs (CIRISEdge#12).
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        # CI hardening: cache restore is a speedup, not a correctness
+        # gate. A flaky runner / Actions infra hiccup should downgrade
+        # to "build from scratch this run", not abort the job
+        # (CIRISVerify v2.1.1+ pattern).
+        continue-on-error: true
+        with:
+          # Exclude ~/.cargo/bin to prevent rustup-init shadow
+          # poisoning. See CIRISVerify v2.1.4 / CIRISPersist v0.7.3
+          # for the full rationale.
+          cache-bin: false
+
+      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
+        shell: bash
+        run: |
+          if cargo build --help 2>&1 | grep -q "rustup-init"; then
+            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
+            rm -rf "$HOME/.cargo/bin"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup default stable
+          cargo --version
+          cargo build --help >/dev/null
+
+      # Default-feature benches per BENCHMARKS.md "Running":
+      #   envelope_canonicalize, envelope_verify, dispatch_inbound,
+      #   outbound_enqueue, accord_threshold_verify, steward_fanout,
+      #   content_fetch_roundtrip, inline_text_pipeline.
+      - name: Run default-feature benches
+        run: cargo bench --benches 2>&1 | tee bench-results.txt
+
+      # Feature-gated benches — invoked separately per BENCHMARKS.md
+      # "Running" section (the same surface the human running locally
+      # invokes). Splitting them out keeps the curve labels grouped
+      # per-transport in the HTML report rather than interleaved.
+      - name: Run transport-http loopback bench
+        run: |
+          cargo bench --features "transport-http" \
+            --bench transport_http_loopback 2>&1 | tee -a bench-results.txt
+
+      - name: Run transport-reticulum loopback bench
+        run: |
+          cargo bench --features "transport-reticulum" \
+            --bench transport_reticulum_loopback 2>&1 | tee -a bench-results.txt
+
+      - name: Run pyo3 subscription_throughput bench
+        run: |
+          cargo bench --features "pyo3" \
+            --bench subscription_throughput 2>&1 | tee -a bench-results.txt
+
+      - name: Upload criterion report
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: target/criterion/
+          if-no-files-found: warn
+
+      - name: Upload results summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-txt
+          path: bench-results.txt
+          if-no-files-found: warn

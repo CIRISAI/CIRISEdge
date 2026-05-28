@@ -847,6 +847,42 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # ─── benches: per-PR compile gate for the criterion bench suite ─────
+  #
+  # `cargo bench --no-run` compiles every bench in `benches/` without
+  # running any. Cheap (~30 s on a warm cache) and catches bit-rot
+  # the moment a bench file's API drifts from the crate surface —
+  # without burning the per-run runner minutes a full
+  # `cargo bench --workspace` would (criterion sample budgets are
+  # measured in minutes).
+  #
+  # Per `docs/BENCHMARKS.md`:
+  #   "ci.yml's `benches` job (proposed) is the fast per-PR gate: it
+  #    compiles every bench (--no-run, including the feature-gated
+  #    transports + pyo3 subscription) so they cannot bit-rot, without
+  #    running them."
+  #
+  # The actual measurement pass is `bench.yml` (push-to-main +
+  # workflow_dispatch). NOT a pass/fail performance gate — that
+  # discipline is the `alloc_stability` test in the normal test job
+  # (the leak guarantee), not noisy wall-clock numbers.
+  benches:
+    name: cargo bench --no-run (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # libtss2 — same dep linux-x86_64-test installs (CIRISEdge#12).
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo bench --no-run (all features)
+        # All three feature-gates so EVERY bench file compiles in
+        # this gate — the feature-gated benches (transport-reticulum,
+        # transport-http, pyo3) cannot bit-rot silently.
+        run: |
+          cargo bench --no-run --features "transport-http transport-reticulum pyo3"
+
   # ─── pyo3-wheel: maturin abi3-py310 wheels ──────────────────────────
   #
   # Three wheels per release. Matrix mirrors CIRISPersist exactly
