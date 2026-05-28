@@ -86,6 +86,15 @@ tracing     = "0.1"
 # IDs
 uuid        = { version = "1", features = ["v4", "serde"] }
 
+# CIRISEdge#29 (v0.11.0) — `parking_lot::RwLock` backs
+# `ReachabilityTracker`'s per-(peer, medium) map. Chosen over
+# `dashmap` (extra license surface, contention-tuning we don't need)
+# and `std::sync::RwLock` (slower uncontended path, less predictable
+# fairness). Already a transitive dep via tokio's `parking_lot`
+# feature; the explicit pin is a single MIT-licensed surface (per
+# deny.toml § licenses.allow) and makes the dep audit-explicit.
+parking_lot = "0.12"
+
 # HTTP transport — feature-gated below
 axum  = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }

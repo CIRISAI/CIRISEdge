@@ -1171,6 +1171,17 @@ fn init_edge_runtime(
         rooting: Some(rooting_dir.clone()),
         resolver: None,
         hybrid_policy,
+        // CIRISEdge#29 (v0.11.0) — wire the reachability tracker into
+        // the Reticulum transport via a post-build `Edge::run`-time
+        // attach is the cleanest threading (the transport is built
+        // BEFORE Edge, so Edge's `reachability_tracker()` accessor
+        // isn't available here). Leaving `None` keeps the cohabitation
+        // path compiling; the v0.16.0 FFI cut (sibling agent's
+        // territory, CIRISEdge#22 Tier 3 wiring) will either (a)
+        // restructure to build the tracker first then thread into both
+        // surfaces, or (b) move the AnnounceReceived hook out of the
+        // transport entirely (publish-subscribe on the resolver path).
+        reachability: None,
     };
 
     // ── Step 5: build the transport + Edge under the host runtime.

@@ -85,6 +85,7 @@ async fn auth_for(
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
         hybrid_policy: HybridPolicy::Ed25519Fallback,
+        ..ReticulumAuth::default()
     }
 }
 

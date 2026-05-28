@@ -102,6 +102,7 @@ async fn auth_for(
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
         hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        ..ReticulumAuth::default()
     }
 }
 

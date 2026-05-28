@@ -93,6 +93,7 @@ use reticulum_std::NodeEvent;
 use super::attestation::{AnnounceAttestation, AttestationError, AttestationPayload};
 use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 use crate::identity::LocalSigner;
+use crate::reachability::{AttemptOutcome, ReachabilityTracker};
 use crate::verify::{
     HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
 };
@@ -314,6 +315,11 @@ pub struct ReticulumTransport {
     /// peer's provenance chain (CIRISEdge#15 step 4). Mirrors the
     /// `HybridPolicy` edge's verify pipeline runs.
     hybrid_policy: HybridPolicy,
+    /// CIRISEdge#29 (v0.11.0) — per-medium reachability tracker. See
+    /// [`ReticulumAuth::reachability`] for the contract; threaded
+    /// through to the event loop's [`EventCtx`] so a rooted announce
+    /// records an [`AttemptOutcome::AnnounceReceived`].
+    reachability: Option<Arc<ReachabilityTracker>>,
 }
 
 /// Federation-authentication wiring for [`ReticulumTransport`] — the
@@ -345,6 +351,15 @@ pub struct ReticulumAuth {
     /// provenance chain. [`Default`] is [`HybridPolicy::Strict`] —
     /// the production posture, matching `EdgeConfig::default`.
     pub hybrid_policy: HybridPolicy,
+    /// CIRISEdge#29 (v0.11.0) — per-medium reachability tracker. When
+    /// `Some`, every successfully-rooted announce records an
+    /// [`AttemptOutcome::AnnounceReceived`] against `(peer_key_id,
+    /// TransportId::RETICULUM_RS)`. Passive reachability evidence —
+    /// proof of liveness, not of delivery. Production wiring threads
+    /// `edge.reachability_tracker()` here; tests omit (the field
+    /// defaults to `None` so all existing Reticulum tests compile
+    /// unchanged).
+    pub reachability: Option<Arc<ReachabilityTracker>>,
 }
 
 impl Default for ReticulumAuth {
@@ -354,6 +369,7 @@ impl Default for ReticulumAuth {
             rooting: None,
             resolver: None,
             hybrid_policy: HybridPolicy::Strict,
+            reachability: None,
         }
     }
 }
@@ -381,6 +397,7 @@ impl ReticulumTransport {
             rooting,
             resolver,
             hybrid_policy,
+            reachability,
         } = auth;
 
         let identity = load_or_generate_identity(&config.identity_path)?;
@@ -474,6 +491,7 @@ impl ReticulumTransport {
             resolver,
             rooting,
             hybrid_policy,
+            reachability,
         })
     }
 
@@ -651,6 +669,7 @@ impl Transport for ReticulumTransport {
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
                         hybrid_policy: self.hybrid_policy,
+                        reachability: self.reachability.as_ref(),
                     };
                     handle_event(event, &ctx).await;
                 }
@@ -673,6 +692,11 @@ struct EventCtx<'a> {
     rooting: Option<&'a dyn RootingDirectory>,
     /// Consumer hybrid PQC policy applied to a rooted chain.
     hybrid_policy: HybridPolicy,
+    /// CIRISEdge#29 — per-medium reachability tracker. `Some` →
+    /// every successfully-rooted announce records an
+    /// `AttemptOutcome::AnnounceReceived` against `(peer_key_id,
+    /// TransportId::RETICULUM_RS)`.
+    reachability: Option<&'a Arc<ReachabilityTracker>>,
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -893,6 +917,20 @@ async fn resolve_announce_cold_start(
                 epoch = attestation.epoch,
                 "peer ROOTED via authenticated cold-start path",
             );
+            // CIRISEdge#29 (v0.11.0) — record passive-evidence
+            // reachability against the (peer, RETICULUM_RS) tuple.
+            // Logged BEFORE the insert so a tracker-only consumer
+            // observes liveness even if a later panic prevents the
+            // insert; the insert + reachability record are
+            // logically independent (the tracker is observability,
+            // the peer map is routing).
+            if let Some(tracker) = ctx.reachability {
+                tracker.record_attempt(
+                    &key_id,
+                    TransportId::RETICULUM_RS,
+                    AttemptOutcome::AnnounceReceived,
+                );
+            }
             peers.insert(
                 key_id,
                 RootedPeer {
