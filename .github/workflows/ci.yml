@@ -1069,6 +1069,17 @@ jobs:
         # summary. Persist + lens log this for human-visible
         # confirmation that the registry isn't running in ephemeral
         # mode (registry AV-28).
+        #
+        # v0.8.1 — registry response evolved to per-install stewards
+        # (US/EU/APAC per CIRISRegistry FSD-002 §2.1 decentralization;
+        # same surface CIRISEdge#20 / persist#105 chase). Shape is now
+        # `{stewards: [{key_id, classical_pubkey, fingerprint,
+        # hardware_class, deployed}, ...]}` — not the old singleton
+        # `{classical: {...}}`. Pre-flight filters to `deployed: true`
+        # rows; in v0.8.x most installs ship with one deployed steward
+        # (US) and two `placeholder_pending_provisioning` rows for the
+        # not-yet-provisioned regions. Fail loudly if NO rows are
+        # deployed (registry running in ephemeral mode — AV-28).
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
@@ -1078,8 +1089,17 @@ jobs:
           fi
           echo "Registry steward-key snapshot for ${REGISTRY_URL}:"
           curl -sf "${REGISTRY_URL}/v1/steward-key" | tee dist/steward-key.json | python3 -m json.tool
-          KID=$(python3 -c 'import json; print(json.load(open("dist/steward-key.json"))["classical"]["key_id"])')
-          echo "registry steward key_id=${KID}" >> "$GITHUB_STEP_SUMMARY"
+          KIDS=$(python3 <<'PY'
+          import json, sys
+          data = json.load(open("dist/steward-key.json"))
+          deployed = [s for s in data.get("stewards", []) if s.get("deployed")]
+          if not deployed:
+              print("::error::No deployed stewards in registry response (AV-28 ephemeral-mode guard)", file=sys.stderr)
+              raise SystemExit(1)
+          print(",".join(s["key_id"] for s in deployed))
+          PY
+          )
+          echo "registry deployed steward key_ids=${KIDS}" >> "$GITHUB_STEP_SUMMARY"
       - name: register binary manifest with CIRISRegistry
         # POST the binary catalog to /v1/verify/binary-manifest with
         # project=ciris-edge. Bridge provisioned the trusted-primitive
