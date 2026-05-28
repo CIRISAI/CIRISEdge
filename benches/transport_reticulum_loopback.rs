@@ -68,11 +68,7 @@ async fn signer_for(key: &BenchFedKey, base: &std::path::Path) -> Arc<LocalSigne
     })
     .await
     .expect("load_local_seed");
-    Arc::new(LocalSigner {
-        key_id: key.key_id.clone(),
-        classical,
-        pqc: None,
-    })
+    Arc::new(LocalSigner::new(key.key_id.clone(), classical, None))
 }
 
 async fn auth_for(
@@ -85,6 +81,7 @@ async fn auth_for(
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
         hybrid_policy: HybridPolicy::Ed25519Fallback,
+        ..ReticulumAuth::default()
     }
 }
 

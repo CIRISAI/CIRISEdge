@@ -30,7 +30,8 @@ use crate::outbound::{
     run_dispatcher, run_sweeps, DispatcherConfig, OutboundHandle, PeerDirectory,
     PeerSubscriptionFilter, StewardDirectory, StewardKey,
 };
-use crate::transport::{InboundFrame, Transport, TransportSendOutcome};
+use crate::reachability::{record_if_tracking, AttemptOutcome, ReachabilityTracker};
+use crate::transport::{InboundFrame, Transport, TransportError, TransportSendOutcome};
 use crate::verify::{
     AccordHolderKey, HybridPolicy, VerifiedEnvelope, VerifyDirectory, VerifyError, VerifyPipeline,
 };
@@ -78,6 +79,13 @@ pub struct EdgeConfig {
     /// [`crate::events::EventBus`] broadcast channels. Default
     /// [`crate::events::DEFAULT_EVENT_CHANNEL_CAPACITY`] (1024).
     pub event_channel_capacity: usize,
+    /// CIRISEdge#29 (v0.11.0) — rolling window in seconds for the
+    /// per-medium reachability tracker. Default 300s (5 minutes). The
+    /// tracker counts `(peer, transport)` attempts and successes
+    /// recorded by the send / dispatch / inbound hook sites; the
+    /// CIRISEdge#22 Tier 3 pymethod surface (v0.16.0) consumes the
+    /// snapshot to render `peer_reachability(key_id) → dict[str, float]`.
+    pub reachability_window_seconds: u64,
 }
 
 impl Default for EdgeConfig {
@@ -101,6 +109,11 @@ impl Default for EdgeConfig {
             dispatcher: DispatcherConfig::default(),
             display_name_path: None,
             event_channel_capacity: crate::events::DEFAULT_EVENT_CHANNEL_CAPACITY,
+            // CIRISEdge#29 — 5min window matches the v0.4.0 PeerResolver
+            // announce-recording cadence + the replay window: a peer
+            // whose announces are still being recorded is by definition
+            // reachable in this window.
+            reachability_window_seconds: 300,
         }
     }
 }
@@ -239,6 +252,16 @@ pub struct Edge {
     /// `Arc<RwLock<_>>` so the read path (called from every UI render)
     /// doesn't block writers; setter is rare (operator-initiated).
     display_name: Arc<std::sync::RwLock<Option<String>>>,
+    /// CIRISEdge#29 (v0.11.0) — per-(peer × medium) reachability
+    /// tracker. Always present (constructed from
+    /// `EdgeConfig::reachability_window_seconds` in
+    /// [`EdgeBuilder::build`]); the send / durable-dispatch / inbound
+    /// hook sites record attempts here. Surfaces via
+    /// [`Self::reachability_tracker`] for the v0.16.0 CIRISEdge#22
+    /// Tier 3 pymethod consumer (the sibling FFI agent's territory —
+    /// no pymethods added in this scope per the issue's "Scope NOT in
+    /// this issue" note).
+    reachability: Arc<ReachabilityTracker>,
     config: EdgeConfig,
 }
 
@@ -319,7 +342,7 @@ impl Edge {
         if let Some(path) = self.config.display_name_path.as_ref() {
             let payload = new_value.as_deref().unwrap_or("");
             std::fs::write(path, payload).map_err(|e| {
-                EdgeError::Config(format!("write display_name_path {path:?}: {e}"))
+                EdgeError::Config(format!("write display_name_path {}: {e}", path.display()))
             })?;
         }
         {
@@ -389,10 +412,37 @@ impl Edge {
         }
         let transport = &self.transports[0];
 
-        let outcome = transport
-            .send(destination_key_id, &envelope_bytes)
-            .await
-            .map_err(EdgeError::Transport)?;
+        // CIRISEdge#29 — record the send-path attempt against the
+        // tracker. Failure-class capture covers both the
+        // `Err(TransportError)` arm (typed transport fault) and the
+        // `Ok(Reject)` arm (peer returned a wire reject). The
+        // `Ok(Delivered)` arm is success.
+        let send_result = transport.send(destination_key_id, &envelope_bytes).await;
+        let outcome = match send_result {
+            Ok(o) => {
+                let attempt_outcome = match &o {
+                    TransportSendOutcome::Delivered => AttemptOutcome::SendSuccess,
+                    TransportSendOutcome::Reject { class, .. } => AttemptOutcome::SendFailure {
+                        error_class: class.clone(),
+                    },
+                };
+                self.reachability.record_attempt(
+                    destination_key_id,
+                    transport.id(),
+                    attempt_outcome,
+                );
+                o
+            }
+            Err(e) => {
+                let error_class = transport_error_class(&e).to_string();
+                self.reachability.record_attempt(
+                    destination_key_id,
+                    transport.id(),
+                    AttemptOutcome::SendFailure { error_class },
+                );
+                return Err(EdgeError::Transport(e));
+            }
+        };
 
         match outcome {
             TransportSendOutcome::Delivered => {
@@ -932,6 +982,7 @@ impl Edge {
             &self.inline_text_subscribers,
             self.config.max_content_body_bytes,
             &directory,
+            Some(&self.reachability),
         )
         .await;
     }
@@ -943,6 +994,21 @@ impl Edge {
     #[must_use]
     pub fn outbound_queue_handle(&self) -> Arc<dyn OutboundHandle> {
         self.queue.clone()
+    }
+
+    /// Rust-level accessor returning a clone of the per-medium
+    /// reachability tracker `Arc` (CIRISEdge#29; v0.11.0). The
+    /// consumer surface is locked here for the CIRISEdge#22 Tier 3
+    /// pymethod cut (v0.16.0): the FFI shell calls
+    /// [`ReachabilityTracker::snapshot`] / [`ReachabilityTracker::snapshot_all`]
+    /// and shapes the result into the Python `dict[str, float]` /
+    /// `list[PeerMediumReachability]` surface the Trust Topology UI
+    /// drives. **No pymethods are added in this scope** — that's the
+    /// sibling FFI agent's territory (the v0.11.0 FFI bundle #31 +
+    /// #34 + #35).
+    #[must_use]
+    pub fn reachability_tracker(&self) -> Arc<ReachabilityTracker> {
+        self.reachability.clone()
     }
 
     /// Rust-level accessor returning the local signer's `key_id` —
@@ -1037,8 +1103,9 @@ impl Edge {
             let ts = self.transports.clone();
             let cfg = self.config.dispatcher.clone();
             let sd = shutdown_rx.clone();
+            let reach = Some(self.reachability.clone());
             tasks.push(tokio::spawn(async move {
-                run_dispatcher(q, ts, cfg, sd).await;
+                run_dispatcher(q, ts, cfg, sd, reach).await;
             }));
         }
         {
@@ -1061,6 +1128,7 @@ impl Edge {
         let signer = self.signer.clone();
         let inline_subs = self.inline_text_subscribers.clone();
         let max_content_body_bytes = self.config.max_content_body_bytes;
+        let reachability = self.reachability.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -1074,6 +1142,7 @@ impl Edge {
                     let queue_clone = queue.clone();
                     let signer_clone = signer.clone();
                     let its = inline_subs.clone();
+                    let reach_clone = reachability.clone();
                     let directory_clone = verify_clone.directory();
                     tokio::spawn(async move {
                         dispatch_inbound(
@@ -1085,6 +1154,7 @@ impl Edge {
                             &its,
                             max_content_body_bytes,
                             &directory_clone,
+                            Some(&reach_clone),
                         ).await;
                     });
                 }
@@ -1144,6 +1214,7 @@ async fn dispatch_inbound(
     inline_text_subscribers: &std::sync::Mutex<HashMap<u64, InlineTextSubscriber>>,
     max_content_body_bytes: usize,
     directory: &Arc<dyn VerifyDirectory>,
+    reachability: Option<&Arc<ReachabilityTracker>>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -1261,6 +1332,30 @@ async fn dispatch_inbound(
                     "FederationAnnouncement body parse failed at AccordCarrier gate; downstream paths handle",
                 );
             }
+        }
+    }
+
+    // CIRISEdge#29 (v0.11.0) — inbound `DeliveryAttestation` is the
+    // strongest reachability signal: the peer cryptographically
+    // confirmed receipt of one of our envelopes. Record an
+    // `AttestationReceived` outcome against `(peer_key_id,
+    // transport_id_from_body)` — note that we use the peer-reported
+    // medium from the attestation body, NOT the transport the
+    // attestation itself arrived over (the attestation may be relayed
+    // via a different medium than the original message it
+    // acknowledges, and the wire-recorded transport_id in the body is
+    // the medium that actually carried the original delivery).
+    if envelope.message_type == MessageType::DeliveryAttestation {
+        if let Ok(att) =
+            serde_json::from_str::<crate::messages::DeliveryAttestation>(envelope.body.get())
+        {
+            let medium_id = transport_id_from_medium(att.transport_id);
+            record_if_tracking(
+                reachability,
+                &att.peer_key_id,
+                medium_id,
+                AttemptOutcome::AttestationReceived,
+            );
         }
     }
 
@@ -1588,6 +1683,10 @@ impl EdgeBuilder {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s.len() <= 256);
 
+        let reachability = Arc::new(ReachabilityTracker::new(
+            self.config.reachability_window_seconds,
+        ));
+
         Ok(Edge {
             verify,
             queue,
@@ -1602,6 +1701,7 @@ impl EdgeBuilder {
             subscription_filter: self.subscription_filter,
             events,
             display_name: Arc::new(std::sync::RwLock::new(display_name)),
+            reachability,
             config: self.config,
         })
     }
@@ -1707,6 +1807,42 @@ fn fan_out_inline_text(
     }
     for id in dead {
         subs.remove(&id);
+    }
+}
+
+/// CIRISEdge#29 — collapse the wire-level [`crate::messages::TransportMedium`]
+/// enum back to a [`crate::transport::TransportId`] for tracker
+/// recording. The forward mapping (`TransportId → TransportMedium`)
+/// is lossy (multiple transports can collapse onto one medium tag —
+/// e.g. RETICULUM_RS and LEVICULUM both → Reticulum); the reverse uses
+/// the canonical representative `TransportId` per medium. Consumers
+/// SHOULD treat the tracker's `TransportId` as a medium-level tag for
+/// `DeliveryAttestation`-sourced records, not a sub-medium discriminator.
+fn transport_id_from_medium(
+    medium: crate::messages::TransportMedium,
+) -> crate::transport::TransportId {
+    use crate::messages::TransportMedium;
+    use crate::transport::TransportId;
+    match medium {
+        TransportMedium::Reticulum => TransportId::RETICULUM_RS,
+        TransportMedium::HttpOverTls | TransportMedium::TcpTls => TransportId::HTTP,
+        TransportMedium::Other => TransportId("other"),
+    }
+}
+
+/// CIRISEdge#29 — classifier string for a [`TransportError`], used as
+/// the `error_class` field on a [`AttemptOutcome::SendFailure`]. Mirrors
+/// the dispatcher's mapping in `src/outbound.rs::dispatch_one` so the
+/// `last_error_class` field on the [`crate::PeerMediumReachability`]
+/// snapshot is consistent across send-path (this method's mapping)
+/// and durable-dispatcher-path (the dispatcher's mapping) outcomes.
+fn transport_error_class(e: &TransportError) -> &'static str {
+    match e {
+        TransportError::Unreachable(_) => "unreachable",
+        TransportError::Timeout(_) => "timeout",
+        TransportError::Config(_) => "config",
+        TransportError::Io(_) => "io",
+        TransportError::BodyTooLarge { .. } => "body_too_large",
     }
 }
 

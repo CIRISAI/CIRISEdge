@@ -93,6 +93,7 @@ use reticulum_std::NodeEvent;
 use super::attestation::{AnnounceAttestation, AttestationError, AttestationPayload};
 use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 use crate::identity::LocalSigner;
+use crate::reachability::{AttemptOutcome, ReachabilityTracker};
 use crate::verify::{
     HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
 };
@@ -319,6 +320,11 @@ pub struct ReticulumTransport {
     /// in `crate::ffi::pyo3`. `None` means a transport built with no
     /// observability bus (the v0.10.x default; back-compat).
     event_bus: Option<Arc<crate::events::EventBus>>,
+    /// CIRISEdge#29 (v0.11.0) — per-medium reachability tracker. See
+    /// [`ReticulumAuth::reachability`] for the contract; threaded
+    /// through to the event loop's [`EventCtx`] so a rooted announce
+    /// records an [`AttemptOutcome::AnnounceReceived`].
+    reachability: Option<Arc<ReachabilityTracker>>,
 }
 
 /// Federation-authentication wiring for [`ReticulumTransport`] — the
@@ -358,6 +364,15 @@ pub struct ReticulumAuth {
     /// `None` → no events emitted (back-compat for callers that don't
     /// care about the AsyncIterator surface).
     pub event_bus: Option<Arc<crate::events::EventBus>>,
+    /// CIRISEdge#29 (v0.11.0) — per-medium reachability tracker. When
+    /// `Some`, every successfully-rooted announce records an
+    /// [`AttemptOutcome::AnnounceReceived`] against `(peer_key_id,
+    /// TransportId::RETICULUM_RS)`. Passive reachability evidence —
+    /// proof of liveness, not of delivery. Production wiring threads
+    /// `edge.reachability_tracker()` here; tests omit (the field
+    /// defaults to `None` so all existing Reticulum tests compile
+    /// unchanged).
+    pub reachability: Option<Arc<ReachabilityTracker>>,
 }
 
 impl Default for ReticulumAuth {
@@ -368,6 +383,7 @@ impl Default for ReticulumAuth {
             resolver: None,
             hybrid_policy: HybridPolicy::Strict,
             event_bus: None,
+            reachability: None,
         }
     }
 }
@@ -396,6 +412,7 @@ impl ReticulumTransport {
             resolver,
             hybrid_policy,
             event_bus,
+            reachability,
         } = auth;
 
         let identity = load_or_generate_identity(&config.identity_path)?;
@@ -490,6 +507,7 @@ impl ReticulumTransport {
             rooting,
             hybrid_policy,
             event_bus,
+            reachability,
         })
     }
 
@@ -682,6 +700,7 @@ impl Transport for ReticulumTransport {
                         rooting: self.rooting.as_deref(),
                         hybrid_policy: self.hybrid_policy,
                         event_bus: self.event_bus.as_deref(),
+                        reachability: self.reachability.as_ref(),
                     };
                     handle_event(event, &ctx).await;
                 }
@@ -719,6 +738,11 @@ struct EventCtx<'a> {
     /// emissions. `None` → no events emitted (the transport was
     /// constructed without `ReticulumAuth::event_bus`).
     event_bus: Option<&'a crate::events::EventBus>,
+    /// CIRISEdge#29 — per-medium reachability tracker. `Some` →
+    /// every successfully-rooted announce records an
+    /// `AttemptOutcome::AnnounceReceived` against `(peer_key_id,
+    /// TransportId::RETICULUM_RS)`.
+    reachability: Option<&'a Arc<ReachabilityTracker>>,
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -834,6 +858,15 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
 /// A drop at any step leaves the peer map untouched: `send` will
 /// surface [`TransportError::Unreachable`] for that `key_id` rather
 /// than route to an unauthenticated destination.
+// v0.11.0 merge: function grew past clippy's 100-line cap once the
+// CIRISEdge#34 announce-event emission and the CIRISEdge#29
+// reachability-tracker hook were both layered into the rooted-success
+// arm. Each emission is a small, related side-effect on the same
+// successful-root verdict; extracting them into a helper would
+// fragment the cold-start verdict logic without adding clarity, so
+// the gate is allowed locally rather than refactored across the
+// merge boundary.
+#[allow(clippy::too_many_lines)]
 async fn resolve_announce_cold_start(
     announce: &reticulum_core::ReceivedAnnounce,
     ctx: &EventCtx<'_>,
@@ -859,7 +892,7 @@ async fn resolve_announce_cold_start(
             if let Some(bus) = ctx.event_bus {
                 bus.emit_announce(crate::events::NetworkEvent::announce(
                     None,
-                    announce.destination_hash().to_vec(),
+                    announce.destination_hash().as_bytes().to_vec(),
                     announce.app_data().to_vec(),
                     crate::events::EventSeverity::Warning,
                     format!("announce dropped: app-data is not a valid attestation: {e}"),
@@ -953,6 +986,21 @@ async fn resolve_announce_cold_start(
                 epoch = attestation.epoch,
                 "peer ROOTED via authenticated cold-start path",
             );
+            // CIRISEdge#29 (v0.11.0) — record passive-evidence
+            // reachability against the (peer, RETICULUM_RS) tuple.
+            // Logged BEFORE the event emission and the peer-map
+            // insert so a tracker-only consumer observes liveness
+            // even if a later panic prevents the insert; the
+            // tracker / event / peer-map writes are logically
+            // independent (the tracker is observability, the peer
+            // map is routing).
+            if let Some(tracker) = ctx.reachability {
+                tracker.record_attempt(
+                    &key_id,
+                    TransportId::RETICULUM_RS,
+                    AttemptOutcome::AnnounceReceived,
+                );
+            }
             // CIRISEdge#34 — successful root → emit announce_received
             // event with info severity. The peer key_id is now known
             // to be authentic; surface it on the announce stream so
@@ -960,7 +1008,7 @@ async fn resolve_announce_cold_start(
             if let Some(bus) = ctx.event_bus {
                 bus.emit_announce(crate::events::NetworkEvent::announce(
                     Some(key_id.clone()),
-                    announce.destination_hash().to_vec(),
+                    announce.destination_hash().as_bytes().to_vec(),
                     announce.app_data().to_vec(),
                     crate::events::EventSeverity::Info,
                     format!(

@@ -43,9 +43,5 @@ pub async fn bench_local_signer(me: &BenchFedKey, tmp: &tempfile::TempDir) -> Ar
     .await
     .expect("load_local_seed");
 
-    Arc::new(LocalSigner {
-        key_id: me.key_id.clone(),
-        classical,
-        pqc: None,
-    })
+    Arc::new(LocalSigner::new(me.key_id.clone(), classical, None))
 }

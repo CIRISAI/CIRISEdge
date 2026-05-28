@@ -26,6 +26,7 @@ use ciris_persist::prelude::{
     OutboundFailureOutcome, OutboundFilter, OutboundQueue, OutboundRow, QueueId,
 };
 
+use crate::reachability::{AttemptOutcome, ReachabilityTracker};
 use crate::transport::{Transport, TransportError, TransportSendOutcome};
 
 /// Adapter trait that erases `FederationDirectory`'s generics for the
@@ -403,11 +404,25 @@ fn compute_next_attempt(attempt: i32, initial: Duration, max: Duration) -> DateT
 }
 
 /// Run the outbound dispatcher loop. Returns when `shutdown` fires.
+///
+/// `reachability` (CIRISEdge#29, v0.11.0) — when `Some`, the
+/// dispatcher records each row's terminal outcome against the
+/// per-(peer × medium) reachability tracker:
+/// - `Ok(Delivered)` → [`AttemptOutcome::DurableDelivered`]
+/// - `Ok(Reject)` / `Err(_)` → [`AttemptOutcome::SendFailure`] with
+///   the typed error class. The `mark_transport_failed` row may still
+///   be retried by the next dispatcher cycle; we record one outcome
+///   per attempt (not per row's lifetime) because the tracker is
+///   measuring per-medium delivery success rate, not row-final state.
+///
+/// `None` keeps the historical signature live for any test/embedder
+/// constructing the dispatcher standalone.
 pub async fn run_dispatcher(
     queue: Arc<dyn OutboundHandle>,
     transports: Vec<Arc<dyn Transport>>,
     config: DispatcherConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    reachability: Option<Arc<ReachabilityTracker>>,
 ) {
     if transports.is_empty() {
         tracing::warn!("dispatcher: no transports configured; outbound loop idle");
@@ -448,16 +463,19 @@ pub async fn run_dispatcher(
         }
 
         for row in claimed {
-            dispatch_one(&*queue, &transports, &row, &config).await;
+            dispatch_one(&*queue, &transports, &row, &config, reachability.as_ref()).await;
         }
     }
 }
 
+#[allow(clippy::too_many_lines)] // CIRISEdge#29 hook insertion crosses the 100-line bound; refactor as
+                                 // part of the dispatcher-tier overhaul (FSD §3.4 follow-up)
 async fn dispatch_one(
     queue: &dyn OutboundHandle,
     transports: &[Arc<dyn Transport>],
     row: &OutboundRow,
     config: &DispatcherConfig,
+    reachability: Option<&Arc<ReachabilityTracker>>,
 ) {
     // Transport selection: first configured transport for now.
     // TODO Phase 2 — per-row transport preference based on
@@ -471,6 +489,18 @@ async fn dispatch_one(
 
     match outcome {
         Ok(TransportSendOutcome::Delivered) => {
+            // CIRISEdge#29 — durable-tier delivered terminal. Stronger
+            // evidence than ephemeral `SendSuccess` because the
+            // durable dispatcher only marks Delivered after the
+            // transport-tier ack (Reticulum: sender-side
+            // ResourceCompleted; HTTPS: 2xx response).
+            if let Some(t) = reachability {
+                t.record_attempt(
+                    &row.destination_key_id,
+                    transport.id(),
+                    AttemptOutcome::DurableDelivered,
+                );
+            }
             if let Err(e) = queue
                 .mark_transport_delivered(&row.queue_id, transport.id().0)
                 .await
@@ -483,6 +513,16 @@ async fn dispatch_one(
         }
         Ok(TransportSendOutcome::Reject { class, detail: _ }) if class == "replay_detected" => {
             // Receiver already has the message (idempotent recovery).
+            // Count as a delivered for reachability — the peer holds
+            // the bytes; the dispatcher's mark_replay_resolved
+            // transitions the row to Delivered.
+            if let Some(t) = reachability {
+                t.record_attempt(
+                    &row.destination_key_id,
+                    transport.id(),
+                    AttemptOutcome::DurableDelivered,
+                );
+            }
             if let Err(e) = queue.mark_replay_resolved(&row.queue_id).await {
                 tracing::error!(
                     queue_id = ?row.queue_id, error = %e,
@@ -491,6 +531,15 @@ async fn dispatch_one(
             }
         }
         Ok(TransportSendOutcome::Reject { class, detail }) => {
+            if let Some(t) = reachability {
+                t.record_attempt(
+                    &row.destination_key_id,
+                    transport.id(),
+                    AttemptOutcome::SendFailure {
+                        error_class: class.clone(),
+                    },
+                );
+            }
             let next_attempt =
                 compute_next_attempt(attempt, config.initial_backoff, config.max_backoff);
             if let Err(e) = queue
@@ -517,6 +566,15 @@ async fn dispatch_one(
                 TransportError::Io(_) => "io",
                 TransportError::BodyTooLarge { .. } => "body_too_large",
             };
+            if let Some(t) = reachability {
+                t.record_attempt(
+                    &row.destination_key_id,
+                    transport.id(),
+                    AttemptOutcome::SendFailure {
+                        error_class: class.to_string(),
+                    },
+                );
+            }
             let next_attempt =
                 compute_next_attempt(attempt, config.initial_backoff, config.max_backoff);
             if let Err(err) = queue

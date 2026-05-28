@@ -125,6 +125,14 @@ use crate::transport::reticulum::{ReticulumAuth, ReticulumTransport, ReticulumTr
 use crate::transport::Transport;
 use crate::verify::{HybridPolicy, RootingDirectory, VerifyDirectory};
 
+// CIRISEdge#35 — stub-info gatherer entry point. Called by
+// `src/bin/stub_gen.rs` to gather every `#[gen_stub_pyclass]` /
+// `#[gen_stub_pymethods]` / `#[gen_stub_pyfunction]` item registered
+// via `inventory::submit!` and emit the merged `.pyi` to
+// `python/ciris_edge/__init__.pyi`. The macro expansion produces
+// `pub fn stub_info() -> pyo3_stub_gen::Result<pyo3_stub_gen::StubInfo>`.
+pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
+
 /// Wire-format schema versions edge supports. Strict allowlist (AV-7);
 /// out-of-set values reject at the verify pipeline. Mirrors persist's
 /// `SUPPORTED_SCHEMA_VERSIONS` export.
@@ -1171,6 +1179,26 @@ fn init_edge_runtime(
         rooting: Some(rooting_dir.clone()),
         resolver: None,
         hybrid_policy,
+        // CIRISEdge#34 — the Reticulum transport is built BEFORE Edge,
+        // so Edge's `events()` accessor isn't available here. The pyo3
+        // surface wires its EventBus into the transport via the
+        // v0.12+ Reticulum substrate hooks (sibling agent's territory);
+        // leaving `None` keeps the cohabitation path compiling and the
+        // announce / interface streams quiet on the Reticulum side
+        // until that wiring lands. HTTP transport remains the
+        // documented event source in the interim.
+        event_bus: None,
+        // CIRISEdge#29 (v0.11.0) — wire the reachability tracker into
+        // the Reticulum transport via a post-build `Edge::run`-time
+        // attach is the cleanest threading (the transport is built
+        // BEFORE Edge, so Edge's `reachability_tracker()` accessor
+        // isn't available here). Leaving `None` keeps the cohabitation
+        // path compiling; the v0.16.0 FFI cut (sibling agent's
+        // territory, CIRISEdge#22 Tier 3 wiring) will either (a)
+        // restructure to build the tracker first then thread into both
+        // surfaces, or (b) move the AnnounceReceived hook out of the
+        // transport entirely (publish-subscribe on the resolver path).
+        reachability: None,
     };
 
     // ── Step 5: build the transport + Edge under the host runtime.

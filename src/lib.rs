@@ -37,6 +37,7 @@ pub mod manifest;
 pub mod messages;
 pub mod observability;
 pub mod outbound;
+pub mod reachability;
 pub mod transport;
 pub mod verify;
 
@@ -66,6 +67,7 @@ pub use outbound::{
     DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter, StewardDirectory,
     StewardKey,
 };
+pub use reachability::{AttemptOutcome, PeerMediumReachability, ReachabilityTracker};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 pub use verify::{
     AccordHolderKey, HybridPolicy, ProvenanceChain, ProvenanceLink, RootingDirectory,
