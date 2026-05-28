@@ -942,6 +942,28 @@ jobs:
         with:
           name: ciris_edge-wheel-${{ matrix.label }}
           path: target/wheels/*.whl
+      # Build the host-side `emit_edge_extras` CLI binary on the
+      # linux-x86_64 wheel runner and hand it off to `build-manifest`
+      # as an artifact. Avoids `build-manifest` recompiling the full
+      # `ciris-edge` release graph a second time just to run a tiny
+      # JSON-emitter binary (CI wall-time optimisation; ~3min saved on
+      # tag runs). The feature set deliberately differs from the wheel
+      # build above: this is a host CLI, NOT a Python extension, so
+      # `pyo3` + `extension-module` must NOT be passed (those would
+      # require libpython at link time and produce a non-executable
+      # binary). `transport-http transport-reticulum` matches the
+      # production Phase 1 transport set that the manifest JSON
+      # documents under `enabled_transports`.
+      - name: cargo build emit_edge_extras (host CLI for build-manifest)
+        if: matrix.label == 'linux-x86_64'
+        run: cargo build --release --bin emit_edge_extras --features "transport-http transport-reticulum"
+      - name: upload emit_edge_extras host binary
+        if: matrix.label == 'linux-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emit-edge-extras-bin
+          path: target/release/emit_edge_extras
+          retention-days: 7
 
   # ─── build-manifest: hybrid-signed release provenance ───────────────
   #
@@ -1008,14 +1030,29 @@ jobs:
           sudo install -m755 build-tool/ciris-build-sign /usr/local/bin/ciris-build-sign
           sudo install -m755 build-tool/ciris-build-verify /usr/local/bin/ciris-build-verify
           ciris-build-sign --version
+      - name: download pre-built emit_edge_extras
+        # The `pyo3-wheel` linux-x86_64 cell builds this host CLI as a
+        # side-effect of its existing release compile and uploads it as
+        # the `emit-edge-extras-bin` artifact. Reusing it here drops
+        # ~3min of wall-time off the tag run that would otherwise be
+        # spent recompiling `ciris-edge` in release mode from scratch.
+        uses: actions/download-artifact@v4
+        with:
+          name: emit-edge-extras-bin
+          path: target/release/
+      - name: make emit_edge_extras executable
+        # actions/upload-artifact strips the executable bit; restore it
+        # before invoking.
+        run: chmod +x target/release/emit_edge_extras
       - name: emit EdgeExtras JSON
         # Reads the source tree (Cargo.toml + Cargo.lock + spec docs +
         # the SchemaVersion enum) and emits the typed extras blob.
-        # Deterministic per checkout. transport-http feature on so
-        # enabled_transports reflects the production Phase 1 build.
+        # Deterministic per checkout. The pre-built binary above was
+        # compiled with `--features "transport-http transport-reticulum"`
+        # so `enabled_transports` reflects the production Phase 1 build.
         run: |
           mkdir -p dist
-          cargo run --release --features "transport-http" --bin emit_edge_extras \
+          target/release/emit_edge_extras \
             > "dist/edge-extras-${{ steps.version.outputs.version }}.json"
           echo "EdgeExtras emitted:"
           cat "dist/edge-extras-${{ steps.version.outputs.version }}.json"
