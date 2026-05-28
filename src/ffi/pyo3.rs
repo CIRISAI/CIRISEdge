@@ -127,6 +127,18 @@ impl PyEdge {
         VERSION
     }
 
+    /// Local agent's federation `key_id` — the identity peers seed
+    /// into their `federation_keys` directory to root inbound traffic
+    /// from this agent. CIRISAgent 2.9.4 displays this on the
+    /// Epistemic Commons operator surface as "your federation
+    /// address is X" so the operator knows what to share with peers
+    /// (CIRISEdge#22 Tier-2.5).
+    ///
+    /// One-line wrapper over [`Edge::signer_key_id`]; no new state.
+    fn signer_key_id(&self) -> String {
+        self.inner.signer_key_id().to_string()
+    }
+
     // ─── CIRISEdge#22 Tier 2 (v0.9.0) — CommunicationBus replacement ──
     //
     // The pymethods below back CIRISAgent 2.9.5's
