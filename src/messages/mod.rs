@@ -23,6 +23,22 @@ pub enum SchemaVersion {
     V1_0_0,
 }
 
+/// Wire discriminator for the inline-text message family (CIRISEdge#22
+/// Tier 2; v0.9.0). Both [`InlineText`] (ephemeral, fire-and-forget) and
+/// [`InlineTextDurable`] (durable, requires_ack) serialize to the same
+/// `{"text": "..."}` body shape and carry this discriminator — the
+/// delivery class lives on the sender's chosen `Message` impl, not on
+/// the receiver's wire shape (receivers see one `InlineText` MessageType
+/// regardless of how the sender shipped it). This is the canonical
+/// implementor of the [`crate::InlineTextMessage`] trait the
+/// `send_inline` / `send_durable_inline` pipeline was designed for.
+///
+/// Discriminator + concrete types both live in `messages/` so the
+/// `PyEdge::send_inline_text` / `PyEdge::send_durable_inline_text` /
+/// `PyEdge::register_inline_text_handler` Python surface (CIRISAgent
+/// 2.9.5 `EdgeCommunicationAdapter`) can reach the same wire shape from
+/// either end.
+///
 /// Discriminator for the body union. Edge dispatches on this *after*
 /// verify; handlers receive the parsed body struct, not raw bytes.
 ///
@@ -116,6 +132,21 @@ pub enum MessageType {
     /// Required so the fetcher fails over to a different peer instead
     /// of hanging (edge#21 spec point 3). Body: [`ContentMiss`].
     ContentMiss,
+
+    // ─── CIRISEdge#22 Tier 2 (v0.9.0) — inline-text family ──────────
+    /// CommunicationBus-replacement inline-text payload. Body shape:
+    /// `{"text": "..."}`. Used by CIRISAgent 2.9.5's
+    /// `EdgeCommunicationAdapter` via the
+    /// [`crate::ffi::pyo3::PyEdge::send_inline_text`] /
+    /// `send_durable_inline_text` / `register_inline_text_handler`
+    /// Python surface. Both [`InlineText`] (ephemeral) and
+    /// [`InlineTextDurable`] (durable, requires_ack) serialize under
+    /// this single discriminator — the delivery class is the sender's
+    /// choice, the receiver sees one wire type. This is the canonical
+    /// [`crate::InlineTextMessage`] implementor; the `speak_pipeline`
+    /// (Classify + Scrub + EncryptAndStore per FSD §1.4) runs on the
+    /// `text` field before signing.
+    InlineText,
 }
 
 /// The signed wire envelope. Carries one verified message + the
@@ -314,6 +345,85 @@ impl Message for FederationKeyDirectoryQuery {
     const TYPE: MessageType = MessageType::FederationKeyDirectoryQuery;
     const DELIVERY: Delivery = Delivery::Ephemeral;
     type Response = FederationKeyDirectoryQueryResponse;
+}
+
+// ─── CIRISEdge#22 Tier 2 (v0.9.0) — inline-text body types ──────────
+//
+// Two `Message` impls share the same `MessageType::InlineText`
+// discriminator on the wire: [`InlineText`] (`Delivery::Ephemeral` —
+// fire-and-forget, no retry, no ACK) and [`InlineTextDurable`]
+// (`Delivery::Durable { requires_ack: true }` — edge-owned retry +
+// observable outcome via [`crate::DurableHandle`]). Receivers see one
+// wire type regardless of which the sender chose; only the sender's
+// queuing semantics differ.
+//
+// Both implement [`crate::InlineTextMessage`] so the `speak_pipeline`
+// (Classify + Scrub + EncryptAndStore per FSD §1.4) runs on the text
+// before signing — the cleartext never leaves the process unredacted.
+// This is the load-bearing forensic-completeness invariant for the
+// CIRISAgent 2.9.5 `EdgeCommunicationAdapter` cutover.
+
+/// Inline-text payload. Wire body shape: `{"text": "..."}`. Shipped via
+/// [`crate::Edge::send_inline`] / [`crate::ffi::pyo3::PyEdge::send_inline_text`]
+/// (ephemeral; fire-and-forget). Use [`InlineTextDurable`] for
+/// edge-owned-retry semantics with a [`crate::DurableHandle`] return.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct InlineText {
+    /// The inline text body. The `speak_pipeline` mutates this in place
+    /// (PII scrub, secret span substitution) before signing.
+    pub text: String,
+}
+
+impl Message for InlineText {
+    const TYPE: MessageType = MessageType::InlineText;
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    type Response = ();
+}
+
+impl crate::handler::InlineTextMessage for InlineText {
+    fn text(&self) -> &str {
+        &self.text
+    }
+    fn set_text(&mut self, text: String) {
+        self.text = text;
+    }
+}
+
+/// Durable inline-text payload — same wire body shape and same
+/// `MessageType::InlineText` discriminator as [`InlineText`], but rides
+/// `Delivery::Durable { requires_ack: true }` so the sender gets a
+/// [`crate::DurableHandle`] and edge-owned retry. Shipped via
+/// [`crate::Edge::send_durable_inline`] /
+/// [`crate::ffi::pyo3::PyEdge::send_durable_inline_text`].
+///
+/// Defaults: 24h TTL, 20 attempts, 60s ACK timeout. Mirrors
+/// [`DSARRequest`]'s durable shape; chat-tier messages don't need the
+/// week-long `BuildManifestPublication` window.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct InlineTextDurable {
+    /// The inline text body. The `speak_pipeline` mutates this in place
+    /// (PII scrub, secret span substitution) before signing.
+    pub text: String,
+}
+
+impl Message for InlineTextDurable {
+    const TYPE: MessageType = MessageType::InlineText;
+    const DELIVERY: Delivery = Delivery::Durable {
+        requires_ack: true,
+        max_attempts: 20,
+        ttl_seconds: 24 * 60 * 60, // 24 hours
+        ack_timeout_seconds: Some(60),
+    };
+    type Response = ();
+}
+
+impl crate::handler::InlineTextMessage for InlineTextDurable {
+    fn text(&self) -> &str {
+        &self.text
+    }
+    fn set_text(&mut self, text: String) {
+        self.text = text;
+    }
 }
 
 // ─── CIRISEdge#18 — FederationAnnouncement + DeliveryAttestation ────
@@ -1268,6 +1378,48 @@ mod tests {
         assert_eq!(body, back);
         // Integrity invariant survives round-trip.
         assert_eq!(sha256_of(&back.bytes), back.sha256);
+    }
+
+    // ─── CIRISEdge#22 Tier 2 (v0.9.0) — inline-text wire contract ───
+
+    /// `InlineText` and `InlineTextDurable` MUST serialize to the
+    /// SAME wire body shape (`{"text": "..."}`) AND carry the SAME
+    /// `MessageType::InlineText` discriminator on the wire. Receivers
+    /// see one wire type regardless of which the sender used; only
+    /// the sender's queuing semantics differ. Pin this — a regression
+    /// that splits the wire types would break the
+    /// `EdgeCommunicationAdapter` (CIRISAgent 2.9.5) round trip.
+    #[test]
+    fn inline_text_family_shares_wire_discriminator_and_body_shape() {
+        assert_eq!(InlineText::TYPE, MessageType::InlineText);
+        assert_eq!(InlineTextDurable::TYPE, MessageType::InlineText);
+        let a = InlineText { text: "hi".into() };
+        let b = InlineTextDurable { text: "hi".into() };
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+            "InlineText and InlineTextDurable wire bodies MUST be identical"
+        );
+        assert_eq!(serde_json::to_string(&a).unwrap(), r#"{"text":"hi"}"#);
+    }
+
+    /// `InlineText` is ephemeral (fire-and-forget);
+    /// `InlineTextDurable` is durable with `requires_ack=true`.
+    /// Pin both — a regression that promotes `InlineText` to durable
+    /// would silently start writing every agent chat-fragment to the
+    /// outbound queue.
+    #[test]
+    fn inline_text_delivery_classes_pinned() {
+        assert!(matches!(InlineText::DELIVERY, Delivery::Ephemeral));
+        match InlineTextDurable::DELIVERY {
+            Delivery::Durable { requires_ack, .. } => {
+                assert!(
+                    requires_ack,
+                    "InlineTextDurable must declare requires_ack=true"
+                );
+            }
+            other => panic!("InlineTextDurable must be Durable; got {other:?}"),
+        }
     }
 
     /// `ContentFetch` JSON round-trip with and without a hint.

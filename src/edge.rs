@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -124,6 +125,25 @@ struct RegisteredHandler {
 
 // ─── Edge ───────────────────────────────────────────────────────────
 
+/// Inline-text inbound subscriber registry entry (CIRISEdge#22 Tier 2).
+///
+/// Each entry holds an unbounded sender that the inbound dispatcher
+/// pushes `(sender_key_id, body_text)` tuples onto. A Python-owned
+/// drainer thread (spawned in [`crate::ffi::pyo3`] when
+/// `register_inline_text_handler` is called) receives from the matching
+/// receiver, acquires the GIL, and invokes the user-supplied Python
+/// callback. Dropping the sender (via [`Edge::unregister_inline_text_subscriber`])
+/// causes the drainer to observe a closed channel and exit cleanly —
+/// the subscription-lifecycle invariant the Python `SubscriptionHandle`
+/// enforces.
+///
+/// Unbounded by design: dropping events under back-pressure would
+/// degrade the CommunicationBus-replacement semantic the Python adapter
+/// builds on. Subscribers that can't keep up must drop their handle —
+/// a closed channel removes the entry from the registry on the next
+/// dispatch (lazy cleanup, no separate sweep needed).
+pub(crate) type InlineTextSubscriber = mpsc::UnboundedSender<(String, String)>;
+
 /// Top-level edge handle. Construct via [`Edge::builder`].
 pub struct Edge {
     verify: Arc<VerifyPipeline>,
@@ -131,6 +151,18 @@ pub struct Edge {
     signer: Arc<LocalSigner>,
     transports: Vec<Arc<dyn Transport>>,
     handlers: Arc<Mutex<HashMap<MessageType, RegisteredHandler>>>,
+    /// Inline-text inbound fan-out registry (CIRISEdge#22 Tier 2;
+    /// v0.9.0). Distinct from `handlers` because the typed handler
+    /// dispatch supports exactly **one** handler per [`MessageType`] —
+    /// the Python `register_inline_text_handler` surface must accept
+    /// multiple concurrent subscribers (one per `EdgeCommunicationAdapter`
+    /// consumer at minimum). Subscriptions are keyed by an
+    /// monotonically-increasing u64 (`inline_text_next_id`); the Python
+    /// `SubscriptionHandle::unsubscribe` removes by id.
+    inline_text_subscribers: Arc<std::sync::Mutex<HashMap<u64, InlineTextSubscriber>>>,
+    /// Subscription id allocator for [`Self::inline_text_subscribers`].
+    /// `AtomicU64::fetch_add` so the allocator is lock-free.
+    inline_text_next_id: Arc<AtomicU64>,
     /// Optional pipeline run on outbound inline-text envelopes
     /// (SPEAK responses, LLM prompts, WBD bodies, DSAR text). When
     /// `Some`, `send_inline` / `send_durable_inline` invoke this
@@ -491,6 +523,106 @@ impl Edge {
         Ok(handles)
     }
 
+    /// Register an inbound inline-text subscriber (CIRISEdge#22 Tier 2;
+    /// v0.9.0). Every verified [`crate::MessageType::InlineText`]
+    /// envelope dispatched through [`Self::run`]'s inbound loop is
+    /// fanned out to every subscriber registered here, as a
+    /// `(sender_key_id, body_text)` tuple pushed onto the returned
+    /// receiver.
+    ///
+    /// The caller owns the receiver — drop it (or call
+    /// [`Self::unregister_inline_text_subscriber`] with the returned id)
+    /// to stop the fan-out. The dispatcher lazy-prunes entries whose
+    /// `send` returns `Err(SendError)` (closed receiver), so dropping
+    /// the receiver alone is sufficient for correctness — the explicit
+    /// unregister exists for tests and for the Python
+    /// `SubscriptionHandle::unsubscribe` surface which needs synchronous
+    /// removal (so a subsequent inbound that arrives before the next
+    /// dispatch's lazy prune cannot fire a callback the consumer
+    /// considers detached).
+    ///
+    /// # Used by
+    ///
+    /// [`crate::ffi::pyo3::PyEdge::register_inline_text_handler`] — the
+    /// Python-facing surface CIRISAgent 2.9.5's `EdgeCommunicationAdapter`
+    /// consumes. The Rust-level method exists so the same fan-out is
+    /// reachable to non-Python embedders (uniffi / swift-bridge shells
+    /// landing in Phase 3).
+    pub fn register_inline_text_subscriber(
+        &self,
+    ) -> (u64, mpsc::UnboundedReceiver<(String, String)>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = self.inline_text_next_id.fetch_add(1, Ordering::Relaxed);
+        let mut subs = self
+            .inline_text_subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subs.insert(id, tx);
+        (id, rx)
+    }
+
+    /// Remove an inline-text subscriber by id. Idempotent — returns
+    /// `true` if the id was registered, `false` if not (matches persist
+    /// `PyEngine::unsubscribe` ergonomics).
+    pub fn unregister_inline_text_subscriber(&self, id: u64) -> bool {
+        let mut subs = self
+            .inline_text_subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subs.remove(&id).is_some()
+    }
+
+    /// Snapshot count of live inline-text subscribers. Diagnostics
+    /// helper — used by the Python tests to verify the lifecycle (a
+    /// `SubscriptionHandle::unsubscribe` or `__exit__` must observe the
+    /// count drop).
+    pub fn inline_text_subscriber_count(&self) -> usize {
+        self.inline_text_subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Manually fan out an InlineText payload to every subscriber.
+    /// Public for tests + future non-dispatcher embedders that want to
+    /// inject a synthetic inbound without going through the verify
+    /// pipeline. The production inbound path calls the free-function
+    /// equivalent from [`dispatch_inbound`].
+    pub fn fan_out_inline_text_for_test(&self, sender_key_id: &str, body_text: &str) {
+        fan_out_inline_text(&self.inline_text_subscribers, sender_key_id, body_text);
+    }
+
+    /// Rust-level accessor returning a clone of the outbound queue
+    /// `Arc`. Used by [`crate::ffi::pyo3::PyDurableHandle`] to poll
+    /// `outbound_status` for `await_ack` semantics independently of
+    /// the `PyEdge`'s lifetime.
+    #[must_use]
+    pub fn outbound_queue_handle(&self) -> Arc<dyn OutboundHandle> {
+        self.queue.clone()
+    }
+
+    /// Rust-level accessor returning the local signer's `key_id` —
+    /// the `signing_key_id` field on outbound envelopes. Used by the
+    /// PyO3 `send_inline_text` body-sha256 pre-computation step.
+    #[must_use]
+    pub fn signer_key_id(&self) -> &str {
+        &self.signer.key_id
+    }
+
+    /// Pub-crate variant of [`Self::run_speak_pipeline`] reachable
+    /// from `crate::ffi::pyo3`. The Python `send_inline_text` /
+    /// `send_durable_inline_text` wrappers need to run the pipeline
+    /// against a typed `InlineText` body to compute the post-pipeline
+    /// `body_sha256` BEFORE calling `send_inline` (which would consume
+    /// the message). Idempotent — running it twice produces the same
+    /// bytes.
+    pub async fn run_speak_pipeline_for_external<M: InlineTextMessage>(
+        &self,
+        msg: &mut M,
+    ) -> Result<(), EdgeError> {
+        self.run_speak_pipeline(msg).await
+    }
+
     /// Test/diagnostics helper — `true` if `peer_key_id` would be
     /// admitted by the configured [`PeerSubscriptionFilter`] for
     /// `message_type`. When no filter is configured, returns `true`
@@ -576,11 +708,14 @@ impl Edge {
         // Inbound dispatch loop — verify + handler dispatch +
         // ACK matching + FederationAnnouncement→DeliveryAttestation
         // emission (FSD §3.2.1 v0.1 emission gate: post-verify,
-        // pre-application-layer-handler).
+        // pre-application-layer-handler) + InlineText fan-out
+        // (CIRISEdge#22 Tier 2; the EdgeCommunicationAdapter inbound
+        // path).
         let verify = self.verify.clone();
         let handlers = self.handlers.clone();
         let queue = self.queue.clone();
         let signer = self.signer.clone();
+        let inline_subs = self.inline_text_subscribers.clone();
         let max_content_body_bytes = self.config.max_content_body_bytes;
         let mut shutdown = shutdown_rx;
         loop {
@@ -594,8 +729,9 @@ impl Edge {
                     let h = handlers.clone();
                     let q = queue.clone();
                     let s = signer.clone();
+                    let its = inline_subs.clone();
                     tokio::spawn(async move {
-                        dispatch_inbound(frame, &v, &h, &q, &s, max_content_body_bytes).await;
+                        dispatch_inbound(frame, &v, &h, &q, &s, &its, max_content_body_bytes).await;
                     });
                 }
                 else => break,
@@ -639,13 +775,16 @@ impl Edge {
 
 /// Inbound dispatch: verify → maybe-ACK-match → `ContentBody`
 /// AV-13/integrity gate (CIRISEdge#21 v0.8.0) → `FederationAnnouncement`
-/// attestation-emission (FSD §3.2.1 v0.1 gate) → handler dispatch.
+/// attestation-emission (FSD §3.2.1 v0.1 gate) → `InlineText` fan-out
+/// (CIRISEdge#22 Tier 2 v0.9.0) → typed handler dispatch.
+#[allow(clippy::too_many_lines)] // dispatch is the load-bearing pipeline composition site
 async fn dispatch_inbound(
     frame: InboundFrame,
     verify: &VerifyPipeline,
     handlers: &Mutex<HashMap<MessageType, RegisteredHandler>>,
     queue: &Arc<dyn OutboundHandle>,
     signer: &Arc<LocalSigner>,
+    inline_text_subscribers: &std::sync::Mutex<HashMap<u64, InlineTextSubscriber>>,
     max_content_body_bytes: usize,
 ) {
     let received_at = frame.received_at;
@@ -745,6 +884,39 @@ async fn dispatch_inbound(
         }
     }
 
+    // CIRISEdge#22 Tier 2 (v0.9.0) — InlineText fan-out. The Python
+    // `register_inline_text_handler` surface supports multiple
+    // concurrent subscribers, which the singleton `handlers` HashMap
+    // does not (one entry per `MessageType`). Fan out to every
+    // registered subscriber here; the typed-handler dispatch still
+    // runs below (so a Rust-side typed `Handler<InlineText>` registered
+    // via `register_handler` continues to work, parallel to the
+    // Python fan-out).
+    //
+    // We parse the body once here; the typed-handler path re-parses
+    // (via the erased handler closure) — the cost is negligible
+    // (the body is already a `RawValue`), and keeping the two paths
+    // independent is structurally simpler than threading a parsed
+    // body through the erased dispatch.
+    if envelope.message_type == MessageType::InlineText {
+        match serde_json::from_str::<crate::messages::InlineText>(envelope.body.get()) {
+            Ok(inline) => {
+                fan_out_inline_text(
+                    inline_text_subscribers,
+                    &envelope.signing_key_id,
+                    &inline.text,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    transport = ?transport,
+                    "InlineText body parse failed at dispatch fan-out",
+                );
+            }
+        }
+    }
+
     // Application handler dispatch.
     let registered = {
         let handlers = handlers.lock().await;
@@ -753,10 +925,15 @@ async fn dispatch_inbound(
             .map(|h| h.erased.clone())
     };
     let Some(erased) = registered else {
-        tracing::warn!(
-            message_type = ?envelope.message_type,
-            "no handler registered; dropping",
-        );
+        // InlineText with no typed Rust handler is not an error — the
+        // Python fan-out above is the intended consumer. Suppress the
+        // `no handler registered` warning for that one type.
+        if envelope.message_type != MessageType::InlineText {
+            tracing::warn!(
+                message_type = ?envelope.message_type,
+                "no handler registered; dropping",
+            );
+        }
         return;
     };
 
@@ -944,6 +1121,8 @@ impl EdgeBuilder {
             signer,
             transports: self.transports,
             handlers: Arc::new(Mutex::new(HashMap::new())),
+            inline_text_subscribers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            inline_text_next_id: Arc::new(AtomicU64::new(1)),
             speak_pipeline: self.speak_pipeline,
             peer_directory: self.peer_directory,
             subscription_filter: self.subscription_filter,
@@ -971,6 +1150,19 @@ impl DurableHandle {
             ))),
         }
     }
+}
+
+/// Pub-crate re-export so [`crate::ffi::pyo3::PyDurableHandle`] can
+/// reuse the same outbound-row → DurableStatus mapping the
+/// `DurableHandle::status_via` Rust method uses. Only the pyo3
+/// surface consumes it today (CIRISEdge#22 Tier 2; v0.9.0); the
+/// `#[cfg]` gate matches the consumer so the non-pyo3 build doesn't
+/// see a dead-code warning.
+#[cfg(feature = "pyo3")]
+pub(crate) fn map_outbound_row_to_status(
+    row: &ciris_persist::prelude::OutboundRow,
+) -> DurableStatus {
+    map_row_to_status(row)
 }
 
 fn map_row_to_status(row: &ciris_persist::prelude::OutboundRow) -> DurableStatus {
@@ -1008,6 +1200,37 @@ fn map_row_to_status(row: &ciris_persist::prelude::OutboundRow) -> DurableStatus
                 last_error_class: row.last_error_class.clone(),
             })
         }
+    }
+}
+
+/// Fan out an inbound InlineText payload to every subscriber in the
+/// registry. Lazily prunes entries whose `send` returns `Err` (the
+/// Python `SubscriptionHandle` has gone out of scope without an
+/// explicit `unsubscribe()` — channel-closed semantics from the
+/// drainer-thread side). Free-function form because `dispatch_inbound`
+/// is itself a free function — the `Edge::fan_out_inline_text` method
+/// (on the type) is a thin wrapper around this same logic for
+/// non-dispatcher callers (tests, future embedders).
+fn fan_out_inline_text(
+    inline_text_subscribers: &std::sync::Mutex<HashMap<u64, InlineTextSubscriber>>,
+    sender_key_id: &str,
+    body_text: &str,
+) {
+    let mut subs = inline_text_subscribers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if subs.is_empty() {
+        return;
+    }
+    let payload = (sender_key_id.to_string(), body_text.to_string());
+    let mut dead: Vec<u64> = Vec::new();
+    for (id, tx) in subs.iter() {
+        if tx.send(payload.clone()).is_err() {
+            dead.push(*id);
+        }
+    }
+    for id in dead {
+        subs.remove(&id);
     }
 }
 

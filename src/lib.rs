@@ -46,8 +46,9 @@ pub use messages::{
     BuildManifestPublicationResponse, ContentBody, ContentFetch, ContentMiss, DSARRequest,
     DSARResponse, DeliveryAttestation, DeliveryAttestationError, EdgeEnvelope,
     FederationAnnouncement, FederationKeyDirectoryQuery, FederationKeyDirectoryQueryResponse,
-    HintShape, MessageType, MissReason, PublicKeyRegistration, PublicKeyRegistrationResponse,
-    SchemaVersion, TransportMedium, DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
+    HintShape, InlineText, InlineTextDurable, MessageType, MissReason, PublicKeyRegistration,
+    PublicKeyRegistrationResponse, SchemaVersion, TransportMedium, DEFAULT_MAX_CONTENT_BODY_BYTES,
+    DELIVERY_ATTESTATION_DOMAIN,
 };
 pub use outbound::{DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
