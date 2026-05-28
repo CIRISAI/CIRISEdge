@@ -19,7 +19,12 @@
 //! - [`HybridPolicy`] / [`VerifyOutcome`] — consumer-side PQC policy
 //!   (OQ-11 closure: day-1 hybrid Ed25519 + ML-DSA-65 verify).
 
-#![forbid(unsafe_code)]
+// v0.9.2 (CIRISEdge#22 cohabitation) — relaxed from `forbid` to `deny`
+// to allow the scoped `PyCapsule` extraction helpers in
+// `src/ffi/pyo3.rs` (`extract_capsule`) to opt into `unsafe` with a
+// documented `#[allow(unsafe_code)]` + `# Safety` block. Everywhere
+// else in the crate, `unsafe` is still rejected.
+#![deny(unsafe_code)]
 #![deny(rust_2018_idioms)]
 #![doc(html_root_url = "https://docs.rs/ciris-edge/0.1.0-pre1")]
 
