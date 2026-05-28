@@ -18,17 +18,17 @@ use futures::future::BoxFuture;
 use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::handler::{
-    AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, Handler, HandlerContext,
-    HandlerError, InlineTextMessage, Message,
+    AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, FederationPriority,
+    Handler, HandlerContext, HandlerError, InlineTextMessage, Message,
 };
 use crate::identity::{build_envelope, envelope_body_sha256, sign_envelope, LocalSigner};
 use crate::messages::{
-    AnnouncementPriority, EdgeEnvelope, FederationAnnouncement, MessageType, RefusalReason,
-    ACCORD_THRESHOLD_M_OF_N,
+    is_federation_attestation_emitting_type, AnnouncementPriority, EdgeEnvelope,
+    FederationAnnouncement, MessageType, RefusalReason, ACCORD_THRESHOLD_M_OF_N,
 };
 use crate::outbound::{
     run_dispatcher, run_sweeps, DispatcherConfig, OutboundHandle, PeerDirectory,
-    PeerSubscriptionFilter,
+    PeerSubscriptionFilter, StewardDirectory, StewardKey,
 };
 use crate::transport::{InboundFrame, Transport, TransportSendOutcome};
 use crate::verify::{
@@ -109,6 +109,18 @@ pub enum EdgeError {
     NoHandler(MessageType),
     #[error("delivery class mismatch: {0:?} declared {1} but called as {2}")]
     DeliveryClassMismatch(MessageType, &'static str, &'static str),
+    /// CIRISEdge#20 — `Edge::send_federation` was called but the
+    /// configured [`StewardDirectory`] returned an empty steward set.
+    /// Typed (NOT a panic) so the caller can surface the operational
+    /// condition: a federation with no stewards in its
+    /// `federation_keys` directory cannot accept high-priority
+    /// federation traffic until the steward set is seeded
+    /// (MISSION.md §3 anti-pattern 6 — fail-loud, no silent drops).
+    #[error(
+        "no stewards registered for FederationPriority::{0:?} \
+         (federation_keys directory has zero identity_type=\"steward\" rows)"
+    )]
+    NoStewards(FederationPriority),
 }
 
 // ─── Type-erased handler dispatch ───────────────────────────────────
@@ -184,6 +196,15 @@ pub struct Edge {
     /// §3.2). When `None`, `send_mandatory` returns a typed config
     /// error — the federation broadcast cannot pick recipients.
     peer_directory: Option<Arc<dyn PeerDirectory>>,
+    /// Optional steward-enumeration adapter consumed by
+    /// [`Edge::send_federation`] for the high-priority steward-class
+    /// fan-out (CIRISEdge#20). Resolved dynamically on every send —
+    /// the rotation-aware semantic the issue's ask #4 requires. When
+    /// `None`, `send_federation` returns a typed config error.
+    /// Production deployments pass `Arc<dyn FederationDirectory>`
+    /// (any persist backend); the blanket impl in `crate::outbound`
+    /// lifts it via persist v2.7.0's `list_keys_by_identity_type`.
+    steward_directory: Option<Arc<dyn StewardDirectory>>,
     /// Optional per-peer subscription filter. Consulted by
     /// subscription-respecting code paths; **deliberately bypassed**
     /// by `Delivery::Mandatory` (the load-bearing wire change of
@@ -202,6 +223,7 @@ pub struct EdgeBuilder {
     speak_pipeline:
         Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
     peer_directory: Option<Arc<dyn PeerDirectory>>,
+    steward_directory: Option<Arc<dyn StewardDirectory>>,
     subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
     config: EdgeConfig,
 }
@@ -216,6 +238,7 @@ impl Edge {
             transports: Vec::new(),
             speak_pipeline: None,
             peer_directory: None,
+            steward_directory: None,
             subscription_filter: None,
             config: EdgeConfig::default(),
         }
@@ -259,6 +282,7 @@ impl Edge {
             let declared = match M::DELIVERY {
                 Delivery::Ephemeral => "Ephemeral",
                 Delivery::Durable { .. } => "Durable",
+                Delivery::Federation { .. } => "Federation",
                 Delivery::Mandatory { .. } => "Mandatory",
             };
             return Err(EdgeError::DeliveryClassMismatch(
@@ -314,6 +338,13 @@ impl Edge {
                 return Err(EdgeError::DeliveryClassMismatch(
                     M::TYPE,
                     "Ephemeral",
+                    "Durable",
+                ));
+            }
+            Delivery::Federation { .. } => {
+                return Err(EdgeError::DeliveryClassMismatch(
+                    M::TYPE,
+                    "Federation",
                     "Durable",
                 ));
             }
@@ -442,6 +473,13 @@ impl Edge {
                     "Mandatory",
                 ));
             }
+            Delivery::Federation { .. } => {
+                return Err(EdgeError::DeliveryClassMismatch(
+                    M::TYPE,
+                    "Federation",
+                    "Mandatory",
+                ));
+            }
             Delivery::Mandatory {
                 authority_signed: _,
                 bypass_subscription,
@@ -528,6 +566,192 @@ impl Edge {
         Ok(handles)
     }
 
+    /// Send a steward-class federation directive — high-priority
+    /// recipient class derived dynamically from persist's
+    /// `federation_keys` directory (`identity_type="steward"`).
+    /// CIRISEdge#20.
+    ///
+    /// # Routing semantic
+    ///
+    /// Mirrors [`Self::send_mandatory`]'s fan-out shape but over the
+    /// steward subset (not the every-peer directory) and DOES respect
+    /// the configured [`PeerSubscriptionFilter`]:
+    ///
+    /// - **Recipient set**: re-resolved on every call via
+    ///   [`StewardDirectory::current_stewards`] — no caching. Steward
+    ///   rotation (Registry FSD-002 §2.1) propagates atomically.
+    /// - **Subscription gate**: consulted (DIFFERENT from `Mandatory`,
+    ///   which bypasses it). Federation routes with preference, not
+    ///   federation-wide push; per the issue's distinction "guaranteed-
+    ///   reachable, not bypass-subscription-by-default but
+    ///   routed-with-preference".
+    /// - **Self-loopback**: filtered (self-delivery would loopback
+    ///   through edge's verify; AV-8 structural misroute — same as
+    ///   `send_mandatory`).
+    /// - **Per-row durability**: the [`Delivery::Federation`] per-row
+    ///   config from `M::DELIVERY` (`max_attempts`, `ttl_seconds`,
+    ///   `requires_ack`, `ack_timeout_seconds`) — the call's
+    ///   `ack_timeout_seconds` argument overrides the type-level
+    ///   default when present (production deployments may want a
+    ///   tighter timeout for rotation-window directives).
+    ///
+    /// # Compile-time vs. runtime DELIVERY check
+    ///
+    /// Conceptually `M::DELIVERY` must equal a `Delivery::Federation`
+    /// variant. Rust's trait-system can't express that as a where-
+    /// clause on an associated constant (no const-generic dispatch on
+    /// enum variant), so the check is runtime — a wrong delivery
+    /// class returns [`EdgeError::DeliveryClassMismatch`] (typed, not
+    /// a panic; consistent with [`Self::send`] / [`Self::send_durable`]
+    /// / [`Self::send_mandatory`]'s mismatch handling).
+    ///
+    /// # Errors
+    ///
+    /// - [`EdgeError::DeliveryClassMismatch`] when `M::DELIVERY` is
+    ///   not `Delivery::Federation`.
+    /// - [`EdgeError::Config`] when no [`StewardDirectory`] is
+    ///   configured on the builder.
+    /// - [`EdgeError::NoStewards`] when the directory resolves to
+    ///   zero stewards — surfaced as a typed error rather than a
+    ///   silent no-op (MISSION.md §3 anti-pattern 6).
+    /// - [`EdgeError::Persist`] on enqueue / directory-read failure.
+    ///
+    /// # Returns
+    ///
+    /// One [`DurableHandle`] per steward the directive was enqueued
+    /// to — callers may observe each independently. The handle count
+    /// reflects the post-filter recipient set (stewards minus self
+    /// minus subscription-rejected).
+    #[allow(clippy::too_many_lines)] // delivery-class match arms + fan-out body
+    pub async fn send_federation<M: Message>(
+        &self,
+        msg: M,
+        ack_timeout_seconds: Option<u64>,
+    ) -> Result<Vec<DurableHandle>, EdgeError> {
+        let (priority, requires_ack, max_attempts, ttl_seconds, type_ack_timeout) =
+            match M::DELIVERY {
+                Delivery::Ephemeral => {
+                    return Err(EdgeError::DeliveryClassMismatch(
+                        M::TYPE,
+                        "Ephemeral",
+                        "Federation",
+                    ));
+                }
+                Delivery::Durable { .. } => {
+                    return Err(EdgeError::DeliveryClassMismatch(
+                        M::TYPE,
+                        "Durable",
+                        "Federation",
+                    ));
+                }
+                Delivery::Mandatory { .. } => {
+                    return Err(EdgeError::DeliveryClassMismatch(
+                        M::TYPE,
+                        "Mandatory",
+                        "Federation",
+                    ));
+                }
+                Delivery::Federation {
+                    priority,
+                    requires_ack,
+                    max_attempts,
+                    ttl_seconds,
+                    ack_timeout_seconds,
+                } => (
+                    priority,
+                    requires_ack,
+                    i32::try_from(max_attempts).unwrap_or(i32::MAX),
+                    i64::try_from(ttl_seconds).unwrap_or(i64::MAX),
+                    ack_timeout_seconds,
+                ),
+            };
+
+        let steward_dir = self.steward_directory.as_ref().ok_or_else(|| {
+            EdgeError::Config(
+                "send_federation: no StewardDirectory configured on EdgeBuilder \
+                 (high-priority federation fan-out cannot enumerate recipients)"
+                    .into(),
+            )
+        })?;
+
+        // CIRISEdge#20 ask #4 — re-resolve on every call (no caching).
+        // Steward rotation per Registry FSD-002 §2.1 propagates
+        // atomically: the next send sees the post-rotation set.
+        let stewards: Vec<StewardKey> = steward_dir
+            .current_stewards()
+            .await
+            .map_err(|e| EdgeError::Persist(format!("StewardDirectory::current_stewards: {e}")))?;
+
+        if stewards.is_empty() {
+            return Err(EdgeError::NoStewards(priority));
+        }
+
+        // Per-row ack_timeout precedence: call-site arg wins when
+        // present (operational override for rotation-window
+        // directives); otherwise the type-level default from
+        // `M::DELIVERY`. Mirrors persist's per-row config precedence
+        // pattern (FSD/EDGE_OUTBOUND_QUEUE.md §4).
+        let ack_timeout_seconds_i64 = ack_timeout_seconds
+            .or(type_ack_timeout)
+            .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
+
+        let mut handles = Vec::with_capacity(stewards.len());
+        for steward in stewards {
+            // Self-loopback filter — same invariant as `send_mandatory`
+            // (sender == receiver loopbacks through edge's verify;
+            // AV-8 structural misroute).
+            if steward.key_id == self.signer.key_id {
+                continue;
+            }
+
+            // CIRISEdge#20 — Federation respects subscription filter
+            // (the distinction from Mandatory). Stewards may opt out
+            // of message types they don't consume; Federation routes
+            // with preference, not federation-wide push.
+            if !self
+                .would_subscription_accept(&steward.key_id, &M::TYPE)
+                .await
+            {
+                tracing::debug!(
+                    steward_key_id = %steward.key_id,
+                    identity_ref = %steward.identity_ref,
+                    message_type = ?M::TYPE,
+                    "send_federation: steward filtered by PeerSubscriptionFilter",
+                );
+                continue;
+            }
+
+            let envelope_bytes = self
+                .build_signed_envelope(&steward.key_id, &msg, None)
+                .await?;
+            let envelope: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
+                .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
+            let body_sha256 = envelope_body_sha256(&envelope);
+            let body_size_bytes = i32::try_from(envelope_bytes.len()).unwrap_or(i32::MAX);
+
+            let queue_id = self
+                .queue
+                .enqueue_outbound(
+                    &self.signer.key_id,
+                    &steward.key_id,
+                    &message_type_str(&envelope.message_type),
+                    "1.0.0",
+                    &envelope_bytes,
+                    &body_sha256,
+                    body_size_bytes,
+                    requires_ack,
+                    ack_timeout_seconds_i64,
+                    max_attempts,
+                    ttl_seconds,
+                    Utc::now(),
+                )
+                .await
+                .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (federation): {e}")))?;
+            handles.push(DurableHandle { queue_id });
+        }
+        Ok(handles)
+    }
+
     /// Register an inbound inline-text subscriber (CIRISEdge#22 Tier 2;
     /// v0.9.0). Every verified [`crate::MessageType::InlineText`]
     /// envelope dispatched through [`Self::run`]'s inbound loop is
@@ -597,14 +821,16 @@ impl Edge {
         fan_out_inline_text(&self.inline_text_subscribers, sender_key_id, body_text);
     }
 
-    /// CIRISEdge#19 — synchronous one-shot driver for the inbound
-    /// dispatch pipeline. Test-only helper: lets integration suites
-    /// drive a single `InboundFrame` through the same code path
-    /// `Edge::run` invokes per inbound message, then observe outbound
-    /// queue state (refusal attestation, acceptance attestation, etc.)
-    /// without standing up the full listener / dispatcher topology.
+    /// Synchronous one-shot driver for the inbound dispatch pipeline.
+    /// Test-only helper: lets integration suites drive a single
+    /// `InboundFrame` through the same code path `Edge::run` invokes
+    /// per inbound message, then observe outbound queue state (refusal
+    /// attestation per CIRISEdge#19, acceptance attestation per #18 +
+    /// StewardDirective per #20, InlineText fan-out per Tier 2, typed
+    /// handler dispatch) without standing up the full listener /
+    /// dispatcher topology.
     ///
-    /// The production callers are the `Edge::run` listener loop; this
+    /// Production callers are the `Edge::run` listener loop; this
     /// shares the same `dispatch_inbound` body, so a regression in
     /// the wire-layer gate is caught from either entry point.
     pub async fn dispatch_inbound_for_test(&self, frame: InboundFrame) {
@@ -956,7 +1182,14 @@ async fn dispatch_inbound(
     // handler; for v0.1 edge emits at this point (per the FSD's
     // pragmatic gate). Application-layer-acceptance tightening is a
     // v0.2+ option per FSD §7 OQ-6.
-    if envelope.message_type == MessageType::FederationAnnouncement {
+    //
+    // CIRISEdge#20 — the emission fires on both the FederationAnnouncement
+    // wire type (Mandatory class) AND the StewardDirective wire type
+    // (Federation class). `is_federation_attestation_emitting_type`
+    // owns the wire-type allowlist so adding future Federation- or
+    // Mandatory-class wire types only touches one helper, not this
+    // dispatch site.
+    if is_federation_attestation_emitting_type(&envelope.message_type) {
         if let Err(e) =
             emit_delivery_attestation(&envelope, body_sha256, transport, signer, queue).await
         {
@@ -965,8 +1198,9 @@ async fn dispatch_inbound(
             // continue (FSD §3.2.1 — missing-attestation-as-
             // delivery-gap is the legitimate observable).
             tracing::warn!(
+                message_type = ?envelope.message_type,
                 error = %e,
-                "FederationAnnouncement received but DeliveryAttestation emission failed",
+                "DeliveryAttestation emission failed",
             );
         }
     }
@@ -1179,9 +1413,28 @@ impl EdgeBuilder {
         self
     }
 
+    /// Wire a [`StewardDirectory`] adapter for `Edge::send_federation`
+    /// fan-out (CIRISEdge#20). Without it `send_federation` returns
+    /// [`EdgeError::Config`] — the high-priority federation push has
+    /// no recipient enumeration.
+    ///
+    /// Any `Arc<dyn FederationDirectory>` (persist v2.7.0+) satisfies
+    /// this via the blanket impl in [`crate::outbound`] — the same
+    /// `Arc` passed to [`Self::directory`] for the verify pipeline
+    /// can be cloned and passed here. Tests stub it with a static
+    /// `Vec<StewardKey>`.
+    #[must_use]
+    pub fn steward_directory(mut self, dir: Arc<dyn StewardDirectory>) -> Self {
+        self.steward_directory = Some(dir);
+        self
+    }
+
     /// Wire a [`PeerSubscriptionFilter`] for subscription-respecting
     /// code paths. **Not consulted by `Delivery::Mandatory`** — the
     /// bypass-subscription wire contract (FSD §3.2 + CIRISEdge#18).
+    /// **Consulted by `Delivery::Federation`** — the high-priority
+    /// fan-out routes with preference, not federation-wide push
+    /// (CIRISEdge#20).
     #[must_use]
     pub fn subscription_filter(mut self, filter: Arc<dyn PeerSubscriptionFilter>) -> Self {
         self.subscription_filter = Some(filter);
@@ -1227,6 +1480,7 @@ impl EdgeBuilder {
             inline_text_next_id: Arc::new(AtomicU64::new(1)),
             speak_pipeline: self.speak_pipeline,
             peer_directory: self.peer_directory,
+            steward_directory: self.steward_directory,
             subscription_filter: self.subscription_filter,
             config: self.config,
         })

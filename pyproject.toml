@@ -48,6 +48,7 @@ classifiers = [
 # drift on edge's consumed paths.
 dependencies = [
     "ciris-persist>=2.7.0,<3",
+    "ciris-persist>=2.6.0,<3",
 ]
 dynamic = ["version"]
 

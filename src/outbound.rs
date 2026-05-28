@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use ciris_persist::federation::types::identity_type as persist_identity_type;
+use ciris_persist::federation::FederationDirectory;
 use ciris_persist::outbound::Error as PersistOutboundError;
 use ciris_persist::prelude::{
     OutboundFailureOutcome, OutboundFilter, OutboundQueue, OutboundRow, QueueId,
@@ -52,6 +54,92 @@ pub trait PeerDirectory: Send + Sync + 'static {
     /// before enqueue (self-delivery would create a loopback at the
     /// dispatcher).
     async fn list_recipients(&self) -> Result<Vec<String>, PersistOutboundError>;
+}
+
+/// Steward identity row surfaced by [`StewardDirectory`] for
+/// CIRISEdge#20 high-priority federation fan-out. Carries the minimum
+/// fields edge needs to address the steward (the `key_id` —
+/// `federation_keys.key_id`) plus a forensic-logging join key
+/// (`identity_ref` — the steward's logical identity reference).
+///
+/// Distinct from persist's full [`ciris_persist::prelude::KeyRecord`]:
+/// edge does not need the public-key bytes / signature columns / row
+/// hash here — the verify pipeline already roots envelopes against
+/// `federation_keys`. This is a routing-table view, not a verification
+/// view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StewardKey {
+    /// `federation_keys.key_id` — the destination address for
+    /// `Edge::send_federation` fan-out.
+    pub key_id: String,
+    /// `federation_keys.identity_ref` — the steward's logical
+    /// identity. Surfaced for forensic logging (operator UIs / audit
+    /// log lines say "fanned out to US steward X" rather than just
+    /// printing the opaque key_id). Not load-bearing for routing.
+    pub identity_ref: String,
+}
+
+/// CIRISEdge#20 — recipient enumeration for the steward-class
+/// federation fan-out. Distinct from [`PeerDirectory`] (which is the
+/// every-peer enumeration consumed by `Delivery::Mandatory`) because
+/// the steward class is a **dynamically-derived subset** of the
+/// federation: any `federation_keys` row with
+/// `identity_type = "steward"` (persist's
+/// [`identity_type::STEWARD`](ciris_persist::federation::types::identity_type::STEWARD))
+/// at the moment `Edge::send_federation` is called.
+///
+/// `current_stewards` is recomputed on every send — there is no
+/// caching layer here; that is the load-bearing semantic supporting
+/// the issue's ask #4 ("dynamic topology adjustment when steward set
+/// changes"). Steward identity rotations per Registry FSD-002 §2.1
+/// propagate to the gossip topology atomically: the next
+/// `send_federation` call sees the post-rotation set without any
+/// edge-side cache invalidation.
+///
+/// Production deployments wrap their `FederationDirectory` (an
+/// `Arc<dyn FederationDirectory>`) — the blanket impl in this module
+/// resolves stewards via persist v2.7.0's
+/// [`list_keys_by_identity_type`](ciris_persist::federation::FederationDirectory::list_keys_by_identity_type).
+/// Tests stub it with a `Vec<StewardKey>`.
+#[async_trait]
+pub trait StewardDirectory: Send + Sync + 'static {
+    /// Enumerate the current steward set. Returns `Vec<StewardKey>`
+    /// keyed by `federation_keys.key_id`; persist returns rows in
+    /// stable lex order so callers can deterministically subset.
+    ///
+    /// Returns an empty `Vec` when no steward rows are present —
+    /// callers (`Edge::send_federation`) MUST surface this as a typed
+    /// error rather than a silent no-op (MISSION.md §3 anti-pattern
+    /// 6 / FSD §3.4 fail-loud invariant).
+    async fn current_stewards(&self) -> Result<Vec<StewardKey>, PersistOutboundError>;
+}
+
+/// Blanket impl: any `Arc<dyn FederationDirectory>` is a
+/// `StewardDirectory`. Calls persist v2.7.0's
+/// [`list_keys_by_identity_type`](ciris_persist::federation::FederationDirectory::list_keys_by_identity_type)
+/// with [`identity_type::STEWARD`](ciris_persist::federation::types::identity_type::STEWARD)
+/// and projects the returned `KeyRecord`s onto the [`StewardKey`]
+/// routing-view shape. Persist's `Error` is mapped onto
+/// [`PersistOutboundError::Backend`] so the call site sees one error
+/// taxonomy across both directory-enumeration paths
+/// (`PeerDirectory::list_recipients` and `StewardDirectory::current_stewards`).
+#[async_trait]
+impl<D: FederationDirectory + Send + Sync + 'static> StewardDirectory for D {
+    async fn current_stewards(&self) -> Result<Vec<StewardKey>, PersistOutboundError> {
+        let rows = self
+            .list_keys_by_identity_type(persist_identity_type::STEWARD)
+            .await
+            .map_err(|e| {
+                PersistOutboundError::Backend(format!("StewardDirectory::current_stewards: {e}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|r| StewardKey {
+                key_id: r.key_id,
+                identity_ref: r.identity_ref,
+            })
+            .collect())
+    }
 }
 
 /// Optional per-peer subscription filter applied by `send_durable` to
