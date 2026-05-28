@@ -83,6 +83,46 @@ tower = { version = "0.5", optional = true }
 hyper = { version = "1",   optional = true, features = ["client", "server", "http1"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
 
+# CIRISEdge#23 (Track B / v0.13.0 cut) — HTTPS transport hardening.
+# Promotes the `transport-http` feature from "Reticulum-unreachable
+# fallback" to production-grade, fully-equivalent transport carrying
+# every wire type. The acceptance bar is "every MessageType::*
+# round-trips over HTTPS" — same `dispatch_inbound` pipeline.
+#
+# Server-side TLS: `axum-server` (rustls integration) accepts a
+# `rustls::ServerConfig`; that config carries either a no-auth
+# verifier (TLS-only) or a custom `ClientCertVerifier` whose
+# `verify_client_cert` consults persist's `federation_keys`
+# directory via `VerifyDirectory::lookup_public_key` and rejects
+# unknown CNs at handshake time. This is the surface that CIRIS
+# Accord §I (Fidelity & Transparency) requires for the mTLS deployment
+# path — no application-layer auth running on top of an unauthenticated
+# socket.
+#
+# Bearer-token path: `jsonwebtoken` decodes a federation-key-signed
+# JWT (Ed25519 via `Algorithm::EdDSA`). The directory's
+# `pubkey_ed25519_base64` is the verification key. Use behind
+# TLS-terminating CDNs where mTLS isn't feasible.
+#
+# Licenses (verified against deny.toml § licenses.allow):
+#   rustls 0.23.x         — Apache-2.0 / ISC / MIT (triple-licensed)
+#   rustls-pemfile 2.x    — Apache-2.0 / ISC / MIT
+#   tokio-rustls 0.26.x   — Apache-2.0 / MIT
+#   axum-server 0.7.x     — MIT
+#   jsonwebtoken 9.x      — MIT
+#   x509-parser 0.16.x    — MIT / Apache-2.0
+# All resolve under the existing allowlist (no deny.toml change).
+rustls         = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "logging", "tls12"] }
+rustls-pemfile = { version = "2",    optional = true }
+tokio-rustls   = { version = "0.26", optional = true, default-features = false, features = ["ring", "logging", "tls12"] }
+axum-server    = { version = "0.7",  optional = true, features = ["tls-rustls-no-provider"] }
+jsonwebtoken   = { version = "9",    optional = true, default-features = false }
+# `x509-parser` is the minimal X.509 sniff the mTLS verifier needs to
+# pull CN + Ed25519 SPKI out of the client cert. Federation identity is
+# rooted in persist (not a CA), so we don't need a full PKI engine —
+# just a CN string and 32-byte raw key.
+x509-parser    = { version = "0.16", optional = true }
+
 # Reticulum transport — feature-gated below. Backed by Leviculum
 # (reticulum-core + reticulum-std, workspace v0.6.3, AGPL-3.0), the
 # canonical Reticulum stack for edge (OQ-07 first impl; Beechat's
@@ -107,7 +147,24 @@ reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028
 default = []
 
 # Phase 1 — HTTP/HTTPS fallback for Reticulum-unreachable deployments.
-transport-http        = ["dep:axum", "dep:tower", "dep:hyper", "dep:reqwest"]
+# CIRISEdge#23 (Track B / v0.13.0) — promoted to production-grade
+# HTTPS transport: server-side TLS via axum-server, client-side TLS
+# via reqwest's rustls stack, mTLS handshake checks the client cert's
+# CN against persist's federation_keys via
+# `VerifyDirectory::lookup_public_key`, and a bearer-token (federation-
+# key-signed JWT) path covers CDN/TLS-termination deployments.
+transport-http        = [
+    "dep:axum",
+    "dep:tower",
+    "dep:hyper",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:tokio-rustls",
+    "dep:axum-server",
+    "dep:jsonwebtoken",
+    "dep:x509-parser",
+]
 
 # Phase 1 — Reticulum canonical wire (OQ-07 first impl). Backed by
 # Leviculum's reticulum-core + reticulum-std. `TransportId::RETICULUM_RS`
@@ -277,6 +334,16 @@ async-trait        = "0.1"
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
 ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.7.0", version = "2", features = ["sqlite", "cirisnode", "classify", "scrub"] }
+# CIRISEdge#23 — `tests/transport_http_hardening.rs` mints self-signed
+# Ed25519 certs on the fly to exercise the rustls server config + the
+# custom `FederationCnVerifier`. `rcgen` is the canonical Rust X.509
+# generator; license: MIT / Apache-2.0. Dev-only — no production
+# dep-tree impact.
+rcgen              = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# rcgen's `KeyPair::from_pkcs8_der_and_sign_algo` takes a
+# `rustls_pki_types::PrivatePkcs8KeyDer`; explicit dev-dep so the
+# test file can name the type.
+rustls-pki-types   = "1"
 
 [lints.rust]
 # v0.9.2 (CIRISEdge#22 cohabitation) — relaxed from `forbid` to `deny`.

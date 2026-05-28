@@ -79,6 +79,19 @@ pub trait VerifyDirectory: Send + Sync + 'static {
     /// rows — edge's wire-layer hook distinguishes this case from
     /// "threshold not met" via [`RefusalReason::NoAccordHoldersConfigured`].
     async fn list_accord_holders(&self) -> Result<Vec<AccordHolderKey>, VerifyError>;
+
+    /// CIRISEdge#23 — fetch a single `federation_keys` row by `key_id`.
+    /// Returns the 32-byte raw Ed25519 pubkey if the row exists, `None`
+    /// otherwise. Used by:
+    ///   - The HTTPS transport's mTLS handshake verifier — the client
+    ///     cert's CN is the federation `key_id`, and the cert's spki
+    ///     public key MUST equal the directory's
+    ///     `pubkey_ed25519_base64` for the handshake to proceed.
+    ///   - The HTTPS transport's bearer-token path — the JWT's `kid`
+    ///     header names a federation key, and verification uses this
+    ///     row's pubkey as the JWT verification key.
+    /// Backed by `FederationDirectory::lookup_public_key`.
+    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<[u8; 32]>, VerifyError>;
 }
 
 #[async_trait]
@@ -139,6 +152,27 @@ impl<F: FederationDirectory + Send + Sync + 'static> VerifyDirectory for F {
             });
         }
         Ok(out)
+    }
+
+    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<[u8; 32]>, VerifyError> {
+        let row = FederationDirectory::lookup_public_key(self, key_id)
+            .await
+            .map_err(|e| VerifyError::VerifyUnavailable(format!("lookup_public_key: {e}")))?;
+        let Some(row) = row else { return Ok(None) };
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(row.pubkey_ed25519_base64.as_bytes())
+            .map_err(|e| {
+                VerifyError::VerifyUnavailable(format!(
+                    "federation_keys.pubkey_ed25519_base64 decode for key_id={key_id}: {e}"
+                ))
+            })?;
+        let pubkey: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+            VerifyError::VerifyUnavailable(format!(
+                "federation_keys.pubkey_ed25519 length != 32 for key_id={key_id} (got {})",
+                raw.len()
+            ))
+        })?;
+        Ok(Some(pubkey))
     }
 }
 
