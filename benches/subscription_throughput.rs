@@ -31,8 +31,20 @@
 //! isolates the fan-out + drainer + GIL cost from the verify cost
 //! (which is benched separately by `dispatch_inbound`).
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
-
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 #![cfg(feature = "pyo3")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -123,7 +135,9 @@ fn bench_subscription(c: &mut Criterion) {
     let (edge, _tmp) = rt.block_on(build_edge());
 
     let mut group = c.benchmark_group("subscription_throughput");
-    group.sample_size(20).measurement_time(Duration::from_secs(8));
+    group
+        .sample_size(20)
+        .measurement_time(Duration::from_secs(8));
 
     for sub_count in [1usize, 4, 16] {
         // Build N subscribers, each pushing onto its own
@@ -156,8 +170,7 @@ fn bench_subscription(c: &mut Criterion) {
         let counters: Vec<Arc<AtomicUsize>> = (0..sub_count)
             .map(|_| Arc::new(AtomicUsize::new(0)))
             .collect();
-        let mut drainer_handles: Vec<std::thread::JoinHandle<()>> =
-            Vec::with_capacity(sub_count);
+        let mut drainer_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(sub_count);
         for (mut rx, counter) in rxs.into_iter().zip(counters.iter().cloned()) {
             let handle = std::thread::spawn(move || {
                 while let Some(_msg) = rx.blocking_recv() {

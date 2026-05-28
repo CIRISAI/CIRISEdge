@@ -20,7 +20,20 @@
 //! the slope expected is linear in N, slope = single-verify cost.
 //! Sub-linear ⇒ a verify cache snuck in (AV-21).
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -34,9 +47,7 @@ use ciris_edge::verify::{HybridPolicy, VerifyDirectory, VerifyPipeline};
 use ciris_edge::TransportId;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use common::{
-    bench_local_signer, build_in_memory_backend, signed_record, BenchFedKey,
-};
+use common::{bench_local_signer, build_in_memory_backend, signed_record, BenchFedKey};
 
 /// Build the fixture: persist backend seeded with `me` (agent) +
 /// `bootstrap` (steward who scrub-signed `me`). Returns a verify
@@ -68,10 +79,7 @@ async fn setup() -> (Arc<VerifyPipeline>, Arc<LocalSigner>, tempfile::TempDir) {
 /// rejects duplicates; the bench pre-builds a pool and replays in
 /// rotation (the replay window is bounded; with a large enough pool
 /// and the LRU eviction, repeated envelopes will pass).
-async fn make_signed_envelope(
-    signer: &Arc<LocalSigner>,
-    body_size: usize,
-) -> Vec<u8> {
+async fn make_signed_envelope(signer: &Arc<LocalSigner>, body_size: usize) -> Vec<u8> {
     let inner = body_size.saturating_sub(11);
     let body = InlineText {
         text: "x".repeat(inner),
@@ -84,7 +92,9 @@ async fn make_signed_envelope(
         None,
     )
     .expect("build envelope");
-    sign_envelope(signer, &mut env).await.expect("sign envelope");
+    sign_envelope(signer, &mut env)
+        .await
+        .expect("sign envelope");
     serde_json::to_vec(&env).expect("envelope to bytes")
 }
 
@@ -110,7 +120,9 @@ fn bench_verify_single(c: &mut Criterion) {
     let (verify, signer, _tmp) = setup_rt.block_on(setup());
 
     let mut group = c.benchmark_group("envelope_verify_single");
-    group.sample_size(30).measurement_time(Duration::from_secs(8));
+    group
+        .sample_size(30)
+        .measurement_time(Duration::from_secs(8));
 
     for size in [256usize, 1024, 4096, 16 * 1024, 64 * 1024] {
         // Pre-sign a pool — each iteration draws from it round-robin.

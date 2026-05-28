@@ -13,8 +13,20 @@
 //! inbound handler pushes the frame onto an `mpsc::Sender<InboundFrame>`
 //! that the bench drains.
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
-
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 #![cfg(feature = "transport-http")]
 
 use std::collections::HashMap;
@@ -23,9 +35,7 @@ use std::time::Duration;
 
 use ciris_edge::transport::http::{HttpTransport, HttpTransportConfig};
 use ciris_edge::transport::{InboundFrame, Transport};
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tokio::sync::{mpsc, Mutex};
 
 fn free_port() -> u16 {
@@ -51,7 +61,10 @@ async fn build_http_loopback() -> HttpFixture {
     let transport_a = Arc::new(HttpTransport::new(a_cfg).expect("HttpTransport A"));
 
     let mut peer_urls = HashMap::new();
-    peer_urls.insert("a".to_string(), format!("http://127.0.0.1:{port_a}/edge/inbound"));
+    peer_urls.insert(
+        "a".to_string(),
+        format!("http://127.0.0.1:{port_a}/edge/inbound"),
+    );
     let b_cfg = HttpTransportConfig {
         peer_urls,
         request_timeout: Duration::from_secs(10),

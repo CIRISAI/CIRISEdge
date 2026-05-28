@@ -23,8 +23,20 @@
 //! one bench that imports it, so a bench that doesn't need the
 //! signer doesn't pull keyring code.
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
-
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 #![allow(dead_code)] // not every bench uses every helper
 #![allow(unused_imports)] // each bench cherry-picks a subset of re-exports
 

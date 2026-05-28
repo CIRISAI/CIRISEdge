@@ -9,7 +9,20 @@
 //! test surface verbatim — a regression in `signed_record` shape
 //! lands here and in the test suite at the same time.
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 
 use std::sync::Arc;
 

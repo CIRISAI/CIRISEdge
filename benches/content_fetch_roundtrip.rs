@@ -32,7 +32,20 @@
 //! size sweep" without exhausting bench wall time); the slope is what
 //! matters for AV-5 / Phase 2-regression detection.
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -46,9 +59,7 @@ use ciris_edge::messages::{sha256_of, ContentBody, MessageType};
 use ciris_edge::transport::{InboundFrame, Transport};
 use ciris_edge::verify::HybridPolicy;
 use ciris_edge::{Edge, EdgeConfig, OutboundHandle, TransportId};
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use common::{
     bench_local_signer, build_in_memory_backend, signed_record, BenchFedKey, NullTransport,
@@ -113,7 +124,9 @@ async fn make_content_body_envelope(
         None,
     )
     .expect("build envelope");
-    sign_envelope(signer, &mut env).await.expect("sign envelope");
+    sign_envelope(signer, &mut env)
+        .await
+        .expect("sign envelope");
     serde_json::to_vec(&env).expect("envelope to bytes")
 }
 
@@ -130,7 +143,9 @@ fn bench_content_fetch(c: &mut Criterion) {
     let dest = fixture.edge.signer_key_id().to_string();
 
     let mut group = c.benchmark_group("content_fetch_roundtrip");
-    group.sample_size(20).measurement_time(Duration::from_secs(10));
+    group
+        .sample_size(20)
+        .measurement_time(Duration::from_secs(10));
 
     // Size sweep: 256 B → 64 KiB (geometric ×4). Larger sizes
     // (1 MiB, 16 MiB) hit the JSON-encoding overhead asymmetrically

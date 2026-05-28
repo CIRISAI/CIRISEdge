@@ -26,7 +26,20 @@
 //! - `Mandatory` — `Edge::send_mandatory` with a 3-peer directory
 //!   (broadcast fan-out).
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -130,7 +143,9 @@ fn bench_enqueue(c: &mut Criterion) {
     let (edge, _tmp) = setup_rt.block_on(build_edge());
 
     let mut group = c.benchmark_group("outbound_enqueue");
-    group.sample_size(30).measurement_time(Duration::from_secs(8));
+    group
+        .sample_size(30)
+        .measurement_time(Duration::from_secs(8));
 
     // ── Ephemeral: send returns EdgeError::Config (Phase 1
     //    request-response not wired); we measure build + sign +
@@ -207,11 +222,9 @@ fn bench_enqueue(c: &mut Criterion) {
                         authority_class: AuthorityClass::RootWa,
                         accord_payload: None,
                         supersedes: None,
-                        expires_at: chrono::DateTime::parse_from_rfc3339(
-                            "2027-01-01T00:00:00Z",
-                        )
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
+                        expires_at: chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
                         evidence_refs: vec![],
                         accord_signatures: vec![],
                     };

@@ -28,15 +28,26 @@
 //! and a flat curve is the bug-shape we're checking for, so we MUST
 //! exercise the loaded code path).
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 
 use std::time::Duration;
 
 use ciris_persist::pipeline::{default_outbound_pipeline, PipelineState};
 use ciris_persist::prelude::InlineTextEnvelope;
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Build a text body of approximately `size` bytes containing one
 /// scrubbable email address (so Classify reports a finding and Scrub
@@ -59,7 +70,9 @@ fn bench_pipeline(c: &mut Criterion) {
     let pipeline = default_outbound_pipeline::<InlineTextEnvelope>();
 
     let mut group = c.benchmark_group("inline_text_pipeline");
-    group.sample_size(30).measurement_time(Duration::from_secs(8));
+    group
+        .sample_size(30)
+        .measurement_time(Duration::from_secs(8));
 
     for size in [64usize, 256, 1024, 4096] {
         group.throughput(Throughput::Bytes(size as u64));

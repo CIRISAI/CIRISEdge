@@ -11,7 +11,20 @@
 //! BENCHMARKS.md proposes N ∈ {1, 4, 16, 64}; the issue body listed
 //! {1, 3, 10, 30}. We follow BENCHMARKS.md (the doc-of-record).
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -95,7 +108,9 @@ fn bench_fanout(c: &mut Criterion) {
         .expect("bench tokio runtime");
 
     let mut group = c.benchmark_group("steward_fanout");
-    group.sample_size(20).measurement_time(Duration::from_secs(10));
+    group
+        .sample_size(20)
+        .measurement_time(Duration::from_secs(10));
 
     for n in [1usize, 4, 16, 64] {
         let (edge, _tmp) = setup_rt.block_on(build_edge_with_n_stewards(n));

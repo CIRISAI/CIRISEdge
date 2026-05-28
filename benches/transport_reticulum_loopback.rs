@@ -21,8 +21,20 @@
 //! 256 B → 64 KiB geometric ×4 per BENCHMARKS.md. The MDU step
 //! is somewhere between 256 B and 1 KiB; the curve should show it.
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
-
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 #![cfg(feature = "transport-reticulum")]
 
 #[path = "common/mod.rs"]
@@ -40,9 +52,7 @@ use ciris_edge::transport::reticulum::{
 use ciris_edge::transport::{InboundFrame, Transport};
 use ciris_edge::verify::RootingDirectory;
 use ciris_edge::HybridPolicy;
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::value::RawValue;
 use tokio::sync::{mpsc, Mutex};
 

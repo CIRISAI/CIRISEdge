@@ -20,7 +20,20 @@
 //! - `StewardDirective` — verify → attestation emission (same hook
 //!   as FederationAnnouncement, per CIRISEdge#20 ask #3).
 
-#![allow(clippy::pedantic, clippy::needless_pass_by_value, clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::cast_possible_truncation, clippy::cast_lossless, clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::items_after_statements, clippy::used_underscore_binding, clippy::field_reassign_with_default, clippy::needless_raw_string_hashes)]
+#![allow(
+    clippy::pedantic,
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::used_underscore_binding,
+    clippy::field_reassign_with_default,
+    clippy::needless_raw_string_hashes
+)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -146,7 +159,9 @@ async fn make_signed_envelope_bytes(
     }
     .expect("build envelope");
 
-    sign_envelope(signer, &mut env).await.expect("sign envelope");
+    sign_envelope(signer, &mut env)
+        .await
+        .expect("sign envelope");
     serde_json::to_vec(&env).expect("envelope to bytes")
 }
 
@@ -178,7 +193,10 @@ fn bench_dispatch(c: &mut Criterion) {
     let pool_per_type: Vec<(&str, MessageType, Vec<Vec<u8>>)> = setup_rt.block_on(async {
         let types = [
             ("InlineText", MessageType::InlineText),
-            ("FederationAnnouncement", MessageType::FederationAnnouncement),
+            (
+                "FederationAnnouncement",
+                MessageType::FederationAnnouncement,
+            ),
             ("ContentFetch", MessageType::ContentFetch),
             ("StewardDirective", MessageType::StewardDirective),
         ];
@@ -196,7 +214,9 @@ fn bench_dispatch(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("dispatch_inbound");
-    group.sample_size(30).measurement_time(Duration::from_secs(8));
+    group
+        .sample_size(30)
+        .measurement_time(Duration::from_secs(8));
 
     for (label, _mt, pool) in &pool_per_type {
         let mut idx = 0usize;
