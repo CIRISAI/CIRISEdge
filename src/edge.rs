@@ -988,22 +988,13 @@ impl EdgeBuilder {
         seed_dir: PathBuf,
         db_path: PathBuf,
     ) -> Result<Self, EdgeError> {
-        let key_id = key_id.into();
-        let pqc_seed = seed_dir.join("ml_dsa_65.seed");
-        let pqc_pair = pqc_seed
-            .exists()
-            .then(|| (Some(format!("{key_id}-pqc")), Some(pqc_seed)));
-        let (pqc_key_id, pqc_key_path) = pqc_pair.unwrap_or((None, None));
-
-        let config = ciris_keyring::LocalSeedConfig {
-            key_id: key_id.clone(),
-            key_path: seed_dir.join("ed25519.seed"),
-            pqc_key_id,
-            pqc_key_path,
-        };
-        let (classical, pqc) = ciris_keyring::load_local_seed(config)
-            .await
-            .map_err(|e| EdgeError::Config(format!("load_local_seed: {e}")))?;
+        // v0.10.0 (CIRISEdge#13): signer-load delegates to the
+        // standalone `LocalSigner::from_keyring_seed_dir` so consumers
+        // that share an existing persist Engine (cohabitation case)
+        // can reuse the same seed-layout convention without
+        // re-implementing it. The builder still owns the
+        // db_path-opens-its-own-pool path here.
+        let signer = LocalSigner::from_keyring_seed_dir(key_id, seed_dir).await?;
 
         let directory = ciris_persist::prelude::FederationDirectorySqlite::open(&db_path)
             .await
@@ -1012,16 +1003,10 @@ impl EdgeBuilder {
             .await
             .map_err(|e| EdgeError::Persist(format!("EdgeOutboundQueueSqlite::open: {e}")))?;
 
-        let signer = Arc::new(LocalSigner {
-            key_id,
-            classical,
-            pqc,
-        });
-
         Ok(Edge::builder()
             .directory(directory)
             .queue(queue)
-            .signer(signer))
+            .signer(Arc::new(signer)))
     }
 
     #[must_use]

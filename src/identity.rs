@@ -14,6 +14,7 @@
 //! operations. The seed bytes never enter edge's process memory;
 //! AV-17 heap-scan property test enforces this empirically.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -41,6 +42,69 @@ pub struct LocalSigner {
     /// `None` during hybrid-pending bootstrap; `Some` once the
     /// `pqc_completed_at` row is filled in.
     pub pqc: Option<Arc<dyn PqcSigner>>,
+}
+
+impl LocalSigner {
+    /// Load an Edge signing identity from a seed directory via
+    /// ciris-keyring — `ed25519.seed` (mandatory) + `ml_dsa_65.seed`
+    /// (optional; engaged when present). CIRISEdge#13.
+    ///
+    /// Standalone counterpart to [`crate::EdgeBuilder::from_keyring_seed_dir`]:
+    /// the builder bundles signer-load AND opens a fresh
+    /// `FederationDirectorySqlite` + `EdgeOutboundQueueSqlite` against
+    /// `db_path`. A consumer that already owns a persist `Engine` (the
+    /// CIRIS 3.0 cohabitation case — one Engine, one pool) wants the
+    /// signer-load half WITHOUT a second connection pool to the same
+    /// DB file. This method delivers exactly that:
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use ciris_edge::LocalSigner;
+    /// // engine_backend: Arc<dyn VerifyDirectory + OutboundHandle>
+    /// let signer = LocalSigner::from_keyring_seed_dir(
+    ///     "edge-key-1",
+    ///     "/etc/ciris/seeds".into(),
+    /// ).await?;
+    /// let edge = Edge::builder()
+    ///     .directory(engine_backend.clone())
+    ///     .queue(engine_backend)
+    ///     .signer(Arc::new(signer))
+    ///     .transport(...)
+    ///     .build()?;
+    /// ```
+    ///
+    /// Edge owns the seed-layout convention (`ed25519.seed`,
+    /// `ml_dsa_65.seed`, `-pqc` key_id suffix); consumers reuse it
+    /// rather than duplicating it. If the layout changes here,
+    /// CIRISLensCore relay-mode and any other consumer track it
+    /// automatically.
+    pub async fn from_keyring_seed_dir(
+        key_id: impl Into<String>,
+        seed_dir: PathBuf,
+    ) -> Result<Self, crate::EdgeError> {
+        let key_id = key_id.into();
+        let pqc_seed = seed_dir.join("ml_dsa_65.seed");
+        let pqc_pair = pqc_seed
+            .exists()
+            .then(|| (Some(format!("{key_id}-pqc")), Some(pqc_seed)));
+        let (pqc_key_id, pqc_key_path) = pqc_pair.unwrap_or((None, None));
+
+        let config = ciris_keyring::LocalSeedConfig {
+            key_id: key_id.clone(),
+            key_path: seed_dir.join("ed25519.seed"),
+            pqc_key_id,
+            pqc_key_path,
+        };
+        let (classical, pqc) = ciris_keyring::load_local_seed(config)
+            .await
+            .map_err(|e| crate::EdgeError::Config(format!("load_local_seed: {e}")))?;
+
+        Ok(LocalSigner {
+            key_id,
+            classical,
+            pqc,
+        })
+    }
 }
 
 /// Build an unsigned envelope around a typed message body. The
