@@ -30,17 +30,20 @@ publish = false
 # Substrate. Owns federation_keys directory, canonicalize_envelope,
 # steward seeds (OS-keyring), verify_hybrid_via_directory primitive,
 # edge_outbound_queue table + Engine surface for send_durable.
-# v2.7.0 (CIRISPersist#109) ships the PyCapsule cohabitation
-# accessors — `federation_directory_capsule` / `outbound_queue_capsule`
-# / `keyring_signer_capsule` `#[pymethod]`s on `PyEngine` — that
-# v0.9.2 edge consumes to construct an `Edge` over the host's
-# already-bootstrapped engine WITHOUT relying on cross-module
-# PyClass identity (the v0.9.1 cohabitation regression). The
-# Option-B `pub fn` accessors (CIRISPersist#95, v2.0.2+) remain
-# for sibling cdylibs that share persist's compiled-in PyTypeInfo;
-# edge uses the capsule path because we cross extension-module
-# boundaries (separate wheels). See ../CIRISPersist/MISSION.md and
-# FSD/EDGE_OUTBOUND_QUEUE.md.
+# v2.7.0 (CIRISPersist#104/#105/#106/#108/#109) ships the PyCapsule
+# cohabitation accessors — `federation_directory_capsule` /
+# `outbound_queue_capsule` / `keyring_signer_capsule` `#[pymethod]`s
+# on `PyEngine` — that v0.9.2 edge consumes to construct an `Edge`
+# over the host's already-bootstrapped engine WITHOUT relying on
+# cross-module PyClass identity (the v0.9.1 cohabitation regression).
+# Also exposes `list_keys_by_identity_type` on FederationDirectory
+# (v2.6.0) — consumed by CIRISEdge#19 AccordCarrier wire-layer
+# 2-of-3 verify (accord_holder enumeration) and #20 steward addressing
+# (steward enumeration). The Option-B `pub fn` accessors
+# (CIRISPersist#95, v2.0.2+) remain for sibling cdylibs that share
+# persist's compiled-in PyTypeInfo; edge uses the capsule path
+# because we cross extension-module boundaries (separate wheels).
+# See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
 ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.7.0", version = "2", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.

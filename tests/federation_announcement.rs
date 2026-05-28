@@ -293,6 +293,7 @@ fn sample_announcement() -> FederationAnnouncement {
             .unwrap()
             .with_timezone(&Utc),
         evidence_refs: vec![],
+        accord_signatures: vec![],
     }
 }
 
