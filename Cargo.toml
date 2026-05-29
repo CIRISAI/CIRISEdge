@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.19.3"
+version = "0.19.4"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -79,14 +79,51 @@ publish = false
 # edge derives `Arc<dyn BlackholeRules>` from the same `BackendDispatch`
 # arm `outbound_queue_capsule` already produces — no new capsule
 # required (the capsule family stays at 6).
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.2.0", version = "3", features = ["sqlite"] }
+#
+# v3.4.2 (CIRISEdge v0.19.4 currency bump) — tracks the persist v3.4.x
+# line so cross-cdylib cohabitation against persist 3.4.x engines does
+# not panic on the `LocalSignerHardwareAdapter: HardwareSigner` trait
+# bound. The persist 3.3.x / 3.4.x line shipped 8 releases on
+# 2026-05-29 across #117 / #118 / #119 / #120 / #121 / #122 / #123 /
+# #127 plus the persist-internal verify v4.0.0 → v4.2.0 pin bump that
+# v3.4.2 itself carries. Edge v0.19.4 is pure currency: no
+# `peer_metadata_for` consumption (deferred to v0.19.6 cohort_scope
+# rework), no `TrustScoring` consumption (deferred to v0.19.6 trust
+# short-circuit), no `put_blob_signing` / canonicalizer-authority
+# adoption — just the pin so the byte-compat surface persist v3.4.2
+# exposes lines up with the verify v4.2.0 surface edge consumes
+# directly via `ciris-keyring` / `ciris-crypto`. The `HardwareSigner`
+# trait shape itself is unchanged between verify v4.0.0 and v4.2.0
+# (verified via `git diff v4.0.0..v4.2.0 src/ciris-keyring/src/`
+# returning only the additive `impl PqcSigner for
+# ciris_crypto::MlDsa65Signer` from CIRISVerify#39); the mismatch
+# panic this cut closes is the cross-cdylib trait-object identity
+# mismatch where edge's `Arc<dyn HardwareSigner>` (compiled against
+# verify v4.0.0's symbol) cannot be downcast from persist 3.4.x's
+# `LocalSignerHardwareAdapter` (compiled against verify v4.2.0). Pin
+# parity restores the single-symbol invariant.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.4.2", version = "3", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
 # major bumps shipped together; pinning identically prevents two
 # distinct PqcSigner traits from landing across the dep graph.
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.0.0", version = "4", features = ["software", "pqc-ml-dsa"] }
-ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.0.0", version = "4", features = ["ed25519", "pqc-ml-dsa"] }
+# v0.19.4 — bumped v4.0.0 → v4.2.0 in lockstep with the persist v3.4.2
+# pin. v4.1.0 added `impl ciris_keyring::PqcSigner for
+# ciris_crypto::MlDsa65Signer` (CIRISVerify#39) so persist
+# `LocalSigner::from_parts` can accept the raw ciris-crypto signer
+# directly; v4.2.0 added the CEG 0.2 cross-wheel-boundary conformance
+# helpers (HumanityAccord + WitnessRelation + ciris-verify-ffi
+# surface) used by persist v3.4.x. Edge consumes the keyring surface
+# the same way it did at v4.0.0 — `Arc<dyn HardwareSigner>` for
+# Ed25519 + `Arc<dyn PqcSigner>` for ML-DSA-65 — so the pin bump is
+# pure currency on edge's side. The bump exists to keep ONE
+# verify-crate symbol across the dep graph: persist v3.4.2 already
+# moved to v4.2.0, and a mixed v4.0.0/v4.2.0 graph produces two
+# distinct trait-object vtables that the trait-bound check in
+# `Arc<dyn HardwareSigner>` cannot reconcile.
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.2.0", version = "4", features = ["software", "pqc-ml-dsa"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.2.0", version = "4", features = ["ed25519", "pqc-ml-dsa"] }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -600,7 +637,7 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.2.0", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.4.2", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3

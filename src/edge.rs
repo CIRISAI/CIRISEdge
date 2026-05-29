@@ -1145,19 +1145,23 @@ impl Edge {
         // `Ok(Reject)` arm (peer returned a wire reject). The
         // `Ok(Delivered)` arm is success.
         // CIRISEdge#28 (v0.19.0) — instrument the transport-send leg
-        // as a nested span; use `Instrument` (not `.entered()`) so
-        // the span is `Send`-friendly across the await.
-        use tracing::Instrument as _;
+        // as a nested span; use `tracing::Instrument` (not
+        // `.entered()`) so the span is `Send`-friendly across the
+        // await. v0.19.4 — clippy 1.95 `items_after_statements`
+        // ratchet: import via the fully-qualified path instead of a
+        // mid-function `use` statement (lint complains about items
+        // appearing after statements within a scope).
         let send_span = tracing::debug_span!(
             "transport.send",
             transport_id = %transport.id().0,
             recipient_key_id = %destination_key_id,
             bytes = envelope_size,
         );
-        let send_result = transport
-            .send(destination_key_id, &envelope_bytes)
-            .instrument(send_span)
-            .await;
+        let send_result = tracing::Instrument::instrument(
+            transport.send(destination_key_id, &envelope_bytes),
+            send_span,
+        )
+        .await;
         let outcome = match send_result {
             Ok(o) => {
                 let attempt_outcome = match &o {
