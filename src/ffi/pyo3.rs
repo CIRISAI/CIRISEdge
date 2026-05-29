@@ -1196,6 +1196,24 @@ pub struct PyDurableHandle {
 /// thread while we synchronously wait on the future. When no current
 /// runtime is set on the calling thread, plain `runtime.block_on` is
 /// correct and drives the future on a runtime worker thread.
+///
+/// v0.19.5 (CIRISEdge#50) — the **bare-thread** branch additionally
+/// installs `runtime.enter()` for the duration of the call. Rationale:
+/// `Handle::block_on` enters the runtime context for the future's
+/// polling, but any **caller-thread-local construction** that
+/// brackets the `block_on` call — most notably `tokio::time::interval`
+/// / `tokio::time::sleep` / any other timer-bound primitive a future
+/// constructor may build *before* its first `.await` — needs a
+/// current runtime at construction time, NOT just at polling time.
+/// `Interval::new_with_period_at` calls `sleep_until(start)` in the
+/// constructor body; under the cohabitation harness this fires from
+/// a thread with no current runtime and panics
+/// `"there is no reactor running"` (`tokio-1.52.3/src/time/interval.rs`).
+///
+/// Entering the runtime ourselves before `block_on` makes the
+/// constructor-time runtime context match the polling-time context.
+/// The guard drops on function return, restoring whatever runtime
+/// posture the caller had. Cheap: one TLS write on enter + drop.
 fn run_async<F, T>(runtime: &RuntimeHandle, fut: F) -> T
 where
     F: std::future::Future<Output = T> + Send,
@@ -1210,6 +1228,16 @@ where
         // `#[tokio::test(flavor = "multi_thread")]`.
         tokio::task::block_in_place(|| runtime.block_on(fut))
     } else {
+        // v0.19.5 (CIRISEdge#50) — enter the runtime context for the
+        // duration of the call so any constructor-time timer build
+        // (`tokio::time::interval` / `sleep` / sqlx pool acquire-timer)
+        // executed during future-assembly finds a current runtime.
+        // `Handle::block_on` itself enters context only for the polling
+        // body; the future-builder code that runs BEFORE the first
+        // poll (the `async move { ... }`-block's prelude, plus any
+        // `Sleep`/`Interval` constructed eagerly via a `let` binding)
+        // needs the explicit guard.
+        let _guard = runtime.enter();
         runtime.block_on(fut)
     }
 }
@@ -4301,5 +4329,176 @@ mod pyo3_tier2_tests {
                 let _ = msg;
             }
         }
+    }
+
+    // ── v0.19.5 (CIRISEdge#50) — durable-send runtime-context regression ─
+    //
+    // The CIRISConformance harness drives wheels through
+    // `init_edge_runtime` and then makes `send_durable_inline_text`
+    // calls. In v0.19.4 those calls SIGABRT with
+    // `there is no reactor running` (tokio-1.52.3/src/time/interval.rs).
+    // The trip-wire is the `send_durable_inline_text` pymethod itself
+    // — the caller doesn't even get back a `DurableHandle`.
+    //
+    // Root cause: the pymethod ran `runtime.block_on(fut)` correctly,
+    // but the `runtime` carried into the `PyDurableHandle` value
+    // returned from the method was a clone of the SAME `RuntimeHandle`,
+    // and the panic shape "no reactor running" only fires when the
+    // host thread has NO current tokio runtime AND the call site
+    // tries to construct a timer-bound primitive (e.g. via
+    // `tokio::time::interval`) without entering one first.
+    //
+    // Repro: a plain (non-`#[tokio::test]`) `#[test]` that
+    //   1. builds a multi-thread runtime via `Runtime::new()`,
+    //   2. assembles the test `Edge` on it,
+    //   3. drops out of the runtime context (the test thread is bare),
+    //   4. calls `PyEdge::send_durable_inline_text` directly.
+    //
+    // With v0.19.4 this test will SIGABRT before returning (the v0.19.5
+    // fix wraps the pymethod's `run_async` invocation in a
+    // `runtime.enter()` guard so the call site has a current runtime
+    // for the duration of the call). The fix is contained — same shape
+    // for `send_inline_text` (which is exercised by the existing tests
+    // and never SIGABRT'd in production, but takes the same `run_async`
+    // path; the guard there is a defense-in-depth measure).
+    //
+    // No `#[tokio::test]`. The `Runtime::new()` is owned by the test
+    // body; its handle is what the PyEdge consumes — exactly the shape
+    // `init_edge_runtime` sees after extracting `runtime_handle_capsule`
+    // from persist.
+
+    /// Sync-context fixture matching the cohabitation harness shape:
+    /// build a multi-thread runtime, assemble the test Edge on it,
+    /// then EXIT the runtime context before returning the
+    /// (PyEdge, queue, runtime) tuple. Callers exercise PyEdge
+    /// pymethods from a thread with no current tokio runtime — exactly
+    /// what `init_edge_runtime` produces after construction.
+    ///
+    /// The Runtime is returned to the caller so it stays alive (the
+    /// PyEdge's `runtime: RuntimeHandle` is just a Handle clone; the
+    /// Runtime itself owns the worker threads + reactor that drive the
+    /// pymethod's `block_on`). Drop order: the caller drops PyEdge
+    /// first (which drops the Arc<Edge>), then Runtime (which joins
+    /// worker threads).
+    fn build_sync_cohab_fixture() -> (PyEdge, Arc<dyn OutboundHandle>, tokio::runtime::Runtime) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build multi-thread runtime");
+        let (edge, queue) = runtime.block_on(build_test_edge());
+        let handle = runtime.handle().clone();
+        let py_edge = PyEdge::for_test(edge, handle);
+        (py_edge, queue, runtime)
+    }
+
+    /// v0.19.5 (CIRISEdge#50) — acceptance gate. The bug shape is a
+    /// hard SIGABRT (panic-on-drop in a tokio worker drop). Asserting
+    /// "did not panic" is necessarily indirect: if the pymethod
+    /// returns Ok with a DurableHandle, the bug did NOT fire. The
+    /// existing v0.19.4 binary aborts the test process before this
+    /// line; the v0.19.5 fix returns a valid handle.
+    #[test]
+    fn send_durable_inline_text_does_not_abort_in_sync_cohab() {
+        init_python();
+        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+        let handle = Python::attach(|py| -> PyResult<PyDurableHandle> {
+            py_edge.send_durable_inline_text(py, "recipient-key", "hello")
+        })
+        .expect("send_durable_inline_text must not abort in sync cohab context");
+        // body_sha256 is the load-bearing forensic join key — its
+        // presence (64-char lowercase hex) means the envelope was
+        // built, signed, hashed, and enqueued. The pymethod ran to
+        // completion.
+        assert_eq!(handle.body_sha256().len(), 64);
+        assert!(handle
+            .body_sha256()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+    }
+
+    /// v0.19.5 (CIRISEdge#50) — the envelope MUST be visible in the
+    /// persist outbound queue with `status=pending` after a successful
+    /// `send_durable_inline_text` return.
+    #[test]
+    fn send_durable_inline_text_envelope_visible_in_outbound() {
+        use ciris_persist::prelude::{OutboundFilter, OutboundStatus};
+
+        init_python();
+        let (py_edge, queue, runtime) = build_sync_cohab_fixture();
+        let queue_id = Python::attach(|py| -> PyResult<String> {
+            let h = py_edge.send_durable_inline_text(py, "recipient-key", "visible-row")?;
+            Ok(h.queue_id().to_string())
+        })
+        .expect("send_durable_inline_text");
+
+        // List pending outbound rows — the new envelope must appear.
+        // Inspect via the same runtime the pymethod used.
+        let rows = runtime.block_on(async {
+            queue
+                .list_outbound(
+                    OutboundFilter {
+                        status: Some(OutboundStatus::Pending),
+                        destination_key_id: Some("recipient-key".to_string()),
+                        ..Default::default()
+                    },
+                    16,
+                )
+                .await
+                .expect("list_outbound")
+        });
+        assert!(
+            rows.iter().any(|r| r.queue_id == queue_id),
+            "enqueued envelope must be visible in list_outbound (queue_id={queue_id}, \
+             observed {} rows): {:?}",
+            rows.len(),
+            rows.iter().map(|r| &r.queue_id).collect::<Vec<_>>(),
+        );
+    }
+
+    /// v0.19.5 (CIRISEdge#50) — `metrics_snapshot()["durable_queue_depth"]`
+    /// must increment by 1 per `send_durable_inline_text` call. The
+    /// `Edge::send_durable_with_cohort_scope` body fires
+    /// `metrics.inc_durable_queue(DeliveryClass::Durable)` AFTER the
+    /// successful `enqueue_outbound`; the snapshot path projects it.
+    #[test]
+    fn send_durable_inline_text_increments_durable_queue_depth_metric() {
+        init_python();
+        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+
+        // Baseline: 0 (fresh Edge, no prior durable sends).
+        let baseline: u64 = Python::attach(|py| -> PyResult<u64> {
+            let snap = py_edge.metrics_snapshot(py)?;
+            let bound = snap.bind(py);
+            let depth = bound.get_item("durable_queue_depth")?;
+            // `durable_queue_depth` dict is keyed by DeliveryClass::as_str().
+            // Missing key = 0 (no enqueue yet).
+            match depth.get_item("durable") {
+                Ok(v) => v.extract::<u64>(),
+                Err(_) => Ok(0),
+            }
+        })
+        .expect("metrics_snapshot baseline");
+
+        // Single enqueue.
+        Python::attach(|py| -> PyResult<()> {
+            py_edge.send_durable_inline_text(py, "recipient-key", "metric-bump")?;
+            Ok(())
+        })
+        .expect("send_durable_inline_text");
+
+        // Post: baseline + 1.
+        let post: u64 = Python::attach(|py| -> PyResult<u64> {
+            let snap = py_edge.metrics_snapshot(py)?;
+            let bound = snap.bind(py);
+            let depth = bound.get_item("durable_queue_depth")?;
+            depth.get_item("durable")?.extract()
+        })
+        .expect("metrics_snapshot post");
+        assert_eq!(
+            post,
+            baseline + 1,
+            "durable_queue_depth[durable] must increment by 1 per send_durable_inline_text \
+             (baseline={baseline}, post={post})"
+        );
     }
 }
