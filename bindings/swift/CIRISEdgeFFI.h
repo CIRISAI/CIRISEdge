@@ -273,6 +273,33 @@ RustBuffer uniffi_ciris_edge_fn_func_last_rotation_at(RustCallStatus *_Nonnull o
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_COUNT
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_COUNT
+uint32_t uniffi_ciris_edge_fn_func_link_count(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_LIST
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_LIST
+RustBuffer uniffi_ciris_edge_fn_func_link_list(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_OPEN
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_OPEN
+RustBuffer uniffi_ciris_edge_fn_func_link_open(RustBuffer destination_hash, uint64_t timeout_ms, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_REQUEST
+RustBuffer uniffi_ciris_edge_fn_func_link_request(RustBuffer link_handle, RustBuffer path, RustBuffer data, uint64_t timeout_ms, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_TEARDOWN
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_LINK_TEARDOWN
+void uniffi_ciris_edge_fn_func_link_teardown(RustBuffer link_id, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_METRICS_SNAPSHOT
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_METRICS_SNAPSHOT
 RustBuffer uniffi_ciris_edge_fn_func_metrics_snapshot(RustCallStatus *_Nonnull out_status
@@ -684,6 +711,36 @@ uint16_t uniffi_ciris_edge_checksum_func_identity_pubkeys(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LAST_ROTATION_AT
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LAST_ROTATION_AT
 uint16_t uniffi_ciris_edge_checksum_func_last_rotation_at(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_COUNT
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_COUNT
+uint16_t uniffi_ciris_edge_checksum_func_link_count(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_LIST
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_LIST
+uint16_t uniffi_ciris_edge_checksum_func_link_list(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_OPEN
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_OPEN
+uint16_t uniffi_ciris_edge_checksum_func_link_open(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_REQUEST
+uint16_t uniffi_ciris_edge_checksum_func_link_request(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_TEARDOWN
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_LINK_TEARDOWN
+uint16_t uniffi_ciris_edge_checksum_func_link_teardown(void
     
 );
 #endif

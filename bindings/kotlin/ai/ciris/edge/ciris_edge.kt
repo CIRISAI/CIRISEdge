@@ -645,6 +645,16 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_ciris_edge_checksum_func_last_rotation_at(
     ): Short
+    external fun uniffi_ciris_edge_checksum_func_link_count(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_link_list(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_link_open(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_link_request(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_link_teardown(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_metrics_snapshot(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_path_table(
@@ -707,169 +717,179 @@ internal object UniffiLib {
         
     }
     external fun uniffi_ciris_edge_fn_func_crate_version(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_current_ratchet_id(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_identity_hash(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_identity_pubkeys(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_last_rotation_at(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_metrics_snapshot(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_path_table(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_peer_add(`keyId`: RustBuffer.ByValue,`pubkeyEd25519Base64`: RustBuffer.ByValue,`transportIdentity`: RustBuffer.ByValue,`policy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_peer_get(`keyId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_peer_health_summary(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_peer_list(`filter`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_peer_probe(`keyId`: RustBuffer.ByValue,`timeoutMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_peer_remove(`handle`: RustBuffer.ByValue,`hard`: Byte,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_peer_set_alias(`keyId`: RustBuffer.ByValue,`alias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_peer_set_notes(`keyId`: RustBuffer.ByValue,`notes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_peer_set_policy(`handle`: RustBuffer.ByValue,`policy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_peer_set_trust(`keyId`: RustBuffer.ByValue,`trust`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_queue_depth(`deliveryClass`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_recent_errors(`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_recent_events(`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_transport_add(`spec`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_transport_config_blob(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_transport_disable(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_transport_enable(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_transport_health(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_transport_list(uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun uniffi_ciris_edge_fn_func_transport_remove(`handle`: RustBuffer.ByValue,`drain`: Byte,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_transport_set_mode(`handle`: RustBuffer.ByValue,`mode`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun uniffi_ciris_edge_fn_func_transport_stats(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_ciris_edge_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_ciris_edge_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_ciris_edge_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    external fun ffi_ciris_edge_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_ciris_edge_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_u8(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_u8(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Byte
-    external fun ffi_ciris_edge_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_i8(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_i8(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Byte
-    external fun ffi_ciris_edge_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_u16(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_u16(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Short
-    external fun ffi_ciris_edge_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_i16(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_i16(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Short
-    external fun ffi_ciris_edge_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_u32(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_u32(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Int
-    external fun ffi_ciris_edge_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_i32(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_i32(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Int
-    external fun ffi_ciris_edge_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_u64(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_u64(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Long
-    external fun ffi_ciris_edge_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_i64(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_i64(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Long
-    external fun ffi_ciris_edge_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_f32(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_f32(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Float
-    external fun ffi_ciris_edge_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_f64(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_f64(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Double
-    external fun ffi_ciris_edge_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_rust_buffer(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_rust_buffer(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): RustBuffer.ByValue
-    external fun ffi_ciris_edge_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_cancel_void(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_free_void(`handle`: Long,
-    ): Unit
-    external fun ffi_ciris_edge_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_current_ratchet_id(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_identity_hash(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_identity_pubkeys(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_last_rotation_at(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_link_count(uniffi_out_err: UniffiRustCallStatus, 
+): Int
+external fun uniffi_ciris_edge_fn_func_link_list(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_link_open(`destinationHash`: RustBuffer.ByValue,`timeoutMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_link_request(`linkHandle`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`timeoutMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_link_teardown(`linkId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_metrics_snapshot(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_path_table(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_peer_add(`keyId`: RustBuffer.ByValue,`pubkeyEd25519Base64`: RustBuffer.ByValue,`transportIdentity`: RustBuffer.ByValue,`policy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_peer_get(`keyId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_peer_health_summary(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_peer_list(`filter`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_peer_probe(`keyId`: RustBuffer.ByValue,`timeoutMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_peer_remove(`handle`: RustBuffer.ByValue,`hard`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_peer_set_alias(`keyId`: RustBuffer.ByValue,`alias`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_peer_set_notes(`keyId`: RustBuffer.ByValue,`notes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_peer_set_policy(`handle`: RustBuffer.ByValue,`policy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_peer_set_trust(`keyId`: RustBuffer.ByValue,`trust`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_queue_depth(`deliveryClass`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_recent_errors(`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_recent_events(`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_transport_add(`spec`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_transport_config_blob(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_transport_disable(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_transport_enable(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_transport_health(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_transport_list(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_transport_remove(`handle`: RustBuffer.ByValue,`drain`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_transport_set_mode(`handle`: RustBuffer.ByValue,`mode`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_transport_stats(`handle`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun ffi_ciris_edge_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun ffi_ciris_edge_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun ffi_ciris_edge_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun ffi_ciris_edge_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun ffi_ciris_edge_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_u8(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_u8(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
+external fun ffi_ciris_edge_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_i8(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_i8(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
+external fun ffi_ciris_edge_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_u16(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_u16(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Short
+external fun ffi_ciris_edge_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_i16(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_i16(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Short
+external fun ffi_ciris_edge_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_u32(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_u32(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Int
+external fun ffi_ciris_edge_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_i32(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_i32(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Int
+external fun ffi_ciris_edge_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_u64(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_u64(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun ffi_ciris_edge_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_i64(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_i64(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun ffi_ciris_edge_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_f32(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_f32(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Float
+external fun ffi_ciris_edge_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_f64(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_f64(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Double
+external fun ffi_ciris_edge_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_rust_buffer(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_rust_buffer(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun ffi_ciris_edge_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_cancel_void(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_free_void(`handle`: Long,
+): Unit
+external fun ffi_ciris_edge_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 
-        
+    
 }
 
 private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
@@ -896,6 +916,21 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_last_rotation_at() != 1939.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_link_count() != 54874.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_link_list() != 2091.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_link_open() != 44421.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_link_request() != 40060.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_link_teardown() != 2573.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_metrics_snapshot() != 47202.toShort()) {
@@ -1276,6 +1311,122 @@ public object FfiConverterTypeEdgeErrorEvent: FfiConverterRustBuffer<EdgeErrorEv
             FfiConverterString.write(value.`className`, buf)
             FfiConverterString.write(value.`message`, buf)
             FfiConverterOptionalString.write(value.`bodySha256`, buf)
+    }
+}
+
+
+
+data class EdgeLinkHandle (
+    var `linkId`: kotlin.ByteArray
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeLinkHandle: FfiConverterRustBuffer<EdgeLinkHandle> {
+    override fun read(buf: ByteBuffer): EdgeLinkHandle {
+        return EdgeLinkHandle(
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeLinkHandle) = (
+            FfiConverterByteArray.allocationSize(value.`linkId`)
+    )
+
+    override fun write(value: EdgeLinkHandle, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`linkId`, buf)
+    }
+}
+
+
+
+data class EdgeLinkInfo (
+    var `linkId`: kotlin.ByteArray
+    , 
+    var `peerIdentityHash`: kotlin.ByteArray
+    , 
+    var `state`: EdgeLinkState
+    , 
+    var `ageSeconds`: kotlin.ULong
+    , 
+    var `rssiDbm`: kotlin.Double?
+    , 
+    var `snrDb`: kotlin.Double?
+    , 
+    var `establishmentRateKbps`: kotlin.Double?
+    , 
+    var `mtu`: kotlin.UInt
+    , 
+    var `mdu`: kotlin.UInt
+    , 
+    var `transportId`: kotlin.String
+    , 
+    var `transportKind`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeLinkInfo: FfiConverterRustBuffer<EdgeLinkInfo> {
+    override fun read(buf: ByteBuffer): EdgeLinkInfo {
+        return EdgeLinkInfo(
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterTypeEdgeLinkState.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterOptionalDouble.read(buf),
+            FfiConverterOptionalDouble.read(buf),
+            FfiConverterOptionalDouble.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeLinkInfo) = (
+            FfiConverterByteArray.allocationSize(value.`linkId`) +
+            FfiConverterByteArray.allocationSize(value.`peerIdentityHash`) +
+            FfiConverterTypeEdgeLinkState.allocationSize(value.`state`) +
+            FfiConverterULong.allocationSize(value.`ageSeconds`) +
+            FfiConverterOptionalDouble.allocationSize(value.`rssiDbm`) +
+            FfiConverterOptionalDouble.allocationSize(value.`snrDb`) +
+            FfiConverterOptionalDouble.allocationSize(value.`establishmentRateKbps`) +
+            FfiConverterUInt.allocationSize(value.`mtu`) +
+            FfiConverterUInt.allocationSize(value.`mdu`) +
+            FfiConverterString.allocationSize(value.`transportId`) +
+            FfiConverterString.allocationSize(value.`transportKind`)
+    )
+
+    override fun write(value: EdgeLinkInfo, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`linkId`, buf)
+            FfiConverterByteArray.write(value.`peerIdentityHash`, buf)
+            FfiConverterTypeEdgeLinkState.write(value.`state`, buf)
+            FfiConverterULong.write(value.`ageSeconds`, buf)
+            FfiConverterOptionalDouble.write(value.`rssiDbm`, buf)
+            FfiConverterOptionalDouble.write(value.`snrDb`, buf)
+            FfiConverterOptionalDouble.write(value.`establishmentRateKbps`, buf)
+            FfiConverterUInt.write(value.`mtu`, buf)
+            FfiConverterUInt.write(value.`mdu`, buf)
+            FfiConverterString.write(value.`transportId`, buf)
+            FfiConverterString.write(value.`transportKind`, buf)
     }
 }
 
@@ -2135,6 +2286,43 @@ public object FfiConverterTypeEdgeBindingsError : FfiConverterRustBuffer<EdgeBin
 
 
 
+enum class EdgeLinkState {
+    
+    PENDING,
+    ACTIVE,
+    CLOSING,
+    CLOSED,
+    STALE;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeLinkState: FfiConverterRustBuffer<EdgeLinkState> {
+    override fun read(buf: ByteBuffer) = try {
+        EdgeLinkState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: EdgeLinkState) = 4UL
+
+    override fun write(value: EdgeLinkState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
 enum class EdgePeerTrust {
     
     TRUSTED,
@@ -2518,6 +2706,34 @@ public object FfiConverterSequenceTypeEdgeErrorEvent: FfiConverterRustBuffer<Lis
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeEdgeLinkInfo: FfiConverterRustBuffer<List<EdgeLinkInfo>> {
+    override fun read(buf: ByteBuffer): List<EdgeLinkInfo> {
+        val len = buf.getInt()
+        return List<EdgeLinkInfo>(len) {
+            FfiConverterTypeEdgeLinkInfo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<EdgeLinkInfo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeEdgeLinkInfo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<EdgeLinkInfo>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeEdgeLinkInfo.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeEdgeNetworkEvent: FfiConverterRustBuffer<List<EdgeNetworkEvent>> {
     override fun read(buf: ByteBuffer): List<EdgeNetworkEvent> {
         val len = buf.getInt()
@@ -2821,6 +3037,60 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
 }
     )
     }
+    
+
+    @Throws(EdgeBindingsException::class) fun `linkCount`(): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_link_count(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `linkList`(): List<EdgeLinkInfo> {
+            return FfiConverterSequenceTypeEdgeLinkInfo.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_link_list(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `linkOpen`(`destinationHash`: kotlin.ByteArray, `timeoutMs`: kotlin.ULong): EdgeLinkHandle {
+            return FfiConverterTypeEdgeLinkHandle.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_link_open(
+    
+        FfiConverterByteArray.lower(`destinationHash`),FfiConverterULong.lower(`timeoutMs`),_status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `linkRequest`(`linkHandle`: EdgeLinkHandle, `path`: kotlin.String, `data`: kotlin.ByteArray, `timeoutMs`: kotlin.ULong): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_link_request(
+    
+        FfiConverterTypeEdgeLinkHandle.lower(`linkHandle`),FfiConverterString.lower(`path`),FfiConverterByteArray.lower(`data`),FfiConverterULong.lower(`timeoutMs`),_status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `linkTeardown`(`linkId`: kotlin.ByteArray)
+        = 
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_link_teardown(
+    
+        FfiConverterByteArray.lower(`linkId`),_status)
+}
+    
     
 
     @Throws(EdgeBindingsException::class) fun `metricsSnapshot`(): EdgeMetricsSnapshot {

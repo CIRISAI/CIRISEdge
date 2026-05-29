@@ -1,4 +1,23 @@
-// CIRISEdge UniFFI surface — v0.13.0 (CIRISEdge#36 GO + #25 + #26 + #31 reads + #28 snapshot reads).
+// CIRISEdge UniFFI surface — v0.14.0 (CIRISEdge#32 Links FFI + #34 subscribe_link_events wiring).
+//
+// v0.14.0 adds the Links surface (#32) under UniFFI: lifecycle reads
+// (`link_list` / `link_count`), an `link_open` + `link_teardown` pair
+// over Reticulum's `Link::establish` / `Link::close`, and a blocking
+// `link_request` wrapping leviculum's request/response surface. Per
+// the v0.13.0 NO-GO carve-out on AsyncIterator, async functions are
+// CASE-BY-CASE — `link_request` is exposed as a sync function that
+// blocks on a tokio runtime handle internally (the same
+// `block_on_runtime` discipline #25 reads + #28 snapshot reads use).
+// An async-iterator polish lands in v0.14.x once UniFFI 0.32+ ships.
+//
+// Companion #34 work: the v0.11.0 `EventBus::link_events` channel
+// (until v0.13.0 a stubbed empty channel) is now populated by the
+// Reticulum transport's link state machine — `LinkRequest`/`LinkEstablished`
+// → `link_established` event; `LinkIdentified` → `link_identified`;
+// `LinkClosed` → `link_closed`; `LinkStale` → `link_stale`. Consumers
+// subscribe via the PyO3-side `subscribe_link_events` AsyncIterator
+// (unchanged surface, now actually receiving events).
+
 //
 // Per the spike's NO-GO carve-out, this UDL does NOT cover:
 //   - init_edge_runtime          (PyCapsule + Bound<PyAny>; PyO3-only)
@@ -122,6 +141,33 @@ namespace ciris_edge {
 
     [Throws=EdgeBindingsError]
     sequence<EdgePathEntry> path_table();
+
+    // ─── #32 Links FFI ───────────────────────────────────────────────
+    [Throws=EdgeBindingsError]
+    sequence<EdgeLinkInfo> link_list();
+
+    [Throws=EdgeBindingsError]
+    u32 link_count();
+
+    [Throws=EdgeBindingsError]
+    EdgeLinkHandle link_open(bytes destination_hash, u64 timeout_ms);
+
+    [Throws=EdgeBindingsError]
+    void link_teardown(bytes link_id);
+
+    // v0.14.0 (CIRISEdge#32) — blocking request/response over a Link.
+    // Returns response bytes (msgpack-encoded by leviculum) or a typed
+    // error on timeout. Per the UniFFI 0.31 spike's NO-GO on
+    // AsyncIterator, async functions are CASE-BY-CASE; this is sync
+    // (uses the v0.13.0 block_on_runtime pattern). Async polish
+    // deferred to v0.14.x once UniFFI 0.32+ ships the async surface.
+    [Throws=EdgeBindingsError]
+    bytes link_request(
+        EdgeLinkHandle link_handle,
+        string path,
+        bytes data,
+        u64 timeout_ms
+    );
 };
 
 // ─── Error type ─────────────────────────────────────────────────────
@@ -279,4 +325,32 @@ dictionary EdgePathEntry {
     u32 hops;
     string? next_hop;
     string? last_seen_at;
+};
+
+// ─── #32 Links FFI types ────────────────────────────────────────────
+
+enum EdgeLinkState {
+    "Pending",
+    "Active",
+    "Closing",
+    "Closed",
+    "Stale",
+};
+
+dictionary EdgeLinkHandle {
+    bytes link_id;
+};
+
+dictionary EdgeLinkInfo {
+    bytes link_id;
+    bytes peer_identity_hash;
+    EdgeLinkState state;
+    u64 age_seconds;
+    double? rssi_dbm;
+    double? snr_db;
+    double? establishment_rate_kbps;
+    u32 mtu;
+    u32 mdu;
+    string transport_id;
+    string transport_kind;
 };

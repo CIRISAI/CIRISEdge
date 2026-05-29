@@ -76,7 +76,7 @@ pub fn install_edge_handle(edge: &Arc<Edge>) {
 /// Resolve the registered Edge to a strong `Arc`. `Err(NotInitialized)`
 /// if `install_edge_handle` was never called OR the underlying Edge
 /// has been dropped.
-fn current_edge() -> Result<Arc<Edge>, crate::EdgeBindingsError> {
+pub(crate) fn current_edge() -> Result<Arc<Edge>, crate::EdgeBindingsError> {
     let slot = edge_slot().read().expect("edge_slot poisoned");
     slot.upgrade()
         .ok_or(crate::EdgeBindingsError::NotInitialized)

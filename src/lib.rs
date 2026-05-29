@@ -124,10 +124,11 @@ pub use verify::{
 // visible at the crate root before `include_scaffolding!` runs.
 #[cfg(feature = "ffi-uniffi")]
 pub use ffi::uniffi_types::{
-    EdgeBindingsError, EdgeErrorEvent, EdgeMetricsSnapshot, EdgeNetworkEvent, EdgePathEntry,
-    EdgePeerFilter, EdgePeerHandle, EdgePeerHealth, EdgePeerInfo, EdgePeerPolicy, EdgePeerTrust,
-    EdgeProbeResult, EdgeTransportHandle, EdgeTransportHealth, EdgeTransportInfo,
-    EdgeTransportSpec, EdgeTransportStats,
+    EdgeBindingsError, EdgeErrorEvent, EdgeLinkHandle, EdgeLinkInfo, EdgeLinkState,
+    EdgeMetricsSnapshot, EdgeNetworkEvent, EdgePathEntry, EdgePeerFilter, EdgePeerHandle,
+    EdgePeerHealth, EdgePeerInfo, EdgePeerPolicy, EdgePeerTrust, EdgeProbeResult,
+    EdgeTransportHandle, EdgeTransportHealth, EdgeTransportInfo, EdgeTransportSpec,
+    EdgeTransportStats,
 };
 
 // UDL function bodies live in `ffi::uniffi_impl` — re-exported here
@@ -142,6 +143,12 @@ pub use ffi::uniffi_impl::{
     transport_enable, transport_health, transport_list, transport_remove, transport_set_mode,
     transport_stats,
 };
+
+// v0.14.0 (CIRISEdge#32) — Links FFI bodies. The scaffolding looks
+// these up by bare name at the crate root, the same pattern v0.13.0
+// established for the #25 / #26 / #28 / #31 reads cut.
+#[cfg(feature = "ffi-uniffi")]
+pub use ffi::uniffi_impl_links::{link_count, link_list, link_open, link_request, link_teardown};
 
 // The included scaffolding emits ~30 `#[unsafe(no_mangle)]` FFI shim
 // declarations (`uniffi_ciris_edge_fn_func_*` + `ffi_*_uniffi_contract_version`
