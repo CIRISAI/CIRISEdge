@@ -1157,6 +1157,90 @@ impl Drop for PySubscriptionHandle {
 
 /// Consumer-side hybrid PQC acceptance policy choice, exposed as a
 /// string kwarg on [`init_edge_runtime`]. Mirrors persist's
+/// v0.18.0 (CIRISEdge#46) — extract a [`crate::CanonicalBootstrapPeer`]
+/// from a Python item (dict literal OR object exposing matching attrs).
+///
+/// Accepted shapes (Python-side):
+/// ```python
+/// {"key_id": "...", "alias": "...", "pubkey_ed25519_base64": "...",
+///  "transport_hint": "tcp://...", "description": "..."}
+/// ```
+/// or any object exposing the same attributes (a dataclass, NamedTuple,
+/// or persist-emitted type). The two-mode fallback is the same shape
+/// `extract_capsule` uses elsewhere: `getattr` first, then mapping
+/// access. `transport_hint` and `description` are optional; the others
+/// are required and a missing field surfaces a typed `ValueError`.
+fn extract_canonical_bootstrap_peer(
+    item: &Bound<'_, PyAny>,
+) -> PyResult<crate::CanonicalBootstrapPeer> {
+    /// Helper: read a string field by name, trying attribute access
+    /// first then dict-like `__getitem__`. Returns the field's bound
+    /// PyAny (a `String` extraction happens at the caller).
+    fn read_field<'py>(item: &Bound<'py, PyAny>, name: &str) -> Option<Bound<'py, PyAny>> {
+        if let Ok(attr) = item.getattr(name) {
+            if !attr.is_none() {
+                return Some(attr);
+            }
+        }
+        match item.get_item(name) {
+            Ok(value) => {
+                if value.is_none() {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
+    let key_id: String = read_field(item, "key_id")
+        .ok_or_else(|| PyValueError::new_err("canonical_bootstrap_peers: missing key_id"))?
+        .extract()
+        .map_err(|e| PyValueError::new_err(format!("canonical_bootstrap_peers.key_id: {e}")))?;
+    let alias: String = read_field(item, "alias")
+        .map(|v| v.extract::<String>())
+        .transpose()
+        .map_err(|e| PyValueError::new_err(format!("canonical_bootstrap_peers.alias: {e}")))?
+        .unwrap_or_default();
+    let pubkey_ed25519_base64: String = read_field(item, "pubkey_ed25519_base64")
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "canonical_bootstrap_peers[{key_id:?}]: missing pubkey_ed25519_base64",
+            ))
+        })?
+        .extract()
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "canonical_bootstrap_peers[{key_id:?}].pubkey_ed25519_base64: {e}",
+            ))
+        })?;
+    let transport_hint: Option<String> = read_field(item, "transport_hint")
+        .map(|v| v.extract::<String>())
+        .transpose()
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "canonical_bootstrap_peers[{key_id:?}].transport_hint: {e}",
+            ))
+        })?;
+    let description: Option<String> = read_field(item, "description")
+        .map(|v| v.extract::<String>())
+        .transpose()
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "canonical_bootstrap_peers[{key_id:?}].description: {e}",
+            ))
+        })?;
+
+    Ok(crate::CanonicalBootstrapPeer {
+        key_id,
+        alias,
+        pubkey_ed25519_base64,
+        transport_hint,
+        description,
+    })
+}
+
 /// `HybridPolicy` discriminants; kept as `&str` rather than a
 /// `#[pyclass]` to keep the surface minimal — the policy choice is
 /// a single switch the host configures once.
@@ -1462,6 +1546,8 @@ fn extract_local_signer(
     local_epoch = 0,
     hybrid_policy = "strict",
     soft_freshness_window_seconds = 60,
+    agent_mode = "proxy",
+    canonical_bootstrap_peers = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -1478,7 +1564,37 @@ fn init_edge_runtime(
     local_epoch: u64,
     hybrid_policy: &str,
     soft_freshness_window_seconds: u64,
+    agent_mode: &str,
+    canonical_bootstrap_peers: Option<Vec<Bound<'_, PyAny>>>,
 ) -> PyResult<PyEdge> {
+    // v0.18.0 (CIRISEdge#45) — decode the wire-string agent_mode token
+    // BEFORE we do any other I/O, so a typed misconfiguration surfaces
+    // a clean `ValueError` from the operator's POV instead of getting
+    // tangled with persist / Reticulum errors downstream.
+    let parsed_agent_mode = crate::AgentMode::from_wire(agent_mode).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "agent_mode must be one of 'client'/'proxy'/'server', got {agent_mode:?}",
+        ))
+    })?;
+
+    // v0.18.0 (CIRISEdge#46) — decode the canonical_bootstrap_peers
+    // list into Rust `CanonicalBootstrapPeer` rows. Each item must be
+    // a dict-like object exposing `key_id` / `alias` /
+    // `pubkey_ed25519_base64` and optional `transport_hint` /
+    // `description` attributes (PyO3 supports both `obj["key_id"]` and
+    // `obj.key_id` access; we use `getattr` first then fall back to
+    // mapping access for dict literals).
+    let canonical_peers: Vec<crate::CanonicalBootstrapPeer> =
+        match canonical_bootstrap_peers.as_ref() {
+            None => Vec::new(),
+            Some(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(extract_canonical_bootstrap_peer(item)?);
+                }
+                out
+            }
+        };
     let hybrid_policy = parse_hybrid_policy(hybrid_policy, soft_freshness_window_seconds)?;
 
     // ── Step 1: extract the substrate handles via PyCapsule from the
@@ -1766,10 +1882,50 @@ fn init_edge_runtime(
         .collect::<PyResult<Vec<_>>>()?;
     let mut transport_config =
         ReticulumTransportConfig::new(PathBuf::from(identity_path), signer.key_id.clone());
+    // v0.18.0 (CIRISEdge#45) — Reticulum still binds its TCP listener
+    // by default; an explicit Client posture from the operator
+    // (agent_mode="client") signals "egress only". The
+    // `transport_config.listen_addr` field is the **socket** the TCP
+    // server listens on; under Client mode we keep the default value
+    // wired (the ReticulumNode itself always has an identity hash that
+    // can receive responses to outbound dials) but suppress the
+    // listener-bind on the v0.18.0 plumbing layer via
+    // `EdgeConfig.listener_bound = false`. Transport-posture
+    // translation (Roaming / Full / Gateway / AP) is deferred — see
+    // `AgentMode` docblock.
     transport_config.listen_addr = listen_addr;
     transport_config.bootstrap_peers = bootstrap_peers;
     transport_config.announce_interval = Duration::from_secs(announce_interval_seconds);
     transport_config.local_epoch = local_epoch;
+
+    // v0.18.0 (CIRISEdge#46) — reseed canonical bootstrap peers into
+    // persist BEFORE the Edge is constructed. The reseed is
+    // idempotent per peer; a Conflict (differing pubkey for an
+    // existing key_id) propagates as a typed `PyRuntimeError` so
+    // operator misconfiguration surfaces loudly at init time. Trust
+    // state and `removed_at` are preserved (the v0.15.1 persist
+    // contract). See `crate::reseed_canonical_bootstrap_peers`
+    // for the full per-peer flow.
+    if !canonical_peers.is_empty() {
+        let directory_for_reseed = Arc::clone(&federation_directory_for_edge);
+        let canonical_peers_for_reseed = canonical_peers.clone();
+        py.detach(|| {
+            runtime
+                .block_on(async move {
+                    crate::reseed_canonical_bootstrap_peers(
+                        &directory_for_reseed,
+                        &canonical_peers_for_reseed,
+                    )
+                    .await
+                })
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "reseed_canonical_bootstrap_peers: {e} (kind={kind})",
+                        kind = e.kind()
+                    ))
+                })
+        })?;
+    }
 
     // CIRISEdge#34 (v0.14.0 wiring) — pre-construct the EventBus +
     // ReachabilityTracker so the Reticulum transport (built before
@@ -1837,6 +1993,18 @@ fn init_edge_runtime(
     // (auth above) so #34 link / announce / interface emissions reach
     // the same channels Edge's `subscribe_link_events` consumers
     // observe — the v0.14.0 close of #34's link half.
+    //
+    // v0.18.0 (CIRISEdge#45) — flow the operator-declared posture
+    // through `AgentMode::apply_defaults` (the single source of truth
+    // for mode → knob mapping) into the EdgeConfig the builder sees.
+    // The default `EdgeConfig::default()` matches AgentMode::Proxy, so
+    // a caller that omits `agent_mode` keeps v0.17.x behaviour exactly.
+    let mut config = crate::edge::EdgeConfig {
+        hybrid_policy,
+        ..Default::default()
+    };
+    parsed_agent_mode.apply_defaults(&mut config);
+
     let edge = Edge::builder()
         .directory(verify_dir)
         .federation_directory(federation_directory_for_edge)
@@ -1853,6 +2021,14 @@ fn init_edge_runtime(
         // wiring the schema unconditionally is harmless when the
         // observer is off (Edge::detector stays None).
         .derived_schema(derived_schema)
+        // v0.18.0 (CIRISEdge#46) — canonical bootstrap-peer set powers
+        // the `peer_remove` hard-remove guard + the `EdgePeerInfo`
+        // canonical-flag projection. The persist reseed already fired
+        // above; this populates the in-memory HashSet.
+        .canonical_bootstrap_peers(canonical_peers)
+        // v0.18.0 (CIRISEdge#45) — flow the parsed agent_mode and its
+        // derived listener_bound + outbound_queue_max into the Edge.
+        .config(config)
         .build()
         .map_err(|e| PyRuntimeError::new_err(format!("Edge::build: {e}")))?;
 
@@ -2908,6 +3084,8 @@ mod pyo3_tier2_tests {
                 0,
                 "strict",
                 60,
+                "proxy",
+                None,
             )?;
             Ok(edge.signer_key_id())
         });
@@ -2985,6 +3163,8 @@ mod pyo3_tier2_tests {
                 0,
                 "strict",
                 60,
+                "proxy",
+                None,
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -3118,6 +3298,8 @@ mod pyo3_tier2_tests {
                 0,
                 "strict",
                 60,
+                "proxy",
+                None,
             )?;
             Ok(())
         });
@@ -3204,6 +3386,8 @@ mod pyo3_tier2_tests {
                 0,
                 "strict",
                 60,
+                "proxy",
+                None,
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -3344,6 +3528,8 @@ mod pyo3_tier2_tests {
                 0,
                 "strict",
                 60,
+                "proxy",
+                None,
             )?;
             Ok(edge.signer_key_id())
         });
@@ -3470,6 +3656,8 @@ mod pyo3_tier2_tests {
                 0,
                 "strict",
                 60,
+                "proxy",
+                None,
             )?;
             Ok(edge.signer_key_id())
         });

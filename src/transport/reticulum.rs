@@ -1718,14 +1718,32 @@ impl ReticulumTransport {
             .map_err(|e| TransportError::Io(format!("blackhole_remove: {e}")))
     }
 
+    /// v0.18.0 (CIRISEdge#33 background-pruner wiring) — expose the
+    /// concrete `Arc<dyn BlackholeRules>` to the [`crate::Edge::run`]
+    /// background pruner spawn. Returns `None` when the transport was
+    /// built without a backend (test fixtures); the spawn site skips
+    /// the task in that case. The clone is cheap (Arc refcount bump);
+    /// the actual `blackhole_prune_expired` work happens on the
+    /// pruner task's own future, not on this accessor.
+    #[must_use]
+    pub fn blackhole_rules_handle(
+        &self,
+    ) -> Option<Arc<dyn ciris_persist::federation::BlackholeRules>> {
+        self.blackhole.clone()
+    }
+
     /// Drop every rule whose `until` is in the past relative to `now`.
     /// Returns the number of rows pruned. Permanent rules (`until IS
     /// NULL`) are NEVER pruned — operators must call
     /// [`Self::routing_blackhole_remove`] explicitly.
     ///
-    /// Intended for operator-cadenced cleanup; v0.16.1 does NOT yet
-    /// schedule a background pruner (deferred follow-up — see
-    /// `init_edge_runtime` docblock for the lifecycle hook rationale).
+    /// v0.18.0 (CIRISEdge#33 background-pruner wiring) — the
+    /// [`crate::Edge::run`] task graph now spawns a background loop
+    /// that calls this method at
+    /// [`crate::EdgeConfig::blackhole_prune_interval_seconds`]
+    /// cadence. Operators may still invoke it manually via the
+    /// routing-table FFI for on-demand cleanup (e.g. immediately
+    /// after editing the deny-list).
     pub async fn routing_blackhole_prune_expired(
         &self,
         now: chrono::DateTime<chrono::Utc>,

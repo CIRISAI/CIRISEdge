@@ -1254,10 +1254,11 @@ public struct EdgePeerInfo: Equatable, Hashable {
     public var trust: EdgePeerTrust
     public var alias: String?
     public var notes: String?
+    public var canonical: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(handle: EdgePeerHandle, pubkeyEd25519Base64: String, identityType: String, rooted: Bool, reachableVia: [String], lastSeenAt: String?, lastAttestationId: String?, policy: EdgePeerPolicy, trust: EdgePeerTrust, alias: String?, notes: String?) {
+    public init(handle: EdgePeerHandle, pubkeyEd25519Base64: String, identityType: String, rooted: Bool, reachableVia: [String], lastSeenAt: String?, lastAttestationId: String?, policy: EdgePeerPolicy, trust: EdgePeerTrust, alias: String?, notes: String?, canonical: Bool) {
         self.handle = handle
         self.pubkeyEd25519Base64 = pubkeyEd25519Base64
         self.identityType = identityType
@@ -1269,6 +1270,7 @@ public struct EdgePeerInfo: Equatable, Hashable {
         self.trust = trust
         self.alias = alias
         self.notes = notes
+        self.canonical = canonical
     }
 
     
@@ -1297,7 +1299,8 @@ public struct FfiConverterTypeEdgePeerInfo: FfiConverterRustBuffer {
                 policy: FfiConverterTypeEdgePeerPolicy.read(from: &buf), 
                 trust: FfiConverterTypeEdgePeerTrust.read(from: &buf), 
                 alias: FfiConverterOptionString.read(from: &buf), 
-                notes: FfiConverterOptionString.read(from: &buf)
+                notes: FfiConverterOptionString.read(from: &buf), 
+                canonical: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1313,6 +1316,7 @@ public struct FfiConverterTypeEdgePeerInfo: FfiConverterRustBuffer {
         FfiConverterTypeEdgePeerTrust.write(value.trust, into: &buf)
         FfiConverterOptionString.write(value.alias, into: &buf)
         FfiConverterOptionString.write(value.notes, into: &buf)
+        FfiConverterBool.write(value.canonical, into: &buf)
     }
 }
 
@@ -2094,6 +2098,8 @@ public enum EdgeBindingsError: Swift.Error, Equatable, Hashable, Foundation.Loca
     
     case Transport(message: String)
     
+    case CannotRemoveCanonicalPeer(message: String)
+    
 
     
 
@@ -2155,6 +2161,10 @@ public struct FfiConverterTypeEdgeBindingsError: FfiConverterRustBuffer {
             message: try FfiConverterString.read(from: &buf)
         )
         
+        case 9: return .CannotRemoveCanonicalPeer(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2182,6 +2192,8 @@ public struct FfiConverterTypeEdgeBindingsError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(7))
         case .Transport(_ /* message is ignored*/):
             writeInt(&buf, Int32(8))
+        case .CannotRemoveCanonicalPeer(_ /* message is ignored*/):
+            writeInt(&buf, Int32(9))
 
         
         }

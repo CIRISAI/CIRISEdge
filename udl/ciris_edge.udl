@@ -265,6 +265,16 @@ enum EdgeBindingsError {
     "Unsupported",
     "Persist",
     "Transport",
+    // v0.18.0 (CIRISEdge#46) — operator attempted `peer_remove(handle,
+    // hard=true)` on a canonical bootstrap peer. The wire-string kind is
+    // `cannot_remove_canonical_peer`. Soft-remove (`hard=false`) on a
+    // canonical peer succeeds — the row is hidden from reads but the
+    // canonical knowledge stays in the operator-supplied bootstrap_peers
+    // set. The reseed at every init does NOT un-hide soft-removed
+    // canonicals (persist's `add_peer_record` is idempotent on the
+    // federation_keys identity row, but does not clear `removed_at` on
+    // the sibling metadata row — by design).
+    "CannotRemoveCanonicalPeer",
 };
 
 // ─── #26 Peer mgmt types ────────────────────────────────────────────
@@ -309,6 +319,11 @@ dictionary EdgePeerInfo {
     EdgePeerTrust trust;
     string? alias;
     string? notes;
+    // v0.18.0 (CIRISEdge#46) — `true` when this `key_id` lives in the
+    // init-supplied bootstrap_peers set. Projection of the in-memory
+    // canonical HashSet on Edge. Hard-remove of canonical peers
+    // surfaces the typed `CannotRemoveCanonicalPeer` error.
+    boolean canonical;
 };
 
 dictionary EdgeProbeResult {

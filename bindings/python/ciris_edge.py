@@ -2276,7 +2276,7 @@ class _UniffiFfiConverterTypeEdgePeerPolicy(_UniffiConverterRustBuffer):
 
 @dataclass
 class EdgePeerInfo:
-    def __init__(self, *, handle:EdgePeerHandle, pubkey_ed25519_base64:str, identity_type:str, rooted:bool, reachable_via:typing.List[str], last_seen_at:typing.Optional[str], last_attestation_id:typing.Optional[str], policy:EdgePeerPolicy, trust:EdgePeerTrust, alias:typing.Optional[str], notes:typing.Optional[str]):
+    def __init__(self, *, handle:EdgePeerHandle, pubkey_ed25519_base64:str, identity_type:str, rooted:bool, reachable_via:typing.List[str], last_seen_at:typing.Optional[str], last_attestation_id:typing.Optional[str], policy:EdgePeerPolicy, trust:EdgePeerTrust, alias:typing.Optional[str], notes:typing.Optional[str], canonical:bool):
         self.handle = handle
         self.pubkey_ed25519_base64 = pubkey_ed25519_base64
         self.identity_type = identity_type
@@ -2288,12 +2288,13 @@ class EdgePeerInfo:
         self.trust = trust
         self.alias = alias
         self.notes = notes
+        self.canonical = canonical
         
         
 
     
     def __str__(self):
-        return "EdgePeerInfo(handle={}, pubkey_ed25519_base64={}, identity_type={}, rooted={}, reachable_via={}, last_seen_at={}, last_attestation_id={}, policy={}, trust={}, alias={}, notes={})".format(self.handle, self.pubkey_ed25519_base64, self.identity_type, self.rooted, self.reachable_via, self.last_seen_at, self.last_attestation_id, self.policy, self.trust, self.alias, self.notes)
+        return "EdgePeerInfo(handle={}, pubkey_ed25519_base64={}, identity_type={}, rooted={}, reachable_via={}, last_seen_at={}, last_attestation_id={}, policy={}, trust={}, alias={}, notes={}, canonical={})".format(self.handle, self.pubkey_ed25519_base64, self.identity_type, self.rooted, self.reachable_via, self.last_seen_at, self.last_attestation_id, self.policy, self.trust, self.alias, self.notes, self.canonical)
     def __eq__(self, other):
         if self.handle != other.handle:
             return False
@@ -2317,6 +2318,8 @@ class EdgePeerInfo:
             return False
         if self.notes != other.notes:
             return False
+        if self.canonical != other.canonical:
+            return False
         return True
 
 class _UniffiFfiConverterTypeEdgePeerInfo(_UniffiConverterRustBuffer):
@@ -2334,6 +2337,7 @@ class _UniffiFfiConverterTypeEdgePeerInfo(_UniffiConverterRustBuffer):
             trust=_UniffiFfiConverterTypeEdgePeerTrust.read(buf),
             alias=_UniffiFfiConverterOptionalString.read(buf),
             notes=_UniffiFfiConverterOptionalString.read(buf),
+            canonical=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -2349,6 +2353,7 @@ class _UniffiFfiConverterTypeEdgePeerInfo(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeEdgePeerTrust.check_lower(value.trust)
         _UniffiFfiConverterOptionalString.check_lower(value.alias)
         _UniffiFfiConverterOptionalString.check_lower(value.notes)
+        _UniffiFfiConverterBoolean.check_lower(value.canonical)
 
     @staticmethod
     def write(value, buf):
@@ -2363,6 +2368,7 @@ class _UniffiFfiConverterTypeEdgePeerInfo(_UniffiConverterRustBuffer):
         _UniffiFfiConverterTypeEdgePeerTrust.write(value.trust, buf)
         _UniffiFfiConverterOptionalString.write(value.alias, buf)
         _UniffiFfiConverterOptionalString.write(value.notes, buf)
+        _UniffiFfiConverterBoolean.write(value.canonical, buf)
 
 class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
     @classmethod
@@ -3006,6 +3012,10 @@ class EdgeBindingsError:  # type: ignore
         def __repr__(self):
             return "EdgeBindingsError.Transport({})".format(repr(str(self)))
     _UniffiTempEdgeBindingsError.Transport = Transport # type: ignore
+    class CannotRemoveCanonicalPeer(_UniffiTempEdgeBindingsError):
+        def __repr__(self):
+            return "EdgeBindingsError.CannotRemoveCanonicalPeer({})".format(repr(str(self)))
+    _UniffiTempEdgeBindingsError.CannotRemoveCanonicalPeer = CannotRemoveCanonicalPeer # type: ignore
 
 EdgeBindingsError = _UniffiTempEdgeBindingsError # type: ignore
 del _UniffiTempEdgeBindingsError
@@ -3047,6 +3057,10 @@ class _UniffiFfiConverterTypeEdgeBindingsError(_UniffiConverterRustBuffer):
             return EdgeBindingsError.Transport(
                 _UniffiFfiConverterString.read(buf),
             )
+        if variant == 9:
+            return EdgeBindingsError.CannotRemoveCanonicalPeer(
+                _UniffiFfiConverterString.read(buf),
+            )
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -3067,6 +3081,8 @@ class _UniffiFfiConverterTypeEdgeBindingsError(_UniffiConverterRustBuffer):
             return
         if isinstance(value, EdgeBindingsError.Transport):
             return
+        if isinstance(value, EdgeBindingsError.CannotRemoveCanonicalPeer):
+            return
 
     @staticmethod
     def write(value, buf):
@@ -3086,6 +3102,8 @@ class _UniffiFfiConverterTypeEdgeBindingsError(_UniffiConverterRustBuffer):
             buf.write_i32(7)
         if isinstance(value, EdgeBindingsError.Transport):
             buf.write_i32(8)
+        if isinstance(value, EdgeBindingsError.CannotRemoveCanonicalPeer):
+            buf.write_i32(9)
 
 class _UniffiFfiConverterMapStringBytes(_UniffiConverterRustBuffer):
     @classmethod

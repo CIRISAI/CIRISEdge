@@ -40,6 +40,13 @@ pub enum EdgeBindingsError {
     Persist,
     #[error("transport error")]
     Transport,
+    /// CIRISEdge#46 (v0.18.0) — operator attempted a hard-remove on a
+    /// peer that the init-supplied `bootstrap_peers` set marks as
+    /// canonical. The wire-string kind is
+    /// `cannot_remove_canonical_peer`. Soft-removal is still permitted;
+    /// see `peer_remove`'s docblock for the rationale.
+    #[error("cannot hard-remove canonical bootstrap peer")]
+    CannotRemoveCanonicalPeer,
 }
 
 // ─── Peer mgmt types (#26) ──────────────────────────────────────────
@@ -90,6 +97,14 @@ pub struct EdgePeerInfo {
     pub trust: EdgePeerTrust,
     pub alias: Option<String>,
     pub notes: Option<String>,
+    /// CIRISEdge#46 (v0.18.0) — projection of the in-memory
+    /// canonical-peer HashSet on the [`crate::Edge`] handle. `true`
+    /// when this `key_id` was supplied via the init `bootstrap_peers`
+    /// parameter (the operator-declared rooting anchor); `false` for
+    /// any peer admitted organically via discovery / `peer_add`.
+    /// Filled by `peer_list` / `peer_get` via
+    /// [`crate::Edge::is_canonical_peer`].
+    pub canonical: bool,
 }
 
 #[derive(Debug, Clone)]

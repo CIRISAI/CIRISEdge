@@ -1938,6 +1938,8 @@ data class EdgePeerInfo (
     var `alias`: kotlin.String?
     , 
     var `notes`: kotlin.String?
+    , 
+    var `canonical`: kotlin.Boolean
     
 ){
     
@@ -1965,6 +1967,7 @@ public object FfiConverterTypeEdgePeerInfo: FfiConverterRustBuffer<EdgePeerInfo>
             FfiConverterTypeEdgePeerTrust.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -1979,7 +1982,8 @@ public object FfiConverterTypeEdgePeerInfo: FfiConverterRustBuffer<EdgePeerInfo>
             FfiConverterTypeEdgePeerPolicy.allocationSize(value.`policy`) +
             FfiConverterTypeEdgePeerTrust.allocationSize(value.`trust`) +
             FfiConverterOptionalString.allocationSize(value.`alias`) +
-            FfiConverterOptionalString.allocationSize(value.`notes`)
+            FfiConverterOptionalString.allocationSize(value.`notes`) +
+            FfiConverterBoolean.allocationSize(value.`canonical`)
     )
 
     override fun write(value: EdgePeerInfo, buf: ByteBuffer) {
@@ -1994,6 +1998,7 @@ public object FfiConverterTypeEdgePeerInfo: FfiConverterRustBuffer<EdgePeerInfo>
             FfiConverterTypeEdgePeerTrust.write(value.`trust`, buf)
             FfiConverterOptionalString.write(value.`alias`, buf)
             FfiConverterOptionalString.write(value.`notes`, buf)
+            FfiConverterBoolean.write(value.`canonical`, buf)
     }
 }
 
@@ -2622,6 +2627,8 @@ sealed class EdgeBindingsException(message: String): kotlin.Exception(message) {
         
         class Transport(message: String) : EdgeBindingsException(message)
         
+        class CannotRemoveCanonicalPeer(message: String) : EdgeBindingsException(message)
+        
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<EdgeBindingsException> {
         override fun lift(error_buf: RustBuffer.ByValue): EdgeBindingsException = FfiConverterTypeEdgeBindingsError.lift(error_buf)
@@ -2643,6 +2650,7 @@ public object FfiConverterTypeEdgeBindingsError : FfiConverterRustBuffer<EdgeBin
             6 -> EdgeBindingsException.Unsupported(FfiConverterString.read(buf))
             7 -> EdgeBindingsException.Persist(FfiConverterString.read(buf))
             8 -> EdgeBindingsException.Transport(FfiConverterString.read(buf))
+            9 -> EdgeBindingsException.CannotRemoveCanonicalPeer(FfiConverterString.read(buf))
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
         
@@ -2684,6 +2692,10 @@ public object FfiConverterTypeEdgeBindingsError : FfiConverterRustBuffer<EdgeBin
             }
             is EdgeBindingsException.Transport -> {
                 buf.putInt(8)
+                Unit
+            }
+            is EdgeBindingsException.CannotRemoveCanonicalPeer -> {
+                buf.putInt(9)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

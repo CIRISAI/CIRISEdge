@@ -7,7 +7,7 @@
 //! registry); peers compose around edge, not into it
 //! (`MISSION.md` §3 anti-pattern 6).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -62,6 +62,137 @@ pub const DEFAULT_HOLDER_DOWNWEIGHT_WINDOW_SECONDS: u64 = 60 * 60;
 /// §10.1.2: "Holders with >= 3 ContentMisses in the window are
 /// downweighted".
 pub const DEFAULT_HOLDER_DOWNWEIGHT_MISS_THRESHOLD: u32 = 3;
+
+/// Default interval (seconds) at which the v0.18.0 background pruner
+/// task calls
+/// [`crate::transport::reticulum::ReticulumTransport::routing_blackhole_prune_expired`]
+/// — 1 hour. `0` disables the background pruner; operators may then
+/// call the prune surface manually via the routing-table FFI.
+pub const DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS: u64 = 3600;
+
+/// CIRISEdge#45 — operator agent posture for the cohabiting peer.
+///
+/// Wire-string codec: `"client" / "proxy" / "server"` (snake_case) to
+/// match the agent-side `AgentMode` enum from CIRISAgent release/2.9.4
+/// (commit `64e026fcc`). Decoded by [`AgentMode::from_wire`]; the
+/// translation into `EdgeConfig` knobs is owned by
+/// [`AgentMode::apply_defaults`] — single source of truth for the
+/// mode → config mapping (no scatter across init paths).
+///
+/// Behaviour matrix (v0.18.0):
+///
+/// | Mode     | Listener bound | Outbound queue max |
+/// |----------|----------------|--------------------|
+/// | Client   | no             | 256                |
+/// | Proxy    | yes            | 4096 (current default) |
+/// | Server   | yes + propagate| 65536              |
+///
+/// Transport-posture translation (Roaming / Full / Gateway / AP)
+/// remains deferred — the v0.12.0 Leviculum interface-diversity work
+/// did not surface a `reticulum_default_posture` enum on EdgeConfig,
+/// so the v0.18.0 cut configures only the listener bind + outbound
+/// queue cap. Transport-posture follow-up tracks the v0.19.0
+/// observability cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    /// Egress-only posture; the edge runtime does not bind a
+    /// listener and ships a minimal (256-row) outbound queue.
+    Client,
+    /// Bidirectional; binds the configured listener, keeps the
+    /// existing v0.17.x outbound-queue default. The CIRISEdge#45
+    /// default mode — preserves v0.17.x behaviour when callers do
+    /// not pass an `agent_mode` kwarg.
+    #[default]
+    Proxy,
+    /// Always-on listener + propagate; bootstrap-node posture with
+    /// a large outbound queue (65536 rows).
+    Server,
+}
+
+impl AgentMode {
+    /// Decode the wire-string token `"client" / "proxy" / "server"`.
+    /// Returns `None` on any other value — the FFI surface maps `None`
+    /// to a typed `ValueError` (PyO3) / `InvalidArgument` (UniFFI).
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "client" => Some(Self::Client),
+            "proxy" => Some(Self::Proxy),
+            "server" => Some(Self::Server),
+            _ => None,
+        }
+    }
+
+    /// Wire-string encoder — inverse of [`Self::from_wire`].
+    #[must_use]
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Proxy => "proxy",
+            Self::Server => "server",
+        }
+    }
+
+    /// Whether this mode binds the operator-configured listener
+    /// (`listen_addr`). [`Self::Client`] is the only mode that returns
+    /// `false`.
+    #[must_use]
+    pub fn binds_listener(&self) -> bool {
+        !matches!(self, Self::Client)
+    }
+
+    /// Default outbound-queue cap for the mode (rows). The v0.17.x
+    /// default is the [`Self::Proxy`] value; client / server widen /
+    /// shrink around it.
+    #[must_use]
+    pub fn default_outbound_queue_max(&self) -> u32 {
+        match self {
+            Self::Client => 256,
+            Self::Proxy => 4096,
+            Self::Server => 65536,
+        }
+    }
+
+    /// Apply the mode-derived defaults onto `config`. CRITICAL: the
+    /// only place the mode → knob mapping lives. Every init path that
+    /// accepts an `AgentMode` calls this exactly once before
+    /// [`EdgeBuilder::config`] is invoked.
+    pub fn apply_defaults(&self, config: &mut EdgeConfig) {
+        config.agent_mode = *self;
+        config.listener_bound = self.binds_listener();
+        config.outbound_queue_max = self.default_outbound_queue_max();
+    }
+}
+
+/// CIRISEdge#46 — canonical bootstrap-peer record. Operator-supplied
+/// at every init via the new `bootstrap_peers` init param; reseeded
+/// idempotently into persist's `federation_keys` directory. The
+/// canonical INVARIANT: `peer_remove(handle, hard=true)` against a
+/// canonical peer returns
+/// [`EdgeBindingsError::CannotRemoveCanonicalPeer`] — the operator
+/// cannot permanently lose knowledge of these rooting anchors. Soft
+/// removal (`hard=false`) is permitted and preserved across restarts
+/// (the reseed does NOT clear `removed_at`).
+#[derive(Debug, Clone)]
+pub struct CanonicalBootstrapPeer {
+    /// Persist `federation_keys.key_id` for the canonical peer.
+    pub key_id: String,
+    /// Operator-friendly display name; surfaces on `peer_list` /
+    /// `peer_get` projections as `EdgePeerInfo.alias`.
+    pub alias: String,
+    /// Base64-encoded Ed25519 public key — the load-bearing identity
+    /// field. Persist's [`add_peer_record`] is idempotent on a
+    /// matching pubkey; rejects with `Conflict` on a differing one.
+    pub pubkey_ed25519_base64: String,
+    /// Optional transport hint (e.g. `"tcp://agents.ciris.ai:4242"`).
+    /// Persist stores this verbatim on the
+    /// `federation_peer_metadata.transport_identity` field.
+    pub transport_hint: Option<String>,
+    /// Operator-supplied free-form description (purpose, owner,
+    /// rotation cadence). Surfaces on the `EdgePeerInfo.notes`
+    /// projection.
+    pub description: Option<String>,
+}
 
 /// Top-level configuration. Defaults match the v0.1.0 P0 invariants
 /// (`docs/THREAT_MODEL.md` §10).
@@ -153,6 +284,35 @@ pub struct EdgeConfig {
     /// edge boots. Defaults to [`crate::ProbePatternConfig::default`]
     /// (conservative thresholds favouring false-negatives).
     pub probe_pattern_observer_config: crate::ProbePatternConfig,
+    /// CIRISEdge#45 (v0.18.0) — the operator-declared posture for the
+    /// cohabiting peer. [`AgentMode::Proxy`] is the default
+    /// (preserves v0.17.x behaviour); init paths that accept the
+    /// `agent_mode` kwarg call [`AgentMode::apply_defaults`] to flip
+    /// the derived fields ([`Self::listener_bound`],
+    /// [`Self::outbound_queue_max`]) before this `EdgeConfig` reaches
+    /// [`EdgeBuilder::config`]. See `AgentMode` for the wire-string
+    /// codec + the full behaviour matrix.
+    pub agent_mode: AgentMode,
+    /// CIRISEdge#45 (v0.18.0) — derived from [`Self::agent_mode`] by
+    /// [`AgentMode::apply_defaults`]. `true` for `proxy / server`,
+    /// `false` for `client`. Hosts that bind their own listener (PyO3
+    /// `init_edge_runtime` Step 4) consult this to decide whether to
+    /// call `transport_config.listen_addr = ...`.
+    pub listener_bound: bool,
+    /// CIRISEdge#45 (v0.18.0) — derived from [`Self::agent_mode`] by
+    /// [`AgentMode::apply_defaults`]. Mode-default outbound queue cap
+    /// (256 / 4096 / 65536). Surfaces on the operator dashboard as
+    /// the configured cap; the actual enforcement lives in the
+    /// outbound dispatcher's row-admission path (already pinned by
+    /// persist's queue plumbing).
+    pub outbound_queue_max: u32,
+    /// CIRISEdge#33 background pruner (v0.18.0 lifecycle hook) —
+    /// seconds between `routing_blackhole_prune_expired` ticks on the
+    /// `Edge::run` task graph. `0` disables the background pruner;
+    /// operators may then call the prune surface manually via the
+    /// routing-table FFI. Default
+    /// [`DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS`] (3600s = 1 hour).
+    pub blackhole_prune_interval_seconds: u64,
 }
 
 impl Default for EdgeConfig {
@@ -193,6 +353,18 @@ impl Default for EdgeConfig {
             // EdgeConfig leaves the detector field as `None`.
             probe_pattern_observer_enabled: false,
             probe_pattern_observer_config: crate::ProbePatternConfig::default(),
+            // CIRISEdge#45 (v0.18.0) — default mode is Proxy. The
+            // listener_bound + outbound_queue_max defaults mirror the
+            // Proxy column of `AgentMode::apply_defaults` so an
+            // unmodified `EdgeConfig::default()` matches v0.17.x.
+            agent_mode: AgentMode::Proxy,
+            listener_bound: true,
+            outbound_queue_max: 4096,
+            // v0.18.0 — background blackhole-rule pruner default.
+            // 0 disables; `Edge::run` skips the spawn when the value
+            // is 0 OR no `Arc<dyn BlackholeRules>` was wired through
+            // the Reticulum transport.
+            blackhole_prune_interval_seconds: DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
         }
     }
 }
@@ -427,6 +599,19 @@ pub struct Edge {
     /// `if let Some(detector) = ...` — disabled deployments pay zero
     /// runtime cost beyond the Option branch.
     pub detector: Option<Arc<crate::ProbePatternObserver>>,
+    /// CIRISEdge#46 (v0.18.0) — set of `key_id`s declared canonical by
+    /// the operator via the init-time `bootstrap_peers` parameter. The
+    /// HashSet is populated at [`EdgeBuilder::build`] from
+    /// [`EdgeBuilder::canonical_bootstrap_peers`] (which the
+    /// PyO3 / UniFFI cohabitation init paths feed). Consulted by
+    /// [`Self::is_canonical_peer`] (the `peer_remove` hard-remove
+    /// guard) and by `EdgePeerInfo` projection. Wrapped in an
+    /// `Arc<RwLock<_>>` so future operator-driven mutations (a
+    /// hypothetical `add_canonical_peer` FFI) can update it without
+    /// re-building Edge — v0.18.0 ships with a load-time-only setter
+    /// (the reseed runs once per init); the lock makes the path
+    /// forward-compatible without binding-side churn.
+    canonical_peers: Arc<std::sync::RwLock<HashSet<String>>>,
     config: EdgeConfig,
 }
 
@@ -468,7 +653,135 @@ pub struct EdgeBuilder {
     /// unset, the detector falls back to the v0.13.0 STUB behavior
     /// (`tracing::warn!` log only).
     derived_schema: Option<Arc<dyn crate::detector::EdgeDetectionAdmission>>,
+    /// CIRISEdge#46 (v0.18.0) — operator-supplied canonical bootstrap
+    /// peers. Populates [`Edge::canonical_peers`] at `build()`. The
+    /// **persist reseed** (calling
+    /// `FederationDirectory::add_peer_record` per row) does NOT happen
+    /// here — `build()` is sync and the directory's contract is async.
+    /// Cohabitation init paths call
+    /// [`reseed_canonical_bootstrap_peers`] separately with the same
+    /// `Vec` before threading it into the builder.
+    canonical_bootstrap_peers: Vec<CanonicalBootstrapPeer>,
     config: EdgeConfig,
+}
+
+/// CIRISEdge#33 background-pruner loop (v0.18.0 lifecycle hook) —
+/// the extracted body of the [`Edge::run`] pruner spawn, exposed so
+/// tests can drive it directly without standing up a Reticulum
+/// transport. Production callers SHOULD NOT spawn this themselves;
+/// `Edge::run` owns the lifecycle.
+///
+/// Loops at `interval_seconds` cadence calling
+/// [`BlackholeRules::blackhole_prune_expired`] with `Utc::now()`.
+/// Exits cleanly when the shutdown watcher fires.
+/// `MissedTickBehavior::Skip` so a system suspend / GC pause doesn't
+/// produce a burst of prune calls on wake.
+pub async fn run_blackhole_pruner(
+    rules: Arc<dyn ciris_persist::federation::BlackholeRules>,
+    interval_seconds: u64,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    if interval_seconds == 0 {
+        // Defensive: callers SHOULD gate the spawn at interval > 0,
+        // but if a caller routes here with 0, exit cleanly rather
+        // than panicking inside `tokio::time::interval` (which
+        // panics on zero-duration tickers).
+        return;
+    }
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                tracing::info!("blackhole pruner: shutdown");
+                break;
+            }
+            _ = ticker.tick() => {
+                match rules.blackhole_prune_expired(Utc::now()).await {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!(
+                                pruned = n,
+                                "blackhole pruner: dropped expired rules",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "blackhole pruner: prune failed",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// CIRISEdge#46 (v0.18.0) — idempotent reseed of canonical bootstrap
+/// peers into persist's `federation_keys` directory.
+///
+/// For each [`CanonicalBootstrapPeer`]:
+///   - Calls
+///     [`FederationDirectory::add_peer_record`](ciris_persist::federation::FederationDirectory::add_peer_record)
+///     with `identity_type = "agent"`. Persist's contract: idempotent
+///     on matching pubkey (silent OK); `Conflict` on differing pubkey.
+///   - Operator-set TRUST state on a LIVE row is preserved: persist's
+///     `add_peer_record` short-circuits on a live metadata row whose
+///     `transport_identity` matches (idempotent no-op).
+///   - Soft-removed rows ARE re-admitted: per the persist v3.1.0+
+///     sqlite contract (see
+///     `tests/canonical_peer.rs::canonical_peer_after_soft_remove_reappears_only_when_unhidden`),
+///     `add_peer_record` against a row whose `removed_at IS NOT NULL`
+///     clears `removed_at` AND resets the metadata fields to defaults
+///     (`trust = Untrusted`, `alias = NULL`, `notes = NULL`). So the
+///     init-time reseed effectively REVERSES a prior soft-hide for
+///     canonical peers. The canonical INVARIANT is "cannot
+///     HARD-remove" (permanent knowledge loss); the persist re-admit
+///     means a canonical row that was operator-soft-hidden returns to
+///     live state at the next init.
+///   - If [`CanonicalBootstrapPeer::alias`] / `description` are
+///     non-empty, fires
+///     [`update_peer_alias`](ciris_persist::federation::FederationDirectory::update_peer_alias)
+///     / `update_peer_notes` so operator-friendly labels appear on
+///     the routing dashboard. The post-`add_peer_record` call lands
+///     against the now-live row (re-admitted from the soft-hidden
+///     state if applicable) — these calls are best-effort (errors
+///     are logged but don't fail the reseed).
+///
+/// Propagates `add_peer_record` errors verbatim — operator
+/// misconfiguration (a differing pubkey for an existing key_id) MUST
+/// surface, not silently pass.
+pub async fn reseed_canonical_bootstrap_peers(
+    directory: &Arc<dyn ciris_persist::federation::FederationDirectory>,
+    peers: &[CanonicalBootstrapPeer],
+) -> Result<(), ciris_persist::federation::Error> {
+    for peer in peers {
+        directory
+            .add_peer_record(
+                &peer.key_id,
+                &peer.pubkey_ed25519_base64,
+                ciris_persist::federation::types::identity_type::AGENT,
+                peer.transport_hint.clone(),
+            )
+            .await?;
+        // Best-effort alias/notes refresh. If the metadata row is
+        // soft-removed (the canonical-but-hidden case) these surface
+        // a `PeerNotFound` from persist — swallowed deliberately so
+        // operator-soft-removed canonicals stay hidden (the row's
+        // labels become re-applicable when the operator un-hides).
+        if !peer.alias.is_empty() {
+            let _ = directory
+                .update_peer_alias(&peer.key_id, Some(peer.alias.clone()))
+                .await;
+        }
+        if let Some(notes) = peer.description.as_ref() {
+            let _ = directory
+                .update_peer_notes(&peer.key_id, Some(notes.clone()))
+                .await;
+        }
+    }
+    Ok(())
 }
 
 impl Edge {
@@ -489,8 +802,32 @@ impl Edge {
             reticulum_transport: None,
             reachability: None,
             derived_schema: None,
+            canonical_bootstrap_peers: Vec::new(),
             config: EdgeConfig::default(),
         }
+    }
+
+    /// CIRISEdge#46 (v0.18.0) — check whether `key_id` is in the
+    /// canonical bootstrap-peer set. Backs the `peer_remove` hard-
+    /// remove guard + the `EdgePeerInfo.canonical` projection.
+    /// O(1) HashSet lookup.
+    #[must_use]
+    pub fn is_canonical_peer(&self, key_id: &str) -> bool {
+        self.canonical_peers
+            .read()
+            .is_ok_and(|set| set.contains(key_id))
+    }
+
+    /// CIRISEdge#46 (v0.18.0) — snapshot of the canonical set as a
+    /// `Vec<String>` (cloned key_ids). Useful for diagnostics and the
+    /// `peer_list` projection (although the projection's hot path
+    /// uses [`Self::is_canonical_peer`] for O(1) checks per row).
+    #[must_use]
+    pub fn canonical_peer_ids(&self) -> Vec<String> {
+        self.canonical_peers
+            .read()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// CIRISEdge#34 accessor — the shared [`crate::events::EventBus`].
@@ -1521,6 +1858,12 @@ impl Edge {
 
     /// Run the listeners + dispatch loops + outbound dispatcher.
     /// Returns when the shutdown signal fires.
+    // v0.18.0 — function grew past clippy's 100-line cap once the #33
+    // background blackhole-pruner spawn landed alongside the existing
+    // listener / dispatcher / sweeps / inbound spawn graph. The
+    // spawn-graph composition is the construction-time contract; extracting
+    // it would fragment the lifecycle invariants without adding clarity.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(self, shutdown_rx: watch::Receiver<bool>) -> Result<(), EdgeError> {
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(1024);
 
@@ -1555,6 +1898,34 @@ impl Edge {
             tasks.push(tokio::spawn(async move {
                 run_sweeps(q, sd).await;
             }));
+        }
+
+        // CIRISEdge#33 background pruner (v0.18.0 lifecycle hook —
+        // closes the v0.16.1 TODO documented on
+        // `ReticulumTransport::routing_blackhole_prune_expired`). Walks
+        // the persist-backed deny-list, dropping rows whose `until` is
+        // past `Utc::now()`. Permanent rules (`until IS NULL`) are
+        // NEVER pruned. Spawns iff (a) `blackhole_prune_interval_seconds`
+        // > 0 AND (b) the Reticulum transport actually wired an
+        // `Arc<dyn BlackholeRules>` backend (test fixtures and
+        // HTTP-only deployments don't). Cancellation: the task lives
+        // for the runtime lifetime; the shutdown watcher is consulted
+        // each tick so a clean shutdown reclaims it without leaking.
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let interval = self.config.blackhole_prune_interval_seconds;
+            if interval > 0 {
+                if let Some(rules) = self
+                    .reticulum_transport
+                    .as_ref()
+                    .and_then(|t| t.blackhole_rules_handle())
+                {
+                    let sd = shutdown_rx.clone();
+                    tasks.push(tokio::spawn(async move {
+                        run_blackhole_pruner(rules, interval, sd).await;
+                    }));
+                }
+            }
         }
 
         // Inbound dispatch loop — verify + handler dispatch +
@@ -2207,6 +2578,24 @@ impl EdgeBuilder {
         self
     }
 
+    /// CIRISEdge#46 (v0.18.0) — supply the operator-declared canonical
+    /// bootstrap-peer set. Each `key_id` is dropped into the in-memory
+    /// canonical HashSet on the constructed [`Edge`], so the `peer_get`
+    /// / `peer_list` projections fill the `canonical: bool` field and
+    /// the `peer_remove` hard-remove guard fires correctly.
+    ///
+    /// This setter populates the IN-MEMORY set only. The persist
+    /// reseed (`add_peer_record` per row) is async and lives in
+    /// [`reseed_canonical_bootstrap_peers`] — cohabitation init paths
+    /// call it before `build()` is invoked. Test fixtures that only
+    /// need the in-memory canonical state (e.g. the `peer_remove`
+    /// guard) can use this setter standalone.
+    #[must_use]
+    pub fn canonical_bootstrap_peers(mut self, peers: Vec<CanonicalBootstrapPeer>) -> Self {
+        self.canonical_bootstrap_peers = peers;
+        self
+    }
+
     /// Configure the outbound inline-text pipeline. When set, edge
     /// runs it on every `send_inline` / `send_durable_inline` call
     /// before signing + shipping. Construct via
@@ -2352,6 +2741,20 @@ impl EdgeBuilder {
             broadcast::channel(self.config.event_channel_capacity.max(1));
         let content_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        // CIRISEdge#46 (v0.18.0) — populate the in-memory canonical
+        // bootstrap-peer set. Empty HashSet when the operator passed no
+        // bootstrap_peers; full set when they did. The persist reseed
+        // is the COHAB INIT path's responsibility (see
+        // `reseed_canonical_bootstrap_peers`); this builder step only
+        // covers the in-memory invariant the `peer_remove` guard +
+        // `EdgePeerInfo.canonical` projection depend on.
+        let canonical_peers = Arc::new(std::sync::RwLock::new(
+            self.canonical_bootstrap_peers
+                .iter()
+                .map(|p| p.key_id.clone())
+                .collect::<HashSet<String>>(),
+        ));
+
         Ok(Edge {
             verify,
             queue,
@@ -2373,6 +2776,7 @@ impl EdgeBuilder {
             reticulum_transport: self.reticulum_transport,
             federation_directory: self.federation_directory,
             detector,
+            canonical_peers,
             config: self.config,
         })
     }
