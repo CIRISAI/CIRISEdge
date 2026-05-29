@@ -50,6 +50,9 @@
 //! get a working `block_in_place` path.
 
 #[cfg(feature = "_reticulum-module")]
+use std::time::Duration;
+
+#[cfg(feature = "_reticulum-module")]
 use crate::transport::TransportError;
 
 #[allow(unused_imports)]
