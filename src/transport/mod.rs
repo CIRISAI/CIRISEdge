@@ -83,6 +83,17 @@ pub enum TransportError {
     Io(String),
     #[error("envelope too large: {actual} bytes > {limit}")]
     BodyTooLarge { actual: usize, limit: usize },
+    /// v0.15.0 (CIRISEdge#33) — peer identity is on the operator-
+    /// configured deny-list. The transport refused to dial. `until` is
+    /// the optional ban expiry (RFC-3339 UTC); `reason` is the optional
+    /// operator-supplied note. The `identity_hash` is the 16-byte
+    /// Reticulum identity hash of the blocked peer.
+    #[error("peer blackholed: identity_hash={identity_hash:?} reason={reason:?} until={until:?}")]
+    PeerBlackholed {
+        identity_hash: Vec<u8>,
+        reason: Option<String>,
+        until: Option<String>,
+    },
 }
 
 /// One inbound frame from a transport — raw envelope bytes plus the

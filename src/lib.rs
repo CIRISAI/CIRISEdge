@@ -124,11 +124,11 @@ pub use verify::{
 // visible at the crate root before `include_scaffolding!` runs.
 #[cfg(feature = "ffi-uniffi")]
 pub use ffi::uniffi_types::{
-    EdgeBindingsError, EdgeErrorEvent, EdgeLinkHandle, EdgeLinkInfo, EdgeLinkState,
-    EdgeMetricsSnapshot, EdgeNetworkEvent, EdgePathEntry, EdgePeerFilter, EdgePeerHandle,
-    EdgePeerHealth, EdgePeerInfo, EdgePeerPolicy, EdgePeerTrust, EdgeProbeResult,
-    EdgeTransportHandle, EdgeTransportHealth, EdgeTransportInfo, EdgeTransportSpec,
-    EdgeTransportStats,
+    EdgeBindingsError, EdgeBlackholeEntry, EdgeErrorEvent, EdgeInFlightAnnounce, EdgeLinkHandle,
+    EdgeLinkInfo, EdgeLinkState, EdgeMetricsSnapshot, EdgeNetworkEvent, EdgePathEntry,
+    EdgePeerFilter, EdgePeerHandle, EdgePeerHealth, EdgePeerInfo, EdgePeerPolicy, EdgePeerTrust,
+    EdgeProbeResult, EdgeRateEntry, EdgeReverseEntry, EdgeRoutingPathEntry, EdgeTransportHandle,
+    EdgeTransportHealth, EdgeTransportInfo, EdgeTransportSpec, EdgeTransportStats, EdgeTunnelInfo,
 };
 
 // UDL function bodies live in `ffi::uniffi_impl` — re-exported here
@@ -149,6 +149,17 @@ pub use ffi::uniffi_impl::{
 // established for the #25 / #26 / #28 / #31 reads cut.
 #[cfg(feature = "ffi-uniffi")]
 pub use ffi::uniffi_impl_links::{link_count, link_list, link_open, link_request, link_teardown};
+
+// v0.15.0 (CIRISEdge#33) — Routing-table FFI bodies. Same crate-root
+// bare-name discipline; the scaffolding's marshalling shells look up
+// `crate::routing_path_table` etc. by bare name.
+#[cfg(feature = "ffi-uniffi")]
+pub use ffi::uniffi_impl_routing::{
+    routing_announce_table, routing_blackhole_add, routing_blackhole_list,
+    routing_blackhole_remove, routing_path_drop, routing_path_drop_via, routing_path_request,
+    routing_path_table, routing_path_to, routing_rate_table, routing_reverse_table,
+    routing_transport_id, routing_transport_uptime, routing_tunnels,
+};
 
 // The included scaffolding emits ~30 `#[unsafe(no_mangle)]` FFI shim
 // declarations (`uniffi_ciris_edge_fn_func_*` + `ffi_*_uniffi_contract_version`

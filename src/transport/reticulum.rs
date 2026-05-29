@@ -901,6 +901,46 @@ pub struct ReticulumTransport {
     /// `request_id` lands here. A `HashSet<[u8; 16]>` so multiple
     /// in-flight requests across links never collide.
     timed_out_requests: Arc<Mutex<HashSet<[u8; 16]>>>,
+    /// CIRISEdge#33 (v0.15.0) — operator-configured deny-list
+    /// (in-memory). Keyed by the 16-byte Reticulum identity hash of
+    /// the blocked peer. `send` consults this BEFORE the leviculum
+    /// connect call; a hit increments the entry's `hits` counter and
+    /// returns `TransportError::PeerBlackholed`.
+    ///
+    /// v0.15.0 limitation: the blackhole table is **process-local**.
+    /// Operator changes survive a `ReticulumTransport` rebuild within
+    /// the same `Edge` (the `Arc<RwLock<...>>` is held by the
+    /// transport instance) but NOT a process restart. A v0.15.x
+    /// patch flips this to a persist-backed store once the
+    /// `cirislens.blackhole_rules` table lands (CIRISPersist
+    /// follow-up filed during v0.15.0 implementation; see issue body
+    /// for the schema sketch).
+    blackhole: Arc<parking_lot::RwLock<HashMap<Vec<u8>, BlackholeRecord>>>,
+    /// CIRISEdge#33 (v0.15.0) — process-wall-clock instant the
+    /// transport was constructed. Backs `routing_transport_uptime`.
+    /// Monotonic via `std::time::Instant`; transport replacement
+    /// rebases the counter, which is the documented contract.
+    started_at: std::time::Instant,
+}
+
+/// CIRISEdge#33 (v0.15.0) — internal blackhole record. Stored under
+/// the `Arc<RwLock<HashMap<Vec<u8>, _>>>` on [`ReticulumTransport`];
+/// projected to the FFI surface as [`crate::ffi::uniffi_types::EdgeBlackholeEntry`].
+///
+/// The `hits` counter is incremented under the RwLock's WRITE guard
+/// from `send`, so the count is reflected in the next `blackhole_list`
+/// snapshot. Implementations that need a contention-free hot path
+/// (very large deny-list, many concurrent sends) should consider
+/// flipping to a `dashmap`-backed store in a follow-up cut.
+#[derive(Debug, Clone)]
+struct BlackholeRecord {
+    until: Option<chrono::DateTime<chrono::Utc>>,
+    reason: Option<String>,
+    // Only read by routing_blackhole_list (#[cfg(feature = "ffi-uniffi")]);
+    // always set by routing_blackhole_add regardless of feature combo.
+    #[cfg_attr(not(feature = "ffi-uniffi"), allow(dead_code))]
+    added_at: chrono::DateTime<chrono::Utc>,
+    hits: u64,
 }
 
 /// Internal registry entry behind [`ReticulumTransport::interface_specs`].
@@ -1173,6 +1213,8 @@ impl ReticulumTransport {
             link_established_at: Arc::new(Mutex::new(HashMap::new())),
             request_responses: Arc::new(Mutex::new(HashMap::new())),
             timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
+            blackhole: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            started_at: std::time::Instant::now(),
         })
     }
 
@@ -1273,6 +1315,7 @@ impl ReticulumTransport {
     /// `reticulum-std`; the v0.14.0 FFI returns `None` for those
     /// fields. The wire shape is pinned so a v0.14.x flip to live
     /// values is non-breaking.
+    #[cfg(feature = "ffi-uniffi")]
     pub async fn link_list(&self) -> Vec<crate::ffi::uniffi_types::EdgeLinkInfo> {
         use crate::ffi::uniffi_types::{EdgeLinkInfo, EdgeLinkState};
         let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
@@ -1473,6 +1516,257 @@ impl ReticulumTransport {
         }
     }
 
+    // ─── CIRISEdge#33 (v0.15.0) Routing-table FFI surface ───────────
+    //
+    // Paths / blackhole / rate / tunnels / announce / reverse. The
+    // routing-table reads are mostly Leviculum-gap-stubbed in v0.15.0
+    // (the per-row enumeration accessors are `pub(crate)` upstream);
+    // the wire shape is pinned so a v0.15.x flip-on is non-breaking.
+    // The blackhole CRUD + path mutation surfaces ARE fully wired —
+    // those don't depend on the upstream visibility cap.
+
+    /// Snapshot every known path-table entry. v0.15.0 returns
+    /// `Vec::new()` — leviculum's `NodeCore::path_table_entries` is
+    /// `pub(crate)` from `reticulum-std`. Wire shape locked so a
+    /// v0.15.x patch can flip on real values without churn.
+    ///
+    /// `max_hops` filters the result to entries whose `hops <= max_hops`
+    /// when supplied. `None` returns the full table.
+    #[cfg(feature = "ffi-uniffi")]
+    #[must_use]
+    pub async fn routing_path_table(
+        &self,
+        max_hops: Option<u32>,
+    ) -> Vec<crate::ffi::uniffi_types::EdgeRoutingPathEntry> {
+        // Stubbed pending Leviculum gap closure. The `max_hops` param
+        // exists in the wire shape so the v0.15.x patch can apply it
+        // without an FFI signature bump.
+        let _ = max_hops;
+        Vec::new()
+    }
+
+    /// Look up a single path entry by destination hash. Currently a
+    /// stub returning `None` for the same reason
+    /// [`Self::routing_path_table`] returns empty: the underlying
+    /// `NodeCore::get_path_clone` is not publicly reachable.
+    #[cfg(feature = "ffi-uniffi")]
+    #[must_use]
+    pub async fn routing_path_to(
+        &self,
+        destination_hash: &[u8],
+    ) -> Option<crate::ffi::uniffi_types::EdgeRoutingPathEntry> {
+        let _ = destination_hash;
+        None
+    }
+
+    /// Fire a PATH_REQUEST for `destination_hash`. Wraps leviculum's
+    /// `ReticulumNode::request_path` — fire-and-forget; the response
+    /// arrives later as a `PathFound` event on the listen loop.
+    ///
+    /// `on_interface` is currently advisory; leviculum's `request_path`
+    /// dispatches to all interfaces. A future cut may add a per-
+    /// interface override when the upstream API allows.
+    pub async fn routing_path_request(
+        &self,
+        destination_hash: &[u8],
+        on_interface: Option<&str>,
+    ) -> Result<(), TransportError> {
+        let _ = on_interface;
+        let dest_hash_array: [u8; 16] = destination_hash.try_into().map_err(|_| {
+            TransportError::Config(format!(
+                "destination_hash must be 16 bytes, got {}",
+                destination_hash.len()
+            ))
+        })?;
+        let dest_hash = DestinationHash::new(dest_hash_array);
+        self.node
+            .request_path(&dest_hash)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum request_path: {e}")))?;
+        Ok(())
+    }
+
+    /// Drop a specific path entry by destination hash. v0.15.0 returns
+    /// `Ok(())` unconditionally — `NodeCore::remove_path` is
+    /// `pub(crate)` upstream and so this is a documented no-op.
+    pub async fn routing_path_drop(&self, destination_hash: &[u8]) -> Result<(), TransportError> {
+        // Validate the input shape so a v0.15.x flip-on doesn't change
+        // the failure mode for callers.
+        let _: [u8; 16] = destination_hash.try_into().map_err(|_| {
+            TransportError::Config(format!(
+                "destination_hash must be 16 bytes, got {}",
+                destination_hash.len()
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Drop every path whose `next_hop == transport_identity_hash`.
+    /// v0.15.0 returns `Ok(())` unconditionally — `NodeCore::drop_all_paths_via`
+    /// is `pub(crate)` upstream.
+    pub async fn routing_path_drop_via(
+        &self,
+        transport_identity_hash: &[u8],
+    ) -> Result<(), TransportError> {
+        let _: [u8; 16] = transport_identity_hash.try_into().map_err(|_| {
+            TransportError::Config(format!(
+                "transport_identity_hash must be 16 bytes, got {}",
+                transport_identity_hash.len()
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Snapshot every blackhole rule. Fully functional in v0.15.0 —
+    /// the rules live in the transport's in-memory `Arc<RwLock<HashMap>>`.
+    #[cfg(feature = "ffi-uniffi")]
+    #[must_use]
+    pub fn routing_blackhole_list(&self) -> Vec<crate::ffi::uniffi_types::EdgeBlackholeEntry> {
+        let guard = self.blackhole.read();
+        guard
+            .iter()
+            .map(|(hash, rec)| crate::ffi::uniffi_types::EdgeBlackholeEntry {
+                identity_hash: hash.clone(),
+                until: rec.until.map(|t| t.to_rfc3339()),
+                reason: rec.reason.clone(),
+                added_at: rec.added_at.to_rfc3339(),
+                hits: rec.hits,
+            })
+            .collect()
+    }
+
+    /// Add or replace a blackhole rule. `until` is RFC-3339 UTC; pass
+    /// `None` for a permanent rule. `reason` is an operator note. The
+    /// `hits` counter resets when a rule is replaced.
+    pub fn routing_blackhole_add(
+        &self,
+        identity_hash: &[u8],
+        until: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<(), TransportError> {
+        if identity_hash.is_empty() {
+            return Err(TransportError::Config(
+                "identity_hash must be non-empty".into(),
+            ));
+        }
+        let until_parsed = if let Some(s) = until {
+            Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| TransportError::Config(format!("until is not RFC-3339: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            )
+        } else {
+            None
+        };
+        let rec = BlackholeRecord {
+            until: until_parsed,
+            reason: reason.map(std::string::ToString::to_string),
+            added_at: chrono::Utc::now(),
+            hits: 0,
+        };
+        let mut guard = self.blackhole.write();
+        guard.insert(identity_hash.to_vec(), rec);
+        Ok(())
+    }
+
+    /// Remove a blackhole rule. Idempotent: returns `Ok(())` whether
+    /// or not the rule existed.
+    pub fn routing_blackhole_remove(&self, identity_hash: &[u8]) -> Result<(), TransportError> {
+        let mut guard = self.blackhole.write();
+        guard.remove(identity_hash);
+        Ok(())
+    }
+
+    /// Snapshot the per-identity announce rate table. v0.15.0 returns
+    /// `Vec::new()` pending Leviculum widening the
+    /// `NodeCore::rate_table_entries` visibility.
+    #[cfg(feature = "ffi-uniffi")]
+    #[must_use]
+    pub async fn routing_rate_table(&self) -> Vec<crate::ffi::uniffi_types::EdgeRateEntry> {
+        Vec::new()
+    }
+
+    /// Seconds since this `ReticulumTransport` was constructed.
+    /// Monotonic. Backs the FFI `routing_transport_uptime`.
+    #[must_use]
+    pub fn routing_transport_uptime(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    /// The routing-layer transport identity hash (16 bytes). Mirrors
+    /// `ReticulumNode::identity_hash`.
+    #[must_use]
+    pub fn routing_transport_id(&self) -> Vec<u8> {
+        self.node.identity_hash().to_vec()
+    }
+
+    /// Snapshot the tunnel synthesize table. v0.15.0 returns
+    /// `Vec::new()` — Reticulum's tunnel table is NOT exposed at any
+    /// public API level (upstream gap).
+    #[cfg(feature = "ffi-uniffi")]
+    #[must_use]
+    pub async fn routing_tunnels(&self) -> Vec<crate::ffi::uniffi_types::EdgeTunnelInfo> {
+        Vec::new()
+    }
+
+    /// Snapshot the in-flight outbound announce retry queue. v0.15.0
+    /// returns `Vec::new()` pending Leviculum widening.
+    #[cfg(feature = "ffi-uniffi")]
+    #[must_use]
+    pub async fn routing_announce_table(
+        &self,
+    ) -> Vec<crate::ffi::uniffi_types::EdgeInFlightAnnounce> {
+        Vec::new()
+    }
+
+    /// Snapshot the reverse routing table (debugging surface). v0.15.0
+    /// returns `Vec::new()` pending Leviculum widening.
+    #[cfg(feature = "ffi-uniffi")]
+    #[must_use]
+    pub async fn routing_reverse_table(&self) -> Vec<crate::ffi::uniffi_types::EdgeReverseEntry> {
+        Vec::new()
+    }
+
+    /// CIRISEdge#33 — internal blackhole check. Returns a typed
+    /// `TransportError::PeerBlackholed` if `identity_hash` is on the
+    /// deny-list (after pruning expired entries); also increments the
+    /// rule's `hits` counter. Called from `send` BEFORE the leviculum
+    /// connect.
+    fn check_blackhole(&self, identity_hash: &[u8]) -> Result<(), TransportError> {
+        // First pass under READ — fast path the common (no-block) case
+        // without taking the write lock.
+        {
+            let guard = self.blackhole.read();
+            let Some(rec) = guard.get(identity_hash) else {
+                return Ok(());
+            };
+            if let Some(until) = rec.until {
+                if chrono::Utc::now() >= until {
+                    // Expired — drop the entry below under write lock.
+                    drop(guard);
+                    self.blackhole.write().remove(identity_hash);
+                    return Ok(());
+                }
+            }
+        }
+        // We hit a live rule — promote to write to bump `hits` + clone
+        // the metadata for the error.
+        let (reason, until) = {
+            let mut guard = self.blackhole.write();
+            let Some(rec) = guard.get_mut(identity_hash) else {
+                // Raced with a remove — let send proceed.
+                return Ok(());
+            };
+            rec.hits = rec.hits.saturating_add(1);
+            (rec.reason.clone(), rec.until.map(|t| t.to_rfc3339()))
+        };
+        Err(TransportError::PeerBlackholed {
+            identity_hash: identity_hash.to_vec(),
+            reason,
+            until,
+        })
+    }
+
     /// Resolve a `destination_key_id` to a Reticulum peer. Consults
     /// the **rooted** announce map first (every entry has cleared the
     /// CIRISEdge#15 cold-start path), then the out-of-band injected
@@ -1523,6 +1817,18 @@ impl Transport for ReticulumTransport {
                  (not directory-resolvable and no announce received)"
             ))
         })?;
+
+        // CIRISEdge#33 (v0.15.0) — operator-deny-list check BEFORE the
+        // leviculum connect call. The blackhole keys on the peer's
+        // 16-byte Reticulum destination_hash (the same bytes
+        // `path_table` returns), so an operator that snapshots the
+        // path table and decides to ban a peer can pass the hash back
+        // unchanged. Resolves `key_id → dest_hash` via `resolve_peer`
+        // above — peers not yet resolved are not blackhole-checkable
+        // (they couldn't be sent to anyway, so the check is
+        // semantically inert at that point).
+        let dest_hash_bytes = peer.dest_hash.into_bytes();
+        self.check_blackhole(&dest_hash_bytes)?;
 
         // Establish a link to the peer's destination. `connect`
         // returns immediately; the link is usable once

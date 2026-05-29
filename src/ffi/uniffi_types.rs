@@ -194,6 +194,151 @@ pub struct EdgePathEntry {
     pub last_seen_at: Option<String>,
 }
 
+// ─── #33 Routing-table FFI types (v0.15.0) ──────────────────────────
+//
+// Per the issue body, the routing-table surface exposes Reticulum's
+// path/announce/rate/tunnels/reverse tables and a typed blackhole
+// (operator deny-list). The `EdgeRouting*` prefix keeps these
+// separate from the existing `EdgePathEntry` (#28 observability
+// snapshot) — the v0.15.0 surface is the richer routing-tier view.
+//
+// **Reticulum-prior-art limitations** (v0.15.0):
+//
+// Leviculum's driver public API exposes `has_path` / `hops_to` /
+// `request_path` / `path_count` and aggregate `transport_stats`, but
+// the per-row enumeration accessors — `path_table_entries`,
+// `rate_table_entries`, `remove_path`, `drop_all_paths_via` — are only
+// `pub(crate)` on `NodeCore` from `reticulum-std`'s driver wrapper.
+// The `announce_table` (in-flight retry queue) and `reverse_table`
+// (debug routing memory) are NEVER publicly exposed at any level. The
+// v0.15.0 routing-table FFI therefore lands the **wire shape** but
+// stubs the body of the enumeration / mutation methods with empty
+// `Vec` returns and `Ok(())` no-ops respectively, pending the upstream
+// Leviculum gap closure. The blackhole table is fully functional
+// (in-memory; durable persistence stubbed pending the
+// `cirislens.blackhole_rules` persist table — CIRISPersist#120). See
+// the docstrings on each `ReticulumTransport::routing_*` method for
+// the per-method gap note.
+//
+// Note: the CIRISAI/leviculum repository has issues disabled (forked
+// from teranos/leviculum). The upstream gap is therefore tracked only
+// in this crate's docstrings + the v0.15.0 CHANGELOG; the eventual
+// widening lands as a fork-side patch in the CIRISAI/leviculum tree
+// (the same fork that strips upstream's broken submodules).
+
+/// Single path-table entry (read view). `destination_hash` is the
+/// 16-byte Reticulum destination hash; `peer_key_id` is filled from
+/// edge's rooted-peer map when the destination matches a known peer
+/// (the cold-start authenticated path, AV-42); `via_transport_id` and
+/// `via_transport_kind` identify the transport carrying the path;
+/// `next_hop` is the 16-byte identity hash of the next-hop peer (empty
+/// when the path is direct / one-hop); timestamps are RFC-3339 UTC.
+///
+/// v0.15.0 limitation: the upstream driver does not expose
+/// `path_table_entries` publicly — see module-level note. The Rust
+/// `path_table()` accessor returns `Vec::new()` until Leviculum lifts
+/// the visibility cap; the wire shape is pinned so a v0.15.x patch
+/// can flip on real values without binding-side churn.
+#[derive(Debug, Clone)]
+pub struct EdgeRoutingPathEntry {
+    pub destination_hash: Vec<u8>,
+    pub peer_key_id: Option<String>,
+    pub hops: u32,
+    pub via_transport_id: String,
+    pub via_transport_kind: String,
+    pub next_hop: Vec<u8>,
+    pub last_seen_at: String,
+    pub expires_at: String,
+}
+
+/// Operator-configured deny-list entry. `identity_hash` is the 16-byte
+/// Reticulum identity hash of the blocked peer; `until` is the optional
+/// RFC-3339 expiry (`None` → permanent until `blackhole_remove`);
+/// `reason` is the operator-supplied note; `hits` is the count of
+/// envelopes the transport dropped because this rule matched.
+///
+/// v0.15.0: in-memory only. The rules survive the `ReticulumTransport`
+/// instance but NOT a process restart. Durability lands in v0.15.x
+/// patch once persist exposes a `cirislens.blackhole_rules` table
+/// (CIRISPersist follow-up filed during v0.15.0 implementation).
+#[derive(Debug, Clone)]
+pub struct EdgeBlackholeEntry {
+    pub identity_hash: Vec<u8>,
+    pub until: Option<String>,
+    pub reason: Option<String>,
+    pub added_at: String,
+    pub hits: u64,
+}
+
+/// Single rate-limit table entry — Reticulum's per-source announce-
+/// frequency tracker exposed for operator inspection. `identity_hash`
+/// is the 16-byte source identity; `announce_freq_per_min` is the
+/// measured frequency; `violations` is the count of rate-cap breaches;
+/// `blocked_until` (RFC-3339 UTC) is the ban expiry when the source
+/// crossed the violation threshold.
+///
+/// v0.15.0 limitation: `rate_table_entries` is not exposed on the
+/// driver public API (only via `pub(crate)` NodeCore::rate_table_entries).
+/// Returns empty until Leviculum widens the visibility.
+#[derive(Debug, Clone)]
+pub struct EdgeRateEntry {
+    pub identity_hash: Vec<u8>,
+    pub announce_freq_per_min: f64,
+    pub violations: u32,
+    pub blocked_until: Option<String>,
+}
+
+/// Reticulum tunnel — long-lived path synthesizing destination
+/// reachability across multi-hop relays. Mirrors the Reticulum Python
+/// `Transport.tunnels` dict shape: a `hash` (the tunnel hash, derived
+/// from the well-known `rnstransport.tunnel.synthesize` destination),
+/// the tunnel's own `tunnel_id` (16 bytes), the current `hops` count,
+/// and the RFC-3339 expiry.
+///
+/// v0.15.0 limitation: `transport.tunnels` is NOT publicly exposed in
+/// reticulum-core / reticulum-std at all — even at `pub(crate)`. The
+/// only references are internal (`tunnel_synthesize_hash` for control-
+/// destination routing). Returns empty pending an upstream Leviculum
+/// gap-closure issue.
+#[derive(Debug, Clone)]
+pub struct EdgeTunnelInfo {
+    pub hash: Vec<u8>,
+    pub tunnel_id: Vec<u8>,
+    pub hops: u32,
+    pub expires_at: String,
+}
+
+/// Single in-flight outbound announce — the retry queue Reticulum
+/// owns for announces it has emitted but not yet seen rebroadcast /
+/// settled. `destination_hash` is the announce target; `attempts` is
+/// the retry counter; `next_retry_at` is the RFC-3339 scheduled
+/// retransmit time.
+///
+/// v0.15.0 limitation: the outbound announce retry queue is
+/// `pub(crate)` from `reticulum-core::transport`. Returns empty
+/// pending Leviculum widening.
+#[derive(Debug, Clone)]
+pub struct EdgeInFlightAnnounce {
+    pub destination_hash: Vec<u8>,
+    pub attempts: u32,
+    pub next_retry_at: String,
+}
+
+/// Single reverse-routing table entry — debugging surface only.
+/// Reticulum's reverse table records which interface a destination
+/// was learned over, so the proof / response path can route back
+/// without re-running PATH_REQUEST.
+///
+/// v0.15.0 limitation: the reverse table is `pub(crate)` from
+/// `reticulum-core::transport` and only consulted internally for
+/// proof routing. Returns empty pending Leviculum widening.
+#[derive(Debug, Clone)]
+pub struct EdgeReverseEntry {
+    pub source_hash: Vec<u8>,
+    pub destination_hash: Vec<u8>,
+    pub last_seen_at: String,
+}
+
 // ─── #32 Links FFI types (v0.14.0) ──────────────────────────────────
 //
 // Mirrors Reticulum's `LinkState` enum projection (Pending / Active /

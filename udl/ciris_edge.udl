@@ -168,6 +168,74 @@ namespace ciris_edge {
         bytes data,
         u64 timeout_ms
     );
+
+    // ─── #33 Routing-table FFI (v0.15.0) ─────────────────────────────
+    //
+    // Paths / blackhole / rate / tunnels / announce / reverse. Per the
+    // v0.15.0 UniFFI/PyO3 split (CIRISEdge#36 spike GO carve-out + #33
+    // locked decision), ALL of the routing-table surface lands under
+    // UniFFI — reads, fire-and-forget path mutations, and the typed
+    // blackhole CRUD. Sync block_on_runtime, no AsyncIterator.
+    //
+    // **Upstream gaps** (Leviculum visibility caps): the per-row path
+    // / rate / tunnel / announce / reverse table accessors are
+    // `pub(crate)` from `reticulum-std` and so currently not reachable
+    // through the public API. The v0.15.0 FFI pins the WIRE SHAPE and
+    // returns empty Vecs from the read methods, with the gap
+    // documented inline. A v0.15.x patch flips the bodies to real
+    // values once the upstream gap-closure issue lands. The
+    // blackhole table is fully functional (in-memory; durable persist
+    // tracked in the persist follow-up filed during this cut).
+    //
+    // **Persistence**: the v0.15.0 blackhole is in-memory only
+    // (Arc<RwLock<HashMap>> on the ReticulumTransport). Durability
+    // lands once persist exposes `cirislens.blackhole_rules`.
+
+    // Paths
+    [Throws=EdgeBindingsError]
+    sequence<EdgeRoutingPathEntry> routing_path_table(u32? max_hops);
+
+    [Throws=EdgeBindingsError]
+    EdgeRoutingPathEntry? routing_path_to(bytes destination_hash);
+
+    [Throws=EdgeBindingsError]
+    void routing_path_request(bytes destination_hash, string? on_interface);
+
+    [Throws=EdgeBindingsError]
+    void routing_path_drop(bytes destination_hash);
+
+    [Throws=EdgeBindingsError]
+    void routing_path_drop_via(bytes transport_identity_hash);
+
+    // Blackhole (operator deny-list)
+    [Throws=EdgeBindingsError]
+    sequence<EdgeBlackholeEntry> routing_blackhole_list();
+
+    [Throws=EdgeBindingsError]
+    void routing_blackhole_add(bytes identity_hash, string? until, string? reason);
+
+    [Throws=EdgeBindingsError]
+    void routing_blackhole_remove(bytes identity_hash);
+
+    // Rate-limit observation
+    [Throws=EdgeBindingsError]
+    sequence<EdgeRateEntry> routing_rate_table();
+
+    // Transport state
+    [Throws=EdgeBindingsError]
+    u64 routing_transport_uptime();
+
+    [Throws=EdgeBindingsError]
+    bytes routing_transport_id();
+
+    [Throws=EdgeBindingsError]
+    sequence<EdgeTunnelInfo> routing_tunnels();
+
+    [Throws=EdgeBindingsError]
+    sequence<EdgeInFlightAnnounce> routing_announce_table();
+
+    [Throws=EdgeBindingsError]
+    sequence<EdgeReverseEntry> routing_reverse_table();
 };
 
 // ─── Error type ─────────────────────────────────────────────────────
@@ -353,4 +421,56 @@ dictionary EdgeLinkInfo {
     u32 mdu;
     string transport_id;
     string transport_kind;
+};
+
+// ─── #33 Routing-table types (v0.15.0) ──────────────────────────────
+//
+// PathEntry / BlackholeEntry / RateEntry / TunnelInfo /
+// InFlightAnnounce / ReverseEntry — the wire shape the issue locks
+// in. See `src/ffi/uniffi_types.rs` for full per-type semantics and
+// the v0.15.0 upstream-Leviculum gap notes.
+
+dictionary EdgeRoutingPathEntry {
+    bytes destination_hash;
+    string? peer_key_id;
+    u32 hops;
+    string via_transport_id;
+    string via_transport_kind;
+    bytes next_hop;
+    string last_seen_at;
+    string expires_at;
+};
+
+dictionary EdgeBlackholeEntry {
+    bytes identity_hash;
+    string? until;
+    string? reason;
+    string added_at;
+    u64 hits;
+};
+
+dictionary EdgeRateEntry {
+    bytes identity_hash;
+    double announce_freq_per_min;
+    u32 violations;
+    string? blocked_until;
+};
+
+dictionary EdgeTunnelInfo {
+    bytes hash;
+    bytes tunnel_id;
+    u32 hops;
+    string expires_at;
+};
+
+dictionary EdgeInFlightAnnounce {
+    bytes destination_hash;
+    u32 attempts;
+    string next_retry_at;
+};
+
+dictionary EdgeReverseEntry {
+    bytes source_hash;
+    bytes destination_hash;
+    string last_seen_at;
 };

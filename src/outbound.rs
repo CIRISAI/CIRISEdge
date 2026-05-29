@@ -565,6 +565,13 @@ async fn dispatch_one(
                 TransportError::Config(_) => "config",
                 TransportError::Io(_) => "io",
                 TransportError::BodyTooLarge { .. } => "body_too_large",
+                // v0.15.0 (CIRISEdge#33) — blackholed peers surface as
+                // a typed reachability error class so the dispatcher
+                // backs off the retry chain. A blackhole is operator-
+                // initiated; treating it as "unreachable" wastes
+                // backoff budget on a peer that won't recover until the
+                // operator lifts the rule.
+                TransportError::PeerBlackholed { .. } => "peer_blackholed",
             };
             if let Some(t) = reachability {
                 t.record_attempt(

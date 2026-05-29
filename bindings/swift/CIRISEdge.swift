@@ -548,6 +548,72 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 }
 
 
+public struct EdgeBlackholeEntry: Equatable, Hashable {
+    public var identityHash: Data
+    public var until: String?
+    public var reason: String?
+    public var addedAt: String
+    public var hits: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(identityHash: Data, until: String?, reason: String?, addedAt: String, hits: UInt64) {
+        self.identityHash = identityHash
+        self.until = until
+        self.reason = reason
+        self.addedAt = addedAt
+        self.hits = hits
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeBlackholeEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeBlackholeEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeBlackholeEntry {
+        return
+            try EdgeBlackholeEntry(
+                identityHash: FfiConverterData.read(from: &buf), 
+                until: FfiConverterOptionString.read(from: &buf), 
+                reason: FfiConverterOptionString.read(from: &buf), 
+                addedAt: FfiConverterString.read(from: &buf), 
+                hits: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeBlackholeEntry, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.identityHash, into: &buf)
+        FfiConverterOptionString.write(value.until, into: &buf)
+        FfiConverterOptionString.write(value.reason, into: &buf)
+        FfiConverterString.write(value.addedAt, into: &buf)
+        FfiConverterUInt64.write(value.hits, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeBlackholeEntry_lift(_ buf: RustBuffer) throws -> EdgeBlackholeEntry {
+    return try FfiConverterTypeEdgeBlackholeEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeBlackholeEntry_lower(_ value: EdgeBlackholeEntry) -> RustBuffer {
+    return FfiConverterTypeEdgeBlackholeEntry.lower(value)
+}
+
+
 public struct EdgeErrorEvent: Equatable, Hashable {
     public var at: String
     public var className: String
@@ -607,6 +673,64 @@ public func FfiConverterTypeEdgeErrorEvent_lift(_ buf: RustBuffer) throws -> Edg
 #endif
 public func FfiConverterTypeEdgeErrorEvent_lower(_ value: EdgeErrorEvent) -> RustBuffer {
     return FfiConverterTypeEdgeErrorEvent.lower(value)
+}
+
+
+public struct EdgeInFlightAnnounce: Equatable, Hashable {
+    public var destinationHash: Data
+    public var attempts: UInt32
+    public var nextRetryAt: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(destinationHash: Data, attempts: UInt32, nextRetryAt: String) {
+        self.destinationHash = destinationHash
+        self.attempts = attempts
+        self.nextRetryAt = nextRetryAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeInFlightAnnounce: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeInFlightAnnounce: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeInFlightAnnounce {
+        return
+            try EdgeInFlightAnnounce(
+                destinationHash: FfiConverterData.read(from: &buf), 
+                attempts: FfiConverterUInt32.read(from: &buf), 
+                nextRetryAt: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeInFlightAnnounce, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.destinationHash, into: &buf)
+        FfiConverterUInt32.write(value.attempts, into: &buf)
+        FfiConverterString.write(value.nextRetryAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeInFlightAnnounce_lift(_ buf: RustBuffer) throws -> EdgeInFlightAnnounce {
+    return try FfiConverterTypeEdgeInFlightAnnounce.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeInFlightAnnounce_lower(_ value: EdgeInFlightAnnounce) -> RustBuffer {
+    return FfiConverterTypeEdgeInFlightAnnounce.lower(value)
 }
 
 
@@ -1328,6 +1452,204 @@ public func FfiConverterTypeEdgeProbeResult_lower(_ value: EdgeProbeResult) -> R
 }
 
 
+public struct EdgeRateEntry: Equatable, Hashable {
+    public var identityHash: Data
+    public var announceFreqPerMin: Double
+    public var violations: UInt32
+    public var blockedUntil: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(identityHash: Data, announceFreqPerMin: Double, violations: UInt32, blockedUntil: String?) {
+        self.identityHash = identityHash
+        self.announceFreqPerMin = announceFreqPerMin
+        self.violations = violations
+        self.blockedUntil = blockedUntil
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeRateEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeRateEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeRateEntry {
+        return
+            try EdgeRateEntry(
+                identityHash: FfiConverterData.read(from: &buf), 
+                announceFreqPerMin: FfiConverterDouble.read(from: &buf), 
+                violations: FfiConverterUInt32.read(from: &buf), 
+                blockedUntil: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeRateEntry, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.identityHash, into: &buf)
+        FfiConverterDouble.write(value.announceFreqPerMin, into: &buf)
+        FfiConverterUInt32.write(value.violations, into: &buf)
+        FfiConverterOptionString.write(value.blockedUntil, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeRateEntry_lift(_ buf: RustBuffer) throws -> EdgeRateEntry {
+    return try FfiConverterTypeEdgeRateEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeRateEntry_lower(_ value: EdgeRateEntry) -> RustBuffer {
+    return FfiConverterTypeEdgeRateEntry.lower(value)
+}
+
+
+public struct EdgeReverseEntry: Equatable, Hashable {
+    public var sourceHash: Data
+    public var destinationHash: Data
+    public var lastSeenAt: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sourceHash: Data, destinationHash: Data, lastSeenAt: String) {
+        self.sourceHash = sourceHash
+        self.destinationHash = destinationHash
+        self.lastSeenAt = lastSeenAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeReverseEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeReverseEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeReverseEntry {
+        return
+            try EdgeReverseEntry(
+                sourceHash: FfiConverterData.read(from: &buf), 
+                destinationHash: FfiConverterData.read(from: &buf), 
+                lastSeenAt: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeReverseEntry, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.sourceHash, into: &buf)
+        FfiConverterData.write(value.destinationHash, into: &buf)
+        FfiConverterString.write(value.lastSeenAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeReverseEntry_lift(_ buf: RustBuffer) throws -> EdgeReverseEntry {
+    return try FfiConverterTypeEdgeReverseEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeReverseEntry_lower(_ value: EdgeReverseEntry) -> RustBuffer {
+    return FfiConverterTypeEdgeReverseEntry.lower(value)
+}
+
+
+public struct EdgeRoutingPathEntry: Equatable, Hashable {
+    public var destinationHash: Data
+    public var peerKeyId: String?
+    public var hops: UInt32
+    public var viaTransportId: String
+    public var viaTransportKind: String
+    public var nextHop: Data
+    public var lastSeenAt: String
+    public var expiresAt: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(destinationHash: Data, peerKeyId: String?, hops: UInt32, viaTransportId: String, viaTransportKind: String, nextHop: Data, lastSeenAt: String, expiresAt: String) {
+        self.destinationHash = destinationHash
+        self.peerKeyId = peerKeyId
+        self.hops = hops
+        self.viaTransportId = viaTransportId
+        self.viaTransportKind = viaTransportKind
+        self.nextHop = nextHop
+        self.lastSeenAt = lastSeenAt
+        self.expiresAt = expiresAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeRoutingPathEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeRoutingPathEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeRoutingPathEntry {
+        return
+            try EdgeRoutingPathEntry(
+                destinationHash: FfiConverterData.read(from: &buf), 
+                peerKeyId: FfiConverterOptionString.read(from: &buf), 
+                hops: FfiConverterUInt32.read(from: &buf), 
+                viaTransportId: FfiConverterString.read(from: &buf), 
+                viaTransportKind: FfiConverterString.read(from: &buf), 
+                nextHop: FfiConverterData.read(from: &buf), 
+                lastSeenAt: FfiConverterString.read(from: &buf), 
+                expiresAt: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeRoutingPathEntry, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.destinationHash, into: &buf)
+        FfiConverterOptionString.write(value.peerKeyId, into: &buf)
+        FfiConverterUInt32.write(value.hops, into: &buf)
+        FfiConverterString.write(value.viaTransportId, into: &buf)
+        FfiConverterString.write(value.viaTransportKind, into: &buf)
+        FfiConverterData.write(value.nextHop, into: &buf)
+        FfiConverterString.write(value.lastSeenAt, into: &buf)
+        FfiConverterString.write(value.expiresAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeRoutingPathEntry_lift(_ buf: RustBuffer) throws -> EdgeRoutingPathEntry {
+    return try FfiConverterTypeEdgeRoutingPathEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeRoutingPathEntry_lower(_ value: EdgeRoutingPathEntry) -> RustBuffer {
+    return FfiConverterTypeEdgeRoutingPathEntry.lower(value)
+}
+
+
 public struct EdgeTransportHandle: Equatable, Hashable {
     public var id: UInt64
     public var kind: String
@@ -1687,6 +2009,68 @@ public func FfiConverterTypeEdgeTransportStats_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeEdgeTransportStats_lower(_ value: EdgeTransportStats) -> RustBuffer {
     return FfiConverterTypeEdgeTransportStats.lower(value)
+}
+
+
+public struct EdgeTunnelInfo: Equatable, Hashable {
+    public var hash: Data
+    public var tunnelId: Data
+    public var hops: UInt32
+    public var expiresAt: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hash: Data, tunnelId: Data, hops: UInt32, expiresAt: String) {
+        self.hash = hash
+        self.tunnelId = tunnelId
+        self.hops = hops
+        self.expiresAt = expiresAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeTunnelInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeTunnelInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeTunnelInfo {
+        return
+            try EdgeTunnelInfo(
+                hash: FfiConverterData.read(from: &buf), 
+                tunnelId: FfiConverterData.read(from: &buf), 
+                hops: FfiConverterUInt32.read(from: &buf), 
+                expiresAt: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeTunnelInfo, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.hash, into: &buf)
+        FfiConverterData.write(value.tunnelId, into: &buf)
+        FfiConverterUInt32.write(value.hops, into: &buf)
+        FfiConverterString.write(value.expiresAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeTunnelInfo_lift(_ buf: RustBuffer) throws -> EdgeTunnelInfo {
+    return try FfiConverterTypeEdgeTunnelInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeTunnelInfo_lower(_ value: EdgeTunnelInfo) -> RustBuffer {
+    return FfiConverterTypeEdgeTunnelInfo.lower(value)
 }
 
 
@@ -2183,6 +2567,30 @@ fileprivate struct FfiConverterOptionTypeEdgePeerPolicy: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeEdgeRoutingPathEntry: FfiConverterRustBuffer {
+    typealias SwiftType = EdgeRoutingPathEntry?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeEdgeRoutingPathEntry.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeEdgeRoutingPathEntry.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeEdgePeerTrust: FfiConverterRustBuffer {
     typealias SwiftType = EdgePeerTrust?
 
@@ -2232,6 +2640,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeEdgeBlackholeEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [EdgeBlackholeEntry]
+
+    public static func write(_ value: [EdgeBlackholeEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeEdgeBlackholeEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [EdgeBlackholeEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [EdgeBlackholeEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeEdgeBlackholeEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeEdgeErrorEvent: FfiConverterRustBuffer {
     typealias SwiftType = [EdgeErrorEvent]
 
@@ -2249,6 +2682,31 @@ fileprivate struct FfiConverterSequenceTypeEdgeErrorEvent: FfiConverterRustBuffe
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeEdgeErrorEvent.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeEdgeInFlightAnnounce: FfiConverterRustBuffer {
+    typealias SwiftType = [EdgeInFlightAnnounce]
+
+    public static func write(_ value: [EdgeInFlightAnnounce], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeEdgeInFlightAnnounce.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [EdgeInFlightAnnounce] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [EdgeInFlightAnnounce]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeEdgeInFlightAnnounce.read(from: &buf))
         }
         return seq
     }
@@ -2382,6 +2840,81 @@ fileprivate struct FfiConverterSequenceTypeEdgePeerInfo: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeEdgeRateEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [EdgeRateEntry]
+
+    public static func write(_ value: [EdgeRateEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeEdgeRateEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [EdgeRateEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [EdgeRateEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeEdgeRateEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeEdgeReverseEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [EdgeReverseEntry]
+
+    public static func write(_ value: [EdgeReverseEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeEdgeReverseEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [EdgeReverseEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [EdgeReverseEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeEdgeReverseEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeEdgeRoutingPathEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [EdgeRoutingPathEntry]
+
+    public static func write(_ value: [EdgeRoutingPathEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeEdgeRoutingPathEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [EdgeRoutingPathEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [EdgeRoutingPathEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeEdgeRoutingPathEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeEdgeTransportInfo: FfiConverterRustBuffer {
     typealias SwiftType = [EdgeTransportInfo]
 
@@ -2399,6 +2932,31 @@ fileprivate struct FfiConverterSequenceTypeEdgeTransportInfo: FfiConverterRustBu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeEdgeTransportInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeEdgeTunnelInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [EdgeTunnelInfo]
+
+    public static func write(_ value: [EdgeTunnelInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeEdgeTunnelInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [EdgeTunnelInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [EdgeTunnelInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeEdgeTunnelInfo.read(from: &buf))
         }
         return seq
     }
@@ -2653,6 +3211,95 @@ public func recentEvents(limit: UInt32)throws  -> [EdgeNetworkEvent]  {
     )
 })
 }
+public func routingAnnounceTable()throws  -> [EdgeInFlightAnnounce]  {
+    return try  FfiConverterSequenceTypeEdgeInFlightAnnounce.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_announce_table($0
+    )
+})
+}
+public func routingBlackholeAdd(identityHash: Data, until: String?, reason: String?)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_blackhole_add(
+        FfiConverterData.lower(identityHash),
+        FfiConverterOptionString.lower(until),
+        FfiConverterOptionString.lower(reason),$0
+    )
+}
+}
+public func routingBlackholeList()throws  -> [EdgeBlackholeEntry]  {
+    return try  FfiConverterSequenceTypeEdgeBlackholeEntry.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_blackhole_list($0
+    )
+})
+}
+public func routingBlackholeRemove(identityHash: Data)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_blackhole_remove(
+        FfiConverterData.lower(identityHash),$0
+    )
+}
+}
+public func routingPathDrop(destinationHash: Data)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_path_drop(
+        FfiConverterData.lower(destinationHash),$0
+    )
+}
+}
+public func routingPathDropVia(transportIdentityHash: Data)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_path_drop_via(
+        FfiConverterData.lower(transportIdentityHash),$0
+    )
+}
+}
+public func routingPathRequest(destinationHash: Data, onInterface: String?)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_path_request(
+        FfiConverterData.lower(destinationHash),
+        FfiConverterOptionString.lower(onInterface),$0
+    )
+}
+}
+public func routingPathTable(maxHops: UInt32?)throws  -> [EdgeRoutingPathEntry]  {
+    return try  FfiConverterSequenceTypeEdgeRoutingPathEntry.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_path_table(
+        FfiConverterOptionUInt32.lower(maxHops),$0
+    )
+})
+}
+public func routingPathTo(destinationHash: Data)throws  -> EdgeRoutingPathEntry?  {
+    return try  FfiConverterOptionTypeEdgeRoutingPathEntry.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_path_to(
+        FfiConverterData.lower(destinationHash),$0
+    )
+})
+}
+public func routingRateTable()throws  -> [EdgeRateEntry]  {
+    return try  FfiConverterSequenceTypeEdgeRateEntry.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_rate_table($0
+    )
+})
+}
+public func routingReverseTable()throws  -> [EdgeReverseEntry]  {
+    return try  FfiConverterSequenceTypeEdgeReverseEntry.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_reverse_table($0
+    )
+})
+}
+public func routingTransportId()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_transport_id($0
+    )
+})
+}
+public func routingTransportUptime()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_transport_uptime($0
+    )
+})
+}
+public func routingTunnels()throws  -> [EdgeTunnelInfo]  {
+    return try  FfiConverterSequenceTypeEdgeTunnelInfo.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_tunnels($0
+    )
+})
+}
 public func transportAdd(spec: EdgeTransportSpec)throws  -> EdgeTransportHandle  {
     return try  FfiConverterTypeEdgeTransportHandle_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_transport_add(
@@ -2802,6 +3449,48 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_recent_events() != 602) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_announce_table() != 19407) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_blackhole_add() != 9306) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_blackhole_list() != 27710) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_blackhole_remove() != 39038) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_path_drop() != 22632) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_path_drop_via() != 23741) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_path_request() != 1577) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_path_table() != 14662) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_path_to() != 58415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_rate_table() != 32532) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_reverse_table() != 51615) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_transport_id() != 26501) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_transport_uptime() != 42323) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_tunnels() != 56409) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_transport_add() != 59654) {
