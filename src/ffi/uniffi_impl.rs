@@ -143,6 +143,7 @@ pub fn peer_list(
         use base64::Engine as _;
         let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(row.pubkey_ed25519);
 
+        let canonical = edge.is_canonical_peer(&row.key_id);
         out.push(crate::EdgePeerInfo {
             handle: crate::EdgePeerHandle {
                 key_id: row.key_id.clone(),
@@ -157,6 +158,7 @@ pub fn peer_list(
             trust: crate::EdgePeerTrust::Trusted,
             alias: None,
             notes: None,
+            canonical,
         });
     }
     Ok(out)
@@ -192,8 +194,11 @@ pub fn peer_get(key_id: String) -> Result<Option<crate::EdgePeerInfo>, crate::Ed
     Ok(row.map(|pubkey| {
         use base64::Engine as _;
         let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(pubkey);
+        let canonical = edge.is_canonical_peer(&key_id);
         crate::EdgePeerInfo {
-            handle: crate::EdgePeerHandle { key_id },
+            handle: crate::EdgePeerHandle {
+                key_id: key_id.clone(),
+            },
             pubkey_ed25519_base64: pubkey_b64,
             identity_type: "unknown".to_string(),
             rooted: true,
@@ -204,6 +209,7 @@ pub fn peer_get(key_id: String) -> Result<Option<crate::EdgePeerInfo>, crate::Ed
             trust: crate::EdgePeerTrust::Trusted,
             alias: None,
             notes: None,
+            canonical,
         }
     }))
 }
@@ -377,11 +383,26 @@ pub fn peer_add(
 /// `HardRemoveWithActiveAttestations`) when active attestations would
 /// be orphaned — the operator either soft-removes (preserves audit
 /// trail) or revokes the key first.
+///
+/// v0.18.0 (CIRISEdge#46) — hard-remove of a CANONICAL bootstrap peer
+/// (one whose `key_id` lives in the init-supplied `bootstrap_peers`
+/// set) is rejected with [`EdgeBindingsError::CannotRemoveCanonicalPeer`]
+/// BEFORE the persist call runs. Soft-remove on a canonical peer is
+/// permitted; the row is hidden from reads, the canonical knowledge
+/// stays in memory, and the init reseed does NOT un-hide it (persist
+/// preserves `removed_at` across the idempotent `add_peer_record`).
 pub fn peer_remove(
     handle: crate::EdgePeerHandle,
     hard: bool,
 ) -> Result<(), crate::EdgeBindingsError> {
     let edge = current_edge()?;
+    if hard && edge.is_canonical_peer(&handle.key_id) {
+        tracing::warn!(
+            key_id = %handle.key_id,
+            "peer_remove(hard=true) rejected on canonical bootstrap peer",
+        );
+        return Err(crate::EdgeBindingsError::CannotRemoveCanonicalPeer);
+    }
     let directory = current_federation_directory()?;
     let key_id = handle.key_id;
     block_on_runtime(&edge, async move {

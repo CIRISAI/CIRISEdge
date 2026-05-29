@@ -68,7 +68,11 @@ pub use detector::{
     ConsentRole, DetectionVerdict, EdgeDetectionAdmission, ProbePatternConfig,
     ProbePatternObserver, ProbePatternState,
 };
-pub use edge::{ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, VerifiedEnvelopeSnapshot};
+pub use edge::{
+    reseed_canonical_bootstrap_peers, run_blackhole_pruner, AgentMode, CanonicalBootstrapPeer,
+    ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, VerifiedEnvelopeSnapshot,
+    DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
+};
 pub use events::{
     EventBus, EventKind, EventSeverity, NetworkEvent, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
