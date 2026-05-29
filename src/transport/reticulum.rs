@@ -1273,6 +1273,7 @@ impl ReticulumTransport {
     /// `reticulum-std`; the v0.14.0 FFI returns `None` for those
     /// fields. The wire shape is pinned so a v0.14.x flip to live
     /// values is non-breaking.
+    #[cfg(feature = "ffi-uniffi")]
     pub async fn link_list(&self) -> Vec<crate::ffi::uniffi_types::EdgeLinkInfo> {
         use crate::ffi::uniffi_types::{EdgeLinkInfo, EdgeLinkState};
         let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);

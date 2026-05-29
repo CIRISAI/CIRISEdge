@@ -49,8 +49,6 @@
 //! host runtime via `block_on_runtime` so non-tokio call sites still
 //! get a working `block_in_place` path.
 
-use std::time::Duration;
-
 #[cfg(feature = "_reticulum-module")]
 use crate::transport::TransportError;
 
@@ -74,6 +72,7 @@ fn current_reticulum(
         .ok_or(crate::EdgeBindingsError::Unsupported)
 }
 
+#[allow(dead_code)]
 fn current_edge_arc() -> Result<std::sync::Arc<crate::edge::Edge>, crate::EdgeBindingsError> {
     // The `ffi::uniffi_impl` module owns the registry; we go through
     // the same private helper by re-implementing the upgrade locally
@@ -203,6 +202,7 @@ fn map_transport_err(e: TransportError) -> crate::EdgeBindingsError {
 /// `block_on_runtime` helper in `uniffi_impl.rs` — uses the host's
 /// current tokio runtime via `block_in_place` when available, else
 /// builds a transient single-thread runtime.
+#[allow(dead_code)]
 fn block_on<F, T>(fut: F) -> Result<T, crate::EdgeBindingsError>
 where
     F: std::future::Future<Output = Result<T, crate::EdgeBindingsError>> + Send,
