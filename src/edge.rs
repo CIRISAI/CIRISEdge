@@ -135,6 +135,24 @@ pub struct EdgeConfig {
     /// spec). A holder hitting this count is downweighted; after the
     /// window lapses without further misses, the downweight clears.
     pub holder_downweight_miss_threshold: u32,
+    /// CIRISEdge#39 (slotted v0.17.0) — Counter-RII probe-pattern
+    /// observer toggle. Default `false` — observation is opt-in per
+    /// deployment per the privacy posture (CIRISEdge#39 spec
+    /// "Configurable on/off"). When `true`, [`Edge::build`] wires a
+    /// [`crate::ProbePatternObserver`] from the federation directory
+    /// plus [`Self::probe_pattern_observer_config`]; when `false`,
+    /// `Edge::detector` is `None` and the `dispatch_inbound` hook is
+    /// a single `Option::is_some` branch.
+    pub probe_pattern_observer_enabled: bool,
+    /// CIRISEdge#39 — detector tuning. When
+    /// [`Self::probe_pattern_observer_enabled`] is `true`, this config
+    /// is cloned into the constructed observer. Calibration-channel
+    /// parameters (cohort centroids, thresholds) reach the detector
+    /// through this field; lens-core's startup load of the current
+    /// `CalibrationBundle` shapes the per-deployment thresholds before
+    /// edge boots. Defaults to [`crate::ProbePatternConfig::default`]
+    /// (conservative thresholds favouring false-negatives).
+    pub probe_pattern_observer_config: crate::ProbePatternConfig,
 }
 
 impl Default for EdgeConfig {
@@ -170,6 +188,11 @@ impl Default for EdgeConfig {
             holds_bytes_ttl_seconds: DEFAULT_HOLDS_BYTES_TTL_SECONDS,
             holder_downweight_window_seconds: DEFAULT_HOLDER_DOWNWEIGHT_WINDOW_SECONDS,
             holder_downweight_miss_threshold: DEFAULT_HOLDER_DOWNWEIGHT_MISS_THRESHOLD,
+            // CIRISEdge#39 — observation is opt-in per deployment
+            // (privacy posture). Default-off means an unmodified
+            // EdgeConfig leaves the detector field as `None`.
+            probe_pattern_observer_enabled: false,
+            probe_pattern_observer_config: crate::ProbePatternConfig::default(),
         }
     }
 }
@@ -346,6 +369,13 @@ pub struct Edge {
     /// `from_keyring_seed_dir` convenience constructor populates it
     /// from the same `FederationDirectorySqlite` it opens for verify.
     federation_directory: Option<Arc<dyn ciris_persist::federation::FederationDirectory>>,
+    /// CIRISEdge#39 (slotted v0.17.0) — optional Counter-RII probe-
+    /// pattern detector. `None` when
+    /// [`EdgeConfig::probe_pattern_observer_enabled`] is `false` (the
+    /// default). The `dispatch_inbound` hook gates emission on
+    /// `if let Some(detector) = ...` — disabled deployments pay zero
+    /// runtime cost beyond the Option branch.
+    pub detector: Option<Arc<crate::ProbePatternObserver>>,
     config: EdgeConfig,
 }
 
@@ -379,6 +409,14 @@ pub struct EdgeBuilder {
     /// one at `build()` from [`EdgeConfig::reachability_window_seconds`]
     /// (the v0.11.0 behaviour).
     reachability: Option<Arc<ReachabilityTracker>>,
+    /// CIRISEdge#39 (v0.17.0) — optional persist `DerivedSchema`
+    /// admission handle. When set AND the probe-pattern observer is
+    /// enabled, the constructed [`crate::ProbePatternObserver`] is
+    /// configured with this handle so `emit_verdict` writes through
+    /// `put_edge_detection_event` (persist v3.1.1+ / #118). When
+    /// unset, the detector falls back to the v0.13.0 STUB behavior
+    /// (`tracing::warn!` log only).
+    derived_schema: Option<Arc<dyn crate::detector::EdgeDetectionAdmission>>,
     config: EdgeConfig,
 }
 
@@ -399,6 +437,7 @@ impl Edge {
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: None,
             reachability: None,
+            derived_schema: None,
             config: EdgeConfig::default(),
         }
     }
@@ -1089,6 +1128,7 @@ impl Edge {
             self.config.max_content_body_bytes,
             &directory,
             Some(&self.reachability),
+            self.detector.as_ref(),
         )
         .await;
     }
@@ -1321,6 +1361,7 @@ impl Edge {
         let inline_subs = self.inline_text_subscribers.clone();
         let max_content_body_bytes = self.config.max_content_body_bytes;
         let reachability = self.reachability.clone();
+        let detector = self.detector.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -1336,6 +1377,7 @@ impl Edge {
                     let its = inline_subs.clone();
                     let reach_clone = reachability.clone();
                     let directory_clone = verify_clone.directory();
+                    let detector_clone = detector.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -1347,6 +1389,7 @@ impl Edge {
                             max_content_body_bytes,
                             &directory_clone,
                             Some(&reach_clone),
+                            detector_clone.as_ref(),
                         ).await;
                     });
                 }
@@ -1407,6 +1450,7 @@ async fn dispatch_inbound(
     max_content_body_bytes: usize,
     directory: &Arc<dyn VerifyDirectory>,
     reachability: Option<&Arc<ReachabilityTracker>>,
+    detector: Option<&Arc<crate::ProbePatternObserver>>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -1424,6 +1468,19 @@ async fn dispatch_inbound(
         verify_outcome,
         ..
     } = verified;
+
+    // CIRISEdge#39 (slotted v0.17.0) — Counter-RII probe-pattern
+    // observation. Runs AFTER verify (the signature gates everything,
+    // and a malformed envelope is filtered before we touch the
+    // detector), BEFORE handler dispatch. Consent-role gating and the
+    // enabled-flag check live inside `observe_inbound` so the call
+    // site is one Option-is-Some branch + one await.
+    if let Some(observer) = detector {
+        observer.observe_inbound(&envelope, transport).await;
+        if let Some(verdict) = observer.check_for_detection(&envelope.signing_key_id).await {
+            observer.emit_verdict(&verdict).await;
+        }
+    }
 
     // CIRISEdge#21 v0.8.0 — `ContentBody` AV-13 size cap + content-
     // addressed integrity check, applied post-verify and BEFORE
@@ -1875,6 +1932,24 @@ impl EdgeBuilder {
         self
     }
 
+    /// CIRISEdge#39 (v0.17.0) — supply a persist `DerivedSchema`
+    /// admission handle for the probe-pattern observer's `emit_verdict`
+    /// path. Required for the observer to write `EdgeDetectionEvent`
+    /// rows via `put_edge_detection_event` (persist v3.1.1+ / #118);
+    /// without it the observer falls back to the v0.13.0 STUB
+    /// `tracing::warn!` behavior. The production cohabitation init
+    /// path (`init_edge_runtime`) derives the handle from the same
+    /// `BackendDispatch` arm that produced the outbound queue + the
+    /// blackhole rules (sibling traits on the same backend).
+    #[must_use]
+    pub fn derived_schema(
+        mut self,
+        schema: Arc<dyn crate::detector::EdgeDetectionAdmission>,
+    ) -> Self {
+        self.derived_schema = Some(schema);
+        self
+    }
+
     /// Configure the outbound inline-text pipeline. When set, edge
     /// runs it on every `send_inline` / `send_durable_inline` call
     /// before signing + shipping. Construct via
@@ -1985,6 +2060,34 @@ impl EdgeBuilder {
             ))
         });
 
+        // CIRISEdge#39 (slotted v0.17.0) — construct the probe-pattern
+        // observer iff the deployment opted in. The observer's
+        // `enabled` flag mirrors the EdgeConfig toggle so a runtime
+        // misconfiguration (enabled flag flipped but the inner config
+        // disabled) still no-ops correctly; we propagate both for
+        // belt-and-suspenders.
+        //
+        // v0.17.0 — when a `derived_schema` handle is wired AND the
+        // observer is enabled, attach it via `with_derived_schema`
+        // so `emit_verdict` admits rows into
+        // `cirislens.edge_detection_events` (persist v3.1.1+ / #118).
+        // Without the handle, the observer falls back to the v0.13.0
+        // STUB `tracing::warn!` behavior — exercised by unit tests
+        // that don't stand up a backend.
+        let detector = if self.config.probe_pattern_observer_enabled {
+            let mut detector_cfg = self.config.probe_pattern_observer_config.clone();
+            detector_cfg.enabled = true;
+            let mut observer =
+                crate::ProbePatternObserver::new(verify.directory(), detector_cfg)
+                    .with_signing_key_id(signer.key_id.clone());
+            if let Some(schema) = self.derived_schema.clone() {
+                observer = observer.with_derived_schema(schema);
+            }
+            Some(Arc::new(observer))
+        } else {
+            None
+        };
+
         Ok(Edge {
             verify,
             queue,
@@ -2003,6 +2106,7 @@ impl EdgeBuilder {
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: self.reticulum_transport,
             federation_directory: self.federation_directory,
+            detector,
             config: self.config,
         })
     }

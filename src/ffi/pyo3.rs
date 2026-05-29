@@ -1340,6 +1340,18 @@ fn init_edge_runtime(
         BackendDispatch::Postgres(b) => b.clone(),
         BackendDispatch::Sqlite(b) => b.clone(),
     };
+    // v0.17.0 (CIRISEdge#39 emit_verdict flip / CIRISPersist#118) —
+    // derive `Arc<dyn EdgeDetectionAdmission>` (the edge-side
+    // object-safe wrapper over persist's `DerivedSchema`) from the
+    // same `BackendDispatch` arm. Both `SqliteBackend` and
+    // `PostgresBackend` impl `DerivedSchema`, and the blanket
+    // [`EdgeDetectionAdmission for T: DerivedSchema`] impl in
+    // `crate::detector` lifts them to the trait object the
+    // `ProbePatternObserver` consumes for `put_edge_detection_event`.
+    let derived_schema: Arc<dyn crate::detector::EdgeDetectionAdmission> = match &queue_dispatch {
+        BackendDispatch::Postgres(b) => b.clone(),
+        BackendDispatch::Sqlite(b) => b.clone(),
+    };
     let queue: Arc<dyn OutboundHandle> = match queue_dispatch {
         BackendDispatch::Postgres(b) => b,
         BackendDispatch::Sqlite(b) => b,
@@ -1552,6 +1564,14 @@ fn init_edge_runtime(
         .reticulum_transport(reticulum_transport)
         .events(Arc::clone(&event_bus))
         .reachability(Arc::clone(&reachability_tracker))
+        // v0.17.0 (CIRISEdge#39 emit_verdict flip) — wire the persist
+        // admission handle so the probe-pattern observer's
+        // `emit_verdict` writes through `put_edge_detection_event`.
+        // The observer itself only constructs when the deployment
+        // sets `EdgeConfig::probe_pattern_observer_enabled = true`;
+        // wiring the schema unconditionally is harmless when the
+        // observer is off (Edge::detector stays None).
+        .derived_schema(derived_schema)
         .build()
         .map_err(|e| PyRuntimeError::new_err(format!("Edge::build: {e}")))?;
 

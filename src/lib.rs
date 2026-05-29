@@ -48,6 +48,7 @@
 #![deny(rust_2018_idioms)]
 #![doc(html_root_url = "https://docs.rs/ciris-edge/0.1.0-pre1")]
 
+pub mod detector;
 mod edge;
 pub mod events;
 pub mod ffi;
@@ -62,6 +63,10 @@ pub mod reachability;
 pub mod transport;
 pub mod verify;
 
+pub use detector::{
+    ConsentRole, DetectionVerdict, EdgeDetectionAdmission, ProbePatternConfig,
+    ProbePatternObserver, ProbePatternState,
+};
 pub use edge::{Edge, EdgeBuilder, EdgeConfig, EdgeError};
 pub use events::{
     EventBus, EventKind, EventSeverity, NetworkEvent, DEFAULT_EVENT_CHANNEL_CAPACITY,
