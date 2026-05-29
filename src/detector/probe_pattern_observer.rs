@@ -914,6 +914,10 @@ mod tests {
             signature: "AAAA".into(),
             signature_pqc: None,
             in_reply_to: None,
+            // CIRIS 3.0 wire types (v0.16.0+) — fields are Option,
+            // None for unit-test traffic.
+            testimonial_witness: None,
+            key_boundary_scope: None,
         }
     }
 

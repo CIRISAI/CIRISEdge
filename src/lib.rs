@@ -60,6 +60,7 @@ pub mod messages;
 pub mod observability;
 pub mod outbound;
 pub mod reachability;
+pub mod sas;
 pub mod transport;
 pub mod verify;
 
@@ -67,7 +68,7 @@ pub use detector::{
     ConsentRole, DetectionVerdict, EdgeDetectionAdmission, ProbePatternConfig,
     ProbePatternObserver, ProbePatternState,
 };
-pub use edge::{Edge, EdgeBuilder, EdgeConfig, EdgeError};
+pub use edge::{ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, VerifiedEnvelopeSnapshot};
 pub use events::{
     EventBus, EventKind, EventSeverity, NetworkEvent, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };

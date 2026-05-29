@@ -15,7 +15,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use chrono::Utc;
 use futures::future::BoxFuture;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 
 use crate::handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, FederationPriority,
@@ -268,6 +268,41 @@ struct RegisteredHandler {
 /// dispatch (lazy cleanup, no separate sweep needed).
 pub(crate) type InlineTextSubscriber = mpsc::UnboundedSender<(String, String)>;
 
+/// CIRISEdge#22 Tier 3 (v0.17.0) — projection of a verified envelope
+/// onto the wire surface the `subscribe_feed` AsyncIterator delivers.
+/// Kept thin (the verify substrate already produced the full
+/// [`VerifiedEnvelope`] internally; we surface the fields the
+/// Python-side consumer needs for routing + correlation).
+#[derive(Debug, Clone)]
+pub struct VerifiedEnvelopeSnapshot {
+    /// The verified envelope itself — sender, message_type, body bytes,
+    /// signatures, nonce, sent_at — all stable wire fields.
+    pub envelope: EdgeEnvelope,
+    /// The body_sha256 the substrate computed at verify time. Same
+    /// shape as `EdgeEnvelope`'s `in_reply_to` field — useful for
+    /// joining inbound responses to outbound requests.
+    pub body_sha256: [u8; 32],
+    /// Transport the frame arrived on (`reticulum-rs` / `http` / etc.).
+    pub transport_id: crate::transport::TransportId,
+    /// Wall-clock at which the inbound frame was received (frame.received_at).
+    pub received_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// CIRISEdge#22 Tier 3 (v0.17.0) — result of an [`Edge::fetch_content`]
+/// call. The Python `fetch_content` pymethod returns the JSON-shaped
+/// projection of this enum.
+#[derive(Debug, Clone)]
+pub enum ContentResult {
+    /// The peer returned a verified `ContentBody` whose
+    /// `sha256(bytes) == requested_sha256` invariant holds (the
+    /// `dispatch_inbound` ContentBody gate validates this before
+    /// signalling the pending channel).
+    Bytes(Vec<u8>),
+    /// The peer returned a `ContentMiss` (typed reason). Fetcher
+    /// SHOULD try another peer per the MissReason taxonomy.
+    ContentMiss { reason: String },
+}
+
 /// Top-level edge handle. Construct via [`Edge::builder`].
 pub struct Edge {
     verify: Arc<VerifyPipeline>,
@@ -287,6 +322,22 @@ pub struct Edge {
     /// Subscription id allocator for [`Self::inline_text_subscribers`].
     /// `AtomicU64::fetch_add` so the allocator is lock-free.
     inline_text_next_id: Arc<AtomicU64>,
+    /// CIRISEdge#22 Tier 3 (v0.17.0) — broadcast channel carrying every
+    /// verified inbound `EdgeEnvelope` for the `subscribe_feed`
+    /// AsyncIterator surface. Construction is unconditional; emission
+    /// in `dispatch_inbound` swallows the channel's "no subscribers"
+    /// error so a build without subscribers pays only an `Arc` refcount.
+    /// Capacity is bounded by [`crate::events::DEFAULT_EVENT_CHANNEL_CAPACITY`]
+    /// (same as `EventBus`) — slow consumers see `Lagged` and skip ahead.
+    verified_envelope_tx: broadcast::Sender<VerifiedEnvelopeSnapshot>,
+    /// CIRISEdge#22 Tier 3 (v0.17.0) — in-flight content-fetch
+    /// correlation map. Each entry pairs a `body_sha256` with a oneshot
+    /// sender; when `dispatch_inbound` sees a verified `ContentBody` or
+    /// `ContentMiss` matching a pending fetch's sha256, the sender is
+    /// signalled and the entry removed. Bounded by call-site lifecycle —
+    /// `Edge::fetch_content` drops the receiver on timeout, which
+    /// closes the oneshot and the dispatcher prunes lazily.
+    content_fetch_pending: Arc<std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<ContentResult>>>>,
     /// Optional pipeline run on outbound inline-text envelopes
     /// (SPEAK responses, LLM prompts, WBD bodies, DSAR text). When
     /// `Some`, `send_inline` / `send_durable_inline` invoke this
@@ -1095,6 +1146,162 @@ impl Edge {
             .len()
     }
 
+    /// CIRISEdge#22 Tier 3 (v0.17.0) — subscribe to the verified-
+    /// envelope feed. Every successfully-verified inbound envelope is
+    /// published on this broadcast channel as a
+    /// [`VerifiedEnvelopeSnapshot`]; the Python `subscribe_feed`
+    /// AsyncIterator wraps the resulting `Receiver`.
+    ///
+    /// Cheap: one `broadcast::subscribe` call. Subscribers that lag
+    /// past the channel's capacity see `Lagged` errors and skip ahead.
+    #[must_use]
+    pub fn subscribe_verified_feed(&self) -> broadcast::Receiver<VerifiedEnvelopeSnapshot> {
+        self.verified_envelope_tx.subscribe()
+    }
+
+    /// CIRISEdge#22 Tier 3 (v0.17.0) — count of live verified-feed
+    /// subscribers. Diagnostic surface for tests.
+    #[must_use]
+    pub fn verified_feed_subscriber_count(&self) -> usize {
+        self.verified_envelope_tx.receiver_count()
+    }
+
+    /// CIRISEdge#22 Tier 3 (v0.17.0) — fetch content addressed by
+    /// `sha256` from `peer_key_id`. Sends a
+    /// [`crate::MessageType::ContentFetch`] envelope to the peer, then
+    /// awaits a matching [`crate::MessageType::ContentBody`] or
+    /// [`crate::MessageType::ContentMiss`] envelope.
+    ///
+    /// Returns one of:
+    /// - `ContentResult::Bytes(bytes)` — the peer served the bytes.
+    ///   The `ContentBody` integrity gate
+    ///   (`sha256(bytes) == requested_sha256`) is enforced in
+    ///   [`dispatch_inbound`] before this returns.
+    /// - `ContentResult::ContentMiss { reason }` — the peer reports
+    ///   the bytes are not available (typed
+    ///   [`crate::messages::MissReason`]).
+    ///
+    /// # Timeout
+    ///
+    /// Caller-supplied. Returns `EdgeError::Config("fetch_content
+    /// timeout")` if no matching response arrives within
+    /// `timeout`.
+    ///
+    /// # Concurrent fetches
+    ///
+    /// Pending fetches are keyed by `sha256` — only one in-flight
+    /// fetch per `sha256` is supported. Re-issuing while another is
+    /// pending replaces the earlier waiter (the prior call's oneshot
+    /// drops, signalling a closed-channel error on the prior
+    /// `await`).
+    ///
+    /// # AV-13 / integrity
+    ///
+    /// The dispatch-side ContentBody gate already enforces the
+    /// content-addressed integrity invariant. This method trusts that
+    /// gate — by the time the pending channel resolves with
+    /// `ContentResult::Bytes`, the bytes have been verified against
+    /// the requested sha256.
+    pub async fn fetch_content(
+        &self,
+        peer_key_id: &str,
+        sha256: [u8; 32],
+        timeout: std::time::Duration,
+    ) -> Result<ContentResult, EdgeError> {
+        // Register the pending fetch BEFORE sending — there is a
+        // race window otherwise where the response arrives before
+        // the waiter is in the map (the dispatcher walks the map
+        // under a sync::Mutex; if no entry, the response is dropped
+        // on the floor and we'd hang).
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self
+                .content_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // If a prior fetch is pending for the same sha256, drop
+            // its sender (the prior await observes a closed channel
+            // and errors out). Re-issue semantics — last writer wins.
+            pending.insert(sha256, tx);
+        }
+
+        // Build + send the ContentFetch envelope. We use the typed
+        // `crate::MessageType::ContentFetch` body shape — the
+        // existing Edge::send returns `EdgeError::Config(...)` for
+        // ephemeral request/response (the v0.8.0 "Phase 2"
+        // correlation not wired carve-out), which is exactly the
+        // success-of-transport path. We map that one specific error
+        // back to Ok so the caller's await proceeds.
+        let fetch = crate::messages::ContentFetch {
+            sha256,
+            response_hint: None,
+        };
+        match self.send(peer_key_id, fetch).await {
+            Ok(()) => {}
+            Err(EdgeError::Config(s))
+                if s.contains("ephemeral request-response correlation not wired") =>
+            {
+                // Transport accepted the bytes — proceed to await.
+            }
+            Err(e) => {
+                // Send failed — clean the pending entry and surface.
+                let mut pending = self
+                    .content_fetch_pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.remove(&sha256);
+                return Err(e);
+            }
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_recv_err)) => {
+                // oneshot sender dropped — either a concurrent fetch
+                // replaced our waiter, or the dispatcher dropped on
+                // a poisoned mutex. Surface as a config error.
+                Err(EdgeError::Config(
+                    "fetch_content waiter closed before response arrived".into(),
+                ))
+            }
+            Err(_) => {
+                // Timeout — clean the pending entry on our way out.
+                let mut pending = self
+                    .content_fetch_pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.remove(&sha256);
+                Err(EdgeError::Config(format!(
+                    "fetch_content timeout after {timeout:?}"
+                )))
+            }
+        }
+    }
+
+    /// CIRISEdge#22 Tier 3 (v0.17.0) — test-only helper to inject a
+    /// fake ContentBody / ContentMiss response into the pending-fetch
+    /// signal map. Used by the integration tests so the fetch_content
+    /// happy path can be exercised without a real Reticulum loopback.
+    #[doc(hidden)]
+    pub fn complete_pending_fetch_for_test(&self, sha256: [u8; 32], result: ContentResult) {
+        let mut pending = self
+            .content_fetch_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = pending.remove(&sha256) {
+            let _ = tx.send(result);
+        }
+    }
+
+    /// CIRISEdge#22 Tier 3 (v0.17.0) — test-only helper to fan out a
+    /// VerifiedEnvelopeSnapshot to verified-feed subscribers without
+    /// running a real verify pipeline. Mirrors the
+    /// `fan_out_inline_text_for_test` pattern.
+    #[doc(hidden)]
+    pub fn fan_out_verified_envelope_for_test(&self, snapshot: VerifiedEnvelopeSnapshot) {
+        let _ = self.verified_envelope_tx.send(snapshot);
+    }
+
     /// Manually fan out an InlineText payload to every subscriber.
     /// Public for tests + future non-dispatcher embedders that want to
     /// inject a synthetic inbound without going through the verify
@@ -1129,6 +1336,8 @@ impl Edge {
             &directory,
             Some(&self.reachability),
             self.detector.as_ref(),
+            &self.verified_envelope_tx,
+            &self.content_fetch_pending,
         )
         .await;
     }
@@ -1362,6 +1571,8 @@ impl Edge {
         let max_content_body_bytes = self.config.max_content_body_bytes;
         let reachability = self.reachability.clone();
         let detector = self.detector.clone();
+        let verified_tx = self.verified_envelope_tx.clone();
+        let content_pending = self.content_fetch_pending.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -1378,6 +1589,8 @@ impl Edge {
                     let reach_clone = reachability.clone();
                     let directory_clone = verify_clone.directory();
                     let detector_clone = detector.clone();
+                    let verified_tx_clone = verified_tx.clone();
+                    let content_pending_clone = content_pending.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -1390,6 +1603,8 @@ impl Edge {
                             &directory_clone,
                             Some(&reach_clone),
                             detector_clone.as_ref(),
+                            &verified_tx_clone,
+                            &content_pending_clone,
                         ).await;
                     });
                 }
@@ -1451,6 +1666,8 @@ async fn dispatch_inbound(
     directory: &Arc<dyn VerifyDirectory>,
     reachability: Option<&Arc<ReachabilityTracker>>,
     detector: Option<&Arc<crate::ProbePatternObserver>>,
+    verified_envelope_tx: &broadcast::Sender<VerifiedEnvelopeSnapshot>,
+    content_fetch_pending: &std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<ContentResult>>>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -1468,6 +1685,17 @@ async fn dispatch_inbound(
         verify_outcome,
         ..
     } = verified;
+
+    // CIRISEdge#22 Tier 3 (v0.17.0) — fan out every verified envelope
+    // on the broadcast channel BEFORE any type-specific gating. The
+    // subscribe_feed AsyncIterator consumer receives the full set; if
+    // there are no subscribers the send returns Err and we swallow it.
+    let _ = verified_envelope_tx.send(VerifiedEnvelopeSnapshot {
+        envelope: envelope.clone(),
+        body_sha256,
+        transport_id: transport,
+        received_at,
+    });
 
     // CIRISEdge#39 (slotted v0.17.0) — Counter-RII probe-pattern
     // observation. Runs AFTER verify (the signature gates everything,
@@ -1507,6 +1735,35 @@ async fn dispatch_inbound(
                     "ContentBody rejected at dispatch gate (AV-13 / integrity)",
                 );
                 return;
+            }
+        }
+        // CIRISEdge#22 Tier 3 (v0.17.0) — verified + integrity-checked
+        // `ContentBody` arrived. Signal any in-flight `fetch_content`
+        // waiter for this sha256 with the bytes. The match key is the
+        // body's own `sha256` field (echoed back in `ContentBody`),
+        // not the envelope-level body_sha256.
+        if let Ok(body) = serde_json::from_str::<crate::messages::ContentBody>(envelope.body.get())
+        {
+            let mut pending = content_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(tx) = pending.remove(&body.sha256) {
+                let _ = tx.send(ContentResult::Bytes(body.bytes));
+            }
+        }
+    }
+
+    // CIRISEdge#22 Tier 3 (v0.17.0) — `ContentMiss` arm of the
+    // fetch_content correlation. Same match-by-body-sha256 rule.
+    if envelope.message_type == MessageType::ContentMiss {
+        if let Ok(miss) = serde_json::from_str::<crate::messages::ContentMiss>(envelope.body.get())
+        {
+            let mut pending = content_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(tx) = pending.remove(&miss.sha256) {
+                let reason = format!("{:?}", miss.reason);
+                let _ = tx.send(ContentResult::ContentMiss { reason });
             }
         }
     }
@@ -2077,9 +2334,8 @@ impl EdgeBuilder {
         let detector = if self.config.probe_pattern_observer_enabled {
             let mut detector_cfg = self.config.probe_pattern_observer_config.clone();
             detector_cfg.enabled = true;
-            let mut observer =
-                crate::ProbePatternObserver::new(verify.directory(), detector_cfg)
-                    .with_signing_key_id(signer.key_id.clone());
+            let mut observer = crate::ProbePatternObserver::new(verify.directory(), detector_cfg)
+                .with_signing_key_id(signer.key_id.clone());
             if let Some(schema) = self.derived_schema.clone() {
                 observer = observer.with_derived_schema(schema);
             }
@@ -2087,6 +2343,14 @@ impl EdgeBuilder {
         } else {
             None
         };
+
+        // CIRISEdge#22 Tier 3 (v0.17.0) — verified-envelope broadcast +
+        // content-fetch pending map. The broadcast capacity matches the
+        // EventBus channel capacity so the two fan-in surfaces age
+        // gracefully under the same back-pressure regime.
+        let (verified_envelope_tx, _) =
+            broadcast::channel(self.config.event_channel_capacity.max(1));
+        let content_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         Ok(Edge {
             verify,
@@ -2096,6 +2360,8 @@ impl EdgeBuilder {
             handlers: Arc::new(Mutex::new(HashMap::new())),
             inline_text_subscribers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inline_text_next_id: Arc::new(AtomicU64::new(1)),
+            verified_envelope_tx,
+            content_fetch_pending,
             speak_pipeline: self.speak_pipeline,
             peer_directory: self.peer_directory,
             steward_directory: self.steward_directory,

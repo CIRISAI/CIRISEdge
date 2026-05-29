@@ -175,6 +175,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyCapsule, PyCapsuleMethods};
 use pyo3::wrap_pyfunction;
 use tokio::runtime::Handle as RuntimeHandle;
+use tokio::sync::Mutex;
 
 use ciris_persist::BackendDispatch;
 
@@ -493,6 +494,286 @@ impl PyEdge {
     fn inline_text_subscriber_count(&self) -> usize {
         self.inner.inline_text_subscriber_count()
     }
+
+    // ─── CIRISEdge#22 Tier 3 (v0.17.0) — Epistemic Commons UI ──────────
+    //
+    // Three load-bearing pymethods backing CIRISAgent 2.10.0's
+    // "Coming Soon" UI gating:
+    //
+    //   - `peer_reachability` — per-medium delivery counters surfaced
+    //      to the Trust Topology drilldown (CIRISEdge#29 substrate;
+    //      v0.11.0 shipped the tracker, this is the FFI surface).
+    //   - `fetch_content`     — content-addressable byte transport
+    //      (CIRISEdge#21 substrate; v0.8.0 shipped the ContentFetch /
+    //      ContentBody / ContentMiss wire types, this is the FFI
+    //      surface).
+    //   - `subscribe_feed`    — verified-envelope AsyncIterator for
+    //      the inbound UI panes.
+    //
+    // All three are thin shims over Rust-side primitives — the
+    // pymethods own GIL discipline and JSON-shape projection, not
+    // the substrate logic.
+
+    /// Per-medium reachability snapshot for `key_id`. Returns a dict
+    /// keyed by transport medium (`"reticulum-rs"`, `"http"`, etc.)
+    /// → `{ratio: float, last_ok_ts: int}` where:
+    ///
+    /// - `ratio` is the rolling-window `successes / attempts` ratio
+    ///   in `[0.0, 1.0]`. An empty dict means "no measurement yet"
+    ///   (consumer SHOULD render "unknown", not "0.0%").
+    /// - `last_ok_ts` is the wall-clock millisecond timestamp of the
+    ///   most recent successful attempt in the window (or 0 if no
+    ///   successes have been recorded).
+    ///
+    /// Cheap: one `parking_lot::RwLock` read of the in-process
+    /// reachability tracker; no I/O.
+    fn peer_reachability(&self, py: Python<'_>, key_id: &str) -> PyResult<Py<pyo3::types::PyDict>> {
+        let tracker = self.inner.reachability_tracker();
+        let snap = tracker.snapshot(key_id);
+        let dict = pyo3::types::PyDict::new(py);
+        for (transport_id, entry) in snap {
+            let medium = transport_id.0;
+            let inner = pyo3::types::PyDict::new(py);
+            inner.set_item("ratio", entry.ratio())?;
+            let last_ok_ts = entry.last_success_at.map_or(0, |t| t.timestamp_millis());
+            inner.set_item("last_ok_ts", last_ok_ts)?;
+            dict.set_item(medium, inner)?;
+        }
+        Ok(dict.unbind())
+    }
+
+    /// Fetch content addressed by `sha256` (hex string) from
+    /// `peer_key_id`. Returns a dict that is either:
+    ///
+    /// - `{"kind": "bytes", "bytes": <bytes>}` — the peer returned
+    ///   a `ContentBody` whose `sha256(bytes) == requested_sha256`
+    ///   invariant was enforced by the dispatch gate.
+    /// - `{"kind": "content_miss", "reason": "<MissReason>"}` —
+    ///   the peer returned a `ContentMiss` (try another holder).
+    ///
+    /// Raises `ValueError` if `sha256` isn't a 64-char hex string.
+    /// Raises `RuntimeError` on timeout or transport failure.
+    #[pyo3(signature = (peer_key_id, sha256, timeout_ms = 30_000))]
+    fn fetch_content(
+        &self,
+        py: Python<'_>,
+        peer_key_id: &str,
+        sha256: &str,
+        timeout_ms: u64,
+    ) -> PyResult<Py<pyo3::types::PyDict>> {
+        // Parse the hex sha256 into a [u8; 32].
+        if sha256.len() != 64 {
+            return Err(PyValueError::new_err(format!(
+                "sha256 must be a 64-char hex string, got {} chars",
+                sha256.len()
+            )));
+        }
+        let mut sha = [0u8; 32];
+        for (i, byte) in sha.iter_mut().enumerate() {
+            let s = &sha256[i * 2..i * 2 + 2];
+            *byte = u8::from_str_radix(s, 16)
+                .map_err(|e| PyValueError::new_err(format!("sha256 hex parse: {e}")))?;
+        }
+
+        let edge = self.inner.clone();
+        let peer = peer_key_id.to_string();
+        let runtime = self.runtime.clone();
+        let result = py.detach(|| {
+            run_async(&runtime, async move {
+                edge.fetch_content(&peer, sha, Duration::from_millis(timeout_ms))
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("fetch_content: {e}")))
+            })
+        })?;
+
+        let dict = pyo3::types::PyDict::new(py);
+        match result {
+            crate::edge::ContentResult::Bytes(bytes) => {
+                dict.set_item("kind", "bytes")?;
+                dict.set_item("bytes", pyo3::types::PyBytes::new(py, &bytes))?;
+            }
+            crate::edge::ContentResult::ContentMiss { reason } => {
+                dict.set_item("kind", "content_miss")?;
+                dict.set_item("reason", reason)?;
+            }
+        }
+        Ok(dict.unbind())
+    }
+
+    /// Subscribe to verified inbound envelopes. Returns a
+    /// [`PyVerifiedFeedSubscription`] — a Python AsyncIterator that
+    /// yields one verified-envelope projection per inbound message.
+    ///
+    /// Iteration shape (one `__anext__` await yields):
+    ///
+    /// ```python
+    /// {
+    ///     "message_type": "InlineText",
+    ///     "signing_key_id": "agent-bob",
+    ///     "destination_key_id": "agent-self",
+    ///     "body_sha256_prefix": "abc12345",  # first 8 hex chars
+    ///     "transport_id": "reticulum-rs",
+    ///     "received_at_ms": 1748392832000,
+    /// }
+    /// ```
+    ///
+    /// The full body is not surfaced through this AsyncIterator —
+    /// consumers route by `message_type` + `body_sha256_prefix` and
+    /// fetch the body via the typed handler dispatch path.
+    fn subscribe_feed(&self) -> PyVerifiedFeedSubscription {
+        let rx = self.inner.subscribe_verified_feed();
+        PyVerifiedFeedSubscription {
+            rx: Arc::new(Mutex::new(Some(rx))),
+            runtime: self.runtime.clone(),
+        }
+    }
+
+    // ─── CIRISEdge#47 (v0.17.0) — Short Authentication String ─────────
+
+    /// Derive a Short Authentication String for verifying the local
+    /// edge's identity against `peer_key_id`. Returns `words`
+    /// (default 5) BIP39-English words deterministically derived from
+    /// the `(local_pub, peer_pub, protocol-constant)` tuple — sorted
+    /// so the words don't depend on which side calls "local".
+    ///
+    /// Two operators displaying the same word list have confirmed
+    /// out-of-band that they share the same peer-key tuple (MITM-
+    /// resistant verification of the federation-key bootstrap).
+    ///
+    /// Raises `ValueError` if `peer_key_id` isn't in the federation
+    /// directory, or if the local signer's public key isn't 32 bytes
+    /// (e.g. hybrid hardware signer without a software-Ed25519
+    /// fallback — see persist `local_signer_capsule` v3.1.1).
+    #[pyo3(signature = (peer_key_id, words = crate::sas::DEFAULT_SAS_WORDS))]
+    fn peer_sas(&self, py: Python<'_>, peer_key_id: &str, words: usize) -> PyResult<Vec<String>> {
+        let (local_pub, peer_pub) =
+            resolve_sas_pubkeys(py, &self.inner, &self.runtime, peer_key_id)?;
+        crate::sas::peer_sas_words(&local_pub, &peer_pub, words).map_err(|e| match e {
+            crate::sas::SasError::WordsOutOfRange(_) => PyValueError::new_err(format!("{e}")),
+            other => PyRuntimeError::new_err(format!("peer_sas: {other}")),
+        })
+    }
+
+    /// Numeric-only variant of [`Self::peer_sas`]. Returns a zero-
+    /// padded decimal string of `digits` characters (default 6 ≈
+    /// 19.93 bits, same as TOTP / Signal SAS).
+    #[pyo3(signature = (peer_key_id, digits = crate::sas::DEFAULT_SAS_DIGITS))]
+    fn peer_sas_digits(
+        &self,
+        py: Python<'_>,
+        peer_key_id: &str,
+        digits: usize,
+    ) -> PyResult<String> {
+        let (local_pub, peer_pub) =
+            resolve_sas_pubkeys(py, &self.inner, &self.runtime, peer_key_id)?;
+        crate::sas::peer_sas_digits(&local_pub, &peer_pub, digits).map_err(|e| match e {
+            crate::sas::SasError::DigitsOutOfRange(_) => PyValueError::new_err(format!("{e}")),
+            other => PyRuntimeError::new_err(format!("peer_sas_digits: {other}")),
+        })
+    }
+}
+
+/// CIRISEdge#22 Tier 3 (v0.17.0) — Python-side projection of the
+/// verified-envelope feed. Backs `PyEdge::subscribe_feed`. Implements
+/// `__aiter__` / `__anext__` so `async for snap in feed: ...` drains
+/// the broadcast receiver.
+#[pyclass(name = "VerifiedFeedSubscription", module = "ciris_edge")]
+pub struct PyVerifiedFeedSubscription {
+    /// `Option<broadcast::Receiver<_>>` so `__anext__` can take the
+    /// receiver via `Mutex::lock()` + `Option::take`, await its
+    /// `recv()`, then restore it on success. `tokio::sync::Mutex`
+    /// (not std) because the lock is held across an .await inside
+    /// the future returned to Python.
+    rx: Arc<Mutex<Option<tokio::sync::broadcast::Receiver<crate::edge::VerifiedEnvelopeSnapshot>>>>,
+    runtime: RuntimeHandle,
+}
+
+#[pymethods]
+impl PyVerifiedFeedSubscription {
+    /// `async for` entry — Python AsyncIterator protocol.
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// `async for` step — returns the next verified-envelope snapshot
+    /// as a Python dict, or raises `StopAsyncIteration` when the
+    /// broadcast channel is closed.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx_holder = self.rx.clone();
+        let _runtime = self.runtime.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // pyo3-async-runtimes drives the future on its own
+            // configured tokio runtime; the receiver is bound to the
+            // broadcast channel directly, no explicit `enter()` needed.
+            let snap_opt = {
+                let mut guard = rx_holder.lock().await;
+                let Some(rx) = guard.as_mut() else {
+                    return Err(PyRuntimeError::new_err("feed subscription closed"));
+                };
+                rx.recv().await
+            };
+            match snap_opt {
+                Ok(snap) => Python::attach(|py| {
+                    let dict = pyo3::types::PyDict::new(py);
+                    dict.set_item("message_type", format!("{:?}", snap.envelope.message_type))?;
+                    dict.set_item("signing_key_id", &snap.envelope.signing_key_id)?;
+                    dict.set_item("destination_key_id", &snap.envelope.destination_key_id)?;
+                    let mut prefix = String::with_capacity(16);
+                    for b in &snap.body_sha256[..8] {
+                        use std::fmt::Write as _;
+                        let _ = write!(prefix, "{b:02x}");
+                    }
+                    dict.set_item("body_sha256_prefix", prefix)?;
+                    dict.set_item("transport_id", snap.transport_id.0)?;
+                    dict.set_item("received_at_ms", snap.received_at.timestamp_millis())?;
+                    Ok(dict.unbind().into_any())
+                }),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => Err(
+                    PyRuntimeError::new_err(format!("feed subscription lagged by {n} events")),
+                ),
+            }
+        })
+    }
+}
+
+/// CIRISEdge#47 (v0.17.0) — extract the 32-byte local Ed25519 pubkey
+/// plus look up the peer's 32-byte pubkey from the federation
+/// directory. Used by [`PyEdge::peer_sas`] / [`PyEdge::peer_sas_digits`].
+fn resolve_sas_pubkeys(
+    py: Python<'_>,
+    edge: &Arc<crate::Edge>,
+    runtime: &RuntimeHandle,
+    peer_key_id: &str,
+) -> PyResult<([u8; 32], [u8; 32])> {
+    let local_signer = edge.signer();
+    let dir = edge.verify_directory();
+    let peer_id = peer_key_id.to_string();
+    let (local_pub_bytes, peer_pub) = py.detach(|| {
+        run_async(runtime, async move {
+            let local =
+                local_signer.classical.public_key().await.map_err(|e| {
+                    PyRuntimeError::new_err(format!("local signer public_key: {e}"))
+                })?;
+            let peer = dir
+                .lookup_public_key(&peer_id)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("directory lookup: {e}")))?
+                .ok_or_else(|| PyValueError::new_err(format!("peer not found: {peer_id:?}")))?;
+            Ok::<_, PyErr>((local, peer))
+        })
+    })?;
+    if local_pub_bytes.len() != 32 {
+        return Err(PyValueError::new_err(format!(
+            "local pubkey must be 32 bytes for SAS derivation, got {}",
+            local_pub_bytes.len()
+        )));
+    }
+    let mut local_pub = [0u8; 32];
+    local_pub.copy_from_slice(&local_pub_bytes);
+    Ok((local_pub, peer_pub))
 }
 
 /// Compute `body_sha256` (hex) for the inline-text payload that
@@ -1612,6 +1893,11 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // returned by `PyEdge::register_inline_text_handler`.
     m.add_class::<PyDurableHandle>()?;
     m.add_class::<PySubscriptionHandle>()?;
+
+    // CIRISEdge#22 Tier 3 (v0.17.0) — verified-envelope AsyncIterator
+    // pyclass returned by `PyEdge::subscribe_feed`. Gates Agent
+    // 2.10.0's Epistemic Commons inbound UI panes.
+    m.add_class::<PyVerifiedFeedSubscription>()?;
 
     // init_edge_runtime — the CIRISEdge#16 / CIRIS-3.0 cohabitation
     // constructor. Only registered when the Reticulum transport is

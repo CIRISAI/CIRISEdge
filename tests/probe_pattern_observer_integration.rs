@@ -394,9 +394,16 @@ async fn emit_verdict_writes_through_put_edge_detection_event() {
     let me = FedKey::new("edge-self", 0xAA);
     let suspect = FedKey::new("external-suspect", 0xCC);
 
+    // The suspect MUST appear in federation_keys for the
+    // edge_detection_events FK (`subject_key_id`) to resolve. In
+    // production an UnconsentedExternal sender that DID verify (i.e.
+    // appears in the directory but is classified at the detector tier
+    // as UnconsentedExternal via the consent-role tag) is the exact
+    // case here; the persist V020 FK enforces that.
     let directory = directory_with(vec![
         signed_record(&bootstrap, &bootstrap, "steward"),
         signed_record(&me, &bootstrap, "agent"),
+        signed_record(&suspect, &bootstrap, "agent"),
     ])
     .await;
     let queue = directory.clone();
@@ -437,7 +444,9 @@ async fn emit_verdict_writes_through_put_edge_detection_event() {
     assert_eq!(row.severity, "warn");
     // The evidence JSON must carry the load-bearing statistic fields.
     assert_eq!(
-        row.evidence.get("message_count").and_then(|v| v.as_u64()),
+        row.evidence
+            .get("message_count")
+            .and_then(serde_json::Value::as_u64),
         Some(42),
         "evidence.message_count round-trips through persist",
     );
