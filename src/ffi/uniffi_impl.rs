@@ -715,6 +715,13 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
     }
     counters.insert("reachability.attempts_total".to_string(), total_attempts);
     counters.insert("reachability.successes_total".to_string(), total_successes);
+    // v0.19.6 (CIRISEdge#48-B) — surface the trust short-circuit drop
+    // counter on the UniFFI snapshot so operators can observe the
+    // drop rate alongside reachability totals.
+    counters.insert(
+        "inbound.dropped_low_trust_total".to_string(),
+        edge.metrics().inbound_dropped_low_trust(),
+    );
     #[allow(clippy::cast_precision_loss)]
     gauges.insert(
         "reachability.peer_medium_count".to_string(),

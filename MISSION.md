@@ -487,7 +487,7 @@ and intentionally does not touch the substrate today. Together these
 fields make CIRISEdge legibly compliant with the CIRIS 3.0 protocol
 surface, in the AGPL letter as well as the apophatic spirit of §1.4.
 
-## 11. Architectural surfaces shipped v0.5.0 → v0.19.x
+## 11. Architectural surfaces shipped v0.5.0 → v0.19.6
 
 The v0.4.0 reverse-engineering pass anchored the v1.0-prep architecture
 floor — verify pipeline, durable outbound, Reticulum + HTTP transports,
@@ -596,22 +596,57 @@ implementation file:
   `src/cohort_scope.rs::CohortScope` +
   `src/edge.rs::enforce_federation_class_scope` /
   `enforce_point_to_point_scope`, pinned by
-  `tests/cohort_scope_refusal.rs`) — edge structurally enforces the
-  wire-format locality dividend at outbound_enqueue: self/family-
-  scoped Contributions never leave the producer's enclosing
-  federation. `Delivery::Federation` / `Delivery::Mandatory` refuse
-  any restricted scope (`SelfOnly` / `Family` / `Cohort`);
-  point-to-point (`Ephemeral` / `Durable`) refuse when the recipient
-  is not authorized for the scope (operator-declared cohort
-  membership via the in-process `cohort_membership` registry). The
+  `tests/cohort_scope_refusal.rs` and
+  `tests/cohort_scope_persist_backed.rs`) — edge structurally
+  enforces the wire-format locality dividend at outbound_enqueue:
+  self/family-scoped Contributions never leave the producer's
+  enclosing federation. `Delivery::Federation` /
+  `Delivery::Mandatory` refuse any restricted scope (`SelfOnly` /
+  `Family` / `Cohort`); point-to-point (`Ephemeral` / `Durable`)
+  refuse when the recipient is not authorized for the scope. The
   consumer-side symmetric check at `dispatch_inbound` rejects
   inbound envelopes whose claimed scope doesn't match the sender's
   directory-recorded scope and emits a moderation-signal
   `cohort_scope_violation` resource event. Default is `Strict` —
   wire-format invariant per FSD `FEDERATION_SCALING_MODEL.md`;
-  `WarnOnly` / `Off` are migration gradients. The CIRISEdge#48-B
-  receiver-side trust short-circuit at `dispatch_inbound` defers to
-  v0.19.2 pending persist's `TrustScoring` trait.
+  `WarnOnly` / `Off` are migration gradients.
+  **v0.19.6 (CIRISEdge#48-A completion)** — the v0.19.1
+  in-process `cohort_membership` HashMap registry is REMOVED.
+  Per-peer cohort_scope source of truth moves to persist's
+  `federation_peer_metadata.policy_blob.cohort_scope` field
+  (CIRISPersist#127, v3.4.1). Operators declare scope via
+  `Engine::update_peer_policy(key_id, PeerPolicyBlob::new(json!(
+  {"cohort_scope": {"kind": "self"|"family"|"public"} OR
+  {"kind": "cohort", "cohort_id": "..."}})))`; edge consumes it via
+  `FederationDirectory::peer_metadata_for(key_id)` at both
+  producer-side `enforce_point_to_point_scope` and consumer-side
+  `dispatch_inbound`. The v0.19.1 deferred `Cohort{id}` consumer
+  arm lands at v0.19.6 — the same persist lookup drives every
+  restricted variant.
+- **Trust short-circuit at dispatch_inbound** (v0.19.6 CIRISEdge#48-B,
+  `src/edge.rs::dispatch_inbound` (trust gate hook) +
+  `EdgeConfig::trust_threshold` + `EdgeConfig::trust_short_circuit_enabled`
+  + `EdgeBuilder::trust_scoring`, pinned by
+  `tests/trust_short_circuit.rs`) — edge consumes persist's
+  `TrustScoring` trait (CIRISPersist#123, v3.4.0) at the inbound
+  dispatch boundary. After signature verify (the substrate gate
+  stays first; verify still runs so persist's scoring surface
+  sees the corpus) and BEFORE handler dispatch, the dispatcher
+  resolves the verified `signing_key_id`'s trust score and DROPS
+  the envelope when the score falls below `trust_threshold`. The
+  drop fires a typed `EventKind::TrustShortCircuited` moderation
+  signal on the EventBus resource channel (same fan-in as
+  `cohort_scope_violation`), so lens-core can downweight the
+  offender's emission cadence at the policy tier; the
+  `EdgeMetrics::inbound_dropped_low_trust` counter increments for
+  operator observability. Default `trust_threshold = 0.0` —
+  bootstrap-permissive (the code path skips the scoring resolver
+  entirely at `≤ 0.0`, matching persist's `AdmissionGate::check`
+  discipline). The effective check is the AND of (`enabled`,
+  `threshold > 0.0`, `Arc<dyn TrustScoring>` wired); any one
+  disabled means no drop fires — the belt-and-suspenders shape
+  prevents a misconfigured deployment from silently rejecting
+  every envelope.
 - **HTTPS production-grade hardening** (v0.18.1 CIRISEdge#23,
   `src/transport/http.rs::HttpsTransport` + `HttpServerConfig` +
   `HttpClientConfig` + `BearerTokenAuth` + `FederationCnVerifier`,

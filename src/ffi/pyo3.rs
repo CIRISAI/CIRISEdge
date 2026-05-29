@@ -2118,6 +2118,25 @@ fn init_edge_runtime(
         BackendDispatch::Postgres(b) => b.clone(),
         BackendDispatch::Sqlite(b) => b.clone(),
     };
+    // v0.19.6 (CIRISEdge#48-B / CIRISPersist#123) — `TrustScoring`
+    // wiring on the cohabitation pyo3 init path is deferred to v0.20.0
+    // RC1. Persist v3.4.0 exposes `Engine::set_admission_gate` (which
+    // installs an `Arc<dyn TrustScoring>` under an `AdmissionGate`),
+    // but does NOT expose an accessor that hands the scoring arc back
+    // out for siblings to consume. Both backends impl
+    // `TrustScoring` only via in-test fixtures — there is no
+    // production `impl TrustScoring for SqliteBackend` we could pivot
+    // on through the existing `BackendDispatch` capsule. The edge
+    // `Edge::trust_scoring()` + `EdgeBuilder::trust_scoring()`
+    // surfaces ARE shipped at v0.19.6 (operators wiring an explicit
+    // scorer can use them via the non-cohabitation builder path); the
+    // cohabitation auto-derive lands once persist exposes an
+    // `Engine::trust_scoring_capsule()` or
+    // `AdmissionGate::scoring_arc()` accessor in a v3.5.1+ cut.
+    // Until then the short-circuit on the cohabitation path is
+    // structurally disabled — same posture as
+    // `trust_threshold = 0.0` (bootstrap-permissive).
+    let trust_scoring: Option<Arc<dyn ciris_persist::federation::TrustScoring>> = None;
     let queue: Arc<dyn OutboundHandle> = match queue_dispatch {
         BackendDispatch::Postgres(b) => b,
         BackendDispatch::Sqlite(b) => b,
@@ -2539,6 +2558,14 @@ fn init_edge_runtime(
         // v0.18.0 (CIRISEdge#45) — flow the parsed agent_mode and its
         // derived listener_bound + outbound_queue_max into the Edge.
         .config(config);
+
+    // v0.19.6 (CIRISEdge#48-B) — wire the optional trust scorer (see
+    // the deferred-derivation comment at Step 2 / `trust_scoring`
+    // binding above). When `None`, the short-circuit is
+    // structurally disabled (the default cohab posture for v0.19.6).
+    if let Some(scoring) = trust_scoring {
+        builder = builder.trust_scoring(scoring);
+    }
 
     // v0.19.3 — Reticulum is conditional (the `disable_reticulum`
     // posture); HTTPS is additive (push as a generic transport into

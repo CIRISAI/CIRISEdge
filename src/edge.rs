@@ -328,6 +328,30 @@ pub struct EdgeConfig {
     ///
     /// See [`crate::cohort_scope`] for the enforcement rules.
     pub cohort_scope_enforcement: CohortScopeEnforcement,
+    /// CIRISEdge#48-B (v0.19.6) — trust-score threshold for the
+    /// inbound dispatch short-circuit. Verified envelopes whose
+    /// `signing_key_id` scores BELOW this threshold are dropped at
+    /// `dispatch_inbound` (after signature verify, before handler
+    /// dispatch) and a moderation signal fires on the EventBus.
+    ///
+    /// Default `0.0` — bootstrap-permissive. Operators raise this as
+    /// trust accumulates across their federation; e.g. set to `0.5`
+    /// once the corpus stabilizes. Values are clamped to `[0.0, 1.0]`
+    /// at the resolver tier (persist's `AdmissionGate` discipline).
+    ///
+    /// **Bootstrap semantics**: `0.0` is functionally equivalent to
+    /// "short-circuit disabled" — the `dispatch_inbound` code path
+    /// guards on `> 0.0` to skip the SQL-backed `trust_score` call
+    /// entirely. Persist's `AdmissionGate::check` mirrors this
+    /// posture (admit at `threshold ≤ 0.0` without dispatching).
+    pub trust_threshold: f64,
+    /// CIRISEdge#48-B (v0.19.6) — explicit on/off override for the
+    /// inbound trust short-circuit. Default `true`; the effective
+    /// short-circuit is the AND of (`enabled`, `threshold > 0.0`,
+    /// `Arc<dyn TrustScoring>` wired). The boolean exists so tests
+    /// (and migration / dev deployments) can disable the check
+    /// independently of the threshold value.
+    pub trust_short_circuit_enabled: bool,
 }
 
 impl Default for EdgeConfig {
@@ -384,6 +408,17 @@ impl Default for EdgeConfig {
             // default MUST be `Strict`. WarnOnly is a migration aid;
             // Off is the escape hatch.
             cohort_scope_enforcement: CohortScopeEnforcement::Strict,
+            // v0.19.6 (CIRISEdge#48-B) — bootstrap-permissive default.
+            // Threshold 0.0 ⇒ the short-circuit code path skips the
+            // scoring resolver entirely. Operators raise this as
+            // trust accumulates across their federation.
+            trust_threshold: 0.0,
+            // v0.19.6 (CIRISEdge#48-B) — explicit on/off override.
+            // Default `true` (effective check still gated on
+            // threshold > 0.0 AND an `Arc<dyn TrustScoring>` wired);
+            // tests / dev paths flip to false to disable independent
+            // of the threshold value.
+            trust_short_circuit_enabled: true,
         }
     }
 }
@@ -476,6 +511,25 @@ pub enum EdgeError {
         /// The cohort scope the directory records for this sender
         /// (`None` = no recorded scope; defaults to `Public`).
         directory_scope: Option<CohortScope>,
+    },
+    /// CIRISEdge#48-B (v0.19.6) — `dispatch_inbound` dropped a
+    /// verified envelope because the sender's trust score fell below
+    /// [`EdgeConfig::trust_threshold`]. Wire-string error kind
+    /// `trust_short_circuit`. Surfaced through the typed-error
+    /// projection on the UniFFI surface and as a moderation signal
+    /// (`EventKind::TrustShortCircuited`) on the EventBus.
+    #[error(
+        "trust short-circuit: sender {signing_key_id} scored {score} \
+         below threshold {threshold} (CIRISEdge#48-B)"
+    )]
+    TrustShortCircuit {
+        /// The sender's `federation_keys.key_id`.
+        signing_key_id: String,
+        /// Observed score returned by the configured
+        /// `TrustScoring::trust_score` resolver.
+        score: f64,
+        /// Operator-configured floor below which the dispatcher drops.
+        threshold: f64,
     },
 }
 
@@ -695,29 +749,23 @@ pub struct Edge {
     /// (the reseed runs once per init); the lock makes the path
     /// forward-compatible without binding-side churn.
     canonical_peers: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// CIRISEdge#48-A (v0.19.1) — operator-declared per-peer cohort
-    /// scope, sourced from the peer's `policy_blob.cohort` field on
-    /// `peer_set_policy` calls. Populated lazily — peers absent from
-    /// the map default to [`CohortScope::Public`] (the implicit pre-
-    /// v0.19.1 behaviour).
+    /// CIRISEdge#48-B (v0.19.6) — optional trust-scoring backend for
+    /// the `dispatch_inbound` short-circuit. When set AND
+    /// [`EdgeConfig::trust_short_circuit_enabled`] is `true` AND
+    /// [`EdgeConfig::trust_threshold`] is positive, the inbound
+    /// dispatcher drops verified envelopes whose
+    /// `signing_key_id` scores below the threshold (per persist's
+    /// `TrustScoring::trust_score` resolution). When `None`, the
+    /// short-circuit is structurally disabled — same posture as
+    /// `trust_threshold = 0.0` (bootstrap-permissive).
     ///
-    /// Producer-side outbound enforcement (`Edge::send_*`) consults
-    /// this map to decide whether the explicit recipient is
-    /// authorized for the declared scope. Consumer-side
-    /// (`dispatch_inbound`) consults it to check the sender's claimed
-    /// scope against the directory-recorded one.
-    ///
-    /// **v0.19.1 dependency on persist**: persist v3.2.0 does not
-    /// expose a `peer_metadata_for(key_id) → PeerMetadataRow` read
-    /// accessor on the `FederationDirectory` trait, so this map is
-    /// the edge-side mirror of what the operator declared via the
-    /// peer-mutation FFI. A future persist cut exposing
-    /// `peer_metadata_for` (or a first-class `cohort_membership`
-    /// API) would allow the read path to consult persist directly;
-    /// for v0.19.1 the in-process map is the authoritative source
-    /// (matches the "edge-only enforcement, no persist coordination"
-    /// constraint of #48-A).
-    pub(crate) cohort_membership: Arc<std::sync::RwLock<HashMap<String, CohortScope>>>,
+    /// **Persist dependency** (v3.4.0+ / CIRISPersist#123): persist
+    /// exposes `Arc<dyn TrustScoring>` via `AdmissionGate` (set on the
+    /// engine through `Engine::set_admission_gate`). The cohabitation
+    /// init path can derive this from the engine's installed gate or
+    /// wire its own scorer; tests pass `MemoryTrustScoring` for
+    /// deterministic fixtures.
+    pub(crate) trust_scoring: Option<Arc<dyn ciris_persist::federation::TrustScoring>>,
     config: EdgeConfig,
 }
 
@@ -768,6 +816,12 @@ pub struct EdgeBuilder {
     /// [`reseed_canonical_bootstrap_peers`] separately with the same
     /// `Vec` before threading it into the builder.
     canonical_bootstrap_peers: Vec<CanonicalBootstrapPeer>,
+    /// CIRISEdge#48-B (v0.19.6) — optional trust-scoring backend (see
+    /// [`Edge::trust_scoring`]). The cohabitation init path can derive
+    /// this from persist's `Engine::admission_gate_for_backend()`
+    /// when an admission gate is installed; tests pass
+    /// `MemoryTrustScoring` directly.
+    trust_scoring: Option<Arc<dyn ciris_persist::federation::TrustScoring>>,
     config: EdgeConfig,
 }
 
@@ -909,6 +963,7 @@ impl Edge {
             reachability: None,
             derived_schema: None,
             canonical_bootstrap_peers: Vec::new(),
+            trust_scoring: None,
             config: EdgeConfig::default(),
         }
     }
@@ -936,42 +991,65 @@ impl Edge {
             .unwrap_or_default()
     }
 
-    /// CIRISEdge#48-A (v0.19.1) — declare a peer's cohort scope. The
-    /// operator-declared scope is consulted by both the producer-side
-    /// outbound enforcement and the consumer-side
-    /// `dispatch_inbound` symmetric check. Idempotent — re-declaring
-    /// the same scope is a no-op.
+    /// CIRISEdge#48-A → #48-A-completion (v0.19.6) — look up a peer's
+    /// declared cohort scope from persist's `federation_peer_metadata`
+    /// directory.
     ///
-    /// Backed by an in-process map; persist v3.2.0 does not yet
-    /// expose a first-class cohort_membership API. The cohabitation
-    /// FFI / pyo3 init paths may seed this via the existing
-    /// `peer_set_policy` write surface — see
-    /// [`crate::ffi::uniffi_impl::peer_set_policy`].
-    pub fn declare_peer_cohort_scope(&self, key_id: &str, scope: CohortScope) {
-        if let Ok(mut map) = self.cohort_membership.write() {
-            map.insert(key_id.to_string(), scope);
+    /// Sources the scope from
+    /// `FederationDirectory::peer_metadata_for(key_id).policy_blob.cohort_scope`
+    /// (persist v3.4.1 / CIRISPersist#127). Returns `None` when:
+    ///
+    ///   - no federation_directory is wired on this [`Edge`] (tests
+    ///     that didn't pass one — the caller interprets `None` as
+    ///     [`CohortScope::Public`], the pre-v0.19.1 implicit default);
+    ///   - the directory has no peer row for `key_id`;
+    ///   - the row's `policy_blob` is absent or doesn't carry a
+    ///     `cohort_scope` field;
+    ///   - the `cohort_scope` JSON value fails to deserialize as a
+    ///     [`CohortScope`] (the lenient posture — a malformed blob
+    ///     defaults to Public + warns; the moderation signal lets
+    ///     lens-core observe the misconfigured row).
+    ///
+    /// The expected JSON shape for `policy_blob.cohort_scope` matches
+    /// the wire form (`#[serde(tag = "kind")]`):
+    /// `{"kind": "public" | "self" | "family", ...}` or
+    /// `{"kind": "cohort", "cohort_id": "..."}`. See
+    /// [`crate::cohort_scope::CohortScope`] for the full enum.
+    ///
+    /// **Migration from v0.19.1**: callers previously seeded scope via
+    /// `Edge::declare_peer_cohort_scope(key_id, scope)` (removed at
+    /// v0.19.6); the persist-backed path uses
+    /// `engine.update_peer_policy(key_id, PeerPolicyBlob::new(json!({"cohort_scope": scope})))`
+    /// (persist v3.1.0+ / CIRISPersist#117 mutation surface).
+    pub async fn peer_cohort_scope_from_persist(&self, key_id: &str) -> Option<CohortScope> {
+        let directory = self.federation_directory.as_ref()?;
+        let metadata = match directory.peer_metadata_for(key_id).await {
+            Ok(opt) => opt?,
+            Err(e) => {
+                tracing::warn!(
+                    event = "edge.cohort_scope.persist_lookup_failed",
+                    key_id,
+                    error = %e,
+                    "peer_metadata_for failed; treating peer as Public",
+                );
+                return None;
+            }
+        };
+        let policy_blob = metadata.policy_blob.as_ref()?;
+        let cohort_value = policy_blob.as_value().get("cohort_scope")?;
+        match serde_json::from_value::<CohortScope>(cohort_value.clone()) {
+            Ok(scope) => Some(scope),
+            Err(e) => {
+                tracing::warn!(
+                    event = "edge.cohort_scope.malformed_policy_blob",
+                    key_id,
+                    error = %e,
+                    cohort_value = %cohort_value,
+                    "policy_blob.cohort_scope failed to deserialize; treating peer as Public",
+                );
+                None
+            }
         }
-    }
-
-    /// CIRISEdge#48-A (v0.19.1) — clear a peer's declared cohort
-    /// scope. After this call the peer is treated as
-    /// [`CohortScope::Public`] (the implicit pre-v0.19.1 behaviour).
-    pub fn clear_peer_cohort_scope(&self, key_id: &str) {
-        if let Ok(mut map) = self.cohort_membership.write() {
-            map.remove(key_id);
-        }
-    }
-
-    /// CIRISEdge#48-A (v0.19.1) — look up a peer's declared cohort
-    /// scope. Returns `None` when the peer has no declared scope; the
-    /// caller interprets `None` as [`CohortScope::Public`] (the
-    /// pre-v0.19.1 implicit default).
-    #[must_use]
-    pub fn peer_cohort_scope(&self, key_id: &str) -> Option<CohortScope> {
-        self.cohort_membership
-            .read()
-            .ok()
-            .and_then(|map| map.get(key_id).cloned())
     }
 
     /// CIRISEdge#48-A (v0.19.1) accessor — current enforcement
@@ -979,6 +1057,15 @@ impl Edge {
     #[must_use]
     pub fn cohort_scope_enforcement(&self) -> CohortScopeEnforcement {
         self.config.cohort_scope_enforcement
+    }
+
+    /// CIRISEdge#48-B (v0.19.6) — accessor for the configured
+    /// trust-scoring backend. Used by tests + the v0.20.0 RC1 metrics
+    /// projection. Cheap `Arc` clone; `None` when no scorer was wired
+    /// (the short-circuit is structurally disabled).
+    #[must_use]
+    pub fn trust_scoring(&self) -> Option<Arc<dyn ciris_persist::federation::TrustScoring>> {
+        self.trust_scoring.clone()
     }
 
     /// CIRISEdge#34 accessor — the shared [`crate::events::EventBus`].
@@ -1127,7 +1214,8 @@ impl Edge {
         // enforcement BEFORE building the signed envelope. Point-to-
         // point: SelfOnly requires recipient == self.signer.key_id;
         // Family / Cohort require directory-recorded scope match.
-        self.enforce_point_to_point_scope(cohort_scope.as_ref(), destination_key_id)?;
+        self.enforce_point_to_point_scope(cohort_scope.as_ref(), destination_key_id)
+            .await?;
 
         let envelope_bytes = self
             .build_signed_envelope_with_cohort_scope(destination_key_id, &msg, None, cohort_scope)
@@ -1295,7 +1383,8 @@ impl Edge {
 
         // CIRISEdge#48-A (v0.19.1) — producer-side recipient
         // enforcement BEFORE enqueueing.
-        self.enforce_point_to_point_scope(cohort_scope.as_ref(), destination_key_id)?;
+        self.enforce_point_to_point_scope(cohort_scope.as_ref(), destination_key_id)
+            .await?;
 
         let envelope_bytes = self
             .build_signed_envelope_with_cohort_scope(destination_key_id, &msg, None, cohort_scope)
@@ -2037,8 +2126,11 @@ impl Edge {
             &self.content_fetch_pending,
             &self.metrics,
             &self.events,
-            &self.cohort_membership,
+            self.federation_directory.as_ref(),
             self.config.cohort_scope_enforcement,
+            self.trust_scoring.as_ref(),
+            self.config.trust_threshold,
+            self.config.trust_short_circuit_enabled,
         )
         .await;
     }
@@ -2310,11 +2402,14 @@ impl Edge {
         let content_pending = self.content_fetch_pending.clone();
         let metrics = self.metrics.clone();
         let events = self.events.clone();
-        // CIRISEdge#48-A (v0.19.1) — clone the cohort_membership
-        // handle + enforcement mode into the dispatcher loop so the
-        // consumer-side check can access both.
-        let cohort_membership = self.cohort_membership.clone();
+        // CIRISEdge#48-A → #48-A-completion (v0.19.6) — clone the
+        // persist federation_directory handle + enforcement mode +
+        // trust short-circuit knobs into the dispatcher loop.
+        let federation_directory_for_cohort = self.federation_directory.clone();
         let cohort_enforcement = self.config.cohort_scope_enforcement;
+        let trust_scoring = self.trust_scoring.clone();
+        let trust_threshold = self.config.trust_threshold;
+        let trust_short_circuit_enabled = self.config.trust_short_circuit_enabled;
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -2335,7 +2430,8 @@ impl Edge {
                     let content_pending_clone = content_pending.clone();
                     let metrics_clone = metrics.clone();
                     let events_clone = events.clone();
-                    let cohort_membership_clone = cohort_membership.clone();
+                    let fed_dir_for_cohort_clone = federation_directory_for_cohort.clone();
+                    let trust_scoring_clone = trust_scoring.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -2352,8 +2448,11 @@ impl Edge {
                             &content_pending_clone,
                             &metrics_clone,
                             &events_clone,
-                            &cohort_membership_clone,
+                            fed_dir_for_cohort_clone.as_ref(),
                             cohort_enforcement,
+                            trust_scoring_clone.as_ref(),
+                            trust_threshold,
+                            trust_short_circuit_enabled,
                         ).await;
                     });
                 }
@@ -2443,12 +2542,15 @@ impl Edge {
         }
     }
 
-    /// CIRISEdge#48-A (v0.19.1) — producer-side enforcement gate for
-    /// `Delivery::Ephemeral` / `Delivery::Durable` (point-to-point).
-    /// `SelfOnly` requires recipient == self.signer.key_id; `Family`
-    /// requires the recipient's recorded scope to be Family; `Cohort`
-    /// requires matching cohort_id.
-    fn enforce_point_to_point_scope(
+    /// CIRISEdge#48-A → #48-A-completion (v0.19.6) — producer-side
+    /// enforcement gate for `Delivery::Ephemeral` / `Delivery::Durable`
+    /// (point-to-point). `SelfOnly` requires
+    /// recipient == self.signer.key_id; `Family` requires the
+    /// recipient's recorded scope to be Family; `Cohort` requires
+    /// matching cohort_id. Recorded scope is sourced from persist's
+    /// `peer_metadata_for` (NOT the v0.19.1 in-process registry; that
+    /// path is removed at v0.19.6).
+    async fn enforce_point_to_point_scope(
         &self,
         cohort_scope: Option<&CohortScope>,
         recipient_key_id: &str,
@@ -2463,7 +2565,7 @@ impl Edge {
             CohortScope::Public => true,
             CohortScope::SelfOnly => recipient_key_id == self.signer.key_id,
             CohortScope::Family | CohortScope::Cohort { .. } => {
-                let recipient_scope = self.peer_cohort_scope(recipient_key_id);
+                let recipient_scope = self.peer_cohort_scope_from_persist(recipient_key_id).await;
                 match recipient_scope.as_ref() {
                     Some(rs) => scope.allows_recipient_scope(rs),
                     None => false,
@@ -2517,7 +2619,8 @@ impl Edge {
         content_fetch_pending,
         metrics,
         events,
-        cohort_membership,
+        federation_directory_for_cohort,
+        trust_scoring,
     ),
     fields(
         transport_id = %frame.transport.0,
@@ -2543,8 +2646,20 @@ async fn dispatch_inbound(
     content_fetch_pending: &std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<ContentResult>>>,
     metrics: &crate::observability::EdgeMetrics,
     events: &Arc<crate::events::EventBus>,
-    cohort_membership: &std::sync::RwLock<HashMap<String, CohortScope>>,
+    // CIRISEdge#48-A → #48-A-completion (v0.19.6) — persist-backed
+    // cohort_scope source-of-truth. Optional because tests that don't
+    // wire a federation_directory still drive this surface; absent
+    // directory means "treat every peer as Public" (lenient default).
+    federation_directory_for_cohort: Option<
+        &Arc<dyn ciris_persist::federation::FederationDirectory>,
+    >,
     cohort_enforcement: CohortScopeEnforcement,
+    // CIRISEdge#48-B (v0.19.6) — persist-backed trust scoring. The
+    // short-circuit fires only when ALL of: scoring is wired,
+    // `trust_short_circuit_enabled`, and `trust_threshold > 0.0`.
+    trust_scoring: Option<&Arc<dyn ciris_persist::federation::TrustScoring>>,
+    trust_threshold: f64,
+    trust_short_circuit_enabled: bool,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -2609,29 +2724,49 @@ async fn dispatch_inbound(
         received_at,
     });
 
-    // CIRISEdge#48-A (v0.19.1) — consumer-side symmetric cohort_scope
-    // check. AFTER verify (signature gates everything; we trust the
-    // claimed scope only insofar as the sender's key vouches for it)
-    // and BEFORE handler dispatch (a violation MUST NOT reach the
-    // application tier). Producer-side refusal at outbound_enqueue
-    // is the structural primitive; this consumer-side check is the
-    // symmetric pair per the CIRISEdge#48-A issue body.
+    // CIRISEdge#48-A → #48-A-completion (v0.19.6) — consumer-side
+    // symmetric cohort_scope check. AFTER verify (signature gates
+    // everything; we trust the claimed scope only insofar as the
+    // sender's key vouches for it) and BEFORE handler dispatch (a
+    // violation MUST NOT reach the application tier). Producer-side
+    // refusal at outbound_enqueue is the structural primitive; this
+    // consumer-side check is the symmetric pair.
     //
-    // Wire-format invariant: for ContributionSubmit envelopes (and any
-    // other envelope carrying a `cohort_scope`), if the claimed scope
-    // is `SelfOnly` or `Family` AND the sender's directory-recorded
-    // scope doesn't match the claim, REJECT with a moderation-signal
-    // event so lens-core can downweight the sender. `Public` and
-    // `Cohort{id}` are NOT short-circuited here at v0.19.1 — `Public`
-    // is the implicit baseline, and `Cohort` membership lookup is
-    // future work alongside the same persist `cohort_membership` API
-    // dependency this whole feature documents.
+    // v0.19.6 sources the sender's recorded scope from persist's
+    // `peer_metadata_for(key_id).policy_blob.cohort_scope` (CIRISPersist
+    // #127, v3.4.1). The in-process `cohort_membership` HashMap from
+    // v0.19.1 is REMOVED — operators declare cohort_scope via
+    // `Engine::update_peer_policy(key_id, json!({"cohort_scope": ...}))`
+    // and the substrate carries the source of truth.
+    //
+    // Wire-format invariant: for envelopes carrying a `cohort_scope`,
+    // if the claimed scope is restricted (`SelfOnly` / `Family` /
+    // `Cohort`) AND the sender's directory-recorded scope doesn't
+    // match the claim, REJECT with a moderation-signal event so
+    // lens-core can downweight the sender. `Public` short-circuits to
+    // OK (the implicit baseline). v0.19.6 adds the `Cohort{id}` arm
+    // that v0.19.1 deferred — the persist read accessor unblocks it.
     if let Some(claimed) = envelope.cohort_scope.as_ref() {
-        if matches!(claimed, CohortScope::SelfOnly | CohortScope::Family) {
-            let recorded_scope = cohort_membership
-                .read()
-                .ok()
-                .and_then(|map| map.get(&envelope.signing_key_id).cloned());
+        if claimed.is_restricted() {
+            let recorded_scope = match federation_directory_for_cohort {
+                Some(dir) => match dir.peer_metadata_for(&envelope.signing_key_id).await {
+                    Ok(opt) => opt
+                        .as_ref()
+                        .and_then(|row| row.policy_blob.as_ref())
+                        .and_then(|blob| blob.as_value().get("cohort_scope").cloned())
+                        .and_then(|v| serde_json::from_value::<CohortScope>(v).ok()),
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "edge.cohort_scope.persist_lookup_failed",
+                            sender_key_id = %envelope.signing_key_id,
+                            error = %e,
+                            "consumer-side peer_metadata_for failed; treating sender as Public",
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
             let matches_directory = match recorded_scope.as_ref() {
                 Some(rs) => rs == claimed,
                 None => false,
@@ -2677,6 +2812,71 @@ async fn dispatch_inbound(
                         return;
                     }
                 }
+            }
+        }
+    }
+
+    // CIRISEdge#48-B (v0.19.6) — trust short-circuit. AFTER verify
+    // (the signature gates everything; verify still runs so persist's
+    // scoring surface sees the corpus) and BEFORE handler dispatch
+    // (a sender below the threshold MUST NOT reach the application
+    // tier). The check is gated on all three of:
+    //
+    //   - `trust_short_circuit_enabled` — operator override for
+    //     migration / tests;
+    //   - `trust_threshold > 0.0` — bootstrap-permissive default;
+    //   - `trust_scoring` wired — tests that don't supply a scorer
+    //     fall through with no overhead.
+    //
+    // Persist's `AdmissionGate::check` short-circuits to admit at
+    // threshold ≤ 0.0 (see CIRISPersist src/federation/replication/
+    // admission.rs); we mirror that posture here so the
+    // bootstrap-permissive baseline does NOT dispatch the (potentially
+    // SQL-backed) `trust_score` call per envelope.
+    if trust_short_circuit_enabled && trust_threshold > 0.0 {
+        if let Some(scorer) = trust_scoring {
+            let score = scorer.trust_score(&envelope.signing_key_id, 0).await;
+            let observed = match score {
+                Ok(s) => s,
+                Err(ciris_persist::federation::TrustScoringError::KeyNotFound(_)) => {
+                    // Unknown key → 0.0 (matches persist AdmissionGate
+                    // discipline; unknown identity has no trust).
+                    0.0
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "edge.trust_short_circuit.scoring_error",
+                        sender_key_id = %envelope.signing_key_id,
+                        error = %e,
+                        "trust_score resolver failed; treating as 0.0 (drop if threshold > 0)",
+                    );
+                    0.0
+                }
+            };
+            if observed < trust_threshold {
+                tracing::Span::current().record("verify_outcome", "trust_short_circuit");
+                tracing::warn!(
+                    event = "edge.trust_short_circuit",
+                    sender_key_id = %envelope.signing_key_id,
+                    score = observed,
+                    threshold = trust_threshold,
+                    "inbound envelope dropped — sender trust below threshold (CIRISEdge#48-B)",
+                );
+                metrics.inc_inbound_dropped_low_trust();
+                // Moderation signal — `TrustShortCircuited` event with
+                // peer_key_id + observed score + threshold-in-message.
+                // Routed onto the resource channel because lens-core
+                // already subscribes there for the cohort_scope
+                // moderation signal; the typed `EventKind` lets it
+                // discriminate without a second subscription. Fire-
+                // and-forget at the call site per the EventBus
+                // discipline.
+                events.emit_resource(crate::events::NetworkEvent::trust_short_circuited(
+                    envelope.signing_key_id.clone(),
+                    observed,
+                    trust_threshold,
+                ));
+                return;
             }
         }
     }
@@ -3224,6 +3424,25 @@ impl EdgeBuilder {
         self
     }
 
+    /// CIRISEdge#48-B (v0.19.6) — supply a persist-backed trust-scoring
+    /// resolver. When set AND
+    /// [`EdgeConfig::trust_short_circuit_enabled`] is `true` AND
+    /// [`EdgeConfig::trust_threshold`] is positive, the inbound
+    /// dispatcher drops verified envelopes whose `signing_key_id`
+    /// scores below the threshold (CIRISPersist#123, v3.4.0).
+    ///
+    /// Production callers (the cohabitation pyo3 init path) derive the
+    /// scorer from the engine's `AdmissionGate`; tests can pass
+    /// `MemoryTrustScoring` directly.
+    #[must_use]
+    pub fn trust_scoring(
+        mut self,
+        scoring: Arc<dyn ciris_persist::federation::TrustScoring>,
+    ) -> Self {
+        self.trust_scoring = Some(scoring);
+        self
+    }
+
     /// CIRISEdge#46 (v0.18.0) — supply the operator-declared canonical
     /// bootstrap-peer set. Each `key_id` is dropped into the in-memory
     /// canonical HashSet on the constructed [`Edge`], so the `peer_get`
@@ -3423,7 +3642,7 @@ impl EdgeBuilder {
             federation_directory: self.federation_directory,
             detector,
             canonical_peers,
-            cohort_membership: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            trust_scoring: self.trust_scoring,
             metrics: crate::observability::EdgeMetrics::new(),
             config: self.config,
         })

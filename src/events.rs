@@ -83,6 +83,14 @@ pub enum EventKind {
     /// (`resource_kind`, `measurement`, `unit`) tuple on the
     /// [`NetworkEvent`] payload.
     ResourcePressure,
+    /// CIRISEdge#48-B (v0.19.6) — moderation signal fired by
+    /// `dispatch_inbound` when a verified envelope's `signing_key_id`
+    /// scores below [`crate::EdgeConfig::trust_threshold`]. Lens-core
+    /// subscribes to downweight the sender's emission cadence; the
+    /// envelope itself is dropped before handler dispatch. Carries the
+    /// offending key on `peer_key_id` and the observed score / floor
+    /// in `measurement` / threshold-as-string blended into `message`.
+    TrustShortCircuited,
     /// Slow-consumer marker — the receiver lagged by N events. Emitted
     /// by the subscription-side adapter, not by the substrate.
     Lagged,
@@ -275,6 +283,44 @@ impl NetworkEvent {
             resource_kind: Some(resource_kind.into()),
             measurement: Some(measurement),
             unit: Some(unit.into()),
+        }
+    }
+
+    /// CIRISEdge#48-B (v0.19.6) — construct a trust-short-circuit
+    /// moderation event. `signing_key_id` is the offending peer's
+    /// `federation_keys.key_id`; `score` is the resolved trust score;
+    /// `threshold` is the configured floor.
+    ///
+    /// Rides on the same `NetworkEvent` union as the other categories:
+    /// `kind = TrustShortCircuited`, `peer_key_id =
+    /// Some(signing_key_id)`, `measurement = Some(score)`,
+    /// `resource_kind = Some("trust_short_circuit")`,
+    /// `unit = Some("ratio")`, severity `Warning`. The threshold rides
+    /// inside the `message` string so consumers can grep without re-
+    /// parsing the event tree.
+    #[must_use]
+    pub fn trust_short_circuited(signing_key_id: String, score: f64, threshold: f64) -> Self {
+        Self {
+            at: Utc::now(),
+            kind: EventKind::TrustShortCircuited,
+            message: format!(
+                "trust short-circuit: sender scored {score} below threshold {threshold} (CIRISEdge#48-B)"
+            ),
+            peer_key_id: Some(signing_key_id),
+            transport_id: None,
+            severity: EventSeverity::Warning,
+            aspect: None,
+            identity_hash: None,
+            app_data: None,
+            rssi_dbm: None,
+            snr_db: None,
+            link_id: None,
+            lagged_count: None,
+            destination_hash: None,
+            hops: None,
+            resource_kind: Some("trust_short_circuit".to_string()),
+            measurement: Some(score),
+            unit: Some("ratio".to_string()),
         }
     }
 

@@ -936,6 +936,42 @@ persist's federation directory (no v3.2.0 read accessor exists), and
 is intentionally larger work than #48-A's wire-format locality
 dividend.
 
+**v0.19.6 addendum (CIRISEdge#48-A completion)**: AV-45 closure
+progress narrowed further. The v0.19.1 in-process `cohort_membership`
+HashMap registry (the "edge-only enforcement, no persist
+coordination" workaround) is REMOVED at v0.19.6. The source of truth
+for per-peer cohort_scope is now persist's
+`federation_peer_metadata.policy_blob.cohort_scope` field, read at
+the consumer-side check via
+`FederationDirectory::peer_metadata_for(key_id)` (CIRISPersist#127,
+v3.4.1). Operators declare per-peer scope via
+`Engine::update_peer_policy(key_id, json!({"cohort_scope": <scope>}))`
+where `<scope>` is the wire-form `CohortScope` JSON (`{"kind":
+"public" | "self" | "family"}` or `{"kind": "cohort", "cohort_id":
+"..."}`). The substrate-tier directory becomes the
+single-source-of-truth across cohabitation peers (the host engine
+and every sibling cdylib see the same scope per peer); the v0.19.1
+edge-side mirror is gone. The previously-deferred consumer-side
+`Cohort{id}` arm (v0.19.1 §"Public and Cohort{id} are NOT
+short-circuited here at v0.19.1") is enabled at v0.19.6 — the same
+persist lookup drives `SelfOnly` / `Family` / `Cohort{id}`. The
+v0.19.6 closure progression table:
+
+  - v0.16.0 — `key_boundary:{scope}` wire form lands (declared, not
+    enforced);
+  - v0.19.1 — `cohort_scope` producer + consumer enforcement against
+    in-process registry (partial — no Cohort{id}, no persist
+    coordination);
+  - v0.19.6 — `cohort_scope` enforcement against persist's federated
+    peer_metadata (full — `SelfOnly` + `Family` + `Cohort{id}`,
+    operator-declared via `update_peer_policy`, edge consumes via
+    `peer_metadata_for`);
+  - PENDING — `key_boundary_scope`-to-signature binding (signature
+    was actually produced under the declared key-boundary scope) —
+    would need a CIRIS 3.0 wire extension or a verify-time per-key
+    scope-resolution surface; intentionally larger work than the
+    wire-format locality dividend.
+
 #### AV-46: peer-mgmt TrustClass = operator opinion, not attestation
 
 **Attack surface (architectural / semantic)**: v0.15.1 wired the
@@ -1023,6 +1059,109 @@ data."
 the `current_edge()?` gate. PR review + the per-surface pre-init
 smoke test pattern catches this; the discipline is "every UniFFI
 free function gates on `current_edge()` first."
+
+#### AV-48: Trust short-circuit at dispatch_inbound
+
+**Attack surface (architectural)**: a peer with high N (volume of
+verified envelopes) but low T (trust score relative to the
+federation's accumulated evidence) can saturate the inbound handler
+pipeline of every peer that subscribes to its emissions. Without a
+trust gate at the dispatch layer, the AV-9 invariant (no dispatch on
+unverified bytes) is necessary but not sufficient: verification
+gates *identity* (the envelope was produced by the claimed key) and
+*integrity* (canonical bytes match the signature); it does NOT gate
+*reputation* (whether this signing identity is one the federation
+has reason to trust at the current handler-dispatch threshold). A
+peer whose key is in `federation_keys` and whose envelopes verify
+cleanly can still flood inbound dispatch with malformed-claim
+payloads, scope-spoofed envelopes (see AV-45), or signed-but-
+adversarial content — and persist's evidence corpus already has the
+attestation graph that lets the substrate compute "this key has low
+trust." Edge needs the fast-path consumer of that signal.
+
+**Mitigation (v0.19.6 CIRISEdge#48-B)**: edge consumes persist's
+`TrustScoring` trait (CIRISPersist#123, v3.4.0) at
+`dispatch_inbound`. After signature verify (the substrate gate
+stays first; verify still runs so persist's scoring surface sees
+the corpus) and BEFORE handler dispatch, the dispatcher resolves
+the verified `signing_key_id`'s trust score and DROPS the envelope
+when the score falls below
+[`EdgeConfig::trust_threshold`]. The drop fires a typed
+`EventKind::TrustShortCircuited` moderation signal on the EventBus
+(resource channel — same fan-in as `cohort_scope_violation`), so
+lens-core can downweight the offender's emission cadence at the
+policy tier. The dropped envelope ALSO bumps the
+`EdgeMetrics::inbound_dropped_low_trust` counter so operators can
+observe the drop rate.
+
+Configuration knobs:
+
+  - `trust_threshold: f64` — floor below which the dispatcher drops.
+    Default `0.0` (bootstrap-permissive — the code path skips the
+    scoring resolver entirely at `≤ 0.0`, matching persist's
+    `AdmissionGate::check` discipline). Operators raise this as the
+    federation's trust corpus stabilizes (e.g. `0.5` after the
+    first quarter of attestation aggregation).
+  - `trust_short_circuit_enabled: bool` — explicit on/off override
+    independent of the threshold value (default `true`; flip to
+    `false` for migration / dev paths that want to disable the
+    check without zeroing the threshold).
+  - `Arc<dyn TrustScoring>` wired via `EdgeBuilder::trust_scoring()`.
+    `None` (the default) structurally disables the short-circuit
+    — same effect as `threshold = 0.0`. The cohabitation pyo3 init
+    path currently leaves this `None` (deferred to v0.20.0 RC1
+    pending an `AdmissionGate::scoring_arc()` accessor in a
+    persist v3.5.1+ cut; persist v3.5.0 exposes the install side
+    `Engine::set_admission_gate` but no read accessor on the gate
+    itself).
+
+The effective check is the AND of all three predicates; any one
+disabled means no drop fires. This belt-and-suspenders shape
+prevents a misconfigured deployment from silently rejecting all
+traffic — if the operator forgets to wire the scorer, the
+short-circuit stays off rather than failing closed.
+
+**Threat that AV-48 does NOT close**: a peer with high N AND high T
+remains a high-volume verified emitter; edge still verifies their
+envelopes and dispatches them. The trust gate is a *reputation*
+filter, not a *volume* filter — the per-transport rate caps (AV-10)
+and bounded inbound queue (AV-13 family) are the volume gates.
+AV-48 is the substrate's pre-dispatch defense against
+*signed-but-untrusted* emissions; it composes with the rate gates,
+not as a replacement.
+
+**Threat that AV-48 INTENTIONALLY leaves observable**: signature
+verification still runs on every inbound envelope even when the
+sender will be dropped. This is by design — persist's `TrustScoring`
+computes its scores over the signed-evidence corpus (CEG §10.1.2),
+so the corpus needs to see the envelopes. A future cut could
+short-circuit even verify for a known-blocked sender (the
+`BlackholeRules` family already supports this at the
+*transport-identity* layer per AV-46); the trust short-circuit gates
+*dispatch*, not *verify*, because the scoring substrate needs
+the verify-side evidence to converge.
+
+**Test**: `tests/trust_short_circuit.rs` pins the behavioral
+contract — 9 tests covering (a) below-threshold drop, (b)
+above-threshold dispatch, (c) at-threshold dispatch (boundary —
+the condition is `score < threshold`, strict `<`), (d) `0.0`
+threshold short-circuits the scoring call entirely, (e) `enabled =
+false` overrides any positive threshold, (f) moderation signal
+event semantics (kind + peer_key_id + measurement +
+resource_kind tag), (g) metrics counter increments, (h) absent
+scorer structurally disables, (i) typed error variant carries
+key_id + score + threshold + issue tag.
+
+**Residual**: the cohabitation pyo3 init path currently leaves
+`trust_scoring = None`, so production cohabitation deployments
+fall back to the bootstrap-permissive default until persist
+exposes the `AdmissionGate::scoring_arc()` (or
+`Engine::trust_scoring_capsule()`) accessor needed to auto-derive
+the scorer from the engine's installed admission gate. Operators
+deploying outside the cohabitation path (e.g. sovereign Pi /
+mobile / standalone hosts using `EdgeBuilder` directly) can wire
+the scorer via `EdgeBuilder::trust_scoring()` immediately at
+v0.19.6.
 
 ### 4.9 Forward-looking invariants (anchored at v0.17.1 for v0.18.x wire-up)
 
@@ -1129,6 +1268,7 @@ distinct deployment mode, not a canonical-peer concern.
 | AV-45 | key_boundary scope-spoofing (declared ≠ actually-signed-under) | P2 | Wire form only at v0.16.0 / v0.17.0; documented as declared-not-enforced | AV-17 process-wide invariant unchanged (scope-irrespective heap-scan) | ⚠ Deferred enforcement (v0.16.1+ binding scope) | `src/key_boundary.rs` (wire codec only) |
 | AV-46 | Operator opinion confused with federation attestation | P3 | Schema separation: `federation_peer_metadata` sibling table per CIRISPersist#117 (not folded into `federation_keys`); `EdgePeerTrust` doc explicit | Documentation; Accord §I operator-autonomy framing | ✓ Mitigated structurally (v0.15.1) | `tests/peer_mutation_ffi.rs` |
 | AV-47 | UniFFI free-function called pre-init / post-teardown | P1 | `OnceLock<RwLock<Weak<Edge>>>` slot + per-surface `current_edge()?` gate; typed `EdgeBindingsError::{NotInitialized,Unsupported}` | `Weak::upgrade` returns `None` on teardown → flips back to `NotInitialized` | ✓ Mitigated (v0.13.0+ UniFFI scaffolding pattern) | `tests/routing_ffi.rs::uniffi_path_table_unsupported_without_init`, `tests/links_ffi.rs::uniffi_link_list_unsupported_without_init` |
+| AV-48 | High-N low-T signed envelope flood at dispatch_inbound | P1 | `Arc<dyn TrustScoring>` consumer at dispatch_inbound (CIRISPersist#123); drop below `trust_threshold` + emit `EventKind::TrustShortCircuited`; `inbound_dropped_low_trust` counter; default `0.0` bootstrap-permissive | Per-transport rate caps (AV-10); bounded inbound queue (AV-13 family) cover the *volume* axis | ✓ Mitigated (v0.19.6 CIRISEdge#48-B) | `tests/trust_short_circuit.rs` |
 | Canonical-peer | Operator silently drops canonical CIRIS infra peer | P1 | Bootstrap reseed on every start; `peer_remove(canonical, hard=true)` → typed `CannotRemoveCanonicalPeer`; `EdgePeerInfo.canonical: bool` | Operator trust-state flip preserved across restart (refuse trust without forgetting peer) | ⚠ Scheduled v0.18.0 (CIRISEdge#46) | tests scheduled v0.18.0 acceptance |
 
 **Pre-Phase-1 P0 must-have bundle**: AV-9 + AV-13 + AV-14 + AV-17 +
@@ -1316,10 +1456,26 @@ V0.13.0 → V0.17.0 SHIPPED (cohab + UniFFI + wire-compliance surfaces)
 
 V0.17.1 DOCUMENTED, ENFORCEMENT SCHEDULED LATER
   ⚠ AV-45  key_boundary scope-binding enforcement deferred to v0.16.1+
-           (wire form ships at v0.16.0; declared-not-enforced)
+           (wire form ships at v0.16.0; declared-not-enforced); v0.19.6
+           narrows the residual to "key_boundary_scope-to-signature
+           binding" only — the cohort_scope half is now persist-backed
+           and structurally enforced
   ⚠ Canonical-peer invariant scheduled v0.18.0 (CIRISEdge#46) —
            bootstrap reseed + typed CannotRemoveCanonicalPeer +
            EdgePeerInfo.canonical field
+
+V0.19.6 SHIPPED (CIRISEdge#48-A completion + #48-B)
+  ✓ AV-48  Trust short-circuit at dispatch_inbound — persist
+           TrustScoring consumer drops verified envelopes whose
+           signing_key_id scores below EdgeConfig::trust_threshold;
+           moderation signal on EventBus; inbound_dropped_low_trust
+           metric (CIRISPersist#123 / CIRISEdge#48-B)
+  ✓ AV-45 partial — cohort_scope source-of-truth moves from
+           in-process registry (v0.19.1 workaround) to persist's
+           federation_peer_metadata.policy_blob.cohort_scope via
+           peer_metadata_for (CIRISPersist#127). Cohort{id}
+           consumer-side check enabled (v0.19.1 deferred arm closes).
+           key_boundary_scope-to-signature binding REMAINS deferred.
 
 PHASE-1 P1 BUNDLE — must land for production cutover
   ⚠ AV-3   Replay LRU with 5-min window
@@ -1388,17 +1544,14 @@ This document is updated:
   trace wire format): trust-boundary review + interaction matrix
   update.
 
-Last updated: 2026-05-29 (v0.17.1 — docs-only cut. Status line
-refreshed from v0.0 spec-only scaffold to v0.17.x production-grade
-(Reticulum + HTTPS both production-grade; ~210 tests; UniFFI
-binding surface; 6-capsule cohabitation incl. `local_signer`).
-Added AV-43 (cohab transport-identity dual-capsule split, mitigated
-v0.13.1/v0.16.1 CIRISEdge#43); AV-44 (testimonial_witness preservation
-invariant, mitigated v0.16.0 CIRISEdge#37); AV-45 (key_boundary scope
-binding deferred to v0.16.1+; wire form only at v0.16.0); AV-46
-(peer-mgmt TrustClass = operator opinion, not attestation; mitigated
-structurally v0.15.1 CIRISEdge#26 + CIRISPersist#117); AV-47 (UniFFI
-pre-init invariant; mitigated v0.13.0+ CIRISEdge#36); canonical-peer
-invariant documented as forward-looking anchor for v0.18.0 wire-up
-of CIRISEdge#46. Prior baselines: 2026-05-22 v0.4.0 AV-42 mitigated,
-2026-05-03 v0.0 scaffold.)
+Last updated: 2026-05-29 (v0.19.6 — last feature cut before RC1.
+AV-48 added (trust short-circuit at dispatch_inbound, mitigated
+v0.19.6 CIRISEdge#48-B via CIRISPersist#123 TrustScoring trait);
+AV-45 closure narrowed (cohort_scope side now persist-backed via
+peer_metadata_for / CIRISPersist#127; only key_boundary_scope-to-
+signature binding remains deferred). Mitigation Matrix gains
+AV-48 row. v0.19.6 closure progression for AV-45 documented in
+the AV-45 § addendum. Prior baselines: 2026-05-29 v0.17.1
+docs-only cut (AV-43/44/45/46/47 added + canonical-peer
+invariant); 2026-05-22 v0.4.0 AV-42 mitigated; 2026-05-03 v0.0
+scaffold.)

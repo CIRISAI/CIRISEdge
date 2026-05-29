@@ -33,6 +33,7 @@ use ciris_edge::{
     CohortScope, CohortScopeEnforcement, Edge, EdgeConfig, EdgeError, FederationAnnouncement,
     InlineText, InlineTextDurable, StewardDirective,
 };
+use ciris_persist::federation::types::PeerPolicyBlob;
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend;
@@ -215,9 +216,31 @@ async fn build_edge_with_directories(
         }],
     });
 
+    // v0.19.6 (CIRISEdge#48-A completion) — declare the family peer's
+    // cohort_scope via persist's `add_peer_record` + `update_peer_policy`.
+    // The v0.19.1 in-process `declare_peer_cohort_scope` shim is removed;
+    // the persist directory is the single source of truth.
+    directory
+        .add_peer_record(
+            &peer_family.key_id,
+            &peer_family.pubkey_b64(),
+            ciris_persist::federation::types::identity_type::AGENT,
+            None,
+        )
+        .await
+        .expect("add_peer_record family");
+    directory
+        .update_peer_policy(
+            &peer_family.key_id,
+            PeerPolicyBlob::new(serde_json::json!({"cohort_scope": {"kind": "family"}})),
+        )
+        .await
+        .expect("update_peer_policy family");
+    let federation_directory_dyn: Arc<dyn FederationDirectory> = directory.clone();
     let transport: Arc<dyn Transport> = Arc::new(NopTransport);
     let edge = Edge::builder()
         .directory(directory.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .federation_directory(federation_directory_dyn)
         .queue(queue)
         .signer(local_signer)
         .transport(transport)
@@ -227,8 +250,6 @@ async fn build_edge_with_directories(
         .build()
         .expect("build edge");
     let edge = Arc::new(edge);
-    // Declare cohort membership for the family peer.
-    edge.declare_peer_cohort_scope(&peer_family.key_id, CohortScope::Family);
     (edge, peer_family.key_id, peer_public.key_id)
 }
 
@@ -496,8 +517,33 @@ async fn build_edge_with_remote_peer(
     let remote_signer = remote.local_signer(tmp.path()).await;
     let transport: Arc<dyn Transport> = Arc::new(NopTransport);
 
+    // v0.19.6 (CIRISEdge#48-A completion) — seed remote's cohort_scope
+    // via persist's `update_peer_policy`. The persist-backed
+    // `peer_metadata_for` lookup at `dispatch_inbound` is the source
+    // of truth; `declare_peer_cohort_scope` is removed.
+    if declare_remote_as_family {
+        directory
+            .add_peer_record(
+                &remote.key_id,
+                &remote.pubkey_b64(),
+                ciris_persist::federation::types::identity_type::AGENT,
+                None,
+            )
+            .await
+            .expect("add_peer_record remote");
+        directory
+            .update_peer_policy(
+                &remote.key_id,
+                PeerPolicyBlob::new(serde_json::json!({"cohort_scope": {"kind": "family"}})),
+            )
+            .await
+            .expect("update_peer_policy remote");
+    }
+    let federation_directory_dyn: Arc<dyn FederationDirectory> = directory.clone();
+
     let edge = Edge::builder()
         .directory(directory.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .federation_directory(federation_directory_dyn)
         .queue(queue)
         .signer(local_signer)
         .transport(transport)
@@ -505,9 +551,6 @@ async fn build_edge_with_remote_peer(
         .build()
         .expect("build edge");
     let edge = Arc::new(edge);
-    if declare_remote_as_family {
-        edge.declare_peer_cohort_scope(&remote.key_id, CohortScope::Family);
-    }
     (edge, remote_signer, local.key_id.clone())
 }
 

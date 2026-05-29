@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.19.5"
+version = "0.19.6"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -80,29 +80,43 @@ publish = false
 # arm `outbound_queue_capsule` already produces — no new capsule
 # required (the capsule family stays at 6).
 #
-# v3.4.2 (CIRISEdge v0.19.4 currency bump) — tracks the persist v3.4.x
-# line so cross-cdylib cohabitation against persist 3.4.x engines does
-# not panic on the `LocalSignerHardwareAdapter: HardwareSigner` trait
-# bound. The persist 3.3.x / 3.4.x line shipped 8 releases on
-# 2026-05-29 across #117 / #118 / #119 / #120 / #121 / #122 / #123 /
-# #127 plus the persist-internal verify v4.0.0 → v4.2.0 pin bump that
-# v3.4.2 itself carries. Edge v0.19.4 is pure currency: no
-# `peer_metadata_for` consumption (deferred to v0.19.6 cohort_scope
-# rework), no `TrustScoring` consumption (deferred to v0.19.6 trust
-# short-circuit), no `put_blob_signing` / canonicalizer-authority
-# adoption — just the pin so the byte-compat surface persist v3.4.2
-# exposes lines up with the verify v4.2.0 surface edge consumes
-# directly via `ciris-keyring` / `ciris-crypto`. The `HardwareSigner`
-# trait shape itself is unchanged between verify v4.0.0 and v4.2.0
-# (verified via `git diff v4.0.0..v4.2.0 src/ciris-keyring/src/`
-# returning only the additive `impl PqcSigner for
-# ciris_crypto::MlDsa65Signer` from CIRISVerify#39); the mismatch
-# panic this cut closes is the cross-cdylib trait-object identity
-# mismatch where edge's `Arc<dyn HardwareSigner>` (compiled against
-# verify v4.0.0's symbol) cannot be downcast from persist 3.4.x's
-# `LocalSignerHardwareAdapter` (compiled against verify v4.2.0). Pin
-# parity restores the single-symbol invariant.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.4.2", version = "3", features = ["sqlite"] }
+# v3.5.0 (CIRISEdge v0.19.6 — last feature cut before RC1). Tracks the
+# persist v3.5.0 line: additive over v3.4.x via #125 (BlobStorage
+# `list_held_by` + `evict_actor` identity-aware storage surface; FSD
+# `FEDERATION_SCALING_MODEL.md` §9 conformance gate) + #126 (CEG
+# §0.5/§0.6/§0.7 canonicalization rejection validators —
+# `validate_envelope_canonical_form` opt-in surface). No schema
+# change, no existing-surface break; v3.4.x consumers keep working.
+#
+# Edge v0.19.6 actively consumes:
+#   - `FederationDirectory::peer_metadata_for(key_id) → Option<PeerMetadataRow>`
+#     (v3.4.1 / CIRISPersist#127) — the read accessor that replaces the
+#     in-process `cohort_membership` HashMap registry from v0.19.1. The
+#     cohort_scope source of truth moves to persist's
+#     `federation_peer_metadata.policy_blob.cohort_scope` field, set
+#     via `update_peer_policy` and read back via `peer_metadata_for`.
+#   - `TrustScoring::trust_score(key_id, recursion_depth) → f64`
+#     (v3.4.0 / CIRISPersist#123) — the async trait-object the edge
+#     dispatch-inbound trust short-circuit (#48-B) drops envelopes
+#     against when the verified sender's score falls below
+#     `EdgeConfig::trust_threshold`. Threaded into Edge via
+#     `EdgeBuilder::trust_scoring(Arc<dyn TrustScoring>)`; the
+#     cohabitation pyo3 init path derives `Arc<dyn TrustScoring>` from
+#     persist's `Engine::admission_gate_for_backend()` when set, else
+#     leaves the trust short-circuit disabled (bootstrap-permissive).
+#
+# v3.5.0's #125 (`list_held_by` / `evict_actor`) is NOT consumed at the
+# edge layer — it's a persist substrate primitive the conformance
+# harness drives directly. v3.5.0's #126 canonicalization validators
+# remain opt-in; edge does not call them inline (matches the persist
+# #126 wiring decision documented at canonical_validation.rs:30-48).
+#
+# Pin floor invariants preserved from v0.19.4:
+#   - verify v4.2.0 pin parity (ciris-keyring + ciris-crypto below);
+#     persist v3.5.0 still pins verify v4.2.0 so the single-symbol
+#     HardwareSigner / PqcSigner trait-object identity invariant
+#     holds across the cohabitation cdylib graph.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.5.0", version = "3", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -637,7 +651,7 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.4.2", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.5.0", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3
