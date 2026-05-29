@@ -363,6 +363,12 @@ pub fn build_envelope<M: Serialize>(
         signature: String::new(),
         signature_pqc: None,
         in_reply_to,
+        // v0.16.0 — wire-form fields default to None. Higher-level
+        // builders may populate these before signing; the helper here
+        // is intentionally neutral so v0.15.x callers continue
+        // emitting byte-equal envelopes.
+        testimonial_witness: None,
+        key_boundary_scope: None,
     })
 }
 

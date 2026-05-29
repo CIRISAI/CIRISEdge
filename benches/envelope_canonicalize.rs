@@ -53,6 +53,8 @@ fn make_envelope(body_size: usize) -> EdgeEnvelope {
         signature: String::new(),
         signature_pqc: None,
         in_reply_to: None,
+        testimonial_witness: None,
+        key_boundary_scope: None,
     }
 }
 

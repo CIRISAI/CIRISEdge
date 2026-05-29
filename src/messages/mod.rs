@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::handler::{Delivery, FederationPriority, Message};
+use crate::key_boundary::KeyBoundaryScope;
 
 /// Wire-format schema version. Pinned by edge release tag; downstream
 /// peers gate on a strict allowlist (AV-7).
@@ -201,6 +202,51 @@ pub enum MessageType {
     Withdraws,
 }
 
+/// CIRISEdge#37 — `testimonial_witness` envelope slot per FSD-002
+/// §3.6.3 v1.4 + §5.14. A **preservation primitive**: edge propagates
+/// the witness verbatim across federation forwarding and does NOT
+/// interpret the `payload` (that lives at the joint-correlation tier
+/// in `ciris-lens-core`). Edge's only obligation is byte-fidelity —
+/// the field is included in the canonical envelope bytes verbatim so
+/// the originator's signature commits to it.
+///
+/// # Wire shape
+///
+/// ```json
+/// {
+///   "kind": "ratchet-conscience",
+///   "payload": { ... opaque to edge ... },
+///   "issuer_key_id": "lens-detector-01",
+///   "issued_at": "2026-05-29T00:00:00.000Z"
+/// }
+/// ```
+///
+/// `payload` carries an arbitrary `serde_json::Value` — including
+/// nested objects, arrays, numbers, strings, null. Edge does not
+/// touch it. Consumers (lens-core's joint-correlation detector
+/// family, ratchet-conscience evaluators, registry attestation
+/// audit) decode `kind` + `payload` according to their own contract.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TestimonialWitness {
+    /// Witness kind tag — opaque to edge. Examples in CIRIS 3.0:
+    /// `"ratchet-conscience"` (RATCHET-stage attestation),
+    /// `"lens-detector"` (lens-core detector emission),
+    /// `"registry-attest"` (registry-side l-tier attestation).
+    /// New kinds land in consumer crates without an edge break.
+    pub kind: String,
+    /// Opaque witness payload. Edge preserves byte-for-byte; consumer
+    /// interprets according to `kind`. May be any JSON value.
+    pub payload: serde_json::Value,
+    /// The signer attesting this witness — `federation_keys.key_id`.
+    /// Edge does NOT verify this against the envelope's
+    /// `signing_key_id` (the witness may be relayed by a forwarder).
+    /// Consumers verify per their own trust chain.
+    pub issuer_key_id: String,
+    /// When the witness was issued (UTC; serializes via chrono's
+    /// default RFC-3339 representation).
+    pub issued_at: DateTime<Utc>,
+}
+
 /// The signed wire envelope. Carries one verified message + the
 /// metadata needed for replay protection, hybrid PQC verify, and
 /// content-derived ACK matching.
@@ -208,6 +254,29 @@ pub enum MessageType {
 /// Canonical bytes for signature are
 /// `Engine.canonicalize_envelope_for_signing()` applied to this struct
 /// (which strips `signature` and `signature_pqc` before canonicalizing).
+///
+/// # v0.16.0 — wire compliance fields
+///
+/// Two CIRIS 3.0 wire-form fields land here:
+///
+/// - [`Self::testimonial_witness`] (D13, CIRISEdge#37): preservation
+///   primitive per FSD-002 §3.6.3 v1.4 + §5.14. Edge propagates
+///   verbatim, signs over it as part of canonical envelope bytes,
+///   does NOT interpret the payload (joint-correlation tier owns
+///   that). `Option`-wrapped with `skip_serializing_if`: existing
+///   v0.15.x envelopes round-trip byte-equal.
+/// - [`Self::key_boundary_scope`] (D26 + CIRISEdge#38): wire-form
+///   scope slot per FSD-002 §3.4 (`process` / `tenant` / `channel` /
+///   `cohort` / `data_class`). Defaults to
+///   [`KeyBoundaryScope::Process`] (AV-17 process-wide invariant —
+///   the v0.15.x default). `Option`-wrapped + skip: pre-v0.16.0
+///   envelopes round-trip byte-equal AND deserialize-default to
+///   `None` (which downstream interprets as `Process` semantics, per
+///   the legacy parse rule in [`crate::key_boundary`]).
+///
+/// Both fields are part of the canonical bytes WHEN PRESENT and
+/// omitted from canonical bytes when `None` — symmetric serialize /
+/// verify path, no special-casing.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EdgeEnvelope {
     /// Wire-format version. Strict allowlist enforced (AV-7).
@@ -243,6 +312,36 @@ pub struct EdgeEnvelope {
     /// closure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<[u8; 32]>,
+    /// CIRISEdge#37 — `testimonial_witness` preservation primitive
+    /// per FSD-002 §3.6.3 v1.4 + §5.14. Edge propagates verbatim and
+    /// signs over it as part of canonical envelope bytes; payload is
+    /// opaque to edge (joint-correlation tier owns interpretation).
+    ///
+    /// `Option`-wrapped with `skip_serializing_if`: when `None`, the
+    /// field is OMITTED from JSON, so existing v0.15.x envelopes
+    /// round-trip byte-equal and pre-v0.16.0 consumers ignore the
+    /// field (serde default). When `Some`, the field IS part of the
+    /// signed canonical bytes — symmetric on the verify path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testimonial_witness: Option<TestimonialWitness>,
+    /// CIRISEdge#38 + D26 — `key_boundary:{scope}` slot per FSD-002
+    /// §3.4 + IEEE Ch6. Edge today carries an AV-17 process-wide
+    /// `key_boundary:no_seed_in_heap` invariant; this field extends
+    /// the wire form to express per-tenant / per-channel / per-cohort
+    /// / per-data-class scoping WITHOUT a wire break.
+    ///
+    /// `Option`-wrapped with `skip_serializing_if`: when `None`, the
+    /// field is OMITTED from JSON — both v0.15.x and v0.16.0 default
+    /// envelopes round-trip byte-equal. When `Some`, the scope IS
+    /// part of canonical bytes (future scope-binding enforcement at
+    /// v0.16.1+ verifies against the value committed here).
+    ///
+    /// **v0.16.0 is wire-only**: edge does NOT enforce
+    /// scope-binding (refusing cross-scope verify, etc.). The slot
+    /// lands so consumers can write and parse the value; enforcement
+    /// follows in a later cut. See `src/key_boundary.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_boundary_scope: Option<KeyBoundaryScope>,
 }
 
 // ─── Phase 1 message types ──────────────────────────────────────────

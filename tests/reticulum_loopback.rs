@@ -57,6 +57,8 @@ fn sample_envelope(signing: &str, destination: &str) -> EdgeEnvelope {
         signature: "ZmFrZS1lZDI1NTE5LXNpZ25hdHVyZS1ieXRlcw==".to_string(),
         signature_pqc: Some("ZmFrZS1tbC1kc2EtNjUtc2lnbmF0dXJl".to_string()),
         in_reply_to: None,
+        testimonial_witness: None,
+        key_boundary_scope: None,
     }
 }
 

@@ -536,6 +536,41 @@ bytes into edge's heap. The test category catches this; the heap
 scan property test passes only if no seed-shaped patterns are found
 across N>=1000 sign operations.
 
+**v0.16.0 wire-form note (CIRISEdge#38 + D26, FSD-002 §3.4):** the
+canonical wire string for this invariant is now
+`key_boundary:{scope}:no_seed_in_heap` where `{scope}` is one of
+`process` / `tenant:{tenant_id}` / `channel:{channel_id}` /
+`cohort:{cohort_id}` / `data_class:{class}`. **The AV-17 invariant
+itself is unchanged at v0.16.0 — edge's process never holds a seed,
+period, scope-irrespective.** The scope slot is a *wire-form
+primitive* so consumers can express per-tenant / per-channel /
+per-cohort / per-data-class isolation contracts that future
+verify-time enforcement (binding signatures to a scope) will check.
+The legacy v0.15.x string `key_boundary:no_seed_in_heap` parses as
+the `process` scope for backward compatibility; existing v0.15.x
+envelopes round-trip byte-equal at v0.16.0 with the
+`key_boundary_scope` envelope field omitted (default `None`). See
+`src/key_boundary.rs` for the typed `KeyBoundaryScope` enum + the
+wire-string codec; v0.16.1+ owns scope-binding enforcement.
+
+**v0.16.0 testimonial_witness wire-form note (CIRISEdge#37, FSD-002
+§3.6.3 v1.4 + §5.14):** the `EdgeEnvelope` now carries an optional
+`testimonial_witness: Option<TestimonialWitness>` field
+(`{kind, payload, issuer_key_id, issued_at}`). It is a
+**preservation primitive** — edge propagates the value verbatim
+across federation forwarding and signs it as part of canonical
+envelope bytes; edge does NOT interpret the opaque `payload` (that
+lives at the joint-correlation tier in `ciris-lens-core` and the
+ratchet-conscience evaluators). The field is `Option`-wrapped with
+`#[serde(default, skip_serializing_if = "Option::is_none")]` so
+existing v0.15.x envelopes round-trip byte-equal; witness-bearing
+envelopes from v0.16.0+ producers are visible to v0.16.0+ consumers
+and ignored by pre-v0.16.0 deserializers. No new AV vector is
+introduced at v0.16.0 — the field is forwarded data, not a privilege
+boundary; verification of the witness against its `issuer_key_id` is
+the consumer's responsibility (the same discipline edge already
+applies to `accord_signatures`, FSD-002 §4.5).
+
 ### 4.5 Multi-medium specific — N2 primitive surface
 
 #### AV-18: Cross-medium replay

@@ -208,6 +208,8 @@ fn sample_envelope(body_size: usize) -> Vec<u8> {
         signature: "ZmFrZS1lZDI1NTE5LXNpZ25hdHVyZS1ieXRlcw==".to_string(),
         signature_pqc: None,
         in_reply_to: None,
+        testimonial_witness: None,
+        key_boundary_scope: None,
     };
     serde_json::to_vec(&env).expect("serialize")
 }
