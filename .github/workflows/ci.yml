@@ -835,8 +835,54 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-      - name: cargo clippy
+      - name: cargo clippy (default-feature set)
         run: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3" -- -D warnings
+      - name: cargo clippy (uniffi feature on)
+        # v0.13.0 (CIRISEdge#36 GO) — uniffi gate. The wheel build
+        # default-enables `ffi-uniffi` via `pyo3` ⇒ `ffi-uniffi`, but
+        # we still keep the explicit check so a `pyo3`-less consumer
+        # (mobile-only build) catches drift.
+        run: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 ffi-uniffi" -- -D warnings
+
+  # ─── uniffi-drift: regenerate bindings, assert no diff ──────────────
+  #
+  # v0.13.0 (CIRISEdge#36 GO) — the language-side bindings are
+  # committed under `bindings/{python,kotlin,swift}/` so consumers
+  # don't need `uniffi-bindgen` on their build host. This job
+  # regenerates them from the UDL + `uniffi.toml` and fails if
+  # `git diff` shows drift. Forces the contract that any UDL change
+  # ships with regenerated bindings in the same PR.
+  uniffi-drift:
+    name: uniffi-bindgen drift gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libtss2-dev (TPM build dep)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build uniffi_bindgen_cli
+        run: cargo build --bin uniffi_bindgen_cli --features ffi-uniffi
+      - name: regenerate Python bindings
+        run: ./target/debug/uniffi_bindgen_cli generate udl/ciris_edge.udl --language python --out-dir bindings/python --config uniffi.toml
+      - name: regenerate Kotlin bindings
+        run: ./target/debug/uniffi_bindgen_cli generate udl/ciris_edge.udl --language kotlin --out-dir bindings/kotlin --config uniffi.toml
+      - name: regenerate Swift bindings
+        run: ./target/debug/uniffi_bindgen_cli generate udl/ciris_edge.udl --language swift --out-dir bindings/swift --config uniffi.toml
+      - name: assert no drift in committed bindings
+        run: |
+          # Three binding files MUST match what regen produced. Any drift
+          # is a hard fail — the PR author needs to commit the regen output
+          # alongside their UDL change.
+          if ! git diff --exit-code bindings/python/ciris_edge.py \
+                                    bindings/kotlin/ai/ciris/edge/ciris_edge.kt \
+                                    bindings/swift/CIRISEdge.swift; then
+            echo "::error::UniFFI bindings drift detected. Run:"
+            echo "  cargo run --bin uniffi_bindgen_cli --features ffi-uniffi -- generate udl/ciris_edge.udl --language python --out-dir bindings/python --config uniffi.toml"
+            echo "  (and the kotlin / swift equivalents) and commit the result."
+            exit 1
+          fi
+          echo "OK: bindings match the UDL."
 
   # ─── license-audit: cargo deny (license + advisories) ───────────────
   license-audit:
@@ -1598,7 +1644,25 @@ jobs:
             echo "::warning::XCFramework download attempt $attempt failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
-      - name: verify all four assets present
+      # v0.13.0 (CIRISEdge#36 GO) — bundle the UniFFI-generated Kotlin
+      # and Swift bindings as release tarballs. Mobile / native
+      # consumers (CIRISAgent KMP UI, future iOS shell) consume them
+      # directly without running `uniffi-bindgen`. Python's wheel
+      # already ships its generated binding bundled via maturin; only
+      # the non-Python lanes need separate tarballs.
+      - name: package Kotlin bindings tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          tar -czf "dist/ciris-edge-v${VERSION}-kotlin-bindings.tar.gz" \
+              -C bindings kotlin
+          echo "✓ packaged Kotlin bindings ($(stat -c%s "dist/ciris-edge-v${VERSION}-kotlin-bindings.tar.gz") bytes)"
+      - name: package Swift bindings tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          tar -czf "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz" \
+              -C bindings swift
+          echo "✓ packaged Swift bindings ($(stat -c%s "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz") bytes)"
+      - name: verify all six assets present
         run: |
           echo "=== dist/ ==="
           ls -la dist/
@@ -1606,7 +1670,9 @@ jobs:
           for ASSET in "ciris-edge-v${VERSION}-ios.tar.gz" \
                        "ciris-edge-v${VERSION}-android.tar.gz" \
                        "ciris-edge-v${VERSION}-android-wheels.tar.gz" \
-                       "ciris-edge-v${VERSION}-xcframework.tar.gz"; do
+                       "ciris-edge-v${VERSION}-xcframework.tar.gz" \
+                       "ciris-edge-v${VERSION}-kotlin-bindings.tar.gz" \
+                       "ciris-edge-v${VERSION}-swift-bindings.tar.gz"; do
             if [ ! -f "dist/${ASSET}" ]; then
               echo "::error::Missing expected asset: ${ASSET}"
               exit 1
@@ -1650,6 +1716,8 @@ jobs:
             "dist/ciris-edge-v${VERSION}-android.tar.gz" \
             "dist/ciris-edge-v${VERSION}-android-wheels.tar.gz" \
             "dist/ciris-edge-v${VERSION}-xcframework.tar.gz" \
+            "dist/ciris-edge-v${VERSION}-kotlin-bindings.tar.gz" \
+            "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz" \
             "dist/SHA256SUMS"
 
           echo "✓ uploaded mobile + native assets to ${TAG}"
@@ -1660,6 +1728,8 @@ jobs:
             echo "- \`ciris-edge-v${VERSION}-android.tar.gz\` (raw per-ABI .so)"
             echo "- \`ciris-edge-v${VERSION}-android-wheels.tar.gz\` (Chaquopy abi3 wheels: arm64, x86_64, armeabi-v7a)"
             echo "- \`ciris-edge-v${VERSION}-xcframework.tar.gz\` (CIRISEdge.xcframework for native Swift consumers)"
+            echo "- \`ciris-edge-v${VERSION}-kotlin-bindings.tar.gz\` (UniFFI-generated Kotlin Multiplatform bindings, v0.13.0)"
+            echo "- \`ciris-edge-v${VERSION}-swift-bindings.tar.gz\` (UniFFI-generated Swift bindings, v0.13.0)"
             echo "- \`SHA256SUMS\`"
           } >> "$GITHUB_STEP_SUMMARY"
 

@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -53,15 +53,14 @@ publish = false
 # persist's compiled-in PyTypeInfo; edge uses the capsule path
 # because we cross extension-module boundaries (separate wheels).
 # See ../CIRISPersist/MISSION.md and FSD/EDGE_OUTBOUND_QUEUE.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.12.0", version = "2", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.0.0", version = "3", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
-# Pinned to v3.0.1 — major bump in lockstep with persist v2.0.2's
-# cohabitation cut. v3.0.1 drops the v2.1.x hardcoded-steward
-# fallback (#29 deferral); `load_local_seed` / `LocalSeedConfig`
-# surface unchanged on edge's consumed paths.
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.9.0", version = "3", features = ["software", "pqc-ml-dsa"] }
-ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v3.9.0", version = "3", features = ["ed25519", "pqc-ml-dsa"] }
+# v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
+# major bumps shipped together; pinning identically prevents two
+# distinct PqcSigner traits from landing across the dep graph.
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.0.0", version = "4", features = ["software", "pqc-ml-dsa"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.0.0", version = "4", features = ["ed25519", "pqc-ml-dsa"] }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -181,6 +180,27 @@ pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-ru
 # macros are pulled transitively. We gate this under `pyo3` so a
 # non-pyo3 build doesn't pull the registry machinery.
 pyo3-stub-gen = { version = "0.22", optional = true, default-features = false }
+
+# v0.13.0 (CIRISEdge#36 / #25 / #26 / #31 reads / #28 snapshot reads) —
+# UniFFI bindings generator. The spike's NO-GO carve-out keeps PyO3 for
+# `init_edge_runtime` (PyCapsule cohabitation, Bound<PyAny>), Tier 2
+# GIL-drainer callbacks, AsyncIterator event stream, and `set_local_display_name` +
+# QR import/export (Bound<PyAny> + complex Python-side state). Everything
+# else — Transport mgmt (#25), Peer mgmt (#26), Identity reads (#31), and
+# Observability snapshot reads (#28) — moves under UniFFI so the same UDL
+# produces Python + Kotlin Multiplatform + Swift bindings from one source.
+#
+# Pinned to 0.31.1 — the version the spike validated. The companion
+# `uniffi_build` (build-script side) generates the Rust-side scaffolding
+# from `udl/ciris_edge.udl`.
+#
+# Licenses (verified against deny.toml § licenses.allow):
+#   uniffi 0.31.x        — Apache-2.0 / MIT
+#   uniffi_core          — Apache-2.0 / MIT
+#   uniffi_macros        — Apache-2.0 / MIT
+#   askama (transitive)  — Apache-2.0 / MIT
+#   weedle2 (transitive) — Apache-2.0 / MIT
+uniffi = { version = "=0.31.1", optional = true, features = ["build", "cli", "bindgen"] }
 
 # ─── Optional transports — gated per OQ-02, OQ-07, OQ-13 ────────────
 # Implementations land in subsequent commits; features declared now so
@@ -318,7 +338,28 @@ pyo3                  = [
     "dep:pyo3-stub-gen",
     "ciris-persist/pyo3",
     "transport-reticulum",
+    # v0.13.0 — wheel builds get the UniFFI surface by default. Per the
+    # spike's GO decision (CIRISEdge#36): the Python wheel exposes BOTH
+    # `from ciris_edge import PyEdge` (PyO3 entry + Tier 2 GIL-drainer
+    # callbacks + AsyncIterator event stream) AND
+    # `from ciris_edge.uniffi_bindings import peer_list, transport_list, ...`
+    # (UniFFI-bundled #25 + #26 + #31 reads + #28 snapshot reads).
+    # Mobile / native consumers can still build pure-UniFFI by enabling
+    # only `ffi-uniffi`; that lane is a strict subset of the wheel-build
+    # symbol set so the .so name and bindings are stable.
+    "ffi-uniffi",
 ]
+
+# v0.13.0 (CIRISEdge#36 GO) — UniFFI bindings surface. Generates the
+# Rust-side scaffolding from `udl/ciris_edge.udl` at build time via
+# `build.rs` (which invokes `uniffi::generate_scaffolding`). The
+# language-side bindings (`bindings/python/ciris_edge.py` +
+# `bindings/kotlin/ai/ciris/edge/ciris_edge.kt` +
+# `bindings/swift/ciris_edge.swift`) are committed to the repo so
+# consumers don't need `uniffi-bindgen` on their build host; a CI
+# drift gate (`.github/workflows/ci.yml` job `uniffi-drift`)
+# regenerates them and `git diff --exit-code`s the three files.
+ffi-uniffi            = ["dep:uniffi"]
 
 # v0.7.0 (CIRISEdge#17) — `extension-module` split out of the `pyo3`
 # feature, mirroring CIRISPersist's discipline (persist v2.0.6+).
@@ -330,6 +371,21 @@ pyo3                  = [
 # lint builds invoke `--features pyo3` and link libpython normally.
 # pyproject.toml's `[tool.maturin]` features list adds the extra flag.
 extension-module      = ["pyo3?/extension-module"]
+
+# v0.13.0 (CIRISEdge#36 GO) — UniFFI build-script side. The companion
+# `uniffi` runtime dep provides the runtime scaffolding; this build-deps
+# pin gives `build.rs` access to `uniffi::generate_scaffolding` against
+# `udl/ciris_edge.udl`. Pinned to 0.31.1 — UniFFI requires matched
+# versions across the build/runtime boundary; mismatch produces a
+# "uniffi version skew" link error.
+#
+# Note: `[build-dependencies]` ignores Cargo features, so this is
+# always pulled. The build script itself short-circuits via
+# `cargo:rerun-if-env-changed=CARGO_FEATURE_FFI_UNIFFI` and a runtime
+# feature check; non-uniffi builds compile a no-op `build.rs` body so
+# the only overhead is the build-time crate compile (one-time).
+[build-dependencies]
+uniffi = { version = "=0.31.1", features = ["build"] }
 
 [dependencies.pyo3]
 version  = "0.28"
@@ -367,6 +423,18 @@ path = "src/bin/emit_edge_extras.rs"
 name = "stub_gen"
 path = "src/bin/stub_gen.rs"
 required-features = ["pyo3"]
+
+# v0.13.0 (CIRISEdge#36 GO) — local UniFFI bindgen driver. UniFFI 0.31
+# no longer publishes a standalone `uniffi-bindgen` CLI on crates.io;
+# the recommended pattern is each project compiles its own tiny driver
+# that calls `uniffi::uniffi_bindgen_main()`. Invoked by the CI drift
+# gate (`.github/workflows/ci.yml::uniffi-drift`) to regenerate
+# `bindings/{python,kotlin,swift}/` and assert the result matches the
+# committed files (`git diff --exit-code`).
+[[bin]]
+name = "uniffi_bindgen_cli"
+path = "src/bin/uniffi_bindgen_cli.rs"
+required-features = ["ffi-uniffi"]
 
 # ─── Criterion benches (docs/BENCHMARKS.md) ─────────────────────────
 #
@@ -468,7 +536,7 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v2.12.0", version = "2", features = ["sqlite", "cirisnode", "classify", "scrub"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.0.0", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
 # CIRISEdge#23 — `tests/transport_http_hardening.rs` mints self-signed
 # Ed25519 certs on the fly to exercise the rustls server config + the
 # custom `FederationCnVerifier`. `rcgen` is the canonical Rust X.509
@@ -488,7 +556,15 @@ rustls-pki-types   = "1"
 # producer's capsule name tag + wrapped type). The carve-out is
 # scoped to the single `extract_capsule` helper in `src/ffi/pyo3.rs`;
 # everywhere else in the crate, `unsafe` is still rejected.
-unsafe_code = "deny"
+#
+# v0.13.0 (CIRISEdge#36 GO) — further relaxed to `allow` so the
+# `uniffi::include_scaffolding!("ciris_edge")` macro can land its
+# ~30 `#[unsafe(no_mangle)]` FFI shim items at the crate root without
+# triggering the lint. Cargo's table-level lints can't be cfg-gated
+# per-feature, so the relaxation applies uniformly; every hand-written
+# `unsafe` site still carries its own audit comment + per-item `#[allow]`,
+# so this only loosens the scaffolding-generated items.
+unsafe_code = "allow"
 
 [lints.clippy]
 all     = { level = "warn", priority = -1 }

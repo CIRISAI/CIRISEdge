@@ -1232,8 +1232,20 @@ fn init_edge_runtime(
         .build()
         .map_err(|e| PyRuntimeError::new_err(format!("Edge::build: {e}")))?;
 
+    let edge_arc = Arc::new(edge);
+
+    // v0.13.0 (CIRISEdge#36 GO) — install the process-global
+    // `Weak<Edge>` so the UniFFI bindings (`crate::ffi::uniffi_impl`)
+    // can resolve to the same runtime on free-function calls. The
+    // PyO3 surface is the entry; UniFFI peer_list / transport_list /
+    // identity_hash / metrics_snapshot all reach back through this
+    // weak handle. See `ffi::uniffi_impl::install_edge_handle` for
+    // the registry shape.
+    #[cfg(feature = "ffi-uniffi")]
+    crate::ffi::uniffi_impl::install_edge_handle(&edge_arc);
+
     Ok(PyEdge {
-        inner: Arc::new(edge),
+        inner: edge_arc,
         runtime,
     })
 }

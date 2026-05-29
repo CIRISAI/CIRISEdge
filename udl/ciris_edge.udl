@@ -1,0 +1,282 @@
+// CIRISEdge UniFFI surface — v0.13.0 (CIRISEdge#36 GO + #25 + #26 + #31 reads + #28 snapshot reads).
+//
+// Per the spike's NO-GO carve-out, this UDL does NOT cover:
+//   - init_edge_runtime          (PyCapsule + Bound<PyAny>; PyO3-only)
+//   - Tier 2 send_inline_text / send_durable_inline_text / register_inline_text_handler
+//                                 (GIL-drainer callback patterns; PyO3-only)
+//   - subscribe_* AsyncIterator   (UniFFI bridges Future, not AsyncIterator)
+//   - set_local_display_name + QR import/export (Bound<PyAny> + complex Python-side state)
+//
+// All other operator-facing surfaces live here. The Rust impl is
+// `src/ffi/uniffi_impl.rs`; the bindings are committed under
+// `bindings/{python,kotlin,swift}/` so consumers can `import` without
+// running `uniffi-bindgen`.
+//
+// All functions key off a process-global `Weak<Edge>` populated by
+// `init_edge_runtime` (PyO3-side). Calls before init return
+// `EdgeError.NotInitialized`. Mutations that persist's API doesn't yet
+// expose return `EdgeError.NotImplemented` with the persist follow-up
+// tracked in CIRISEdge#36 closure.
+//
+// Type-name discipline: UDL-side records share the `Edge` prefix to
+// avoid collision with the bare-name types already at the crate root
+// (`NetworkEvent`, `EventSeverity`, `TransportError`, etc., re-exported
+// by `lib.rs`). Bindings present without the prefix in the surface
+// language — UniFFI's binding generators take the UDL name verbatim.
+
+namespace ciris_edge {
+    // ─── Runtime version ─────────────────────────────────────────────
+    [Throws=EdgeBindingsError]
+    string crate_version();
+
+    // ─── #26 Peer mgmt — reads ───────────────────────────────────────
+    [Throws=EdgeBindingsError]
+    sequence<EdgePeerInfo> peer_list(EdgePeerFilter? filter);
+
+    [Throws=EdgeBindingsError]
+    EdgePeerInfo? peer_get(string key_id);
+
+    // ─── #26 Peer mgmt — mutations (stubbed pending persist follow-up) ─
+    [Throws=EdgeBindingsError]
+    EdgePeerHandle peer_add(
+        string key_id,
+        string pubkey_ed25519_base64,
+        string? transport_identity,
+        EdgePeerPolicy? policy
+    );
+
+    [Throws=EdgeBindingsError]
+    void peer_remove(EdgePeerHandle handle, boolean hard);
+
+    [Throws=EdgeBindingsError]
+    void peer_set_alias(string key_id, string? alias);
+
+    [Throws=EdgeBindingsError]
+    void peer_set_trust(string key_id, EdgePeerTrust trust);
+
+    [Throws=EdgeBindingsError]
+    void peer_set_notes(string key_id, string? notes);
+
+    [Throws=EdgeBindingsError]
+    void peer_set_policy(EdgePeerHandle handle, EdgePeerPolicy policy);
+
+    [Throws=EdgeBindingsError]
+    EdgeProbeResult peer_probe(string key_id, u64 timeout_ms);
+
+    // ─── #25 Transport mgmt ──────────────────────────────────────────
+    [Throws=EdgeBindingsError]
+    sequence<EdgeTransportInfo> transport_list();
+
+    [Throws=EdgeBindingsError]
+    EdgeTransportHandle transport_add(EdgeTransportSpec spec);
+
+    [Throws=EdgeBindingsError]
+    void transport_remove(EdgeTransportHandle handle, boolean drain);
+
+    [Throws=EdgeBindingsError]
+    void transport_enable(EdgeTransportHandle handle);
+
+    [Throws=EdgeBindingsError]
+    void transport_disable(EdgeTransportHandle handle);
+
+    [Throws=EdgeBindingsError]
+    void transport_set_mode(EdgeTransportHandle handle, string mode);
+
+    [Throws=EdgeBindingsError]
+    EdgeTransportStats transport_stats(EdgeTransportHandle handle);
+
+    [Throws=EdgeBindingsError]
+    EdgeTransportHealth transport_health(EdgeTransportHandle handle);
+
+    [Throws=EdgeBindingsError]
+    string transport_config_blob(EdgeTransportHandle handle);
+
+    // ─── #31 Identity READS (mutations stay PyO3) ────────────────────
+    [Throws=EdgeBindingsError]
+    bytes identity_hash();
+
+    [Throws=EdgeBindingsError]
+    record<string, bytes> identity_pubkeys();
+
+    [Throws=EdgeBindingsError]
+    string current_ratchet_id();
+
+    [Throws=EdgeBindingsError]
+    string last_rotation_at();
+
+    // ─── #28 Observability — SNAPSHOT READS subset ───────────────────
+    [Throws=EdgeBindingsError]
+    EdgeMetricsSnapshot metrics_snapshot();
+
+    [Throws=EdgeBindingsError]
+    sequence<EdgeNetworkEvent> recent_events(u32 limit);
+
+    [Throws=EdgeBindingsError]
+    sequence<EdgeErrorEvent> recent_errors(u32 limit);
+
+    [Throws=EdgeBindingsError]
+    record<string, u64> queue_depth(string? delivery_class);
+
+    [Throws=EdgeBindingsError]
+    sequence<EdgePeerHealth> peer_health_summary();
+
+    [Throws=EdgeBindingsError]
+    sequence<EdgePathEntry> path_table();
+};
+
+// ─── Error type ─────────────────────────────────────────────────────
+//
+// Flat error surface — variants are detail-free so the UDL maps onto a
+// simple discriminant. Detail strings flow back as `Display`
+// renderings; the calling language's exception type has a `message()`
+// accessor. Per UniFFI 0.31 convention, `flat_error` enums need an
+// `impl Display` on the Rust side — provided by `thiserror` on
+// `EdgeError` in `ffi/uniffi_impl.rs`.
+
+[Error]
+enum EdgeBindingsError {
+    "NotInitialized",
+    "NotImplemented",
+    "NotFound",
+    "InvalidArgument",
+    "Internal",
+    "Unsupported",
+    "Persist",
+    "Transport",
+};
+
+// ─── #26 Peer mgmt types ────────────────────────────────────────────
+
+dictionary EdgePeerHandle {
+    string key_id;
+};
+
+enum EdgePeerTrust {
+    "Trusted",
+    "Untrusted",
+    "Blocked",
+    "Unknown",
+};
+
+dictionary EdgePeerPolicy {
+    sequence<string> subscription_filter;
+    u32 max_queue_depth;
+    u32? ack_timeout_seconds_override;
+    string? priority_class;
+};
+
+dictionary EdgePeerFilter {
+    EdgePeerTrust? trust;
+    string? identity_type;
+    boolean? rooted;
+};
+
+dictionary EdgePeerInfo {
+    EdgePeerHandle handle;
+    string pubkey_ed25519_base64;
+    string identity_type;
+    boolean rooted;
+    sequence<string> reachable_via;
+    string? last_seen_at;
+    string? last_attestation_id;
+    EdgePeerPolicy policy;
+    EdgePeerTrust trust;
+    string? alias;
+    string? notes;
+};
+
+dictionary EdgeProbeResult {
+    boolean reachable;
+    u64? latency_ms;
+    string? failure_class;
+};
+
+// ─── #25 Transport mgmt types ───────────────────────────────────────
+
+dictionary EdgeTransportHandle {
+    u64 id;
+    string kind;
+};
+
+dictionary EdgeTransportSpec {
+    string kind;
+    string config_json;
+};
+
+dictionary EdgeTransportInfo {
+    EdgeTransportHandle handle;
+    string config_summary_json;
+    u32 peer_count;
+    u64 bytes_in;
+    u64 bytes_out;
+    string started_at;
+    string? last_error;
+};
+
+dictionary EdgeTransportStats {
+    string name;
+    string kind;
+    string status;
+    boolean online;
+    u64? bitrate_bps;
+    string mode;
+    u64 rxb;
+    u64 txb;
+    u32? hw_mtu;
+    u32? ifac_size;
+    string? ifac_signature;
+    double? rssi_dbm;
+    double? snr_db;
+    double? airtime_long_pct;
+    double? airtime_short_pct;
+    double? cpu_load_pct;
+    double? battery_pct;
+};
+
+dictionary EdgeTransportHealth {
+    string link_state;
+    string? last_success_at;
+    string? last_error_at;
+    string? last_error;
+    u32 peer_count;
+};
+
+// ─── #28 Observability snapshot types ───────────────────────────────
+
+dictionary EdgeMetricsSnapshot {
+    record<string, u64> counters;
+    record<string, double> gauges;
+    string snapshot_at;
+    u64 window_seconds;
+};
+
+dictionary EdgeNetworkEvent {
+    string at;
+    string kind;
+    string severity;
+    string body_json;
+};
+
+dictionary EdgeErrorEvent {
+    string at;
+    string class_name;
+    string message;
+    string? body_sha256;
+};
+
+dictionary EdgePeerHealth {
+    string peer_key_id;
+    double reachability_ratio;
+    string? last_success_at;
+    string? last_error_class;
+    u64 attempts;
+    u64 successes;
+};
+
+dictionary EdgePathEntry {
+    string peer_key_id;
+    string transport_kind;
+    u32 hops;
+    string? next_hop;
+    string? last_seen_at;
+};

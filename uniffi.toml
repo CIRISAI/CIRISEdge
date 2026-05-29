@@ -1,0 +1,24 @@
+# UniFFI binding-generator config — v0.13.0 (CIRISEdge#36 GO).
+#
+# `cdylib_name` MUST match the actual `[lib].name`-derived `.so`
+# basename — that's the file the generated Python / Kotlin / Swift
+# bindings dlopen at import time. `[lib].name` defaults to the
+# package name with hyphens flipped to underscores: `ciris-edge` →
+# `ciris_edge` → `libciris_edge.so`.
+#
+# Python: the wheel ships `libciris_edge.so` as `ciris_edge.abi3.so`
+# (maturin's abi3 rename); the UniFFI bindings call
+# `ctypes.CDLL("libciris_edge.so")` via the generated loader. The
+# Python wrapper in `python/ciris_edge/uniffi_bindings/__init__.py`
+# patches that loader to point at the abi3-suffixed file at import
+# time — see that file's docblock for the bridge rationale.
+[bindings.python]
+cdylib_name = "ciris_edge"
+
+[bindings.kotlin]
+package_name = "ai.ciris.edge"
+cdylib_name = "ciris_edge"
+
+[bindings.swift]
+cdylib_name = "ciris_edge"
+module_name = "CIRISEdge"

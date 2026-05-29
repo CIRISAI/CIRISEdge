@@ -47,7 +47,7 @@ classifiers = [
 # Persist prelude surface unchanged — pure currency bump, zero API
 # drift on edge's consumed paths.
 dependencies = [
-    "ciris-persist>=2.12.0,<3",
+    "ciris-persist>=3.0.0,<4",
 ]
 dynamic = ["version"]
 
@@ -66,6 +66,11 @@ Issues = "https://github.com/CIRISAI/CIRISEdge/issues"
 # symbols when the wheel is imported. `cargo test --features pyo3`
 # (no `extension-module`) still works because tests need the libpython
 # link.
+#
+# v0.13.0 (CIRISEdge#36 GO) — `pyo3` now transitively enables
+# `ffi-uniffi`, so the wheel ships BOTH the PyO3 entry surface AND the
+# UniFFI bindings. See `Cargo.toml::[features.pyo3]` for the implication
+# rationale.
 features = ["pyo3", "extension-module"]
 module-name = "ciris_edge"
 # abi3-py310 — one wheel covers Python 3.10+. v0.7.0 (CIRISEdge#17)
@@ -78,3 +83,17 @@ module-name = "ciris_edge"
 # persist's matrix exactly).
 python-source = "python"
 strip = true
+
+# v0.13.0 (CIRISEdge#36 GO) — bundle the UniFFI bridge Python module +
+# the generated `ciris_edge.py` (as `_generated.py` next to the
+# wrapper). The wrapper's `_load_uniffi_bindings_module` looks here
+# first; falls back to the dev-repo path for local builds.
+include = [
+    { path = "bindings/python/ciris_edge.py", format = "wheel" },
+]
+
+# Maturin's `include` doesn't rename inside the wheel; we wire the
+# wrapper's lookup to handle both names. For the install layout, the
+# generated `ciris_edge.py` lands at the wheel root next to
+# `python/ciris_edge/uniffi_bindings/__init__.py` — the wrapper's
+# fallback path resolves both.

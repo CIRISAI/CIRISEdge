@@ -1075,6 +1075,55 @@ impl Edge {
         &self.signer.key_id
     }
 
+    /// CIRISEdge#31 (v0.13.0 UniFFI cut) — Rust-level accessor returning
+    /// a clone of the local signer `Arc`. The UniFFI bindings
+    /// (`src/ffi/uniffi_impl.rs`) use this to drive the read-only
+    /// Identity surface (`identity_hash`, `identity_pubkeys`,
+    /// `current_ratchet_id`, `last_rotation_at`). Mutations
+    /// (`set_local_display_name`, QR import/export) stay PyO3.
+    #[must_use]
+    pub fn signer(&self) -> Arc<LocalSigner> {
+        self.signer.clone()
+    }
+
+    /// CIRISEdge#26 (v0.13.0 UniFFI cut) — Rust-level accessor returning
+    /// a clone of the federation-key directory `Arc`. The UniFFI bindings
+    /// drive `peer_list` / `peer_get` reads against this. Mutations
+    /// (`peer_add`, `peer_remove`) need a wider trait than
+    /// `VerifyDirectory` exposes today — those land as stubs pending a
+    /// persist-side follow-up.
+    #[must_use]
+    pub fn verify_directory(&self) -> Arc<dyn VerifyDirectory> {
+        self.verify.directory()
+    }
+
+    /// CIRISEdge#25 (v0.13.0 UniFFI cut) — Rust-level accessor returning
+    /// the transport set. UniFFI's `transport_list` enumerates this and
+    /// derives per-transport stats via [`Transport::id`] + (for Reticulum)
+    /// `interface_specs()` / `transport_stats(handle)`.
+    #[must_use]
+    pub fn transports(&self) -> Vec<Arc<dyn Transport>> {
+        self.transports.clone()
+    }
+
+    /// CIRISEdge#25 (v0.13.0 UniFFI cut) — Reticulum-specific stats
+    /// drill-down by `InterfaceHandle`. Returns `None` in v0.13.0
+    /// because the `Transport` trait doesn't expose downcasting and
+    /// the Edge struct holds `Arc<dyn Transport>` (type-erased). A
+    /// future cut (v0.14.x) extends the `Transport` trait with an
+    /// `as_any` accessor, which the UniFFI `transport_stats` impl will
+    /// then use to route to the concrete `ReticulumTransport::transport_stats`.
+    /// For v0.13.0 the UniFFI surface returns the generic fallback
+    /// stats (status `unknown`); the wire shape is pinned.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn reticulum_stats_for_handle(
+        &self,
+        _id: usize,
+    ) -> Option<crate::transport::reticulum::TransportStats> {
+        None
+    }
+
     /// Pub-crate variant of [`Self::run_speak_pipeline`] reachable
     /// from `crate::ffi::pyo3`. The Python `send_inline_text` /
     /// `send_durable_inline_text` wrappers need to run the pipeline
