@@ -487,7 +487,7 @@ and intentionally does not touch the substrate today. Together these
 fields make CIRISEdge legibly compliant with the CIRIS 3.0 protocol
 surface, in the AGPL letter as well as the apophatic spirit of §1.4.
 
-## 11. Architectural surfaces shipped v0.5.0 → v0.18.x
+## 11. Architectural surfaces shipped v0.5.0 → v0.19.x
 
 The v0.4.0 reverse-engineering pass anchored the v1.0-prep architecture
 floor — verify pipeline, durable outbound, Reticulum + HTTP transports,
@@ -632,6 +632,26 @@ implementation file:
   cryptographic root is persist's federation-attested
   `federation_keys` directory, not a CA chain or operator-local
   `TrustClass` opinion.
+- **HTTPS Python-init parity** (v0.19.3 CIRISEdge#49,
+  `src/ffi/pyo3.rs::init_edge_runtime` + `src/transport/http.rs::HttpsInitParams`
+  + `src/transport/http.rs::mint_dev_self_signed_pair`,
+  cross-wheel contract pinned by `tests/https_pyedge_init.rs`,
+  deployment guide in `docs/HTTPS_DEPLOYMENT.md` §5). The v0.18.1
+  HTTPS surface is now reachable from the Python init boundary —
+  six new optional kwargs (`https_listen_addr` / `https_tls_cert_path`
+  / `https_tls_key_path` / `https_mtls_required` /
+  `https_bearer_secret` / `https_dev_self_signed`) plus
+  `disable_reticulum` cover the four deployment cells the
+  CIRISConformance v0.19.3+ harness (#3 + #4) drives:
+  Reticulum-only (default), Reticulum + HTTPS coexistence,
+  HTTPS-only (`disable_reticulum=True`), and HTTPS-with-mTLS.
+  Validation is typed: `dev_self_signed=True` + cert paths
+  yields `ValueError("conflicting TLS config: ...")`. The
+  dev-cert mint uses a deterministic seed derived from
+  `SHA-256("ciris-edge::dev-self-signed::v1\0" ‖ federation_key_id)` —
+  **NOT** the federation seed (AV-17 preserved). v0.19.3 is the
+  cross-wheel boundary closure for HTTPS; the Rust mechanism was
+  finished at v0.18.1.
 
 ## 12. How to maintain this document
 
