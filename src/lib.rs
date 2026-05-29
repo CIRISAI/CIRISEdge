@@ -161,9 +161,10 @@ pub use ffi::uniffi_impl_links::{link_count, link_list, link_open, link_request,
 #[cfg(feature = "ffi-uniffi")]
 pub use ffi::uniffi_impl_routing::{
     routing_announce_table, routing_blackhole_add, routing_blackhole_list,
-    routing_blackhole_remove, routing_path_drop, routing_path_drop_via, routing_path_request,
-    routing_path_table, routing_path_to, routing_rate_table, routing_reverse_table,
-    routing_transport_id, routing_transport_uptime, routing_tunnels,
+    routing_blackhole_prune_expired, routing_blackhole_remove, routing_path_drop,
+    routing_path_drop_via, routing_path_request, routing_path_table, routing_path_to,
+    routing_rate_table, routing_reverse_table, routing_transport_id, routing_transport_uptime,
+    routing_tunnels,
 };
 
 // The included scaffolding emits ~30 `#[unsafe(no_mangle)]` FFI shim

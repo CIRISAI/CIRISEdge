@@ -901,46 +901,28 @@ pub struct ReticulumTransport {
     /// `request_id` lands here. A `HashSet<[u8; 16]>` so multiple
     /// in-flight requests across links never collide.
     timed_out_requests: Arc<Mutex<HashSet<[u8; 16]>>>,
-    /// CIRISEdge#33 (v0.15.0) — operator-configured deny-list
-    /// (in-memory). Keyed by the 16-byte Reticulum identity hash of
-    /// the blocked peer. `send` consults this BEFORE the leviculum
-    /// connect call; a hit increments the entry's `hits` counter and
-    /// returns `TransportError::PeerBlackholed`.
+    /// CIRISEdge#33 — operator-configured deny-list. Keyed by the
+    /// 16-byte Reticulum identity hash of the blocked peer. `send`
+    /// consults this BEFORE the leviculum connect call; a hit
+    /// increments the entry's `hits` counter (via
+    /// `BlackholeRules::blackhole_record_hit`, fire-and-forget on a
+    /// spawned task) and returns `TransportError::PeerBlackholed`.
     ///
-    /// v0.15.0 limitation: the blackhole table is **process-local**.
-    /// Operator changes survive a `ReticulumTransport` rebuild within
-    /// the same `Edge` (the `Arc<RwLock<...>>` is held by the
-    /// transport instance) but NOT a process restart. A v0.15.x
-    /// patch flips this to a persist-backed store once the
-    /// `cirislens.blackhole_rules` table lands (CIRISPersist
-    /// follow-up filed during v0.15.0 implementation; see issue body
-    /// for the schema sketch).
-    blackhole: Arc<parking_lot::RwLock<HashMap<Vec<u8>, BlackholeRecord>>>,
+    /// v0.16.1 (CIRISPersist#120) — flipped from the v0.15.0
+    /// in-memory `Arc<RwLock<HashMap<Vec<u8>, BlackholeRecord>>>` to a
+    /// persist-backed `Arc<dyn BlackholeRules>` over the V052
+    /// `cirislens.blackhole_rules` table. Rules now survive process
+    /// restarts — the v0.15.0 acceptance criterion. `None` indicates a
+    /// transport built without a blackhole backend (typically a test
+    /// fixture that doesn't exercise the routing-table FFI surface);
+    /// `routing_blackhole_*` returns `TransportError::Config` in that
+    /// case, and the send-path enforcement check is a no-op.
+    blackhole: Option<Arc<dyn ciris_persist::federation::BlackholeRules>>,
     /// CIRISEdge#33 (v0.15.0) — process-wall-clock instant the
     /// transport was constructed. Backs `routing_transport_uptime`.
     /// Monotonic via `std::time::Instant`; transport replacement
     /// rebases the counter, which is the documented contract.
     started_at: std::time::Instant,
-}
-
-/// CIRISEdge#33 (v0.15.0) — internal blackhole record. Stored under
-/// the `Arc<RwLock<HashMap<Vec<u8>, _>>>` on [`ReticulumTransport`];
-/// projected to the FFI surface as [`crate::ffi::uniffi_types::EdgeBlackholeEntry`].
-///
-/// The `hits` counter is incremented under the RwLock's WRITE guard
-/// from `send`, so the count is reflected in the next `blackhole_list`
-/// snapshot. Implementations that need a contention-free hot path
-/// (very large deny-list, many concurrent sends) should consider
-/// flipping to a `dashmap`-backed store in a follow-up cut.
-#[derive(Debug, Clone)]
-struct BlackholeRecord {
-    until: Option<chrono::DateTime<chrono::Utc>>,
-    reason: Option<String>,
-    // Only read by routing_blackhole_list (#[cfg(feature = "ffi-uniffi")]);
-    // always set by routing_blackhole_add regardless of feature combo.
-    #[cfg_attr(not(feature = "ffi-uniffi"), allow(dead_code))]
-    added_at: chrono::DateTime<chrono::Utc>,
-    hits: u64,
 }
 
 /// Internal registry entry behind [`ReticulumTransport::interface_specs`].
@@ -1004,6 +986,19 @@ pub struct ReticulumAuth {
     /// defaults to `None` so all existing Reticulum tests compile
     /// unchanged).
     pub reachability: Option<Arc<ReachabilityTracker>>,
+    /// CIRISEdge#33 (v0.16.1 durable flip) — persist-backed operator
+    /// deny-list. When `Some`, `routing_blackhole_*` CRUD methods and
+    /// the send-path enforcement check route through the supplied
+    /// `Arc<dyn BlackholeRules>` (persist V052 `cirislens.blackhole_rules`
+    /// table; CIRISPersist#120). When `None`, the routing-table FFI
+    /// blackhole surface returns `TransportError::Config("blackhole
+    /// rules unavailable")` — tests that don't care about blackhole
+    /// CRUD typically pass `None`; production cohabitation
+    /// (`init_edge_runtime`) always passes the engine's
+    /// `Arc<dyn BlackholeRules>`. `routing_blackhole_*` calls no longer
+    /// touch process-local state — durability survives transport
+    /// rebuild AND process restart (the v0.15.0 acceptance criterion).
+    pub blackhole_rules: Option<Arc<dyn ciris_persist::federation::BlackholeRules>>,
 }
 
 impl Default for ReticulumAuth {
@@ -1015,6 +1010,7 @@ impl Default for ReticulumAuth {
             hybrid_policy: HybridPolicy::Strict,
             event_bus: None,
             reachability: None,
+            blackhole_rules: None,
         }
     }
 }
@@ -1053,6 +1049,7 @@ impl ReticulumTransport {
             hybrid_policy,
             event_bus,
             reachability,
+            blackhole_rules,
         } = auth;
 
         let identity = load_or_generate_identity(&config.identity_path)?;
@@ -1213,7 +1210,7 @@ impl ReticulumTransport {
             link_established_at: Arc::new(Mutex::new(HashMap::new())),
             request_responses: Arc::new(Mutex::new(HashMap::new())),
             timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
-            blackhole: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            blackhole: blackhole_rules,
             started_at: std::time::Instant::now(),
         })
     }
@@ -1617,28 +1614,49 @@ impl ReticulumTransport {
         Ok(())
     }
 
-    /// Snapshot every blackhole rule. Fully functional in v0.15.0 —
-    /// the rules live in the transport's in-memory `Arc<RwLock<HashMap>>`.
+    /// Snapshot every blackhole rule. v0.16.1 (CIRISPersist#120 flip)
+    /// — backed by persist's V052 `cirislens.blackhole_rules` table.
+    /// Returns `TransportError::Config("blackhole rules unavailable")`
+    /// when the transport was constructed without a
+    /// `ReticulumAuth.blackhole_rules` backend.
     #[cfg(feature = "ffi-uniffi")]
-    #[must_use]
-    pub fn routing_blackhole_list(&self) -> Vec<crate::ffi::uniffi_types::EdgeBlackholeEntry> {
-        let guard = self.blackhole.read();
-        guard
-            .iter()
-            .map(|(hash, rec)| crate::ffi::uniffi_types::EdgeBlackholeEntry {
-                identity_hash: hash.clone(),
+    pub async fn routing_blackhole_list(
+        &self,
+    ) -> Result<Vec<crate::ffi::uniffi_types::EdgeBlackholeEntry>, TransportError> {
+        let store = self
+            .blackhole
+            .as_ref()
+            .ok_or_else(|| TransportError::Config("blackhole rules unavailable".into()))?;
+        let rows = store
+            .blackhole_list()
+            .await
+            .map_err(|e| TransportError::Io(format!("blackhole_list: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|rec| crate::ffi::uniffi_types::EdgeBlackholeEntry {
+                identity_hash: rec.identity_hash,
                 until: rec.until.map(|t| t.to_rfc3339()),
-                reason: rec.reason.clone(),
+                reason: rec.reason,
                 added_at: rec.added_at.to_rfc3339(),
-                hits: rec.hits,
+                // Persist's `BlackholeRecord.hits` is i64 (DB-native).
+                // Edge's wire surface is u64; saturating cast for
+                // negative-impossible defensive posture.
+                #[allow(clippy::cast_sign_loss)]
+                hits: rec.hits.max(0) as u64,
             })
-            .collect()
+            .collect())
     }
 
     /// Add or replace a blackhole rule. `until` is RFC-3339 UTC; pass
-    /// `None` for a permanent rule. `reason` is an operator note. The
-    /// `hits` counter resets when a rule is replaced.
-    pub fn routing_blackhole_add(
+    /// `None` for a permanent rule. `reason` is an operator note.
+    ///
+    /// v0.16.1 (CIRISPersist#120 flip) — backed by persist's V052
+    /// `cirislens.blackhole_rules` table; operator-intent fields
+    /// (`until`, `reason`) are overwritten on conflict but `hits` and
+    /// `added_at` are preserved (re-upsert is intent-change, not
+    /// counter-reset — distinct from the v0.15.0 in-memory shape
+    /// which reset `hits` on replace).
+    pub async fn routing_blackhole_add(
         &self,
         identity_hash: &[u8],
         until: Option<&str>,
@@ -1649,6 +1667,15 @@ impl ReticulumTransport {
                 "identity_hash must be non-empty".into(),
             ));
         }
+        // Persist enforces a 16-byte length; surface the bad-length
+        // path as our typed Config error rather than letting it leak
+        // through as the persist error variant.
+        if identity_hash.len() != 16 {
+            return Err(TransportError::Config(format!(
+                "identity_hash must be 16 bytes, got {}",
+                identity_hash.len()
+            )));
+        }
         let until_parsed = if let Some(s) = until {
             Some(
                 chrono::DateTime::parse_from_rfc3339(s)
@@ -1658,23 +1685,59 @@ impl ReticulumTransport {
         } else {
             None
         };
-        let rec = BlackholeRecord {
-            until: until_parsed,
-            reason: reason.map(std::string::ToString::to_string),
-            added_at: chrono::Utc::now(),
-            hits: 0,
-        };
-        let mut guard = self.blackhole.write();
-        guard.insert(identity_hash.to_vec(), rec);
-        Ok(())
+        let store = self
+            .blackhole
+            .as_ref()
+            .ok_or_else(|| TransportError::Config("blackhole rules unavailable".into()))?;
+        store
+            .blackhole_upsert(identity_hash, until_parsed, reason)
+            .await
+            .map_err(|e| TransportError::Io(format!("blackhole_upsert: {e}")))
     }
 
     /// Remove a blackhole rule. Idempotent: returns `Ok(())` whether
-    /// or not the rule existed.
-    pub fn routing_blackhole_remove(&self, identity_hash: &[u8]) -> Result<(), TransportError> {
-        let mut guard = self.blackhole.write();
-        guard.remove(identity_hash);
-        Ok(())
+    /// or not the rule existed (POSIX `rm -f` ergonomics; persist's
+    /// `blackhole_remove` is silent-no-op on unknown identity).
+    pub async fn routing_blackhole_remove(
+        &self,
+        identity_hash: &[u8],
+    ) -> Result<(), TransportError> {
+        if identity_hash.len() != 16 {
+            return Err(TransportError::Config(format!(
+                "identity_hash must be 16 bytes, got {}",
+                identity_hash.len()
+            )));
+        }
+        let store = self
+            .blackhole
+            .as_ref()
+            .ok_or_else(|| TransportError::Config("blackhole rules unavailable".into()))?;
+        store
+            .blackhole_remove(identity_hash)
+            .await
+            .map_err(|e| TransportError::Io(format!("blackhole_remove: {e}")))
+    }
+
+    /// Drop every rule whose `until` is in the past relative to `now`.
+    /// Returns the number of rows pruned. Permanent rules (`until IS
+    /// NULL`) are NEVER pruned — operators must call
+    /// [`Self::routing_blackhole_remove`] explicitly.
+    ///
+    /// Intended for operator-cadenced cleanup; v0.16.1 does NOT yet
+    /// schedule a background pruner (deferred follow-up — see
+    /// `init_edge_runtime` docblock for the lifecycle hook rationale).
+    pub async fn routing_blackhole_prune_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, TransportError> {
+        let store = self
+            .blackhole
+            .as_ref()
+            .ok_or_else(|| TransportError::Config("blackhole rules unavailable".into()))?;
+        store
+            .blackhole_prune_expired(now)
+            .await
+            .map_err(|e| TransportError::Io(format!("blackhole_prune_expired: {e}")))
     }
 
     /// Snapshot the per-identity announce rate table. v0.15.0 returns
@@ -1729,42 +1792,75 @@ impl ReticulumTransport {
 
     /// CIRISEdge#33 — internal blackhole check. Returns a typed
     /// `TransportError::PeerBlackholed` if `identity_hash` is on the
-    /// deny-list (after pruning expired entries); also increments the
-    /// rule's `hits` counter. Called from `send` BEFORE the leviculum
-    /// connect.
-    fn check_blackhole(&self, identity_hash: &[u8]) -> Result<(), TransportError> {
-        // First pass under READ — fast path the common (no-block) case
-        // without taking the write lock.
-        {
-            let guard = self.blackhole.read();
-            let Some(rec) = guard.get(identity_hash) else {
-                return Ok(());
-            };
+    /// deny-list (after skipping expired entries — `blackhole_list`
+    /// returns all rows including expired ones, so the check filters
+    /// `until <= now` here rather than relying on `prune_expired` to
+    /// have run); also fires off a `record_hit` to bump the counter.
+    /// Called from `send` BEFORE the leviculum connect.
+    ///
+    /// v0.16.1 (CIRISPersist#120 flip) — the rule lookup is a single
+    /// `blackhole_list` round-trip; production deployments expecting
+    /// large deny-lists should batch hits client-side per the
+    /// `BlackholeRules::blackhole_record_hit` docblock. The hit
+    /// increment is fire-and-forget (`tokio::spawn`) so the send-path
+    /// latency stays at one DB read.
+    ///
+    /// When the transport was built without a blackhole backend
+    /// (`ReticulumAuth.blackhole_rules == None`), this is a silent
+    /// no-op — the send proceeds. Tests that don't care about
+    /// blackhole semantics typically omit the backend.
+    async fn check_blackhole(&self, identity_hash: &[u8]) -> Result<(), TransportError> {
+        let Some(store) = self.blackhole.as_ref() else {
+            return Ok(());
+        };
+        // Pull the full row set; v0.16.1 cohabitation deployments have
+        // operator-curated deny-lists in the low-dozens range. A
+        // future cut can pivot to a single-row lookup primitive if
+        // persist exposes one (the trait surface today is
+        // `blackhole_list` only — see #120 docblock for the rationale
+        // of batched-flush over per-row lookup).
+        let rows = store
+            .blackhole_list()
+            .await
+            .map_err(|e| TransportError::Io(format!("blackhole_list (check): {e}")))?;
+        let now = chrono::Utc::now();
+        for rec in rows {
+            if rec.identity_hash != identity_hash {
+                continue;
+            }
             if let Some(until) = rec.until {
-                if chrono::Utc::now() >= until {
-                    // Expired — drop the entry below under write lock.
-                    drop(guard);
-                    self.blackhole.write().remove(identity_hash);
+                if now >= until {
+                    // Expired rule — let send proceed. A background
+                    // pruner (deferred to a follow-up cut) will drop
+                    // it lazily; in the interim operators can call
+                    // `routing_blackhole_prune_expired` manually.
                     return Ok(());
                 }
             }
+            // Live hit — fire-and-forget the hit-record so the
+            // counter reflects observation. `record_hit` is race-
+            // tolerant (silent no-op if the rule was removed between
+            // our check and the spawned increment), so the spawned
+            // task's outcome doesn't affect correctness.
+            let store_clone = Arc::clone(store);
+            let hash_clone = identity_hash.to_vec();
+            tokio::spawn(async move {
+                if let Err(e) = store_clone.blackhole_record_hit(&hash_clone).await {
+                    tracing::warn!(
+                        ?hash_clone,
+                        error = %e,
+                        "blackhole_record_hit failed; the rule blocked the send \
+                         correctly but the hits counter did not advance",
+                    );
+                }
+            });
+            return Err(TransportError::PeerBlackholed {
+                identity_hash: rec.identity_hash,
+                reason: rec.reason,
+                until: rec.until.map(|t| t.to_rfc3339()),
+            });
         }
-        // We hit a live rule — promote to write to bump `hits` + clone
-        // the metadata for the error.
-        let (reason, until) = {
-            let mut guard = self.blackhole.write();
-            let Some(rec) = guard.get_mut(identity_hash) else {
-                // Raced with a remove — let send proceed.
-                return Ok(());
-            };
-            rec.hits = rec.hits.saturating_add(1);
-            (rec.reason.clone(), rec.until.map(|t| t.to_rfc3339()))
-        };
-        Err(TransportError::PeerBlackholed {
-            identity_hash: identity_hash.to_vec(),
-            reason,
-            until,
-        })
+        Ok(())
     }
 
     /// Resolve a `destination_key_id` to a Reticulum peer. Consults
@@ -1828,7 +1924,7 @@ impl Transport for ReticulumTransport {
         // (they couldn't be sent to anyway, so the check is
         // semantically inert at that point).
         let dest_hash_bytes = peer.dest_hash.into_bytes();
-        self.check_blackhole(&dest_hash_bytes)?;
+        self.check_blackhole(&dest_hash_bytes).await?;
 
         // Establish a link to the peer's destination. `connect`
         // returns immediately; the link is usable once

@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -63,11 +63,23 @@ publish = false
 # live calls. v3.1.1 also pulls #118 (put_edge_detection_event admission;
 # unblocks CIRISEdge#39 emit_verdict at v0.13.1) and #119
 # (local_signer_capsule for the ReticulumTransport identity handoff at
-# v0.13.1). Both v3.1.0 and v3.1.1 stay in the v3.1.x line so a single
-# `tag = "v3.1.1"` pin pulls #117 + #118 + #119; only #117 is the
-# relevant unlock for v0.15.1, the others are forward-pin for the
-# v0.13.1 follow-up cut.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.1.1", version = "3", features = ["sqlite"] }
+# v0.13.1).
+# v3.2.0 (CIRISPersist#120) — adds the sibling `BlackholeRules` trait
+# (`blackhole_list` / `_upsert` / `_remove` / `_record_hit` /
+# `_prune_expired`) + V052 `cirislens.blackhole_rules` table giving
+# CIRISEdge's `ReticulumTransport` a durable per-identity deny-list.
+# CIRISEdge v0.16.1 flips the v0.15.0 in-memory
+# `Arc<RwLock<HashMap<Vec<u8>, BlackholeRecord>>>` to
+# `Arc<dyn BlackholeRules>` over the cohabitating engine's backend —
+# the v0.15.0 acceptance criterion required durability. The trait is
+# sibling to (not folded into) `FederationDirectory` because federation
+# directory is about crypto identities + trust statements; blackhole is
+# about transport-layer address denials (distinct concern, distinct
+# lifetime). Both `SqliteBackend` + `PostgresBackend` implement it, so
+# edge derives `Arc<dyn BlackholeRules>` from the same `BackendDispatch`
+# arm `outbound_queue_capsule` already produces — no new capsule
+# required (the capsule family stays at 6).
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.2.0", version = "3", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -550,7 +562,7 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.1.1", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.2.0", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
 # CIRISEdge#23 — `tests/transport_http_hardening.rs` mints self-signed
 # Ed25519 certs on the fly to exercise the rustls server config + the
 # custom `FederationCnVerifier`. `rcgen` is the canonical Rust X.509

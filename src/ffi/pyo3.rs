@@ -65,6 +65,69 @@
 //! expose `runtime_handle_capsule`; init_edge_runtime emits a typed
 //! `PyRuntimeError` pointing at the upgrade path.
 //!
+//! # v0.16.1 cherry-pick — local_signer_capsule (CIRISPersist#119, CIRISEdge#43)
+//!
+//! v0.13.0 / v0.14.0 / v0.15.0 / v0.16.0 read the Reticulum-transport
+//! federation Ed25519 pubkey from the `keyring_signer_capsule` (the
+//! hardware-rooted hybrid signer). Under
+//! `keyring_storage_kind = hardware_hsm_only` the hardware path emits
+//! a 65-byte hybrid pubkey (e.g. TPM P-256), and
+//! `ReticulumTransport::new` correctly rejected with `"federation
+//! Ed25519 pubkey must be 32 bytes, got 65"` — blocking
+//! CIRISAgent 2.9.4's cohabitation-init handshake on every hardware
+//! deployment. The fix landed on the `v0.13.x-line` branch as v0.13.1
+//! but never reached main (v0.14.0–v0.16.0 still carried the broken
+//! init path); v0.16.1 cherry-picks the fix onto the v0.16-line so
+//! downstream consumers `pip install ciris-edge>=0.14.0` get a working
+//! cohab.
+//!
+//! v0.16.1 consumes persist v3.1.1's `local_signer_capsule` — a sixth
+//! `PyCapsule` accessor wrapping `Arc<ciris_persist::signing::LocalSigner>`
+//! (a software Ed25519 identity loaded from the agent's
+//! `local_key_path`). The capsule is wrapped in persist's
+//! `LocalSignerHardwareAdapter` (which implements
+//! `ciris_keyring::HardwareSigner` honestly with a 32-byte raw Ed25519
+//! `public_key()`) and threaded into the [`ReticulumAuth.signer`]
+//! field. The hot-path scrub-signing surface
+//! (`Edge::builder().signer(...)` → `Edge::send_durable` envelope
+//! signing) stays on the hardware-rooted `keyring_signer_capsule` —
+//! that is the correct primitive for forensic envelope signing.
+//!
+//! Two capsules, two roles, one engine: keyring_signer drives
+//! hot-path scrub envelopes; local_signer drives transport-link
+//! identity. AV-17 unchanged — neither seed crosses the FFI; both
+//! signers arrive as `Arc<dyn Trait>` opaque pointers.
+//!
+//! When `local_signer_capsule` raises the typed
+//! `ValueError("local_signer_unavailable")` (older cohab-init paths
+//! predating persist v2.12.0 / #112), init_edge_runtime falls back to
+//! the existing v0.13.0 behavior — keyring_signer drives BOTH the
+//! envelope and transport-identity surfaces. A warning log names the
+//! upgrade path. Production hardware-keyring deployments MUST be on
+//! persist v3.1.1+ with `from_shared_with_local` for cohab init to
+//! succeed; the fallback preserves binary compatibility for
+//! still-on-3.0.x consumers using the software-only keyring path
+//! (where the 32-byte Ed25519 invariant happens to hold from the
+//! keyring signer side).
+//!
+//! # v0.16.1 — blackhole_rules durable flip (CIRISPersist#120, CIRISEdge#33)
+//!
+//! v0.15.0 shipped the routing-table FFI with an in-memory
+//! `Arc<RwLock<HashMap<Vec<u8>, BlackholeRecord>>>` backing the
+//! operator-configured deny-list. The wire shape was the v0.15.0 lock;
+//! the storage was process-restart-lossy. v0.15.0's acceptance
+//! criterion required durability — landing depended on persist
+//! shipping a `BlackholeRules` trait + table.
+//!
+//! Persist v3.2.0 (CIRISPersist#120) ships the sibling `BlackholeRules`
+//! trait (`blackhole_list` / `_upsert` / `_remove` / `_record_hit` /
+//! `_prune_expired`) + V052 `cirislens.blackhole_rules` table; v0.16.1
+//! consumes it. The `Arc<dyn BlackholeRules>` is derived from the same
+//! `BackendDispatch` arm `outbound_queue_capsule` already produces —
+//! no new capsule needed. Operator-set rules survive process restarts;
+//! the hot-path send check + `record_hit` increment route through the
+//! same backend pool the rest of edge already uses.
+//!
 //! # Unsafe carve-out
 //!
 //! WHY: `PyCapsule` extraction is inherently unsafe — `cap.reference::<T>()`
@@ -869,8 +932,17 @@ fn parse_hybrid_policy(s: &str, soft_freshness_window_seconds: u64) -> PyResult<
 ///    - `"runtime_handle_capsule"` wraps
 ///      `tokio::runtime::Handle` (v2.8.0 — CIRISPersist#111
 ///      cross-cdylib statics fix)
-/// 2. Edge's `Cargo.toml` pins `ciris-persist = "2", tag = "v2.8.0"`
-///    and pyproject.toml pins `ciris-persist>=2.8.0,<3` — together,
+///    - `"local_signer_capsule"` wraps
+///      `std::sync::Arc<ciris_persist::signing::LocalSigner>`
+///      (v3.1.1 — CIRISPersist#119; the 32-byte Ed25519 transport-
+///      identity surface consumed by `ReticulumTransport::new` for
+///      federation identity attestation under `hardware_hsm_only`
+///      keyring storage). Extracted via the typed-fallback
+///      [`extract_local_signer`] helper rather than this generic
+///      helper, because it has a fall-back-able `Unavailable`
+///      failure mode the others do not.
+/// 2. Edge's `Cargo.toml` pins `ciris-persist = "3", tag = "v3.2.0"`
+///    and pyproject.toml pins `ciris-persist>=3.2.0,<4` — together,
 ///    these enforce that the host engine's `*_capsule` pymethods exist,
 ///    return a `PyCapsule`, and carry the wrapped types persist's
 ///    docblocks document.
@@ -919,6 +991,94 @@ where
     Ok(map(inner))
 }
 
+/// v0.16.1 cherry-pick (CIRISEdge#43 / CIRISPersist#119) — typed
+/// outcome of the `local_signer_capsule` extraction attempt. Only
+/// [`init_edge_runtime`] consumes this; the variants drive the
+/// fallback-vs-hard-error decision in Step 3.5.
+#[cfg(feature = "transport-reticulum")]
+enum LocalSignerCapsuleError {
+    /// Engine doesn't expose `local_signer_capsule` at all (persist
+    /// older than v3.1.1). Fallback to keyring_signer for transport
+    /// identity; log a warning naming the persist upgrade path.
+    MethodAbsent,
+    /// Engine exposes the method but raised the typed
+    /// `ValueError("local_signer_unavailable")` — the agent
+    /// constructed the engine without `local_key_id` + `local_key_path`
+    /// (pre-2.12.0 / #112 init paths). Fallback to keyring_signer for
+    /// transport identity; log a warning naming the init-path upgrade.
+    Unavailable,
+    /// Any other failure (capsule cast mismatch, unexpected exception
+    /// type) — surface as a hard error from `init_edge_runtime` rather
+    /// than silently fall back.
+    Other(PyErr),
+}
+
+/// v0.16.1 cherry-pick (CIRISEdge#43 / CIRISPersist#119) — extract the
+/// persist transport-identity `Arc<LocalSigner>` from the shared
+/// engine's `local_signer_capsule()` pymethod.
+///
+/// Returns:
+/// - `Ok(Arc<ciris_persist::signing::LocalSigner>)` on success — the
+///   wrapped Arc is cloned out of the capsule for the caller to keep
+///   beyond the capsule's lifetime.
+/// - `Err(LocalSignerCapsuleError::MethodAbsent)` when
+///   `engine.hasattr("local_signer_capsule")` is false.
+/// - `Err(LocalSignerCapsuleError::Unavailable)` when the method
+///   exists but raised `ValueError("local_signer_unavailable")`.
+/// - `Err(LocalSignerCapsuleError::Other(_))` for any other failure
+///   (non-PyCapsule return value, wrong capsule name tag, etc.).
+///
+/// Distinct from [`extract_capsule`] because the local_signer path
+/// has a fall-back-able failure mode (the typed
+/// `local_signer_unavailable` ValueError) that the other capsules do
+/// not — for those, a missing method is a hard "wrong persist version"
+/// error.
+#[cfg(feature = "transport-reticulum")]
+#[allow(unsafe_code)]
+fn extract_local_signer(
+    engine: &Bound<'_, PyAny>,
+) -> Result<Arc<ciris_persist::signing::LocalSigner>, LocalSignerCapsuleError> {
+    if !engine.hasattr("local_signer_capsule").unwrap_or(false) {
+        return Err(LocalSignerCapsuleError::MethodAbsent);
+    }
+    let result = engine.call_method0("local_signer_capsule").map_err(|e| {
+        // Distinguish the typed `ValueError("local_signer_unavailable")`
+        // from any other exception. Persist v3.1.1's
+        // `local_signer_capsule_py` raises ONLY that exact
+        // ValueError when the engine wasn't constructed with
+        // local_key_id + local_key_path; anything else is a real
+        // error.
+        Python::attach(|py| {
+            if e.is_instance_of::<PyValueError>(py)
+                && e.value(py).to_string() == "local_signer_unavailable"
+            {
+                LocalSignerCapsuleError::Unavailable
+            } else {
+                LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
+                    "engine.local_signer_capsule() raised: {e}"
+                )))
+            }
+        })
+    })?;
+    let cap: Bound<'_, PyCapsule> = result.cast_into::<PyCapsule>().map_err(|e| {
+        LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
+            "engine.local_signer_capsule() did not return a PyCapsule (got {e}); \
+             persist 3.1.1 cohabitation contract violated"
+        )))
+    })?;
+    // SAFETY: persist v3.1.1+'s `local_signer_capsule_py` wraps a
+    // `Arc<ciris_persist::signing::LocalSigner>` under the name tag
+    // `"ciris_persist::local_signer"`. The Cargo pin
+    // (`ciris-persist = { tag = "v3.2.0", version = "3" }`) enforces
+    // that contract (v3.2.0 carries v3.1.1's surface forward). The
+    // cloned `Arc` is owned by the caller — the capsule reference
+    // doesn't escape this function.
+    #[allow(deprecated)]
+    let inner: &Arc<ciris_persist::signing::LocalSigner> =
+        unsafe { cap.reference::<Arc<ciris_persist::signing::LocalSigner>>() };
+    Ok(Arc::clone(inner))
+}
+
 /// Construct an [`Edge`] from the host's shared persist engine.
 ///
 /// This is the CIRIS 3.0 cohabitation entry point (CIRISEdge#16,
@@ -952,13 +1112,36 @@ where
 /// - Calls `engine.keyring_signer_capsule()` → extracts
 ///   `KeyringSignerHandle` (`Arc<dyn HardwareSigner>` +
 ///   `Option<Arc<dyn PqcSigner>>` + `key_id`) and wraps them in edge's
-///   own [`LocalSigner`]. The keyring identity is NOT re-bootstrapped
-///   — the cohabitation invariant is "one keyring identity per host"
+///   own [`LocalSigner`]. This drives the hot-path scrub-envelope
+///   signing surface (`Edge::send_durable`). The keyring identity is
+///   NOT re-bootstrapped — the cohabitation invariant is "one keyring
+///   identity per host"
 ///   (`docs/COHABITATION.md` rule 1).
+/// - v0.16.1 cherry-pick (CIRISEdge#43): Calls
+///   `engine.local_signer_capsule()` → extracts
+///   `Arc<ciris_persist::signing::LocalSigner>`, wraps it in
+///   `ciris_persist::signing::LocalSignerHardwareAdapter` (32-byte raw
+///   Ed25519 `public_key`), and threads it into the
+///   `ReticulumAuth.signer` field as the federation Ed25519 identity.
+///   When the engine raises the typed
+///   `ValueError("local_signer_unavailable")` (older cohab-init paths
+///   predating persist v2.12.0 / #112), falls back to using the
+///   keyring signer for transport identity — the v0.13.0 behavior;
+///   the operator gets a warning log naming the upgrade path. Under
+///   `keyring_storage_kind = hardware_hsm_only` the fallback path
+///   will fail at `ReticulumTransport::new` with the v0.13.0
+///   65-byte-pubkey error shape (the diagnostic the operator needs
+///   to see).
+/// - v0.16.1 (CIRISEdge#33 durability flip): derives
+///   `Arc<dyn BlackholeRules>` from the already-extracted
+///   `BackendDispatch` and threads it into [`ReticulumAuth`] so the
+///   transport's operator deny-list is persisted via the V052
+///   `cirislens.blackhole_rules` table.
 /// - Builds a [`ReticulumTransport`] with [`ReticulumAuth`] wiring
-///   the signer + rooting directory + the configured hybrid policy.
-///   The transport's authenticated cold-start path (CIRISEdge#15,
-///   AV-42 closure) is then live.
+///   the transport-identity signer + rooting directory + the
+///   configured hybrid policy + the durable blackhole store. The
+///   transport's authenticated cold-start path (CIRISEdge#15, AV-42
+///   closure) is then live.
 /// - Assembles `Edge::builder().directory(..).queue(..).signer(..)
 ///   .transport(..).build()` and returns the [`PyEdge`] wrapper.
 ///
@@ -1146,22 +1329,135 @@ fn init_edge_runtime(
             BackendDispatch::Postgres(b) => (b.clone(), b.clone()),
             BackendDispatch::Sqlite(b) => (b.clone(), b.clone()),
         };
+    // v0.16.1 (CIRISEdge#33 durable flip / CIRISPersist#120) — derive
+    // `Arc<dyn BlackholeRules>` from the same `BackendDispatch` arm.
+    // Sibling trait to `FederationDirectory`; both backends impl it.
+    // No new capsule needed — the existing `outbound_queue_capsule`
+    // surface gives us everything (the V052 `cirislens.blackhole_rules`
+    // table lives in the same DB as the outbound queue).
+    let blackhole_rules: Arc<dyn ciris_persist::federation::BlackholeRules> = match &queue_dispatch
+    {
+        BackendDispatch::Postgres(b) => b.clone(),
+        BackendDispatch::Sqlite(b) => b.clone(),
+    };
     let queue: Arc<dyn OutboundHandle> = match queue_dispatch {
         BackendDispatch::Postgres(b) => b,
         BackendDispatch::Sqlite(b) => b,
     };
 
-    // ── Step 3: keyring signer parts → edge's LocalSigner.
+    // ── Step 3: keyring signer parts → edge's hot-path LocalSigner.
     //
     // persist's `KeyringSignerHandle` already contains the cloned
     // `Arc<dyn HardwareSigner>` + optional `Arc<dyn PqcSigner>` the
     // host loaded; wrap them in edge's local-signer struct without
-    // re-bootstrapping the keyring (AV-17 / COHABITATION rule 1).
+    // re-bootstrapping the keyring (AV-17 / COHABITATION rule 1). This
+    // `signer` is the **scrub-envelope** signing surface threaded into
+    // `Edge::builder().signer(...)` — `Edge::send_durable` and the
+    // inbound dispatch ACK path use it for hybrid hardware-rooted
+    // signatures.
     let signer = Arc::new(LocalSigner::new(
         signer_handle.key_id.clone(),
         signer_handle.signer.clone(),
         signer_handle.pqc_signer.clone(),
     ));
+
+    // ── Step 3.5: local_signer_capsule → Reticulum transport-identity
+    // signer (CIRISEdge#43 / CIRISPersist#119, v0.16.1 cherry-pick from
+    // v0.13.1).
+    //
+    // The Reticulum transport's federation Ed25519 identity
+    // attestation reads a 32-byte raw pubkey via `signer.classical
+    // .public_key()` — see `src/transport/reticulum.rs`
+    // `build_local_attestation`. The hardware-rooted keyring signer
+    // (Step 3 above) emits a **65-byte hybrid pubkey** under
+    // `keyring_storage_kind = hardware_hsm_only` (TPM P-256), which
+    // `ReticulumTransport::new` correctly rejects with
+    // `"federation Ed25519 pubkey must be 32 bytes, got 65"`. That was
+    // the v0.13.0 production blocker for CIRISAgent 2.9.4's hardware-
+    // keyring cohabitation init handshake.
+    //
+    // Persist v3.1.1 (CIRISPersist#119) exposes the agent's
+    // transport-identity `Arc<LocalSigner>` (software Ed25519 loaded
+    // from `local_key_path`) via `local_signer_capsule()`. We extract
+    // it, wrap it in `LocalSignerHardwareAdapter` (an
+    // `Arc<dyn HardwareSigner>` whose `public_key()` returns the
+    // 32-byte raw Ed25519 — exactly the surface Reticulum needs), and
+    // build a second edge `LocalSigner` over it. The hot-path
+    // `signer` (Step 3) stays hardware-rooted; only the
+    // `ReticulumAuth.signer` (Step 4 below) takes this transport-
+    // identity signer.
+    //
+    // Fallback: when the engine raises
+    // `ValueError("local_signer_unavailable")` (older cohab-init
+    // paths — agent didn't construct the engine with
+    // `from_shared_with_local` / `local_key_id` + `local_key_path`),
+    // we log a warning and fall through to the v0.13.0 behavior:
+    // ReticulumAuth.signer carries the keyring signer. Under
+    // hardware_hsm_only that will still fail at transport build, but
+    // with the same diagnostic v0.13.0 produced — the operator's
+    // upgrade path is now clear. Software-only keyring deployments
+    // (where the keyring signer also yields a 32-byte Ed25519
+    // pubkey) continue to work unchanged.
+    //
+    // Method-absent (pre-v3.1.1 persist): same fallback path, named
+    // separately for diagnostic clarity. Note the v0.16.1 floor is
+    // v3.2.0 (BlackholeRules); the capsule was added at v3.1.1 so this
+    // branch only fires against severely-stale persist installs the
+    // v3.2.0 floor is already pulling forward.
+    let reticulum_identity_signer: Arc<LocalSigner> = match extract_local_signer(&engine) {
+        Ok(local_signer_arc) => {
+            // Adapt persist's `Arc<LocalSigner>` to
+            // `Arc<dyn HardwareSigner>` via persist's adapter — the
+            // adapter's `public_key()` returns the 32-byte raw Ed25519
+            // (`SigningKey::verifying_key().to_bytes()`). We thread it
+            // into edge's `LocalSigner` `classical` slot. PQC stays
+            // `None` here — the Reticulum attestation only signs the
+            // Ed25519 transport-identity payload; PQC envelope signing
+            // is the hot-path keyring signer's responsibility.
+            let adapter: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+                ciris_persist::signing::LocalSignerHardwareAdapter::new(local_signer_arc),
+            );
+            Arc::new(LocalSigner::new(
+                signer_handle.key_id.clone(),
+                adapter,
+                None,
+            ))
+        }
+        Err(LocalSignerCapsuleError::Unavailable) => {
+            tracing::warn!(
+                "ciris_persist.Engine raised local_signer_unavailable from \
+                 local_signer_capsule(); falling back to keyring_signer for \
+                 Reticulum transport identity. Under keyring_storage_kind = \
+                 hardware_hsm_only this fallback will fail at \
+                 ReticulumTransport::new with 'federation Ed25519 pubkey \
+                 must be 32 bytes, got 65'. Upgrade the agent's cohab-init \
+                 path to construct ciris_persist.Engine with local_key_id + \
+                 local_key_path (Engine.from_shared_with_local, persist \
+                 v2.12.0+ / #112)."
+            );
+            signer.clone()
+        }
+        Err(LocalSignerCapsuleError::MethodAbsent) => {
+            tracing::warn!(
+                "ciris_persist.Engine does not expose local_signer_capsule() \
+                 (persist < 3.1.1); falling back to keyring_signer for \
+                 Reticulum transport identity. Under keyring_storage_kind = \
+                 hardware_hsm_only this fallback will fail at \
+                 ReticulumTransport::new with 'federation Ed25519 pubkey \
+                 must be 32 bytes, got 65'. v0.16.1's Cargo floor is \
+                 `tag = \"v3.2.0\"`; this branch indicates a forced-pin \
+                 mismatch on the consumer side."
+            );
+            signer.clone()
+        }
+        Err(LocalSignerCapsuleError::Other(e)) => {
+            // Non-typed failure (capsule cast failure, etc.) — surface
+            // as a hard error rather than silently fall back. This
+            // preserves the v0.13.0 "loud failure on unexpected
+            // capsule shape" contract.
+            return Err(e);
+        }
+    };
 
     // ── Step 4: parse the Reticulum transport config.
     let listen_addr = listen_addr
@@ -1196,12 +1492,26 @@ fn init_edge_runtime(
     ));
 
     let auth = ReticulumAuth {
-        signer: Some(signer.clone()),
+        // v0.16.1 cherry-pick (CIRISEdge#43): the Reticulum-identity
+        // signer is split out from the hot-path keyring signer above.
+        // When local_signer_capsule is available
+        // (`from_shared_with_local`-constructed engine, persist
+        // v3.1.1+), this carries the 32-byte raw Ed25519 transport
+        // identity adapted via `LocalSignerHardwareAdapter`. When
+        // unavailable, it falls through to the same `signer` the
+        // envelope path uses (v0.13.0 behavior). See Step 3.5 above
+        // for the fallback rationale.
+        signer: Some(reticulum_identity_signer.clone()),
         rooting: Some(rooting_dir.clone()),
         resolver: None,
         hybrid_policy,
         event_bus: Some(Arc::clone(&event_bus)),
         reachability: Some(Arc::clone(&reachability_tracker)),
+        // v0.16.1 (CIRISEdge#33 durable flip / CIRISPersist#120) —
+        // route the routing-table FFI's deny-list through persist's
+        // V052 `cirislens.blackhole_rules` table. Rules survive
+        // process restarts; the in-memory HashMap is gone.
+        blackhole_rules: Some(Arc::clone(&blackhole_rules)),
     };
 
     // ── Step 5: build the transport + Edge under the host runtime.
@@ -2319,9 +2629,11 @@ mod pyo3_tier2_tests {
                 assert!(
                     !msg.contains("federation_directory_capsule")
                         && !msg.contains("outbound_queue_capsule")
-                        && !msg.contains("keyring_signer_capsule"),
+                        && !msg.contains("keyring_signer_capsule")
+                        && !msg.contains("local_signer_capsule"),
                     "init_edge_runtime must reach past capsule extraction with a \
-                     valid PyEngine engine arg (the v0.9.2 cohabitation contract); \
+                     valid PyEngine engine arg (the v0.9.2 cohabitation contract; \
+                     v0.16.1 cherry-pick adds local_signer_capsule for CIRISEdge#43); \
                      got: {msg}"
                 );
                 // Also reject the v0.9.1 cross-module identity regression
@@ -2614,5 +2926,290 @@ mod pyo3_tier2_tests {
                  can diagnose; got: {msg}"
             );
         });
+    }
+
+    // ── v0.16.1 cherry-pick (CIRISEdge#43 / CIRISPersist#119) — local_signer_capsule
+    //
+    // The federation-cohab unblocker for CIRISAgent 2.9.4 (originally
+    // shipped at v0.13.1 on the `v0.13.x-line` branch; this is the
+    // cherry-pick onto main so v0.16+ consumers get the fix too).
+    // v0.13.0–v0.16.0 read the Reticulum transport-identity Ed25519
+    // pubkey from `keyring_signer_capsule`, which under
+    // `keyring_storage_kind = hardware_hsm_only` emits a 65-byte hybrid
+    // pubkey (TPM P-256). `ReticulumTransport::new` correctly rejected
+    // with `"federation Ed25519 pubkey must be 32 bytes, got 65"`,
+    // blocking every hardware-keyring cohab init. Persist v3.1.1
+    // adds `local_signer_capsule()` exposing the software Ed25519
+    // transport-identity `Arc<LocalSigner>`; v0.16.1 routes the
+    // Reticulum-identity primitive through it via
+    // `LocalSignerHardwareAdapter`. The hot-path scrub-envelope
+    // signing surface stays on `keyring_signer_capsule`.
+    //
+    // The two tests below pin:
+    //   1. happy path — an engine constructed with `local_key_id` +
+    //      `local_key_path` populates `local_signer_capsule`;
+    //      `init_edge_runtime` extracts it and uses the 32-byte
+    //      Ed25519 surface as the Reticulum identity. Transport
+    //      construction succeeds.
+    //   2. fallback path — an engine constructed WITHOUT
+    //      `local_key_id` raises `ValueError("local_signer_unavailable")`
+    //      from `local_signer_capsule()`; `init_edge_runtime` falls
+    //      back to `keyring_signer` and logs a warning. The init then
+    //      either succeeds (software-keyring host: keyring signer
+    //      yields a 32-byte Ed25519 pubkey) or fails at
+    //      `ReticulumTransport::new` with the v0.13.0 65-byte error
+    //      (hardware-keyring host) — either shape is the documented
+    //      fallback behavior.
+    //
+    // We can't directly assert "transport identity is 32 bytes" from
+    // outside the transport (no public accessor); the test asserts the
+    // INDIRECT INVARIANT: with local_signer_capsule available, init
+    // reaches `signer_key_id()` cleanly (transport built successfully).
+    // The 32-byte invariant is enforced by `build_local_attestation`'s
+    // hard check (`src/transport/reticulum.rs`); any regression there
+    // would surface as a `federation Ed25519 pubkey must be 32 bytes`
+    // error message.
+
+    /// v0.16.1 cherry-pick — happy path. Engine constructed with
+    /// `local_key_id` + `local_key_path` exposes a populated
+    /// `local_signer_capsule()`. `init_edge_runtime` routes the
+    /// Reticulum-identity signer through `LocalSignerHardwareAdapter`
+    /// and the transport builds cleanly (the 32-byte Ed25519 raw
+    /// pubkey from `LocalSigner.signing_key.verifying_key().to_bytes()`
+    /// satisfies `ReticulumTransport::new`'s identity validation,
+    /// regardless of what the platform keyring's `signing_key_id`
+    /// resolves to — hardware P-256 included).
+    ///
+    /// The test asserts `outcome` is `Ok` OR — if the platform keyring
+    /// happens to fail in a DIFFERENT downstream stage (e.g. socket
+    /// bind on a hostile CI runner) — at minimum the error message
+    /// does NOT contain "32 bytes, got 65" (the v0.13.0 blocker shape)
+    /// and does NOT contain "local_signer_capsule" (capsule extraction
+    /// failure).
+    #[test]
+    fn py_init_edge_runtime_local_signer_capsule_supplies_reticulum_identity() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let identity_path = tmp.path().join("transport.id");
+        let local_seed_path = tmp.path().join("local.seed");
+        // A deterministic 32-byte seed → known software Ed25519
+        // identity. `LocalSigner::from_config` reads this verbatim and
+        // builds a `SigningKey::from_bytes(seed)`. The 32-byte raw
+        // pubkey surface via `LocalSignerHardwareAdapter::public_key`
+        // is what the Reticulum identity attestation consumes.
+        std::fs::write(&local_seed_path, [0x42_u8; 32]).expect("write local seed");
+
+        let signer_key_id = format!(
+            "edge-cohabit-local-signer-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let outcome: Result<String, PyErr> = Python::attach(|py| -> PyResult<String> {
+            install_ciris_persist_module(py)?;
+            let ciris_persist_mod = py.import("ciris_persist")?;
+            let engine_cls = ciris_persist_mod.getattr("Engine")?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("dsn", "sqlite::memory:")?;
+            kwargs.set_item("signing_key_id", signer_key_id.as_str())?;
+            kwargs.set_item("local_key_id", "edge-cohabit-local-id")?;
+            kwargs.set_item("local_key_path", local_seed_path.to_string_lossy().as_ref())?;
+            kwargs.set_item("pqc_sweep_on_init", false)?;
+            let engine = engine_cls.call((), Some(&kwargs))?;
+            // Sanity: the engine MUST expose local_signer_capsule under
+            // persist v3.1.1+. If this hasattr returns false, the
+            // Cargo pin (v3.2.0) didn't take — fail loudly so the
+            // operator sees the wrong-persist diagnostic up front.
+            assert!(
+                engine.hasattr("local_signer_capsule")?,
+                "ciris_persist v3.1.1+ MUST expose local_signer_capsule \
+                 (CIRISPersist#119) — Cargo pin out of sync?"
+            );
+            let edge = init_edge_runtime(
+                py,
+                engine,
+                identity_path.to_str().expect("identity path utf8"),
+                "127.0.0.1:0",
+                vec![],
+                300,
+                0,
+                "strict",
+                60,
+            )?;
+            Ok(edge.signer_key_id())
+        });
+
+        match outcome {
+            Ok(key_id) => {
+                // Happy path — local_signer_capsule supplied the 32-byte
+                // Ed25519 transport identity; the hardware-rooted keyring
+                // signer (which may have been P-256 / 65-byte under TPM)
+                // drives the Edge::send_durable scrub envelope path.
+                // signer_key_id is the keyring's key_id (the envelope-
+                // signing identity), NOT the Reticulum-transport
+                // identity — that's a separate dual-key identity loaded
+                // from `identity_path`.
+                assert_eq!(
+                    key_id,
+                    signer_key_id.as_str(),
+                    "signer_key_id must round-trip the engine's signing identity \
+                     (the keyring/envelope identity, not the Reticulum transport \
+                     identity)"
+                );
+            }
+            Err(e) => {
+                // If init still fails, the failure MUST NOT be the
+                // v0.13.0 "32 bytes, got 65" blocker — that's the
+                // exact shape v0.16.1 is meant to close. Capsule
+                // extraction itself must also not surface as the
+                // failure point.
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("32 bytes, got 65"),
+                    "v0.16.1 must close the v0.13.0 'federation Ed25519 pubkey \
+                     must be 32 bytes, got 65' blocker under hardware_hsm_only \
+                     keyring storage. Got: {msg}"
+                );
+                assert!(
+                    !msg.contains("local_signer_capsule"),
+                    "local_signer_capsule extraction must succeed when the engine \
+                     was constructed with local_key_id + local_key_path. Got: {msg}"
+                );
+                assert!(
+                    !msg.contains("local_signer_unavailable"),
+                    "local_signer_unavailable fallback must NOT trigger when \
+                     local_key_path is supplied. Got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// v0.16.1 cherry-pick — fallback path. Engine constructed
+    /// WITHOUT `local_key_id` (and without `local_key_path`) raises
+    /// the typed `ValueError("local_signer_unavailable")` from
+    /// `local_signer_capsule()`. `init_edge_runtime` MUST detect this
+    /// typed shape and fall through to keyring_signer for the
+    /// Reticulum-identity surface (logging a warning); it MUST NOT
+    /// surface the unavailable signal as a hard PyError.
+    ///
+    /// Under a software-fallback keyring host (CI without TPM access),
+    /// the keyring signer yields a 32-byte Ed25519 pubkey and the
+    /// transport build succeeds — meaning the test path's outcome is
+    /// `Ok` (signer_key_id round-trips). Under a hardware-keyring
+    /// host (TPM P-256), the fallback path fails at
+    /// `ReticulumTransport::new` with the v0.13.0 "32 bytes, got 65"
+    /// shape — that's the diagnostic the operator needs to see; the
+    /// test accepts that shape too.
+    ///
+    /// What the test REJECTS:
+    ///   - `local_signer_unavailable` surfacing as a PyError (failure
+    ///     of the fallback detection logic — would block init even on
+    ///     software-keyring hosts).
+    ///   - `local_signer_capsule` mentioned in a PyTypeError shape
+    ///     (capsule extraction failure — should be caught + fall
+    ///     through, not error).
+    ///
+    /// Persist's `from_shared_with_local` path requires both
+    /// `local_key_id` AND `local_key_path` to be set; omitting one
+    /// gives `LocalSignerError::PqcConfigInconsistent`-style errors at
+    /// engine construction. We omit BOTH to land cleanly on the "no
+    /// local signer" branch — `self.local_signer` ends up `None`,
+    /// which is exactly what `local_signer_capsule_py` checks.
+    #[test]
+    fn py_init_edge_runtime_local_signer_unavailable_falls_back_cleanly() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let identity_path = tmp.path().join("transport.id");
+
+        let signer_key_id = format!(
+            "edge-cohabit-nolocal-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let outcome: Result<String, PyErr> = Python::attach(|py| -> PyResult<String> {
+            install_ciris_persist_module(py)?;
+            let ciris_persist_mod = py.import("ciris_persist")?;
+            let engine_cls = ciris_persist_mod.getattr("Engine")?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("dsn", "sqlite::memory:")?;
+            kwargs.set_item("signing_key_id", signer_key_id.as_str())?;
+            // Deliberately NOT setting local_key_id / local_key_path —
+            // this is the "older cohab init path" the v3.1.1
+            // local_signer_capsule fallback contract documents.
+            kwargs.set_item("pqc_sweep_on_init", false)?;
+            let engine = engine_cls.call((), Some(&kwargs))?;
+            // Sanity: the engine exposes local_signer_capsule (the
+            // method exists on v3.1.1+), but it will raise
+            // ValueError("local_signer_unavailable") when called
+            // because `local_signer` is None on this engine.
+            assert!(
+                engine.hasattr("local_signer_capsule")?,
+                "persist v3.1.1+ MUST expose local_signer_capsule even when \
+                 local_signer is None (the method raises a typed error)"
+            );
+            let edge = init_edge_runtime(
+                py,
+                engine,
+                identity_path.to_str().expect("identity path utf8"),
+                "127.0.0.1:0",
+                vec![],
+                300,
+                0,
+                "strict",
+                60,
+            )?;
+            Ok(edge.signer_key_id())
+        });
+
+        match outcome {
+            Ok(key_id) => {
+                // Software-keyring host — fallback to keyring_signer
+                // happened to yield a 32-byte Ed25519 pubkey, transport
+                // built. The fallback warning was logged via tracing
+                // (not asserted here — would need a tracing-subscriber
+                // capture fixture for that).
+                assert_eq!(
+                    key_id,
+                    signer_key_id.as_str(),
+                    "fallback path must still round-trip signer_key_id when the \
+                     keyring signer yields a 32-byte Ed25519 pubkey"
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // The fallback MUST have detected
+                // local_signer_unavailable as a typed signal — it must
+                // NOT surface in the final error message (that would
+                // mean the typed-error detection logic failed and the
+                // error propagated as a hard failure).
+                assert!(
+                    !msg.contains("local_signer_unavailable"),
+                    "local_signer_unavailable ValueError MUST be caught + drive \
+                     fallback to keyring_signer. Surfacing it as a PyError is the \
+                     bug v0.16.1's typed-error-detection branch closes. Got: {msg}"
+                );
+                // Capsule-extraction failure on local_signer_capsule
+                // must not be the failure shape either.
+                assert!(
+                    !msg.contains("engine.local_signer_capsule() did not return"),
+                    "local_signer_capsule extraction must follow the typed \
+                     fallback contract, not the cast-failure path. Got: {msg}"
+                );
+                // Acceptable downstream failure: the 65-byte hardware
+                // pubkey rejection from ReticulumTransport::new. That's
+                // the v0.13.0 shape that hardware deployments WILL still
+                // see when the engine wasn't built with local_key_path.
+                // Document this in the test report — operator's upgrade
+                // path is "build engine with local_key_path".
+                let _ = msg;
+            }
+        }
     }
 }

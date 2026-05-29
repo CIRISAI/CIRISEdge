@@ -68,6 +68,12 @@ async fn auth_with(
     directory: Arc<ciris_persist::store::sqlite::SqliteBackend>,
     base: &std::path::Path,
 ) -> ReticulumAuth {
+    // v0.16.1 — the routing-table FFI's blackhole surface is now
+    // persist-backed; SqliteBackend implements BlackholeRules so the
+    // same fixture directory powers both the rooting + blackhole
+    // surfaces. The V052 `cirislens.blackhole_rules` table is created
+    // by `FederationDirectorySqlite::open`'s migration run.
+    let blackhole: Arc<dyn ciris_persist::federation::BlackholeRules> = directory.clone();
     ReticulumAuth {
         signer: Some(signer_for(key, base).await),
         rooting: Some(directory as Arc<dyn RootingDirectory>),
@@ -75,6 +81,7 @@ async fn auth_with(
         hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
         event_bus: None,
         reachability: None,
+        blackhole_rules: Some(blackhole),
     }
 }
 
@@ -338,12 +345,14 @@ async fn blackhole_add_lists_entry() {
 
     transport
         .routing_blackhole_add(&id_perm, None, Some("perma-ban"))
+        .await
         .expect("permanent add");
     transport
         .routing_blackhole_add(&id_until, Some(&future), Some("temp-ban"))
+        .await
         .expect("until add");
 
-    let list = transport.routing_blackhole_list();
+    let list = transport.routing_blackhole_list().await.expect("list");
     assert_eq!(list.len(), 2);
     let perm = list
         .iter()
@@ -361,12 +370,14 @@ async fn blackhole_add_lists_entry() {
     // Bad RFC-3339 → typed Config error.
     let err = transport
         .routing_blackhole_add(&[0xFFu8; 16], Some("not-a-date"), None)
+        .await
         .expect_err("bad until");
     assert!(matches!(err, TransportError::Config(_)));
 
     // Empty identity_hash → typed Config error.
     let err = transport
         .routing_blackhole_add(&[], None, None)
+        .await
         .expect_err("empty identity_hash");
     assert!(matches!(err, TransportError::Config(_)));
 
@@ -386,20 +397,35 @@ async fn blackhole_remove_idempotent() {
     let id = vec![0x99u8; 16];
     transport
         .routing_blackhole_remove(&id)
+        .await
         .expect("remove of non-existent");
 
     transport
         .routing_blackhole_add(&id, None, None)
+        .await
         .expect("add");
-    assert_eq!(transport.routing_blackhole_list().len(), 1);
+    assert_eq!(
+        transport
+            .routing_blackhole_list()
+            .await
+            .expect("list")
+            .len(),
+        1
+    );
 
     transport
         .routing_blackhole_remove(&id)
+        .await
         .expect("first remove");
     transport
         .routing_blackhole_remove(&id)
+        .await
         .expect("second remove (idempotent)");
-    assert!(transport.routing_blackhole_list().is_empty());
+    assert!(transport
+        .routing_blackhole_list()
+        .await
+        .expect("list")
+        .is_empty());
 
     listen.abort();
 }
@@ -425,6 +451,7 @@ async fn blackhole_enforcement_returns_peer_blackholed_error() {
     // Blackhole A on B.
     transport_b
         .routing_blackhole_add(&dest_hash_a, None, Some("acceptance-test"))
+        .await
         .expect("blackhole_add");
 
     // Attempt to send — must surface the typed PeerBlackholed error.
@@ -468,6 +495,7 @@ async fn blackhole_hits_counter_increments_on_block() {
 
     transport_b
         .routing_blackhole_add(&dest_hash_a, None, None)
+        .await
         .expect("blackhole_add");
 
     // Drive 3 attempts.
@@ -478,12 +506,22 @@ async fn blackhole_hits_counter_increments_on_block() {
             .expect_err("blackholed");
     }
 
-    let list = transport_b.routing_blackhole_list();
-    let entry = list
-        .iter()
-        .find(|e| e.identity_hash == dest_hash_a)
-        .expect("entry exists");
-    assert_eq!(entry.hits, 3, "hits counter must increment per block");
+    // v0.16.1: hit recording is fire-and-forget through a spawned
+    // tokio task hitting the persist backend. Let the spawned hits
+    // settle before snapshotting — three short polls cover the
+    // SQLite round-trip latency without baking in a fixed sleep.
+    let mut entry_hits: u64 = 0;
+    for _ in 0..20 {
+        let list = transport_b.routing_blackhole_list().await.expect("list");
+        if let Some(entry) = list.iter().find(|e| e.identity_hash == dest_hash_a) {
+            entry_hits = entry.hits;
+            if entry_hits >= 3 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(entry_hits, 3, "hits counter must increment per block");
 
     listen_a.abort();
     listen_b.abort();
@@ -676,4 +714,341 @@ fn uniffi_path_table_unsupported_without_init() {
     assert!(matches!(err, ciris_edge::EdgeBindingsError::NotInitialized));
     let err = ciris_edge::routing_tunnels().expect_err("no Edge installed");
     assert!(matches!(err, ciris_edge::EdgeBindingsError::NotInitialized));
+}
+
+// ─── v0.16.1 — Blackhole durability flip (CIRISPersist#120) ─────────
+//
+// The v0.15.0 `Arc<RwLock<HashMap>>` shape is gone. The transport now
+// holds an `Arc<dyn BlackholeRules>` over persist's V052
+// `cirislens.blackhole_rules` table. The five tests below pin the
+// new contract:
+//
+//   1. `blackhole_durable_round_trip` — add a rule on transport A,
+//      tear down + rebuild the transport against the SAME backend
+//      Arc; assert the rule still appears in `routing_blackhole_list`.
+//      Durability proof — the v0.15.0 shape failed this test by
+//      construction (the HashMap died with the transport).
+//
+//   2. `blackhole_enforcement_records_hit_through_persist` — send to
+//      a blackholed peer; assert persist's `hits` counter (visible
+//      via the next `blackhole_list` snapshot) reflects the hit.
+//      Drives through the spawned `record_hit` fire-and-forget path.
+//
+//   3. `blackhole_prune_expired_clears_only_expired` — add rules
+//      with mix of `until=None` and `until=past`; call
+//      `routing_blackhole_prune_expired`; assert only the expired
+//      rule was removed. Pins the "permanent rules survive prune"
+//      invariant (`until IS NULL` semantics).
+//
+//   4. `blackhole_upsert_preserves_hits_on_intent_change` — set
+//      `hits` to 5 via repeated `check_blackhole` triggers, upsert
+//      with a new reason; assert `hits` is still 5. Distinct from
+//      v0.15.0's reset-on-replace behavior — the persist contract
+//      treats re-upsert as intent-change, not counter-reset.
+//
+//   5. `blackhole_remove_unknown_silent_ok` — call `routing_blackhole_remove`
+//      on a never-added hash; assert no error (POSIX `rm -f`
+//      ergonomics; persist's `blackhole_remove` is silent-no-op).
+
+/// Helper — build a `ReticulumAuth` pinned to a specific backend Arc,
+/// so the durable-round-trip test can rebuild the transport pointed
+/// at the SAME backend (the durability invariant).
+async fn auth_pinned_backend(
+    key: &TestFedKey,
+    directory: Arc<ciris_persist::store::sqlite::SqliteBackend>,
+    blackhole: Arc<dyn ciris_persist::federation::BlackholeRules>,
+    base: &std::path::Path,
+) -> ReticulumAuth {
+    ReticulumAuth {
+        signer: Some(signer_for(key, base).await),
+        rooting: Some(directory as Arc<dyn RootingDirectory>),
+        resolver: None,
+        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        event_bus: None,
+        reachability: None,
+        blackhole_rules: Some(blackhole),
+    }
+}
+
+/// Durability — rule survives transport teardown + rebuild against the
+/// same backend. v0.15.0 in-memory HashMap fails this by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackhole_durable_round_trip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let steward = TestFedKey::new("steward-durable-bh", 0x40);
+    let key_a = TestFedKey::new("edge-durable-bh-aaaa", 0x41);
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&key_a, &steward, "agent"),
+    ])
+    .await;
+    let blackhole: Arc<dyn ciris_persist::federation::BlackholeRules> = directory.clone();
+
+    let id = vec![0xC0u8; 16];
+
+    // First transport — add the rule.
+    {
+        let cfg = {
+            let mut c = ReticulumTransportConfig::new(
+                tmp.path().join("a1/transport.id"),
+                "edge-durable-bh-aaaa",
+            );
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.announce_interval = Duration::from_secs(2);
+            c
+        };
+        let auth =
+            auth_pinned_backend(&key_a, directory.clone(), blackhole.clone(), tmp.path()).await;
+        let transport = Arc::new(
+            ReticulumTransport::new(cfg, auth)
+                .await
+                .expect("build transport (1)"),
+        );
+        let (tx, _rx) = mpsc::channel::<InboundFrame>(16);
+        let t1 = transport.clone();
+        let listen = tokio::spawn(async move { t1.listen(tx).await });
+
+        transport
+            .routing_blackhole_add(&id, None, Some("durable-acceptance"))
+            .await
+            .expect("add rule");
+        let list = transport.routing_blackhole_list().await.expect("list (1)");
+        assert_eq!(list.len(), 1, "rule visible in same instance");
+
+        listen.abort();
+        drop(transport);
+    }
+
+    // Second transport — DIFFERENT instance, SAME backend Arc.
+    let cfg = {
+        let mut c = ReticulumTransportConfig::new(
+            tmp.path().join("a2/transport.id"),
+            "edge-durable-bh-aaaa",
+        );
+        c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        c.announce_interval = Duration::from_secs(2);
+        c
+    };
+    let auth = auth_pinned_backend(&key_a, directory.clone(), blackhole.clone(), tmp.path()).await;
+    let transport = Arc::new(
+        ReticulumTransport::new(cfg, auth)
+            .await
+            .expect("build transport (2)"),
+    );
+    let (tx, _rx) = mpsc::channel::<InboundFrame>(16);
+    let t2 = transport.clone();
+    let listen = tokio::spawn(async move { t2.listen(tx).await });
+
+    let list = transport.routing_blackhole_list().await.expect("list (2)");
+    let found = list
+        .iter()
+        .find(|e| e.identity_hash == id)
+        .expect("rule survived transport rebuild — durability proof");
+    assert_eq!(found.reason.as_deref(), Some("durable-acceptance"));
+
+    listen.abort();
+}
+
+/// `blackhole_record_hit` drives through persist — the `hits` counter
+/// on the snapshot reflects the send-path `check_blackhole` hit (the
+/// same invariant as v0.15.0, now through the persist surface).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackhole_enforcement_records_hit_through_persist() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_transport_a, transport_b, listen_a, listen_b) = paired_transports(tmp.path()).await;
+
+    let dest_hash_a = transport_b
+        .peer_dest_hash_for_test("edge-routing-aaaa")
+        .await
+        .expect("rooted peer dest_hash")
+        .to_vec();
+
+    transport_b
+        .routing_blackhole_add(&dest_hash_a, None, Some("persist-hit"))
+        .await
+        .expect("blackhole_add");
+
+    let _ = transport_b
+        .send("edge-routing-aaaa", b"hit-record-test")
+        .await
+        .expect_err("blackholed");
+
+    // Hit recording is fire-and-forget — poll for the counter to reach
+    // 1 within a bounded window. The persist record_hit is a single
+    // UPDATE so the latency is small even under contention.
+    let mut observed: u64 = 0;
+    for _ in 0..40 {
+        let list = transport_b.routing_blackhole_list().await.expect("list");
+        if let Some(rec) = list.iter().find(|e| e.identity_hash == dest_hash_a) {
+            observed = rec.hits;
+            if observed >= 1 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        observed >= 1,
+        "persist `hits` counter must reflect the spawned record_hit (got {observed})"
+    );
+
+    listen_a.abort();
+    listen_b.abort();
+}
+
+/// `blackhole_prune_expired` drops only `until <= now` rules; permanent
+/// rules (`until IS NULL`) survive — the persist contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackhole_prune_expired_clears_only_expired() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (transport, listen) = single_transport(tmp.path()).await;
+
+    let id_perm = vec![0x71u8; 16];
+    let id_expired = vec![0x72u8; 16];
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+
+    transport
+        .routing_blackhole_add(&id_perm, None, Some("permanent"))
+        .await
+        .expect("add permanent");
+    transport
+        .routing_blackhole_add(&id_expired, Some(&past), Some("expired"))
+        .await
+        .expect("add expired");
+
+    let pruned = transport
+        .routing_blackhole_prune_expired(chrono::Utc::now())
+        .await
+        .expect("prune");
+    assert_eq!(pruned, 1, "exactly one expired rule pruned");
+
+    let list = transport.routing_blackhole_list().await.expect("list");
+    assert_eq!(list.len(), 1, "only the permanent rule remains");
+    assert_eq!(list[0].identity_hash, id_perm, "permanent rule survives");
+
+    listen.abort();
+}
+
+/// Re-upsert with new reason preserves `hits` + `added_at` — the
+/// persist contract treats upsert as intent-change, not counter-reset.
+/// Distinct from v0.15.0's in-memory shape which reset `hits` on
+/// replace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackhole_upsert_preserves_hits_on_intent_change() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Build a single-transport fixture but keep the backend Arc so we
+    // can drive `record_hit` directly (the send-path goes through a
+    // resolved-peer dest_hash, which is the rooted-cohabitation
+    // shape; for this counter-preservation test we drive the
+    // primitive at the BlackholeRules level).
+    let steward = TestFedKey::new("steward-upsert-bh", 0x50);
+    let key_a = TestFedKey::new("edge-upsert-bh-aaaa", 0x51);
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&key_a, &steward, "agent"),
+    ])
+    .await;
+    let blackhole: Arc<dyn ciris_persist::federation::BlackholeRules> = directory.clone();
+    let cfg = {
+        let mut c =
+            ReticulumTransportConfig::new(tmp.path().join("a/transport.id"), "edge-upsert-bh-aaaa");
+        c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        c.announce_interval = Duration::from_secs(2);
+        c
+    };
+    let auth = auth_pinned_backend(&key_a, directory.clone(), blackhole.clone(), tmp.path()).await;
+    let transport = Arc::new(
+        ReticulumTransport::new(cfg, auth)
+            .await
+            .expect("build transport"),
+    );
+    let (tx, _rx) = mpsc::channel::<InboundFrame>(16);
+    let t = transport.clone();
+    let listen = tokio::spawn(async move { t.listen(tx).await });
+
+    let id = vec![0x88u8; 16];
+
+    transport
+        .routing_blackhole_add(&id, None, Some("v1-reason"))
+        .await
+        .expect("initial add");
+
+    // Drive 3 hits directly via the BlackholeRules trait — the
+    // send-path is mediated by a resolved peer, but the counter-
+    // preservation contract lives at the persist trait level.
+    for _ in 0..3 {
+        blackhole
+            .blackhole_record_hit(&id)
+            .await
+            .expect("record_hit");
+    }
+
+    let list = transport.routing_blackhole_list().await.expect("list");
+    let entry = list.iter().find(|e| e.identity_hash == id).expect("entry");
+    assert_eq!(entry.hits, 3, "hits accumulated before re-upsert");
+    let original_added_at = entry.added_at.clone();
+
+    // Sleep a tick so any added_at-change would be observable.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Re-upsert with a different reason — intent change.
+    transport
+        .routing_blackhole_add(&id, None, Some("v2-reason"))
+        .await
+        .expect("re-upsert");
+
+    let list = transport.routing_blackhole_list().await.expect("list (2)");
+    let entry = list
+        .iter()
+        .find(|e| e.identity_hash == id)
+        .expect("entry (2)");
+    assert_eq!(
+        entry.hits, 3,
+        "hits counter MUST survive a re-upsert (intent-change, not counter-reset)"
+    );
+    assert_eq!(
+        entry.added_at, original_added_at,
+        "added_at MUST be preserved across re-upsert (forensic marker)"
+    );
+    assert_eq!(
+        entry.reason.as_deref(),
+        Some("v2-reason"),
+        "operator-intent fields overwrite"
+    );
+
+    listen.abort();
+}
+
+/// Remove on an unknown hash returns `Ok(())` — POSIX `rm -f`
+/// ergonomics; persist's `blackhole_remove` is silent-no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackhole_remove_unknown_silent_ok() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (transport, listen) = single_transport(tmp.path()).await;
+
+    let id = vec![0x09u8; 16];
+    // never added.
+    transport
+        .routing_blackhole_remove(&id)
+        .await
+        .expect("remove of never-added hash returns Ok(())");
+
+    listen.abort();
 }

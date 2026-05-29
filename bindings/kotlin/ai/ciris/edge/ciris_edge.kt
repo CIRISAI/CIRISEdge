@@ -691,6 +691,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_ciris_edge_checksum_func_routing_blackhole_list(
     ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_blackhole_prune_expired(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_routing_blackhole_remove(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_routing_path_drop(
@@ -800,6 +802,8 @@ external fun uniffi_ciris_edge_fn_func_routing_blackhole_add(`identityHash`: Rus
 ): Unit
 external fun uniffi_ciris_edge_fn_func_routing_blackhole_list(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_blackhole_prune_expired(uniffi_out_err: UniffiRustCallStatus, 
+): Long
 external fun uniffi_ciris_edge_fn_func_routing_blackhole_remove(`identityHash`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_ciris_edge_fn_func_routing_path_drop(`destinationHash`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1041,6 +1045,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_routing_blackhole_list() != 27710.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_blackhole_prune_expired() != 46507.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_routing_blackhole_remove() != 39038.toShort()) {
@@ -3879,6 +3886,17 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
             return FfiConverterSequenceTypeEdgeBlackholeEntry.lift(
     uniffiRustCallWithError(EdgeBindingsException) { _status ->
     UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_list(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingBlackholePruneExpired`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_prune_expired(
     
         _status)
 }
