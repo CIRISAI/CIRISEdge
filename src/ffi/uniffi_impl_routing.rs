@@ -15,9 +15,14 @@
 //! the underlying `ReticulumTransport` (whose state machine is
 //! tokio-async) block on the host's tokio runtime via the
 //! v0.13.0 `block_on_runtime` pattern (mirrored from
-//! `uniffi_impl_links.rs`). Mutations (`routing_blackhole_add` /
-//! `routing_blackhole_remove`) operate on the in-memory
-//! `Arc<RwLock<...>>` without touching async — they're sync inside.
+//! `uniffi_impl_links.rs`).
+//!
+//! v0.16.1 (CIRISPersist#120 flip): blackhole CRUD also goes through
+//! `block_on` since the persist-backed `routing_blackhole_*` methods
+//! are now async (each call is a DB round-trip via
+//! `Arc<dyn BlackholeRules>`). The v0.15.0 in-memory `Arc<RwLock<...>>`
+//! is gone; durability is the v0.15.0 acceptance criterion this cut
+//! closes.
 //!
 //! # Edge transport plumbing
 //!
@@ -152,7 +157,12 @@ pub fn routing_blackhole_list() -> Result<Vec<crate::EdgeBlackholeEntry>, crate:
     #[cfg(feature = "_reticulum-module")]
     {
         let transport = current_reticulum()?;
-        Ok(transport.routing_blackhole_list())
+        block_on(async move {
+            transport
+                .routing_blackhole_list()
+                .await
+                .map_err(map_transport_err)
+        })
     }
     #[cfg(not(feature = "_reticulum-module"))]
     {
@@ -168,9 +178,12 @@ pub fn routing_blackhole_add(
     #[cfg(feature = "_reticulum-module")]
     {
         let transport = current_reticulum()?;
-        transport
-            .routing_blackhole_add(&identity_hash, until.as_deref(), reason.as_deref())
-            .map_err(map_transport_err)
+        block_on(async move {
+            transport
+                .routing_blackhole_add(&identity_hash, until.as_deref(), reason.as_deref())
+                .await
+                .map_err(map_transport_err)
+        })
     }
     #[cfg(not(feature = "_reticulum-module"))]
     {
@@ -183,13 +196,44 @@ pub fn routing_blackhole_remove(identity_hash: Vec<u8>) -> Result<(), crate::Edg
     #[cfg(feature = "_reticulum-module")]
     {
         let transport = current_reticulum()?;
-        transport
-            .routing_blackhole_remove(&identity_hash)
-            .map_err(map_transport_err)
+        block_on(async move {
+            transport
+                .routing_blackhole_remove(&identity_hash)
+                .await
+                .map_err(map_transport_err)
+        })
     }
     #[cfg(not(feature = "_reticulum-module"))]
     {
         let _ = identity_hash;
+        Err(crate::EdgeBindingsError::Unsupported)
+    }
+}
+
+/// v0.16.1 — operator-driven prune of expired blackhole rules.
+/// Returns the number of rows dropped (rules whose `until` is in the
+/// past relative to wall-clock `now`). Permanent rules (`until IS
+/// NULL`) are NEVER pruned — operators must call
+/// `routing_blackhole_remove` to drop them.
+///
+/// TODO (deferred from v0.16.1): wire a background pruner task at
+/// `init_edge_runtime` time, configurable via
+/// `EdgeConfig::blackhole_prune_interval_seconds` (default 3600).
+/// Until that lands, operators are expected to call this from the
+/// host's housekeeping loop on whatever cadence they prefer.
+pub fn routing_blackhole_prune_expired() -> Result<u64, crate::EdgeBindingsError> {
+    #[cfg(feature = "_reticulum-module")]
+    {
+        let transport = current_reticulum()?;
+        block_on(async move {
+            transport
+                .routing_blackhole_prune_expired(chrono::Utc::now())
+                .await
+                .map_err(map_transport_err)
+        })
+    }
+    #[cfg(not(feature = "_reticulum-module"))]
+    {
         Err(crate::EdgeBindingsError::Unsupported)
     }
 }

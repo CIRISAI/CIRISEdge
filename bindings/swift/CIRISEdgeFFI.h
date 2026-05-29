@@ -395,6 +395,12 @@ RustBuffer uniffi_ciris_edge_fn_func_routing_blackhole_list(RustCallStatus *_Non
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_PRUNE_EXPIRED
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_PRUNE_EXPIRED
+uint64_t uniffi_ciris_edge_fn_func_routing_blackhole_prune_expired(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_REMOVE
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_REMOVE
 void uniffi_ciris_edge_fn_func_routing_blackhole_remove(RustBuffer identity_hash, RustCallStatus *_Nonnull out_status
@@ -926,6 +932,12 @@ uint16_t uniffi_ciris_edge_checksum_func_routing_blackhole_add(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_LIST
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_LIST
 uint16_t uniffi_ciris_edge_checksum_func_routing_blackhole_list(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_PRUNE_EXPIRED
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_PRUNE_EXPIRED
+uint16_t uniffi_ciris_edge_checksum_func_routing_blackhole_prune_expired(void
     
 );
 #endif

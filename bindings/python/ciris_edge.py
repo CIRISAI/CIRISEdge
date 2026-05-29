@@ -534,6 +534,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_routing_blackhole_list() != 27710:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_routing_blackhole_prune_expired() != 46507:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_routing_blackhole_remove() != 39038:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_routing_path_drop() != 22632:
@@ -980,6 +982,10 @@ _UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_list.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_list.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_prune_expired.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_prune_expired.restype = ctypes.c_uint64
 _UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_remove.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1164,6 +1170,9 @@ _UniffiLib.uniffi_ciris_edge_checksum_func_routing_blackhole_add.restype = ctype
 _UniffiLib.uniffi_ciris_edge_checksum_func_routing_blackhole_list.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_routing_blackhole_list.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_routing_blackhole_prune_expired.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_routing_blackhole_prune_expired.restype = ctypes.c_uint16
 _UniffiLib.uniffi_ciris_edge_checksum_func_routing_blackhole_remove.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_routing_blackhole_remove.restype = ctypes.c_uint16
@@ -3921,6 +3930,17 @@ def routing_blackhole_list() -> typing.List[EdgeBlackholeEntry]:
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
+def routing_blackhole_prune_expired() -> int:
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterUInt64.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_prune_expired,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def routing_blackhole_remove(identity_hash: bytes) -> None:
     
     _UniffiFfiConverterBytes.check_lower(identity_hash)
@@ -4249,6 +4269,7 @@ __all__ = [
     "routing_announce_table",
     "routing_blackhole_add",
     "routing_blackhole_list",
+    "routing_blackhole_prune_expired",
     "routing_blackhole_remove",
     "routing_path_drop",
     "routing_path_drop_via",

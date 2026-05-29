@@ -217,6 +217,14 @@ namespace ciris_edge {
     [Throws=EdgeBindingsError]
     void routing_blackhole_remove(bytes identity_hash);
 
+    // v0.16.1 (CIRISPersist#120) — operator-driven prune of expired
+    // rules. Returns the rows-affected count. Permanent rules
+    // (`until IS NULL`) are NEVER pruned. TODO: a v0.16.x patch wires
+    // a background pruner task; until then operators call this from
+    // the host's housekeeping loop.
+    [Throws=EdgeBindingsError]
+    u64 routing_blackhole_prune_expired();
+
     // Rate-limit observation
     [Throws=EdgeBindingsError]
     sequence<EdgeRateEntry> routing_rate_table();

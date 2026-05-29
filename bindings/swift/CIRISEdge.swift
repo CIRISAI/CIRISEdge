@@ -3231,6 +3231,12 @@ public func routingBlackholeList()throws  -> [EdgeBlackholeEntry]  {
     )
 })
 }
+public func routingBlackholePruneExpired()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_routing_blackhole_prune_expired($0
+    )
+})
+}
 public func routingBlackholeRemove(identityHash: Data)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_routing_blackhole_remove(
         FfiConverterData.lower(identityHash),$0
@@ -3458,6 +3464,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_routing_blackhole_list() != 27710) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_routing_blackhole_prune_expired() != 46507) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_routing_blackhole_remove() != 39038) {

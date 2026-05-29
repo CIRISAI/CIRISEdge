@@ -78,6 +78,7 @@ async fn auth_with_bus(
         hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
         event_bus: Some(bus),
         reachability: None,
+        blackhole_rules: None,
     }
 }
 
