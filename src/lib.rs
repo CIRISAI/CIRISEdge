@@ -48,6 +48,7 @@
 #![deny(rust_2018_idioms)]
 #![doc(html_root_url = "https://docs.rs/ciris-edge/0.1.0-pre1")]
 
+pub mod cohort_scope;
 pub mod detector;
 mod edge;
 pub mod events;
@@ -64,6 +65,7 @@ pub mod sas;
 pub mod transport;
 pub mod verify;
 
+pub use cohort_scope::{CohortScope, CohortScopeEnforcement};
 pub use detector::{
     ConsentRole, DetectionVerdict, EdgeDetectionAdmission, ProbePatternConfig,
     ProbePatternObserver, ProbePatternState,

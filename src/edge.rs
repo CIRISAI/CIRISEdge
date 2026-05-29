@@ -17,6 +17,7 @@ use chrono::Utc;
 use futures::future::BoxFuture;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 
+use crate::cohort_scope::{CohortScope, CohortScopeEnforcement};
 use crate::handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, FederationPriority,
     Handler, HandlerContext, HandlerError, InlineTextMessage, Message,
@@ -313,6 +314,20 @@ pub struct EdgeConfig {
     /// routing-table FFI. Default
     /// [`DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS`] (3600s = 1 hour).
     pub blackhole_prune_interval_seconds: u64,
+    /// CIRISEdge#48-A (v0.19.1) — cohort-scope enforcement posture
+    /// per FSD `FEDERATION_SCALING_MODEL.md` + CIRISNodeCore SCHEMA
+    /// §3.2. Default is [`CohortScopeEnforcement::Strict`] —
+    /// **wire-format invariant**, not a deployment knob. Operators
+    /// who need a staged rollout may temporarily set `WarnOnly`;
+    /// production MUST default to `Strict`.
+    ///
+    /// `Strict` rejects with a typed [`EdgeError::CohortScopeRefused*`]
+    /// variant. `WarnOnly` emits a `tracing::warn!` and allows the
+    /// envelope through. `Off` skips the check entirely — testing /
+    /// dev only.
+    ///
+    /// See [`crate::cohort_scope`] for the enforcement rules.
+    pub cohort_scope_enforcement: CohortScopeEnforcement,
 }
 
 impl Default for EdgeConfig {
@@ -365,6 +380,10 @@ impl Default for EdgeConfig {
             // is 0 OR no `Arc<dyn BlackholeRules>` was wired through
             // the Reticulum transport.
             blackhole_prune_interval_seconds: DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
+            // v0.19.1 (CIRISEdge#48-A) — wire-format invariant; the
+            // default MUST be `Strict`. WarnOnly is a migration aid;
+            // Off is the escape hatch.
+            cohort_scope_enforcement: CohortScopeEnforcement::Strict,
         }
     }
 }
@@ -400,6 +419,64 @@ pub enum EdgeError {
          (federation_keys directory has zero identity_type=\"steward\" rows)"
     )]
     NoStewards(FederationPriority),
+    /// CIRISEdge#48-A (v0.19.1) — refused `send_federation` /
+    /// federation-class fan-out because the message-level cohort_scope
+    /// is `SelfOnly` or `Family` (locality variants MUST NOT cross
+    /// federation-class hops). Wire-format invariant per FSD
+    /// `FEDERATION_SCALING_MODEL.md`.
+    #[error(
+        "cohort_scope {cohort_scope:?} refused on federation-class fan-out \
+         (locality variants MUST NOT cross federation hops; CIRISEdge#48-A)"
+    )]
+    CohortScopeRefusedFederation {
+        /// The declared cohort scope.
+        cohort_scope: CohortScope,
+    },
+    /// CIRISEdge#48-A (v0.19.1) — refused `send_mandatory` because
+    /// the message-level cohort_scope is `SelfOnly` or `Family`.
+    /// Wire-format invariant per FSD `FEDERATION_SCALING_MODEL.md`.
+    #[error(
+        "cohort_scope {cohort_scope:?} refused on mandatory broadcast \
+         (locality variants MUST NOT broadcast federation-wide; CIRISEdge#48-A)"
+    )]
+    CohortScopeRefusedMandatory {
+        /// The declared cohort scope.
+        cohort_scope: CohortScope,
+    },
+    /// CIRISEdge#48-A (v0.19.1) — refused point-to-point
+    /// (`send` / `send_durable`) because the recipient is not authorized
+    /// for the declared cohort scope (recipient not in family cohort
+    /// / not in named cohort / not self).
+    #[error(
+        "cohort_scope {cohort_scope:?} refused: recipient {recipient_key_id} \
+         is not authorized for this scope (CIRISEdge#48-A)"
+    )]
+    CohortScopeRefusedRecipient {
+        /// The declared cohort scope.
+        cohort_scope: CohortScope,
+        /// The recipient `federation_keys.key_id` that failed the
+        /// scope authorization.
+        recipient_key_id: String,
+    },
+    /// CIRISEdge#48-A (v0.19.1) — consumer-side symmetric check.
+    /// Inbound envelope's claimed `cohort_scope` does not match the
+    /// sender's directory-recorded scope. Emitted at
+    /// `dispatch_inbound` and projected as a moderation-signal event
+    /// on the EventBus.
+    #[error(
+        "cohort_scope violation: sender {sender_key_id} claimed \
+         {claimed_scope:?} but directory records {directory_scope:?} \
+         (CIRISEdge#48-A)"
+    )]
+    CohortScopeViolation {
+        /// The sender's `federation_keys.key_id`.
+        sender_key_id: String,
+        /// The cohort scope the sender CLAIMED on the envelope.
+        claimed_scope: CohortScope,
+        /// The cohort scope the directory records for this sender
+        /// (`None` = no recorded scope; defaults to `Public`).
+        directory_scope: Option<CohortScope>,
+    },
 }
 
 // ─── Type-erased handler dispatch ───────────────────────────────────
@@ -618,6 +695,29 @@ pub struct Edge {
     /// (the reseed runs once per init); the lock makes the path
     /// forward-compatible without binding-side churn.
     canonical_peers: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// CIRISEdge#48-A (v0.19.1) — operator-declared per-peer cohort
+    /// scope, sourced from the peer's `policy_blob.cohort` field on
+    /// `peer_set_policy` calls. Populated lazily — peers absent from
+    /// the map default to [`CohortScope::Public`] (the implicit pre-
+    /// v0.19.1 behaviour).
+    ///
+    /// Producer-side outbound enforcement (`Edge::send_*`) consults
+    /// this map to decide whether the explicit recipient is
+    /// authorized for the declared scope. Consumer-side
+    /// (`dispatch_inbound`) consults it to check the sender's claimed
+    /// scope against the directory-recorded one.
+    ///
+    /// **v0.19.1 dependency on persist**: persist v3.2.0 does not
+    /// expose a `peer_metadata_for(key_id) → PeerMetadataRow` read
+    /// accessor on the `FederationDirectory` trait, so this map is
+    /// the edge-side mirror of what the operator declared via the
+    /// peer-mutation FFI. A future persist cut exposing
+    /// `peer_metadata_for` (or a first-class `cohort_membership`
+    /// API) would allow the read path to consult persist directly;
+    /// for v0.19.1 the in-process map is the authoritative source
+    /// (matches the "edge-only enforcement, no persist coordination"
+    /// constraint of #48-A).
+    pub(crate) cohort_membership: Arc<std::sync::RwLock<HashMap<String, CohortScope>>>,
     config: EdgeConfig,
 }
 
@@ -836,6 +936,51 @@ impl Edge {
             .unwrap_or_default()
     }
 
+    /// CIRISEdge#48-A (v0.19.1) — declare a peer's cohort scope. The
+    /// operator-declared scope is consulted by both the producer-side
+    /// outbound enforcement and the consumer-side
+    /// `dispatch_inbound` symmetric check. Idempotent — re-declaring
+    /// the same scope is a no-op.
+    ///
+    /// Backed by an in-process map; persist v3.2.0 does not yet
+    /// expose a first-class cohort_membership API. The cohabitation
+    /// FFI / pyo3 init paths may seed this via the existing
+    /// `peer_set_policy` write surface — see
+    /// [`crate::ffi::uniffi_impl::peer_set_policy`].
+    pub fn declare_peer_cohort_scope(&self, key_id: &str, scope: CohortScope) {
+        if let Ok(mut map) = self.cohort_membership.write() {
+            map.insert(key_id.to_string(), scope);
+        }
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) — clear a peer's declared cohort
+    /// scope. After this call the peer is treated as
+    /// [`CohortScope::Public`] (the implicit pre-v0.19.1 behaviour).
+    pub fn clear_peer_cohort_scope(&self, key_id: &str) {
+        if let Ok(mut map) = self.cohort_membership.write() {
+            map.remove(key_id);
+        }
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) — look up a peer's declared cohort
+    /// scope. Returns `None` when the peer has no declared scope; the
+    /// caller interprets `None` as [`CohortScope::Public`] (the
+    /// pre-v0.19.1 implicit default).
+    #[must_use]
+    pub fn peer_cohort_scope(&self, key_id: &str) -> Option<CohortScope> {
+        self.cohort_membership
+            .read()
+            .ok()
+            .and_then(|map| map.get(key_id).cloned())
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) accessor — current enforcement
+    /// posture.
+    #[must_use]
+    pub fn cohort_scope_enforcement(&self) -> CohortScopeEnforcement {
+        self.config.cohort_scope_enforcement
+    }
+
     /// CIRISEdge#34 accessor — the shared [`crate::events::EventBus`].
     /// Cheap Arc clone; consumers (the pyo3 surface, internal emission
     /// helpers, tests) call `subscribe_*` to get a fresh receiver.
@@ -947,6 +1092,23 @@ impl Edge {
         destination_key_id: &str,
         msg: M,
     ) -> Result<M::Response, EdgeError> {
+        self.send_with_cohort_scope(destination_key_id, msg, None)
+            .await
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) — send an ephemeral message tagged
+    /// with an explicit `cohort_scope`. The locality variants
+    /// (`SelfOnly`, `Family`, `Cohort`) refuse to outbound when the
+    /// explicit recipient is not authorized for the scope per the
+    /// recipient-determination rules of CIRISEdge#48-A.
+    ///
+    /// Refusal returns a typed [`EdgeError::CohortScopeRefusedRecipient`].
+    pub async fn send_with_cohort_scope<M: Message>(
+        &self,
+        destination_key_id: &str,
+        msg: M,
+        cohort_scope: Option<CohortScope>,
+    ) -> Result<M::Response, EdgeError> {
         if !matches!(M::DELIVERY, Delivery::Ephemeral) {
             let declared = match M::DELIVERY {
                 Delivery::Ephemeral => "Ephemeral",
@@ -961,8 +1123,14 @@ impl Edge {
             ));
         }
 
+        // CIRISEdge#48-A (v0.19.1) — producer-side recipient
+        // enforcement BEFORE building the signed envelope. Point-to-
+        // point: SelfOnly requires recipient == self.signer.key_id;
+        // Family / Cohort require directory-recorded scope match.
+        self.enforce_point_to_point_scope(cohort_scope.as_ref(), destination_key_id)?;
+
         let envelope_bytes = self
-            .build_signed_envelope(destination_key_id, &msg, None)
+            .build_signed_envelope_with_cohort_scope(destination_key_id, &msg, None, cohort_scope)
             .await?;
 
         if self.transports.is_empty() {
@@ -1073,6 +1241,19 @@ impl Edge {
         destination_key_id: &str,
         msg: M,
     ) -> Result<DurableHandle, EdgeError> {
+        self.send_durable_with_cohort_scope(destination_key_id, msg, None)
+            .await
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) — send a durable message tagged with
+    /// an explicit `cohort_scope`. Producer-side recipient enforcement
+    /// matches [`Self::send_with_cohort_scope`].
+    pub async fn send_durable_with_cohort_scope<M: Message>(
+        &self,
+        destination_key_id: &str,
+        msg: M,
+        cohort_scope: Option<CohortScope>,
+    ) -> Result<DurableHandle, EdgeError> {
         let (requires_ack, max_attempts, ttl_seconds, ack_timeout_seconds) = match M::DELIVERY {
             Delivery::Ephemeral => {
                 return Err(EdgeError::DeliveryClassMismatch(
@@ -1108,8 +1289,12 @@ impl Edge {
             ),
         };
 
+        // CIRISEdge#48-A (v0.19.1) — producer-side recipient
+        // enforcement BEFORE enqueueing.
+        self.enforce_point_to_point_scope(cohort_scope.as_ref(), destination_key_id)?;
+
         let envelope_bytes = self
-            .build_signed_envelope(destination_key_id, &msg, None)
+            .build_signed_envelope_with_cohort_scope(destination_key_id, &msg, None, cohort_scope)
             .await?;
         let envelope: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
             .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
@@ -1236,6 +1421,25 @@ impl Edge {
         &self,
         msg: M,
     ) -> Result<Vec<DurableHandle>, EdgeError> {
+        self.send_mandatory_with_cohort_scope(msg, None).await
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) — send a `Delivery::Mandatory`
+    /// broadcast tagged with an explicit `cohort_scope`. Refuses
+    /// federation-wide fan-out for locality scopes (`SelfOnly`,
+    /// `Family`, `Cohort`) — wire-format invariant per FSD
+    /// `FEDERATION_SCALING_MODEL.md`. Refusal returns a typed
+    /// [`EdgeError::CohortScopeRefusedMandatory`].
+    #[allow(clippy::too_many_lines)] // fan-out body matches send_mandatory
+    pub async fn send_mandatory_with_cohort_scope<M: Message>(
+        &self,
+        msg: M,
+        cohort_scope: Option<CohortScope>,
+    ) -> Result<Vec<DurableHandle>, EdgeError> {
+        // CIRISEdge#48-A (v0.19.1) — refuse mandatory fan-out for any
+        // locality scope BEFORE walking peer_directory. Structural
+        // wire-format invariant; happens before recipient enumeration.
+        self.enforce_federation_class_scope(cohort_scope.as_ref(), false)?;
         let (max_attempts, ttl_seconds) = match M::DELIVERY {
             Delivery::Ephemeral => {
                 return Err(EdgeError::DeliveryClassMismatch(
@@ -1315,7 +1519,9 @@ impl Edge {
             // regardless of per-peer opt-in"; calling
             // `is_subscribed(peer, M::TYPE)` here would re-introduce
             // the opt-in gate this class exists to remove.
-            let envelope_bytes = self.build_signed_envelope(&peer, &msg, None).await?;
+            let envelope_bytes = self
+                .build_signed_envelope_with_cohort_scope(&peer, &msg, None, cohort_scope.clone())
+                .await?;
             let envelope: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
                 .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
             let body_sha256 = envelope_body_sha256(&envelope);
@@ -1420,6 +1626,26 @@ impl Edge {
         msg: M,
         ack_timeout_seconds: Option<u64>,
     ) -> Result<Vec<DurableHandle>, EdgeError> {
+        self.send_federation_with_cohort_scope(msg, ack_timeout_seconds, None)
+            .await
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) — send a `Delivery::Federation`
+    /// steward-class directive tagged with an explicit `cohort_scope`.
+    /// Refuses federation-class fan-out for locality scopes
+    /// (`SelfOnly`, `Family`, `Cohort`) — wire-format invariant per
+    /// FSD `FEDERATION_SCALING_MODEL.md`. Refusal returns a typed
+    /// [`EdgeError::CohortScopeRefusedFederation`].
+    #[allow(clippy::too_many_lines)] // fan-out body matches send_federation
+    pub async fn send_federation_with_cohort_scope<M: Message>(
+        &self,
+        msg: M,
+        ack_timeout_seconds: Option<u64>,
+        cohort_scope: Option<CohortScope>,
+    ) -> Result<Vec<DurableHandle>, EdgeError> {
+        // CIRISEdge#48-A (v0.19.1) — refuse federation-class fan-out
+        // for any locality scope BEFORE enumerating stewards.
+        self.enforce_federation_class_scope(cohort_scope.as_ref(), true)?;
         let (priority, requires_ack, max_attempts, ttl_seconds, type_ack_timeout) =
             match M::DELIVERY {
                 Delivery::Ephemeral => {
@@ -1514,7 +1740,12 @@ impl Edge {
             }
 
             let envelope_bytes = self
-                .build_signed_envelope(&steward.key_id, &msg, None)
+                .build_signed_envelope_with_cohort_scope(
+                    &steward.key_id,
+                    &msg,
+                    None,
+                    cohort_scope.clone(),
+                )
                 .await?;
             let envelope: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
                 .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
@@ -1802,6 +2033,8 @@ impl Edge {
             &self.content_fetch_pending,
             &self.metrics,
             &self.events,
+            &self.cohort_membership,
+            self.config.cohort_scope_enforcement,
         )
         .await;
     }
@@ -2073,6 +2306,11 @@ impl Edge {
         let content_pending = self.content_fetch_pending.clone();
         let metrics = self.metrics.clone();
         let events = self.events.clone();
+        // CIRISEdge#48-A (v0.19.1) — clone the cohort_membership
+        // handle + enforcement mode into the dispatcher loop so the
+        // consumer-side check can access both.
+        let cohort_membership = self.cohort_membership.clone();
+        let cohort_enforcement = self.config.cohort_scope_enforcement;
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -2093,6 +2331,7 @@ impl Edge {
                     let content_pending_clone = content_pending.clone();
                     let metrics_clone = metrics.clone();
                     let events_clone = events.clone();
+                    let cohort_membership_clone = cohort_membership.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -2109,6 +2348,8 @@ impl Edge {
                             &content_pending_clone,
                             &metrics_clone,
                             &events_clone,
+                            &cohort_membership_clone,
+                            cohort_enforcement,
                         ).await;
                     });
                 }
@@ -2122,13 +2363,18 @@ impl Edge {
         Ok(())
     }
 
-    /// Build + sign an envelope around a typed message. Internal
-    /// helper used by both [`Self::send`] and [`Self::send_durable`].
-    async fn build_signed_envelope<M: Message>(
+    /// CIRISEdge#48-A (v0.19.1) — build + sign an envelope with an
+    /// optional cohort_scope slot. Sets the slot BEFORE the canonical-
+    /// bytes signature so the scope is committed-to by the sender's
+    /// signature. Callers passing `None` for `cohort_scope` produce a
+    /// v0.19.0-equivalent envelope (slot omitted from JSON via
+    /// `skip_serializing_if`).
+    async fn build_signed_envelope_with_cohort_scope<M: Message>(
         &self,
         destination_key_id: &str,
         msg: &M,
         in_reply_to: Option<[u8; 32]>,
+        cohort_scope: Option<CohortScope>,
     ) -> Result<Vec<u8>, EdgeError> {
         let mut envelope = build_envelope(
             M::TYPE,
@@ -2137,6 +2383,7 @@ impl Edge {
             msg,
             in_reply_to,
         )?;
+        envelope.cohort_scope = cohort_scope;
         sign_envelope(&self.signer, &mut envelope).await?;
         let bytes = serde_json::to_vec(&envelope)
             .map_err(|e| EdgeError::Config(format!("envelope serialize: {e}")))?;
@@ -2148,6 +2395,97 @@ impl Edge {
             )));
         }
         Ok(bytes)
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) — producer-side enforcement gate for
+    /// `Delivery::Federation` / `Delivery::Mandatory` fan-outs. The
+    /// locality variants (`SelfOnly`, `Family`, `Cohort`) MUST NOT
+    /// cross federation-class hops. Returns `Ok(())` when public OR
+    /// when enforcement is off/warn (warn logs but allows).
+    fn enforce_federation_class_scope(
+        &self,
+        cohort_scope: Option<&CohortScope>,
+        federation_variant: bool,
+    ) -> Result<(), EdgeError> {
+        let Some(scope) = cohort_scope else {
+            return Ok(());
+        };
+        if !scope.is_restricted() {
+            return Ok(());
+        }
+        match self.config.cohort_scope_enforcement {
+            CohortScopeEnforcement::Off => Ok(()),
+            CohortScopeEnforcement::WarnOnly => {
+                tracing::warn!(
+                    event = "edge.cohort_scope.warn_only",
+                    enforcement = %CohortScopeEnforcement::WarnOnly.as_str(),
+                    cohort_scope = ?scope,
+                    federation_variant,
+                    "cohort_scope locality refusal bypassed (WarnOnly mode); CIRISEdge#48-A",
+                );
+                Ok(())
+            }
+            CohortScopeEnforcement::Strict => {
+                if federation_variant {
+                    Err(EdgeError::CohortScopeRefusedFederation {
+                        cohort_scope: scope.clone(),
+                    })
+                } else {
+                    Err(EdgeError::CohortScopeRefusedMandatory {
+                        cohort_scope: scope.clone(),
+                    })
+                }
+            }
+        }
+    }
+
+    /// CIRISEdge#48-A (v0.19.1) — producer-side enforcement gate for
+    /// `Delivery::Ephemeral` / `Delivery::Durable` (point-to-point).
+    /// `SelfOnly` requires recipient == self.signer.key_id; `Family`
+    /// requires the recipient's recorded scope to be Family; `Cohort`
+    /// requires matching cohort_id.
+    fn enforce_point_to_point_scope(
+        &self,
+        cohort_scope: Option<&CohortScope>,
+        recipient_key_id: &str,
+    ) -> Result<(), EdgeError> {
+        let Some(scope) = cohort_scope else {
+            return Ok(());
+        };
+        if !scope.is_restricted() {
+            return Ok(());
+        }
+        let allowed = match scope {
+            CohortScope::Public => true,
+            CohortScope::SelfOnly => recipient_key_id == self.signer.key_id,
+            CohortScope::Family | CohortScope::Cohort { .. } => {
+                let recipient_scope = self.peer_cohort_scope(recipient_key_id);
+                match recipient_scope.as_ref() {
+                    Some(rs) => scope.allows_recipient_scope(rs),
+                    None => false,
+                }
+            }
+        };
+        if allowed {
+            return Ok(());
+        }
+        match self.config.cohort_scope_enforcement {
+            CohortScopeEnforcement::Off => Ok(()),
+            CohortScopeEnforcement::WarnOnly => {
+                tracing::warn!(
+                    event = "edge.cohort_scope.warn_only",
+                    enforcement = %CohortScopeEnforcement::WarnOnly.as_str(),
+                    cohort_scope = ?scope,
+                    recipient_key_id,
+                    "cohort_scope recipient refusal bypassed (WarnOnly mode); CIRISEdge#48-A",
+                );
+                Ok(())
+            }
+            CohortScopeEnforcement::Strict => Err(EdgeError::CohortScopeRefusedRecipient {
+                cohort_scope: scope.clone(),
+                recipient_key_id: recipient_key_id.to_string(),
+            }),
+        }
     }
 }
 
@@ -2175,6 +2513,7 @@ impl Edge {
         content_fetch_pending,
         metrics,
         events,
+        cohort_membership,
     ),
     fields(
         transport_id = %frame.transport.0,
@@ -2200,6 +2539,8 @@ async fn dispatch_inbound(
     content_fetch_pending: &std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<ContentResult>>>,
     metrics: &crate::observability::EdgeMetrics,
     events: &Arc<crate::events::EventBus>,
+    cohort_membership: &std::sync::RwLock<HashMap<String, CohortScope>>,
+    cohort_enforcement: CohortScopeEnforcement,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -2263,6 +2604,78 @@ async fn dispatch_inbound(
         transport_id: transport,
         received_at,
     });
+
+    // CIRISEdge#48-A (v0.19.1) — consumer-side symmetric cohort_scope
+    // check. AFTER verify (signature gates everything; we trust the
+    // claimed scope only insofar as the sender's key vouches for it)
+    // and BEFORE handler dispatch (a violation MUST NOT reach the
+    // application tier). Producer-side refusal at outbound_enqueue
+    // is the structural primitive; this consumer-side check is the
+    // symmetric pair per the CIRISEdge#48-A issue body.
+    //
+    // Wire-format invariant: for ContributionSubmit envelopes (and any
+    // other envelope carrying a `cohort_scope`), if the claimed scope
+    // is `SelfOnly` or `Family` AND the sender's directory-recorded
+    // scope doesn't match the claim, REJECT with a moderation-signal
+    // event so lens-core can downweight the sender. `Public` and
+    // `Cohort{id}` are NOT short-circuited here at v0.19.1 — `Public`
+    // is the implicit baseline, and `Cohort` membership lookup is
+    // future work alongside the same persist `cohort_membership` API
+    // dependency this whole feature documents.
+    if let Some(claimed) = envelope.cohort_scope.as_ref() {
+        if matches!(claimed, CohortScope::SelfOnly | CohortScope::Family) {
+            let recorded_scope = cohort_membership
+                .read()
+                .ok()
+                .and_then(|map| map.get(&envelope.signing_key_id).cloned());
+            let matches_directory = match recorded_scope.as_ref() {
+                Some(rs) => rs == claimed,
+                None => false,
+            };
+            if !matches_directory {
+                match cohort_enforcement {
+                    CohortScopeEnforcement::Off => {
+                        // No enforcement; fall through to handler.
+                    }
+                    CohortScopeEnforcement::WarnOnly => {
+                        tracing::warn!(
+                            event = "edge.cohort_scope.violation.warn_only",
+                            enforcement = %CohortScopeEnforcement::WarnOnly.as_str(),
+                            sender_key_id = %envelope.signing_key_id,
+                            claimed_scope = ?claimed,
+                            directory_scope = ?recorded_scope,
+                            "consumer-side cohort_scope violation bypassed (WarnOnly mode); CIRISEdge#48-A",
+                        );
+                    }
+                    CohortScopeEnforcement::Strict => {
+                        tracing::Span::current().record("verify_outcome", "cohort_scope_violation");
+                        tracing::warn!(
+                            event = "edge.cohort_scope.violation",
+                            sender_key_id = %envelope.signing_key_id,
+                            claimed_scope = ?claimed,
+                            directory_scope = ?recorded_scope,
+                            "consumer-side cohort_scope violation REJECTED (CIRISEdge#48-A)",
+                        );
+                        // CIRISEdge#48-A — moderation-signal event on
+                        // the EventBus so lens-core can downweight the
+                        // sender. Wire shape: resource event tagged
+                        // with the sender's key id + a severity of
+                        // Warning. The scope-violation discriminator
+                        // lives in the description string so consumers
+                        // can grep without re-parsing the event tree.
+                        events.emit_resource(crate::events::NetworkEvent::resource(
+                            "cohort_scope_violation",
+                            1.0,
+                            "count",
+                            crate::events::EventSeverity::Warning,
+                            "cohort_scope violation (CIRISEdge#48-A)",
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+    }
 
     // CIRISEdge#39 (slotted v0.17.0) — Counter-RII probe-pattern
     // observation. Runs AFTER verify (the signature gates everything,
@@ -3006,6 +3419,7 @@ impl EdgeBuilder {
             federation_directory: self.federation_directory,
             detector,
             canonical_peers,
+            cohort_membership: Arc::new(std::sync::RwLock::new(HashMap::new())),
             metrics: crate::observability::EdgeMetrics::new(),
             config: self.config,
         })

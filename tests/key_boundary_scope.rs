@@ -262,6 +262,7 @@ fn envelope_carries_scope_when_set() {
         key_boundary_scope: Some(KeyBoundaryScope::Tenant {
             tenant_id: "acme".to_string(),
         }),
+        cohort_scope: None,
     };
 
     let json = serde_json::to_string(&env).expect("serialize");

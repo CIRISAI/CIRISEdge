@@ -909,6 +909,33 @@ form first lets downstream substrate consumers (CIRISLens,
 CIRISAgent) start emitting scoped envelopes and gather migration
 signal before the binding semantics solidify.
 
+**v0.19.1 addendum (CIRISEdge#48-A)**: partial closure. The
+`cohort_scope` side of the locality scope family — a sibling slot
+to `key_boundary_scope` per CIRISNodeCore SCHEMA §3.2 / FSD
+`FEDERATION_SCALING_MODEL.md` — is now STRUCTURALLY enforced at
+both the producer side (refusal at `Edge::send_*` outbound enqueue:
+`SelfOnly` / `Family` / `Cohort` MUST NOT cross federation-class /
+mandatory-class hops, and point-to-point delivery refuses when the
+recipient is not authorized for the declared scope) and the
+consumer side (symmetric check at `dispatch_inbound`: an inbound
+envelope whose claimed `SelfOnly` / `Family` scope doesn't match the
+sender's directory-recorded scope is REJECTED with a moderation-
+signal event on the EventBus). Default enforcement posture is
+[`CohortScopeEnforcement::Strict`] per wire-format invariant; the
+`WarnOnly` and `Off` modes exist as operator migration gradients
+(`Off` is explicitly testing/dev only). The producer-side refusal
+returns typed [`EdgeError::CohortScopeRefused{Federation,Mandatory,Recipient}`]
+variants; the consumer-side refusal emits a `cohort_scope_violation`
+resource event so lens-core can downweight the sender. See
+[`src/cohort_scope.rs`] + the consumer-side hook in
+`src/edge.rs::dispatch_inbound`. The full
+`key_boundary_scope`-to-signature binding (signature was actually
+produced under the declared key-boundary scope) remains deferred —
+that would require a verify-time per-key scope-resolution surface in
+persist's federation directory (no v3.2.0 read accessor exists), and
+is intentionally larger work than #48-A's wire-format locality
+dividend.
+
 #### AV-46: peer-mgmt TrustClass = operator opinion, not attestation
 
 **Attack surface (architectural / semantic)**: v0.15.1 wired the

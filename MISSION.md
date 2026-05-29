@@ -592,6 +592,26 @@ implementation file:
   documented now (and threat-modeled in §AV-canonical-peer below) so
   downstream substrate consumers can pin against the contract before
   the wire-up ships.
+- **Cohort scope enforcement** (v0.19.1 CIRISEdge#48-A,
+  `src/cohort_scope.rs::CohortScope` +
+  `src/edge.rs::enforce_federation_class_scope` /
+  `enforce_point_to_point_scope`, pinned by
+  `tests/cohort_scope_refusal.rs`) — edge structurally enforces the
+  wire-format locality dividend at outbound_enqueue: self/family-
+  scoped Contributions never leave the producer's enclosing
+  federation. `Delivery::Federation` / `Delivery::Mandatory` refuse
+  any restricted scope (`SelfOnly` / `Family` / `Cohort`);
+  point-to-point (`Ephemeral` / `Durable`) refuse when the recipient
+  is not authorized for the scope (operator-declared cohort
+  membership via the in-process `cohort_membership` registry). The
+  consumer-side symmetric check at `dispatch_inbound` rejects
+  inbound envelopes whose claimed scope doesn't match the sender's
+  directory-recorded scope and emits a moderation-signal
+  `cohort_scope_violation` resource event. Default is `Strict` —
+  wire-format invariant per FSD `FEDERATION_SCALING_MODEL.md`;
+  `WarnOnly` / `Off` are migration gradients. The CIRISEdge#48-B
+  receiver-side trust short-circuit at `dispatch_inbound` defers to
+  v0.19.2 pending persist's `TrustScoring` trait.
 - **HTTPS production-grade hardening** (v0.18.1 CIRISEdge#23,
   `src/transport/http.rs::HttpsTransport` + `HttpServerConfig` +
   `HttpClientConfig` + `BearerTokenAuth` + `FederationCnVerifier`,

@@ -55,6 +55,7 @@ fn make_envelope(body_size: usize) -> EdgeEnvelope {
         in_reply_to: None,
         testimonial_witness: None,
         key_boundary_scope: None,
+        cohort_scope: None,
     }
 }
 

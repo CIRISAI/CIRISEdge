@@ -59,6 +59,7 @@ fn sample_envelope(signing: &str, destination: &str) -> EdgeEnvelope {
         in_reply_to: None,
         testimonial_witness: None,
         key_boundary_scope: None,
+        cohort_scope: None,
     }
 }
 
