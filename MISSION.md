@@ -6,9 +6,9 @@
 > file. Methodology: `~/CIRISAgent/FSD/MISSION_DRIVEN_DEVELOPMENT.md`
 > and the overview at [ciris.ai/mdd](https://ciris.ai/mdd).
 
-**Version**: 1.0
-**Status**: Active — reverse-engineered against `main` at v0.4.0
-**Date**: 2026-05-22
+**Version**: 1.1
+**Status**: Active — refreshed against `main` at v0.17.x (v1.0-prep docs cut)
+**Date**: 2026-05-29
 
 This is the reverse-engineered MDD charter for CIRISEdge: it maps the
 four pillars — Mission (WHY) / Protocols (WHO) / Schemas (WHAT) / Logic
@@ -222,6 +222,51 @@ with deliberate cross-repo coordination.
   over the public Rust API; the `Edge` class registration lands in a
   later minor. `crate-type = ["cdylib", "rlib"]` so one wheel serves
   Python while `cargo` consumers get the `rlib`.
+- **UniFFI binding surface** (`udl/ciris_edge.udl`, v0.13.0
+  CIRISEdge#36 GO) — a single UDL drives auto-generated Python,
+  Kotlin, and Swift bindings via `uniffi::generate_scaffolding` in
+  `build.rs`. The spike's GO carve-out keeps the load-bearing
+  cohabitation primitives on PyO3 (`init_edge_runtime` PyCapsule
+  cohabitation, Tier 2 GIL-drainer callbacks, AsyncIterator event
+  stream, QR import/export with `Bound<PyAny>` complexity); every
+  other read/CRUD surface — transport mgmt (#25), peer mgmt (#26),
+  identity reads (#31), observability snapshot reads (#28), links
+  FFI (#32), routing FFI (#33) — moves under UniFFI so the same UDL
+  produces Python + Kotlin Multiplatform + Swift bindings from one
+  source. Free-function shape registered via `install_edge_handle`
+  (`src/ffi/uniffi_impl.rs::install_edge_handle`); pre-init callers
+  receive typed `EdgeBindingsError::NotInitialized` rather than
+  panics or garbage data (AV-47).
+- **The 6-capsule cohabitation surface** (`src/ffi/pyo3.rs::extract_capsule`)
+  — when edge cohabits with an already-bootstrapped persist `Engine`
+  in the same Python process, the engine hands edge five (now six,
+  with persist v3.1.1's `local_signer_capsule`) opaque `PyCapsule`
+  pointers: `federation_directory_capsule`, `outbound_queue_capsule`,
+  `keyring_signer_capsule`, `runtime_handle_capsule`, and
+  `local_signer_capsule`. The sixth slot (`blob_storage_capsule`)
+  is the contract shape reserved for the v0.18.x content-fetch
+  durability cohabitation. "Each capsule one job" is the architectural
+  primitive: the hot-path **hardware-rooted scrub envelope signer**
+  arrives through `keyring_signer_capsule` (P-256 + ML-DSA hybrid
+  under `hardware_hsm_only`) while the **32-byte Ed25519 Reticulum
+  transport identity** arrives through `local_signer_capsule`
+  (LocalSigner over a `local_key_path` seed). Two capsules, two
+  signing identities, one cohabiting engine — the split is what makes
+  AV-43 closure structural rather than a runtime check.
+- **Verify-4 FederationKeyset hybrid pubkey separation**
+  (`src/identity.rs::EdgeFederationKeyMetadata::pubkey_ml_dsa_65_base64`,
+  `src/verify.rs::AccordHolderKey::pubkey_ed25519`) — CIRISVerify v4.0
+  formalizes the federation key's transport (Ed25519) and PQC
+  (ML-DSA-65) components as distinct first-class fields. Edge reads
+  `pubkey_ed25519_base64` for the §6.1 attestation cold-start root +
+  `AccordHolderKey` accord-holder enumeration, and
+  `pubkey_ml_dsa_65_base64` (when present on the federation row) for
+  the hybrid verify second leg via `verify_hybrid_via_directory`. The
+  field separation is what makes consumer `HybridPolicy` selectable
+  per-peer: strict-hybrid rejects rows with `pubkey_ml_dsa_65_base64 =
+  None`; soft-hybrid+freshness accepts pending rows within a freshness
+  budget; Ed25519-fallback honors the row even when the PQC half is
+  absent.
 
 ## 3. SCHEMAS (WHAT)
 
@@ -442,7 +487,113 @@ and intentionally does not touch the substrate today. Together these
 fields make CIRISEdge legibly compliant with the CIRIS 3.0 protocol
 surface, in the AGPL letter as well as the apophatic spirit of §1.4.
 
-## 11. How to maintain this document
+## 11. Architectural surfaces shipped v0.5.0 → v0.17.x
+
+The v0.4.0 reverse-engineering pass anchored the v1.0-prep architecture
+floor — verify pipeline, durable outbound, Reticulum + HTTP transports,
+authenticated `PeerResolver` cold-start (AV-42). The minors between
+v0.4.0 and v0.17.0 added six load-bearing surfaces that the v1.0 doc
+contract must name explicitly. Each is anchored to its primary
+implementation file:
+
+- **Link lifecycle primitive** (v0.14.0 CIRISEdge#32,
+  `src/transport/reticulum.rs::link_open` / `link_teardown` /
+  `link_request`; `src/events.rs::LinkEvent`) — Reticulum's Link
+  becomes an operator-visible lifecycle: `link_open(dest_hash)` →
+  `LinkEstablished` event → typed `LinkId` returned → `link_request`
+  / `link_teardown` over the established link → `LinkDropped` event on
+  close. Links carry encrypted Curve25519-derived DH keys per
+  connection (Reticulum-native, not edge-defined); they are
+  **security-relevant because traffic over a Link is encrypted under
+  a per-connection key derived from both endpoints' transport
+  identities** — Reticulum's `LinkEstablished` is the point past which
+  bytes are no longer wire-readable to a passive adversary. Edge
+  exposes the lifecycle through `EdgeLinkInfo` + `EdgeLinkState`
+  (`src/ffi/uniffi_types.rs`) so operators can see which peers
+  currently have a live link, when it established, and tear stale
+  links down.
+- **Routing-table FFI primitives** (v0.15.0 CIRISEdge#33,
+  `src/ffi/uniffi_impl_routing.rs`) — six routing surfaces exposed
+  for operator visibility + policy: `routing_path_table` /
+  `routing_path_to` / `routing_path_request` / `routing_path_drop` /
+  `routing_path_drop_via` (Reticulum's announced-paths view);
+  `routing_blackhole_list` / `_add` / `_remove` /
+  `_prune_expired` (operator deny-list, per-Reticulum-identity);
+  `routing_rate_table` (per-source rate-limit decay view);
+  `routing_tunnels` / `routing_transport_uptime` /
+  `routing_transport_id`; `routing_announce_table` (in-flight
+  announces); `routing_reverse_table` (reverse path-resolution
+  cache). The blackhole surface is the architecturally-interesting
+  one: it is **local operator policy, not federation attestation**
+  — see AV-46. v0.16.1 (CIRISEdge#33 follow-up + CIRISPersist#120)
+  flipped blackhole storage from in-memory
+  `Arc<RwLock<HashMap<Vec<u8>, BlackholeRecord>>>` to durable
+  persist-backed `Arc<dyn BlackholeRules>` over the V052
+  `cirislens.blackhole_rules` table; operator-set rules now survive
+  process restarts.
+- **Peer-mgmt mutation surface** (v0.15.1 CIRISEdge#26,
+  `src/ffi/uniffi_impl.rs::peer_add` / `peer_remove` /
+  `peer_set_alias` / `peer_set_trust` / `peer_set_notes` /
+  `peer_set_policy`) — six peer-CRUD methods wiring persist v3.1.0's
+  `FederationDirectory` mutation surface (CIRISPersist#117). The
+  typed `EdgePeerTrust` enum (`Untrusted` / `Trusted` / `Restricted`
+  / `Blocked`) mirrors persist's `TrustClass`. **TrustClass is
+  operator opinion, not federation attestation** — a peer marked
+  `Blocked` locally is not being attested-against by the federation;
+  see AV-46. The opinion lives in persist's `federation_peer_metadata`
+  sibling table (per CIRISPersist#117 — not folded into
+  `federation_keys`), preserving the "federation directory is about
+  identity, operator metadata is about policy" separation.
+- **testimonial_witness preservation primitive** (v0.16.0
+  CIRISEdge#37, FSD-002 §3.6.3 v1.4, `src/messages/mod.rs::
+  TestimonialWitness`; round-trip pinned by
+  `tests/testimonial_witness_round_trip.rs`) — `EdgeEnvelope` now
+  carries an optional `testimonial_witness: Option<TestimonialWitness>`
+  field. Edge forwards the value verbatim across federation forwarding
+  and signs it as part of canonical envelope bytes; edge does **not**
+  interpret the opaque `payload`. The asymmetry is M-1 rendered as
+  architecture and is treated in detail in §10 above + AV-44 below.
+- **key_boundary `{scope}` slot** (v0.16.0 CIRISEdge#38,
+  `src/key_boundary.rs::KeyBoundaryScope`) — wire-form scope slot
+  extending the AV-17 invariant string. Wire form:
+  `key_boundary:{process|tenant|channel|cohort|data_class}:no_seed_in_heap`.
+  The AV-17 process-level invariant (no seed in edge's heap) is
+  **unchanged at v0.16.0 — scope-irrespective**. The slot is wire-form
+  only at v0.16.0 / v0.17.0; signature-to-scope binding enforcement
+  is v0.16.1+ scope. Treated in detail in §10 above + AV-45 below.
+- **SAS deterministic UX helper** (v0.17.0 CIRISEdge#47,
+  `src/sas.rs::peer_sas_words` / `peer_sas_digits`) — a deterministic,
+  order-independent representation of `(local_pub, peer_pub,
+  CIRIS_SAS_PROTOCOL_CONSTANT)` that two operators can verbally
+  confirm out-of-band to verify they share the same peer identity
+  (MITM-resistant elevation from `EdgePeerTrust::Untrusted` to
+  `Trusted`). The recipe is `H(sorted(local_pub ‖ peer_pub) ‖
+  CIRIS_SAS_PROTOCOL_CONSTANT)` with the protocol constant locked as
+  `ciris-edge::peer-sas::v1\0` (`src/sas.rs::CIRIS_SAS_PROTOCOL_CONSTANT`,
+  pinned by `tests::peer_sas_protocol_constant_locked`). BIP39 English
+  wordlist; default 5 words ≈ 55 bits, default 6 digits ≈ 20 bits —
+  consumer picks the tier their UX channel supports. The order-
+  independence (`sort_unstable` before hashing) guarantees both peers
+  compute the same SAS regardless of who is "local" — critical for an
+  out-of-band verbal-confirmation UX.
+- **Canonical-peer invariant** (CIRISEdge#46, scheduled v0.18.0 —
+  anchored here as a v0.17.1 documented requirement so v1.0-prep
+  consumers can rely on the contract shape). Bootstrap peers (the
+  canonical CIRIS infrastructure roster — e.g. `agents.ciris.ai`) are
+  re-seeded into `federation_peer_metadata` on every Edge start; the
+  operator can flip their trust state (`Untrusted` / `Blocked`) and
+  that flip survives restarts; the operator **cannot** permanently
+  remove a canonical peer — `peer_remove(handle, hard=true)` on a
+  canonical peer returns typed `CANNOT_REMOVE_CANONICAL_PEER` and
+  `EdgePeerInfo` gains a `canonical: bool` field. This aligns with
+  Reticulum's structural distinction between propagation nodes (the
+  infrastructure roster) and peers (operator-controlled trust
+  relationships). The wiring lands at v0.18.0; the invariant is
+  documented now (and threat-modeled in §AV-canonical-peer below) so
+  downstream substrate consumers can pin against the contract before
+  the wire-up ships.
+
+## 12. How to maintain this document
 
 A working document, not a release artifact. Update it whenever:
 

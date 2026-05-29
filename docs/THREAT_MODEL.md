@@ -1,7 +1,15 @@
 # CIRISEdge Threat Model
 
-**Status:** v0.0 baseline scaffold (pre-Phase-1 implementation; spec-only as
-of `3fc4ab0`). Updated each minor release once code lands.
+**Status:** v0.17.x production-grade — Reticulum + HTTPS transports both
+shipped at production grade (HTTPS promoted from "fallback" to
+fully-equivalent transport at v0.13.0 CIRISEdge#23 Track B);
+authenticated `PeerResolver` cold-start (AV-42, v0.4.0); UniFFI binding
+surface (v0.13.0 CIRISEdge#36 GO); 6-capsule cohabitation handoff with
+`local_signer` for the Reticulum transport identity (v0.16.1 main-line
+cherry-pick of v0.13.1 patch line, CIRISEdge#43); ~210 tests across the
+verify / replay / authenticated-resolution / links / routing / peer-mgmt
+/ SAS surfaces. Prior baseline: v0.0 spec-only scaffold at `3fc4ab0`.
+Updated each minor release.
 **Audience:** federation peers integrating against `ciris-edge`, security
 reviewers, downstream substrate consumers (`CIRISLens`, `CIRISAgent`,
 `CIRISRegistry`).
@@ -206,8 +214,13 @@ closure). Edge tests assert this invariant by heap-scan property tests
 
 ## 4. Attack Vectors
 
-Twenty-four vectors organized by adversary goal. Each lists the attack,
-the primary mitigation, secondary mitigation, and residual risk.
+Thirty-one vectors organized by adversary goal (twenty-four
+pre-Phase-1 vectors AV-1..AV-25; AV-42 added at v0.4.0;
+AV-43..AV-47 added at v0.17.1 — these document architectural surfaces
+that landed across v0.13.0 → v0.17.0; plus the canonical-peer
+invariant documented as a forward-looking threat-modeling anchor for
+the v0.18.0 wire-up of CIRISEdge#46). Each lists the attack, the
+primary mitigation, secondary mitigation, and residual risk.
 
 ### 4.1 Identity / Forgery — adversary wants their bytes counted
 
@@ -757,6 +770,301 @@ audit chain). The `epoch` field gives transport-identity rotation a
 monotonic supersede signal; revocation of a stale binding before its
 epoch bumps is a v0.2.x freshness concern.
 
+### 4.8 Cohabitation / FFI cohab discipline — v0.13.0 → v0.17.0 surfaces
+
+#### AV-43: Federation transport identity 32-byte vs 65-byte hybrid
+
+**Attack surface (architectural)**: when edge cohabits with a host
+process's already-bootstrapped persist `Engine` (the CIRIS 3.0
+cohabitation lane — agent + edge + lens in one Python process), the
+hardware-rooted 65-byte hybrid `keyring_signer_capsule` (P-256 +
+ML-DSA hybrid under `hardware_hsm_only`) is the correct primitive for
+**hot-path scrub envelope signing** — that is the forensic-grade
+identity the federation expects on outbound envelopes. But the
+Reticulum transport's Curve25519-derived DH key-exchange needs a
+**32-byte Ed25519 private key** to mint the dual-key transport
+identity. A naive cohab implementation could either (a) try to drive
+Reticulum's transport-identity construction from the 65-byte hybrid
+signer (Reticulum can't consume it; the transport never establishes)
+or (b) reach back into the cohabiting engine and copy the local-signer
+seed across the FFI boundary into edge's heap — breaking AV-17.
+
+**Mitigation**: v0.13.1 (patch line) + v0.16.1 (main line cherry-pick
+per CIRISEdge#43) close this with `init_edge_runtime`'s **Step 3.5**
+dual-capsule extraction. After persist v3.1.1 (CIRISPersist#119), the
+cohab engine exposes a second signer capsule alongside the first:
+`local_signer_capsule` wraps an `Arc<dyn ciris_keyring::LocalSigner>`
+constructed from the engine's `local_key_path` 32-byte Ed25519 seed.
+`init_edge_runtime` extracts the capsule via the same
+`extract_capsule` helper (`src/ffi/pyo3.rs::extract_capsule`) it uses
+for the other four cohab capsules, then wraps the resulting
+`Arc<dyn LocalSigner>` in persist's `LocalSignerHardwareAdapter` — an
+adapter that implements `Arc<dyn HardwareSigner>` so the Reticulum
+transport can consume it through the same trait surface it always
+has. **AV-17 holds: neither seed crosses the FFI boundary** — both
+signers arrive as opaque `Arc<dyn Trait>` pointers wrapped in
+`PyCapsule`s; edge's heap holds the trait objects, not the seed
+bytes. Two capsules, two roles, one cohabiting engine: the
+hardware-rooted hybrid drives scrub envelope signing on the hot path,
+the local Ed25519 drives Reticulum's transport identity.
+
+**Test**: the cohabitation init path is exercised through the
+PyCapsule extraction smoke tests in `src/ffi/pyo3.rs` (cf. line ~2936
+where the error-message contract for the four mandatory capsules is
+pinned, and line ~3007 where the runtime-handle-capsule fallback is
+checked). For v3.1.1-pre engines that don't expose `local_signer_capsule`
+yet, the `LocalSignerCapsuleAttempt::NotPresent` branch falls back to
+the legacy seed-file path (`src/identity.rs::LocalSigner::from_seed_dir`)
+predating persist v2.12.0 / #112; AV-17's heap-scan property test
+covers both paths uniformly because the invariant is "no seed bytes in
+edge's heap during sign", scope-irrespective.
+
+**Residual**: a future contributor wires Reticulum's transport
+identity through `keyring_signer_capsule` directly (bypassing the
+adapter), or copies the local seed across the FFI rather than holding
+the capsule. PR review catches the first (the type doesn't compile —
+Reticulum's transport-identity constructor expects 32 bytes, not 65);
+the AV-17 heap-scan property test catches the second.
+
+#### AV-44: testimonial_witness preservation invariant
+
+**Attack surface (architectural + integrity)**: at v0.16.0 the
+`EdgeEnvelope` carries an optional
+`testimonial_witness: Option<TestimonialWitness>` field
+(`{kind, payload, issuer_key_id, issued_at}`) propagated verbatim from
+the joint-correlation tier (lens-core detectors, ratchet-conscience
+evaluators, registry attesters). The threat is **silent witness drop
+or re-interpretation by edge** along the forwarding path — either
+would break the M-1 Fidelity & Transparency audit chain (the chain
+requires every witness a downstream evaluator might need to be
+visible end-to-end) and would silently substitute edge's reading of
+the payload for the policy tier's signed claim, breaking Respect
+for Autonomy ("the policy tier owns its own meaning").
+
+**Mitigation**: the field is `Option`-wrapped with
+`#[serde(default, skip_serializing_if = "Option::is_none")]` so
+v0.15.x envelopes round-trip byte-equal at v0.16.0+ (no spurious
+`"testimonial_witness": null` appears in serialized JSON when the
+field is `None`). Canonical bytes derive through
+`ciris_persist::canonicalize_envelope_for_signing` — the single
+source of canonicalization (CIRISPersist#7) — so the witness bytes
+participate in the signature exactly as the issuer wrote them.
+**Edge does not interpret the opaque `payload`** — the payload is
+the issuer's bytes, signed by the issuer's key; verification of the
+witness against its `issuer_key_id` is the consumer's responsibility,
+the same discipline edge already applies to `accord_signatures`
+(FSD-002 §4.5).
+
+**Test**: `tests/testimonial_witness_round_trip.rs` pins the
+preservation contract: v0.15.x backward-compat (key absent when
+`None`); witness round-trips byte-equal when `Some`; canonical bytes
+differ between present-vs-absent witness (i.e. the field is in the
+signed bytes); multi-issuer witnesses round-trip byte-equal; the
+"one witness per envelope" type-level invariant (the field is
+`Option<TestimonialWitness>`, not `Vec`).
+
+**Residual**: a future contributor adds an "edge-side witness sniff"
+helper that parses the opaque `payload` to make a routing decision.
+That would break the Respect-for-Autonomy framing of §10. PR review
+catches; the discipline is "if you need to read a witness, you are
+not edge — the witness is for the policy tier."
+
+#### AV-45: key_boundary {scope} binding-deferred
+
+**Attack surface (architectural)**: v0.16.0 ships the wire form
+`key_boundary:{scope}:no_seed_in_heap` where `{scope}` is one of
+`process` / `tenant:{tenant_id}` / `channel:{channel_id}` /
+`cohort:{cohort_id}` / `data_class:{class}` (typed via
+`src/key_boundary.rs::KeyBoundaryScope`). **Signature-to-scope binding
+enforcement** — the verify-time check that a signature was produced
+under a key actually scoped per the envelope's declared scope — is
+v0.16.1+ scope and explicitly NOT closed at v0.16.0 / v0.17.0.
+The threat is **scope-spoofing**: an envelope claims
+`key_boundary:tenant:foo:no_seed_in_heap` but is signed by a
+process-wide key (or by a key scoped to a different tenant). A
+consumer naively trusting the declared scope would mis-attribute the
+claim to a key-boundary it was not actually signed under.
+
+**Mitigation (v0.16.0 / v0.17.0)**: the wire form exists so
+downstream consumers can express their scoping contracts on the wire
+without a wire break; future enforcement (a verify-time check that
+binds signatures to a scope) will check the declaration against the
+substrate's scope-keyed signing-key resolution. **AV-17 itself is
+unchanged at v0.16.0 / v0.17.0 — edge's process never holds a seed,
+scope-irrespective** (the heap-scan property test covers the
+process-wide invariant, which holds for every scope). Consumers
+should treat the `key_boundary_scope` field as a *declared* contract,
+not an *enforced* one, until v0.16.1+ binding enforcement lands.
+Legacy v0.15.x envelopes carrying the bare
+`key_boundary:no_seed_in_heap` string parse as the
+`KeyBoundaryScope::Process` variant for backward compatibility
+(`src/key_boundary.rs::LEGACY_NO_SEED_IN_HEAP`).
+
+**Residual**: scope-spoofing is detectable only by the consumer's
+own scope-binding check until edge enforces it. **Document this as a
+known deferred-enforcement scope** so multi-tenant / per-cohort
+deployments do not assume the wire field is enforced at v0.16.0 /
+v0.17.0. The deferred enforcement is intentional — landing the wire
+form first lets downstream substrate consumers (CIRISLens,
+CIRISAgent) start emitting scoped envelopes and gather migration
+signal before the binding semantics solidify.
+
+#### AV-46: peer-mgmt TrustClass = operator opinion, not attestation
+
+**Attack surface (architectural / semantic)**: v0.15.1 wired the
+peer-mgmt mutation surface (`src/ffi/uniffi_impl.rs::peer_add` /
+`peer_remove` / `peer_set_alias` / `peer_set_trust` / `peer_set_notes`
+/ `peer_set_policy`) against persist v3.1.0's `FederationDirectory`
+mutation methods (CIRISPersist#117). The typed `TrustClass` enum
+(`Untrusted` / `Trusted` / `Restricted` / `Blocked`) carries the
+operator's view of the peer. The threat is **confusing operator
+opinion with federation attestation**: a downstream consumer reading
+`TrustClass::Blocked` on a peer-info row might infer that the
+federation has attested-against this peer (revocation, fraud finding,
+etc.) when in fact the operator simply chose to refuse traffic from
+that peer on this Edge instance. The reverse confusion is worse —
+treating an operator's `Trusted` flip as if it were a federation
+attestation would let a single compromised operator effectively
+"vouch" for an adversary peer to the rest of the substrate.
+
+**Mitigation**: **operator opinion lives in
+`federation_peer_metadata` — a sibling table to `federation_keys`,
+per CIRISPersist#117 — NOT folded into the directory itself.** The
+schema separation is the load-bearing invariant: federation directory
+rows carry the federation's attested view (crypto identities, trust
+statements signed by the federation); operator metadata rows carry
+the per-instance operator opinion (alias, trust class, notes,
+policy). Edge surfaces both in `EdgePeerInfo`, but the structural
+separation makes "this is an operator opinion" textually obvious at
+every call site. Trust-state mutations **bypass §6.1
+chain-honesty by design** — they are a local-policy primitive, not a
+wire-attested claim. The framing aligns with CIRIS Accord §I
+Respect-for-Autonomy: an operator's right to refuse traffic is theirs;
+that refusal does not propagate as an attestation against the peer.
+
+**Test**: `tests/peer_mutation_ffi.rs` exercises the mutation surface
+through the UniFFI free-function shape — `peer_add` → `peer_get`
+round-trips the typed `EdgePeerTrust`; `peer_set_trust` flips persist
+through `edge_trust_to_persist` (`src/ffi/uniffi_impl.rs:248`); the
+post-mutation `peer_list` view reflects the operator opinion.
+
+**Residual**: a downstream consumer reads `peer_get(handle).trust`
+and infers a federation attestation. Documentation is the mitigation
+— the `EdgePeerTrust` doc comment names this explicitly. The
+structural separation in persist's schema (sibling table, not folded
+column) makes the inversion expensive to do accidentally.
+
+#### AV-47: UniFFI pre-init invariant
+
+**Attack surface (cross-language correctness)**: every UniFFI FFI
+free function in `src/ffi/uniffi_impl.rs` /
+`src/ffi/uniffi_impl_links.rs` / `src/ffi/uniffi_impl_routing.rs`
+dispatches through the global `install_edge_handle` registry slot
+(`src/ffi/uniffi_impl.rs::install_edge_handle`, a
+`OnceLock<RwLock<Weak<Edge>>>`). The threat is **a cross-language
+consumer (Python, Kotlin, Swift) calling an FFI free function before
+`init_edge_runtime` has populated the slot, or after the Edge has
+been torn down**. The naive failure mode is a panic (UniFFI surfaces
+panics as language-level exceptions on most targets, but Swift's
+binding contract requires `Result`-shaped errors, not panics);
+returning garbage data (e.g. an empty `Vec`) is worse because the
+consumer would silently treat "no Edge installed yet" as "Edge is up
+but has no state".
+
+**Mitigation**: every FFI free function checks slot population via
+`current_edge()` (`src/ffi/uniffi_impl.rs:79`) and returns typed
+`EdgeBindingsError::NotInitialized` if the slot is empty, OR typed
+`EdgeBindingsError::Unsupported` if the slot is populated but the
+specific FFI surface is unavailable (e.g. an FFI free function whose
+backing trait method is `NotImplemented` on the current persist
+version). **No FFI free function panics, returns garbage, or
+silently does nothing** — every entry point is `Result`-typed with
+the same `EdgeBindingsError` discriminant set across the crate. The
+`Weak<Edge>` design also handles teardown gracefully: after the
+strong `Arc<Edge>` is dropped, `Weak::upgrade()` returns `None` and
+the FFI surfaces flip back to `NotInitialized`.
+
+**Test**: `tests/routing_ffi.rs::uniffi_path_table_unsupported_without_init`
+and `tests/links_ffi.rs::uniffi_link_list_unsupported_without_init`
+pin the invariant for the routing and links surfaces. Analogous
+pre-init smoke tests cover the peer-mgmt surface; the assertion is
+"no `install_edge_handle` call → FFI returns typed
+`NotInitialized` / `Unsupported`, never panics, never returns garbage
+data."
+
+**Residual**: a contributor adds a new FFI free function and forgets
+the `current_edge()?` gate. PR review + the per-surface pre-init
+smoke test pattern catches this; the discipline is "every UniFFI
+free function gates on `current_edge()` first."
+
+### 4.9 Forward-looking invariants (anchored at v0.17.1 for v0.18.x wire-up)
+
+#### Canonical-peer invariant (CIRISEdge#46 — scheduled v0.18.0)
+
+**Attack surface (operational)**: bootstrap peers — the canonical
+CIRIS infrastructure roster (`agents.ciris.ai`, the steward bootstrap
+nodes, the registry peers) — are how a fresh Edge discovers the
+federation at all. The threat is **an operator silently dropping a
+canonical CIRIS infrastructure peer and losing federation reach** —
+either by accident (an over-aggressive `peer_remove` cleanup script)
+or by an adversary with operator-tier access who wants to isolate a
+victim Edge from the wider federation while still letting it run.
+A naive peer-mutation surface (the v0.15.1 shape) would let
+`peer_remove(handle, hard=true)` permanently delete the
+`agents.ciris.ai` row from the local `federation_peer_metadata`
+table; the operator might never notice the deletion until federation
+traffic dries up.
+
+**Mitigation (scheduled v0.18.0)**: the v0.18.0 cut introduces three
+linked invariants:
+
+1. **Bootstrap peers re-seeded on every Edge start.** A canonical
+   roster (the federation's published infrastructure list, ratified
+   via the same CIRISRegistry channel as the substrate version pins)
+   is reconciled into `federation_peer_metadata` at startup. Missing
+   canonical peers are re-inserted with default `Untrusted` trust
+   state; existing rows keep their operator-set trust state untouched.
+2. **Operator trust state survives restarts.** An operator who has
+   flipped `agents.ciris.ai` to `Blocked` will see it remain `Blocked`
+   across restarts — the reconcile pass preserves
+   `federation_peer_metadata.trust_class` for existing rows. The
+   operator-autonomy framing of AV-46 holds: the user can refuse
+   trust.
+3. **Hard-remove is rejected for canonical peers.**
+   `peer_remove(handle, hard=true)` against a canonical peer returns
+   typed `EdgeBindingsError::CannotRemoveCanonicalPeer` (the exact
+   error name lands at v0.18.0; the discriminant is reserved here
+   for the contract). The operator can refuse trust but cannot lose
+   knowledge — canonical peers are infrastructure-class. The
+   `EdgePeerInfo` row gains a `canonical: bool` field so the consumer
+   can render the "this peer is infrastructure, you may refuse trust
+   but cannot remove" UX semantic.
+
+The split aligns with Reticulum's structural distinction between
+propagation nodes (the infrastructure roster — fixed, infra-class)
+and peers (operator-controlled trust relationships — mutable).
+Documenting the invariant at v0.17.1 (ahead of the v0.18.0 wire-up)
+primes the threat model: downstream substrate consumers
+(CIRISLens, CIRISAgent, CIRISRegistry) can pin against the contract
+shape before the wiring ships, and v0.18.0's acceptance tests can be
+written against the documented invariant rather than reverse-engineered
+from the implementation.
+
+**Test (scheduled)**: v0.18.0 acceptance suite must pin
+(a) canonical-peer reseed on fresh start; (b) operator-flipped trust
+state preserved across restart; (c) `peer_remove(canonical,
+hard=true)` returns typed `CannotRemoveCanonicalPeer`;
+(d) `EdgePeerInfo.canonical` is `true` for bootstrap peers, `false`
+for operator-added peers.
+
+**Residual**: an operator who blocks every canonical peer locally
+loses federation reach — by design. The mitigation is **knowledge
+without trust**: the operator sees the canonical peers in
+`peer_list`, knows what they are (`canonical: true`), and can choose
+to refuse traffic; they cannot accidentally forget the peers exist.
+A wholly air-gapped deployment (no federation reach by design) is a
+distinct deployment mode, not a canonical-peer concern.
+
 ---
 
 ## 5. Mitigation Matrix
@@ -789,6 +1097,12 @@ epoch bumps is a v0.2.x freshness concern.
 | AV-24 | Build-manifest forgery | P1 | Hybrid Ed25519 + ML-DSA-65 release sig | AGPL license-lock | ⚠ Same as lens, persist | — |
 | AV-25 | Cross-Reticulum-impl drift | P2 | Byte-equivalence regression test | — | ⚠ Forward-looking (Leviculum) | — |
 | AV-42 | Spoofed transport-identity ↔ federation-key binding | P1 | Two-step root + attestation-verify cold-start path (`root_binding` + announce attestation) | Consumer `HybridPolicy` over the rooted chain | ✓ Mitigated (CIRISEdge#15, v0.4.0) | `tests/reticulum_av42.rs` |
+| AV-43 | 32-byte vs 65-byte hybrid transport identity confusion in cohab | P1 | Step 3.5 dual-capsule extraction in `init_edge_runtime`; `LocalSignerHardwareAdapter` wraps `local_signer_capsule` for the Reticulum transport identity | AV-17 heap-scan property test (both signers cross FFI as opaque `Arc<dyn Trait>`) | ✓ Mitigated (CIRISEdge#43, v0.13.1 patch / v0.16.1 main cherry-pick) | `src/ffi/pyo3.rs::extract_capsule` smoke tests |
+| AV-44 | testimonial_witness silent drop / re-interpretation | P1 | `#[serde(default, skip_serializing_if = "Option::is_none")]`; canonical bytes via `ciris_persist::canonicalize_envelope_for_signing`; edge does not interpret `payload` | Consumer verifies witness against `issuer_key_id` (same discipline as `accord_signatures`) | ✓ Mitigated (v0.16.0 CIRISEdge#37) | `tests/testimonial_witness_round_trip.rs` |
+| AV-45 | key_boundary scope-spoofing (declared ≠ actually-signed-under) | P2 | Wire form only at v0.16.0 / v0.17.0; documented as declared-not-enforced | AV-17 process-wide invariant unchanged (scope-irrespective heap-scan) | ⚠ Deferred enforcement (v0.16.1+ binding scope) | `src/key_boundary.rs` (wire codec only) |
+| AV-46 | Operator opinion confused with federation attestation | P3 | Schema separation: `federation_peer_metadata` sibling table per CIRISPersist#117 (not folded into `federation_keys`); `EdgePeerTrust` doc explicit | Documentation; Accord §I operator-autonomy framing | ✓ Mitigated structurally (v0.15.1) | `tests/peer_mutation_ffi.rs` |
+| AV-47 | UniFFI free-function called pre-init / post-teardown | P1 | `OnceLock<RwLock<Weak<Edge>>>` slot + per-surface `current_edge()?` gate; typed `EdgeBindingsError::{NotInitialized,Unsupported}` | `Weak::upgrade` returns `None` on teardown → flips back to `NotInitialized` | ✓ Mitigated (v0.13.0+ UniFFI scaffolding pattern) | `tests/routing_ffi.rs::uniffi_path_table_unsupported_without_init`, `tests/links_ffi.rs::uniffi_link_list_unsupported_without_init` |
+| Canonical-peer | Operator silently drops canonical CIRIS infra peer | P1 | Bootstrap reseed on every start; `peer_remove(canonical, hard=true)` → typed `CannotRemoveCanonicalPeer`; `EdgePeerInfo.canonical: bool` | Operator trust-state flip preserved across restart (refuse trust without forgetting peer) | ⚠ Scheduled v0.18.0 (CIRISEdge#46) | tests scheduled v0.18.0 acceptance |
 
 **Pre-Phase-1 P0 must-have bundle**: AV-9 + AV-13 + AV-14 + AV-17 +
 hybrid verify (OQ-11 closure). The first four are the structural
@@ -957,6 +1271,29 @@ V0.4.0 SHIPPED (CIRISEdge#15 / CIRISVerify#28 Phase 3)
            replaces v0.3.1 trust-on-first-use on the PeerResolver
            cold-start path)
 
+V0.13.0 → V0.17.0 SHIPPED (cohab + UniFFI + wire-compliance surfaces)
+  ✓ AV-43  Federation transport identity 32-byte vs 65-byte hybrid
+           split (Step 3.5 dual-capsule extraction +
+           LocalSignerHardwareAdapter; CIRISEdge#43, v0.13.1 patch /
+           v0.16.1 main cherry-pick)
+  ✓ AV-44  testimonial_witness preservation invariant
+           (Option-wrapped wire field; canonical bytes via persist;
+           CIRISEdge#37, v0.16.0)
+  ✓ AV-46  Schema-level separation of operator opinion from federation
+           attestation (peer-mgmt mutation surface against
+           federation_peer_metadata sibling table; CIRISEdge#26 +
+           CIRISPersist#117, v0.15.1)
+  ✓ AV-47  UniFFI pre-init invariant (every FFI free function gates
+           on current_edge() → typed NotInitialized / Unsupported;
+           CIRISEdge#36 GO, v0.13.0)
+
+V0.17.1 DOCUMENTED, ENFORCEMENT SCHEDULED LATER
+  ⚠ AV-45  key_boundary scope-binding enforcement deferred to v0.16.1+
+           (wire form ships at v0.16.0; declared-not-enforced)
+  ⚠ Canonical-peer invariant scheduled v0.18.0 (CIRISEdge#46) —
+           bootstrap reseed + typed CannotRemoveCanonicalPeer +
+           EdgePeerInfo.canonical field
+
 PHASE-1 P1 BUNDLE — must land for production cutover
   ⚠ AV-3   Replay LRU with 5-min window
   ⚠ AV-5   Cross-impl byte-equivalence test for canonicalize_envelope
@@ -1024,7 +1361,17 @@ This document is updated:
   trace wire format): trust-boundary review + interaction matrix
   update.
 
-Last updated: 2026-05-22 (v0.4.0 — AV-42 added + mitigated: the
-authenticated transport-identity ↔ federation-key binding cold-start
-path lands with CIRISEdge#15 / CIRISVerify#28 Phase 3. Prior baseline:
-2026-05-03 v0.0 scaffold).
+Last updated: 2026-05-29 (v0.17.1 — docs-only cut. Status line
+refreshed from v0.0 spec-only scaffold to v0.17.x production-grade
+(Reticulum + HTTPS both production-grade; ~210 tests; UniFFI
+binding surface; 6-capsule cohabitation incl. `local_signer`).
+Added AV-43 (cohab transport-identity dual-capsule split, mitigated
+v0.13.1/v0.16.1 CIRISEdge#43); AV-44 (testimonial_witness preservation
+invariant, mitigated v0.16.0 CIRISEdge#37); AV-45 (key_boundary scope
+binding deferred to v0.16.1+; wire form only at v0.16.0); AV-46
+(peer-mgmt TrustClass = operator opinion, not attestation; mitigated
+structurally v0.15.1 CIRISEdge#26 + CIRISPersist#117); AV-47 (UniFFI
+pre-init invariant; mitigated v0.13.0+ CIRISEdge#36); canonical-peer
+invariant documented as forward-looking anchor for v0.18.0 wire-up
+of CIRISEdge#46. Prior baselines: 2026-05-22 v0.4.0 AV-42 mitigated,
+2026-05-03 v0.0 scaffold.)
