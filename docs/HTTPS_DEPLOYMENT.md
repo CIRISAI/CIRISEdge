@@ -231,3 +231,87 @@ contract is the same one Reticulum carries — what an HTTPS-served
 peer sees is byte-equivalent to what a Reticulum-served peer sees,
 and the verify pipeline catches the same set of canonicalization,
 signature, and replay invariants.
+
+---
+
+## 5. Driving HTTPS from the Python init surface (v0.19.3)
+
+v0.13.0 + v0.18.1 made HTTPS production-grade at the **Rust layer**.
+v0.19.3 (CIRISEdge#49) exposes the same surface at the **cross-wheel
+Python boundary** so the cohabiting agent (and the CIRISConformance
+v0.19.3+ harness) can stand up an HTTPS-listening edge from Python.
+
+Six new optional kwargs land on `init_edge_runtime`, all backward-
+compatible (absence preserves the v0.19.0 Reticulum-only behaviour
+exactly):
+
+```python
+# Python harness / agent-side init:
+edge.init_edge_runtime(
+    engine, identity_path,
+    https_listen_addr="0.0.0.0:4242",
+    https_tls_cert_path="/etc/ciris/server.pem",
+    https_tls_key_path="/etc/ciris/server.key",
+    https_mtls_required=True,
+)
+```
+
+| kwarg                       | Type     | Default | Purpose                                                                  |
+| --------------------------- | -------- | ------- | ------------------------------------------------------------------------ |
+| `https_listen_addr`         | `str?`   | `None`  | Toggle. When set, edge constructs an `HttpsTransport`.                   |
+| `https_tls_cert_path`       | `str?`   | `None`  | Operator-supplied PEM cert chain.                                        |
+| `https_tls_key_path`        | `str?`   | `None`  | Operator-supplied PEM private key.                                       |
+| `https_mtls_required`       | `bool`   | `False` | Enable `FederationCnVerifier` (§2).                                      |
+| `https_bearer_secret`       | `bytes?` | `None`  | Optional shared HMAC secret for the bearer-token path (§3).              |
+| `https_dev_self_signed`     | `bool`   | `False` | Mint an ephemeral CN=key_id cert into a tmpdir at init time (§1).        |
+| `disable_reticulum`         | `bool`   | `False` | HTTPS-only mode. Requires `https_listen_addr`. Skips Reticulum entirely. |
+
+**Mutual exclusivity rule.** `https_dev_self_signed=True` PLUS any of
+`https_tls_cert_path` / `https_tls_key_path` is rejected with a typed
+`ValueError("conflicting TLS config: dev_self_signed and cert paths
+cannot both be set")`. Operator must choose ONE mode — either
+"mint an ephemeral cert" or "use my PEM paths".
+
+**Cert + key pair rule.** Exactly one of `https_tls_cert_path` /
+`https_tls_key_path` without the other yields
+`ValueError("https_tls_cert_path and https_tls_key_path must both
+be set (got only one)")`.
+
+**Multi-transport coexistence.** When `disable_reticulum=False` (the
+default) AND `https_listen_addr` is set, the edge runs BOTH
+Reticulum AND HTTPS concurrently. Both transports listen; outbound
+`Edge::send` routes per `transport_id` resolution. This is the
+canonical "operator wants both substrates active" deployment.
+
+**HTTPS-only deployments.** `disable_reticulum=True` + `https_listen_addr`
+constructs an edge that listens only on HTTPS. Useful for managed-K8s
+deployments where Reticulum's UDPv6 multicast is unreachable.
+`disable_reticulum=True` WITHOUT `https_listen_addr` is rejected —
+an edge with no transports cannot dispatch.
+
+**Dev-cert minting (v0.19.3).** When `https_dev_self_signed=True`,
+`init_edge_runtime` mints a CN=`federation_key_id` Ed25519 self-
+signed cert into a tmpdir whose lifetime is bound to the
+returned `PyEdge` (the tmpdir is held by the `Arc<TempDir>`
+threaded into `PyEdge._dev_cert_tmpdir`). The seed is derived
+deterministically from `SHA-256("ciris-edge::dev-self-signed::v1\0"
+‖ federation_key_id)` — reproducible per-key_id, NOT reused
+from the federation seed (AV-17). The `dev_self_signed` flag is
+also flipped on `HttpServerConfig`, so the v0.18.1 listener-bind
+`tracing::warn!("DEV_ONLY", ...)` warning fires.
+
+**Cross-wheel acceptance gate.** CIRISConformance v0.19.3+ (#3 + #4)
+drives `init_edge_runtime` with the matrix:
+
+- HTTPS-only via `https_dev_self_signed=True` + `disable_reticulum=True`
+- Reticulum + HTTPS via `https_listen_addr` only
+- HTTPS with mTLS via `https_tls_cert_path` + `https_mtls_required=True`
+- HTTPS with bearer via `https_bearer_secret`
+
+Each conformance cell exercises one combination end-to-end via the
+real persist `PyEngine` + the real Python interpreter; the Rust-
+side pin is `tests/https_pyedge_init.rs`, which validates every
+load-bearing primitive (`HttpsInitParams::parse`,
+`mint_dev_self_signed_pair`, `HttpsTransport` construction)
+without spinning up Python — a Python failure points back to one
+of those primitives, which fails here first.

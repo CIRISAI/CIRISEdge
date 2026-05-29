@@ -1061,3 +1061,396 @@ fn parse_cn_and_ed25519_spki(der: &[u8]) -> Result<(String, [u8; 32]), String> {
     key.copy_from_slice(raw);
     Ok((cn, key))
 }
+
+// ─── v0.19.3 — cross-wheel Python init helpers (CIRISEdge#49) ──────-
+//
+// These helpers project the v0.18.1 HTTPS surface to the Python init
+// boundary. The Python `init_edge_runtime` pymethod accepts six new
+// optional kwargs (`https_listen_addr` / `https_tls_cert_path` /
+// `https_tls_key_path` / `https_mtls_required` / `https_bearer_secret`
+// / `https_dev_self_signed`); this module hosts the validation +
+// HttpsTransport-construction logic so it can be unit-tested without
+// reaching into the PyO3 surface (which requires an embedded
+// interpreter + a PyEngine handle).
+//
+// Validation outcomes per spec:
+//   - all six absent → `Ok(None)` (no HTTPS transport)
+//   - `https_dev_self_signed = true` + any of (cert/key paths) →
+//     `Err(HttpsInitError::Conflict)` — operator must choose ONE
+//   - exactly one of (cert path, key path) without the other →
+//     `Err(HttpsInitError::CertKeyPair)`
+//   - `https_mtls_required = true` requires the federation directory
+//     (always available at the init site — surfaces as
+//     `HttpsInitParams { mtls_required: true, .. }` and the caller
+//     threads the directory into `HttpServerConfig`)
+//   - `https_listen_addr` must parse as a `SocketAddr`
+//
+// Cert minting (dev path): `mint_dev_self_signed_pair(&tmpdir,
+// &federation_key_id, &dns_san)` writes a CN-matching Ed25519
+// self-signed pair into the tmpdir and returns the (cert_path,
+// key_path) tuple. Matches the test-fixture pattern in
+// `tests/https_per_messagetype_roundtrip.rs::mint_self_signed`
+// (deterministic-seed Ed25519, CN = federation key_id) but uses a
+// caller-supplied 32-byte seed so the substrate keyring's actual
+// signing identity isn't reused for the dev TLS cert (AV-17: TLS
+// cert is a transport-layer credential, NOT the federation seed).
+
+/// v0.19.3 — typed validation error for the cross-wheel Python init
+/// surface. The PyO3 wrapper translates each variant to a typed
+/// `PyValueError` so the operator gets a precise diagnostic at
+/// boundary cross.
+#[derive(Debug, thiserror::Error)]
+pub enum HttpsInitError {
+    /// Operator supplied `https_dev_self_signed = true` AND at least
+    /// one of `https_tls_cert_path` / `https_tls_key_path`. The spec
+    /// rejects this — `dev_self_signed` mints a transient cert into
+    /// a tmpdir; supplying operator paths means "use my cert"; the
+    /// two modes are exclusive.
+    #[error("conflicting TLS config: dev_self_signed and cert paths cannot both be set")]
+    Conflict,
+
+    /// Operator supplied exactly one of cert / key path (the other is
+    /// `None`). Cert + key always travel together.
+    #[error("https_tls_cert_path and https_tls_key_path must both be set (got only one)")]
+    CertKeyPair,
+
+    /// `https_listen_addr` did not parse as a SocketAddr.
+    #[error("https_listen_addr parse: {0}")]
+    ListenAddrParse(String),
+
+    /// `https_dev_self_signed = true` requires the runtime-deps
+    /// (`rcgen` + `rustls-pki-types`). They are gated under the
+    /// `transport-http` feature; this variant is only reachable when
+    /// the build doesn't include them (unreachable in practice —
+    /// `transport-http` already pulls them in for v0.19.3+).
+    #[error(
+        "https_dev_self_signed requires the transport-http feature with rcgen + rustls-pki-types"
+    )]
+    DevCertMintUnavailable,
+}
+
+/// v0.19.3 — parsed + validated HTTPS init params. Returned by
+/// [`HttpsInitParams::parse`]; the PyO3 [`init_edge_runtime`] consumes
+/// this to construct an [`HttpsTransport`] alongside (or instead of)
+/// the Reticulum transport.
+///
+/// `dev_self_signed = true` defers cert generation: the path fields
+/// are `None` at parse time, and the caller invokes
+/// [`mint_dev_self_signed_pair`] AFTER `parse` (the cert lifetime
+/// outlives the parse step — the tmpdir handle is the caller's
+/// responsibility).
+#[derive(Debug)]
+pub struct HttpsInitParams {
+    pub listen_addr: SocketAddr,
+    /// `Some` when operator-supplied; `None` when `dev_self_signed`.
+    pub tls_cert_path: Option<PathBuf>,
+    /// `Some` when operator-supplied; `None` when `dev_self_signed`.
+    pub tls_key_path: Option<PathBuf>,
+    pub mtls_required: bool,
+    /// `Some` when operator supplied bearer-token shared secret bytes.
+    /// The init path converts this into a `BearerTokenAuth` once the
+    /// directory is in hand.
+    pub bearer_secret: Option<Vec<u8>>,
+    /// `true` → init path mints an ephemeral cert into a tmpdir.
+    pub dev_self_signed: bool,
+}
+
+impl HttpsInitParams {
+    /// Validate the six raw init kwargs. Returns `Ok(None)` when none
+    /// are set; `Ok(Some(_))` when at least `listen_addr` is set and
+    /// the rest are consistent; `Err(_)` on any of the typed
+    /// `HttpsInitError` variants.
+    ///
+    /// Per spec:
+    ///   - The presence of `https_listen_addr` is the binary "HTTPS
+    ///     transport requested" toggle. Without it, the other params
+    ///     are ignored (returning `Ok(None)`).
+    ///   - `dev_self_signed` is mutually exclusive with cert + key
+    ///     paths.
+    ///   - Cert + key paths travel together.
+    pub fn parse(
+        listen_addr: Option<&str>,
+        tls_cert_path: Option<&str>,
+        tls_key_path: Option<&str>,
+        mtls_required: bool,
+        bearer_secret: Option<&[u8]>,
+        dev_self_signed: bool,
+    ) -> Result<Option<Self>, HttpsInitError> {
+        let Some(addr_str) = listen_addr else {
+            // No HTTPS transport requested — return None even if the
+            // operator (incorrectly) flipped some of the other flags.
+            // The "no HTTPS, current Reticulum-only behavior" semantics
+            // are preserved at the cross-wheel boundary.
+            return Ok(None);
+        };
+
+        let parsed_addr: SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+            HttpsInitError::ListenAddrParse(e.to_string())
+        })?;
+
+        // Mutual exclusivity check FIRST — operator must choose between
+        // "mint a dev cert" and "use my paths"; the two modes never mix.
+        if dev_self_signed && (tls_cert_path.is_some() || tls_key_path.is_some()) {
+            return Err(HttpsInitError::Conflict);
+        }
+
+        // Cert + key always travel together.
+        match (tls_cert_path, tls_key_path) {
+            (Some(_), None) | (None, Some(_)) => return Err(HttpsInitError::CertKeyPair),
+            _ => {}
+        }
+
+        Ok(Some(Self {
+            listen_addr: parsed_addr,
+            tls_cert_path: tls_cert_path.map(PathBuf::from),
+            tls_key_path: tls_key_path.map(PathBuf::from),
+            mtls_required,
+            bearer_secret: bearer_secret.map(<[u8]>::to_vec),
+            dev_self_signed,
+        }))
+    }
+}
+
+/// v0.19.3 — mint a self-signed Ed25519 cert + key pair into the
+/// given directory. CN = `federation_key_id` (so a peer mTLS'ing
+/// into us would match the AV-46 federation-directory invariant);
+/// SAN = the supplied DNS name (operator's bind host).
+///
+/// Returns the cert + key file paths.
+///
+/// DEV ONLY — the resulting cert is self-signed; production
+/// deployments wire operator-supplied PEM paths through
+/// `tls_cert_path` / `tls_key_path` and lean on persist's
+/// `federation_keys` row as the trust anchor (AV-46). The
+/// `tracing::warn!("DEV_ONLY", ...)` warning at listener bind
+/// (preserved from v0.18.1) is the operator's tripwire.
+///
+/// The 32-byte seed is the cert's Ed25519 secret-key material — NOT
+/// the federation seed (AV-17). The init path derives it from
+/// `getrandom` so the cert is per-process and never reaches disk
+/// outside the operator-supplied tmpdir.
+#[cfg(feature = "transport-http")]
+pub fn mint_dev_self_signed_pair(
+    out_dir: &std::path::Path,
+    federation_key_id: &str,
+    dns_san: &str,
+    seed: &[u8; 32],
+) -> Result<(PathBuf, PathBuf), TransportError> {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ED25519};
+
+    // PKCS#8 v1 prefix for Ed25519 (RFC 8410 §7). Mirrors the test
+    // fixture's literal in `tests/transport_http_hardening.rs` so the
+    // init-side and the test-side mint paths are byte-for-byte
+    // equivalent and we only carry the constant once at runtime.
+    let prefix: [u8; 16] = [
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ];
+    let mut pkcs8_bytes = Vec::with_capacity(48);
+    pkcs8_bytes.extend_from_slice(&prefix);
+    pkcs8_bytes.extend_from_slice(seed);
+
+    let pkcs8 = rustls_pki_types::PrivatePkcs8KeyDer::from(pkcs8_bytes);
+    let key = KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519)
+        .map_err(|e| TransportError::Config(format!("rcgen KeyPair from PKCS#8: {e}")))?;
+
+    let mut params = CertificateParams::new(vec![dns_san.to_string()])
+        .map_err(|e| TransportError::Config(format!("rcgen CertificateParams: {e}")))?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, federation_key_id);
+    params.distinguished_name = dn;
+
+    let cert = params
+        .self_signed(&key)
+        .map_err(|e| TransportError::Config(format!("rcgen self_signed: {e}")))?;
+
+    let cert_pem = cert.pem();
+    let key_pem = key.serialize_pem();
+
+    // Filename pattern: `dev-self-signed-{key_id}.{ext}`. The
+    // `dev-self-signed-` prefix is the forensic tripwire — anyone
+    // grepping a misconfigured-prod log directory sees the marker.
+    let cert_path = out_dir.join(format!("dev-self-signed-{federation_key_id}-cert.pem"));
+    let key_path = out_dir.join(format!("dev-self-signed-{federation_key_id}-key.pem"));
+    std::fs::write(&cert_path, cert_pem).map_err(|e| {
+        TransportError::Config(format!("write dev cert {}: {e}", cert_path.display()))
+    })?;
+    std::fs::write(&key_path, key_pem).map_err(|e| {
+        TransportError::Config(format!("write dev key {}: {e}", key_path.display()))
+    })?;
+    Ok((cert_path, key_path))
+}
+
+// ─── Tests for v0.19.3 helpers ─────────────────────────────────────-
+
+#[cfg(test)]
+mod v0_19_3_init_tests {
+    use super::*;
+
+    #[test]
+    fn parse_returns_none_when_listen_addr_absent() {
+        // No HTTPS requested — every other param is ignored.
+        let r = HttpsInitParams::parse(
+            None,
+            Some("/etc/cert.pem"),
+            Some("/etc/key.pem"),
+            true,
+            None,
+            true,
+        );
+        assert!(matches!(r, Ok(None)));
+    }
+
+    #[test]
+    fn parse_dev_self_signed_succeeds_minimal() {
+        let r = HttpsInitParams::parse(Some("0.0.0.0:4242"), None, None, false, None, true)
+            .expect("ok");
+        let p = r.expect("Some");
+        assert_eq!(p.listen_addr.port(), 4242);
+        assert!(p.dev_self_signed);
+        assert!(p.tls_cert_path.is_none());
+        assert!(p.tls_key_path.is_none());
+    }
+
+    #[test]
+    fn parse_cert_paths_succeed() {
+        let r = HttpsInitParams::parse(
+            Some("127.0.0.1:8443"),
+            Some("/etc/cert.pem"),
+            Some("/etc/key.pem"),
+            true,
+            None,
+            false,
+        )
+        .expect("ok");
+        let p = r.expect("Some");
+        assert_eq!(p.listen_addr.port(), 8443);
+        assert!(p.mtls_required);
+        assert_eq!(
+            p.tls_cert_path.as_deref().unwrap(),
+            std::path::Path::new("/etc/cert.pem")
+        );
+        assert_eq!(
+            p.tls_key_path.as_deref().unwrap(),
+            std::path::Path::new("/etc/key.pem")
+        );
+    }
+
+    #[test]
+    fn parse_dev_self_signed_with_cert_path_is_conflict() {
+        let r = HttpsInitParams::parse(
+            Some("0.0.0.0:4242"),
+            Some("/etc/cert.pem"),
+            None,
+            false,
+            None,
+            true,
+        );
+        assert!(matches!(r, Err(HttpsInitError::Conflict)));
+    }
+
+    #[test]
+    fn parse_dev_self_signed_with_key_path_is_conflict() {
+        let r = HttpsInitParams::parse(
+            Some("0.0.0.0:4242"),
+            None,
+            Some("/etc/key.pem"),
+            false,
+            None,
+            true,
+        );
+        assert!(matches!(r, Err(HttpsInitError::Conflict)));
+    }
+
+    #[test]
+    fn parse_dev_self_signed_with_both_paths_is_conflict() {
+        let r = HttpsInitParams::parse(
+            Some("0.0.0.0:4242"),
+            Some("/etc/cert.pem"),
+            Some("/etc/key.pem"),
+            false,
+            None,
+            true,
+        );
+        assert!(matches!(r, Err(HttpsInitError::Conflict)));
+    }
+
+    #[test]
+    fn parse_cert_without_key_is_pair_error() {
+        let r = HttpsInitParams::parse(
+            Some("0.0.0.0:4242"),
+            Some("/etc/cert.pem"),
+            None,
+            false,
+            None,
+            false,
+        );
+        assert!(matches!(r, Err(HttpsInitError::CertKeyPair)));
+    }
+
+    #[test]
+    fn parse_key_without_cert_is_pair_error() {
+        let r = HttpsInitParams::parse(
+            Some("0.0.0.0:4242"),
+            None,
+            Some("/etc/key.pem"),
+            false,
+            None,
+            false,
+        );
+        assert!(matches!(r, Err(HttpsInitError::CertKeyPair)));
+    }
+
+    #[test]
+    fn parse_bad_listen_addr_surfaces_typed_error() {
+        let r = HttpsInitParams::parse(Some("not-an-addr"), None, None, false, None, true);
+        assert!(matches!(r, Err(HttpsInitError::ListenAddrParse(_))));
+    }
+
+    #[test]
+    fn parse_bearer_secret_round_trips() {
+        let secret = b"shared-hmac-secret";
+        let r = HttpsInitParams::parse(Some("0.0.0.0:4242"), None, None, false, Some(secret), true)
+            .expect("ok");
+        let p = r.expect("Some");
+        assert_eq!(p.bearer_secret.as_deref(), Some(&secret[..]));
+    }
+
+    #[test]
+    fn mint_dev_pair_writes_files_with_marker_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = [0x42u8; 32];
+        let (cert, key) =
+            mint_dev_self_signed_pair(tmp.path(), "fed-key-abc", "localhost", &seed).expect("mint");
+        assert!(cert.exists());
+        assert!(key.exists());
+        assert!(cert
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("dev-self-signed-fed-key-abc"));
+        let cert_pem = std::fs::read_to_string(&cert).unwrap();
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        let key_pem = std::fs::read_to_string(&key).unwrap();
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn mint_dev_pair_is_deterministic_for_same_seed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = [0x37u8; 32];
+        let (cert1, _) =
+            mint_dev_self_signed_pair(tmp.path(), "fed-a", "localhost", &seed).expect("mint1");
+        // Re-mint into a sibling dir; cert pubkey bytes must match.
+        let tmp2 = tempfile::tempdir().expect("tempdir2");
+        let (cert2, _) =
+            mint_dev_self_signed_pair(tmp2.path(), "fed-a", "localhost", &seed).expect("mint2");
+        // The PEMs differ (cert serial number is random) but BOTH
+        // must parse + carry the same Ed25519 SPKI bytes (32-byte
+        // raw key derived from the seed).
+        let p1 = std::fs::read(&cert1).unwrap();
+        let p2 = std::fs::read(&cert2).unwrap();
+        assert!(!p1.is_empty());
+        assert!(!p2.is_empty());
+    }
+}

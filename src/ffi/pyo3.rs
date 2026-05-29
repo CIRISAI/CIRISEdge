@@ -226,6 +226,18 @@ pub struct PyEdge {
     /// cohabitation entry point ([`init_edge_runtime`]); test builds
     /// inject one explicitly via [`PyEdge::for_test`].
     runtime: RuntimeHandle,
+    /// v0.19.3 (CIRISEdge#49) — when `init_edge_runtime` was invoked
+    /// with `https_dev_self_signed=True`, this holds the
+    /// `Arc<tempfile::TempDir>` whose path carries the minted
+    /// `dev-self-signed-{key_id}-{cert,key}.pem` files. The HTTPS
+    /// listener reads those files at bind time (which happens AFTER
+    /// init_edge_runtime returns); if the TempDir Drops before then
+    /// the files vanish and rustls fails to start the server.
+    /// Lifetime is now tied to PyEdge, which lives for the duration
+    /// of the Python-owned Edge handle. `None` for non-dev paths
+    /// (operator-supplied cert paths persist independently).
+    #[cfg(feature = "transport-http")]
+    _dev_cert_tmpdir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl PyEdge {
@@ -249,7 +261,12 @@ impl PyEdge {
     /// `PyEngine` round-trip needed). Not exposed to Python.
     #[cfg(test)]
     pub(crate) fn for_test(inner: Arc<Edge>, runtime: RuntimeHandle) -> Self {
-        Self { inner, runtime }
+        Self {
+            inner,
+            runtime,
+            #[cfg(feature = "transport-http")]
+            _dev_cert_tmpdir: None,
+        }
     }
 }
 
@@ -1799,6 +1816,13 @@ fn extract_local_signer(
     soft_freshness_window_seconds = 60,
     agent_mode = "proxy",
     canonical_bootstrap_peers = None,
+    https_listen_addr = None,
+    https_tls_cert_path = None,
+    https_tls_key_path = None,
+    https_mtls_required = false,
+    https_bearer_secret = None,
+    https_dev_self_signed = false,
+    disable_reticulum = false,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -1817,7 +1841,73 @@ fn init_edge_runtime(
     soft_freshness_window_seconds: u64,
     agent_mode: &str,
     canonical_bootstrap_peers: Option<Vec<Bound<'_, PyAny>>>,
+    // v0.19.3 (CIRISEdge#49) — cross-wheel HTTPS init surface. All
+    // six are additive optional kwargs; absence preserves the
+    // v0.19.0 Reticulum-only behaviour exactly. Validation happens
+    // in [`crate::transport::http::HttpsInitParams::parse`]; the
+    // typed `HttpsInitError` variants translate to `PyValueError`
+    // at the boundary below.
+    https_listen_addr: Option<&str>,
+    https_tls_cert_path: Option<&str>,
+    https_tls_key_path: Option<&str>,
+    https_mtls_required: bool,
+    https_bearer_secret: Option<&[u8]>,
+    https_dev_self_signed: bool,
+    // v0.19.3 — HTTPS-only deployments. When `True`, the Reticulum
+    // transport is NOT constructed; only HTTPS routes inbound +
+    // outbound. Defaults to `False` so existing Reticulum-only +
+    // Reticulum+HTTPS coexistence callers keep their behaviour.
+    disable_reticulum: bool,
 ) -> PyResult<PyEdge> {
+    // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
+    // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
+    // paths) and the cert+key-pair check both surface as typed
+    // ValueError immediately, so the operator gets a clean diagnostic
+    // before touching persist or the Reticulum identity files.
+    //
+    // When `transport-http` is NOT compiled in, ANY https_* param
+    // being set is a hard error — the build doesn't carry the
+    // HttpsTransport surface at all.
+    #[cfg(not(feature = "transport-http"))]
+    if https_listen_addr.is_some()
+        || https_tls_cert_path.is_some()
+        || https_tls_key_path.is_some()
+        || https_mtls_required
+        || https_bearer_secret.is_some()
+        || https_dev_self_signed
+        || disable_reticulum
+    {
+        return Err(PyValueError::new_err(
+            "https_* init params (and disable_reticulum) require the transport-http \
+             feature; this wheel was built without it",
+        ));
+    }
+
+    #[cfg(feature = "transport-http")]
+    let https_init_params: Option<crate::transport::http::HttpsInitParams> = {
+        crate::transport::http::HttpsInitParams::parse(
+            https_listen_addr,
+            https_tls_cert_path,
+            https_tls_key_path,
+            https_mtls_required,
+            https_bearer_secret,
+            https_dev_self_signed,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?
+    };
+
+    // v0.19.3 — `disable_reticulum=True` is only valid when an HTTPS
+    // listener was also requested. An edge with no transports at all
+    // can't dispatch anything; surface as a typed ValueError instead
+    // of silently building a dead runtime.
+    #[cfg(feature = "transport-http")]
+    if disable_reticulum && https_init_params.is_none() {
+        return Err(PyValueError::new_err(
+            "disable_reticulum=True requires https_listen_addr to be set \
+             (an edge with no transports cannot send or receive)",
+        ));
+    }
+
     // v0.18.0 (CIRISEdge#45) — decode the wire-string agent_mode token
     // BEFORE we do any other I/O, so a typed misconfiguration surfaces
     // a clean `ValueError` from the operator's POV instead of getting
@@ -2229,15 +2319,157 @@ fn init_edge_runtime(
     // v0.14.0 (CIRISEdge#32) — keep the typed `Arc<ReticulumTransport>`
     // for the Links FFI surface; `EdgeBuilder::reticulum_transport`
     // also upcasts + pushes it into the generic transport vec.
-    let reticulum_transport: Arc<ReticulumTransport> = py.detach(|| {
-        runtime
-            .block_on(async {
-                ReticulumTransport::new(transport_config, auth)
-                    .await
-                    .map(Arc::new)
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("ReticulumTransport::new: {e}")))
-    })?;
+    //
+    // v0.19.3 (CIRISEdge#49) — `disable_reticulum=True` skips the
+    // Reticulum build entirely. The HTTPS-only deployment path
+    // (conformance harness #3 / #4) needs an edge that does NOT
+    // bind a TCP listener for Reticulum; instead the only inbound
+    // path is the HTTPS POST handler. When `disable_reticulum=False`
+    // (the default), v0.19.0 behaviour is preserved exactly: we
+    // build Reticulum + (optionally) HTTPS, and both are active
+    // concurrently as `EdgeBuilder::transport` entries.
+    #[cfg(feature = "transport-http")]
+    let reticulum_disabled = disable_reticulum;
+    #[cfg(not(feature = "transport-http"))]
+    let reticulum_disabled = false;
+
+    let reticulum_transport: Option<Arc<ReticulumTransport>> = if reticulum_disabled {
+        // HTTPS-only deployment — skip Reticulum entirely. The
+        // `auth` and `transport_config` builds above were
+        // intentionally NOT wrapped in this conditional so the
+        // operator gets the same identity-load + canonical-reseed
+        // diagnostics regardless of whether Reticulum then binds.
+        // Drop them here so unused-binding lints don't fire (the
+        // `auth` carries an Arc<ReticulumIdentity>; dropping the
+        // single owner releases it cleanly).
+        let _ = (transport_config, auth);
+        None
+    } else {
+        let t: Arc<ReticulumTransport> = py.detach(|| {
+            runtime
+                .block_on(async {
+                    ReticulumTransport::new(transport_config, auth)
+                        .await
+                        .map(Arc::new)
+                })
+                .map_err(|e| PyRuntimeError::new_err(format!("ReticulumTransport::new: {e}")))
+        })?;
+        Some(t)
+    };
+
+    // ── Step 5.5 (v0.19.3 / CIRISEdge#49) — HTTPS transport build.
+    //
+    // When `https_init_params` resolves to `Some`, mint the dev cert
+    // (if requested) into a tmpdir whose lifetime we extend across
+    // the rest of init, then assemble `HttpServerConfig` + wire it
+    // into an `HttpsTransport`. The transport joins the generic
+    // `EdgeBuilder::transport` list — `Edge::run`'s
+    // `dispatch_inbound` consumes the same `mpsc::Sender<InboundFrame>`
+    // sink regardless of carrier (v0.13.0 / v0.18.1 contract).
+    //
+    // mTLS path: `verify_dir` is the federation directory edge
+    // already holds; the `FederationCnVerifier` consults it at
+    // handshake time. Same Arc both verify pipeline + mTLS verifier
+    // share — operator deny-listing via `peer_set_trust(Blocked)`
+    // does NOT revoke mTLS (AV-46, documented in docs/HTTPS_DEPLOYMENT.md
+    // §2); the mTLS handshake checks `federation_keys.pubkey_ed25519_base64`,
+    // not `TrustClass`.
+    //
+    // Bearer path: when `bearer_secret` is supplied, wire it as a
+    // `BearerTokenAuth` whose directory is `verify_dir`. The
+    // shared-HMAC secret is a v0.19.3 simplification for the
+    // conformance harness — the production bearer mode signs JWTs
+    // with the federation Ed25519 key (`mint_federation_jwt`); the
+    // shared-secret path is harness-only.
+    //
+    // `_dev_cert_tmpdir` keeps the tempdir alive for the rest of
+    // init (transport `listen` borrows the cert paths; if the
+    // tempdir Drops, the files are deleted and rustls's startup
+    // load would fail). The Arc is moved into the PyEdge wrapper
+    // below so it lives for the whole Edge runtime.
+    #[cfg(feature = "transport-http")]
+    #[allow(clippy::items_after_statements)]
+    let (https_transport, https_dev_cert_tmpdir): (
+        Option<Arc<crate::transport::http::HttpsTransport>>,
+        Option<Arc<tempfile::TempDir>>,
+    ) = if let Some(params) = https_init_params {
+        use crate::transport::http::{
+            BearerTokenAuth, HttpClientConfig, HttpServerConfig, HttpsTransport,
+        };
+        use sha2::{Digest, Sha256};
+        let (cert_path, key_path, tmpdir_handle, mark_dev) = if params.dev_self_signed {
+            let tmp = tempfile::tempdir()
+                .map_err(|e| PyRuntimeError::new_err(format!("dev-cert tmpdir: {e}")))?;
+            // Deterministic seed = first 32 bytes of SHA-256 over
+            // the federation key_id + a v0.19.3-pinned constant.
+            // Avoids reusing the federation seed (AV-17) AND keeps
+            // the dev cert reproducible per (key_id, build) so
+            // conformance harness runs cross-check cleanly.
+            let mut h = Sha256::new();
+            h.update(b"ciris-edge::dev-self-signed::v1\0");
+            h.update(signer.key_id.as_bytes());
+            let digest = h.finalize();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&digest);
+            // DNS SAN = the host portion of `https_listen_addr`. If
+            // bound to a wildcard (`0.0.0.0`), fall back to "localhost"
+            // so the harness can dial via that name.
+            let dns_san = match params.listen_addr.ip() {
+                std::net::IpAddr::V4(v4) if v4.is_unspecified() => "localhost".to_string(),
+                std::net::IpAddr::V6(v6) if v6.is_unspecified() => "localhost".to_string(),
+                ip => ip.to_string(),
+            };
+            let (cert, key) = crate::transport::http::mint_dev_self_signed_pair(
+                tmp.path(),
+                &signer.key_id,
+                &dns_san,
+                &seed,
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("mint_dev_self_signed_pair: {e}")))?;
+            (cert, key, Some(Arc::new(tmp)), true)
+        } else {
+            (
+                params
+                    .tls_cert_path
+                    .expect("validated by HttpsInitParams::parse"),
+                params
+                    .tls_key_path
+                    .expect("validated by HttpsInitParams::parse"),
+                None,
+                false,
+            )
+        };
+
+        let bearer_auth = params.bearer_secret.as_ref().map(|_| BearerTokenAuth {
+            directory: Arc::clone(&verify_dir),
+            expected_audience: None,
+        });
+
+        let mut server_config = HttpServerConfig::new(params.listen_addr, cert_path, key_path);
+        server_config.mtls_required = params.mtls_required;
+        server_config.dev_self_signed = mark_dev;
+        server_config.directory = if params.mtls_required {
+            Some(Arc::clone(&verify_dir))
+        } else {
+            None
+        };
+        server_config.bearer_auth = bearer_auth;
+
+        // No per-peer URL map at init time — the operator wires
+        // those via the routing FFI in a follow-up (v0.20.0 #50
+        // scope). HTTPS server-only at v0.19.3 closes the inbound
+        // path that #3 / #4 need.
+        let transport = HttpsTransport::new(
+            Some(server_config),
+            HttpClientConfig::default(),
+            std::collections::HashMap::new(),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("HttpsTransport::new: {e}")))?;
+
+        (Some(Arc::new(transport)), tmpdir_handle)
+    } else {
+        (None, None)
+    };
 
     // ── Step 6: assemble the Edge. The pre-built EventBus +
     // ReachabilityTracker are shared with the Reticulum transport
@@ -2256,12 +2488,11 @@ fn init_edge_runtime(
     };
     parsed_agent_mode.apply_defaults(&mut config);
 
-    let edge = Edge::builder()
-        .directory(verify_dir)
+    let mut builder = Edge::builder()
+        .directory(Arc::clone(&verify_dir))
         .federation_directory(federation_directory_for_edge)
         .queue(queue)
         .signer(signer)
-        .reticulum_transport(reticulum_transport)
         .events(Arc::clone(&event_bus))
         .reachability(Arc::clone(&reachability_tracker))
         // v0.17.0 (CIRISEdge#39 emit_verdict flip) — wire the persist
@@ -2279,7 +2510,23 @@ fn init_edge_runtime(
         .canonical_bootstrap_peers(canonical_peers)
         // v0.18.0 (CIRISEdge#45) — flow the parsed agent_mode and its
         // derived listener_bound + outbound_queue_max into the Edge.
-        .config(config)
+        .config(config);
+
+    // v0.19.3 — Reticulum is conditional (the `disable_reticulum`
+    // posture); HTTPS is additive (push as a generic transport into
+    // the builder's transport vec). Both can be active concurrently:
+    // `Edge::run` iterates the transport vec and runs each `listen`
+    // on a sibling tokio task; outbound `send` consults `transport_id`
+    // routing to pick the right medium per envelope.
+    if let Some(reticulum_t) = reticulum_transport {
+        builder = builder.reticulum_transport(reticulum_t);
+    }
+    #[cfg(feature = "transport-http")]
+    if let Some(https_t) = https_transport {
+        builder = builder.transport(https_t as Arc<dyn crate::transport::Transport>);
+    }
+
+    let edge = builder
         .build()
         .map_err(|e| PyRuntimeError::new_err(format!("Edge::build: {e}")))?;
 
@@ -2298,6 +2545,8 @@ fn init_edge_runtime(
     Ok(PyEdge {
         inner: edge_arc,
         runtime,
+        #[cfg(feature = "transport-http")]
+        _dev_cert_tmpdir: https_dev_cert_tmpdir,
     })
 }
 
@@ -3391,6 +3640,13 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
+                None,  // https_listen_addr
+                None,  // https_tls_cert_path
+                None,  // https_tls_key_path
+                false, // https_mtls_required
+                None,  // https_bearer_secret
+                false, // https_dev_self_signed
+                false, // disable_reticulum
             )?;
             Ok(edge.signer_key_id())
         });
@@ -3470,6 +3726,13 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
+                None,  // https_listen_addr
+                None,  // https_tls_cert_path
+                None,  // https_tls_key_path
+                false, // https_mtls_required
+                None,  // https_bearer_secret
+                false, // https_dev_self_signed
+                false, // disable_reticulum
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -3605,6 +3868,13 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
+                None,  // https_listen_addr
+                None,  // https_tls_cert_path
+                None,  // https_tls_key_path
+                false, // https_mtls_required
+                None,  // https_bearer_secret
+                false, // https_dev_self_signed
+                false, // disable_reticulum
             )?;
             Ok(())
         });
@@ -3693,6 +3963,13 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
+                None,  // https_listen_addr
+                None,  // https_tls_cert_path
+                None,  // https_tls_key_path
+                false, // https_mtls_required
+                None,  // https_bearer_secret
+                false, // https_dev_self_signed
+                false, // disable_reticulum
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -3835,6 +4112,13 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
+                None,  // https_listen_addr
+                None,  // https_tls_cert_path
+                None,  // https_tls_key_path
+                false, // https_mtls_required
+                None,  // https_bearer_secret
+                false, // https_dev_self_signed
+                false, // disable_reticulum
             )?;
             Ok(edge.signer_key_id())
         });
@@ -3963,6 +4247,13 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
+                None,  // https_listen_addr
+                None,  // https_tls_cert_path
+                None,  // https_tls_key_path
+                false, // https_mtls_required
+                None,  // https_bearer_secret
+                false, // https_dev_self_signed
+                false, // disable_reticulum
             )?;
             Ok(edge.signer_key_id())
         });

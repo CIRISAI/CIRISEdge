@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.19.0"
+version = "0.19.3"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -174,6 +174,25 @@ jsonwebtoken   = { version = "9",    optional = true, default-features = false }
 # rooted in persist (not a CA), so we don't need a full PKI engine —
 # just a CN string and 32-byte raw key.
 x509-parser    = { version = "0.16", optional = true }
+# v0.19.3 (CIRISEdge#49) — `rcgen` minimal X.509 mint for the
+# `https_dev_self_signed=True` cross-wheel Python init path. The
+# pyo3 `init_edge_runtime` surface mints an ephemeral self-signed
+# Ed25519 cert (CN = federation key_id, SAN = the operator's bind
+# host) into a tmpdir so the conformance harness can drive an HTTPS
+# listener without operator-supplied PEM paths. Loud-warns on bind
+# via `tracing::warn!("DEV_ONLY")` (preserved from v0.18.1). Same
+# crate / version / license already vetted under the v0.18.1
+# dev-dependency surface; lifted to optional-runtime here so the
+# init path can reach it. Apache-2.0 / MIT.
+rcgen          = { version = "0.13", optional = true, default-features = false, features = ["pem", "ring"] }
+rustls-pki-types = { version = "1", optional = true }
+# v0.19.3 (CIRISEdge#49) — the `init_edge_runtime`
+# `https_dev_self_signed=True` path needs a tempdir that outlives the
+# pyo3 init call (the HTTPS listener reads the cert files at bind
+# time, which happens AFTER init returns). `tempfile` was already a
+# dev-dep; lifted to optional runtime here under `transport-http`.
+# License: MIT / Apache-2.0 (deny.toml allowlist clean).
+tempfile       = { version = "3", optional = true }
 
 # Reticulum transport — feature-gated below. Backed by Leviculum
 # (reticulum-core + reticulum-std, workspace v0.6.3, AGPL-3.0), the
@@ -262,6 +281,16 @@ transport-http        = [
     "dep:axum-server",
     "dep:jsonwebtoken",
     "dep:x509-parser",
+    # v0.19.3 (CIRISEdge#49) — `init_edge_runtime`'s
+    # `https_dev_self_signed=True` path mints an ephemeral Ed25519
+    # cert via rcgen. The crate's `dev_self_signed` flag itself
+    # is just a forensic log marker; the cross-wheel surface needs
+    # the actual cert-mint primitive on the runtime side so the
+    # conformance harness can drive an HTTPS listener with no
+    # operator-supplied PEM paths.
+    "dep:rcgen",
+    "dep:rustls-pki-types",
+    "dep:tempfile",
 ]
 
 # Phase 1 — Reticulum canonical wire (OQ-07 first impl). Backed by
@@ -572,16 +601,16 @@ async-trait        = "0.1"
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
 ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.2.0", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
-# CIRISEdge#23 — `tests/transport_http_hardening.rs` mints self-signed
-# Ed25519 certs on the fly to exercise the rustls server config + the
-# custom `FederationCnVerifier`. `rcgen` is the canonical Rust X.509
-# generator; license: MIT / Apache-2.0. Dev-only — no production
-# dep-tree impact.
-rcgen              = { version = "0.13", default-features = false, features = ["pem", "ring"] }
-# rcgen's `KeyPair::from_pkcs8_der_and_sign_algo` takes a
-# `rustls_pki_types::PrivatePkcs8KeyDer`; explicit dev-dep so the
-# test file can name the type.
-rustls-pki-types   = "1"
+# CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
+# `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
+# (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3
+# (CIRISEdge#49) lifted `rcgen` + `rustls-pki-types` into optional
+# runtime dependencies gated under `transport-http` so the
+# `init_edge_runtime` cross-wheel Python surface can mint a dev cert
+# for the `https_dev_self_signed=True` path. License: MIT / Apache-2.0
+# (deny.toml allowlist clean). No additional pin needed here — the
+# `[dependencies]` entry already names the version under the
+# `transport-http` feature flag.
 
 [lints.rust]
 # v0.9.2 (CIRISEdge#22 cohabitation) — relaxed from `forbid` to `deny`.
