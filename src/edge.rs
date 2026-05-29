@@ -547,6 +547,12 @@ pub struct Edge {
     /// so a build without subscribers has zero overhead beyond the
     /// `Arc` refcount.
     events: Arc<crate::events::EventBus>,
+    /// CIRISEdge#28 (v0.19.0) — counter + gauge bag. Every send /
+    /// receive / verify-failure / transport-bytes path increments
+    /// the appropriate field; `metrics_snapshot` on the PyO3 / UniFFI
+    /// surface projects the live state. Cheap clone (every field is
+    /// an `Arc`). See [`crate::observability::EdgeMetrics`].
+    metrics: crate::observability::EdgeMetrics,
     /// CIRISEdge#31 — operator-set local display name. Backs
     /// `local_display_name` / `set_local_display_name` on the
     /// pyo3 surface. Persisted to disk if [`EdgeConfig::display_name_path`]
@@ -838,6 +844,15 @@ impl Edge {
         self.events.clone()
     }
 
+    /// CIRISEdge#28 (v0.19.0) accessor — the live
+    /// [`crate::observability::EdgeMetrics`] bag. Cheap clone; consumers
+    /// (PyO3 / UniFFI projection methods, internal emission helpers,
+    /// tests) call `.snapshot()` to render a typed bundle.
+    #[must_use]
+    pub fn metrics(&self) -> crate::observability::EdgeMetrics {
+        self.metrics.clone()
+    }
+
     /// CIRISEdge#31 — read the operator-set local display name. Returns
     /// `None` when no name was ever set, OR when the configured
     /// `display_name_path` couldn't be read at `Edge::build` time.
@@ -917,6 +932,16 @@ impl Edge {
     /// Send an ephemeral message. Caller-owned retry — failure is
     /// visible (OQ-09 closure). Compile-time: `M::DELIVERY` must be
     /// `Ephemeral`; runtime check rejects `Durable` mis-use.
+    #[tracing::instrument(
+        name = "edge.send",
+        skip(self, msg),
+        fields(
+            recipient_key_id = %destination_key_id,
+            message_type = ?M::TYPE,
+            delivery_class = "ephemeral",
+            signing_key_id = %self.signer.key_id,
+        ),
+    )]
     pub async fn send<M: Message>(
         &self,
         destination_key_id: &str,
@@ -944,13 +969,27 @@ impl Edge {
             return Err(EdgeError::Config("no transport configured".into()));
         }
         let transport = &self.transports[0];
+        let envelope_size = envelope_bytes.len() as u64;
 
         // CIRISEdge#29 — record the send-path attempt against the
         // tracker. Failure-class capture covers both the
         // `Err(TransportError)` arm (typed transport fault) and the
         // `Ok(Reject)` arm (peer returned a wire reject). The
         // `Ok(Delivered)` arm is success.
-        let send_result = transport.send(destination_key_id, &envelope_bytes).await;
+        // CIRISEdge#28 (v0.19.0) — instrument the transport-send leg
+        // as a nested span; use `Instrument` (not `.entered()`) so
+        // the span is `Send`-friendly across the await.
+        use tracing::Instrument as _;
+        let send_span = tracing::debug_span!(
+            "transport.send",
+            transport_id = %transport.id().0,
+            recipient_key_id = %destination_key_id,
+            bytes = envelope_size,
+        );
+        let send_result = transport
+            .send(destination_key_id, &envelope_bytes)
+            .instrument(send_span)
+            .await;
         let outcome = match send_result {
             Ok(o) => {
                 let attempt_outcome = match &o {
@@ -964,6 +1003,16 @@ impl Edge {
                     transport.id(),
                     attempt_outcome,
                 );
+                // CIRISEdge#28 (v0.19.0) — count the bytes shipped, and
+                // bump the sent counter on a successful delivery. A
+                // `Reject` arm counts as a send_failure with the
+                // peer-reported class.
+                if matches!(&o, TransportSendOutcome::Delivered) {
+                    self.metrics.add_bytes_out(transport.id(), envelope_size);
+                    self.metrics.inc_sent(&M::TYPE);
+                } else if let TransportSendOutcome::Reject { class, .. } = &o {
+                    self.metrics.inc_send_failure(transport.id(), class);
+                }
                 o
             }
             Err(e) => {
@@ -971,7 +1020,17 @@ impl Edge {
                 self.reachability.record_attempt(
                     destination_key_id,
                     transport.id(),
-                    AttemptOutcome::SendFailure { error_class },
+                    AttemptOutcome::SendFailure {
+                        error_class: error_class.clone(),
+                    },
+                );
+                self.metrics.inc_send_failure(transport.id(), &error_class);
+                tracing::error!(
+                    event = "edge.send.transport_error",
+                    transport_id = %transport.id().0,
+                    error_class = %error_class,
+                    error = %e,
+                    "transport send error",
                 );
                 return Err(EdgeError::Transport(e));
             }
@@ -999,6 +1058,16 @@ impl Edge {
 
     /// Send a durable message. Edge-owned retry; the returned handle
     /// observes the eventual outcome (OQ-09 closure).
+    #[tracing::instrument(
+        name = "edge.send_durable",
+        skip(self, msg),
+        fields(
+            recipient_key_id = %destination_key_id,
+            message_type = ?M::TYPE,
+            delivery_class = "durable",
+            signing_key_id = %self.signer.key_id,
+        ),
+    )]
     pub async fn send_durable<M: Message>(
         &self,
         destination_key_id: &str,
@@ -1066,6 +1135,35 @@ impl Edge {
             .await
             .map_err(|e| EdgeError::Persist(format!("enqueue_outbound: {e}")))?;
 
+        // CIRISEdge#28 (v0.19.0) — durable enqueue is the metric-visible
+        // moment for the durable class. Counts toward both
+        // `envelopes_sent_total` (the type was offered to the wire
+        // through the durable surface) and `durable_queue_depth`.
+        self.metrics.inc_sent(&M::TYPE);
+        self.metrics
+            .inc_durable_queue(crate::observability::DeliveryClass::Durable);
+        // ResourceEvent — surface the durable-queue accumulation as a
+        // resource-pressure observation so consumers' meta-observability
+        // streams see queue growth in real time. Conservative: severity
+        // = Info; the call site has no threshold view of "pressure",
+        // we just emit the delta.
+        let depth_snap = self
+            .metrics
+            .durable_queue_depth
+            .read()
+            .get(&crate::observability::DeliveryClass::Durable)
+            .copied()
+            .unwrap_or(0);
+        #[allow(clippy::cast_precision_loss)]
+        self.events
+            .emit_resource(crate::events::NetworkEvent::resource(
+                "durable_queue_depth",
+                depth_snap as f64,
+                "count",
+                crate::events::EventSeverity::Info,
+                "durable enqueue (CIRISEdge#28 v0.19.0)",
+            ));
+
         Ok(DurableHandle { queue_id })
     }
 
@@ -1125,6 +1223,15 @@ impl Edge {
     ///   on the [`EdgeBuilder`] — the substrate broadcast cannot pick
     ///   recipients without it.
     /// - [`EdgeError::Persist`] on enqueue failure.
+    #[tracing::instrument(
+        name = "edge.send_mandatory",
+        skip(self, msg),
+        fields(
+            message_type = ?M::TYPE,
+            delivery_class = "mandatory",
+            signing_key_id = %self.signer.key_id,
+        ),
+    )]
     pub async fn send_mandatory<M: Message>(
         &self,
         msg: M,
@@ -1233,6 +1340,11 @@ impl Edge {
                 .await
                 .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (mandatory): {e}")))?;
             handles.push(DurableHandle { queue_id });
+            // CIRISEdge#28 (v0.19.0) — count per peer (one envelope
+            // signed/enqueued per recipient on Mandatory fan-out).
+            self.metrics.inc_sent(&M::TYPE);
+            self.metrics
+                .inc_durable_queue(crate::observability::DeliveryClass::Mandatory);
         }
         Ok(handles)
     }
@@ -1294,6 +1406,15 @@ impl Edge {
     /// reflects the post-filter recipient set (stewards minus self
     /// minus subscription-rejected).
     #[allow(clippy::too_many_lines)] // delivery-class match arms + fan-out body
+    #[tracing::instrument(
+        name = "edge.send_federation",
+        skip(self, msg),
+        fields(
+            message_type = ?M::TYPE,
+            delivery_class = "federation",
+            signing_key_id = %self.signer.key_id,
+        ),
+    )]
     pub async fn send_federation<M: Message>(
         &self,
         msg: M,
@@ -1419,6 +1540,10 @@ impl Edge {
                 .await
                 .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (federation): {e}")))?;
             handles.push(DurableHandle { queue_id });
+            // CIRISEdge#28 (v0.19.0) — federation fan-out per steward.
+            self.metrics.inc_sent(&M::TYPE);
+            self.metrics
+                .inc_durable_queue(crate::observability::DeliveryClass::Federation);
         }
         Ok(handles)
     }
@@ -1675,6 +1800,8 @@ impl Edge {
             self.detector.as_ref(),
             &self.verified_envelope_tx,
             &self.content_fetch_pending,
+            &self.metrics,
+            &self.events,
         )
         .await;
     }
@@ -1944,6 +2071,8 @@ impl Edge {
         let detector = self.detector.clone();
         let verified_tx = self.verified_envelope_tx.clone();
         let content_pending = self.content_fetch_pending.clone();
+        let metrics = self.metrics.clone();
+        let events = self.events.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -1962,6 +2091,8 @@ impl Edge {
                     let detector_clone = detector.clone();
                     let verified_tx_clone = verified_tx.clone();
                     let content_pending_clone = content_pending.clone();
+                    let metrics_clone = metrics.clone();
+                    let events_clone = events.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -1976,6 +2107,8 @@ impl Edge {
                             detector_clone.as_ref(),
                             &verified_tx_clone,
                             &content_pending_clone,
+                            &metrics_clone,
+                            &events_clone,
                         ).await;
                     });
                 }
@@ -2026,6 +2159,32 @@ impl Edge {
 /// typed handler dispatch.
 #[allow(clippy::too_many_lines)] // dispatch is the load-bearing pipeline composition site
 #[allow(clippy::too_many_arguments)] // composition site for all dispatch primitives
+#[tracing::instrument(
+    name = "edge.dispatch_inbound",
+    skip(
+        frame,
+        verify,
+        handlers,
+        queue,
+        signer,
+        inline_text_subscribers,
+        directory,
+        reachability,
+        detector,
+        verified_envelope_tx,
+        content_fetch_pending,
+        metrics,
+        events,
+    ),
+    fields(
+        transport_id = %frame.transport.0,
+        envelope_bytes = frame.envelope_bytes.len(),
+        signing_key_id = tracing::field::Empty,
+        message_type = tracing::field::Empty,
+        body_sha256_prefix = tracing::field::Empty,
+        verify_outcome = tracing::field::Empty,
+    ),
+)]
 async fn dispatch_inbound(
     frame: InboundFrame,
     verify: &VerifyPipeline,
@@ -2039,13 +2198,28 @@ async fn dispatch_inbound(
     detector: Option<&Arc<crate::ProbePatternObserver>>,
     verified_envelope_tx: &broadcast::Sender<VerifiedEnvelopeSnapshot>,
     content_fetch_pending: &std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<ContentResult>>>,
+    metrics: &crate::observability::EdgeMetrics,
+    events: &Arc<crate::events::EventBus>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
+    // CIRISEdge#28 (v0.19.0) — count the bytes consumed by the
+    // listener side regardless of verify outcome (the wire spent the
+    // bytes; observability covers them).
+    metrics.add_bytes_in(transport, frame.envelope_bytes.len() as u64);
     let verified = match verify.verify(&frame.envelope_bytes, transport).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(transport = ?transport, error = %e, "verify rejected");
+            let class = crate::observability::VerifyErrorClass::from_verify_error(&e);
+            metrics.inc_verify_failure(class);
+            tracing::Span::current().record("verify_outcome", class.as_str());
+            tracing::error!(
+                event = "edge.dispatch_inbound.verify_rejected",
+                transport_id = %transport.0,
+                verify_error_class = class.as_str(),
+                error = %e,
+                "verify rejected",
+            );
             return;
         }
     };
@@ -2056,6 +2230,28 @@ async fn dispatch_inbound(
         verify_outcome,
         ..
     } = verified;
+
+    // CIRISEdge#28 (v0.19.0) — record structured span fields the
+    // tracing-subscriber consumers (CIRISLens, CIRISAgent UI)
+    // downstream alert on.
+    {
+        let span = tracing::Span::current();
+        span.record("signing_key_id", envelope.signing_key_id.as_str());
+        span.record(
+            "message_type",
+            tracing::field::debug(&envelope.message_type),
+        );
+        let mut prefix = String::with_capacity(16);
+        for b in &body_sha256[..8] {
+            use std::fmt::Write as _;
+            let _ = write!(prefix, "{b:02x}");
+        }
+        span.record("body_sha256_prefix", prefix.as_str());
+        span.record("verify_outcome", tracing::field::debug(&verify_outcome));
+    }
+
+    // CIRISEdge#28 (v0.19.0) — count the verified inbound envelope.
+    metrics.inc_received(&envelope.message_type);
 
     // CIRISEdge#22 Tier 3 (v0.17.0) — fan out every verified envelope
     // on the broadcast channel BEFORE any type-specific gating. The
@@ -2170,6 +2366,18 @@ async fn dispatch_inbound(
                             ?reason,
                             "AccordCarrier FederationAnnouncement REFUSED at wire-layer multi-sig gate (CIRISEdge#19)",
                         );
+                        // CIRISEdge#34 v0.19.0 — refusal IS a path-lost
+                        // signal: edge-substrate declined to propagate
+                        // because the multi-sig threshold wasn't met.
+                        events.emit_path(crate::events::NetworkEvent::path(
+                            crate::events::EventKind::PathLost,
+                            body_sha256.to_vec(),
+                            0,
+                            Some(transport.0.to_string()),
+                            Some(envelope.signing_key_id.clone()),
+                            crate::events::EventSeverity::Warning,
+                            "AccordCarrier refused at wire-layer gate",
+                        ));
                         if let Err(e) = emit_delivery_refusal_attestation(
                             &envelope,
                             body_sha256,
@@ -2233,6 +2441,27 @@ async fn dispatch_inbound(
                 medium_id,
                 AttemptOutcome::AttestationReceived,
             );
+            // CIRISEdge#34 v0.19.0 — peer cryptographically confirmed
+            // a delivery via `medium_id`. Project this as a PathEvent
+            // (PathDiscovered) so consumers' meta-observability streams
+            // see the cold-start reach signal.
+            //
+            // `destination_hash` here is the body_sha256 of the
+            // attestation envelope (the attestation's own join key);
+            // it isn't the Reticulum 16-byte dest hash, but the wire
+            // shape carries arbitrary bytes and downstream consumers
+            // route on (peer_key_id, kind) primarily. The Reticulum
+            // path-table-side emission lands the canonical 16-byte
+            // hash on its own arms.
+            events.emit_path(crate::events::NetworkEvent::path(
+                crate::events::EventKind::PathDiscovered,
+                body_sha256.to_vec(),
+                0,
+                Some(medium_id.0.to_string()),
+                Some(att.peer_key_id.clone()),
+                crate::events::EventSeverity::Info,
+                "delivery attestation confirms reach",
+            ));
         }
     }
 
@@ -2777,6 +3006,7 @@ impl EdgeBuilder {
             federation_directory: self.federation_directory,
             detector,
             canonical_peers,
+            metrics: crate::observability::EdgeMetrics::new(),
             config: self.config,
         })
     }

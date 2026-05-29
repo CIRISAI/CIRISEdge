@@ -671,6 +671,149 @@ impl PyEdge {
             other => PyRuntimeError::new_err(format!("peer_sas_digits: {other}")),
         })
     }
+
+    // ─── CIRISEdge#34 (v0.19.0) — Network-event AsyncIterator surface ───
+    //
+    // Six pymethods backing the per-category broadcast bus. Each
+    // returns a `PyNetworkEventSubscription` implementing
+    // `__aiter__` / `__anext__` so consumers write
+    // `async for ev in edge.subscribe_announces(): ...`. The dict
+    // shape yielded by `__anext__` is documented on the pyclass impl.
+    //
+    // Channel cardinality (per [`crate::events::EventBus`]):
+    //
+    //   - subscribe_announces        → AnnounceReceived emissions
+    //   - subscribe_link_events      → LinkEstablished / LinkDropped
+    //   - subscribe_interface_events → TransportUp / TransportDown
+    //   - subscribe_path_events      → PathDiscovered / PathLost
+    //   - subscribe_resource_events  → ResourcePressure (queue depth,
+    //                                   transport buffer pressure)
+    //   - subscribe_all              → fan-in of all the above
+
+    /// Subscribe to announce events (PeerResolver cold-start path).
+    /// Yields one dict per arriving announce; raises `StopAsyncIteration`
+    /// when the channel closes.
+    fn subscribe_announces(&self) -> PyNetworkEventSubscription {
+        PyNetworkEventSubscription::new(self.inner.events().subscribe_announces())
+    }
+
+    /// Subscribe to link events (Reticulum link establish/drop). v0.14.2
+    /// wired the Rust-side EventBus channel; v0.19.0 ships the pymethod
+    /// surface.
+    fn subscribe_link_events(&self) -> PyNetworkEventSubscription {
+        PyNetworkEventSubscription::new(self.inner.events().subscribe_links())
+    }
+
+    /// Subscribe to interface events (transport_up / transport_down).
+    fn subscribe_interface_events(&self) -> PyNetworkEventSubscription {
+        PyNetworkEventSubscription::new(self.inner.events().subscribe_interfaces())
+    }
+
+    /// Subscribe to path events (CIRISEdge#34 v0.19.0). Yields
+    /// PathDiscovered / PathLost dicts. Emission sites:
+    /// `dispatch_inbound` `DeliveryAttestation` arm (PathDiscovered),
+    /// `dispatch_inbound` AccordCarrier wire-layer refusal arm
+    /// (PathLost), plus the Reticulum transport's path-table hooks.
+    fn subscribe_path_events(&self) -> PyNetworkEventSubscription {
+        PyNetworkEventSubscription::new(self.inner.events().subscribe_paths())
+    }
+
+    /// Subscribe to resource events (CIRISEdge#34 v0.19.0). Yields
+    /// ResourcePressure dicts carrying (`resource_kind`, `measurement`,
+    /// `unit`). v0.19.0 emission sites: `send_durable` /
+    /// `send_mandatory` / `send_federation` (durable_queue_depth
+    /// gauges).
+    fn subscribe_resource_events(&self) -> PyNetworkEventSubscription {
+        PyNetworkEventSubscription::new(self.inner.events().subscribe_resources())
+    }
+
+    /// Subscribe to the union of every per-category stream — every
+    /// emission is fanned-in here in arrival order.
+    fn subscribe_all(&self) -> PyNetworkEventSubscription {
+        PyNetworkEventSubscription::new(self.inner.events().subscribe_all())
+    }
+
+    // ─── CIRISEdge#28 (v0.19.0) — metrics snapshot ─────────────────
+
+    /// Snapshot the live edge metrics as a Python `dict` of `dict`s.
+    /// Each call is point-in-time; consumers poll repeatedly for
+    /// change-detection.
+    ///
+    /// Shape:
+    ///
+    /// ```python
+    /// {
+    ///   "envelopes_sent_total":     {"InlineText": 42, ...},
+    ///   "envelopes_received_total": {"FederationAnnouncement": 7, ...},
+    ///   "send_failures_total":      {"reticulum-rs:unreachable": 1, ...},
+    ///   "verify_failures_total":    {"replay_detected": 3, ...},
+    ///   "durable_queue_depth":      {"durable": 5, "mandatory": 0, ...},
+    ///   "transport_bytes_in_total": {"reticulum-rs": 24576, ...},
+    ///   "transport_bytes_out_total":{"http": 1024, ...},
+    ///   "peer_reachability_ratio":  {"peer-x:reticulum-rs": 0.75, ...},
+    /// }
+    /// ```
+    fn metrics_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Mirror the live reachability tracker into the gauge before
+        // snapshotting — consumers expect the gauge to be current.
+        let reach_snap = self.inner.reachability_tracker().snapshot_all();
+        let m = self.inner.metrics();
+        for entry in &reach_snap {
+            m.set_peer_reachability(&entry.peer_key_id, entry.transport_id.0, entry.ratio());
+        }
+        let bundle = m.snapshot();
+        let root = pyo3::types::PyDict::new(py);
+
+        let envelopes_sent = pyo3::types::PyDict::new(py);
+        for (k, v) in &bundle.envelopes_sent_total {
+            envelopes_sent.set_item(format!("{k:?}"), *v)?;
+        }
+        root.set_item("envelopes_sent_total", envelopes_sent)?;
+
+        let envelopes_received = pyo3::types::PyDict::new(py);
+        for (k, v) in &bundle.envelopes_received_total {
+            envelopes_received.set_item(format!("{k:?}"), *v)?;
+        }
+        root.set_item("envelopes_received_total", envelopes_received)?;
+
+        let send_failures = pyo3::types::PyDict::new(py);
+        for ((t, c), v) in &bundle.send_failures_total {
+            send_failures.set_item(format!("{}:{c}", t.0), *v)?;
+        }
+        root.set_item("send_failures_total", send_failures)?;
+
+        let verify_failures = pyo3::types::PyDict::new(py);
+        for (k, v) in &bundle.verify_failures_total {
+            verify_failures.set_item(k.as_str(), *v)?;
+        }
+        root.set_item("verify_failures_total", verify_failures)?;
+
+        let durable_depth = pyo3::types::PyDict::new(py);
+        for (k, v) in &bundle.durable_queue_depth {
+            durable_depth.set_item(k.as_str(), *v)?;
+        }
+        root.set_item("durable_queue_depth", durable_depth)?;
+
+        let bytes_in = pyo3::types::PyDict::new(py);
+        for (k, v) in &bundle.transport_bytes_in_total {
+            bytes_in.set_item(k.0, *v)?;
+        }
+        root.set_item("transport_bytes_in_total", bytes_in)?;
+
+        let bytes_out = pyo3::types::PyDict::new(py);
+        for (k, v) in &bundle.transport_bytes_out_total {
+            bytes_out.set_item(k.0, *v)?;
+        }
+        root.set_item("transport_bytes_out_total", bytes_out)?;
+
+        let reachability = pyo3::types::PyDict::new(py);
+        for ((peer, medium), v) in &bundle.peer_reachability_ratio {
+            reachability.set_item(format!("{peer}:{medium}"), *v)?;
+        }
+        root.set_item("peer_reachability_ratio", reachability)?;
+
+        Ok(root.unbind().into_any())
+    }
 }
 
 /// CIRISEdge#22 Tier 3 (v0.17.0) — Python-side projection of the
@@ -737,6 +880,114 @@ impl PyVerifiedFeedSubscription {
             }
         })
     }
+}
+
+/// CIRISEdge#34 (v0.19.0) — Python-side projection of the per-category
+/// network event broadcast. Backs every `PyEdge::subscribe_*`
+/// pymethod (announces, link, interface, path, resource, all). Wire
+/// shape is a Python dict — see `__anext__` for the keys.
+#[pyclass(name = "NetworkEventSubscription", module = "ciris_edge")]
+pub struct PyNetworkEventSubscription {
+    rx: Arc<Mutex<Option<tokio::sync::broadcast::Receiver<crate::events::NetworkEvent>>>>,
+}
+
+impl PyNetworkEventSubscription {
+    fn new(rx: tokio::sync::broadcast::Receiver<crate::events::NetworkEvent>) -> Self {
+        Self {
+            rx: Arc::new(Mutex::new(Some(rx))),
+        }
+    }
+}
+
+#[pymethods]
+impl PyNetworkEventSubscription {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Yields the next [`crate::events::NetworkEvent`] as a Python dict.
+    /// Keys:
+    ///
+    /// ```python
+    /// {
+    ///   "at": "2026-05-29T12:34:56Z",      # RFC-3339 UTC
+    ///   "kind": "PathDiscovered",           # EventKind debug repr
+    ///   "severity": "info" | "warning" | "error",
+    ///   "message": "<free-form>",
+    ///   "peer_key_id": str | None,
+    ///   "transport_id": str | None,
+    ///   # category-specific optional fields:
+    ///   "identity_hash": bytes | None,
+    ///   "app_data": bytes | None,
+    ///   "aspect": str | None,
+    ///   "link_id": bytes | None,
+    ///   "destination_hash": bytes | None,
+    ///   "hops": int | None,
+    ///   "resource_kind": str | None,
+    ///   "measurement": float | None,
+    ///   "unit": str | None,
+    ///   "lagged_count": int | None,
+    /// }
+    /// ```
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx_holder = self.rx.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let recv_outcome = {
+                let mut guard = rx_holder.lock().await;
+                let Some(rx) = guard.as_mut() else {
+                    return Err(PyRuntimeError::new_err("network event subscription closed"));
+                };
+                rx.recv().await
+            };
+            match recv_outcome {
+                Ok(ev) => Python::attach(|py| {
+                    let dict = network_event_to_pydict(py, &ev)?;
+                    Ok(dict.unbind().into_any())
+                }),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    Err(PyRuntimeError::new_err(format!(
+                        "network event subscription lagged by {n} events"
+                    )))
+                }
+            }
+        })
+    }
+}
+
+/// CIRISEdge#34 (v0.19.0) — project a [`crate::events::NetworkEvent`]
+/// into a Python dict matching the documented `__anext__` shape.
+fn network_event_to_pydict<'py>(
+    py: Python<'py>,
+    ev: &crate::events::NetworkEvent,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("at", ev.at.to_rfc3339())?;
+    dict.set_item("kind", format!("{:?}", ev.kind))?;
+    let sev = match ev.severity {
+        crate::events::EventSeverity::Info => "info",
+        crate::events::EventSeverity::Warning => "warning",
+        crate::events::EventSeverity::Error => "error",
+    };
+    dict.set_item("severity", sev)?;
+    dict.set_item("message", &ev.message)?;
+    dict.set_item("peer_key_id", ev.peer_key_id.clone())?;
+    dict.set_item("transport_id", ev.transport_id.clone())?;
+    dict.set_item("aspect", ev.aspect.clone())?;
+    dict.set_item("identity_hash", ev.identity_hash.clone())?;
+    dict.set_item("app_data", ev.app_data.clone())?;
+    dict.set_item("rssi_dbm", ev.rssi_dbm)?;
+    dict.set_item("snr_db", ev.snr_db)?;
+    dict.set_item("link_id", ev.link_id.clone())?;
+    dict.set_item("destination_hash", ev.destination_hash.clone())?;
+    dict.set_item("hops", ev.hops)?;
+    dict.set_item("resource_kind", ev.resource_kind.clone())?;
+    dict.set_item("measurement", ev.measurement)?;
+    dict.set_item("unit", ev.unit.clone())?;
+    dict.set_item("lagged_count", ev.lagged_count)?;
+    Ok(dict)
 }
 
 /// CIRISEdge#47 (v0.17.0) — extract the 32-byte local Ed25519 pubkey
@@ -2075,6 +2326,10 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // 2.10.0's Epistemic Commons inbound UI panes.
     m.add_class::<PyVerifiedFeedSubscription>()?;
 
+    // CIRISEdge#34 (v0.19.0) — per-category network-event AsyncIterator
+    // pyclass returned by every `PyEdge::subscribe_*` pymethod.
+    m.add_class::<PyNetworkEventSubscription>()?;
+
     // init_edge_runtime — the CIRISEdge#16 / CIRIS-3.0 cohabitation
     // constructor. Only registered when the Reticulum transport is
     // compiled in — that is the canonical wire for the cohabitation
@@ -2948,6 +3203,56 @@ mod pyo3_tier2_tests {
              (CIRISAgent#756 Q1 / FSD §1.4) — body_sha256 must reflect the \
              post-pipeline body, not the input"
         );
+    }
+
+    /// CIRISEdge#28 (v0.19.0) — `PyEdge::metrics_snapshot` round-trips
+    /// through the PyO3 boundary as a dict of dicts. We bump a counter
+    /// via Rust-side `inc_sent`, then read it back through the Python
+    /// projection and assert the key + count survive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metrics_snapshot_round_trip_through_pyo3() {
+        init_python();
+        let (edge, _queue) = build_test_edge().await;
+        // Bump a counter on the live Edge metrics — exercises the
+        // same Arc<RwLock<_>> path the production send/receive sites
+        // walk.
+        edge.metrics().inc_sent(&crate::MessageType::InlineText);
+        edge.metrics().inc_sent(&crate::MessageType::InlineText);
+        edge.metrics().inc_sent(&crate::MessageType::ContentFetch);
+        edge.metrics()
+            .inc_send_failure(crate::TransportId::HTTP, "timeout");
+
+        let py_edge = PyEdge::for_test(edge.clone(), tokio::runtime::Handle::current());
+
+        Python::attach(|py| {
+            let snap = py_edge.metrics_snapshot(py).expect("metrics_snapshot");
+            let snap_bound = snap.bind(py);
+            let envelopes_sent = snap_bound
+                .get_item("envelopes_sent_total")
+                .expect("envelopes_sent_total key");
+            let inline_text_count: u64 = envelopes_sent
+                .get_item("InlineText")
+                .expect("InlineText key")
+                .extract()
+                .expect("u64 extract");
+            assert_eq!(inline_text_count, 2);
+            let content_fetch_count: u64 = envelopes_sent
+                .get_item("ContentFetch")
+                .expect("ContentFetch key")
+                .extract()
+                .expect("u64 extract");
+            assert_eq!(content_fetch_count, 1);
+
+            let send_failures = snap_bound
+                .get_item("send_failures_total")
+                .expect("send_failures_total key");
+            let http_timeout_count: u64 = send_failures
+                .get_item("http:timeout")
+                .expect("http:timeout key")
+                .extract()
+                .expect("u64 extract");
+            assert_eq!(http_timeout_count, 1);
+        });
     }
 
     // ── v0.9.2 (CIRISEdge#22 / CIRISPersist#109) — cohabitation

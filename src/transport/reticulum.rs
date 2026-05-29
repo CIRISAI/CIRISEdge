@@ -2338,6 +2338,11 @@ fn link_event(
         snr_db: None,
         link_id: Some(link_id.as_bytes().to_vec()),
         lagged_count: None,
+        destination_hash: None,
+        hops: None,
+        resource_kind: None,
+        measurement: None,
+        unit: None,
     }
 }
 
