@@ -610,6 +610,146 @@ public func FfiConverterTypeEdgeErrorEvent_lower(_ value: EdgeErrorEvent) -> Rus
 }
 
 
+public struct EdgeLinkHandle: Equatable, Hashable {
+    public var linkId: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(linkId: Data) {
+        self.linkId = linkId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeLinkHandle: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeLinkHandle: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeLinkHandle {
+        return
+            try EdgeLinkHandle(
+                linkId: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeLinkHandle, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.linkId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeLinkHandle_lift(_ buf: RustBuffer) throws -> EdgeLinkHandle {
+    return try FfiConverterTypeEdgeLinkHandle.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeLinkHandle_lower(_ value: EdgeLinkHandle) -> RustBuffer {
+    return FfiConverterTypeEdgeLinkHandle.lower(value)
+}
+
+
+public struct EdgeLinkInfo: Equatable, Hashable {
+    public var linkId: Data
+    public var peerIdentityHash: Data
+    public var state: EdgeLinkState
+    public var ageSeconds: UInt64
+    public var rssiDbm: Double?
+    public var snrDb: Double?
+    public var establishmentRateKbps: Double?
+    public var mtu: UInt32
+    public var mdu: UInt32
+    public var transportId: String
+    public var transportKind: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(linkId: Data, peerIdentityHash: Data, state: EdgeLinkState, ageSeconds: UInt64, rssiDbm: Double?, snrDb: Double?, establishmentRateKbps: Double?, mtu: UInt32, mdu: UInt32, transportId: String, transportKind: String) {
+        self.linkId = linkId
+        self.peerIdentityHash = peerIdentityHash
+        self.state = state
+        self.ageSeconds = ageSeconds
+        self.rssiDbm = rssiDbm
+        self.snrDb = snrDb
+        self.establishmentRateKbps = establishmentRateKbps
+        self.mtu = mtu
+        self.mdu = mdu
+        self.transportId = transportId
+        self.transportKind = transportKind
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EdgeLinkInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeLinkInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeLinkInfo {
+        return
+            try EdgeLinkInfo(
+                linkId: FfiConverterData.read(from: &buf), 
+                peerIdentityHash: FfiConverterData.read(from: &buf), 
+                state: FfiConverterTypeEdgeLinkState.read(from: &buf), 
+                ageSeconds: FfiConverterUInt64.read(from: &buf), 
+                rssiDbm: FfiConverterOptionDouble.read(from: &buf), 
+                snrDb: FfiConverterOptionDouble.read(from: &buf), 
+                establishmentRateKbps: FfiConverterOptionDouble.read(from: &buf), 
+                mtu: FfiConverterUInt32.read(from: &buf), 
+                mdu: FfiConverterUInt32.read(from: &buf), 
+                transportId: FfiConverterString.read(from: &buf), 
+                transportKind: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EdgeLinkInfo, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.linkId, into: &buf)
+        FfiConverterData.write(value.peerIdentityHash, into: &buf)
+        FfiConverterTypeEdgeLinkState.write(value.state, into: &buf)
+        FfiConverterUInt64.write(value.ageSeconds, into: &buf)
+        FfiConverterOptionDouble.write(value.rssiDbm, into: &buf)
+        FfiConverterOptionDouble.write(value.snrDb, into: &buf)
+        FfiConverterOptionDouble.write(value.establishmentRateKbps, into: &buf)
+        FfiConverterUInt32.write(value.mtu, into: &buf)
+        FfiConverterUInt32.write(value.mdu, into: &buf)
+        FfiConverterString.write(value.transportId, into: &buf)
+        FfiConverterString.write(value.transportKind, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeLinkInfo_lift(_ buf: RustBuffer) throws -> EdgeLinkInfo {
+    return try FfiConverterTypeEdgeLinkInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeLinkInfo_lower(_ value: EdgeLinkInfo) -> RustBuffer {
+    return FfiConverterTypeEdgeLinkInfo.lower(value)
+}
+
+
 public struct EdgeMetricsSnapshot: Equatable, Hashable {
     public var counters: [String: UInt64]
     public var gauges: [String: Double]
@@ -1682,6 +1822,94 @@ public func FfiConverterTypeEdgeBindingsError_lower(_ value: EdgeBindingsError) 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum EdgeLinkState: Equatable, Hashable {
+    
+    case pending
+    case active
+    case closing
+    case closed
+    case stale
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension EdgeLinkState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeLinkState: FfiConverterRustBuffer {
+    typealias SwiftType = EdgeLinkState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeLinkState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .pending
+        
+        case 2: return .active
+        
+        case 3: return .closing
+        
+        case 4: return .closed
+        
+        case 5: return .stale
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EdgeLinkState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .pending:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .active:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .closing:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .closed:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .stale:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeLinkState_lift(_ buf: RustBuffer) throws -> EdgeLinkState {
+    return try FfiConverterTypeEdgeLinkState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeLinkState_lower(_ value: EdgeLinkState) -> RustBuffer {
+    return FfiConverterTypeEdgeLinkState.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum EdgePeerTrust: Equatable, Hashable {
     
     case trusted
@@ -2029,6 +2257,31 @@ fileprivate struct FfiConverterSequenceTypeEdgeErrorEvent: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeEdgeLinkInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [EdgeLinkInfo]
+
+    public static func write(_ value: [EdgeLinkInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeEdgeLinkInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [EdgeLinkInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [EdgeLinkInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeEdgeLinkInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeEdgeNetworkEvent: FfiConverterRustBuffer {
     typealias SwiftType = [EdgeNetworkEvent]
 
@@ -2258,6 +2511,42 @@ public func lastRotationAt()throws  -> String  {
     )
 })
 }
+public func linkCount()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_link_count($0
+    )
+})
+}
+public func linkList()throws  -> [EdgeLinkInfo]  {
+    return try  FfiConverterSequenceTypeEdgeLinkInfo.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_link_list($0
+    )
+})
+}
+public func linkOpen(destinationHash: Data, timeoutMs: UInt64)throws  -> EdgeLinkHandle  {
+    return try  FfiConverterTypeEdgeLinkHandle_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_link_open(
+        FfiConverterData.lower(destinationHash),
+        FfiConverterUInt64.lower(timeoutMs),$0
+    )
+})
+}
+public func linkRequest(linkHandle: EdgeLinkHandle, path: String, data: Data, timeoutMs: UInt64)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_link_request(
+        FfiConverterTypeEdgeLinkHandle_lower(linkHandle),
+        FfiConverterString.lower(path),
+        FfiConverterData.lower(data),
+        FfiConverterUInt64.lower(timeoutMs),$0
+    )
+})
+}
+public func linkTeardown(linkId: Data)throws   {try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_link_teardown(
+        FfiConverterData.lower(linkId),$0
+    )
+}
+}
 public func metricsSnapshot()throws  -> EdgeMetricsSnapshot  {
     return try  FfiConverterTypeEdgeMetricsSnapshot_lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_metrics_snapshot($0
@@ -2453,6 +2742,21 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_last_rotation_at() != 1939) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_link_count() != 54874) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_link_list() != 2091) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_link_open() != 44421) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_link_request() != 40060) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_link_teardown() != 2573) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_metrics_snapshot() != 47202) {

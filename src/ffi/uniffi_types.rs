@@ -193,3 +193,38 @@ pub struct EdgePathEntry {
     pub next_hop: Option<String>,
     pub last_seen_at: Option<String>,
 }
+
+// ─── #32 Links FFI types (v0.14.0) ──────────────────────────────────
+//
+// Mirrors Reticulum's `LinkState` enum projection (Pending / Active /
+// Closing / Closed / Stale). Leviculum's `LinkState::Handshake` rolls
+// into `Pending` from the consumer's POV — the link is not yet usable.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeLinkState {
+    Pending,
+    Active,
+    Closing,
+    Closed,
+    Stale,
+}
+
+#[derive(Debug, Clone)]
+pub struct EdgeLinkHandle {
+    pub link_id: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EdgeLinkInfo {
+    pub link_id: Vec<u8>,
+    pub peer_identity_hash: Vec<u8>,
+    pub state: EdgeLinkState,
+    pub age_seconds: u64,
+    pub rssi_dbm: Option<f64>,
+    pub snr_db: Option<f64>,
+    pub establishment_rate_kbps: Option<f64>,
+    pub mtu: u32,
+    pub mdu: u32,
+    pub transport_id: String,
+    pub transport_kind: String,
+}

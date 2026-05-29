@@ -488,6 +488,16 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_last_rotation_at() != 1939:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_link_count() != 54874:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_link_list() != 2091:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_link_open() != 44421:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_link_request() != 40060:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_link_teardown() != 2573:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_metrics_snapshot() != 47202:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_path_table() != 4368:
@@ -819,6 +829,33 @@ _UniffiLib.uniffi_ciris_edge_fn_func_last_rotation_at.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_ciris_edge_fn_func_last_rotation_at.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_ciris_edge_fn_func_link_count.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_link_count.restype = ctypes.c_uint32
+_UniffiLib.uniffi_ciris_edge_fn_func_link_list.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_link_list.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_ciris_edge_fn_func_link_open.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_link_open.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_ciris_edge_fn_func_link_request.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_link_request.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_ciris_edge_fn_func_link_teardown.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_link_teardown.restype = None
 _UniffiLib.uniffi_ciris_edge_fn_func_metrics_snapshot.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -964,6 +1001,21 @@ _UniffiLib.uniffi_ciris_edge_checksum_func_identity_pubkeys.restype = ctypes.c_u
 _UniffiLib.uniffi_ciris_edge_checksum_func_last_rotation_at.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_last_rotation_at.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_count.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_count.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_list.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_list.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_open.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_open.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_request.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_request.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_teardown.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_link_teardown.restype = ctypes.c_uint16
 _UniffiLib.uniffi_ciris_edge_checksum_func_metrics_snapshot.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_metrics_snapshot.restype = ctypes.c_uint16
@@ -1150,6 +1202,120 @@ class _UniffiFfiConverterTypeEdgeErrorEvent(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.write(value.message, buf)
         _UniffiFfiConverterOptionalString.write(value.body_sha256, buf)
 
+class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        size = buf.read_i32()
+        if size < 0:
+            raise InternalError("Unexpected negative byte string length")
+        return buf.read(size)
+
+    @staticmethod
+    def check_lower(value):
+        try:
+            memoryview(value)
+        except TypeError:
+            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_i32(len(value))
+        buf.write(value)
+
+@dataclass
+class EdgeLinkHandle:
+    def __init__(self, *, link_id:bytes):
+        self.link_id = link_id
+        
+        
+
+    
+    def __str__(self):
+        return "EdgeLinkHandle(link_id={})".format(self.link_id)
+    def __eq__(self, other):
+        if self.link_id != other.link_id:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeEdgeLinkHandle(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return EdgeLinkHandle(
+            link_id=_UniffiFfiConverterBytes.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterBytes.check_lower(value.link_id)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterBytes.write(value.link_id, buf)
+
+
+
+
+
+
+class EdgeLinkState(enum.Enum):
+    
+    PENDING = 0
+    
+    ACTIVE = 1
+    
+    CLOSING = 2
+    
+    CLOSED = 3
+    
+    STALE = 4
+    
+
+
+class _UniffiFfiConverterTypeEdgeLinkState(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return EdgeLinkState.PENDING
+        if variant == 2:
+            return EdgeLinkState.ACTIVE
+        if variant == 3:
+            return EdgeLinkState.CLOSING
+        if variant == 4:
+            return EdgeLinkState.CLOSED
+        if variant == 5:
+            return EdgeLinkState.STALE
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == EdgeLinkState.PENDING:
+            return
+        if value == EdgeLinkState.ACTIVE:
+            return
+        if value == EdgeLinkState.CLOSING:
+            return
+        if value == EdgeLinkState.CLOSED:
+            return
+        if value == EdgeLinkState.STALE:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == EdgeLinkState.PENDING:
+            buf.write_i32(1)
+        if value == EdgeLinkState.ACTIVE:
+            buf.write_i32(2)
+        if value == EdgeLinkState.CLOSING:
+            buf.write_i32(3)
+        if value == EdgeLinkState.CLOSED:
+            buf.write_i32(4)
+        if value == EdgeLinkState.STALE:
+            buf.write_i32(5)
+
+
+
 class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
     CLASS_NAME = "u64"
     VALUE_MIN = 0
@@ -1162,6 +1328,143 @@ class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
     @staticmethod
     def write(value, buf):
         buf.write_u64(value)
+
+class _UniffiFfiConverterFloat64(_UniffiConverterPrimitiveFloat):
+    @staticmethod
+    def read(buf):
+        return buf.read_double()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_double(value)
+
+class _UniffiFfiConverterOptionalFloat64(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterFloat64.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterFloat64.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterFloat64.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterUInt32(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u32"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**32
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u32()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u32(value)
+
+@dataclass
+class EdgeLinkInfo:
+    def __init__(self, *, link_id:bytes, peer_identity_hash:bytes, state:EdgeLinkState, age_seconds:int, rssi_dbm:typing.Optional[float], snr_db:typing.Optional[float], establishment_rate_kbps:typing.Optional[float], mtu:int, mdu:int, transport_id:str, transport_kind:str):
+        self.link_id = link_id
+        self.peer_identity_hash = peer_identity_hash
+        self.state = state
+        self.age_seconds = age_seconds
+        self.rssi_dbm = rssi_dbm
+        self.snr_db = snr_db
+        self.establishment_rate_kbps = establishment_rate_kbps
+        self.mtu = mtu
+        self.mdu = mdu
+        self.transport_id = transport_id
+        self.transport_kind = transport_kind
+        
+        
+
+    
+    def __str__(self):
+        return "EdgeLinkInfo(link_id={}, peer_identity_hash={}, state={}, age_seconds={}, rssi_dbm={}, snr_db={}, establishment_rate_kbps={}, mtu={}, mdu={}, transport_id={}, transport_kind={})".format(self.link_id, self.peer_identity_hash, self.state, self.age_seconds, self.rssi_dbm, self.snr_db, self.establishment_rate_kbps, self.mtu, self.mdu, self.transport_id, self.transport_kind)
+    def __eq__(self, other):
+        if self.link_id != other.link_id:
+            return False
+        if self.peer_identity_hash != other.peer_identity_hash:
+            return False
+        if self.state != other.state:
+            return False
+        if self.age_seconds != other.age_seconds:
+            return False
+        if self.rssi_dbm != other.rssi_dbm:
+            return False
+        if self.snr_db != other.snr_db:
+            return False
+        if self.establishment_rate_kbps != other.establishment_rate_kbps:
+            return False
+        if self.mtu != other.mtu:
+            return False
+        if self.mdu != other.mdu:
+            return False
+        if self.transport_id != other.transport_id:
+            return False
+        if self.transport_kind != other.transport_kind:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeEdgeLinkInfo(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return EdgeLinkInfo(
+            link_id=_UniffiFfiConverterBytes.read(buf),
+            peer_identity_hash=_UniffiFfiConverterBytes.read(buf),
+            state=_UniffiFfiConverterTypeEdgeLinkState.read(buf),
+            age_seconds=_UniffiFfiConverterUInt64.read(buf),
+            rssi_dbm=_UniffiFfiConverterOptionalFloat64.read(buf),
+            snr_db=_UniffiFfiConverterOptionalFloat64.read(buf),
+            establishment_rate_kbps=_UniffiFfiConverterOptionalFloat64.read(buf),
+            mtu=_UniffiFfiConverterUInt32.read(buf),
+            mdu=_UniffiFfiConverterUInt32.read(buf),
+            transport_id=_UniffiFfiConverterString.read(buf),
+            transport_kind=_UniffiFfiConverterString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterBytes.check_lower(value.link_id)
+        _UniffiFfiConverterBytes.check_lower(value.peer_identity_hash)
+        _UniffiFfiConverterTypeEdgeLinkState.check_lower(value.state)
+        _UniffiFfiConverterUInt64.check_lower(value.age_seconds)
+        _UniffiFfiConverterOptionalFloat64.check_lower(value.rssi_dbm)
+        _UniffiFfiConverterOptionalFloat64.check_lower(value.snr_db)
+        _UniffiFfiConverterOptionalFloat64.check_lower(value.establishment_rate_kbps)
+        _UniffiFfiConverterUInt32.check_lower(value.mtu)
+        _UniffiFfiConverterUInt32.check_lower(value.mdu)
+        _UniffiFfiConverterString.check_lower(value.transport_id)
+        _UniffiFfiConverterString.check_lower(value.transport_kind)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterBytes.write(value.link_id, buf)
+        _UniffiFfiConverterBytes.write(value.peer_identity_hash, buf)
+        _UniffiFfiConverterTypeEdgeLinkState.write(value.state, buf)
+        _UniffiFfiConverterUInt64.write(value.age_seconds, buf)
+        _UniffiFfiConverterOptionalFloat64.write(value.rssi_dbm, buf)
+        _UniffiFfiConverterOptionalFloat64.write(value.snr_db, buf)
+        _UniffiFfiConverterOptionalFloat64.write(value.establishment_rate_kbps, buf)
+        _UniffiFfiConverterUInt32.write(value.mtu, buf)
+        _UniffiFfiConverterUInt32.write(value.mdu, buf)
+        _UniffiFfiConverterString.write(value.transport_id, buf)
+        _UniffiFfiConverterString.write(value.transport_kind, buf)
 
 class _UniffiFfiConverterMapStringUInt64(_UniffiConverterRustBuffer):
     @classmethod
@@ -1193,15 +1496,6 @@ class _UniffiFfiConverterMapStringUInt64(_UniffiConverterRustBuffer):
             val = _UniffiFfiConverterUInt64.read(buf)
             d[key] = val
         return d
-
-class _UniffiFfiConverterFloat64(_UniffiConverterPrimitiveFloat):
-    @staticmethod
-    def read(buf):
-        return buf.read_double()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_double(value)
 
 class _UniffiFfiConverterMapStringFloat64(_UniffiConverterRustBuffer):
     @classmethod
@@ -1329,19 +1623,6 @@ class _UniffiFfiConverterTypeEdgeNetworkEvent(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.write(value.kind, buf)
         _UniffiFfiConverterString.write(value.severity, buf)
         _UniffiFfiConverterString.write(value.body_json, buf)
-
-class _UniffiFfiConverterUInt32(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u32"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**32
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u32()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u32(value)
 
 @dataclass
 class EdgePathEntry:
@@ -2101,31 +2382,6 @@ class _UniffiFfiConverterTypeEdgeTransportSpec(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.write(value.kind, buf)
         _UniffiFfiConverterString.write(value.config_json, buf)
 
-class _UniffiFfiConverterOptionalFloat64(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterFloat64.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterFloat64.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterFloat64.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
 @dataclass
 class EdgeTransportStats:
     def __init__(self, *, name:str, kind:str, status:str, online:bool, bitrate_bps:typing.Optional[int], mode:str, rxb:int, txb:int, hw_mtu:typing.Optional[int], ifac_size:typing.Optional[int], ifac_signature:typing.Optional[str], rssi_dbm:typing.Optional[float], snr_db:typing.Optional[float], airtime_long_pct:typing.Optional[float], airtime_short_pct:typing.Optional[float], cpu_load_pct:typing.Optional[float], battery_pct:typing.Optional[float]):
@@ -2380,26 +2636,6 @@ class _UniffiFfiConverterTypeEdgeBindingsError(_UniffiConverterRustBuffer):
         if isinstance(value, EdgeBindingsError.Transport):
             buf.write_i32(8)
 
-class _UniffiFfiConverterBytes(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        size = buf.read_i32()
-        if size < 0:
-            raise InternalError("Unexpected negative byte string length")
-        return buf.read(size)
-
-    @staticmethod
-    def check_lower(value):
-        try:
-            memoryview(value)
-        except TypeError:
-            raise TypeError("a bytes-like object is required, not {!r}".format(type(value).__name__))
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_i32(len(value))
-        buf.write(value)
-
 class _UniffiFfiConverterMapStringBytes(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, items):
@@ -2430,6 +2666,29 @@ class _UniffiFfiConverterMapStringBytes(_UniffiConverterRustBuffer):
             val = _UniffiFfiConverterBytes.read(buf)
             d[key] = val
         return d
+
+class _UniffiFfiConverterSequenceTypeEdgeLinkInfo(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeEdgeLinkInfo.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeEdgeLinkInfo.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeEdgeLinkInfo.read(buf) for i in range(count)
+        ]
 
 class _UniffiFfiConverterSequenceTypeEdgePathEntry(_UniffiConverterRustBuffer):
     @classmethod
@@ -2708,6 +2967,82 @@ def last_rotation_at() -> str:
     _uniffi_ffi_result = _uniffi_rust_call_with_error(
         _uniffi_error_converter,
         _UniffiLib.uniffi_ciris_edge_fn_func_last_rotation_at,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def link_count() -> int:
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_link_count,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def link_list() -> typing.List[EdgeLinkInfo]:
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterSequenceTypeEdgeLinkInfo.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_link_list,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def link_open(destination_hash: bytes,timeout_ms: int) -> EdgeLinkHandle:
+    
+    _UniffiFfiConverterBytes.check_lower(destination_hash)
+
+    _UniffiFfiConverterUInt64.check_lower(timeout_ms)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterBytes.lower(destination_hash),
+        _UniffiFfiConverterUInt64.lower(timeout_ms),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeEdgeLinkHandle.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_link_open,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def link_request(link_handle: EdgeLinkHandle,path: str,data: bytes,timeout_ms: int) -> bytes:
+    
+    _UniffiFfiConverterTypeEdgeLinkHandle.check_lower(link_handle)
+
+    _UniffiFfiConverterString.check_lower(path)
+
+    _UniffiFfiConverterBytes.check_lower(data)
+
+    _UniffiFfiConverterUInt64.check_lower(timeout_ms)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterTypeEdgeLinkHandle.lower(link_handle),
+        _UniffiFfiConverterString.lower(path),
+        _UniffiFfiConverterBytes.lower(data),
+        _UniffiFfiConverterUInt64.lower(timeout_ms),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterBytes.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_link_request,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def link_teardown(link_id: bytes) -> None:
+    
+    _UniffiFfiConverterBytes.check_lower(link_id)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterBytes.lower(link_id),
+    )
+    _uniffi_lift_return = lambda val: None
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_link_teardown,
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
@@ -3071,9 +3406,12 @@ def transport_stats(handle: EdgeTransportHandle) -> EdgeTransportStats:
 
 __all__ = [
     "InternalError",
+    "EdgeLinkState",
     "EdgePeerTrust",
     "EdgeBindingsError",
     "EdgeErrorEvent",
+    "EdgeLinkHandle",
+    "EdgeLinkInfo",
     "EdgeMetricsSnapshot",
     "EdgeNetworkEvent",
     "EdgePathEntry",
@@ -3093,6 +3431,11 @@ __all__ = [
     "identity_hash",
     "identity_pubkeys",
     "last_rotation_at",
+    "link_count",
+    "link_list",
+    "link_open",
+    "link_request",
+    "link_teardown",
     "metrics_snapshot",
     "path_table",
     "peer_add",

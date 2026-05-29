@@ -318,6 +318,18 @@ pub struct Edge {
     /// no pymethods added in this scope per the issue's "Scope NOT in
     /// this issue" note).
     reachability: Arc<ReachabilityTracker>,
+    /// CIRISEdge#32 (v0.14.0) — typed handle to the Reticulum
+    /// transport, if one was registered via
+    /// [`EdgeBuilder::reticulum_transport`]. The transport is ALSO
+    /// upcast and pushed into [`Self::transports`] so the listen-loop
+    /// machinery is unchanged; this sidecar gives the Links FFI surface
+    /// a path to the concrete `ReticulumTransport::link_*` methods
+    /// without an `Any`-style downcast. `None` when only HTTP / other
+    /// non-Reticulum transports were registered — the UniFFI
+    /// `link_open` / `link_request` / `link_teardown` then return
+    /// `EdgeBindingsError::Unsupported`.
+    #[cfg(feature = "_reticulum-module")]
+    reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
     config: EdgeConfig,
 }
 
@@ -333,6 +345,19 @@ pub struct EdgeBuilder {
     steward_directory: Option<Arc<dyn StewardDirectory>>,
     subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
     events: Option<Arc<crate::events::EventBus>>,
+    /// CIRISEdge#32 (v0.14.0) — see [`Edge::reticulum_transport`]. Set
+    /// via [`EdgeBuilder::reticulum_transport`]; the same `Arc` is also
+    /// pushed into `transports` so listen+send fan-out is unchanged.
+    #[cfg(feature = "_reticulum-module")]
+    reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
+    /// CIRISEdge#34 (v0.14.0 wiring) — optionally pre-built
+    /// reachability tracker so a Reticulum transport constructed BEFORE
+    /// Edge (the pyo3 cohabitation init order) can share the same
+    /// tracker instance Edge ends up exposing via
+    /// [`Edge::reachability_tracker`]. `None` → the builder constructs
+    /// one at `build()` from [`EdgeConfig::reachability_window_seconds`]
+    /// (the v0.11.0 behaviour).
+    reachability: Option<Arc<ReachabilityTracker>>,
     config: EdgeConfig,
 }
 
@@ -349,6 +374,9 @@ impl Edge {
             steward_directory: None,
             subscription_filter: None,
             events: None,
+            #[cfg(feature = "_reticulum-module")]
+            reticulum_transport: None,
+            reachability: None,
             config: EdgeConfig::default(),
         }
     }
@@ -1107,21 +1135,34 @@ impl Edge {
     }
 
     /// CIRISEdge#25 (v0.13.0 UniFFI cut) — Reticulum-specific stats
-    /// drill-down by `InterfaceHandle`. Returns `None` in v0.13.0
-    /// because the `Transport` trait doesn't expose downcasting and
-    /// the Edge struct holds `Arc<dyn Transport>` (type-erased). A
-    /// future cut (v0.14.x) extends the `Transport` trait with an
-    /// `as_any` accessor, which the UniFFI `transport_stats` impl will
-    /// then use to route to the concrete `ReticulumTransport::transport_stats`.
-    /// For v0.13.0 the UniFFI surface returns the generic fallback
-    /// stats (status `unknown`); the wire shape is pinned.
+    /// drill-down by `InterfaceHandle`. v0.14.0 (CIRISEdge#32) — wired
+    /// through the typed [`Self::reticulum_transport`] handle: routes
+    /// to the concrete `ReticulumTransport::transport_stats`. Returns
+    /// `None` if no Reticulum transport was registered OR the handle
+    /// id is out of range (the v0.12.0 contract — registered indices
+    /// only).
     #[cfg(feature = "_reticulum-module")]
     #[must_use]
     pub fn reticulum_stats_for_handle(
         &self,
-        _id: usize,
+        id: usize,
     ) -> Option<crate::transport::reticulum::TransportStats> {
-        None
+        let transport = self.reticulum_transport.as_ref()?;
+        transport.transport_stats(crate::transport::reticulum::InterfaceHandle(id))
+    }
+
+    /// CIRISEdge#32 (v0.14.0) — typed accessor for the Reticulum
+    /// transport. Returns `None` if the Edge was built without
+    /// [`EdgeBuilder::reticulum_transport`] (e.g. an HTTP-only deployment
+    /// or a test that registered `Arc<dyn Transport>` via the generic
+    /// [`EdgeBuilder::transport`] path). The Links UniFFI surface
+    /// consults this; `None` → `EdgeBindingsError::Unsupported`.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn reticulum_transport(
+        &self,
+    ) -> Option<Arc<crate::transport::reticulum::ReticulumTransport>> {
+        self.reticulum_transport.clone()
     }
 
     /// Pub-crate variant of [`Self::run_speak_pipeline`] reachable
@@ -1708,6 +1749,32 @@ impl EdgeBuilder {
         self
     }
 
+    /// CIRISEdge#32 (v0.14.0) — register the Reticulum transport with
+    /// BOTH a typed `Arc<ReticulumTransport>` retained on the builder
+    /// AND its `Arc<dyn Transport>` upcast pushed into the transport
+    /// collection (so the listen / send fan-out is identical to the
+    /// generic [`Self::transport`] path). The typed side feeds the
+    /// Links FFI surface (`link_open` / `link_request` / `link_teardown`
+    /// / `link_list` / `link_count`) which needs the concrete
+    /// `ReticulumTransport::link_*` methods.
+    ///
+    /// Existing call sites that don't need the Links surface can keep
+    /// using [`Self::transport`] with an upcast Arc; this method is the
+    /// additive variant. The typed handle is OPTIONAL — `link_open`
+    /// returns `EdgeBindingsError::Unsupported` when no Reticulum
+    /// transport is registered.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn reticulum_transport(
+        mut self,
+        transport: Arc<crate::transport::reticulum::ReticulumTransport>,
+    ) -> Self {
+        self.transports
+            .push(Arc::clone(&transport) as Arc<dyn Transport>);
+        self.reticulum_transport = Some(transport);
+        self
+    }
+
     /// CIRISEdge#34 — supply a pre-built [`crate::events::EventBus`].
     /// Optional; if omitted the builder constructs one at `build()`
     /// time with [`EdgeConfig::event_channel_capacity`]. Useful when
@@ -1717,6 +1784,19 @@ impl EdgeBuilder {
     #[must_use]
     pub fn events(mut self, events: Arc<crate::events::EventBus>) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// CIRISEdge#34 (v0.14.0 wiring) — supply a pre-built
+    /// [`ReachabilityTracker`]. Optional; if omitted the builder
+    /// constructs one at `build()` from
+    /// [`EdgeConfig::reachability_window_seconds`]. The pyo3 cohabitation
+    /// init path uses this to share a tracker `Arc` between Edge and a
+    /// Reticulum transport built BEFORE Edge (which can't reach back
+    /// through `Edge::reachability_tracker()`).
+    #[must_use]
+    pub fn reachability(mut self, tracker: Arc<ReachabilityTracker>) -> Self {
+        self.reachability = Some(tracker);
         self
     }
 
@@ -1824,9 +1904,11 @@ impl EdgeBuilder {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s.len() <= 256);
 
-        let reachability = Arc::new(ReachabilityTracker::new(
-            self.config.reachability_window_seconds,
-        ));
+        let reachability = self.reachability.unwrap_or_else(|| {
+            Arc::new(ReachabilityTracker::new(
+                self.config.reachability_window_seconds,
+            ))
+        });
 
         Ok(Edge {
             verify,
@@ -1843,6 +1925,8 @@ impl EdgeBuilder {
             events,
             display_name: Arc::new(std::sync::RwLock::new(display_name)),
             reachability,
+            #[cfg(feature = "_reticulum-module")]
+            reticulum_transport: self.reticulum_transport,
             config: self.config,
         })
     }

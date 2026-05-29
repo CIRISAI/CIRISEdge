@@ -27,3 +27,11 @@ pub mod uniffi_types;
 
 #[cfg(feature = "ffi-uniffi")]
 pub mod uniffi_impl;
+
+// v0.14.0 (CIRISEdge#32) — Links FFI surface (link_list / link_count /
+// link_open / link_teardown / link_request). Split into its own
+// module so the lifecycle hooks stay close to the Reticulum-specific
+// transport code without growing `uniffi_impl.rs` beyond the v0.13.0
+// reads / mgmt scope.
+#[cfg(feature = "ffi-uniffi")]
+pub mod uniffi_impl_links;

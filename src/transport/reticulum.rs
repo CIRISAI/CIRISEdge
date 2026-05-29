@@ -886,6 +886,21 @@ pub struct ReticulumTransport {
     /// stable identifier the v0.13.0 UniFFI pymethod will hand back to
     /// Python; this v0.12.0 cut lets us pin it.
     interface_specs: Arc<std::sync::Mutex<Vec<RegisteredInterface>>>,
+    /// CIRISEdge#32 (v0.14.0) — link establishment time tracking.
+    /// `LinkId → established_at` (UTC unix seconds), populated by
+    /// the event loop on `LinkEstablished` and removed on `LinkClosed`
+    /// / `LinkStale`. Backs [`Self::link_list`]'s `age_seconds` field.
+    link_established_at: Arc<Mutex<HashMap<LinkId, u64>>>,
+    /// CIRISEdge#32 (v0.14.0) — request/response slot. The listen-loop
+    /// populates this on `NodeEvent::ResponseReceived` keyed by
+    /// `request_id`; [`Self::link_request`] polls + removes.
+    request_responses: Arc<Mutex<HashMap<[u8; 16], Vec<u8>>>>,
+    /// CIRISEdge#32 (v0.14.0) — typed timeout sentinel. The listen-loop
+    /// populates this on `NodeEvent::RequestTimedOut`;
+    /// [`Self::link_request`] surfaces the `Timeout` error when a
+    /// `request_id` lands here. A `HashSet<[u8; 16]>` so multiple
+    /// in-flight requests across links never collide.
+    timed_out_requests: Arc<Mutex<HashSet<[u8; 16]>>>,
 }
 
 /// Internal registry entry behind [`ReticulumTransport::interface_specs`].
@@ -1155,6 +1170,9 @@ impl ReticulumTransport {
             event_bus,
             reachability,
             interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
+            link_established_at: Arc::new(Mutex::new(HashMap::new())),
+            request_responses: Arc::new(Mutex::new(HashMap::new())),
+            timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -1208,6 +1226,251 @@ impl ReticulumTransport {
     /// authenticated discovery has converged before a `send`.
     pub async fn knows_peer(&self, destination_key_id: &str) -> bool {
         self.resolve_peer(destination_key_id).await.is_some()
+    }
+
+    /// v0.14.0 (CIRISEdge#32) — return the 16-byte Reticulum
+    /// destination hash for a rooted peer. Test seam: the Links FFI
+    /// tests need `dest_hash` to drive `link_open(dest_hash)` after
+    /// rooting has converged. Production callers use `send(key_id, ...)`
+    /// which threads the resolution internally; this accessor surfaces
+    /// the dest_hash bytes by name so the test can decouple from the
+    /// internal `ResolvedPeer` type.
+    #[doc(hidden)]
+    pub async fn peer_dest_hash_for_test(&self, destination_key_id: &str) -> Option<[u8; 16]> {
+        self.resolve_peer(destination_key_id)
+            .await
+            .map(|p| p.dest_hash.into_bytes())
+    }
+
+    // ─── CIRISEdge#32 (v0.14.0) Links FFI surface ───────────────────
+    //
+    // The Reticulum link lifecycle is normally an internal substrate
+    // concern that `send` drives end-to-end (resolve → connect →
+    // wait-established → send_resource → wait-completed → drop). The
+    // Links FFI surface elevates the lifecycle to operator-visible
+    // primitives so a host (the UniFFI bindings consumer) can:
+    //   - enumerate currently-active links (`link_list`)
+    //   - count them (`link_count`)
+    //   - explicitly establish + tear down a link to a destination
+    //     (`open_link` / `teardown_link`)
+    //   - send a request/response over a link (`request_on_link`).
+    //
+    // The lifecycle hooks the event loop already runs
+    // (`handle_event::LinkRequest|LinkEstablished|LinkIdentified|LinkClosed|LinkStale`)
+    // ALSO emit `LinkEvent`s on `event_bus.emit_link(...)` so the
+    // `subscribe_link_events` AsyncIterator (closes the link half of
+    // CIRISEdge#34) actually fires.
+
+    /// Snapshot every link the event loop has seen reach `Active`.
+    /// State is `Active` by definition (closed/stale links are removed
+    /// from the established set). Each entry carries the negotiated
+    /// MTU/MDU from leviculum's per-link accessor, the link
+    /// establishment time (for `age_seconds`), and the transport id +
+    /// kind (`"reticulum-rs"` / `"ReticulumTransport"`).
+    ///
+    /// v0.14.0 limitation: leviculum's RPC `LinkStats` surface
+    /// (rssi/snr/establishment-rate) is `pub(crate)` from
+    /// `reticulum-std`; the v0.14.0 FFI returns `None` for those
+    /// fields. The wire shape is pinned so a v0.14.x flip to live
+    /// values is non-breaking.
+    pub async fn link_list(&self) -> Vec<crate::ffi::uniffi_types::EdgeLinkInfo> {
+        use crate::ffi::uniffi_types::{EdgeLinkInfo, EdgeLinkState};
+        let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+        let established = self.established_links.lock().await;
+        let mut out = Vec::with_capacity(established.len());
+        let established_at = self.link_established_at.lock().await;
+        for link_id in established.iter() {
+            let mtu = self.node.link_negotiated_mtu(link_id).unwrap_or(0);
+            let mdu = self
+                .node
+                .link_mdu(link_id)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0);
+            let peer_identity_hash = self
+                .node
+                .get_remote_identity(link_id)
+                .map(|id| id.hash().to_vec())
+                .unwrap_or_default();
+            let age_seconds = established_at
+                .get(link_id)
+                .map_or(0, |t| now_secs.saturating_sub(*t));
+            out.push(EdgeLinkInfo {
+                link_id: link_id.as_bytes().to_vec(),
+                peer_identity_hash,
+                state: EdgeLinkState::Active,
+                age_seconds,
+                rssi_dbm: None,
+                snr_db: None,
+                establishment_rate_kbps: None,
+                mtu,
+                mdu,
+                transport_id: TransportId::RETICULUM_RS.0.to_string(),
+                transport_kind: "ReticulumTransport".to_string(),
+            });
+        }
+        out
+    }
+
+    /// Number of currently-active links. Equivalent to
+    /// `link_list().await.len()` but skips the per-link allocation.
+    pub async fn link_count(&self) -> usize {
+        self.established_links.lock().await.len()
+    }
+
+    /// Explicitly open a Reticulum Link to `destination_hash`. The
+    /// underlying [`ReticulumNode::connect`] is invoked; this method
+    /// then polls until the link reaches `LinkEstablished` on both
+    /// ends (or the timeout fires). The peer's transport-tier signing
+    /// key is sourced from the rooted-peer map — the destination must
+    /// have already been rooted via the authenticated cold-start path
+    /// (CIRISEdge#15) for this method to find its signing key.
+    /// Otherwise returns `TransportError::Unreachable`.
+    ///
+    /// On success returns the established `LinkId` bytes. The link
+    /// stays in the established set until a `LinkClosed` event arrives
+    /// (peer-initiated close OR a [`Self::link_teardown`] call).
+    pub async fn link_open(
+        &self,
+        destination_hash: &[u8],
+        timeout: Duration,
+    ) -> Result<[u8; 16], TransportError> {
+        // Resolve the signing_key from rooted peers — we look up by
+        // destination_hash (the rooted-peer map keys on key_id but
+        // each entry carries the dest_hash). Linear scan; the rooted
+        // map is small (federation member count).
+        let dest_hash_array: [u8; 16] = destination_hash.try_into().map_err(|_| {
+            TransportError::Config(format!(
+                "destination_hash must be 16 bytes, got {}",
+                destination_hash.len()
+            ))
+        })?;
+        let dest_hash = DestinationHash::new(dest_hash_array);
+        let signing_key = {
+            let peers = self.peers.lock().await;
+            peers
+                .values()
+                .find(|p| p.peer.dest_hash == dest_hash)
+                .map(|p| p.peer.signing_key)
+        };
+        let Some(signing_key) = signing_key else {
+            return Err(TransportError::Unreachable(format!(
+                "no rooted peer known for destination_hash={dest_hash} \
+                 (link_open requires a rooted announce; call link_open after \
+                  subscribe_announces emits a peer-rooted event)"
+            )));
+        };
+
+        let link = self
+            .node
+            .connect(&dest_hash, &signing_key)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
+        let link_id = *link.link_id();
+
+        let established = wait_until_async(timeout, Duration::from_millis(50), || async {
+            self.established_links.lock().await.contains(&link_id)
+        })
+        .await;
+        if !established {
+            return Err(TransportError::Timeout(timeout));
+        }
+        Ok(link_id.into_bytes())
+    }
+
+    /// Tear down the link identified by `link_id`. Drains any
+    /// in-flight requests (waits up to `RESOURCE_TRANSFER_TIMEOUT` for
+    /// the sent-resources set to clear) then sends LINKCLOSE to the
+    /// peer.
+    ///
+    /// Idempotent: a second call (or a call against a link the event
+    /// loop has already removed) is a no-op that returns `Ok(())`.
+    pub async fn link_teardown(&self, link_id_bytes: &[u8]) -> Result<(), TransportError> {
+        let link_id_array: [u8; 16] = link_id_bytes.try_into().map_err(|_| {
+            TransportError::Config(format!(
+                "link_id must be 16 bytes, got {}",
+                link_id_bytes.len()
+            ))
+        })?;
+        let link_id = LinkId::new(link_id_array);
+
+        // Idempotent — if the link isn't in the established set, the
+        // peer already closed or we already tore it down.
+        if !self.established_links.lock().await.contains(&link_id) {
+            return Ok(());
+        }
+
+        // Best-effort drain — wait briefly for any pending sender-side
+        // resource to drop out of `sent_resources`. The drain is
+        // bounded so a wedged peer can't block teardown indefinitely.
+        let _drained = wait_until_async(
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+            || async { self.sent_resources.lock().await.is_empty() },
+        )
+        .await;
+
+        // close_link emits a LinkClosed event on the loop; the loop's
+        // handle_event removes the link from `established_links`.
+        let _ = self.node.close_link(&link_id).await;
+        // Eagerly remove so a second teardown is the no-op above.
+        self.established_links.lock().await.remove(&link_id);
+        self.link_established_at.lock().await.remove(&link_id);
+        Ok(())
+    }
+
+    /// Send a request over an established link and wait for the
+    /// response. Blocking-style: the response arrives via a
+    /// `NodeEvent::ResponseReceived` on the listener loop, which
+    /// records it in a per-request-id slot keyed by the returned
+    /// `request_id`. This method polls that slot.
+    ///
+    /// `data` is opaque bytes; leviculum re-wraps for msgpack on the
+    /// wire. Returns the response bytes on success or
+    /// `TransportError::Timeout` if no response arrives in `timeout`.
+    pub async fn link_request(
+        &self,
+        link_id_bytes: &[u8],
+        path: &str,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, TransportError> {
+        let link_id_array: [u8; 16] = link_id_bytes.try_into().map_err(|_| {
+            TransportError::Config(format!(
+                "link_id must be 16 bytes, got {}",
+                link_id_bytes.len()
+            ))
+        })?;
+        let link_id = LinkId::new(link_id_array);
+
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let request_id = self
+            .node
+            .send_request(&link_id, path, Some(data), Some(timeout_ms))
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum send_request: {e}")))?;
+
+        // Poll the per-request response slot. The listen-loop populates
+        // `request_responses` on `ResponseReceived` and removes the
+        // request_id from `pending_requests` on `RequestTimedOut`.
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let mut responses = self.request_responses.lock().await;
+                if let Some(bytes) = responses.remove(&request_id) {
+                    return Ok(bytes);
+                }
+            }
+            {
+                let mut timed = self.timed_out_requests.lock().await;
+                if timed.remove(&request_id) {
+                    return Err(TransportError::Timeout(timeout));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(TransportError::Timeout(timeout));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Resolve a `destination_key_id` to a Reticulum peer. Consults
@@ -1391,6 +1654,9 @@ impl Transport for ReticulumTransport {
                         hybrid_policy: self.hybrid_policy,
                         event_bus: self.event_bus.as_deref(),
                         reachability: self.reachability.as_ref(),
+                        link_established_at: &self.link_established_at,
+                        request_responses: &self.request_responses,
+                        timed_out_requests: &self.timed_out_requests,
                     };
                     handle_event(event, &ctx).await;
                 }
@@ -1433,12 +1699,29 @@ struct EventCtx<'a> {
     /// `AttemptOutcome::AnnounceReceived` against `(peer_key_id,
     /// TransportId::RETICULUM_RS)`.
     reachability: Option<&'a Arc<ReachabilityTracker>>,
+    /// CIRISEdge#32 (v0.14.0) — link establishment timestamps,
+    /// populated on `LinkEstablished` / cleared on `LinkClosed` /
+    /// `LinkStale`.
+    link_established_at: &'a Mutex<HashMap<LinkId, u64>>,
+    /// CIRISEdge#32 (v0.14.0) — per-request response slot, populated
+    /// on `NodeEvent::ResponseReceived`.
+    request_responses: &'a Mutex<HashMap<[u8; 16], Vec<u8>>>,
+    /// CIRISEdge#32 (v0.14.0) — per-request timeout sentinel,
+    /// populated on `NodeEvent::RequestTimedOut`.
+    timed_out_requests: &'a Mutex<HashSet<[u8; 16]>>,
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
 /// link requests are accepted with auto-resource-accept; established
 /// links + completed sender-side resources unblock [`Transport::send`];
 /// completed receiver-side resources become [`InboundFrame`]s.
+// v0.14.0 (CIRISEdge#32 + #34 link-half) — grew past clippy's 100-line
+// cap once the LinkIdentified / LinkStale / ResponseReceived /
+// RequestTimedOut arms + the link-event emissions on existing arms
+// landed. Each new arm is a small typed routing of one NodeEvent
+// variant onto a side-effect (record / emit); extracting would
+// fragment the event-loop verdict across multiple helpers.
+#[allow(clippy::too_many_lines)]
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
     match event {
         NodeEvent::AnnounceReceived { announce, .. } => {
@@ -1472,6 +1755,65 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 .node
                 .set_resource_strategy(&link_id, ResourceStrategy::AcceptAll);
             ctx.established_links.lock().await.insert(link_id);
+            // CIRISEdge#32 (v0.14.0) — record establish time for the
+            // Links FFI surface's `age_seconds` derivation.
+            let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+            ctx.link_established_at
+                .lock()
+                .await
+                .insert(link_id, now_secs);
+            // CIRISEdge#34 link half (v0.14.0) — emit `link_established`
+            // event on the link channel. The bus is fire-and-forget;
+            // no subscriber attached → drop silently.
+            if let Some(bus) = ctx.event_bus {
+                bus.emit_link(link_event(
+                    crate::events::EventKind::LinkEstablished,
+                    &link_id,
+                    None,
+                    crate::events::EventSeverity::Info,
+                    "link established",
+                ));
+            }
+        }
+        NodeEvent::LinkIdentified {
+            link_id,
+            identity_hash,
+        } => {
+            // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`
+            // event with the peer's truncated identity hash. The peer
+            // proved its identity over an already-established link via
+            // LINKIDENTIFY; `get_remote_identity(link_id)` now returns
+            // Some(_).
+            if let Some(bus) = ctx.event_bus {
+                use std::fmt::Write as _;
+                let mut peer_id_hex = String::with_capacity(identity_hash.len().saturating_mul(2));
+                for b in &identity_hash {
+                    let _ = write!(peer_id_hex, "{b:02x}");
+                }
+                bus.emit_link(link_event(
+                    crate::events::EventKind::LinkEstablished, // closest existing kind
+                    &link_id,
+                    Some(peer_id_hex),
+                    crate::events::EventSeverity::Info,
+                    "link identified",
+                ));
+            }
+        }
+        NodeEvent::LinkStale { link_id } => {
+            // Bookkeeping cleanup + emit. The link may still be in
+            // `established_links` (leviculum hasn't yet seen LinkClosed
+            // arrive); leave the set alone — `LinkClosed` is the
+            // authoritative removal point — but surface the staleness
+            // on the event stream so the UI can render a warning.
+            if let Some(bus) = ctx.event_bus {
+                bus.emit_link(link_event(
+                    crate::events::EventKind::LinkDropped,
+                    &link_id,
+                    None,
+                    crate::events::EventSeverity::Warning,
+                    "link became stale",
+                ));
+            }
         }
         NodeEvent::ResourceCompleted {
             link_id,
@@ -1511,11 +1853,71 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             link_id, reason, ..
         } => {
             ctx.established_links.lock().await.remove(&link_id);
+            ctx.link_established_at.lock().await.remove(&link_id);
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
+            // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
+            // event. Severity reflects whether the close was graceful.
+            if let Some(bus) = ctx.event_bus {
+                let severity = match reason {
+                    reticulum_core::link::LinkCloseReason::Normal => {
+                        crate::events::EventSeverity::Info
+                    }
+                    _ => crate::events::EventSeverity::Warning,
+                };
+                bus.emit_link(link_event(
+                    crate::events::EventKind::LinkDropped,
+                    &link_id,
+                    None,
+                    severity,
+                    format!("link closed: {reason:?}"),
+                ));
+            }
+        }
+        NodeEvent::ResponseReceived {
+            request_id,
+            response_data,
+            ..
+        } => {
+            // CIRISEdge#32 (v0.14.0) — feed the per-request response
+            // slot the link_request poller reads.
+            ctx.request_responses
+                .lock()
+                .await
+                .insert(request_id, response_data);
+        }
+        NodeEvent::RequestTimedOut { request_id, .. } => {
+            ctx.timed_out_requests.lock().await.insert(request_id);
         }
         other => {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
+    }
+}
+
+/// Build a [`NetworkEvent`] populated with link-event fields. Helper
+/// for the v0.14.0 CIRISEdge#34 link-half wiring — keeps the
+/// `handle_event` arms' ceremony low.
+fn link_event(
+    kind: crate::events::EventKind,
+    link_id: &LinkId,
+    peer_key_id: Option<String>,
+    severity: crate::events::EventSeverity,
+    message: impl Into<String>,
+) -> crate::events::NetworkEvent {
+    crate::events::NetworkEvent {
+        at: Utc::now(),
+        kind,
+        message: message.into(),
+        peer_key_id,
+        transport_id: Some(TransportId::RETICULUM_RS.0.to_string()),
+        severity,
+        aspect: None,
+        identity_hash: None,
+        app_data: None,
+        rssi_dbm: None,
+        snr_db: None,
+        link_id: Some(link_id.as_bytes().to_vec()),
+        lagged_count: None,
     }
 }
 

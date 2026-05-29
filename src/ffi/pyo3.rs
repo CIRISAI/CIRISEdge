@@ -122,6 +122,7 @@ use crate::messages::{InlineText, InlineTextDurable};
 use crate::outbound::OutboundHandle;
 #[cfg(feature = "transport-reticulum")]
 use crate::transport::reticulum::{ReticulumAuth, ReticulumTransport, ReticulumTransportConfig};
+#[cfg(test)]
 use crate::transport::Transport;
 use crate::verify::{HybridPolicy, RootingDirectory, VerifyDirectory};
 
@@ -1174,31 +1175,26 @@ fn init_edge_runtime(
     transport_config.announce_interval = Duration::from_secs(announce_interval_seconds);
     transport_config.local_epoch = local_epoch;
 
+    // CIRISEdge#34 (v0.14.0 wiring) — pre-construct the EventBus +
+    // ReachabilityTracker so the Reticulum transport (built before
+    // Edge) can emit announce / interface / **link** events into the
+    // same bus Edge later registers via `EdgeBuilder::events(...)`.
+    // The link half of #34 needs this so the transport's
+    // Link{Established,Identified,Closed,Stale} hooks find a bus to
+    // emit on; without it the channels stay quiet (the v0.13.0
+    // posture).
+    let event_bus = Arc::new(crate::events::EventBus::default());
+    let reachability_tracker = Arc::new(crate::reachability::ReachabilityTracker::new(
+        crate::edge::EdgeConfig::default().reachability_window_seconds,
+    ));
+
     let auth = ReticulumAuth {
         signer: Some(signer.clone()),
         rooting: Some(rooting_dir.clone()),
         resolver: None,
         hybrid_policy,
-        // CIRISEdge#34 — the Reticulum transport is built BEFORE Edge,
-        // so Edge's `events()` accessor isn't available here. The pyo3
-        // surface wires its EventBus into the transport via the
-        // v0.12+ Reticulum substrate hooks (sibling agent's territory);
-        // leaving `None` keeps the cohabitation path compiling and the
-        // announce / interface streams quiet on the Reticulum side
-        // until that wiring lands. HTTP transport remains the
-        // documented event source in the interim.
-        event_bus: None,
-        // CIRISEdge#29 (v0.11.0) — wire the reachability tracker into
-        // the Reticulum transport via a post-build `Edge::run`-time
-        // attach is the cleanest threading (the transport is built
-        // BEFORE Edge, so Edge's `reachability_tracker()` accessor
-        // isn't available here). Leaving `None` keeps the cohabitation
-        // path compiling; the v0.16.0 FFI cut (sibling agent's
-        // territory, CIRISEdge#22 Tier 3 wiring) will either (a)
-        // restructure to build the tracker first then thread into both
-        // surfaces, or (b) move the AnnounceReceived hook out of the
-        // transport entirely (publish-subscribe on the resolver path).
-        reachability: None,
+        event_bus: Some(Arc::clone(&event_bus)),
+        reachability: Some(Arc::clone(&reachability_tracker)),
     };
 
     // ── Step 5: build the transport + Edge under the host runtime.
@@ -1213,22 +1209,31 @@ fn init_edge_runtime(
     // releases the GIL while the persist runtime (held by the shared
     // `PyEngine`) drives the future to completion — the host's tokio
     // runtime owns the worker threads edge's transport schedules on.
-    let transport: Arc<dyn Transport> = py.detach(|| {
+    // v0.14.0 (CIRISEdge#32) — keep the typed `Arc<ReticulumTransport>`
+    // for the Links FFI surface; `EdgeBuilder::reticulum_transport`
+    // also upcasts + pushes it into the generic transport vec.
+    let reticulum_transport: Arc<ReticulumTransport> = py.detach(|| {
         runtime
             .block_on(async {
                 ReticulumTransport::new(transport_config, auth)
                     .await
-                    .map(|t| Arc::new(t) as Arc<dyn Transport>)
+                    .map(Arc::new)
             })
             .map_err(|e| PyRuntimeError::new_err(format!("ReticulumTransport::new: {e}")))
     })?;
 
-    // ── Step 6: assemble the Edge.
+    // ── Step 6: assemble the Edge. The pre-built EventBus +
+    // ReachabilityTracker are shared with the Reticulum transport
+    // (auth above) so #34 link / announce / interface emissions reach
+    // the same channels Edge's `subscribe_link_events` consumers
+    // observe — the v0.14.0 close of #34's link half.
     let edge = Edge::builder()
         .directory(verify_dir)
         .queue(queue)
         .signer(signer)
-        .transport(transport)
+        .reticulum_transport(reticulum_transport)
+        .events(Arc::clone(&event_bus))
+        .reachability(Arc::clone(&reachability_tracker))
         .build()
         .map_err(|e| PyRuntimeError::new_err(format!("Edge::build: {e}")))?;
 
