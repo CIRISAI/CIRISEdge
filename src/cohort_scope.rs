@@ -120,6 +120,15 @@ impl CohortScope {
     /// recipient match (where `self` is the OUTBOUND scope and
     /// `recipient_scope` is the recipient's recorded scope).
     #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "v0.19.4 — clippy 1.95 ratchet. The match deliberately \
+                  enumerates each (sender, recipient) variant pair in \
+                  documentation-pair order. Merging the `_ => false` \
+                  fallthroughs would erase the per-variant rationale \
+                  comments that document the cohort-scope wire-format \
+                  invariant for downstream auditors."
+    )]
     pub fn allows_recipient_scope(&self, recipient_scope: &CohortScope) -> bool {
         match (self, recipient_scope) {
             // Public content may go anywhere.
