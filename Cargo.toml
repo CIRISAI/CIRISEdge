@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -110,6 +110,15 @@ tracing     = "0.1"
 
 # IDs
 uuid        = { version = "1", features = ["v4", "serde"] }
+
+# CIRISEdge#47 (v0.17.0) — Short Authentication String (SAS) helper.
+# `peer_sas` / `peer_sas_digits` produce a deterministic, order-
+# independent representation of the (local_pub, peer_pub, protocol-
+# constant) tuple so two operators can verbally confirm they share the
+# same peer identity (MITM-resistant out-of-band verification).
+# BIP39 English wordlist — 2048 words × 11 bits, 5 words ≈ 55 bits.
+# License: Apache-2.0 / MIT (resolves under deny.toml § licenses.allow).
+bip39       = "2"
 
 # CIRISEdge#29 (v0.11.0) — `parking_lot::RwLock` backs
 # `ReachabilityTracker`'s per-(peer, medium) map. Chosen over
