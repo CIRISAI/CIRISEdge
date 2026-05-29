@@ -74,7 +74,8 @@ pub use edge::{
     DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
 };
 pub use events::{
-    EventBus, EventKind, EventSeverity, NetworkEvent, DEFAULT_EVENT_CHANNEL_CAPACITY,
+    EventBus, EventKind, EventSeverity, NetworkEvent, PathEvent, ResourceEvent,
+    DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
 pub use handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, FederationPriority,
@@ -99,6 +100,9 @@ pub use messages::{
     ACCORD_THRESHOLD_M_OF_N, DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
     DELIVERY_REFUSAL_ATTESTATION_DOMAIN, FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
     GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
+};
+pub use observability::{
+    DeliveryClass as MetricsDeliveryClass, EdgeMetrics, EdgeMetricsBundle, VerifyErrorClass,
 };
 pub use outbound::{
     DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter, StewardDirectory,
