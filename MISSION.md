@@ -487,7 +487,7 @@ and intentionally does not touch the substrate today. Together these
 fields make CIRISEdge legibly compliant with the CIRIS 3.0 protocol
 surface, in the AGPL letter as well as the apophatic spirit of §1.4.
 
-## 11. Architectural surfaces shipped v0.5.0 → v0.17.x
+## 11. Architectural surfaces shipped v0.5.0 → v0.18.x
 
 The v0.4.0 reverse-engineering pass anchored the v1.0-prep architecture
 floor — verify pipeline, durable outbound, Reticulum + HTTP transports,
@@ -592,6 +592,26 @@ implementation file:
   documented now (and threat-modeled in §AV-canonical-peer below) so
   downstream substrate consumers can pin against the contract before
   the wire-up ships.
+- **HTTPS production-grade hardening** (v0.18.1 CIRISEdge#23,
+  `src/transport/http.rs::HttpsTransport` + `HttpServerConfig` +
+  `HttpClientConfig` + `BearerTokenAuth` + `FederationCnVerifier`,
+  per-MessageType round-trip pinned by
+  `tests/https_per_messagetype_roundtrip.rs`, deployment guide in
+  `docs/HTTPS_DEPLOYMENT.md`). HTTPS is no longer the degraded path; it
+  carries every `MessageType::*` variant byte-equivalent to Reticulum.
+  Operators choose the medium that fits their deployment substrate
+  without sacrificing wire fidelity — managed-Kubernetes deployments
+  reach the federation through bearer-token-authenticated HTTPS over a
+  CDN-terminated ingress; air-gapped operator-controlled hosts reach
+  it through mTLS-authenticated HTTPS where the cert's Subject CN +
+  SPKI must match a `federation_keys` row (the
+  `FederationCnVerifier`); local dev uses a self-signed cert minted
+  via `rcgen` with a loud `DEV_ONLY` `tracing::warn!` on bind. The
+  threat-model invariants AV-43 (cohabitation key isolation) and AV-46
+  (peer-mgmt opinion-vs-attestation) hold across all three paths: the
+  cryptographic root is persist's federation-attested
+  `federation_keys` directory, not a CA chain or operator-local
+  `TrustClass` opinion.
 
 ## 12. How to maintain this document
 
