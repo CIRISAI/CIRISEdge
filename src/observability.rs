@@ -224,6 +224,15 @@ pub struct EdgeMetrics {
     /// reachability tracker; consumers can read the mirror without
     /// reaching across to [`crate::ReachabilityTracker`].
     pub peer_reachability_ratio: Arc<RwLock<HashMap<(String, String), f64>>>,
+    /// CIRISEdge#48-B (v0.19.6) — count of inbound envelopes dropped
+    /// at `dispatch_inbound` because the verified sender's trust
+    /// score fell below [`crate::EdgeConfig::trust_threshold`].
+    /// Incremented only on the dispatch-time drop path; envelopes
+    /// admitted at-or-above threshold do NOT touch this counter.
+    /// Single `Arc<AtomicU64>` (not a per-key bag) — the offending
+    /// `signing_key_id` already rides on the matching
+    /// `EventKind::TrustShortCircuited` event.
+    pub inbound_dropped_low_trust: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl EdgeMetrics {
@@ -278,6 +287,23 @@ impl EdgeMetrics {
         *guard.entry(class).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#48-B (v0.19.6) — increment the
+    /// `inbound_dropped_low_trust` counter. Called from
+    /// `dispatch_inbound` once per drop.
+    pub fn inc_inbound_dropped_low_trust(&self) {
+        self.inbound_dropped_low_trust
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#48-B (v0.19.6) — read the
+    /// `inbound_dropped_low_trust` counter. Used by tests + the
+    /// metrics snapshot projection.
+    #[must_use]
+    pub fn inbound_dropped_low_trust(&self) -> u64 {
+        self.inbound_dropped_low_trust
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Update the per-peer reachability ratio gauge. Replaces (does
     /// not accumulate) — the underlying tracker computes the rolling
     /// ratio and the gauge mirrors it.
@@ -303,6 +329,7 @@ impl EdgeMetrics {
             transport_bytes_in_total: self.transport_bytes_in_total.read().clone(),
             transport_bytes_out_total: self.transport_bytes_out_total.read().clone(),
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
+            inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
         }
     }
 }
@@ -321,6 +348,9 @@ pub struct EdgeMetricsBundle {
     pub transport_bytes_in_total: HashMap<TransportId, u64>,
     pub transport_bytes_out_total: HashMap<TransportId, u64>,
     pub peer_reachability_ratio: HashMap<(String, String), f64>,
+    /// CIRISEdge#48-B (v0.19.6) — cumulative count of envelopes
+    /// dropped at `dispatch_inbound` due to trust short-circuit.
+    pub inbound_dropped_low_trust: u64,
 }
 
 #[cfg(test)]
