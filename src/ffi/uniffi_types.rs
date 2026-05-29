@@ -44,12 +44,17 @@ pub enum EdgeBindingsError {
 
 // ─── Peer mgmt types (#26) ──────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+// v0.15.1 (CIRISEdge#26 mutation surface) — variants aligned 1:1 with
+// persist v3.1.0 `ciris_persist::federation::TrustClass`. Total mapping
+// in both directions (see `edge_trust_to_persist` /
+// `persist_trust_to_edge` helpers in `uniffi_impl.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EdgePeerTrust {
-    Trusted,
+    #[default]
     Untrusted,
+    Trusted,
+    Restricted,
     Blocked,
-    Unknown,
 }
 
 #[derive(Debug, Clone)]

@@ -2726,10 +2726,10 @@ public object FfiConverterTypeEdgeLinkState: FfiConverterRustBuffer<EdgeLinkStat
 
 enum class EdgePeerTrust {
     
-    TRUSTED,
     UNTRUSTED,
-    BLOCKED,
-    UNKNOWN;
+    TRUSTED,
+    RESTRICTED,
+    BLOCKED;
 
     
 

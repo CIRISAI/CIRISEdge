@@ -208,60 +208,267 @@ pub fn peer_get(key_id: String) -> Result<Option<crate::EdgePeerInfo>, crate::Ed
     }))
 }
 
-// ─── #26 Peer mgmt — MUTATIONS (stubbed) ────────────────────────────
+// ─── #26 Peer mgmt — MUTATIONS (v0.15.1 LIVE, CIRISPersist#117) ─────
 //
-// PERSIST-FOLLOWUP: the mutation paths below all return
-// `NotImplemented`. They need a wider `VerifyDirectory` trait surface
-// (insert / delete / update_alias / update_trust / update_notes /
-// update_policy) — tracked under CIRISPersist#117
-// (https://github.com/CIRISAI/CIRISPersist/issues/117). Once persist
-// ships the surface and CIRISEdge bumps the pin (v0.14.0 cut), each
-// stub below flips to a real implementation.
+// v0.13.0 stubbed these as `PEER_MUTATION_FOLLOWUP` returning
+// `EdgeBindingsError::NotImplemented`: persist's `FederationDirectory`
+// trait did not yet expose the per-peer write surface they need (only
+// the keypair-row admission path `put_public_key`, which is the
+// federation-shared identity layer, not the operator-local
+// per-instance metadata these mutations target).
+//
+// CIRISPersist v3.1.0 (CIRISPersist#117) closes that gap by adding 6
+// new `async fn`s on `FederationDirectory` — `add_peer_record`,
+// `remove_peer_record`, `update_peer_alias`, `update_peer_trust`,
+// `update_peer_notes`, `update_peer_policy` — backed by the V051
+// `federation_peer_metadata` sibling table. Each method is
+// `#[async_trait]` object-safe (matched 1:1 by the
+// `Arc<dyn FederationDirectory>` we now retain on Edge via
+// `EdgeBuilder::federation_directory` and the pyo3 cohabitation init
+// path's `federation_directory_capsule` extraction).
+//
+// `peer_probe` STAYS `NotImplemented` — it's a network primitive
+// (Reticulum-backed live reachability), NOT persist-backed. Separate
+// follow-up (CIRISEdge#22 / v0.16.0 reachability surface).
 
+/// Look up the concrete `Arc<dyn FederationDirectory>` Edge retains
+/// for peer-mutation FFI calls. Returns `Unsupported` when the host
+/// wired only a `VerifyDirectory` (e.g., tests that don't exercise the
+/// mutation surface) — distinct from `NotInitialized` (no Edge
+/// installed at all).
+fn current_federation_directory(
+) -> Result<Arc<dyn ciris_persist::federation::FederationDirectory>, crate::EdgeBindingsError> {
+    let edge = current_edge()?;
+    edge.federation_directory()
+        .ok_or(crate::EdgeBindingsError::Unsupported)
+}
+
+/// EdgePeerTrust → persist TrustClass — total mapping per v0.15.1
+/// alignment (variants match 1:1).
+fn edge_trust_to_persist(t: crate::EdgePeerTrust) -> ciris_persist::federation::TrustClass {
+    use ciris_persist::federation::TrustClass;
+    match t {
+        crate::EdgePeerTrust::Untrusted => TrustClass::Untrusted,
+        crate::EdgePeerTrust::Trusted => TrustClass::Trusted,
+        crate::EdgePeerTrust::Restricted => TrustClass::Restricted,
+        crate::EdgePeerTrust::Blocked => TrustClass::Blocked,
+    }
+}
+
+/// EdgePeerPolicy → persist PeerPolicyBlob. The blob is opaque to
+/// persist (`#[serde(transparent)]` newtype over `serde_json::Value`),
+/// so we serialize the entire edge-side dictionary and let persist
+/// round-trip the JSON verbatim. Infallible — `serde_json::json!`
+/// can't fail over `Vec<String>` / `u32` / `Option<u32>` /
+/// `Option<String>` primitives.
+fn edge_policy_to_blob(p: &crate::EdgePeerPolicy) -> ciris_persist::federation::PeerPolicyBlob {
+    // Build the JSON value via a serde-friendly intermediate so the
+    // wire shape is predictable (named fields, snake_case keys
+    // matching the UDL field names).
+    let value = serde_json::json!({
+        "subscription_filter": p.subscription_filter,
+        "max_queue_depth": p.max_queue_depth,
+        "ack_timeout_seconds_override": p.ack_timeout_seconds_override,
+        "priority_class": p.priority_class,
+    });
+    ciris_persist::federation::PeerPolicyBlob(value)
+}
+
+/// Persist `federation::Error` → `EdgeBindingsError`. Maps the two
+/// typed variants introduced by CIRISPersist#117 specifically:
+/// - `PeerNotFound { .. }` → `NotFound`
+/// - `HardRemoveWithActiveAttestations { .. }` → `InvalidArgument`
+///   (the caller asked for an action the data model rejects; the
+///   fix is operator-driven — soft-remove or revoke first)
+///
+/// All other persist errors (Backend / Conflict / InvalidArgument /
+/// SignatureInvalid / RateLimited / admission variants) fold into
+/// `Persist` — the binding consumer reads the stable
+/// `Error::kind()` token off the debug-display when they need
+/// finer-grained discrimination.
+fn map_federation_err(e: ciris_persist::federation::Error) -> crate::EdgeBindingsError {
+    use ciris_persist::federation::Error as FE;
+    match e {
+        FE::PeerNotFound { ref key_id } => {
+            tracing::debug!(key_id = %key_id, kind = e.kind(), "federation peer not found");
+            crate::EdgeBindingsError::NotFound
+        }
+        FE::HardRemoveWithActiveAttestations {
+            ref key_id,
+            attestation_count,
+        } => {
+            tracing::warn!(
+                key_id = %key_id,
+                attestation_count,
+                kind = e.kind(),
+                "hard-remove rejected due to active attestations",
+            );
+            crate::EdgeBindingsError::InvalidArgument
+        }
+        FE::InvalidArgument(_) => {
+            tracing::warn!(error = %e, kind = e.kind(), "peer mutation invalid argument");
+            crate::EdgeBindingsError::InvalidArgument
+        }
+        FE::Conflict(_) => {
+            tracing::warn!(error = %e, kind = e.kind(), "peer mutation conflict");
+            crate::EdgeBindingsError::InvalidArgument
+        }
+        other => {
+            tracing::warn!(error = %other, kind = other.kind(), "peer mutation persist error");
+            crate::EdgeBindingsError::Persist
+        }
+    }
+}
+
+/// `peer_add(key_id, pubkey_ed25519_base64, transport_identity, policy)`
+/// — admits a new peer row via persist's
+/// [`FederationDirectory::add_peer_record`]. Idempotent on a matching
+/// pubkey; rejects with `InvalidArgument` (mapped from persist's
+/// `Conflict`) on a differing pubkey for the same `key_id`.
+///
+/// The default `identity_type` for a newly-added operator-bound peer
+/// is the persist-defined `"agent"` token
+/// ([`ciris_persist::federation::types::identity_type::AGENT`]) — the
+/// general-purpose federation identity bucket. Stewards / accord
+/// holders / substrate keys land via the registry's admission path,
+/// not this FFI.
+///
+/// If `policy` is supplied, follows the `add_peer_record` call with an
+/// immediate `update_peer_policy` so the operator-set policy lands
+/// atomically from the caller's POV. The trust class defaults to
+/// `Untrusted` (persist's default); operators promote via
+/// `peer_set_trust`.
 pub fn peer_add(
-    _key_id: String,
-    _pubkey_ed25519_base64: String,
-    _transport_identity: Option<String>,
-    _policy: Option<crate::EdgePeerPolicy>,
+    key_id: String,
+    pubkey_ed25519_base64: String,
+    transport_identity: Option<String>,
+    policy: Option<crate::EdgePeerPolicy>,
 ) -> Result<crate::EdgePeerHandle, crate::EdgeBindingsError> {
-    Err(crate::EdgeBindingsError::NotImplemented)
+    let edge = current_edge()?;
+    let directory = current_federation_directory()?;
+    let key_id_owned = key_id.clone();
+    let policy_blob = policy.as_ref().map(edge_policy_to_blob);
+    block_on_runtime(&edge, async move {
+        directory
+            .add_peer_record(
+                &key_id_owned,
+                &pubkey_ed25519_base64,
+                ciris_persist::federation::types::identity_type::AGENT,
+                transport_identity,
+            )
+            .await
+            .map_err(map_federation_err)?;
+        if let Some(blob) = policy_blob {
+            directory
+                .update_peer_policy(&key_id_owned, blob)
+                .await
+                .map_err(map_federation_err)?;
+        }
+        Ok(crate::EdgePeerHandle {
+            key_id: key_id_owned,
+        })
+    })
 }
 
+/// `peer_remove(handle, hard)` — soft-remove (default) marks the
+/// `federation_peer_metadata.removed_at = NOW()`; hard-remove DELETEs
+/// the `federation_keys` row AND (cascade) the metadata row.
+/// Hard-remove is rejected with `InvalidArgument` (mapped from
+/// `HardRemoveWithActiveAttestations`) when active attestations would
+/// be orphaned — the operator either soft-removes (preserves audit
+/// trail) or revokes the key first.
 pub fn peer_remove(
-    _handle: crate::EdgePeerHandle,
-    _hard: bool,
+    handle: crate::EdgePeerHandle,
+    hard: bool,
 ) -> Result<(), crate::EdgeBindingsError> {
-    Err(crate::EdgeBindingsError::NotImplemented)
+    let edge = current_edge()?;
+    let directory = current_federation_directory()?;
+    let key_id = handle.key_id;
+    block_on_runtime(&edge, async move {
+        directory
+            .remove_peer_record(&key_id, hard)
+            .await
+            .map_err(map_federation_err)
+    })
 }
 
+/// `peer_set_alias(key_id, alias)` — operator-local display name.
+/// `None` clears the field. Returns `NotFound` when the key has no
+/// peer metadata row.
 pub fn peer_set_alias(
-    _key_id: String,
-    _alias: Option<String>,
+    key_id: String,
+    alias: Option<String>,
 ) -> Result<(), crate::EdgeBindingsError> {
-    Err(crate::EdgeBindingsError::NotImplemented)
+    let edge = current_edge()?;
+    let directory = current_federation_directory()?;
+    block_on_runtime(&edge, async move {
+        directory
+            .update_peer_alias(&key_id, alias)
+            .await
+            .map_err(map_federation_err)
+    })
 }
 
+/// `peer_set_trust(key_id, trust)` — promote / demote a peer's
+/// operator-trust class. Variants map 1:1 to persist v3.1.0's
+/// [`TrustClass`](ciris_persist::federation::TrustClass)
+/// (`Untrusted` / `Trusted` / `Restricted` / `Blocked`).
 pub fn peer_set_trust(
-    _key_id: String,
-    _trust: crate::EdgePeerTrust,
+    key_id: String,
+    trust: crate::EdgePeerTrust,
 ) -> Result<(), crate::EdgeBindingsError> {
-    Err(crate::EdgeBindingsError::NotImplemented)
+    let edge = current_edge()?;
+    let directory = current_federation_directory()?;
+    let persist_trust = edge_trust_to_persist(trust);
+    block_on_runtime(&edge, async move {
+        directory
+            .update_peer_trust(&key_id, persist_trust)
+            .await
+            .map_err(map_federation_err)
+    })
 }
 
+/// `peer_set_notes(key_id, notes)` — operator-local free-form notes.
+/// `None` clears the field.
 pub fn peer_set_notes(
-    _key_id: String,
-    _notes: Option<String>,
+    key_id: String,
+    notes: Option<String>,
 ) -> Result<(), crate::EdgeBindingsError> {
-    Err(crate::EdgeBindingsError::NotImplemented)
+    let edge = current_edge()?;
+    let directory = current_federation_directory()?;
+    block_on_runtime(&edge, async move {
+        directory
+            .update_peer_notes(&key_id, notes)
+            .await
+            .map_err(map_federation_err)
+    })
 }
 
+/// `peer_set_policy(handle, policy)` — replaces the per-peer policy
+/// blob. Persist round-trips the JSON verbatim
+/// (`PeerPolicyBlob(serde_json::Value)`); the shape is owned by this
+/// FFI (matches the `EdgePeerPolicy` UDL dictionary).
 pub fn peer_set_policy(
-    _handle: crate::EdgePeerHandle,
-    _policy: crate::EdgePeerPolicy,
+    handle: crate::EdgePeerHandle,
+    policy: crate::EdgePeerPolicy,
 ) -> Result<(), crate::EdgeBindingsError> {
-    Err(crate::EdgeBindingsError::NotImplemented)
+    let edge = current_edge()?;
+    let directory = current_federation_directory()?;
+    let blob = edge_policy_to_blob(&policy);
+    let key_id = handle.key_id;
+    block_on_runtime(&edge, async move {
+        directory
+            .update_peer_policy(&key_id, blob)
+            .await
+            .map_err(map_federation_err)
+    })
 }
 
+/// `peer_probe(key_id, timeout_ms)` — STAYS `NotImplemented` at
+/// v0.15.1. The probe is a network primitive (Reticulum-backed live
+/// reachability), distinct from the persist-backed peer-metadata
+/// mutations the rest of this section landed. Tracked under a
+/// separate v0.16.x follow-up.
 pub fn peer_probe(
     _key_id: String,
     _timeout_ms: u64,
@@ -629,17 +836,32 @@ mod tests {
     }
 
     #[test]
-    fn peer_add_returns_not_implemented_stub() {
-        // Persist's VerifyDirectory trait doesn't expose mutation
-        // paths yet (the v0.13.0 stub-with-followup posture). Sanity-
-        // check the typed error class is what callers will see.
+    fn peer_add_before_init_returns_not_initialized() {
+        // v0.15.1: the 6 peer-mutation entry points are LIVE
+        // (persist#117). Pre-init posture surfaces `NotInitialized`,
+        // mirroring `peer_list_before_init_returns_not_initialized`.
+        // Full round-trip + per-variant + typed-error mapping coverage
+        // lives in the integration test `tests/peer_mutation_ffi.rs`
+        // (which uses a real `FederationDirectorySqlite` + an
+        // installed `Edge` to exercise the persist v3.1.0 surface).
         let err = peer_add(
             "key-1".to_string(),
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
             None,
             None,
         )
-        .expect_err("stub returns NotImplemented");
+        .expect_err("no edge installed yet");
+        assert!(matches!(err, crate::EdgeBindingsError::NotInitialized));
+    }
+
+    #[test]
+    fn peer_probe_remains_not_implemented() {
+        // v0.15.1 carve-out: `peer_probe` is a network primitive
+        // (Reticulum-backed live reachability), NOT persist-backed —
+        // it stays `NotImplemented` while the 6 sibling persist-backed
+        // mutations flip to LIVE. The follow-up cut for the probe
+        // surface tracks under CIRISEdge#22 / v0.16.x reachability.
+        let err = peer_probe("key-1".to_string(), 1000).expect_err("probe stays stubbed");
         assert!(matches!(err, crate::EdgeBindingsError::NotImplemented));
     }
 }

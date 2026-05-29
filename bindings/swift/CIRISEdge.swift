@@ -2296,10 +2296,10 @@ public func FfiConverterTypeEdgeLinkState_lower(_ value: EdgeLinkState) -> RustB
 
 public enum EdgePeerTrust: Equatable, Hashable {
     
-    case trusted
     case untrusted
+    case trusted
+    case restricted
     case blocked
-    case unknown
 
 
 
@@ -2321,13 +2321,13 @@ public struct FfiConverterTypeEdgePeerTrust: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .trusted
+        case 1: return .untrusted
         
-        case 2: return .untrusted
+        case 2: return .trusted
         
-        case 3: return .blocked
+        case 3: return .restricted
         
-        case 4: return .unknown
+        case 4: return .blocked
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2337,19 +2337,19 @@ public struct FfiConverterTypeEdgePeerTrust: FfiConverterRustBuffer {
         switch value {
         
         
-        case .trusted:
+        case .untrusted:
             writeInt(&buf, Int32(1))
         
         
-        case .untrusted:
+        case .trusted:
             writeInt(&buf, Int32(2))
         
         
-        case .blocked:
+        case .restricted:
             writeInt(&buf, Int32(3))
         
         
-        case .unknown:
+        case .blocked:
             writeInt(&buf, Int32(4))
         
         }
