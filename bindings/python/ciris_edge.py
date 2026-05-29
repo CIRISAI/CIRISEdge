@@ -1917,13 +1917,13 @@ class _UniffiFfiConverterTypeEdgePathEntry(_UniffiConverterRustBuffer):
 
 class EdgePeerTrust(enum.Enum):
     
-    TRUSTED = 0
+    UNTRUSTED = 0
     
-    UNTRUSTED = 1
+    TRUSTED = 1
     
-    BLOCKED = 2
+    RESTRICTED = 2
     
-    UNKNOWN = 3
+    BLOCKED = 3
     
 
 
@@ -1932,36 +1932,36 @@ class _UniffiFfiConverterTypeEdgePeerTrust(_UniffiConverterRustBuffer):
     def read(buf):
         variant = buf.read_i32()
         if variant == 1:
-            return EdgePeerTrust.TRUSTED
-        if variant == 2:
             return EdgePeerTrust.UNTRUSTED
+        if variant == 2:
+            return EdgePeerTrust.TRUSTED
         if variant == 3:
-            return EdgePeerTrust.BLOCKED
+            return EdgePeerTrust.RESTRICTED
         if variant == 4:
-            return EdgePeerTrust.UNKNOWN
+            return EdgePeerTrust.BLOCKED
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
     def check_lower(value):
-        if value == EdgePeerTrust.TRUSTED:
-            return
         if value == EdgePeerTrust.UNTRUSTED:
             return
-        if value == EdgePeerTrust.BLOCKED:
+        if value == EdgePeerTrust.TRUSTED:
             return
-        if value == EdgePeerTrust.UNKNOWN:
+        if value == EdgePeerTrust.RESTRICTED:
+            return
+        if value == EdgePeerTrust.BLOCKED:
             return
         raise ValueError(value)
 
     @staticmethod
     def write(value, buf):
-        if value == EdgePeerTrust.TRUSTED:
-            buf.write_i32(1)
         if value == EdgePeerTrust.UNTRUSTED:
+            buf.write_i32(1)
+        if value == EdgePeerTrust.TRUSTED:
             buf.write_i32(2)
-        if value == EdgePeerTrust.BLOCKED:
+        if value == EdgePeerTrust.RESTRICTED:
             buf.write_i32(3)
-        if value == EdgePeerTrust.UNKNOWN:
+        if value == EdgePeerTrust.BLOCKED:
             buf.write_i32(4)
 
 

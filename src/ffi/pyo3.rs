@@ -1128,11 +1128,18 @@ fn init_edge_runtime(
         Arc::strong_count(&directory_arc) >= 1,
         "federation_directory_capsule produced a live Arc",
     );
-    // Hold a reference to the directory_arc so the borrow-checker
-    // sees the consumed-on-purpose capsule extraction. Drop it
-    // explicitly after the debug assert to avoid an unused-var
-    // warning under -D warnings.
-    drop(directory_arc);
+    // v0.15.1 (CIRISEdge#26 mutation surface) — retain the
+    // `Arc<dyn FederationDirectory>` for the UniFFI peer-mutation
+    // entry points (`peer_add` / `peer_remove` /
+    // `peer_set_{alias,trust,notes,policy}`). These need the concrete
+    // FederationDirectory trait object — distinct from `verify_dir`
+    // (which is an `Arc<dyn VerifyDirectory>` adapter). Both
+    // ultimately reference the same backend (persist's
+    // `federation_directory_capsule` is carved from the engine's one
+    // `BackendDispatch`), but the trait-object identities differ
+    // because edge holds two separate `dyn`-trait views.
+    let federation_directory_for_edge: Arc<dyn ciris_persist::federation::FederationDirectory> =
+        directory_arc;
 
     let (verify_dir, rooting_dir): (Arc<dyn VerifyDirectory>, Arc<dyn RootingDirectory>) =
         match &queue_dispatch {
@@ -1229,6 +1236,7 @@ fn init_edge_runtime(
     // observe — the v0.14.0 close of #34's link half.
     let edge = Edge::builder()
         .directory(verify_dir)
+        .federation_directory(federation_directory_for_edge)
         .queue(queue)
         .signer(signer)
         .reticulum_transport(reticulum_transport)

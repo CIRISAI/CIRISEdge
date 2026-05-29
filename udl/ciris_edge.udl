@@ -265,11 +265,15 @@ dictionary EdgePeerHandle {
     string key_id;
 };
 
+// v0.15.1 (CIRISEdge#26 mutation surface) — variants aligned 1:1 with
+// persist v3.1.0 `ciris_persist::federation::TrustClass`
+// (`Untrusted` / `Trusted` / `Restricted` / `Blocked`) so the mapping
+// is total. `Untrusted` is the default per persist's `#[derive(Default)]`.
 enum EdgePeerTrust {
-    "Trusted",
     "Untrusted",
+    "Trusted",
+    "Restricted",
     "Blocked",
-    "Unknown",
 };
 
 dictionary EdgePeerPolicy {

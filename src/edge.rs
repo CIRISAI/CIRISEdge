@@ -330,12 +330,33 @@ pub struct Edge {
     /// `EdgeBindingsError::Unsupported`.
     #[cfg(feature = "_reticulum-module")]
     reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
+    /// CIRISEdge#26 mutation surface (v0.15.1) — optional
+    /// concrete-typed `Arc<dyn FederationDirectory>` retained so the
+    /// UniFFI peer-mutation surface (`peer_add` / `peer_remove` /
+    /// `peer_set_{alias,trust,notes,policy}`) can drive the 6 persist
+    /// v3.1.0 (CIRISPersist#117) methods that aren't reachable through
+    /// the type-erased [`VerifyDirectory`] adapter.
+    ///
+    /// `None` when the host didn't wire one (e.g., tests that only need
+    /// the verify pipeline); the 6 mutation FFIs surface
+    /// `EdgeBindingsError::Unsupported` in that case. The pyo3
+    /// cohabitation init path
+    /// (`crate::ffi::pyo3::init_edge_runtime`) populates it from the
+    /// `federation_directory_capsule` it already extracts; the
+    /// `from_keyring_seed_dir` convenience constructor populates it
+    /// from the same `FederationDirectorySqlite` it opens for verify.
+    federation_directory: Option<Arc<dyn ciris_persist::federation::FederationDirectory>>,
     config: EdgeConfig,
 }
 
 /// Builder for [`Edge`]. See FSD §3.2 for the call shape.
 pub struct EdgeBuilder {
     directory: Option<Arc<dyn VerifyDirectory>>,
+    /// CIRISEdge#26 mutation surface (v0.15.1) — see
+    /// [`Edge::federation_directory`]. Set via
+    /// [`EdgeBuilder::federation_directory`]; `None` → the 6 UniFFI
+    /// peer-mutation entry points surface `Unsupported`.
+    federation_directory: Option<Arc<dyn ciris_persist::federation::FederationDirectory>>,
     queue: Option<Arc<dyn OutboundHandle>>,
     signer: Option<Arc<LocalSigner>>,
     transports: Vec<Arc<dyn Transport>>,
@@ -366,6 +387,7 @@ impl Edge {
     pub fn builder() -> EdgeBuilder {
         EdgeBuilder {
             directory: None,
+            federation_directory: None,
             queue: None,
             signer: None,
             transports: Vec::new(),
@@ -1125,6 +1147,30 @@ impl Edge {
         self.verify.directory()
     }
 
+    /// CIRISEdge#26 mutation surface (v0.15.1) — concrete-typed
+    /// `Arc<dyn FederationDirectory>` if the host wired one via
+    /// [`EdgeBuilder::federation_directory`] (or one of the
+    /// convenience constructors that opens its own backend).
+    ///
+    /// `None` when no concrete directory was wired — the 6 UniFFI
+    /// peer-mutation entry points
+    /// (`peer_add` / `peer_remove` / `peer_set_{alias,trust,notes,policy}`)
+    /// consult this accessor and return `EdgeBindingsError::Unsupported`
+    /// when it returns `None`.
+    ///
+    /// Distinct from [`Self::verify_directory`] (which returns the
+    /// type-erased `Arc<dyn VerifyDirectory>` adapter the verify
+    /// pipeline holds): persist's `FederationDirectory` trait is
+    /// object-safe via `#[async_trait]`, so we can hold it as a
+    /// distinct trait object alongside the verify-adapter without a
+    /// `Sized` downcast.
+    #[must_use]
+    pub fn federation_directory(
+        &self,
+    ) -> Option<Arc<dyn ciris_persist::federation::FederationDirectory>> {
+        self.federation_directory.clone()
+    }
+
     /// CIRISEdge#25 (v0.13.0 UniFFI cut) — Rust-level accessor returning
     /// the transport set. UniFFI's `transport_list` enumerates this and
     /// derives per-transport stats via [`Transport::id`] + (for Reticulum)
@@ -1719,8 +1765,16 @@ impl EdgeBuilder {
             .await
             .map_err(|e| EdgeError::Persist(format!("EdgeOutboundQueueSqlite::open: {e}")))?;
 
+        // v0.15.1 (CIRISEdge#26 mutation surface) — the underlying
+        // `FederationDirectorySqlite` IS a `FederationDirectory`; clone
+        // the `Arc` so the UniFFI peer-mutation entry points reach the
+        // 6 persist v3.1.0 (CIRISPersist#117) methods without an
+        // unsized downcast through `VerifyDirectory`.
+        let federation_directory: Arc<dyn ciris_persist::federation::FederationDirectory> =
+            directory.clone();
         Ok(Edge::builder()
             .directory(directory)
+            .federation_directory(federation_directory)
             .queue(queue)
             .signer(Arc::new(signer)))
     }
@@ -1728,6 +1782,27 @@ impl EdgeBuilder {
     #[must_use]
     pub fn directory(mut self, directory: Arc<dyn VerifyDirectory>) -> Self {
         self.directory = Some(directory);
+        self
+    }
+
+    /// CIRISEdge#26 mutation surface (v0.15.1) — wire the concrete
+    /// `Arc<dyn FederationDirectory>` the UniFFI peer-mutation entry
+    /// points need. Optional; if omitted, those entry points surface
+    /// `EdgeBindingsError::Unsupported`. Distinct from
+    /// [`Self::directory`] because persist's `FederationDirectory`
+    /// trait is object-safe (`#[async_trait]`) while
+    /// [`VerifyDirectory`] is a separate adapter trait that uses an
+    /// unsized blanket impl over `FederationDirectory`.
+    ///
+    /// Production callers (pyo3 cohabitation init) typically pass the
+    /// same `Arc` they pass to `.directory(...)` after an
+    /// upcast — the two trait objects can refer to the same backend.
+    #[must_use]
+    pub fn federation_directory(
+        mut self,
+        directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
+    ) -> Self {
+        self.federation_directory = Some(directory);
         self
     }
 
@@ -1927,6 +2002,7 @@ impl EdgeBuilder {
             reachability,
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: self.reticulum_transport,
+            federation_directory: self.federation_directory,
             config: self.config,
         })
     }
