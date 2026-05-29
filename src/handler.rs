@@ -252,6 +252,17 @@ pub struct DurableHandle {
 }
 
 /// Terminal outcome of a durable send.
+//
+// v0.16.0 — the `Delivered { ack: Option<EdgeEnvelope>, ... }` variant
+// crossed clippy's `large_enum_variant` default threshold once
+// CIRISEdge#37 (testimonial_witness) + CIRISEdge#38 (key_boundary_scope)
+// added their fields to `EdgeEnvelope`. Boxing the ack would change
+// `DurableOutcome`'s public surface for a purely cosmetic reason —
+// every consumer pattern-matches on `Delivered { ack, .. }` and would
+// have to dereference. The variant is also constructed exactly once
+// per terminal durable send (rare event); the size discrepancy is
+// real but not hot-path. Scope the lint off here with the audit comment.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum DurableOutcome {
     Delivered {
@@ -269,6 +280,12 @@ pub enum DurableOutcome {
 }
 
 /// Snapshot of an in-flight durable send.
+//
+// v0.16.0 — same `large_enum_variant` carve-out as `DurableOutcome`:
+// `Terminal(DurableOutcome)` carries the same ACK envelope downstream,
+// so the lint fires for the same reason. Public API stability >
+// per-variant byte-uniformity here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum DurableStatus {
     Pending {

@@ -418,6 +418,30 @@ detector is complete; the only counterweight is **legibility under
 audit**. AGPL makes that structurally enforceable, not socially
 expected.
 
+The v0.16.0 wire-compliance fields anchor here. `testimonial_witness`
+(CIRISEdge#37, FSD-002 §3.6.3 v1.4 + §5.14) is a **preservation
+primitive**: edge propagates whatever the joint-correlation tier
+(lens-core detectors, ratchet-conscience evaluators, registry
+attesters) signs into the envelope, verbatim, and signs the bytes
+under its forwarding key — but it does NOT interpret the payload.
+That asymmetry is M-1 rendered as architecture: the wire surface
+must carry every witness a future detector class will need to make
+visible (Fidelity & Transparency — the audit chain must never
+silently drop attestation traffic), and the wire crate must never
+silently re-interpret what a higher tier has signed (Respect for
+Autonomy — the policy tier owns its own meaning, edge is reach not
+gate). `key_boundary:{scope}` (CIRISEdge#38 + D26, FSD-002 §3.4)
+extends edge's load-bearing AV-17 invariant (no seed bytes in edge's
+heap; see `docs/THREAT_MODEL.md` §AV-17) with a wire-form scope slot
+— `process` (the v0.15.x default), `tenant`, `channel`, `cohort`,
+`data_class` — so a multi-tenant or per-cohort deployment can express
+its key isolation contract on the wire without a wire break. The
+v0.16.0 cut lands the slot's wire shape only; future enforcement
+(binding signatures to a scope at verify time) is a v0.16.1+ scope
+and intentionally does not touch the substrate today. Together these
+fields make CIRISEdge legibly compliant with the CIRIS 3.0 protocol
+surface, in the AGPL letter as well as the apophatic spirit of §1.4.
+
 ## 11. How to maintain this document
 
 A working document, not a release artifact. Update it whenever:

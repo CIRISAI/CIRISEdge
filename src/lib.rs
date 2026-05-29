@@ -53,6 +53,7 @@ pub mod events;
 pub mod ffi;
 pub mod handler;
 pub mod identity;
+pub mod key_boundary;
 pub mod manifest;
 pub mod messages;
 pub mod observability;
@@ -70,6 +71,10 @@ pub use handler::{
     Handler, HandlerContext, HandlerError, InlineTextMessage, Message,
 };
 pub use identity::LocalSigner;
+pub use key_boundary::{
+    KeyBoundaryParseError, KeyBoundaryScope, KEY_BOUNDARY_PREFIX, KEY_BOUNDARY_SUFFIX,
+    LEGACY_NO_SEED_IN_HEAP,
+};
 pub use messages::{
     is_federation_attestation_emitting_type, AccordCarrier, AccordEventsBatch,
     AccordEventsResponse, AccordSignature, AnnouncementKind, AnnouncementPriority,
@@ -80,8 +85,8 @@ pub use messages::{
     FederationKeyDirectoryQueryResponse, GoalDeclaration, GoalDeclarationResponse, GoalRetirement,
     GoalRetirementResponse, HintShape, InlineText, InlineTextDurable, MessageType, MissReason,
     PublicKeyRegistration, PublicKeyRegistrationResponse, RefusalReason, SchemaVersion,
-    StewardDirective, TransportMedium, WithdrawalReason, Withdraws, ACCORD_THRESHOLD_M_OF_N,
-    DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
+    StewardDirective, TestimonialWitness, TransportMedium, WithdrawalReason, Withdraws,
+    ACCORD_THRESHOLD_M_OF_N, DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
     DELIVERY_REFUSAL_ATTESTATION_DOMAIN, FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
     GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
 };
