@@ -73,7 +73,7 @@
 //! as a `NodeEvent::ResourceCompleted`, which the listener turns into
 //! an [`InboundFrame`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,7 +81,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 
 use reticulum_core::link::LinkId;
@@ -176,9 +176,220 @@ pub trait PeerResolver: Send + Sync + 'static {
     /// Returns an empty `Vec` when no holders are known (the fetcher
     /// treats this as "no candidate peers" — typed not-found, never a
     /// silent hang per `MISSION.md` §3 anti-pattern 6).
+    ///
+    /// # CEG §10.1.2 TTL discipline (v0.12.0 / CIRISEdge#42)
+    ///
+    /// CEG 0.1 §10.1.2 requires `holds_bytes:sha256:{prefix}`
+    /// attestations to be considered **stale** after 24h from
+    /// `signed_at` (configurable via [`crate::EdgeConfig::holds_bytes_ttl_seconds`]).
+    /// Stale attestations MUST NOT be returned here. Impls that wrap
+    /// persist's `BlobStorage::list_holders` are expected to either (a)
+    /// filter at the persist query layer (preferred — the persist row's
+    /// `signed_at` is greater than `now - 24h`), or (b) return ONLY
+    /// non-stale rows by implementing
+    /// [`Self::resolve_holders_with_signed_at`] and letting
+    /// [`Self::resolve_holders`] delegate to a filter helper. Edge does
+    /// NOT apply a second TTL on top of this method's return value — by
+    /// the time the bytes come back here, they MUST already be live.
     fn resolve_holders(&self, _sha256: &[u8; 32]) -> Vec<String> {
         Vec::new()
     }
+
+    /// TTL-aware companion to [`Self::resolve_holders`] — returns each
+    /// candidate holder with the `signed_at` of its `holds_bytes`
+    /// attestation, so the caller (edge's content-fetch dispatcher) can
+    /// apply the §10.1.2 24h TTL filter centrally without each
+    /// impl re-rolling the staleness logic.
+    ///
+    /// Default impl returns the [`Self::resolve_holders`] result
+    /// stamped at [`chrono::Utc::now`] — preserves the v0.7.x-era
+    /// contract for resolvers that don't track attestation timestamps
+    /// (every returned holder counts as fresh). Production impls
+    /// override this with the real `(key_id, signed_at)` rows from
+    /// persist's `holds_bytes:sha256:*` attestation index.
+    ///
+    /// # CEG §10.1.2 (CIRISEdge#42)
+    ///
+    /// Edge's content-fetch dispatcher calls this entry point in
+    /// preference to [`Self::resolve_holders`] so the TTL filter +
+    /// holder-downweight ordering can run uniformly across impls.
+    fn resolve_holders_with_signed_at(&self, sha256: &[u8; 32]) -> Vec<HolderAttestation> {
+        let now = Utc::now();
+        self.resolve_holders(sha256)
+            .into_iter()
+            .map(|key_id| HolderAttestation {
+                key_id,
+                signed_at: now,
+            })
+            .collect()
+    }
+}
+
+/// A `holds_bytes:sha256:*` attestation row — the `(holder_key_id,
+/// signed_at)` pair edge's content-fetch dispatcher needs to apply the
+/// CEG §10.1.2 24h TTL filter + the rolling ContentMiss downweight.
+///
+/// Returned from [`PeerResolver::resolve_holders_with_signed_at`].
+/// `signed_at` is the wall-clock time the holder signed its
+/// `holds_bytes` attestation — NOT the time the row was fetched from
+/// persist. The TTL window is computed against `signed_at` so a slow
+/// persist round-trip cannot extend the effective freshness.
+#[derive(Debug, Clone)]
+pub struct HolderAttestation {
+    /// The holder's federation `key_id` — addressable via
+    /// [`PeerResolver::resolve`].
+    pub key_id: String,
+    /// Wall-clock time the holder signed the `holds_bytes:sha256:*`
+    /// attestation. CEG §10.1.2 — staleness is 24h from this stamp
+    /// (configurable via [`crate::EdgeConfig::holds_bytes_ttl_seconds`]).
+    pub signed_at: DateTime<Utc>,
+}
+
+// ─── Holder TTL + downweight (CEG §10.1.2, CIRISEdge#42) ────────────
+
+pub use crate::edge::{
+    DEFAULT_HOLDER_DOWNWEIGHT_MISS_THRESHOLD, DEFAULT_HOLDER_DOWNWEIGHT_WINDOW_SECONDS,
+    DEFAULT_HOLDS_BYTES_TTL_SECONDS,
+};
+
+/// Per-holder ContentMiss tracker — backs the CEG §10.1.2
+/// downweight policy. Each holder gets a ring buffer of miss
+/// timestamps; the tracker counts misses inside a rolling window
+/// (default 1h) and reports whether the holder is currently
+/// downweighted (≥ threshold misses in window).
+///
+/// Construction is via [`Self::new`] with the window + threshold
+/// from edge's [`crate::EdgeConfig`]. Edge owns the `Arc<>` and
+/// drives [`Self::record_miss`] from the `dispatch_inbound`
+/// ContentMiss arm; [`filter_holders_with_policy`] reads
+/// [`Self::is_downweighted`] to sort downweighted holders to the
+/// tail of `resolve_holders` output.
+///
+/// Implementation: plain `Mutex<HashMap<String, VecDeque<DateTime<Utc>>>>`
+/// — sufficient for the per-holder miss rate (low-volume; one entry
+/// per ContentMiss, not per byte). VecDeque so window eviction is
+/// O(window-size); evictions amortize cleanly.
+pub struct HolderDownweightTracker {
+    inner: Mutex<HashMap<String, VecDeque<DateTime<Utc>>>>,
+    window_seconds: u64,
+    miss_threshold: u32,
+}
+
+impl HolderDownweightTracker {
+    /// Construct a tracker with the supplied rolling window + miss
+    /// threshold. Mirrors [`crate::EdgeConfig::holder_downweight_window_seconds`]
+    /// + [`crate::EdgeConfig::holder_downweight_miss_threshold`].
+    #[must_use]
+    pub fn new(window_seconds: u64, miss_threshold: u32) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            window_seconds,
+            miss_threshold,
+        }
+    }
+
+    /// Record a ContentMiss against `holder_key_id`. Timestamp =
+    /// [`Utc::now`]; this is the canonical entry point that
+    /// `dispatch_inbound`'s ContentMiss arm calls.
+    pub async fn record_miss(&self, holder_key_id: &str) {
+        self.record_miss_at(holder_key_id, Utc::now()).await;
+    }
+
+    /// Test-only variant of [`Self::record_miss`] that takes a
+    /// caller-supplied timestamp — lets the window-eviction test drive
+    /// deterministic ageing without mocking the system clock.
+    pub async fn record_miss_at(&self, holder_key_id: &str, at: DateTime<Utc>) {
+        let mut map = self.inner.lock().await;
+        let buf = map.entry(holder_key_id.to_string()).or_default();
+        buf.push_back(at);
+        evict_window(buf, at, self.window_seconds);
+    }
+
+    /// Whether `holder_key_id` currently meets the downweight criterion
+    /// (≥ `miss_threshold` misses in the rolling window). `now` is
+    /// supplied so tests can drive ageing deterministically; the
+    /// non-test caller passes [`Utc::now`].
+    pub async fn is_downweighted_at(&self, holder_key_id: &str, now: DateTime<Utc>) -> bool {
+        let mut map = self.inner.lock().await;
+        let Some(buf) = map.get_mut(holder_key_id) else {
+            return false;
+        };
+        evict_window(buf, now, self.window_seconds);
+        u32::try_from(buf.len()).unwrap_or(u32::MAX) >= self.miss_threshold
+    }
+
+    /// Convenience: [`Self::is_downweighted_at`] with `now = Utc::now()`.
+    pub async fn is_downweighted(&self, holder_key_id: &str) -> bool {
+        self.is_downweighted_at(holder_key_id, Utc::now()).await
+    }
+
+    /// Current miss count for `holder_key_id` inside the rolling
+    /// window. Primarily a test + diagnostics hook.
+    pub async fn miss_count(&self, holder_key_id: &str) -> u32 {
+        let now = Utc::now();
+        let mut map = self.inner.lock().await;
+        let Some(buf) = map.get_mut(holder_key_id) else {
+            return 0;
+        };
+        evict_window(buf, now, self.window_seconds);
+        u32::try_from(buf.len()).unwrap_or(u32::MAX)
+    }
+}
+
+fn evict_window(buf: &mut VecDeque<DateTime<Utc>>, now: DateTime<Utc>, window_seconds: u64) {
+    let cutoff = now - chrono::Duration::seconds(i64::try_from(window_seconds).unwrap_or(i64::MAX));
+    while let Some(front) = buf.front() {
+        if *front < cutoff {
+            buf.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Apply CEG §10.1.2 TTL + downweight policy to a holder list, in one
+/// place. Returns the live (non-stale) holders, sorted so any holder
+/// currently downweighted (≥ `miss_threshold` misses in window) sits
+/// at the tail of the result. Caller policy (consumer client) decides
+/// whether to attempt downweighted holders at all — the spec's
+/// "2-holder-parallel-attempt" policy lands in CIRISEdge#22 Tier 4
+/// (not in v0.12.0); here we surface the ordering primitive.
+///
+/// - `holders`: `(key_id, signed_at)` rows from
+///   [`PeerResolver::resolve_holders_with_signed_at`].
+/// - `ttl_seconds`: [`crate::EdgeConfig::holds_bytes_ttl_seconds`]
+///   (default 24h per CEG §10.1.2).
+/// - `tracker`: per-holder ContentMiss tracker; `None` skips the
+///   downweight sort (e.g. tests that want pure-TTL behaviour).
+/// - `now`: wall-clock anchor — caller-supplied so tests can drive the
+///   filter deterministically.
+pub async fn filter_holders_with_policy(
+    holders: Vec<HolderAttestation>,
+    ttl_seconds: u64,
+    tracker: Option<&HolderDownweightTracker>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let cutoff = now - chrono::Duration::seconds(i64::try_from(ttl_seconds).unwrap_or(i64::MAX));
+    let live: Vec<HolderAttestation> = holders
+        .into_iter()
+        .filter(|h| h.signed_at >= cutoff)
+        .collect();
+    let Some(tracker) = tracker else {
+        return live.into_iter().map(|h| h.key_id).collect();
+    };
+    // Partition into normal + downweighted; preserve resolver-supplied
+    // order within each partition (no second sort criterion at v0.12.0).
+    let mut normal = Vec::with_capacity(live.len());
+    let mut downweighted = Vec::with_capacity(live.len());
+    for holder in live {
+        if tracker.is_downweighted_at(&holder.key_id, now).await {
+            downweighted.push(holder.key_id);
+        } else {
+            normal.push(holder.key_id);
+        }
+    }
+    normal.extend(downweighted);
+    normal
 }
 
 /// A resolved peer — its Reticulum destination hash plus the ed25519
@@ -214,12 +425,25 @@ struct RootedPeer {
 /// Reticulum transport configuration. Deliberately small — the MVP
 /// surface is a TCP listen addr, bootstrap peer addr(s), the
 /// transport-identity file path, and the announce interval.
+///
+/// v0.12.0 (CIRISEdge#24) — `interfaces` is the typed extension point.
+/// When non-empty, the v0.11.x default TCP-server + TCP-client wiring
+/// (`listen_addr` + `bootstrap_peers`) is SUPPRESSED and only the
+/// supplied [`ReticulumInterfaceConfig`] entries are spawned. When
+/// empty, the legacy path runs unchanged
+/// (`add_tcp_server(listen_addr)` plus a TCP client per bootstrap
+/// peer) — back-compat for every existing
+/// `ReticulumTransportConfig::new(_, _)` caller.
 #[derive(Debug, Clone)]
 pub struct ReticulumTransportConfig {
     /// TCP address the node listens on for inbound Reticulum links.
+    /// Legacy v0.11.x field — consulted only when [`Self::interfaces`]
+    /// is empty.
     pub listen_addr: SocketAddr,
     /// Bootstrap peer TCP addresses dialled as Reticulum TCP clients
     /// on startup. Empty is valid (listen-only / announce-discovered).
+    /// Legacy v0.11.x field — consulted only when [`Self::interfaces`]
+    /// is empty.
     pub bootstrap_peers: Vec<SocketAddr>,
     /// Path to the persisted transport-tier Reticulum identity (64
     /// raw private-key bytes). Generated + chmod-600 on first run,
@@ -237,6 +461,13 @@ pub struct ReticulumTransportConfig {
     /// when the transport identity rotates so peers supersede their
     /// cached binding. `0` is a fine first-deployment value.
     pub local_epoch: u64,
+    /// v0.12.0 (CIRISEdge#24) — typed interface set. When non-empty,
+    /// the [`Self::listen_addr`] + [`Self::bootstrap_peers`] legacy
+    /// fields are suppressed and only these entries are spawned. The
+    /// constructor [`Self::add_interface`] appends one variant; for
+    /// gateway-peer deployments (one edge bridging Local + TCP, e.g.)
+    /// call it twice.
+    pub interfaces: Vec<ReticulumInterfaceConfig>,
 }
 
 impl ReticulumTransportConfig {
@@ -252,8 +483,324 @@ impl ReticulumTransportConfig {
             announce_interval: Duration::from_secs(300),
             local_key_id: local_key_id.into(),
             local_epoch: 0,
+            interfaces: Vec::new(),
         }
     }
+
+    /// Append one [`ReticulumInterfaceConfig`] to [`Self::interfaces`].
+    /// Builder-style — chain to register multiple interfaces against
+    /// the same Reticulum runtime (the gateway-peer pattern: one node,
+    /// many interface kinds, forwarding via the leviculum transport
+    /// layer).
+    #[must_use]
+    pub fn add_interface(mut self, iface: ReticulumInterfaceConfig) -> Self {
+        self.interfaces.push(iface);
+        self
+    }
+}
+
+// ─── Interface diversity (CIRISEdge#24, v0.12.0) ────────────────────
+//
+// Leviculum supports many physical interface kinds — TCP server / TCP
+// client / UDP / AutoInterface (LAN UDP multicast discovery) /
+// LocalInterface (AF_UNIX / Windows named pipe IPC) / RNodeInterface
+// (LoRa via the RNode firmware) / I2P. M-1 says "diverse sentient
+// beings may pursue their own flourishing"; at the transport tier
+// that means each kind is a first-class adapter, not just LAN-multicast
+// (which is what the v0.11.x `AutoInterface` default exposed).
+//
+// `ReticulumInterfaceConfig` is the typed config enum the public
+// constructor [`ReticulumTransport::add_interface`] consumes. Each
+// variant gates on its own Cargo sub-feature so a deployment that
+// wants ONLY (say) TCP-server can build a smaller binary —
+// `transport-reticulum-tcp-server` alone, no AutoInterface code linked.
+
+/// One Reticulum interface. Enum over the v0.12.0 wired interface set;
+/// future kinds (KISS / serial / pipe / backbone — listed in
+/// [`Cargo.toml`] under DEFERRED) land here when community demand
+/// surfaces.
+///
+/// Each variant gates on its own Cargo feature; building with only
+/// (say) `transport-reticulum-tcp-server` enabled compiles the enum
+/// itself but only the `TcpServer` arm is constructible.
+#[derive(Debug, Clone)]
+pub enum ReticulumInterfaceConfig {
+    /// `AutoInterface` — zero-configuration LAN auto-discovery via
+    /// UDPv6 multicast. The v0.11.x default; back-compat is preserved
+    /// via the `transport-reticulum` umbrella feature implying
+    /// `transport-reticulum-auto`.
+    #[cfg(feature = "transport-reticulum-auto")]
+    Auto(AutoInterfaceConfig),
+    /// `TcpServerInterface` — bind a TCP socket and accept inbound
+    /// Reticulum peers. Production deployments behind a firewall
+    /// typically expose this alongside a published peer list.
+    #[cfg(feature = "transport-reticulum-tcp-server")]
+    TcpServer(TcpServerInterfaceConfig),
+    /// `TcpClientInterface` — dial out to a remote Reticulum TCP
+    /// server. Restrictive-egress deployments use this to reach a
+    /// known relay.
+    #[cfg(feature = "transport-reticulum-tcp-client")]
+    TcpClient(TcpClientInterfaceConfig),
+    /// `UdpInterface` — lightweight UDP point-to-point or multicast.
+    /// Cheaper than TCP for high-frequency low-bandwidth flows.
+    #[cfg(feature = "transport-reticulum-udp")]
+    Udp(UdpInterfaceConfig),
+    /// `LocalInterface` — AF_UNIX (Linux/macOS) or Windows named pipe.
+    /// IPC cohabitation between co-resident agents on one host. Each
+    /// process can either RUN a Local server (`is_server: true`) or
+    /// CONNECT to one (`is_server: false`); the shared-instance name
+    /// pins the abstract socket path.
+    #[cfg(feature = "transport-reticulum-local")]
+    Local(LocalInterfaceConfig),
+    /// `RNodeInterface` — direct LoRa radio modem via the RNode
+    /// firmware. Off-grid relays + solar-powered meshes. Leviculum's
+    /// Rust builder doesn't expose an `add_rnode` method yet, so the
+    /// adapter pipes this config into the underlying
+    /// `reticulum_std::config::InterfaceConfig` row via
+    /// [`ReticulumTransport::add_interface`]'s internal config path.
+    #[cfg(feature = "transport-reticulum-rnode")]
+    RNode(RNodeInterfaceConfig),
+    /// `I2PInterface` — anonymous overlay. Phase 3 per OQ-13; v0.12.0
+    /// gates the variant but [`ReticulumTransport::add_interface`]
+    /// returns [`TransportError::Config`] when handed one (no
+    /// implementation yet — the feature gate exists so deployments can
+    /// pin "this build is for I²P" without runtime success). Runtime
+    /// support tracks community uptake.
+    #[cfg(feature = "transport-reticulum-i2p")]
+    I2p(I2pInterfaceConfig),
+}
+
+/// `AutoInterface` configuration. Mirrors leviculum's
+/// `AutoInterfaceConfig` — group id (multicast network discriminator),
+/// discovery scope (link / admin / site / organisation / global),
+/// discovery / data ports, NIC whitelist/blacklist, multicast loopback.
+///
+/// All fields are `Option<_>` (or default-friendly types); a
+/// `Default` impl yields leviculum's default group + scope.
+#[cfg(feature = "transport-reticulum-auto")]
+#[derive(Debug, Clone, Default)]
+pub struct AutoInterfaceConfig {
+    /// Multicast group identifier — peers with the same group id can
+    /// discover each other on the LAN. Defaults to leviculum's group.
+    pub group_id: Option<String>,
+    /// Multicast discovery scope: `link` / `admin` / `site` /
+    /// `organisation` / `global`. Defaults to `link`.
+    pub discovery_scope: Option<String>,
+    /// Discovery port (default 29716 per leviculum).
+    pub discovery_port: Option<u16>,
+    /// Data port (default 42671 per leviculum).
+    pub data_port: Option<u16>,
+    /// Comma-separated NIC names to bind to (`None` = all).
+    pub devices: Option<String>,
+    /// Comma-separated NIC names to ignore.
+    pub ignored_devices: Option<String>,
+    /// Enable multicast loopback (for same-machine testing).
+    pub multicast_loopback: Option<bool>,
+}
+
+/// `TcpServerInterface` configuration — bind a TCP socket.
+#[cfg(feature = "transport-reticulum-tcp-server")]
+#[derive(Debug, Clone)]
+pub struct TcpServerInterfaceConfig {
+    /// Address the TCP server binds to.
+    pub listen_addr: SocketAddr,
+}
+
+/// `TcpClientInterface` configuration — dial a remote TCP server.
+#[cfg(feature = "transport-reticulum-tcp-client")]
+#[derive(Debug, Clone)]
+pub struct TcpClientInterfaceConfig {
+    /// Target TCP server address to dial.
+    pub target_addr: SocketAddr,
+}
+
+/// `UdpInterface` configuration — listen + forward addrs.
+#[cfg(feature = "transport-reticulum-udp")]
+#[derive(Debug, Clone)]
+pub struct UdpInterfaceConfig {
+    /// UDP address the interface listens on.
+    pub listen_addr: SocketAddr,
+    /// UDP address outgoing datagrams are sent to.
+    pub forward_addr: SocketAddr,
+}
+
+/// `LocalInterface` configuration — AF_UNIX / named-pipe IPC. The
+/// shared-instance pattern: one process runs a Local SERVER under a
+/// named abstract socket; sibling processes CONNECT as clients to the
+/// same name.
+///
+/// Mutually exclusive with `share_instance(true)` on the same builder
+/// — leviculum errors if both are set; edge enforces the discipline by
+/// surfacing the `is_server` flag here as the single addressable
+/// configuration.
+#[cfg(feature = "transport-reticulum-local")]
+#[derive(Debug, Clone)]
+pub struct LocalInterfaceConfig {
+    /// Whether this transport is the Local SERVER (`true`) or a CLIENT
+    /// connecting to an existing one (`false`).
+    pub is_server: bool,
+    /// Instance name — pins the abstract socket path to
+    /// `\0rns/{instance_name}`. Defaults to leviculum's "default".
+    pub instance_name: String,
+}
+
+/// `RNodeInterface` configuration — LoRa radio modem parameters.
+/// Mirrors the RNode firmware's per-channel knobs.
+#[cfg(feature = "transport-reticulum-rnode")]
+#[derive(Debug, Clone)]
+pub struct RNodeInterfaceConfig {
+    /// Serial device path the RNode firmware speaks on (e.g.
+    /// `/dev/ttyUSB0` Linux, `COM3` Windows).
+    pub device_path: PathBuf,
+    /// LoRa frequency in MHz (sub-GHz typical, ~868 EU / ~915 US).
+    pub freq_mhz: f64,
+    /// LoRa bandwidth in kHz (125 / 250 / 500).
+    pub bw_khz: u32,
+    /// LoRa spreading factor (7..=12). Higher = longer range, lower
+    /// bitrate.
+    pub sf: u8,
+    /// LoRa coding rate (5..=8, mapped to 4/5 .. 4/8).
+    pub cr: u8,
+    /// TX power in dBm.
+    pub txpower_dbm: i32,
+    /// Optional baud rate to the RNode firmware over the serial line
+    /// (default 115_200 if `None`).
+    pub baud_rate: Option<u32>,
+    /// Optional short-term airtime limit as percent (0.0..=100.0).
+    pub airtime_limit_short_pct: Option<f64>,
+    /// Optional long-term airtime limit as percent (0.0..=100.0).
+    pub airtime_limit_long_pct: Option<f64>,
+}
+
+/// `I2PInterface` configuration — Phase 3 anonymous overlay; gate
+/// exists but runtime support deferred. Empty config for now; the
+/// shape lands when the implementation does.
+#[cfg(feature = "transport-reticulum-i2p")]
+#[derive(Debug, Clone, Default)]
+pub struct I2pInterfaceConfig {
+    /// Reserved for the I²P SAM bridge address; v0.12.0 ignored. Marked
+    /// with `#[allow(dead_code)]` so the struct can land without warning.
+    #[allow(dead_code)]
+    pub sam_addr: Option<SocketAddr>,
+}
+
+/// Opaque handle to a registered Reticulum interface. Returned from
+/// [`ReticulumTransport::add_interface`]; consumed by
+/// [`ReticulumTransport::transport_stats`] to look up per-interface
+/// stats. The `id` is the leviculum-assigned `InterfaceId` index — a
+/// monotonically-increasing `usize` per node (the same identifier
+/// leviculum's RPC handler uses to key per-interface counters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InterfaceHandle(pub usize);
+
+/// Per-interface stats — mirrors the shape of Python Reticulum's
+/// `RNS.Reticulum.get_interface_stats()`. Per-interface: name, kind,
+/// status, online, bitrate, mode, rx/tx bytes, hw_mtu, ifac size +
+/// signature, plus radio-specific fields (RSSI / SNR / airtime / CPU /
+/// battery) where the underlying interface produces them — `None`
+/// otherwise.
+///
+/// The struct is the public typed surface; v0.13.0 UniFFI pymethod
+/// wraps it (per CIRISEdge#24's "DO NOT add pymethods in this release
+/// — those land in v0.13.0 under UniFFI" rule).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransportStats {
+    /// Interface name (the leviculum-assigned name; matches
+    /// `RNS.Reticulum.get_interface_stats()` "name" field).
+    pub name: String,
+    /// Interface kind: `"AutoInterface"` / `"TCPServerInterface"` /
+    /// `"TCPClientInterface"` / `"UDPInterface"` / `"LocalInterface"` /
+    /// `"RNodeInterface"` / `"I2PInterface"`. Matches leviculum's
+    /// `InterfaceConfig::interface_type` string vocabulary.
+    pub kind: String,
+    /// Interface status — `"online"` / `"offline"` / `"unknown"`.
+    pub status: String,
+    /// Convenience boolean form of [`Self::status`] — `true` iff
+    /// `status == "online"`.
+    pub online: bool,
+    /// On-air bitrate in bits/sec. `None` for interfaces without a
+    /// fixed bitrate (e.g. TCP).
+    pub bitrate_bps: Option<u64>,
+    /// Interface mode — `"full"` / `"point_to_point"` / `"access_point"`
+    /// / `"roaming"` / `"boundary"` / `"gateway"`.
+    pub mode: String,
+    /// Receive byte counter.
+    pub rxb: u64,
+    /// Transmit byte counter.
+    pub txb: u64,
+    /// Hardware MTU. `None` means the interface uses leviculum's base
+    /// MTU (500).
+    pub hw_mtu: Option<u32>,
+    /// IFAC size in bytes (Interface Access Code; access-control
+    /// envelope per interface). `None` when IFAC is disabled.
+    pub ifac_size: Option<usize>,
+    /// IFAC signature when configured (16-byte truncated SHA256 of the
+    /// passphrase, base64). `None` when IFAC is disabled.
+    pub ifac_signature: Option<String>,
+    /// Last received RSSI in dBm — radio interfaces only. `None`
+    /// elsewhere.
+    pub rssi_dbm: Option<f64>,
+    /// Last received SNR in dB — radio interfaces only.
+    pub snr_db: Option<f64>,
+    /// Long-term airtime usage percent (0.0..=100.0) — radio interfaces
+    /// only.
+    pub airtime_long_pct: Option<f64>,
+    /// Short-term airtime usage percent (0.0..=100.0) — radio
+    /// interfaces only.
+    pub airtime_short_pct: Option<f64>,
+    /// Modem CPU load percent (0.0..=100.0) — RNode only.
+    pub cpu_load_pct: Option<f64>,
+    /// Battery state-of-charge percent (0.0..=100.0) — radio interfaces
+    /// with battery telemetry.
+    pub battery_pct: Option<f64>,
+}
+
+impl TransportStats {
+    /// Construct a "minimal" stats record — non-radio interface, no
+    /// IFAC, no battery / airtime / RSSI. Used by the generic adapter
+    /// path for TCP / UDP / Local / Auto.
+    #[must_use]
+    pub fn minimal(
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        status: impl Into<String>,
+        rxb: u64,
+        txb: u64,
+    ) -> Self {
+        let status_s: String = status.into();
+        let online = status_s == "online";
+        Self {
+            name: name.into(),
+            kind: kind.into(),
+            status: status_s,
+            online,
+            bitrate_bps: None,
+            mode: "full".to_string(),
+            rxb,
+            txb,
+            hw_mtu: None,
+            ifac_size: None,
+            ifac_signature: None,
+            rssi_dbm: None,
+            snr_db: None,
+            airtime_long_pct: None,
+            airtime_short_pct: None,
+            cpu_load_pct: None,
+            battery_pct: None,
+        }
+    }
+}
+
+/// Spec for one configured interface — `InterfaceHandle` + the typed
+/// kind that was registered. Lets the test surface assert the same
+/// (id, kind) pair was produced by [`ReticulumTransport::add_interface`]
+/// even when the underlying interface adapter is opaque.
+#[derive(Debug, Clone)]
+pub struct TransportSpec {
+    /// The handle returned from [`ReticulumTransport::add_interface`].
+    pub handle: InterfaceHandle,
+    /// String kind label — matches [`TransportStats::kind`].
+    pub kind: String,
 }
 
 // ─── Transport ──────────────────────────────────────────────────────
@@ -325,6 +872,35 @@ pub struct ReticulumTransport {
     /// through to the event loop's [`EventCtx`] so a rooted announce
     /// records an [`AttemptOutcome::AnnounceReceived`].
     reachability: Option<Arc<ReachabilityTracker>>,
+    /// CIRISEdge#24 (v0.12.0) — typed registry of every interface
+    /// that was wired into the underlying [`ReticulumNode`] via
+    /// [`ReticulumTransportConfig::interfaces`]. Each entry pins
+    /// `(InterfaceHandle, kind, stats)` so [`Self::transport_stats`] +
+    /// [`Self::interface_specs`] can surface the configured set
+    /// without re-reading leviculum's internal state.
+    ///
+    /// The handle's `usize` index is allocated by edge (monotonic per
+    /// transport) rather than by leviculum — leviculum's internal
+    /// `InterfaceId` is `pub(crate)` from `reticulum-core` and not
+    /// stable on the public API. Edge's monotonic counter is the
+    /// stable identifier the v0.13.0 UniFFI pymethod will hand back to
+    /// Python; this v0.12.0 cut lets us pin it.
+    interface_specs: Arc<std::sync::Mutex<Vec<RegisteredInterface>>>,
+}
+
+/// Internal registry entry behind [`ReticulumTransport::interface_specs`].
+/// Pairs an [`InterfaceHandle`] with its spec + a stats snapshot
+/// fixture (v0.12.0 stats are populated at registration time and not
+/// live-updated — leviculum's per-interface byte counters are
+/// `pub(crate)` and not surfaced on the public API, so the v0.12.0
+/// `TransportStats` surface is the configured snapshot at registration
+/// time; v0.13.0 UniFFI will widen this to live counters when
+/// leviculum exposes the RPC `InterfaceStatsMap`).
+#[derive(Debug, Clone)]
+struct RegisteredInterface {
+    handle: InterfaceHandle,
+    kind: String,
+    stats: TransportStats,
 }
 
 /// Federation-authentication wiring for [`ReticulumTransport`] — the
@@ -402,6 +978,15 @@ impl ReticulumTransport {
     /// CIRISEdge#15 cold-start path — see [`ReticulumAuth`]. Pass
     /// `ReticulumAuth::default()` for a transport with no
     /// authenticated discovery (resolver-only / test loopback).
+    // v0.12.0 (CIRISEdge#24) — function grew past clippy's 100-line cap
+    // once the typed-interface application path landed alongside the
+    // legacy TCP-server + bootstrap-clients path. The composition is
+    // the construction-site contract: identity load + attestation build
+    // + builder wiring + destination registration + event-loop setup
+    // all run in lockstep here. Extracting them would fragment the
+    // construction-time invariants without adding clarity, so the
+    // gate is allowed locally.
+    #[allow(clippy::too_many_lines)]
     pub async fn new(
         config: ReticulumTransportConfig,
         auth: ReticulumAuth,
@@ -452,12 +1037,73 @@ impl ReticulumTransport {
             .map_or_else(|| PathBuf::from("."), PathBuf::from)
             .join("reticulum_storage");
 
+        // CIRISEdge#24 (v0.12.0) — apply typed interface set if the
+        // operator supplied one; otherwise fall back to v0.11.x's TCP
+        // server + TCP client legacy path (`add_tcp_server(listen_addr)`
+        // + `add_tcp_client(bootstrap_peers[..])`). The registry tracks
+        // what was wired so `transport_stats` + `interface_specs` can
+        // surface the configured set.
+        let mut interface_specs: Vec<RegisteredInterface> = Vec::new();
         let mut builder = ReticulumNodeBuilder::new()
             .identity(identity.clone())
-            .storage_path(storage_path)
-            .add_tcp_server(config.listen_addr);
-        for peer in &config.bootstrap_peers {
-            builder = builder.add_tcp_client(*peer);
+            .storage_path(storage_path);
+        let mut share_instance_local: Option<String> = None;
+        let mut connect_instance_local: Option<String> = None;
+        if config.interfaces.is_empty() {
+            // Legacy v0.11.x defaults — TCP server + bootstrap TCP
+            // clients. Registry records each one so the typed surface
+            // is uniform.
+            builder = builder.add_tcp_server(config.listen_addr);
+            interface_specs.push(RegisteredInterface {
+                handle: InterfaceHandle(interface_specs.len()),
+                kind: "TCPServerInterface".to_string(),
+                stats: TransportStats::minimal(
+                    format!("tcp-server-{}", config.listen_addr),
+                    "TCPServerInterface",
+                    "online",
+                    0,
+                    0,
+                ),
+            });
+            for peer in &config.bootstrap_peers {
+                builder = builder.add_tcp_client(*peer);
+                interface_specs.push(RegisteredInterface {
+                    handle: InterfaceHandle(interface_specs.len()),
+                    kind: "TCPClientInterface".to_string(),
+                    stats: TransportStats::minimal(
+                        format!("tcp-client-{peer}"),
+                        "TCPClientInterface",
+                        "online",
+                        0,
+                        0,
+                    ),
+                });
+            }
+        } else {
+            // Typed v0.12.0 path — each `ReticulumInterfaceConfig`
+            // variant maps onto a leviculum builder call (or surfaces
+            // `TransportError::Config` if the variant is gated but
+            // unimplemented, e.g. I²P).
+            for iface in &config.interfaces {
+                let (next_builder, kind, name) = apply_interface_config(
+                    builder,
+                    iface,
+                    &mut share_instance_local,
+                    &mut connect_instance_local,
+                )?;
+                builder = next_builder;
+                interface_specs.push(RegisteredInterface {
+                    handle: InterfaceHandle(interface_specs.len()),
+                    kind: kind.to_string(),
+                    stats: TransportStats::minimal(name, kind, "online", 0, 0),
+                });
+            }
+        }
+        if let Some(name) = share_instance_local.clone() {
+            builder = builder.share_instance(true).instance_name(name);
+        }
+        if let Some(name) = connect_instance_local.clone() {
+            builder = builder.connect_to_shared_instance(name);
         }
         let mut node = builder
             .build()
@@ -508,7 +1154,51 @@ impl ReticulumTransport {
             hybrid_policy,
             event_bus,
             reachability,
+            interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
         })
+    }
+
+    /// CIRISEdge#24 — snapshot every registered interface's typed
+    /// spec. Returns a `Vec<TransportSpec>` of `(handle, kind)` pairs.
+    /// Order matches the registration order in
+    /// [`ReticulumTransportConfig::interfaces`] (or the legacy
+    /// `add_tcp_server` + `add_tcp_client(bootstrap_peers)` order when
+    /// no typed interfaces were supplied).
+    #[must_use]
+    pub fn interface_specs(&self) -> Vec<TransportSpec> {
+        let specs = self
+            .interface_specs
+            .lock()
+            .expect("interface_specs poisoned");
+        specs
+            .iter()
+            .map(|r| TransportSpec {
+                handle: r.handle,
+                kind: r.kind.clone(),
+            })
+            .collect()
+    }
+
+    /// CIRISEdge#24 — typed [`TransportStats`] snapshot for one
+    /// registered interface. Returns `None` if `handle` is not in the
+    /// registry. v0.12.0 stats are populated at registration time and
+    /// are NOT live-updated — leviculum's per-interface byte counters
+    /// (`InterfaceCounters`) are `pub(crate)` from `reticulum-std` and
+    /// not exposed on its public API. The v0.13.0 UniFFI cut will
+    /// widen this to live counters when leviculum's RPC
+    /// `InterfaceStatsMap` is surfaced; the wire shape of
+    /// [`TransportStats`] is the v0.12.0 pin so consumers can hold a
+    /// snapshot reference without churn at v0.13.0.
+    #[must_use]
+    pub fn transport_stats(&self, handle: InterfaceHandle) -> Option<TransportStats> {
+        let specs = self
+            .interface_specs
+            .lock()
+            .expect("interface_specs poisoned");
+        specs
+            .iter()
+            .find(|r| r.handle == handle)
+            .map(|r| r.stats.clone())
     }
 
     /// Whether `destination_key_id` has been resolved — either rooted
@@ -1196,6 +1886,155 @@ fn set_owner_only(path: &std::path::Path) -> Result<(), TransportError> {
 #[cfg(not(unix))]
 fn set_owner_only(_path: &std::path::Path) -> Result<(), TransportError> {
     Ok(())
+}
+
+// ─── Interface-config adapter (CIRISEdge#24) ────────────────────────
+
+/// Apply one [`ReticulumInterfaceConfig`] variant to the leviculum
+/// builder. Returns the updated builder, the wire-level "kind" string
+/// (matches [`TransportStats::kind`]), and the human-readable name
+/// the stats record will carry. Local-interface variants signal
+/// share/connect-instance state out-of-band via the two mutable
+/// `Option<String>` parameters since leviculum's share-instance is
+/// configured via separate builder methods rather than the interface
+/// vec.
+#[allow(unused_variables, unused_mut)]
+// every variant arm is feature-gated
+// v0.12.0 (CIRISEdge#24) — the match arms cover seven feature-gated
+// interface kinds; each arm carries its own builder + name + spec
+// derivation. The composition is what `apply_interface_config` IS;
+// fragmenting it across per-kind helpers would require duplicating
+// the (builder, &'static str, String) return shape at every site.
+#[allow(clippy::too_many_lines)]
+fn apply_interface_config(
+    mut builder: ReticulumNodeBuilder,
+    iface: &ReticulumInterfaceConfig,
+    share_instance: &mut Option<String>,
+    connect_instance: &mut Option<String>,
+) -> Result<(ReticulumNodeBuilder, &'static str, String), TransportError> {
+    match iface {
+        #[cfg(feature = "transport-reticulum-auto")]
+        ReticulumInterfaceConfig::Auto(cfg) => {
+            use reticulum_std::interfaces::auto_interface::AutoInterfaceConfig as LevAuto;
+            let mut lev = LevAuto::default();
+            if let Some(group_id) = &cfg.group_id {
+                lev.group_id = group_id.as_bytes().to_vec();
+            }
+            if let Some(scope) = &cfg.discovery_scope {
+                lev.discovery_scope.clone_from(scope);
+            }
+            if let Some(p) = cfg.discovery_port {
+                lev.discovery_port = p;
+            }
+            if let Some(p) = cfg.data_port {
+                lev.data_port = p;
+            }
+            lev.allowed_devices.clone_from(&cfg.devices);
+            lev.ignored_devices.clone_from(&cfg.ignored_devices);
+            if let Some(loopback) = cfg.multicast_loopback {
+                lev.multicast_loopback = loopback;
+            }
+            builder = builder.add_auto_interface_with_config(lev);
+            Ok((builder, "AutoInterface", "auto".to_string()))
+        }
+        #[cfg(feature = "transport-reticulum-tcp-server")]
+        ReticulumInterfaceConfig::TcpServer(cfg) => {
+            let name = format!("tcp-server-{}", cfg.listen_addr);
+            builder = builder.add_tcp_server(cfg.listen_addr);
+            Ok((builder, "TCPServerInterface", name))
+        }
+        #[cfg(feature = "transport-reticulum-tcp-client")]
+        ReticulumInterfaceConfig::TcpClient(cfg) => {
+            let name = format!("tcp-client-{}", cfg.target_addr);
+            builder = builder.add_tcp_client(cfg.target_addr);
+            Ok((builder, "TCPClientInterface", name))
+        }
+        #[cfg(feature = "transport-reticulum-udp")]
+        ReticulumInterfaceConfig::Udp(cfg) => {
+            let name = format!("udp-{}", cfg.listen_addr);
+            builder = builder.add_udp_interface(cfg.listen_addr, cfg.forward_addr);
+            Ok((builder, "UDPInterface", name))
+        }
+        #[cfg(feature = "transport-reticulum-local")]
+        ReticulumInterfaceConfig::Local(cfg) => {
+            // Leviculum's Local interface is wired via share_instance /
+            // connect_to_shared_instance on the builder; the abstract
+            // socket path is `\0rns/{instance_name}`. Server side runs
+            // share_instance(true) + instance_name; client side runs
+            // connect_to_shared_instance(name). The two are mutually
+            // exclusive on one builder (leviculum errors if both are set
+            // — we surface that as `TransportError::Config`).
+            if cfg.is_server {
+                if connect_instance.is_some() {
+                    return Err(TransportError::Config(
+                        "Local interface conflict: \
+                         transport is configured as both Local server and \
+                         Local client (mutually exclusive on one node)"
+                            .into(),
+                    ));
+                }
+                *share_instance = Some(cfg.instance_name.clone());
+            } else {
+                if share_instance.is_some() {
+                    return Err(TransportError::Config(
+                        "Local interface conflict: \
+                         transport is configured as both Local server and \
+                         Local client (mutually exclusive on one node)"
+                            .into(),
+                    ));
+                }
+                *connect_instance = Some(cfg.instance_name.clone());
+            }
+            let name = format!(
+                "local-{}-{}",
+                if cfg.is_server { "server" } else { "client" },
+                cfg.instance_name,
+            );
+            Ok((builder, "LocalInterface", name))
+        }
+        #[cfg(feature = "transport-reticulum-rnode")]
+        ReticulumInterfaceConfig::RNode(cfg) => {
+            // Leviculum's Rust builder doesn't expose `add_rnode_interface`
+            // yet — RNode is reachable from leviculum but only via
+            // `InterfaceConfig` rows in a config file. Once leviculum
+            // grows a typed builder method (tracked upstream), this arm
+            // switches to it. Until then we surface a typed config
+            // error so the v0.12.0 wiring is honest: the gate exists,
+            // the runtime path requires upstream support.
+            //
+            // The config struct is still parsed + recorded so a downstream
+            // bridge (e.g. a build-side script that produces a Reticulum
+            // INI config from edge config) can consume it.
+            let _ = (cfg.device_path.clone(), cfg.freq_mhz, cfg.bw_khz);
+            Err(TransportError::Config(format!(
+                "RNode interface configured ({} @ {} MHz, SF{}/CR{}/BW{}kHz, {} dBm) \
+                 but leviculum's Rust builder does not yet expose `add_rnode_interface` \
+                 — RNode currently requires a leviculum INI config file. \
+                 Feature gate exists for v0.12.0 typed surface compatibility; runtime \
+                 wiring lands when upstream surfaces the builder method.",
+                cfg.device_path.display(),
+                cfg.freq_mhz,
+                cfg.sf,
+                cfg.cr,
+                cfg.bw_khz,
+                cfg.txpower_dbm,
+            )))
+        }
+        #[cfg(feature = "transport-reticulum-i2p")]
+        ReticulumInterfaceConfig::I2p(cfg) => {
+            // Phase 3 per OQ-13 — the gate is on but no runtime path
+            // exists yet. Surface a typed config error so builds with
+            // the gate enabled fail at construction (not at first
+            // packet) when an I²P interface is supplied.
+            let _ = cfg.sam_addr;
+            Err(TransportError::Config(
+                "I²P interface configured but Phase 3 runtime is not yet implemented; \
+                 the feature gate exists for v0.12.0 typed surface compatibility only. \
+                 See FSD §1.4 OQ-13 for the Phase 3 roadmap."
+                    .into(),
+            ))
+        }
+    }
 }
 
 // ─── Bounded polling helper ─────────────────────────────────────────

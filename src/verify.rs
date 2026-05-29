@@ -276,6 +276,23 @@ pub enum VerifyError {
     /// Step 7 — federation directory unavailable (substrate fault).
     #[error("verify substrate unavailable: {0}")]
     VerifyUnavailable(String),
+    /// CIRISEdge#42 (v0.12.0, CEG §10.1.1) — `ContentBody` integrity
+    /// check failed: `sha256(body.bytes) != body.sha256`. The envelope
+    /// signature verified (the responder really did send these bytes
+    /// claiming this SHA), but the content-addressed contract was
+    /// violated. CEG §10.1.1 normative — full SHA-256 of received
+    /// bytes MUST be verified before any handler dispatch; short-
+    /// circuiting to a prefix is REJECTED by the spec.
+    #[error(
+        "content integrity check failed: claimed_sha256={claimed_sha256} \
+         but sha256(bytes)={actual_sha256}"
+    )]
+    ContentIntegrity {
+        /// The SHA-256 the responder claimed (`body.sha256`).
+        claimed_sha256: String,
+        /// The SHA-256 actually computed over `body.bytes`.
+        actual_sha256: String,
+    },
 }
 
 /// A successfully-verified envelope. The only way to construct one is

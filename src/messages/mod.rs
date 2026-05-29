@@ -187,6 +187,18 @@ pub enum MessageType {
     /// to a future amendment per CIRISEdge#41 body §"Out of scope". Body:
     /// [`GoalRetirement`].
     GoalRetirement,
+
+    // ─── CIRISEdge#42 (v0.12.0) — CEG §10.1.2 ContentMiss feedback ──
+    /// CEG 0.1 §10.1.2 — consumer-side feedback emitted when a
+    /// `ContentFetch` attempt returned a `ContentMiss` (or otherwise
+    /// failed full-SHA verify) against a holder that advertised
+    /// `holds_bytes:sha256:{prefix}` for the requested SHA. The
+    /// withdrawal is signed by the consumer's local key and shipped
+    /// via the existing federation evidence path (`Delivery::Durable`).
+    /// Receivers aggregate per `(holder_key_id, sha256)` and apply the
+    /// downweight policy in their own `PeerResolver`. Body:
+    /// [`Withdraws`].
+    Withdraws,
 }
 
 /// The signed wire envelope. Carries one verified message + the
@@ -1780,6 +1792,83 @@ impl GoalRetirement {
         }
         out
     }
+}
+
+// ─── CIRISEdge#42 (v0.12.0) — Withdraws (CEG §10.1.2) ───────────────
+//
+// Consumer-side feedback: when a `ContentFetch` returns a `ContentMiss`
+// (the holder advertised `holds_bytes:sha256:{prefix}` but didn't
+// actually serve the bytes), the consumer signs a `Withdraws`
+// attestation against the `(holder_key_id, sha256)` pair and ships it
+// via the existing federation evidence path. Receivers aggregate per
+// holder and apply the downweight policy in their own `PeerResolver`.
+//
+// The withdrawal is NOT the same as a `holds_bytes` retraction by the
+// holder itself — that would be a `holds_bytes` attestation with
+// `is_active = false` (or a `superseded` row) at the substrate tier.
+// `Withdraws` is consumer-emitted: the consumer is saying "this
+// holder advertised holding these bytes but failed to deliver".
+
+/// Reason a [`Withdraws`] was emitted. The taxonomy is closed at
+/// v0.12.0 — receivers branching on this field can rely on the full
+/// set being known.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WithdrawalReason {
+    /// The holder responded with [`MessageType::ContentMiss`] — the
+    /// canonical CEG §10.1.2 case. The consumer's fetch attempt
+    /// completed (no transport failure) but the holder declined to
+    /// serve the bytes despite advertising the `holds_bytes`
+    /// attestation.
+    ContentMiss,
+    /// The holder served a [`ContentBody`] but the SHA-256 of
+    /// `body.bytes` did not match `body.sha256`. CEG §10.1.1
+    /// content-integrity failure — the consumer MUST withdraw the
+    /// holder per the spec.
+    IntegrityFailure,
+    /// The holder did not respond within the consumer's fetch
+    /// timeout. CEG §10.1.2 explicitly lists timeout-as-miss because
+    /// a holder advertising bytes it cannot deliver fails the
+    /// federation's reach guarantee.
+    Timeout,
+}
+
+/// CEG §10.1.2 consumer-side withdrawal attestation. Signed by the
+/// consumer's federation key (via the surrounding envelope's
+/// hybrid Ed25519 + ML-DSA-65 signature — no body-internal signature).
+/// Receivers aggregate per `(holder_key_id, sha256)` and apply the
+/// downweight policy in their own [`crate::transport::reticulum::PeerResolver`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Withdraws {
+    /// The holder whose `holds_bytes:sha256:{prefix}` attestation is
+    /// being withdrawn against. `federation_keys.key_id`.
+    pub holder_key_id: String,
+    /// The SHA-256 the holder advertised holding. 32 bytes raw,
+    /// base64-standard on the wire (44 chars), same convention as
+    /// [`ContentBody::sha256`].
+    pub sha256: [u8; 32],
+    /// Why the consumer is withdrawing — see [`WithdrawalReason`].
+    pub withdrawal_reason: WithdrawalReason,
+    /// When the consumer observed the failure that triggered the
+    /// withdrawal. NOT raw send-time — the consumer's observation
+    /// is the load-bearing input for the receiver's downweight
+    /// window arithmetic.
+    pub observed_at: DateTime<Utc>,
+}
+
+impl Message for Withdraws {
+    const TYPE: MessageType = MessageType::Withdraws;
+    /// Durable, fire-and-forget — the withdrawal IS the audit
+    /// observable; no second ACK needed. Same long-haul shape as
+    /// [`DeliveryAttestation`] (24h TTL, 20 attempts) — withdrawals
+    /// are federation evidence at the same cadence as attestations.
+    const DELIVERY: Delivery = Delivery::Durable {
+        requires_ack: false,
+        max_attempts: 20,
+        ttl_seconds: 24 * 60 * 60,
+        ack_timeout_seconds: None,
+    };
+    type Response = ();
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -212,10 +212,86 @@ transport-http        = [
 # Phase 1 — Reticulum canonical wire (OQ-07 first impl). Backed by
 # Leviculum's reticulum-core + reticulum-std. `TransportId::RETICULUM_RS`
 # is the metrics tag; the impl lives in `src/transport/reticulum.rs`.
-transport-reticulum   = ["dep:reticulum-std", "dep:reticulum-core"]
+#
+# v0.12.0 (CIRISEdge#24) — refactored from a single umbrella feature
+# into per-interface sub-features. `transport-reticulum` remains the
+# umbrella + back-compat alias (every existing pin "wants the Reticulum
+# transport at all" still resolves); deployments that want a specific
+# interface set turn on the sub-features they care about. The umbrella
+# defaults to `transport-reticulum-auto` (the pre-v0.12.0 behaviour:
+# AutoInterface = LAN auto-discovery via UDPv6 multicast).
+#
+# WIRED sub-features (have a `ReticulumInterfaceConfig` variant + Rust-
+# side constructor that maps onto a `reticulum_std::driver::*` builder
+# method or InterfaceConfig row):
+#
+#   transport-reticulum-auto         — `AutoInterface`
+#   transport-reticulum-tcp-server   — `TcpServerInterface`
+#   transport-reticulum-tcp-client   — `TcpClientInterface`
+#   transport-reticulum-udp          — `UdpInterface`
+#   transport-reticulum-local        — `LocalInterface` (AF_UNIX shared
+#                                       instance; IPC cohabitation)
+#   transport-reticulum-rnode        — `RNodeInterface` (LoRa via RNode;
+#                                       config-driven only, leviculum
+#                                       doesn't expose a Rust-side
+#                                       `add_rnode` on the builder yet,
+#                                       so we route via InterfaceConfig)
+#   transport-reticulum-i2p          — `I2PInterface` (Phase 3 per
+#                                       OQ-13; gate exists, runtime
+#                                       impl deferred — building with
+#                                       just this flag links the gate
+#                                       but `add_reticulum_interface`
+#                                       returns `TransportError::Config`
+#                                       when handed an `I2p` variant)
+#
+# DEFERRED (gates may be added in a future cut once community demand
+# materializes; per the v0.12.0 brief, kiss / ax25_kiss / serial / pipe
+# / backbone are not implemented):
+#
+#   transport-reticulum-kiss      — KISS framing (AX.25 packet radio)
+#   transport-reticulum-ax25-kiss — AX.25 over KISS
+#   transport-reticulum-serial    — raw serial line
+#   transport-reticulum-pipe      — Unix named pipe
+#   transport-reticulum-backbone  — Reticulum "backbone" tunnel
+# Umbrella feature `transport-reticulum`: links the Reticulum module,
+# pulls in the leviculum deps, AND enables every wired sub-feature
+# (per CIRISEdge#24's "The existing `transport-reticulum` feature
+# becomes an umbrella that enables all of them" requirement).
+# Deployments that need a smaller binary pick the specific
+# `transport-reticulum-*` sub-feature(s) they want; existing pins
+# like `transport-reticulum` keep working unchanged AND surface the
+# full `ReticulumInterfaceConfig` variant set.
+transport-reticulum             = [
+    "transport-reticulum-auto",
+    "transport-reticulum-tcp-server",
+    "transport-reticulum-tcp-client",
+    "transport-reticulum-udp",
+    "transport-reticulum-local",
+    "transport-reticulum-rnode",
+    "transport-reticulum-i2p",
+    "dep:reticulum-std",
+    "dep:reticulum-core",
+]
+transport-reticulum-auto        = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
+transport-reticulum-tcp-server  = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
+transport-reticulum-tcp-client  = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
+transport-reticulum-udp         = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
+transport-reticulum-local       = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
+transport-reticulum-rnode       = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
+transport-reticulum-i2p         = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
+
+# Internal aggregator — any reticulum-* sub-feature flips this on, and
+# every cfg site in the code that needs "the Reticulum transport module
+# in any flavor" gates on it. NOT a public feature (underscore prefix
+# is the convention); consumers wire `transport-reticulum` (the
+# umbrella) or a specific sub-feature. The umbrella ALSO enables this
+# via its transitive `transport-reticulum-auto` dependency.
+_reticulum-module               = []
 
 # Phase 3 — additional transports, productionized when community uptake
-# justifies (OQ-13).
+# justifies (OQ-13). The bare wire-level transports (LoRa not via
+# Reticulum, raw serial, I²P not via Reticulum) are separate from the
+# `transport-reticulum-*` Reticulum-interface family above.
 # transport-lora        = []
 # transport-serial      = []
 # transport-i2p         = []

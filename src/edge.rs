@@ -38,6 +38,31 @@ use crate::verify::{
 
 // ─── Public configuration ───────────────────────────────────────────
 
+// ─── CEG §10.1.2 spec constants (CIRISEdge#42, v0.12.0) ─────────────
+
+/// Default TTL for a `holds_bytes:sha256:*` attestation row — 24
+/// hours from `signed_at`, per CEG 0.1 §10.1.2. Configurable via
+/// [`EdgeConfig::holds_bytes_ttl_seconds`]; this constant is the
+/// spec-pinned default the [`Default`] impl on [`EdgeConfig`] reads.
+/// Lives at the crate root (not behind the reticulum-feature gate) so
+/// non-reticulum builds compile EdgeConfig::default unchanged.
+pub const DEFAULT_HOLDS_BYTES_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Default rolling window for the per-holder ContentMiss downweight
+/// — 1 hour, per CEG 0.1 §10.1.2. A holder with ≥
+/// [`DEFAULT_HOLDER_DOWNWEIGHT_MISS_THRESHOLD`] ContentMisses inside
+/// this window is sorted to the tail of
+/// `filter_holders_with_policy` output; after the window lapses
+/// without further misses, the downweight clears and the holder
+/// reappears at normal priority.
+pub const DEFAULT_HOLDER_DOWNWEIGHT_WINDOW_SECONDS: u64 = 60 * 60;
+
+/// Default ContentMiss count threshold within the rolling window — a
+/// holder hitting this many misses is downweighted. Per CEG 0.1
+/// §10.1.2: "Holders with >= 3 ContentMisses in the window are
+/// downweighted".
+pub const DEFAULT_HOLDER_DOWNWEIGHT_MISS_THRESHOLD: u32 = 3;
+
 /// Top-level configuration. Defaults match the v0.1.0 P0 invariants
 /// (`docs/THREAT_MODEL.md` §10).
 #[derive(Debug, Clone)]
@@ -86,6 +111,30 @@ pub struct EdgeConfig {
     /// CIRISEdge#22 Tier 3 pymethod surface (v0.16.0) consumes the
     /// snapshot to render `peer_reachability(key_id) → dict[str, float]`.
     pub reachability_window_seconds: u64,
+    /// CIRISEdge#42 (v0.12.0, CEG §10.1.2) — TTL in seconds for
+    /// `holds_bytes:sha256:{prefix}` attestations. After this many
+    /// seconds elapse from `signed_at`, the attestation is **stale**
+    /// and `PeerResolver::resolve_holders_with_signed_at` results are
+    /// filtered to exclude it before `filter_holders_with_policy`
+    /// returns. Default [`DEFAULT_HOLDS_BYTES_TTL_SECONDS`] (86_400s =
+    /// 24 hours per CEG §10.1.2 spec). Test deployments may shorten
+    /// this to verify the staleness logic; production should leave it
+    /// at the default.
+    pub holds_bytes_ttl_seconds: u64,
+    /// CIRISEdge#42 (v0.12.0, CEG §10.1.2) — rolling window in seconds
+    /// for the per-holder ContentMiss downweight tracker. A holder
+    /// with ≥ [`Self::holder_downweight_miss_threshold`] misses inside
+    /// this window is sorted to the tail of
+    /// `filter_holders_with_policy` output. Default
+    /// [`DEFAULT_HOLDER_DOWNWEIGHT_WINDOW_SECONDS`] (3600s = 1 hour
+    /// per CEG §10.1.2 spec).
+    pub holder_downweight_window_seconds: u64,
+    /// CIRISEdge#42 (v0.12.0, CEG §10.1.2) — ContentMiss count
+    /// threshold inside the downweight window. Default
+    /// [`DEFAULT_HOLDER_DOWNWEIGHT_MISS_THRESHOLD`] (3 per CEG §10.1.2
+    /// spec). A holder hitting this count is downweighted; after the
+    /// window lapses without further misses, the downweight clears.
+    pub holder_downweight_miss_threshold: u32,
 }
 
 impl Default for EdgeConfig {
@@ -114,6 +163,13 @@ impl Default for EdgeConfig {
             // whose announces are still being recorded is by definition
             // reachable in this window.
             reachability_window_seconds: 300,
+            // CIRISEdge#42 (CEG §10.1.2) — spec-pinned defaults. The
+            // 24h TTL and 1h downweight window are normative; the 3-miss
+            // threshold mirrors the spec's "Holders with >= 3
+            // ContentMisses in the window are downweighted" sentence.
+            holds_bytes_ttl_seconds: DEFAULT_HOLDS_BYTES_TTL_SECONDS,
+            holder_downweight_window_seconds: DEFAULT_HOLDER_DOWNWEIGHT_WINDOW_SECONDS,
+            holder_downweight_miss_threshold: DEFAULT_HOLDER_DOWNWEIGHT_MISS_THRESHOLD,
         }
     }
 }
@@ -1359,6 +1415,42 @@ async fn dispatch_inbound(
         }
     }
 
+    // CIRISEdge#42 (v0.12.0, CEG §10.1.2) — `ContentMiss` is the
+    // canonical CEG §10.1.2 trigger for emitting a `Withdraws`
+    // attestation against the holder. The peer (the holder) advertised
+    // `holds_bytes:sha256:{prefix}` for this SHA, we asked, and the
+    // holder responded with a typed miss. The withdrawal is shipped
+    // via the existing federation evidence path; receivers aggregate
+    // per `(holder_key_id, sha256)` and apply the downweight policy in
+    // their own PeerResolver.
+    //
+    // This hook fires BEFORE typed handler dispatch — application
+    // handlers see the ContentMiss after the substrate has recorded
+    // its observability. The emission failure does NOT block
+    // application dispatch (same discipline as the
+    // DeliveryAttestation emission below).
+    if envelope.message_type == MessageType::ContentMiss {
+        if let Ok(miss) = serde_json::from_str::<crate::messages::ContentMiss>(envelope.body.get())
+        {
+            if let Err(e) = emit_withdraws(
+                &envelope.signing_key_id,
+                miss.sha256,
+                crate::messages::WithdrawalReason::ContentMiss,
+                signer,
+                queue,
+            )
+            .await
+            {
+                tracing::warn!(
+                    holder_key_id = %envelope.signing_key_id,
+                    reason = ?miss.reason,
+                    error = %e,
+                    "Withdraws emission failed (CIRISEdge#42, CEG §10.1.2)",
+                );
+            }
+        }
+    }
+
     // FSD §3.2.1 v0.1 emission gate — post-verify-pipeline, the
     // announcement has cleared edge's signature + freshness + replay
     // gates. NodeCore's authority-class verifier runs at the consumer
@@ -1890,18 +1982,33 @@ fn validate_content_body(
         });
     }
 
-    // Content-addressed integrity gate (CIRISEdge#21 spec point 2).
+    // Content-addressed integrity gate — CEG §10.1.1 NORMATIVE +
+    // CIRISEdge#21 spec point 2.
+    //
     // `sha256(bytes) == claimed_sha256` is the WHOLE POINT of the
-    // content-fetch primitive; a mismatch is a typed schema violation
-    // under the content-addressed contract.
+    // content-fetch primitive; a mismatch is a typed integrity
+    // violation under the content-addressed contract.
+    //
+    // # CEG §10.1.1 short-circuit-verify pin (CIRISEdge#42, v0.12.0)
+    //
+    // The spec is normative on FULL-SHA verify: the entire `body.bytes`
+    // payload is hashed and compared against the entire `body.sha256`
+    // claim. Verifying only a prefix (first N bytes / prefix of the
+    // hash) is REJECTED by CEG §10.1.1. The `sha256_of` call below
+    // hashes the complete byte vector; any future "optimization" that
+    // hashes only `body.bytes[..N]` or compares only `body.sha256[..N]`
+    // is a spec violation.
+    //
+    // This invariant is regression-tested by
+    // `tests/ceg_content_discipline.rs::content_body_short_circuit_verify_pinned_off`
+    // — that test passes ONLY when the full-SHA verify path executes.
+    // A regression that short-circuits will fail that test.
     let actual = sha256_of(&body.bytes);
     if actual != body.sha256 {
-        return Err(VerifyError::SchemaInvalid(format!(
-            "ContentBody integrity check failed: claimed sha256={} \
-             but sha256(bytes)={}",
-            hex_encode(&body.sha256),
-            hex_encode(&actual),
-        )));
+        return Err(VerifyError::ContentIntegrity {
+            claimed_sha256: hex_encode(&body.sha256),
+            actual_sha256: hex_encode(&actual),
+        });
     }
 
     Ok(())
@@ -2091,6 +2198,92 @@ async fn emit_delivery_attestation(
         )
         .await
         .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (attestation): {e}")))?;
+
+    Ok(())
+}
+
+/// CIRISEdge#42 (v0.12.0, CEG §10.1.2) — emit a [`Withdraws`]
+/// attestation against `holder_key_id` for the bytes hashing to
+/// `sha256`. Signed by the consumer's local key via the surrounding
+/// envelope (hybrid Ed25519 + ML-DSA-65); shipped via the existing
+/// federation evidence path (`Delivery::Durable`).
+///
+/// Receivers aggregate per `(holder_key_id, sha256)` and apply the
+/// downweight policy in their own
+/// [`crate::transport::reticulum::PeerResolver`]. The destination of
+/// the withdrawal envelope is the **holder itself** — the peer who
+/// advertised the `holds_bytes` attestation we are withdrawing against
+/// (so the holder sees its own observability). Future federation
+/// collectors that aggregate withdrawals can subscribe via the
+/// `Delivery::Mandatory` retransmission path; v0.12.0 ships the
+/// point-to-point shape only.
+async fn emit_withdraws(
+    holder_key_id: &str,
+    sha256: [u8; 32],
+    reason: crate::messages::WithdrawalReason,
+    signer: &Arc<LocalSigner>,
+    queue: &Arc<dyn OutboundHandle>,
+) -> Result<(), EdgeError> {
+    use crate::messages::Withdraws;
+
+    let withdraws = Withdraws {
+        holder_key_id: holder_key_id.to_string(),
+        sha256,
+        withdrawal_reason: reason,
+        observed_at: Utc::now(),
+    };
+
+    // Wrap in a typed envelope addressed to the holder. The envelope's
+    // hybrid signature IS the proof-of-authority — no body-internal
+    // signature (same shape as GoalRetirement, CIRISEdge#41).
+    let envelope_bytes = {
+        let mut env = build_envelope(
+            MessageType::Withdraws,
+            &signer.key_id,
+            holder_key_id,
+            &withdraws,
+            None,
+        )?;
+        sign_envelope(signer, &mut env).await?;
+        serde_json::to_vec(&env)
+            .map_err(|e| EdgeError::Config(format!("withdraws envelope serialize: {e}")))?
+    };
+    let env: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
+        .map_err(|e| EdgeError::Config(format!("re-parse withdraws envelope: {e}")))?;
+    let body_sha256_w = envelope_body_sha256(&env);
+    let body_size_bytes = i32::try_from(envelope_bytes.len()).unwrap_or(i32::MAX);
+
+    // Match Withdraws::DELIVERY (same shape as DeliveryAttestation —
+    // fire-and-forget Durable, 24h TTL, 20 attempts).
+    let (max_attempts, ttl_seconds) = match crate::messages::Withdraws::DELIVERY {
+        Delivery::Durable {
+            max_attempts,
+            ttl_seconds,
+            ..
+        } => (
+            i32::try_from(max_attempts).unwrap_or(i32::MAX),
+            i64::try_from(ttl_seconds).unwrap_or(i64::MAX),
+        ),
+        _ => (20, 24 * 60 * 60),
+    };
+
+    queue
+        .enqueue_outbound(
+            &signer.key_id,
+            holder_key_id,
+            &message_type_str(&MessageType::Withdraws),
+            "1.0.0",
+            &envelope_bytes,
+            &body_sha256_w,
+            body_size_bytes,
+            false, // requires_ack: false (Withdraws is fire-and-forget)
+            None,
+            max_attempts,
+            ttl_seconds,
+            Utc::now(),
+        )
+        .await
+        .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (withdraws): {e}")))?;
 
     Ok(())
 }

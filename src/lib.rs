@@ -60,9 +60,10 @@ pub use messages::{
     FederationKeyDirectoryQueryResponse, GoalDeclaration, GoalDeclarationResponse, GoalRetirement,
     GoalRetirementResponse, HintShape, InlineText, InlineTextDurable, MessageType, MissReason,
     PublicKeyRegistration, PublicKeyRegistrationResponse, RefusalReason, SchemaVersion,
-    StewardDirective, TransportMedium, ACCORD_THRESHOLD_M_OF_N, DEFAULT_MAX_CONTENT_BODY_BYTES,
-    DELIVERY_ATTESTATION_DOMAIN, DELIVERY_REFUSAL_ATTESTATION_DOMAIN,
-    FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN, GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
+    StewardDirective, TransportMedium, WithdrawalReason, Withdraws, ACCORD_THRESHOLD_M_OF_N,
+    DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
+    DELIVERY_REFUSAL_ATTESTATION_DOMAIN, FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
+    GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
 };
 pub use outbound::{
     DispatcherConfig, OutboundHandle, PeerDirectory, PeerSubscriptionFilter, StewardDirectory,

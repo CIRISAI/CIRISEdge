@@ -22,13 +22,13 @@ pub mod http;
 /// federation-key binding carried in Reticulum announce app-data
 /// (CIRISEdge#15 / AV-42). Feature-gated alongside the Reticulum
 /// transport, its only consumer.
-#[cfg(feature = "transport-reticulum")]
+#[cfg(feature = "_reticulum-module")]
 pub mod attestation;
 
 /// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
 /// (`reticulum-core` + `reticulum-std`). Canonical wire per
 /// `MISSION.md` §2; HTTP is the documented fallback.
-#[cfg(feature = "transport-reticulum")]
+#[cfg(feature = "_reticulum-module")]
 pub mod reticulum;
 
 // Remaining implementations land in subsequent commits; trait shape
