@@ -2068,6 +2068,11 @@ fn transport_error_class(e: &TransportError) -> &'static str {
         TransportError::Config(_) => "config",
         TransportError::Io(_) => "io",
         TransportError::BodyTooLarge { .. } => "body_too_large",
+        // v0.15.0 (CIRISEdge#33) — blackholed peer (operator deny-list
+        // hit) is a distinct reachability class from substrate
+        // unreachability. Surface it to the reachability tracker so
+        // operators can disambiguate "peer down" from "peer banned".
+        TransportError::PeerBlackholed { .. } => "peer_blackholed",
     }
 }
 

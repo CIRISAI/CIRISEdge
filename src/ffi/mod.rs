@@ -35,3 +35,12 @@ pub mod uniffi_impl;
 // reads / mgmt scope.
 #[cfg(feature = "ffi-uniffi")]
 pub mod uniffi_impl_links;
+
+// v0.15.0 (CIRISEdge#33) — Routing-table FFI surface (paths /
+// blackhole / rate / tunnels / announce / reverse). Same per-feature
+// split rationale as `uniffi_impl_links`: keeps the
+// Reticulum-specific surface close to the transport code without
+// growing the top-level UniFFI impl module past the v0.13.0 reads /
+// mgmt scope.
+#[cfg(feature = "ffi-uniffi")]
+pub mod uniffi_impl_routing;

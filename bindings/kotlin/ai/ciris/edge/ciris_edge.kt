@@ -685,6 +685,34 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_ciris_edge_checksum_func_recent_events(
     ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_announce_table(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_blackhole_add(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_blackhole_list(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_blackhole_remove(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_path_drop(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_path_drop_via(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_path_request(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_path_table(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_path_to(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_rate_table(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_reverse_table(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_transport_id(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_transport_uptime(
+    ): Short
+    external fun uniffi_ciris_edge_checksum_func_routing_tunnels(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_transport_add(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_transport_config_blob(
@@ -765,6 +793,34 @@ external fun uniffi_ciris_edge_fn_func_queue_depth(`deliveryClass`: RustBuffer.B
 external fun uniffi_ciris_edge_fn_func_recent_errors(`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_recent_events(`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_announce_table(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_blackhole_add(`identityHash`: RustBuffer.ByValue,`until`: RustBuffer.ByValue,`reason`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_routing_blackhole_list(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_blackhole_remove(`identityHash`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_routing_path_drop(`destinationHash`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_routing_path_drop_via(`transportIdentityHash`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_routing_path_request(`destinationHash`: RustBuffer.ByValue,`onInterface`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_ciris_edge_fn_func_routing_path_table(`maxHops`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_path_to(`destinationHash`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_rate_table(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_reverse_table(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_transport_id(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_routing_transport_uptime(uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_ciris_edge_fn_func_routing_tunnels(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_transport_add(`spec`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -976,6 +1032,48 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_recent_events() != 602.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_announce_table() != 19407.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_blackhole_add() != 9306.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_blackhole_list() != 27710.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_blackhole_remove() != 39038.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_path_drop() != 22632.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_path_drop_via() != 23741.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_path_request() != 1577.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_path_table() != 14662.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_path_to() != 58415.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_rate_table() != 32532.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_reverse_table() != 51615.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_transport_id() != 26501.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_transport_uptime() != 42323.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_routing_tunnels() != 56409.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_transport_add() != 59654.toShort()) {
@@ -1268,6 +1366,59 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
 
 
 
+data class EdgeBlackholeEntry (
+    var `identityHash`: kotlin.ByteArray
+    , 
+    var `until`: kotlin.String?
+    , 
+    var `reason`: kotlin.String?
+    , 
+    var `addedAt`: kotlin.String
+    , 
+    var `hits`: kotlin.ULong
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeBlackholeEntry: FfiConverterRustBuffer<EdgeBlackholeEntry> {
+    override fun read(buf: ByteBuffer): EdgeBlackholeEntry {
+        return EdgeBlackholeEntry(
+            FfiConverterByteArray.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeBlackholeEntry) = (
+            FfiConverterByteArray.allocationSize(value.`identityHash`) +
+            FfiConverterOptionalString.allocationSize(value.`until`) +
+            FfiConverterOptionalString.allocationSize(value.`reason`) +
+            FfiConverterString.allocationSize(value.`addedAt`) +
+            FfiConverterULong.allocationSize(value.`hits`)
+    )
+
+    override fun write(value: EdgeBlackholeEntry, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`identityHash`, buf)
+            FfiConverterOptionalString.write(value.`until`, buf)
+            FfiConverterOptionalString.write(value.`reason`, buf)
+            FfiConverterString.write(value.`addedAt`, buf)
+            FfiConverterULong.write(value.`hits`, buf)
+    }
+}
+
+
+
 data class EdgeErrorEvent (
     var `at`: kotlin.String
     , 
@@ -1311,6 +1462,49 @@ public object FfiConverterTypeEdgeErrorEvent: FfiConverterRustBuffer<EdgeErrorEv
             FfiConverterString.write(value.`className`, buf)
             FfiConverterString.write(value.`message`, buf)
             FfiConverterOptionalString.write(value.`bodySha256`, buf)
+    }
+}
+
+
+
+data class EdgeInFlightAnnounce (
+    var `destinationHash`: kotlin.ByteArray
+    , 
+    var `attempts`: kotlin.UInt
+    , 
+    var `nextRetryAt`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeInFlightAnnounce: FfiConverterRustBuffer<EdgeInFlightAnnounce> {
+    override fun read(buf: ByteBuffer): EdgeInFlightAnnounce {
+        return EdgeInFlightAnnounce(
+            FfiConverterByteArray.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeInFlightAnnounce) = (
+            FfiConverterByteArray.allocationSize(value.`destinationHash`) +
+            FfiConverterUInt.allocationSize(value.`attempts`) +
+            FfiConverterString.allocationSize(value.`nextRetryAt`)
+    )
+
+    override fun write(value: EdgeInFlightAnnounce, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`destinationHash`, buf)
+            FfiConverterUInt.write(value.`attempts`, buf)
+            FfiConverterString.write(value.`nextRetryAt`, buf)
     }
 }
 
@@ -1889,6 +2083,165 @@ public object FfiConverterTypeEdgeProbeResult: FfiConverterRustBuffer<EdgeProbeR
 
 
 
+data class EdgeRateEntry (
+    var `identityHash`: kotlin.ByteArray
+    , 
+    var `announceFreqPerMin`: kotlin.Double
+    , 
+    var `violations`: kotlin.UInt
+    , 
+    var `blockedUntil`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeRateEntry: FfiConverterRustBuffer<EdgeRateEntry> {
+    override fun read(buf: ByteBuffer): EdgeRateEntry {
+        return EdgeRateEntry(
+            FfiConverterByteArray.read(buf),
+            FfiConverterDouble.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeRateEntry) = (
+            FfiConverterByteArray.allocationSize(value.`identityHash`) +
+            FfiConverterDouble.allocationSize(value.`announceFreqPerMin`) +
+            FfiConverterUInt.allocationSize(value.`violations`) +
+            FfiConverterOptionalString.allocationSize(value.`blockedUntil`)
+    )
+
+    override fun write(value: EdgeRateEntry, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`identityHash`, buf)
+            FfiConverterDouble.write(value.`announceFreqPerMin`, buf)
+            FfiConverterUInt.write(value.`violations`, buf)
+            FfiConverterOptionalString.write(value.`blockedUntil`, buf)
+    }
+}
+
+
+
+data class EdgeReverseEntry (
+    var `sourceHash`: kotlin.ByteArray
+    , 
+    var `destinationHash`: kotlin.ByteArray
+    , 
+    var `lastSeenAt`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeReverseEntry: FfiConverterRustBuffer<EdgeReverseEntry> {
+    override fun read(buf: ByteBuffer): EdgeReverseEntry {
+        return EdgeReverseEntry(
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeReverseEntry) = (
+            FfiConverterByteArray.allocationSize(value.`sourceHash`) +
+            FfiConverterByteArray.allocationSize(value.`destinationHash`) +
+            FfiConverterString.allocationSize(value.`lastSeenAt`)
+    )
+
+    override fun write(value: EdgeReverseEntry, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`sourceHash`, buf)
+            FfiConverterByteArray.write(value.`destinationHash`, buf)
+            FfiConverterString.write(value.`lastSeenAt`, buf)
+    }
+}
+
+
+
+data class EdgeRoutingPathEntry (
+    var `destinationHash`: kotlin.ByteArray
+    , 
+    var `peerKeyId`: kotlin.String?
+    , 
+    var `hops`: kotlin.UInt
+    , 
+    var `viaTransportId`: kotlin.String
+    , 
+    var `viaTransportKind`: kotlin.String
+    , 
+    var `nextHop`: kotlin.ByteArray
+    , 
+    var `lastSeenAt`: kotlin.String
+    , 
+    var `expiresAt`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeRoutingPathEntry: FfiConverterRustBuffer<EdgeRoutingPathEntry> {
+    override fun read(buf: ByteBuffer): EdgeRoutingPathEntry {
+        return EdgeRoutingPathEntry(
+            FfiConverterByteArray.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeRoutingPathEntry) = (
+            FfiConverterByteArray.allocationSize(value.`destinationHash`) +
+            FfiConverterOptionalString.allocationSize(value.`peerKeyId`) +
+            FfiConverterUInt.allocationSize(value.`hops`) +
+            FfiConverterString.allocationSize(value.`viaTransportId`) +
+            FfiConverterString.allocationSize(value.`viaTransportKind`) +
+            FfiConverterByteArray.allocationSize(value.`nextHop`) +
+            FfiConverterString.allocationSize(value.`lastSeenAt`) +
+            FfiConverterString.allocationSize(value.`expiresAt`)
+    )
+
+    override fun write(value: EdgeRoutingPathEntry, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`destinationHash`, buf)
+            FfiConverterOptionalString.write(value.`peerKeyId`, buf)
+            FfiConverterUInt.write(value.`hops`, buf)
+            FfiConverterString.write(value.`viaTransportId`, buf)
+            FfiConverterString.write(value.`viaTransportKind`, buf)
+            FfiConverterByteArray.write(value.`nextHop`, buf)
+            FfiConverterString.write(value.`lastSeenAt`, buf)
+            FfiConverterString.write(value.`expiresAt`, buf)
+    }
+}
+
+
+
 data class EdgeTransportHandle (
     var `id`: kotlin.ULong
     , 
@@ -2189,6 +2542,54 @@ public object FfiConverterTypeEdgeTransportStats: FfiConverterRustBuffer<EdgeTra
             FfiConverterOptionalDouble.write(value.`airtimeShortPct`, buf)
             FfiConverterOptionalDouble.write(value.`cpuLoadPct`, buf)
             FfiConverterOptionalDouble.write(value.`batteryPct`, buf)
+    }
+}
+
+
+
+data class EdgeTunnelInfo (
+    var `hash`: kotlin.ByteArray
+    , 
+    var `tunnelId`: kotlin.ByteArray
+    , 
+    var `hops`: kotlin.UInt
+    , 
+    var `expiresAt`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeTunnelInfo: FfiConverterRustBuffer<EdgeTunnelInfo> {
+    override fun read(buf: ByteBuffer): EdgeTunnelInfo {
+        return EdgeTunnelInfo(
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: EdgeTunnelInfo) = (
+            FfiConverterByteArray.allocationSize(value.`hash`) +
+            FfiConverterByteArray.allocationSize(value.`tunnelId`) +
+            FfiConverterUInt.allocationSize(value.`hops`) +
+            FfiConverterString.allocationSize(value.`expiresAt`)
+    )
+
+    override fun write(value: EdgeTunnelInfo, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`hash`, buf)
+            FfiConverterByteArray.write(value.`tunnelId`, buf)
+            FfiConverterUInt.write(value.`hops`, buf)
+            FfiConverterString.write(value.`expiresAt`, buf)
     }
 }
 
@@ -2618,6 +3019,38 @@ public object FfiConverterOptionalTypeEdgePeerPolicy: FfiConverterRustBuffer<Edg
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeEdgeRoutingPathEntry: FfiConverterRustBuffer<EdgeRoutingPathEntry?> {
+    override fun read(buf: ByteBuffer): EdgeRoutingPathEntry? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeEdgeRoutingPathEntry.read(buf)
+    }
+
+    override fun allocationSize(value: EdgeRoutingPathEntry?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeEdgeRoutingPathEntry.allocationSize(value)
+        }
+    }
+
+    override fun write(value: EdgeRoutingPathEntry?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeEdgeRoutingPathEntry.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeEdgePeerTrust: FfiConverterRustBuffer<EdgePeerTrust?> {
     override fun read(buf: ByteBuffer): EdgePeerTrust? {
         if (buf.get().toInt() == 0) {
@@ -2678,6 +3111,34 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeEdgeBlackholeEntry: FfiConverterRustBuffer<List<EdgeBlackholeEntry>> {
+    override fun read(buf: ByteBuffer): List<EdgeBlackholeEntry> {
+        val len = buf.getInt()
+        return List<EdgeBlackholeEntry>(len) {
+            FfiConverterTypeEdgeBlackholeEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<EdgeBlackholeEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeEdgeBlackholeEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<EdgeBlackholeEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeEdgeBlackholeEntry.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeEdgeErrorEvent: FfiConverterRustBuffer<List<EdgeErrorEvent>> {
     override fun read(buf: ByteBuffer): List<EdgeErrorEvent> {
         val len = buf.getInt()
@@ -2696,6 +3157,34 @@ public object FfiConverterSequenceTypeEdgeErrorEvent: FfiConverterRustBuffer<Lis
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeEdgeErrorEvent.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeEdgeInFlightAnnounce: FfiConverterRustBuffer<List<EdgeInFlightAnnounce>> {
+    override fun read(buf: ByteBuffer): List<EdgeInFlightAnnounce> {
+        val len = buf.getInt()
+        return List<EdgeInFlightAnnounce>(len) {
+            FfiConverterTypeEdgeInFlightAnnounce.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<EdgeInFlightAnnounce>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeEdgeInFlightAnnounce.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<EdgeInFlightAnnounce>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeEdgeInFlightAnnounce.write(it, buf)
         }
     }
 }
@@ -2846,6 +3335,90 @@ public object FfiConverterSequenceTypeEdgePeerInfo: FfiConverterRustBuffer<List<
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeEdgeRateEntry: FfiConverterRustBuffer<List<EdgeRateEntry>> {
+    override fun read(buf: ByteBuffer): List<EdgeRateEntry> {
+        val len = buf.getInt()
+        return List<EdgeRateEntry>(len) {
+            FfiConverterTypeEdgeRateEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<EdgeRateEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeEdgeRateEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<EdgeRateEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeEdgeRateEntry.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeEdgeReverseEntry: FfiConverterRustBuffer<List<EdgeReverseEntry>> {
+    override fun read(buf: ByteBuffer): List<EdgeReverseEntry> {
+        val len = buf.getInt()
+        return List<EdgeReverseEntry>(len) {
+            FfiConverterTypeEdgeReverseEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<EdgeReverseEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeEdgeReverseEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<EdgeReverseEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeEdgeReverseEntry.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeEdgeRoutingPathEntry: FfiConverterRustBuffer<List<EdgeRoutingPathEntry>> {
+    override fun read(buf: ByteBuffer): List<EdgeRoutingPathEntry> {
+        val len = buf.getInt()
+        return List<EdgeRoutingPathEntry>(len) {
+            FfiConverterTypeEdgeRoutingPathEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<EdgeRoutingPathEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeEdgeRoutingPathEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<EdgeRoutingPathEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeEdgeRoutingPathEntry.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeEdgeTransportInfo: FfiConverterRustBuffer<List<EdgeTransportInfo>> {
     override fun read(buf: ByteBuffer): List<EdgeTransportInfo> {
         val len = buf.getInt()
@@ -2864,6 +3437,34 @@ public object FfiConverterSequenceTypeEdgeTransportInfo: FfiConverterRustBuffer<
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeEdgeTransportInfo.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeEdgeTunnelInfo: FfiConverterRustBuffer<List<EdgeTunnelInfo>> {
+    override fun read(buf: ByteBuffer): List<EdgeTunnelInfo> {
+        val len = buf.getInt()
+        return List<EdgeTunnelInfo>(len) {
+            FfiConverterTypeEdgeTunnelInfo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<EdgeTunnelInfo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeEdgeTunnelInfo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<EdgeTunnelInfo>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeEdgeTunnelInfo.write(it, buf)
         }
     }
 }
@@ -3248,6 +3849,155 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
     UniffiLib.uniffi_ciris_edge_fn_func_recent_events(
     
         FfiConverterUInt.lower(`limit`),_status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingAnnounceTable`(): List<EdgeInFlightAnnounce> {
+            return FfiConverterSequenceTypeEdgeInFlightAnnounce.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_announce_table(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingBlackholeAdd`(`identityHash`: kotlin.ByteArray, `until`: kotlin.String?, `reason`: kotlin.String?)
+        = 
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_add(
+    
+        FfiConverterByteArray.lower(`identityHash`),FfiConverterOptionalString.lower(`until`),FfiConverterOptionalString.lower(`reason`),_status)
+}
+    
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingBlackholeList`(): List<EdgeBlackholeEntry> {
+            return FfiConverterSequenceTypeEdgeBlackholeEntry.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_list(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingBlackholeRemove`(`identityHash`: kotlin.ByteArray)
+        = 
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_blackhole_remove(
+    
+        FfiConverterByteArray.lower(`identityHash`),_status)
+}
+    
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingPathDrop`(`destinationHash`: kotlin.ByteArray)
+        = 
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_path_drop(
+    
+        FfiConverterByteArray.lower(`destinationHash`),_status)
+}
+    
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingPathDropVia`(`transportIdentityHash`: kotlin.ByteArray)
+        = 
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_path_drop_via(
+    
+        FfiConverterByteArray.lower(`transportIdentityHash`),_status)
+}
+    
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingPathRequest`(`destinationHash`: kotlin.ByteArray, `onInterface`: kotlin.String?)
+        = 
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_path_request(
+    
+        FfiConverterByteArray.lower(`destinationHash`),FfiConverterOptionalString.lower(`onInterface`),_status)
+}
+    
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingPathTable`(`maxHops`: kotlin.UInt?): List<EdgeRoutingPathEntry> {
+            return FfiConverterSequenceTypeEdgeRoutingPathEntry.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_path_table(
+    
+        FfiConverterOptionalUInt.lower(`maxHops`),_status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingPathTo`(`destinationHash`: kotlin.ByteArray): EdgeRoutingPathEntry? {
+            return FfiConverterOptionalTypeEdgeRoutingPathEntry.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_path_to(
+    
+        FfiConverterByteArray.lower(`destinationHash`),_status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingRateTable`(): List<EdgeRateEntry> {
+            return FfiConverterSequenceTypeEdgeRateEntry.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_rate_table(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingReverseTable`(): List<EdgeReverseEntry> {
+            return FfiConverterSequenceTypeEdgeReverseEntry.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_reverse_table(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingTransportId`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_transport_id(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingTransportUptime`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_transport_uptime(
+    
+        _status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `routingTunnels`(): List<EdgeTunnelInfo> {
+            return FfiConverterSequenceTypeEdgeTunnelInfo.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_routing_tunnels(
+    
+        _status)
 }
     )
     }

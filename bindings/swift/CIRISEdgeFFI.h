@@ -378,6 +378,83 @@ RustBuffer uniffi_ciris_edge_fn_func_recent_errors(uint32_t limit, RustCallStatu
 RustBuffer uniffi_ciris_edge_fn_func_recent_events(uint32_t limit, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_ANNOUNCE_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_ANNOUNCE_TABLE
+RustBuffer uniffi_ciris_edge_fn_func_routing_announce_table(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_ADD
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_ADD
+void uniffi_ciris_edge_fn_func_routing_blackhole_add(RustBuffer identity_hash, RustBuffer until, RustBuffer reason, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_LIST
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_LIST
+RustBuffer uniffi_ciris_edge_fn_func_routing_blackhole_list(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_REMOVE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_BLACKHOLE_REMOVE
+void uniffi_ciris_edge_fn_func_routing_blackhole_remove(RustBuffer identity_hash, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_DROP
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_DROP
+void uniffi_ciris_edge_fn_func_routing_path_drop(RustBuffer destination_hash, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_DROP_VIA
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_DROP_VIA
+void uniffi_ciris_edge_fn_func_routing_path_drop_via(RustBuffer transport_identity_hash, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_REQUEST
+void uniffi_ciris_edge_fn_func_routing_path_request(RustBuffer destination_hash, RustBuffer on_interface, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_TABLE
+RustBuffer uniffi_ciris_edge_fn_func_routing_path_table(RustBuffer max_hops, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_TO
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_PATH_TO
+RustBuffer uniffi_ciris_edge_fn_func_routing_path_to(RustBuffer destination_hash, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_RATE_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_RATE_TABLE
+RustBuffer uniffi_ciris_edge_fn_func_routing_rate_table(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_REVERSE_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_REVERSE_TABLE
+RustBuffer uniffi_ciris_edge_fn_func_routing_reverse_table(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_TRANSPORT_ID
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_TRANSPORT_ID
+RustBuffer uniffi_ciris_edge_fn_func_routing_transport_id(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_TRANSPORT_UPTIME
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_TRANSPORT_UPTIME
+uint64_t uniffi_ciris_edge_fn_func_routing_transport_uptime(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_TUNNELS
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_TUNNELS
+RustBuffer uniffi_ciris_edge_fn_func_routing_tunnels(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_TRANSPORT_ADD
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_TRANSPORT_ADD
 RustBuffer uniffi_ciris_edge_fn_func_transport_add(RustBuffer spec, RustCallStatus *_Nonnull out_status
@@ -831,6 +908,90 @@ uint16_t uniffi_ciris_edge_checksum_func_recent_errors(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_RECENT_EVENTS
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_RECENT_EVENTS
 uint16_t uniffi_ciris_edge_checksum_func_recent_events(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_ANNOUNCE_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_ANNOUNCE_TABLE
+uint16_t uniffi_ciris_edge_checksum_func_routing_announce_table(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_ADD
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_ADD
+uint16_t uniffi_ciris_edge_checksum_func_routing_blackhole_add(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_LIST
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_LIST
+uint16_t uniffi_ciris_edge_checksum_func_routing_blackhole_list(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_REMOVE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_BLACKHOLE_REMOVE
+uint16_t uniffi_ciris_edge_checksum_func_routing_blackhole_remove(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_DROP
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_DROP
+uint16_t uniffi_ciris_edge_checksum_func_routing_path_drop(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_DROP_VIA
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_DROP_VIA
+uint16_t uniffi_ciris_edge_checksum_func_routing_path_drop_via(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_REQUEST
+uint16_t uniffi_ciris_edge_checksum_func_routing_path_request(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_TABLE
+uint16_t uniffi_ciris_edge_checksum_func_routing_path_table(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_TO
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_PATH_TO
+uint16_t uniffi_ciris_edge_checksum_func_routing_path_to(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_RATE_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_RATE_TABLE
+uint16_t uniffi_ciris_edge_checksum_func_routing_rate_table(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_REVERSE_TABLE
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_REVERSE_TABLE
+uint16_t uniffi_ciris_edge_checksum_func_routing_reverse_table(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_TRANSPORT_ID
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_TRANSPORT_ID
+uint16_t uniffi_ciris_edge_checksum_func_routing_transport_id(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_TRANSPORT_UPTIME
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_TRANSPORT_UPTIME
+uint16_t uniffi_ciris_edge_checksum_func_routing_transport_uptime(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_TUNNELS
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROUTING_TUNNELS
+uint16_t uniffi_ciris_edge_checksum_func_routing_tunnels(void
     
 );
 #endif
