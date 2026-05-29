@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::cohort_scope::CohortScope;
 use crate::handler::{Delivery, FederationPriority, Message};
 use crate::key_boundary::KeyBoundaryScope;
 
@@ -342,6 +343,26 @@ pub struct EdgeEnvelope {
     /// follows in a later cut. See `src/key_boundary.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_boundary_scope: Option<KeyBoundaryScope>,
+    /// CIRISEdge#48-A (v0.19.1) — `cohort_scope` slot per
+    /// CIRISNodeCore SCHEMA §3.2 + FSD `FEDERATION_SCALING_MODEL.md`.
+    /// Carries the originator's declared cohort scope; edge structurally
+    /// enforces the wire-format locality dividend at
+    /// `Edge::send_*` (producer side) and at `dispatch_inbound`
+    /// (consumer side) per [`crate::cohort_scope::CohortScope`].
+    ///
+    /// `Option`-wrapped with `skip_serializing_if`: when `None`, the
+    /// field is OMITTED from JSON, so existing v0.19.0 envelopes
+    /// round-trip byte-equal and deserialize-default to `None` (which
+    /// edge interprets as [`CohortScope::Public`] — the legacy
+    /// implicit behaviour). When `Some`, the scope IS part of canonical
+    /// bytes and edge enforces the producer-side refusal + consumer-
+    /// side symmetric check per the [`CohortScope`] semantics.
+    ///
+    /// Default enforcement posture is
+    /// [`crate::cohort_scope::CohortScopeEnforcement::Strict`] per
+    /// CIRISEdge#48-A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohort_scope: Option<CohortScope>,
 }
 
 // ─── Phase 1 message types ──────────────────────────────────────────

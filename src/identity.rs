@@ -369,6 +369,7 @@ pub fn build_envelope<M: Serialize>(
         // emitting byte-equal envelopes.
         testimonial_witness: None,
         key_boundary_scope: None,
+        cohort_scope: None,
     })
 }
 

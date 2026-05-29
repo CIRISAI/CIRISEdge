@@ -42,6 +42,7 @@ fn v015_envelope() -> EdgeEnvelope {
         in_reply_to: None,
         testimonial_witness: None,
         key_boundary_scope: None,
+        cohort_scope: None,
     }
 }
 
@@ -66,6 +67,10 @@ fn envelope_without_witness_round_trips_unchanged() {
         !json.contains("key_boundary_scope"),
         "v0.15.x backward-compat: key_boundary_scope must NOT appear in JSON when None; got: {json}"
     );
+    assert!(
+        !json.contains("cohort_scope"),
+        "v0.19.0 backward-compat: cohort_scope must NOT appear in JSON when None; got: {json}"
+    );
 
     // Round-trip through deserialize → re-serialize → byte-equal.
     let back: EdgeEnvelope = serde_json::from_str(&json).expect("deserialize");
@@ -73,6 +78,7 @@ fn envelope_without_witness_round_trips_unchanged() {
     assert_eq!(json, again, "v0.15.x envelope must round-trip byte-equal");
     assert!(back.testimonial_witness.is_none());
     assert!(back.key_boundary_scope.is_none());
+    assert!(back.cohort_scope.is_none());
 }
 
 /// v0.16.0 — a witness-bearing envelope round-trips through

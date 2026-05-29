@@ -210,6 +210,7 @@ fn sample_envelope(body_size: usize) -> Vec<u8> {
         in_reply_to: None,
         testimonial_witness: None,
         key_boundary_scope: None,
+        cohort_scope: None,
     };
     serde_json::to_vec(&env).expect("serialize")
 }

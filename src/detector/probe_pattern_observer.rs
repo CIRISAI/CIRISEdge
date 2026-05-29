@@ -918,6 +918,9 @@ mod tests {
             // None for unit-test traffic.
             testimonial_witness: None,
             key_boundary_scope: None,
+            // v0.19.1 (CIRISEdge#48-A) — cohort_scope absent on
+            // detector unit-test fixtures.
+            cohort_scope: None,
         }
     }
 
