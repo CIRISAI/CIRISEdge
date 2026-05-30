@@ -47,8 +47,12 @@ jobs:
       # libtss2 for the `tpm` keyring feature — auto-enabled by
       # ciris-persist v1.10.0+ for Linux targets. Same dep edge's
       # `linux-x86_64-test` job in ci.yml installs (CIRISEdge#12).
-      - name: install libtss2-dev (TPM build dep)
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
+        # v0.19.7 (CIRISEdge#50) — `libsqlite3-dev` added alongside
+        # `libtss2-dev`. Persist v3.5.3+ drops the rusqlite `bundled`
+        # feature; the bench compile now needs the system sqlite
+        # header set. Mirrors ci.yml.
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
