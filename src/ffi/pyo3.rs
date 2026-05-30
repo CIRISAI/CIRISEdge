@@ -2727,6 +2727,17 @@ fn init_edge_runtime(
         .federation_directory(federation_directory_for_edge)
         .queue(queue)
         .signer(signer)
+        // v1.1.2 (CIRISEdge#50 darwin follow-on completion) — also
+        // pass the local-seed-derived signer extracted at Step 3.5.
+        // `Edge::scrub_signer` (added in v1.1.1) routes envelope
+        // signing through this in-memory adapter when its key_id
+        // matches `signer.key_id`, mirroring CIRISPersist#137/#138
+        // `select_signer`. v1.1.1 added the field + setter but
+        // **omitted this builder call** (commit 534d53f), so
+        // self.local_signer stayed None and signing routed through
+        // the forensic keyring path — identical behavior to v1.1.0
+        // on headless darwin. This line completes the fix.
+        .local_signer(reticulum_identity_signer.clone())
         .events(Arc::clone(&event_bus))
         .reachability(Arc::clone(&reachability_tracker))
         // v0.17.0 (CIRISEdge#39 emit_verdict flip) — wire the persist
