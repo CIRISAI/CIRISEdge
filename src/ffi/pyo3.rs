@@ -1674,6 +1674,106 @@ enum LocalSignerCapsuleError {
     Other(PyErr),
 }
 
+/// v0.20.0 RC1 (CIRISEdge#51 / CIRISPersist#129) — typed outcome of
+/// the `trust_scoring_capsule` extraction attempt. Only
+/// [`init_edge_runtime`] consumes this; the variants drive the
+/// fallback-vs-hard-error decision at the v0.20.0 RC1 wiring site —
+/// missing method AND the typed `trust_scoring_unavailable`
+/// ValueError both fall back to the v0.19.6 bootstrap-permissive
+/// `trust_scoring = None` posture.
+#[cfg(feature = "transport-reticulum")]
+enum TrustScoringCapsuleError {
+    /// Engine doesn't expose `trust_scoring_capsule` at all (persist
+    /// older than v3.5.1). Fallback to `None` posture (bootstrap-
+    /// permissive); log a warning naming the persist upgrade path.
+    MethodAbsent,
+    /// Engine exposes the method but raised the typed
+    /// `ValueError("trust_scoring_unavailable")` — no `AdmissionGate`
+    /// has been installed via `Engine::set_admission_gate`.
+    /// Fallback to `None` posture; log an info-level breadcrumb (this
+    /// is the expected bootstrap default until the operator opts
+    /// into trust-gated dispatch).
+    Unavailable,
+    /// Any other failure (capsule cast mismatch, unexpected exception
+    /// type) — surface as a hard error from `init_edge_runtime` rather
+    /// than silently fall back. Loud-fail per the v0.13.0 contract.
+    Other(PyErr),
+}
+
+/// v0.20.0 RC1 (CIRISEdge#51 / CIRISPersist#129) — extract the
+/// persist trust-scoring `Arc<dyn TrustScoring>` from the shared
+/// engine's `trust_scoring_capsule()` pymethod.
+///
+/// Returns:
+/// - `Ok(Arc<dyn TrustScoring>)` on success — the wrapped Arc is
+///   cloned out of the capsule for the caller to keep beyond the
+///   capsule's lifetime.
+/// - `Err(TrustScoringCapsuleError::MethodAbsent)` when
+///   `engine.hasattr("trust_scoring_capsule")` is false. Persist older
+///   than v3.5.1 — fall back to the v0.19.6 `None` posture.
+/// - `Err(TrustScoringCapsuleError::Unavailable)` when the method
+///   exists but raised `ValueError("trust_scoring_unavailable")`.
+///   Persist v3.5.1+ with no installed admission gate — also fall
+///   back to the `None` posture (the bootstrap default).
+/// - `Err(TrustScoringCapsuleError::Other(_))` for any other failure
+///   (non-PyCapsule return value, wrong capsule name tag, etc.) —
+///   loud-fail at the init boundary.
+///
+/// Mirrors [`extract_local_signer`]'s shape: a capsule with a
+/// fall-back-able failure mode (typed
+/// `trust_scoring_unavailable` ValueError) needs its own typed-outcome
+/// helper rather than the generic [`extract_capsule`] path (which
+/// hard-fails on any method-call exception).
+///
+/// Capsule contract (CIRISPersist v3.5.1 / src/ffi/pyo3.rs):
+/// - Name tag: `"ciris_persist::trust_scoring"`
+/// - Wrapped type: `Arc<dyn ciris_persist::federation::TrustScoring>`
+#[cfg(feature = "transport-reticulum")]
+#[allow(unsafe_code)]
+fn extract_trust_scoring(
+    engine: &Bound<'_, PyAny>,
+) -> Result<Arc<dyn ciris_persist::federation::TrustScoring>, TrustScoringCapsuleError> {
+    if !engine.hasattr("trust_scoring_capsule").unwrap_or(false) {
+        return Err(TrustScoringCapsuleError::MethodAbsent);
+    }
+    let result = engine.call_method0("trust_scoring_capsule").map_err(|e| {
+        // Distinguish the typed
+        // `ValueError("trust_scoring_unavailable")` from any other
+        // exception. Persist v3.5.1's `trust_scoring_capsule_py`
+        // raises ONLY that exact ValueError when no
+        // AdmissionGate is installed; anything else is a real
+        // error.
+        Python::attach(|py| {
+            if e.is_instance_of::<PyValueError>(py)
+                && e.value(py).to_string() == "trust_scoring_unavailable"
+            {
+                TrustScoringCapsuleError::Unavailable
+            } else {
+                TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
+                    "engine.trust_scoring_capsule() raised: {e}"
+                )))
+            }
+        })
+    })?;
+    let cap: Bound<'_, PyCapsule> = result.cast_into::<PyCapsule>().map_err(|e| {
+        TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
+            "engine.trust_scoring_capsule() did not return a PyCapsule (got {e}); \
+             persist 3.5.1 cohabitation contract violated"
+        )))
+    })?;
+    // SAFETY: persist v3.5.1+'s `trust_scoring_capsule_py` wraps an
+    // `Arc<dyn ciris_persist::federation::TrustScoring>` under the
+    // name tag `"ciris_persist::trust_scoring"`. The Cargo pin
+    // (`ciris-persist = { tag = "v3.6.3", version = "3" }`) enforces
+    // that contract (v3.6.3 carries v3.5.1's surface forward via
+    // v3.5.2 + v3.6.0). The cloned `Arc` is owned by the caller —
+    // the capsule reference doesn't escape this function.
+    #[allow(deprecated)]
+    let inner: &Arc<dyn ciris_persist::federation::TrustScoring> =
+        unsafe { cap.reference::<Arc<dyn ciris_persist::federation::TrustScoring>>() };
+    Ok(Arc::clone(inner))
+}
+
 /// v0.16.1 cherry-pick (CIRISEdge#43 / CIRISPersist#119) — extract the
 /// persist transport-identity `Arc<LocalSigner>` from the shared
 /// engine's `local_signer_capsule()` pymethod.
@@ -1819,6 +1919,15 @@ fn extract_local_signer(
 ///     announce_interval_seconds=300,
 ///     local_epoch=0,
 ///     hybrid_policy="strict",
+///     agent_mode="server",          # v0.18.0 (CIRISEdge#45);
+///                                   # v0.20.0 RC1 (CIRISEdge#51)
+///                                   # extends to CEWP L0/L1 tier
+///                                   # defaults
+///     # Optional v0.20.0 RC1 operator overrides:
+///     disk_budget_bytes=512 * 1024**3,  # Override Server's 1 TB L1
+///                                       # default; advisory at edge
+///     trust_recursion_depth=0,          # Override Server's depth=1
+///                                       # default to strict
 /// )
 /// ```
 ///
@@ -1851,6 +1960,8 @@ fn extract_local_signer(
     https_bearer_secret = None,
     https_dev_self_signed = false,
     disable_reticulum = false,
+    disk_budget_bytes = None,
+    trust_recursion_depth = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -1886,6 +1997,18 @@ fn init_edge_runtime(
     // outbound. Defaults to `False` so existing Reticulum-only +
     // Reticulum+HTTPS coexistence callers keep their behaviour.
     disable_reticulum: bool,
+    // v0.20.0 RC1 (CIRISEdge#51) — optional operator overrides for the
+    // CEWP L0/L1 tier defaults. `None` → use the `AgentMode`-derived
+    // default (Client = 0, Proxy = 256 GB, Server = 1 TB for
+    // `disk_budget_bytes`; Client = 0, Proxy = 0, Server = 1 for
+    // `trust_recursion_depth`). `Some(_)` pins the per-deployment
+    // value AFTER `AgentMode::apply_defaults` runs, so a curated
+    // server (e.g.) can pin depth = 0 even though L1 default is 1.
+    // `trust_recursion_depth` is clamped to `u8`'s range; persist's
+    // `TrustScoring::trust_score(_, recursion_depth: u8)` consumes it
+    // verbatim.
+    disk_budget_bytes: Option<u64>,
+    trust_recursion_depth: Option<u8>,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -2118,25 +2241,60 @@ fn init_edge_runtime(
         BackendDispatch::Postgres(b) => b.clone(),
         BackendDispatch::Sqlite(b) => b.clone(),
     };
-    // v0.19.6 (CIRISEdge#48-B / CIRISPersist#123) — `TrustScoring`
-    // wiring on the cohabitation pyo3 init path is deferred to v0.20.0
-    // RC1. Persist v3.4.0 exposes `Engine::set_admission_gate` (which
-    // installs an `Arc<dyn TrustScoring>` under an `AdmissionGate`),
-    // but does NOT expose an accessor that hands the scoring arc back
-    // out for siblings to consume. Both backends impl
-    // `TrustScoring` only via in-test fixtures — there is no
-    // production `impl TrustScoring for SqliteBackend` we could pivot
-    // on through the existing `BackendDispatch` capsule. The edge
-    // `Edge::trust_scoring()` + `EdgeBuilder::trust_scoring()`
-    // surfaces ARE shipped at v0.19.6 (operators wiring an explicit
-    // scorer can use them via the non-cohabitation builder path); the
-    // cohabitation auto-derive lands once persist exposes an
-    // `Engine::trust_scoring_capsule()` or
-    // `AdmissionGate::scoring_arc()` accessor in a v3.5.1+ cut.
-    // Until then the short-circuit on the cohabitation path is
-    // structurally disabled — same posture as
-    // `trust_threshold = 0.0` (bootstrap-permissive).
-    let trust_scoring: Option<Arc<dyn ciris_persist::federation::TrustScoring>> = None;
+    // v0.20.0 RC1 (CIRISEdge#51 / CIRISPersist#129) — close the
+    // v0.19.6 cohabitation-deferral residual. Persist v3.5.1 shipped
+    // the 7th cohabitation capsule (`trust_scoring_capsule()`), and
+    // v3.6.3 (this Edge's pin) carries it forward. We attempt to
+    // extract the `Arc<dyn TrustScoring>` from the engine's installed
+    // `AdmissionGate`; the typed `TrustScoringCapsuleError` outcomes
+    // map to:
+    //
+    //  - `MethodAbsent` → severely-stale persist (< v3.5.1); the
+    //    v0.20.0 Cargo floor (v3.6.3) makes this branch unreachable
+    //    in production but the warning fires defensively so a
+    //    forced-pin mismatch surfaces loud.
+    //  - `Unavailable` → typed `trust_scoring_unavailable` ValueError
+    //    from persist (no `AdmissionGate` installed via
+    //    `Engine::set_admission_gate`). This IS the bootstrap default
+    //    posture — fall back to `None` so the dispatch short-circuit
+    //    stays structurally disabled (matches `trust_threshold = 0.0`
+    //    discipline). Log an info breadcrumb so the operator can
+    //    correlate.
+    //  - `Other(_)` → unexpected exception or capsule cast failure;
+    //    loud-fail per the v0.13.0 contract.
+    //
+    // On success the wired scorer reaches `EdgeBuilder::trust_scoring`
+    // at Step 6 below; in tandem with `EdgeConfig::trust_threshold`
+    // (operator-configured) and the new `trust_recursion_depth` field
+    // it gates the inbound short-circuit at `dispatch_inbound`.
+    let trust_scoring: Option<Arc<dyn ciris_persist::federation::TrustScoring>> =
+        match extract_trust_scoring(&engine) {
+            Ok(scorer) => Some(scorer),
+            Err(TrustScoringCapsuleError::Unavailable) => {
+                tracing::info!(
+                    "ciris_persist.Engine raised trust_scoring_unavailable from \
+                     trust_scoring_capsule(); no AdmissionGate installed — \
+                     dispatch_inbound trust short-circuit stays structurally \
+                     disabled (bootstrap-permissive default, same as \
+                     EdgeConfig::trust_threshold = 0.0). Install a gate via \
+                     persist's Engine::set_admission_gate(...) to opt in."
+                );
+                None
+            }
+            Err(TrustScoringCapsuleError::MethodAbsent) => {
+                tracing::warn!(
+                    "ciris_persist.Engine does not expose trust_scoring_capsule() \
+                     (persist < 3.5.1); falling back to None posture for \
+                     dispatch_inbound trust short-circuit. v0.20.0 RC1's Cargo \
+                     floor is `tag = \"v3.6.3\"`; this branch indicates a \
+                     forced-pin mismatch on the consumer side."
+                );
+                None
+            }
+            Err(TrustScoringCapsuleError::Other(e)) => {
+                return Err(e);
+            }
+        };
     let queue: Arc<dyn OutboundHandle> = match queue_dispatch {
         BackendDispatch::Postgres(b) => b,
         BackendDispatch::Sqlite(b) => b,
@@ -2534,6 +2692,21 @@ fn init_edge_runtime(
         ..Default::default()
     };
     parsed_agent_mode.apply_defaults(&mut config);
+    // v0.20.0 RC1 (CIRISEdge#51) — operator overrides for the CEWP
+    // L0/L1 tier defaults. `apply_defaults` set both fields to the
+    // mode-derived value; `Some(_)` here pins a per-deployment
+    // override. The two knobs are orthogonal — disk_budget_bytes is
+    // advisory at edge (persist/host enforces capacity), while
+    // trust_recursion_depth threads through dispatch_inbound's
+    // `TrustScoring::trust_score` call (depth 0 = strict direct
+    // attestations; depth 1 = friend-of-friends via persist's
+    // delegates_to walk).
+    if let Some(bytes) = disk_budget_bytes {
+        config.disk_budget_bytes = bytes;
+    }
+    if let Some(depth) = trust_recursion_depth {
+        config.trust_recursion_depth = depth;
+    }
 
     let mut builder = Edge::builder()
         .directory(Arc::clone(&verify_dir))
@@ -3702,6 +3875,8 @@ mod pyo3_tier2_tests {
                 None,  // https_bearer_secret
                 false, // https_dev_self_signed
                 false, // disable_reticulum
+                None,  // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,  // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -3788,6 +3963,8 @@ mod pyo3_tier2_tests {
                 None,  // https_bearer_secret
                 false, // https_dev_self_signed
                 false, // disable_reticulum
+                None,  // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,  // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -3930,6 +4107,8 @@ mod pyo3_tier2_tests {
                 None,  // https_bearer_secret
                 false, // https_dev_self_signed
                 false, // disable_reticulum
+                None,  // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,  // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
             )?;
             Ok(())
         });
@@ -4025,6 +4204,8 @@ mod pyo3_tier2_tests {
                 None,  // https_bearer_secret
                 false, // https_dev_self_signed
                 false, // disable_reticulum
+                None,  // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,  // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -4174,6 +4355,8 @@ mod pyo3_tier2_tests {
                 None,  // https_bearer_secret
                 false, // https_dev_self_signed
                 false, // disable_reticulum
+                None,  // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,  // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -4309,6 +4492,8 @@ mod pyo3_tier2_tests {
                 None,  // https_bearer_secret
                 false, // https_dev_self_signed
                 false, // disable_reticulum
+                None,  // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,  // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
             )?;
             Ok(edge.signer_key_id())
         });

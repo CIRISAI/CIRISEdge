@@ -93,6 +93,33 @@ substrate**: edge does not reason, score, store, or root identity — it
 *carries the cryptographic envelope between deployments* and rejects
 the malformed before any application code is reached.
 
+### 1.3.1 CEWP context — edge as the transport tier of the seven-repo stack
+
+CIRIS 3.0 is the **CIRIS Epistemic Web Platform (CEWP)** — a seven-repo
+stack where each crate owns exactly one tier of the federation
+substrate. v0.20.0 RC1 (CIRISEdge#51) is the cut that explicitly
+anchors edge as the **transport tier**:
+
+| Repo            | Tier                                          |
+|-----------------|-----------------------------------------------|
+| CIRISGUI        | UI / interaction surface                      |
+| CIRISAgent      | reasoning / policy                            |
+| CIRISNodeCore   | node-side service substrate (tasks, secrets)  |
+| CIRISLensCore   | scoring / detection                           |
+| CIRISRegistry   | federation-ratified release manifests         |
+| CIRISPersist    | storage substrate (DB + canonicalize + keys)  |
+| CIRISVerify     | crypto primitives (hardware signer / hybrid)  |
+| **CIRISEdge**   | **transport — signed envelopes between peers** |
+
+The CEWP framing makes two claims load-bearing at the transport tier
+(`FSD/FEDERATION_SCALING_MODEL.md` + `CIRISNodeCore/FSD/CEWP.md`):
+**"no datacenters required"** and **"switching cost approaches zero"**.
+Edge is the crate that has to actually make those true on the wire —
+a federation whose transport silently forwards through one CDN is
+neither datacenter-free nor switch-able. The CEWP framing is not a
+new contract; it is a renaming of the v0.4.0 mission posture against
+the v1.0 surface area.
+
 ### 1.4 Apophatic bound — what CIRISEdge will not be
 
 CIRIS is partly defined by structural refusal. CIRISEdge's refusals are
@@ -487,14 +514,16 @@ and intentionally does not touch the substrate today. Together these
 fields make CIRISEdge legibly compliant with the CIRIS 3.0 protocol
 surface, in the AGPL letter as well as the apophatic spirit of §1.4.
 
-## 11. Architectural surfaces shipped v0.5.0 → v0.19.6
+## 11. Architectural surfaces shipped v0.5.0 → v0.20.0 RC1
 
 The v0.4.0 reverse-engineering pass anchored the v1.0-prep architecture
 floor — verify pipeline, durable outbound, Reticulum + HTTP transports,
 authenticated `PeerResolver` cold-start (AV-42). The minors between
-v0.4.0 and v0.17.0 added six load-bearing surfaces that the v1.0 doc
-contract must name explicitly. Each is anchored to its primary
-implementation file:
+v0.4.0 and v0.20.0 RC1 added load-bearing surfaces that the v1.0 doc
+contract must name explicitly. v0.20.0 RC1 (CIRISEdge#51) is the last
+infrastructure cut before v1.0.0 GA — v0.20.1 ships multimedia (#52),
+v1.0.0 ships as the "Agent 3.0 / CEWP" release. Each surface is
+anchored to its primary implementation file:
 
 - **Link lifecycle primitive** (v0.14.0 CIRISEdge#32,
   `src/transport/reticulum.rs::link_open` / `link_teardown` /
@@ -647,6 +676,43 @@ implementation file:
   disabled means no drop fires — the belt-and-suspenders shape
   prevents a misconfigured deployment from silently rejecting
   every envelope.
+  **v0.20.0 RC1 (CIRISEdge#51 / CIRISPersist#129)** — the v0.19.6
+  cohabitation-deferral residual is closed. Persist v3.5.1 shipped
+  the 7th cohabitation capsule (`Engine::trust_scoring_capsule`,
+  name tag `ciris_persist::trust_scoring`); v0.20.0 RC1 consumes it
+  via `src/ffi/pyo3.rs::extract_trust_scoring`. The cohab pyo3 init
+  path now auto-derives the `Arc<dyn TrustScoring>` from the
+  engine's installed `AdmissionGate` and falls back to the
+  bootstrap-permissive `None` posture (matching `trust_threshold =
+  0.0`) when the typed `ValueError("trust_scoring_unavailable")`
+  fires — no `AdmissionGate` installed means no gate.
+- **CEWP L0/L1 tier vocabulary** (v0.20.0 RC1 CIRISEdge#51,
+  `src/edge.rs::AgentMode::{default_disk_budget_bytes,default_trust_recursion_depth}`
+  + `EdgeConfig::{disk_budget_bytes,trust_recursion_depth}` +
+  `src/ffi/pyo3.rs::init_edge_runtime` (the `disk_budget_bytes` +
+  `trust_recursion_depth` optional kwargs), pinned by
+  `tests/agent_mode_init.rs` and `tests/trust_recursion_depth_wired.rs`)
+  — `AgentMode` extends from v0.18.0's listener-bound + outbound-
+  queue-cap mapping to the full CEWP L0/L1 tier vocabulary per FSD
+  `FEDERATION_SCALING_MODEL.md` + CIRISNodeCore `FSD/CEWP.md`:
+
+  | Mode     | Listener | Out-queue | Disk budget | Trust recursion |
+  |----------|----------|-----------|-------------|-----------------|
+  | Client   | no       | 256       | 0           | 0               |
+  | Proxy    | yes      | 4096      | 256 GB (L0) | 0 (strict)      |
+  | Server   | yes      | 65536     | 1 TB (L1)   | 1 (FoF)         |
+
+  `disk_budget_bytes` is **advisory at the edge tier** — persist or
+  the host consults `Edge::disk_budget_bytes()` to enforce capacity-
+  gated admission; edge does not store anything (apophatic bound
+  §1.4 "Not a storage layer"). `trust_recursion_depth` is
+  **consulted** at `dispatch_inbound`'s short-circuit as the
+  `recursion_depth` argument to `TrustScoring::trust_score`
+  (replacing v0.19.6's hardcoded `0`). Operator overrides on
+  `init_edge_runtime` allow per-deployment tuning — a curated
+  server may pin depth = 0 even though L1 default is 1, and a
+  storage-constrained proxy may shrink its 256 GB budget to a
+  per-deployment cap. L2+ depths deferred to a post-v1.0 cut.
 - **HTTPS production-grade hardening** (v0.18.1 CIRISEdge#23,
   `src/transport/http.rs::HttpsTransport` + `HttpServerConfig` +
   `HttpClientConfig` + `BearerTokenAuth` + `FederationCnVerifier`,

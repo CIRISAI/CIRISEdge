@@ -1107,13 +1107,18 @@ Configuration knobs:
     `false` for migration / dev paths that want to disable the
     check without zeroing the threshold).
   - `Arc<dyn TrustScoring>` wired via `EdgeBuilder::trust_scoring()`.
-    `None` (the default) structurally disables the short-circuit
-    — same effect as `threshold = 0.0`. The cohabitation pyo3 init
-    path currently leaves this `None` (deferred to v0.20.0 RC1
-    pending an `AdmissionGate::scoring_arc()` accessor in a
-    persist v3.5.1+ cut; persist v3.5.0 exposes the install side
-    `Engine::set_admission_gate` but no read accessor on the gate
-    itself).
+    `None` (the default) structurally disables the short-circuit —
+    same effect as `threshold = 0.0`. **v0.20.0 RC1
+    (CIRISEdge#51 / CIRISPersist#129)**: the cohabitation pyo3 init
+    path now auto-derives the scorer via
+    `extract_trust_scoring(engine)` (`src/ffi/pyo3.rs`), which
+    consumes persist v3.5.1+'s `Engine::trust_scoring_capsule`
+    (name tag `ciris_persist::trust_scoring`, wrapped type
+    `Arc<dyn TrustScoring>`). When no `AdmissionGate` has been
+    installed (the typed `ValueError("trust_scoring_unavailable")`),
+    the cohab path falls back to `None` (bootstrap-permissive) and
+    logs an info breadcrumb naming the install path
+    (`Engine::set_admission_gate`).
 
 The effective check is the AND of all three predicates; any one
 disabled means no drop fires. This belt-and-suspenders shape
@@ -1152,16 +1157,120 @@ resource_kind tag), (g) metrics counter increments, (h) absent
 scorer structurally disables, (i) typed error variant carries
 key_id + score + threshold + issue tag.
 
-**Residual**: the cohabitation pyo3 init path currently leaves
-`trust_scoring = None`, so production cohabitation deployments
-fall back to the bootstrap-permissive default until persist
-exposes the `AdmissionGate::scoring_arc()` (or
-`Engine::trust_scoring_capsule()`) accessor needed to auto-derive
-the scorer from the engine's installed admission gate. Operators
-deploying outside the cohabitation path (e.g. sovereign Pi /
-mobile / standalone hosts using `EdgeBuilder` directly) can wire
-the scorer via `EdgeBuilder::trust_scoring()` immediately at
-v0.19.6.
+**v0.20.0 RC1 closure** (CIRISEdge#51 / CIRISPersist#129): the
+v0.19.6 cohabitation-deferral residual is removed. Persist v3.5.1
+shipped the 7th cohabitation capsule
+(`Engine::trust_scoring_capsule`, name tag
+`ciris_persist::trust_scoring`); edge consumes it via
+`src/ffi/pyo3.rs::extract_trust_scoring`. The cohab pyo3 init now
+auto-derives the `Arc<dyn TrustScoring>` from the engine's
+installed `AdmissionGate` (the same Arc that
+`Engine::set_admission_gate(...)` installs) and falls back to the
+bootstrap-permissive `None` posture (matching the operator
+sentinel `trust_threshold = 0.0`) when no gate is installed. The
+typed `TrustScoringCapsuleError::Other` variant preserves the
+v0.13.0 "loud fail on unexpected capsule shape" contract; missing
+methods and typed unavailability fall back with structured warn /
+info logs. Operators deploying outside the cohabitation path
+(sovereign Pi / mobile / standalone hosts using `EdgeBuilder`
+directly) continue to wire the scorer via
+`EdgeBuilder::trust_scoring()` — unchanged from v0.19.6.
+
+**v0.20.0 RC1 recursion-depth wiring** (CIRISEdge#51,
+`EdgeConfig::trust_recursion_depth` + `AgentMode::
+default_trust_recursion_depth`): the resolver call now passes the
+operator-configured depth (CEWP L0 = 0, L1 = 1) instead of v0.19.6's
+hardcoded `0`. Persist's `TrustScoring::trust_score(_,
+recursion_depth: u8)` walks `delegates_to` edges per the BFS in
+`crate::federation::topology::build_delegation_graph`; depth = 0
+yields strict direct attestations, depth = 1 yields friend-of-
+friends. The L0/L1 tier is documented as a security boundary
+below (§4.9 CEWP L0/L1 tier model).
+
+#### CEWP L0/L1 tier model — recursion depth as blast-radius bound, disk budget as capacity-gated admission contract (v0.20.0 RC1, CIRISEdge#51)
+
+**Architectural framing**: CIRIS 3.0 is the **CIRIS Epistemic Web
+Platform (CEWP)** per FSD `FEDERATION_SCALING_MODEL.md` +
+`CIRISNodeCore/FSD/CEWP.md`. The federation scales across
+deployments with **distinct storage + trust tiers** — a sovereign Pi
+(L0 / Proxy) is not a curated bootstrap host (L1 / Server); a
+hyperscaler-detached client is neither. v0.20.0 RC1 promotes
+`AgentMode` from the v0.18.0 "listener bind + outbound queue cap"
+posture-only knobs to the full L0/L1 tier vocabulary:
+
+| Mode     | CEWP tier | Disk budget   | Trust recursion |
+|----------|-----------|---------------|-----------------|
+| Client   | n/a       | 0             | 0               |
+| Proxy    | L0        | 256 GB        | 0 (strict)      |
+| Server   | L1        | 1 TB          | 1 (FoF)         |
+
+**`trust_recursion_depth` as security boundary**: the depth threads
+into persist's `TrustScoring::trust_score(key_id, recursion_depth)`
+(CIRISPersist#123) which walks `delegates_to` attestation edges per
+the BFS in `crate::federation::topology::build_delegation_graph`.
+**Higher depth = wider attestation graph = larger blast radius if
+a single attester is compromised**. Strict depth = 0 (L0) only
+counts attestations directly targeting the key; depth = 1 (L1)
+walks one `delegates_to` hop and counts the attester's attesters as
+well. The L0/L1 default is a **conservative bound** — the spec's
+"distinct CEWP tiers" framing maps directly onto attestation-graph
+distance. Operators may override per deployment via
+`init_edge_runtime`'s `trust_recursion_depth` kwarg (e.g. a curated
+bootstrap host may pin depth = 0 even though L1 default is 1, when
+the operator wants direct-trust strictness regardless of tier).
+
+**`disk_budget_bytes` as capacity-gated admission contract**: edge
+**does not enforce** the budget — persist or the host consults
+`Edge::disk_budget_bytes()` (`src/edge.rs`) at admission time. The
+edge surface exposes the budget as a contract: a peer declaring
+itself an L1 server agrees to host up to 1 TB of evidence; a peer
+declaring itself an L0 proxy agrees to 256 GB. The substrate that
+admits content rows checks `disk_budget_bytes` against current
+table size before write — capacity-gated admission per persist's
+`AdmissionGate` discipline. Without the per-tier contract,
+federation peers cannot reason about who can hold what, and the
+N_eff measurement that CIRIS's Proof-of-Benefit substrate computes
+(`PROOF_OF_BENEFIT_FEDERATION.md` §2.4) becomes opaque to capacity
+constraints.
+
+**Threat that the L0/L1 model intentionally leaves open**: a peer
+declaring itself L1 but actually only having 32 GB of storage is
+not detectable from the edge tier alone. The discrepancy surfaces
+at persist's first admission failure (a row is too large to admit
+under the actual capacity); the operator gets a typed error from
+persist + an opportunity to either reduce the budget declaration
+or expand storage. Edge advertises the contract; persist enforces
+it; the **declaration-vs-reality gap is a persist responsibility,
+not an edge one**. The apophatic bound §1.4 "Not a storage layer"
+holds.
+
+**Threat that the L0/L1 model architecturally closes**: a peer
+declaring itself L1 but pinning depth = 5 to inflate its trust
+score is blocked at the persist tier — persist's `TrustScoring`
+admits the depth as an argument but persist's `AdmissionGate`
+discipline can cap the effective depth per-deployment. Edge is the
+contract-surface; persist is the policy-enforcement-surface. L2+
+tiers (depth ≥ 2, multi-TB) are deferred to a post-v1.0 cut — the
+v1.0 GA contract is L0/L1 only.
+
+**Test**: `tests/agent_mode_init.rs` (12 tests covering the
+default-budget + recursion-depth matrix per mode + operator-
+override semantics) and `tests/trust_recursion_depth_wired.rs` (5
+tests pinning the
+`EdgeConfig::trust_recursion_depth → dispatch_inbound →
+TrustScoring::trust_score` byte-equivalence flow via a recording
+scorer).
+
+**Residual**: `disk_budget_bytes` is advisory at edge — operators
+must use persist's `Engine::set_capacity_budget` (post-v1.0
+follow-up; documented contract not yet shipped) to get
+persist-tier enforcement. Until persist v3.7+, an L0 proxy that
+exceeds 256 GB will see persist admit rows past the declared budget
+with no edge-side rejection; the operator sees the discrepancy via
+the standard persist row-count + disk-usage observability surface,
+not via a typed `AV-49 DiskBudgetExceeded` rejection. The wire
+contract (the field exists and is byte-equivalent across peers) is
+locked at v0.20.0 RC1; enforcement is a persist follow-up.
 
 ### 4.9 Forward-looking invariants (anchored at v0.17.1 for v0.18.x wire-up)
 
@@ -1476,6 +1585,24 @@ V0.19.6 SHIPPED (CIRISEdge#48-A completion + #48-B)
            peer_metadata_for (CIRISPersist#127). Cohort{id}
            consumer-side check enabled (v0.19.1 deferred arm closes).
            key_boundary_scope-to-signature binding REMAINS deferred.
+
+V0.20.0 RC1 SHIPPED (CIRISEdge#51 — CEWP infrastructure cut)
+  ✓ AV-48  cohabitation residual CLOSED — pyo3 init now
+           auto-derives Arc<dyn TrustScoring> via persist v3.5.1's
+           Engine::trust_scoring_capsule (7th cohab capsule, name
+           tag ciris_persist::trust_scoring); typed
+           ValueError("trust_scoring_unavailable") falls back to
+           the bootstrap-permissive None posture (CIRISPersist#129)
+  ✓ CEWP L0/L1 tier model — AgentMode extends from listener+queue
+           knobs to the full CEWP vocabulary: disk_budget_bytes
+           (advisory at edge; persist/host enforces) +
+           trust_recursion_depth (threaded into
+           TrustScoring::trust_score replacing v0.19.6's hardcoded
+           0); L0/L1 documented as security boundary in §4.9
+           (recursion depth = blast radius bound; storage budget =
+           capacity-gated admission contract). Operator overrides
+           on init_edge_runtime allow per-deployment tuning. L2+
+           depths deferred to post-v1.0.
 
 PHASE-1 P1 BUNDLE — must land for production cutover
   ⚠ AV-3   Replay LRU with 5-min window
