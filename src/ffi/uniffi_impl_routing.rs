@@ -34,13 +34,18 @@
 //!
 //! # Upstream Leviculum gaps
 //!
-//! Per the v0.15.0 brief, several read methods return empty Vecs in
-//! v0.15.0 because the underlying `NodeCore::*_table_entries`
-//! accessors are `pub(crate)` from `reticulum-std` (or never exposed,
-//! in the case of `tunnels` and `reverse_table`). The wire shape is
-//! pinned so a v0.15.x patch can flip on real values without
-//! binding-side churn. See per-method docs on
-//! `ReticulumTransport::routing_*` for the gap notes.
+//! v0.15.0 shipped 8 read methods as documented Vec::new() stubs
+//! because the underlying accessors were `pub(crate)` in
+//! reticulum-std. v1.1.0 (CIRISEdge#44) closes 5 of them — the
+//! CIRISAI/leviculum fork now exposes `path_table_entries`,
+//! `rate_table_entries`, `get_path_clone`, `remove_path`, and
+//! `drop_all_paths_via` publicly on `ReticulumNode`. The remaining
+//! 3 (`routing_tunnels`, `routing_announce_table`,
+//! `routing_reverse_table`) stay Vec::new() — those backing data
+//! structures either don't exist as collections in this Leviculum
+//! fork or have a wire-shape mismatch with Edge's pinned schema.
+//! See per-method docs on `ReticulumTransport::routing_*` for the
+//! detailed status.
 
 #[cfg(feature = "_reticulum-module")]
 use crate::transport::TransportError;
