@@ -1268,9 +1268,87 @@ persist-tier enforcement. Until persist v3.7+, an L0 proxy that
 exceeds 256 GB will see persist admit rows past the declared budget
 with no edge-side rejection; the operator sees the discrepancy via
 the standard persist row-count + disk-usage observability surface,
-not via a typed `AV-49 DiskBudgetExceeded` rejection. The wire
+not via a typed disk-budget rejection (a future
+`DiskBudgetExceeded` shape; reserved name not yet taken). The wire
 contract (the field exists and is byte-equivalent across peers) is
 locked at v0.20.0 RC1; enforcement is a persist follow-up.
+
+#### AV-49 — Multimedia tier transport semantics (v0.20.1, CIRISEdge#52)
+
+**AV-49 — Multimedia tier transport semantics**:
+- takedown_notice fast-path bypasses standard rate-limiting for TVEC/GIFCT-CIP/NCMEC (legal-compliance basis)
+- Edge does not fetch external bytes; consumer's client fetches directly from external_uri (avoiding edge-as-MitM concerns + bandwidth amplification)
+- L1-as-CDN-edge opt-in is operator choice; opt-out is the default
+- BlobBody::External bytes are NOT scrubbed by edge (scrub primitive is for inline_text_pipeline only); external content is the publisher's responsibility
+
+**Implementation surfaces (CIRISEdge#52, v0.20.1)**:
+
+- `src/multimedia.rs` — typed `FastPathLegalBasis` (TVEC, GIFCT-CIP,
+  NCMEC) + `ContributionSubjectKind` (TakedownNotice, KeyGrant) +
+  `ContributionDispatchProbe` (best-effort body-field projection) +
+  `ExternalRefWithAcl` (wire-form for the BlobBody::External pointer)
+  + `cdn_edge_prefetch_stub` (L1-CDN-edge async entry point).
+- `src/edge.rs::dispatch_inbound` — Contribution sub-dispatch arm
+  fires `edge.dispatch.takedown_fast_path` on a fast-path
+  legal_basis match, `edge.dispatch.key_grant` on KeyGrant, and
+  `tokio::spawn`s `cdn_edge_prefetch_stub` on Server-mode +
+  l1_cdn_edge_enabled + external blob_body_kind.
+- `src/edge.rs::validate_content_body` — short-circuits the AV-13
+  + SHA-256 integrity gate when the body's `kind == "external"`
+  discriminator is set; edge does NOT re-hash external bytes (they
+  are not held at edge to hash).
+- `EdgeConfig::{l1_cdn_edge_enabled, l1_cdn_edge_external_uri_base}` —
+  L1-as-CDN-edge opt-in. Default `false / None`. Operator-set per
+  deployment; Client + Proxy modes IGNORE the flag (Spec §2.7
+  restricts CDN-edge to L1/Server).
+
+**Threat that AV-49 INTENTIONALLY closes**: a malicious peer
+attempting to coerce edge into bandwidth amplification by sending
+`BlobBody::External` envelopes that point at attacker-controlled
+URIs — edge structurally does NOT fetch external bytes, so the
+attacker cannot induce edge-side egress regardless of how many
+Contribution envelopes they ship. The consumer's client decides
+whether to fetch, and the consumer's client side is where the
+fetch policy lives.
+
+**Threat that AV-49 INTENTIONALLY leaves observable**: a TakedownNotice
+carrying a forged `legal_basis: tvec` to inflate dispatch priority.
+The fast-path arm is an OBSERVABILITY emission (`tracing::info!` +
+ResourceEvent on the event bus) — it does NOT grant the sender any
+authority edge would not otherwise extend; the substrate's existing
+ModerationEvent + Slashing path is the corrective if the
+legal_basis claim is later disputed. The fast-path is a routing
+hint, not an admission grant.
+
+**Threat that AV-49 does NOT close**: a Server-mode L1 operator who
+opts in to L1-as-CDN-edge and then prefetches malicious bytes from
+an attacker-controlled `external_uri` (post-v1.0 follow-up; the
+v0.20.1 stub does NOT actually fetch). When the full prefetch
+implementation lands, the operator's L1-CDN-edge will be subject to
+the publisher's signed ACL (carried in `ExternalRefWithAcl::acl_signature`)
++ the SHA-256 verification step (`external_sha256_hex`); a
+mismatched fetch MUST be discarded (the operator's own substrate
+admission gates remain authoritative). The wire shape locks the
+contract; the full enforcement lands when the prefetch ships.
+
+**Test**: `tests/multimedia_tier.rs` — 22 tests covering the
+fast-path legal_basis vocabulary, the Contribution sub-dispatch
+routing matrix, BlobBody::External vs inline bytes, the
+L1-as-CDN-edge gate matrix (mode × enabled × URI base), and the
+cohort_scope preservation (Strict enforcement still applies BEFORE
+the multimedia sub-dispatch arm executes — defence-in-depth).
+Plus 10 in-module unit tests pinning the wire-string codec for
+the typed enums.
+
+**Residual**: the L1-as-CDN-edge prefetch is a STUB at v0.20.1 —
+`cdn_edge_prefetch_stub` logs the trigger via `tracing::info!`
+but does NOT perform the HTTP GET. The wire shape is locked here;
+the full implementation (reqwest-driven fetch + SHA verification +
+operator-base re-publish + holds_bytes re-emission) is a post-v1.0
+cut. Operators who flip `l1_cdn_edge_enabled = true` at v0.20.1
+see the trigger fire in observability but no bytes move — the
+operator-side opt-in surface is locked; the bytes-fetching wire
+follows when persist's external-content admission lands.
 
 ### 4.9 Forward-looking invariants (anchored at v0.17.1 for v0.18.x wire-up)
 
@@ -1378,6 +1456,7 @@ distinct deployment mode, not a canonical-peer concern.
 | AV-46 | Operator opinion confused with federation attestation | P3 | Schema separation: `federation_peer_metadata` sibling table per CIRISPersist#117 (not folded into `federation_keys`); `EdgePeerTrust` doc explicit | Documentation; Accord §I operator-autonomy framing | ✓ Mitigated structurally (v0.15.1) | `tests/peer_mutation_ffi.rs` |
 | AV-47 | UniFFI free-function called pre-init / post-teardown | P1 | `OnceLock<RwLock<Weak<Edge>>>` slot + per-surface `current_edge()?` gate; typed `EdgeBindingsError::{NotInitialized,Unsupported}` | `Weak::upgrade` returns `None` on teardown → flips back to `NotInitialized` | ✓ Mitigated (v0.13.0+ UniFFI scaffolding pattern) | `tests/routing_ffi.rs::uniffi_path_table_unsupported_without_init`, `tests/links_ffi.rs::uniffi_link_list_unsupported_without_init` |
 | AV-48 | High-N low-T signed envelope flood at dispatch_inbound | P1 | `Arc<dyn TrustScoring>` consumer at dispatch_inbound (CIRISPersist#123); drop below `trust_threshold` + emit `EventKind::TrustShortCircuited`; `inbound_dropped_low_trust` counter; default `0.0` bootstrap-permissive | Per-transport rate caps (AV-10); bounded inbound queue (AV-13 family) cover the *volume* axis | ✓ Mitigated (v0.19.6 CIRISEdge#48-B) | `tests/trust_short_circuit.rs` |
+| AV-49 | Multimedia tier transport semantics (takedown fast-path, BlobBody::External, L1-as-CDN-edge opt-in) | P1 | takedown_notice fast-path observability emission (TVEC/GIFCT-CIP/NCMEC); `validate_content_body` short-circuits AV-13 + SHA gate on `kind == "external"` (edge does NOT fetch external bytes); L1-CDN-edge opt-in default OFF; Client + Proxy modes ignore the flag | Publisher's signed ACL on `ExternalRefWithAcl::acl_signature`; consumer's client verifies fetched bytes against `external_sha256_hex`; substrate's ModerationEvent + Slashing path corrective for forged legal_basis | ✓ Mitigated (v0.20.1 CIRISEdge#52) | `tests/multimedia_tier.rs` |
 | Canonical-peer | Operator silently drops canonical CIRIS infra peer | P1 | Bootstrap reseed on every start; `peer_remove(canonical, hard=true)` → typed `CannotRemoveCanonicalPeer`; `EdgePeerInfo.canonical: bool` | Operator trust-state flip preserved across restart (refuse trust without forgetting peer) | ⚠ Scheduled v0.18.0 (CIRISEdge#46) | tests scheduled v0.18.0 acceptance |
 
 **Pre-Phase-1 P0 must-have bundle**: AV-9 + AV-13 + AV-14 + AV-17 +

@@ -58,6 +58,7 @@ pub mod identity;
 pub mod key_boundary;
 pub mod manifest;
 pub mod messages;
+pub mod multimedia;
 pub mod observability;
 pub mod outbound;
 pub mod reachability;
@@ -102,6 +103,10 @@ pub use messages::{
     ACCORD_THRESHOLD_M_OF_N, DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
     DELIVERY_REFUSAL_ATTESTATION_DOMAIN, FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
     GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
+};
+pub use multimedia::{
+    cdn_edge_prefetch_stub, is_fast_path_legal_basis, ContributionDispatchProbe,
+    ContributionSubjectKind, ExternalRefWithAcl, FastPathLegalBasis,
 };
 pub use observability::{
     DeliveryClass as MetricsDeliveryClass, EdgeMetrics, EdgeMetricsBundle, VerifyErrorClass,

@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.20.0"
+version = "0.20.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -10,9 +10,37 @@ repository = "https://github.com/CIRISAI/CIRISEdge"
 readme = "README.md"
 publish = false
 
-# Status: v0.20.0 RC1 — CEWP infrastructure cut. The penultimate
-# release before v1.0.0 GA, framing edge as the transport tier of the
-# CIRIS Epistemic Web Platform (CIRISEdge#51).
+# Status: v0.20.1 — multimedia tier transport. The LAST feature cut
+# before v1.0.0 GA. Adds the four CEWP multimedia-tier transport
+# surface pieces per CIRISNodeCore/FSD/MEDIA_SHARING.md on top of the
+# v0.20.0 RC1 substrate (CIRISEdge#52):
+#
+#  1. Contribution subject_kind discriminator — dispatch_inbound
+#     sub-routes on `takedown_notice` (fast-path on TVEC / GIFCT-CIP /
+#     NCMEC `legal_basis`) and `key_grant` (addressed point-to-point)
+#     inside MessageType::ContributionSubmit envelopes. Unknown
+#     subject_kinds fall through to the existing handler unchanged.
+#  2. FastPathLegalBasis enum (`src/multimedia.rs`) — pins the
+#     legal-compliance vocabulary that bumps dispatch priority +
+#     emits a synthetic FederationAnnouncement. Matches CIRISRegistry
+#     CEG 0.3 §5.6.8.
+#  3. BlobBody::External wire shape — `ContentBody` extended with the
+#     `kind == "external"` discriminator + `ExternalRefWithAcl`
+#     pointer struct. Edge does NOT fetch external bytes; the
+#     consumer's client fetches directly from `external_uri`.
+#     `validate_content_body` skips AV-13 + SHA gates for external
+#     bodies (external scrub is the publisher's responsibility per
+#     MEDIA_SHARING.md §2.6).
+#  4. L1-as-CDN-edge opt-in — `EdgeConfig::l1_cdn_edge_enabled` +
+#     `l1_cdn_edge_external_uri_base`. When enabled AND
+#     `agent_mode == Server`, dispatch fires
+#     `cdn_edge_prefetch_stub` (full HTTP-fetch implementation
+#     deferred post-v1.0; wire shape + dispatch path locked here).
+#     Default OFF; Client + Proxy modes ignore the flag.
+#
+# THREAT_MODEL.md AV-49 documents the multimedia-tier security
+# invariants. After v0.20.1 lands, v1.0.0 GA is the ship: a
+# version-bump + release notes cut.
 #
 # v0.20.0 RC1 closes four substrate pieces:
 #  1. trust_scoring_capsule cohab wiring — the v0.19.6 deferral
