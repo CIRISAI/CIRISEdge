@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "0.19.7"
+version = "0.20.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -10,21 +10,43 @@ repository = "https://github.com/CIRISAI/CIRISEdge"
 readme = "README.md"
 publish = false
 
-# Status: v0.4.0 — authenticated Reticulum peer resolution. The
-# PeerResolver cold-start path (CIRISEdge#15 / CIRISVerify#28 Phase 3)
-# replaces v0.3.1's trust-on-first-use announce-recording: an announce
-# carries a federation-key-signed transport-identity attestation that
-# the resolver roots against persist's federation_keys directory
-# (ciris-persist v1.12.0 `root_binding`) before verifying the
-# attestation signature — AV-42 closure. Verify pipeline, durable
-# outbound queue + dispatcher, typed handler dispatch, outbound
-# inline-text pipeline, HTTP transport, and the Reticulum transport
-# (Leviculum-backed; OQ-07) all shipped. PyO3 surface and Phase 3
-# multi-medium transports (LoRa / serial / I²P) follow.
-# See FSD/CIRIS_EDGE.md for the architecture, MISSION.md for M-1
-# alignment per module, docs/THREAT_MODEL.md for the v0.1.0 P0
+# Status: v0.20.0 RC1 — CEWP infrastructure cut. The penultimate
+# release before v1.0.0 GA, framing edge as the transport tier of the
+# CIRIS Epistemic Web Platform (CIRISEdge#51).
+#
+# v0.20.0 RC1 closes four substrate pieces:
+#  1. trust_scoring_capsule cohab wiring — the v0.19.6 deferral
+#     paragraph in THREAT_MODEL.md §4.8 (AV-48) is removed. The 7th
+#     PyCapsule accessor (`Engine::trust_scoring_capsule`, persist
+#     v3.5.1, name tag `ciris_persist::trust_scoring`) is consumed by
+#     `extract_trust_scoring` in src/ffi/pyo3.rs; the
+#     `init_edge_runtime` cohabitation path now derives the scorer
+#     automatically when an `AdmissionGate` is installed and falls back
+#     to the bootstrap-permissive `None` posture (matching
+#     `trust_threshold = 0.0`) when the typed
+#     `ValueError("trust_scoring_unavailable")` fires.
+#  2. CEWP L0/L1 tier refinement — `AgentMode` gains
+#     `default_disk_budget_bytes` + `default_trust_recursion_depth`
+#     (Client 0/0, Proxy 256GB/0, Server 1TB/1). `EdgeConfig` gains
+#     `disk_budget_bytes` + `trust_recursion_depth` fields with
+#     `init_edge_runtime` optional kwargs for per-deployment override.
+#     `dispatch_inbound` now passes `EdgeConfig::trust_recursion_depth`
+#     to `TrustScoring::trust_score` (replacing v0.19.6's hardcoded 0).
+#  3. MISSION + THREAT_MODEL CEWP-framing refresh — §11 and AV-48
+#     reflect the v0.20.0 RC1 closure; §4.9 documents L0/L1 as a
+#     security boundary (blast radius bound via recursion depth;
+#     capacity-gated admission via disk budget).
+#  4. Hardening polish — `cargo audit` / `cargo deny check` clean,
+#     doc comments cite v0.19.7 + v0.20.0 lineage (persist v3.6.3,
+#     verify v4.4.2, CEWP framing).
+#
+# v0.20.1 ships multimedia tier (#52); v1.0.0 ships as the
+# "Agent 3.0 / CEWP" release.
+#
+# See FSD/CIRIS_EDGE.md for the architecture, MISSION.md §11 for the
+# CEWP L0/L1 tier table, docs/THREAT_MODEL.md for the v0.1.0 P0
 # invariants (AV-9 + AV-13 + AV-14 + AV-17 + hybrid-verify-via-persist)
-# and AV-42 for the authenticated-binding cold-start path.
+# and AV-48 (v0.20.0 RC1 closure) for the trust short-circuit posture.
 
 [dependencies]
 # Substrate. Owns federation_keys directory, canonicalize_envelope,

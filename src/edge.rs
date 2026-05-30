@@ -80,13 +80,22 @@ pub const DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS: u64 = 3600;
 /// [`AgentMode::apply_defaults`] — single source of truth for the
 /// mode → config mapping (no scatter across init paths).
 ///
-/// Behaviour matrix (v0.18.0):
+/// Behaviour matrix (v0.20.0 RC1 — CEWP L0/L1 tier refinement):
 ///
-/// | Mode     | Listener bound | Outbound queue max |
-/// |----------|----------------|--------------------|
-/// | Client   | no             | 256                |
-/// | Proxy    | yes            | 4096 (current default) |
-/// | Server   | yes + propagate| 65536              |
+/// | Mode     | Listener | Out-queue | Disk budget   | Trust recursion |
+/// |----------|----------|-----------|---------------|-----------------|
+/// | Client   | no       | 256       | 0             | 0               |
+/// | Proxy    | yes      | 4096      | 256 GB (L0)   | 0 (strict)      |
+/// | Server   | yes      | 65536     | 1 TB (L1)     | 1 (FoF)         |
+///
+/// v0.20.0 RC1 (CIRISEdge#51) extends the v0.18.0 listener/queue
+/// mapping with the full CEWP L0/L1 tier vocabulary. The
+/// `disk_budget_bytes` field is **advisory** at the edge tier (persist
+/// or the host enforces capacity-gated admission); the
+/// `trust_recursion_depth` is **consulted** at `dispatch_inbound`'s
+/// trust short-circuit (it's the `recursion_depth` argument to
+/// `TrustScoring::trust_score`, replacing v0.19.6's hardcoded `0`).
+/// L2+ tiers are deferred to a post-v1.0 cut.
 ///
 /// Transport-posture translation (Roaming / Full / Gateway / AP)
 /// remains deferred — the v0.12.0 Leviculum interface-diversity work
@@ -154,14 +163,62 @@ impl AgentMode {
         }
     }
 
+    /// CIRISEdge#51 (v0.20.0 RC1) — default disk budget for the mode
+    /// (bytes). Advisory at the edge tier — persist or the host
+    /// consults this via [`Edge::disk_budget_bytes`] to enforce
+    /// capacity-gated admission. Client = 0 (no storage), Proxy = 256
+    /// GB (L0 CEWP tier), Server = 1 TB (L1 CEWP tier). L2+ tiers
+    /// deferred to a post-v1.0 cut.
+    #[must_use]
+    pub fn default_disk_budget_bytes(&self) -> u64 {
+        match self {
+            Self::Client => 0,
+            Self::Proxy => 256 * 1024 * 1024 * 1024, // 256 GB
+            Self::Server => 1024 * 1024 * 1024 * 1024, // 1 TB
+        }
+    }
+
+    /// CIRISEdge#51 (v0.20.0 RC1) — default trust recursion depth for
+    /// the mode. Consumed at [`dispatch_inbound`]'s trust short-circuit
+    /// as the `recursion_depth` argument to
+    /// `TrustScoring::trust_score` (replacing v0.19.6's hardcoded `0`).
+    /// Client = 0 (no inbound dispatch), Proxy = 0 (strict — direct
+    /// attestations only), Server = 1 (friend-of-friends — walks one
+    /// `delegates_to` hop). L2+ tiers deferred to a post-v1.0 cut.
+    ///
+    /// `match_same_arms` is allowed here because Client and Proxy
+    /// share the value (`0`) for distinct semantic reasons — Client
+    /// has no inbound dispatch at all (the value is moot), Proxy has
+    /// inbound dispatch but pins strict direct trust per the CEWP L0
+    /// "tight blast radius" stance. Collapsing the arms would erase
+    /// the per-mode documentation site.
+    #[must_use]
+    #[allow(clippy::match_same_arms)]
+    pub fn default_trust_recursion_depth(&self) -> u8 {
+        match self {
+            Self::Client => 0,
+            Self::Proxy => 0,
+            Self::Server => 1,
+        }
+    }
+
     /// Apply the mode-derived defaults onto `config`. CRITICAL: the
     /// only place the mode → knob mapping lives. Every init path that
     /// accepts an `AgentMode` calls this exactly once before
     /// [`EdgeBuilder::config`] is invoked.
+    ///
+    /// v0.20.0 RC1 (CIRISEdge#51) — extended from the v0.18.0
+    /// listener/queue knobs to cover the full CEWP L0/L1 tier
+    /// vocabulary: `disk_budget_bytes` + `trust_recursion_depth`.
+    /// Operator overrides on [`init_edge_runtime`] re-set the fields
+    /// AFTER `apply_defaults`, so the mode-default is the floor not
+    /// the ceiling.
     pub fn apply_defaults(&self, config: &mut EdgeConfig) {
         config.agent_mode = *self;
         config.listener_bound = self.binds_listener();
         config.outbound_queue_max = self.default_outbound_queue_max();
+        config.disk_budget_bytes = self.default_disk_budget_bytes();
+        config.trust_recursion_depth = self.default_trust_recursion_depth();
     }
 }
 
@@ -352,6 +409,29 @@ pub struct EdgeConfig {
     /// (and migration / dev deployments) can disable the check
     /// independently of the threshold value.
     pub trust_short_circuit_enabled: bool,
+    /// CIRISEdge#51 (v0.20.0 RC1) — CEWP L0/L1 storage budget for the
+    /// edge tier (bytes). **Advisory at edge** — persist or the host
+    /// reads this via [`Edge::disk_budget_bytes`] to enforce
+    /// capacity-gated admission. Defaults are sourced from
+    /// [`AgentMode::default_disk_budget_bytes`]: Client = 0, Proxy =
+    /// 256 GB (L0), Server = 1 TB (L1). Operator override on
+    /// `init_edge_runtime` (the new `disk_budget_bytes` kwarg) pins a
+    /// per-deployment value AFTER `apply_defaults` runs. See
+    /// `MISSION.md` §11 (L0/L1 tier table) and `THREAT_MODEL.md` §4.9
+    /// (CEWP tier as security boundary).
+    pub disk_budget_bytes: u64,
+    /// CIRISEdge#51 (v0.20.0 RC1) — CEWP L0/L1 trust-graph recursion
+    /// depth for the [`dispatch_inbound`] short-circuit. Threaded
+    /// into `TrustScoring::trust_score(key_id, recursion_depth)` as
+    /// the second arg (replacing v0.19.6's hardcoded `0`). Defaults
+    /// from [`AgentMode::default_trust_recursion_depth`]: Client = 0,
+    /// Proxy = 0 (strict direct trust), Server = 1 (friend-of-
+    /// friends — one `delegates_to` hop). Operator override on
+    /// `init_edge_runtime` (the new `trust_recursion_depth` kwarg)
+    /// pins a per-deployment value (e.g. a curated server pinning
+    /// depth = 0 even though L1 default is 1). L2+ depths deferred
+    /// to a post-v1.0 cut.
+    pub trust_recursion_depth: u8,
 }
 
 impl Default for EdgeConfig {
@@ -419,6 +499,14 @@ impl Default for EdgeConfig {
             // tests / dev paths flip to false to disable independent
             // of the threshold value.
             trust_short_circuit_enabled: true,
+            // v0.20.0 RC1 (CIRISEdge#51) — defaults mirror the Proxy
+            // column of `AgentMode::default_*` so an unmodified
+            // `EdgeConfig::default()` continues to match the v0.18.0
+            // proxy posture (256 GB / depth 0). `apply_defaults`
+            // overwrites both per declared mode; operator overrides
+            // on init_edge_runtime overwrite again per deployment.
+            disk_budget_bytes: 256 * 1024 * 1024 * 1024,
+            trust_recursion_depth: 0,
         }
     }
 }
@@ -1066,6 +1154,25 @@ impl Edge {
     #[must_use]
     pub fn trust_scoring(&self) -> Option<Arc<dyn ciris_persist::federation::TrustScoring>> {
         self.trust_scoring.clone()
+    }
+
+    /// CIRISEdge#51 (v0.20.0 RC1) — CEWP L0/L1 advisory disk budget
+    /// (bytes) sourced from [`EdgeConfig::disk_budget_bytes`]. Edge
+    /// does not enforce this — persist or the host consults the
+    /// accessor to enforce capacity-gated admission.
+    #[must_use]
+    pub fn disk_budget_bytes(&self) -> u64 {
+        self.config.disk_budget_bytes
+    }
+
+    /// CIRISEdge#51 (v0.20.0 RC1) — CEWP L0/L1 trust-graph recursion
+    /// depth sourced from [`EdgeConfig::trust_recursion_depth`].
+    /// Threaded into `dispatch_inbound`'s `TrustScoring::trust_score`
+    /// call; exposed here so hosts can mirror the same depth on
+    /// out-of-band trust queries.
+    #[must_use]
+    pub fn trust_recursion_depth(&self) -> u8 {
+        self.config.trust_recursion_depth
     }
 
     /// CIRISEdge#34 accessor — the shared [`crate::events::EventBus`].
@@ -2131,6 +2238,7 @@ impl Edge {
             self.trust_scoring.as_ref(),
             self.config.trust_threshold,
             self.config.trust_short_circuit_enabled,
+            self.config.trust_recursion_depth,
         )
         .await;
     }
@@ -2410,6 +2518,10 @@ impl Edge {
         let trust_scoring = self.trust_scoring.clone();
         let trust_threshold = self.config.trust_threshold;
         let trust_short_circuit_enabled = self.config.trust_short_circuit_enabled;
+        // CIRISEdge#51 (v0.20.0 RC1) — capture into the dispatcher loop
+        // so each spawned `dispatch_inbound` task gets the operator-
+        // configured recursion depth (CEWP L0/L1 0/1 default).
+        let trust_recursion_depth = self.config.trust_recursion_depth;
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -2453,6 +2565,7 @@ impl Edge {
                             trust_scoring_clone.as_ref(),
                             trust_threshold,
                             trust_short_circuit_enabled,
+                            trust_recursion_depth,
                         ).await;
                     });
                 }
@@ -2660,6 +2773,11 @@ async fn dispatch_inbound(
     trust_scoring: Option<&Arc<dyn ciris_persist::federation::TrustScoring>>,
     trust_threshold: f64,
     trust_short_circuit_enabled: bool,
+    // CIRISEdge#51 (v0.20.0 RC1) — trust-graph recursion depth threaded
+    // through to `TrustScoring::trust_score(key_id, recursion_depth)`.
+    // v0.19.6 hardcoded `0` (strict direct trust); v0.20.0 RC1 honours
+    // `EdgeConfig::trust_recursion_depth` (CEWP L0/L1 default 0/1).
+    trust_recursion_depth: u8,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -2835,7 +2953,9 @@ async fn dispatch_inbound(
     // SQL-backed) `trust_score` call per envelope.
     if trust_short_circuit_enabled && trust_threshold > 0.0 {
         if let Some(scorer) = trust_scoring {
-            let score = scorer.trust_score(&envelope.signing_key_id, 0).await;
+            let score = scorer
+                .trust_score(&envelope.signing_key_id, trust_recursion_depth)
+                .await;
             let observed = match score {
                 Ok(s) => s,
                 Err(ciris_persist::federation::TrustScoringError::KeyNotFound(_)) => {
