@@ -336,6 +336,24 @@ impl HolderDownweightTracker {
     }
 }
 
+/// Lowercase hex encode without the dev-only `hex` crate. v1.1.0
+/// (CIRISEdge#44) — the routing-table FFI needs to project the
+/// 16-byte transport identity into a string for the
+/// `EdgeRoutingPathEntry.via_transport_id` wire field; the existing
+/// inline `write!("{b:02x}")` pattern (used in the LinkEstablished
+/// event emit at line ~2365) was hoisted here so both call sites
+/// share the same formatter. Gated on `ffi-uniffi` because both
+/// consumers are FFI-only — non-FFI builds don't need it.
+#[cfg(feature = "ffi-uniffi")]
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 fn evict_window(buf: &mut VecDeque<DateTime<Utc>>, now: DateTime<Utc>, window_seconds: u64) {
     let cutoff = now - chrono::Duration::seconds(i64::try_from(window_seconds).unwrap_or(i64::MAX));
     while let Some(front) = buf.front() {
@@ -1515,45 +1533,142 @@ impl ReticulumTransport {
 
     // ─── CIRISEdge#33 (v0.15.0) Routing-table FFI surface ───────────
     //
-    // Paths / blackhole / rate / tunnels / announce / reverse. The
-    // routing-table reads are mostly Leviculum-gap-stubbed in v0.15.0
-    // (the per-row enumeration accessors are `pub(crate)` upstream);
-    // the wire shape is pinned so a v0.15.x flip-on is non-breaking.
-    // The blackhole CRUD + path mutation surfaces ARE fully wired —
-    // those don't depend on the upstream visibility cap.
+    // Paths / blackhole / rate / tunnels / announce / reverse. v1.1.0
+    // (CIRISEdge#44) flips on the 5 Leviculum accessors that the fork
+    // now exposes publicly (`reticulum_std::driver::ReticulumNode::
+    // {path_table_entries, rate_table_entries, get_path_clone,
+    // remove_path, drop_all_paths_via}`). The remaining 3 read
+    // surfaces (`routing_tunnels`, `routing_announce_table`,
+    // `routing_reverse_table`) stay documented Vec::new() — those
+    // backing data structures don't exist as collections in this
+    // Leviculum fork (only `tunnel_synthesize_hash` is computed for
+    // control-destination routing) and the reverse_table's stored
+    // shape (packet_hash → interface_index pair) doesn't project to
+    // the source_hash/destination_hash wire schema Edge pinned.
 
-    /// Snapshot every known path-table entry. v0.15.0 returns
-    /// `Vec::new()` — leviculum's `NodeCore::path_table_entries` is
-    /// `pub(crate)` from `reticulum-std`. Wire shape locked so a
-    /// v0.15.x patch can flip on real values without churn.
+    /// Project a Leviculum monotonic-clock `expires_ms` (ms since
+    /// NodeCore construction) into an RFC-3339 UTC wall-clock string.
+    ///
+    /// Anchors against `chrono::Utc::now()` plus the delta from the
+    /// node's current `now_ms`. The two clocks aren't perfectly
+    /// aligned — `now_ms` starts when NodeCore is built, `Utc::now()`
+    /// is the actual wall clock — so the projection has up to ~1ms
+    /// of jitter per call. That's well within the ms-resolution of
+    /// the wire shape's RFC-3339 timestamps and matches the precision
+    /// of every other timestamp on the routing FFI surface.
+    #[cfg(feature = "ffi-uniffi")]
+    fn project_monotonic_ms(&self, target_ms: u64) -> chrono::DateTime<Utc> {
+        let now_ms = self.node.now_ms();
+        // Compute signed delta so timestamps already in the past
+        // (rare — usually expiry sweeps would have removed them, but
+        // could happen if expiry just lapsed between the snapshot and
+        // this projection) render as past wall-clock values.
+        let delta_ms = i64::try_from(target_ms)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(now_ms).unwrap_or(i64::MAX));
+        chrono::Utc::now() + chrono::Duration::milliseconds(delta_ms)
+    }
+
+    /// Resolve a Reticulum destination hash to its rooted peer
+    /// `key_id`, when one exists. v1.1.0 (CIRISEdge#44) — the peer
+    /// table is keyed by `peer_key_id (String)`; this is the reverse
+    /// lookup needed by the routing-table FFI to populate
+    /// `EdgeRoutingPathEntry.peer_key_id`. Returns `None` when the
+    /// destination is unknown / unrooted (the common case for relay
+    /// hops + transient destinations).
+    #[cfg(feature = "ffi-uniffi")]
+    async fn peer_key_id_for_dest_hash(&self, dest_hash: &[u8; 16]) -> Option<String> {
+        let peers = self.peers.lock().await;
+        for (key_id, rooted) in peers.iter() {
+            if rooted.peer.dest_hash.as_bytes() == dest_hash {
+                return Some(key_id.clone());
+            }
+        }
+        None
+    }
+
+    /// Snapshot every known path-table entry. v1.1.0 (CIRISEdge#44) —
+    /// backed by leviculum's now-public
+    /// `ReticulumNode::path_table_entries` (each row is a deep
+    /// `PathTableExport` clone; no mutex-borrowed references escape).
     ///
     /// `max_hops` filters the result to entries whose `hops <= max_hops`
-    /// when supplied. `None` returns the full table.
+    /// when supplied. `None` returns the full table. The `peer_key_id`
+    /// field is filled when the destination matches a currently-rooted
+    /// peer (CIRISEdge#15 cold-start authenticated path); unknown /
+    /// relay destinations get `None`.
+    ///
+    /// Timestamps are wall-clock projections of leviculum's monotonic
+    /// `expires_ms` — see [`Self::project_monotonic_ms`] for the
+    /// precision contract. `last_seen_at` is the call-time wall
+    /// clock (path entries don't carry an insertion timestamp in
+    /// leviculum's storage shape).
     #[cfg(feature = "ffi-uniffi")]
-    #[must_use]
     pub async fn routing_path_table(
         &self,
         max_hops: Option<u32>,
     ) -> Vec<crate::ffi::uniffi_types::EdgeRoutingPathEntry> {
-        // Stubbed pending Leviculum gap closure. The `max_hops` param
-        // exists in the wire shape so the v0.15.x patch can apply it
-        // without an FFI signature bump.
-        let _ = max_hops;
-        Vec::new()
+        let raw = self.node.path_table_entries();
+        let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+        let transport_kind = "reticulum".to_string();
+        let mut out = Vec::with_capacity(raw.len());
+        for entry in raw {
+            if let Some(cap) = max_hops {
+                if u32::from(entry.hops) > cap {
+                    continue;
+                }
+            }
+            let peer_key_id = self.peer_key_id_for_dest_hash(&entry.hash).await;
+            let next_hop_bytes = entry.next_hop.map(|h| h.to_vec()).unwrap_or_default();
+            // `via_transport_id` is a free-form string identifier for
+            // the transport carrying the path. Leviculum's path-table
+            // export doesn't tag each row with the originating
+            // interface name (only the index); we surface the
+            // routing-layer transport identity as a stable hex
+            // identifier so the wire shape carries SOMETHING the
+            // operator can correlate with `routing_transport_id`.
+            let via_transport_id = hex_encode_lower(&self.node.identity_hash());
+            out.push(crate::ffi::uniffi_types::EdgeRoutingPathEntry {
+                destination_hash: entry.hash.to_vec(),
+                peer_key_id,
+                hops: u32::from(entry.hops),
+                via_transport_id,
+                via_transport_kind: transport_kind.clone(),
+                next_hop: next_hop_bytes,
+                last_seen_at: now_rfc3339.clone(),
+                expires_at: self.project_monotonic_ms(entry.expires_ms).to_rfc3339(),
+            });
+        }
+        out
     }
 
-    /// Look up a single path entry by destination hash. Currently a
-    /// stub returning `None` for the same reason
-    /// [`Self::routing_path_table`] returns empty: the underlying
-    /// `NodeCore::get_path_clone` is not publicly reachable.
+    /// Look up a single path entry by destination hash. v1.1.0
+    /// (CIRISEdge#44) — backed by leviculum's now-public
+    /// `ReticulumNode::get_path_clone`. Returns `None` when the
+    /// destination is unknown OR when `destination_hash` is not 16
+    /// bytes (typed-error-free for the not-found-vs-bad-input
+    /// distinction — callers can pre-validate length).
     #[cfg(feature = "ffi-uniffi")]
-    #[must_use]
     pub async fn routing_path_to(
         &self,
         destination_hash: &[u8],
     ) -> Option<crate::ffi::uniffi_types::EdgeRoutingPathEntry> {
-        let _ = destination_hash;
-        None
+        let dest_hash_array: [u8; 16] = destination_hash.try_into().ok()?;
+        let dest_hash = DestinationHash::new(dest_hash_array);
+        let entry = self.node.get_path_clone(&dest_hash)?;
+        let peer_key_id = self.peer_key_id_for_dest_hash(&dest_hash_array).await;
+        let next_hop_bytes = entry.next_hop.map(|h| h.to_vec()).unwrap_or_default();
+        let via_transport_id = hex_encode_lower(&self.node.identity_hash());
+        Some(crate::ffi::uniffi_types::EdgeRoutingPathEntry {
+            destination_hash: dest_hash_array.to_vec(),
+            peer_key_id,
+            hops: u32::from(entry.hops),
+            via_transport_id,
+            via_transport_kind: "reticulum".to_string(),
+            next_hop: next_hop_bytes,
+            last_seen_at: chrono::Utc::now().to_rfc3339(),
+            expires_at: self.project_monotonic_ms(entry.expires_ms).to_rfc3339(),
+        })
     }
 
     /// Fire a PATH_REQUEST for `destination_hash`. Wraps leviculum's
@@ -1583,34 +1698,45 @@ impl ReticulumTransport {
         Ok(())
     }
 
-    /// Drop a specific path entry by destination hash. v0.15.0 returns
-    /// `Ok(())` unconditionally — `NodeCore::remove_path` is
-    /// `pub(crate)` upstream and so this is a documented no-op.
+    /// Drop a specific path entry by destination hash. v1.1.0
+    /// (CIRISEdge#44) — backed by leviculum's now-public
+    /// `ReticulumNode::remove_path`. Returns `Ok(())` whether or not
+    /// the entry existed (POSIX `rm -f` ergonomics; callers asking to
+    /// drop an unknown path get a successful no-op rather than an
+    /// error — matches the contract of `routing_blackhole_remove`).
     pub async fn routing_path_drop(&self, destination_hash: &[u8]) -> Result<(), TransportError> {
-        // Validate the input shape so a v0.15.x flip-on doesn't change
-        // the failure mode for callers.
-        let _: [u8; 16] = destination_hash.try_into().map_err(|_| {
+        let dest_hash_array: [u8; 16] = destination_hash.try_into().map_err(|_| {
             TransportError::Config(format!(
                 "destination_hash must be 16 bytes, got {}",
                 destination_hash.len()
             ))
         })?;
+        let dest_hash = DestinationHash::new(dest_hash_array);
+        // Discard the bool — the FFI contract is fire-and-forget
+        // idempotent; operators inspect `routing_path_to` afterwards
+        // if they need to confirm removal.
+        let _ = self.node.remove_path(&dest_hash);
         Ok(())
     }
 
     /// Drop every path whose `next_hop == transport_identity_hash`.
-    /// v0.15.0 returns `Ok(())` unconditionally — `NodeCore::drop_all_paths_via`
-    /// is `pub(crate)` upstream.
+    /// v1.1.0 (CIRISEdge#44) — backed by leviculum's now-public
+    /// `ReticulumNode::drop_all_paths_via`. The return count is
+    /// dropped on the FFI floor; operators inspect
+    /// `routing_path_table` afterwards if they need to confirm bulk
+    /// removal.
     pub async fn routing_path_drop_via(
         &self,
         transport_identity_hash: &[u8],
     ) -> Result<(), TransportError> {
-        let _: [u8; 16] = transport_identity_hash.try_into().map_err(|_| {
+        let via_array: [u8; 16] = transport_identity_hash.try_into().map_err(|_| {
             TransportError::Config(format!(
                 "transport_identity_hash must be 16 bytes, got {}",
                 transport_identity_hash.len()
             ))
         })?;
+        let via_hash = DestinationHash::new(via_array);
+        let _ = self.node.drop_all_paths_via(&via_hash);
         Ok(())
     }
 
@@ -1758,13 +1884,47 @@ impl ReticulumTransport {
             .map_err(|e| TransportError::Io(format!("blackhole_prune_expired: {e}")))
     }
 
-    /// Snapshot the per-identity announce rate table. v0.15.0 returns
-    /// `Vec::new()` pending Leviculum widening the
-    /// `NodeCore::rate_table_entries` visibility.
+    /// Snapshot the per-identity announce rate table. v1.1.0
+    /// (CIRISEdge#44) — backed by leviculum's now-public
+    /// `ReticulumNode::rate_table_entries` (each row is a deep
+    /// `RateTableExport` clone). The wire shape projects:
+    ///
+    /// * `identity_hash` ← `hash` (Reticulum 16-byte destination hash)
+    /// * `announce_freq_per_min` — computed from `last_ms`. Leviculum's
+    ///   rate table doesn't carry an explicit frequency value; it
+    ///   tracks `last_ms` (last accepted announce timestamp) and
+    ///   `rate_violations` (cap breaches). We can't reconstruct the
+    ///   sliding-window rate from a single observation; v1.1.0 emits
+    ///   `0.0` and documents this on the wire shape.
+    /// * `violations` ← `rate_violations`
+    /// * `blocked_until` ← wall-clock projection of `blocked_until_ms`
+    ///   when `> 0`; `None` when the identity is not currently
+    ///   blocked.
     #[cfg(feature = "ffi-uniffi")]
-    #[must_use]
     pub async fn routing_rate_table(&self) -> Vec<crate::ffi::uniffi_types::EdgeRateEntry> {
-        Vec::new()
+        let raw = self.node.rate_table_entries();
+        raw.into_iter()
+            .map(|entry| {
+                let blocked_until = if entry.blocked_until_ms > 0 {
+                    Some(
+                        self.project_monotonic_ms(entry.blocked_until_ms)
+                            .to_rfc3339(),
+                    )
+                } else {
+                    None
+                };
+                crate::ffi::uniffi_types::EdgeRateEntry {
+                    identity_hash: entry.hash.to_vec(),
+                    // Sliding-window rate is not stored in Leviculum's
+                    // rate-table export; emitted as 0.0 with the
+                    // contract noted in the doc-comment + wire-shape
+                    // docblock on `EdgeRateEntry`.
+                    announce_freq_per_min: 0.0,
+                    violations: u32::from(entry.rate_violations),
+                    blocked_until,
+                }
+            })
+            .collect()
     }
 
     /// Seconds since this `ReticulumTransport` was constructed.
@@ -1781,17 +1941,26 @@ impl ReticulumTransport {
         self.node.identity_hash().to_vec()
     }
 
-    /// Snapshot the tunnel synthesize table. v0.15.0 returns
-    /// `Vec::new()` — Reticulum's tunnel table is NOT exposed at any
-    /// public API level (upstream gap).
+    /// Snapshot the tunnel synthesize table. v1.1.0 (CIRISEdge#44) —
+    /// permanently returns `Vec::new()` in this Leviculum fork. The
+    /// CIRISAI/leviculum fork does NOT maintain a tunnels collection:
+    /// only `tunnel_synthesize_hash` is computed (a single
+    /// well-known hash for control-destination routing), not a
+    /// populated `tunnels` dictionary. The wire shape stays pinned
+    /// for forward-compat with a future Leviculum cut that grows the
+    /// data structure.
     #[cfg(feature = "ffi-uniffi")]
     #[must_use]
     pub async fn routing_tunnels(&self) -> Vec<crate::ffi::uniffi_types::EdgeTunnelInfo> {
         Vec::new()
     }
 
-    /// Snapshot the in-flight outbound announce retry queue. v0.15.0
-    /// returns `Vec::new()` pending Leviculum widening.
+    /// Snapshot the in-flight outbound announce retry queue. v1.1.0
+    /// (CIRISEdge#44) — permanently returns `Vec::new()` in this
+    /// Leviculum fork. The retry-queue collection (`retry_queues` in
+    /// reticulum-std::driver) is scoped to the driver event loop and
+    /// not surfaced on `ReticulumNode` at any visibility level. The
+    /// wire shape stays pinned for forward-compat.
     #[cfg(feature = "ffi-uniffi")]
     #[must_use]
     pub async fn routing_announce_table(
@@ -1800,8 +1969,16 @@ impl ReticulumTransport {
         Vec::new()
     }
 
-    /// Snapshot the reverse routing table (debugging surface). v0.15.0
-    /// returns `Vec::new()` pending Leviculum widening.
+    /// Snapshot the reverse routing table (debugging surface). v1.1.0
+    /// (CIRISEdge#44) — permanently returns `Vec::new()` in this
+    /// Leviculum fork. The underlying `ReverseEntry` shape stores
+    /// `(timestamp_ms, receiving_interface_index,
+    /// outbound_interface_index)` keyed by packet hash — it does NOT
+    /// carry `source_hash` or `destination_hash` which Edge's wire
+    /// shape (`EdgeReverseEntry { source_hash, destination_hash,
+    /// last_seen_at }`) requires. Closing this gap needs a Leviculum
+    /// design pass to expand ReverseEntry, not just a visibility
+    /// widening.
     #[cfg(feature = "ffi-uniffi")]
     #[must_use]
     pub async fn routing_reverse_table(&self) -> Vec<crate::ffi::uniffi_types::EdgeReverseEntry> {

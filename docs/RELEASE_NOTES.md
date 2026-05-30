@@ -1,5 +1,82 @@
 # CIRISEdge Release Notes
 
+# v1.1.0 — Routing-table FFI flip-on (CIRISEdge#44)
+
+**2026-05-30** — Closes 5 of the 8 routing-table read surfaces that
+shipped as documented `Vec::new()` stubs in v0.15.0. The CIRISAI/
+leviculum fork is bumped to a feature branch that exposes the
+underlying NodeCore accessors publicly on the `ReticulumNode` async-
+runtime wrapper.
+
+## What v1.1.0 flips on
+
+The Portal Network screen + federation-maintainer diagnostics now
+get real values from:
+
+- `routing_path_table(max_hops)` — every known path-table entry,
+  filtered by hop cap. `peer_key_id` is resolved against edge's
+  rooted-peer map (the CIRISEdge#15 cold-start authenticated path);
+  `expires_at` is a wall-clock projection of leviculum's monotonic
+  `expires_ms`.
+- `routing_path_to(destination_hash)` — single-row lookup by 16-byte
+  destination hash.
+- `routing_path_drop(destination_hash)` — drop one entry. Idempotent
+  (POSIX `rm -f` ergonomics).
+- `routing_path_drop_via(transport_identity_hash)` — drop every path
+  whose `next_hop` matches; useful when a transport peer is known
+  to be down.
+- `routing_rate_table()` — per-identity announce rate / violations /
+  ban-until snapshot. `announce_freq_per_min` is `0.0` (leviculum's
+  rate-table export doesn't store the sliding-window rate; consumers
+  that need a curve sample `last_ms` across snapshots).
+
+## What stays Vec::new() (forever, in this Leviculum fork)
+
+The remaining 3 routing reads continue to return empty for
+structural reasons:
+
+- `routing_tunnels()` — the CIRISAI/leviculum fork does not maintain
+  a tunnels collection (only `tunnel_synthesize_hash` for control-
+  destination routing).
+- `routing_announce_table()` — the in-flight announce retry queue is
+  scoped to the driver event loop and not surfaced on `ReticulumNode`
+  at any visibility level.
+- `routing_reverse_table()` — leviculum's `ReverseEntry` stores
+  `(timestamp_ms, receiving_interface_index, outbound_interface_index)`
+  keyed by packet hash, which doesn't project to Edge's pinned
+  `EdgeReverseEntry { source_hash, destination_hash, last_seen_at }`
+  wire schema. Closing this needs a Leviculum design pass, not just
+  a visibility widening.
+
+The wire shapes stay pinned so a future Leviculum cut can flip on
+real values without binding-side churn.
+
+## Leviculum bump
+
+`Cargo.toml` `reticulum-core` / `reticulum-std` pin advances from
+`a7e11028` to `d8e44bc7` (CIRISAI/leviculum feature/edge-44-public-
+accessors branch). The branch adds 6 public methods on
+`reticulum_std::driver::ReticulumNode`:
+
+- `path_table_entries() -> Vec<PathTableExport>`
+- `rate_table_entries() -> Vec<RateTableExport>`
+- `get_path_clone(&DestinationHash) -> Option<PathEntry>`
+- `remove_path(&DestinationHash) -> bool`
+- `drop_all_paths_via(&DestinationHash) -> usize`
+- `now_ms() -> u64` (for wall-clock anchoring of the ms-stamped exports)
+
+No new types — all returned shapes are existing `pub` structs from
+`reticulum_core::{transport, storage_types}`.
+
+## Test surface
+
+- `tests/routing_ffi.rs` — 23 tests pass. The 8 ex-stub tests are
+  updated to exercise the real Leviculum reads (empty-table behaviour
+  on a freshly-built transport, idempotent drop ergonomics, bad-length
+  typed errors).
+- The 3 forever-stubbed reads (tunnels / announces / reverse) keep
+  their empty-Vec assertions with updated rationale comments.
+
 # v1.0.0 GA — Agent 3.0 / CEWP
 
 **2026-05-30** — Federation transport tier of the seven-repo CIRIS

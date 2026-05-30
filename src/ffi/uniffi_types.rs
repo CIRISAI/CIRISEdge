@@ -254,11 +254,11 @@ pub struct EdgePathEntry {
 /// `next_hop` is the 16-byte identity hash of the next-hop peer (empty
 /// when the path is direct / one-hop); timestamps are RFC-3339 UTC.
 ///
-/// v0.15.0 limitation: the upstream driver does not expose
-/// `path_table_entries` publicly — see module-level note. The Rust
-/// `path_table()` accessor returns `Vec::new()` until Leviculum lifts
-/// the visibility cap; the wire shape is pinned so a v0.15.x patch
-/// can flip on real values without binding-side churn.
+/// v1.1.0 (CIRISEdge#44) — backed by leviculum's now-public
+/// `ReticulumNode::path_table_entries`. `expires_at` is a wall-clock
+/// projection of the monotonic `expires_ms`; `last_seen_at` is the
+/// call-time wall clock (Leviculum's storage shape doesn't carry an
+/// insertion timestamp).
 #[derive(Debug, Clone)]
 pub struct EdgeRoutingPathEntry {
     pub destination_hash: Vec<u8>,
@@ -297,9 +297,14 @@ pub struct EdgeBlackholeEntry {
 /// `blocked_until` (RFC-3339 UTC) is the ban expiry when the source
 /// crossed the violation threshold.
 ///
-/// v0.15.0 limitation: `rate_table_entries` is not exposed on the
-/// driver public API (only via `pub(crate)` NodeCore::rate_table_entries).
-/// Returns empty until Leviculum widens the visibility.
+/// v1.1.0 (CIRISEdge#44) — backed by leviculum's now-public
+/// `ReticulumNode::rate_table_entries`. `announce_freq_per_min` is
+/// emitted as `0.0` (Leviculum's `RateTableExport` carries
+/// `last_ms` + `rate_violations` only — the sliding-window rate
+/// can't be reconstructed from a single observation; consumers that
+/// need rate-curve data should sample `last_ms` across multiple
+/// snapshots and compute the derivative themselves). `blocked_until`
+/// is `None` when `blocked_until_ms == 0` (identity not banned).
 #[derive(Debug, Clone)]
 pub struct EdgeRateEntry {
     pub identity_hash: Vec<u8>,
@@ -315,11 +320,12 @@ pub struct EdgeRateEntry {
 /// the tunnel's own `tunnel_id` (16 bytes), the current `hops` count,
 /// and the RFC-3339 expiry.
 ///
-/// v0.15.0 limitation: `transport.tunnels` is NOT publicly exposed in
-/// reticulum-core / reticulum-std at all — even at `pub(crate)`. The
-/// only references are internal (`tunnel_synthesize_hash` for control-
-/// destination routing). Returns empty pending an upstream Leviculum
-/// gap-closure issue.
+/// v1.1.0 (CIRISEdge#44) — permanently returns empty in this
+/// Leviculum fork. The CIRISAI/leviculum fork does not maintain a
+/// tunnels collection at all (only `tunnel_synthesize_hash` is
+/// computed for control-destination routing, not stored). Wire shape
+/// stays pinned for forward-compat with a future Leviculum cut that
+/// grows the data structure.
 #[derive(Debug, Clone)]
 pub struct EdgeTunnelInfo {
     pub hash: Vec<u8>,
@@ -334,9 +340,11 @@ pub struct EdgeTunnelInfo {
 /// the retry counter; `next_retry_at` is the RFC-3339 scheduled
 /// retransmit time.
 ///
-/// v0.15.0 limitation: the outbound announce retry queue is
-/// `pub(crate)` from `reticulum-core::transport`. Returns empty
-/// pending Leviculum widening.
+/// v1.1.0 (CIRISEdge#44) — permanently returns empty in this
+/// Leviculum fork. The retry-queue collection is scoped to the
+/// driver event loop in reticulum-std and not surfaced on
+/// `ReticulumNode` at any visibility level. Wire shape stays pinned
+/// for forward-compat.
 #[derive(Debug, Clone)]
 pub struct EdgeInFlightAnnounce {
     pub destination_hash: Vec<u8>,
@@ -349,9 +357,13 @@ pub struct EdgeInFlightAnnounce {
 /// was learned over, so the proof / response path can route back
 /// without re-running PATH_REQUEST.
 ///
-/// v0.15.0 limitation: the reverse table is `pub(crate)` from
-/// `reticulum-core::transport` and only consulted internally for
-/// proof routing. Returns empty pending Leviculum widening.
+/// v1.1.0 (CIRISEdge#44) — permanently returns empty in this
+/// Leviculum fork. Leviculum's `ReverseEntry` stores
+/// `(timestamp_ms, receiving_interface_index,
+/// outbound_interface_index)` keyed by packet hash; that shape does
+/// NOT carry `source_hash` or `destination_hash` which this wire
+/// schema requires. Closing the gap needs a Leviculum design pass
+/// to expand `ReverseEntry`, not just a visibility widening.
 #[derive(Debug, Clone)]
 pub struct EdgeReverseEntry {
     pub source_hash: Vec<u8>,

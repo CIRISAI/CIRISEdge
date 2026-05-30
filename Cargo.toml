@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -192,7 +192,7 @@ publish = false
 # bundles a copy into `ciris_persist.libs/` so `pip install ciris-edge`
 # Just Works on any glibc≥2.34 host; `cargo`-side builds require
 # `libsqlite3-dev` (apt) / `libsqlite3` (brew) — see docs/PYPI_PUBLISH.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.6.4", version = "3", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.6.5", version = "3", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -338,8 +338,22 @@ tempfile       = { version = "3", optional = true }
 # dead integ-harness submodules (commit a7e1102); reticulum-core +
 # reticulum-std build untouched. Fork tracks teranos/leviculum, whose
 # base carries the macOS-compat commits edge's darwin CI needs.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", version = "0.6", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "a7e11028af137229ce22490879a1a6fd45af7ebe", version = "0.6", optional = true }
+#
+# v1.1.0 (CIRISEdge#44) — bumped to d8e44bc which adds 6 public
+# accessors on ReticulumNode: path_table_entries, rate_table_entries,
+# get_path_clone, remove_path, drop_all_paths_via, and now_ms (the
+# monotonic-clock query needed to project ms timestamps into RFC-3339
+# wall-clock strings). Closes 5 of the 8 routing-table gap-stubs
+# shipped in v0.15.0. The remaining 3 (tunnels, in_flight_announces,
+# reverse_table) have no backing data structure in this Leviculum
+# fork — tunnels/in_flight_announces don't exist as collections (only
+# `tunnel_synthesize_hash` is computed for control-destination
+# routing), and the reverse_table stores packet-hash → interface-index
+# mappings whose shape doesn't match Edge's source_hash/destination_hash
+# wire schema. Those 3 remain documented Vec::new() pending an
+# upstream Leviculum design pass.
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "d8e44bc77b471d3cde79f37579c66c7ee345235e", version = "0.6", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "d8e44bc77b471d3cde79f37579c66c7ee345235e", version = "0.6", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
@@ -731,7 +745,7 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.6.4", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v3.6.5", version = "3", features = ["sqlite", "cirisnode", "classify", "scrub"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3

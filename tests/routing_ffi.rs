@@ -1,6 +1,10 @@
 //! v0.15.0 (CIRISEdge#33) — Routing-table FFI acceptance gate.
+//! v1.1.0 (CIRISEdge#44) — Leviculum-gap flip-on: paths + rate now
+//! call real `ReticulumNode` accessors; tunnels/announces/reverse
+//! remain documented Vec::new() (no backing data in the Leviculum
+//! fork).
 //!
-//! Exercises the v0.15.0 routing surface on `ReticulumTransport`
+//! Exercises the routing surface on `ReticulumTransport`
 //! (paths / blackhole / rate / tunnels / announce / reverse + the
 //! send-path blackhole enforcement). Mirrors the v0.14.0 Links FFI
 //! test layout — Rust-level tests against the transport, plus a
@@ -12,9 +16,10 @@
 //!
 //!   1. **Single-transport** — read/mutation surfaces that don't
 //!      require a peer. Stand up one `ReticulumTransport` and assert
-//!      the routing methods return the documented v0.15.0 shapes
-//!      (empty Vecs for the Leviculum-gap-stubbed reads, real values
-//!      for `transport_id` / `transport_uptime` / the blackhole CRUD).
+//!      the routing methods return the documented shapes (empty Vecs
+//!      for the 3 forever-stubbed reads, real Leviculum reads for the
+//!      5 v1.1.0-flipped accessors, real values for `transport_id` /
+//!      `transport_uptime` / the blackhole CRUD).
 //!
 //!   2. **Paired-transport** — the blackhole enforcement path. Stand
 //!      up two transports paired over loopback TCP, wait for rooting
@@ -210,13 +215,13 @@ where
     }
 }
 
-// ─── Tests: read surfaces (Leviculum-gap-stubbed) ───────────────────
+// ─── Tests: read surfaces (CIRISEdge#44 — Leviculum flip-on) ───────
 
 /// `routing_path_table` returns an empty Vec on a freshly-built
-/// transport. v0.15.0 returns empty regardless of state — the
-/// upstream `NodeCore::path_table_entries` is `pub(crate)`. This test
-/// pins the v0.15.0 behaviour so a v0.15.x flip-on flags as a behaviour
-/// change.
+/// transport that has never received an announce. v1.1.0 (CIRISEdge#44)
+/// — the underlying `ReticulumNode::path_table_entries` is now public;
+/// a fresh node with no peers and no inbound announces has zero rows.
+/// The test exercises the real Leviculum read, not a stub.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn path_table_empty_initially() {
     let _ = tracing_subscriber::fmt()
@@ -228,16 +233,20 @@ async fn path_table_empty_initially() {
     let table = transport.routing_path_table(None).await;
     assert!(
         table.is_empty(),
-        "v0.15.0 path_table is stubbed (Leviculum gap); expected empty"
+        "freshly-built transport with no peers has no path entries"
     );
+    // `max_hops` filter is wired — passing Some applies the hop cap
+    // even when the underlying table is empty (still emits []).
     let filtered = transport.routing_path_table(Some(3)).await;
     assert!(filtered.is_empty(), "max_hops filter on empty table");
 
     listen.abort();
 }
 
-/// `routing_path_to(unknown)` returns `None`. v0.15.0 always returns
-/// `None` pending Leviculum widening.
+/// `routing_path_to(unknown)` returns `None` because no entry matches.
+/// v1.1.0 (CIRISEdge#44) — backed by `ReticulumNode::get_path_clone`.
+/// Bad-length input also returns `None` (typed-error-free; callers
+/// pre-validate length when they need to distinguish).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn path_to_returns_none() {
     let _ = tracing_subscriber::fmt()
@@ -247,7 +256,13 @@ async fn path_to_returns_none() {
     let (transport, listen) = single_transport(tmp.path()).await;
 
     let result = transport.routing_path_to(&[0u8; 16]).await;
-    assert!(result.is_none(), "v0.15.0 path_to is stubbed");
+    assert!(result.is_none(), "unknown destination_hash returns None");
+
+    // Bad-length input is also None (not a typed error — the contract
+    // is "no entry matches"; length-validation is the caller's
+    // responsibility when they need to distinguish).
+    let bad_len = transport.routing_path_to(&[0u8; 4]).await;
+    assert!(bad_len.is_none(), "bad-length input returns None");
 
     listen.abort();
 }
@@ -285,7 +300,9 @@ async fn path_request_is_fire_and_forget() {
 }
 
 /// `routing_path_drop` accepts a valid 16-byte hash and returns
-/// `Ok(())` (v0.15.0 no-op pending Leviculum). Bad length errors.
+/// `Ok(())` whether or not the entry existed (POSIX `rm -f`
+/// ergonomics). v1.1.0 (CIRISEdge#44) — backed by
+/// `ReticulumNode::remove_path`. Bad length still errors typed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn path_drop_clears_entry() {
     let _ = tracing_subscriber::fmt()
@@ -294,10 +311,15 @@ async fn path_drop_clears_entry() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (transport, listen) = single_transport(tmp.path()).await;
 
+    // Idempotent — dropping a never-known entry succeeds.
     transport
         .routing_path_drop(&[0u8; 16])
         .await
-        .expect("v0.15.0 path_drop is a no-op");
+        .expect("path_drop is idempotent (rm -f ergonomics)");
+
+    // After the drop, path_to confirms the entry remains absent.
+    let after = transport.routing_path_to(&[0u8; 16]).await;
+    assert!(after.is_none(), "path_to after drop confirms absence");
 
     let err = transport
         .routing_path_drop(&[0u8; 4])
@@ -309,7 +331,10 @@ async fn path_drop_clears_entry() {
 }
 
 /// `routing_path_drop_via` accepts a valid 16-byte hash and returns
-/// `Ok(())` (v0.15.0 no-op).
+/// `Ok(())`. v1.1.0 (CIRISEdge#44) — backed by
+/// `ReticulumNode::drop_all_paths_via`. Bulk-eviction; the FFI
+/// surface discards the count of removed paths (operators inspect
+/// `routing_path_table` after for confirmation).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn path_drop_via_clears_all_paths_through_transport() {
     let _ = tracing_subscriber::fmt()
@@ -321,7 +346,14 @@ async fn path_drop_via_clears_all_paths_through_transport() {
     transport
         .routing_path_drop_via(&[0xBBu8; 16])
         .await
-        .expect("v0.15.0 path_drop_via is a no-op");
+        .expect("path_drop_via on empty table is a no-op");
+
+    // Bad length still surfaces as Config error.
+    let err = transport
+        .routing_path_drop_via(&[0u8; 8])
+        .await
+        .expect_err("bad length");
+    assert!(matches!(err, TransportError::Config(_)));
 
     listen.abort();
 }
@@ -527,10 +559,13 @@ async fn blackhole_hits_counter_increments_on_block() {
     listen_b.abort();
 }
 
-// ─── Tests: rate / tunnels / announce / reverse (stubbed reads) ────
+// ─── Tests: rate (flipped on) / tunnels / announce / reverse (gap) ─
 
 /// `routing_rate_table` returns empty on a freshly-built transport.
-/// v0.15.0 returns empty regardless of state.
+/// v1.1.0 (CIRISEdge#44) — backed by
+/// `ReticulumNode::rate_table_entries`. A node that has not yet
+/// processed any announces has zero rows; the test exercises the
+/// real Leviculum read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rate_table_empty_initially() {
     let _ = tracing_subscriber::fmt()
@@ -542,13 +577,17 @@ async fn rate_table_empty_initially() {
     let table = transport.routing_rate_table().await;
     assert!(
         table.is_empty(),
-        "v0.15.0 rate_table is stubbed (Leviculum gap)"
+        "freshly-built transport with no announces has empty rate table"
     );
 
     listen.abort();
 }
 
-/// `tunnels_list` returns empty (v0.15.0 stub).
+/// `tunnels_list` returns empty by design. v1.1.0 (CIRISEdge#44) —
+/// the CIRISAI/leviculum fork does not maintain a tunnels collection
+/// (only `tunnel_synthesize_hash` for control-destination routing).
+/// The wire shape stays pinned for forward-compat with a future
+/// Leviculum cut that grows the data structure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tunnels_list_empty_initially() {
     let _ = tracing_subscriber::fmt()
@@ -560,13 +599,16 @@ async fn tunnels_list_empty_initially() {
     let t = transport.routing_tunnels().await;
     assert!(
         t.is_empty(),
-        "v0.15.0 tunnels are stubbed (Reticulum gap; not publicly exposed)"
+        "tunnels collection does not exist in this Leviculum fork"
     );
 
     listen.abort();
 }
 
-/// `announce_table` returns empty (v0.15.0 stub).
+/// `announce_table` returns empty by design. v1.1.0 (CIRISEdge#44) —
+/// the in-flight announce retry queue is scoped to the driver event
+/// loop in reticulum-std and not surfaced on `ReticulumNode` at any
+/// visibility level. The wire shape stays pinned for forward-compat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn announce_table_reflects_in_flight() {
     let _ = tracing_subscriber::fmt()
@@ -576,17 +618,21 @@ async fn announce_table_reflects_in_flight() {
     let (transport, listen) = single_transport(tmp.path()).await;
 
     let a = transport.routing_announce_table().await;
-    // v0.15.0 stub returns empty. Once Leviculum widens the
-    // outbound_announces visibility this test will need updating to
-    // assert presence of at least one entry while the announce-tick
-    // is in flight.
-    assert!(a.is_empty(), "v0.15.0 announce_table is stubbed");
+    assert!(
+        a.is_empty(),
+        "in-flight announce queue is not exposed by Leviculum's public API"
+    );
 
     listen.abort();
 }
 
-/// `reverse_table` returns empty (v0.15.0 stub). Documents the round-
-/// trip contract for the v0.15.x flip-on.
+/// `reverse_table` returns empty by design. v1.1.0 (CIRISEdge#44) —
+/// Leviculum's `ReverseEntry` stores `(timestamp_ms,
+/// receiving_interface_index, outbound_interface_index)` keyed by
+/// packet hash; that shape doesn't carry `source_hash` /
+/// `destination_hash` fields, so Edge's `EdgeReverseEntry` wire
+/// schema can't be populated without an upstream Leviculum design
+/// pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reverse_table_round_trip() {
     let _ = tracing_subscriber::fmt()
@@ -596,7 +642,10 @@ async fn reverse_table_round_trip() {
     let (transport, listen) = single_transport(tmp.path()).await;
 
     let r = transport.routing_reverse_table().await;
-    assert!(r.is_empty(), "v0.15.0 reverse_table is stubbed");
+    assert!(
+        r.is_empty(),
+        "reverse_table shape mismatch prevents wire-shape projection"
+    );
 
     listen.abort();
 }
@@ -646,13 +695,14 @@ async fn transport_id_stable_after_init() {
     listen.abort();
 }
 
-// ─── Tests: peer_key_id field on path entry (gap-stubbed) ──────────
+// ─── Tests: peer_key_id field on path entry (v1.1.0 wired) ─────────
 
 /// `peer_key_id` on a PathEntry is filled when the destination_hash
-/// matches a rooted peer; `None` when no rooted peer matches. v0.15.0
-/// returns empty path_table so this test confirms the per-row stub
-/// shape doesn't smuggle in any state — it documents the v0.15.x
-/// flip-on expectations.
+/// matches a rooted peer; `None` when no rooted peer matches. v1.1.0
+/// (CIRISEdge#44) — the per-row resolution is now wired against the
+/// edge's `peers` map. A freshly-built transport with no rooted peers
+/// produces zero rows, but the wire-shape type contract is exercised
+/// via the loop (which compiles iff `peer_key_id: Option<String>`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_key_id_filled_from_directory() {
     let _ = tracing_subscriber::fmt()
@@ -661,24 +711,29 @@ async fn peer_key_id_filled_from_directory() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (transport, listen) = single_transport(tmp.path()).await;
 
-    // v0.15.0 — empty path_table by design (Leviculum gap). The
-    // per-row peer_key_id-fill semantics will be exercised once the
-    // upstream entries land.
     let table = transport.routing_path_table(None).await;
     for entry in &table {
-        // When real entries land, the rooted-peer match yields Some.
-        // For now there are zero entries; the loop is a documentation
-        // of intent only.
-        let _ = entry.peer_key_id.clone();
+        // Wire-shape check: `peer_key_id` is `Option<String>` and the
+        // resolution logic is in place to fill it when a rooted peer
+        // matches the destination hash (CIRISEdge#15 cold-start path).
+        let _: Option<String> = entry.peer_key_id.clone();
     }
-    assert!(table.is_empty(), "v0.15.0 stub returns empty");
+    // No rooted peers + no inbound announces → empty table. The
+    // multi-node loopback fixture in tests/reticulum_av42.rs covers
+    // the populated-table case where the rooted-peer match yields
+    // Some(key_id).
+    assert!(
+        table.is_empty(),
+        "no rooted peers + no inbound announces → empty path table"
+    );
 
     listen.abort();
 }
 
 /// Symmetric counterpart — when the destination_hash does not match a
-/// rooted peer, `peer_key_id` must be `None`. v0.15.0 stub returns
-/// empty; the assertion is on the wire shape only.
+/// rooted peer, `peer_key_id` must be `None`. v1.1.0 (CIRISEdge#44) —
+/// real Leviculum reads; the wire-shape check holds across the
+/// populated and empty cases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_key_id_none_when_directory_miss() {
     let _ = tracing_subscriber::fmt()
