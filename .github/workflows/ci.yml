@@ -1039,7 +1039,76 @@ jobs:
         # pyproject.toml's [tool.maturin].features list also names both;
         # we pass --features here too so the CI invocation is
         # self-documenting and resistant to pyproject drift.
-        run: maturin build --release --strip --features "pyo3 extension-module"
+        #
+        # v1.0.1 (CIRISEdge#50 re-reopen) — on Linux, skip maturin's
+        # default auditwheel pass and run auditwheel manually below with
+        # `--exclude libsqlite3.so.0`. Without the exclude, auditwheel
+        # sidecars edge's libsqlite3 into `ciris_edge.libs/` with a
+        # mangled SONAME (`libsqlite3-eac351cf.so.0`), and the resulting
+        # PyPI wheel ends up with a SECOND libsqlite3 in the cohabitation
+        # process alongside persist's. The two are independent libsqlite3
+        # instances with their own `sqlite3GlobalConfig` static globals;
+        # edge's is never `sqlite3_initialize`d → null `xMalloc` →
+        # SIGSEGV on the durable-send SQL path. Same fix shape persist
+        # v3.6.3 used (CIRISPersist#136). System libsqlite3 stays a
+        # runtime dep (manylinux base image includes it).
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            maturin build --release --strip --features "pyo3 extension-module" --auditwheel=skip
+          else
+            maturin build --release --strip --features "pyo3 extension-module"
+          fi
+      - name: auditwheel repair --exclude libsqlite3.so.0 (Linux only)
+        # v1.0.1 (CIRISEdge#50 re-reopen) — manual auditwheel with the
+        # libsqlite3 exclude. Mirrors CIRISPersist v3.6.3's CIRISPersist#136
+        # auditwheel exclude so edge.so and persist.so both NEEDED a
+        # plain `libsqlite3.so.0` that the dynamic loader unifies → ONE
+        # libsqlite3 instance shared across cdylibs.
+        if: runner.os == 'Linux'
+        run: |
+          pip install auditwheel
+          mkdir -p target/wheels/repaired
+          for whl in target/wheels/*linux*.whl; do
+            auditwheel repair --exclude libsqlite3.so.0 -w target/wheels/repaired/ "$whl"
+            rm "$whl"
+          done
+          mv target/wheels/repaired/*.whl target/wheels/
+          rmdir target/wheels/repaired
+      - name: verify libsqlite3 is plain NEEDED entry (Linux only)
+        # v1.0.1 (CIRISEdge#50 re-reopen) — post-build gate that fails
+        # the build if auditwheel re-introduced the mangled SONAME. The
+        # NEEDED entry MUST be plain `libsqlite3.so.0` (not
+        # `libsqlite3-<hash>.so.0`). Mirrors CIRISPersist v3.5.3's CI gate.
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          for whl in target/wheels/*linux*.whl; do
+            echo "::group::Verifying $whl"
+            tmp=$(mktemp -d)
+            unzip -q "$whl" -d "$tmp"
+            so=$(find "$tmp" -name "*.so" -path "*/ciris_edge/*" | head -1)
+            if [ -z "$so" ]; then
+              echo "::error::no ciris_edge .so found in $whl"; exit 1
+            fi
+            needed=$(readelf -d "$so" | grep -i sqlite3 || true)
+            echo "NEEDED libsqlite3 lines:"
+            echo "$needed"
+            if echo "$needed" | grep -q 'libsqlite3-[0-9a-f]\+\.so\.0'; then
+              echo "::error::$whl has a MANGLED libsqlite3 SONAME — auditwheel exclude failed"
+              exit 1
+            fi
+            if ! echo "$needed" | grep -q 'libsqlite3\.so\.0'; then
+              echo "::error::$whl has NO libsqlite3.so.0 NEEDED entry — verify auditwheel ran"
+              exit 1
+            fi
+            # Confirm no libsqlite3 sidecar
+            if ls "$tmp"/ciris_edge.libs/libsqlite3* 2>/dev/null; then
+              echo "::error::$whl has a libsqlite3 in .libs sidecar — auditwheel exclude failed"
+              exit 1
+            fi
+            rm -rf "$tmp"
+            echo "::endgroup::"
+          done
       - name: confirm wheel shape
         # v0.7.0 (CIRISEdge#17) — abi3-py310 not cp311-abi3. Chaquopy
         # bundles Python 3.10; abi3 is forward-compatible so the py310
