@@ -6,9 +6,9 @@
 > file. Methodology: `~/CIRISAgent/FSD/MISSION_DRIVEN_DEVELOPMENT.md`
 > and the overview at [ciris.ai/mdd](https://ciris.ai/mdd).
 
-**Version**: 1.1
-**Status**: Active — refreshed against `main` at v0.17.x (v1.0-prep docs cut)
-**Date**: 2026-05-29
+**Version**: 2.0
+**Status**: v1.0.0 — Agent 3.0 / CEWP GA
+**Date**: 2026-05-30
 
 This is the reverse-engineered MDD charter for CIRISEdge: it maps the
 four pillars — Mission (WHY) / Protocols (WHO) / Schemas (WHAT) / Logic
@@ -514,16 +514,31 @@ and intentionally does not touch the substrate today. Together these
 fields make CIRISEdge legibly compliant with the CIRIS 3.0 protocol
 surface, in the AGPL letter as well as the apophatic spirit of §1.4.
 
-## 11. Architectural surfaces shipped v0.5.0 → v0.20.0 RC1
+## 11. Architectural surfaces shipped v0.5.0 → v1.0.0 GA
+
+**v1.0.0 GA — Agent 3.0 / CEWP**: CIRISEdge ships as the **federation
+transport tier of the seven-repo CIRIS Epistemic Web Platform** (CEWP)
+Agent 3.0 stack. Reticulum (canonical mesh, multi-medium reach over
+TCP / UDP / RNode-LoRa / Local-AF_UNIX / I²P / AutoInterface) and
+HTTPS (mTLS + bearer-token + dev self-signed) are both production-
+grade, byte-equivalent transports carrying every `MessageType::*`
+variant the registry defines. The substrate is locked at
+**ciris-persist v3.6.3** + **ciris-verify v4.4.2** — the CEWP-aligned
+pin matrix the conformance harness drives. ~417 tests pass across the
+verify / replay / authenticated-resolution / links / routing /
+peer-mgmt / SAS / cohort-scope / trust-short-circuit / multimedia /
+cohabitation / UniFFI / HTTPS-init surfaces. The seven AV-43 → AV-49
+invariants below are the v1.0 security contract — see
+`docs/THREAT_MODEL.md`.
 
 The v0.4.0 reverse-engineering pass anchored the v1.0-prep architecture
 floor — verify pipeline, durable outbound, Reticulum + HTTP transports,
 authenticated `PeerResolver` cold-start (AV-42). The minors between
-v0.4.0 and v0.20.0 RC1 added load-bearing surfaces that the v1.0 doc
-contract must name explicitly. v0.20.0 RC1 (CIRISEdge#51) is the last
-infrastructure cut before v1.0.0 GA — v0.20.1 ships multimedia (#52),
-v1.0.0 ships as the "Agent 3.0 / CEWP" release. Each surface is
-anchored to its primary implementation file:
+v0.4.0 and v1.0.0 GA added load-bearing surfaces that the v1.0 doc
+contract must name explicitly. v0.20.0 RC1 (CIRISEdge#51) was the
+last infrastructure cut, v0.20.1 the last feature cut (multimedia
+#52), v1.0.0 is the GA ship. Each surface is anchored to its primary
+implementation file:
 
 - **Link lifecycle primitive** (v0.14.0 CIRISEdge#32,
   `src/transport/reticulum.rs::link_open` / `link_teardown` /

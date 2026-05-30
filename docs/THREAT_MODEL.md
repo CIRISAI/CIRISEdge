@@ -1,15 +1,19 @@
 # CIRISEdge Threat Model
 
-**Status:** v0.17.x production-grade — Reticulum + HTTPS transports both
-shipped at production grade (HTTPS promoted from "fallback" to
-fully-equivalent transport at v0.13.0 CIRISEdge#23 Track B);
-authenticated `PeerResolver` cold-start (AV-42, v0.4.0); UniFFI binding
-surface (v0.13.0 CIRISEdge#36 GO); 6-capsule cohabitation handoff with
+**Status:** v1.0.0 GA — production-grade. Substrate locked. ~417 tests
+pass against the CEWP-aligned pins (ciris-persist v3.6.3 +
+ciris-verify v4.4.2). Reticulum + HTTPS transports both production-
+grade, byte-equivalent (HTTPS promoted from "fallback" to fully-
+equivalent at v0.13.0 CIRISEdge#23 Track B). Authenticated
+`PeerResolver` cold-start (AV-42, v0.4.0). UniFFI binding surface
+(v0.13.0 CIRISEdge#36 GO). 7-capsule cohabitation handoff with
 `local_signer` for the Reticulum transport identity (v0.16.1 main-line
-cherry-pick of v0.13.1 patch line, CIRISEdge#43); ~210 tests across the
-verify / replay / authenticated-resolution / links / routing / peer-mgmt
-/ SAS surfaces. Prior baseline: v0.0 spec-only scaffold at `3fc4ab0`.
-Updated each minor release.
+cherry-pick of v0.13.1 patch line, CIRISEdge#43) and
+`trust_scoring_capsule` for the dispatch-inbound trust short-circuit
+(v0.20.0 RC1, CIRISEdge#51 / CIRISPersist#129). The v1.0 security
+contract is the seven invariants AV-43 through AV-49 — each is
+mitigated structurally, not by runtime hope. Prior baseline: v0.0
+spec-only scaffold at `3fc4ab0`. Updated each minor release.
 **Audience:** federation peers integrating against `ciris-edge`, security
 reviewers, downstream substrate consumers (`CIRISLens`, `CIRISAgent`,
 `CIRISRegistry`).
@@ -1683,6 +1687,57 @@ V0.20.0 RC1 SHIPPED (CIRISEdge#51 — CEWP infrastructure cut)
            on init_edge_runtime allow per-deployment tuning. L2+
            depths deferred to post-v1.0.
 
+V0.20.1 SHIPPED (CIRISEdge#52 — multimedia tier transport, last feature cut)
+  ✓ AV-49  Multimedia tier transport semantics — Contribution
+           subject_kind discriminator (takedown_notice fast-path
+           on TVEC / GIFCT-CIP / NCMEC legal_basis; key_grant
+           point-to-point); BlobBody::External wire shape
+           (validate_content_body skips AV-13 + SHA gates for
+           external bytes — publisher's responsibility per
+           MEDIA_SHARING.md §2.6); L1-as-CDN-edge opt-in default
+           OFF (Client + Proxy modes ignore the flag; full HTTP
+           fetch implementation deferred post-v1.0 — wire shape +
+           dispatch path locked at v0.20.1). Substrate primitives
+           backed by CIRISPersist v3.6.0 (#134 multimedia tier).
+
+V1.0.0 GA SHIPPED — Agent 3.0 / CEWP federation transport tier
+  v1.0 SECURITY CONTRACT = AV-43 through AV-49 (all structurally mitigated):
+    ✓ AV-43  Federation transport identity 32-byte vs 65-byte hybrid
+             split (Step 3.5 dual-capsule extraction +
+             LocalSignerHardwareAdapter; v0.13.1 / v0.16.1 cherry-pick)
+    ✓ AV-44  testimonial_witness preservation invariant
+             (Option-wrapped wire field; canonical bytes via persist;
+             edge propagates verbatim, never interprets)
+    ✓ AV-45  key_boundary {scope} wire form shipped (v0.16.0);
+             cohort_scope source-of-truth persist-backed at v0.19.6
+             via federation_peer_metadata.policy_blob.cohort_scope;
+             key_boundary-scope-to-signature binding deferred to
+             v1.0.x+ (declared-not-enforced at GA — wire surface
+             stable for downstream consumers)
+    ✓ AV-46  Schema-level separation of operator opinion
+             (federation_peer_metadata sibling table) from
+             federation attestation (federation_keys directory) —
+             EdgePeerTrust is operator policy, not attestation
+    ✓ AV-47  UniFFI pre-init invariant — every FFI free function
+             gates on current_edge() and returns typed
+             NotInitialized rather than panicking; Weak::upgrade
+             flips back to NotInitialized on teardown
+    ✓ AV-48  Trust short-circuit at dispatch_inbound (substrate gate
+             stays first; trust drop fires moderation event +
+             inbound_dropped_low_trust counter); cohabitation
+             cohab residual CLOSED via 7th capsule (v0.20.0 RC1)
+    ✓ AV-49  Multimedia tier transport semantics — takedown fast-path
+             observability; BlobBody::External non-fetch contract;
+             L1-as-CDN-edge opt-in OFF by default (v0.20.1)
+  SUBSTRATE LOCKED:
+    ciris-persist v3.6.3 + ciris-verify v4.4.2
+  CROSS-CDYLIB SQLITE UNIFICATION (v0.19.7 closure of CIRISEdge#50):
+    persist v3.5.3 → wheel-tier dynamic libsqlite3 linkage;
+    5 sibling traits (FederationDirectory, OutboundQueue,
+    TrustScoring, BlackholeRules, LocalSigner) structurally
+    protected against cross-cdylib vtable null-slot crashes
+    (persist v3.6.1+ + edge v0.19.7+).
+
 PHASE-1 P1 BUNDLE — must land for production cutover
   ⚠ AV-3   Replay LRU with 5-min window
   ⚠ AV-5   Cross-impl byte-equivalence test for canonicalize_envelope
@@ -1750,14 +1805,13 @@ This document is updated:
   trace wire format): trust-boundary review + interaction matrix
   update.
 
-Last updated: 2026-05-29 (v0.19.6 — last feature cut before RC1.
-AV-48 added (trust short-circuit at dispatch_inbound, mitigated
-v0.19.6 CIRISEdge#48-B via CIRISPersist#123 TrustScoring trait);
-AV-45 closure narrowed (cohort_scope side now persist-backed via
-peer_metadata_for / CIRISPersist#127; only key_boundary_scope-to-
-signature binding remains deferred). Mitigation Matrix gains
-AV-48 row. v0.19.6 closure progression for AV-45 documented in
-the AV-45 § addendum. Prior baselines: 2026-05-29 v0.17.1
-docs-only cut (AV-43/44/45/46/47 added + canonical-peer
-invariant); 2026-05-22 v0.4.0 AV-42 mitigated; 2026-05-03 v0.0
-scaffold.)
+Last updated: 2026-05-30 (v1.0.0 GA — Agent 3.0 / CEWP. The v1.0
+security contract is the seven invariants AV-43 through AV-49,
+each structurally mitigated. Substrate locked at ciris-persist
+v3.6.3 + ciris-verify v4.4.2. Posture Summary v1.0.0 GA block
+added with the full enumeration. Prior baselines: 2026-05-29
+v0.20.0 RC1 (CEWP infrastructure cut, AV-48 cohab residual
+closed); 2026-05-29 v0.19.6 (AV-48 mitigated, AV-45 narrowed);
+2026-05-29 v0.17.1 docs-only cut (AV-43/44/45/46/47 added +
+canonical-peer invariant); 2026-05-22 v0.4.0 AV-42 mitigated;
+2026-05-03 v0.0 scaffold.)
