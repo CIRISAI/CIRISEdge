@@ -26,8 +26,15 @@ jobs:
       # which links libtss2. Cargo unions the feature across the graph
       # so edge inherits it even though edge only asks for `software`.
       # Closes CIRISEdge#12.
-      - name: install libtss2-dev (TPM build dep)
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
+        # v0.19.7 (CIRISEdge#50) — added `libsqlite3-dev` alongside
+        # `libtss2-dev`. Persist v3.5.3+ dropped the rusqlite `bundled`
+        # feature in favour of dynamic linkage so the wheel + edge
+        # share ONE libsqlite3.so at runtime (closes the cross-wheel
+        # SIGSEGV CIRISEdge#50 hit at v0.19.5). The transitive build
+        # graph now needs the system header set at compile time.
+        # Mirrors persist's `.github/workflows/ci.yml` after v3.5.3.
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (transport-http + transport-reticulum + pyo3)
@@ -827,8 +834,15 @@ jobs:
       - uses: actions/checkout@v4
       # libtss2 for the `tpm` keyring feature — clippy compiles the
       # full graph. See linux-x86_64-test above; CIRISEdge#12.
-      - name: install libtss2-dev (TPM build dep)
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
+        # v0.19.7 (CIRISEdge#50) — added `libsqlite3-dev` alongside
+        # `libtss2-dev`. Persist v3.5.3+ dropped the rusqlite `bundled`
+        # feature in favour of dynamic linkage so the wheel + edge
+        # share ONE libsqlite3.so at runtime (closes the cross-wheel
+        # SIGSEGV CIRISEdge#50 hit at v0.19.5). The transitive build
+        # graph now needs the system header set at compile time.
+        # Mirrors persist's `.github/workflows/ci.yml` after v3.5.3.
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -857,8 +871,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: install libtss2-dev (TPM build dep)
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
+        # v0.19.7 (CIRISEdge#50) — added `libsqlite3-dev` alongside
+        # `libtss2-dev`. Persist v3.5.3+ dropped the rusqlite `bundled`
+        # feature in favour of dynamic linkage so the wheel + edge
+        # share ONE libsqlite3.so at runtime (closes the cross-wheel
+        # SIGSEGV CIRISEdge#50 hit at v0.19.5). The transitive build
+        # graph now needs the system header set at compile time.
+        # Mirrors persist's `.github/workflows/ci.yml` after v3.5.3.
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build uniffi_bindgen_cli
@@ -918,8 +939,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # libtss2 — same dep linux-x86_64-test installs (CIRISEdge#12).
-      - name: install libtss2-dev (TPM build dep)
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
+        # v0.19.7 (CIRISEdge#50) — added `libsqlite3-dev` alongside
+        # `libtss2-dev`. Persist v3.5.3+ dropped the rusqlite `bundled`
+        # feature in favour of dynamic linkage so the wheel + edge
+        # share ONE libsqlite3.so at runtime (closes the cross-wheel
+        # SIGSEGV CIRISEdge#50 hit at v0.19.5). The transitive build
+        # graph now needs the system header set at compile time.
+        # Mirrors persist's `.github/workflows/ci.yml` after v3.5.3.
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo bench --no-run (all features)
@@ -955,9 +983,16 @@ jobs:
       # libtss2 for the `tpm` keyring feature on the Linux wheel
       # builds. macOS wheels build the base keyring (no tss-esapi),
       # so this step is Linux-only. See CIRISEdge#12.
-      - name: install libtss2-dev (TPM build dep)
+      # v0.19.7 (CIRISEdge#50) — also installs `libsqlite3-dev`
+      # alongside `libtss2-dev`. Persist v3.5.3+ dropped the rusqlite
+      # `bundled` feature; the wheel-build's auditwheel pass needs the
+      # system libsqlite3.so present so it can sidecar-bundle it into
+      # `ciris_persist.libs/`. macOS wheels link the host's Apple-
+      # provided libsqlite3 (delocate handles it), so this step
+      # stays Linux-only.
+      - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below
@@ -1078,8 +1113,15 @@ jobs:
       - uses: actions/checkout@v4
       # libtss2 for the `tpm` keyring feature — build-manifest
       # compiles the graph to emit EdgeExtras. See CIRISEdge#12.
-      - name: install libtss2-dev (TPM build dep)
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
+        # v0.19.7 (CIRISEdge#50) — added `libsqlite3-dev` alongside
+        # `libtss2-dev`. Persist v3.5.3+ dropped the rusqlite `bundled`
+        # feature in favour of dynamic linkage so the wheel + edge
+        # share ONE libsqlite3.so at runtime (closes the cross-wheel
+        # SIGSEGV CIRISEdge#50 hit at v0.19.5). The transitive build
+        # graph now needs the system header set at compile time.
+        # Mirrors persist's `.github/workflows/ci.yml` after v3.5.3.
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
