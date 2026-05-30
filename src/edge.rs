@@ -755,6 +755,15 @@ pub struct Edge {
     verify: Arc<VerifyPipeline>,
     queue: Arc<dyn OutboundHandle>,
     signer: Arc<LocalSigner>,
+    /// v1.1.1 (CIRISEdge#50 darwin follow-on; mirrors CIRISPersist#137/#138
+    /// `select_signer`). When the cohabitation init path supplies a
+    /// local seed signer that names the same `key_id` as `signer`, this
+    /// holds the in-memory adapter so envelope signing skips the
+    /// platform-keyring IPC. `scrub_signer()` resolves to this when
+    /// the alias matches; falls back to `signer` otherwise. None for
+    /// non-cohabitation builds + sw_file deployments that don't supply
+    /// `local_key_path`.
+    local_signer: Option<Arc<LocalSigner>>,
     transports: Vec<Arc<dyn Transport>>,
     handlers: Arc<Mutex<HashMap<MessageType, RegisteredHandler>>>,
     /// Inline-text inbound fan-out registry (CIRISEdge#22 Tier 2;
@@ -923,6 +932,8 @@ pub struct EdgeBuilder {
     federation_directory: Option<Arc<dyn ciris_persist::federation::FederationDirectory>>,
     queue: Option<Arc<dyn OutboundHandle>>,
     signer: Option<Arc<LocalSigner>>,
+    /// v1.1.1 — see `Edge::local_signer`.
+    local_signer: Option<Arc<LocalSigner>>,
     transports: Vec<Arc<dyn Transport>>,
     speak_pipeline:
         Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
@@ -1096,6 +1107,7 @@ impl Edge {
             federation_directory: None,
             queue: None,
             signer: None,
+            local_signer: None,
             transports: Vec::new(),
             speak_pipeline: None,
             peer_directory: None,
@@ -2345,6 +2357,34 @@ impl Edge {
         self.signer.clone()
     }
 
+    /// v1.1.1 — choose between the in-memory local signer and the
+    /// forensic (platform-keyring) signer at envelope-sign time.
+    /// Mirrors CIRISPersist#137/#138 `select_signer` discipline:
+    /// when the local signer's `key_id` matches `signer`'s (the
+    /// common cohabitation case where `local_key_path` was supplied
+    /// at Engine construction), prefer the in-memory adapter so
+    /// signing skips the keychain/dbus/libsecret IPC.
+    ///
+    /// Closes the CIRISEdge#50 darwin headless-CI follow-on:
+    /// platform-keyring `sign()` fails on macOS runners where the
+    /// Keychain isn't unlocked → `send_durable_inline_text` crashed
+    /// the subprocess at the envelope sign step → conformance
+    /// `test_durable_send_enqueues_to_outbound_queue` got an empty
+    /// stdout → JSONDecodeError. With the local-signer fast-path,
+    /// the sign is an in-memory Ed25519 op (~14µs) that works
+    /// regardless of platform keyring state.
+    ///
+    /// Returns `&self.signer` (forensic) when no `local_signer` was
+    /// supplied or when the local alias doesn't match — preserving
+    /// the v0.13.1 split for hardware-rooted forensic envelope
+    /// signing.
+    fn scrub_signer(&self) -> &Arc<LocalSigner> {
+        match self.local_signer.as_ref() {
+            Some(local) if local.key_id == self.signer.key_id => local,
+            _ => &self.signer,
+        }
+    }
+
     /// CIRISEdge#26 (v0.13.0 UniFFI cut) — Rust-level accessor returning
     /// a clone of the federation-key directory `Arc`. The UniFFI bindings
     /// drive `peer_list` / `peer_get` reads against this. Mutations
@@ -2671,7 +2711,7 @@ impl Edge {
             in_reply_to,
         )?;
         envelope.cohort_scope = cohort_scope;
-        sign_envelope(&self.signer, &mut envelope).await?;
+        sign_envelope(self.scrub_signer(), &mut envelope).await?;
         let bytes = serde_json::to_vec(&envelope)
             .map_err(|e| EdgeError::Config(format!("envelope serialize: {e}")))?;
         if bytes.len() > self.config.max_body_bytes {
@@ -3693,6 +3733,19 @@ impl EdgeBuilder {
         self
     }
 
+    /// v1.1.1 — supply an in-memory local-seed signer alongside the
+    /// hot-path forensic signer. When the local signer's `key_id`
+    /// matches the forensic signer's, `Edge::scrub_signer()` resolves
+    /// to the local one so envelope signing skips the platform-keyring
+    /// IPC. Mirrors CIRISPersist#137/#138 `select_signer` discipline
+    /// on the edge side — closes the CIRISEdge#50 darwin headless-CI
+    /// follow-on where keychain-IPC fails the durable-send sign step.
+    #[must_use]
+    pub fn local_signer(mut self, local_signer: Arc<LocalSigner>) -> Self {
+        self.local_signer = Some(local_signer);
+        self
+    }
+
     #[must_use]
     pub fn transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transports.push(transport);
@@ -3968,6 +4021,7 @@ impl EdgeBuilder {
             verify,
             queue,
             signer,
+            local_signer: self.local_signer,
             transports: self.transports,
             handlers: Arc::new(Mutex::new(HashMap::new())),
             inline_text_subscribers: Arc::new(std::sync::Mutex::new(HashMap::new())),
