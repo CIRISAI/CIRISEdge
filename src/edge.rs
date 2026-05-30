@@ -254,6 +254,16 @@ pub struct CanonicalBootstrapPeer {
 
 /// Top-level configuration. Defaults match the v0.1.0 P0 invariants
 /// (`docs/THREAT_MODEL.md` §10).
+///
+/// `EdgeConfig` carries four independent operator booleans
+/// (`probe_pattern_observer_enabled`, `listener_bound`,
+/// `trust_short_circuit_enabled`, `l1_cdn_edge_enabled`); each maps
+/// directly onto a distinct substrate feature. Bundling them into a
+/// sub-struct would obscure the flat surface the cohabitation init
+/// path + UniFFI bindings depend on, so the
+/// `clippy::struct_excessive_bools` lint is suppressed at the
+/// struct level (not at any call site).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct EdgeConfig {
     /// Consumer-side hybrid PQC acceptance policy (OQ-11).
@@ -432,6 +442,33 @@ pub struct EdgeConfig {
     /// depth = 0 even though L1 default is 1). L2+ depths deferred
     /// to a post-v1.0 cut.
     pub trust_recursion_depth: u8,
+    /// CIRISEdge#52 (v0.20.1) — L1-as-CDN-edge opt-in per
+    /// MEDIA_SHARING.md §2.7. When `true` AND
+    /// [`Self::agent_mode`] is `AgentMode::Server` (L1), edge
+    /// pre-fetches external multimedia content + re-emits its own
+    /// `holds_bytes:sha256:{hash}` attestation so federation peers
+    /// can fetch through the operator's CDN tier. Default `false`
+    /// (opt-in per the spec); Client and Proxy modes ignore the
+    /// flag regardless of its value.
+    ///
+    /// **Implementation status at v0.20.1**: the dispatch hook fires
+    /// [`crate::multimedia::cdn_edge_prefetch_stub`] which logs the
+    /// opt-in trigger via `tracing::info!` but does NOT perform the
+    /// actual HTTP fetch — the wire shape + dispatch path are locked
+    /// here; the full bytes-fetching implementation is a post-v1.0
+    /// follow-up. See `docs/THREAT_MODEL.md` AV-49.
+    pub l1_cdn_edge_enabled: bool,
+    /// CIRISEdge#52 (v0.20.1) — operator's S3-class base URI for
+    /// L1-as-CDN-edge re-publication. Required when
+    /// [`Self::l1_cdn_edge_enabled`] is `true`; ignored otherwise.
+    /// The prefetch stub re-publishes content at
+    /// `{l1_cdn_edge_external_uri_base}/{sha256_hex}` and emits a
+    /// fresh `holds_bytes` attestation against that URI.
+    ///
+    /// `None` when L1-CDN-edge is disabled (the default); operators
+    /// who flip the boolean MUST also supply this base before
+    /// `Edge::build`.
+    pub l1_cdn_edge_external_uri_base: Option<String>,
 }
 
 impl Default for EdgeConfig {
@@ -507,6 +544,12 @@ impl Default for EdgeConfig {
             // on init_edge_runtime overwrite again per deployment.
             disk_budget_bytes: 256 * 1024 * 1024 * 1024,
             trust_recursion_depth: 0,
+            // v0.20.1 (CIRISEdge#52) — opt-in per MEDIA_SHARING.md
+            // §2.7. Disabled by default across every mode; operators
+            // flip the boolean on L1 servers that want to act as
+            // CDN edges for external multimedia content.
+            l1_cdn_edge_enabled: false,
+            l1_cdn_edge_external_uri_base: None,
         }
     }
 }
@@ -692,6 +735,19 @@ pub enum ContentResult {
     /// The peer returned a `ContentMiss` (typed reason). Fetcher
     /// SHOULD try another peer per the MissReason taxonomy.
     ContentMiss { reason: String },
+    /// CIRISEdge#52 (v0.20.1) — multimedia tier: the peer returned a
+    /// `BlobBody::External` pointer (MEDIA_SHARING.md §2.6). Edge
+    /// does NOT fetch the bytes; the consumer's client fetches
+    /// directly from `external_uri` and verifies against
+    /// `external_sha256_hex`. The fetcher's Python surface projects
+    /// this as a dict `{"external_uri": ..., "external_sha256_hex": ...}`.
+    External {
+        /// Publisher's S3-class pointer.
+        external_uri: String,
+        /// Hex-encoded SHA-256 of the external bytes. The consumer's
+        /// client verifies fetched bytes against this hash.
+        external_sha256_hex: String,
+    },
 }
 
 /// Top-level edge handle. Construct via [`Edge::builder`].
@@ -2239,6 +2295,9 @@ impl Edge {
             self.config.trust_threshold,
             self.config.trust_short_circuit_enabled,
             self.config.trust_recursion_depth,
+            self.config.agent_mode,
+            self.config.l1_cdn_edge_enabled,
+            self.config.l1_cdn_edge_external_uri_base.clone(),
         )
         .await;
     }
@@ -2522,6 +2581,14 @@ impl Edge {
         // so each spawned `dispatch_inbound` task gets the operator-
         // configured recursion depth (CEWP L0/L1 0/1 default).
         let trust_recursion_depth = self.config.trust_recursion_depth;
+        // CIRISEdge#52 (v0.20.1) — multimedia tier knobs threaded
+        // into each dispatched envelope. `agent_mode` gates the
+        // L1-as-CDN-edge prefetch arm; the URI base is `Option`
+        // because the prefetch hook only fires when both the
+        // boolean is `true` AND a base is supplied.
+        let agent_mode_for_dispatch = self.config.agent_mode;
+        let l1_cdn_edge_enabled = self.config.l1_cdn_edge_enabled;
+        let l1_cdn_edge_external_uri_base = self.config.l1_cdn_edge_external_uri_base.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -2544,6 +2611,7 @@ impl Edge {
                     let events_clone = events.clone();
                     let fed_dir_for_cohort_clone = federation_directory_for_cohort.clone();
                     let trust_scoring_clone = trust_scoring.clone();
+                    let l1_cdn_edge_external_uri_base_clone = l1_cdn_edge_external_uri_base.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -2566,6 +2634,9 @@ impl Edge {
                             trust_threshold,
                             trust_short_circuit_enabled,
                             trust_recursion_depth,
+                            agent_mode_for_dispatch,
+                            l1_cdn_edge_enabled,
+                            l1_cdn_edge_external_uri_base_clone,
                         ).await;
                     });
                 }
@@ -2778,6 +2849,13 @@ async fn dispatch_inbound(
     // v0.19.6 hardcoded `0` (strict direct trust); v0.20.0 RC1 honours
     // `EdgeConfig::trust_recursion_depth` (CEWP L0/L1 default 0/1).
     trust_recursion_depth: u8,
+    // CIRISEdge#52 (v0.20.1) — multimedia tier: agent_mode gates
+    // L1-as-CDN-edge (only `Server`/L1 acts); the cdn-edge knobs are
+    // captured here so the dispatch sub-arm on `ContributionSubmit`
+    // can fire the prefetch stub without re-reading the config.
+    agent_mode: AgentMode,
+    l1_cdn_edge_enabled: bool,
+    l1_cdn_edge_external_uri_base: Option<String>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -3046,7 +3124,31 @@ async fn dispatch_inbound(
         // waiter for this sha256 with the bytes. The match key is the
         // body's own `sha256` field (echoed back in `ContentBody`),
         // not the envelope-level body_sha256.
-        if let Ok(body) = serde_json::from_str::<crate::messages::ContentBody>(envelope.body.get())
+        //
+        // CIRISEdge#52 (v0.20.1) — the External variant correlates
+        // by the hex-decoded `external_sha256_hex` and signals via
+        // `ContentResult::External` so the fetcher sees a typed
+        // "this is a pointer, not bytes" outcome. Edge does NOT
+        // dereference the pointer; the consumer's client fetches the
+        // bytes directly from `external_uri` (MEDIA_SHARING.md §2.6).
+        if is_external_content_body(envelope.body.get().as_bytes()) {
+            if let Ok(external) =
+                serde_json::from_str::<ContentBodyExternalProbe>(envelope.body.get())
+            {
+                if let Ok(sha) = hex_to_sha256(&external.external_sha256_hex) {
+                    let mut pending = content_fetch_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(tx) = pending.remove(&sha) {
+                        let _ = tx.send(ContentResult::External {
+                            external_uri: external.external_uri,
+                            external_sha256_hex: external.external_sha256_hex,
+                        });
+                    }
+                }
+            }
+        } else if let Ok(body) =
+            serde_json::from_str::<crate::messages::ContentBody>(envelope.body.get())
         {
             let mut pending = content_fetch_pending
                 .lock()
@@ -3325,6 +3427,128 @@ async fn dispatch_inbound(
                     error = %e,
                     transport = ?transport,
                     "InlineText body parse failed at dispatch fan-out",
+                );
+            }
+        }
+    }
+
+    // CIRISEdge#52 (v0.20.1) — multimedia tier sub-dispatch on
+    // `MessageType::ContributionSubmit`. Inspects the body's
+    // `subject_kind` discriminator (additive at v0.20.1 per
+    // MEDIA_SHARING.md). The probe is observation-only — the
+    // existing typed-handler dispatch below is preserved on every
+    // branch (the sub-dispatch fires observables + the L1-CDN
+    // prefetch stub, but does NOT consume the envelope).
+    //
+    // Branches (per MEDIA_SHARING.md §5.2 + §2.6 + §2.7):
+    //
+    //   1. `takedown_notice` + fast-path `legal_basis` (TVEC /
+    //      GIFCT-CIP / NCMEC) → emit `edge.dispatch.takedown_fast_path`
+    //      span event so observability streams see the
+    //      legal-compliance trigger; pass through to handler.
+    //   2. `key_grant` → emit `edge.dispatch.key_grant` event with
+    //      the addressed `recipient_key_id`; edge does NOT
+    //      gossip-propagate (KeyGrants ride point-to-point on the
+    //      envelope's existing `destination_key_id`).
+    //   3. Contribution carrying `blob_body.kind == "external"`
+    //      AND `agent_mode == Server` (L1) AND
+    //      `l1_cdn_edge_enabled` → `tokio::spawn` the prefetch
+    //      stub (full impl deferred post-v1.0).
+    //   4. Any other Contribution → pass through; the existing
+    //      typed handler dispatch path picks it up unchanged.
+    if envelope.message_type == MessageType::ContributionSubmit {
+        let probe = crate::multimedia::ContributionDispatchProbe::from_body_bytes(
+            envelope.body.get().as_bytes(),
+        );
+        match probe.typed_subject_kind() {
+            Some(crate::multimedia::ContributionSubjectKind::TakedownNotice) => {
+                if let Some(basis) = probe.fast_path_basis() {
+                    tracing::info!(
+                        event = "edge.dispatch.takedown_fast_path",
+                        sender_key_id = %envelope.signing_key_id,
+                        legal_basis = basis.as_str(),
+                        content_sha256_hex = probe.content_sha256_hex.as_deref().unwrap_or(""),
+                        "takedown_notice fast-path triggered (CIRISEdge#52)",
+                    );
+                    tracing::Span::current().record("multimedia_dispatch", "takedown_fast_path");
+                    // Synthetic FederationAnnouncement to known
+                    // holders: best-effort observability emission via
+                    // the resource event channel. The federation-tier
+                    // emission lands in a future cut (when persist's
+                    // holds_bytes index reachable at edge); for now
+                    // the tracing span IS the cross-peer observable
+                    // (lens-core consumes the span and ships it).
+                    events.emit_resource(crate::events::NetworkEvent::resource(
+                        "takedown_fast_path",
+                        1.0,
+                        "count",
+                        crate::events::EventSeverity::Warning,
+                        basis.as_str(),
+                    ));
+                } else {
+                    tracing::debug!(
+                        event = "edge.dispatch.takedown_standard",
+                        sender_key_id = %envelope.signing_key_id,
+                        legal_basis = probe.legal_basis.as_deref().unwrap_or(""),
+                        "takedown_notice standard-dispatch (non-fast-path legal_basis)",
+                    );
+                }
+            }
+            Some(crate::multimedia::ContributionSubjectKind::KeyGrant) => {
+                tracing::info!(
+                    event = "edge.dispatch.key_grant",
+                    sender_key_id = %envelope.signing_key_id,
+                    recipient_key_id = probe.recipient_key_id.as_deref().unwrap_or(""),
+                    destination_key_id = %envelope.destination_key_id,
+                    "key_grant addressed-delivery (point-to-point; not gossiped)",
+                );
+                tracing::Span::current().record("multimedia_dispatch", "key_grant");
+                // Point-to-point semantics: edge's existing fan-out
+                // is bound by `envelope.destination_key_id` already
+                // (the Contribution rides Durable/Ephemeral classes;
+                // no Mandatory broadcast); KeyGrants therefore do
+                // NOT gossip-propagate by structural design — no
+                // additional gate is needed at this hook.
+            }
+            None => {
+                // Unknown / unset subject_kind — legacy Contribution
+                // pre-v0.20.1, or a NodeCore subject_kind we don't
+                // discriminate at the transport tier. Fall through
+                // to the existing handler dispatch unchanged.
+            }
+        }
+
+        // CIRISEdge#52 (v0.20.1) — L1-as-CDN-edge prefetch hook
+        // per MEDIA_SHARING.md §2.7. Three conjunctive gates:
+        // (1) operator declared L1 mode (`AgentMode::Server`),
+        // (2) operator opted in via `l1_cdn_edge_enabled = true`,
+        // (3) operator supplied an `l1_cdn_edge_external_uri_base`.
+        // Client + Proxy modes IGNORE the flag regardless of its
+        // value (spec §2.7 — "L1 operators can opt in").
+        if matches!(agent_mode, AgentMode::Server)
+            && l1_cdn_edge_enabled
+            && probe.blob_body_kind.as_deref()
+                == Some(crate::multimedia::ExternalRefWithAcl::WIRE_KIND)
+        {
+            if let (Some(uri), Some(sha_hex), Some(base)) = (
+                probe.external_uri.clone(),
+                probe.content_sha256_hex.clone(),
+                l1_cdn_edge_external_uri_base.clone(),
+            ) {
+                tracing::info!(
+                    event = "edge.l1_cdn_edge.prefetch_hook_fired",
+                    external_uri = %uri,
+                    external_sha256_hex = %sha_hex,
+                    operator_base = %base,
+                    "L1-as-CDN-edge prefetch hook fired (stub at v0.20.1)",
+                );
+                tokio::spawn(crate::multimedia::cdn_edge_prefetch_stub(
+                    uri, sha_hex, base,
+                ));
+            } else {
+                tracing::debug!(
+                    event = "edge.l1_cdn_edge.prefetch_skipped_missing_fields",
+                    "L1-CDN-edge enabled but external_uri/sha/base missing on this Contribution",
                 );
             }
         }
@@ -3944,6 +4168,25 @@ fn validate_content_body(
 ) -> Result<(), VerifyError> {
     use crate::messages::{sha256_of, ContentBody};
 
+    // CIRISEdge#52 (v0.20.1) — multimedia tier: a `ContentBody`
+    // carrying a `BlobBody::External` pointer (wire-form
+    // `kind == "external"`) is NOT subject to the inline-bytes AV-13
+    // size cap NOR the SHA-256 integrity gate. External multimedia
+    // bytes ride the publisher's S3-class store directly; edge
+    // carries only the metadata + ACL pointer. The consumer's
+    // client is responsible for fetching from `external_uri` and
+    // verifying the bytes against `external_sha256_hex` (NOT
+    // against the envelope-level SHA — those are distinct hashes).
+    //
+    // Per MEDIA_SHARING.md §2.6 + THREAT_MODEL AV-49: edge does
+    // NOT scrub external bytes (the scrub primitive is for
+    // inline_text_pipeline only). The discriminator probe runs
+    // BEFORE the inline-bytes parse so we don't fail-fast on a
+    // body that intentionally lacks the inline `bytes` field.
+    if is_external_content_body(envelope.body.get().as_bytes()) {
+        return Ok(());
+    }
+
     let body: ContentBody = serde_json::from_str(envelope.body.get())
         .map_err(|e| VerifyError::SchemaInvalid(format!("ContentBody body parse: {e}")))?;
 
@@ -3987,6 +4230,52 @@ fn validate_content_body(
     }
 
     Ok(())
+}
+
+/// CIRISEdge#52 (v0.20.1) — detect whether a `ContentBody` envelope
+/// carries a `BlobBody::External` pointer (the multimedia-tier shape
+/// per MEDIA_SHARING.md §2.6) vs the inline-bytes shape (v0.8.0+).
+///
+/// The discriminator lives at JSON `body.kind == "external"`. Probes
+/// via a minimal `serde_json` parse — best-effort, returns `false`
+/// on parse error (the calling site falls through to the inline-bytes
+/// parse which surfaces the schema error via the standard AV-13
+/// error path).
+fn is_external_content_body(body_bytes: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct KindProbe {
+        #[serde(default)]
+        kind: Option<String>,
+    }
+    let probe: KindProbe = match serde_json::from_slice(body_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    probe.kind.as_deref() == Some(crate::multimedia::ExternalRefWithAcl::WIRE_KIND)
+}
+
+/// CIRISEdge#52 (v0.20.1) — minimal projection of the
+/// `BlobBody::External` `ContentBody` wire shape used to correlate
+/// the `fetch_content` pending channel by `external_sha256_hex`.
+#[derive(serde::Deserialize)]
+struct ContentBodyExternalProbe {
+    external_uri: String,
+    external_sha256_hex: String,
+}
+
+/// CIRISEdge#52 (v0.20.1) — hex-decode a 64-char SHA-256 hex string
+/// to its raw 32-byte form, for the `content_fetch_pending` join
+/// key. Returns `Err(())` on length / charset mismatch.
+fn hex_to_sha256(hex_str: &str) -> Result<[u8; 32], ()> {
+    if hex_str.len() != 64 {
+        return Err(());
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|_| ())?;
+        out[i] = u8::from_str_radix(s, 16).map_err(|_| ())?;
+    }
+    Ok(out)
 }
 
 /// Cheap hex-encode helper for diagnostic log lines. Uses

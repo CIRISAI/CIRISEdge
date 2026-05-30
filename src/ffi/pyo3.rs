@@ -613,6 +613,20 @@ impl PyEdge {
                 dict.set_item("kind", "content_miss")?;
                 dict.set_item("reason", reason)?;
             }
+            // CIRISEdge#52 (v0.20.1) — multimedia tier: peer returned
+            // a `BlobBody::External` pointer. Python surface returns
+            // {"kind": "external", "external_uri": ..., "external_sha256_hex": ...};
+            // the consumer's client fetches bytes directly from
+            // `external_uri` (edge does NOT dereference the pointer
+            // per MEDIA_SHARING.md §2.6 + THREAT_MODEL AV-49).
+            crate::edge::ContentResult::External {
+                external_uri,
+                external_sha256_hex,
+            } => {
+                dict.set_item("kind", "external")?;
+                dict.set_item("external_uri", external_uri)?;
+                dict.set_item("external_sha256_hex", external_sha256_hex)?;
+            }
         }
         Ok(dict.unbind())
     }

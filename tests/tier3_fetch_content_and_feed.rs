@@ -200,7 +200,7 @@ async fn tier3_fetch_content_returns_bytes_on_match() {
     let result = fetch_task.await.expect("task").expect("fetch");
     match result {
         ContentResult::Bytes(b) => assert_eq!(b, expected_bytes),
-        ContentResult::ContentMiss { .. } => panic!("expected Bytes, got ContentMiss"),
+        other => panic!("expected Bytes, got {other:?}"),
     }
 }
 
@@ -240,7 +240,7 @@ async fn tier3_fetch_content_surfaces_content_miss() {
     let result = fetch_task.await.expect("task").expect("fetch");
     match result {
         ContentResult::ContentMiss { reason } => assert_eq!(reason, "NotHeld"),
-        ContentResult::Bytes(_) => panic!("expected ContentMiss, got Bytes"),
+        other => panic!("expected ContentMiss, got {other:?}"),
     }
 }
 
@@ -432,6 +432,6 @@ async fn tier3_dispatch_inbound_signals_fetch_content() {
     let result = fetch_task.await.expect("task").expect("fetch");
     match result {
         ContentResult::Bytes(b) => assert_eq!(b, bytes),
-        ContentResult::ContentMiss { .. } => panic!("expected Bytes, got ContentMiss"),
+        other => panic!("expected Bytes, got {other:?}"),
     }
 }
