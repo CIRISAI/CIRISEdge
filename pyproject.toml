@@ -71,7 +71,14 @@ Issues = "https://github.com/CIRISAI/CIRISEdge/issues"
 # `ffi-uniffi`, so the wheel ships BOTH the PyO3 entry surface AND the
 # UniFFI bindings. See `Cargo.toml::[features.pyo3]` for the implication
 # rationale.
-features = ["pyo3", "extension-module"]
+#
+# v1.1.4 (CIRISEdge#56) — `transport-http` added so the published wheel
+# can actually exercise the HTTPS init surface (v0.19.3 / CIRISEdge#49).
+# Without it the API was reachable (FFI is feature-gate-blind) but every
+# call raised `ValueError: built without it` at runtime, blocking
+# CIRISConformance#3 + #4. `pyo3` already pulls `transport-reticulum`
+# transitively; the wheel now ships BOTH transports.
+features = ["pyo3", "extension-module", "transport-http"]
 module-name = "ciris_edge"
 # abi3-py310 — one wheel covers Python 3.10+. v0.7.0 (CIRISEdge#17)
 # dropped the py310/py311 minor-version pin so Chaquopy (bundles

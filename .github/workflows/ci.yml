@@ -1052,11 +1052,18 @@ jobs:
         # SIGSEGV on the durable-send SQL path. Same fix shape persist
         # v3.6.3 used (CIRISPersist#136). System libsqlite3 stays a
         # runtime dep (manylinux base image includes it).
+        # v1.1.4 (CIRISEdge#56) — added `transport-http` so the published
+        # wheel can exercise the v0.19.3 HTTPS init surface. The pyo3
+        # feature already pulls transport-reticulum; this adds the second
+        # transport. The CI invocation and pyproject's [tool.maturin]
+        # features list both name all three, redundantly, so a future
+        # drift between the two surfaces fails loudly instead of silently
+        # publishing a wheel missing a transport.
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            maturin build --release --strip --features "pyo3 extension-module" --auditwheel=skip
+            maturin build --release --strip --features "pyo3 extension-module transport-http" --auditwheel=skip
           else
-            maturin build --release --strip --features "pyo3 extension-module"
+            maturin build --release --strip --features "pyo3 extension-module transport-http"
           fi
       - name: auditwheel repair --exclude libsqlite3.so.0 (Linux only)
         # v1.0.1 (CIRISEdge#50 re-reopen) — manual auditwheel with the
