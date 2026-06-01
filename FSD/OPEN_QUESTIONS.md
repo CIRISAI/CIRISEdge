@@ -40,6 +40,79 @@ Phase 3 kickoff once the first multi-medium transport PR is in flight.
 
 ## CLOSED
 
+Resolutions from the 2026-06-01 CEG RC1 bifurcation pass. These are the
+four Edge-court forks (E1–E4) raised against the CEG 0.10 streaming /
+multicast spec. CEG normative text lands in CIRISRegistry
+(`FSD/CEG/`); the Edge-side resolutions and the corrected source
+anchors live in [`CEG_RC1_BIFURCATION.md`](CEG_RC1_BIFURCATION.md).
+
+### OQ-14: E2E content encryption vs transport layering — RESOLVED (two independent layers) — 2026-06-01
+
+The per-subscriber epoch-DEK cascade is the **content** layer; the
+transit wrap is a **transport** layer; they are independent and the
+transport wrap never replaces the cascade. Grounded in
+`THREAT_MODEL.md` AV-15: *"Reticulum provides native link-layer
+encryption … HTTP fallback uses TLS … Edge does NOT add a third
+encryption layer."* The producer encrypts media bytes under the epoch
+DEK before they enter the envelope, so **Edge ships ciphertext it
+cannot read** (`multimedia.rs`: "Edge does NOT fetch the bytes; the
+consumer's client fetches directly from `external_uri`"). A relay
+terminating a Reticulum link sees the envelope, never the media
+plaintext — E2E holds.
+
+Correction folded in: "transit-key / prod-lens-via-transit-key /
+#857" is **not an Edge concept** (0 occurrences in the tree). Edge's
+transit layer *is* Reticulum link encryption / TLS; #857 is a
+Lens/Persist-side artifact. Spec cites AV-15, not "transit-key."
+
+### OQ-15: RC1 multicast transport shape — RESOLVED A (pull-only) — 2026-06-01
+
+RC1 multicast is pull-only: producer seals chunks under the epoch DEK
+→ `holds_bytes` directory → subscribers pull. This is the *current*
+Edge posture, not a deferral — `ContentFetch`/`ContentBody`/
+`ContentMiss` (CIRISEdge#42, CEG §10.1.1) plus `ExternalRefWithAcl`
+already implement pull. No media relay/fan-out tree exists in the
+tree (the only fan-out is `send_mandatory`/`send_federation` peer
+*enumeration*, CIRISEdge#20 — not media multicast). Relay/fan-out
+tree deferred to 1.x.
+
+Correction folded in: this is **not** tracked by CIRISEdge#46 (which
+is canonical bootstrap-peer hard-remove, v0.18.0). The deferred
+media-relay tree has no Edge tracking issue yet; it is net-new.
+
+### OQ-16: Live-delivery-set ownership — RESOLVED (entitled ∧ reachable) — 2026-06-01
+
+Three-way join, not two. Edge already owns **transport-reachability**
+liveness — `reachability.rs` (CIRISEdge#29), a node-local per-`(peer,
+transport)` ring buffer, explicitly *"proof of liveness, not of
+delivery"*. Persist owns **durable entitlement** (roster +
+epoch-key grants, propagated as CEG envelopes). The fan-out filter is
+`entitled ∧ reachable`: entitlement from Persist ∩ reachability from
+Edge #29. **Subscriber-presence rides the existing #29 tracker** — it
+is node-local, TTL'd, never minted as an attestation, never
+replicated, never logged (P2 invariant + the `cohort_scope` "never
+emits `holds_bytes`" discipline). No new substrate ⇒ it ships at RC1.
+
+This supersedes the original E3 framing ("Persist holds the live set,
+Edge just sends"), which conflated Edge's existing reachability
+substrate with a Persist presence registry.
+
+### OQ-17: Durable-entitlement propagation path — RESOLVED (existing federation-attestation path) — 2026-06-01
+
+Durable entitlement (roster + epoch-key grants) propagates as signed
+federation-attestation messages with `DELIVERY = Durable` over the
+existing `send_federation` / `send_durable` →
+`cirislens.edge_outbound_queue` path
+(`is_federation_attestation_emitting_type`, OQ-09 / CIRISPersist#16).
+No net-new Edge transport for the durable side — they are just more
+`federation_attestations`.
+
+Correction folded in: the cutover precedent is **OQ-04
+(alongside-window) + OQ-09 (`edge_outbound_queue`)**, not "#41" (not
+in the Edge tree; likely a Persist/Lens issue).
+
+---
+
 Resolutions captured during the 2026-05-03 design pass. Each entry
 summarizes the question and the rationale that landed; the full
 options/trade-offs treatment is preserved in this file's git history.
