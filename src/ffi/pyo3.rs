@@ -1280,10 +1280,7 @@ pub struct PyDurableHandle {
 /// the watchdog (plain `rx.recv()`, no timer overhead).
 type BoxedFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
-fn run_async<F, T>(
-    executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor,
-    fut: F,
-) -> T
+fn run_async<F, T>(executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor, fut: F) -> T
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -1427,8 +1424,7 @@ impl PyDurableHandle {
             // loop and sleep run on the GIL-released py.detach
             // thread using std primitives. Cost: one spawn per
             // 50ms poll instead of one spawn for the whole loop.
-            let deadline =
-                std::time::Instant::now() + Duration::from_millis(timeout_ms);
+            let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
             loop {
                 let queue_id = self.queue_id.clone();
                 let queue = self.queue.clone();
@@ -1437,9 +1433,7 @@ impl PyDurableHandle {
                     queue
                         .outbound_status(&queue_id)
                         .await
-                        .map_err(|e| {
-                            PyRuntimeError::new_err(format!("outbound_status: {e}"))
-                        })
+                        .map_err(|e| PyRuntimeError::new_err(format!("outbound_status: {e}")))
                 })?;
                 if let Some(r) = row {
                     if matches!(
@@ -2312,8 +2306,7 @@ fn init_edge_runtime(
     #[allow(unsafe_code)]
     let executor: ciris_persist::ffi::executor_capsule::AsyncExecutor = unsafe {
         extract_capsule::<usize, _, _>(&engine, "executor_capsule", |raw_usize| {
-            let ptr =
-                *raw_usize as *const ciris_persist::ffi::executor_capsule::AsyncExecutor;
+            let ptr = *raw_usize as *const ciris_persist::ffi::executor_capsule::AsyncExecutor;
             // SAFETY: `raw_usize` is the `Box::into_raw`'d pointer
             // produced by persist's `build_capsule_with_destructor`.
             // The Box's allocation is alive for the lifetime of the
