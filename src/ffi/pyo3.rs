@@ -1196,63 +1196,108 @@ pub struct PyDurableHandle {
 }
 
 /// Drive an async future to completion from a synchronous PyMethod
-/// context. The complication: the calling thread might be a tokio
-/// worker (in our integration tests, `#[tokio::test]` spins up a
-/// runtime that drives the test fn AND the pymethod's `block_on`),
-/// in which case a naive `runtime.block_on(fut)` panics with
-/// "Cannot start a runtime from within a runtime". In production
-/// (CIRISAgent's pyo3 entry: a Python thread that is NOT a tokio
-/// worker), `runtime.block_on(fut)` is the correct path.
+/// context, runtime-context-agnostic.
 ///
-/// We detect the situation via [`tokio::runtime::Handle::try_current`]
-/// and use [`tokio::task::block_in_place`] (multi-thread runtime only,
-/// which the cohabitation runtime always is) to yield the worker
-/// thread while we synchronously wait on the future. When no current
-/// runtime is set on the calling thread, plain `runtime.block_on` is
-/// correct and drives the future on a runtime worker thread.
+/// # Why the rewrite (v1.1.7, CIRISEdge#58 / CIRISPersist#139)
 ///
-/// v0.19.5 (CIRISEdge#50) — the **bare-thread** branch additionally
-/// installs `runtime.enter()` for the duration of the call. Rationale:
-/// `Handle::block_on` enters the runtime context for the future's
-/// polling, but any **caller-thread-local construction** that
-/// brackets the `block_on` call — most notably `tokio::time::interval`
-/// / `tokio::time::sleep` / any other timer-bound primitive a future
-/// constructor may build *before* its first `.await` — needs a
-/// current runtime at construction time, NOT just at polling time.
-/// `Interval::new_with_period_at` calls `sleep_until(start)` in the
-/// constructor body; under the cohabitation harness this fires from
-/// a thread with no current runtime and panics
-/// `"there is no reactor running"` (`tokio-1.52.3/src/time/interval.rs`).
+/// The previous implementation branched on
+/// [`tokio::runtime::Handle::try_current`]:
 ///
-/// Entering the runtime ourselves before `block_on` makes the
-/// constructor-time runtime context match the polling-time context.
-/// The guard drops on function return, restoring whatever runtime
-/// posture the caller had. Cheap: one TLS write on enter + drop.
+/// - `Ok`  → `tokio::task::block_in_place(|| runtime.block_on(fut))`
+/// - `Err` → `let _g = runtime.enter(); runtime.block_on(fut)`
+///
+/// That **assumes the current handle (if any) belongs to `runtime`**.
+/// In a cohabitation process where multiple sister cdylibs each carry
+/// their own runtimes (verify ships its lazy `ciris_verify_init`
+/// runtime starting at v4.7.1; persist ships the engine's runtime
+/// handed to edge via `runtime_handle_capsule`), `try_current()` may
+/// return a handle to **a different runtime** than the one passed in.
+/// `block_in_place(|| runtime.block_on(fut))` is then ill-defined
+/// (one runtime's worker released to run another runtime's `block_on`):
+/// in practice we observed an intermittent silent hang in
+/// `send_durable_inline_text` against the postgres backend (25–30%
+/// hit rate; substrate idle, all 32 tokio workers parked, no trace
+/// events emitted past the call entry) and persist saw an explicit
+/// `"no reactor running"` panic on a sqlx-postgres IO source
+/// registration. Same race, two manifestations.
+///
+/// # The new shape
+///
+/// Spawn `fut` on `runtime` (deterministic placement; runtime context
+/// at first poll is exactly `runtime`'s) and block the calling thread
+/// on a sync channel until the spawned task delivers the result. This
+/// is runtime-agnostic for the calling thread: it works whether the
+/// caller is a Python thread, a tokio worker, or a `spawn_blocking`
+/// thread, because the only assumption is "I can spawn on `runtime`."
+///
+/// Cost: one extra atomic to spawn + one std `mpsc::sync_channel`
+/// recv. Measured overhead in cohab tests: <1ms median.
+///
+/// # The 'static bound
+///
+/// Driven by [`tokio::runtime::Handle::spawn`]. Every existing call
+/// site already passes an `async move { ... }` block over Arc-cloned
+/// / owned data — `'static` was implicit already; this signature
+/// makes it explicit.
+///
+/// # Diagnostics — env-controlled stall watchdog
+///
+/// Set `CIRIS_EDGE_RUN_ASYNC_STALL_WARN_MS` (default `5000`) to log
+/// a `tracing::warn!` line every N ms the spawned task remains
+/// outstanding. The line carries `elapsed_ms` so a tail of warnings
+/// pinpoints the hang point in real time. Set to `0` to disable
+/// the watchdog (plain `rx.recv()`, no timer overhead).
+///
+/// If the spawned task ends WITHOUT sending (panic inside the
+/// future, or runtime shutdown mid-flight), the channel's sender is
+/// dropped → `recv` returns `Disconnected` → we panic with a
+/// descriptive message. Tokio's default panic hook still logs the
+/// underlying panic via tracing.
 fn run_async<F, T>(runtime: &RuntimeHandle, fut: F) -> T
 where
-    F: std::future::Future<Output = T> + Send,
-    T: Send,
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // We're on a tokio worker — yield via block_in_place + delegate
-        // back to the same runtime's block_on under the released worker.
-        // Requires a multi-thread runtime; CIRISAgent's cohabitation
-        // runtime IS multi-thread (persist's `Runtime::new()` builds
-        // a multi-thread runtime by default), and our pyo3 tests use
-        // `#[tokio::test(flavor = "multi_thread")]`.
-        tokio::task::block_in_place(|| runtime.block_on(fut))
-    } else {
-        // v0.19.5 (CIRISEdge#50) — enter the runtime context for the
-        // duration of the call so any constructor-time timer build
-        // (`tokio::time::interval` / `sleep` / sqlx pool acquire-timer)
-        // executed during future-assembly finds a current runtime.
-        // `Handle::block_on` itself enters context only for the polling
-        // body; the future-builder code that runs BEFORE the first
-        // poll (the `async move { ... }`-block's prelude, plus any
-        // `Sleep`/`Interval` constructed eagerly via a `let` binding)
-        // needs the explicit guard.
-        let _guard = runtime.enter();
-        runtime.block_on(fut)
+    // CIRISEdge#58: deterministic-placement spawn + sync recv.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+    runtime.spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+
+    let stall_ms = std::env::var("CIRIS_EDGE_RUN_ASYNC_STALL_WARN_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5_000);
+
+    if stall_ms == 0 {
+        return rx.recv().expect(
+            "ciris_edge::run_async spawned task ended without sending \
+             (panic inside the task or runtime shutdown — check tracing logs)",
+        );
+    }
+
+    let timeout = std::time::Duration::from_millis(stall_ms);
+    let start = std::time::Instant::now();
+    loop {
+        match rx.recv_timeout(timeout) {
+            Ok(t) => return t,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    threshold_ms = stall_ms,
+                    "ciris_edge::run_async stalled \u{2014} spawned task hasn't \
+                     completed; the future or its substrate dep is wedged. \
+                     Set CIRIS_EDGE_RUN_ASYNC_STALL_WARN_MS=0 to silence."
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "ciris_edge::run_async spawned task ended without sending \
+                     (panic inside the task or runtime shutdown \u{2014} check \
+                     tracing logs for the underlying error)"
+                );
+            }
+        }
     }
 }
 
@@ -2805,13 +2850,68 @@ fn init_edge_runtime(
 
 /// Top-level Python module entry point. `import ciris_edge` triggers
 /// this; per-symbol bindings register here as they land.
+// CIRISEdge#58 — diagnostic surface, gated under the `debug-tools`
+// Cargo feature. When the feature is OFF (the default for every
+// release wheel), neither pyfunction exists on the Python module
+// and `crate::debug` is not compiled — no FFI surface, no env-var
+// reading, no panic-capture machinery in the binary. See
+// `Cargo.toml::[features].debug-tools` for the security rationale.
+#[cfg(feature = "debug-tools")]
+#[pyfunction]
+/// Read the process-global background-thread panic count.
+///
+/// Counts every panic captured by the [`crate::debug::install_panic_logger`]
+/// hook in this process since first install. Returns `0` if the hook
+/// was never installed (i.e. `CIRIS_EDGE_PANIC_LOG` was unset).
+/// Useful from harness scripts to detect "did any background thread
+/// panic during this operation" without parsing the log file:
+///
+/// ```python
+/// before = ciris_edge.panic_count()
+/// edge.send_durable_inline_text(kid, "x")
+/// if ciris_edge.panic_count() > before:
+///     # Inspect $CIRIS_EDGE_PANIC_LOG.{pid} for the resolved backtrace.
+///     ...
+/// ```
+fn panic_count() -> u64 {
+    crate::debug::PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "debug-tools")]
+#[pyfunction]
+/// Install the panic-logging hook now.
+///
+/// Reads `CIRIS_EDGE_PANIC_LOG` at install time. Calling without the
+/// env var set is a no-op. Returns `True` if the hook is active (or
+/// already-installed), `False` if the env var was absent. Safe to
+/// call repeatedly; only the first call installs.
+fn install_panic_logger() -> bool {
+    crate::debug::install_panic_logger()
+}
+
 #[pymodule]
 fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // v1.1.7 (CIRISEdge#58) — diagnostic harness, gated under the
+    // `debug-tools` Cargo feature. Default release wheels (where the
+    // feature is OFF) compile NONE of this: no panic hook install,
+    // no `CIRIS_EDGE_PANIC_LOG` env var reading, no FFI surface.
+    // Harness wheels built with `--features debug-tools` auto-install
+    // the hook on import (if the env var is set) and register the
+    // `panic_count` / `install_panic_logger` pyfunctions.
+    #[cfg(feature = "debug-tools")]
+    crate::debug::install_panic_logger();
+
     m.add("__version__", VERSION)?;
     m.add(
         "SUPPORTED_SCHEMA_VERSIONS",
         SUPPORTED_SCHEMA_VERSIONS.to_vec(),
     )?;
+
+    #[cfg(feature = "debug-tools")]
+    {
+        m.add_function(wrap_pyfunction!(panic_count, m)?)?;
+        m.add_function(wrap_pyfunction!(install_panic_logger, m)?)?;
+    }
 
     // PyEdge — the cohabitation handle wrapping Arc<Edge>.
     m.add_class::<PyEdge>()?;

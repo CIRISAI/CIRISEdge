@@ -49,6 +49,8 @@
 #![doc(html_root_url = "https://docs.rs/ciris-edge/0.1.0-pre1")]
 
 pub mod cohort_scope;
+#[cfg(feature = "debug-tools")]
+pub mod debug;
 pub mod detector;
 mod edge;
 pub mod events;
