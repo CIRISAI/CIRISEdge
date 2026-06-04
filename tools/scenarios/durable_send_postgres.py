@@ -6,12 +6,39 @@ by tools/race_repro.py.
 
 Expects: postgres reachable at $CIRIS_REPRO_DSN
 (default postgres://postgres:postgres@localhost:5433/conformance).
+
+On Linux, the subprocess opts into PR_SET_PTRACER_ANY via libc.prctl
+at the very start of main() so the harness's `--gdb-on-hang` can
+attach without `kernel.yama.ptrace_scope=0` / sudo. No effect on
+macOS / Windows.
 """
+import ctypes
+import ctypes.util
 import json
 import os
+import platform
 import secrets
 import sys
 import tempfile
+
+
+def _opt_in_ptrace() -> None:
+    """Allow non-parent ptrace attach.
+
+    Linux's Yama LSM defaults `kernel.yama.ptrace_scope=1`, meaning only
+    a direct parent can ptrace this process. Calling
+    `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` from inside the tracee
+    relaxes that to "any process with the same uid". Required so the
+    harness's `tools/debug_attach.sh` (and `race_repro.py --gdb-on-hang`)
+    can attach to capture all-thread backtraces during a hang.
+    """
+    if platform.system() != "Linux":
+        return
+    PR_SET_PTRACER = 0x59616D61          # 1499766118
+    PR_SET_PTRACER_ANY = ctypes.c_ulong(-1).value  # libc uses (unsigned long)-1
+    libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    libc = ctypes.CDLL(libc_name, use_errno=True)
+    libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
 
 DB = os.environ.get(
     "CIRIS_REPRO_DSN",
@@ -26,6 +53,7 @@ def stamp(phase: str) -> None:
 
 
 def main() -> None:
+    _opt_in_ptrace()
     stamp("python_start")
     import ciris_persist as cp
     stamp("import_persist")

@@ -174,6 +174,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyCapsule, PyCapsuleMethods};
 use pyo3::wrap_pyfunction;
+#[cfg(test)]
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::Mutex;
 
@@ -218,14 +219,17 @@ pub struct PyEdge {
     /// The shared edge runtime. `Arc` so sibling cdylibs can clone
     /// and own a reference for the duration of their dispatch loops.
     inner: Arc<Edge>,
-    /// Tokio runtime handle captured at construction time — used by the
-    /// CIRISEdge#22 Tier 2 (v0.9.0) `send_inline_text` /
-    /// `send_durable_inline_text` / `DurableHandle::await_ack` pymethods
-    /// to drive `Edge`'s async surface from synchronous Python. Captured
-    /// from `ciris_persist::current_runtime_handle()` under the
-    /// cohabitation entry point ([`init_edge_runtime`]); test builds
-    /// inject one explicitly via [`PyEdge::for_test`].
-    runtime: RuntimeHandle,
+    /// ABI-stable async executor (CIRISPersist v3.13.0
+    /// `executor_capsule_v1`). The vtable's `spawn` fn-ptr lives in
+    /// `ciris_persist.abi3.so`, so dispatching through it runs the
+    /// spawned future on persist's tokio runtime — closing the
+    /// cross-cdylib tokio-aliasing class (CIRISEdge#58 / #59).
+    /// `Arc` because [`PyDurableHandle`] /
+    /// [`PyVerifiedFeedSubscription`] / etc. clone it for their own
+    /// lifecycle. Replaces the pre-v1.1.8 `runtime: RuntimeHandle`
+    /// field that exposed a `tokio::Handle` to consumer-side
+    /// dispatch (the cross-tokio aliasing trap).
+    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
     /// v0.19.3 (CIRISEdge#49) — when `init_edge_runtime` was invoked
     /// with `https_dev_self_signed=True`, this holds the
     /// `Arc<tempfile::TempDir>` whose path carries the minted
@@ -254,16 +258,31 @@ impl PyEdge {
         self.inner.clone()
     }
 
-    /// Test-only constructor — accepts a pre-built `Arc<Edge>` and an
-    /// explicit tokio runtime handle. Used by the integration tests at
-    /// the bottom of this module so a PyEdge can be exercised against
-    /// an `Edge` assembled directly from substrate primitives (no
-    /// `PyEngine` round-trip needed). Not exposed to Python.
+    /// Test-only constructor. Builds a fresh multi-thread runtime,
+    /// wraps it in an `AsyncExecutor` via persist's
+    /// `build_persist_executor`, and exposes it on the resulting
+    /// `PyEdge`. The `runtime: RuntimeHandle` parameter is unused
+    /// post-CIRISEdge#59 (kept for signature compatibility with
+    /// existing test call sites; will be removed in a follow-up).
+    ///
+    /// Production builds get the executor from persist's
+    /// `executor_capsule` via the cross-cdylib ABI-stable vtable;
+    /// tests are in-process so the PyCapsule round-trip is
+    /// unnecessary — same vtable, direct construction.
     #[cfg(test)]
-    pub(crate) fn for_test(inner: Arc<Edge>, runtime: RuntimeHandle) -> Self {
+    pub(crate) fn for_test(inner: Arc<Edge>, _runtime: RuntimeHandle) -> Self {
+        let rt_arc = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .expect("for_test runtime"),
+        );
+        let executor =
+            Arc::new(ciris_persist::ffi::executor_capsule::build_persist_executor(rt_arc));
         Self {
             inner,
-            runtime,
+            executor,
             #[cfg(feature = "transport-http")]
             _dev_cert_tmpdir: None,
         }
@@ -341,9 +360,9 @@ impl PyEdge {
         let edge = self.inner.clone();
         let recipient = recipient_key_id.to_string();
         let text_owned = text.to_string();
-        let runtime = self.runtime.clone();
+        let executor = self.executor.clone();
         py.detach(|| {
-            run_async(&runtime, async move {
+            run_async(&executor, async move {
                 // Build the typed body, run `send_inline` so the
                 // speak_pipeline runs + the envelope is signed + the
                 // transport ships it (or the no-op test transport
@@ -403,12 +422,12 @@ impl PyEdge {
         let edge = self.inner.clone();
         let recipient = recipient_key_id.to_string();
         let text_owned = text.to_string();
-        let runtime = self.runtime.clone();
+        let executor = self.executor.clone();
         let queue_arc: Arc<dyn OutboundHandle> = edge.outbound_queue_handle();
-        let runtime_for_handle = runtime.clone();
+        let executor_for_handle = executor.clone();
         let queue_for_handle = queue_arc.clone();
         py.detach(|| {
-            run_async(&runtime, async move {
+            run_async(&executor, async move {
                 let msg = InlineTextDurable { text: text_owned };
                 let body_sha = compute_inline_text_body_sha(&edge, &recipient, &msg.text).await?;
                 let handle = edge
@@ -420,7 +439,7 @@ impl PyEdge {
                 Ok(PyDurableHandle {
                     queue_id: handle.queue_id,
                     body_sha256_hex: body_sha,
-                    runtime: runtime_for_handle,
+                    executor: executor_for_handle,
                     queue: queue_for_handle,
                 })
             })
@@ -594,9 +613,9 @@ impl PyEdge {
 
         let edge = self.inner.clone();
         let peer = peer_key_id.to_string();
-        let runtime = self.runtime.clone();
+        let executor = self.executor.clone();
         let result = py.detach(|| {
-            run_async(&runtime, async move {
+            run_async(&executor, async move {
                 edge.fetch_content(&peer, sha, Duration::from_millis(timeout_ms))
                     .await
                     .map_err(|e| PyRuntimeError::new_err(format!("fetch_content: {e}")))
@@ -655,7 +674,7 @@ impl PyEdge {
         let rx = self.inner.subscribe_verified_feed();
         PyVerifiedFeedSubscription {
             rx: Arc::new(Mutex::new(Some(rx))),
-            runtime: self.runtime.clone(),
+            executor: self.executor.clone(),
         }
     }
 
@@ -678,7 +697,7 @@ impl PyEdge {
     #[pyo3(signature = (peer_key_id, words = crate::sas::DEFAULT_SAS_WORDS))]
     fn peer_sas(&self, py: Python<'_>, peer_key_id: &str, words: usize) -> PyResult<Vec<String>> {
         let (local_pub, peer_pub) =
-            resolve_sas_pubkeys(py, &self.inner, &self.runtime, peer_key_id)?;
+            resolve_sas_pubkeys(py, &self.inner, &self.executor, peer_key_id)?;
         crate::sas::peer_sas_words(&local_pub, &peer_pub, words).map_err(|e| match e {
             crate::sas::SasError::WordsOutOfRange(_) => PyValueError::new_err(format!("{e}")),
             other => PyRuntimeError::new_err(format!("peer_sas: {other}")),
@@ -696,7 +715,7 @@ impl PyEdge {
         digits: usize,
     ) -> PyResult<String> {
         let (local_pub, peer_pub) =
-            resolve_sas_pubkeys(py, &self.inner, &self.runtime, peer_key_id)?;
+            resolve_sas_pubkeys(py, &self.inner, &self.executor, peer_key_id)?;
         crate::sas::peer_sas_digits(&local_pub, &peer_pub, digits).map_err(|e| match e {
             crate::sas::SasError::DigitsOutOfRange(_) => PyValueError::new_err(format!("{e}")),
             other => PyRuntimeError::new_err(format!("peer_sas_digits: {other}")),
@@ -859,7 +878,10 @@ pub struct PyVerifiedFeedSubscription {
     /// (not std) because the lock is held across an .await inside
     /// the future returned to Python.
     rx: Arc<Mutex<Option<tokio::sync::broadcast::Receiver<crate::edge::VerifiedEnvelopeSnapshot>>>>,
-    runtime: RuntimeHandle,
+    /// CIRISEdge#59 — the executor capsule (cross-cdylib ABI-stable
+    /// spawn primitive). Used by `__anext__`'s `run_async` to drive
+    /// `broadcast::Receiver::recv()` from sync Python.
+    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
 }
 
 #[pymethods]
@@ -874,7 +896,10 @@ impl PyVerifiedFeedSubscription {
     /// broadcast channel is closed.
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rx_holder = self.rx.clone();
-        let _runtime = self.runtime.clone();
+        // CIRISEdge#59 — pyo3_async_runtimes drives the future on its
+        // own configured tokio runtime; we don't need to thread the
+        // executor here.
+        let _ = &self.executor;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // pyo3-async-runtimes drives the future on its own
             // configured tokio runtime; the receiver is bound to the
@@ -1027,14 +1052,14 @@ fn network_event_to_pydict<'py>(
 fn resolve_sas_pubkeys(
     py: Python<'_>,
     edge: &Arc<crate::Edge>,
-    runtime: &RuntimeHandle,
+    executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor,
     peer_key_id: &str,
 ) -> PyResult<([u8; 32], [u8; 32])> {
     let local_signer = edge.signer();
     let dir = edge.verify_directory();
     let peer_id = peer_key_id.to_string();
     let (local_pub_bytes, peer_pub) = py.detach(|| {
-        run_async(runtime, async move {
+        run_async(executor, async move {
             let local =
                 local_signer.classical.public_key().await.map_err(|e| {
                     PyRuntimeError::new_err(format!("local signer public_key: {e}"))
@@ -1185,9 +1210,11 @@ pub struct PyDurableHandle {
     /// `send_durable_inline_text` time so the Python caller can match
     /// inbound ACKs by SHA without re-deriving from the envelope.
     body_sha256_hex: String,
-    /// Tokio runtime to drive `OutboundHandle::outbound_status` polls
-    /// from synchronous Python.
-    runtime: RuntimeHandle,
+    /// ABI-stable async executor — same one PyEdge holds; cloned at
+    /// `send_durable_inline_text` time so the handle's own
+    /// `is_acknowledged` / `await_ack` polls go through persist's
+    /// runtime via the vtable (CIRISEdge#59).
+    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
     /// Shared outbound-queue handle — same `Arc<dyn OutboundHandle>`
     /// the `Edge` holds. Cloning the Arc lets the handle outlive the
     /// `PyEdge` that produced it (Python ownership semantics differ
@@ -1196,49 +1223,53 @@ pub struct PyDurableHandle {
 }
 
 /// Drive an async future to completion from a synchronous PyMethod
-/// context, runtime-context-agnostic.
+/// context, via persist's ABI-stable async-executor capsule.
 ///
-/// # Why the rewrite (v1.1.7, CIRISEdge#58 / CIRISPersist#139)
+/// # Why this shape (CIRISEdge#58 / CIRISEdge#59 / CIRISPersist#157)
 ///
-/// The previous implementation branched on
-/// [`tokio::runtime::Handle::try_current`]:
+/// The pre-v1.1.8 implementation captured a `tokio::runtime::Handle`
+/// from persist via `runtime_handle_capsule` and called
+/// `runtime.spawn(fut)` from edge's code. With two `tokio` crates
+/// statically linked into one process (one inside `ciris_edge.abi3.so`,
+/// one inside `ciris_persist.abi3.so` — different patch versions in
+/// practice), the `spawn` method was dispatched through **edge's**
+/// tokio while the handle's underlying runtime data belonged to
+/// **persist's** tokio. The cross-crate vtable mismatch silently
+/// queued tasks into a runtime view whose workers nobody parked into
+/// → ~27% deadlock rate on `send_durable_inline_text` against
+/// cohabitating persist (CIRISEdge#58 thread dump; CIRISPersist#156
+/// false-cause issue closed).
 ///
-/// - `Ok`  → `tokio::task::block_in_place(|| runtime.block_on(fut))`
-/// - `Err` → `let _g = runtime.enter(); runtime.block_on(fut)`
+/// CIRISPersist v3.13.0 ships an ABI-stable `executor_capsule` whose
+/// `vtable.spawn` function-pointer lives inside
+/// `ciris_persist.abi3.so`. Invoking it from edge transfers control
+/// into persist's `.so`, where persist's own tokio code calls
+/// `runtime.spawn(...)` against the runtime it owns. The future ends
+/// up on persist's worker pool; persist's workers poll it. No cross-
+/// cdylib dispatch — same structural pattern that closed the
+/// libsqlite3 cross-cdylib SIGSEGV class at CIRISPersist#141.
 ///
-/// That **assumes the current handle (if any) belongs to `runtime`**.
-/// In a cohabitation process where multiple sister cdylibs each carry
-/// their own runtimes (verify ships its lazy `ciris_verify_init`
-/// runtime starting at v4.7.1; persist ships the engine's runtime
-/// handed to edge via `runtime_handle_capsule`), `try_current()` may
-/// return a handle to **a different runtime** than the one passed in.
-/// `block_in_place(|| runtime.block_on(fut))` is then ill-defined
-/// (one runtime's worker released to run another runtime's `block_on`):
-/// in practice we observed an intermittent silent hang in
-/// `send_durable_inline_text` against the postgres backend (25–30%
-/// hit rate; substrate idle, all 32 tokio workers parked, no trace
-/// events emitted past the call entry) and persist saw an explicit
-/// `"no reactor running"` panic on a sqlx-postgres IO source
-/// registration. Same race, two manifestations.
+/// # The consumer contract
 ///
-/// # The new shape
+/// Per persist's executor_capsule docs: the spawned future runs on a
+/// tokio worker owned by persist's tokio. Tokio thread-locals on that
+/// worker belong to **persist's** tokio. **The spawned future MUST
+/// NOT use edge's tokio primitives** — `tokio::time::*`,
+/// `tokio::sync::Notify`, `tokio::spawn` (the free function), etc.
+/// — because those resolve through edge's tokio, whose thread-locals
+/// are unset on a persist-owned worker → `"there is no reactor
+/// running"` panic.
 ///
-/// Spawn `fut` on `runtime` (deterministic placement; runtime context
-/// at first poll is exactly `runtime`'s) and block the calling thread
-/// on a sync channel until the spawned task delivers the result. This
-/// is runtime-agnostic for the calling thread: it works whether the
-/// caller is a Python thread, a tokio worker, or a `spawn_blocking`
-/// thread, because the only assumption is "I can spawn on `runtime`."
+/// What IS safe inside the spawned future:
+/// - Calls to persist's public async API (`Engine::*`, trait methods
+///   on `Arc<dyn FederationDirectory>` / `BackendDispatch`) — those
+///   dispatch into persist's `.so` and use persist's tokio.
+/// - `std::sync::mpsc` / std primitives (no tokio involvement).
+/// - Pure-CPU work + `.await` points on persist-side futures.
 ///
-/// Cost: one extra atomic to spawn + one std `mpsc::sync_channel`
-/// recv. Measured overhead in cohab tests: <1ms median.
-///
-/// # The 'static bound
-///
-/// Driven by [`tokio::runtime::Handle::spawn`]. Every existing call
-/// site already passes an `async move { ... }` block over Arc-cloned
-/// / owned data — `'static` was implicit already; this signature
-/// makes it explicit.
+/// Edge's own async surfaces (`Edge::send_durable_inline`,
+/// `Edge::send_inline`, etc.) need a per-call-site audit (CIRISEdge#59
+/// T5) to ensure they meet this contract.
 ///
 /// # Diagnostics — env-controlled stall watchdog
 ///
@@ -1247,22 +1278,53 @@ pub struct PyDurableHandle {
 /// outstanding. The line carries `elapsed_ms` so a tail of warnings
 /// pinpoints the hang point in real time. Set to `0` to disable
 /// the watchdog (plain `rx.recv()`, no timer overhead).
-///
-/// If the spawned task ends WITHOUT sending (panic inside the
-/// future, or runtime shutdown mid-flight), the channel's sender is
-/// dropped → `recv` returns `Disconnected` → we panic with a
-/// descriptive message. Tokio's default panic hook still logs the
-/// underlying panic via tracing.
-fn run_async<F, T>(runtime: &RuntimeHandle, fut: F) -> T
+type BoxedFut = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+fn run_async<F, T>(
+    executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor,
+    fut: F,
+) -> T
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    // CIRISEdge#58: deterministic-placement spawn + sync recv.
+    // CIRISEdge#58 / #59: spawn via persist's executor_capsule
+    // vtable — control transfers into persist's .so so the spawn
+    // dispatches onto persist's tokio runtime, closing the cross-
+    // cdylib tokio-aliasing class.
     let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
-    runtime.spawn(async move {
+
+    // Wrap the typed future into the executor's `Output = ()` shape
+    // via the mpsc sender. The wrapping closure is *also* edge-side
+    // code, but it only does `let _ = tx.send(fut.await)` — no tokio
+    // primitives are referenced here, so polling on a persist worker
+    // is safe.
+    let inner_fut: BoxedFut = Box::pin(async move {
         let _ = tx.send(fut.await);
     });
+    // The vtable contract: `task: *mut TaskOpaque` is a
+    // `Box::into_raw`'d `Box<Pin<Box<dyn Future<Output = ()> + Send +
+    // 'static>>>`. Construct that outer Box, lower to *mut TaskOpaque,
+    // hand to the vtable.
+    let outer_box: Box<BoxedFut> = Box::new(inner_fut);
+    let task_ptr: *mut ciris_persist::ffi::executor_capsule::TaskOpaque =
+        Box::into_raw(outer_box).cast();
+    // SAFETY: `executor.data` and `task_ptr` satisfy the safety
+    // contract documented on `AsyncExecutorVTable::spawn`:
+    //   - `executor.data` is the opaque pointer produced by persist's
+    //     `executor_capsule` for `executor.vtable` (we extracted both
+    //     from the same `executor_capsule_v1` PyCapsule in init).
+    //   - `task_ptr` is the `Box::into_raw`'d outer box for the inner
+    //     pinned future, with the exact shape the vtable expects.
+    //   - The Arc<Runtime> backing `executor.data` is alive because
+    //     the PyCapsule is rooted in `PyEdge::executor` (Arc) and the
+    //     PyCapsule itself is kept alive by the Python `engine` /
+    //     `edge` references, which the caller holds for the duration
+    //     of this call.
+    #[allow(unsafe_code)]
+    unsafe {
+        (executor.vtable.spawn)(executor.data, task_ptr);
+    }
 
     let stall_ms = std::env::var("CIRIS_EDGE_RUN_ASYNC_STALL_WARN_MS")
         .ok()
@@ -1319,9 +1381,9 @@ impl PyDurableHandle {
     fn is_acknowledged(&self, py: Python<'_>) -> PyResult<bool> {
         let queue_id = self.queue_id.clone();
         let queue = self.queue.clone();
-        let runtime = self.runtime.clone();
+        let executor = self.executor.clone();
         py.detach(|| {
-            run_async(&runtime, async move {
+            run_async(&executor, async move {
                 let row = queue
                     .outbound_status(&queue_id)
                     .await
@@ -1350,31 +1412,48 @@ impl PyDurableHandle {
     ///
     /// GIL is released for the entire poll loop via `py.detach`.
     fn await_ack(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<bool> {
-        let queue_id = self.queue_id.clone();
-        let queue = self.queue.clone();
-        let runtime = self.runtime.clone();
+        let executor = self.executor.clone();
         py.detach(|| {
-            run_async(&runtime, async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-                loop {
-                    let row = queue
+            // CIRISEdge#59 — the previous version did the poll loop
+            // *inside* the spawned future via `tokio::time::sleep` +
+            // `tokio::time::Instant`. Both resolve through edge's
+            // tokio crate; when the future runs on persist's worker
+            // (via the executor capsule's vtable dispatch), those
+            // tokio thread-locals are unset → "no reactor running"
+            // panic. The fix moves the loop OUTSIDE the spawned
+            // future: each iteration spawns a single
+            // `outbound_status` call (which uses persist's tokio
+            // entirely, via the OutboundHandle trait dispatch), the
+            // loop and sleep run on the GIL-released py.detach
+            // thread using std primitives. Cost: one spawn per
+            // 50ms poll instead of one spawn for the whole loop.
+            let deadline =
+                std::time::Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                let queue_id = self.queue_id.clone();
+                let queue = self.queue.clone();
+                let executor_ref = &executor;
+                let row = run_async(executor_ref, async move {
+                    queue
                         .outbound_status(&queue_id)
                         .await
-                        .map_err(|e| PyRuntimeError::new_err(format!("outbound_status: {e}")))?;
-                    if let Some(r) = row {
-                        if matches!(
-                            crate::edge::map_outbound_row_to_status(&r),
-                            DurableStatus::Terminal(DurableOutcome::Delivered { .. }),
-                        ) {
-                            return Ok(true);
-                        }
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!("outbound_status: {e}"))
+                        })
+                })?;
+                if let Some(r) = row {
+                    if matches!(
+                        crate::edge::map_outbound_row_to_status(&r),
+                        DurableStatus::Terminal(DurableOutcome::Delivered { .. }),
+                    ) {
+                        return Ok::<bool, pyo3::PyErr>(true);
                     }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Ok(false);
-                    }
-                    tokio::time::sleep(Duration::from_millis(AWAIT_ACK_POLL_INTERVAL_MS)).await;
                 }
-            })
+                if std::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                std::thread::sleep(Duration::from_millis(AWAIT_ACK_POLL_INTERVAL_MS));
+            }
         })
     }
 
@@ -2206,6 +2285,63 @@ fn init_edge_runtime(
     // a "no reactor running" panic.
     let _runtime_guard = runtime.enter();
 
+    // v1.1.8 (CIRISEdge#58 / CIRISEdge#59 / CIRISPersist#157) — the
+    // ABI-stable executor capsule. Pre-v3.13.0 persist exposes only
+    // `runtime_handle_capsule` (deprecated; cross-tokio-aliasing trap
+    // documented in CIRISPersist#156); v3.13.0+ adds `executor_capsule`
+    // whose vtable function pointers live inside `ciris_persist.abi3.so`
+    // — invoking `vtable.spawn` from edge dispatches into persist's
+    // .so, spawning onto persist's tokio without any cross-crate
+    // dispatch. The hot-path send/recv pymethods consume this instead
+    // of the raw `tokio::Handle`. See `run_async`'s docs.
+    if !engine.hasattr("executor_capsule").unwrap_or(false) {
+        return Err(PyRuntimeError::new_err(
+            "persist v3.13.0+ required for ABI-stable async cohabitation — \
+             your persist version doesn't expose executor_capsule. \
+             Upgrade ciris-persist (Cargo `tag = \"v3.13.0\"`, pyproject \
+             `ciris-persist>=3.13.0,<4`). See CIRISEdge#58 / CIRISPersist#157.",
+        ));
+    }
+    // The executor capsule stores a `*mut AsyncExecutor as usize`
+    // (persist's `build_capsule_with_destructor` passes the
+    // `Box::into_raw`'d pointer cast to usize). Extract as `usize`,
+    // then cast back to `*const AsyncExecutor` and bitwise-copy the
+    // struct fields. The PyCapsule destructor (set by persist) calls
+    // `vtable.drop` at Python GC time; edge only owns a reference
+    // copy of the executor, never the destructor responsibility.
+    #[allow(unsafe_code)]
+    let executor: ciris_persist::ffi::executor_capsule::AsyncExecutor = unsafe {
+        extract_capsule::<usize, _, _>(&engine, "executor_capsule", |raw_usize| {
+            let ptr =
+                *raw_usize as *const ciris_persist::ffi::executor_capsule::AsyncExecutor;
+            // SAFETY: `raw_usize` is the `Box::into_raw`'d pointer
+            // produced by persist's `build_capsule_with_destructor`.
+            // The Box's allocation is alive for the lifetime of the
+            // PyCapsule (its destructor runs `Box::from_raw` at GC
+            // time), which is rooted in the Python `engine` object
+            // outliving this extraction.
+            let e = &*ptr;
+            ciris_persist::ffi::executor_capsule::AsyncExecutor {
+                data: e.data,
+                vtable: e.vtable,
+            }
+        })?
+    };
+    // ABI version check — refuse mismatched capsule versions cleanly
+    // rather than risk UB on a vtable-layout drift.
+    if executor.vtable.abi_version
+        != ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION
+    {
+        return Err(PyRuntimeError::new_err(format!(
+            "persist executor_capsule ABI version mismatch — capsule v{}, \
+             edge expects v{}; upgrade ciris-persist or pin edge to a \
+             compatible floor",
+            executor.vtable.abi_version,
+            ciris_persist::ffi::executor_capsule::ASYNC_EXECUTOR_ABI_VERSION,
+        )));
+    }
+    let executor = Arc::new(executor);
+
     #[allow(unsafe_code)]
     let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> = unsafe {
         extract_capsule::<Arc<dyn ciris_persist::federation::FederationDirectory>, _, _>(
@@ -2840,9 +2976,13 @@ fn init_edge_runtime(
     #[cfg(feature = "ffi-uniffi")]
     crate::ffi::uniffi_impl::install_edge_handle(&edge_arc);
 
+    // Suppress unused-binding warning for `runtime` — kept in scope
+    // for the init-body `runtime.enter()` guard but not stored on
+    // PyEdge post-CIRISEdge#59 (the executor handles all spawns).
+    let _ = runtime;
     Ok(PyEdge {
         inner: edge_arc,
-        runtime,
+        executor,
         #[cfg(feature = "transport-http")]
         _dev_cert_tmpdir: https_dev_cert_tmpdir,
     })
@@ -3439,10 +3579,19 @@ mod pyo3_tier2_tests {
             // build a synthetic `PyDurableHandle` for the test.
             // Take the runtime + queue from the py_edge directly.
             let edge_arc = py_edge.edge_handle();
+            let test_rt = std::sync::Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(1)
+                    .build()
+                    .expect("test handle runtime"),
+            );
             let handle = PyDurableHandle {
                 queue_id: queue_id.clone(),
                 body_sha256_hex: "0".repeat(64),
-                runtime: tokio::runtime::Handle::current(),
+                executor: Arc::new(
+                    ciris_persist::ffi::executor_capsule::build_persist_executor(test_rt),
+                ),
                 queue: edge_arc.outbound_queue_handle(),
             };
             handle.await_ack(py, 5000)
