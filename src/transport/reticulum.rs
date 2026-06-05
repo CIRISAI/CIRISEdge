@@ -849,7 +849,9 @@ pub struct ReticulumTransport {
     local_attestation: Option<Vec<u8>>,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
-    events: Mutex<Option<mpsc::Receiver<NodeEvent>>>,
+    /// Leviculum PR #9 switched this to an unbounded channel so node
+    /// events are never dropped before a consumer attaches.
+    events: Mutex<Option<mpsc::UnboundedReceiver<NodeEvent>>>,
     /// `key_id → rooted peer`, populated by the authenticated
     /// cold-start path from received announces. Every entry has been
     /// rooted against the persist directory + had its attestation

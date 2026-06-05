@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "1.1.10"
+version = "1.1.11"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -373,8 +373,8 @@ tempfile       = { version = "3", optional = true }
 # mappings whose shape doesn't match Edge's source_hash/destination_hash
 # wire schema. Those 3 remain documented Vec::new() pending an
 # upstream Leviculum design pass.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "4c1b68f72ee3655035cc57667ae167ee4dbc951b", version = "0.6", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "4c1b68f72ee3655035cc57667ae167ee4dbc951b", version = "0.6", optional = true }
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "e63bb9a6a75f215a5465823ebe5176e30dd12384", version = "0.6", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "e63bb9a6a75f215a5465823ebe5176e30dd12384", version = "0.6", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
