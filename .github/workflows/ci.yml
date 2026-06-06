@@ -1512,9 +1512,52 @@ jobs:
   #
   # Implementation lives in `CIRISAI/CIRISConformance` as a reusable
   # workflow — see that repo's README for adding new cases.
+  # ─── extract-substrate-pins: Cargo.toml → JSON pin-overrides ────────
+  #
+  # Reads edge's actual Cargo.toml pins for ciris-persist (Python wheel)
+  # and ciris-keyring (= ciris-verify Python wheel — both come from
+  # CIRISVerify at the same tag) and emits a JSON object that the
+  # cohabitation gate feeds into the harness's `pin-overrides` input.
+  #
+  # This eliminates the substrate-currency race: edge's own Cargo pin
+  # IS the cohabitation contract. The conformance matrix becomes
+  # documentation-of-record + nightly drift gate, but is no longer on
+  # the critical path of an edge release. Before this job existed, we
+  # had to force-push a conformance matrix bump in lockstep with every
+  # edge tag (v1.1.9 / v1.1.10 / v1.1.11 / v1.1.12 all hit it).
+  extract-substrate-pins:
+    name: extract substrate pins from Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      pin-overrides: ${{ steps.extract.outputs.json }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: extract
+        run: |
+          python3 <<'PYEOF' >> "$GITHUB_OUTPUT"
+          import re, json
+          text = open('Cargo.toml').read()
+          def find_tag(crate):
+              m = re.search(rf'^{re.escape(crate)}\s*=\s*\{{[^}}]*tag\s*=\s*"v(\d+\.\d+\.\d+)"', text, re.M)
+              if not m:
+                  raise SystemExit(f'no tag found for {crate} in Cargo.toml')
+              return m.group(1)
+          persist = find_tag('ciris-persist')
+          keyring = find_tag('ciris-keyring')
+          crypto  = find_tag('ciris-crypto')
+          assert keyring == crypto, f'ciris-keyring ({keyring}) and ciris-crypto ({crypto}) must share a tag — both come from CIRISVerify'
+          pins = {
+              'ciris-persist': f'ciris-persist=={persist}',
+              'ciris-verify':  f'ciris-verify=={keyring}',
+          }
+          print(f'json={json.dumps(pins)}')
+          PYEOF
+          echo "extracted:"
+          grep '^json=' "$GITHUB_OUTPUT"
+
   cohabitation-conformance:
     name: cohabitation (${{ matrix.platform }} × ${{ matrix.backend }})
-    needs: pyo3-wheel
+    needs: [pyo3-wheel, extract-substrate-pins]
     strategy:
       fail-fast: false
       matrix:
@@ -1531,6 +1574,7 @@ jobs:
       backend: ${{ matrix.backend }}
       under-test-wheel-artifact: ciris_edge-wheel-${{ matrix.platform }}
       under-test-package: ciris-edge
+      pin-overrides: ${{ needs.extract-substrate-pins.outputs.pin-overrides }}
 
   # ─── publish-pypi: tag-gated wheel upload via OIDC ──────────────────
   #
