@@ -30,6 +30,11 @@ pub mod federation_session;
 /// agnostic primitives consumed by every transport.
 pub mod addressing;
 
+/// Realtime A/V mesh profile — direct RNS Link low-latency push with
+/// two-layer hybrid-PQC crypto (transit key under epoch DEK) and
+/// reachability-driven fan-out (CIRISEdge#62 / CEG 0.13 §10.5.8).
+pub mod realtime_av;
+
 /// Announce attestation — the authenticated transport-identity ↔
 /// federation-key binding carried in Reticulum announce app-data
 /// (CIRISEdge#15 / AV-42). Feature-gated alongside the Reticulum
