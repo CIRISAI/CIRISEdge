@@ -217,7 +217,7 @@ ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v4.0.1
 # distinct trait-object vtables that the trait-bound check in
 # `Arc<dyn HardwareSigner>` cannot reconcile.
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.8.0", version = "4", features = ["software", "pqc-ml-dsa"] }
-ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.8.0", version = "4", features = ["ed25519", "pqc-ml-dsa"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v4.8.0", version = "4", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex"] }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -259,6 +259,11 @@ base64      = "0.22"
 # Errors / logs
 thiserror   = "1"
 tracing     = "0.1"
+
+# Federation-session KEX (CIRISEdge#54). `zeroize` for explicit
+# scrub of session keys + KEX private material — same crate used
+# transitively by ciris-crypto, so no version skew risk.
+zeroize     = "1"
 
 # IDs
 uuid        = { version = "1", features = ["v4", "serde"] }
