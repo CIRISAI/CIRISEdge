@@ -18,6 +18,18 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "transport-http")]
 pub mod http;
 
+/// Hybrid X25519 + ML-KEM-768 KEX for federation session-key setup
+/// (CIRISEdge#54 — Fed TM §3.3 Gap C closure). Stateless verbs that
+/// operate on caller-supplied KEX pubkeys / privkeys; pubkey
+/// advertisement + AEAD framing live in the medium-specific transports
+/// that consume the derived session key.
+pub mod federation_session;
+
+/// N1 cryptographic addressing (`destination = sha256(pubkey)[..16]`)
+/// + sliding-window replay protection per peer (CIRISEdge#53). Medium-
+/// agnostic primitives consumed by every transport.
+pub mod addressing;
+
 /// Announce attestation — the authenticated transport-identity ↔
 /// federation-key binding carried in Reticulum announce app-data
 /// (CIRISEdge#15 / AV-42). Feature-gated alongside the Reticulum
