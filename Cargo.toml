@@ -265,6 +265,13 @@ tracing     = "0.1"
 # transitively by ciris-crypto, so no version skew risk.
 zeroize     = "1"
 
+# Packet-radio transport frame CRC (CIRISEdge#53 N2). Only pulled in
+# when `transport-packet-radio` is on — the IEEE CRC-32 is the
+# transport-layer corruption-detection contract, NOT a security MAC
+# (security integrity is the outer AEAD's job). `crc32fast` is the
+# canonical Rust impl + hardware-accelerated on x86_64 SSE 4.2.
+crc32fast   = { version = "1", optional = true }
+
 # IDs
 uuid        = { version = "1", features = ["v4", "serde"] }
 
@@ -573,8 +580,15 @@ _reticulum-module               = []
 # justifies (OQ-13). The bare wire-level transports (LoRa not via
 # Reticulum, raw serial, I²P not via Reticulum) are separate from the
 # `transport-reticulum-*` Reticulum-interface family above.
-# transport-lora        = []
-# transport-serial      = []
+#
+# CIRISEdge#53 N2 closure: `transport-packet-radio` ships the generic
+# OSI-L2 plug (frame codec + driver trait + Transport impl). Specific
+# hardware drivers (LoRa SX127x, AX.25 KISS, raw serial) plug in via
+# `PacketRadioDriver` impls in separate crates or follow-up features
+# once a deployment target locks in.
+transport-packet-radio = ["dep:crc32fast"]
+# transport-lora        = []  # specific driver atop transport-packet-radio
+# transport-serial      = []  # specific driver atop transport-packet-radio
 # transport-i2p         = []
 
 # pyo3 — Python bindings for the lens FastAPI cutover (Phase 1)
