@@ -1882,6 +1882,19 @@ jobs:
             "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz" \
             "dist/SHA256SUMS"
 
+          # Promote draft → published. Idempotent on already-published
+          # releases. Closes the v1.2.0 regression where a prior failed
+          # tag-CI run had created the release in draft state; the
+          # follow-up successful run uploaded assets to the existing
+          # release but never flipped it published, so consumers couldn't
+          # see iOS / Android assets via the Release page even though
+          # PyPI was green. `gh release edit` is no-op on a non-draft
+          # release, so unconditional invocation is the simplest fix.
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+          echo "✓ ensured ${TAG} is published (draft → false)"
+
           echo "✓ uploaded mobile + native assets to ${TAG}"
           {
             echo "## Mobile + native release assets"
