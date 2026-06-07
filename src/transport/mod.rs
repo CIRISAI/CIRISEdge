@@ -35,6 +35,14 @@ pub mod addressing;
 /// reachability-driven fan-out (CIRISEdge#62 / CEG 0.13 §10.5.8).
 pub mod realtime_av;
 
+/// Packet-radio transport — N2 multi-medium plug (CIRISEdge#53 Fed
+/// TM §3.3 Gap D). LoRa / AX.25 / raw-serial mediums plug in via the
+/// [`packet_radio::driver::PacketRadioDriver`] trait. Feature-gated
+/// since it pulls a CRC dep + tokio's mpsc layer, neither of which the
+/// pure-Reticulum / pure-HTTP build needs.
+#[cfg(feature = "transport-packet-radio")]
+pub mod packet_radio;
+
 /// Announce attestation — the authenticated transport-identity ↔
 /// federation-key binding carried in Reticulum announce app-data
 /// (CIRISEdge#15 / AV-42). Feature-gated alongside the Reticulum
