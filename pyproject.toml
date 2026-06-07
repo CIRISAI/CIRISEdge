@@ -48,7 +48,7 @@ classifiers = [
 # Persist prelude surface unchanged — pure currency bump, zero API
 # drift on edge's consumed paths.
 dependencies = [
-    "ciris-persist>=4.0.1,<5",
+    "ciris-persist>=4.1.0,<5",
 ]
 dynamic = ["version"]
 
