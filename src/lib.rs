@@ -64,6 +64,7 @@ pub mod multimedia;
 pub mod observability;
 pub mod outbound;
 pub mod reachability;
+pub mod replication;
 pub mod sas;
 pub mod transport;
 pub mod verify;
