@@ -73,10 +73,13 @@
 //!   surfaced via `tracing` spans the binding PR will wire to a
 //!   metric backend.
 
+pub mod coordinator;
 pub mod protocol;
 pub mod session;
 pub mod summary;
 
+#[doc(inline)]
+pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
 #[doc(inline)]
 pub use protocol::{
     DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
