@@ -74,12 +74,15 @@
 //!   metric backend.
 
 pub mod coordinator;
+pub mod directory;
 pub mod protocol;
 pub mod session;
 pub mod summary;
 
 #[doc(inline)]
 pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
+#[doc(inline)]
+pub use directory::{DirectoryStateAdapter, MutableDirectoryStateAdapter, ReplicationDirectory};
 #[doc(inline)]
 pub use protocol::{
     DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
