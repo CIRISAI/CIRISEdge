@@ -13,12 +13,55 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # ─── linux-x86_64 — full features (transport-http + pyo3) ──────────
+  # ─── linux-x86_64 — feature-combo gauntlet ──────────────────────────
   # Mission alignment: the lens cutover (Phase 1) consumes edge from
-  # Python via the pyo3 feature; this job covers that path.
+  # Python via the pyo3 feature; the `pyo3-full` matrix entry covers
+  # that path. The other entries are the lane-isolation gauntlet.
+  #
+  # ## Feature-combo matrix (per persist's `linux-x86_64-test`
+  # substrate-matrix precedent — CIRISPersist v2.0.1)
+  #
+  # Edge's optional features compose orthogonally — a regression in
+  # one transport lane can hide behind another lane being enabled.
+  # Before this matrix, a single full-features invocation masked
+  # `cfg(feature = "transport-reticulum")` breakage that the
+  # `transport-http`-only build would surface immediately. The
+  # matrix catches lane-isolation regressions at PR time, not at
+  # downstream consumer integration.
+  #
+  # Entries:
+  #   - core: minimal — just `transport-http`. Catches any module
+  #     that accidentally requires reticulum / packet-radio / pyo3
+  #     to compile.
+  #   - reticulum: canonical wire (MISSION §1.4). Builds the
+  #     Leviculum-backed stack standalone.
+  #   - packet-radio: CIRISEdge#53 N2 transport. Newer + less
+  #     battle-tested; first-class gauntlet entry.
+  #   - all-transports: all three lanes together. Catches feature-
+  #     interaction breakage.
+  #   - pyo3-full: the wheel-build canonical (transport-http +
+  #     transport-reticulum + pyo3). Runs `cargo test --all-targets`
+  #     so lib tests + integration tests + doctests all exercise.
+  #
+  # `fail-fast: false` so a regression in one entry doesn't mask
+  # regressions in others. Wall-clock = slowest single entry (not
+  # the sum) because matrix entries run in parallel — adopted from
+  # persist's substrate matrix precedent. Web-search-validated
+  # against `cargo-feature-combinations` (the Rust-community
+  # canonical pattern) + `doc.rust-lang.org/cargo/guide/continuous-
+  # integration.html`. Source citations live in the PR description.
   linux-x86_64-test:
-    name: linux-x86_64 (full features)
+    name: linux-x86_64 (${{ matrix.combo.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        combo:
+          - { name: core,           features: "transport-http" }
+          - { name: reticulum,      features: "transport-reticulum" }
+          - { name: packet-radio,   features: "transport-packet-radio" }
+          - { name: all-transports, features: "transport-http transport-reticulum transport-packet-radio" }
+          - { name: pyo3-full,      features: "transport-http transport-reticulum pyo3", all_targets: "true" }
     steps:
       - uses: actions/checkout@v4
       # ciris-keyring's `tpm` feature (auto-enabled for Linux targets
@@ -37,11 +80,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test (transport-http + transport-reticulum + pyo3)
-        # transport-reticulum included so the Leviculum-backed Reticulum
-        # transport + the reticulum_loopback acceptance test are exercised
-        # in CI — "full features" must mean all of them (CIRISEdge#14).
-        run: cargo test --features "transport-http transport-reticulum pyo3" --all-targets
+        with:
+          # Per-combo cache key so each matrix entry gets its own
+          # target dir (different feature sets compile to different
+          # artifacts; sharing the cache would cause recompile thrash).
+          key: ${{ matrix.combo.name }}
+      - name: cargo test --features "${{ matrix.combo.features }}"
+        # pyo3-full runs --all-targets to exercise the integration
+        # test suite (transport_http_hardening, reticulum_loopback,
+        # https_per_messagetype_roundtrip, etc.); the transport-lane
+        # entries run --lib only because the integration suites need
+        # the full pyo3 + http stack to link.
+        run: |
+          if [ "${{ matrix.combo.all_targets }}" = "true" ]; then
+            cargo test --features "${{ matrix.combo.features }}" --all-targets
+          else
+            cargo test --features "${{ matrix.combo.features }}" --lib
+          fi
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
