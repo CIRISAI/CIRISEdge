@@ -72,6 +72,49 @@
 //!   counters for round counts, bytes transferred, diff sizes are
 //!   surfaced via `tracing` spans the binding PR will wire to a
 //!   metric backend.
+//!
+//! ## NAT traversal
+//!
+//! Edge does **not** implement STUN / TURN / ICE — and shouldn't.
+//!
+//! Reticulum (the canonical wire per MISSION §1.4) routes by
+//! **cryptographic destination address** (`sha256(pubkey)[..16]`,
+//! the same shape this crate's `transport::addressing` builds for
+//! the packet-radio plug). Transit nodes carry packets by
+//! destination-hash without decrypt capability — the relay can't
+//! read what it's carrying, can't even tell which CEG namespace
+//! it's in. As long as a NAT'd peer's announce graph reaches *any*
+//! publicly-reachable transport node, mesh routing carries packets
+//! both ways without endpoint-translation gymnastics.
+//!
+//! The federation topology itself supplies that public-side peer
+//! set, by construction:
+//!
+//! - **Registry servers** — substrate of the federation; public by
+//!   definition (CEG 0.15 §0.4, registry-anchored normative refs).
+//! - **CIRISLens (LensCore → edge)** — public observability surface
+//!   per the lens-opt-in model. The opt-in dimension is at the
+//!   policy layer (does lens get to see this peer's CEG envelopes
+//!   for telemetry?); the transit layer (Reticulum relay through
+//!   lens's edge instance) is orthogonal — lens can relay packets
+//!   it can't read.
+//! - **Agent 2.9.6 (CEG/RET-native)** — community-server-opt-in
+//!   instances on public IPs join the transport graph for free.
+//!   Mobile agents behind NAT inherit the same benefit they give
+//!   to other NAT'd peers.
+//! - **Any other CEG 0.15 community peer with a public interface.**
+//!
+//! Practical implication: the only operator-doc bit is "your peer
+//! set should include at least one publicly-reachable CIRIS peer"
+//! — which is *automatically* satisfied if the operator points at
+//! the registry / lens / public-agent set at all.
+//!
+//! **HTTP transport** stays the one exception: its accept-side
+//! still needs port-forward / reverse-proxy to be reachable from
+//! outside the NAT. That's operator config (Cloudflare Tunnel,
+//! nginx reverse proxy, etc.), not edge code. Operators behind
+//! hard NATs should use Reticulum, which is what MISSION §1.4
+//! designates canonical anyway.
 
 pub mod coordinator;
 pub mod directory;
