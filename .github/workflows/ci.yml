@@ -11,14 +11,71 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # ── Crates.io index resilience ──
+  # Default `CARGO_NET_RETRY` is 3, which has surfaced as a flake
+  # surface on macOS PyO3 cross-compile lanes (the iOS PyO3 sim job on
+  # PR #76 hit "no matching package named `heck` found" — the
+  # non-sim iOS PyO3 lane pulled the identical dep and succeeded
+  # within the same run). Bumping to 10 catches the long-tail of
+  # transient `index.crates.io` resolution flakes without changing
+  # behavior on the happy path. Per cargo-cooldown's
+  # COOLDOWN_HTTP_RETRIES precedent (default 2, max 8 — we go one
+  # above for stateless CI). Cross-process retry (via
+  # nick-fields/retry@v3) wraps the historically-flake-prone
+  # cargo invocations in the iOS / Android cross-compile lanes —
+  # see the matching steps below for the per-step retry policy.
+  CARGO_NET_RETRY: "10"
 
 jobs:
-  # ─── linux-x86_64 — full features (transport-http + pyo3) ──────────
+  # ─── linux-x86_64 — feature-combo gauntlet ──────────────────────────
   # Mission alignment: the lens cutover (Phase 1) consumes edge from
-  # Python via the pyo3 feature; this job covers that path.
+  # Python via the pyo3 feature; the `pyo3-full` matrix entry covers
+  # that path. The other entries are the lane-isolation gauntlet.
+  #
+  # ## Feature-combo matrix (per persist's `linux-x86_64-test`
+  # substrate-matrix precedent — CIRISPersist v2.0.1)
+  #
+  # Edge's optional features compose orthogonally — a regression in
+  # one transport lane can hide behind another lane being enabled.
+  # Before this matrix, a single full-features invocation masked
+  # `cfg(feature = "transport-reticulum")` breakage that the
+  # `transport-http`-only build would surface immediately. The
+  # matrix catches lane-isolation regressions at PR time, not at
+  # downstream consumer integration.
+  #
+  # Entries:
+  #   - core: minimal — just `transport-http`. Catches any module
+  #     that accidentally requires reticulum / packet-radio / pyo3
+  #     to compile.
+  #   - reticulum: canonical wire (MISSION §1.4). Builds the
+  #     Leviculum-backed stack standalone.
+  #   - packet-radio: CIRISEdge#53 N2 transport. Newer + less
+  #     battle-tested; first-class gauntlet entry.
+  #   - all-transports: all three lanes together. Catches feature-
+  #     interaction breakage.
+  #   - pyo3-full: the wheel-build canonical (transport-http +
+  #     transport-reticulum + pyo3). Runs `cargo test --all-targets`
+  #     so lib tests + integration tests + doctests all exercise.
+  #
+  # `fail-fast: false` so a regression in one entry doesn't mask
+  # regressions in others. Wall-clock = slowest single entry (not
+  # the sum) because matrix entries run in parallel — adopted from
+  # persist's substrate matrix precedent. Web-search-validated
+  # against `cargo-feature-combinations` (the Rust-community
+  # canonical pattern) + `doc.rust-lang.org/cargo/guide/continuous-
+  # integration.html`. Source citations live in the PR description.
   linux-x86_64-test:
-    name: linux-x86_64 (full features)
+    name: linux-x86_64 (${{ matrix.combo.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        combo:
+          - { name: core,           features: "transport-http" }
+          - { name: reticulum,      features: "transport-reticulum" }
+          - { name: packet-radio,   features: "transport-packet-radio" }
+          - { name: all-transports, features: "transport-http transport-reticulum transport-packet-radio" }
+          - { name: pyo3-full,      features: "transport-http transport-reticulum pyo3", all_targets: "true" }
     steps:
       - uses: actions/checkout@v4
       # ciris-keyring's `tpm` feature (auto-enabled for Linux targets
@@ -37,11 +94,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test (transport-http + transport-reticulum + pyo3)
-        # transport-reticulum included so the Leviculum-backed Reticulum
-        # transport + the reticulum_loopback acceptance test are exercised
-        # in CI — "full features" must mean all of them (CIRISEdge#14).
-        run: cargo test --features "transport-http transport-reticulum pyo3" --all-targets
+        with:
+          # Per-combo cache key so each matrix entry gets its own
+          # target dir (different feature sets compile to different
+          # artifacts; sharing the cache would cause recompile thrash).
+          key: ${{ matrix.combo.name }}
+      - name: cargo test --features "${{ matrix.combo.features }}"
+        # pyo3-full runs --all-targets to exercise the integration
+        # test suite (transport_http_hardening, reticulum_loopback,
+        # https_per_messagetype_roundtrip, etc.); the transport-lane
+        # entries run --lib only because the integration suites need
+        # the full pyo3 + http stack to link.
+        run: |
+          if [ "${{ matrix.combo.all_targets }}" = "true" ]; then
+            cargo test --features "${{ matrix.combo.features }}" --all-targets
+          else
+            cargo test --features "${{ matrix.combo.features }}" --lib
+          fi
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
@@ -208,11 +277,22 @@ jobs:
       # UniFFI/JNI) take this artifact; the Chaquopy variant below is
       # for the Python-agent cohabitation case.
       - name: cargo ndk build (${{ matrix.abi }} — plain, no PyO3)
+        # Cross-process retry via nick-fields/retry@v3 — catches
+        # transient `index.crates.io` resolution flakes the in-process
+        # CARGO_NET_RETRY=10 can't (e.g. when cargo gives up but a
+        # fresh process succeeds, which we observed on PR #76's iOS
+        # PyO3 sim lane). 3 attempts × 20 min each = worst-case 60 min
+        # wall-clock, but typical case is 1 attempt at ~5 min. Same
+        # rationale documented at the workflow `env:` block.
+        uses: nick-fields/retry@v3
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: >-
-          cargo ndk -t ${{ matrix.abi }} build --release
-          --features "$MOBILE_BASE_FEATURES"
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          command: >-
+            cargo ndk -t ${{ matrix.abi }} build --release
+            --features "$MOBILE_BASE_FEATURES"
       - name: save plain .so
         run: |
           mkdir -p dist/${{ matrix.abi }}
@@ -258,12 +338,17 @@ jobs:
           file "${STUB_DIR}/libpython3.10.so"
 
       - name: cargo ndk build (${{ matrix.abi }} — PyO3 Chaquopy abi3)
+        # Cross-process retry — see plain-build step for rationale.
+        uses: nick-fields/retry@v3
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           RUSTFLAGS: "-L ${{ runner.temp }}/python-stub -C link-arg=-Wl,--no-as-needed -C link-arg=-lpython3.10"
-        run: >-
-          cargo ndk -t ${{ matrix.abi }} build --release --lib
-          --features "$MOBILE_PYO3_FEATURES"
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          command: >-
+            cargo ndk -t ${{ matrix.abi }} build --release --lib
+            --features "$MOBILE_PYO3_FEATURES"
 
       - name: verify DT_NEEDED includes libpython3.10.so
         # AV-NN: the whole point of the stub-link dance is the
@@ -486,17 +571,24 @@ jobs:
         # cohabitation wire (MISSION §1.4). No PyO3 here (see job
         # docblock above for the rationale); no transport-http
         # (cloud fallback, not mobile).
-        run: |
-          # v0.7.1 — `--lib` so the bin target (`emit_edge_extras`,
-          # used only by the build-manifest emitter on the host) isn't
-          # also linked under this RUSTFLAGS. The `-install_name` flag
-          # is `-dynamiclib`-only; applying it to the bin target's
-          # `cc` invocation fails with `invalid argument` because the
-          # bin links as an executable, not a dylib. Verify's lane
-          # doesn't hit this because its repo has no `[[bin]]`.
-          RUSTFLAGS="-C link-arg=-install_name -C link-arg=@rpath/CIRISEdge.framework/CIRISEdge" \
-            cargo build --release --target ${{ matrix.target }} --lib \
-              --features "transport-reticulum"
+        #
+        # v0.7.1 — `--lib` so the bin target (`emit_edge_extras`,
+        # used only by the build-manifest emitter on the host) isn't
+        # also linked under this RUSTFLAGS. The `-install_name` flag
+        # is `-dynamiclib`-only; applying it to the bin target's
+        # `cc` invocation fails with `invalid argument`.
+        #
+        # Cross-process retry via nick-fields/retry@v3 — see Android
+        # lanes for rationale.
+        uses: nick-fields/retry@v3
+        env:
+          RUSTFLAGS: "-C link-arg=-install_name -C link-arg=@rpath/CIRISEdge.framework/CIRISEdge"
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          command: >-
+            cargo build --release --target ${{ matrix.target }} --lib
+            --features "transport-reticulum"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -717,18 +809,30 @@ jobs:
           echo "✓ Python-Apple-support ${PYTHON_IOS_VER}-${PYTHON_IOS_BUILD} staged for ${{ matrix.target }}"
           ls -la "$STAGE_DIR/"
       - name: cargo build (ios PyO3 — ${{ matrix.target }})
+        # Direct `cargo build` — NOT `maturin build`. Maturin 1.13's
+        # platform check rejects darwin→iOS cross-compile; persist
+        # documented this in v2.0.4 and the constraint persists.
+        #
+        # Cross-process retry via nick-fields/retry@v3 — this is the
+        # lane that observably flaked on PR #76 (`heck` not found in
+        # crates.io index on this specific runner; non-sim iOS PyO3
+        # pulled the same dep and succeeded). Per the env-block
+        # rationale: CARGO_NET_RETRY=10 covers in-process retries;
+        # this wrapper covers the case where cargo gives up but a
+        # fresh process succeeds.
+        uses: nick-fields/retry@v3
         env:
           PYO3_CROSS: "1"
           PYO3_CROSS_PYTHON_VERSION: "3.10"
           PYO3_CROSS_LIB_DIR: ${{ steps.python-ios.outputs.lib_dir }}
-        # Direct `cargo build` — NOT `maturin build`. Maturin 1.13's
-        # platform check rejects darwin→iOS cross-compile; persist
-        # documented this in v2.0.4 and the constraint persists.
-        run: >-
-          cargo build --release
-          --target ${{ matrix.target }}
-          --lib
-          --features "$IOS_PYO3_FEATURES"
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          command: >-
+            cargo build --release
+            --target ${{ matrix.target }}
+            --lib
+            --features "$IOS_PYO3_FEATURES"
       - name: strip + rename + install_name fix
         # Mach-O rename: libciris_edge.dylib → ciris_edge.abi3.so
         # (Python extension naming convention). install_name_tool
@@ -954,8 +1058,18 @@ jobs:
         # All three feature-gates so EVERY bench file compiles in
         # this gate — the feature-gated benches (transport-reticulum,
         # transport-http, pyo3) cannot bit-rot silently.
-        run: |
-          cargo bench --no-run --features "transport-http transport-reticulum pyo3"
+        #
+        # Cross-process retry — same rationale as the iOS/Android
+        # cross-compile lanes. PR #76 observed the `heck` index flake
+        # hitting this lane too (CARGO_NET_RETRY=10 alone wasn't
+        # enough when crates.io has a sustained regional sync hiccup;
+        # a fresh process attempt after a delay clears the cached
+        # negative resolution).
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          command: cargo bench --no-run --features "transport-http transport-reticulum pyo3"
 
   # ─── pyo3-wheel: maturin abi3-py310 wheels ──────────────────────────
   #
@@ -1514,38 +1628,36 @@ jobs:
   # workflow — see that repo's README for adding new cases.
   # ─── extract-substrate-pins: Cargo.toml → JSON pin-overrides ────────
   #
-  # Reads edge's actual Cargo.toml pin for ciris-persist and emits a
-  # JSON object that the cohabitation gate feeds into the harness's
-  # `pin-overrides` input.
+  # Reads edge's actual Cargo.toml pins for ciris-persist (Python wheel)
+  # and ciris-keyring (= ciris-verify Python wheel — both come from
+  # CIRISVerify at the same tag) and emits a JSON object that the
+  # cohabitation gate feeds into the harness's `pin-overrides` input.
   #
   # This eliminates the substrate-currency race: edge's own Cargo pin
   # IS the cohabitation contract. The conformance matrix becomes
   # documentation-of-record + nightly drift gate, but is no longer on
-  # the critical path of an edge release. Before this job existed, we
-  # had to force-push a conformance matrix bump in lockstep with every
-  # edge tag (v1.1.9 / v1.1.10 / v1.1.11 / v1.1.12 all hit it).
+  # the critical path of an edge release.
   #
-  # ## Why ciris-verify is NOT pinned here
+  # ## History — why this job briefly stopped emitting ciris-verify
   #
-  # Earlier versions of this job ALSO emitted `ciris-verify==<tag>`,
-  # extracted from edge's ciris-keyring/ciris-crypto Cargo tag. That
-  # was wrong: the Cargo tag is the **Rust-internal** verify crate
-  # (compiled into edge's + persist's cdylib symbol tables), while
-  # the Python `ciris-verify` wheel is a **separate** cdylib at a
-  # **separate** process boundary. Neither edge nor persist (via
-  # PyCapsule cohabitation) imports the Python ciris-verify wheel —
-  # they use Rust-internal cohabitation through their compiled cdylibs.
+  # During the v1.4.0/v1.4.1 cycle, persist v4.8.0's pyproject still
+  # pinned `ciris-verify<5,>=4.4.2` while edge's Cargo pin moved to
+  # ciris-keyring/crypto v5.0.0. Forcing the Python `ciris-verify==5.0.0`
+  # alongside persist 4.8.0 was unresolvable (the Python pin ceiling
+  # and the Cargo pin ceiling diverged). This job temporarily stopped
+  # emitting the ciris-verify override; the v1.4.1 release notes
+  # documented the workaround.
   #
-  # The two pins can legitimately diverge. The v1.4.0 cycle hit
-  # ResolutionImpossible because edge's Cargo pin was v5.0.0 but
-  # persist v4.8.0's PUBLISHED pyproject pins `ciris-verify<5,>=4.4.2`
-  # — forcing the Python wheel to v5.0.0 alongside persist 4.8.0
-  # was unresolvable, even though the Cargo cohabitation worked fine.
+  # **Persist v4.10.0 closes the divergence** — its pyproject bumps
+  # `ciris-verify` to `>=5.0.0,<6` (matching the Rust pin). The
+  # conformance matrix can now install `ciris-verify==5.0.0` alongside
+  # `ciris-persist==4.10.0` without conflict, so this job re-enables
+  # the ciris-verify pin-override extraction.
   #
-  # The fix: let persist's pyproject resolve the Python ciris-verify
-  # wheel transitively. The Cargo-side cohabitation is asserted
-  # independently by edge's wheel-build CI job (which uses the
-  # Cargo pin directly + the cargo deny / clippy gates).
+  # Going forward, if persist's pyproject ciris-verify ceiling lags
+  # again, this job will need to either skip the ciris-verify override
+  # (the v1.4.0 workaround) or persist needs to coordinate the pyproject
+  # bump with its own Cargo bump.
   extract-substrate-pins:
     name: extract substrate pins from Cargo.toml
     runs-on: ubuntu-latest
@@ -1564,16 +1676,12 @@ jobs:
                   raise SystemExit(f'no tag found for {crate} in Cargo.toml')
               return m.group(1)
           persist = find_tag('ciris-persist')
-          # Verify the Cargo-side keyring/crypto pair shares a tag —
-          # they MUST come from CIRISVerify at the same release. The
-          # tag itself is NOT emitted as a Python-side pin-override
-          # (see job docstring); this assertion is purely a sanity
-          # check on edge's own Cargo.toml shape.
           keyring = find_tag('ciris-keyring')
           crypto  = find_tag('ciris-crypto')
           assert keyring == crypto, f'ciris-keyring ({keyring}) and ciris-crypto ({crypto}) must share a tag — both come from CIRISVerify'
           pins = {
               'ciris-persist': f'ciris-persist=={persist}',
+              'ciris-verify':  f'ciris-verify=={keyring}',
           }
           print(f'json={json.dumps(pins)}')
           PYEOF
