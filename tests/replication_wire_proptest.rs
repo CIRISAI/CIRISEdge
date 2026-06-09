@@ -56,6 +56,7 @@ fn arb_envelope_kind() -> impl Strategy<Value = EnvelopeKind> {
         Just(EnvelopeKind::IdentityOccurrenceRevocation),
         Just(EnvelopeKind::FamilyMembershipRevocation),
         Just(EnvelopeKind::CommunityMembershipRevocation),
+        Just(EnvelopeKind::LocationProof),
     ]
 }
 

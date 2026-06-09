@@ -329,6 +329,10 @@ mod tests {
                 kind: EnvelopeKind::CommunityMembershipRevocation,
                 refs: vec![],
             }),
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::LocationProof,
+                refs: vec![],
+            }),
         ];
         for msg in cases {
             let framed = wrap(&msg);

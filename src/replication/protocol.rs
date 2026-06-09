@@ -48,24 +48,25 @@ use serde::{Deserialize, Serialize};
 /// ## v1 wire-stable taxonomy — aligned 1:1 with persist's
 /// `FederationDirectory` `put_*` surface
 ///
-/// Per `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.3, the nine variants
-/// here match persist's nine put_* admit methods exactly. This means
-/// `apply_envelope_bytes` dispatches via a simple match on
-/// `EnvelopeKind` — no JSON shape sniffing, no schema inference. Each
-/// branch deserializes the matching `Signed*Record` and calls the
-/// matching put_*.
+/// Per `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.3, the ten variants
+/// here match persist's ten put_* admit methods exactly (as of
+/// persist v4.10.0). `apply_envelope_bytes` dispatches via a simple
+/// match on `EnvelopeKind` — no JSON shape sniffing, no schema
+/// inference. Each branch deserializes the matching `Signed*Record`
+/// and calls the matching put_*.
 ///
-/// | Variant                          | Persist put_*                                 |
-/// |----------------------------------|------------------------------------------------|
-/// | `Key`                            | `put_public_key(SignedKeyRecord)`             |
-/// | `Attestation`                    | `put_attestation(SignedAttestation)`          |
-/// | `Revocation`                     | `put_revocation(SignedRevocation)`            |
-/// | `IdentityOccurrence`             | `put_identity_occurrence(SignedIdentityOccurrence)` |
-/// | `Family`                         | `put_family(SignedFamily)`                    |
-/// | `Community`                      | `put_community(SignedCommunity)`              |
-/// | `IdentityOccurrenceRevocation`   | `put_identity_occurrence_revocation(...)` (v4.8.0) |
-/// | `FamilyMembershipRevocation`     | `put_family_membership_revocation(...)` (v4.8.0) |
-/// | `CommunityMembershipRevocation`  | `put_community_membership_revocation(...)` (v4.8.0) |
+/// | Variant                          | Persist put_*                                       | Substrate ship |
+/// |----------------------------------|------------------------------------------------------|----------------|
+/// | `Key`                            | `put_public_key(SignedKeyRecord)`                   | v1.0+          |
+/// | `Attestation`                    | `put_attestation(SignedAttestation)`                | v1.0+          |
+/// | `Revocation`                     | `put_revocation(SignedRevocation)`                  | v1.0+          |
+/// | `IdentityOccurrence`             | `put_identity_occurrence(SignedIdentityOccurrence)` | CEG 0.7        |
+/// | `Family`                         | `put_family(SignedFamily)`                          | CEG 0.7        |
+/// | `Community`                      | `put_community(SignedCommunity)`                    | CEG 0.8        |
+/// | `IdentityOccurrenceRevocation`   | `put_identity_occurrence_revocation(...)`           | v4.8.0 (#161)  |
+/// | `FamilyMembershipRevocation`     | `put_family_membership_revocation(...)`             | v4.8.0 (#161)  |
+/// | `CommunityMembershipRevocation`  | `put_community_membership_revocation(...)`          | v4.8.0 (#161)  |
+/// | `LocationProof`                  | `put_location_proof(SignedLocationProof)`           | v4.10.0 (#154) |
 ///
 /// Adding a variant going forward bumps `WIRE_PROTOCOL_VERSION` (see
 /// `wire_frame.rs`). Anticipated v2 additions (operational-data CEG
@@ -110,6 +111,16 @@ pub enum EnvelopeKind {
     /// forward-secrecy primitive per CIRISPersist v4.8.0 (#161).
     /// `put_community_membership_revocation(...)`.
     CommunityMembershipRevocation,
+    /// `federation_location_proofs` — CEG 0.8 §0.8.1 normative privacy
+    /// primitive (H3 rough-only geographic claim, resolution ≤ 7).
+    /// CIRISPersist v4.10.0 (#154) ships V068 + `LocationProof` /
+    /// `SignedLocationProof` types + `put_location_proof` on all 3
+    /// backends + the pure-Rust `h3o` validation helpers
+    /// (`validate_location_cell` / `h3_cell_contained`). The substrate's
+    /// resolution-≤-7 rejection IS the privacy enforcement — a producer
+    /// can't over-share precise location even if client UI gating fails.
+    /// `put_location_proof(SignedLocationProof)`.
+    LocationProof,
 }
 
 /// A reference to a single envelope in a peer's local state. The
@@ -291,7 +302,7 @@ mod tests {
         assert!(matches!(r, Err(ProtocolError::Decode(_))));
     }
 
-    /// All nine `EnvelopeKind` variants round-trip via JSON — kind
+    /// All ten `EnvelopeKind` variants round-trip via JSON — kind
     /// values are wire-load-bearing per FSD §3.3.
     #[test]
     fn envelope_kind_wire_values_are_stable() {
@@ -314,6 +325,7 @@ mod tests {
                 EnvelopeKind::CommunityMembershipRevocation,
                 "community_membership_revocation",
             ),
+            (EnvelopeKind::LocationProof, "location_proof"),
         ];
         for (kind, wire) in cases {
             let m = ReplicationMessage::Summary(SummaryMessage { kind, refs: vec![] });
@@ -340,6 +352,7 @@ mod tests {
             EnvelopeKind::IdentityOccurrenceRevocation,
             EnvelopeKind::FamilyMembershipRevocation,
             EnvelopeKind::CommunityMembershipRevocation,
+            EnvelopeKind::LocationProof,
         ];
         let wires: HashSet<String> = kinds
             .iter()

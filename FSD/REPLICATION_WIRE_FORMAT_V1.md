@@ -145,27 +145,36 @@ the signed-epoch version, NOT by a caller flag). When that flip
 happens, replication wire bytes auto-flip too — edge calls persist's
 canonicalizer at runtime; no edge-side coordination needed.
 
-### 3.3 EnvelopeKind taxonomy — DECISION: expand 4→9
+### 3.3 EnvelopeKind taxonomy — DECISION: expand 4→10
 
 This was the genuinely open question. We resolve it by aligning the
 replication kind discriminator **1:1 with persist's `FederationDirectory`
-put_* surface**. Nine variants:
+put_* surface**. **Ten variants** as of persist v4.10.0:
 
-| `EnvelopeKind` variant      | Persist put_* method                          | Wire tag         |
-|-----------------------------|------------------------------------------------|------------------|
-| `Key`                       | `put_public_key(SignedKeyRecord)`             | `"key"`          |
-| `Attestation`               | `put_attestation(SignedAttestation)`          | `"attestation"`  |
-| `Revocation`                | `put_revocation(SignedRevocation)`            | `"revocation"`   |
-| `IdentityOccurrence`        | `put_identity_occurrence(SignedIdentityOccurrence)` | `"identity_occurrence"` |
-| `Family`                    | `put_family(SignedFamily)`                    | `"family"`       |
-| `Community`                 | `put_community(SignedCommunity)`              | `"community"`    |
-| `IdentityOccurrenceRevocation` | `put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation)` | `"identity_occurrence_revocation"` |
-| `FamilyMembershipRevocation`   | `put_family_membership_revocation(SignedFamilyMembershipRevocation)`   | `"family_membership_revocation"` |
-| `CommunityMembershipRevocation` | `put_community_membership_revocation(SignedCommunityMembershipRevocation)` | `"community_membership_revocation"` |
+| `EnvelopeKind` variant      | Persist put_* method                          | Wire tag                          | Substrate ship |
+|-----------------------------|------------------------------------------------|-----------------------------------|----------------|
+| `Key`                       | `put_public_key(SignedKeyRecord)`             | `"key"`                           | v1.0+ |
+| `Attestation`               | `put_attestation(SignedAttestation)`          | `"attestation"`                   | v1.0+ |
+| `Revocation`                | `put_revocation(SignedRevocation)`            | `"revocation"`                    | v1.0+ |
+| `IdentityOccurrence`        | `put_identity_occurrence(SignedIdentityOccurrence)` | `"identity_occurrence"`     | CEG 0.7 |
+| `Family`                    | `put_family(SignedFamily)`                    | `"family"`                        | CEG 0.7 |
+| `Community`                 | `put_community(SignedCommunity)`              | `"community"`                     | CEG 0.8 |
+| `IdentityOccurrenceRevocation` | `put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation)` | `"identity_occurrence_revocation"` | v4.8.0 (#161) |
+| `FamilyMembershipRevocation`   | `put_family_membership_revocation(SignedFamilyMembershipRevocation)`   | `"family_membership_revocation"`   | v4.8.0 (#161) |
+| `CommunityMembershipRevocation` | `put_community_membership_revocation(SignedCommunityMembershipRevocation)` | `"community_membership_revocation"` | v4.8.0 (#161) |
+| `LocationProof`             | `put_location_proof(SignedLocationProof)`     | `"location_proof"`                | v4.10.0 (#154) |
 
 The wire tag is the `serde(rename = "snake_case")` form. Tagged via
 `#[serde(tag = "kind")]` at the message layer (Summary / Diff /
 Fetch / Deliver each carry their kind on the wire).
+
+The 10th variant `LocationProof` is the CEG 0.8 §0.8.1 normative
+privacy primitive — a geographic claim bounded to H3 resolution ≤ 7,
+enforced at the substrate (CIRISPersist v4.10.0, V068
+`federation_location_proofs` + `validate_location_cell`). The
+substrate's resolution-≤-7 rejection IS the privacy enforcement; a
+producer can't over-share precise location even if client UI gating
+fails.
 
 Justification:
 
@@ -294,13 +303,13 @@ gives operators flexibility post-init.
 
 ## 4. Acceptance criteria
 
-- [ ] 9-variant `EnvelopeKind` shipped; serde tags match §3.3 table
+- [ ] 10-variant `EnvelopeKind` shipped; serde tags match §3.3 table
 - [ ] `WIRE_PROTOCOL_VERSION = 0x01` byte added to wire frame; wrap/try_unwrap updated
 - [ ] `FederationDirectoryReplicationBridge` implements `ReplicationDirectory`
   over `Arc<dyn FederationDirectory> + Arc<dyn ReadEngine>`
 - [ ] In-memory hash→bytes cache (LRU, 4096 default capacity) populated
   from bulk-list responses
-- [ ] All 9 kinds round-trip via `apply_envelope_bytes` → persist `put_*`
+- [ ] All 10 kinds round-trip via `apply_envelope_bytes` → persist `put_*`
   → list_envelope_refs (in-memory sqlite test)
 - [ ] PyO3 init accepts `replication_peers` + `replication_cadence_seconds`;
   `PyEdge.register_replication_peer` hot-add works
