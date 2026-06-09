@@ -1058,8 +1058,18 @@ jobs:
         # All three feature-gates so EVERY bench file compiles in
         # this gate — the feature-gated benches (transport-reticulum,
         # transport-http, pyo3) cannot bit-rot silently.
-        run: |
-          cargo bench --no-run --features "transport-http transport-reticulum pyo3"
+        #
+        # Cross-process retry — same rationale as the iOS/Android
+        # cross-compile lanes. PR #76 observed the `heck` index flake
+        # hitting this lane too (CARGO_NET_RETRY=10 alone wasn't
+        # enough when crates.io has a sustained regional sync hiccup;
+        # a fresh process attempt after a delay clears the cached
+        # negative resolution).
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          command: cargo bench --no-run --features "transport-http transport-reticulum pyo3"
 
   # ─── pyo3-wheel: maturin abi3-py310 wheels ──────────────────────────
   #
