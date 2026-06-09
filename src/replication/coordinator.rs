@@ -308,27 +308,32 @@ impl ReplicationCoordinator {
         super::wire_frame::try_unwrap(bytes).map_err(CoordinatorError::from)
     }
 
-    /// Backward-compatible parser that REQUIRES bytes to be a valid
-    /// replication frame — returns `Err` if not, matching the PR #70
-    /// behavior. New code should prefer [`Self::try_parse_inbound_bytes`]
-    /// for the trichotomy (absent magic = NotAReplicationFrame, not
-    /// an error).
+    /// Strict parser that REQUIRES bytes to be a valid replication
+    /// frame at the locked [`super::wire_frame::WIRE_PROTOCOL_VERSION`]
+    /// (v1). Returns `Err` if the magic prefix is absent, the version
+    /// byte is unrecognized, or the body is malformed. Prefer
+    /// [`Self::try_parse_inbound_bytes`] in new dispatcher code so
+    /// non-replication bytes route cleanly (Ok(None)) without
+    /// surfacing as errors.
     ///
-    /// Tolerates both framed (CRPL-prefixed, the current wire format)
-    /// and bare (legacy, pre-#71-wire-frame) inputs — bare inputs
-    /// route directly to [`ReplicationMessage::from_bytes`]. The
-    /// tolerance ships because the on-wire codec changed between
-    /// PR #70 (bare JSON) and this PR (CRPL-prefixed); a fleet
-    /// running mixed builds during a rolling upgrade can still
-    /// exchange messages. The tolerance can be removed once edge
-    /// v1.3.x reaches end-of-life.
+    /// ## v1 wire-stability — no pre-v1 bare-JSON tolerance
+    ///
+    /// Prior cuts of the replication module (#69 / #70) shipped a
+    /// `parse_inbound_bytes` that tolerated bare-JSON inputs (no
+    /// `CRPL` magic) to ease the rolling-upgrade window when the
+    /// wire-frame prefix landed (#72). v1 LOCKS the wire format
+    /// per `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.5: every
+    /// replication frame MUST carry the 5-byte preamble (`CRPL` +
+    /// `VER`). Bare-JSON inputs now surface as
+    /// `CoordinatorError::Protocol(Decode(_))`. This is the
+    /// version-stable contract going forward.
     pub fn parse_inbound_bytes(bytes: &[u8]) -> Result<ReplicationMessage, CoordinatorError> {
         match super::wire_frame::try_unwrap(bytes) {
             Ok(Some(msg)) => Ok(msg),
-            Ok(None) => {
-                // Legacy bare-JSON fallback for mid-rolling-upgrade fleets.
-                ReplicationMessage::from_bytes(bytes).map_err(CoordinatorError::from)
-            }
+            Ok(None) => Err(CoordinatorError::Protocol(ProtocolError::Decode(
+                "replication frame magic absent — wire format requires CRPL+VER preamble (v1)"
+                    .into(),
+            ))),
             Err(e) => Err(CoordinatorError::from(e)),
         }
     }
@@ -698,23 +703,26 @@ mod tests {
         assert!(matches!(r, Err(CoordinatorError::Protocol(_))));
     }
 
-    /// Backward-compatible `parse_inbound_bytes` accepts BOTH the
-    /// new framed wire form AND the legacy bare-JSON form — important
-    /// during a rolling fleet upgrade.
+    /// `parse_inbound_bytes` is STRICT at v1: bare-JSON without the
+    /// CRPL+VER preamble surfaces as `Protocol(Decode)`. The pre-v1
+    /// rolling-upgrade tolerance is gone per FSD §3.5.
     #[test]
-    fn parse_inbound_bytes_tolerates_legacy_bare_json() {
+    fn parse_inbound_bytes_strict_v1_rejects_bare_json() {
         let msg = ReplicationMessage::Summary(SummaryMessage {
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
-        // Legacy form (bare JSON, no CRPL magic).
+        // Bare form — refused.
         let bare = msg.to_bytes();
-        let parsed = ReplicationCoordinator::parse_inbound_bytes(&bare).expect("parse");
-        assert_eq!(parsed, msg);
-        // New form (CRPL-prefixed) also parses.
+        let r = ReplicationCoordinator::parse_inbound_bytes(&bare);
+        assert!(
+            matches!(r, Err(CoordinatorError::Protocol(_))),
+            "v1 wire requires CRPL+VER preamble; bare-JSON must refuse"
+        );
+        // Framed form (CRPL+VER+body) — accepted.
         let framed = super::super::wire_frame::wrap(&msg);
-        let parsed2 = ReplicationCoordinator::parse_inbound_bytes(&framed).expect("parse");
-        assert_eq!(parsed2, msg);
+        let parsed = ReplicationCoordinator::parse_inbound_bytes(&framed).expect("parse");
+        assert_eq!(parsed, msg);
     }
 
     /// `parse_inbound_bytes` refuses junk cleanly — defence against

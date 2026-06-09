@@ -43,26 +43,73 @@ use serde::{Deserialize, Serialize};
 
 /// The kinds of envelope the anti-entropy protocol replicates. Each
 /// kind corresponds to a separate sync stream so partitions on one
-/// kind don't gate convergence on others. Extending this enum is
-/// additive (new variant); the receiver gracefully unknowns variants
-/// it doesn't recognize via serde's untagged-fallback behavior. New
-/// variants MUST be appended (not inserted) to preserve serialized
-/// wire order for the explicit JSON-name representation.
+/// kind don't gate convergence on others.
+///
+/// ## v1 wire-stable taxonomy — aligned 1:1 with persist's
+/// `FederationDirectory` `put_*` surface
+///
+/// Per `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.3, the nine variants
+/// here match persist's nine put_* admit methods exactly. This means
+/// `apply_envelope_bytes` dispatches via a simple match on
+/// `EnvelopeKind` — no JSON shape sniffing, no schema inference. Each
+/// branch deserializes the matching `Signed*Record` and calls the
+/// matching put_*.
+///
+/// | Variant                          | Persist put_*                                 |
+/// |----------------------------------|------------------------------------------------|
+/// | `Key`                            | `put_public_key(SignedKeyRecord)`             |
+/// | `Attestation`                    | `put_attestation(SignedAttestation)`          |
+/// | `Revocation`                     | `put_revocation(SignedRevocation)`            |
+/// | `IdentityOccurrence`             | `put_identity_occurrence(SignedIdentityOccurrence)` |
+/// | `Family`                         | `put_family(SignedFamily)`                    |
+/// | `Community`                      | `put_community(SignedCommunity)`              |
+/// | `IdentityOccurrenceRevocation`   | `put_identity_occurrence_revocation(...)` (v4.8.0) |
+/// | `FamilyMembershipRevocation`     | `put_family_membership_revocation(...)` (v4.8.0) |
+/// | `CommunityMembershipRevocation`  | `put_community_membership_revocation(...)` (v4.8.0) |
+///
+/// Adding a variant going forward bumps `WIRE_PROTOCOL_VERSION` (see
+/// `wire_frame.rs`). Anticipated v2 additions (operational-data CEG
+/// envelopes for CIRISRegistry#58 Phase 2 / CIRIS 2.0): `Org`,
+/// `User`, `License`, `Partner` or whatever Registry settles on.
+///
+/// New variants MUST be appended (not inserted) to preserve `Ord` /
+/// `Hash` stability on the `BTreeMap<EnvelopeKind, …>` keys
+/// `LocalState` uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeKind {
-    /// `federation_keys` table — newly-published key registrations.
+    /// `federation_keys` — newly-published key registrations.
+    /// `put_public_key(SignedKeyRecord)`.
     Key,
-    /// `federation_attestations` table — `trust_grant` / `holds_bytes`
-    /// / consent / etc.
+    /// `federation_attestations` — trust grants / scores / withdraws /
+    /// delegates_to / etc. `put_attestation(SignedAttestation)`.
     Attestation,
-    /// `federation_revocations` table — anti-rollback per CIRISPersist
-    /// V058.
+    /// `federation_revocations` — key-level revocations with R1/Q1
+    /// quorum-merge per CIRISPersist V058.
+    /// `put_revocation(SignedRevocation)`.
     Revocation,
-    /// `federation_communities` (CEG 0.8) once shipped — placeholder
-    /// reserved here so the kind enum doesn't have to change when the
-    /// substrate lands.
+    /// `federation_identity_occurrences` — agent / human / partner
+    /// occurrence records per CEG 0.7.
+    /// `put_identity_occurrence(SignedIdentityOccurrence)`.
+    IdentityOccurrence,
+    /// `federation_families` — family roster declarations per CEG 0.7.
+    /// `put_family(SignedFamily)`.
+    Family,
+    /// `federation_communities` — community roster declarations per
+    /// CEG 0.8. `put_community(SignedCommunity)`.
     Community,
+    /// `federation_identity_occurrence_revocations` — Option-A forward-
+    /// secrecy primitive per CIRISPersist v4.8.0 (#161).
+    /// `put_identity_occurrence_revocation(...)`.
+    IdentityOccurrenceRevocation,
+    /// `federation_family_membership_revocations` — Option-A forward-
+    /// secrecy primitive per CIRISPersist v4.8.0 (#161).
+    /// `put_family_membership_revocation(...)`.
+    FamilyMembershipRevocation,
+    /// `federation_community_membership_revocations` — Option-A
+    /// forward-secrecy primitive per CIRISPersist v4.8.0 (#161).
+    /// `put_community_membership_revocation(...)`.
+    CommunityMembershipRevocation,
 }
 
 /// A reference to a single envelope in a peer's local state. The
@@ -154,6 +201,13 @@ impl ReplicationMessage {
 pub enum ProtocolError {
     #[error("replication message decode failed: {0}")]
     Decode(String),
+    /// The wire frame carried a version byte the local code can't
+    /// speak. The frame's MAG prefix asserted it was a replication
+    /// frame, but the version byte was outside the locally-supported
+    /// set (currently only `WIRE_PROTOCOL_VERSION = 0x01`). Surfaced
+    /// by `wire_frame::try_unwrap`; the caller logs + drops.
+    #[error("unknown replication wire-protocol version: {0:#x}")]
+    UnknownVersion(u8),
 }
 
 #[cfg(test)]
@@ -237,15 +291,29 @@ mod tests {
         assert!(matches!(r, Err(ProtocolError::Decode(_))));
     }
 
-    /// All four `EnvelopeKind` variants round-trip via JSON — kind
-    /// values are wire-load-bearing.
+    /// All nine `EnvelopeKind` variants round-trip via JSON — kind
+    /// values are wire-load-bearing per FSD §3.3.
     #[test]
     fn envelope_kind_wire_values_are_stable() {
         let cases = [
             (EnvelopeKind::Key, "key"),
             (EnvelopeKind::Attestation, "attestation"),
             (EnvelopeKind::Revocation, "revocation"),
+            (EnvelopeKind::IdentityOccurrence, "identity_occurrence"),
+            (EnvelopeKind::Family, "family"),
             (EnvelopeKind::Community, "community"),
+            (
+                EnvelopeKind::IdentityOccurrenceRevocation,
+                "identity_occurrence_revocation",
+            ),
+            (
+                EnvelopeKind::FamilyMembershipRevocation,
+                "family_membership_revocation",
+            ),
+            (
+                EnvelopeKind::CommunityMembershipRevocation,
+                "community_membership_revocation",
+            ),
         ];
         for (kind, wire) in cases {
             let m = ReplicationMessage::Summary(SummaryMessage { kind, refs: vec![] });
@@ -254,5 +322,29 @@ mod tests {
             assert!(s.contains(wire), "expected `{wire}` in {s}");
             assert_eq!(ReplicationMessage::from_bytes(&bytes).unwrap(), m);
         }
+    }
+
+    /// Wire-stability sanity: confirm no two kinds collide on their
+    /// serde rename. Catches accidental duplicates if a future
+    /// variant is added with a typo.
+    #[test]
+    fn envelope_kind_wire_values_are_unique() {
+        use std::collections::HashSet;
+        let kinds = [
+            EnvelopeKind::Key,
+            EnvelopeKind::Attestation,
+            EnvelopeKind::Revocation,
+            EnvelopeKind::IdentityOccurrence,
+            EnvelopeKind::Family,
+            EnvelopeKind::Community,
+            EnvelopeKind::IdentityOccurrenceRevocation,
+            EnvelopeKind::FamilyMembershipRevocation,
+            EnvelopeKind::CommunityMembershipRevocation,
+        ];
+        let wires: HashSet<String> = kinds
+            .iter()
+            .map(|k| serde_json::to_string(k).unwrap())
+            .collect();
+        assert_eq!(wires.len(), kinds.len(), "wire-name collision detected");
     }
 }
