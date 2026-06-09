@@ -191,10 +191,15 @@ impl ReplicationCoordinator {
     }
 
     /// Emit a [`ReplicationMessage`] on the underlying transport.
-    /// Serializes via [`ReplicationMessage::to_bytes`], hands to
-    /// [`Transport::send`] addressed at the configured peer_key_id.
+    /// Wraps via [`super::wire_frame::wrap`] (4-byte CRPL magic
+    /// prefix + JSON body), then hands to [`Transport::send`]
+    /// addressed at the configured peer_key_id.
+    ///
+    /// The magic prefix lets the application's [`Transport::listen`]
+    /// loop route inbound bytes to the replication path without
+    /// parsing every byte as every possible payload kind.
     pub async fn send_message(&self, msg: &ReplicationMessage) -> Result<(), CoordinatorError> {
-        let bytes = msg.to_bytes();
+        let bytes = super::wire_frame::wrap(msg);
         self.transport
             .send(&self.peer_key_id, &bytes)
             .await
@@ -202,12 +207,48 @@ impl ReplicationCoordinator {
             .map_err(CoordinatorError::from)
     }
 
-    /// Parse on-wire bytes back into a [`ReplicationMessage`]. The
-    /// application's listen loop calls this when it has identified
-    /// the inbound bytes as a replication frame (via the frame-kind
-    /// prefix or per-medium port discriminator — out of scope here).
+    /// Try to parse on-wire bytes as a [`ReplicationMessage`].
+    /// Returns:
+    ///
+    /// - `Ok(Some(msg))` — bytes carry the CRPL magic and the JSON
+    ///   body decoded cleanly. The caller's listen-loop dispatcher
+    ///   feeds the message to [`Self::drive_round_step`].
+    /// - `Ok(None)` — bytes are not a replication frame (magic
+    ///   absent). The caller's dispatcher falls through to its
+    ///   non-replication path (existing signed-envelope handler,
+    ///   future key_grant handler, etc.).
+    /// - `Err(CoordinatorError::Protocol)` — bytes have the CRPL
+    ///   magic but the JSON body is malformed. Protocol violation
+    ///   by the sender; the caller typically logs + drops the frame.
+    pub fn try_parse_inbound_bytes(
+        bytes: &[u8],
+    ) -> Result<Option<ReplicationMessage>, CoordinatorError> {
+        super::wire_frame::try_unwrap(bytes).map_err(CoordinatorError::from)
+    }
+
+    /// Backward-compatible parser that REQUIRES bytes to be a valid
+    /// replication frame — returns `Err` if not, matching the PR #70
+    /// behavior. New code should prefer [`Self::try_parse_inbound_bytes`]
+    /// for the trichotomy (absent magic = NotAReplicationFrame, not
+    /// an error).
+    ///
+    /// Tolerates both framed (CRPL-prefixed, the current wire format)
+    /// and bare (legacy, pre-#71-wire-frame) inputs — bare inputs
+    /// route directly to [`ReplicationMessage::from_bytes`]. The
+    /// tolerance ships because the on-wire codec changed between
+    /// PR #70 (bare JSON) and this PR (CRPL-prefixed); a fleet
+    /// running mixed builds during a rolling upgrade can still
+    /// exchange messages. The tolerance can be removed once edge
+    /// v1.3.x reaches end-of-life.
     pub fn parse_inbound_bytes(bytes: &[u8]) -> Result<ReplicationMessage, CoordinatorError> {
-        ReplicationMessage::from_bytes(bytes).map_err(CoordinatorError::from)
+        match super::wire_frame::try_unwrap(bytes) {
+            Ok(Some(msg)) => Ok(msg),
+            Ok(None) => {
+                // Legacy bare-JSON fallback for mid-rolling-upgrade fleets.
+                ReplicationMessage::from_bytes(bytes).map_err(CoordinatorError::from)
+            }
+            Err(e) => Err(CoordinatorError::from(e)),
+        }
     }
 }
 
@@ -455,6 +496,59 @@ mod tests {
             matches!(parsed, ReplicationMessage::Diff(_)),
             "expected Bob's Diff, got {parsed:?}"
         );
+    }
+
+    /// `try_parse_inbound_bytes` returns `Ok(None)` for non-replication
+    /// bytes — the caller routes to non-replication dispatch.
+    #[test]
+    fn try_parse_inbound_bytes_returns_none_for_non_replication() {
+        let r = ReplicationCoordinator::try_parse_inbound_bytes(b"{\"agent\":\"alice\"}")
+            .expect("not an error");
+        assert!(r.is_none());
+    }
+
+    /// `try_parse_inbound_bytes` returns `Ok(Some(msg))` for properly
+    /// framed replication bytes (round-trip via the new wire frame).
+    #[test]
+    fn try_parse_inbound_bytes_round_trips_framed() {
+        let msg = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![],
+        });
+        let framed = super::super::wire_frame::wrap(&msg);
+        let parsed = ReplicationCoordinator::try_parse_inbound_bytes(&framed)
+            .expect("not an error")
+            .expect("some");
+        assert_eq!(parsed, msg);
+    }
+
+    /// `try_parse_inbound_bytes` surfaces `Err(Protocol)` when the
+    /// magic is present but the body is malformed.
+    #[test]
+    fn try_parse_inbound_bytes_protocol_error_on_bad_body() {
+        let mut bytes = super::super::wire_frame::REPLICATION_FRAME_MAGIC.to_vec();
+        bytes.extend_from_slice(b"{not json");
+        let r = ReplicationCoordinator::try_parse_inbound_bytes(&bytes);
+        assert!(matches!(r, Err(CoordinatorError::Protocol(_))));
+    }
+
+    /// Backward-compatible `parse_inbound_bytes` accepts BOTH the
+    /// new framed wire form AND the legacy bare-JSON form — important
+    /// during a rolling fleet upgrade.
+    #[test]
+    fn parse_inbound_bytes_tolerates_legacy_bare_json() {
+        let msg = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![],
+        });
+        // Legacy form (bare JSON, no CRPL magic).
+        let bare = msg.to_bytes();
+        let parsed = ReplicationCoordinator::parse_inbound_bytes(&bare).expect("parse");
+        assert_eq!(parsed, msg);
+        // New form (CRPL-prefixed) also parses.
+        let framed = super::super::wire_frame::wrap(&msg);
+        let parsed2 = ReplicationCoordinator::parse_inbound_bytes(&framed).expect("parse");
+        assert_eq!(parsed2, msg);
     }
 
     /// `parse_inbound_bytes` refuses junk cleanly — defence against

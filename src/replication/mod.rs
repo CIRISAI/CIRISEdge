@@ -78,6 +78,7 @@ pub mod directory;
 pub mod protocol;
 pub mod session;
 pub mod summary;
+pub mod wire_frame;
 
 #[doc(inline)]
 pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
@@ -92,3 +93,8 @@ pub use protocol::{
 pub use session::{ReplicationOutcome, Session, SessionRole};
 #[doc(inline)]
 pub use summary::{LocalState, StalenessSignal, StateApplier, StateProvider};
+#[doc(inline)]
+pub use wire_frame::{
+    try_unwrap as try_unwrap_replication_frame, wrap as wrap_replication_frame,
+    REPLICATION_FRAME_MAGIC,
+};
