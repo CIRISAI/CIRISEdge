@@ -1514,10 +1514,9 @@ jobs:
   # workflow — see that repo's README for adding new cases.
   # ─── extract-substrate-pins: Cargo.toml → JSON pin-overrides ────────
   #
-  # Reads edge's actual Cargo.toml pins for ciris-persist (Python wheel)
-  # and ciris-keyring (= ciris-verify Python wheel — both come from
-  # CIRISVerify at the same tag) and emits a JSON object that the
-  # cohabitation gate feeds into the harness's `pin-overrides` input.
+  # Reads edge's actual Cargo.toml pin for ciris-persist and emits a
+  # JSON object that the cohabitation gate feeds into the harness's
+  # `pin-overrides` input.
   #
   # This eliminates the substrate-currency race: edge's own Cargo pin
   # IS the cohabitation contract. The conformance matrix becomes
@@ -1525,6 +1524,28 @@ jobs:
   # the critical path of an edge release. Before this job existed, we
   # had to force-push a conformance matrix bump in lockstep with every
   # edge tag (v1.1.9 / v1.1.10 / v1.1.11 / v1.1.12 all hit it).
+  #
+  # ## Why ciris-verify is NOT pinned here
+  #
+  # Earlier versions of this job ALSO emitted `ciris-verify==<tag>`,
+  # extracted from edge's ciris-keyring/ciris-crypto Cargo tag. That
+  # was wrong: the Cargo tag is the **Rust-internal** verify crate
+  # (compiled into edge's + persist's cdylib symbol tables), while
+  # the Python `ciris-verify` wheel is a **separate** cdylib at a
+  # **separate** process boundary. Neither edge nor persist (via
+  # PyCapsule cohabitation) imports the Python ciris-verify wheel —
+  # they use Rust-internal cohabitation through their compiled cdylibs.
+  #
+  # The two pins can legitimately diverge. The v1.4.0 cycle hit
+  # ResolutionImpossible because edge's Cargo pin was v5.0.0 but
+  # persist v4.8.0's PUBLISHED pyproject pins `ciris-verify<5,>=4.4.2`
+  # — forcing the Python wheel to v5.0.0 alongside persist 4.8.0
+  # was unresolvable, even though the Cargo cohabitation worked fine.
+  #
+  # The fix: let persist's pyproject resolve the Python ciris-verify
+  # wheel transitively. The Cargo-side cohabitation is asserted
+  # independently by edge's wheel-build CI job (which uses the
+  # Cargo pin directly + the cargo deny / clippy gates).
   extract-substrate-pins:
     name: extract substrate pins from Cargo.toml
     runs-on: ubuntu-latest
@@ -1543,12 +1564,16 @@ jobs:
                   raise SystemExit(f'no tag found for {crate} in Cargo.toml')
               return m.group(1)
           persist = find_tag('ciris-persist')
+          # Verify the Cargo-side keyring/crypto pair shares a tag —
+          # they MUST come from CIRISVerify at the same release. The
+          # tag itself is NOT emitted as a Python-side pin-override
+          # (see job docstring); this assertion is purely a sanity
+          # check on edge's own Cargo.toml shape.
           keyring = find_tag('ciris-keyring')
           crypto  = find_tag('ciris-crypto')
           assert keyring == crypto, f'ciris-keyring ({keyring}) and ciris-crypto ({crypto}) must share a tag — both come from CIRISVerify'
           pins = {
               'ciris-persist': f'ciris-persist=={persist}',
-              'ciris-verify':  f'ciris-verify=={keyring}',
           }
           print(f'json={json.dumps(pins)}')
           PYEOF
