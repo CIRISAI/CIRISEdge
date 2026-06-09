@@ -82,22 +82,39 @@ pub enum CoordinatorError {
 }
 
 /// Binds one [`Session`] to one transport peer. The application
-/// constructs one of these per `(peer_key_id, kind)` pair, holds it
-/// across the lifetime of that anti-entropy relationship, and drives
-/// rounds via [`Self::run_initiator_round`] / [`Self::feed_inbound_bytes`].
+/// constructs one of these per `(peer_key_id, kind, role)` triple,
+/// holds it across the lifetime of that anti-entropy relationship,
+/// and drives rounds via [`Self::drive_round_step`] +
+/// [`Self::send_message`] from its scheduler / listen-loop glue.
 ///
-/// Implementation note: the [`Session`] state machine borrows the
-/// provider plus applier; the coordinator holds them as
-/// `Arc<dyn StateProvider>` and `Arc<Mutex<dyn StateApplier>>` so we
-/// can construct a fresh Session per round without lifetime
-/// gymnastics. The mutex on the applier is for `&mut` access during
-/// apply; the provider trait is `&self`-only so no mutex needed.
+/// ## Long-lived session
+///
+/// The [`Session`] is held inside a `Mutex` for the coordinator's
+/// lifetime. The state machine's `last_summary_sent`,
+/// `last_remote_summary`, and `diff_want_count` persist across the
+/// Summary → Diff → Deliver phase boundaries, so the post-Apply
+/// [`StalenessSignal`] computes correctly (`BoundedBy { missing }` /
+/// `InSync`) instead of degrading to `Unknown`. After a round
+/// completes (`DriveStep::Complete` is observed), the coordinator
+/// auto-resets the session so the next round can begin without
+/// caller bookkeeping; the application's scheduler just calls
+/// `drive_round_step(None)` (initiator) again to start the next
+/// round, or `drive_round_step(Some(inbound))` (responder) on the
+/// next inbound Summary.
 pub struct ReplicationCoordinator {
     transport: Arc<dyn Transport>,
     peer_key_id: String,
     kind: EnvelopeKind,
+    role: SessionRole,
     provider: Arc<dyn StateProvider>,
     applier: Arc<Mutex<dyn StateApplier>>,
+    /// The long-lived state machine for this peer-pair anti-entropy
+    /// relationship. Wrapped in `Mutex` so `drive_round_step` can
+    /// take `&self` (matching the existing API + letting the
+    /// scheduler / listen-loop call it concurrently from different
+    /// tasks; the mutex serializes them — anti-entropy is sequential
+    /// per peer-pair by protocol).
+    session: Mutex<Session>,
 }
 
 impl ReplicationCoordinator {
@@ -105,6 +122,7 @@ impl ReplicationCoordinator {
         transport: Arc<dyn Transport>,
         peer_key_id: impl Into<String>,
         kind: EnvelopeKind,
+        role: SessionRole,
         provider: Arc<dyn StateProvider>,
         applier: Arc<Mutex<dyn StateApplier>>,
     ) -> Self {
@@ -112,58 +130,81 @@ impl ReplicationCoordinator {
             transport,
             peer_key_id: peer_key_id.into(),
             kind,
+            role,
             provider,
             applier,
+            session: Mutex::new(Session::new(role, kind)),
         }
     }
 
-    /// Run one initiator-side anti-entropy round with the configured
-    /// peer. Returns the round's report (admitted / refused / staleness)
-    /// or a `CoordinatorError` if the transport or protocol misbehaves.
+    /// Step the held [`Session`] one transition forward.
     ///
-    /// The round drives the full sequence:
+    /// - `msg = None` — start a new round (initiator only). Returns
+    ///   `SendThenWait` with our outbound Summary.
+    /// - `msg = Some(inbound)` — feed an inbound replication message
+    ///   into the session.
     ///
-    /// 1. Build our [`super::protocol::SummaryMessage`] from
-    ///    [`StateProvider::local_refs`].
-    /// 2. Send via [`Transport::send`].
-    /// 3. Wait for the peer's reply messages (delivered via
-    ///    [`Self::feed_inbound_bytes`] from the application's listen
-    ///    loop).
-    /// 4. Apply received envelopes via [`StateApplier::apply_envelope`].
-    /// 5. Return the [`RoundReport`].
+    /// The session is long-lived across the call boundary, so
+    /// `diff_want_count` recorded during the Diff phase carries into
+    /// the Deliver phase — the post-Apply [`StalenessSignal`]
+    /// computes correctly (`BoundedBy` / `InSync`), no longer
+    /// `Unknown`.
     ///
-    /// **For this PR's scope**, the "wait for the peer's reply" step is
-    /// driven by a [`tokio::sync::oneshot`] the application fills from
-    /// its listen loop via [`Self::feed_inbound_bytes`]. Production
-    /// wiring with a real transport would use a multi-message channel
-    /// (the peer sends Summary + Diff + Deliver in three packets); for
-    /// now the coordinator supports one-shot via the caller-driven
-    /// loop test pattern, and we document the multi-message extension
-    /// as the next sub-task.
-    ///
-    /// Test-driver pattern (used in the in-memory tests below) — the
-    /// caller alternates `coordinator.run_initiator_round()` with
-    /// `coordinator.feed_inbound_bytes(...)` to step the round
-    /// through its phases.
+    /// When the session completes (Applied outcome), the coordinator
+    /// auto-resets it so the next `drive_round_step(None)` /
+    /// inbound Summary starts a fresh round without caller
+    /// bookkeeping.
     pub async fn drive_round_step(
         &self,
         msg: Option<ReplicationMessage>,
     ) -> Result<DriveStep, CoordinatorError> {
-        let mut applier = self.applier.lock().await;
-        let mut session = Session::new(
-            match msg {
-                None => SessionRole::Initiator,
-                Some(_) => SessionRole::Responder,
-            },
-            self.kind,
-            self.provider.as_ref(),
-            &mut *applier,
-        );
+        let mut session = self.session.lock().await;
         let outcome = match msg {
-            None => session.start_round(),
-            Some(m) => session.on_message(m),
+            None => session.start_round(self.provider.as_ref()),
+            Some(m) => {
+                let mut applier = self.applier.lock().await;
+                session.on_message(m, self.provider.as_ref(), &mut *applier)
+            }
         };
-        Ok(Self::outcome_to_step(outcome))
+        let step = Self::outcome_to_step(outcome);
+        // Auto-reset on round completion so the next call can drive
+        // a fresh round without the caller threading state.
+        if matches!(step, DriveStep::Complete(_)) {
+            session.reset();
+        }
+        Ok(step)
+    }
+
+    /// Whether this coordinator's session has completed its current
+    /// round (Applied has been observed). Useful for the scheduler
+    /// to decide whether to start a new round or wait. Note that
+    /// `drive_round_step` auto-resets on Complete, so this returns
+    /// `true` only briefly during a `drive_round_step` call that
+    /// observes Applied; in practice the scheduler reads the
+    /// `DriveStep::Complete` return directly.
+    pub async fn is_round_complete(&self) -> bool {
+        self.session.lock().await.is_complete()
+    }
+
+    /// The session's configured role. Fixed at construction; used
+    /// by the scheduler to decide which side calls
+    /// `drive_round_step(None)` to initiate each round.
+    pub fn role(&self) -> SessionRole {
+        self.role
+    }
+
+    /// The envelope kind this coordinator's anti-entropy round
+    /// runs over. Fixed at construction; the scheduler reads this
+    /// when fanning round cadence across (peer × kind) pairs.
+    pub fn kind(&self) -> EnvelopeKind {
+        self.kind
+    }
+
+    /// The peer identity this coordinator is bound to. Fixed at
+    /// construction; metrics + telemetry consumers tag round
+    /// reports with this.
+    pub fn peer_key_id(&self) -> &str {
+        &self.peer_key_id
     }
 
     fn outcome_to_step(outcome: ReplicationOutcome) -> DriveStep {
@@ -382,7 +423,12 @@ mod tests {
     /// Build a peer pair with disjoint state. Each peer holds two
     /// envelopes, none in common. After one anti-entropy round both
     /// should know all four.
+    ///
+    /// `clippy::too_many_lines` allowed because the seven explicit
+    /// phases are the test — collapsing them into helpers obscures
+    /// the round-shape this fixture demonstrates.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn two_coordinators_converge_via_in_memory_transport() {
         let (alice_t, bob_t) = alice_bob_transports();
         let alice_t = Arc::new(alice_t);
@@ -420,6 +466,7 @@ mod tests {
             alice_t.clone(),
             "bob",
             EnvelopeKind::Key,
+            SessionRole::Initiator,
             a_provider.clone(),
             a_applier.clone(),
         );
@@ -427,12 +474,17 @@ mod tests {
             bob_t.clone(),
             "alice",
             EnvelopeKind::Key,
+            SessionRole::Responder,
             b_provider.clone(),
             b_applier.clone(),
         );
 
-        // Step the round manually — this is what the production
-        // scheduler/listen-loop combination automates.
+        // Drive the full anti-entropy round end-to-end across both
+        // coordinators. With the long-lived session refactor, each
+        // coordinator's Session preserves last_summary_sent +
+        // diff_want_count across the Summary → Diff → Deliver phase
+        // boundaries — so the final Applied outcomes carry correct
+        // `StalenessSignal::InSync` instead of degrading to `Unknown`.
 
         // 1. Alice initiates → emits Summary.
         let alice_step1 = alice_coord.drive_round_step(None).await.unwrap();
@@ -443,16 +495,14 @@ mod tests {
             }
             o => panic!("expected SendThenWait, got {o:?}"),
         };
-        // Send via transport (proves the transport binding works).
         alice_coord.send_message(&alice_summary).await.unwrap();
 
-        // 2. Bob receives Alice's Summary from his inbox.
+        // 2. Bob receives Alice's Summary → emits {Summary, Diff}.
         let bob_received_bytes = {
             let mut inbox = bob_t.my_inbox.lock().await;
             inbox.recv().await.expect("bob inbox")
         };
         let bob_inbound = ReplicationCoordinator::parse_inbound_bytes(&bob_received_bytes).unwrap();
-        // Bob processes the message (Responder role).
         let bob_step1 = bob_coord.drive_round_step(Some(bob_inbound)).await.unwrap();
         let (bob_summary, bob_diff) = match bob_step1 {
             DriveStep::SendThenWait(ref msgs) => {
@@ -464,38 +514,113 @@ mod tests {
         bob_coord.send_message(&bob_summary).await.unwrap();
         bob_coord.send_message(&bob_diff).await.unwrap();
 
-        // 3. The protocol from this point is complex enough that
-        // exercising it via drive_round_step iteration would require
-        // a stateful session held across calls. For this PR's scope
-        // — proving the transport binding works — we've shown:
-        //   a. drive_round_step yields the right outcome
-        //   b. send_message serializes + ships
-        //   c. parse_inbound_bytes deserializes
-        // The full multi-step end-to-end orchestration is the next
-        // sub-task (a stateful long-lived session held by the
-        // coordinator across round phases).
-        //
-        // Confirm the bytes arrived in Alice's inbox.
-        let alice_received_summary = {
+        // 3. Alice receives Bob's Summary → emits Diff (recording
+        //    diff_want_count = 2 into the held Session).
+        let alice_recv_summary_bytes = {
             let mut inbox = alice_t.my_inbox.lock().await;
-            inbox.recv().await.expect("alice inbox bob summary")
+            inbox.recv().await.expect("alice recv summary")
         };
-        let parsed =
-            ReplicationCoordinator::parse_inbound_bytes(&alice_received_summary).expect("parse");
-        assert!(
-            matches!(parsed, ReplicationMessage::Summary(_)),
-            "expected Bob's Summary, got {parsed:?}"
-        );
-        let alice_received_diff = {
+        let alice_recv_summary =
+            ReplicationCoordinator::parse_inbound_bytes(&alice_recv_summary_bytes).unwrap();
+        let alice_step2 = alice_coord
+            .drive_round_step(Some(alice_recv_summary))
+            .await
+            .unwrap();
+        let alice_diff = match alice_step2 {
+            DriveStep::SendThenWait(ref msgs) => {
+                assert_eq!(msgs.len(), 1);
+                msgs[0].clone()
+            }
+            o => panic!("expected SendThenWait, got {o:?}"),
+        };
+        alice_coord.send_message(&alice_diff).await.unwrap();
+
+        // 4. Alice receives Bob's Diff → emits Deliver(env_1, env_2).
+        let alice_recv_diff_bytes = {
             let mut inbox = alice_t.my_inbox.lock().await;
-            inbox.recv().await.expect("alice inbox bob diff")
+            inbox.recv().await.expect("alice recv diff")
         };
-        let parsed =
-            ReplicationCoordinator::parse_inbound_bytes(&alice_received_diff).expect("parse");
-        assert!(
-            matches!(parsed, ReplicationMessage::Diff(_)),
-            "expected Bob's Diff, got {parsed:?}"
-        );
+        let alice_recv_diff =
+            ReplicationCoordinator::parse_inbound_bytes(&alice_recv_diff_bytes).unwrap();
+        let alice_step3 = alice_coord
+            .drive_round_step(Some(alice_recv_diff))
+            .await
+            .unwrap();
+        let alice_deliver = match alice_step3 {
+            DriveStep::SendThenWait(ref msgs) => {
+                assert_eq!(msgs.len(), 1);
+                msgs[0].clone()
+            }
+            o => panic!("expected SendThenWait, got {o:?}"),
+        };
+        alice_coord.send_message(&alice_deliver).await.unwrap();
+
+        // 5. Bob receives Alice's Diff → emits Deliver(env_3, env_4).
+        let bob_recv_diff_bytes = {
+            let mut inbox = bob_t.my_inbox.lock().await;
+            inbox.recv().await.expect("bob recv diff")
+        };
+        let bob_recv_diff =
+            ReplicationCoordinator::parse_inbound_bytes(&bob_recv_diff_bytes).unwrap();
+        let bob_step2 = bob_coord
+            .drive_round_step(Some(bob_recv_diff))
+            .await
+            .unwrap();
+        let bob_deliver = match bob_step2 {
+            DriveStep::SendThenWait(ref msgs) => {
+                assert_eq!(msgs.len(), 1);
+                msgs[0].clone()
+            }
+            o => panic!("expected SendThenWait, got {o:?}"),
+        };
+        bob_coord.send_message(&bob_deliver).await.unwrap();
+
+        // 6. Alice receives Bob's Deliver → Applied(admitted=2, InSync).
+        let alice_recv_deliver_bytes = {
+            let mut inbox = alice_t.my_inbox.lock().await;
+            inbox.recv().await.expect("alice recv deliver")
+        };
+        let alice_recv_deliver =
+            ReplicationCoordinator::parse_inbound_bytes(&alice_recv_deliver_bytes).unwrap();
+        let alice_final = alice_coord
+            .drive_round_step(Some(alice_recv_deliver))
+            .await
+            .unwrap();
+        match alice_final {
+            DriveStep::Complete(report) => {
+                assert_eq!(report.kind, EnvelopeKind::Key);
+                assert_eq!(report.admitted, 2);
+                assert_eq!(report.refused, 0);
+                // The long-lived session preserved diff_want_count = 2
+                // from step 3 through to here — both admitted, so InSync.
+                assert_eq!(report.staleness, StalenessSignal::InSync);
+            }
+            o => panic!("expected Complete, got {o:?}"),
+        }
+
+        // 7. Bob receives Alice's Deliver → Applied(admitted=2, InSync).
+        let bob_recv_deliver_bytes = {
+            let mut inbox = bob_t.my_inbox.lock().await;
+            inbox.recv().await.expect("bob recv deliver")
+        };
+        let bob_recv_deliver =
+            ReplicationCoordinator::parse_inbound_bytes(&bob_recv_deliver_bytes).unwrap();
+        let bob_final = bob_coord
+            .drive_round_step(Some(bob_recv_deliver))
+            .await
+            .unwrap();
+        match bob_final {
+            DriveStep::Complete(report) => {
+                assert_eq!(report.admitted, 2);
+                assert_eq!(report.staleness, StalenessSignal::InSync);
+            }
+            o => panic!("expected Complete, got {o:?}"),
+        }
+
+        // Both coordinators auto-reset on completion (the round is
+        // ready to begin again on the next scheduler tick).
+        assert!(!alice_coord.is_round_complete().await);
+        assert!(!bob_coord.is_round_complete().await);
     }
 
     /// `try_parse_inbound_bytes` returns `Ok(None)` for non-replication
@@ -594,6 +719,7 @@ mod tests {
             alice_t,
             "nobody_home",
             EnvelopeKind::Key,
+            SessionRole::Initiator,
             a_provider,
             a_applier,
         );
@@ -628,6 +754,7 @@ mod tests {
             Arc::new(alice_t),
             "bob",
             EnvelopeKind::Key,
+            SessionRole::Initiator,
             provider,
             applier,
         );
@@ -665,6 +792,7 @@ mod tests {
             Arc::new(alice_t),
             "bob",
             EnvelopeKind::Key,
+            SessionRole::Responder,
             provider,
             applier,
         );
@@ -691,9 +819,13 @@ mod tests {
         }
     }
 
-    /// Round terminates on Deliver (Applied → Complete report).
+    /// Deliver fed directly into a session that never saw a prior
+    /// Diff yields `StalenessSignal::Unknown` — the session's
+    /// `diff_want_count` is `None`, the honest signal is "I don't
+    /// know how stale I am." NOT the same as the prior (pre-long-
+    /// lived) `Unknown` bug; here it's correct.
     #[tokio::test]
-    async fn applied_outcome_maps_to_complete_step() {
+    async fn deliver_without_prior_diff_yields_unknown_staleness() {
         let (alice_t, _bob_t) = alice_bob_transports();
         let provider = Arc::new(StaticProvider {
             state: LocalState::new(),
@@ -708,16 +840,10 @@ mod tests {
             Arc::new(alice_t),
             "bob",
             EnvelopeKind::Key,
+            SessionRole::Initiator,
             provider,
             applier,
         );
-        // Feed an Initiator session: start_round then a Diff back.
-        // Then a Deliver. Because the Session is built fresh per
-        // drive_round_step call (single-shot for this PR), the
-        // diff_want_count from the Diff phase doesn't carry into the
-        // Deliver phase. So Applied here will report Unknown
-        // staleness — that's the v1 limitation; the long-lived
-        // session is the layer-(b)-extension followup.
         let deliver_msg = ReplicationMessage::Deliver(DeliverMessage {
             kind: EnvelopeKind::Key,
             envelopes: vec![b"e1".to_vec()],
@@ -728,11 +854,139 @@ mod tests {
                 assert_eq!(report.kind, EnvelopeKind::Key);
                 assert_eq!(report.admitted, 1);
                 assert_eq!(report.refused, 0);
-                // Single-shot session loses diff_want_count → Unknown.
+                // No prior Diff → diff_want_count is None → honest
+                // Unknown. (Contrast with the full-round path in
+                // `two_coordinators_converge_via_in_memory_transport`
+                // where the long-lived session carries diff_want_count
+                // through and reports InSync.)
                 assert_eq!(report.staleness, StalenessSignal::Unknown);
             }
             o => panic!("expected Complete, got {o:?}"),
         }
+    }
+
+    /// Long-lived Session: driving the full Initiator-side phase
+    /// chain (Summary → recv remote Summary → recv Diff → recv
+    /// Deliver) through a single coordinator yields the correct
+    /// post-Apply staleness — the held session preserves
+    /// `diff_want_count` across the call boundaries.
+    #[tokio::test]
+    async fn long_lived_session_preserves_diff_want_count_across_calls() {
+        let (alice_t, _bob_t) = alice_bob_transports();
+        // Alice has env_1; will learn env_3 + env_4 from "bob"
+        // (synthesized via direct drive_round_step calls).
+        let mut alice_state = LocalState::new();
+        alice_state.insert(EnvelopeKind::Key, h(1), 1);
+        let provider = Arc::new(StaticProvider {
+            state: alice_state,
+            envelopes: HashMap::from([(h(1), b"env_1".to_vec())]),
+        });
+        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
+            admitted_bytes: Vec::new(),
+            known: HashMap::from([(b"env_3".to_vec(), h(3)), (b"env_4".to_vec(), h(4))]),
+            local_hashes: [h(1)].into_iter().collect(),
+        }));
+        let coord = ReplicationCoordinator::new(
+            Arc::new(alice_t),
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        );
+
+        // Phase 1: Initiator starts a round → Summary out.
+        let _ = coord.drive_round_step(None).await.unwrap();
+
+        // Phase 2: Synthesize Bob's Summary (advertising env_3 + env_4)
+        // and feed it. Session computes Diff (want = [h(3), h(4)],
+        // diff_want_count = 2) and stores it.
+        let bob_summary = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![
+                EnvelopeRef {
+                    envelope_hash: h(3),
+                    seq: 3,
+                },
+                EnvelopeRef {
+                    envelope_hash: h(4),
+                    seq: 4,
+                },
+            ],
+        });
+        let step2 = coord.drive_round_step(Some(bob_summary)).await.unwrap();
+        match step2 {
+            DriveStep::SendThenWait(msgs) => {
+                if let ReplicationMessage::Diff(d) = &msgs[0] {
+                    assert_eq!(d.want, vec![h(3), h(4)]);
+                } else {
+                    panic!("expected Diff");
+                }
+            }
+            o => panic!("expected SendThenWait, got {o:?}"),
+        }
+
+        // Phase 3: Synthesize Bob's Diff (asking for env_1) → Deliver out.
+        let bob_diff = ReplicationMessage::Diff(DiffMessage {
+            kind: EnvelopeKind::Key,
+            want: vec![h(1)],
+        });
+        let _ = coord.drive_round_step(Some(bob_diff)).await.unwrap();
+
+        // Phase 4: Synthesize Bob's Deliver (env_3 + env_4).
+        // The session's diff_want_count = 2 from phase 2 is still set;
+        // both envelopes admit; staleness should be InSync.
+        let bob_deliver = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![b"env_3".to_vec(), b"env_4".to_vec()],
+        });
+        let step4 = coord.drive_round_step(Some(bob_deliver)).await.unwrap();
+        match step4 {
+            DriveStep::Complete(report) => {
+                assert_eq!(report.admitted, 2);
+                assert_eq!(report.refused, 0);
+                assert_eq!(report.staleness, StalenessSignal::InSync);
+            }
+            o => panic!("expected Complete, got {o:?}"),
+        }
+    }
+
+    /// After a round completes, the coordinator auto-resets the
+    /// session so the next call begins a fresh round — the
+    /// scheduler doesn't have to track per-peer "in flight" state.
+    #[tokio::test]
+    async fn round_auto_resets_after_complete() {
+        let (alice_t, _bob_t) = alice_bob_transports();
+        let provider = Arc::new(StaticProvider {
+            state: LocalState::new(),
+            envelopes: HashMap::new(),
+        });
+        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
+            admitted_bytes: Vec::new(),
+            known: HashMap::from([(b"e1".to_vec(), h(1))]),
+            local_hashes: std::collections::HashSet::new(),
+        }));
+        let coord = ReplicationCoordinator::new(
+            Arc::new(alice_t),
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        );
+        // Drive into Applied (degenerate path: Deliver without Diff).
+        let deliver = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![b"e1".to_vec()],
+        });
+        let step = coord.drive_round_step(Some(deliver)).await.unwrap();
+        assert!(matches!(step, DriveStep::Complete(_)));
+        // After Complete, the session auto-reset; is_complete is false.
+        assert!(!coord.is_round_complete().await);
+        // The next drive_round_step(None) starts a fresh round
+        // (would otherwise be a debug_assert panic if the session
+        // were still mid-round).
+        let _ = coord.drive_round_step(None).await.unwrap();
     }
 
     /// Mismatched-kind inbound message produces `DriveStep::Refused`
@@ -753,6 +1007,7 @@ mod tests {
             Arc::new(alice_t),
             "bob",
             EnvelopeKind::Key, // ← session is for Key
+            SessionRole::Responder,
             provider,
             applier,
         );

@@ -78,14 +78,26 @@ pub enum ReplicationOutcome {
 }
 
 /// One direction of an anti-entropy round. The caller creates one
-/// session per `(peer, kind)` pair, drives it via `start_round`
+/// session per `(peer, kind, role)` triple, drives it via `start_round`
 /// (initiator) / `on_message` (either role), and reads the
 /// `ReplicationOutcome` to decide what to send next.
-pub struct Session<'a> {
+///
+/// ## Lifetime model
+///
+/// The session is fully **owned** — it carries no borrows. The
+/// [`StateProvider`] and [`StateApplier`] are passed as method
+/// parameters on each call, so a session can live across multiple
+/// calls without lifetime gymnastics. This enables a long-lived
+/// session inside [`super::ReplicationCoordinator`] that preserves
+/// `diff_want_count` across the Diff and Deliver phases — the
+/// documented `Unknown`-staleness gap closes.
+///
+/// After a round completes (`Applied` outcome), call [`Self::reset`]
+/// to clear the per-round state and prepare for the next round with
+/// the same peer.
+pub struct Session {
     role: SessionRole,
     kind: EnvelopeKind,
-    provider: &'a dyn StateProvider,
-    applier: &'a mut dyn StateApplier,
     /// What we sent the peer in our most recent Summary — used to
     /// fulfill their Diff against our state.
     last_summary_sent: Option<SummaryMessage>,
@@ -98,23 +110,20 @@ pub struct Session<'a> {
     /// to get residual missing — works regardless of whether the
     /// Provider sees the Applier's writes, since the count is
     /// already known).
+    ///
+    /// The long-lived session preserves this across the Diff →
+    /// Deliver phase boundary, so [`Self::on_deliver`] computes
+    /// `BoundedBy { missing }` / `InSync` instead of `Unknown`.
     diff_want_count: Option<usize>,
     /// Whether the round has completed from this side's view.
     completed: bool,
 }
 
-impl<'a> Session<'a> {
-    pub fn new(
-        role: SessionRole,
-        kind: EnvelopeKind,
-        provider: &'a dyn StateProvider,
-        applier: &'a mut dyn StateApplier,
-    ) -> Self {
+impl Session {
+    pub fn new(role: SessionRole, kind: EnvelopeKind) -> Self {
         Self {
             role,
             kind,
-            provider,
-            applier,
             last_summary_sent: None,
             last_remote_summary: None,
             diff_want_count: None,
@@ -122,14 +131,32 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// Clear per-round state so the session can drive a new round
+    /// with the same peer. Preserves `role` + `kind`. Idempotent —
+    /// calling on a fresh session is a no-op.
+    pub fn reset(&mut self) {
+        self.last_summary_sent = None;
+        self.last_remote_summary = None;
+        self.diff_want_count = None;
+        self.completed = false;
+    }
+
+    pub fn role(&self) -> SessionRole {
+        self.role
+    }
+
+    pub fn kind(&self) -> EnvelopeKind {
+        self.kind
+    }
+
     /// Start a round. Only valid for [`SessionRole::Initiator`] —
     /// responders wait for an inbound Summary via [`Self::on_message`].
-    pub fn start_round(&mut self) -> ReplicationOutcome {
+    pub fn start_round(&mut self, provider: &dyn StateProvider) -> ReplicationOutcome {
         debug_assert!(
             matches!(self.role, SessionRole::Initiator),
             "start_round() is initiator-only"
         );
-        let refs = self.provider.local_refs(self.kind);
+        let refs = provider.local_refs(self.kind);
         let summary = SummaryMessage {
             kind: self.kind,
             refs,
@@ -146,24 +173,35 @@ impl<'a> Session<'a> {
     ///   also sends our Summary at this point.
     /// - Inbound Diff → Send Deliver (envelopes from our state matching
     ///   their wants).
-    /// - Inbound Deliver → Apply envelopes via StateApplier; mark the
-    ///   round complete from our side.
+    /// - Inbound Deliver → Apply envelopes via [`StateApplier`]; mark
+    ///   the round complete from our side.
     /// - Inbound Fetch → Same as Diff (responder fulfills the request).
-    pub fn on_message(&mut self, msg: ReplicationMessage) -> ReplicationOutcome {
+    pub fn on_message(
+        &mut self,
+        msg: ReplicationMessage,
+        provider: &dyn StateProvider,
+        applier: &mut dyn StateApplier,
+    ) -> ReplicationOutcome {
         match msg {
-            ReplicationMessage::Summary(remote_summary) => self.on_summary(&remote_summary),
-            ReplicationMessage::Diff(diff) => self.on_diff(&diff),
-            ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver),
-            ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch),
+            ReplicationMessage::Summary(remote_summary) => {
+                self.on_summary(&remote_summary, provider)
+            }
+            ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider),
+            ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier),
+            ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider),
         }
     }
 
-    fn on_summary(&mut self, remote: &SummaryMessage) -> ReplicationOutcome {
+    fn on_summary(
+        &mut self,
+        remote: &SummaryMessage,
+        provider: &dyn StateProvider,
+    ) -> ReplicationOutcome {
         if remote.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
         self.last_remote_summary = Some(remote.clone());
-        let local = self.provider.local_refs(self.kind);
+        let local = provider.local_refs(self.kind);
         let want = diff_refs(&local, &remote.refs);
         let mut outbound = Vec::new();
         // Responder ALSO needs to send its Summary so the
@@ -172,7 +210,7 @@ impl<'a> Session<'a> {
         // (matching the initiator's sequence). For initiators, we
         // already sent our Summary in start_round; skip resending.
         if matches!(self.role, SessionRole::Responder) && self.last_summary_sent.is_none() {
-            let my_refs = self.provider.local_refs(self.kind);
+            let my_refs = provider.local_refs(self.kind);
             let my_summary = SummaryMessage {
                 kind: self.kind,
                 refs: my_refs,
@@ -188,14 +226,14 @@ impl<'a> Session<'a> {
         ReplicationOutcome::Send(outbound)
     }
 
-    fn on_diff(&mut self, diff: &DiffMessage) -> ReplicationOutcome {
+    fn on_diff(&mut self, diff: &DiffMessage, provider: &dyn StateProvider) -> ReplicationOutcome {
         if diff.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
         let envelopes: Vec<Vec<u8>> = diff
             .want
             .iter()
-            .filter_map(|h| self.provider.fetch_envelope(self.kind, h))
+            .filter_map(|h| provider.fetch_envelope(self.kind, h))
             .collect();
         ReplicationOutcome::Send(vec![ReplicationMessage::Deliver(DeliverMessage {
             kind: self.kind,
@@ -203,23 +241,34 @@ impl<'a> Session<'a> {
         })])
     }
 
-    fn on_fetch(&mut self, fetch: &FetchMessage) -> ReplicationOutcome {
+    fn on_fetch(
+        &mut self,
+        fetch: &FetchMessage,
+        provider: &dyn StateProvider,
+    ) -> ReplicationOutcome {
         // Fetch is structurally identical to Diff on the responder
         // side — both ask "give me these specific envelopes."
-        self.on_diff(&DiffMessage {
-            kind: fetch.kind,
-            want: fetch.want.clone(),
-        })
+        self.on_diff(
+            &DiffMessage {
+                kind: fetch.kind,
+                want: fetch.want.clone(),
+            },
+            provider,
+        )
     }
 
-    fn on_deliver(&mut self, deliver: &DeliverMessage) -> ReplicationOutcome {
+    fn on_deliver(
+        &mut self,
+        deliver: &DeliverMessage,
+        applier: &mut dyn StateApplier,
+    ) -> ReplicationOutcome {
         if deliver.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
         let mut admitted = 0usize;
         let mut refused = 0usize;
         for env_bytes in &deliver.envelopes {
-            if self.applier.apply_envelope(self.kind, env_bytes) {
+            if applier.apply_envelope(self.kind, env_bytes) {
                 admitted += 1;
             } else {
                 refused += 1;
@@ -355,21 +404,11 @@ mod tests {
         let mut a_applier = applier_for(&[(h(3), b"env_3".to_vec()), (h(4), b"env_4".to_vec())]);
         let mut b_applier = applier_for(&[(h(1), b"env_1".to_vec()), (h(2), b"env_2".to_vec())]);
 
-        let mut alice = Session::new(
-            SessionRole::Initiator,
-            EnvelopeKind::Key,
-            &a_provider,
-            &mut a_applier,
-        );
-        let mut bob = Session::new(
-            SessionRole::Responder,
-            EnvelopeKind::Key,
-            &b_provider,
-            &mut b_applier,
-        );
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
 
         // 1. Alice starts → sends Summary.
-        let alice_step1 = alice.start_round();
+        let alice_step1 = alice.start_round(&a_provider);
         let alice_summary = match alice_step1 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -379,7 +418,7 @@ mod tests {
         };
 
         // 2. Bob receives Alice's Summary → emits {Summary, Diff}.
-        let bob_step1 = bob.on_message(alice_summary);
+        let bob_step1 = bob.on_message(alice_summary, &b_provider, &mut b_applier);
         let (bob_summary, bob_diff) = match bob_step1 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 2);
@@ -390,7 +429,7 @@ mod tests {
 
         // 3. Alice receives Bob's Summary → emits Diff. (Then
         //    receives Bob's Diff → emits Deliver.)
-        let alice_step2 = alice.on_message(bob_summary);
+        let alice_step2 = alice.on_message(bob_summary, &a_provider, &mut a_applier);
         let alice_diff = match alice_step2 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -400,7 +439,7 @@ mod tests {
         };
 
         // 4. Bob receives Alice's Diff → emits Deliver(env_1, env_2).
-        let bob_step2 = bob.on_message(alice_diff);
+        let bob_step2 = bob.on_message(alice_diff, &b_provider, &mut b_applier);
         let bob_deliver = match bob_step2 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -410,7 +449,7 @@ mod tests {
         };
 
         // 5. Alice receives Bob's Diff → emits Deliver(env_3, env_4).
-        let alice_step3 = alice.on_message(bob_diff);
+        let alice_step3 = alice.on_message(bob_diff, &a_provider, &mut a_applier);
         let alice_deliver = match alice_step3 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -420,7 +459,7 @@ mod tests {
         };
 
         // 6. Alice applies Bob's Deliver → admitted env_3 + env_4.
-        let alice_final = alice.on_message(bob_deliver);
+        let alice_final = alice.on_message(bob_deliver, &a_provider, &mut a_applier);
         match alice_final {
             ReplicationOutcome::Applied {
                 admitted,
@@ -436,7 +475,7 @@ mod tests {
         }
 
         // 7. Bob applies Alice's Deliver → admitted env_1 + env_2.
-        let bob_final = bob.on_message(alice_deliver);
+        let bob_final = bob.on_message(alice_deliver, &b_provider, &mut b_applier);
         match bob_final {
             ReplicationOutcome::Applied {
                 admitted,
@@ -478,45 +517,36 @@ mod tests {
         let mut a_applier = applier_for(&[(h(4), b"e4".to_vec())]);
         let mut b_applier = applier_for(&[(h(1), b"e1".to_vec())]);
 
-        let mut alice = Session::new(
-            SessionRole::Initiator,
-            EnvelopeKind::Attestation,
-            &a_provider,
-            &mut a_applier,
-        );
-        let mut bob = Session::new(
-            SessionRole::Responder,
-            EnvelopeKind::Attestation,
-            &b_provider,
-            &mut b_applier,
-        );
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation);
+        let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
 
         // Mechanical round-drive (same as full_sync above).
-        let m_alice_summary = match alice.start_round() {
+        let m_alice_summary = match alice.start_round(&a_provider) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let (m_bob_summary, m_bob_diff) = match bob.on_message(m_alice_summary) {
-            ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
-            _ => panic!(),
-        };
-        let m_alice_diff = match alice.on_message(m_bob_summary) {
+        let (m_bob_summary, m_bob_diff) =
+            match bob.on_message(m_alice_summary, &b_provider, &mut b_applier) {
+                ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
+                _ => panic!(),
+            };
+        let m_alice_diff = match alice.on_message(m_bob_summary, &a_provider, &mut a_applier) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let m_bob_deliver = match bob.on_message(m_alice_diff) {
+        let m_bob_deliver = match bob.on_message(m_alice_diff, &b_provider, &mut b_applier) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let m_alice_deliver = match alice.on_message(m_bob_diff) {
+        let m_alice_deliver = match alice.on_message(m_bob_diff, &a_provider, &mut a_applier) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        match alice.on_message(m_bob_deliver) {
+        match alice.on_message(m_bob_deliver, &a_provider, &mut a_applier) {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
         }
-        match bob.on_message(m_alice_deliver) {
+        match bob.on_message(m_alice_deliver, &b_provider, &mut b_applier) {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
         }
@@ -537,35 +567,26 @@ mod tests {
         let mut a_applier = applier_for(&[]);
         let mut b_applier = applier_for(&[]);
 
-        let mut alice = Session::new(
-            SessionRole::Initiator,
-            EnvelopeKind::Key,
-            &a_provider,
-            &mut a_applier,
-        );
-        let mut bob = Session::new(
-            SessionRole::Responder,
-            EnvelopeKind::Key,
-            &b_provider,
-            &mut b_applier,
-        );
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
 
         // Drive round.
-        let alice_summary = match alice.start_round() {
+        let alice_summary = match alice.start_round(&a_provider) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let (bob_summary_resp, bob_diff_msg) = match bob.on_message(alice_summary) {
-            ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
-            _ => panic!(),
-        };
-        let alice_diff_msg = match alice.on_message(bob_summary_resp) {
+        let (bob_summary_resp, bob_diff_msg) =
+            match bob.on_message(alice_summary, &b_provider, &mut b_applier) {
+                ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
+                _ => panic!(),
+            };
+        let alice_diff_msg = match alice.on_message(bob_summary_resp, &a_provider, &mut a_applier) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
         // Bob's Deliver from Alice's Diff should be empty (Alice has
         // everything Bob has).
-        let bob_deliver_msg = match bob.on_message(alice_diff_msg) {
+        let bob_deliver_msg = match bob.on_message(alice_diff_msg, &b_provider, &mut b_applier) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
@@ -573,7 +594,7 @@ mod tests {
             assert!(d.envelopes.is_empty(), "bob should deliver nothing");
         }
         // Same for Alice's Deliver from Bob's Diff.
-        let alice_deliver_msg = match alice.on_message(bob_diff_msg) {
+        let alice_deliver_msg = match alice.on_message(bob_diff_msg, &a_provider, &mut a_applier) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
@@ -581,7 +602,7 @@ mod tests {
             assert!(d.envelopes.is_empty(), "alice should deliver nothing");
         }
         // Applied with 0 admitted, InSync staleness.
-        match alice.on_message(bob_deliver_msg) {
+        match alice.on_message(bob_deliver_msg, &a_provider, &mut a_applier) {
             ReplicationOutcome::Applied {
                 admitted,
                 staleness,
@@ -600,16 +621,15 @@ mod tests {
     fn mismatched_kind_refused() {
         let provider = provider_with(&[]);
         let mut applier = applier_for(&[]);
-        let mut s = Session::new(
-            SessionRole::Responder,
-            EnvelopeKind::Key,
+        let mut s = Session::new(SessionRole::Responder, EnvelopeKind::Key);
+        let r = s.on_message(
+            ReplicationMessage::Diff(DiffMessage {
+                kind: EnvelopeKind::Revocation, // ← wrong kind for this session
+                want: vec![],
+            }),
             &provider,
             &mut applier,
         );
-        let r = s.on_message(ReplicationMessage::Diff(DiffMessage {
-            kind: EnvelopeKind::Revocation, // ← wrong kind for this session
-            want: vec![],
-        }));
         assert_eq!(r, ReplicationOutcome::UnexpectedMessage);
     }
 
@@ -623,16 +643,15 @@ mod tests {
             (EnvelopeKind::Attestation, h(2), b"e2".to_vec(), 2),
         ]);
         let mut applier = applier_for(&[]);
-        let mut s = Session::new(
-            SessionRole::Responder,
-            EnvelopeKind::Attestation,
+        let mut s = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let r = s.on_message(
+            ReplicationMessage::Fetch(FetchMessage {
+                kind: EnvelopeKind::Attestation,
+                want: vec![h(1), h(99)], // h(99) doesn't exist
+            }),
             &provider,
             &mut applier,
         );
-        let r = s.on_message(ReplicationMessage::Fetch(FetchMessage {
-            kind: EnvelopeKind::Attestation,
-            want: vec![h(1), h(99)], // h(99) doesn't exist
-        }));
         match r {
             ReplicationOutcome::Send(msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -657,12 +676,7 @@ mod tests {
         // refused).
         let a_provider = provider_with(&[]);
         let mut a_applier = applier_for(&[(h(1), b"e1".to_vec())]);
-        let mut alice = Session::new(
-            SessionRole::Initiator,
-            EnvelopeKind::Key,
-            &a_provider,
-            &mut a_applier,
-        );
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
         // Skip the wire dance — drive on_message directly.
         let bob_summary = ReplicationMessage::Summary(SummaryMessage {
             kind: EnvelopeKind::Key,
@@ -681,8 +695,8 @@ mod tests {
                 },
             ],
         });
-        alice.start_round();
-        let _ = alice.on_message(bob_summary);
+        alice.start_round(&a_provider);
+        let _ = alice.on_message(bob_summary, &a_provider, &mut a_applier);
         let bob_deliver = ReplicationMessage::Deliver(DeliverMessage {
             kind: EnvelopeKind::Key,
             envelopes: vec![
@@ -691,7 +705,7 @@ mod tests {
                 b"unknown_e3".to_vec(),
             ],
         });
-        match alice.on_message(bob_deliver) {
+        match alice.on_message(bob_deliver, &a_provider, &mut a_applier) {
             ReplicationOutcome::Applied {
                 admitted,
                 refused,
