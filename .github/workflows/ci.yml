@@ -11,6 +11,20 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # ── Crates.io index resilience ──
+  # Default `CARGO_NET_RETRY` is 3, which has surfaced as a flake
+  # surface on macOS PyO3 cross-compile lanes (the iOS PyO3 sim job on
+  # PR #76 hit "no matching package named `heck` found" — the
+  # non-sim iOS PyO3 lane pulled the identical dep and succeeded
+  # within the same run). Bumping to 10 catches the long-tail of
+  # transient `index.crates.io` resolution flakes without changing
+  # behavior on the happy path. Per cargo-cooldown's
+  # COOLDOWN_HTTP_RETRIES precedent (default 2, max 8 — we go one
+  # above for stateless CI). Cross-process retry (via
+  # nick-fields/retry@v3) wraps the historically-flake-prone
+  # cargo invocations in the iOS / Android cross-compile lanes —
+  # see the matching steps below for the per-step retry policy.
+  CARGO_NET_RETRY: "10"
 
 jobs:
   # ─── linux-x86_64 — feature-combo gauntlet ──────────────────────────
@@ -263,11 +277,22 @@ jobs:
       # UniFFI/JNI) take this artifact; the Chaquopy variant below is
       # for the Python-agent cohabitation case.
       - name: cargo ndk build (${{ matrix.abi }} — plain, no PyO3)
+        # Cross-process retry via nick-fields/retry@v3 — catches
+        # transient `index.crates.io` resolution flakes the in-process
+        # CARGO_NET_RETRY=10 can't (e.g. when cargo gives up but a
+        # fresh process succeeds, which we observed on PR #76's iOS
+        # PyO3 sim lane). 3 attempts × 20 min each = worst-case 60 min
+        # wall-clock, but typical case is 1 attempt at ~5 min. Same
+        # rationale documented at the workflow `env:` block.
+        uses: nick-fields/retry@v3
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: >-
-          cargo ndk -t ${{ matrix.abi }} build --release
-          --features "$MOBILE_BASE_FEATURES"
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          command: >-
+            cargo ndk -t ${{ matrix.abi }} build --release
+            --features "$MOBILE_BASE_FEATURES"
       - name: save plain .so
         run: |
           mkdir -p dist/${{ matrix.abi }}
@@ -313,12 +338,17 @@ jobs:
           file "${STUB_DIR}/libpython3.10.so"
 
       - name: cargo ndk build (${{ matrix.abi }} — PyO3 Chaquopy abi3)
+        # Cross-process retry — see plain-build step for rationale.
+        uses: nick-fields/retry@v3
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           RUSTFLAGS: "-L ${{ runner.temp }}/python-stub -C link-arg=-Wl,--no-as-needed -C link-arg=-lpython3.10"
-        run: >-
-          cargo ndk -t ${{ matrix.abi }} build --release --lib
-          --features "$MOBILE_PYO3_FEATURES"
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          command: >-
+            cargo ndk -t ${{ matrix.abi }} build --release --lib
+            --features "$MOBILE_PYO3_FEATURES"
 
       - name: verify DT_NEEDED includes libpython3.10.so
         # AV-NN: the whole point of the stub-link dance is the
@@ -541,17 +571,24 @@ jobs:
         # cohabitation wire (MISSION §1.4). No PyO3 here (see job
         # docblock above for the rationale); no transport-http
         # (cloud fallback, not mobile).
-        run: |
-          # v0.7.1 — `--lib` so the bin target (`emit_edge_extras`,
-          # used only by the build-manifest emitter on the host) isn't
-          # also linked under this RUSTFLAGS. The `-install_name` flag
-          # is `-dynamiclib`-only; applying it to the bin target's
-          # `cc` invocation fails with `invalid argument` because the
-          # bin links as an executable, not a dylib. Verify's lane
-          # doesn't hit this because its repo has no `[[bin]]`.
-          RUSTFLAGS="-C link-arg=-install_name -C link-arg=@rpath/CIRISEdge.framework/CIRISEdge" \
-            cargo build --release --target ${{ matrix.target }} --lib \
-              --features "transport-reticulum"
+        #
+        # v0.7.1 — `--lib` so the bin target (`emit_edge_extras`,
+        # used only by the build-manifest emitter on the host) isn't
+        # also linked under this RUSTFLAGS. The `-install_name` flag
+        # is `-dynamiclib`-only; applying it to the bin target's
+        # `cc` invocation fails with `invalid argument`.
+        #
+        # Cross-process retry via nick-fields/retry@v3 — see Android
+        # lanes for rationale.
+        uses: nick-fields/retry@v3
+        env:
+          RUSTFLAGS: "-C link-arg=-install_name -C link-arg=@rpath/CIRISEdge.framework/CIRISEdge"
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          command: >-
+            cargo build --release --target ${{ matrix.target }} --lib
+            --features "transport-reticulum"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -772,18 +809,30 @@ jobs:
           echo "✓ Python-Apple-support ${PYTHON_IOS_VER}-${PYTHON_IOS_BUILD} staged for ${{ matrix.target }}"
           ls -la "$STAGE_DIR/"
       - name: cargo build (ios PyO3 — ${{ matrix.target }})
+        # Direct `cargo build` — NOT `maturin build`. Maturin 1.13's
+        # platform check rejects darwin→iOS cross-compile; persist
+        # documented this in v2.0.4 and the constraint persists.
+        #
+        # Cross-process retry via nick-fields/retry@v3 — this is the
+        # lane that observably flaked on PR #76 (`heck` not found in
+        # crates.io index on this specific runner; non-sim iOS PyO3
+        # pulled the same dep and succeeded). Per the env-block
+        # rationale: CARGO_NET_RETRY=10 covers in-process retries;
+        # this wrapper covers the case where cargo gives up but a
+        # fresh process succeeds.
+        uses: nick-fields/retry@v3
         env:
           PYO3_CROSS: "1"
           PYO3_CROSS_PYTHON_VERSION: "3.10"
           PYO3_CROSS_LIB_DIR: ${{ steps.python-ios.outputs.lib_dir }}
-        # Direct `cargo build` — NOT `maturin build`. Maturin 1.13's
-        # platform check rejects darwin→iOS cross-compile; persist
-        # documented this in v2.0.4 and the constraint persists.
-        run: >-
-          cargo build --release
-          --target ${{ matrix.target }}
-          --lib
-          --features "$IOS_PYO3_FEATURES"
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          command: >-
+            cargo build --release
+            --target ${{ matrix.target }}
+            --lib
+            --features "$IOS_PYO3_FEATURES"
       - name: strip + rename + install_name fix
         # Mach-O rename: libciris_edge.dylib → ciris_edge.abi3.so
         # (Python extension naming convention). install_name_tool
