@@ -76,6 +76,7 @@
 pub mod coordinator;
 pub mod directory;
 pub mod protocol;
+pub mod scheduler;
 pub mod session;
 pub mod summary;
 pub mod wire_frame;
@@ -89,6 +90,8 @@ pub use protocol::{
     DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
     SummaryMessage,
 };
+#[doc(inline)]
+pub use scheduler::{ReplicationScheduler, RoundEvent, SchedulerConfig};
 #[doc(inline)]
 pub use session::{ReplicationOutcome, Session, SessionRole};
 #[doc(inline)]

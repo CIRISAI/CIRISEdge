@@ -115,9 +115,24 @@ pub struct ReplicationCoordinator {
     /// tasks; the mutex serializes them — anti-entropy is sequential
     /// per peer-pair by protocol).
     session: Mutex<Session>,
+    /// Sender half of the inbound-message channel. The application's
+    /// [`Transport::listen`] loop calls
+    /// [`Self::deliver_inbound`] which routes here; the
+    /// [`super::scheduler::ReplicationScheduler`] reads the other
+    /// end via [`Self::recv_inbound`] to step a round between
+    /// `SendThenWait` and the next inbound. Bounded capacity 8 —
+    /// enough to absorb the few in-flight Summary / Diff / Deliver
+    /// messages without blocking the listen loop on a slow round.
+    inbound_tx: tokio::sync::mpsc::Sender<ReplicationMessage>,
+    inbound_rx: Mutex<tokio::sync::mpsc::Receiver<ReplicationMessage>>,
 }
 
 impl ReplicationCoordinator {
+    /// Default inbound mpsc capacity. A round in flight has at most
+    /// 3 messages queued (Summary + Diff + Deliver); 8 gives slack
+    /// for a slightly-late deliver while the scheduler is mid-step.
+    pub const INBOUND_CHANNEL_CAPACITY: usize = 8;
+
     pub fn new(
         transport: Arc<dyn Transport>,
         peer_key_id: impl Into<String>,
@@ -126,6 +141,7 @@ impl ReplicationCoordinator {
         provider: Arc<dyn StateProvider>,
         applier: Arc<Mutex<dyn StateApplier>>,
     ) -> Self {
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(Self::INBOUND_CHANNEL_CAPACITY);
         Self {
             transport,
             peer_key_id: peer_key_id.into(),
@@ -134,7 +150,32 @@ impl ReplicationCoordinator {
             provider,
             applier,
             session: Mutex::new(Session::new(role, kind)),
+            inbound_tx,
+            inbound_rx: Mutex::new(inbound_rx),
         }
+    }
+
+    /// Deliver an inbound replication message into this coordinator's
+    /// queue. Called by the application's [`Transport::listen`] loop
+    /// after [`Self::parse_inbound_bytes`] yields a
+    /// [`ReplicationMessage`].
+    ///
+    /// Returns `Err(NoRoundInProgress)` if the inbound channel is full
+    /// (the scheduler isn't keeping up; back-pressure surfaces). The
+    /// listen loop typically logs + drops the frame.
+    pub fn deliver_inbound(&self, msg: ReplicationMessage) -> Result<(), CoordinatorError> {
+        self.inbound_tx
+            .try_send(msg)
+            .map_err(|_| CoordinatorError::NoRoundInProgress)
+    }
+
+    /// Wait for the next inbound replication message from the
+    /// listen-loop-fed queue. Returns `None` if the channel is
+    /// permanently closed (the coordinator is being dropped). The
+    /// scheduler awaits on this between `SendThenWait` and the
+    /// next round step.
+    pub async fn recv_inbound(&self) -> Option<ReplicationMessage> {
+        self.inbound_rx.lock().await.recv().await
     }
 
     /// Step the held [`Session`] one transition forward.
