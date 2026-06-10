@@ -205,7 +205,11 @@ pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 const SUPPORTED_SCHEMA_VERSIONS: [&str; 1] = ["1.0.0"];
 
 /// Crate version (compile-time). Surfaces as `ciris_edge.__version__`.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Re-exported from [`crate::version::VERSION`] so the C FFI accessor
+/// (`ciris_edge_version`), the Rust constant, and `__version__` all
+/// share one source of truth (see CIRISPersist#189 — version exposure
+/// for the agent Trust-page binary-refresh integrity check).
+use crate::version::VERSION;
 
 /// Python-reachable handle wrapping `Arc<Edge>`. Constructed by
 /// [`init_edge_runtime`]; sibling cdylibs (CIRISNodeCore /

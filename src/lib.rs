@@ -68,6 +68,7 @@ pub mod replication;
 pub mod sas;
 pub mod transport;
 pub mod verify;
+pub mod version;
 
 pub use cohort_scope::{CohortScope, CohortScopeEnforcement};
 pub use detector::{
