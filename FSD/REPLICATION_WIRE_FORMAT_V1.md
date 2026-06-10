@@ -211,7 +211,44 @@ flag-day required.
 
 **v1 stays unchanged** — `persist_row_hash` uniformly, all-persist
 federations only. Documented as an explicit interop boundary, not a
-silent caveat.
+silent caveat. **The deferred path resolves in §3.2.2.**
+
+#### 3.2.2 v2 envelope_hash basis — LOCKED (CEG 1.0-RC2)
+
+**Resolution of the §3.2.1 deferred-interop path.** CEG 1.0-RC2
+(`v-ceg-1.0-rc2`, commit `b21fe84`) closed blocker A as **JCS**
+(RFC 8785 — not TupleHash128); CEG 1.0-RC1 (`v-ceg-1.0-rc1`, commit
+`8872bfe`) shipped the canonical-bytes redesign. CIRISRegistry#70
+review (Edge ✅ · Verify ✅ · Persist ✅) locked the v2 wire surface
+in the same RC2 cut.
+
+**v2 `envelope_hash` = `sha256(JCS(Signed*Record))`**, uniformly
+across all v2-emitting kinds. Edge-defined; reproducible by any
+CEG-§0.9-conformant implementation; non-persist CEG implementers
+gain full interop with v2-capable peers.
+
+The architectural shift from v1:
+
+- **v1**: `envelope_hash = persist_row_hash` (V1Python, persist-internal).
+  All-persist federations only; an explicit interop boundary per §3.2.1.
+- **v2**: `envelope_hash = sha256(JCS(Signed*Record))` (CEG-§0.9-conformant,
+  edge-defined). Any CEG implementation reproduces it.
+
+Per §3.5, peer-by-peer transition: v2-capable peers exchange v2
+envelopes with v2-capable peers and v1 envelopes with v1-only peers.
+The version byte negotiates; no flag-day.
+
+**`PartnerRecord` admission depends on JCS basis.** Per the Verify
+review catch locked in RC2 §5.6.8.13: M distinct stewards must sign
+**byte-identical JCS canonical bytes** for the M-of-N steward quorum
+to admit. The §0.9.2.1 rule 1 set-semantics declaration on
+`capabilities_granted[]` / `capabilities_denied[]` /
+unordered-list-inside-`constraints` (lexicographic sort) is what
+makes M-of-N convergence possible — without it, two stewards
+emitting the same grant in different field order produce different
+canonical bytes and the quorum silently fails to admit. Edge's v2
+wire surfaces these arrays via the same JCS pass that produces
+`envelope_hash`; consistency by construction.
 
 The wire bytes include the embedded scrub signatures + the
 server-computed `persist_row_hash` field — the **full record** as
@@ -424,9 +461,10 @@ This FSD anchors v1 so the path is clear:
    for trust data. Operational-data still on Spock multi-master.
 2. **CIRIS 2.0 cut** — Spock fully removed. Operational-data envelopes
    defined by Registry (per #58 Phase 2). Wire bumps to `VER = 0x02`
-   adding `EnvelopeKind::Org`, `User`, `License`, `Partner` (or
-   whatever Registry names them). Edge tolerates both v1 and v2
-   wire during the rolling-upgrade window via the version byte.
+   adding **three** new `EnvelopeKind`s (per §5.2 below — locked at
+   RC2, narrower than the four originally anticipated). Edge tolerates
+   both v1 and v2 wire during the rolling-upgrade window via the
+   version byte.
 3. **Post-2.0** — Spock-free federation; one CEG-native replication
    mechanism; single auditable cryptographic-provenance trail across
    every cross-region state change.
@@ -436,6 +474,71 @@ detail. Without it, the v1 → v2 transition would require a coordinated
 fleet-wide flag day. With it, individual peers can upgrade
 independently and the framing dispatch tells them what they're
 receiving.
+
+### 5.2 v2 EnvelopeKind additions — LOCKED (CEG 1.0-RC2 §5.6.8.13)
+
+CIRISRegistry#70 specified the operational-data envelope shape;
+three-sided federation review (Edge ✅ · Verify ✅ · Persist ✅)
+locked decisions; CEG 1.0-RC2 codified at §5.6.8.13. The v2
+`EnvelopeKind` additions are **three**, not the four originally
+forecast:
+
+| v2 `EnvelopeKind` | wire token | merge intent (§10.1.6) | rationale |
+|---|---|---|---|
+| `Organization` | `organization` | `lww_skew_bounded` | public org identity federates; PII (`tax_id`, contacts, `metadata`) stays region-local |
+| `OrgMembership` | `org_membership` | `lww_skew_bounded` + `withdrawal_forward_only` | authz binding (`user_id`/`org_id`/`role`) federates; **User PII never federates** |
+| `PartnerRecord` | `partner_record` | `monotonic_quorum` (V058-generalized) | combines old `License`+`Partner`; M-of-N steward quorum + monotonic-fail-secure (more-restrictive wins) |
+
+**`User` is explicitly dropped from the wire.** The original §5
+forecast anticipated four kinds (`Org`/`User`/`License`/`Partner`);
+the federate-the-trust/authz-minimal-projection principle keeps PII
+per-region — only the `OrgMembership` role binding crosses. The old
+`License`+`Partner` pair collapses into the existing combined
+`PartnerRecord` shape (already hybrid-signed today; CEG-native just
+means it propagates by envelope instead of Spock).
+
+**Wire tokens are normative** — snake_case per the §3.3 v1
+convention; the CEG cut names them explicitly so no implementation
+re-derives. Per §3.2.2, all three v2 kinds use
+`envelope_hash = sha256(JCS(Signed*Record))`.
+
+**Edge's v2 implementation scope:**
+
+1. Add `Organization`, `OrgMembership`, `PartnerRecord` to
+   `EnvelopeKind` under a `WireVersion::V2` discriminant.
+2. Implement v2 `envelope_hash` per §3.2.2 (JCS-conformant).
+3. Extend `Session` version negotiation to advertise v2 + fall back
+   to v1 with v1-only peers (the §3.5 byte already supports this).
+4. Wire `Bridge::apply_envelope_bytes` to persist's three new
+   admit surfaces (`put_organization` / `put_org_membership` /
+   `put_partner_record`).
+5. **No new coordinator code** — merge policy stays persist-side
+   (`lww_skew_bounded` + `withdrawal_forward_only` + `monotonic_quorum`
+   dispatched declaratively per §10.1.6, never inferred). The
+   M-of-N quorum aggregation, `revision: u64` anti-rollback, and
+   skew-bound LWW are all admit-time checks edge stays agnostic to.
+
+**Substrate prerequisites for the v2 cycle:**
+
+- **`ciris-persist` v5.x** carrying `put_organization` /
+  `put_org_membership` / `put_partner_record` admit surfaces,
+  V058-generalized `verify_coord` for `license_id`, skew-bound LWW
+  precedence, stable-id grouping.
+- **`ciris-verify` v6.x** carrying the `delegates_to` role-chain
+  resolver applied to operational subject_kinds + `verify_founder_quorum`
+  for `PartnerRecord` admission.
+- CIRISConformance#9 M-of-N identical-bytes vector set published
+  (the Verify-raised catch — locked in RC2).
+
+### 5.3 v2 → v3 (and beyond)
+
+CEG 1.0-RC2 declares the **design surface complete** — #70 was the
+one scheduled addition; RC2→1.0 changes are found defects, not
+design additions. Edge's v3+ surface area is therefore expected to
+be either (a) optimization-driven (e.g., O(log N) MLS rekey tree
+when the relay/multicast 1.x cycle drives it — currently CIRISEdge#66)
+or (b) reactive to defect-driven CEG amendments. No further forecast
+EnvelopeKinds expected.
 
 ## 6. Non-goals (explicit, with linked tracking)
 
