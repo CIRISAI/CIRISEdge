@@ -86,34 +86,50 @@ The 5 design questions surfaced during layer (c-2) investigation
 resolve as follows. Citations are by direction (CEG / persist /
 edge MISSION).
 
-### 3.1 envelope_hash semantics — LOCKED (CEG + persist)
+### 3.1 envelope_hash semantics — **AMENDED v1: `persist_row_hash` uniformly**
 
-The federation envelope identity is **`original_content_hash`**:
-sha256 over the canonical bytes of the inner `*_envelope` JSON
-value carried inside each `Signed*Record`.
+**Original lock (preserved for history):** spec-owner review chose
+`original_content_hash` as the envelope identity for v1.
 
-Every persist federation record type (`KeyRecord`, `Attestation`,
-`Revocation`, `IdentityOccurrence`, `Family`, `Community`, the V067
-membership-revocation triple from v4.8.0) carries the same shape:
-- A `*_envelope: serde_json::Value` field — the inner CEG envelope
-- An `original_content_hash: String` field — hex sha256 of canonical
-  bytes of that envelope
-- Embedded scrub signatures (Ed25519 classical + ML-DSA-65 hybrid)
-- A server-computed `persist_row_hash: String` over the full record
+**v1 implementation discovery (layer (c-2) wiring):** only **3 of the
+10** `Signed*Record` inner types carry `original_content_hash` —
+`KeyRecord`, `Attestation`, `Revocation` (the legacy shape with an
+inner `*_envelope: Value` field). The 7 newer types
+(`IdentityOccurrence`, `Family`, `Community`, the three V067
+membership-revocations from v4.8.0, `LocationProof` from v4.10.0)
+carry only `persist_row_hash`. The CEG 0.7+ record shapes store
+their typed Rust fields directly without an inner JSON envelope
+field, so there is no `original_content_hash` to compute.
 
-We use `original_content_hash` (the **content** identity), not
-`persist_row_hash` (the **row** identity). Justification:
+**Decision (v1 amendment):** the v1 wire uses `persist_row_hash`
+**uniformly** across all 10 kinds as `EnvelopeRef::envelope_hash`.
 
-- `original_content_hash` is deterministic across nodes; same content
-  claim → same hash regardless of which node observed it. That's the
-  property anti-entropy summary↔diff convergence requires.
-- v4.7.0 `register_public_key` typed return (Registered /
-  AlreadyRegistered / RotationCollision) defines persist's stance:
-  same `key_id` + same pubkey → idempotent; same `key_id` + different
-  pubkey → rotation collision. Content identity is the dedup boundary.
-- CEG §0.9.2.1 (canonical-bytes determinism rules) locks the
-  canonicalization that makes `original_content_hash` reproducible
-  cross-impl.
+Justification:
+
+- **Uniform** — no per-kind special-casing. A single match arm in
+  the bridge handles every kind's hash extraction.
+- **Deterministic across nodes** — persist's `compute_persist_row_hash`
+  is sha256 over canonical(record minus `persist_row_hash` itself);
+  same content + same scrub-signing inputs on every peer → same hash.
+- **Stronger convergence than `original_content_hash`** — full-record
+  identity (includes embedded scrub signatures). Same byte-identical
+  record on every peer or no convergence. Ed25519 and ML-DSA-65 are
+  deterministic (FIPS 204 final), so same signer + same payload →
+  same signature → same `persist_row_hash`. The "different witnesses
+  → same envelope" ambiguity that motivated picking
+  `original_content_hash` doesn't apply when the wire identity binds
+  to the full Signed*Record.
+- **Still satisfies the v4.7.0 `register_public_key` idempotency
+  story** — same `key_id` + same pubkey + same scrub-signatures →
+  same `persist_row_hash` → idempotent dedup. A rotation collision
+  (same key_id, different pubkey) yields a different
+  `persist_row_hash`, surfacing at admit-time.
+
+The original-lock anchor at `original_content_hash` was the right
+answer for the 3 legacy record types but doesn't generalize. The
+amendment chooses the answer that does. Tracked in the bridge's
+module docs (`src/replication/bridge.rs`) alongside the
+implementation.
 
 ### 3.2 envelope_bytes wire format — LOCKED (edge MISSION + persist)
 

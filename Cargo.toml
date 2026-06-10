@@ -255,6 +255,12 @@ libc        = { version = "0.2", optional = true }
 # Hashing — body_sha256 forensic join key + in_reply_to ACK matching.
 sha2        = "0.10"
 base64      = "0.22"
+# v1.6.0 (CIRISEdge#65 layer (c-2)) — `hex` decode of persist's
+# `persist_row_hash` (hex-encoded SHA-256, 64 chars lowercase) into
+# the 32-byte `envelope_hash` shape replication uses on the wire.
+# Same crate previously lifted to runtime in v1.4.x for the
+# AccordCarrier hex path; dev-deps copy kept for the test fixtures.
+hex         = "0.4"
 
 # Errors / logs
 thiserror   = "1"
