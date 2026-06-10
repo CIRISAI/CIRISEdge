@@ -143,21 +143,75 @@ Edge does **not** define canonicalization rules. Quoting `MISSION.md`
 edge re-implements no canonicalization rule. Canonical bytes are not
 edge's to define."* Layer (c-2) calls persist's canonicalizer directly.
 
-#### 3.2.1 Transitional caveat — V1Python vs CEG §0.9/JCS (tracked)
+#### 3.2.1 Canonicalization status post-persist-v4.15.0
 
-Until the 2.9.6 substrate triple flips `produce_canon_version()` from
-`V1Python` to `V2Jcs`, **`envelope_hash` is persist-V1Python-canonical,
-NOT CEG §0.9/JCS-canonical.** A *non-persist* CEG implementation
-cannot reproduce envelope identity (and thus cannot participate in
-anti-entropy) until the flip lands.
+**Persist v4.15.0 LANDED the JCS canonicalization flip** (2026-06-09,
+the 2.9.6 substrate triple cutover, CEG 1.0 §0.9 conformance milestone,
+CIRISPersist#171/#176). `produce_canon_version()` flipped V1Python →
+V2Jcs. The transitional caveat originally documented here is partially
+resolved + a new architectural finding now anchors here.
 
-This is acceptable for the all-persist federation today, but it's
-the one place the wire diverges from CEG-normative canonicalization
-and is named here as a tracked transitional gap tied to the existing
-canon-version gate. No code change required — the runtime call to
-persist's canonicalizer auto-flips when the gate advances; downstream
-implementations consuming this FSD should treat envelope-identity
-interop with non-persist peers as **pending the 2.9.6 cutover**.
+**What flipped (relevant to edge):**
+- The 3 legacy types' `original_content_hash` field (KeyRecord,
+  Attestation, Revocation — the shape with an inner `*_envelope:
+  Value` field) is now sha256 over **JCS-canonical** bytes. For
+  records signed with schema version ≥ "3.0.0", the hash is
+  CEG-§0.9-conformant and reproducible by non-persist
+  implementations.
+- Records signed pre-flip (schema "2.7.x") stay V1Python-canonical;
+  the signed-epoch version-gate in `canon_version_for_trace_schema`
+  dispatches the right canonicalizer per record. The discriminator
+  is inside the signed bytes — downgrade-safe (FSD §6).
+
+**What did NOT flip (persist's design intent):**
+- **`persist_row_hash` STAYS V1Python forever.** Persist explicitly
+  documents this in its v4.15.0 release notes: *"Internal
+  `persist_row_hash` + audit `canonical_bytes_for_entry` — never
+  cross the federation boundary; stay Python-compat per FSD OQ-2."*
+- The carve-out reflects persist's stated boundary model: `persist_row_hash`
+  is a per-node integrity invariant, not a cross-federation
+  identity. Flipping it would invalidate every existing persisted
+  row's recomputable hash — a substrate-wide rewrite cost that
+  persist's design avoided.
+
+**Architectural finding (anchored here for the record):**
+
+Edge's v1 wire DOES cross `persist_row_hash` over the federation
+boundary as `EnvelopeRef::envelope_hash` per the v1.6.0 §3.1
+amendment. This is **contrary to persist's stated intent** but
+operationally sound:
+
+- `persist_row_hash` is deterministic (`compute_persist_row_hash` is
+  sha256 over canonical(record minus `persist_row_hash` itself); same
+  bytes in, same bytes out, on every node)
+- Same scrub-signed record produces same `persist_row_hash` on every
+  peer (Ed25519 + ML-DSA-65 deterministic per FIPS 204 final)
+- The V1Python canonicalizer used inside `compute_persist_row_hash`
+  is a fixed, version-stable function — not subject to the
+  `produce_canon_version()` gate that flipped to JCS
+
+The trade-off: a **non-persist CEG implementation cannot reproduce
+edge's envelope_hash for the 7 newer types**, because it would have
+to implement persist's V1Python canonicalization (which persist
+considers internal). Concretely:
+
+- All-persist federations: full interop. ✓
+- Non-persist CEG implementations: must implement persist-compat
+  V1Python canonicalization OR a future wire-protocol-version bump
+  (v2) introduces a CEG-conformant hash basis.
+
+The path to non-persist CEG interop for replication is therefore
+**deferred to a v2 wire-protocol-version cycle**, when CIRISRegistry#58
+Phase 2's operational-data envelopes drive a `WIRE_PROTOCOL_VERSION
+= 0x02` cut anyway. v2 would settle on a CEG-§0.9-conformant
+envelope-identity scheme for all kinds (likely: sha256 of
+JCS-canonical(Signed*Record), edge-defined). The version byte
+mechanism (§3.5) makes the v1→v2 transition peer-by-peer; no
+flag-day required.
+
+**v1 stays unchanged** — `persist_row_hash` uniformly, all-persist
+federations only. Documented as an explicit interop boundary, not a
+silent caveat.
 
 The wire bytes include the embedded scrub signatures + the
 server-computed `persist_row_hash` field — the **full record** as
