@@ -116,6 +116,7 @@
 //! hard NATs should use Reticulum, which is what MISSION §1.4
 //! designates canonical anyway.
 
+pub mod bridge;
 pub mod coordinator;
 pub mod directory;
 pub mod protocol;
@@ -124,6 +125,8 @@ pub mod session;
 pub mod summary;
 pub mod wire_frame;
 
+#[doc(inline)]
+pub use bridge::{BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge};
 #[doc(inline)]
 pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
 #[doc(inline)]
