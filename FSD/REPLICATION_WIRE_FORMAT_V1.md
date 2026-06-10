@@ -17,7 +17,8 @@ shipping; expand the kind taxonomy now to match persist's surface 1:1.
 - [`../MISSION.md`](../MISSION.md) §3 (canonicalization isn't edge's to define)
 - [`CIRISRegistry#58`](https://github.com/CIRISAI/CIRISRegistry/issues/58) — "remove Spock" epic ("Edge owns propagation")
 - [`CIRISPersist src/federation/types.rs`](https://github.com/CIRISAI/CIRISPersist/blob/main/src/federation/types.rs) — record shapes
-- CEG 0.15 §0.9 canonicalization rules + §0.9.2.1 determinism rules
+- CEG §0.9 canonicalization rules + §0.9.2.1 determinism rules (anchors
+  stable through CEG 0.15 → 0.17)
 
 ---
 
@@ -65,7 +66,7 @@ In:
 - Envelope identity (`envelope_hash`) and wire-byte format
   (`envelope_bytes`) for every kind of federation envelope
 - Replication kind taxonomy (`EnvelopeKind`) — expanded from the
-  4-variant pre-v1 shape to a **9-variant v1 shape** aligned 1:1
+  4-variant pre-v1 shape to a **10-variant v1 shape** aligned 1:1
   with persist's `FederationDirectory` put_* surface
 - Wire-protocol version marker; advancement rules
 - Bridge implementation surface (`FederationDirectoryReplicationBridge`)
@@ -76,7 +77,7 @@ Out:
 
 - The R1/Q1 quorum-merge semantics (substrate-side; persist owns)
 - Operational-data CEG envelope shapes (Registry owns)
-- Streaming/multicast (CEG 0.15 §10.5 — separate axis; CIRISEdge#66)
+- Streaming/multicast (CEG §10.5 — separate axis; CIRISEdge#66)
 - Cross-region peer-set discovery (operator config)
 
 ## 3. Decision authority — what's locked, what's open
@@ -125,6 +126,22 @@ Edge does **not** define canonicalization rules. Quoting `MISSION.md`
 §3: *"`sign_envelope` calls `ciris_persist::canonicalize_envelope_for_signing`;
 edge re-implements no canonicalization rule. Canonical bytes are not
 edge's to define."* Layer (c-2) calls persist's canonicalizer directly.
+
+#### 3.2.1 Transitional caveat — V1Python vs CEG §0.9/JCS (tracked)
+
+Until the 2.9.6 substrate triple flips `produce_canon_version()` from
+`V1Python` to `V2Jcs`, **`envelope_hash` is persist-V1Python-canonical,
+NOT CEG §0.9/JCS-canonical.** A *non-persist* CEG implementation
+cannot reproduce envelope identity (and thus cannot participate in
+anti-entropy) until the flip lands.
+
+This is acceptable for the all-persist federation today, but it's
+the one place the wire diverges from CEG-normative canonicalization
+and is named here as a tracked transitional gap tied to the existing
+canon-version gate. No code change required — the runtime call to
+persist's canonicalizer auto-flips when the gate advances; downstream
+implementations consuming this FSD should treat envelope-identity
+interop with non-persist peers as **pending the 2.9.6 cutover**.
 
 The wire bytes include the embedded scrub signatures + the
 server-computed `persist_row_hash` field — the **full record** as
@@ -311,6 +328,11 @@ gives operators flexibility post-init.
   from bulk-list responses
 - [ ] All 10 kinds round-trip via `apply_envelope_bytes` → persist `put_*`
   → list_envelope_refs (in-memory sqlite test)
+- [ ] Federation-tier-only invariant (§7.1) enforced + tested: a
+  §10.1.4-invisible private IdentityOccurrence/Family/Community MUST
+  NOT appear in `list_envelope_refs`; a federation-present record
+  MUST appear; a local-tier (pre-promotion) attestation MUST NOT
+  appear in `list_envelope_refs(Attestation)`
 - [ ] PyO3 init accepts `replication_peers` + `replication_cadence_seconds`;
   `PyEdge.register_replication_peer` hot-add works
 - [ ] `try_unwrap_replication_frame` rejects unknown version bytes with
@@ -328,7 +350,7 @@ version bump (`0x01` → `0x02`).
 This FSD anchors v1 so the path is clear:
 
 1. **CIRIS 1.x replication line** — v1 wire (`VER = 0x01`),
-   nine `EnvelopeKind`s, federation directory + R1/Q1 quorum-merge
+   ten `EnvelopeKind`s, federation directory + R1/Q1 quorum-merge
    for trust data. Operational-data still on Spock multi-master.
 2. **CIRIS 2.0 cut** — Spock fully removed. Operational-data envelopes
    defined by Registry (per #58 Phase 2). Wire bumps to `VER = 0x02`
@@ -377,6 +399,68 @@ plumbing. The security envelope is unchanged:
   metadata, NOT integrity primitives. A peer that lies about its
   version causes its envelope to be rejected at parse; the embedded
   scrub signatures remain the integrity floor.
+
+### 7.1 Federation-tier-only invariant (CEG §10.1.4 / §10.1.5)
+
+**Normative invariant:** Replication carries only federation-PRESENT
+`Signed*Record` envelopes — never local-only or pre-promotion content.
+The line that must hold: *federation directory = federation-present
+records only; the private at-rest tier is a separate local store.*
+
+Two enforcement mechanisms, by kind:
+
+- **`Attestation`** — safe by construction. CEG §10.1.5 defines local-
+  tier attestations as **deferred-signature** (producer-only-visible);
+  promotion is the act of hybrid-signing `JCS(envelope)`. A local-tier
+  attestation has **no `SignedAttestation` form** until promoted, so
+  it is **structurally ineligible** to appear in
+  `list_envelope_refs(Attestation)`. The wire format enforces this by
+  type — no new gate required.
+
+- **`IdentityOccurrence` / `Family` / `Community`** — signed forms
+  exist for both private (CEG §10.1.4 structurally-invisible) and
+  federation-present records. The structural guarantee that protects
+  attestations does **NOT** extend here. Layer (c-2) MUST enforce an
+  **explicit scope gate**: the bridge reads only the federation
+  directory (`federation_identity_occurrences` / `federation_families`
+  / `federation_communities`); CEG §10.1.4-invisible private records
+  live in a separate local-only store that `list_envelope_refs`
+  MUST NOT read.
+
+A **cross-region self** (CEG §8.1.12.7 Self-at-login — app+agent
+occurrences sharing a Self DEK across regions) is precisely the case
+that exercises this gate. Three things legitimately cross regions
+for a cross-region self, all safe:
+1. The `IdentityOccurrence` directory envelope — **cleartext
+   provenance** (occurrence id, pubkey, `transport_destination`,
+   `cohort_scope`), federation-PRESENT by intent. This is how the
+   federation resolves "these instances are one self" and how peers
+   reach them.
+2. The shared **Self DEK** — as a wrapped key-grant
+   (`wrap_algorithm: v2`), ciphertext, only the target instance
+   unwraps.
+3. The **encrypted content** — DEK-encrypted, via content-fetch,
+   never via this directory stream.
+
+A §10.1.4-invisible *private* self (federation-absent) MUST NOT
+cross. That is the line.
+
+**Layer (c-2) acceptance tests (Finding 1 fence):**
+
+1. A §10.1.4-invisible IdentityOccurrence / Family / Community
+   record (private at-rest tier) MUST NOT appear in
+   `list_envelope_refs(IdentityOccurrence | Family | Community)`.
+2. A federation-present occurrence (declared `cohort_scope: federation`
+   + transport binding) MUST appear in `list_envelope_refs`.
+3. A local-tier (pre-promotion) attestation MUST NOT appear in
+   `list_envelope_refs(Attestation)` — structurally true today;
+   pin as a regression test.
+
+Substrate confirmation required (persist side): `list_attestations`
+/ `list_identity_occurrences` / `list_families` / `list_communities`
+in the `ReadEngine` bulk surface read ONLY federation-tier promoted
+rows, never a local-tier / pre-promotion store. Almost certainly
+true today; the test fences the invariant against future refactors.
 
 New attack surface from replication itself:
 
