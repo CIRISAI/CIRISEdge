@@ -868,6 +868,179 @@ impl PyEdge {
 
         Ok(root.unbind().into_any())
     }
+
+    // ── CIRISEdge#65 v1.6.3 — PyO3 init wiring for replication ──────
+    //
+    // Closes the 8th and final rung of #65's v1 ladder per
+    // FSD/REPLICATION_WIRE_FORMAT_V1.md §3.7. Spawns a
+    // `ReplicationRuntime` (bridge + registry + scheduler) bound to
+    // this PyEdge's federation directory and first transport;
+    // returns a `PyReplicationHandle` the operator holds for the
+    // lifetime of their replication peer set.
+
+    /// Start the replication runtime over this edge's federation
+    /// directory + transport.
+    ///
+    /// `peers` is a list of `(peer_key_id, kind_str)` tuples where
+    /// `kind_str` is one of the 10 wire-stable kinds per FSD §3.3:
+    /// "key" / "attestation" / "revocation" / "identity_occurrence"
+    /// / "family" / "community" / "identity_occurrence_revocation"
+    /// / "family_membership_revocation" /
+    /// "community_membership_revocation" / "location_proof".
+    ///
+    /// `cadence_seconds` overrides the scheduler's default 30 s
+    /// per-round cadence; `None` keeps the default. The round
+    /// timeout stays at the scheduler default (10 s).
+    ///
+    /// Errors:
+    /// - `ValueError("edge has no federation_directory wired")` if
+    ///   the cohabitation init path didn't supply one (the typical
+    ///   test-fixture trap).
+    /// - `ValueError("edge has no transport wired")` if no
+    ///   transport was registered at init.
+    /// - `ValueError("unknown EnvelopeKind: {token}")` if a kind
+    ///   string in `peers` doesn't match the 10 wire tokens.
+    #[pyo3(signature = (peers, cadence_seconds = None))]
+    fn start_replication(
+        &self,
+        py: Python<'_>,
+        peers: Vec<(String, String)>,
+        cadence_seconds: Option<u64>,
+    ) -> PyResult<PyReplicationHandle> {
+        let directory = self
+            .inner
+            .federation_directory()
+            .ok_or_else(|| PyValueError::new_err("edge has no federation_directory wired"))?;
+        let transports = self.inner.transports();
+        let transport = transports
+            .into_iter()
+            .next()
+            .ok_or_else(|| PyValueError::new_err("edge has no transport wired"))?;
+
+        let mut typed_peers = Vec::with_capacity(peers.len());
+        for (peer_key_id, kind_str) in peers {
+            let kind = parse_envelope_kind(&kind_str)?;
+            typed_peers.push(crate::replication::ReplicationPeer { peer_key_id, kind });
+        }
+
+        let mut config = crate::replication::ReplicationRuntimeConfig::default();
+        if let Some(secs) = cadence_seconds {
+            config.scheduler.cadence = std::time::Duration::from_secs(secs);
+        }
+
+        let executor = self.executor.clone();
+        let runtime = py.detach(|| {
+            run_async(&executor, async move {
+                crate::replication::ReplicationRuntime::start(
+                    directory,
+                    transport,
+                    typed_peers,
+                    config,
+                )
+                .await
+            })
+        });
+
+        Ok(PyReplicationHandle {
+            inner: Arc::new(tokio::sync::Mutex::new(Some(runtime))),
+            executor: self.executor.clone(),
+        })
+    }
+}
+
+/// Parse a wire-stable kind string into [`crate::replication::EnvelopeKind`].
+/// The token set is the 10 `#[serde(rename_all = "snake_case")]`
+/// variants per FSD §3.3.
+fn parse_envelope_kind(s: &str) -> PyResult<crate::replication::EnvelopeKind> {
+    use crate::replication::EnvelopeKind;
+    match s {
+        "key" => Ok(EnvelopeKind::Key),
+        "attestation" => Ok(EnvelopeKind::Attestation),
+        "revocation" => Ok(EnvelopeKind::Revocation),
+        "identity_occurrence" => Ok(EnvelopeKind::IdentityOccurrence),
+        "family" => Ok(EnvelopeKind::Family),
+        "community" => Ok(EnvelopeKind::Community),
+        "identity_occurrence_revocation" => Ok(EnvelopeKind::IdentityOccurrenceRevocation),
+        "family_membership_revocation" => Ok(EnvelopeKind::FamilyMembershipRevocation),
+        "community_membership_revocation" => Ok(EnvelopeKind::CommunityMembershipRevocation),
+        "location_proof" => Ok(EnvelopeKind::LocationProof),
+        other => Err(PyValueError::new_err(format!(
+            "unknown EnvelopeKind: {other:?} (valid: key, attestation, revocation, \
+             identity_occurrence, family, community, \
+             identity_occurrence_revocation, family_membership_revocation, \
+             community_membership_revocation, location_proof)"
+        ))),
+    }
+}
+
+/// Python-facing handle for the `ReplicationRuntime`.
+///
+/// Construct via [`PyEdge::start_replication`]; hold for the
+/// lifetime of the application's replication peer set; call
+/// `register_peer` for hot-add; call `stop` for graceful shutdown.
+///
+/// Clones of this handle (Python references) share the same inner
+/// runtime — first `stop` shuts down; subsequent `stop` calls are
+/// no-ops.
+#[pyclass(unsendable)]
+pub struct PyReplicationHandle {
+    inner: Arc<tokio::sync::Mutex<Option<crate::replication::ReplicationRuntime>>>,
+    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+}
+
+#[pymethods]
+impl PyReplicationHandle {
+    /// Number of currently registered `(peer_key_id, kind)` pairs.
+    /// Returns 0 after `stop()`.
+    fn registered_count(&self, py: Python<'_>) -> usize {
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                let guard = inner.lock().await;
+                if let Some(rt) = guard.as_ref() {
+                    rt.registry().len().await
+                } else {
+                    0
+                }
+            })
+        })
+    }
+
+    /// Hot-add a `(peer_key_id, kind)` after start. See
+    /// `ReplicationRuntime::register_peer` for the v1 limitation
+    /// (hot-adds default to Responder role; the scheduler's
+    /// Initiator set is fixed at start in v1).
+    fn register_peer(&self, py: Python<'_>, peer_key_id: &str, kind: &str) -> PyResult<()> {
+        let kind = parse_envelope_kind(kind)?;
+        let peer = peer_key_id.to_string();
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                let guard = inner.lock().await;
+                if let Some(rt) = guard.as_ref() {
+                    rt.register_peer(peer, kind).await;
+                }
+            });
+        });
+        Ok(())
+    }
+
+    /// Stop the replication runtime — signals the scheduler to
+    /// exit and awaits its run loop. Idempotent.
+    fn stop(&self, py: Python<'_>) {
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                let mut guard = inner.lock().await;
+                if let Some(mut rt) = guard.take() {
+                    rt.shutdown().await;
+                }
+            });
+        });
+    }
 }
 
 /// CIRISEdge#22 Tier 3 (v0.17.0) — Python-side projection of the
@@ -3068,6 +3241,11 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // CIRISEdge#34 (v0.19.0) — per-category network-event AsyncIterator
     // pyclass returned by every `PyEdge::subscribe_*` pymethod.
     m.add_class::<PyNetworkEventSubscription>()?;
+
+    // CIRISEdge#65 v1 (v1.6.3) — replication runtime handle. Returned
+    // by `PyEdge::start_replication`; the operator holds it for the
+    // lifetime of their peer set and calls `register_peer` / `stop`.
+    m.add_class::<PyReplicationHandle>()?;
 
     // init_edge_runtime — the CIRISEdge#16 / CIRIS-3.0 cohabitation
     // constructor. Only registered when the Reticulum transport is
