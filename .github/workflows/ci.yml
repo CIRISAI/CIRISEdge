@@ -78,6 +78,24 @@ jobs:
           - { name: pyo3-full,      features: "transport-http transport-reticulum pyo3", all_targets: "true" }
     steps:
       - uses: actions/checkout@v4
+      # pyo3-full builds the largest target set (--all-targets: lib +
+      # integration tests + benches + doctests against persist + verify
+      # + criterion). At persist v5.0.0 + verify v5.0.0 the cumulative
+      # compile artifact set exceeds the default GitHub runner's 14GB
+      # disk. jlumbroso/free-disk-space frees ~30GB by removing the
+      # preinstalled Android SDK / .NET / GHC / dotnet toolchains we
+      # don't use — keeps the leaner --lib lanes (core / reticulum /
+      # packet-radio / all-transports) from paying the ~60s setup cost.
+      - name: free disk space (pyo3-full only — large compile footprint)
+        if: matrix.combo.name == 'pyo3-full'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
       # ciris-keyring's `tpm` feature (auto-enabled for Linux targets
       # by ciris-persist v1.10.0+, CIRISPersist#87) builds tss-esapi,
       # which links libtss2. Cargo unions the feature across the graph
