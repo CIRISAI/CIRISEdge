@@ -2460,6 +2460,29 @@ impl Edge {
         self.reticulum_transport.clone()
     }
 
+    /// v2.1.0 (CIRISPersist `LocalIdentityAggregate` RET-transport
+    /// role) — return edge's 64-byte Reticulum transport-identity
+    /// public material when a Reticulum transport is wired:
+    /// `x25519_pub (32) ‖ ed25519_pub (32)`. Cohabiting cdylibs (the
+    /// LocalIdentityAggregate constructor on persist's side; lens-core
+    /// relay) read this to populate the RET-transport role of their
+    /// aggregate hashes — edge owns the transport identity per
+    /// `crate::identity::federation_identity_hash` doc note.
+    ///
+    /// Returns `None` for an Edge built without
+    /// [`EdgeBuilder::reticulum_transport`] (HTTP-only deployments or
+    /// tests that registered `Arc<dyn Transport>` via the generic
+    /// [`EdgeBuilder::transport`] path). The Reticulum destination
+    /// hash (`sha256(buf)[..16]`) is left to the caller — persist's
+    /// aggregate already has its own hash machinery.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn local_transport_pubkey(&self) -> Option<[u8; 64]> {
+        self.reticulum_transport
+            .as_ref()
+            .map(|t| t.local_transport_pubkey())
+    }
+
     /// Pub-crate variant of [`Self::run_speak_pipeline`] reachable
     /// from `crate::ffi::pyo3`. The Python `send_inline_text` /
     /// `send_durable_inline_text` wrappers need to run the pipeline
