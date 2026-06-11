@@ -546,24 +546,18 @@ re-derives. Per §3.2.2, all three v2 kinds use
   (the Verify-raised catch from RC2 review). Persist + verify own the
   fixture generation; edge consumes the vectors via conformance tests.
 
-**v2.0.0 known limitation — `partner_record` is admit-only.**
+**v2.0.1 — `partner_record` is bidirectional (CLOSED LIMITATION).**
 
-`PartnerRecord`'s row shape (per CIRISPersist v5.1.0's
-`federation::operational::PartnerRecord`) does NOT carry the M-of-N
-steward signatures inline — they live in the
-`SignedPartnerRecord` write wrapper. Persist v5.1.0's
-`list_partner_records_since` returns rows only (no companion
-`list_signed_partner_records_since`). Edge's
-`Bridge::list_partner_records` therefore returns empty — the Initiator
-side does NOT advertise `partner_record` envelopes via anti-entropy
-enumeration. The Responder side admits peer-pushed
-`SignedPartnerRecord` bytes correctly (the sender ships the M-of-N
-signatures inline; verify v5.1.0's `verify_partner_record_quorum`
-admits on receipt). The fully bidirectional path lights up when persist
-ships `list_signed_partner_records_since` (a v5.2 follow-up filed
-upstream). Organization + OrgMembership are fully bidirectional at
-v2.0.0 because their row shapes carry the single-signer Ed25519 +
-ML-DSA-65 signatures inline.
+CIRISPersist v5.2.0 (CIRISPersist#194) shipped V072 + the
+`list_signed_partner_records_since` surface that returns the full
+`SignedPartnerRecord` wrapper — row + `steward_signatures` + threshold —
+straight from the new V072 storage. Edge v2.0.1 wires
+`Bridge::list_partner_records` to it. A peer-cached envelope re-emits as
+the same bytes the original sender hashed, so anti-entropy convergence
+for `partner_record` is complete in both directions.
+
+All 3 v2 operational kinds are now fully bidirectional. The v2 cycle is
+feature-complete.
 
 ### 5.3 v2 → v3 (and beyond)
 
