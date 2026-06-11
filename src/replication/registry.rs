@@ -392,13 +392,14 @@ mod tests {
     #[tokio::test]
     async fn route_unknown_version_is_protocol_error() {
         let registry = ReplicationRegistry::new();
-        // Forge a v2 frame.
+        // Forge a v3 frame (v1 and v2 are both recognized as of
+        // CIRISEdge v2.0.0; v3 is reserved for a future cut).
         let msg = ReplicationMessage::Summary(SummaryMessage {
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
-        let v2 = wire_frame::wrap_at_version(&msg, 0x02);
-        let r = registry.route_inbound_bytes("anyone", &v2).await;
+        let v3 = wire_frame::wrap_at_version(&msg, 0x03);
+        let r = registry.route_inbound_bytes("anyone", &v3).await;
         // UnknownVersion surfaces via the Protocol error.
         assert!(matches!(r, Err(RegistryError::Protocol(_))));
     }
