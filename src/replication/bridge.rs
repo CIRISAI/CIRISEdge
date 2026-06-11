@@ -683,10 +683,12 @@ impl FederationDirectoryReplicationBridge {
     //
     // v2 operational kinds enumerate via persist's
     // `list_organizations_since` / `list_org_memberships_since` /
-    // `list_partner_records_since` (cursor + limit; CIRISPersist v5.1.0
-    // shipped these explicitly "for CIRISEdge#65 v2 bridge"). Each row's
-    // wire `envelope_hash` is `sha256(JCS(Signed*Record))` per FSD §3.2.2
-    // — JCS-conformant, edge-defined, reproducible by any non-persist
+    // `list_signed_partner_records_since` (cursor + limit; CIRISPersist
+    // v5.1.0 shipped the first two and v5.2.0 / #194 shipped the third
+    // explicitly "for CIRISEdge#65 v2 bidirectional partner_record"
+    // — closes the v2.0.0 admit-only carve-out). Each row's wire
+    // `envelope_hash` is `sha256(JCS(Signed*Record))` per FSD §3.2.2 —
+    // JCS-conformant, edge-defined, reproducible by any non-persist
     // CEG implementer (the §3.2.1 deferred-interop fix).
     //
     // The page limit is operator-tunable via [`BridgeConfig::operational_page_limit`];
@@ -754,34 +756,42 @@ impl FederationDirectoryReplicationBridge {
     }
 
     async fn list_partner_records(&self) -> Vec<EnvelopeRef> {
-        // v2.0.0 — `partner_record` is **admit-only**, not emit.
+        // v2.0.1 — `partner_record` is now **bidirectional**.
         //
-        // `partner_record` is the one operational kind whose row shape
-        // (`PartnerRecord`) does NOT carry its M distinct steward
-        // signatures inline. The signatures live in the
-        // [`SignedPartnerRecord`] write wrapper (a `Vec<ThresholdSignature>`
-        // alongside the row + threshold). Persist v5.1.0's
-        // `list_partner_records_since` returns `PartnerRecord` rows
-        // only — no companion `list_signed_partner_records_since` exists
-        // yet. Returning empty here means edge does NOT emit
-        // `partner_record` envelopes via anti-entropy enumeration.
-        //
-        // What still works in v2.0.0: `apply_partner_record` admits
-        // peer-pushed [`SignedPartnerRecord`] envelopes (the sender's
-        // wire bytes carry the steward signature set, persist verifies
-        // M-of-N via verify v5.1.0's `verify_partner_record_quorum`).
-        // What's blocked until persist v5.2: peer-initiated *Summary*
-        // round-trips for this kind. The Initiator side advertises an
-        // empty ref set; the Responder doesn't know we have rows.
-        //
-        // Tracking: a CIRISPersist follow-up issue
-        // (`list_signed_partner_records_since`) will return the signed
-        // wrapper directly; once it lands, this method enumerates with
-        // a real ref set + JCS hash basis matching admission identity.
-        // Organization + OrgMembership are fully functional in v2.0.0
-        // because their row shape carries the single signer's
-        // Ed25519/ML-DSA-65 signatures inline.
-        Vec::new()
+        // CIRISPersist v5.2.0 (CIRISPersist#194) shipped the
+        // `list_signed_partner_records_since` surface that returns the
+        // full `SignedPartnerRecord` wrapper — row + steward_signatures
+        // + threshold — straight from persist's V072 storage. That
+        // closes the admit-only carve-out v2.0.0 documented: edge can
+        // now enumerate locally-held partner_records with a JCS hash
+        // that reproduces on every peer, completing the anti-entropy
+        // convergence loop for this kind.
+        let mut refs = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let limit = self.config.operational_page_limit;
+        if let Ok(signed_rows) = self
+            .directory
+            .list_signed_partner_records_since(None, limit)
+            .await
+        {
+            for signed in signed_rows {
+                let Some(hash) = v2_envelope_hash(&signed) else {
+                    continue;
+                };
+                if !seen.insert(hash) {
+                    continue;
+                }
+                let asserted_at = signed.partner_record.asserted_at;
+                let bytes = serde_json::to_vec(&signed).unwrap_or_default();
+                self.cache_insert(EnvelopeKind::PartnerRecord, hash, bytes)
+                    .await;
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq: Self::ms_seq(asserted_at),
+                });
+            }
+        }
+        refs
     }
 }
 
@@ -1399,19 +1409,24 @@ mod tests {
         assert!(!admitted);
     }
 
-    /// v2.0.0 known limitation: `list_partner_records` returns empty
-    /// pending CIRISPersist v5.2's `list_signed_partner_records_since`
-    /// (PartnerRecord's row shape doesn't carry the M-of-N steward
-    /// signatures inline, so naive reconstruction would break
-    /// convergence). Fence the docs-vs-code contract so the empty Vec
-    /// is intentional, not a regression.
+    /// v2.0.1 — bidirectional `partner_record` replication lights up.
+    /// Persist v5.2.0's `list_signed_partner_records_since` returns the
+    /// full `SignedPartnerRecord` wrapper with `steward_signatures`
+    /// inline (CIRISPersist#194 / V072), so a peer-cached envelope
+    /// re-emits as the same bytes the original sender hashed. Tests
+    /// against an empty backend (no rows) confirms the no-rows path
+    /// returns an empty ref set without panic. The deeper convergence
+    /// (sender's hash = receiver's hash from peer's
+    /// `list_signed_partner_records_since` output) is fenced by the
+    /// JCS-determinism + key-order-invariance tests above + persist's
+    /// own V072 cohabitation convergence_roundtrip test.
     #[tokio::test]
-    async fn v2_list_partner_records_returns_empty_for_v2_0() {
+    async fn v2_list_partner_records_handles_empty_backend() {
         let (_backend, bridge) = make_bridge(&[]);
         let refs = bridge.list_envelope_refs(EnvelopeKind::PartnerRecord).await;
         assert!(
             refs.is_empty(),
-            "v2.0.0 ships PartnerRecord admit-only; emit blocked on persist v5.2"
+            "empty backend yields empty ref set (no panics, no errors)"
         );
     }
 }
