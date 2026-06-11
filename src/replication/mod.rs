@@ -128,7 +128,10 @@ pub mod summary;
 pub mod wire_frame;
 
 #[doc(inline)]
-pub use bridge::{BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge};
+pub use bridge::{
+    BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge, KeyDirectoryProvider,
+    OperationalProviders, RootStewardsProvider, StewardRosterProvider,
+};
 #[doc(inline)]
 pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
 #[doc(inline)]
@@ -151,5 +154,6 @@ pub use summary::{LocalState, StalenessSignal, StateApplier, StateProvider};
 #[doc(inline)]
 pub use wire_frame::{
     try_unwrap as try_unwrap_replication_frame, wrap as wrap_replication_frame,
-    REPLICATION_FRAME_MAGIC,
+    wrap_for_kind as wrap_replication_frame_for_kind, REPLICATION_FRAME_MAGIC,
+    WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION_V2,
 };

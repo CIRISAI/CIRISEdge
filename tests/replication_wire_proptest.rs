@@ -35,7 +35,7 @@
 
 use ciris_edge::replication::protocol::ProtocolError;
 use ciris_edge::replication::wire_frame::{
-    try_unwrap, wrap, wrap_at_version, WIRE_PROTOCOL_VERSION,
+    try_unwrap, wrap, wrap_at_version, WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION_V2,
 };
 use ciris_edge::replication::{
     DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
@@ -138,14 +138,18 @@ proptest! {
         prop_assert!(r.is_none());
     }
 
-    /// Property 3: any version byte other than `WIRE_PROTOCOL_VERSION`
-    /// surfaces as `UnknownVersion(v)`, regardless of body content.
-    /// Anchors the v1→v2 transition story: a v1 receiver seeing a v2
-    /// frame fails cleanly with a typed error the scheduler can act
-    /// on (drop the peer, downgrade, etc.).
+    /// Property 3: any version byte other than the recognized set
+    /// (`WIRE_PROTOCOL_VERSION` = 0x01, `WIRE_PROTOCOL_VERSION_V2` =
+    /// 0x02 as of CIRISEdge v2.0.0 per CEG 1.0-RC2 §5.6.8.13) surfaces
+    /// as `UnknownVersion(v)`, regardless of body content. Anchors the
+    /// v2→v3+ transition story: a v2 receiver seeing a v3 frame fails
+    /// cleanly with a typed error the scheduler can act on (drop the
+    /// peer, downgrade, etc.).
     #[test]
     fn unknown_version_byte_always_surfaces_typed_error(
-        version in any::<u8>().prop_filter("non-v1 version", |v| *v != WIRE_PROTOCOL_VERSION),
+        version in any::<u8>().prop_filter("unrecognized version", |v| {
+            *v != WIRE_PROTOCOL_VERSION && *v != WIRE_PROTOCOL_VERSION_V2
+        }),
         body in prop::collection::vec(any::<u8>(), 0..256),
     ) {
         let mut frame = REPLICATION_FRAME_MAGIC.to_vec();

@@ -58,22 +58,40 @@
 //! requires touching every existing send site to opt in; this approach
 //! only touches the sites that need the new wire kind.
 //!
-//! ## Version-byte rollover (v1 → v2 path)
+//! ## Version-byte rollover (v1 → v2 path — ACTIVE per v2.0.0)
 //!
-//! Per FSD §5, v2 will introduce operational-data CEG envelopes
-//! (orgs / users / licenses / partners) for Spock removal (CIRISRegistry
-//! #58 Phase 2). A node speaking v2 will:
+//! v2 introduces 3 operational-data CEG envelopes per CEG 1.0-RC2
+//! §5.6.8.13 (CIRISRegistry#70): `organization` / `org_membership` /
+//! `partner_record` (User PII never federates; License+Partner collapse
+//! into PartnerRecord per FSD §5.2). A v2 node:
 //!
-//! - SEND `VER = 0x02` frames carrying the v2 codec (which may add
-//!   message variants, new `EnvelopeKind`s, or change message
-//!   field encodings)
-//! - RECEIVE both `VER = 0x01` (legacy) and `VER = 0x02` frames; the
-//!   `try_unwrap` dispatch routes by version
+//! - SENDS `VER = 0x02` frames carrying messages whose `kind` is one
+//!   of the 3 operational variants. The v1 message shapes
+//!   (Summary/Diff/Fetch/Deliver) are unchanged — v2 reuses them.
+//! - SENDS `VER = 0x01` frames for the 10 v1 kinds (Key through
+//!   LocationProof) — preserves v1 peer interop without a flag-day.
+//!   The version selection is per-message, keyed off the message's
+//!   `EnvelopeKind`. See [`wrap_for_kind`].
+//! - RECEIVES both `VER = 0x01` and `VER = 0x02` frames; [`try_unwrap`]
+//!   dispatches both. Body decode is identical for both versions —
+//!   the version byte's purpose is the kind-tag namespace it permits.
 //!
 //! v1 nodes that see `VER = 0x02` return `ProtocolError::UnknownVersion(0x02)`
-//! and the round fails — the sender's scheduler observes the failure
-//! and either drops the peer or downgrades. There's no silent
-//! misinterpretation.
+//! and drop the frame. v1 nodes that receive a `VER = 0x01` frame
+//! carrying an unknown kind tag (one of the 3 v2 variants) return
+//! `ProtocolError::Decode` at serde — this can't happen if the sender
+//! routes via [`wrap_for_kind`] (it never emits v2 kinds at v1
+//! framing), but the receiver's defense-in-depth catches a
+//! misconfigured peer.
+//!
+//! ## v2 envelope_hash basis is JCS — at the bridge layer, not here
+//!
+//! Per FSD §3.2.2, v2's `envelope_hash` is `sha256(JCS(Signed*Record))`
+//! for the 3 operational kinds — closes the §3.2.1 deferred-interop
+//! path. This module is wire-layer plumbing; the JCS computation lives
+//! in the bridge (`bridge::v2_envelope_hash`). The v1 trust kinds
+//! continue to use `persist_row_hash` per FSD §3.1 (v1 wire stays
+//! unchanged, peer-by-peer compatible).
 
 use super::protocol::{ProtocolError, ReplicationMessage};
 
@@ -83,11 +101,29 @@ use super::protocol::{ProtocolError, ReplicationMessage};
 /// unambiguously a replication frame.
 pub const REPLICATION_FRAME_MAGIC: [u8; 4] = *b"CRPL";
 
-/// Replication wire-protocol version. Locked to `0x01` for v1 per
-/// `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.5. Bumps to `0x02` for
-/// the CIRIS 2.0 cut (operational-data envelopes per
-/// CIRISRegistry#58 Phase 2).
+/// Replication wire-protocol version for v1 — the 10 trust-data kinds
+/// (Key / Attestation / Revocation / IdentityOccurrence / Family /
+/// Community / IdentityOccurrenceRevocation / FamilyMembershipRevocation /
+/// CommunityMembershipRevocation / LocationProof). Locked per
+/// `FSD/REPLICATION_WIRE_FORMAT_V1.md` §3.5; remains wire-stable
+/// indefinitely so v1 peers stay interoperable across the v1→v2
+/// transition (FSD §3.7).
 pub const WIRE_PROTOCOL_VERSION: u8 = 0x01;
+
+/// Replication wire-protocol version for v2 — adds the 3 operational-
+/// data kinds (Organization / OrgMembership / PartnerRecord) per CEG
+/// 1.0-RC2 §5.6.8.13 (CIRISRegistry#70). v2 reuses the v1 message
+/// shapes (Summary / Diff / Fetch / Deliver) but extends the
+/// [`super::EnvelopeKind`] tag namespace; the version byte's role is
+/// to gate which tags the receiver expects.
+///
+/// FSD §3.2.2 also flips the `envelope_hash` basis for v2-emitted
+/// envelopes from `persist_row_hash` to `sha256(JCS(Signed*Record))`
+/// — the JCS computation lives in
+/// [`crate::replication::bridge`] (the v2 hash basis is a bridge
+/// concern, not a wire-frame concern; this module just routes the
+/// version byte).
+pub const WIRE_PROTOCOL_VERSION_V2: u8 = 0x02;
 
 /// Length of the wire-frame preamble (`MAG` + `VER`). The body
 /// follows starting at offset `PREAMBLE_LEN`.
@@ -97,11 +133,31 @@ pub const PREAMBLE_LEN: usize = REPLICATION_FRAME_MAGIC.len() + 1;
 /// [`crate::transport::Transport::send`]. Allocates one `Vec` of
 /// exactly `PREAMBLE_LEN + msg.to_bytes().len()` bytes.
 ///
-/// The frame uses the current [`WIRE_PROTOCOL_VERSION`] byte. To wrap
-/// at a specific version (e.g. for cross-version interop testing),
-/// use [`wrap_at_version`].
+/// **Defaults to v1 framing.** For v2.0.0+ correct outbound version
+/// selection (per the FSD §3.7 peer-by-peer transition), use
+/// [`wrap_for_kind`] — it picks the wire version automatically based
+/// on the message's [`super::EnvelopeKind`]. Direct use of `wrap` is
+/// safe for code that knows it's exchanging v1-only kinds.
 pub fn wrap(msg: &ReplicationMessage) -> Vec<u8> {
     wrap_at_version(msg, WIRE_PROTOCOL_VERSION)
+}
+
+/// Wrap a [`ReplicationMessage`] at the wire version appropriate for
+/// its [`super::EnvelopeKind`].
+///
+/// The 10 v1 kinds emit at `0x01`; the 3 v2 operational kinds
+/// (Organization / OrgMembership / PartnerRecord) emit at `0x02`. The
+/// version selection is per-message — a sender freely mixes v1 frames
+/// and v2 frames within the same peer connection, and the receiver's
+/// [`try_unwrap`] dispatch handles both. This is the FSD §3.7 peer-by-
+/// peer transition mechanism: v1-only peers reject v2-framed messages
+/// at the UnknownVersion error, but continue to handle v1 frames
+/// from the same v2-capable sender.
+///
+/// All `ReplicationMessage` variants carry their `kind` in their inner
+/// payload; this helper extracts it via [`ReplicationMessage::kind`].
+pub fn wrap_for_kind(msg: &ReplicationMessage) -> Vec<u8> {
+    wrap_at_version(msg, msg.kind().min_wire_version())
 }
 
 /// Wrap a message at a specific protocol version. Production code
@@ -153,7 +209,13 @@ pub fn try_unwrap(bytes: &[u8]) -> Result<Option<ReplicationMessage>, ProtocolEr
         ));
     }
     let version = bytes[REPLICATION_FRAME_MAGIC.len()];
-    if version != WIRE_PROTOCOL_VERSION {
+    // v2.0.0 (CEG 1.0-RC2 §5.6.8.13 / FSD §5.2) — accept both v1 and v2
+    // framing. The message body decode is version-agnostic; the version
+    // byte gates which kind-tag namespace the receiver expects. A
+    // mismatched body (e.g. a v2 kind tag in a v1 frame, which a
+    // well-behaved sender never emits but a misconfigured peer might)
+    // surfaces as `ProtocolError::Decode` at the serde layer below.
+    if version != WIRE_PROTOCOL_VERSION && version != WIRE_PROTOCOL_VERSION_V2 {
         return Err(ProtocolError::UnknownVersion(version));
     }
     let body = &bytes[PREAMBLE_LEN..];
@@ -229,17 +291,19 @@ mod tests {
     }
 
     /// Bytes with the magic but an unknown version byte yield
-    /// `Err(ProtocolError::UnknownVersion(v))`. Exercises the v1→v2
-    /// rollover path: a v1 receiver seeing a v2 frame surfaces the
+    /// `Err(ProtocolError::UnknownVersion(v))`. Exercises the v2→v3+
+    /// rollover path: a v2 receiver seeing a v3 frame surfaces the
     /// typed unknown-version error so the scheduler can decide
-    /// whether to drop the peer or downgrade.
+    /// whether to drop the peer or downgrade. v1 + v2 are both
+    /// recognized as of v2.0.0 (FSD §3.7 peer-by-peer transition).
     #[test]
     fn unknown_version_byte_is_typed_error() {
-        let mut v2_bytes = REPLICATION_FRAME_MAGIC.to_vec();
-        v2_bytes.push(0x02); // v2 — not yet supported
-        v2_bytes.extend_from_slice(br#"{"type":"summary","kind":"key","refs":[]}"#);
-        let r = try_unwrap(&v2_bytes);
-        assert!(matches!(r, Err(ProtocolError::UnknownVersion(0x02))));
+        // v3 — reserved for a future cut beyond CEG 1.0-RC2.
+        let mut v3_bytes = REPLICATION_FRAME_MAGIC.to_vec();
+        v3_bytes.push(0x03);
+        v3_bytes.extend_from_slice(br#"{"type":"summary","kind":"key","refs":[]}"#);
+        let r = try_unwrap(&v3_bytes);
+        assert!(matches!(r, Err(ProtocolError::UnknownVersion(0x03))));
 
         // Same for a future v0xFF — caps at u8 max.
         let mut vff_bytes = REPLICATION_FRAME_MAGIC.to_vec();
@@ -261,28 +325,35 @@ mod tests {
     }
 
     /// `wrap_at_version` lets test fixtures forge cross-version frames.
-    /// Round-trip via the current version works; forged v2 frames
-    /// surface UnknownVersion.
+    /// Round-trip via either recognized version works; forged v3+
+    /// frames surface UnknownVersion.
     #[test]
     fn wrap_at_version_forges_cross_version_frames() {
         let msg = ReplicationMessage::Summary(SummaryMessage {
             kind: EnvelopeKind::Key,
             refs: vec![],
         });
-        // Current version — round-trips.
+        // v1 — round-trips (v1 trust kind on v1 framing).
         let v1 = wrap_at_version(&msg, WIRE_PROTOCOL_VERSION);
         assert_eq!(try_unwrap(&v1).unwrap().unwrap(), msg);
-        // Forged v2 — surfaces UnknownVersion.
-        let v2 = wrap_at_version(&msg, 0x02);
+        // v2 — also round-trips (v2 receiver accepts v1 kinds at v2
+        // framing too; the version byte gates which tags are
+        // permitted, not which message shapes).
+        let v2 = wrap_at_version(&msg, WIRE_PROTOCOL_VERSION_V2);
+        assert_eq!(try_unwrap(&v2).unwrap().unwrap(), msg);
+        // Forged v3 — surfaces UnknownVersion.
+        let v3 = wrap_at_version(&msg, 0x03);
         assert!(matches!(
-            try_unwrap(&v2),
-            Err(ProtocolError::UnknownVersion(0x02))
+            try_unwrap(&v3),
+            Err(ProtocolError::UnknownVersion(0x03))
         ));
     }
 
     /// All four `ReplicationMessage` variants round-trip through
-    /// wrap/try_unwrap. Exercises all 9 `EnvelopeKind` variants too
-    /// — one per variant to catch any serde-tag regression.
+    /// wrap/try_unwrap. Exercises all 13 `EnvelopeKind` variants (10 v1
+    /// trust kinds + 3 v2 operational kinds) — one per variant to catch
+    /// any serde-tag regression. v2 kinds wrap via `wrap_for_kind`
+    /// (auto-selects 0x02 framing per their `min_wire_version`).
     #[test]
     fn all_variants_round_trip() {
         use crate::replication::protocol::{
@@ -333,9 +404,25 @@ mod tests {
                 kind: EnvelopeKind::LocationProof,
                 refs: vec![],
             }),
+            // v2 kinds — round-trip via wrap_for_kind (selects 0x02).
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Organization,
+                refs: vec![EnvelopeRef {
+                    envelope_hash: h,
+                    seq: 1,
+                }],
+            }),
+            ReplicationMessage::Diff(DiffMessage {
+                kind: EnvelopeKind::OrgMembership,
+                want: vec![h],
+            }),
+            ReplicationMessage::Deliver(DeliverMessage {
+                kind: EnvelopeKind::PartnerRecord,
+                envelopes: vec![b"signed_partner_bytes".to_vec()],
+            }),
         ];
         for msg in cases {
-            let framed = wrap(&msg);
+            let framed = wrap_for_kind(&msg);
             let unwrapped = try_unwrap(&framed).expect("decode").expect("magic");
             assert_eq!(unwrapped, msg);
         }
@@ -358,5 +445,68 @@ mod tests {
         let bytes = REPLICATION_FRAME_MAGIC.to_vec();
         let r = try_unwrap(&bytes);
         assert!(matches!(r, Err(ProtocolError::Decode(_))));
+    }
+
+    /// v2.0.0 / FSD §3.7 — `wrap_for_kind` selects the version byte
+    /// per the message's [`EnvelopeKind::min_wire_version`]: 0x01 for
+    /// the 10 v1 trust kinds, 0x02 for the 3 v2 operational kinds.
+    #[test]
+    fn wrap_for_kind_selects_version_per_kind() {
+        // v1 trust kind → 0x01 framing.
+        let msg_v1 = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![],
+        });
+        let framed = wrap_for_kind(&msg_v1);
+        assert_eq!(framed[REPLICATION_FRAME_MAGIC.len()], WIRE_PROTOCOL_VERSION);
+
+        // v2 operational kind → 0x02 framing.
+        let msg_v2 = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::Organization,
+            refs: vec![],
+        });
+        let framed = wrap_for_kind(&msg_v2);
+        assert_eq!(
+            framed[REPLICATION_FRAME_MAGIC.len()],
+            WIRE_PROTOCOL_VERSION_V2
+        );
+
+        // OrgMembership → 0x02.
+        let msg_v2 = ReplicationMessage::Diff(crate::replication::protocol::DiffMessage {
+            kind: EnvelopeKind::OrgMembership,
+            want: vec![],
+        });
+        let framed = wrap_for_kind(&msg_v2);
+        assert_eq!(
+            framed[REPLICATION_FRAME_MAGIC.len()],
+            WIRE_PROTOCOL_VERSION_V2
+        );
+
+        // PartnerRecord → 0x02.
+        let msg_v2 = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::PartnerRecord,
+            refs: vec![],
+        });
+        let framed = wrap_for_kind(&msg_v2);
+        assert_eq!(
+            framed[REPLICATION_FRAME_MAGIC.len()],
+            WIRE_PROTOCOL_VERSION_V2
+        );
+    }
+
+    /// v2.0.0 acceptance: v2 framing also round-trips the v1 trust
+    /// kinds (the version byte gates which tags are *permitted*, not
+    /// which message *shapes*). This guarantees a v2-capable sender
+    /// can address a v2-capable peer with v1-kind messages under v2
+    /// framing without spec drift.
+    #[test]
+    fn v2_framing_accepts_v1_kinds() {
+        let msg = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![],
+        });
+        let v2 = wrap_at_version(&msg, WIRE_PROTOCOL_VERSION_V2);
+        let unwrapped = try_unwrap(&v2).expect("decode").expect("magic");
+        assert_eq!(unwrapped, msg);
     }
 }

@@ -121,6 +121,59 @@ pub enum EnvelopeKind {
     /// can't over-share precise location even if client UI gating fails.
     /// `put_location_proof(SignedLocationProof)`.
     LocationProof,
+    /// v2 wire (CEG 1.0-RC2 §5.6.8.13 / FSD §5.2) — operational-data
+    /// envelope: an `organization` row (public org identity, LWW +
+    /// withdrawal-forward-only). PII (`tax_id`, contacts, `metadata`)
+    /// stays region-local; never federates. CIRISPersist v5.1.0 ships
+    /// `put_organization(SignedOrganization, key_directory, root_stewards)`.
+    /// REQUIRES `WIRE_PROTOCOL_VERSION = 0x02`.
+    Organization,
+    /// v2 wire (CEG 1.0-RC2 §5.6.8.13 / FSD §5.2) — operational-data
+    /// envelope: an `org_membership` row (the authz binding —
+    /// `user_id`/`org_id`/`role`/`status`; LWW + withdrawal-forward-only).
+    /// User PII NEVER federates: only the role binding crosses. CIRISPersist
+    /// v5.1.0 ships `put_org_membership(SignedOrgMembership, key_directory,
+    /// root_stewards)`. REQUIRES `WIRE_PROTOCOL_VERSION = 0x02`.
+    OrgMembership,
+    /// v2 wire (CEG 1.0-RC2 §5.6.8.13 / FSD §5.2) — operational-data
+    /// envelope: a `partner_record` row (combines old License+Partner;
+    /// M-of-N steward quorum + monotonic-fail-secure merge — `revoked` >
+    /// `suspended` > `active`). CIRISPersist v5.1.0 ships
+    /// `put_partner_record(SignedPartnerRecord, steward_roster)`.
+    /// REQUIRES `WIRE_PROTOCOL_VERSION = 0x02`.
+    PartnerRecord,
+}
+
+impl EnvelopeKind {
+    /// The minimum [`crate::replication::wire_frame::WIRE_PROTOCOL_VERSION`]
+    /// at which this kind can be exchanged on the wire.
+    ///
+    /// The 10 v1 kinds (Key through LocationProof) ride at `0x01`. The
+    /// 3 v2 operational kinds (Organization / OrgMembership /
+    /// PartnerRecord — CEG 1.0-RC2 §5.6.8.13) require `0x02` framing
+    /// because v1-only peers don't recognize the new tags and would
+    /// reject the body at serde-decode time. Used by
+    /// [`crate::replication::wire_frame::wrap_for_kind`] to pick the
+    /// outbound version automatically per the FSD §3.7 peer-by-peer
+    /// transition path.
+    #[must_use]
+    pub fn min_wire_version(self) -> u8 {
+        match self {
+            Self::Key
+            | Self::Attestation
+            | Self::Revocation
+            | Self::IdentityOccurrence
+            | Self::Family
+            | Self::Community
+            | Self::IdentityOccurrenceRevocation
+            | Self::FamilyMembershipRevocation
+            | Self::CommunityMembershipRevocation
+            | Self::LocationProof => crate::replication::wire_frame::WIRE_PROTOCOL_VERSION,
+            Self::Organization | Self::OrgMembership | Self::PartnerRecord => {
+                crate::replication::wire_frame::WIRE_PROTOCOL_VERSION_V2
+            }
+        }
+    }
 }
 
 /// A reference to a single envelope in a peer's local state. The
@@ -193,6 +246,22 @@ pub enum ReplicationMessage {
 }
 
 impl ReplicationMessage {
+    /// The `EnvelopeKind` this message is about. All four message
+    /// variants (Summary / Diff / Fetch / Deliver) carry an inner
+    /// `kind` field — used by
+    /// [`crate::replication::wire_frame::wrap_for_kind`] to pick the
+    /// outbound wire-protocol version (v1 for the 10 trust kinds, v2
+    /// for the 3 v2 operational kinds per FSD §3.7 / §5.2).
+    #[must_use]
+    pub fn kind(&self) -> EnvelopeKind {
+        match self {
+            Self::Summary(m) => m.kind,
+            Self::Diff(m) => m.kind,
+            Self::Fetch(m) => m.kind,
+            Self::Deliver(m) => m.kind,
+        }
+    }
+
     /// Serialize to JSON bytes for transport. Returns the bytes ready
     /// to hand to `Transport::send`.
     pub fn to_bytes(&self) -> Vec<u8> {

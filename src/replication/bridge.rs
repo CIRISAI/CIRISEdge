@@ -77,12 +77,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use ciris_persist::federation::operational::{
+    SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
+};
 use ciris_persist::federation::types::{
     SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
     SignedKeyRecord, SignedLocationProof, SignedRevocation,
 };
 use ciris_persist::federation::FederationDirectory;
+use ciris_verify_core::threshold::ThresholdMember;
 
 use super::directory::ReplicationDirectory;
 use super::protocol::{EnvelopeKind, EnvelopeRef};
@@ -101,16 +105,27 @@ pub struct BridgeConfig {
     /// covers federations up to ~thousands of envelopes per kind.
     /// FIFO eviction.
     pub cache_capacity: usize,
+    /// Page size for the v2 operational kinds' bulk-list sweep
+    /// (`list_organizations_since` / `list_org_memberships_since` /
+    /// `list_partner_records_since`). v2.0.0 ships unlimited single-page
+    /// (`u32::MAX`) by default — federations of operational records are
+    /// O(orgs × partners), far below the wire MTU concern that motivated
+    /// pagination. Operators with very large operational rosters tune
+    /// this downward and accept multiple round trips per round.
+    pub operational_page_limit: u32,
 }
 
 impl BridgeConfig {
     pub const DEFAULT_CACHE_CAPACITY: usize = 4096;
+    /// Default for [`Self::operational_page_limit`].
+    pub const DEFAULT_OPERATIONAL_PAGE_LIMIT: u32 = u32::MAX;
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
             cache_capacity: Self::DEFAULT_CACHE_CAPACITY,
+            operational_page_limit: Self::DEFAULT_OPERATIONAL_PAGE_LIMIT,
         }
     }
 }
@@ -121,6 +136,51 @@ impl Default for BridgeConfig {
 /// so the bridge observes peer-set evolution without restart.
 pub type CohortProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
+/// Type alias for the v2 key-directory provider — an operator-configured
+/// callback yielding the current federation key_directory
+/// (`Vec<ThresholdMember>`). Re-invoked on each operational admit so
+/// admission sees the live directory. Used by persist's
+/// `put_organization` / `put_org_membership` admit surfaces for the
+/// single-signer role-chain authority check (Verify v5.1.0's
+/// `resolve_role_authority`). When `None`, the bridge refuses to admit
+/// operational-kind envelopes (returns `false` from `apply_*`) —
+/// fail-closed.
+pub type KeyDirectoryProvider = Arc<dyn Fn() -> Vec<ThresholdMember> + Send + Sync>;
+
+/// Type alias for the v2 root-stewards provider — an operator-configured
+/// callback yielding the federation's bootstrap steward `member_id`s.
+/// Used by persist's `put_organization` / `put_org_membership` admit
+/// surfaces to anchor the role-chain at trust root (the founder set
+/// per CEG §9.1). When `None`, the bridge refuses to admit operational-
+/// kind envelopes — fail-closed.
+pub type RootStewardsProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Type alias for the v2 steward-roster provider — an operator-configured
+/// callback yielding the current federation steward roster
+/// (`Vec<ThresholdMember>`). Used by persist's `put_partner_record`
+/// admit surface for the M-of-N steward quorum verification. When
+/// `None`, the bridge refuses to admit `partner_record` envelopes —
+/// fail-closed.
+pub type StewardRosterProvider = Arc<dyn Fn() -> Vec<ThresholdMember> + Send + Sync>;
+
+/// v2 (CEG 1.0-RC2 §5.6.8.13 / FSD §5.2) — operational-data admission
+/// providers bundle. Operators set this at bridge construction time to
+/// enable v2 operational-kind admission; leaving it `None` keeps the
+/// bridge v1-only (operational `apply_*` returns `false`, gracefully
+/// declining to admit).
+#[derive(Clone)]
+pub struct OperationalProviders {
+    /// The federation key_directory — `Vec<ThresholdMember>`. See
+    /// [`KeyDirectoryProvider`].
+    pub key_directory: KeyDirectoryProvider,
+    /// The federation bootstrap stewards' `member_id`s. See
+    /// [`RootStewardsProvider`].
+    pub root_stewards: RootStewardsProvider,
+    /// The federation steward roster — `Vec<ThresholdMember>`. See
+    /// [`StewardRosterProvider`].
+    pub steward_roster: StewardRosterProvider,
+}
+
 // ─── The bridge ──────────────────────────────────────────────────────
 
 /// Production-grade [`ReplicationDirectory`] implementation over
@@ -129,15 +189,23 @@ pub struct FederationDirectoryReplicationBridge {
     directory: Arc<dyn FederationDirectory>,
     cohort: CohortProvider,
     cache: Mutex<BridgeCache>,
+    config: BridgeConfig,
+    /// v2 operational-data admission providers. `None` = v2 admission
+    /// fail-closed; operational kinds' `apply_*` returns `false` without
+    /// touching persist. Set via [`Self::with_operational`] or
+    /// [`Self::with_config_and_operational`].
+    operational: Option<OperationalProviders>,
 }
 
 impl FederationDirectoryReplicationBridge {
-    /// Construct with default [`BridgeConfig`].
+    /// Construct with default [`BridgeConfig`], **v1-only** (no v2
+    /// operational-kind admission). For v2 operational admission, use
+    /// [`Self::with_operational`].
     pub fn new(directory: Arc<dyn FederationDirectory>, cohort: CohortProvider) -> Self {
         Self::with_config(directory, cohort, BridgeConfig::default())
     }
 
-    /// Construct with explicit configuration.
+    /// Construct with explicit configuration, **v1-only**.
     pub fn with_config(
         directory: Arc<dyn FederationDirectory>,
         cohort: CohortProvider,
@@ -148,6 +216,40 @@ impl FederationDirectoryReplicationBridge {
             directory,
             cohort,
             cache,
+            config,
+            operational: None,
+        }
+    }
+
+    /// Construct with default [`BridgeConfig`] **+ v2 operational
+    /// admission enabled**. The operational providers (key_directory /
+    /// root_stewards / steward_roster) are required for the bridge to
+    /// admit `organization` / `org_membership` / `partner_record`
+    /// envelopes; without them, the operational-kind `apply_*` returns
+    /// `false` (fail-closed; v1 kinds remain unaffected).
+    pub fn with_operational(
+        directory: Arc<dyn FederationDirectory>,
+        cohort: CohortProvider,
+        operational: OperationalProviders,
+    ) -> Self {
+        Self::with_config_and_operational(directory, cohort, BridgeConfig::default(), operational)
+    }
+
+    /// Construct with explicit configuration **+ v2 operational
+    /// admission enabled**.
+    pub fn with_config_and_operational(
+        directory: Arc<dyn FederationDirectory>,
+        cohort: CohortProvider,
+        config: BridgeConfig,
+        operational: OperationalProviders,
+    ) -> Self {
+        let cache = Mutex::new(BridgeCache::with_capacity(config.cache_capacity));
+        Self {
+            directory,
+            cohort,
+            cache,
+            config,
+            operational: Some(operational),
         }
     }
 
@@ -224,6 +326,9 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             EnvelopeKind::IdentityOccurrence => self.list_identity_occurrences().await,
             EnvelopeKind::Family => self.list_families().await,
             EnvelopeKind::Community => self.list_communities().await,
+            EnvelopeKind::Organization => self.list_organizations().await,
+            EnvelopeKind::OrgMembership => self.list_org_memberships().await,
+            EnvelopeKind::PartnerRecord => self.list_partner_records().await,
             EnvelopeKind::IdentityOccurrenceRevocation => {
                 self.list_identity_occurrence_revocations().await
             }
@@ -255,6 +360,9 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             }
             EnvelopeKind::Family => self.apply_family(envelope_bytes).await,
             EnvelopeKind::Community => self.apply_community(envelope_bytes).await,
+            EnvelopeKind::Organization => self.apply_organization(envelope_bytes).await,
+            EnvelopeKind::OrgMembership => self.apply_org_membership(envelope_bytes).await,
+            EnvelopeKind::PartnerRecord => self.apply_partner_record(envelope_bytes).await,
             EnvelopeKind::IdentityOccurrenceRevocation => {
                 self.apply_identity_occurrence_revocation(envelope_bytes)
                     .await
@@ -570,6 +678,111 @@ impl FederationDirectoryReplicationBridge {
         }
         refs
     }
+
+    // ── v2 operational-data list_* ─────────────────────────────────
+    //
+    // v2 operational kinds enumerate via persist's
+    // `list_organizations_since` / `list_org_memberships_since` /
+    // `list_partner_records_since` (cursor + limit; CIRISPersist v5.1.0
+    // shipped these explicitly "for CIRISEdge#65 v2 bridge"). Each row's
+    // wire `envelope_hash` is `sha256(JCS(Signed*Record))` per FSD §3.2.2
+    // — JCS-conformant, edge-defined, reproducible by any non-persist
+    // CEG implementer (the §3.2.1 deferred-interop fix).
+    //
+    // The page limit is operator-tunable via [`BridgeConfig::operational_page_limit`];
+    // default `u32::MAX` covers federations whose operational rosters
+    // (orgs × memberships × licenses) fit in a single page.
+    //
+    // Skipping with `continue` on a row whose JCS hash can't be computed
+    // is safe: the row exists in persist but won't be advertised on the
+    // wire this round; the next round retries. Logging that skip is a
+    // v2.0.x follow-up (matches the v1 trust-kinds' silent-skip on
+    // decode_hash failure).
+
+    async fn list_organizations(&self) -> Vec<EnvelopeRef> {
+        let mut refs = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let limit = self.config.operational_page_limit;
+        if let Ok(rows) = self.directory.list_organizations_since(None, limit).await {
+            for row in rows {
+                let signed = SignedOrganization {
+                    organization: row.clone(),
+                };
+                let Some(hash) = v2_envelope_hash(&signed) else {
+                    continue;
+                };
+                if !seen.insert(hash) {
+                    continue;
+                }
+                let bytes = serde_json::to_vec(&signed).unwrap_or_default();
+                self.cache_insert(EnvelopeKind::Organization, hash, bytes)
+                    .await;
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq: Self::ms_seq(row.asserted_at),
+                });
+            }
+        }
+        refs
+    }
+
+    async fn list_org_memberships(&self) -> Vec<EnvelopeRef> {
+        let mut refs = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let limit = self.config.operational_page_limit;
+        if let Ok(rows) = self.directory.list_org_memberships_since(None, limit).await {
+            for row in rows {
+                let signed = SignedOrgMembership {
+                    org_membership: row.clone(),
+                };
+                let Some(hash) = v2_envelope_hash(&signed) else {
+                    continue;
+                };
+                if !seen.insert(hash) {
+                    continue;
+                }
+                let bytes = serde_json::to_vec(&signed).unwrap_or_default();
+                self.cache_insert(EnvelopeKind::OrgMembership, hash, bytes)
+                    .await;
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq: Self::ms_seq(row.asserted_at),
+                });
+            }
+        }
+        refs
+    }
+
+    async fn list_partner_records(&self) -> Vec<EnvelopeRef> {
+        // v2.0.0 — `partner_record` is **admit-only**, not emit.
+        //
+        // `partner_record` is the one operational kind whose row shape
+        // (`PartnerRecord`) does NOT carry its M distinct steward
+        // signatures inline. The signatures live in the
+        // [`SignedPartnerRecord`] write wrapper (a `Vec<ThresholdSignature>`
+        // alongside the row + threshold). Persist v5.1.0's
+        // `list_partner_records_since` returns `PartnerRecord` rows
+        // only — no companion `list_signed_partner_records_since` exists
+        // yet. Returning empty here means edge does NOT emit
+        // `partner_record` envelopes via anti-entropy enumeration.
+        //
+        // What still works in v2.0.0: `apply_partner_record` admits
+        // peer-pushed [`SignedPartnerRecord`] envelopes (the sender's
+        // wire bytes carry the steward signature set, persist verifies
+        // M-of-N via verify v5.1.0's `verify_partner_record_quorum`).
+        // What's blocked until persist v5.2: peer-initiated *Summary*
+        // round-trips for this kind. The Initiator side advertises an
+        // empty ref set; the Responder doesn't know we have rows.
+        //
+        // Tracking: a CIRISPersist follow-up issue
+        // (`list_signed_partner_records_since`) will return the signed
+        // wrapper directly; once it lands, this method enumerates with
+        // a real ref set + JCS hash basis matching admission identity.
+        // Organization + OrgMembership are fully functional in v2.0.0
+        // because their row shape carries the single signer's
+        // Ed25519/ML-DSA-65 signatures inline.
+        Vec::new()
+    }
 }
 
 // ─── apply_envelope_bytes — per-kind dispatch ───────────────────────
@@ -656,6 +869,91 @@ impl FederationDirectoryReplicationBridge {
             Err(_) => false,
         }
     }
+
+    // ── v2 operational-data apply_* ────────────────────────────────
+    //
+    // The 3 v2 operational kinds (CEG 1.0-RC2 §5.6.8.13) gate on the
+    // [`OperationalProviders`] callbacks being set at bridge
+    // construction. Without them, admission fail-closes (returns
+    // `false`); persist is not touched. With them, the bridge resolves
+    // the live `key_directory` / `root_stewards` / `steward_roster` via
+    // the operator-supplied closures and passes them to persist's
+    // `put_*` admit surface. Persist + verify perform the 4-check
+    // admission pipeline (skew-bound, no-payment-processor identifiers,
+    // authority, set-semantics) — edge stays agnostic per the FSD §5.2
+    // commitment "merge policy stays persist-side per §10.1.6 declared
+    // intents."
+
+    async fn apply_organization(&self, bytes: &[u8]) -> bool {
+        let Some(ops) = self.operational.as_ref() else {
+            return false;
+        };
+        let Ok(signed) = serde_json::from_slice::<SignedOrganization>(bytes) else {
+            return false;
+        };
+        let key_directory = (ops.key_directory)();
+        let root_stewards = (ops.root_stewards)();
+        self.directory
+            .put_organization(signed, &key_directory, &root_stewards)
+            .await
+            .is_ok()
+    }
+
+    async fn apply_org_membership(&self, bytes: &[u8]) -> bool {
+        let Some(ops) = self.operational.as_ref() else {
+            return false;
+        };
+        let Ok(signed) = serde_json::from_slice::<SignedOrgMembership>(bytes) else {
+            return false;
+        };
+        let key_directory = (ops.key_directory)();
+        let root_stewards = (ops.root_stewards)();
+        self.directory
+            .put_org_membership(signed, &key_directory, &root_stewards)
+            .await
+            .is_ok()
+    }
+
+    async fn apply_partner_record(&self, bytes: &[u8]) -> bool {
+        let Some(ops) = self.operational.as_ref() else {
+            return false;
+        };
+        let Ok(signed) = serde_json::from_slice::<SignedPartnerRecord>(bytes) else {
+            return false;
+        };
+        let steward_roster = (ops.steward_roster)();
+        self.directory
+            .put_partner_record(signed, &steward_roster)
+            .await
+            .is_ok()
+    }
+}
+
+// ─── v2 envelope_hash basis — JCS (FSD §3.2.2) ──────────────────────
+//
+// v2 closes the §3.2.1 deferred-interop path: operational-kind
+// `envelope_hash` is `sha256(JCS(Signed*Record))`, edge-defined +
+// CEG-§0.9-conformant. This is the SAME computation any non-persist
+// CEG implementation can reproduce — no `persist_row_hash` dependency.
+//
+// The function lives at module scope rather than as a method so the
+// `list_organizations` / `list_org_memberships` / `list_partner_records`
+// sweeps can call it without borrowing `self`.
+
+/// Compute the v2 envelope_hash for a serde-`Serialize`-able value.
+/// Per FSD §3.2.2: `sha256(JCS(value))`. Edge calls
+/// [`ciris_verify_core::jcs::canonicalize`] for the JCS step — the
+/// canonical-bytes encoding is not edge's to define (FSD §3.2). Returns
+/// `None` if either step fails (serialization → JSON Value, JCS
+/// canonicalization); the caller skips the envelope rather than emit a
+/// non-reproducible hash.
+fn v2_envelope_hash<T: serde::Serialize>(value: &T) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let json_value = serde_json::to_value(value).ok()?;
+    let canonical = ciris_verify_core::jcs::canonicalize(&json_value).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    Some(hasher.finalize().into())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -969,5 +1267,151 @@ mod tests {
         assert!(cache.get(EnvelopeKind::Key, &h1).is_some());
         // The value is the FIRST inserted (no overwrite on dup).
         assert_eq!(cache.get(EnvelopeKind::Key, &h1).unwrap(), b"v1");
+    }
+
+    // ── v2 operational-data (FSD §5.2 / CEG 1.0-RC2 §5.6.8.13) ──────
+
+    /// JCS envelope_hash is deterministic: hashing the same serializable
+    /// value twice yields identical bytes. The federation invariant —
+    /// peer A and peer B both compute the same `envelope_hash` from the
+    /// same on-wire bytes — depends on this.
+    #[test]
+    fn v2_envelope_hash_is_deterministic() {
+        let value = serde_json::json!({
+            "organization": {
+                "attestation_id": "att-1",
+                "org_id": "org-acme",
+                "name": "ACME",
+                "status": "active",
+            }
+        });
+        let h1 = v2_envelope_hash(&value).expect("hash 1");
+        let h2 = v2_envelope_hash(&value).expect("hash 2");
+        assert_eq!(h1, h2);
+    }
+
+    /// JCS canonicalization sorts keys lexicographically — different
+    /// key ordering in the input value produces identical canonical
+    /// bytes and thus identical hashes. This is what makes M-of-N
+    /// steward quorum admission converge per RC2 §5.6.8.13 (the
+    /// Verify-raised "byte-identical JCS" catch).
+    #[test]
+    fn v2_envelope_hash_is_key_order_invariant() {
+        let a = serde_json::json!({
+            "alpha": 1,
+            "beta": 2,
+            "gamma": 3,
+        });
+        let b = serde_json::json!({
+            "gamma": 3,
+            "alpha": 1,
+            "beta": 2,
+        });
+        let ha = v2_envelope_hash(&a).expect("hash a");
+        let hb = v2_envelope_hash(&b).expect("hash b");
+        assert_eq!(
+            ha, hb,
+            "JCS sorts keys — same logical object MUST hash identically"
+        );
+    }
+
+    /// JCS canonicalization distinguishes different values — two
+    /// envelopes with different content MUST hash to different bytes.
+    /// Sanity check that v2_envelope_hash isn't degenerate.
+    #[test]
+    fn v2_envelope_hash_differentiates_distinct_values() {
+        let a = serde_json::json!({"org_id": "alice"});
+        let b = serde_json::json!({"org_id": "bob"});
+        let ha = v2_envelope_hash(&a).expect("hash a");
+        let hb = v2_envelope_hash(&b).expect("hash b");
+        assert_ne!(ha, hb);
+    }
+
+    /// Without `OperationalProviders` configured, `apply_organization`
+    /// fail-closes (returns `false`) — v2 admission requires the
+    /// operator to wire up `key_directory` + `root_stewards`. Verifies
+    /// the v1-bridge constructors don't accidentally admit v2 envelopes.
+    #[tokio::test]
+    async fn apply_organization_fail_closes_without_operational_providers() {
+        let (_backend, bridge) = make_bridge(&["k1".into()]);
+        // Bridge constructed via `new` (no operational providers).
+        // Even if the bytes happen to deserialize cleanly, admission
+        // must refuse.
+        let bytes = br#"{"organization": {
+            "attestation_id": "att-1",
+            "org_id": "org-acme",
+            "name": "ACME",
+            "org_type": "internal",
+            "status": "active",
+            "asserted_at": "2026-06-10T20:00:00Z",
+            "attesting_key_id": "k1",
+            "signed_envelope": {},
+            "ed25519_signature_base64": ""
+        }}"#;
+        let admitted = bridge
+            .apply_envelope_bytes(EnvelopeKind::Organization, bytes)
+            .await;
+        assert!(
+            !admitted,
+            "v2 operational admission MUST fail-close without OperationalProviders"
+        );
+    }
+
+    /// Same fail-closed invariant for `org_membership`.
+    #[tokio::test]
+    async fn apply_org_membership_fail_closes_without_operational_providers() {
+        let (_backend, bridge) = make_bridge(&["k1".into()]);
+        let bytes = br#"{"org_membership": {
+            "attestation_id": "att-1",
+            "user_id": "u1",
+            "org_id": "org-acme",
+            "role": "viewer",
+            "status": "active",
+            "asserted_at": "2026-06-10T20:00:00Z",
+            "attesting_key_id": "k1",
+            "signed_envelope": {},
+            "ed25519_signature_base64": ""
+        }}"#;
+        let admitted = bridge
+            .apply_envelope_bytes(EnvelopeKind::OrgMembership, bytes)
+            .await;
+        assert!(!admitted);
+    }
+
+    /// Same fail-closed invariant for `partner_record`.
+    #[tokio::test]
+    async fn apply_partner_record_fail_closes_without_operational_providers() {
+        let (_backend, bridge) = make_bridge(&["k1".into()]);
+        let bytes = br#"{
+            "partner_record": {
+                "attestation_id":"att-1","license_id":"lic-1","partner_id":"p-1","org_id":"org-1",
+                "license_type":"community","max_autonomy_tier":"A0","requires_supervisor":false,
+                "deployment_limit":1,"offline_grace_hours":24,"status":"active","revision":1,
+                "issued_at":"2026-06-10T20:00:00Z","expires_at":"2027-06-10T20:00:00Z",
+                "asserted_at":"2026-06-10T20:00:00Z","signed_envelope":{}
+            },
+            "steward_signatures": [],
+            "threshold": 0
+        }"#;
+        let admitted = bridge
+            .apply_envelope_bytes(EnvelopeKind::PartnerRecord, bytes)
+            .await;
+        assert!(!admitted);
+    }
+
+    /// v2.0.0 known limitation: `list_partner_records` returns empty
+    /// pending CIRISPersist v5.2's `list_signed_partner_records_since`
+    /// (PartnerRecord's row shape doesn't carry the M-of-N steward
+    /// signatures inline, so naive reconstruction would break
+    /// convergence). Fence the docs-vs-code contract so the empty Vec
+    /// is intentional, not a regression.
+    #[tokio::test]
+    async fn v2_list_partner_records_returns_empty_for_v2_0() {
+        let (_backend, bridge) = make_bridge(&[]);
+        let refs = bridge.list_envelope_refs(EnvelopeKind::PartnerRecord).await;
+        assert!(
+            refs.is_empty(),
+            "v2.0.0 ships PartnerRecord admit-only; emit blocked on persist v5.2"
+        );
     }
 }

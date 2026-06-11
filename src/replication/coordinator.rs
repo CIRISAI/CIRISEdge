@@ -281,7 +281,12 @@ impl ReplicationCoordinator {
     /// loop route inbound bytes to the replication path without
     /// parsing every byte as every possible payload kind.
     pub async fn send_message(&self, msg: &ReplicationMessage) -> Result<(), CoordinatorError> {
-        let bytes = super::wire_frame::wrap(msg);
+        // v2.0.0 (FSD §3.7) — pick the wire version automatically from
+        // the message's EnvelopeKind. v1 trust kinds emit at 0x01; v2
+        // operational kinds emit at 0x02. The receiver's try_unwrap
+        // accepts both, so v2-capable peers exchange both versions and
+        // v1-only peers reject 0x02 frames at UnknownVersion (FSD §3.5).
+        let bytes = super::wire_frame::wrap_for_kind(msg);
         self.transport
             .send(&self.peer_key_id, &bytes)
             .await

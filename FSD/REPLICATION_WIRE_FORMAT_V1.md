@@ -502,33 +502,68 @@ convention; the CEG cut names them explicitly so no implementation
 re-derives. Per §3.2.2, all three v2 kinds use
 `envelope_hash = sha256(JCS(Signed*Record))`.
 
-**Edge's v2 implementation scope:**
+**Edge's v2 implementation scope — SHIPPED at v2.0.0:**
 
-1. Add `Organization`, `OrgMembership`, `PartnerRecord` to
-   `EnvelopeKind` under a `WireVersion::V2` discriminant.
-2. Implement v2 `envelope_hash` per §3.2.2 (JCS-conformant).
-3. Extend `Session` version negotiation to advertise v2 + fall back
-   to v1 with v1-only peers (the §3.5 byte already supports this).
-4. Wire `Bridge::apply_envelope_bytes` to persist's three new
-   admit surfaces (`put_organization` / `put_org_membership` /
-   `put_partner_record`).
-5. **No new coordinator code** — merge policy stays persist-side
+1. ✅ Added `Organization`, `OrgMembership`, `PartnerRecord` to
+   `EnvelopeKind` (appended for `Ord`/`Hash` stability on
+   `LocalState`'s `BTreeMap<EnvelopeKind, …>` keys).
+2. ✅ Implemented v2 `envelope_hash` per §3.2.2 (JCS-conformant) —
+   `bridge::v2_envelope_hash` calls
+   `ciris_verify_core::jcs::canonicalize` then sha256.
+3. ✅ Wire-version negotiation extended — `WIRE_PROTOCOL_VERSION_V2 = 0x02`
+   in `wire_frame.rs`; `try_unwrap` accepts both `0x01` and `0x02`;
+   `wrap_for_kind` selects per-message version via
+   `EnvelopeKind::min_wire_version` (v2 kinds emit at `0x02`, v1 kinds
+   stay at `0x01`); `Coordinator::send_message` calls `wrap_for_kind`.
+4. ✅ `Bridge::apply_envelope_bytes` extended with `apply_organization` /
+   `apply_org_membership` / `apply_partner_record` — each dispatches
+   to persist v5.1.1's `put_organization` / `put_org_membership` /
+   `put_partner_record` with the operator-supplied `OperationalProviders`
+   (key_directory + root_stewards + steward_roster).
+5. ✅ No new coordinator code — merge policy stays persist-side
    (`lww_skew_bounded` + `withdrawal_forward_only` + `monotonic_quorum`
-   dispatched declaratively per §10.1.6, never inferred). The
-   M-of-N quorum aggregation, `revision: u64` anti-rollback, and
-   skew-bound LWW are all admit-time checks edge stays agnostic to.
+   per §10.1.6, dispatched declaratively, never inferred).
+6. ✅ `OperationalProviders` bundle in `BridgeConfig` — optional;
+   when unset (`v1-only` bridge construction via `new` / `with_config`),
+   all 3 operational `apply_*` fail-close to `false` without touching
+   persist. Operators opt into v2 admission via
+   `with_operational` / `with_config_and_operational`.
 
-**Substrate prerequisites for the v2 cycle:**
+**Substrate prerequisites — SATISFIED:**
 
-- **`ciris-persist` v5.x** carrying `put_organization` /
-  `put_org_membership` / `put_partner_record` admit surfaces,
-  V058-generalized `verify_coord` for `license_id`, skew-bound LWW
-  precedence, stable-id grouping.
-- **`ciris-verify` v6.x** carrying the `delegates_to` role-chain
-  resolver applied to operational subject_kinds + `verify_founder_quorum`
-  for `PartnerRecord` admission.
-- CIRISConformance#9 M-of-N identical-bytes vector set published
-  (the Verify-raised catch — locked in RC2).
+- ✅ **`ciris-persist` v5.1.1** ships `put_organization` /
+  `put_org_membership` / `put_partner_record` admit surfaces + the
+  two §10.1.6 merge dispatchers (`resolve_lww` for organization /
+  org_membership; `resolve_monotonic_quorum` for partner_record) +
+  V058-generalized `verify_coord` for `license_id` + skew-bound LWW
+  precedence + stable-id grouping.
+- ✅ **`ciris-verify` v5.1.0** ships `ciris_verify_core::operational_admit`
+  (the role-chain resolver applied to operational subject_kinds via
+  `resolve_role_authority` + `verify_founder_quorum` for partner_record
+  admission) + `ciris_verify_core::jcs::canonicalize` (the JCS basis
+  v2 envelope_hash invokes).
+- ⏳ **CIRISConformance#9** M-of-N identical-bytes vector set — pending
+  (the Verify-raised catch from RC2 review). Persist + verify own the
+  fixture generation; edge consumes the vectors via conformance tests.
+
+**v2.0.0 known limitation — `partner_record` is admit-only.**
+
+`PartnerRecord`'s row shape (per CIRISPersist v5.1.0's
+`federation::operational::PartnerRecord`) does NOT carry the M-of-N
+steward signatures inline — they live in the
+`SignedPartnerRecord` write wrapper. Persist v5.1.0's
+`list_partner_records_since` returns rows only (no companion
+`list_signed_partner_records_since`). Edge's
+`Bridge::list_partner_records` therefore returns empty — the Initiator
+side does NOT advertise `partner_record` envelopes via anti-entropy
+enumeration. The Responder side admits peer-pushed
+`SignedPartnerRecord` bytes correctly (the sender ships the M-of-N
+signatures inline; verify v5.1.0's `verify_partner_record_quorum`
+admits on receipt). The fully bidirectional path lights up when persist
+ships `list_signed_partner_records_since` (a v5.2 follow-up filed
+upstream). Organization + OrgMembership are fully bidirectional at
+v2.0.0 because their row shapes carry the single-signer Ed25519 +
+ML-DSA-65 signatures inline.
 
 ### 5.3 v2 → v3 (and beyond)
 
