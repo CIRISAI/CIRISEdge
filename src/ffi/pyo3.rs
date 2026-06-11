@@ -234,6 +234,28 @@ pub struct PyEdge {
     /// field that exposed a `tokio::Handle` to consumer-side
     /// dispatch (the cross-tokio aliasing trap).
     executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+    /// v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — the host persist
+    /// `Engine` PyObject the agent passed to [`init_edge_runtime`].
+    /// Re-exposed via the [`PyEdge::engine`] pymethod so cohabiting
+    /// cdylibs (CIRISLensCore relay + client modes, future
+    /// CIRISNodeCore extensions) can reach the **same** engine
+    /// instance the host wired into edge.
+    ///
+    /// Each cohabiting cdylib carries its own per-wheel
+    /// `ciris_persist::ffi::pyo3::current_rust_engine()` `OnceLock`
+    /// static, so a non-host cdylib calling it gets `None` or a
+    /// different instance — that's lens-core's #43 P0 bug. Re-exposing
+    /// the engine via PyEdge gives every cohabiting cdylib a stable
+    /// path to the host engine: extract capsules from it
+    /// (`federation_directory_capsule`, etc.) for Rust-side handle
+    /// handoff, or call its Python methods (`receive_and_persist`,
+    /// `local_sign`) which dispatch cross-wheel correctly via Python's
+    /// name-based method resolution.
+    ///
+    /// `None` only for the test-only `for_test` constructor (no engine
+    /// in pure-Rust test contexts). Production `init_edge_runtime`
+    /// always populates this with the caller-supplied engine.
+    engine: Option<Py<PyAny>>,
     /// v0.19.3 (CIRISEdge#49) — when `init_edge_runtime` was invoked
     /// with `https_dev_self_signed=True`, this holds the
     /// `Arc<tempfile::TempDir>` whose path carries the minted
@@ -287,6 +309,12 @@ impl PyEdge {
         Self {
             inner,
             executor,
+            // v2.1.0 — pure-Rust tests don't carry an Engine; the
+            // `engine()` pymethod raises a typed RuntimeError when
+            // called on a `for_test`-constructed PyEdge. Tests that
+            // need the engine field set use full `init_edge_runtime`
+            // with a synthesized Python engine instead.
+            engine: None,
             #[cfg(feature = "transport-http")]
             _dev_cert_tmpdir: None,
         }
@@ -301,6 +329,101 @@ impl PyEdge {
     #[staticmethod]
     fn crate_version() -> &'static str {
         VERSION
+    }
+
+    /// v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — return the host
+    /// persist `Engine` PyObject that was passed to
+    /// [`init_edge_runtime`].
+    ///
+    /// Cohabiting cdylibs (CIRISLensCore relay + client modes,
+    /// CIRISNodeCore extensions, etc.) call this to reach the same
+    /// engine the host wired into edge — closing the cross-wheel
+    /// `current_rust_engine()` `OnceLock` gap (each cdylib carries its
+    /// own per-wheel `OnceLock` static, so a non-host cdylib calling
+    /// it sees `None` or a different instance — that's the lens-core
+    /// #43 P0).
+    ///
+    /// The returned object is the byte-identical Python handle the
+    /// agent constructed and passed in. Cohabiting code can:
+    /// - Call its Python methods (`receive_and_persist`, `local_sign`,
+    ///   etc.) — dispatch is name-based + cross-wheel-safe; the
+    ///   `process_trace_batch` pattern lens-core relies on works
+    ///   without any per-wheel state.
+    /// - Extract its capsules (`federation_directory_capsule`,
+    ///   `outbound_queue_capsule`, `keyring_signer_capsule`,
+    ///   `executor_capsule`, etc.) for Rust-side handle handoff —
+    ///   same pattern edge itself uses inside `init_edge_runtime`.
+    ///
+    /// For Rust async contexts that need to call back into the
+    /// engine, store the returned `PyObject` and use
+    /// `Python::attach(|py| engine.bind(py).call_method1(...))` —
+    /// works across wheels because Python method dispatch is
+    /// name-based, not cdylib-bound.
+    ///
+    /// Raises `RuntimeError` if PyEdge was constructed via the
+    /// test-only `for_test` constructor (no engine in pure-Rust test
+    /// contexts).
+    fn engine(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.engine {
+            Some(engine) => Ok(engine.clone_ref(py)),
+            None => Err(PyRuntimeError::new_err(
+                "PyEdge::engine() — no engine bound on this handle (the \
+                 for_test() test-only constructor was used)",
+            )),
+        }
+    }
+
+    /// v2.1.0 (CIRISPersist `LocalIdentityAggregate` RET-transport role
+    /// — needed for CIRISAgent 2.9.6) — return edge's Reticulum
+    /// transport-identity public keys as a `dict` with two
+    /// base64-encoded fields:
+    ///
+    /// ```python
+    /// edge.transport_identity_pubkeys() == {
+    ///     "x25519_pub_base64":  "...",  # 32 raw bytes, base64 standard
+    ///     "ed25519_pub_base64": "...",  # 32 raw bytes, base64 standard
+    /// }
+    /// ```
+    ///
+    /// Persist's `LocalIdentityAggregate` builder reads these to
+    /// populate the RET-transport role (the third role in the
+    /// `{signing, content-KEM, RET-transport}` triple — the other two
+    /// are persist-self-sourced). The Reticulum destination hash
+    /// `sha256(x25519 ‖ ed25519)[..16]` is left to the caller —
+    /// persist's aggregate hashes the role contents itself.
+    ///
+    /// Edge owns this keypair end-to-end per the
+    /// `crate::identity::federation_identity_hash` doc note:
+    /// "the Reticulum destination hash lives on the *transport
+    /// identity*, a different key pair generated by
+    /// `src/transport/reticulum.rs`."
+    ///
+    /// Returns `None` for an HTTPS-only or transport-less Edge build
+    /// (`disable_reticulum=True` at `init_edge_runtime`, or a wheel
+    /// built without the `_reticulum-module` feature). Returns the
+    /// dict otherwise.
+    fn transport_identity_pubkeys<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            use base64::Engine as _;
+            let Some(buf) = self.inner.local_transport_pubkey() else {
+                return Ok(None);
+            };
+            let dict = pyo3::types::PyDict::new(py);
+            let x25519_b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..32]);
+            let ed25519_b64 = base64::engine::general_purpose::STANDARD.encode(&buf[32..64]);
+            dict.set_item("x25519_pub_base64", x25519_b64)?;
+            dict.set_item("ed25519_pub_base64", ed25519_b64)?;
+            Ok(Some(dict))
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            let _ = py;
+            Ok(None)
+        }
     }
 
     /// Local agent's federation `key_id` — the identity peers seed
@@ -3150,9 +3273,18 @@ fn init_edge_runtime(
     // for the init-body `runtime.enter()` guard but not stored on
     // PyEdge post-CIRISEdge#59 (the executor handles all spawns).
     let _ = runtime;
+    // v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — retain a strong
+    // reference to the host engine PyObject so [`PyEdge::engine`] can
+    // hand it to cohabiting cdylibs. `Bound::unbind()` converts the
+    // GIL-bound reference into a Send + Sync `Py<PyAny>` storable on
+    // the PyEdge struct; Python's atomic refcount keeps the engine
+    // alive at least until PyEdge drops. Cheap: one Python refcount
+    // bump.
+    let engine_handle = engine.clone().unbind();
     Ok(PyEdge {
         inner: edge_arc,
         executor,
+        engine: Some(engine_handle),
         #[cfg(feature = "transport-http")]
         _dev_cert_tmpdir: https_dev_cert_tmpdir,
     })
@@ -3317,6 +3449,40 @@ mod tests {
             p.edge_handle()
         }
         let _ = _assert_signature as fn(&PyEdge) -> Arc<Edge>;
+    }
+
+    /// v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — the `engine()`
+    /// pymethod signature is the cross-wheel cohabitation contract for
+    /// the host engine handoff. If this stops type-checking, lens-core
+    /// (and any future cohabiting cdylib) loses its path to the
+    /// shared engine. Locks `fn(&PyEdge, Python<'_>) -> PyResult<Py<PyAny>>`.
+    #[test]
+    fn engine_pymethod_signature_is_stable() {
+        fn _assert_signature(p: &PyEdge, py: Python<'_>) -> PyResult<Py<PyAny>> {
+            p.engine(py)
+        }
+        let _ = _assert_signature as fn(&PyEdge, Python<'_>) -> PyResult<Py<PyAny>>;
+    }
+
+    /// v2.1.0 — the `transport_identity_pubkeys()` pymethod signature is
+    /// the cohabitation contract for persist's `LocalIdentityAggregate`
+    /// RET-transport role (needed for CIRISAgent 2.9.6). If this stops
+    /// type-checking, persist's aggregate constructor loses the
+    /// edge-sourced X25519 + Ed25519 transport pubkey path. Locks
+    /// `fn(&PyEdge, Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>>`.
+    #[test]
+    fn transport_identity_pubkeys_pymethod_signature_is_stable() {
+        fn _assert_signature<'py>(
+            p: &PyEdge,
+            py: Python<'py>,
+        ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+            p.transport_identity_pubkeys(py)
+        }
+        let _ = _assert_signature
+            as for<'py> fn(
+                &PyEdge,
+                Python<'py>,
+            ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>>;
     }
 
     /// `BackendDispatch::Sqlite` Arc casts cleanly to all three of
