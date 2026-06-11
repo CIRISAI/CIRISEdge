@@ -1109,6 +1109,14 @@ jobs:
           - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
           - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
           - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
+          # v2.1.1 (CIRISEdge#87 / leviculum#10) — windows-x86_64 wheel.
+          # Unblocked by Leviculum's 4c15dfd Windows port of reticulum-std
+          # (TCP-loopback IPC/RPC for LocalInterface + iphlpapi for
+          # AutoInterface). The wheel is the cohabitation surface
+          # CIRISLensCore Windows wheel + CIRISAgent 2.9.6 Windows
+          # surface consume. Builds native on windows-latest (MSVC
+          # toolchain), matching the upstream validation lane.
+          - { os: windows-latest,   label: windows-x86_64, tag: win_amd64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -1191,6 +1199,11 @@ jobs:
         # features list both name all three, redundantly, so a future
         # drift between the two surfaces fails loudly instead of silently
         # publishing a wheel missing a transport.
+        #
+        # v2.1.1 (CIRISEdge#87 / leviculum#10) — `shell: bash` forces Git
+        # Bash on windows-latest so the `if [ ... ]` shell test resolves
+        # (default Windows shell is pwsh; pwsh chokes on POSIX `[`).
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             maturin build --release --strip --features "pyo3 extension-module transport-http" --auditwheel=skip
@@ -1256,6 +1269,11 @@ jobs:
         # maturin can still silently emit cp31N-cp31N wheels; catch at
         # build time, before PyPI. Same v0.1.10-regression closure
         # persist uses.
+        #
+        # v2.1.1 (CIRISEdge#87 / leviculum#10) — `shell: bash` to force
+        # Git Bash on windows-latest; pwsh can't parse `ls -la` + the
+        # `if ! ls ... >/dev/null` shell test.
+        shell: bash
         run: |
           ls -la target/wheels/
           if ! ls target/wheels/*-cp310-abi3-*.whl >/dev/null 2>&1; then
