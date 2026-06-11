@@ -39,16 +39,20 @@ classifiers = [
 # Pin to <2 because we expect persist to follow semver-major on
 # breaking changes; v0.2.x edge consumes v1.x persist. Bump the
 # upper bound when v0.3.x edge coordinates with v2.x persist.
-# v0.2.8 — pin floor bumped to >=1.11.0, currency catch-up on the
-# CIRIS 3.0 cohabitation convergence point. All co-resident consumers
-# (agent + NodeCore + LensCore + edge) must link one identical
-# ciris-persist version to share the OnceLock-backed Engine
-# process-singleton (CIRISPersist#85 EPIC). v1.11.0 pins CIRISVerify
-# v2.8.0; edge's keyring/crypto pins move v2.7.0 → v2.8.0 in lockstep.
-# Persist prelude surface unchanged — pure currency bump, zero API
-# drift on edge's consumed paths.
+# v2.0.2 — Cargo↔pyproject skew fix. Cargo.toml has linked persist
+# v5.x since v1.7.0 (currently v5.2.0), but pyproject's
+# `ciris-persist>=4.15.0,<5` carried over from the v4.x line and was
+# never bumped in lockstep. Net effect on PyPI: edge 1.7.0 / 2.0.0 /
+# 2.0.1 wheels published with Requires-Dist asking for persist <5
+# while their bundled cdylib expects persist 5 — ResolutionImpossible
+# when a downstream consumer (e.g. CIRISLensCore 1.0.0, which pins
+# `ciris-persist==5.2.0`) tries to co-install with edge. Flagged by
+# the lens-core maintainer. v2.0.2 is a metadata-only cut that aligns
+# the pyproject ceiling with what Cargo actually links. All co-resident
+# consumers must still share one ciris-persist version process-wide
+# (the OnceLock-backed Engine singleton; CIRISPersist#85 EPIC).
 dependencies = [
-    "ciris-persist>=4.15.0,<5",
+    "ciris-persist>=5.2.0,<6",
 ]
 dynamic = ["version"]
 
