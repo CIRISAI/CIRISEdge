@@ -1102,11 +1102,6 @@ jobs:
   # quirks).
   pyo3-wheel:
     name: maturin abi3-py310 wheel (${{ matrix.label }})
-    # v2.1.1 — windows-x86_64 wheel toolchain still in progress
-    # (CIRISEdge#90); the matrix entry runs to surface its state but
-    # doesn't gate the rest of the gauntlet. Linux + darwin wheels stay
-    # required (their failure DOES fail the workflow).
-    continue-on-error: ${{ matrix.label == 'windows-x86_64' }}
     strategy:
       fail-fast: false
       matrix:
@@ -1114,20 +1109,14 @@ jobs:
           - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
           - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
           - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
-          # v2.1.1 (CIRISEdge#87 / leviculum#10) — windows-x86_64 wheel.
-          # Leviculum's 4c15dfd Windows port of reticulum-std unblocked
-          # one layer (LocalInterface + AutoInterface compile on
-          # Windows). A second layer remains: ciris-persist's `pyo3`
-          # feature force-includes `postgres` → `openssl-sys`, and
-          # making openssl-sys link cleanly on windows-latest is a
-          # multi-step toolchain dance (Chocolatey OpenSSL 4.0.x ships
-          # libs in `lib\VC\x64\MT` not `lib`; OpenSSL 3.x needs
-          # specific version pinning). Tracking as CIRISEdge#90 —
-          # marked `continue-on-error: true` here so the v2.1.1 release
-          # train (persist 5.5 substrate floor + reticulum-std Windows
-          # port for downstream lens-core/agent) ships ASAP without
-          # blocking on the wheel-toolchain yak-shave. CIRISEdge#90
-          # tracks lighting the Windows wheel up in v2.1.2+.
+          # v2.1.1 (CIRISEdge#87 / #90 / leviculum#10) — windows-x86_64
+          # wheel. Leviculum's 4c15dfd Windows port of reticulum-std
+          # unblocked the FIRST layer (LocalInterface + AutoInterface
+          # compile on Windows); the SECOND layer (openssl-sys link via
+          # vcpkg static x64-windows-static) lands in this same cut per
+          # the OpenSSL install step below. Closes CIRISEdge#90 by
+          # validating the full Windows wheel build end-to-end in the
+          # gauntlet.
           - { os: windows-latest,   label: windows-x86_64, tag: win_amd64 }
     runs-on: ${{ matrix.os }}
     steps:
@@ -1145,42 +1134,64 @@ jobs:
       - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
-      # v2.1.1 (CIRISEdge#87 / leviculum#10) — Windows-only build deps.
-      # ciris-persist's `pyo3` feature force-includes its `postgres`
-      # feature, which pulls `dep:openssl` → openssl-sys → openssl-src.
-      # openssl-src builds OpenSSL from source via perl/Configure;
-      # GitHub's windows-latest image ships Git Bash's stripped-down
-      # perl which lacks Locale::Maketext::Simple, and Strawberry Perl
-      # on the runner is non-trivial to make precedence-correct against
-      # Git Bash's perl in @INC.
+      # v2.1.1 (CIRISEdge#87 / #90 / leviculum#10) — Windows-only build
+      # deps. ciris-persist's `pyo3` feature force-includes its
+      # `postgres` feature, which pulls `dep:openssl` → openssl-sys.
+      # On Linux/macOS the system OpenSSL satisfies openssl-sys; on
+      # Windows there's no such system OpenSSL.
       #
-      # Cleaner pattern: install pre-built OpenSSL via Chocolatey
-      # (which already lives on the runner image), set OPENSSL_DIR so
-      # openssl-sys finds the prebuilt libs, and set
-      # OPENSSL_NO_VENDOR=1 so openssl-sys does NOT try to compile
-      # OpenSSL from source via perl/Configure at all. Same pattern
-      # persist + verify use on their own Windows runners.
+      # Two earlier attempts failed:
+      # 1. Strawberry Perl + openssl-src vendored build: openssl-src
+      #    invokes perl/Configure, which loads modules from Git Bash's
+      #    stripped-down perl (in @INC ahead of Strawberry) and dies
+      #    on Locale::Maketext::Simple. Strawberry precedence is
+      #    non-trivial to force in the openssl-src subprocess.
+      # 2. Chocolatey OpenSSL 4.0.1 (slproweb): installs but ships libs
+      #    under `lib\VC\x64\MT\` not `lib\`, so openssl-sys 0.9.116
+      #    fails to find libssl.lib / libcrypto.lib in
+      #    `<OPENSSL_DIR>\lib`.
       #
-      # Stage-2 follow-up would be to decouple persist's `pyo3` from
-      # `postgres` (mirror of CIRISEdge#87 on the persist side); until
-      # then, this install unblocks the wheel build.
-      - name: install OpenSSL via Chocolatey + export OPENSSL_DIR (Windows)
+      # vcpkg static install matches openssl-sys's expected layout
+      # exactly: `installed/x64-windows-static/lib/{libssl.lib,
+      # libcrypto.lib}`. vcpkg is pre-installed on the windows-latest
+      # image at `$VCPKG_INSTALLATION_ROOT` (typically `C:\vcpkg`),
+      # and the static triplet links into the cdylib so the produced
+      # wheel has zero runtime OpenSSL dependency.
+      #
+      # Stage-2 follow-up still applies: decouple persist's `pyo3`
+      # from `postgres` (mirror of CIRISEdge#87 on the persist side).
+      # Once that lands, this whole step disappears.
+      - name: install OpenSSL via vcpkg (static, x64-windows-static)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          choco install openssl --no-progress -y
-          # Chocolatey's openssl package installs to one of these
-          # canonical paths; pick whichever exists.
-          for d in '/c/Program Files/OpenSSL-Win64' '/c/Program Files/OpenSSL' '/c/ProgramData/chocolatey/lib/openssl/local'; do
-            if [ -d "$d" ]; then
-              echo "OPENSSL_DIR=${d/\/c\//C:\\}" | sed 's#/#\\#g' >> "$GITHUB_ENV"
-              echo "OPENSSL_NO_VENDOR=1" >> "$GITHUB_ENV"
-              echo "::notice::OpenSSL_DIR=$d (mapped to Windows path in env)"
-              exit 0
-            fi
-          done
-          echo "::error::Chocolatey installed openssl but no canonical install dir found"
-          exit 1
+          set -euo pipefail
+          # vcpkg ships pre-installed on windows-latest. Install the
+          # static x64 triplet so openssl-sys statically links + the
+          # wheel needs no runtime OpenSSL.
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:x64-windows-static --x-install-root="$VCPKG_INSTALLATION_ROOT/installed"
+          # openssl-sys reads OPENSSL_DIR (root) or OPENSSL_LIB_DIR +
+          # OPENSSL_INCLUDE_DIR (split). Use the split form because
+          # the static triplet's layout is
+          # `installed/x64-windows-static/{lib,include}` — that maps
+          # cleanly to *_LIB_DIR + *_INCLUDE_DIR. OPENSSL_STATIC=1
+          # forces static linkage; OPENSSL_NO_VENDOR=1 stops openssl-sys
+          # from falling back to openssl-src's perl/Configure build.
+          ROOT="$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static"
+          # Convert msys-style path to Windows backslashed form for the
+          # env vars (openssl-sys's build script treats them as path
+          # strings handed to MSVC).
+          win_root=$(cygpath -w "$ROOT")
+          {
+            echo "OPENSSL_DIR=${win_root}"
+            echo "OPENSSL_LIB_DIR=${win_root}\\lib"
+            echo "OPENSSL_INCLUDE_DIR=${win_root}\\include"
+            echo "OPENSSL_STATIC=1"
+            echo "OPENSSL_NO_VENDOR=1"
+          } >> "$GITHUB_ENV"
+          echo "::notice::OpenSSL_DIR=${win_root} (vcpkg static x64-windows-static)"
+          # Sanity probe — confirm the libs are where openssl-sys looks.
+          ls -la "${ROOT}/lib/libssl.lib" "${ROOT}/lib/libcrypto.lib"
       - uses: dtolnay/rust-toolchain@stable
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below
