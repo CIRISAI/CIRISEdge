@@ -1102,6 +1102,12 @@ jobs:
   # quirks).
   pyo3-wheel:
     name: maturin abi3-py310 wheel (${{ matrix.label }})
+    # v2.1.1 — windows-x86_64 wheel is now REQUIRED (closes
+    # CIRISEdge#90). All three layers landed:
+    #   1. leviculum 4c15dfd — reticulum-std Windows port (leviculum#10/#11)
+    #   2. vcpkg static x64-windows-static — openssl-sys link
+    #   3. CIRISPersist v5.5.1 — Unix-only code paths cfg-gated (#200)
+    # A regression in any of the three fails the gauntlet.
     strategy:
       fail-fast: false
       matrix:
@@ -1109,6 +1115,15 @@ jobs:
           - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
           - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
           - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
+          # v2.1.1 (CIRISEdge#87 / #90 / leviculum#10) — windows-x86_64
+          # wheel. Leviculum's 4c15dfd Windows port of reticulum-std
+          # unblocked the FIRST layer (LocalInterface + AutoInterface
+          # compile on Windows); the SECOND layer (openssl-sys link via
+          # vcpkg static x64-windows-static) lands in this same cut per
+          # the OpenSSL install step below. Closes CIRISEdge#90 by
+          # validating the full Windows wheel build end-to-end in the
+          # gauntlet.
+          - { os: windows-latest,   label: windows-x86_64, tag: win_amd64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -1125,6 +1140,64 @@ jobs:
       - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
+      # v2.1.1 (CIRISEdge#87 / #90 / leviculum#10) — Windows-only build
+      # deps. ciris-persist's `pyo3` feature force-includes its
+      # `postgres` feature, which pulls `dep:openssl` → openssl-sys.
+      # On Linux/macOS the system OpenSSL satisfies openssl-sys; on
+      # Windows there's no such system OpenSSL.
+      #
+      # Two earlier attempts failed:
+      # 1. Strawberry Perl + openssl-src vendored build: openssl-src
+      #    invokes perl/Configure, which loads modules from Git Bash's
+      #    stripped-down perl (in @INC ahead of Strawberry) and dies
+      #    on Locale::Maketext::Simple. Strawberry precedence is
+      #    non-trivial to force in the openssl-src subprocess.
+      # 2. Chocolatey OpenSSL 4.0.1 (slproweb): installs but ships libs
+      #    under `lib\VC\x64\MT\` not `lib\`, so openssl-sys 0.9.116
+      #    fails to find libssl.lib / libcrypto.lib in
+      #    `<OPENSSL_DIR>\lib`.
+      #
+      # vcpkg static install matches openssl-sys's expected layout
+      # exactly: `installed/x64-windows-static/lib/{libssl.lib,
+      # libcrypto.lib}`. vcpkg is pre-installed on the windows-latest
+      # image at `$VCPKG_INSTALLATION_ROOT` (typically `C:\vcpkg`),
+      # and the static triplet links into the cdylib so the produced
+      # wheel has zero runtime OpenSSL dependency.
+      #
+      # Stage-2 follow-up still applies: decouple persist's `pyo3`
+      # from `postgres` (mirror of CIRISEdge#87 on the persist side).
+      # Once that lands, this whole step disappears.
+      - name: install OpenSSL via vcpkg (static, x64-windows-static)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # vcpkg ships pre-installed on windows-latest. Install the
+          # static x64 triplet so openssl-sys statically links + the
+          # wheel needs no runtime OpenSSL.
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:x64-windows-static --x-install-root="$VCPKG_INSTALLATION_ROOT/installed"
+          # openssl-sys reads OPENSSL_DIR (root) or OPENSSL_LIB_DIR +
+          # OPENSSL_INCLUDE_DIR (split). Use the split form because
+          # the static triplet's layout is
+          # `installed/x64-windows-static/{lib,include}` — that maps
+          # cleanly to *_LIB_DIR + *_INCLUDE_DIR. OPENSSL_STATIC=1
+          # forces static linkage; OPENSSL_NO_VENDOR=1 stops openssl-sys
+          # from falling back to openssl-src's perl/Configure build.
+          ROOT="$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static"
+          # Convert msys-style path to Windows backslashed form for the
+          # env vars (openssl-sys's build script treats them as path
+          # strings handed to MSVC).
+          win_root=$(cygpath -w "$ROOT")
+          {
+            echo "OPENSSL_DIR=${win_root}"
+            echo "OPENSSL_LIB_DIR=${win_root}\\lib"
+            echo "OPENSSL_INCLUDE_DIR=${win_root}\\include"
+            echo "OPENSSL_STATIC=1"
+            echo "OPENSSL_NO_VENDOR=1"
+          } >> "$GITHUB_ENV"
+          echo "::notice::OpenSSL_DIR=${win_root} (vcpkg static x64-windows-static)"
+          # Sanity probe — confirm the libs are where openssl-sys looks.
+          ls -la "${ROOT}/lib/libssl.lib" "${ROOT}/lib/libcrypto.lib"
       - uses: dtolnay/rust-toolchain@stable
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below
@@ -1191,6 +1264,11 @@ jobs:
         # features list both name all three, redundantly, so a future
         # drift between the two surfaces fails loudly instead of silently
         # publishing a wheel missing a transport.
+        #
+        # v2.1.1 (CIRISEdge#87 / leviculum#10) — `shell: bash` forces Git
+        # Bash on windows-latest so the `if [ ... ]` shell test resolves
+        # (default Windows shell is pwsh; pwsh chokes on POSIX `[`).
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             maturin build --release --strip --features "pyo3 extension-module transport-http" --auditwheel=skip
@@ -1256,6 +1334,11 @@ jobs:
         # maturin can still silently emit cp31N-cp31N wheels; catch at
         # build time, before PyPI. Same v0.1.10-regression closure
         # persist uses.
+        #
+        # v2.1.1 (CIRISEdge#87 / leviculum#10) — `shell: bash` to force
+        # Git Bash on windows-latest; pwsh can't parse `ls -la` + the
+        # `if ! ls ... >/dev/null` shell test.
+        shell: bash
         run: |
           ls -la target/wheels/
           if ! ls target/wheels/*-cp310-abi3-*.whl >/dev/null 2>&1; then
