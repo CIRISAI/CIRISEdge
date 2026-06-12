@@ -1314,20 +1314,19 @@ jobs:
         # `windows.<N>.<M>.<P>.lib` import libs — under `-Zbuild-std`
         # the linker doesn't auto-discover them.
         shell: bash
-        env:
-          # v2.2.1 — only consumed by the Windows path below, but
-          # GitHub Actions step-level env doesn't support `if:`. Setting
-          # these unconditionally is harmless on non-Windows runners
-          # because the Windows branch is the only one that reads
-          # them.
-          RUSTUP_TOOLCHAIN: ${{ runner.os == 'Windows' && 'nightly' || '' }}
-          CARGO_BUILD_TARGET: ${{ runner.os == 'Windows' && 'x86_64-win7-windows-msvc' || '' }}
-          CARGO_UNSTABLE_BUILD_STD: ${{ runner.os == 'Windows' && 'std,panic_abort' || '' }}
         run: |
           set -euo pipefail
           if [ "${{ runner.os }}" = "Linux" ]; then
             maturin build --release --strip --features "pyo3 extension-module transport-http" --auditwheel=skip
           elif [ "${{ runner.os }}" = "Windows" ]; then
+            # Win7 build-std env vars — scoped to this shell branch so
+            # non-Windows runners never see them. Setting
+            # CARGO_BUILD_TARGET='' at step-level env breaks cargo
+            # ("target was empty"); the empty string is treated as an
+            # explicit (invalid) target rather than as unset.
+            export RUSTUP_TOOLCHAIN=nightly
+            export CARGO_BUILD_TARGET=x86_64-win7-windows-msvc
+            export CARGO_UNSTABLE_BUILD_STD=std,panic_abort
             # Sanity: Tier-3 target must be in nightly's target-list
             # (catches rustc upstream renames before the build runs).
             if ! rustc --print target-list | grep -qx 'x86_64-win7-windows-msvc'; then
