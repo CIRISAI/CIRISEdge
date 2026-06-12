@@ -1102,6 +1102,11 @@ jobs:
   # quirks).
   pyo3-wheel:
     name: maturin abi3-py310 wheel (${{ matrix.label }})
+    # v2.1.1 — windows-x86_64 wheel toolchain still in progress
+    # (CIRISEdge#90); the matrix entry runs to surface its state but
+    # doesn't gate the rest of the gauntlet. Linux + darwin wheels stay
+    # required (their failure DOES fail the workflow).
+    continue-on-error: ${{ matrix.label == 'windows-x86_64' }}
     strategy:
       fail-fast: false
       matrix:
@@ -1110,12 +1115,19 @@ jobs:
           - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
           - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
           # v2.1.1 (CIRISEdge#87 / leviculum#10) — windows-x86_64 wheel.
-          # Unblocked by Leviculum's 4c15dfd Windows port of reticulum-std
-          # (TCP-loopback IPC/RPC for LocalInterface + iphlpapi for
-          # AutoInterface). The wheel is the cohabitation surface
-          # CIRISLensCore Windows wheel + CIRISAgent 2.9.6 Windows
-          # surface consume. Builds native on windows-latest (MSVC
-          # toolchain), matching the upstream validation lane.
+          # Leviculum's 4c15dfd Windows port of reticulum-std unblocked
+          # one layer (LocalInterface + AutoInterface compile on
+          # Windows). A second layer remains: ciris-persist's `pyo3`
+          # feature force-includes `postgres` → `openssl-sys`, and
+          # making openssl-sys link cleanly on windows-latest is a
+          # multi-step toolchain dance (Chocolatey OpenSSL 4.0.x ships
+          # libs in `lib\VC\x64\MT` not `lib`; OpenSSL 3.x needs
+          # specific version pinning). Tracking as CIRISEdge#90 —
+          # marked `continue-on-error: true` here so the v2.1.1 release
+          # train (persist 5.5 substrate floor + reticulum-std Windows
+          # port for downstream lens-core/agent) ships ASAP without
+          # blocking on the wheel-toolchain yak-shave. CIRISEdge#90
+          # tracks lighting the Windows wheel up in v2.1.2+.
           - { os: windows-latest,   label: windows-x86_64, tag: win_amd64 }
     runs-on: ${{ matrix.os }}
     steps:
