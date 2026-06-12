@@ -1123,6 +1123,18 @@ jobs:
           # the OpenSSL install step below. Closes CIRISEdge#90 by
           # validating the full Windows wheel build end-to-end in the
           # gauntlet.
+          #
+          # v2.2.1 (CIRISPersist#205 mirror) — Win7-capable. Built with
+          # the Tier-3 `x86_64-win7-windows-msvc` target via nightly +
+          # `-Zbuild-std`, so std keeps the Win7 fallback paths (keyed
+          # events, GetSystemTimeAsFileTime, RtlGenRandom) instead of
+          # stable ≥1.78's hard-imported Win8/Win10 APIs (WaitOnAddress,
+          # GetSystemTimePreciseAsFileTime, ProcessPrng). The artifact
+          # is the SAME `win_amd64.whl` file (one wheel pip resolves
+          # for any 64-bit Windows) and runs unchanged on Win7 SP1 +
+          # Server 2008 R2 + Win10/11. Built std with persist + verify
+          # whose own wheels do the same thing — full vertical Win7
+          # support across the CIRIS family.
           - { os: windows-latest,   label: windows-x86_64, tag: win_amd64 }
     runs-on: ${{ matrix.os }}
     steps:
@@ -1198,7 +1210,20 @@ jobs:
           echo "::notice::OpenSSL_DIR=${win_root} (vcpkg static x64-windows-static)"
           # Sanity probe — confirm the libs are where openssl-sys looks.
           ls -la "${ROOT}/lib/libssl.lib" "${ROOT}/lib/libcrypto.lib"
+      # v2.2.1 (CIRISPersist#205 mirror) — Windows uses nightly +
+      # rust-src so the Tier-3 `x86_64-win7-windows-msvc` target can
+      # build std from source via `-Zbuild-std`. Tier-3 ships no
+      # precompiled std; without build-std the link fails. Persist
+      # v5.5.4 / v5.5.5 + verify v5.1.3 ship Win7-capable wheels using
+      # this exact pattern; edge v2.2.1 mirrors so the published
+      # `win_amd64.whl` runs on Win7 SP1 + Server 2008 R2 in addition
+      # to Win10/11 (one wheel, broadest support).
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Windows'
+      - uses: dtolnay/rust-toolchain@nightly
+        if: runner.os == 'Windows'
+        with:
+          components: rust-src
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below
       # actively corrects. CIRISVerify v2.1.4+ pattern; persist v0.7.2's
@@ -1227,7 +1252,13 @@ jobs:
               sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
-          rustup default stable
+          # v2.2.1 — Windows needs nightly (Tier-3 build-std); other
+          # OSes use stable.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            rustup default nightly
+          else
+            rustup default stable
+          fi
           cargo --version
           cargo build --help >/dev/null
       - uses: actions/setup-python@v5
@@ -1268,10 +1299,58 @@ jobs:
         # v2.1.1 (CIRISEdge#87 / leviculum#10) — `shell: bash` forces Git
         # Bash on windows-latest so the `if [ ... ]` shell test resolves
         # (default Windows shell is pwsh; pwsh chokes on POSIX `[`).
+        #
+        # v2.2.1 (CIRISPersist#205 mirror) — Windows build now targets
+        # the Tier-3 `x86_64-win7-windows-msvc` triple via
+        # `-Zbuild-std`. nightly compiles std from source for the Win7
+        # target (no precompiled std exists). The resulting wheel is
+        # ABI-compatible with Win7 SP1 + Server 2008 R2 in addition to
+        # Win10/11. Maturin tags it `win_amd64` (same wheel filename;
+        # x86_64 + windows is the only thing pip platform-tag-matches
+        # against), and the published wheel runs unchanged across the
+        # whole Win7→Win11 range. The LNK1181 workaround augments LIB
+        # with the per-version `windows_x86_64_msvc-*/lib` directories
+        # the `windows-targets` crate ships for its own
+        # `windows.<N>.<M>.<P>.lib` import libs — under `-Zbuild-std`
+        # the linker doesn't auto-discover them.
         shell: bash
+        env:
+          # v2.2.1 — only consumed by the Windows path below, but
+          # GitHub Actions step-level env doesn't support `if:`. Setting
+          # these unconditionally is harmless on non-Windows runners
+          # because the Windows branch is the only one that reads
+          # them.
+          RUSTUP_TOOLCHAIN: ${{ runner.os == 'Windows' && 'nightly' || '' }}
+          CARGO_BUILD_TARGET: ${{ runner.os == 'Windows' && 'x86_64-win7-windows-msvc' || '' }}
+          CARGO_UNSTABLE_BUILD_STD: ${{ runner.os == 'Windows' && 'std,panic_abort' || '' }}
         run: |
+          set -euo pipefail
           if [ "${{ runner.os }}" = "Linux" ]; then
             maturin build --release --strip --features "pyo3 extension-module transport-http" --auditwheel=skip
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            # Sanity: Tier-3 target must be in nightly's target-list
+            # (catches rustc upstream renames before the build runs).
+            if ! rustc --print target-list | grep -qx 'x86_64-win7-windows-msvc'; then
+              echo "::error::x86_64-win7-windows-msvc not in nightly target-list — target may have been renamed; check rustc release notes"
+              exit 1
+            fi
+            # LNK1181 workaround: pre-fetch the dep graph (so the
+            # windows_x86_64_msvc-* crates land under ~/.cargo/registry/src),
+            # then add each version's /lib subdir to LIB so link.exe finds
+            # the `windows.<N>.<M>.<P>.lib` import libraries
+            # `windows-targets` references inline.
+            cargo fetch
+            extra=""
+            while IFS= read -r d; do
+              extra="${extra};$(cygpath -w "$d")"
+            done < <(find "$HOME/.cargo/registry/src" -type d -path '*windows_x86_64_msvc-*/lib' 2>/dev/null | sort -u)
+            if [ -n "$extra" ]; then
+              export LIB="${LIB:-}${extra}"
+              echo "::notice::LIB augmented with windows_x86_64_msvc import-lib dirs:${extra}"
+            else
+              echo "::warning::no windows_x86_64_msvc import-lib dirs found under cargo registry"
+            fi
+            maturin build --release --strip --features "pyo3 extension-module transport-http"
           else
             maturin build --release --strip --features "pyo3 extension-module transport-http"
           fi
