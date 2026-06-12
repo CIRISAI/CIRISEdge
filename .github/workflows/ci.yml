@@ -1133,6 +1133,23 @@ jobs:
       - name: install libtss2-dev + libsqlite3-dev (TPM + sqlite build deps)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
+      # v2.1.1 (CIRISEdge#87 / leviculum#10) — Windows-only build deps.
+      # ciris-persist's `pyo3` feature force-includes its `postgres`
+      # feature, which pulls `dep:openssl` → openssl-sys → openssl-src.
+      # openssl-src builds OpenSSL from source via perl/Configure; on
+      # the Windows runner's default Strawberry-free perl, Configure
+      # fails with "Can't locate Locale/Maketext/Simple.pm". Strawberry
+      # Perl carries the missing module + cl.exe-compatible OpenSSL
+      # toolchain. Same shape persist + verify use on their own Windows
+      # wheel runners. Stage-2 follow-up would be to decouple persist's
+      # `pyo3` from `postgres` (mirror of CIRISEdge#87 on the persist
+      # side); until then, this install unblocks the wheel build.
+      - name: install Strawberry Perl (Windows OpenSSL build prereq)
+        if: runner.os == 'Windows'
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+          distribution: strawberry
       - uses: dtolnay/rust-toolchain@stable
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below

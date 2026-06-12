@@ -93,6 +93,19 @@ ignore = [
     "RUSTSEC-2025-0090",  # unic-* unmaintained
     "RUSTSEC-2025-0098",  # unic-* unmaintained
     "RUSTSEC-2025-0100",  # unic-* unmaintained
+
+    # v2.1.1 — pyo3 0.28 BoundList/Tuple iterator nth/nth_back overflow
+    # → out-of-bounds read in unchecked usize arithmetic. Fixed in pyo3
+    # 0.29.0 per the advisory's "Solution: Upgrade to >=0.29.0". Edge
+    # does NOT call `BoundListIterator::nth` / `BoundTupleIterator::nth`
+    # / `nth_back` anywhere (grep confirms; the affected paths are
+    # iterator-skipping helpers we don't use). The whole CIRIS family
+    # (persist 5.5.0 / verify 5.1.0 / edge 2.1.1) is on pyo3 0.28 and
+    # must move in lockstep — edge moving alone would create two pyo3
+    # versions in the cohabitation graph + risk cross-cdylib type
+    # collisions. Tracking the lockstep upgrade in CIRISEdge#89; this
+    # ignore lifts when that PR lands.
+    "RUSTSEC-2026-0176",  # pyo3 0.28 BoundList/Tuple nth/nth_back overflow
 ]
 
 [sources]
