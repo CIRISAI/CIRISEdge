@@ -1,0 +1,69 @@
+# Pre-commit hooks for CIRISEdge.
+#
+# Install: pip install pre-commit && pre-commit install --install-hooks --hook-type pre-commit --hook-type pre-push
+#
+# Two stages by design:
+# - `commit` (default `pre-commit` stage): fast checks only.
+#   `cargo fmt --check`, generic whitespace/YAML/TOML hygiene. Runs on
+#   `git commit` (a few seconds).
+# - `pre-push`: the slow gates that catch what fmt can't.
+#   `cargo clippy` on the canonical feature set. Runs on `git push`
+#   (~30s warm, 90s cold).
+#
+# To bypass once: `git commit --no-verify` / `git push --no-verify`.
+# Only use for genuine emergencies — the local gates mirror CI's
+# `clippy + fmt` lane, so a hook failure means CI will fail too.
+
+# Excludes are deliberately broad:
+# - Cargo.lock / *.lock: tool-managed, never hand-edit
+# - target/: build cache
+# - bindings/: UniFFI-generated (Swift / Kotlin / Python FFI shims) —
+#   regenerated on every uniffi-bindgen run, manual edits get clobbered
+# - python/.*\.so + __pycache__: local maturin develop sideeffects
+# - .github/workflows/: GitHub Actions templating breaks plain YAML
+#   parsing
+exclude: |
+  (?x)^(
+    Cargo\.lock|
+    .*\.lock|
+    target/.*|
+    bindings/.*|
+    python/.*\.so|
+    python/.*/__pycache__/.*|
+    \.github/workflows/.*\.yml
+  )$
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+
+  # cargo fmt — runs at commit time. Fast (<1s for staged files).
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+
+  # cargo clippy — runs at push time. ~30s warm. Mirrors CI's
+  # `clippy + fmt` lane feature set so failures here = failures in CI.
+  - repo: local
+    hooks:
+      - id: cargo-clippy
+        name: cargo clippy (transport-http,transport-reticulum,pyo3) -D warnings
+        entry: cargo clippy --features "transport-http transport-reticulum pyo3" --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
