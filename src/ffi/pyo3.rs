@@ -426,6 +426,34 @@ impl PyEdge {
         }
     }
 
+    /// v2.2.2 (CIRISEdge#97) — return edge's announced RNS destination
+    /// hash as a lowercase hex string: the 16-byte `*dest.hash()` value
+    /// Reticulum computes at `Destination` construction time over the
+    /// identity + app aspects (NOT `sha256(pubkey)[..16]` — consumers
+    /// can't safely re-derive it from
+    /// [`Self::transport_identity_pubkeys`] alone).
+    ///
+    /// This is the destination peers resolve to dial this node. RNS
+    /// shows destinations conventionally as hex strings; CIRISLensCore
+    /// v1.4.0+'s `install_ret_relay` (CIRISLensCore#43) calls this to
+    /// surface the dialable RNS address alongside the transport
+    /// pubkeys.
+    ///
+    /// Returns `None` for HTTPS-only or transport-less Edge builds
+    /// (`disable_reticulum=True`, or a wheel built without the
+    /// `_reticulum-module` feature). Returns the 32-character lowercase
+    /// hex string otherwise.
+    fn reticulum_dest_hash_hex(&self) -> Option<String> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            self.inner.local_dest_hash().map(hex::encode)
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            None
+        }
+    }
+
     /// Local agent's federation `key_id` — the identity peers seed
     /// into their `federation_keys` directory to root inbound traffic
     /// from this agent. CIRISAgent 2.9.4 displays this on the

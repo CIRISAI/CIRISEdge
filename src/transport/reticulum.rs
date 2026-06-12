@@ -1277,6 +1277,27 @@ impl ReticulumTransport {
         self.local_transport_pubkey
     }
 
+    /// v2.2.2 (CIRISEdge#97) — return edge's announced RNS destination
+    /// hash: the 16-byte `*dest.hash()` value Reticulum computes at
+    /// `Destination` construction time over the identity + app aspects
+    /// (NOT a plain `sha256(pubkey)[..16]` — that's why consumers need
+    /// this accessor; they can't re-derive it from
+    /// [`Self::local_transport_pubkey`] safely).
+    ///
+    /// This is the destination peers resolve to dial this node:
+    /// announces carry it as `self.local_dest_hash`, the routing
+    /// table keys on it, and a peer's path lookup returns it.
+    /// Cohabiting cdylibs (CIRISLensCore v1.4.0+'s `install_ret_relay`
+    /// per CIRISLensCore#43) call this to surface the dialable RNS
+    /// address alongside the transport pubkeys.
+    #[must_use]
+    pub fn local_dest_hash(&self) -> [u8; 16] {
+        let bytes = self.local_dest_hash.as_bytes();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(bytes);
+        out
+    }
+
     /// spec. Returns a `Vec<TransportSpec>` of `(handle, kind)` pairs.
     /// Order matches the registration order in
     /// [`ReticulumTransportConfig::interfaces`] (or the legacy
