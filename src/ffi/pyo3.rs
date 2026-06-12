@@ -1105,7 +1105,7 @@ fn parse_envelope_kind(s: &str) -> PyResult<crate::replication::EnvelopeKind> {
 /// Clones of this handle (Python references) share the same inner
 /// runtime — first `stop` shuts down; subsequent `stop` calls are
 /// no-ops.
-#[pyclass(unsendable)]
+#[pyclass(name = "ReplicationHandle", module = "ciris_edge", unsendable)]
 pub struct PyReplicationHandle {
     inner: Arc<tokio::sync::Mutex<Option<crate::replication::ReplicationRuntime>>>,
     executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,

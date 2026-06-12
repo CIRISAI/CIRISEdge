@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "2.1.2"
+version = "2.2.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -364,6 +364,16 @@ x509-parser    = { version = "0.16", optional = true }
 # dev-dependency surface; lifted to optional-runtime here so the
 # init path can reach it. Apache-2.0 / MIT.
 rcgen          = { version = "0.13", optional = true, default-features = false, features = ["pem", "ring"] }
+# v2.2.0 — pin time <0.3.48 to dodge a transitive incompatibility. time
+# 0.3.48 (published 2026-06-12) added a generic `Into<String>` impl that
+# conflicts with rcgen 0.13.x and 0.14.x's blanket `impl<T: Into<String>>
+# From<T>` for OtherNameValue / DnValue (E0119 — "conflicting
+# implementations"). Both rcgen versions fail with this time version;
+# the fix has to land in rcgen upstream. Edge doesn't use the `time`
+# API surface directly — this constraint is pure transitive resolution
+# control. Drop when rcgen upstream ships the fix (track via
+# https://github.com/rustls/rcgen/issues).
+time           = { version = ">=0.3, <0.3.48", default-features = false }
 rustls-pki-types = { version = "1", optional = true }
 # v0.19.3 (CIRISEdge#49) — the `init_edge_runtime`
 # `https_dev_self_signed=True` path needs a tempdir that outlives the
