@@ -1102,15 +1102,12 @@ jobs:
   # quirks).
   pyo3-wheel:
     name: maturin abi3-py310 wheel (${{ matrix.label }})
-    # v2.1.1 — windows-x86_64 wheel still blocked at persist's Unix-
-    # only code paths (CIRISPersist's `tokio::signal::unix` +
-    # `url::Host::Unix` references compile on Linux/macOS but not on
-    # MSVC). Tracked downstream of CIRISEdge#90 as CIRISPersist#NNN
-    # (persist-side Windows portability). vcpkg openssl-sys install
-    # below got the Windows compile past openssl; the Unix-only code
-    # in persist's lib is the next gate. windows-x86_64 stays
-    # continue-on-error until persist closes that gap.
-    continue-on-error: ${{ matrix.label == 'windows-x86_64' }}
+    # v2.1.1 — windows-x86_64 wheel is now REQUIRED (closes
+    # CIRISEdge#90). All three layers landed:
+    #   1. leviculum 4c15dfd — reticulum-std Windows port (leviculum#10/#11)
+    #   2. vcpkg static x64-windows-static — openssl-sys link
+    #   3. CIRISPersist v5.5.1 — Unix-only code paths cfg-gated (#200)
+    # A regression in any of the three fails the gauntlet.
     strategy:
       fail-fast: false
       matrix:
