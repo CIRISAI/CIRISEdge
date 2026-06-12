@@ -1136,20 +1136,39 @@ jobs:
       # v2.1.1 (CIRISEdge#87 / leviculum#10) — Windows-only build deps.
       # ciris-persist's `pyo3` feature force-includes its `postgres`
       # feature, which pulls `dep:openssl` → openssl-sys → openssl-src.
-      # openssl-src builds OpenSSL from source via perl/Configure; on
-      # the Windows runner's default Strawberry-free perl, Configure
-      # fails with "Can't locate Locale/Maketext/Simple.pm". Strawberry
-      # Perl carries the missing module + cl.exe-compatible OpenSSL
-      # toolchain. Same shape persist + verify use on their own Windows
-      # wheel runners. Stage-2 follow-up would be to decouple persist's
-      # `pyo3` from `postgres` (mirror of CIRISEdge#87 on the persist
-      # side); until then, this install unblocks the wheel build.
-      - name: install Strawberry Perl (Windows OpenSSL build prereq)
+      # openssl-src builds OpenSSL from source via perl/Configure;
+      # GitHub's windows-latest image ships Git Bash's stripped-down
+      # perl which lacks Locale::Maketext::Simple, and Strawberry Perl
+      # on the runner is non-trivial to make precedence-correct against
+      # Git Bash's perl in @INC.
+      #
+      # Cleaner pattern: install pre-built OpenSSL via Chocolatey
+      # (which already lives on the runner image), set OPENSSL_DIR so
+      # openssl-sys finds the prebuilt libs, and set
+      # OPENSSL_NO_VENDOR=1 so openssl-sys does NOT try to compile
+      # OpenSSL from source via perl/Configure at all. Same pattern
+      # persist + verify use on their own Windows runners.
+      #
+      # Stage-2 follow-up would be to decouple persist's `pyo3` from
+      # `postgres` (mirror of CIRISEdge#87 on the persist side); until
+      # then, this install unblocks the wheel build.
+      - name: install OpenSSL via Chocolatey + export OPENSSL_DIR (Windows)
         if: runner.os == 'Windows'
-        uses: shogo82148/actions-setup-perl@v1
-        with:
-          perl-version: '5.38'
-          distribution: strawberry
+        shell: bash
+        run: |
+          choco install openssl --no-progress -y
+          # Chocolatey's openssl package installs to one of these
+          # canonical paths; pick whichever exists.
+          for d in '/c/Program Files/OpenSSL-Win64' '/c/Program Files/OpenSSL' '/c/ProgramData/chocolatey/lib/openssl/local'; do
+            if [ -d "$d" ]; then
+              echo "OPENSSL_DIR=${d/\/c\//C:\\}" | sed 's#/#\\#g' >> "$GITHUB_ENV"
+              echo "OPENSSL_NO_VENDOR=1" >> "$GITHUB_ENV"
+              echo "::notice::OpenSSL_DIR=$d (mapped to Windows path in env)"
+              exit 0
+            fi
+          done
+          echo "::error::Chocolatey installed openssl but no canonical install dir found"
+          exit 1
       - uses: dtolnay/rust-toolchain@stable
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below
