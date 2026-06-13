@@ -268,6 +268,103 @@ pub struct PyEdge {
     /// (operator-supplied cert paths persist independently).
     #[cfg(feature = "transport-http")]
     _dev_cert_tmpdir: Option<Arc<tempfile::TempDir>>,
+    /// v2.4.0 (CIRISEdge#103) — shared-instance lease cleanup state.
+    /// When `init_edge_runtime` won the SharedInstanceDirectory
+    /// election (auto role) and spawned the heartbeat task, this
+    /// carries the parts [`Self::close`] needs to release the lease
+    /// cleanly: a shutdown signal for the heartbeat loop + the
+    /// `(name, owner_pid, lease)` triple for
+    /// `release_shared_instance_lease`.
+    ///
+    /// `Mutex` because `close()` takes `&self` (PyO3 / pyclass — no
+    /// `&mut self` from Python without `pyclass(unsendable)`) and we
+    /// need interior mutability to `take()` the contents on the
+    /// first close. Idempotent across multiple close calls.
+    ///
+    /// `None` when:
+    /// - shared-instance was not configured (`local_instance_name=None`)
+    /// - the operator pinned `local_instance_role="client"` (no lease
+    ///   held)
+    /// - `local_instance_role="auto"` lost the election (sibling is
+    ///   server; no lease held)
+    /// - this is a `for_test` constructor
+    #[cfg(feature = "transport-reticulum-local")]
+    shared_instance_cleanup: std::sync::Mutex<Option<SharedInstanceCleanup>>,
+}
+
+/// v2.4.0 (CIRISEdge#103) — best-effort cleanup if the Python caller
+/// let `PyEdge` get GC'd without calling [`PyEdge::close`]
+/// explicitly. Mirrors the close() path: signal the heartbeat to
+/// stop + release the lease, this time WITHOUT `py.detach` (Drop
+/// runs without the GIL anyway). On any error path, the lease ages
+/// out via the staleness window — Drop never panics.
+#[cfg(feature = "transport-reticulum-local")]
+impl Drop for PyEdge {
+    fn drop(&mut self) {
+        // Lock the cleanup state. If poisoned (a prior call panicked
+        // inside the lock), or empty (already closed), skip.
+        let Ok(mut guard) = self.shared_instance_cleanup.lock() else {
+            return;
+        };
+        let Some(mut cleanup) = guard.take() else {
+            return;
+        };
+        // Signal heartbeat task to stop. `send(()) -> Err(_)` only
+        // when the receiver already dropped (task exited early); fine
+        // to ignore.
+        if let Some(tx) = cleanup.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        // Best-effort release. Errors logged (no propagation possible
+        // from Drop). The persist Engine's tokio runtime is reached
+        // via the executor capsule we still hold an Arc to — it lives
+        // for as long as the host engine's PyObject does, which the
+        // `self.engine` field still references.
+        let directory = cleanup.directory;
+        let lease = cleanup.lease;
+        let instance_name_for_log = lease.instance_name.clone();
+        let release_result = run_async(&self.executor, async move {
+            directory.release_shared_instance_lease(&lease).await
+        });
+        match release_result {
+            Ok(()) => {
+                tracing::info!(
+                    instance_name = %instance_name_for_log,
+                    "PyEdge::drop: shared-instance lease released (no explicit close() called)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    instance_name = %instance_name_for_log,
+                    error = %e,
+                    "PyEdge::drop: shared-instance lease release failed; \
+                     lease will age out via staleness window"
+                );
+            }
+        }
+    }
+}
+
+/// v2.4.0 (CIRISEdge#103) — auto-elected server's lease state, held
+/// by [`PyEdge::shared_instance_cleanup`] from `init_edge_runtime`
+/// until [`PyEdge::close`] runs the release path. See the field doc
+/// for when this is populated vs `None`.
+#[cfg(feature = "transport-reticulum-local")]
+struct SharedInstanceCleanup {
+    /// Shutdown signal for the heartbeat task; the loop `tokio::select!`s
+    /// on the matching `Receiver`. Sending `()` (via
+    /// [`tokio::sync::oneshot::Sender::send`]) breaks the loop on its
+    /// next iteration. `Option` so [`PyEdge::close`] can `take()` it
+    /// and `send` once; subsequent calls observe `None` and skip.
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The lease as last seen by `init_edge_runtime`. Stored so the
+    /// close path's `release_shared_instance_lease` ownership check
+    /// can match the row.
+    lease: ciris_persist::federation::SharedInstanceLease,
+    /// The federation directory handle the close path uses to call
+    /// `release_shared_instance_lease`. Clone of the same Arc the
+    /// heartbeat task holds.
+    directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
 }
 
 impl PyEdge {
@@ -317,6 +414,8 @@ impl PyEdge {
             engine: None,
             #[cfg(feature = "transport-http")]
             _dev_cert_tmpdir: None,
+            #[cfg(feature = "transport-reticulum-local")]
+            shared_instance_cleanup: std::sync::Mutex::new(None),
         }
     }
 }
@@ -329,6 +428,122 @@ impl PyEdge {
     #[staticmethod]
     fn crate_version() -> &'static str {
         VERSION
+    }
+
+    /// v2.4.0 (CIRISEdge#103) — graceful close. Idempotent; safe to
+    /// call from `__del__`, `atexit` hooks, FastAPI shutdown handlers,
+    /// `try/finally` blocks, etc.
+    ///
+    /// When this Edge owns a Reticulum shared-instance lease (auto-
+    /// elected server), close():
+    ///
+    /// 1. Signals the heartbeat task to stop (oneshot — the loop's
+    ///    `tokio::select!` preempts the 10s sleep on the next
+    ///    iteration).
+    /// 2. Calls `FederationDirectory::release_shared_instance_lease`
+    ///    to free the lease row immediately (ownership-checked; safe
+    ///    if the lease was already stolen by a sibling, in which case
+    ///    persist returns `false` and we treat it as a no-op).
+    ///
+    /// Without close(), a worker exit leaves the lease row populated
+    /// until the 30s staleness window elapses — sibling re-election
+    /// then takes that full window. With close() the handoff is
+    /// hundreds of milliseconds (one persist roundtrip), matching the
+    /// orchestrator's expectations on `kubectl rollout restart` /
+    /// `systemd reload`.
+    ///
+    /// For Edges with no shared-instance lease (no `local_instance_name`
+    /// supplied, `local_instance_role="client"`, or election lost),
+    /// close() is a no-op — the surface is present on every Edge so
+    /// callers don't need to introspect.
+    ///
+    /// Errors from the persist release call are LOGGED but NOT
+    /// raised: at process-shutdown time, a backend error doesn't
+    /// help the caller (they're already exiting), and the lease will
+    /// age out via the staleness window as a fallback.
+    #[cfg(feature = "transport-reticulum-local")]
+    #[allow(clippy::unnecessary_wraps)] // Keep PyResult for future-proofing the pymethod shape
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let Ok(mut guard) = self.shared_instance_cleanup.lock() else {
+            // PoisonError: a prior caller panicked inside the lock.
+            // Treat as already-closed and return Ok — re-panicking from
+            // close() is worse than tolerating the poison.
+            tracing::warn!(
+                "PyEdge::close: shared_instance_cleanup mutex poisoned; \
+                 skipping release path"
+            );
+            return Ok(());
+        };
+        let Some(mut cleanup) = guard.take() else {
+            // Already closed, or never had a lease in the first place.
+            return Ok(());
+        };
+        // Signal the heartbeat task FIRST so it stops touching the
+        // lease before our release call lands. The receiver-side
+        // `tokio::select!` is `biased` to preempt the 10s sleep.
+        if let Some(tx) = cleanup.shutdown_tx.take() {
+            let _ = tx.send(()); // err only if the receiver already dropped (task exited).
+        }
+        // Release the lease via run_async. Errors logged + swallowed.
+        let directory = cleanup.directory;
+        let lease = cleanup.lease;
+        let instance_name_for_log = lease.instance_name.clone();
+        py.detach(|| {
+            let release_result = run_async(&self.executor, async move {
+                directory.release_shared_instance_lease(&lease).await
+            });
+            match release_result {
+                Ok(()) => {
+                    tracing::info!(
+                        instance_name = %instance_name_for_log,
+                        "Reticulum shared-instance lease released on close"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        instance_name = %instance_name_for_log,
+                        error = %e,
+                        "Reticulum shared-instance lease release failed; \
+                         lease will age out via staleness window \
+                         (ownership-checked release is a no-op when a \
+                         sibling already stole the lease)"
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// v2.4.0 (CIRISEdge#103) — `close()` shim for wheels built
+    /// without `transport-reticulum-local`. Always Ok; provided so the
+    /// Python API surface is feature-invariant (callers don't need to
+    /// `hasattr(edge, "close")` based on the wheel's feature set).
+    #[cfg(not(feature = "transport-reticulum-local"))]
+    fn close(&self, _py: Python<'_>) -> PyResult<()> {
+        Ok(())
+    }
+
+    /// v2.4.0 (CIRISEdge#103) — context-manager support so callers
+    /// can write `with init_edge_runtime(...) as edge: ...` and have
+    /// close() fire automatically on the with-block exit. Mirrors the
+    /// `contextlib.contextmanager` shape (`__enter__` returns self,
+    /// `__exit__` calls close()).
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// v2.4.0 (CIRISEdge#103) — context-manager exit. Always calls
+    /// close(); never suppresses the exception (returns `None`
+    /// implicitly — Python's `with` semantics).
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.close(py)
     }
 
     /// v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — return the host
@@ -464,6 +679,58 @@ impl PyEdge {
     /// One-line wrapper over [`Edge::signer_key_id`]; no new state.
     fn signer_key_id(&self) -> String {
         self.inner.signer_key_id().to_string()
+    }
+
+    /// v2.4.0 (CIRISEdge#95) — fetch a remote peer's hybrid KEM
+    /// pubkeys (x25519 + ML-KEM-768) from persist's federation
+    /// directory for `FederationSession::initiate` consumers
+    /// (CIRISLensCore#34 RET-native relay).
+    ///
+    /// `occurrence_key_id` is the per-device occurrence key; content-
+    /// KEM keys live at the occurrence level per CEG §5.6.8.4.
+    ///
+    /// ```python
+    /// edge.resolve_peer_kex_pubkeys(peer_occurrence_key_id) == {
+    ///     "x25519_pub_base64":     "...",  # 32 raw bytes, base64 standard
+    ///     "ml_kem_768_pub_base64": "...",  # 1184 raw bytes, base64 standard
+    /// }
+    /// # OR None if the occurrence is unknown / has no registered
+    /// # encryption_pubkeys block / has expired (valid_until in past).
+    /// ```
+    ///
+    /// Returns `None` for: occurrence not in directory, occurrence
+    /// expired, occurrence has no `encryption_pubkeys` block, or an
+    /// Edge built without a federation directory wired (test
+    /// constructors). Raises `RuntimeError` only on persist-backend
+    /// failure or malformed base64 / wrong byte length in the
+    /// stored row (operator-visible substrate corruption).
+    fn resolve_peer_kex_pubkeys<'py>(
+        &self,
+        py: Python<'py>,
+        occurrence_key_id: &str,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let inner = self.inner.clone();
+        let occurrence_key_id_owned = occurrence_key_id.to_string();
+        let kex = py.detach(|| {
+            run_async(&self.executor, async move {
+                inner
+                    .resolve_peer_kex_pubkeys(&occurrence_key_id_owned)
+                    .await
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("resolve_peer_kex_pubkeys: {e}")))
+        })?;
+        let Some(kex) = kex else {
+            let _ = b64; // suppress unused-binding lint in the None path
+            return Ok(None);
+        };
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("x25519_pub_base64", b64.encode(kex.x25519_pub))?;
+        if let Some(mlkem) = kex.mlkem768_pub {
+            dict.set_item("ml_kem_768_pub_base64", b64.encode(mlkem))?;
+        }
+        Ok(Some(dict))
     }
 
     // ─── CIRISEdge#22 Tier 2 (v0.9.0) — CommunicationBus replacement ──
@@ -3226,73 +3493,107 @@ fn init_edge_runtime(
     // a clean lease. (Auto-restart of the transport mid-process is out
     // of scope for v2.3.0 — Reticulum interfaces aren't swappable
     // live; the orchestrator owns process lifecycle.)
+    //
+    // v2.4.0 (CIRISEdge#103) — the heartbeat loop now `tokio::select!`s
+    // on a oneshot::Receiver so `PyEdge::close` can short-circuit it
+    // (rather than waiting up to 10s for the loop's next iteration).
+    // The matching Sender + lease + directory clone are stashed on
+    // PyEdge below so close() can also call
+    // `release_shared_instance_lease` to free the lease row
+    // immediately (rather than waiting for the 30s staleness window).
     #[cfg(feature = "transport-reticulum-local")]
-    if let Some(initial_lease) = acquired_lease {
-        let directory_for_heartbeat = Arc::clone(&federation_directory_for_edge);
-        let executor_for_heartbeat = Arc::clone(&executor);
-        let instance_name_outer = initial_lease.instance_name.clone();
-        let instance_name_inner = initial_lease.instance_name.clone();
-        let heartbeat_fut: BoxedFut = Box::pin(async move {
-            let mut lease = initial_lease;
-            let mut consecutive_backend_errors: u32 = 0;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                match directory_for_heartbeat
-                    .heartbeat_shared_instance(&lease)
-                    .await
-                {
-                    Ok(Some(renewed)) => {
-                        lease = renewed;
-                        consecutive_backend_errors = 0;
-                    }
-                    Ok(None) => {
-                        tracing::error!(
-                            instance_name = %instance_name_inner,
-                            "Reticulum shared-instance lease was stolen \
-                             (sibling promoted; this process is demoted to \
-                             a stale server). Restart this worker to re-elect."
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        consecutive_backend_errors += 1;
-                        tracing::warn!(
-                            instance_name = %instance_name_inner,
-                            error = %e,
-                            consecutive_errors = consecutive_backend_errors,
-                            "shared-instance heartbeat backend error"
-                        );
-                        if consecutive_backend_errors >= 6 {
-                            tracing::error!(
+    let shared_instance_cleanup: Option<SharedInstanceCleanup> =
+        if let Some(initial_lease) = acquired_lease {
+            let directory_for_heartbeat = Arc::clone(&federation_directory_for_edge);
+            let directory_for_cleanup = Arc::clone(&federation_directory_for_edge);
+            let executor_for_heartbeat = Arc::clone(&executor);
+            let instance_name_outer = initial_lease.instance_name.clone();
+            let instance_name_inner = initial_lease.instance_name.clone();
+            let lease_for_cleanup = initial_lease.clone();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let heartbeat_fut: BoxedFut = Box::pin(async move {
+                let mut lease = initial_lease;
+                let mut consecutive_backend_errors: u32 = 0;
+                let mut shutdown_rx = shutdown_rx;
+                loop {
+                    tokio::select! {
+                        biased;
+                        // Shutdown branch (biased so it preempts the sleep).
+                        // Either explicit close() signal or close() dropped the
+                        // sender without sending — both terminate the loop.
+                        _ = &mut shutdown_rx => {
+                            tracing::info!(
                                 instance_name = %instance_name_inner,
-                                "shared-instance heartbeat: 6 consecutive backend \
-                                 errors — abandoning heartbeat task. Lease will \
-                                 expire after the staleness window."
+                                "shared-instance heartbeat: shutdown signal received; \
+                                 exiting loop"
                             );
                             return;
                         }
+                        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                    }
+                    match directory_for_heartbeat
+                        .heartbeat_shared_instance(&lease)
+                        .await
+                    {
+                        Ok(Some(renewed)) => {
+                            lease = renewed;
+                            consecutive_backend_errors = 0;
+                        }
+                        Ok(None) => {
+                            tracing::error!(
+                                instance_name = %instance_name_inner,
+                                "Reticulum shared-instance lease was stolen \
+                                 (sibling promoted; this process is demoted to \
+                                 a stale server). Restart this worker to re-elect."
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            consecutive_backend_errors += 1;
+                            tracing::warn!(
+                                instance_name = %instance_name_inner,
+                                error = %e,
+                                consecutive_errors = consecutive_backend_errors,
+                                "shared-instance heartbeat backend error"
+                            );
+                            if consecutive_backend_errors >= 6 {
+                                tracing::error!(
+                                    instance_name = %instance_name_inner,
+                                    "shared-instance heartbeat: 6 consecutive backend \
+                                     errors — abandoning heartbeat task. Lease will \
+                                     expire after the staleness window."
+                                );
+                                return;
+                            }
+                        }
                     }
                 }
+            });
+            let outer_box: Box<BoxedFut> = Box::new(heartbeat_fut);
+            let task_ptr: *mut ciris_persist::ffi::executor_capsule::TaskOpaque =
+                Box::into_raw(outer_box).cast();
+            // SAFETY: same contract as `run_async` — `executor.data` and
+            // `executor.vtable` come from the same `executor_capsule_v1`
+            // PyCapsule extracted at the top of init; `task_ptr` is a
+            // freshly-boxed `BoxedFut`. Fire-and-forget (no completion
+            // channel); the spawned future loops until self-termination
+            // (shutdown signal / lease stolen / repeated backend errors).
+            #[allow(unsafe_code)]
+            unsafe {
+                (executor_for_heartbeat.vtable.spawn)(executor_for_heartbeat.data, task_ptr);
             }
-        });
-        let outer_box: Box<BoxedFut> = Box::new(heartbeat_fut);
-        let task_ptr: *mut ciris_persist::ffi::executor_capsule::TaskOpaque =
-            Box::into_raw(outer_box).cast();
-        // SAFETY: same contract as `run_async` — `executor.data` and
-        // `executor.vtable` come from the same `executor_capsule_v1`
-        // PyCapsule extracted at the top of init; `task_ptr` is a
-        // freshly-boxed `BoxedFut`. Fire-and-forget (no completion
-        // channel); the spawned future loops until self-termination
-        // (lease stolen / repeated backend errors).
-        #[allow(unsafe_code)]
-        unsafe {
-            (executor_for_heartbeat.vtable.spawn)(executor_for_heartbeat.data, task_ptr);
-        }
-        tracing::info!(
-            instance_name = %instance_name_outer,
-            "Reticulum shared-instance heartbeat task spawned (10s cadence)"
-        );
-    }
+            tracing::info!(
+                instance_name = %instance_name_outer,
+                "Reticulum shared-instance heartbeat task spawned (10s cadence)"
+            );
+            Some(SharedInstanceCleanup {
+                shutdown_tx: Some(shutdown_tx),
+                lease: lease_for_cleanup,
+                directory: directory_for_cleanup,
+            })
+        } else {
+            None
+        };
 
     // ── Step 5.5 (v0.19.3 / CIRISEdge#49) — HTTPS transport build.
     //
@@ -3531,6 +3832,8 @@ fn init_edge_runtime(
         engine: Some(engine_handle),
         #[cfg(feature = "transport-http")]
         _dev_cert_tmpdir: https_dev_cert_tmpdir,
+        #[cfg(feature = "transport-reticulum-local")]
+        shared_instance_cleanup: std::sync::Mutex::new(shared_instance_cleanup),
     })
 }
 
