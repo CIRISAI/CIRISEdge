@@ -2483,6 +2483,25 @@ impl Edge {
             .map(|t| t.local_transport_pubkey())
     }
 
+    /// v2.2.2 (CIRISEdge#97) — return edge's announced RNS destination
+    /// hash when a Reticulum transport is wired: the 16-byte
+    /// `*dest.hash()` value peers resolve to dial this node.
+    /// Cohabiting cdylibs (CIRISLensCore v1.4.0+'s `install_ret_relay`)
+    /// read this to surface the dialable RNS address alongside the
+    /// pubkeys from [`Self::local_transport_pubkey`].
+    ///
+    /// Returns `None` for HTTPS-only / transport-less Edge builds
+    /// (`disable_reticulum=True` at `init_edge_runtime`, or a wheel
+    /// built without the `_reticulum-module` feature) — same posture
+    /// as [`Self::local_transport_pubkey`].
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn local_dest_hash(&self) -> Option<[u8; 16]> {
+        self.reticulum_transport
+            .as_ref()
+            .map(|t| t.local_dest_hash())
+    }
+
     /// Pub-crate variant of [`Self::run_speak_pipeline`] reachable
     /// from `crate::ffi::pyo3`. The Python `send_inline_text` /
     /// `send_durable_inline_text` wrappers need to run the pipeline

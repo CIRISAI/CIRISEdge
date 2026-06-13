@@ -1108,6 +1108,20 @@ jobs:
     #   2. vcpkg static x64-windows-static — openssl-sys link
     #   3. CIRISPersist v5.5.1 — Unix-only code paths cfg-gated (#200)
     # A regression in any of the three fails the gauntlet.
+    #
+    # v2.2.2 (CIRISPersist#208 mirror) — Windows nightly pinned via
+    # NIGHTLY_PIN. rust-cache's key includes the rustc version, so a
+    # daily-rotating `dtolnay/rust-toolchain@nightly` would bust the
+    # build-std cache every day (Windows wheel went 21.9m → cold every
+    # run). Pinning + per-(os,label) cache key drops Windows wheel to
+    # ~10-12m warm projected. Bump NIGHTLY_PIN deliberately when a
+    # std/build-std fix lands; tracks the known-good nightly the wheel
+    # last shipped against. KEEP IN SYNC with the toolchain step's
+    # `toolchain:` AND the maturin-build step's `RUSTUP_TOOLCHAIN:` —
+    # divergence causes `-Zbuild-std` to look for std source in a
+    # toolchain that has no rust-src installed.
+    env:
+      NIGHTLY_PIN: nightly-2026-06-12
     strategy:
       fail-fast: false
       matrix:
@@ -1220,17 +1234,35 @@ jobs:
       # to Win10/11 (one wheel, broadest support).
       - uses: dtolnay/rust-toolchain@stable
         if: runner.os != 'Windows'
-      - uses: dtolnay/rust-toolchain@nightly
+      # v2.2.2 (CIRISPersist#208 mirror) — pinned nightly via
+      # `@master + toolchain:` instead of `@nightly` (rolling). Rolling
+      # nightly busts rust-cache every day since the cache key includes
+      # rustc version. NIGHTLY_PIN is set at job-level env above.
+      - uses: dtolnay/rust-toolchain@master
         if: runner.os == 'Windows'
         with:
+          toolchain: ${{ env.NIGHTLY_PIN }}
           components: rust-src
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below
       # actively corrects. CIRISVerify v2.1.4+ pattern; persist v0.7.2's
       # original work + verify's follow-up active-heal step.
+      #
+      # v2.2.2 (CIRISPersist#208 mirror) — `key: wheel-${{ matrix.label }}`
+      # gives each matrix entry its own cache slot. Without this, all
+      # 4 wheel jobs (linux x86_64, linux aarch64, darwin aarch64,
+      # windows x86_64) thrash a SINGLE shared cache slot — the last
+      # one written wins, every other entry hits an unusable cache
+      # (different target triple, different artifacts) and recompiles
+      # from scratch. Per-label keying drops the Windows wheel from
+      # ~21.9m cold to ~10-12m warm projected. Zero quality impact:
+      # cargo fingerprints on Cargo.lock+rustc and always recompiles
+      # edge's own (changed) crate; the published wheel is identical
+      # to a clean build.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          key: wheel-${{ matrix.label }}
         continue-on-error: true
       - name: Repair toolchain if rustup-init shadow (cache-poison heal)
         # v0.7.0 (CIRISEdge#17) — CIRISVerify v2.1.4+ pattern verbatim.
@@ -1254,8 +1286,10 @@ jobs:
           fi
           # v2.2.1 — Windows needs nightly (Tier-3 build-std); other
           # OSes use stable.
+          # v2.2.2 — Windows uses the pinned NIGHTLY_PIN, not rolling
+          # nightly (cache-warmth preservation; see job-level env block).
           if [ "${{ runner.os }}" = "Windows" ]; then
-            rustup default nightly
+            rustup default "${NIGHTLY_PIN}"
           else
             rustup default stable
           fi
@@ -1324,7 +1358,12 @@ jobs:
             # CARGO_BUILD_TARGET='' at step-level env breaks cargo
             # ("target was empty"); the empty string is treated as an
             # explicit (invalid) target rather than as unset.
-            export RUSTUP_TOOLCHAIN=nightly
+            # v2.2.2 — RUSTUP_TOOLCHAIN tracks the pinned NIGHTLY_PIN
+            # the toolchain step + Repair-toolchain step also use.
+            # Divergence between RUSTUP_TOOLCHAIN here and the actually-
+            # installed toolchain causes -Zbuild-std to look for std
+            # source in a toolchain that has no rust-src.
+            export RUSTUP_TOOLCHAIN="${NIGHTLY_PIN}"
             export CARGO_BUILD_TARGET=x86_64-win7-windows-msvc
             export CARGO_UNSTABLE_BUILD_STD=std,panic_abort
             # Sanity: Tier-3 target must be in nightly's target-list
