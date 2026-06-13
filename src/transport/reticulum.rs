@@ -87,7 +87,7 @@ use tokio::sync::{mpsc, Mutex};
 use reticulum_core::link::LinkId;
 use reticulum_core::resource::ResourceStrategy;
 use reticulum_core::{Destination, DestinationHash, DestinationType, Direction, Identity};
-use reticulum_std::driver::{ReticulumNode, ReticulumNodeBuilder};
+use reticulum_std::driver::{EventReceiver, ReticulumNode, ReticulumNodeBuilder};
 use reticulum_std::NodeEvent;
 
 use super::attestation::{AnnounceAttestation, AttestationError, AttestationPayload};
@@ -862,7 +862,12 @@ pub struct ReticulumTransport {
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
     /// events are never dropped before a consumer attaches.
-    events: Mutex<Option<mpsc::UnboundedReceiver<NodeEvent>>>,
+    /// v3.0.0 — leviculum upstream introduced the two-bounded-plane
+    /// channel (lossless control + droppable data) at ffd261d; the
+    /// receiver type became `EventReceiver` with the same `.recv()` /
+    /// `.try_recv()` surface — call sites unchanged, field type
+    /// updated.
+    events: Mutex<Option<EventReceiver>>,
     /// `key_id → rooted peer`, populated by the authenticated
     /// cold-start path from received announces. Every entry has been
     /// rooted against the persist directory + had its attestation

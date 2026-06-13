@@ -197,7 +197,43 @@ use crate::verify::{HybridPolicy, RootingDirectory, VerifyDirectory};
 // via `inventory::submit!` and emit the merged `.pyi` to
 // `python/ciris_edge/__init__.pyi`. The macro expansion produces
 // `pub fn stub_info() -> pyo3_stub_gen::Result<pyo3_stub_gen::StubInfo>`.
-pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
+//
+// v3.0.0 (CIRISEdge#89) — pyo3-stub-gen has no pyo3 0.29-compatible
+// release as of v3.0.0; the dep is dropped from Cargo.toml's `pyo3`
+// feature list. Edge has zero active `#[gen_stub_*]` attributes
+// anywhere in `src/` (every match is in a doc comment), so this
+// gatherer registered an empty set; the existing `__init__.pyi`
+// stays as the hand-maintained consumer-facing surface. A no-op
+// `stub_info()` keeps `src/bin/stub_gen.rs` compiling — restore the
+// macro invocation here when pyo3-stub-gen ships a 0.29 cut.
+//
+// pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
+pub fn stub_info() -> Result<NoopStubInfo, Box<dyn std::error::Error>> {
+    Ok(NoopStubInfo)
+}
+
+/// v3.0.0 (CIRISEdge#89) — placeholder for the
+/// `pyo3_stub_gen::StubInfo` shape `stub_gen` calls `.generate()` on.
+/// While pyo3-stub-gen catches up to pyo3 0.29, this no-op preserves
+/// the `stub_gen` binary's compile shape: it does nothing on
+/// `generate()` and prints a notice. The existing
+/// `python/ciris_edge/__init__.pyi` is the source of truth for the
+/// Python type surface; CI's stub-drift gate is satisfied as long as
+/// it is not regenerated.
+pub struct NoopStubInfo;
+
+impl NoopStubInfo {
+    /// Stand-in for `pyo3_stub_gen::StubInfo::generate`. No-op; the
+    /// hand-maintained `__init__.pyi` is the source of truth until
+    /// pyo3-stub-gen ships 0.29 support.
+    pub fn generate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        eprintln!(
+            "stub_gen: no-op (pyo3-stub-gen has no pyo3 0.29 release yet; \
+             see CIRISEdge#89 + Cargo.toml comment near pyo3-stub-gen)"
+        );
+        Ok(())
+    }
+}
 
 /// Wire-format schema versions edge supports. Strict allowlist (AV-7);
 /// out-of-set values reject at the verify pipeline. Mirrors persist's
@@ -2370,12 +2406,32 @@ where
     // produced by `reference::<T>()` is valid for the duration of the
     // map closure. The deprecation on `PyCapsule::reference` is
     // acknowledged: 0.28 ships `pointer_checked` as the
-    // non-deprecated alternative, but it still requires an unsafe
-    // deref + cast at the call site, so the safety surface is
-    // unchanged. We allow the deprecation here to keep the call site
-    // compact.
-    #[allow(deprecated)]
-    let inner: &T = unsafe { cap.reference::<T>() };
+    // non-deprecated alternative, and 0.29 REMOVES `reference()` —
+    // edge v3.0.0 (CIRISEdge#89) consumes `pointer_checked` with the
+    // same unsafe deref + cast at the call site. The safety surface
+    // is unchanged from the .reference() era; the SAFETY comment on
+    // the function-level docs still applies in full.
+    // v3.0.0 (CIRISEdge#89) — pyo3 0.29's `pointer_checked(name)`
+    // enforces a name match against the capsule's stored name when
+    // `name` is `Some`; `None` is only valid for unnamed capsules.
+    // Persist's capsules ALL have names (e.g.
+    // `c"ciris_persist::federation_directory"`), so we MUST pass the
+    // capsule's own name back through. Extracting via `cap.name()`
+    // returns the capsule-stored name as a `CapsuleName`; the
+    // `.as_cstr()` view feeds straight into `pointer_checked`.
+    // SAFETY (cap.name().as_cstr()): `CapsuleName::as_cstr` requires
+    // the capsule's name not to change between the `.name()` call and
+    // the `.pointer_checked()` call. We hold `cap` (the `Bound`) for
+    // both, no Python code runs between them, and the capsule's name
+    // is set once at construction in persist — no SetName drift.
+    let name = cap
+        .name()
+        .map_err(|e| PyTypeError::new_err(format!("engine.{method}(): capsule name: {e}")))?;
+    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
+    let ptr = cap
+        .pointer_checked(name_cstr)
+        .map_err(|e| PyTypeError::new_err(format!("engine.{method}(): pointer_checked: {e}")))?;
+    let inner: &T = unsafe { &*(ptr.as_ptr() as *const T) };
     Ok(map(inner))
 }
 
@@ -2495,9 +2551,24 @@ fn extract_trust_scoring(
     // that contract (v3.6.3 carries v3.5.1's surface forward via
     // v3.5.2 + v3.6.0). The cloned `Arc` is owned by the caller —
     // the capsule reference doesn't escape this function.
-    #[allow(deprecated)]
+    // v3.0.0 (CIRISEdge#89) — pyo3 0.29 removes `.reference()`;
+    // use `pointer_checked` + cast (same safety contract as before).
+    // pyo3 0.29's `pointer_checked(name)` enforces a name match; pass
+    // the capsule's own name through. See `extract_engine_capsule_arc`
+    // above for the matching pattern + SAFETY rationale.
+    let name = cap.name().map_err(|e| {
+        TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
+            "trust_scoring_capsule: capsule name: {e}"
+        )))
+    })?;
+    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
+    let ptr = cap.pointer_checked(name_cstr).map_err(|e| {
+        TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
+            "trust_scoring_capsule: pointer_checked: {e}"
+        )))
+    })?;
     let inner: &Arc<dyn ciris_persist::federation::TrustScoring> =
-        unsafe { cap.reference::<Arc<dyn ciris_persist::federation::TrustScoring>>() };
+        unsafe { &*(ptr.as_ptr() as *const Arc<dyn ciris_persist::federation::TrustScoring>) };
     Ok(Arc::clone(inner))
 }
 
@@ -2561,9 +2632,24 @@ fn extract_local_signer(
     // that contract (v3.2.0 carries v3.1.1's surface forward). The
     // cloned `Arc` is owned by the caller — the capsule reference
     // doesn't escape this function.
-    #[allow(deprecated)]
+    // v3.0.0 (CIRISEdge#89) — pyo3 0.29 removes `.reference()`;
+    // use `pointer_checked` + cast (same safety contract as before).
+    // pyo3 0.29's `pointer_checked(name)` enforces a name match; pass
+    // the capsule's own name through. See `extract_engine_capsule_arc`
+    // above for the matching pattern + SAFETY rationale.
+    let name = cap.name().map_err(|e| {
+        LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
+            "local_signer_capsule: capsule name: {e}"
+        )))
+    })?;
+    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
+    let ptr = cap.pointer_checked(name_cstr).map_err(|e| {
+        LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
+            "local_signer_capsule: pointer_checked: {e}"
+        )))
+    })?;
     let inner: &Arc<ciris_persist::signing::LocalSigner> =
-        unsafe { cap.reference::<Arc<ciris_persist::signing::LocalSigner>>() };
+        unsafe { &*(ptr.as_ptr() as *const Arc<ciris_persist::signing::LocalSigner>) };
     Ok(Arc::clone(inner))
 }
 

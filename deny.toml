@@ -94,18 +94,11 @@ ignore = [
     "RUSTSEC-2025-0098",  # unic-* unmaintained
     "RUSTSEC-2025-0100",  # unic-* unmaintained
 
-    # v2.1.1 — pyo3 0.28 transitive-only advisories. Both fixed in
-    # pyo3 0.29.0; whole CIRIS substrate family must move in lockstep
-    # to avoid two-pyo3-versions in cohabitation graph. Tracking the
-    # lockstep upgrade in CIRISEdge#89 — these lift when that lands.
-    "RUSTSEC-2026-0176",  # pyo3 0.28 BoundList/Tuple nth/nth_back overflow
-                          # (edge does NOT call .nth()/.nth_back() on PyO3
-                          #  iterators — grep confirms; transitive-only)
-    "RUSTSEC-2026-0177",  # pyo3 0.28 PyCFunction::new_closure missing Sync
-                          # bound (data-race exposure on free-threaded Python
-                          #  variant; edge's pyfunctions are all `#[pyfunction]`
-                          #  attribute-macro generated, not new_closure-based;
-                          #  transitive-only)
+    # v3.0.0 (CIRISEdge#89) — the pyo3 0.28 → 0.29 family lockstep
+    # landed. RUSTSEC-2026-0176 + RUSTSEC-2026-0177 are GONE from the
+    # tree (pyo3 0.29 ships both fixes); the ignores that lived here
+    # since v2.1.1 are removed. If `cargo deny check advisories`
+    # surfaces either again, something regressed the substrate pin.
 ]
 
 [sources]
