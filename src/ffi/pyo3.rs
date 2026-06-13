@@ -769,6 +769,59 @@ impl PyEdge {
         Ok(Some(dict))
     }
 
+    /// v3.1.0 (CIRISEdge#108 / CIRISPersist#183, CEG §5.6.8.8.1) —
+    /// list every reachable address registered for `occurrence_key_id`
+    /// via persist's V078 `transport_destinations` table.
+    ///
+    /// ```python
+    /// edge.list_transport_destinations_for(peer_occurrence_key_id) == [
+    ///     {
+    ///         "occurrence_key_id": "...",
+    ///         "transport_kind": "reticulum",      # or "websocket" / "https" / op-defined
+    ///         "destination": "<RNS hash hex>",    # transport-kind-specific
+    ///         "asserted_at": "2026-06-13T23:59:00Z",
+    ///         "last_seen_at": "2026-06-13T23:59:30Z",   # or None
+    ///     },
+    ///     ...
+    /// ]
+    /// ```
+    ///
+    /// Empty list when the occurrence has no registered addresses
+    /// (not an error). Empty list for Edges built without a federation
+    /// directory (test constructors). Raises `RuntimeError` on
+    /// persist-backend failure.
+    ///
+    /// Liveness filtering on `last_seen_at` age is the caller's
+    /// responsibility per persist's contract — reachability is
+    /// mutable + disposable.
+    fn list_transport_destinations_for<'py>(
+        &self,
+        py: Python<'py>,
+        occurrence_key_id: &str,
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyDict>>> {
+        let inner = self.inner.clone();
+        let occurrence_owned = occurrence_key_id.to_string();
+        let rows = py.detach(|| {
+            run_async(&self.executor, async move {
+                inner
+                    .list_transport_destinations_for(&occurrence_owned)
+                    .await
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("list_transport_destinations_for: {e}")))
+        })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("occurrence_key_id", row.occurrence_key_id)?;
+            dict.set_item("transport_kind", row.transport_kind)?;
+            dict.set_item("destination", row.destination)?;
+            dict.set_item("asserted_at", row.asserted_at.to_rfc3339())?;
+            dict.set_item("last_seen_at", row.last_seen_at.map(|ts| ts.to_rfc3339()))?;
+            out.push(dict);
+        }
+        Ok(out)
+    }
+
     // ─── CIRISEdge#22 Tier 2 (v0.9.0) — CommunicationBus replacement ──
     //
     // The pymethods below back CIRISAgent 2.9.5's
@@ -2791,6 +2844,7 @@ enum LocalInstanceRole {
     trust_recursion_depth = None,
     local_instance_name = None,
     local_instance_role = "auto",
+    agent_occurrence_key_id = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -2855,6 +2909,25 @@ fn init_edge_runtime(
     // any effect — v2.2.x behavior is preserved exactly.
     local_instance_name: Option<&str>,
     local_instance_role: &str,
+    // v3.1.0 (CIRISEdge#108 / CIRISPersist#183, CEG §5.6.8.8.1) —
+    // self-at-login transport_destination registration. When
+    // `Some(occurrence_key_id)`, after the Reticulum transport
+    // successfully binds, edge calls
+    // `FederationDirectory::put_transport_destination` with the
+    // resolved `(occurrence_key_id, "reticulum", local_dest_hash_hex)`
+    // tuple — making this node's RNS destination hash discoverable
+    // for peer reachability lookups. Idempotent (V078 composite PK on
+    // `(occurrence_key_id, transport_kind, destination)`); re-asserts
+    // on every `init_edge_runtime` call refresh `asserted_at`.
+    //
+    // The caller is expected to have run `Engine::self_at_login`
+    // first to mint the agent occurrence + obtain its `key_id` —
+    // edge does not derive the occurrence_key_id itself (the
+    // identity/occurrence cardinality is a host-tier concern).
+    //
+    // `None` (the default) preserves the v3.0.x init behaviour
+    // exactly; no transport_destination row is written.
+    agent_occurrence_key_id: Option<&str>,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -3565,6 +3638,79 @@ fn init_edge_runtime(
         })?;
         Some(t)
     };
+
+    // v3.1.0 (CIRISEdge#108 / CIRISPersist#183, CEG §5.6.8.8.1) —
+    // self-at-login transport_destination registration. When the
+    // caller supplied `agent_occurrence_key_id` AND we successfully
+    // built the Reticulum transport, register this node's RNS
+    // destination hash so peers querying
+    // `list_transport_destinations_for(occurrence_key_id)` can dial
+    // us. Idempotent on the (occurrence_key_id, transport_kind,
+    // destination) PK; re-asserts update `asserted_at` in place.
+    //
+    // Skip silently when:
+    //   - `agent_occurrence_key_id` is None (caller opted out;
+    //     v3.0.x init behaviour preserved)
+    //   - `reticulum_transport` is None (disable_reticulum=True; no
+    //     RNS destination to advertise)
+    //   - `local_dest_hash()` returns None (transport built but
+    //     destination not yet computed — should not occur in
+    //     practice; defensive)
+    //
+    // A registration failure is LOGGED but not raised — reachability
+    // is mutable + disposable per persist's contract; a missed
+    // assertion just means peers fall back to other addresses or
+    // re-resolve next time. Failing init for a reachability hint is
+    // disproportionate.
+    #[cfg(feature = "_reticulum-module")]
+    if let (Some(occurrence_key_id), Some(transport)) =
+        (agent_occurrence_key_id, reticulum_transport.as_ref())
+    {
+        // ReticulumTransport::local_dest_hash returns [u8; 16] (not
+        // Option) — the destination is set at transport construction
+        // (see ReticulumTransport::new), so it's always available
+        // here. Edge::local_dest_hash returns Option only because
+        // the Edge wrapper may not have a Reticulum transport at
+        // all (HTTPS-only paths); we're inside the
+        // `reticulum_transport.is_some()` arm so the inner method
+        // applies.
+        let dest_hash = transport.local_dest_hash();
+        {
+            let destination_hex = hex::encode(dest_hash);
+            let directory_for_register = Arc::clone(&federation_directory_for_edge);
+            let row = ciris_persist::federation::self_at_login::TransportDestination {
+                occurrence_key_id: occurrence_key_id.to_string(),
+                transport_kind: "reticulum".to_string(),
+                destination: destination_hex.clone(),
+                asserted_at: chrono::Utc::now(),
+                last_seen_at: None,
+            };
+            let occurrence_for_log = occurrence_key_id.to_string();
+            let register_result = run_async(&executor, async move {
+                directory_for_register.put_transport_destination(&row).await
+            });
+            match register_result {
+                Ok(()) => {
+                    tracing::info!(
+                        occurrence_key_id = %occurrence_for_log,
+                        transport_kind = "reticulum",
+                        destination = %destination_hex,
+                        "transport_destination registered (self-at-login)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        occurrence_key_id = %occurrence_for_log,
+                        transport_kind = "reticulum",
+                        destination = %destination_hex,
+                        error = %e,
+                        "transport_destination registration failed; peers may need \
+                         to retry reachability lookup"
+                    );
+                }
+            }
+        }
+    }
 
     // v2.3.0 (CIRISEdge#100) — heartbeat task for the shared-instance
     // lease (auto-elected server only). Persist's stale-after window is
@@ -5127,6 +5273,7 @@ mod pyo3_tier2_tests {
                 None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
                 "auto", // local_instance_role
+                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -5217,6 +5364,7 @@ mod pyo3_tier2_tests {
                 None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,   // local_instance_name (v2.3.0)
                 "auto", // local_instance_role
+                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -5363,6 +5511,7 @@ mod pyo3_tier2_tests {
                 None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
                 "auto", // local_instance_role
+                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
             )?;
             Ok(())
         });
@@ -5462,6 +5611,7 @@ mod pyo3_tier2_tests {
                 None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,   // local_instance_name (v2.3.0)
                 "auto", // local_instance_role
+                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -5615,6 +5765,7 @@ mod pyo3_tier2_tests {
                 None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
                 "auto", // local_instance_role
+                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -5754,6 +5905,7 @@ mod pyo3_tier2_tests {
                 None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
                 "auto", // local_instance_role
+                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
             )?;
             Ok(edge.signer_key_id())
         });

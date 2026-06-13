@@ -1271,6 +1271,40 @@ impl Edge {
         }))
     }
 
+    /// v3.1.0 (CIRISEdge#108 / CIRISPersist#183, CEG §5.6.8.8.1) —
+    /// list every reachable transport address registered for an
+    /// occurrence ("how do I reach this occurrence?"). Delegates to
+    /// persist's `FederationDirectory::list_transport_destinations_for`
+    /// (V078 `transport_destinations` table).
+    ///
+    /// Returns the full set unfiltered — liveness filtering (on
+    /// `last_seen_at` age) is the caller's responsibility per
+    /// persist's documented contract; reachability is mutable +
+    /// disposable. A typical caller filters by `transport_kind ==
+    /// "reticulum"` for RNS dialing, and discards rows whose
+    /// `last_seen_at` is older than some operator-tier threshold.
+    ///
+    /// Returns:
+    /// - `Ok(Vec<_>)` — zero or more rows; empty when the
+    ///   occurrence has no registered addresses (not an error)
+    /// - `Ok(Vec::new())` — Edge has no federation_directory wired
+    ///   (test constructors); a graceful no-op so call sites don't
+    ///   need to introspect
+    /// - `Err(EdgeError::Persist)` on persist-backend error
+    pub async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<ciris_persist::federation::self_at_login::TransportDestination>, EdgeError>
+    {
+        let Some(directory) = self.federation_directory.as_ref() else {
+            return Ok(Vec::new());
+        };
+        directory
+            .list_transport_destinations_for(occurrence_key_id)
+            .await
+            .map_err(|e| EdgeError::Persist(format!("list_transport_destinations_for: {e}")))
+    }
+
     /// CIRISEdge#48-A (v0.19.1) accessor — current enforcement
     /// posture.
     #[must_use]
