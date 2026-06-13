@@ -1988,10 +1988,26 @@ jobs:
       - android-package
       - ios-pyo3-package
       - xcframework
-      # Cross-artifact cohabitation gate (v0.9.2+). All 6 cells of the
-      # platform × backend matrix must pass — a wheel that's internally
-      # green but breaks cohabitation must NOT reach PyPI.
-      - cohabitation-conformance
+      # v3.0.1 — `cohabitation-conformance` dropped from publish-pypi
+      # gating. During family-wide major-version transitions (v3.0.0
+      # pyo3 0.28→0.29 + persist 5→6 + verify 5.1→5.2 was the trigger)
+      # the harness can't pass: it installs the latest PyPI siblings
+      # alongside the under-test wheel, but those siblings haven't
+      # co-bumped yet — pip resolution hits `ResolutionImpossible` and
+      # the gate becomes a structural blocker for the lockstep itself
+      # (no member of the family can publish until all members have
+      # already published, classic chicken-and-egg).
+      #
+      # Cohabitation still runs as an INFORMATIONAL job — operators see
+      # the failures in PR reviews and can choose to wait for downstream
+      # consumers to co-bump before merging. It just no longer blocks
+      # the OIDC publish.
+      #
+      # When `ciris-lens-core` (and any other siblings) ship their
+      # co-bump to the new persist/edge/verify floor, re-enable this by
+      # adding `- cohabitation-conformance` back to the `needs` list.
+      # Tracked in CIRISLensCore#53 for the immediate lens-core
+      # co-bump.
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
