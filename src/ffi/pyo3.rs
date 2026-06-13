@@ -2411,8 +2411,25 @@ where
     // same unsafe deref + cast at the call site. The safety surface
     // is unchanged from the .reference() era; the SAFETY comment on
     // the function-level docs still applies in full.
+    // v3.0.0 (CIRISEdge#89) — pyo3 0.29's `pointer_checked(name)`
+    // enforces a name match against the capsule's stored name when
+    // `name` is `Some`; `None` is only valid for unnamed capsules.
+    // Persist's capsules ALL have names (e.g.
+    // `c"ciris_persist::federation_directory"`), so we MUST pass the
+    // capsule's own name back through. Extracting via `cap.name()`
+    // returns the capsule-stored name as a `CapsuleName`; the
+    // `.as_cstr()` view feeds straight into `pointer_checked`.
+    // SAFETY (cap.name().as_cstr()): `CapsuleName::as_cstr` requires
+    // the capsule's name not to change between the `.name()` call and
+    // the `.pointer_checked()` call. We hold `cap` (the `Bound`) for
+    // both, no Python code runs between them, and the capsule's name
+    // is set once at construction in persist — no SetName drift.
+    let name = cap
+        .name()
+        .map_err(|e| PyTypeError::new_err(format!("engine.{method}(): capsule name: {e}")))?;
+    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
     let ptr = cap
-        .pointer_checked(None)
+        .pointer_checked(name_cstr)
         .map_err(|e| PyTypeError::new_err(format!("engine.{method}(): pointer_checked: {e}")))?;
     let inner: &T = unsafe { &*(ptr.as_ptr() as *const T) };
     Ok(map(inner))
@@ -2536,7 +2553,16 @@ fn extract_trust_scoring(
     // the capsule reference doesn't escape this function.
     // v3.0.0 (CIRISEdge#89) — pyo3 0.29 removes `.reference()`;
     // use `pointer_checked` + cast (same safety contract as before).
-    let ptr = cap.pointer_checked(None).map_err(|e| {
+    // pyo3 0.29's `pointer_checked(name)` enforces a name match; pass
+    // the capsule's own name through. See `extract_engine_capsule_arc`
+    // above for the matching pattern + SAFETY rationale.
+    let name = cap.name().map_err(|e| {
+        TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
+            "trust_scoring_capsule: capsule name: {e}"
+        )))
+    })?;
+    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
+    let ptr = cap.pointer_checked(name_cstr).map_err(|e| {
         TrustScoringCapsuleError::Other(PyTypeError::new_err(format!(
             "trust_scoring_capsule: pointer_checked: {e}"
         )))
@@ -2608,7 +2634,16 @@ fn extract_local_signer(
     // doesn't escape this function.
     // v3.0.0 (CIRISEdge#89) — pyo3 0.29 removes `.reference()`;
     // use `pointer_checked` + cast (same safety contract as before).
-    let ptr = cap.pointer_checked(None).map_err(|e| {
+    // pyo3 0.29's `pointer_checked(name)` enforces a name match; pass
+    // the capsule's own name through. See `extract_engine_capsule_arc`
+    // above for the matching pattern + SAFETY rationale.
+    let name = cap.name().map_err(|e| {
+        LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
+            "local_signer_capsule: capsule name: {e}"
+        )))
+    })?;
+    let name_cstr = name.as_ref().map(|n| unsafe { n.as_cstr() });
+    let ptr = cap.pointer_checked(name_cstr).map_err(|e| {
         LocalSignerCapsuleError::Other(PyTypeError::new_err(format!(
             "local_signer_capsule: pointer_checked: {e}"
         )))
