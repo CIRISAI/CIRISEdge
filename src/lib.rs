@@ -48,6 +48,7 @@
 #![deny(rust_2018_idioms)]
 #![doc(html_root_url = "https://docs.rs/ciris-edge/0.1.0-pre1")]
 
+pub mod blob_swarm;
 pub mod cohort_scope;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
