@@ -1208,6 +1208,69 @@ impl Edge {
         }
     }
 
+    /// v2.4.0 (CIRISEdge#95) — resolve a remote peer's hybrid KEM
+    /// pubkeys (x25519 + ML-KEM-768) from persist's federation
+    /// directory for `FederationSession::initiate` consumers.
+    ///
+    /// `occurrence_key_id` is the per-device occurrence key (NOT the
+    /// identity key) — content KEM keys live at the occurrence level
+    /// per CEG §5.6.8.4.
+    ///
+    /// Returns:
+    /// - `Ok(Some(PeerKexPubkeys))` when persist has both halves
+    ///   registered for the occurrence
+    /// - `Ok(None)` when the occurrence is unknown, expired
+    ///   (`valid_until` in the past), or has no `encryption_pubkeys`
+    ///   block
+    /// - `Err(EdgeError::Persist)` on persist-backend error
+    ///
+    /// Delegates to
+    /// [`FederationDirectory::resolve_encryption_keys`](ciris_persist::federation::FederationDirectory::resolve_encryption_keys)
+    /// (persist v4.13.0+, `EncryptionPubkeys { x25519_base64,
+    /// ml_kem_768_base64 }`) and base64-decodes the two halves into
+    /// the wire-byte shape `PeerKexPubkeys` carries. A decode failure
+    /// or wrong byte count surfaces as `Err(EdgeError::Persist)`
+    /// rather than silent `Ok(None)` — a malformed row in persist
+    /// must be operator-visible.
+    pub async fn resolve_peer_kex_pubkeys(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<crate::transport::federation_session::PeerKexPubkeys>, EdgeError> {
+        use base64::Engine as _;
+        let Some(directory) = self.federation_directory.as_ref() else {
+            return Ok(None);
+        };
+        let encryption_pubkeys = directory
+            .resolve_encryption_keys(occurrence_key_id)
+            .await
+            .map_err(|e| EdgeError::Persist(format!("resolve_encryption_keys: {e}")))?;
+        let Some(pk) = encryption_pubkeys else {
+            return Ok(None);
+        };
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let x25519_raw = b64.decode(&pk.x25519_base64).map_err(|e| {
+            EdgeError::Persist(format!(
+                "resolve_peer_kex_pubkeys({occurrence_key_id}): x25519 base64 decode: {e}"
+            ))
+        })?;
+        let x25519_pub: [u8; 32] = x25519_raw.as_slice().try_into().map_err(|_| {
+            EdgeError::Persist(format!(
+                "resolve_peer_kex_pubkeys({occurrence_key_id}): x25519 wrong length \
+                 ({}; expected 32)",
+                x25519_raw.len()
+            ))
+        })?;
+        let mlkem768_pub = b64.decode(&pk.ml_kem_768_base64).map_err(|e| {
+            EdgeError::Persist(format!(
+                "resolve_peer_kex_pubkeys({occurrence_key_id}): ml-kem-768 base64 decode: {e}"
+            ))
+        })?;
+        Ok(Some(crate::transport::federation_session::PeerKexPubkeys {
+            x25519_pub,
+            mlkem768_pub: Some(mlkem768_pub),
+        }))
+    }
+
     /// CIRISEdge#48-A (v0.19.1) accessor — current enforcement
     /// posture.
     #[must_use]

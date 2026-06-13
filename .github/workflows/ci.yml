@@ -1100,8 +1100,29 @@ jobs:
   # Each matrix entry runs on a NATIVE runner for that target so we
   # avoid cross-compile drama (sysroot, linkers, vendored crypto
   # quirks).
+  # v2.4.0 (CIRISEdge#84) — pre-wheel Cargo<->pyproject pin-skew guard.
+  # The v1.7.0 -> v2.0.1 cascade shipped three wheels with
+  # `Requires-Dist: ciris-persist<5,>=4.15.0` while the bundled cdylib
+  # linked persist v5.x; downstream `pip install` hit ResolutionImpossible.
+  # This job parses both files and fails fast if the Cargo-pinned tag
+  # does not satisfy the pyproject PEP 440 constraint, before any wheel
+  # is built. ~10s job; gates pyo3-wheel via `needs:`.
+  cargo-pyproject-skew-check:
+    name: cargo <-> pyproject pin-skew check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install packaging
+        run: python -m pip install --quiet "packaging>=23"
+      - name: check skew
+        run: python3 .github/scripts/check_cargo_pyproject_skew.py
+
   pyo3-wheel:
     name: maturin abi3-py310 wheel (${{ matrix.label }})
+    needs: [cargo-pyproject-skew-check]
     # v2.1.1 — windows-x86_64 wheel is now REQUIRED (closes
     # CIRISEdge#90). All three layers landed:
     #   1. leviculum 4c15dfd — reticulum-std Windows port (leviculum#10/#11)
