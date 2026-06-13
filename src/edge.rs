@@ -759,6 +759,39 @@ pub struct VerifiedEnvelopeSnapshot {
     pub received_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// CIRISEdge#55 — type alias for the swarm-fetch pending-map shape.
+/// Keyed by `(blob_sha256, chunk_sha256)` — the scheduler runs many
+/// chunk fetches in parallel across multiple blobs, and chunk-SHA
+/// alone can't disambiguate. Lifted to a type to keep
+/// `clippy::type_complexity` happy at the dispatcher signature.
+type BlobChunkPendingMap =
+    std::sync::Mutex<HashMap<([u8; 32], [u8; 32]), oneshot::Sender<ChunkResult>>>;
+
+/// CIRISEdge#55 — result of a single [`Edge::fetch_blob_chunk`] call.
+///
+/// One-chunk-from-one-peer atomic primitive the swarm scheduler
+/// orchestrates. Distinct from [`ContentResult`] because chunk
+/// fetching has different semantics:
+/// - No External variant (chunks are always inline; external
+///   bodies are whole-blob, never chunked).
+/// - No in-dispatch SHA verification — the integrity gate is
+///   `persist.put_blob_chunk(blob_sha, chunk_sha, bytes)` which
+///   verifies + stores atomically per the §10.1.1 trust seam. The
+///   scheduler hands bytes from this enum directly to put_blob_chunk;
+///   on `ChunkMismatch` from persist the scheduler demotes the peer.
+#[derive(Debug, Clone)]
+pub enum ChunkResult {
+    /// The peer returned a `BlobChunkBody` carrying the chunk bytes.
+    /// The scheduler MUST hand these to `put_blob_chunk` for the
+    /// SHA verification + store step (see seam doc above).
+    Bytes(Vec<u8>),
+    /// The peer returned a `BlobChunkMiss` (typed reason). Scheduler
+    /// behavior depends on the reason: `NotHeld` → try another
+    /// holder; `Withdrawn` / `Revoked` → abort the whole blob fetch;
+    /// `PolicyDenied` → demote this peer for the session.
+    ChunkMiss { reason: String },
+}
+
 /// CIRISEdge#22 Tier 3 (v0.17.0) — result of an [`Edge::fetch_content`]
 /// call. The Python `fetch_content` pymethod returns the JSON-shaped
 /// projection of this enum.
@@ -831,6 +864,22 @@ pub struct Edge {
     /// `Edge::fetch_content` drops the receiver on timeout, which
     /// closes the oneshot and the dispatcher prunes lazily.
     content_fetch_pending: Arc<std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<ContentResult>>>>,
+    /// CIRISEdge#55 v2.5.0 — chunked-blob swarm fetch correlation map.
+    // Type-alias on the line above intentionally not lifted to a `type` —
+    // the existing `content_fetch_pending` field declares its type inline
+    // verbatim, and the swarm field mirrors that shape for code-review
+    // consistency. Clippy's "very complex type" is suppressed below at
+    // the field, not at the struct, to scope the allow narrowly.
+    /// Keyed by `(blob_sha256, chunk_sha256)` because the scheduler
+    /// runs many chunk fetches in parallel across multiple blobs;
+    /// chunk-SHA alone can't disambiguate (two blobs could in principle
+    /// share a chunk, and the scheduler's per-blob state needs the
+    /// blob-SHA at the routing layer anyway).
+    ///
+    /// Same lifecycle discipline as `content_fetch_pending`: the
+    /// receiver-side `Edge::fetch_blob_chunk` drops the receiver on
+    /// timeout, closing the oneshot; the dispatcher prunes lazily.
+    blob_chunk_fetch_pending: Arc<BlobChunkPendingMap>,
     /// Optional pipeline run on outbound inline-text envelopes
     /// (SPEAK responses, LLM prompts, WBD bodies, DSAR text). When
     /// `Some`, `send_inline` / `send_durable_inline` invoke this
@@ -2388,6 +2437,121 @@ impl Edge {
         }
     }
 
+    /// CIRISEdge#55 v2.5.0 — fetch a single chunk of a chunked blob
+    /// from `peer_key_id`. The atomic primitive the swarm scheduler
+    /// orchestrates.
+    ///
+    /// Sends a [`crate::MessageType::BlobChunkFetch`] envelope to the
+    /// peer, awaits a matching [`crate::MessageType::BlobChunkBody`]
+    /// (`ChunkResult::Bytes`) or [`crate::MessageType::BlobChunkMiss`]
+    /// (`ChunkResult::ChunkMiss`).
+    ///
+    /// # Integrity gate (CIRISPersist#145 §10.1.1 seam)
+    ///
+    /// **This method does NOT verify the chunk SHA in-dispatch.** The
+    /// caller MUST hand the returned bytes to
+    /// `persist.put_blob_chunk(blob_sha, chunk_sha, &bytes)` for the
+    /// atomic verify+store step. Persist returns `ChunkMismatch` on
+    /// hash failure; the swarm scheduler treats that as dishonest-peer
+    /// evidence and demotes per [`crate::blob_swarm::PeerState`]
+    /// `record_dishonest_strike`. Skipping the put_blob_chunk step
+    /// drops the integrity guarantee.
+    ///
+    /// # Timeout
+    ///
+    /// Caller-supplied. Returns
+    /// `EdgeError::Config("fetch_blob_chunk timeout")` if no matching
+    /// response arrives within `timeout`. The swarm scheduler's
+    /// per-request cap pairs with this.
+    ///
+    /// # Concurrent fetches
+    ///
+    /// Keyed by `(blob_sha256, chunk_sha256)` — exactly one in-flight
+    /// fetch per chunk per peer. Re-issuing while another is pending
+    /// replaces the earlier waiter (prior call observes a closed
+    /// channel). The scheduler's per-peer in-flight cap prevents this
+    /// in normal operation.
+    pub async fn fetch_blob_chunk(
+        &self,
+        peer_key_id: &str,
+        blob_sha256: [u8; 32],
+        chunk_sha256: [u8; 32],
+        timeout: std::time::Duration,
+    ) -> Result<ChunkResult, EdgeError> {
+        let key = (blob_sha256, chunk_sha256);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self
+                .blob_chunk_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.insert(key, tx);
+        }
+
+        let fetch = crate::messages::BlobChunkFetch {
+            blob_sha256,
+            chunk_sha256,
+            response_hint: None,
+        };
+        match self.send(peer_key_id, fetch).await {
+            Ok(()) => {}
+            Err(EdgeError::Config(s))
+                if s.contains("ephemeral request-response correlation not wired") =>
+            {
+                // Same v0.17.0 carve-out as fetch_content — transport
+                // accepted the bytes; the correlation rides our
+                // pending-map, not the transport's request/response
+                // primitive.
+            }
+            Err(e) => {
+                let mut pending = self
+                    .blob_chunk_fetch_pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.remove(&key);
+                return Err(e);
+            }
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(EdgeError::Config(
+                "fetch_blob_chunk channel closed before response".into(),
+            )),
+            Err(_) => {
+                let mut pending = self
+                    .blob_chunk_fetch_pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.remove(&key);
+                Err(EdgeError::Config(format!(
+                    "fetch_blob_chunk timeout after {timeout:?}"
+                )))
+            }
+        }
+    }
+
+    /// CIRISEdge#55 — test-only sibling of
+    /// [`Self::complete_pending_fetch_for_test`]: inject a fake
+    /// `BlobChunkBody` / `BlobChunkMiss` outcome into the pending-chunk
+    /// signal map. Used by the swarm scheduler's integration tests so
+    /// the orchestrator can be exercised without a real loopback.
+    #[doc(hidden)]
+    pub fn complete_pending_chunk_fetch_for_test(
+        &self,
+        blob_sha256: [u8; 32],
+        chunk_sha256: [u8; 32],
+        result: ChunkResult,
+    ) {
+        let mut pending = self
+            .blob_chunk_fetch_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = pending.remove(&(blob_sha256, chunk_sha256)) {
+            let _ = tx.send(result);
+        }
+    }
+
     /// CIRISEdge#22 Tier 3 (v0.17.0) — test-only helper to fan out a
     /// VerifiedEnvelopeSnapshot to verified-feed subscribers without
     /// running a real verify pipeline. Mirrors the
@@ -2433,6 +2597,7 @@ impl Edge {
             self.detector.as_ref(),
             &self.verified_envelope_tx,
             &self.content_fetch_pending,
+            &self.blob_chunk_fetch_pending,
             &self.metrics,
             &self.events,
             self.federation_directory.as_ref(),
@@ -2786,6 +2951,7 @@ impl Edge {
         let detector = self.detector.clone();
         let verified_tx = self.verified_envelope_tx.clone();
         let content_pending = self.content_fetch_pending.clone();
+        let blob_chunk_pending = self.blob_chunk_fetch_pending.clone();
         let metrics = self.metrics.clone();
         let events = self.events.clone();
         // CIRISEdge#48-A → #48-A-completion (v0.19.6) — clone the
@@ -2834,6 +3000,7 @@ impl Edge {
                     let detector_clone = detector.clone();
                     let verified_tx_clone = verified_tx.clone();
                     let content_pending_clone = content_pending.clone();
+                    let blob_chunk_pending_clone = blob_chunk_pending.clone();
                     let metrics_clone = metrics.clone();
                     let events_clone = events.clone();
                     let fed_dir_for_cohort_clone = federation_directory_for_cohort.clone();
@@ -2854,6 +3021,7 @@ impl Edge {
                             detector_clone.as_ref(),
                             &verified_tx_clone,
                             &content_pending_clone,
+                            &blob_chunk_pending_clone,
                             &metrics_clone,
                             &events_clone,
                             fed_dir_for_cohort_clone.as_ref(),
@@ -3060,6 +3228,12 @@ async fn dispatch_inbound(
     detector: Option<&Arc<crate::ProbePatternObserver>>,
     verified_envelope_tx: &broadcast::Sender<VerifiedEnvelopeSnapshot>,
     content_fetch_pending: &std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<ContentResult>>>,
+    // CIRISEdge#55 — sibling pending-map for chunked-blob swarm fetch.
+    // Keyed by `(blob_sha256, chunk_sha256)` because the scheduler runs
+    // many chunk fetches in parallel across multiple blobs; blob-SHA
+    // alone can't disambiguate concurrent fetches against the same
+    // chunk-SHA across distinct blobs.
+    blob_chunk_fetch_pending: &BlobChunkPendingMap,
     metrics: &crate::observability::EdgeMetrics,
     events: &Arc<crate::events::EventBus>,
     // CIRISEdge#48-A → #48-A-completion (v0.19.6) — persist-backed
@@ -3412,6 +3586,58 @@ async fn dispatch_inbound(
             if let Some(tx) = pending.remove(&miss.sha256) {
                 let reason = format!("{:?}", miss.reason);
                 let _ = tx.send(ContentResult::ContentMiss { reason });
+            }
+        }
+    }
+
+    // CIRISEdge#55 — chunked-blob swarm correlation arms. Mirror the
+    // ContentBody / ContentMiss shape exactly, except:
+    //
+    // - Key is (blob_sha256, chunk_sha256) — both echoed in the
+    //   responder's body so we can match against the scheduler's
+    //   pending-map without correlating envelope `in_reply_to`.
+    //
+    // - We do NOT in-dispatch verify `sha256(bytes) == chunk_sha256`.
+    //   That gate is `persist.put_blob_chunk(blob_sha, chunk_sha, bytes)`
+    //   (CIRISPersist#145 §10.1.1 seam) — the swarm scheduler hands the
+    //   bytes from the pending oneshot directly to put_blob_chunk; on
+    //   ChunkMismatch the scheduler demotes the responding peer. This
+    //   dispatcher only enforces AV-13 (size); persist owns SHA verify.
+    //
+    // - AV-13 size gate: chunks above the ceiling are dropped at the
+    //   dispatch boundary with a tracing::warn (same shape as ContentBody).
+    if envelope.message_type == MessageType::BlobChunkBody {
+        if envelope.body.get().len() > max_content_body_bytes {
+            tracing::warn!(
+                transport = ?transport,
+                body_bytes = envelope.body.get().len(),
+                max_content_body_bytes,
+                "BlobChunkBody rejected at dispatch gate (AV-13 size cap)",
+            );
+            return;
+        }
+        if let Ok(body) =
+            serde_json::from_str::<crate::messages::BlobChunkBody>(envelope.body.get())
+        {
+            let mut pending = blob_chunk_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(tx) = pending.remove(&(body.blob_sha256, body.chunk_sha256)) {
+                let _ = tx.send(ChunkResult::Bytes(body.bytes));
+            }
+        }
+    }
+
+    if envelope.message_type == MessageType::BlobChunkMiss {
+        if let Ok(miss) =
+            serde_json::from_str::<crate::messages::BlobChunkMiss>(envelope.body.get())
+        {
+            let mut pending = blob_chunk_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(tx) = pending.remove(&(miss.blob_sha256, miss.chunk_sha256)) {
+                let reason = format!("{:?}", miss.reason);
+                let _ = tx.send(ChunkResult::ChunkMiss { reason });
             }
         }
     }
@@ -4282,6 +4508,8 @@ impl EdgeBuilder {
         let (verified_envelope_tx, _) =
             broadcast::channel(self.config.event_channel_capacity.max(1));
         let content_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // CIRISEdge#55 — sibling pending-map for chunk fetches.
+        let blob_chunk_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // CIRISEdge#46 (v0.18.0) — populate the in-memory canonical
         // bootstrap-peer set. Empty HashSet when the operator passed no
@@ -4308,6 +4536,7 @@ impl EdgeBuilder {
             inline_text_next_id: Arc::new(AtomicU64::new(1)),
             verified_envelope_tx,
             content_fetch_pending,
+            blob_chunk_fetch_pending,
             speak_pipeline: self.speak_pipeline,
             peer_directory: self.peer_directory,
             steward_directory: self.steward_directory,

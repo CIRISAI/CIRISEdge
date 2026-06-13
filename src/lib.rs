@@ -78,7 +78,7 @@ pub use detector::{
 };
 pub use edge::{
     reseed_canonical_bootstrap_peers, run_blackhole_pruner, AgentMode, CanonicalBootstrapPeer,
-    ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, VerifiedEnvelopeSnapshot,
+    ChunkResult, ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, VerifiedEnvelopeSnapshot,
     DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
 };
 pub use events::{
