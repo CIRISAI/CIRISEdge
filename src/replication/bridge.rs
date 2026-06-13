@@ -904,7 +904,7 @@ impl FederationDirectoryReplicationBridge {
         let key_directory = (ops.key_directory)();
         let root_stewards = (ops.root_stewards)();
         self.directory
-            .put_organization(signed, &key_directory, &root_stewards)
+            .put_organization(signed, key_directory.as_slice(), root_stewards.as_slice())
             .await
             .is_ok()
     }
@@ -919,7 +919,7 @@ impl FederationDirectoryReplicationBridge {
         let key_directory = (ops.key_directory)();
         let root_stewards = (ops.root_stewards)();
         self.directory
-            .put_org_membership(signed, &key_directory, &root_stewards)
+            .put_org_membership(signed, key_directory.as_slice(), root_stewards.as_slice())
             .await
             .is_ok()
     }
@@ -933,7 +933,7 @@ impl FederationDirectoryReplicationBridge {
         };
         let steward_roster = (ops.steward_roster)();
         self.directory
-            .put_partner_record(signed, &steward_roster)
+            .put_partner_record(signed, steward_roster.as_slice())
             .await
             .is_ok()
     }

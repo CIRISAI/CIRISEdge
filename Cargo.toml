@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "2.4.0"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -192,7 +192,7 @@ publish = false
 # bundles a copy into `ciris_persist.libs/` so `pip install ciris-edge`
 # Just Works on any glibc≥2.34 host; `cargo`-side builds require
 # `libsqlite3-dev` (apt) / `libsqlite3` (brew) — see docs/PYPI_PUBLISH.md.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v5.8.0", version = "5", features = ["sqlite"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v6.0.1", version = "6", features = ["sqlite"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -216,8 +216,8 @@ ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v5.8.0
 # moved to v4.4.2, and a mixed v4.2.0/v4.4.2 graph produces two
 # distinct trait-object vtables that the trait-bound check in
 # `Arc<dyn HardwareSigner>` cannot reconcile.
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.1.3", version = "5", features = ["software", "pqc-ml-dsa"] }
-ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.1.3", version = "5", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "aes-gcm"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.2.0", version = "5", features = ["software", "pqc-ml-dsa"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.2.0", version = "5", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "aes-gcm"] }
 # v2.0.0 (CIRISEdge#65 v2 wire cycle) — direct dep on ciris-verify-core
 # for `jcs::canonicalize` (the v2 `envelope_hash` basis per FSD §3.2.2:
 # `sha256(JCS(Signed*Record))`) + `threshold::ThresholdMember` (the
@@ -226,7 +226,7 @@ ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.1.3"
 # edge's to define"); the v2 wire-hash basis flips to JCS in lockstep
 # with CEG 1.0-RC2 §3.2.2 / §5.6.8.13. v5.1.0 is the lockstep
 # substrate floor with persist v5.1.1 (operational-data admit surface).
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.1.3", version = "5" }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v5.2.0", version = "5" }
 
 # Async runtime
 tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -435,8 +435,8 @@ tempfile       = { version = "3", optional = true }
 # currency with zero source-side changes on edge's side. `.recv().await`
 # unchanged. Future leviculum upstream releases land via the one-command
 # `scripts/ciris-sync-upstream.sh` rebase upstream-side now.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "ded96eeb3b4dd7b8b6774c28c7fb30c51acf714d", version = "0.6", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "ded96eeb3b4dd7b8b6774c28c7fb30c51acf714d", version = "0.6", optional = true }
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "ffd261d73b77acde892be766064ff9dbc956812e", version = "0.6", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "ffd261d73b77acde892be766064ff9dbc956812e", version = "0.6", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
@@ -454,14 +454,25 @@ qrcodegen = "1.8"
 # `__anext__` constructs a Python awaitable from a
 # `tokio::sync::broadcast::Receiver::recv()` future via this crate.
 # Gated under `pyo3` (only the AsyncIterator surface needs it).
-pyo3-async-runtimes = { version = "0.28", optional = true, features = ["tokio-runtime"] }
+pyo3-async-runtimes = { version = "0.29", optional = true, features = ["tokio-runtime"] }
 
 # v0.11.0 (CIRISEdge#35) — Stub generator dependency. Runtime-side
 # helpers used by `#[gen_stub_pyclass]` / `#[gen_stub_pymethods]` /
 # `#[gen_stub_pyfunction]`. The matching `pyo3-stub-gen-derive` proc-
 # macros are pulled transitively. We gate this under `pyo3` so a
 # non-pyo3 build doesn't pull the registry machinery.
-pyo3-stub-gen = { version = "0.22", optional = true, default-features = false }
+#
+# v3.0.0 (CIRISEdge#89) — pyo3-stub-gen 0.22.x does NOT compile against
+# pyo3 0.29 (PyCapsuleMethods::downcast removed; impl_exception_stub_type!
+# E0119 conflict on PyOSError/PyIOError). No 0.29-compatible upstream
+# release as of v3.0.0 (latest 0.22.3, 2026-05-16). Edge has zero active
+# `#[gen_stub_*]` attributes anywhere in `src/` (every match is in a doc
+# comment), so the surface this crate added — `define_stub_info_gatherer!`
+# + the `stub_gen` binary — is no-op'd while pyo3-stub-gen catches up.
+# Add an upstream-issue cross-ref here when one is filed. The existing
+# `python/ciris_edge/__init__.pyi` stays as the consumer-facing surface
+# and CI's stub-drift gate is satisfied as long as it doesn't regenerate.
+# pyo3-stub-gen = { version = "0.22", optional = true, default-features = false }
 
 # v0.13.0 (CIRISEdge#36 / #25 / #26 / #31 reads / #28 snapshot reads) —
 # UniFFI bindings generator. The spike's NO-GO carve-out keeps PyO3 for
@@ -660,7 +671,10 @@ transport-packet-radio = ["dep:crc32fast"]
 pyo3                  = [
     "dep:pyo3",
     "dep:pyo3-async-runtimes",
-    "dep:pyo3-stub-gen",
+    # v3.0.0 — `dep:pyo3-stub-gen` dropped pending the upstream 0.29
+    # release. See the commented-out `pyo3-stub-gen = ...` block above
+    # for the full rationale + the no-op shape this leaves in
+    # `src/ffi/pyo3.rs` and `src/bin/stub_gen.rs`.
     "ciris-persist/pyo3",
     "transport-reticulum",
     # v0.13.0 — wheel builds get the UniFFI surface by default. Per the
@@ -713,7 +727,7 @@ extension-module      = ["pyo3?/extension-module"]
 uniffi = { version = "=0.31.1", features = ["build"] }
 
 [dependencies.pyo3]
-version  = "0.28"
+version  = "0.29"
 # v0.7.0 (CIRISEdge#17) — `abi3-py310`, not `abi3-py311`. Chaquopy
 # bundles Python 3.10 (Android mobile cohabitation, CIRISPersist#96–99
 # precedent); abi3 is forward-compatible so a py310-tagged wheel runs
@@ -861,7 +875,7 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v5.8.0", version = "5", features = ["sqlite", "cirisnode", "classify", "scrub"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v6.0.1", version = "6", features = ["sqlite", "cirisnode", "classify", "scrub"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3
