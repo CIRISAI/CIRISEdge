@@ -880,6 +880,16 @@ pub struct Edge {
     /// receiver-side `Edge::fetch_blob_chunk` drops the receiver on
     /// timeout, closing the oneshot; the dispatcher prunes lazily.
     blob_chunk_fetch_pending: Arc<BlobChunkPendingMap>,
+    /// CIRISEdge#55 v3.4.0-pre1 — server-side hook for inbound
+    /// `BlobChunkFetch` envelopes. When `Some`, `dispatch_inbound`
+    /// consults this trait object to answer chunk-fetch requests with
+    /// either `BlobChunkBody` (we hold the chunk) or `BlobChunkMiss`
+    /// (we don't). When `None`, edge silently drops inbound
+    /// `BlobChunkFetch` envelopes — same posture as edge#21 phase 1
+    /// `ContentFetch`, which also has no in-core responder; consumer
+    /// crates (lens-core / agent) wrap their persist `BlobStorage`
+    /// handle in a `BlobChunkSource` impl.
+    blob_chunk_source: Option<Arc<dyn crate::blob_swarm::BlobChunkSource>>,
     /// Optional pipeline run on outbound inline-text envelopes
     /// (SPEAK responses, LLM prompts, WBD bodies, DSAR text). When
     /// `Some`, `send_inline` / `send_durable_inline` invoke this
@@ -1025,6 +1035,8 @@ pub struct EdgeBuilder {
         Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
     peer_directory: Option<Arc<dyn PeerDirectory>>,
     steward_directory: Option<Arc<dyn StewardDirectory>>,
+    /// CIRISEdge#55 v3.4.0-pre1 — see [`Edge::blob_chunk_source`].
+    blob_chunk_source: Option<Arc<dyn crate::blob_swarm::BlobChunkSource>>,
     subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
     events: Option<Arc<crate::events::EventBus>>,
     /// CIRISEdge#32 (v0.14.0) — see [`Edge::reticulum_transport`]. Set
@@ -1198,6 +1210,7 @@ impl Edge {
             speak_pipeline: None,
             peer_directory: None,
             steward_directory: None,
+            blob_chunk_source: None,
             subscription_filter: None,
             events: None,
             #[cfg(feature = "_reticulum-module")]
@@ -2542,13 +2555,16 @@ impl Edge {
         blob_sha256: [u8; 32],
         chunk_sha256: [u8; 32],
         result: ChunkResult,
-    ) {
+    ) -> bool {
         let mut pending = self
             .blob_chunk_fetch_pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(tx) = pending.remove(&(blob_sha256, chunk_sha256)) {
             let _ = tx.send(result);
+            true
+        } else {
+            false
         }
     }
 
@@ -2612,6 +2628,7 @@ impl Edge {
             self.config.delegation_authority_gate_enabled,
             self.config.delegation_graph_max_depth,
             self.canonical_peers.clone(),
+            self.blob_chunk_source.as_ref(),
         )
         .await;
     }
@@ -2982,6 +2999,8 @@ impl Edge {
         let delegation_authority_gate_enabled = self.config.delegation_authority_gate_enabled;
         let delegation_graph_max_depth = self.config.delegation_graph_max_depth;
         let delegation_trust_roots = self.canonical_peers.clone();
+        // CIRISEdge#55 v3.4.0-pre1 — server-side responder hook.
+        let blob_chunk_source = self.blob_chunk_source.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -3007,6 +3026,7 @@ impl Edge {
                     let trust_scoring_clone = trust_scoring.clone();
                     let l1_cdn_edge_external_uri_base_clone = l1_cdn_edge_external_uri_base.clone();
                     let delegation_trust_roots_clone = delegation_trust_roots.clone();
+                    let blob_chunk_source_clone = blob_chunk_source.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -3036,6 +3056,7 @@ impl Edge {
                             delegation_authority_gate_enabled,
                             delegation_graph_max_depth,
                             delegation_trust_roots_clone,
+                            blob_chunk_source_clone.as_ref(),
                         ).await;
                     });
                 }
@@ -3205,6 +3226,7 @@ impl Edge {
         federation_directory_for_cohort,
         trust_scoring,
         delegation_trust_roots,
+        blob_chunk_source,
     ),
     fields(
         transport_id = %frame.transport.0,
@@ -3272,6 +3294,10 @@ async fn dispatch_inbound(
     delegation_authority_gate_enabled: bool,
     delegation_graph_max_depth: usize,
     delegation_trust_roots: Arc<std::sync::RwLock<HashSet<String>>>,
+    // CIRISEdge#55 v3.4.0-pre1 — optional server-side responder for
+    // inbound `BlobChunkFetch` envelopes. None → silently drop the
+    // envelope (same posture as ContentFetch in edge#21 phase 1).
+    blob_chunk_source: Option<&Arc<dyn crate::blob_swarm::BlobChunkSource>>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -3639,6 +3665,175 @@ async fn dispatch_inbound(
                 let reason = format!("{:?}", miss.reason);
                 let _ = tx.send(ChunkResult::ChunkMiss { reason });
             }
+        }
+    }
+
+    // CIRISEdge#55 v3.4.0-pre1 — server-side `BlobChunkFetch` handler.
+    // When a `BlobChunkSource` is wired and the envelope is addressed
+    // to us, look up the chunk in our local store and respond with
+    // either `BlobChunkBody` (we hold it) or `BlobChunkMiss` (we don't
+    // / refused). When no source is wired, drop the envelope — same
+    // posture as edge#21 phase 1 ContentFetch (consumer-crate owned
+    // responder; edge core stays domain-agnostic at the substrate
+    // tier and this hook is opt-in).
+    if envelope.message_type == MessageType::BlobChunkFetch {
+        if let Some(source) = blob_chunk_source {
+            if let Ok(req) =
+                serde_json::from_str::<crate::messages::BlobChunkFetch>(envelope.body.get())
+            {
+                use crate::messages::{
+                    BlobChunkBody, BlobChunkMiss as BlobChunkMissBody, MissReason,
+                };
+                let (response_kind, response_envelope_bytes) = match source
+                    .read_chunk(req.blob_sha256, req.chunk_sha256)
+                {
+                    Ok(Some(bytes)) => {
+                        // AV-13 size gate on outbound: refuse to
+                        // emit a chunk that exceeds the ceiling
+                        // (the peer would drop it anyway, but the
+                        // wire surface should never propose an
+                        // oversize body).
+                        if bytes.len() > max_content_body_bytes {
+                            tracing::warn!(
+                                transport = ?transport,
+                                chunk_size = bytes.len(),
+                                max = max_content_body_bytes,
+                                "BlobChunkFetch responder: chunk exceeds AV-13 ceiling, replying NotHeld",
+                            );
+                            let miss = BlobChunkMissBody {
+                                blob_sha256: req.blob_sha256,
+                                chunk_sha256: req.chunk_sha256,
+                                reason: MissReason::NotHeld,
+                            };
+                            match build_chunk_response_envelope(
+                                MessageType::BlobChunkMiss,
+                                &envelope.signing_key_id,
+                                signer,
+                                &miss,
+                                body_sha256,
+                            )
+                            .await
+                            {
+                                Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "BlobChunkFetch responder: failed to build miss envelope",
+                                    );
+                                    (MessageType::BlobChunkMiss, None)
+                                }
+                            }
+                        } else {
+                            let body = BlobChunkBody {
+                                blob_sha256: req.blob_sha256,
+                                chunk_sha256: req.chunk_sha256,
+                                bytes,
+                            };
+                            match build_chunk_response_envelope(
+                                MessageType::BlobChunkBody,
+                                &envelope.signing_key_id,
+                                signer,
+                                &body,
+                                body_sha256,
+                            )
+                            .await
+                            {
+                                Ok(bytes) => (MessageType::BlobChunkBody, Some(bytes)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "BlobChunkFetch responder: failed to build body envelope",
+                                    );
+                                    (MessageType::BlobChunkBody, None)
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        let miss = BlobChunkMissBody {
+                            blob_sha256: req.blob_sha256,
+                            chunk_sha256: req.chunk_sha256,
+                            reason: MissReason::NotHeld,
+                        };
+                        match build_chunk_response_envelope(
+                            MessageType::BlobChunkMiss,
+                            &envelope.signing_key_id,
+                            signer,
+                            &miss,
+                            body_sha256,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "BlobChunkFetch responder: failed to build miss envelope",
+                                );
+                                (MessageType::BlobChunkMiss, None)
+                            }
+                        }
+                    }
+                    Err(refusal) => {
+                        let miss = BlobChunkMissBody {
+                            blob_sha256: req.blob_sha256,
+                            chunk_sha256: req.chunk_sha256,
+                            reason: refusal.to_miss_reason(),
+                        };
+                        match build_chunk_response_envelope(
+                            MessageType::BlobChunkMiss,
+                            &envelope.signing_key_id,
+                            signer,
+                            &miss,
+                            body_sha256,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "BlobChunkFetch responder: failed to build refusal envelope",
+                                );
+                                (MessageType::BlobChunkMiss, None)
+                            }
+                        }
+                    }
+                };
+
+                if let Some(bytes) = response_envelope_bytes {
+                    let env: Result<EdgeEnvelope, _> = serde_json::from_slice(&bytes);
+                    if let Ok(env) = env {
+                        let body_sha = envelope_body_sha256(&env);
+                        let body_size = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
+                        // Ephemeral delivery class — short TTL, single attempt.
+                        // The fetcher's per-request timeout governs retry,
+                        // not the outbound queue.
+                        let _ = queue
+                            .enqueue_outbound(
+                                &signer.key_id,
+                                &envelope.signing_key_id,
+                                &message_type_str(&response_kind),
+                                "1.0.0",
+                                &bytes,
+                                &body_sha,
+                                body_size,
+                                false,
+                                None,
+                                1,
+                                60,
+                                Utc::now(),
+                            )
+                            .await;
+                    }
+                }
+            }
+        } else {
+            tracing::debug!(
+                transport = ?transport,
+                signing_key_id = %envelope.signing_key_id,
+                "BlobChunkFetch received but no BlobChunkSource wired; dropping (CIRISEdge#55)",
+            );
         }
     }
 
@@ -4409,6 +4604,21 @@ impl EdgeBuilder {
         self
     }
 
+    /// CIRISEdge#55 v3.4.0-pre1 — wire a [`crate::blob_swarm::BlobChunkSource`]
+    /// hook so this edge can answer inbound `BlobChunkFetch` envelopes
+    /// from its local blob store. Without it, edge silently drops
+    /// inbound `BlobChunkFetch` envelopes (same posture as edge#21
+    /// phase 1 `ContentFetch`). Consumer crates wrap their persist
+    /// `BlobStorage` handle.
+    #[must_use]
+    pub fn blob_chunk_source(
+        mut self,
+        source: Arc<dyn crate::blob_swarm::BlobChunkSource>,
+    ) -> Self {
+        self.blob_chunk_source = Some(source);
+        self
+    }
+
     /// Wire a [`PeerSubscriptionFilter`] for subscription-respecting
     /// code paths. **Not consulted by `Delivery::Mandatory`** — the
     /// bypass-subscription wire contract (FSD §3.2 + CIRISEdge#18).
@@ -4540,6 +4750,7 @@ impl EdgeBuilder {
             speak_pipeline: self.speak_pipeline,
             peer_directory: self.peer_directory,
             steward_directory: self.steward_directory,
+            blob_chunk_source: self.blob_chunk_source,
             subscription_filter: self.subscription_filter,
             events,
             display_name: Arc::new(std::sync::RwLock::new(display_name)),
@@ -4705,6 +4916,28 @@ fn message_type_str(mt: &MessageType) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{mt:?}"))
+}
+
+/// CIRISEdge#55 v3.4.0-pre1 — build + sign a typed `EdgeEnvelope`
+/// carrying a `BlobChunkBody` or `BlobChunkMiss` response. Returns
+/// the serialized bytes for enqueue. Pure helper; no queue side-effect.
+async fn build_chunk_response_envelope<M: serde::Serialize>(
+    message_type: MessageType,
+    destination_key_id: &str,
+    signer: &Arc<LocalSigner>,
+    body: &M,
+    in_reply_to: [u8; 32],
+) -> Result<Vec<u8>, EdgeError> {
+    let mut env = build_envelope(
+        message_type,
+        &signer.key_id,
+        destination_key_id,
+        body,
+        Some(in_reply_to),
+    )?;
+    sign_envelope(signer, &mut env).await?;
+    serde_json::to_vec(&env)
+        .map_err(|e| EdgeError::Config(format!("chunk response envelope serialize: {e}")))
 }
 
 /// Validate a `ContentBody`-typed envelope against (a) the AV-13

@@ -71,6 +71,10 @@ pub mod transport;
 pub mod verify;
 pub mod version;
 
+pub use blob_swarm::{
+    BlobChunkSource, BlobChunkVerifier, ChunkManifestLite, ChunkSourceRefusal, ChunkVerifyError,
+    PeerState, SwarmConfig, SwarmError, SwarmScheduler,
+};
 pub use cohort_scope::{CohortScope, CohortScopeEnforcement};
 pub use detector::{
     ConsentRole, DetectionVerdict, EdgeDetectionAdmission, ProbePatternConfig,
