@@ -1694,6 +1694,22 @@ pub enum MissReason {
     /// peers MAY still serve the bytes — the fetcher SHOULD retry
     /// elsewhere.
     PolicyDenied,
+    /// v3.5.0 (CIRISEdge#116 / CIRISPersist#149) — this responder is
+    /// under disk pressure and is shedding proxy serves first to
+    /// protect local/family content. The fetcher SHOULD retry
+    /// elsewhere; trying this peer again imminently is unlikely to
+    /// succeed (pressure recovers on a monitor-loop cadence, not
+    /// per-request). Distinct from `PolicyDenied` so dashboards can
+    /// surface the pressure signal honestly + so the scheduler can
+    /// down-weight the peer for the rest of the session without
+    /// demoting it for policy reasons.
+    ///
+    /// Surfaces on the wire when a consumer-side handler calls
+    /// `Engine::serve_blob_to_peer` and gets
+    /// `BlobError::DiskPressureProxyRefused`. The translation is
+    /// operator-tier (consumer maps the typed substrate refusal to
+    /// this typed wire refusal).
+    DiskPressure,
 }
 
 /// Response indicating the responder will not serve the requested

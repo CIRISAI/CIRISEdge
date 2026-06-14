@@ -316,6 +316,12 @@ pub enum ChunkSourceRefusal {
     Revoked,
     /// Local policy denied the fetch.
     PolicyDenied,
+    /// v3.5.0 (CIRISEdge#116 / CIRISPersist#149) — responder is under
+    /// disk pressure and shedding proxy serves. Surfaces when a
+    /// consumer's `BlobChunkSource` impl wraps persist's
+    /// `Engine::serve_blob_to_peer` and observes
+    /// `BlobError::DiskPressureProxyRefused`.
+    DiskPressure,
 }
 
 impl ChunkSourceRefusal {
@@ -326,6 +332,7 @@ impl ChunkSourceRefusal {
             Self::Withdrawn => crate::messages::MissReason::Withdrawn,
             Self::Revoked => crate::messages::MissReason::Revoked,
             Self::PolicyDenied => crate::messages::MissReason::PolicyDenied,
+            Self::DiskPressure => crate::messages::MissReason::DiskPressure,
         }
     }
 }
@@ -586,6 +593,17 @@ impl SwarmScheduler {
                         return Err(SwarmError::GoneFederationWide(blob_hex));
                     }
                     if r.contains("PolicyDenied") {
+                        if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
+                            state.demoted = true;
+                        }
+                    }
+                    // v3.5.0 (CIRISEdge#116) — DiskPressure is a
+                    // permanent-for-this-session refusal per persist's
+                    // contract (pressure recovers on a monitor-loop
+                    // cadence, not per-request). Demote the peer for
+                    // the rest of the fetch; chunk re-queues for
+                    // another holder.
+                    if r.contains("DiskPressure") {
                         if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
                             state.demoted = true;
                         }
