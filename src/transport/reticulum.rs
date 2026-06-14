@@ -2552,6 +2552,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 envelope_bytes: data,
                 transport: TransportId::RETICULUM_RS,
                 received_at: Utc::now(),
+                source_key_id: None,
             };
             if let Err(e) = ctx.sink.send(frame).await {
                 tracing::error!(error = %e, "inbound channel send failed");

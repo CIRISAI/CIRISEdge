@@ -247,6 +247,7 @@ impl Transport for PacketRadioTransport {
                         envelope_bytes: payload,
                         transport: self.transport_id,
                         received_at: Utc::now(),
+                        source_key_id: None,
                     };
                     if sink.send(frame).await.is_err() {
                         // Sink closed — listener should exit cleanly.

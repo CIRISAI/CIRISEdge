@@ -492,6 +492,7 @@ async fn dispatch_with_cohort_scope(
         envelope_bytes: bytes,
         transport: TransportId::HTTP,
         received_at: Utc::now(),
+        source_key_id: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
     Ok(())

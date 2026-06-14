@@ -602,6 +602,7 @@ async fn inbound_handler(
         envelope_bytes: body.to_vec(),
         transport: TransportId::HTTP,
         received_at: Utc::now(),
+        source_key_id: None,
     };
     match state.sink.send(frame).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),

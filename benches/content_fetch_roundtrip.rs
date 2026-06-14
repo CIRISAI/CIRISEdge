@@ -182,6 +182,7 @@ fn bench_content_fetch(c: &mut Criterion) {
                         envelope_bytes,
                         transport: TransportId::HTTP,
                         received_at: Utc::now(),
+                        source_key_id: None,
                     };
                     edge.dispatch_inbound_for_test(black_box(frame)).await;
                 }

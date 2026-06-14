@@ -189,6 +189,7 @@ impl Transport for InjectTransport {
                 envelope_bytes: bytes,
                 transport: TransportId::HTTP,
                 received_at: chrono::Utc::now(),
+                source_key_id: None,
             };
             if sink.send(frame).await.is_err() {
                 break;
