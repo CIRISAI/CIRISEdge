@@ -79,6 +79,7 @@ async fn auth_with_bus(
         event_bus: Some(bus),
         reachability: None,
         blackhole_rules: None,
+        transport_identity_keystore: None,
     }
 }
 

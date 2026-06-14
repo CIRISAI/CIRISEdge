@@ -2845,6 +2845,7 @@ enum LocalInstanceRole {
     local_instance_name = None,
     local_instance_role = "auto",
     agent_occurrence_key_id = None,
+    transport_identity_keyring_dir = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -2928,6 +2929,28 @@ fn init_edge_runtime(
     // `None` (the default) preserves the v3.0.x init behaviour
     // exactly; no transport_destination row is written.
     agent_occurrence_key_id: Option<&str>,
+    // v3.1.0 (CIRISEdge#99) — when `Some(dir)`, edge constructs a
+    // `ciris_keyring::BlobTransportKeystore::platform(signer_key_id,
+    // dir)` and injects it into `ReticulumAuth::transport_identity_keystore`.
+    // The keystore tier picks the best available backend (TPM /
+    // Secure Enclave / StrongBox / encrypted software fallback) for
+    // the host platform.
+    //
+    // First-call semantics depend on the on-disk state at
+    // `identity_path`:
+    //   - File exists → bytes are ADOPTED into the keystore and the
+    //     file is renamed to `<identity_path>.migrated-<unix_ts>`.
+    //     The destination hash is preserved (byte-identical
+    //     adoption); peer routing tables + signed announces stay
+    //     valid. Operator manually removes the recovery copy.
+    //   - File absent → fresh bytes generated atomically in the
+    //     keystore (hardware RNG where the tier offers it).
+    //   - Keystore already populated for `signer_key_id` → those
+    //     bytes are used directly; the file is not touched.
+    //
+    // `None` (the default) preserves v3.0.x chmod-600 file-only
+    // behavior exactly.
+    transport_identity_keyring_dir: Option<&str>,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -3563,6 +3586,29 @@ fn init_edge_runtime(
         crate::edge::EdgeConfig::default().reachability_window_seconds,
     ));
 
+    // v3.1.0 (CIRISEdge#99) — when the operator opts in, construct a
+    // platform `BlobTransportKeystore` rooted at the operator-supplied
+    // directory. The keystore picks the best available hardware tier
+    // (TPM / SE / StrongBox) for the host; falls back to encrypted
+    // software when no hardware tier is reachable. Errors at
+    // construction time (e.g. directory not writable) surface as a
+    // typed `PyRuntimeError` so the operator gets a clean diagnostic
+    // before any transport bind.
+    let transport_identity_keystore: Option<Arc<dyn ciris_keyring::TransportIdentityKeystore>> =
+        if let Some(dir) = transport_identity_keyring_dir {
+            use ciris_keyring::BlobTransportKeystore;
+            let ks = BlobTransportKeystore::platform(signer.key_id.clone(), dir).map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "transport_identity_keyring_dir={dir:?}: \
+                 BlobTransportKeystore::platform({}): {e}",
+                    signer.key_id
+                ))
+            })?;
+            Some(Arc::new(ks) as Arc<dyn ciris_keyring::TransportIdentityKeystore>)
+        } else {
+            None
+        };
+
     let auth = ReticulumAuth {
         // v0.16.1 cherry-pick (CIRISEdge#43): the Reticulum-identity
         // signer is split out from the hot-path keyring signer above.
@@ -3584,6 +3630,8 @@ fn init_edge_runtime(
         // V052 `cirislens.blackhole_rules` table. Rules survive
         // process restarts; the in-memory HashMap is gone.
         blackhole_rules: Some(Arc::clone(&blackhole_rules)),
+        // v3.1.0 (CIRISEdge#99) — keyring-tier RNS transport identity.
+        transport_identity_keystore,
     };
 
     // ── Step 5: build the transport + Edge under the host runtime.
@@ -5274,6 +5322,7 @@ mod pyo3_tier2_tests {
                 None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -5365,6 +5414,7 @@ mod pyo3_tier2_tests {
                 None,   // local_instance_name (v2.3.0)
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -5512,6 +5562,7 @@ mod pyo3_tier2_tests {
                 None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
             )?;
             Ok(())
         });
@@ -5612,6 +5663,7 @@ mod pyo3_tier2_tests {
                 None,   // local_instance_name (v2.3.0)
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -5766,6 +5818,7 @@ mod pyo3_tier2_tests {
                 None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -5906,6 +5959,7 @@ mod pyo3_tier2_tests {
                 None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
             )?;
             Ok(edge.signer_key_id())
         });
