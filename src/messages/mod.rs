@@ -964,6 +964,64 @@ pub enum RefusalReason {
     /// correct even for a perfectly-signed envelope, because the
     /// downstream trust chain has no root.
     NoAccordHoldersConfigured,
+    /// CIRISEdge#108 part 2 (v3.2.0) — the envelope signer could not
+    /// be tied back to a trusted root via a non-retracted, in-scope
+    /// federation-tier `delegates_to` chain.
+    ///
+    /// Carries the `required_scope` (one of `act_on_behalf`,
+    /// `message_io`, `network_presence`, `sub_delegation` —
+    /// `SELF_AT_LOGIN_DELEGATION_SCOPE` per CEG §8.1.12.7) and a
+    /// `kind`-tagged sub-reason discriminator so a federation
+    /// collector can distinguish "no trust roots configured" (the
+    /// substrate-not-bootstrapped story) from "signer has no inbound
+    /// delegation" / "delegation present but retracted" / "delegation
+    /// present but missing required scope".
+    DelegationNotAuthorized {
+        /// The scope token the wire-tier gate required for this
+        /// MessageType (e.g. `message_io` for InlineText).
+        required_scope: String,
+        /// Sub-reason discriminator. Mirrors the `kind`-tag
+        /// discipline of the outer `RefusalReason` enum so a single
+        /// JSON parse on the receiver yields a typed structured
+        /// reason.
+        sub_reason: DelegationRefusalSubReason,
+    },
+}
+
+/// CIRISEdge#108 part 2 (v3.2.0) — taxonomy of WHY a
+/// [`RefusalReason::DelegationNotAuthorized`] fired. Distinguishes
+/// substrate-bootstrap failures (`NoTrustRoots`) from envelope-content
+/// failures (`SignerUnreached`, `RetractedAtRoot`, `MissingScope`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DelegationRefusalSubReason {
+    /// Edge holds no canonical bootstrap peers — the substrate is
+    /// not bootstrapped for delegation-gated traffic. Refusing is
+    /// correct even for a perfectly-signed envelope with a perfectly-
+    /// formed delegation chain, because the chain has no root.
+    NoTrustRoots,
+    /// One or more trust roots are configured, but BFS from each
+    /// (via persist's `build_delegation_graph` semantics) never
+    /// reaches `envelope.signing_key_id`. Either the signer was
+    /// never delegated to, or the delegation lives at a deeper
+    /// depth than this edge's `delegation_graph_max_depth`.
+    SignerUnreached,
+    /// A `delegates_to` edge to the signer exists in the graph, but
+    /// it carries a `withdraws` / `recants` retraction (CEG 0.6
+    /// §3.2.3). Distinct from `SignerUnreached` so a steward end can
+    /// see "the chain WAS valid, then the granter retracted" — a
+    /// load-bearing forensic signal.
+    RetractedAtRoot,
+    /// A non-retracted `delegates_to` edge to the signer exists, but
+    /// none of the chain edges carry the required scope token (e.g.
+    /// the user delegated `network_presence` but not `message_io`).
+    MissingScope,
+    /// Persist's [`ciris_persist::federation::FederationDirectory`]
+    /// surface returned an error walking the graph. Treated as a
+    /// substrate fault — refusing is the conservative safe default
+    /// (same posture as `NoAccordHoldersConfigured` on the
+    /// AccordCarrier gate).
+    SubstrateUnavailable,
 }
 
 /// Domain-separation tag for [`DeliveryRefusalAttestation::canonical_bytes`].
