@@ -316,6 +316,12 @@ pub enum ChunkSourceRefusal {
     Revoked,
     /// Local policy denied the fetch.
     PolicyDenied,
+    /// v3.5.0 (CIRISEdge#116 / CIRISPersist#149) — responder is under
+    /// disk pressure and shedding proxy serves. Surfaces when a
+    /// consumer's `BlobChunkSource` impl wraps persist's
+    /// `Engine::serve_blob_to_peer` and observes
+    /// `BlobError::DiskPressureProxyRefused`.
+    DiskPressure,
 }
 
 impl ChunkSourceRefusal {
@@ -326,6 +332,7 @@ impl ChunkSourceRefusal {
             Self::Withdrawn => crate::messages::MissReason::Withdrawn,
             Self::Revoked => crate::messages::MissReason::Revoked,
             Self::PolicyDenied => crate::messages::MissReason::PolicyDenied,
+            Self::DiskPressure => crate::messages::MissReason::DiskPressure,
         }
     }
 }
@@ -511,11 +518,26 @@ impl SwarmScheduler {
             // are at or below threshold, issue duplicate requests to
             // any peer with capacity. First response wins; later
             // arrivals find no pending oneshot and are dropped.
+            //
+            // v3.5.0 (CIRISEdge#118 fix) — `maybe_endgame_dispatch`
+            // MUST update `total_in_flight` for the duplicates it
+            // launches; otherwise the per-outcome decrement at line
+            // ~548 saturates `total_in_flight` to 0 prematurely (one
+            // decrement per response, including duplicates), the
+            // loop-exit condition fires while real dispatches are
+            // still outstanding, and the assemble pass fails with
+            // `ChunkUnreachable` for whichever chunk's main-dispatch
+            // response was still in flight.
             let remaining = pending.len() + total_in_flight;
             if remaining > 0 && remaining <= self.config.endgame_threshold {
-                // Clone in-flight chunks to re-dispatch on extra peers.
-                // We do this opportunistically; the bookkeeping is light.
-                self.maybe_endgame_dispatch(blob_sha256, &chunk_bytes, &manifest, &mut peers, &tx);
+                self.maybe_endgame_dispatch(
+                    blob_sha256,
+                    &chunk_bytes,
+                    &manifest,
+                    &mut peers,
+                    &tx,
+                    &mut total_in_flight,
+                );
             }
 
             // If nothing is in flight AND nothing is pending, we're
@@ -586,6 +608,17 @@ impl SwarmScheduler {
                         return Err(SwarmError::GoneFederationWide(blob_hex));
                     }
                     if r.contains("PolicyDenied") {
+                        if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
+                            state.demoted = true;
+                        }
+                    }
+                    // v3.5.0 (CIRISEdge#116) — DiskPressure is a
+                    // permanent-for-this-session refusal per persist's
+                    // contract (pressure recovers on a monitor-loop
+                    // cadence, not per-request). Demote the peer for
+                    // the rest of the fetch; chunk re-queues for
+                    // another holder.
+                    if r.contains("DiskPressure") {
                         if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
                             state.demoted = true;
                         }
@@ -693,6 +726,7 @@ impl SwarmScheduler {
         manifest: &ChunkManifestLite,
         peers: &mut HashMap<String, PeerState>,
         tx: &tokio::sync::mpsc::Sender<FetchOutcome>,
+        total_in_flight: &mut usize,
     ) {
         for (chunk_sha, _) in &manifest.chunks {
             if chunk_bytes.contains_key(chunk_sha) {
@@ -711,6 +745,14 @@ impl SwarmScheduler {
                 if let Some(state) = peers.get_mut(&peer) {
                     state.in_flight = state.in_flight.saturating_add(1);
                 }
+                // v3.5.0 (CIRISEdge#118 fix) — track endgame
+                // duplicates in `total_in_flight` too. Each duplicate
+                // dispatched here will produce a completion outcome,
+                // which the main loop's per-outcome decrement at
+                // line ~548 will subtract from `total_in_flight`. If
+                // we don't add here, the decrement saturates and the
+                // loop exits with real dispatches still outstanding.
+                *total_in_flight += 1;
             }
         }
     }
