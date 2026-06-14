@@ -469,6 +469,35 @@ pub struct EdgeConfig {
     /// who flip the boolean MUST also supply this base before
     /// `Edge::build`.
     pub l1_cdn_edge_external_uri_base: Option<String>,
+    /// CIRISEdge#108 part 2 (v3.2.0) — operator-driven on/off switch
+    /// for the federation-tier delegation authority gate on inbound
+    /// dispatch. When `true`, edge walks persist's `delegates_to`
+    /// chain (CEG §8.1.12.7 — persist v6.5.0 `Engine::self_at_login`)
+    /// from each configured trust root (the
+    /// [`CanonicalBootstrapPeer`] set already wired via
+    /// `EdgeBuilder::canonical_bootstrap_peers`) and refuses any
+    /// envelope whose signer cannot be reached through a non-
+    /// retracted, in-scope chain.
+    ///
+    /// Default `false` — bootstrap-permissive while v3.2.0 stabilizes.
+    /// Operators who enable this MUST also configure trust roots
+    /// (via `canonical_bootstrap_peers`); enabling the gate with an
+    /// empty trust-root set refuses every InlineText envelope.
+    ///
+    /// **At v3.2.0-pre1 the gate applies to `MessageType::InlineText`
+    /// only.** All other MessageType variants bypass the gate
+    /// regardless of this flag — narrowing the blast radius while the
+    /// design settles. Coverage extends to `FederationAnnouncement`,
+    /// `ContributionSubmit`, and the durable variants in v3.2.x
+    /// follow-ups.
+    pub delegation_authority_gate_enabled: bool,
+    /// CIRISEdge#108 part 2 (v3.2.0) — BFS depth bound for the
+    /// `build_delegation_graph` walk that backs the authority gate.
+    /// Clamped at persist's `MAX_DELEGATION_DEPTH = 16` regardless of
+    /// this value. Default `4` — covers user→agent (the `self_at_login`
+    /// 1-hop case) plus 3 levels of sub-delegation, which is the
+    /// FSD-002 §2.2.1 default transitive depth + 1 hop of headroom.
+    pub delegation_graph_max_depth: usize,
 }
 
 impl Default for EdgeConfig {
@@ -550,6 +579,14 @@ impl Default for EdgeConfig {
             // CDN edges for external multimedia content.
             l1_cdn_edge_enabled: false,
             l1_cdn_edge_external_uri_base: None,
+            // v3.2.0-pre1 (CIRISEdge#108 part 2) — opt-in. Default
+            // off so adding the field is non-breaking for every
+            // existing deployment + test.
+            delegation_authority_gate_enabled: false,
+            // FSD-002 §2.2.1 default transitive delegation depth = 2,
+            // plus 2 hops of headroom for sub-delegation chains a
+            // future cut may introduce. Persist clamps at 16.
+            delegation_graph_max_depth: 4,
         }
     }
 }
@@ -2407,6 +2444,9 @@ impl Edge {
             self.config.agent_mode,
             self.config.l1_cdn_edge_enabled,
             self.config.l1_cdn_edge_external_uri_base.clone(),
+            self.config.delegation_authority_gate_enabled,
+            self.config.delegation_graph_max_depth,
+            self.canonical_peers.clone(),
         )
         .await;
     }
@@ -2768,6 +2808,14 @@ impl Edge {
         let agent_mode_for_dispatch = self.config.agent_mode;
         let l1_cdn_edge_enabled = self.config.l1_cdn_edge_enabled;
         let l1_cdn_edge_external_uri_base = self.config.l1_cdn_edge_external_uri_base.clone();
+        // CIRISEdge#108 part 2 (v3.2.0-pre1) — delegation authority
+        // gate knobs. The trust-roots `Arc<RwLock>` is the same one
+        // `Edge::canonical_peers` exposes; read inside the gate so a
+        // future operator-driven mutation takes effect on the next
+        // envelope without rebuilding dispatch.
+        let delegation_authority_gate_enabled = self.config.delegation_authority_gate_enabled;
+        let delegation_graph_max_depth = self.config.delegation_graph_max_depth;
+        let delegation_trust_roots = self.canonical_peers.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -2791,6 +2839,7 @@ impl Edge {
                     let fed_dir_for_cohort_clone = federation_directory_for_cohort.clone();
                     let trust_scoring_clone = trust_scoring.clone();
                     let l1_cdn_edge_external_uri_base_clone = l1_cdn_edge_external_uri_base.clone();
+                    let delegation_trust_roots_clone = delegation_trust_roots.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -2816,6 +2865,9 @@ impl Edge {
                             agent_mode_for_dispatch,
                             l1_cdn_edge_enabled,
                             l1_cdn_edge_external_uri_base_clone,
+                            delegation_authority_gate_enabled,
+                            delegation_graph_max_depth,
+                            delegation_trust_roots_clone,
                         ).await;
                     });
                 }
@@ -2984,6 +3036,7 @@ impl Edge {
         events,
         federation_directory_for_cohort,
         trust_scoring,
+        delegation_trust_roots,
     ),
     fields(
         transport_id = %frame.transport.0,
@@ -3035,6 +3088,16 @@ async fn dispatch_inbound(
     agent_mode: AgentMode,
     l1_cdn_edge_enabled: bool,
     l1_cdn_edge_external_uri_base: Option<String>,
+    // CIRISEdge#108 part 2 (v3.2.0-pre1) — federation-tier delegation
+    // authority gate. `delegation_trust_roots` is the
+    // `Arc<RwLock<HashSet<String>>>` of canonical bootstrap peer
+    // key_ids that `Edge` already maintains; we read it inside the
+    // gate so an operator-driven canonical-peer mutation (a future
+    // FFI cut) takes effect on the next inbound envelope without
+    // restarting dispatch.
+    delegation_authority_gate_enabled: bool,
+    delegation_graph_max_depth: usize,
+    delegation_trust_roots: Arc<std::sync::RwLock<HashSet<String>>>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -3574,6 +3637,84 @@ async fn dispatch_inbound(
             Err(e) => {
                 tracing::error!(error = %e, "match_ack_to_outbound failed");
                 return;
+            }
+        }
+    }
+
+    // CIRISEdge#108 part 2 (v3.2.0-pre1) — federation-tier
+    // delegation authority gate. Walks persist v6.5.0's
+    // `delegates_to` chain (the substrate side of CEG §8.1.12.7) from
+    // each canonical bootstrap peer; refuses envelopes whose signer
+    // can't be tied back via a non-retracted, in-scope edge.
+    //
+    // At v3.2.0-pre1 the gate fires for `MessageType::InlineText`
+    // ONLY. Every other variant falls through (gate-disabled in
+    // `delegation_scope_for_message_type`). Operators opt in via
+    // `EdgeConfig::delegation_authority_gate_enabled`; default off so
+    // adding the gate is non-breaking. Substrate not wired (no
+    // federation directory) → bypass entirely.
+    if delegation_authority_gate_enabled {
+        if let Some(required_scope) = delegation_scope_for_message_type(&envelope.message_type) {
+            if let Some(fed_dir) = federation_directory_for_cohort {
+                let trust_roots = {
+                    let guard = delegation_trust_roots
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.iter().cloned().collect::<Vec<_>>()
+                };
+                match verify_self_at_login_delegation(
+                    &envelope.signing_key_id,
+                    fed_dir,
+                    &trust_roots,
+                    required_scope,
+                    delegation_graph_max_depth,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        // Authorized — fall through to fan-out + handler.
+                    }
+                    Err(sub_reason) => {
+                        tracing::warn!(
+                            event = "edge.delegation_gate.refused",
+                            sender_key_id = %envelope.signing_key_id,
+                            message_type = ?envelope.message_type,
+                            required_scope = required_scope,
+                            ?sub_reason,
+                            "envelope REFUSED at delegation authority gate (CIRISEdge#108 part 2)",
+                        );
+                        let refusal_reason = RefusalReason::DelegationNotAuthorized {
+                            required_scope: required_scope.to_owned(),
+                            sub_reason,
+                        };
+                        if let Err(e) = emit_delivery_refusal_attestation(
+                            &envelope,
+                            body_sha256,
+                            transport,
+                            signer,
+                            queue,
+                            refusal_reason,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "DeliveryRefusalAttestation emission failed (CIRISEdge#108 part 2)",
+                            );
+                        }
+                        return;
+                    }
+                }
+            } else {
+                // Gate enabled but no federation_directory wired —
+                // structurally cannot verify; warn once and bypass.
+                // (The bypass is intentional: tests + bootstrap paths
+                // that flip the boolean before wiring persist would
+                // otherwise refuse every envelope.)
+                tracing::warn!(
+                    event = "edge.delegation_gate.bypassed_no_directory",
+                    "delegation_authority_gate_enabled but no federation_directory wired; bypassing gate (CIRISEdge#108 part 2)",
+                );
             }
         }
     }
@@ -4846,6 +4987,196 @@ async fn verify_accord_carrier(
     }
 }
 
+/// CIRISEdge#108 part 2 (v3.2.0, CEG §8.1.12.7) — scope tokens the
+/// authority gate honors, mirroring persist v6.5.0's
+/// `SELF_AT_LOGIN_DELEGATION_SCOPE` constants. Pinned locally so edge
+/// doesn't import the const directly (and so a future persist rename
+/// surfaces at this site instead of silently).
+pub(crate) const SCOPE_MESSAGE_IO: &str = "message_io";
+#[allow(dead_code)] // v3.2.x follow-up: FederationAnnouncement gate
+pub(crate) const SCOPE_NETWORK_PRESENCE: &str = "network_presence";
+#[allow(dead_code)] // v3.2.x follow-up: ContributionSubmit gate
+pub(crate) const SCOPE_ACT_ON_BEHALF: &str = "act_on_behalf";
+#[allow(dead_code)] // v3.2.x follow-up: depth > 1 chain gate
+pub(crate) const SCOPE_SUB_DELEGATION: &str = "sub_delegation";
+
+/// CIRISEdge#108 part 2 (v3.2.0) — federation-tier delegation authority
+/// gate.
+///
+/// Persist v6.5.0's `Engine::self_at_login` (CEG §8.1.12.7) co-admits
+/// an app occurrence + an agent occurrence under one identity key,
+/// writes `delegates_to(user → agent, scope: SELF_AT_LOGIN_DELEGATION_SCOPE)`,
+/// and promotes that delegation to the federation tier. Edge consumes
+/// that promotion HERE: given an inbound envelope signed by some
+/// `agent_key_X`, walk the federation directory to find a chain of
+/// non-retracted `delegates_to` edges from a trusted root to
+/// `agent_key_X` that carries `required_scope`.
+///
+/// # Algorithm
+///
+/// 1. Empty trust-root set → `NoTrustRoots` (refuse; substrate not
+///    bootstrapped for delegation-gated traffic).
+/// 2. For each trust root: walk persist's
+///    [`ciris_persist::federation::topology::build_delegation_graph`]
+///    BFS forward from the root, depth-bounded by `max_depth`.
+/// 3. Collect every `DelegationEdge.to_key == signer_key`:
+///    - If the matched edge carries a `withdrawn_by` annotation, mark
+///      "retracted-at-root" (don't admit, but remember in case no
+///      live edge surfaces — the retraction is the load-bearing
+///      forensic story).
+///    - Else inspect the raw attestation envelope: a
+///      `self_at_login`-shaped delegation writes scope as a JSON
+///      ARRAY. (Persist's `DelegationEdge.scope` field only reads
+///      `as_str()` — see persist v6.5.0
+///      `src/federation/topology.rs:457`; for set-shaped scopes the
+///      field is empty. We re-fetch the raw envelope via
+///      `directory.list_attestations_for(signer)` and check the
+///      scope set ourselves.)
+///    - If `required_scope` ∈ set → admit (`Ok(())`).
+/// 4. If at least one edge surfaced but every match was retracted →
+///    `RetractedAtRoot`.
+/// 5. If at least one edge surfaced but none carried the scope →
+///    `MissingScope`.
+/// 6. Otherwise → `SignerUnreached`.
+async fn verify_self_at_login_delegation(
+    signer_key: &str,
+    directory: &Arc<dyn ciris_persist::federation::FederationDirectory>,
+    trusted_roots: &[String],
+    required_scope: &str,
+    max_depth: usize,
+) -> Result<(), crate::messages::DelegationRefusalSubReason> {
+    use crate::messages::DelegationRefusalSubReason;
+    use ciris_persist::federation::topology::{build_delegation_graph, MAX_DELEGATION_DEPTH};
+    use ciris_persist::federation::types::attestation_type;
+
+    if trusted_roots.is_empty() {
+        return Err(DelegationRefusalSubReason::NoTrustRoots);
+    }
+
+    let effective_depth = max_depth.clamp(1, MAX_DELEGATION_DEPTH);
+
+    // Track forensic state across roots — we want the most-specific
+    // refusal reason (a retraction beats "unreached", a scope-miss
+    // beats "unreached", a substrate fault preempts everything).
+    let mut substrate_fault = false;
+    let mut any_match = false;
+    let mut any_unretracted_match = false;
+    let mut any_retracted_match = false;
+
+    // Pre-fetch the signer's inbound delegations once — we need the
+    // raw envelopes to recover the set-shaped scope that persist's
+    // DelegationEdge.scope drops.
+    let signer_inbound = match directory.as_ref().list_attestations_for(signer_key).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                event = "edge.delegation_gate.substrate_fault",
+                signer_key = %signer_key,
+                error = %e,
+                "list_attestations_for(signer) failed",
+            );
+            return Err(DelegationRefusalSubReason::SubstrateUnavailable);
+        }
+    };
+
+    for root in trusted_roots {
+        let graph = match build_delegation_graph(directory.as_ref(), root, effective_depth).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    event = "edge.delegation_gate.substrate_fault",
+                    root = %root,
+                    error = %e,
+                    "build_delegation_graph failed; treating root as unreached",
+                );
+                substrate_fault = true;
+                continue;
+            }
+        };
+        for edge in &graph.edges {
+            if edge.to_key != signer_key {
+                continue;
+            }
+            any_match = true;
+            if edge.withdrawn_by.is_some() {
+                any_retracted_match = true;
+                continue;
+            }
+            // Look up the matching raw envelope to recover the scope
+            // set. Multiple delegates_to rows for the same
+            // (granter, grantee) are uncommon at depth-1 (one per
+            // self_at_login flow) but persist does not collapse
+            // them, so we accept ANY matching row that carries the
+            // required scope.
+            let scope_ok = signer_inbound.iter().any(|att| {
+                att.attestation_type == attestation_type::DELEGATES_TO
+                    && att.attesting_key_id == edge.from_key
+                    && envelope_scope_contains(&att.attestation_envelope, required_scope)
+            });
+            if scope_ok {
+                return Ok(());
+            }
+            any_unretracted_match = true;
+        }
+    }
+
+    // Forensic discrimination — most-specific wins. A successful
+    // admit short-circuits above; falling through means refuse.
+    if any_unretracted_match {
+        // We found an in-graph live edge but no scope match — clearer
+        // than calling this "unreached".
+        Err(DelegationRefusalSubReason::MissingScope)
+    } else if any_retracted_match {
+        Err(DelegationRefusalSubReason::RetractedAtRoot)
+    } else if !any_match && substrate_fault {
+        // Every root walk faulted; we cannot prove or disprove
+        // reachability. Conservative refuse.
+        Err(DelegationRefusalSubReason::SubstrateUnavailable)
+    } else {
+        Err(DelegationRefusalSubReason::SignerUnreached)
+    }
+}
+
+/// CIRISEdge#108 part 2 (v3.2.0) — does the `scope` field on a
+/// `delegates_to` envelope contain `wanted`?
+///
+/// The `self_at_login` envelope writes scope as a JSON **array** of
+/// tokens (per persist v6.5.0
+/// `src/federation/self_at_login.rs::delegates_to_agent_envelope`);
+/// other delegation writers may use a string. Handle both shapes — a
+/// non-`self_at_login` writer that emits a single string scope
+/// matches when the string equals `wanted`.
+fn envelope_scope_contains(envelope: &serde_json::Value, wanted: &str) -> bool {
+    match envelope.get("scope") {
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(wanted)),
+        Some(serde_json::Value::String(s)) => s == wanted,
+        _ => false,
+    }
+}
+
+/// CIRISEdge#108 part 2 (v3.2.0) — which scope token a given
+/// `MessageType` requires for the delegation gate. Returns `None` for
+/// MessageType variants where the gate does NOT apply at v3.2.0-pre1.
+/// The narrow-cut shape: only `InlineText` is gated; the other
+/// variants are listed here as `None` (with a comment naming the
+/// follow-up scope) so the v3.2.x extension is a one-line change per
+/// arm.
+pub(crate) fn delegation_scope_for_message_type(mt: &MessageType) -> Option<&'static str> {
+    match mt {
+        MessageType::InlineText => Some(SCOPE_MESSAGE_IO),
+        // v3.2.x follow-ups (deferred from v3.2.0-pre1):
+        //   InlineTextDurable           → SCOPE_MESSAGE_IO
+        //   FederationAnnouncement      → SCOPE_NETWORK_PRESENCE
+        //   ContributionSubmit          → SCOPE_ACT_ON_BEHALF
+        //   StewardDirective            → SCOPE_ACT_ON_BEHALF (TBD)
+        //   DeliveryAttestation         → un-gated (substrate-emitted)
+        //   DeliveryRefusalAttestation  → un-gated (substrate-emitted)
+        //   ContentMiss / ContentBody   → un-gated (content-routing)
+        //   AckEnvelope                 → un-gated (transport-tier)
+        _ => None,
+    }
+}
+
 /// Verify one Ed25519 signature against a 32-byte pubkey and the
 /// canonical bytes. Returns `false` on base64-decode failure, wrong
 /// signature length, or signature-verification failure (any error is
@@ -4982,4 +5313,330 @@ async fn emit_delivery_refusal_attestation(
         .map_err(|e| EdgeError::Persist(format!("enqueue_outbound (refusal): {e}")))?;
 
     Ok(())
+}
+
+/// CIRISEdge#108 part 2 (v3.2.0) — local mirror of persist v6.5.0
+/// `SELF_AT_LOGIN_DELEGATION_SCOPE` for test fixtures only. Persist's
+/// constant is `[&str; 4]` of `&'static str`; we mirror the bytes here
+/// so the test module can pass `&SELF_AT_LOGIN_SCOPE_TOKENS` without
+/// pulling persist's const into the runtime path (the gate logic
+/// itself parses the tokens out of the envelope's `scope` JSON
+/// array — it has no compile-time dependency on the constant).
+#[cfg(test)]
+const SELF_AT_LOGIN_SCOPE_TOKENS: [&str; 4] = [
+    SCOPE_ACT_ON_BEHALF,
+    SCOPE_MESSAGE_IO,
+    SCOPE_NETWORK_PRESENCE,
+    SCOPE_SUB_DELEGATION,
+];
+
+// ── CIRISEdge#108 part 2 (v3.2.0-pre1) — delegation gate tests ─────
+#[cfg(test)]
+mod delegation_gate_tests {
+    //! Unit coverage for [`verify_self_at_login_delegation`] + the
+    //! supporting envelope helpers. The fixtures mirror the persist
+    //! v6.5.0 `Engine::self_at_login` write shape (CEG §8.1.12.7):
+    //! `attestation_type = "delegates_to"`, envelope with
+    //! `kind: "delegates_to"`, `dimension:
+    //! "self:delegates_to:agent_occurrence:v1"`, `scope: [...]`.
+    use super::*;
+    use ciris_persist::federation::types::{
+        algorithm, attestation_type as att_type, identity_type, Attestation, KeyRecord,
+        SignedAttestation, SignedKeyRecord,
+    };
+    use ciris_persist::store::MemoryBackend;
+
+    fn key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
+        let now = Utc::now();
+        KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: "0".repeat(44),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: algorithm::HYBRID.into(),
+            identity_type: identity_type_.into(),
+            identity_ref: format!("{identity_type_}-ref-{key_id}"),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({
+                "key_id": key_id,
+                "identity_type": identity_type_,
+            }),
+            original_content_hash: "0".repeat(64),
+            scrub_signature_classical: "x".repeat(88),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        }
+    }
+
+    /// Build a `delegates_to` Attestation row matching the persist
+    /// v6.5.0 `self_at_login` shape: scope as JSON array.
+    #[allow(clippy::similar_names)] // granter/grantee mirrors persist's column names
+    fn delegates_to_row(granter: &str, grantee: &str, scope: &[&str]) -> Attestation {
+        let now = Utc::now();
+        Attestation {
+            attestation_id: format!("att-{granter}-{grantee}"),
+            attesting_key_id: granter.into(),
+            attested_key_id: grantee.into(),
+            attestation_type: att_type::DELEGATES_TO.into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "kind": "delegates_to",
+                "dimension": "self:delegates_to:agent_occurrence:v1",
+                "agent_occurrence_key_id": grantee,
+                "bilateral_pair_id": format!("pair-{granter}-{grantee}"),
+                "scope": scope,
+            }),
+            original_content_hash: "0".repeat(64),
+            scrub_signature_classical: "x".repeat(88),
+            scrub_signature_pqc: None,
+            scrub_key_id: granter.into(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".into(),
+            tier: "federation".into(),
+            promoted_at: None,
+        }
+    }
+
+    fn withdraws_row(granter: &str, target: &str) -> Attestation {
+        let now = Utc::now();
+        Attestation {
+            attestation_id: format!("withdraws-{granter}-{target}"),
+            attesting_key_id: granter.into(),
+            attested_key_id: target.into(),
+            attestation_type: att_type::WITHDRAWS.into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "kind": "withdraws",
+                "dimension": "withdraws:self:delegates_to:agent_occurrence:v1",
+                "target_attestation_id": format!("att-{granter}-{target}"),
+            }),
+            original_content_hash: "0".repeat(64),
+            scrub_signature_classical: "x".repeat(88),
+            scrub_signature_pqc: None,
+            scrub_key_id: granter.into(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".into(),
+            tier: "federation".into(),
+            promoted_at: None,
+        }
+    }
+
+    async fn seed_keys(backend: &Arc<MemoryBackend>, keys: &[(&str, &str)]) {
+        use ciris_persist::federation::FederationDirectory;
+        for (kid, itype) in keys {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: key_record(kid, itype),
+                })
+                .await
+                .expect("seed key");
+        }
+    }
+
+    async fn seed_attestation(backend: &Arc<MemoryBackend>, att: Attestation) {
+        use ciris_persist::federation::FederationDirectory;
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .expect("seed attestation");
+    }
+
+    #[test]
+    fn envelope_scope_contains_handles_array_string_and_missing() {
+        // self_at_login shape: array.
+        let v = serde_json::json!({"scope": ["act_on_behalf", "message_io"]});
+        assert!(envelope_scope_contains(&v, SCOPE_MESSAGE_IO));
+        assert!(!envelope_scope_contains(&v, SCOPE_NETWORK_PRESENCE));
+        // Other-writer shape: single string.
+        let v = serde_json::json!({"scope": "message_io"});
+        assert!(envelope_scope_contains(&v, SCOPE_MESSAGE_IO));
+        assert!(!envelope_scope_contains(&v, SCOPE_ACT_ON_BEHALF));
+        // Missing/malformed.
+        let v = serde_json::json!({});
+        assert!(!envelope_scope_contains(&v, SCOPE_MESSAGE_IO));
+        let v = serde_json::json!({"scope": 42});
+        assert!(!envelope_scope_contains(&v, SCOPE_MESSAGE_IO));
+    }
+
+    #[test]
+    fn scope_map_starts_narrow_at_inline_text() {
+        // v3.2.0-pre1 narrow cut: only InlineText is gated. Every
+        // other variant returns None so the gate skips it.
+        assert_eq!(
+            delegation_scope_for_message_type(&MessageType::InlineText),
+            Some(SCOPE_MESSAGE_IO),
+        );
+        assert_eq!(
+            delegation_scope_for_message_type(&MessageType::FederationAnnouncement),
+            None,
+        );
+        assert_eq!(
+            delegation_scope_for_message_type(&MessageType::ContributionSubmit),
+            None,
+        );
+        assert_eq!(
+            delegation_scope_for_message_type(&MessageType::DeliveryAttestation),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_trust_roots_refuses_with_no_trust_roots() {
+        let backend = Arc::new(MemoryBackend::new());
+        seed_keys(&backend, &[("agent", identity_type::AGENT)]).await;
+        let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
+        let out = verify_self_at_login_delegation(
+            "agent",
+            &dir,
+            &[], // no trust roots
+            SCOPE_MESSAGE_IO,
+            4,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Err(crate::messages::DelegationRefusalSubReason::NoTrustRoots),
+        );
+    }
+
+    #[tokio::test]
+    async fn happy_path_admits_signer_reached_via_in_scope_chain() {
+        let backend = Arc::new(MemoryBackend::new());
+        seed_keys(
+            &backend,
+            &[
+                ("user-root", identity_type::USER),
+                ("agent", identity_type::AGENT),
+            ],
+        )
+        .await;
+        seed_attestation(
+            &backend,
+            delegates_to_row("user-root", "agent", &super::SELF_AT_LOGIN_SCOPE_TOKENS),
+        )
+        .await;
+        let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
+        let out = verify_self_at_login_delegation(
+            "agent",
+            &dir,
+            &["user-root".into()],
+            SCOPE_MESSAGE_IO,
+            4,
+        )
+        .await;
+        assert_eq!(out, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn missing_delegation_refuses_with_signer_unreached() {
+        let backend = Arc::new(MemoryBackend::new());
+        seed_keys(
+            &backend,
+            &[
+                ("user-root", identity_type::USER),
+                ("agent", identity_type::AGENT),
+            ],
+        )
+        .await;
+        // NO attestation seeded — the user never delegated to the
+        // agent.
+        let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
+        let out = verify_self_at_login_delegation(
+            "agent",
+            &dir,
+            &["user-root".into()],
+            SCOPE_MESSAGE_IO,
+            4,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Err(crate::messages::DelegationRefusalSubReason::SignerUnreached),
+        );
+    }
+
+    #[tokio::test]
+    async fn retracted_delegation_refuses_with_retracted_at_root() {
+        let backend = Arc::new(MemoryBackend::new());
+        seed_keys(
+            &backend,
+            &[
+                ("user-root", identity_type::USER),
+                ("agent", identity_type::AGENT),
+            ],
+        )
+        .await;
+        seed_attestation(
+            &backend,
+            delegates_to_row("user-root", "agent", &super::SELF_AT_LOGIN_SCOPE_TOKENS),
+        )
+        .await;
+        // Same granter retracts the delegation — persist's
+        // build_delegation_graph buckets the retraction and stamps
+        // `withdrawn_by` on the DelegationEdge.
+        seed_attestation(&backend, withdraws_row("user-root", "agent")).await;
+        let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
+        let out = verify_self_at_login_delegation(
+            "agent",
+            &dir,
+            &["user-root".into()],
+            SCOPE_MESSAGE_IO,
+            4,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Err(crate::messages::DelegationRefusalSubReason::RetractedAtRoot),
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_without_required_scope_refuses_with_missing_scope() {
+        let backend = Arc::new(MemoryBackend::new());
+        seed_keys(
+            &backend,
+            &[
+                ("user-root", identity_type::USER),
+                ("agent", identity_type::AGENT),
+            ],
+        )
+        .await;
+        // Delegate ONLY network_presence — the InlineText path
+        // requires message_io, so the gate refuses on scope.
+        seed_attestation(
+            &backend,
+            delegates_to_row("user-root", "agent", &[SCOPE_NETWORK_PRESENCE]),
+        )
+        .await;
+        let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
+        let out = verify_self_at_login_delegation(
+            "agent",
+            &dir,
+            &["user-root".into()],
+            SCOPE_MESSAGE_IO,
+            4,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Err(crate::messages::DelegationRefusalSubReason::MissingScope),
+        );
+    }
 }
