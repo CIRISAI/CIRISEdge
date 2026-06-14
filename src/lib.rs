@@ -48,6 +48,7 @@
 #![deny(rust_2018_idioms)]
 #![doc(html_root_url = "https://docs.rs/ciris-edge/0.1.0-pre1")]
 
+pub mod blob_swarm;
 pub mod cohort_scope;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
@@ -70,6 +71,10 @@ pub mod transport;
 pub mod verify;
 pub mod version;
 
+pub use blob_swarm::{
+    BlobChunkSource, BlobChunkVerifier, ChunkManifestLite, ChunkSourceRefusal, ChunkVerifyError,
+    PeerState, SwarmConfig, SwarmError, SwarmScheduler,
+};
 pub use cohort_scope::{CohortScope, CohortScopeEnforcement};
 pub use detector::{
     ConsentRole, DetectionVerdict, EdgeDetectionAdmission, ProbePatternConfig,
@@ -77,7 +82,7 @@ pub use detector::{
 };
 pub use edge::{
     reseed_canonical_bootstrap_peers, run_blackhole_pruner, AgentMode, CanonicalBootstrapPeer,
-    ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, VerifiedEnvelopeSnapshot,
+    ChunkResult, ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, VerifiedEnvelopeSnapshot,
     DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
 };
 pub use events::{

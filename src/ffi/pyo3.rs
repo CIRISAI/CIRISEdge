@@ -1161,6 +1161,110 @@ impl PyEdge {
         Ok(dict.unbind())
     }
 
+    /// CIRISEdge#55 v3.4.0-pre1 — adaptive multi-peer swarm fetch.
+    ///
+    /// Fetches a chunked blob from a set of holders concurrently with
+    /// per-peer EWMA RTT tracking, in-flight caps, dishonest-peer
+    /// demotion, and endgame mode (duplicate requests for the last
+    /// chunks). Returns the assembled blob bytes.
+    ///
+    /// # Inputs
+    ///
+    /// - `blob_sha256_hex` — 64-char hex of the overall blob SHA-256.
+    /// - `manifest_chunks` — ordered list of `(chunk_sha_hex,
+    ///   chunk_size)` tuples (the persist `ChunkManifest.chunks`
+    ///   projection).
+    /// - `total_size` — Σ chunk sizes; validated against `manifest_chunks`.
+    /// - `holders` — list of `key_id` strings, typically the result of
+    ///   `engine.list_holders(blob_sha256)`. Edge does NOT query
+    ///   persist directly — the caller owns the holder enumeration.
+    /// - `timeout_ms` — per-chunk request timeout (default 30000).
+    ///
+    /// # Errors
+    ///
+    /// - `ValueError` — hex parse failure, manifest mismatch, etc.
+    /// - `RuntimeError` — typed `SwarmError` variants (NoHolders,
+    ///   ChunkUnreachable, Substrate, GoneFederationWide).
+    ///
+    /// # Manifest discovery
+    ///
+    /// v3.4.0-pre1 leaves manifest discovery to the caller — given a
+    /// blob SHA, where do I get the manifest? lens-core / agent
+    /// orchestration owns that question. The straightforward pattern
+    /// is: `fetch_content(blob_sha256)` → if the response is a
+    /// `chunk_dag` manifest, parse it into `manifest_chunks` + pass
+    /// here.
+    #[pyo3(signature = (blob_sha256_hex, manifest_chunks, total_size, holders, timeout_ms = 30_000))]
+    #[allow(clippy::needless_pass_by_value)] // pyo3 surface takes owned Vecs
+    fn fetch_blob_swarm(
+        &self,
+        py: Python<'_>,
+        blob_sha256_hex: &str,
+        manifest_chunks: Vec<(String, usize)>,
+        total_size: u64,
+        holders: Vec<String>,
+        timeout_ms: u64,
+    ) -> PyResult<Py<pyo3::types::PyBytes>> {
+        // Parse the blob SHA.
+        if blob_sha256_hex.len() != 64 {
+            return Err(PyValueError::new_err(format!(
+                "blob_sha256_hex must be a 64-char hex string, got {} chars",
+                blob_sha256_hex.len()
+            )));
+        }
+        let mut blob_sha = [0u8; 32];
+        for (i, byte) in blob_sha.iter_mut().enumerate() {
+            let s = &blob_sha256_hex[i * 2..i * 2 + 2];
+            *byte = u8::from_str_radix(s, 16)
+                .map_err(|e| PyValueError::new_err(format!("blob_sha256 hex parse: {e}")))?;
+        }
+
+        // Parse the chunk list.
+        let mut chunks = Vec::with_capacity(manifest_chunks.len());
+        for (idx, (sha_hex, size)) in manifest_chunks.iter().enumerate() {
+            if sha_hex.len() != 64 {
+                return Err(PyValueError::new_err(format!(
+                    "manifest_chunks[{idx}].sha_hex must be 64 chars, got {}",
+                    sha_hex.len()
+                )));
+            }
+            let mut sha = [0u8; 32];
+            for (i, byte) in sha.iter_mut().enumerate() {
+                let s = &sha_hex[i * 2..i * 2 + 2];
+                *byte = u8::from_str_radix(s, 16)
+                    .map_err(|e| PyValueError::new_err(format!("chunk_sha hex parse: {e}")))?;
+            }
+            chunks.push((sha, *size));
+        }
+        let manifest = crate::blob_swarm::ChunkManifestLite { chunks, total_size };
+
+        // v3.4.0-pre1 swarm wrapper takes the verifier from the
+        // engine if one is wired; for the bare PyEdge surface we
+        // construct a default "hash-check-only" verifier that uses
+        // `sha2` directly (no persist write). The full
+        // `put_blob_chunks` path lands in a follow-up cut once the
+        // engine wrapper is in scope.
+        let verifier = std::sync::Arc::new(DefaultPyChunkVerifier)
+            as std::sync::Arc<dyn crate::blob_swarm::BlobChunkVerifier>;
+        let config = crate::blob_swarm::SwarmConfig {
+            per_request_timeout: Duration::from_millis(timeout_ms),
+            ..crate::blob_swarm::SwarmConfig::default()
+        };
+        let scheduler =
+            crate::blob_swarm::SwarmScheduler::new(self.inner.clone(), verifier, config);
+
+        let result = py.detach(|| {
+            run_async(&self.executor, async move {
+                scheduler
+                    .fetch_blob(blob_sha, manifest, holders)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("fetch_blob_swarm: {e}")))
+            })
+        })?;
+
+        Ok(pyo3::types::PyBytes::new(py, &result).unbind())
+    }
+
     /// Subscribe to verified inbound envelopes. Returns a
     /// [`PyVerifiedFeedSubscription`] — a Python AsyncIterator that
     /// yields one verified-envelope projection per inbound message.
@@ -1547,6 +1651,42 @@ impl PyReplicationHandle {
                 }
             });
         });
+    }
+}
+
+/// CIRISEdge#55 v3.4.0-pre1 — default chunk verifier for the
+/// `fetch_blob_swarm` pymethod. Hash-checks the chunk bytes locally
+/// (returns `Mismatch` on hash failure so the scheduler demotes the
+/// peer) but does NOT persist via `put_blob_chunks`. The persist-
+/// integrated verifier lands in a follow-up cut once the engine
+/// adapter is in scope for the PyEdge path.
+///
+/// Visible-to-tests: the scheduler treats `Mismatch` as a dishonest-
+/// peer strike; the unverified bytes are returned to the Python
+/// caller as the assembled blob. Callers writing persist-backed
+/// applications should wire a real verifier through the Rust API
+/// surface (`SwarmScheduler::new`).
+struct DefaultPyChunkVerifier;
+
+impl crate::blob_swarm::BlobChunkVerifier for DefaultPyChunkVerifier {
+    fn verify_and_store(
+        &self,
+        _blob_sha256: [u8; 32],
+        chunk_sha256: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), crate::blob_swarm::ChunkVerifyError> {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let out = h.finalize();
+        let mut actual = [0u8; 32];
+        actual.copy_from_slice(&out);
+        if actual != chunk_sha256 {
+            return Err(crate::blob_swarm::ChunkVerifyError::Mismatch {
+                chunk_sha: hex::encode(chunk_sha256),
+            });
+        }
+        Ok(())
     }
 }
 

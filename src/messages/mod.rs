@@ -145,6 +145,47 @@ pub enum MessageType {
     /// of hanging (edge#21 spec point 3). Body: [`ContentMiss`].
     ContentMiss,
 
+    // ─── CIRISEdge#55 (v2.5.0) — chunked-blob swarm fetch ──────────
+    //
+    // The Phase-2 chunked path the v0.8.0 ContentChunk comment above
+    // deferred. Now landing against the stable persist#145 substrate:
+    // `BlobStorage::list_holders` for candidate discovery, `ChunkManifest`
+    // for the chunk-list shape, and `BlobStorage::put_blob_chunk` for
+    // atomic per-chunk SHA verification + store (returns ChunkMismatch
+    // on hash failure — the trust primitive). Edge owns the carrier op +
+    // the adaptive scheduler; persist owns the verify-on-write seam.
+    //
+    // Three variants mirror the Phase-1 ContentFetch / ContentBody /
+    // ContentMiss triple exactly — same Ephemeral delivery class, same
+    // typed-envelope response shape, same MissReason vocabulary. The
+    // discriminator differs: BlobChunk* carries BOTH `blob_sha256`
+    // (overall blob, manifest-bound) and `chunk_sha256` (this specific
+    // chunk). Two SHAs because the scheduler maintains per-blob state
+    // (which chunks pending) and per-chunk responses correlate at the
+    // chunk-SHA level (one outstanding chunk-request may be answered by
+    // any holder).
+    /// Request the bytes of a single chunk identified by
+    /// `(blob_sha256, chunk_sha256)`. Ephemeral, retryable. Any peer
+    /// listed in `BlobStorage::list_holders(blob_sha256)` may respond
+    /// with [`MessageType::BlobChunkBody`]; a peer that does not hold
+    /// the chunk responds with [`MessageType::BlobChunkMiss`]. Body:
+    /// [`BlobChunkFetch`].
+    BlobChunkFetch,
+    /// Response carrying the chunk bytes for a
+    /// [`MessageType::BlobChunkFetch`]. Receiver hands the bytes to
+    /// `persist.put_blob_chunk(blob_sha, chunk_sha, bytes)` which
+    /// atomically verifies `sha256(bytes) == chunk_sha256` and stores
+    /// (or returns `ChunkMismatch` on hash failure). Body:
+    /// [`BlobChunkBody`].
+    BlobChunkBody,
+    /// Response indicating the responder will not serve the requested
+    /// chunk. Same [`MissReason`] vocabulary as
+    /// [`MessageType::ContentMiss`] — `NotHeld` (try another peer)
+    /// vs `Withdrawn`/`Revoked` (gone federation-wide) vs
+    /// `PolicyDenied` (this responder only). Body:
+    /// [`BlobChunkMiss`].
+    BlobChunkMiss,
+
     // ─── CIRISEdge#20 (v0.10.0) — Federation steward class ──────────
     /// Steward-class federation directive — rides
     /// `Delivery::Federation { priority: StewardClass }`. Edge derives
@@ -1678,6 +1719,115 @@ impl Message for ContentMiss {
     type Response = ();
 }
 
+// ─── CIRISEdge#55 — chunked-blob swarm wire shapes ──────────────────
+
+/// Fetch one chunk of a chunked blob (v2.5.0, CIRISEdge#55).
+///
+/// Distinct from [`ContentFetch`] in two ways:
+///   - Carries TWO SHAs: `blob_sha256` (overall, bound by the
+///     `ChunkManifest`) and `chunk_sha256` (this specific chunk).
+///   - Modeled for swarm-style multi-peer scheduling — the requester
+///     issues many of these concurrently across the set returned by
+///     `BlobStorage::list_holders(blob_sha256)`, with per-peer EWMA +
+///     in-flight caps.
+///
+/// Same [`Delivery::Ephemeral`] class as [`ContentFetch`] — point-to-
+/// point, retryable, no Mandatory fan-out. Any peer holding the chunk
+/// may respond with [`BlobChunkBody`]; a peer that does not (or
+/// refuses under policy) responds with [`BlobChunkMiss`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlobChunkFetch {
+    /// SHA-256 of the OVERALL blob (manifest-bound). Lets the
+    /// responder cheaply scope the lookup to a single blob's chunk set
+    /// instead of a full index scan.
+    pub blob_sha256: [u8; 32],
+    /// SHA-256 of the SPECIFIC chunk requested. The
+    /// [`ChunkManifest`](https://github.com/CIRISAI/CIRISPersist)
+    /// (persist v4.1, CIRISPersist#142) is what binds this to a byte
+    /// range inside `blob_sha256`.
+    pub chunk_sha256: [u8; 32],
+    /// Optional fetcher-side preference shape. Reuses the
+    /// [`HintShape`] vocabulary from [`ContentFetch`] — no new
+    /// hint-class is introduced for swarm-fetch; the scheduler-side
+    /// logic (EWMA, in-flight cap) is fetcher-local and not wire-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_hint: Option<HintShape>,
+}
+
+impl Message for BlobChunkFetch {
+    const TYPE: MessageType = MessageType::BlobChunkFetch;
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    /// Like [`ContentFetch`], the peer chooses BlobChunkBody xor
+    /// BlobChunkMiss; both are typed envelopes carrying their own
+    /// bodies. `()` marks the wire-level "no inline response struct".
+    type Response = ();
+}
+
+/// Response carrying the bytes for a [`BlobChunkFetch`].
+///
+/// # Integrity invariant (CIRISEdge#55 / CIRISPersist#145 seam)
+///
+/// The receiver does NOT verify in-handler; it hands the body to
+/// `BlobStorage::put_blob_chunk(blob_sha256, chunk_sha256, &bytes)`
+/// which atomically verifies `sha256(bytes) == chunk_sha256` and
+/// stores. On hash failure persist returns `ChunkMismatch`; the
+/// scheduler treats that as evidence the responder is dishonest and
+/// demotes them from the candidate set for the rest of the session.
+///
+/// This is the §10.1.1 verify-on-write seam — edge transports bytes,
+/// persist owns SHA verification + persistence in one atomic step.
+///
+/// # Size bound
+///
+/// `bytes.len()` is bounded by [`DEFAULT_MAX_CONTENT_BODY_BYTES`] (the
+/// same AV-13 ceiling that bounds [`ContentBody`]) — individual
+/// chunks above that ceiling SHOULD NOT exist (the persist chunk
+/// boundary is set well below). Operators using non-default chunk
+/// sizes MUST keep chunks under the ceiling.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlobChunkBody {
+    /// SHA-256 of the OVERALL blob — echoed back from the request for
+    /// scheduler-side correlation when many fetches are outstanding
+    /// across multiple blobs.
+    pub blob_sha256: [u8; 32],
+    /// SHA-256 the responder claims this chunk hashes to. Verified by
+    /// `BlobStorage::put_blob_chunk` on receipt.
+    pub chunk_sha256: [u8; 32],
+    /// The chunk bytes. Bounded by [`DEFAULT_MAX_CONTENT_BODY_BYTES`]
+    /// (AV-13 ceiling).
+    pub bytes: Vec<u8>,
+}
+
+impl Message for BlobChunkBody {
+    const TYPE: MessageType = MessageType::BlobChunkBody;
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    type Response = ();
+}
+
+/// Response indicating the responder will not serve the requested
+/// chunk. Same [`MissReason`] vocabulary as [`ContentMiss`] — the
+/// scheduler's reaction differs per reason: `NotHeld` → try another
+/// holder; `Withdrawn` / `Revoked` → abort the whole fetch (chunk is
+/// gone federation-wide); `PolicyDenied` → demote this responder for
+/// the rest of the session.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlobChunkMiss {
+    /// SHA-256 of the OVERALL blob — echoed for correlation.
+    pub blob_sha256: [u8; 32],
+    /// SHA-256 the requester asked for — echoed for body-level
+    /// correlation (envelope-level correlation rides
+    /// `in_reply_to`).
+    pub chunk_sha256: [u8; 32],
+    /// Why the responder is missing or refusing.
+    pub reason: MissReason,
+}
+
+impl Message for BlobChunkMiss {
+    const TYPE: MessageType = MessageType::BlobChunkMiss;
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    type Response = ();
+}
+
 /// Compute the SHA-256 of a byte slice. The receiver-side integrity
 /// check (`sha256(bytes) == ContentBody.sha256`) calls this; exposed
 /// pub so consumers building [`ContentBody`] can compute the field
@@ -2289,6 +2439,52 @@ mod tests {
         assert_eq!(ContentFetch::TYPE, MessageType::ContentFetch);
         assert_eq!(ContentBody::TYPE, MessageType::ContentBody);
         assert_eq!(ContentMiss::TYPE, MessageType::ContentMiss);
+    }
+
+    /// CIRISEdge#55 — the chunked-blob swarm triple mirrors the
+    /// whole-file ContentFetch family exactly: same Ephemeral
+    /// delivery class, same TYPE-discriminator round-trip.
+    #[test]
+    fn blob_chunk_fetch_family_declares_ephemeral() {
+        assert!(matches!(BlobChunkFetch::DELIVERY, Delivery::Ephemeral));
+        assert!(matches!(BlobChunkBody::DELIVERY, Delivery::Ephemeral));
+        assert!(matches!(BlobChunkMiss::DELIVERY, Delivery::Ephemeral));
+        assert_eq!(BlobChunkFetch::TYPE, MessageType::BlobChunkFetch);
+        assert_eq!(BlobChunkBody::TYPE, MessageType::BlobChunkBody);
+        assert_eq!(BlobChunkMiss::TYPE, MessageType::BlobChunkMiss);
+    }
+
+    /// CIRISEdge#55 — round-trip both SHAs through JSON serde.
+    /// Catches accidental wire-shape drift between Fetch / Body / Miss
+    /// (all three must carry the same SHA pair).
+    #[test]
+    fn blob_chunk_wire_shapes_round_trip_through_json() {
+        let blob = [7u8; 32];
+        let chunk = [11u8; 32];
+        let fetch = BlobChunkFetch {
+            blob_sha256: blob,
+            chunk_sha256: chunk,
+            response_hint: None,
+        };
+        let body = BlobChunkBody {
+            blob_sha256: blob,
+            chunk_sha256: chunk,
+            bytes: vec![1, 2, 3],
+        };
+        let miss = BlobChunkMiss {
+            blob_sha256: blob,
+            chunk_sha256: chunk,
+            reason: MissReason::NotHeld,
+        };
+        let f_rt: BlobChunkFetch =
+            serde_json::from_str(&serde_json::to_string(&fetch).unwrap()).unwrap();
+        let b_rt: BlobChunkBody =
+            serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        let m_rt: BlobChunkMiss =
+            serde_json::from_str(&serde_json::to_string(&miss).unwrap()).unwrap();
+        assert_eq!(f_rt, fetch);
+        assert_eq!(b_rt, body);
+        assert_eq!(m_rt, miss);
     }
 
     /// `MissReason` serde rules MUST be `snake_case` — pinned by the
