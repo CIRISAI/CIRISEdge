@@ -592,17 +592,29 @@ async fn inbound_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Some(auth) = state.bearer_auth.as_ref() {
-        if let Err(rej) = verify_bearer_token(headers, auth).await {
-            tracing::warn!(reason = %rej, "HTTPS bearer-token rejected");
-            return (StatusCode::UNAUTHORIZED, rej).into_response();
+    // v3.5.1 (CIRISEdge#119 + #120) — when bearer auth is configured
+    // and succeeds, the verified JWT's `kid` IS the peer's federation
+    // key_id (validated to match `iss` per the JWT contract). Pass it
+    // through to InboundFrame so the install_replication_routing
+    // pre-route can attribute CRPL frames to the right coordinator.
+    // mTLS-based attribution (CN extraction) is a separate follow-up
+    // tracked in #120 § HTTPS.
+    let source_key_id = if let Some(auth) = state.bearer_auth.as_ref() {
+        match verify_bearer_token(headers, auth).await {
+            Ok(kid) => Some(kid),
+            Err(rej) => {
+                tracing::warn!(reason = %rej, "HTTPS bearer-token rejected");
+                return (StatusCode::UNAUTHORIZED, rej).into_response();
+            }
         }
-    }
+    } else {
+        None
+    };
     let frame = InboundFrame {
         envelope_bytes: body.to_vec(),
         transport: TransportId::HTTP,
         received_at: Utc::now(),
-        source_key_id: None,
+        source_key_id,
     };
     match state.sink.send(frame).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
@@ -655,7 +667,16 @@ fn ed25519_seed_to_pkcs8(seed: &[u8; 32]) -> Vec<u8> {
     out
 }
 
-async fn verify_bearer_token(headers: HeaderMap, auth: &BearerTokenAuth) -> Result<(), String> {
+/// v3.5.1 (CIRISEdge#119 + #120) — on success, returns the peer's
+/// federation key_id (the JWT's `kid` header / `iss` claim, both
+/// validated to match per RFC 7519). Consumed by the inbound POST
+/// handler to populate `InboundFrame::source_key_id` so
+/// `Edge::install_replication_routing`'s CRPL pre-route can attribute
+/// the frame to a peer-keyed coordinator.
+///
+/// Previously returned `Result<(), String>`; the additive change
+/// surfaces the verified identity at no extra cost (already decoded).
+async fn verify_bearer_token(headers: HeaderMap, auth: &BearerTokenAuth) -> Result<String, String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)
         .ok_or_else(|| "missing Authorization header".to_string())?
@@ -693,7 +714,7 @@ async fn verify_bearer_token(headers: HeaderMap, auth: &BearerTokenAuth) -> Resu
             decoded.claims.iss
         ));
     }
-    Ok(())
+    Ok(kid)
 }
 
 // ─── Server-side TLS (axum-server + rustls) ─────────────────────────
