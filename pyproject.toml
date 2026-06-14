@@ -52,7 +52,7 @@ classifiers = [
 # consumers must still share one ciris-persist version process-wide
 # (the OnceLock-backed Engine singleton; CIRISPersist#85 EPIC).
 dependencies = [
-    "ciris-persist>=6.5.0,<7",
+    "ciris-persist>=6.7.0,<7",
 ]
 dynamic = ["version"]
 
