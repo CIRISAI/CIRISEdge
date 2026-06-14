@@ -1035,6 +1035,32 @@ pub struct ReticulumAuth {
     /// touch process-local state — durability survives transport
     /// rebuild AND process restart (the v0.15.0 acceptance criterion).
     pub blackhole_rules: Option<Arc<dyn ciris_persist::federation::BlackholeRules>>,
+    /// v3.1.0 (CIRISEdge#99) — keyring-backed RNS transport identity
+    /// storage. When `Some`, edge consults the keystore BEFORE the
+    /// `identity_path` file:
+    ///   - keystore.load(key_id) → `Some` → use those bytes
+    ///   - keystore.load(key_id) → `None` AND file exists → adopt-and-
+    ///     migrate: read the 64 file bytes, store via
+    ///     keystore.store(key_id, bytes), archive the original file to
+    ///     `<path>.migrated-<ts>` (rename, never delete — operator
+    ///     keeps the recovery copy until they're satisfied)
+    ///   - keystore.load(key_id) → `None` AND no file → generate fresh
+    ///     via keystore.generate_and_store(key_id), then load
+    ///
+    /// `None` (the default) preserves the v3.0.x chmod-600 file-only
+    /// behavior exactly. When `Some` and the platform tier is
+    /// hardware-backed (TPM / SE / StrongBox per the keystore's own
+    /// `is_hardware_backed()`), the at-rest exfil class documented in
+    /// CIRISEdge#99 (filesystem reads, backups, snapshots, permission
+    /// misconfig) is closed.
+    ///
+    /// AV-17 carve-out: the federation signing key never crosses
+    /// here — this is the transport-tier (X25519 + Ed25519) identity
+    /// only. Reticulum's `Identity::from_private_key_bytes` still
+    /// holds the bytes transiently to construct the in-process
+    /// Identity; the keyring trade-off is at-rest only, not RAM.
+    /// CIRISEdge#99 documents this explicitly.
+    pub transport_identity_keystore: Option<Arc<dyn ciris_keyring::TransportIdentityKeystore>>,
 }
 
 impl Default for ReticulumAuth {
@@ -1047,6 +1073,7 @@ impl Default for ReticulumAuth {
             event_bus: None,
             reachability: None,
             blackhole_rules: None,
+            transport_identity_keystore: None,
         }
     }
 }
@@ -1086,9 +1113,24 @@ impl ReticulumTransport {
             event_bus,
             reachability,
             blackhole_rules,
+            transport_identity_keystore,
         } = auth;
 
-        let identity = load_or_generate_identity(&config.identity_path)?;
+        // v3.1.0 (CIRISEdge#99) — when the host wired a
+        // `TransportIdentityKeystore`, load/adopt/generate via the
+        // keystore tier (TPM / SE / StrongBox / software fallback).
+        // When `None`, fall through to the v3.0.x chmod-600 file-only
+        // path. See [`load_or_adopt_or_generate_identity_with_keystore`]
+        // for the precedence rules + migration semantics.
+        let identity = if let Some(keystore) = transport_identity_keystore.as_ref() {
+            load_or_adopt_or_generate_identity_with_keystore(
+                &config.identity_path,
+                &config.local_key_id,
+                keystore.as_ref(),
+            )?
+        } else {
+            load_or_generate_identity(&config.identity_path)?
+        };
 
         // v2.1.0 (CIRISPersist LocalIdentityAggregate RET-transport
         // role) — copy the 64-byte dual-key public material to a
@@ -2910,6 +2952,135 @@ async fn build_local_attestation(
 }
 
 // ─── Identity persistence (AV-17) ───────────────────────────────────
+
+/// v3.1.0 (CIRISEdge#99) — keystore-tier identity load/adopt/generate.
+///
+/// Precedence:
+///
+/// 1. **Keystore hit** — `keystore.load(key_id)` returned the 64 bytes.
+///    Use them. No filesystem touch.
+///
+/// 2. **Keystore miss + existing file** — `keystore.load` returned
+///    `None` (fresh keystore entry) AND the chmod-600 file at `path`
+///    exists. **Adopt-and-migrate**: read the 64 file bytes,
+///    `keystore.store(key_id, bytes)`, then RENAME the file to
+///    `<path>.migrated-<unix_ts>`. The destination hash is preserved
+///    end-to-end (the bytes are byte-identical) so peer routing
+///    tables + signed announces keep working — auto-*regeneration*
+///    on upgrade would invalidate every peer's saved destination
+///    and is explicitly avoided. The original file is renamed (not
+///    deleted) so the operator keeps a recovery copy until they're
+///    satisfied; they remove `<path>.migrated-*` manually.
+///
+/// 3. **Keystore miss + no file** — fresh install.
+///    `keystore.generate_and_store(key_id)` (atomic; durable before
+///    return; uses hardware RNG where the tier offers it), then
+///    `keystore.load(key_id)` for the bytes.
+///
+/// All branches return a constructed `reticulum_std::Identity`.
+/// Failure to construct the Identity from the loaded bytes is a hard
+/// `TransportError::Config` — fail-loud, never a silently-misshapen
+/// identity.
+///
+/// Threat model: this closes the at-rest exfil class (filesystem
+/// reads, backups, snapshots, permission misconfig). The transient
+/// RAM window inside Reticulum's `Identity::from_private_key_bytes`
+/// is documented in CIRISEdge#99 as out-of-scope — leviculum's API
+/// takes raw bytes for internal crypto; the keyring trade-off is
+/// at-rest only, not RAM.
+fn load_or_adopt_or_generate_identity_with_keystore(
+    path: &std::path::Path,
+    key_id: &str,
+    keystore: &dyn ciris_keyring::TransportIdentityKeystore,
+) -> Result<Identity, TransportError> {
+    // Step 1: keystore hit?
+    let from_keystore = keystore.load(key_id).map_err(|e| {
+        TransportError::Config(format!(
+            "keystore load for transport identity {key_id}: {e}"
+        ))
+    })?;
+
+    let bytes: [u8; 64] = if let Some(b) = from_keystore {
+        tracing::info!(
+            key_id,
+            hardware_backed = keystore.is_hardware_backed(),
+            "loaded RNS transport identity from keystore"
+        );
+        b
+    } else if path.exists() {
+        // Step 2: adopt-and-migrate from the existing chmod-600 file.
+        let file_bytes = std::fs::read(path).map_err(|e| {
+            TransportError::Config(format!("adopt: read identity {}: {e}", path.display()))
+        })?;
+        let arr: [u8; 64] = file_bytes.as_slice().try_into().map_err(|_| {
+            TransportError::Config(format!(
+                "adopt: identity {} is {} bytes, expected 64",
+                path.display(),
+                file_bytes.len()
+            ))
+        })?;
+        keystore.store(key_id, &arr).map_err(|e| {
+            TransportError::Config(format!("adopt: keystore store for {key_id}: {e}"))
+        })?;
+        // Rename original file. Best-effort; the keystore copy is
+        // already durable so a rename failure is a warning (the
+        // operator may need to manually move/secure the file).
+        // Falls back to PID+timestamp suffix when SystemTime::now is
+        // unsuitable (very unlikely in practice).
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let archived = path.with_extension(format!("migrated-{suffix}"));
+        match std::fs::rename(path, &archived) {
+            Ok(()) => {
+                tracing::warn!(
+                    key_id,
+                    archived = %archived.display(),
+                    hardware_backed = keystore.is_hardware_backed(),
+                    "adopted RNS transport identity from file into keystore; \
+                     original archived (keystore-tier now load-bearing)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    key_id,
+                    path = %path.display(),
+                    error = %e,
+                    "adopted RNS transport identity into keystore BUT failed \
+                     to archive original file; operator should manually \
+                     move/secure it (keystore-tier is now load-bearing)"
+                );
+            }
+        }
+        arr
+    } else {
+        // Step 3: fresh install — generate + store atomically.
+        keystore.generate_and_store(key_id).map_err(|e| {
+            TransportError::Config(format!(
+                "generate_and_store transport identity {key_id}: {e}"
+            ))
+        })?;
+        let fresh = keystore
+            .load(key_id)
+            .map_err(|e| TransportError::Config(format!("post-generate load for {key_id}: {e}")))?
+            .ok_or_else(|| {
+                TransportError::Config(format!(
+                    "post-generate load for {key_id} returned None — \
+                     keystore contract violation"
+                ))
+            })?;
+        tracing::info!(
+            key_id,
+            hardware_backed = keystore.is_hardware_backed(),
+            "generated fresh RNS transport identity in keystore"
+        );
+        fresh
+    };
+
+    Identity::from_private_key_bytes(&bytes).map_err(|e| {
+        TransportError::Config(format!("parse keystore-loaded identity {key_id}: {e}"))
+    })
+}
 
 /// Load the transport identity from `path`, or generate + persist a
 /// fresh one on first run. The file holds 64 raw private-key bytes

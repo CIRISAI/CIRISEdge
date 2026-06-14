@@ -87,6 +87,7 @@ async fn auth_with(
         event_bus: None,
         reachability: None,
         blackhole_rules: Some(blackhole),
+        transport_identity_keystore: None,
     }
 }
 
@@ -822,6 +823,7 @@ async fn auth_pinned_backend(
         event_bus: None,
         reachability: None,
         blackhole_rules: Some(blackhole),
+        transport_identity_keystore: None,
     }
 }
 
