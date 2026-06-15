@@ -277,7 +277,7 @@ mod tests {
     /// A legitimately signed attestation verifies; a tamper does not.
     #[test]
     fn signed_attestation_round_trips_and_rejects_tamper() {
-        let signer = ciris_crypto::Ed25519Signer::random();
+        let signer = ciris_crypto::Ed25519Signer::random().unwrap();
         let fed_pubkey: [u8; 32] = signer.public_key().unwrap().try_into().unwrap();
         let transport_pubkey = [0x5au8; 32];
 
