@@ -4505,7 +4505,9 @@ fn federation_session_respond(
     own_mlkem768_pub: Option<&[u8]>,
     handshake_msg_json: &[u8],
 ) -> PyResult<[u8; 32]> {
-    use crate::transport::federation_session::{FederationSession, OwnKexKeys, SessionHandshakeMsg};
+    use crate::transport::federation_session::{
+        FederationSession, OwnKexKeys, SessionHandshakeMsg,
+    };
     use ciris_crypto::hybrid_kex::{
         ClassicalHandshakeMsg, HybridHandshakeMsg, KEX_ALGORITHM_CLASSICAL_V1,
         KEX_ALGORITHM_HYBRID_V1,
