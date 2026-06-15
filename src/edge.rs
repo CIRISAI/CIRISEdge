@@ -890,6 +890,24 @@ pub struct Edge {
     /// crates (lens-core / agent) wrap their persist `BlobStorage`
     /// handle in a `BlobChunkSource` impl.
     blob_chunk_source: Option<Arc<dyn crate::blob_swarm::BlobChunkSource>>,
+    /// v3.5.1 (CIRISEdge#119) — opt-in replication routing hook.
+    /// Headless composition roots (CIRISServer) call
+    /// [`Edge::install_replication_routing`] to register the
+    /// `ReplicationRuntime`'s registry; `Edge::run` then checks every
+    /// inbound frame against [`ReplicationRegistry::route_inbound_bytes`]
+    /// BEFORE the normal handler dispatch path. Replication frames
+    /// (CRPL magic prefix) get delivered to the matching coordinator;
+    /// everything else falls through.
+    ///
+    /// `OnceLock` because the lifecycle is `install once before
+    /// Edge::run` — the lookup is a cheap atomic load on every
+    /// inbound frame. Wrapped in `Arc` so the inbound dispatch loop
+    /// can hold a clone without contention.
+    ///
+    /// `None` (uninitialized) preserves the v3.5.0 behavior exactly:
+    /// no replication routing, every frame goes to `dispatch_inbound`.
+    replication_registry:
+        Arc<std::sync::OnceLock<Arc<crate::replication::registry::ReplicationRegistry>>>,
     /// Optional pipeline run on outbound inline-text envelopes
     /// (SPEAK responses, LLM prompts, WBD bodies, DSAR text). When
     /// `Some`, `send_inline` / `send_durable_inline` invoke this
@@ -1504,6 +1522,51 @@ impl Edge {
             *guard = new_value;
         }
         Ok(())
+    }
+
+    /// v3.5.1 (CIRISEdge#119) — install the replication runtime's
+    /// registry so [`Self::run`]'s inbound dispatch loop routes CRPL
+    /// (replication-protocol) frames to
+    /// [`ReplicationRegistry::route_inbound_bytes`](crate::replication::registry::ReplicationRegistry::route_inbound_bytes)
+    /// BEFORE the normal handler dispatch path.
+    ///
+    /// This is the opt-in seam the
+    /// [`ReplicationRuntime`](crate::replication::runtime::ReplicationRuntime)
+    /// module docs name as the v1.7 follow-up — unblocks headless
+    /// composition roots (CIRISServer) where the application doesn't
+    /// own the transport.listen loop and therefore can't manually
+    /// call `route_inbound_bytes` on inbound bytes.
+    ///
+    /// # Lifecycle
+    ///
+    /// Set-once via `OnceLock`. Call BEFORE [`Self::run`]; calls after
+    /// `run` has started take effect on the NEXT inbound frame. A
+    /// second install attempt is silently ignored (the first wins;
+    /// re-routing mid-run would race the dispatch loop's atomic load).
+    ///
+    /// # Source attribution
+    ///
+    /// Replication routing fires ONLY when the inbound frame carries
+    /// a transport-confirmed `source_key_id`
+    /// ([`InboundFrame::source_key_id`](crate::transport::InboundFrame::source_key_id)
+    /// is `Some`). Per-transport attribution (Reticulum link-rooted
+    /// peer lookup, HTTPS mTLS surfacing) lands as separate v3.5.x
+    /// cuts; until then, replication routing is no-op for any
+    /// transport that hasn't been wired for peer attribution.
+    ///
+    /// # See also
+    ///
+    /// - [`Self::run`] consumes the registered registry.
+    /// - [`ReplicationRuntime::registry`](crate::replication::runtime::ReplicationRuntime::registry)
+    ///   produces the `Arc<ReplicationRegistry>` to pass here.
+    pub fn install_replication_routing(
+        &self,
+        runtime: &crate::replication::runtime::ReplicationRuntime,
+    ) {
+        // Idempotent — first call wins. A second call returns Err but
+        // we ignore it: the OnceLock semantics + the lifecycle
+        // (install-before-run) make this a no-op race-free guarantee.
+        let _ = self.replication_registry.set(runtime.registry());
     }
 
     /// Register a typed handler for message type `M`. Compile-time
@@ -3001,6 +3064,16 @@ impl Edge {
         let delegation_trust_roots = self.canonical_peers.clone();
         // CIRISEdge#55 v3.4.0-pre1 — server-side responder hook.
         let blob_chunk_source = self.blob_chunk_source.clone();
+        // CIRISEdge#119 v3.5.1 — opt-in replication routing. When the
+        // OnceLock has been populated by
+        // `Edge::install_replication_routing`, the inbound loop
+        // consults the registry's `route_inbound_bytes` BEFORE
+        // dispatching as a normal envelope. CRPL frames (magic prefix)
+        // get delivered to the matching coordinator; everything else
+        // falls through to `dispatch_inbound`. The Arc clone is cheap
+        // (atomic refcount bump per inbound frame) and the OnceLock
+        // load inside the loop is a cheap atomic.
+        let replication_registry = self.replication_registry.clone();
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -3009,6 +3082,49 @@ impl Edge {
                     break;
                 }
                 Some(frame) = inbound_rx.recv() => {
+                    // v3.5.1 (CIRISEdge#119) — CRPL pre-dispatch.
+                    // Routes inbound replication frames to the
+                    // registered coordinator. Gated on:
+                    //   - registry installed (OnceLock populated)
+                    //   - frame carries a transport-confirmed
+                    //     source_key_id (None = transport hasn't been
+                    //     wired for peer attribution; can't safely
+                    //     route to a peer-keyed coordinator)
+                    if let (Some(registry), Some(source)) = (
+                        replication_registry.get(),
+                        frame.source_key_id.as_deref(),
+                    ) {
+                        match registry
+                            .route_inbound_bytes(source, &frame.envelope_bytes)
+                            .await
+                        {
+                            Ok(crate::replication::registry::RouteOutcome::Routed) => {
+                                // Replication frame delivered; do NOT
+                                // fall through to envelope dispatch.
+                                continue;
+                            }
+                            Ok(crate::replication::registry::RouteOutcome::NotAReplicationFrame) => {
+                                // No CRPL magic — fall through to the
+                                // existing envelope dispatch path.
+                            }
+                            Ok(crate::replication::registry::RouteOutcome::NoCoordinatorRegistered { kind }) => {
+                                tracing::warn!(
+                                    peer = %source,
+                                    ?kind,
+                                    "CRPL frame received but no coordinator registered for (peer, kind); dropping"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer = %source,
+                                    error = %e,
+                                    "replication route_inbound_bytes failed; dropping frame"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let verify_clone = verify.clone();
                     let handlers_clone = handlers.clone();
                     let queue_clone = queue.clone();
@@ -4751,6 +4867,7 @@ impl EdgeBuilder {
             peer_directory: self.peer_directory,
             steward_directory: self.steward_directory,
             blob_chunk_source: self.blob_chunk_source,
+            replication_registry: Arc::new(std::sync::OnceLock::new()),
             subscription_filter: self.subscription_filter,
             events,
             display_name: Arc::new(std::sync::RwLock::new(display_name)),

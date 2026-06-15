@@ -234,6 +234,7 @@ async fn dispatch_contribution(
         envelope_bytes: bytes,
         transport: TransportId::HTTP,
         received_at: Utc::now(),
+        source_key_id: None,
     })
     .await;
 }

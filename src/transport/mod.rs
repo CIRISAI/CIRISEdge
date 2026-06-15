@@ -128,6 +128,26 @@ pub struct InboundFrame {
     pub envelope_bytes: Vec<u8>,
     pub transport: TransportId,
     pub received_at: DateTime<Utc>,
+    /// v3.5.1 (CIRISEdge#119) — transport-confirmed source identity
+    /// for the inbound frame. `Some(key_id)` when the transport can
+    /// vouch for the peer that sent these bytes (Reticulum: the link's
+    /// rooted-peer key; HTTPS: mTLS-verified CN or bearer-decoded
+    /// identity). `None` when the transport hasn't been wired for
+    /// source attribution yet — preserves v3.5.0 behavior.
+    ///
+    /// Consumed by [`Edge::install_replication_routing`] (CIRISEdge#119)
+    /// to gate inbound CRPL frame routing to
+    /// `ReplicationRegistry::route_inbound_bytes`: replication
+    /// routing fires ONLY when `source_key_id` is `Some` (no peer
+    /// attribution → can't safely deliver to a peer-keyed
+    /// coordinator). For envelope-tier dispatch the verify pipeline
+    /// independently extracts the signer from the envelope bytes —
+    /// `source_key_id` is the orthogonal transport-tier hint.
+    ///
+    /// Transports that don't yet populate this field set `None`;
+    /// per-transport attribution lands as separate cuts (Reticulum
+    /// link-rooted lookup, HTTPS mTLS surfacing).
+    pub source_key_id: Option<String>,
 }
 
 /// The trait every transport implements. Edge holds a

@@ -927,6 +927,20 @@ pub struct ReticulumTransport {
     /// the event loop on `LinkEstablished` and removed on `LinkClosed`
     /// / `LinkStale`. Backs [`Self::link_list`]'s `age_seconds` field.
     link_established_at: Arc<Mutex<HashMap<LinkId, u64>>>,
+    /// v3.5.1 (CIRISEdge#119 + #120) — per-link rooted-peer attribution.
+    /// Populated on `NodeEvent::LinkIdentified` by deriving the link's
+    /// expected destination hash from its remote `identity.hash()` +
+    /// the federation name_hash, then scanning the rooted peers map
+    /// for a match. Removed on `LinkClosed`. Consumed by
+    /// `NodeEvent::ResourceCompleted` to populate
+    /// [`InboundFrame::source_key_id`](crate::transport::InboundFrame::source_key_id)
+    /// so [`Edge::install_replication_routing`](crate::Edge::install_replication_routing)
+    /// can route inbound CRPL frames to the right coordinator.
+    ///
+    /// `None`-equivalent (link absent from map) when the link hasn't
+    /// been LinkIdentified yet, or when the link's remote identity
+    /// doesn't match any rooted peer (pre-handshake / cold-start).
+    link_to_peer_key_id: Arc<Mutex<HashMap<LinkId, String>>>,
     /// CIRISEdge#32 (v0.14.0) — request/response slot. The listen-loop
     /// populates this on `NodeEvent::ResponseReceived` keyed by
     /// `request_id`; [`Self::link_request`] polls + removes.
@@ -1296,6 +1310,7 @@ impl ReticulumTransport {
             reachability,
             interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
             link_established_at: Arc::new(Mutex::new(HashMap::new())),
+            link_to_peer_key_id: Arc::new(Mutex::new(HashMap::new())),
             request_responses: Arc::new(Mutex::new(HashMap::new())),
             timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
             blackhole: blackhole_rules,
@@ -2365,6 +2380,7 @@ impl Transport for ReticulumTransport {
                         link_established_at: &self.link_established_at,
                         request_responses: &self.request_responses,
                         timed_out_requests: &self.timed_out_requests,
+                        link_to_peer_key_id: &self.link_to_peer_key_id,
                     };
                     handle_event(event, &ctx).await;
                 }
@@ -2417,6 +2433,13 @@ struct EventCtx<'a> {
     /// CIRISEdge#32 (v0.14.0) — per-request timeout sentinel,
     /// populated on `NodeEvent::RequestTimedOut`.
     timed_out_requests: &'a Mutex<HashSet<[u8; 16]>>,
+    /// v3.5.1 (CIRISEdge#119 + #120) — per-link rooted-peer
+    /// attribution. Populated on `NodeEvent::LinkIdentified` after
+    /// matching the link's remote identity to a rooted peer; consumed
+    /// on `NodeEvent::ResourceCompleted` to populate
+    /// `InboundFrame::source_key_id` for the
+    /// `Edge::install_replication_routing` lookup.
+    link_to_peer_key_id: &'a Mutex<HashMap<LinkId, String>>,
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -2506,6 +2529,27 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     "link identified",
                 ));
             }
+            // v3.5.1 (CIRISEdge#119 + #120) — populate
+            // link_to_peer_key_id. Derive the link's expected
+            // destination hash from its identity_hash + the federation
+            // name_hash (constant); scan rooted peers for a match.
+            // The rooted peer's dest_hash is the same Reticulum
+            // computes for its `peers[key_id].peer.dest_hash`, so a
+            // direct byte-equal compare resolves the link → key_id
+            // attribution. Used downstream by
+            // `Edge::install_replication_routing`.
+            let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
+            let expected_dest_hash =
+                Destination::compute_destination_hash(&name_hash, &identity_hash);
+            let peers_guard = ctx.peers.lock().await;
+            let matched_key = peers_guard
+                .iter()
+                .find(|(_, rp)| rp.peer.dest_hash == expected_dest_hash)
+                .map(|(k, _)| k.clone());
+            drop(peers_guard);
+            if let Some(key_id) = matched_key {
+                ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
+            }
         }
         NodeEvent::LinkStale { link_id } => {
             // Bookkeeping cleanup + emit. The link may still be in
@@ -2548,10 +2592,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 bytes = data.len(),
                 "inbound envelope resource completed",
             );
+            // v3.5.1 (CIRISEdge#119 + #120) — populate source_key_id
+            // from the per-link rooted-peer attribution table when
+            // available. `None` falls back to v3.5.0 behavior (no
+            // routing fires inside `Edge::install_replication_routing`).
+            let source_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
             let frame = InboundFrame {
                 envelope_bytes: data,
                 transport: TransportId::RETICULUM_RS,
                 received_at: Utc::now(),
+                source_key_id,
             };
             if let Err(e) = ctx.sink.send(frame).await {
                 tracing::error!(error = %e, "inbound channel send failed");
@@ -2562,6 +2612,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         } => {
             ctx.established_links.lock().await.remove(&link_id);
             ctx.link_established_at.lock().await.remove(&link_id);
+            // v3.5.1 (CIRISEdge#119 + #120) — drop the link's rooted
+            // peer attribution when the link closes.
+            ctx.link_to_peer_key_id.lock().await.remove(&link_id);
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.

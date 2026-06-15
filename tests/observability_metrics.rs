@@ -287,6 +287,7 @@ async fn metrics_counter_increments_on_receive() {
         envelope_bytes,
         transport: TransportId::HTTP,
         received_at: chrono::Utc::now(),
+        source_key_id: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -406,6 +407,7 @@ async fn metrics_transport_bytes_io_counted() {
         envelope_bytes,
         transport: TransportId::HTTP,
         received_at: chrono::Utc::now(),
+        source_key_id: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -461,6 +463,7 @@ async fn metrics_verify_failure_classified_by_error() {
         envelope_bytes: b"not-a-real-envelope".to_vec(),
         transport: TransportId::HTTP,
         received_at: chrono::Utc::now(),
+        source_key_id: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
