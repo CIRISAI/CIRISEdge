@@ -771,7 +771,7 @@ mod tests {
         let dek = dummy_dek();
         let stream = StreamId([0xAB; 32]);
         let epoch = Epoch(0xDEAD_BEEF);
-        let cseq = ChunkSeq(0xC0FFEE);
+        let cseq = ChunkSeq(0x00C0_FFEE);
         let inner = seal_av_inner(b"x", &dek, stream, epoch, cseq).expect("inner");
         assert_eq!(inner.stream_id(), stream);
         assert_eq!(inner.epoch(), epoch);
