@@ -49,9 +49,23 @@
 //! module owns a tightened ratio threshold ([`REALTIME_MIN_RATIO`])
 //! that callers can override.
 //!
+//! ## Fan-out optimization (inner-once / outer-N)
+//!
+//! Sending one frame to N mesh participants via [`seal_av_chunk`] N
+//! times re-does the **inner** AEAD work N times, but the inner seal
+//! is identical across the whole mesh (the inner nonce is
+//! `(stream_id, epoch, chunk_seq)` only — no per-Link input — and the
+//! epoch DEK is mesh-wide). [`seal_av_inner`] computes the inner half
+//! once; [`seal_av_outer`] applies the per-Link outer seal N times.
+//! Measured ~1.98× speedup at N=50, 16 KiB frames (CIRISEdge#122).
+//!
+//! Wire shape is byte-identical to N × [`seal_av_chunk`] — pure
+//! sender-side optimization, no codec implication.
+//!
 //! ## What this module IS
 //!
-//! - Chunk-seal / chunk-open primitives ([`seal_av_chunk`], [`open_av_chunk`]).
+//! - Single-chunk seal / open ([`seal_av_chunk`], [`open_av_chunk`]).
+//! - Fan-out seal split ([`seal_av_inner`] + [`seal_av_outer`], #122).
 //! - Wire shape definitions ([`SealedAvChunk`], [`StreamId`], [`Epoch`],
 //!   [`EpochDek`]).
 //! - The mesh-participant filter ([`RealtimeFanout::plan`]) over the
@@ -237,6 +251,122 @@ pub fn derive_outer_nonce(link_id: &[u8], link_seq: u64) -> [u8; 12] {
     out
 }
 
+/// The inner-sealed half of a chunk — E2E ciphertext shared across the
+/// whole mesh, *before* the per-Link outer seal is applied. Produced by
+/// [`seal_av_inner`] once per `(stream_id, epoch, chunk_seq)` and
+/// consumed N times by [`seal_av_outer`] (one per mesh participant).
+///
+/// Carries the chunk header (`stream_id` / `epoch` / `chunk_seq`) so
+/// the outer step can stamp it into the wire shape without re-threading
+/// those values through the call site.
+///
+/// CIRISEdge#122 fan-out optimization — see module docs § "Fan-out
+/// optimization (inner-once / outer-N)".
+#[derive(Debug, Clone)]
+pub struct InnerSealed {
+    stream_id: StreamId,
+    epoch: Epoch,
+    chunk_seq: ChunkSeq,
+    /// Inner AES-256-GCM ciphertext: `AEAD(epoch_dek, inner_nonce, plaintext)`.
+    inner_ciphertext: Vec<u8>,
+}
+
+impl InnerSealed {
+    /// Read access for the stream identity header — callers occasionally
+    /// route the inner-sealed ciphertext through application logic
+    /// (e.g. caching, repartitioning) before applying the per-Link outer
+    /// seal.
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+    pub fn chunk_seq(&self) -> ChunkSeq {
+        self.chunk_seq
+    }
+    /// Borrow the inner ciphertext. Still sealed under the epoch DEK —
+    /// safe to ferry across the mesh.
+    pub fn inner_ciphertext(&self) -> &[u8] {
+        &self.inner_ciphertext
+    }
+}
+
+/// Seal the **inner** AEAD layer only — E2E sealed under the epoch DEK,
+/// independent of any Link. Produces an [`InnerSealed`] that can be
+/// fed to [`seal_av_outer`] once per mesh participant. CIRISEdge#122
+/// fan-out optimization: at room scale (N≈50) cuts sender CPU per
+/// chunk roughly in half because the inner AEAD work is amortized
+/// across the whole mesh instead of repeated per Link.
+///
+/// The inner nonce derivation is identical to [`seal_av_chunk`]'s
+/// inner step, so the on-wire bytes are byte-identical to N calls to
+/// `seal_av_chunk` with the same `(stream_id, epoch, chunk_seq)` and
+/// per-link `(transit_key, link_id, link_seq)` — fan-out optimization
+/// is a pure compute-side change, no wire-format implication.
+pub fn seal_av_inner(
+    plaintext: &[u8],
+    epoch_dek: &EpochDek,
+    stream_id: StreamId,
+    epoch: Epoch,
+    chunk_seq: ChunkSeq,
+) -> Result<InnerSealed, RealtimeAvError> {
+    let inner_nonce = derive_inner_nonce(stream_id, epoch, chunk_seq);
+    let inner_ciphertext = aes_gcm::encrypt(epoch_dek.as_bytes(), &inner_nonce, plaintext)
+        .map_err(RealtimeAvError::InnerAead)?;
+    Ok(InnerSealed {
+        stream_id,
+        epoch,
+        chunk_seq,
+        inner_ciphertext,
+    })
+}
+
+/// Reconstruct an [`InnerSealed`] from its parts. Internal-shape
+/// helper for cross-wheel PyO3 callers (CIRISEdge#123) — Python passes
+/// the inner ciphertext bytes + header fields back through the FFI
+/// boundary, and the outer-seal step rebuilds the handle here.
+///
+/// Rust callers should use [`seal_av_inner`] directly; this is the
+/// bytes-in escape hatch for the published Python wheel.
+#[doc(hidden)]
+pub fn inner_sealed_from_parts(
+    stream_id: StreamId,
+    epoch: Epoch,
+    chunk_seq: ChunkSeq,
+    inner_ciphertext: Vec<u8>,
+) -> InnerSealed {
+    InnerSealed {
+        stream_id,
+        epoch,
+        chunk_seq,
+        inner_ciphertext,
+    }
+}
+
+/// Seal the **outer** AEAD layer for one Link, given a pre-computed
+/// [`InnerSealed`]. The companion to [`seal_av_inner`].
+///
+/// Apply this once per mesh participant. The inner ciphertext is
+/// shared across the whole mesh; only the outer nonce + transit key
+/// differ per Link.
+pub fn seal_av_outer(
+    inner: &InnerSealed,
+    transit_key: &[u8; 32],
+    link_id: &[u8],
+    link_seq: u64,
+) -> Result<SealedAvChunk, RealtimeAvError> {
+    let outer_nonce = derive_outer_nonce(link_id, link_seq);
+    let outer_sealed = aes_gcm::encrypt(transit_key, &outer_nonce, &inner.inner_ciphertext)
+        .map_err(RealtimeAvError::OuterAead)?;
+    Ok(SealedAvChunk {
+        stream_id: inner.stream_id,
+        epoch: inner.epoch,
+        chunk_seq: inner.chunk_seq,
+        double_sealed_ciphertext: outer_sealed,
+    })
+}
+
 /// Seal a chunk for one mesh participant. Applies the two-layer
 /// crypto in inside-out order: inner DEK seal first (E2E), then outer
 /// transit-key seal (hop). Returns the on-wire bytes ready for the
@@ -247,6 +377,12 @@ pub fn derive_outer_nonce(link_id: &[u8], link_seq: u64) -> [u8; 12] {
 /// attacker holding ciphertext from Link X cannot replay it onto
 /// Link Y even if they have Link Y's transit key (different nonces
 /// → AEAD rejects on decrypt).
+///
+/// For mesh fan-out (one frame → N participants) prefer
+/// [`seal_av_inner`] + N × [`seal_av_outer`] — the inner AEAD work is
+/// identical across the mesh and amortizes (~2× sender CPU win at
+/// N=50, CIRISEdge#122). `seal_av_chunk` remains the right call for
+/// N=1 paths and the wire-shape compose primitive.
 #[allow(clippy::too_many_arguments)]
 pub fn seal_av_chunk(
     plaintext: &[u8],
@@ -258,18 +394,8 @@ pub fn seal_av_chunk(
     epoch: Epoch,
     chunk_seq: ChunkSeq,
 ) -> Result<SealedAvChunk, RealtimeAvError> {
-    let inner_nonce = derive_inner_nonce(stream_id, epoch, chunk_seq);
-    let inner_sealed = aes_gcm::encrypt(epoch_dek.as_bytes(), &inner_nonce, plaintext)
-        .map_err(RealtimeAvError::InnerAead)?;
-    let outer_nonce = derive_outer_nonce(link_id, link_seq);
-    let outer_sealed = aes_gcm::encrypt(transit_key, &outer_nonce, &inner_sealed)
-        .map_err(RealtimeAvError::OuterAead)?;
-    Ok(SealedAvChunk {
-        stream_id,
-        epoch,
-        chunk_seq,
-        double_sealed_ciphertext: outer_sealed,
-    })
+    let inner = seal_av_inner(plaintext, epoch_dek, stream_id, epoch, chunk_seq)?;
+    seal_av_outer(&inner, transit_key, link_id, link_seq)
 }
 
 /// Inverse of [`seal_av_chunk`]. Unwraps outer transit-key seal then
@@ -573,6 +699,84 @@ mod tests {
         let plan = RealtimeFanout::plan(&participants, &tracker, transport_id, REALTIME_MIN_RATIO);
         let ids: Vec<&str> = plan.iter().map(|p| p.peer_key_id.as_str()).collect();
         assert_eq!(ids, vec!["alice"], "only alice meets REALTIME_MIN_RATIO");
+    }
+
+    /// #122 fan-out split: composing `seal_av_inner` + `seal_av_outer`
+    /// produces byte-identical wire to `seal_av_chunk` for the same
+    /// inputs. Load-bearing — guarantees the optimization is a pure
+    /// compute-side change with zero wire-format implication.
+    #[test]
+    fn inner_outer_split_matches_single_chunk_wire() {
+        let plaintext = b"frame bytes";
+        let dek = dummy_dek();
+        let stream = dummy_stream();
+        let epoch = Epoch(7);
+        let cseq = ChunkSeq(99);
+        let transit = dummy_transit();
+        let link = b"link-A";
+        let lseq = 42u64;
+
+        let single = seal_av_chunk(plaintext, &transit, link, lseq, &dek, stream, epoch, cseq)
+            .expect("single");
+        let inner = seal_av_inner(plaintext, &dek, stream, epoch, cseq).expect("inner");
+        let split = seal_av_outer(&inner, &transit, link, lseq).expect("outer");
+
+        assert_eq!(single.stream_id, split.stream_id);
+        assert_eq!(single.epoch, split.epoch);
+        assert_eq!(single.chunk_seq, split.chunk_seq);
+        assert_eq!(
+            single.double_sealed_ciphertext, split.double_sealed_ciphertext,
+            "fan-out split changed the wire bytes"
+        );
+    }
+
+    /// #122 fan-out: ONE `seal_av_inner` + N `seal_av_outer` calls for
+    /// distinct Links each produce a sealed chunk that opens correctly
+    /// on its own Link — exactly mirroring N independent
+    /// `seal_av_chunk` calls.
+    #[test]
+    fn inner_once_outer_n_fanout_opens_per_link() {
+        let plaintext = b"mesh frame";
+        let dek = dummy_dek();
+        let stream = dummy_stream();
+        let epoch = Epoch(3);
+        let cseq = ChunkSeq(10);
+        let transit = dummy_transit();
+
+        let inner = seal_av_inner(plaintext, &dek, stream, epoch, cseq).expect("inner");
+        let links: Vec<(&[u8], u64)> = vec![
+            (b"link-A", 100),
+            (b"link-B", 200),
+            (b"link-C", 300),
+            (b"link-D", 400),
+        ];
+        for (link_id, link_seq) in links {
+            let sealed = seal_av_outer(&inner, &transit, link_id, link_seq).expect("outer");
+            // Each per-Link wire opens with the matching Link state.
+            let opened = open_av_chunk(&sealed, &transit, link_id, link_seq, &dek).expect("open");
+            assert_eq!(opened, plaintext);
+            // And refuses on a different Link's state — outer nonce
+            // is per-Link.
+            let r = open_av_chunk(&sealed, &transit, b"link-X", link_seq, &dek);
+            assert!(matches!(r, Err(RealtimeAvError::OuterAead(_))));
+        }
+    }
+
+    /// #122 — the InnerSealed accessor surface preserves the chunk
+    /// header so a caller can route the inner ciphertext through
+    /// app-level logic (cache, repartition) before applying the
+    /// per-Link outer seal.
+    #[test]
+    fn inner_sealed_header_accessors() {
+        let dek = dummy_dek();
+        let stream = StreamId([0xAB; 32]);
+        let epoch = Epoch(0xDEAD_BEEF);
+        let cseq = ChunkSeq(0x00C0_FFEE);
+        let inner = seal_av_inner(b"x", &dek, stream, epoch, cseq).expect("inner");
+        assert_eq!(inner.stream_id(), stream);
+        assert_eq!(inner.epoch(), epoch);
+        assert_eq!(inner.chunk_seq(), cseq);
+        assert!(!inner.inner_ciphertext().is_empty());
     }
 
     /// Threshold tunability — a stricter threshold (0.9) drops bob

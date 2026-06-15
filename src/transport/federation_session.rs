@@ -58,24 +58,36 @@ use zeroize::Zeroize;
 pub const ALGORITHM_HYBRID_V1: &str = KEX_ALGORITHM_HYBRID_V1;
 pub const ALGORITHM_CLASSICAL_V1: &str = KEX_ALGORITHM_CLASSICAL_V1;
 
-/// The two negotiated outcomes. ML-KEM-only is intentionally not
+/// The negotiated outcomes. ML-KEM-only is intentionally not
 /// representable — see module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KexAlgorithm {
     /// Hybrid X25519 + ML-KEM-768. Default whenever the peer advertises
-    /// both halves.
+    /// both halves; falls back to [`Self::Classical`] silently when the
+    /// peer is classical-only.
     Hybrid,
+    /// Hybrid X25519 + ML-KEM-768 with NO classical fallback. Caller
+    /// asserts the channel content is HNDL-sensitive (CEG §10.5.5;
+    /// realtime A/V; key_grant DEK distribution) — a peer that hasn't
+    /// advertised ML-KEM-768 is REJECTED with
+    /// [`SessionError::HybridRequiredButPeerLacksMlkem`] rather than
+    /// silently degraded.
+    HybridRequired,
     /// Classical X25519 only. Admitted when the peer hasn't published
-    /// an ML-KEM-768 pubkey.
+    /// an ML-KEM-768 pubkey AND the caller opted in to fallback via
+    /// [`Self::Hybrid`] (NOT [`Self::HybridRequired`]).
     Classical,
 }
 
 impl KexAlgorithm {
     /// Stable identifier — call sites stamp this into the transport
-    /// envelope per CIRISEdge#54 acceptance criterion 1.
+    /// envelope per CIRISEdge#54 acceptance criterion 1. `HybridRequired`
+    /// stamps the same wire ID as `Hybrid` (they negotiate to the same
+    /// wire output — `HybridRequired` differs only in refusing the
+    /// fallback path).
     pub fn wire_id(self) -> &'static str {
         match self {
-            Self::Hybrid => ALGORITHM_HYBRID_V1,
+            Self::Hybrid | Self::HybridRequired => ALGORITHM_HYBRID_V1,
             Self::Classical => ALGORITHM_CLASSICAL_V1,
         }
     }
@@ -205,6 +217,13 @@ pub enum SessionError {
     /// key pair to decapsulate.
     #[error("hybrid responder missing ML-KEM-768 private key")]
     HybridResponderMissingMlkem,
+    /// Caller requested [`KexAlgorithm::HybridRequired`] (HNDL-strict
+    /// mode) against a peer that hasn't advertised ML-KEM-768. Refused
+    /// rather than silently negotiated down to classical — `HybridRequired`
+    /// is the caller asserting the channel content must survive into the
+    /// post-quantum era, and a classical-only outcome would violate that.
+    #[error("HybridRequired mode rejects classical-fallback peer (HNDL discipline)")]
+    HybridRequiredButPeerLacksMlkem,
 }
 
 impl From<hybrid_kex::KexError> for SessionError {
@@ -244,12 +263,18 @@ impl FederationSession {
         if peer.x25519_pub == [0u8; 32] && peer.mlkem768_pub.is_some() {
             return Err(SessionError::MlKemOnlyRejected);
         }
-        // Negotiation: hybrid only when caller asked for hybrid AND peer
-        // advertised the ML-KEM half. Everything else collapses to classical.
-        let actual = if matches!(requested, KexAlgorithm::Hybrid) && peer.mlkem768_pub.is_some() {
-            KexAlgorithm::Hybrid
-        } else {
-            KexAlgorithm::Classical
+        // Negotiation:
+        // - HybridRequired + peer has ML-KEM → hybrid
+        // - HybridRequired + peer lacks ML-KEM → REJECT (HNDL discipline)
+        // - Hybrid + peer has ML-KEM → hybrid
+        // - Hybrid + peer lacks ML-KEM → classical fallback
+        // - Classical (requested) → classical
+        let actual = match (requested, peer.mlkem768_pub.is_some()) {
+            (KexAlgorithm::HybridRequired, false) => {
+                return Err(SessionError::HybridRequiredButPeerLacksMlkem);
+            }
+            (KexAlgorithm::HybridRequired | KexAlgorithm::Hybrid, true) => KexAlgorithm::Hybrid,
+            (KexAlgorithm::Hybrid, false) | (KexAlgorithm::Classical, _) => KexAlgorithm::Classical,
         };
         match actual {
             KexAlgorithm::Hybrid => {
@@ -261,6 +286,13 @@ impl FederationSession {
                 let (msg, k) = hybrid_kex::initiate_classical(&peer.x25519_pub)?;
                 Ok((SessionHandshakeMsg::Classical(msg), SessionKey(k)))
             }
+            // `actual` is the post-negotiation outcome — the negotiation
+            // arm above either returns Err for `HybridRequired` against
+            // a classical peer or collapses to `Hybrid` against a
+            // hybrid one, so `HybridRequired` never reaches here.
+            KexAlgorithm::HybridRequired => unreachable!(
+                "post-negotiation actual is Hybrid or Classical; HybridRequired never escapes"
+            ),
         }
     }
 
@@ -460,5 +492,59 @@ mod tests {
         let own = fresh_recipient();
         let s = format!("{own:?}");
         assert!(s.contains("<redacted>"), "private key leaked: {s}");
+    }
+
+    /// HNDL-strict mode succeeds against a hybrid peer — produces the
+    /// same hybrid session key as plain `Hybrid` mode would.
+    #[test]
+    fn hybrid_required_succeeds_against_hybrid_peer() {
+        let responder = fresh_recipient();
+        let peer_view = advertise(&responder);
+        let (msg, initiator_key) =
+            FederationSession::initiate(&peer_view, KexAlgorithm::HybridRequired)
+                .expect("initiate");
+        assert_eq!(msg.algorithm(), ALGORITHM_HYBRID_V1);
+        let responder_key = FederationSession::respond(&responder, &msg).expect("respond");
+        assert_eq!(initiator_key.as_bytes(), responder_key.as_bytes());
+    }
+
+    /// HNDL-strict mode refuses a classical-only peer instead of
+    /// silently degrading. This is the load-bearing assertion for
+    /// CEG §10.5.5 realtime A/V + key_grant DEK distribution: the
+    /// content's HNDL-secrecy is the caller's intent, and the substrate
+    /// honors it by refusal rather than fallback.
+    #[test]
+    fn hybrid_required_refuses_classical_only_peer() {
+        let responder = fresh_recipient();
+        let peer_view = advertise_classical_only(&responder);
+        let r = FederationSession::initiate(&peer_view, KexAlgorithm::HybridRequired);
+        assert!(
+            matches!(r, Err(SessionError::HybridRequiredButPeerLacksMlkem)),
+            "expected HybridRequiredButPeerLacksMlkem, got {r:?}"
+        );
+    }
+
+    /// HybridRequired still rejects the ML-KEM-only peer view shape
+    /// (defense-in-depth — the all-zero X25519 sentinel from upstream
+    /// deserializers should NOT trigger fallback semantics).
+    #[test]
+    fn hybrid_required_rejects_mlkem_only_peer_view() {
+        let responder = fresh_recipient();
+        let bad = PeerKexPubkeys {
+            x25519_pub: [0u8; 32],
+            mlkem768_pub: responder.mlkem768_pub.clone(),
+        };
+        let r = FederationSession::initiate(&bad, KexAlgorithm::HybridRequired);
+        assert!(matches!(r, Err(SessionError::MlKemOnlyRejected)));
+    }
+
+    /// HybridRequired stamps the hybrid wire ID — interop with existing
+    /// `Hybrid` responders is byte-identical, only the initiator
+    /// negotiation policy differs.
+    #[test]
+    fn hybrid_required_wire_id_matches_hybrid() {
+        assert_eq!(KexAlgorithm::HybridRequired.wire_id(), ALGORITHM_HYBRID_V1);
+        assert_eq!(KexAlgorithm::Hybrid.wire_id(), ALGORITHM_HYBRID_V1);
+        assert_eq!(KexAlgorithm::Classical.wire_id(), ALGORITHM_CLASSICAL_V1);
     }
 }

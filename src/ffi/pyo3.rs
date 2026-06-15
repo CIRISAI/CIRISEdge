@@ -4298,6 +4298,286 @@ fn install_panic_logger() -> bool {
     crate::debug::install_panic_logger()
 }
 
+// ─── CIRISEdge#123 — cross-wheel conformance surface ─────────────────
+//
+// Thin PyO3 wrappers over existing Rust pub fns in `transport::realtime_av`
+// + `transport::federation_session` + the leviculum RNS destination-hash
+// (CEG §5.6.8.8.1.1) so the published Python wheel can drive these
+// surfaces under CIRISConformance — measuring the production cohabitation
+// cost (cross-wheel / FFI) of the realtime A/V mesh profile.
+//
+// No wire/API change to the Rust crate. All bytes in / bytes out — none
+// of the redacted-Debug newtypes (EpochDek / SessionKey / OwnKexKeys)
+// escape the Python boundary; callers thread the raw 32-byte slices.
+
+/// Coerce a Python `bytes`-like into a fixed-length array. Mirrors the
+/// idiom used for the federation-session KEX keys + epoch DEKs.
+fn fixed_bytes<const N: usize>(label: &str, b: &[u8]) -> PyResult<[u8; N]> {
+    if b.len() != N {
+        return Err(PyValueError::new_err(format!(
+            "{label}: expected {N} bytes, got {}",
+            b.len()
+        )));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(b);
+    Ok(out)
+}
+
+/// Seal a chunk under both the inner epoch DEK and the outer transit
+/// key (CEG §10.5.5 E1). Returns the on-wire bytes
+/// (`SealedAvChunk::to_bytes`) — caller threads them straight into the
+/// RNS Link outbound queue.
+#[pyfunction]
+#[pyo3(signature = (plaintext, transit_key, link_id, link_seq, epoch_dek, stream_id, epoch, chunk_seq))]
+#[allow(clippy::too_many_arguments)]
+fn seal_av_chunk(
+    plaintext: &[u8],
+    transit_key: &[u8],
+    link_id: &[u8],
+    link_seq: u64,
+    epoch_dek: &[u8],
+    stream_id: &[u8],
+    epoch: u64,
+    chunk_seq: u64,
+) -> PyResult<Vec<u8>> {
+    use crate::transport::realtime_av;
+    let transit = fixed_bytes::<32>("transit_key", transit_key)?;
+    let dek_bytes = fixed_bytes::<32>("epoch_dek", epoch_dek)?;
+    let stream = fixed_bytes::<32>("stream_id", stream_id)?;
+    let dek = realtime_av::EpochDek::from_bytes(dek_bytes);
+    let sealed = realtime_av::seal_av_chunk(
+        plaintext,
+        &transit,
+        link_id,
+        link_seq,
+        &dek,
+        realtime_av::StreamId(stream),
+        realtime_av::Epoch(epoch),
+        realtime_av::ChunkSeq(chunk_seq),
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("seal_av_chunk: {e}")))?;
+    Ok(sealed.to_bytes())
+}
+
+/// Open a sealed A/V chunk (inverse of [`seal_av_chunk`]). Input is the
+/// on-wire bytes; returns the chunk plaintext.
+#[pyfunction]
+#[pyo3(signature = (sealed_bytes, transit_key, link_id, link_seq, epoch_dek))]
+fn open_av_chunk(
+    sealed_bytes: &[u8],
+    transit_key: &[u8],
+    link_id: &[u8],
+    link_seq: u64,
+    epoch_dek: &[u8],
+) -> PyResult<Vec<u8>> {
+    use crate::transport::realtime_av;
+    let transit = fixed_bytes::<32>("transit_key", transit_key)?;
+    let dek_bytes = fixed_bytes::<32>("epoch_dek", epoch_dek)?;
+    let dek = realtime_av::EpochDek::from_bytes(dek_bytes);
+    let sealed = realtime_av::SealedAvChunk::from_bytes(sealed_bytes)
+        .map_err(|e| PyValueError::new_err(format!("open_av_chunk: parse: {e}")))?;
+    realtime_av::open_av_chunk(&sealed, &transit, link_id, link_seq, &dek)
+        .map_err(|e| PyRuntimeError::new_err(format!("open_av_chunk: aead: {e}")))
+}
+
+/// Inner-only seal — produces the inner AEAD ciphertext (E2E sealed
+/// under the epoch DEK). CIRISEdge#122 fan-out optimization: call once
+/// per chunk, then call [`seal_av_outer`] N times for the mesh.
+#[pyfunction]
+#[pyo3(signature = (plaintext, epoch_dek, stream_id, epoch, chunk_seq))]
+fn seal_av_inner(
+    plaintext: &[u8],
+    epoch_dek: &[u8],
+    stream_id: &[u8],
+    epoch: u64,
+    chunk_seq: u64,
+) -> PyResult<Vec<u8>> {
+    use crate::transport::realtime_av;
+    let dek_bytes = fixed_bytes::<32>("epoch_dek", epoch_dek)?;
+    let stream = fixed_bytes::<32>("stream_id", stream_id)?;
+    let dek = realtime_av::EpochDek::from_bytes(dek_bytes);
+    let inner = realtime_av::seal_av_inner(
+        plaintext,
+        &dek,
+        realtime_av::StreamId(stream),
+        realtime_av::Epoch(epoch),
+        realtime_av::ChunkSeq(chunk_seq),
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("seal_av_inner: {e}")))?;
+    Ok(inner.inner_ciphertext().to_vec())
+}
+
+/// Outer-only seal — given a pre-computed inner ciphertext (from
+/// [`seal_av_inner`]) and per-Link state, produces the on-wire bytes.
+/// CIRISEdge#122 fan-out optimization companion.
+///
+/// `stream_id` / `epoch` / `chunk_seq` are the chunk-header fields
+/// stamped into the wire shape (NOT inputs to the outer AEAD; the
+/// outer nonce derives only from `link_id` + `link_seq`).
+#[pyfunction]
+#[pyo3(signature = (inner_ciphertext, transit_key, link_id, link_seq, stream_id, epoch, chunk_seq))]
+#[allow(clippy::too_many_arguments)]
+fn seal_av_outer(
+    inner_ciphertext: &[u8],
+    transit_key: &[u8],
+    link_id: &[u8],
+    link_seq: u64,
+    stream_id: &[u8],
+    epoch: u64,
+    chunk_seq: u64,
+) -> PyResult<Vec<u8>> {
+    use crate::transport::realtime_av;
+    let transit = fixed_bytes::<32>("transit_key", transit_key)?;
+    let stream = fixed_bytes::<32>("stream_id", stream_id)?;
+    // Rebuild the inner sealed handle from its parts. The Rust struct's
+    // constructor is private; we go through the `seal_av_inner` ->
+    // `seal_av_outer` path conceptually by reconstructing equivalent
+    // bytes-equivalent state via a synthesized inner. Since the outer
+    // step only reads `inner_ciphertext` + the chunk header, we wrap
+    // them through the public ciphertext-bytes helper.
+    let inner = realtime_av::inner_sealed_from_parts(
+        realtime_av::StreamId(stream),
+        realtime_av::Epoch(epoch),
+        realtime_av::ChunkSeq(chunk_seq),
+        inner_ciphertext.to_vec(),
+    );
+    let sealed = realtime_av::seal_av_outer(&inner, &transit, link_id, link_seq)
+        .map_err(|e| PyRuntimeError::new_err(format!("seal_av_outer: {e}")))?;
+    Ok(sealed.to_bytes())
+}
+
+/// Hybrid X25519 + ML-KEM-768 KEX — initiator side (CIRISEdge#54).
+///
+/// `algorithm` is one of `"hybrid"`, `"hybrid-required"`, or `"classical"`.
+/// HNDL-strict callers (realtime A/V, key_grant DEK distribution) should
+/// pass `"hybrid-required"`: classical fallback is REJECTED rather than
+/// silently negotiated down.
+///
+/// Returns `(handshake_msg_json_bytes, session_key, negotiated_algorithm_wire_id)`.
+/// The handshake JSON round-trips through
+/// [`federation_session_respond`]; the session key is 32 bytes (the
+/// AES-256-GCM key for the transport layer).
+#[pyfunction]
+#[pyo3(signature = (peer_x25519_pub, peer_mlkem768_pub, algorithm))]
+fn federation_session_initiate(
+    peer_x25519_pub: &[u8],
+    peer_mlkem768_pub: Option<&[u8]>,
+    algorithm: &str,
+) -> PyResult<(Vec<u8>, [u8; 32], String)> {
+    use crate::transport::federation_session::{
+        FederationSession, KexAlgorithm, PeerKexPubkeys, SessionHandshakeMsg,
+    };
+    let x_pub = fixed_bytes::<32>("peer_x25519_pub", peer_x25519_pub)?;
+    let peer = PeerKexPubkeys {
+        x25519_pub: x_pub,
+        mlkem768_pub: peer_mlkem768_pub.map(<[u8]>::to_vec),
+    };
+    let requested = match algorithm {
+        "hybrid" => KexAlgorithm::Hybrid,
+        "hybrid-required" => KexAlgorithm::HybridRequired,
+        "classical" => KexAlgorithm::Classical,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "algorithm: expected 'hybrid' | 'hybrid-required' | 'classical', got {other:?}"
+            )));
+        }
+    };
+    let (msg, key) = FederationSession::initiate(&peer, requested)
+        .map_err(|e| PyRuntimeError::new_err(format!("initiate: {e}")))?;
+    let json = match &msg {
+        SessionHandshakeMsg::Hybrid(m) => serde_json::to_vec(m),
+        SessionHandshakeMsg::Classical(m) => serde_json::to_vec(m),
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("handshake encode: {e}")))?;
+    let mut key_out = [0u8; 32];
+    key_out.copy_from_slice(key.as_bytes());
+    Ok((json, key_out, msg.algorithm().to_string()))
+}
+
+/// Hybrid X25519 + ML-KEM-768 KEX — responder side. Recomputes the same
+/// 32-byte session key the initiator derived.
+#[pyfunction]
+#[pyo3(signature = (own_x25519_priv, own_mlkem768_priv, own_mlkem768_pub, handshake_msg_json))]
+fn federation_session_respond(
+    own_x25519_priv: &[u8],
+    own_mlkem768_priv: Option<&[u8]>,
+    own_mlkem768_pub: Option<&[u8]>,
+    handshake_msg_json: &[u8],
+) -> PyResult<[u8; 32]> {
+    use crate::transport::federation_session::{
+        FederationSession, OwnKexKeys, SessionHandshakeMsg,
+    };
+    use ciris_crypto::hybrid_kex::{
+        ClassicalHandshakeMsg, HybridHandshakeMsg, KEX_ALGORITHM_CLASSICAL_V1,
+        KEX_ALGORITHM_HYBRID_V1,
+    };
+    let x_priv = fixed_bytes::<32>("own_x25519_priv", own_x25519_priv)?;
+    let own = OwnKexKeys {
+        x25519_priv: x_priv,
+        mlkem768_priv: own_mlkem768_priv.map(<[u8]>::to_vec),
+        mlkem768_pub: own_mlkem768_pub.map(<[u8]>::to_vec),
+    };
+    // Peek at the algorithm field — the JSON object always has an
+    // `algorithm` string at the top.
+    let raw: serde_json::Value = serde_json::from_slice(handshake_msg_json)
+        .map_err(|e| PyValueError::new_err(format!("handshake decode: {e}")))?;
+    let algo = raw
+        .get("algorithm")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PyValueError::new_err("handshake missing `algorithm` field"))?;
+    let msg = match algo {
+        a if a == KEX_ALGORITHM_HYBRID_V1 => {
+            let m: HybridHandshakeMsg = serde_json::from_slice(handshake_msg_json)
+                .map_err(|e| PyValueError::new_err(format!("hybrid decode: {e}")))?;
+            SessionHandshakeMsg::Hybrid(m)
+        }
+        a if a == KEX_ALGORITHM_CLASSICAL_V1 => {
+            let m: ClassicalHandshakeMsg = serde_json::from_slice(handshake_msg_json)
+                .map_err(|e| PyValueError::new_err(format!("classical decode: {e}")))?;
+            SessionHandshakeMsg::Classical(m)
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown algorithm: {other:?}"
+            )));
+        }
+    };
+    let key = FederationSession::respond(&own, &msg)
+        .map_err(|e| PyRuntimeError::new_err(format!("respond: {e}")))?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(key.as_bytes());
+    Ok(out)
+}
+
+/// CEG §5.6.8.8.1.1 — RC6-pinned two-stage RNS destination-hash recompute.
+/// Lets a conformance verifier independently derive an arbitrary peer's
+/// `destination_hash` from its advertised `(x25519_pub, ed25519_pub)`
+/// + the binding's app-name + aspect list.
+///
+/// Returns 16 bytes (the TRUNCATED_HASHLENGTH the spec pins). AV-42
+/// destination-authenticity recompute (CIRISVerify#28).
+#[cfg(feature = "transport-reticulum")]
+#[pyfunction]
+#[pyo3(signature = (app_name, aspects, x25519_pub, ed25519_pub))]
+fn rns_destination_hash(
+    app_name: &str,
+    aspects: &Bound<'_, PyAny>,
+    x25519_pub: &[u8],
+    ed25519_pub: &[u8],
+) -> PyResult<[u8; 16]> {
+    use reticulum_core::{Destination, Identity};
+    let x_pub = fixed_bytes::<32>("x25519_pub", x25519_pub)?;
+    let ed_pub = fixed_bytes::<32>("ed25519_pub", ed25519_pub)?;
+    let identity = Identity::from_public_keys(&x_pub, &ed_pub)
+        .map_err(|e| PyValueError::new_err(format!("identity: {e:?}")))?;
+    let aspects_vec: Vec<String> = aspects.extract()?;
+    let aspects_ref: Vec<&str> = aspects_vec.iter().map(String::as_str).collect();
+    let name_hash = Destination::compute_name_hash(app_name, &aspects_ref);
+    let dest_hash = Destination::compute_destination_hash(&name_hash, identity.hash());
+    Ok(*dest_hash.as_bytes())
+}
+
 #[pymodule]
 fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v1.1.7 (CIRISEdge#58) — diagnostic harness, gated under the
@@ -4353,6 +4633,22 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // point in a future revision.
     #[cfg(feature = "transport-reticulum")]
     m.add_function(wrap_pyfunction!(init_edge_runtime, m)?)?;
+
+    // CIRISEdge#123 — cross-wheel conformance surface for
+    // realtime_av + federation_session + RNS dest-hash. Lets
+    // CIRISConformance / CIRISServer drive the substrate's HNDL-safe
+    // crypto paths from Python without reimplementing them. The
+    // realtime_av + federation_session wrappers are always available;
+    // the RNS dest-hash wrapper requires the leviculum reticulum-core
+    // dep that ships under `transport-reticulum`.
+    m.add_function(wrap_pyfunction!(seal_av_chunk, m)?)?;
+    m.add_function(wrap_pyfunction!(open_av_chunk, m)?)?;
+    m.add_function(wrap_pyfunction!(seal_av_inner, m)?)?;
+    m.add_function(wrap_pyfunction!(seal_av_outer, m)?)?;
+    m.add_function(wrap_pyfunction!(federation_session_initiate, m)?)?;
+    m.add_function(wrap_pyfunction!(federation_session_respond, m)?)?;
+    #[cfg(feature = "transport-reticulum")]
+    m.add_function(wrap_pyfunction!(rns_destination_hash, m)?)?;
 
     Ok(())
 }
