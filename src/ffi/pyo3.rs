@@ -4755,16 +4755,17 @@ fn member_from_py(
 
 /// Map an `AvSessionError` to the appropriate `PyErr`.
 ///
-/// - `PeerLacksMlkem` + `ReplaceNotSupported` are input-validation
-///   errors (`PyValueError`).
+/// - `PeerLacksMlkem` is an input-validation error (`PyValueError`).
 /// - `JoinerSurfaceUnwired` + `Mls(_)` are operation failures
 ///   (`PyRuntimeError`).
+///
+/// Note: as of L5-C (CIRISEdge#131) `ReplaceNotSupported` no longer
+/// exists — `RosterDelta::Replace` is implemented via batched
+/// commits and any failure surfaces as `Mls(_)` instead.
 fn map_av_session_err(e: &crate::transport::realtime_av_session::AvSessionError) -> PyErr {
     use crate::transport::realtime_av_session::AvSessionError;
     match e {
-        AvSessionError::PeerLacksMlkem(_) | AvSessionError::ReplaceNotSupported => {
-            PyValueError::new_err(format!("{e}"))
-        }
+        AvSessionError::PeerLacksMlkem(_) => PyValueError::new_err(format!("{e}")),
         AvSessionError::JoinerSurfaceUnwired | AvSessionError::Mls(_) => {
             PyRuntimeError::new_err(format!("{e}"))
         }
@@ -4845,15 +4846,18 @@ impl PyAvSession {
             .inner
             .advance_epoch(RosterDelta::Join(member))
             .map_err(|e| map_av_session_err(&e))?;
-        // Welcome is `Some(_)` on Join per the AvSession contract. If
-        // it ever fires `None` (would be a regression) we surface a
-        // typed RuntimeError rather than silently emitting empty
-        // bytes.
-        let welcome = artifacts.welcome_bytes.ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "advance_epoch(Join) returned no Welcome — internal invariant violated",
-            )
-        })?;
+        // `welcome_bytes` is `Vec<Vec<u8>>` after L5-C. On a single-
+        // Join path the AvSession contract gives us exactly one
+        // Welcome; any other shape would be a regression.
+        let mut welcome_list = artifacts.welcome_bytes;
+        let welcome = match welcome_list.len() {
+            1 => welcome_list.remove(0),
+            n => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "advance_epoch(Join) returned {n} Welcomes — internal invariant violated (want 1)"
+                )));
+            }
+        };
         let mut dek_out = [0u8; 32];
         dek_out.copy_from_slice(artifacts.new_dek.as_bytes());
         Ok((

@@ -323,6 +323,12 @@ pub enum MlsError {
     /// Tried to look up a member by `key_id` and didn't find one.
     #[error("member not found in group: {0}")]
     MemberNotFound(String),
+    /// [`MlsSession::commit_batch`] called with an empty `ops`
+    /// slice. The batch surface treats a no-op as a caller error
+    /// — the AvSession layer's `advance_epoch` is a state-rotation
+    /// verb, and there is no rotation to perform on an empty batch.
+    #[error("commit_batch called with empty ops — no roster mutation requested")]
+    EmptyBatch,
 }
 
 /// A CIRIS-shaped wrapper around an [`openmls::prelude::MlsGroup`]
@@ -642,6 +648,198 @@ impl MlsSession {
     pub fn is_active(&self) -> bool {
         self.group.is_active()
     }
+
+    /// Collect the CIRIS `key_id` of every member currently in the
+    /// MLS group, including the local participant. Walks
+    /// `self.group.members()` and pulls each member's
+    /// `BasicCredential` `serialized_content()` (which is the
+    /// `key_id` bytes we stamped at `create` / `commit_add` time).
+    ///
+    /// Used by
+    /// [`crate::transport::realtime_av_session::AvSession::advance_epoch`]
+    /// to compute `RosterDelta::Replace` diffs. Returns owned
+    /// `String`s because the underlying openmls `members()`
+    /// iterator borrows ephemeral storage.
+    pub fn member_key_ids(&self) -> Vec<String> {
+        self.group
+            .members()
+            .map(|m| String::from_utf8_lossy(m.credential.serialized_content()).into_owned())
+            .collect()
+    }
+
+    /// Multi-proposal batch commit (CIRISEdge#131 L5-C). Queue N MLS
+    /// Add/Remove proposals on the current epoch via
+    /// [`MlsGroup::commit_builder`], then stage ONE Commit that
+    /// closes them all in a single epoch advance. Produces ONE
+    /// `Commit` + N×`Welcome` (one entry per Add, in the order the
+    /// Adds appear in `ops`) + ONE new `RootSecret`.
+    ///
+    /// ## Welcome cardinality (openmls 0.8.1 nuance)
+    ///
+    /// openmls 0.8.1's [`CommitMessageBundle`] carries a SINGLE
+    /// `Welcome` message whose body is `Vec<EncryptedGroupSecrets>`
+    /// — one entry per added joiner. Per the brief's surface
+    /// contract, we serialize that one Welcome and clone its bytes
+    /// once per Add so the caller has a per-joiner routing handle
+    /// (every Vec<u8> in the returned Vec is bytewise identical;
+    /// joiner-side `StagedWelcome::new_from_welcome` filters
+    /// `secrets` by KeyPackageRef internally). Removes produce no
+    /// Welcome entries.
+    ///
+    /// ## Atomic HNDL gate
+    ///
+    /// Every `RosterOp::Add` member is HNDL-pre-checked BEFORE any
+    /// proposal is queued: a single classical-only Add rejects the
+    /// whole batch with [`MlsError::PeerLacksMlkem`] and leaves the
+    /// MLS group at its pre-call epoch. No partial state.
+    ///
+    /// ## Empty `ops`
+    ///
+    /// `ops` empty returns [`MlsError::EmptyBatch`] — we prefer an
+    /// explicit error over silently no-oping or force-self-updating,
+    /// because the AvSession surface treats `advance_epoch` as a
+    /// state-mutation verb whose return shape signals "the epoch
+    /// rotated". A caller with an empty batch should not be calling
+    /// `advance_epoch` at all.
+    ///
+    /// ## openmls 0.8.1 API path used
+    ///
+    /// `group.commit_builder().propose_adds(kps).propose_removals(idxs)
+    /// .load_psks(storage)?.build(rand, crypto, signer, |_| true)?
+    /// .stage_commit(provider)?` then `merge_pending_commit`. This
+    /// is the documented multi-proposal commit surface in openmls
+    /// 0.8.1; there is no separate `commit_to_pending_proposals` —
+    /// the builder consumes own proposals at build-time.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn commit_batch(
+        &mut self,
+        ops: &[RosterOp],
+    ) -> Result<(Commit, Vec<Welcome>, RootSecret), MlsError> {
+        use openmls::prelude::LeafNodeIndex;
+
+        if ops.is_empty() {
+            return Err(MlsError::EmptyBatch);
+        }
+
+        // ── Atomic HNDL gate ─────────────────────────────────────
+        // Walk the whole ops list FIRST, refusing the entire batch
+        // if ANY Add lacks ML-KEM-768. The MLS group's epoch must
+        // stay unchanged on this error so callers can retry after
+        // fixing the bad member.
+        for op in ops {
+            if let RosterOp::Add(m) = op {
+                if m.kex_pubkeys.mlkem768_pub.is_none() {
+                    return Err(MlsError::PeerLacksMlkem(m.key_id.clone()));
+                }
+            }
+        }
+
+        // ── Resolve all Removes to LeafNodeIndex up front ────────
+        // Done before queueing so a not-found Remove also fails
+        // closed without touching the group.
+        let mut remove_indices: Vec<LeafNodeIndex> = Vec::new();
+        for op in ops {
+            if let RosterOp::Remove(key_id) = op {
+                let idx = self
+                    .group
+                    .members()
+                    .find(|m| m.credential.serialized_content() == key_id.as_bytes())
+                    .map(|m| m.index)
+                    .ok_or_else(|| MlsError::MemberNotFound(key_id.clone()))?;
+                remove_indices.push(idx);
+            }
+        }
+
+        // ── Mint KeyPackages for every Add ───────────────────────
+        // Same skeleton path commit_add uses: each member's
+        // KeyPackage is minted locally on the inviter side. Track
+        // (key_id, sig_pub) for the member_signature_keys map
+        // update on success.
+        let mut add_key_packages = Vec::new();
+        let mut add_records: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut add_count: usize = 0;
+        for op in ops {
+            if let RosterOp::Add(m) = op {
+                let (kp, sig_pub) = mint_member_key_package(&self.provider, &m.key_id)?;
+                add_key_packages.push(kp);
+                add_records.push((m.key_id.clone(), sig_pub));
+                add_count += 1;
+            }
+        }
+
+        // ── Build + stage the single batched commit ──────────────
+        let bundle = {
+            let builder = self.group.commit_builder();
+            let builder = builder
+                .propose_adds(add_key_packages)
+                .propose_removals(remove_indices);
+            let loaded = builder
+                .load_psks(self.provider.storage())
+                .map_err(|e| MlsError::CommitAddFailed(format!("load_psks: {e:?}")))?;
+            let complete = loaded
+                .build(
+                    self.provider.rand(),
+                    self.provider.crypto(),
+                    &self.signer,
+                    |_| true,
+                )
+                .map_err(|e| MlsError::CommitAddFailed(format!("commit_builder build: {e:?}")))?;
+            complete
+                .stage_commit(self.provider.as_ref())
+                .map_err(|e| MlsError::CommitAddFailed(format!("stage_commit: {e:?}")))?
+        };
+
+        // Merge our own pending commit — we are the committer, no
+        // remote to wait on.
+        self.group
+            .merge_pending_commit(self.provider.as_ref())
+            .map_err(|e| MlsError::CommitAddFailed(format!("merge_pending_commit: {e:?}")))?;
+
+        // ── Build the wire artifacts ─────────────────────────────
+        let commit_msg = bundle.commit().clone();
+        let commit_bytes = serialize_mls_message(&commit_msg)?;
+
+        // openmls produces ONE Welcome with N EncryptedGroupSecrets
+        // (one per joiner). Per the brief's surface contract: emit
+        // one Welcome entry per Add, in Add-order. The bytes are
+        // identical across entries (joiner-side filters by its own
+        // KeyPackageRef); callers route by ops-order to N joiners.
+        let welcome_bytes_opt = bundle
+            .to_welcome_msg()
+            .map(|msg| serialize_mls_message(&msg))
+            .transpose()?;
+        let welcomes: Vec<Welcome> = match (welcome_bytes_opt, add_count) {
+            (Some(bytes), n) if n > 0 => (0..n).map(|_| Welcome(bytes.clone())).collect(),
+            _ => Vec::new(),
+        };
+
+        // ── Update CIRIS-side member tracking ────────────────────
+        // Remove first then add — matches the order the MLS apply-
+        // proposals step takes, and avoids transient name collisions
+        // if a key_id is being remove-then-readded.
+        for op in ops {
+            if let RosterOp::Remove(key_id) = op {
+                self.member_signature_keys.remove(key_id);
+            }
+        }
+        for (key_id, sig_pub) in add_records {
+            self.member_signature_keys.insert(key_id, sig_pub);
+        }
+
+        let root = export_root_secret(&self.group, self.provider.as_ref())?;
+        Ok((Commit(commit_bytes), welcomes, root))
+    }
+}
+
+/// A single roster mutation inside a batched epoch advance — see
+/// [`crate::transport::realtime_av_session::RosterDelta::Batch`] for
+/// the surface, and [`MlsSession::commit_batch`] for the body.
+#[derive(Debug, Clone)]
+pub enum RosterOp {
+    /// Add a member. HNDL pre-check (ML-KEM-768 required) applies.
+    Add(Member),
+    /// Remove a member by their CIRIS `key_id`.
+    Remove(String),
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────
@@ -982,5 +1180,238 @@ mod tests {
             matches!(r, Err(MlsError::WelcomeFailed(_))),
             "expected WelcomeFailed, got {r:?}"
         );
+    }
+
+    // ─── L5-C commit_batch surface (CIRISEdge#131) ──────────────────
+
+    /// `commit_batch` with N Adds (N ∈ {2, 8, 20}) → ONE Commit + N
+    /// Welcome entries + ONE new RootSecret. Epoch advances by 1.
+    #[test]
+    fn mls_commit_batch_n_adds() {
+        for &n in &[2usize, 8, 20] {
+            let (mut session, root0) =
+                MlsSession::create("creator", vec![hybrid_member("seed")]).expect("create");
+            let pre_epoch = session.epoch();
+
+            let ops: Vec<RosterOp> = (0..n)
+                .map(|i| RosterOp::Add(hybrid_member(&format!("joiner-{i:03}"))))
+                .collect();
+            let (commit, welcomes, root1) = session
+                .commit_batch(&ops)
+                .unwrap_or_else(|e| panic!("commit_batch({n}) failed: {e:?}"));
+
+            assert!(!commit.0.is_empty(), "[n={n}] Commit empty");
+            assert_eq!(welcomes.len(), n, "[n={n}] expected {n} Welcomes");
+            for (i, w) in welcomes.iter().enumerate() {
+                assert!(!w.0.is_empty(), "[n={n}] Welcome[{i}] empty");
+            }
+            assert_ne!(root0.as_bytes(), root1.as_bytes(), "[n={n}] root unchanged");
+            assert_eq!(
+                session.epoch(),
+                pre_epoch + 1,
+                "[n={n}] epoch must advance by 1"
+            );
+            assert_eq!(
+                session.member_count(),
+                2 + n,
+                "[n={n}] roster = creator + seed + {n}"
+            );
+        }
+    }
+
+    /// `commit_batch` with N Removes (N ∈ {2, 8}) → ONE Commit + 0
+    /// Welcomes + ONE new RootSecret. Epoch advances by 1.
+    #[test]
+    fn mls_commit_batch_n_removes() {
+        for &n in &[2usize, 8] {
+            // Build a group of (creator + n peers).
+            let peers: Vec<Member> = (0..n)
+                .map(|i| hybrid_member(&format!("peer-{i:03}")))
+                .collect();
+            let (mut session, _root0) =
+                MlsSession::create("creator", peers).expect("create initial");
+            assert_eq!(session.member_count(), 1 + n);
+
+            // Remove all n peers in one batch.
+            let ops: Vec<RosterOp> = (0..n)
+                .map(|i| RosterOp::Remove(format!("peer-{i:03}")))
+                .collect();
+            let (commit, welcomes, _root1) = session
+                .commit_batch(&ops)
+                .unwrap_or_else(|e| panic!("[n={n}] commit_batch failed: {e:?}"));
+
+            assert!(!commit.0.is_empty(), "[n={n}] Commit empty");
+            assert!(
+                welcomes.is_empty(),
+                "[n={n}] no Welcomes on a Remove-only batch"
+            );
+            assert_eq!(session.member_count(), 1, "[n={n}] only creator left");
+        }
+    }
+
+    /// Interleaved Adds and Removes in one batch. Verifies that
+    /// the proposal-queue ordering produces a coherent commit
+    /// (openmls's apply_proposals step applies Removes then Adds,
+    /// regardless of ops-order in the slice).
+    #[test]
+    fn mls_commit_batch_mixed() {
+        let (mut session, _root0) = MlsSession::create(
+            "creator",
+            vec![
+                hybrid_member("alice"),
+                hybrid_member("bob"),
+                hybrid_member("carol"),
+            ],
+        )
+        .expect("create");
+
+        let ops = vec![
+            RosterOp::Remove("alice".to_string()),
+            RosterOp::Add(hybrid_member("dave")),
+            RosterOp::Remove("bob".to_string()),
+            RosterOp::Add(hybrid_member("ed")),
+        ];
+        let (commit, welcomes, _root) = session
+            .commit_batch(&ops)
+            .expect("mixed batch should succeed");
+
+        assert!(!commit.0.is_empty());
+        assert_eq!(welcomes.len(), 2, "2 Adds → 2 Welcomes");
+        // Final MLS roster: creator + carol + dave + ed.
+        assert_eq!(session.member_count(), 4);
+        let key_ids = session.member_key_ids();
+        let as_strs: Vec<&str> = key_ids.iter().map(String::as_str).collect();
+        assert!(as_strs.contains(&"creator"));
+        assert!(as_strs.contains(&"carol"));
+        assert!(as_strs.contains(&"dave"));
+        assert!(as_strs.contains(&"ed"));
+        assert!(!as_strs.contains(&"alice"));
+        assert!(!as_strs.contains(&"bob"));
+    }
+
+    /// Atomic HNDL gate at the MLS layer: a classical-only Add in
+    /// the batch fails-closed BEFORE any proposal is queued. The
+    /// group's epoch must not advance.
+    #[test]
+    fn mls_commit_batch_hndl_pre_check() {
+        let (mut session, _root0) = MlsSession::create(
+            "creator",
+            vec![hybrid_member("alice"), hybrid_member("bob")],
+        )
+        .expect("create");
+        let pre_epoch = session.epoch();
+        let pre_count = session.member_count();
+
+        let ops = vec![
+            RosterOp::Add(hybrid_member("dave")),
+            RosterOp::Add(classical_only_member("badpeer")),
+            RosterOp::Remove("alice".to_string()),
+        ];
+        let r = session.commit_batch(&ops);
+        assert!(
+            matches!(r, Err(MlsError::PeerLacksMlkem(ref k)) if k == "badpeer"),
+            "expected PeerLacksMlkem(badpeer), got {r:?}"
+        );
+
+        // No partial state — epoch + roster unchanged.
+        assert_eq!(session.epoch(), pre_epoch);
+        assert_eq!(session.member_count(), pre_count);
+    }
+
+    /// Empty `ops` returns `EmptyBatch` (no silent no-op).
+    #[test]
+    fn mls_commit_batch_empty_returns_explicit_error() {
+        let (mut session, _root0) =
+            MlsSession::create("creator", vec![hybrid_member("alice")]).expect("create");
+        let pre_epoch = session.epoch();
+        let r = session.commit_batch(&[]);
+        assert!(
+            matches!(r, Err(MlsError::EmptyBatch)),
+            "expected EmptyBatch, got {r:?}"
+        );
+        assert_eq!(session.epoch(), pre_epoch);
+    }
+
+    /// Remove of an unknown key_id surfaces `MemberNotFound`
+    /// atomically (no proposal queued).
+    #[test]
+    fn mls_commit_batch_remove_unknown_fails_atomically() {
+        let (mut session, _root0) =
+            MlsSession::create("creator", vec![hybrid_member("alice")]).expect("create");
+        let pre_epoch = session.epoch();
+        let pre_count = session.member_count();
+
+        let ops = vec![
+            RosterOp::Add(hybrid_member("bob")),
+            RosterOp::Remove("ghost".to_string()),
+        ];
+        let r = session.commit_batch(&ops);
+        assert!(
+            matches!(r, Err(MlsError::MemberNotFound(ref k)) if k == "ghost"),
+            "expected MemberNotFound(ghost), got {r:?}"
+        );
+        assert_eq!(session.epoch(), pre_epoch);
+        assert_eq!(session.member_count(), pre_count);
+    }
+
+    /// `member_key_ids` reflects the full current group roster
+    /// (including the local creator). Walks `self.group.members()`
+    /// and reads each `BasicCredential`'s `serialized_content` to
+    /// recover the `key_id` strings stamped at create / add time.
+    #[test]
+    fn member_key_ids_lists_full_roster() {
+        let (session, _root0) = MlsSession::create(
+            "creator",
+            vec![hybrid_member("alice"), hybrid_member("bob")],
+        )
+        .expect("create");
+        let mut ids = session.member_key_ids();
+        ids.sort();
+        let mut expected = vec![
+            "creator".to_string(),
+            "alice".to_string(),
+            "bob".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    /// Empirical order-of-magnitude sanity check for the PR #131
+    /// review's "20-25 mass-joins ~180ms → ~10-20ms" claim. Ignored
+    /// by default (timing-sensitive; not a regression bench).
+    /// Run with: `cargo test --release -- --ignored
+    /// empirical_batch_speedup --nocapture`.
+    #[test]
+    #[ignore = "timing-sensitive; run explicitly with --ignored --nocapture"]
+    fn empirical_batch_speedup() {
+        use std::time::Instant;
+
+        const N: usize = 25;
+
+        // Baseline: N sequential commit_add calls.
+        let (mut session, _) =
+            MlsSession::create("creator", vec![hybrid_member("seed")]).expect("create");
+        let start = Instant::now();
+        for i in 0..N {
+            let _ = session
+                .commit_add(hybrid_member(&format!("seq-{i:03}")))
+                .expect("seq commit_add");
+        }
+        let seq_ms = start.elapsed().as_millis();
+
+        // L5-C: one commit_batch(N).
+        let (mut session, _) =
+            MlsSession::create("creator", vec![hybrid_member("seed")]).expect("create");
+        let ops: Vec<RosterOp> = (0..N)
+            .map(|i| RosterOp::Add(hybrid_member(&format!("bat-{i:03}"))))
+            .collect();
+        let start = Instant::now();
+        let _ = session.commit_batch(&ops).expect("commit_batch");
+        let batch_ms = start.elapsed().as_millis();
+
+        // Integer ratio is enough for an order-of-magnitude sanity
+        // check; avoids the cast_precision_loss lint on u128→f64.
+        let ratio = seq_ms / batch_ms.max(1);
+        eprintln!("[L5-C empirical] N={N}: seq={seq_ms}ms batch={batch_ms}ms speedup~={ratio}x");
     }
 }
