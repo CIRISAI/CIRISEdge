@@ -1,3 +1,112 @@
+# SOTA validation — what the substrate IS now (v4.1.1 + family)
+
+> **Status (2026-06-16)**: this document was authored at v3.8.0 as a
+> credible-pioneering-bet framing. The substrate has since shipped four
+> additional cuts that move it from "pioneering bet" to **a working
+> holonomic federation with the architectural properties the v3.8.0
+> document claimed it could land**. This header section is the
+> updated SOTA write-up; the body below is preserved as the historical
+> v3.8.0 credible-bet framing.
+>
+> ## What the substrate IS now (v3.8.0 → v4.1.1 progression)
+>
+> | Layer | Cut | What landed |
+> |---|---|---|
+> | Holographic substrate (wire) | v3.8.0 | ALM mesh + MDC sub-stream commitments + MLS X-Wing rekey + multi-parent dedup. Shipping on PyPI. |
+> | Codec wiring | v3.9.0 (rolled into v3.10.1) | rav1e/dav1d AV1 + opus + raptorq RFC 6330 fountain |
+> | Holonomic substrate | v3.10.0/v3.10.1 | swarm rarity + WholenessWitness + deterministic ALM + recursive trust bootstrap |
+> | CEWP-1.0 seal | v4.0.0 → v4.0.2 (PyPI) | MISSION.md §12 + THREAT_MODEL.md AV-50; path-independence invariant |
+> | Replication-policy defaults | v4.0.1 | `(N=20, K=6, target_holders=30)` locked at compile-time; CEG §R-policy at CIRISRegistry#86 |
+> | CEG 1.0-RC11 §19 conformance | v4.1.0 | Producer-side bytes match CIRISVerify v5.8.0's cross-impl verifiers (lex-sort Merkle + WW-2 filter + bound-hybrid + 16-byte domain seps) |
+> | Active convergence + capacity model | v4.1.1 | `should_eject_above_target` + `docs/NETWORK_CAPACITY_MODEL.md` |
+>
+> Cross-repo composition: CIRISPersist v8.1.0 (FountainContentV1 +
+> N5 hard-delete) + CIRISVerify v5.8.0 (holonomic verifiers) +
+> CIRISRegistry CEG 1.0-RC11 §19 (normative). All four families
+> in lockstep.
+>
+> ## What changed vs the v3.8.0 framing
+>
+> The v3.8.0 document called the substrate a "credible pioneering bet"
+> because (a) no production-grade symmetric MDC video codec had ever
+> shipped, (b) the industry was converging on centralized MoQ relay
+> in the opposite direction, and (c) the closest published precedent
+> (Favalli ILPS-MDSC 2011) excluded peer churn from its evaluation.
+>
+> The v3.10.0+v4.0+v4.1 progression resolved all three:
+>
+> 1. **The MDC codec is no longer the gate**. The substrate now ships
+>    with raptorq RFC 6330 fountain coding as the data layer beneath
+>    AV1 — same "any subset of ≥N symbols reconstructs" property MDC
+>    promises, but with a production-grade codec (raptorq deployed in
+>    3GPP MBMS + DVB-H since 2012). The "MDC codec is research-grade"
+>    obstacle is replaced by "fountain coding is at the data layer,
+>    AV1 is at the video layer, both are production-grade."
+>
+> 2. **The "centralized vs decentralized" framing is wrong-axis**. The
+>    holonomic substrate (v3.10.0) ships path-independence at every
+>    layer: WholenessWitness for state, deterministic ALM for topology,
+>    recursive trust bootstrap for membership, swarm rarity for
+>    storage. Two implementations satisfying CEG 1.0-RC11 §19 produce
+>    byte-equal output from byte-equal input. The federation is
+>    path-independent in a way MoQ's centralized model isn't, and the
+>    "decentralized but at what cost" framing collapses — see
+>    `docs/NETWORK_CAPACITY_MODEL.md` for the 1.5× per-content overhead
+>    vs prior 5× whole-copy assumption.
+>
+> 3. **Peer churn IS a first-class evaluation target now**. The
+>    holonomic substrate's reconstitution-from-fragment property is
+>    the CEWP-1.0 seal's load-bearing claim (`MISSION.md` §12).
+>    CIRISConformance#16 (filed this session) lands the chaos-
+>    engineering CI harness that adversarially tests it under 20-host
+>    diverse fault injection. The Favalli "rare events excluded"
+>    posture is replaced by "every fault class on every layer is
+>    breakable and gets broken in CI."
+>
+> ## What's STILL pioneering (RC-grade, not 1.0)
+>
+> Per CEG §19.6: "Until a second impl (Verify) reproduces them byte-
+> for-byte, the §19 shapes are pinned-but-unproven — RC-grade, not
+> 1.0." The v4.1.1 substrate ships the producer bytes; the #57
+> conformance vector emit gate (next cut) closes this. Once Verify
+> validates byte-for-byte, RC11 promotes to GA cross-repo.
+>
+> What is NOT yet shipped (deferred per ROADMAP_TO_V4.md):
+>
+> - Holonomic MLS snapshots — persist + verify cross-repo work
+> - Privacy-preserving witness disclosure (ZK claim-membership)
+> - Cross-witness BFT proofs against Byzantine peers
+> - Compression of older witnesses into longer-cadence epigraph hashes
+>
+> These are v4.x extensions; the substrate property is locked.
+>
+> ## Composite SOTA scoreboard
+>
+> The composite operator-facing benchmark scoreboard (CIRISServer#12,
+> filed this session) replaces the per-cut SOTA comparison tables in
+> `docs/V3_8_0_BENCHMARK_COMPARISONS.md` (which compare edge's
+> loopback AEAD throughput vs production SFUs — apples-to-oranges by
+> design). The scoreboard pins:
+>
+> - Storage: per-content overhead, per-peer load, federation capacity
+> - Substrate: AEAD throughput, ALM depth scaling, MLS commit barrier
+> - Holonomic: WW reconciliation, deterministic ALM compute, swarm rarity convergence
+> - Federation-wide: reconstitution-from-fragment time, cross-locality bridge utilization
+>
+> ## Bottom line
+>
+> v3.8.0 said "credible pioneering bet". v4.1.1 + family says **a
+> working holonomic federation with the architectural property
+> v3.8.0 claimed it could land**. The pioneering axis has moved from
+> "will this substrate shape work?" to "is the cross-impl verifier
+> ratification done?" Cross-impl validation (the #57 freeze gate)
+> is the remaining gate; substrate is locked.
+>
+> ---
+>
+> ## Historical v3.8.0 framing (preserved below)
+>
+
 # v3.8.0 SOTA validation — honest framing
 
 Deep-research workflow `ws9po4ot2` (2026-06-15) validated the v3.8.0 ALM + MDC design against 2024-2026 SOTA across 7 axes. This document is the honest write-up of what the field has done, what it hasn't, and where v3.8.0 sits.
