@@ -359,7 +359,12 @@ impl std::fmt::Debug for MlsSession {
             .field("epoch", &self.group.epoch().as_u64())
             .field("member_count", &self.group.members().count())
             .field("is_active", &self.group.is_active())
+            .field("provider", &"<opaque-libcrux>")
             .field("signer", &"<redacted>")
+            .field(
+                "member_key_ids",
+                &self.member_signature_keys.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -382,6 +387,7 @@ impl MlsSession {
     /// [`RootSecret`]. Note that openmls's `MlsGroup::new` produces
     /// an epoch-1 group; the `RootSecret` is derived from that
     /// epoch's exporter.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn create(
         own_key_id: &str,
         initial_members: Vec<Member>,
@@ -480,6 +486,7 @@ impl MlsSession {
     ///
     /// Performs the HNDL pre-check on `new_member` before any MLS
     /// code runs.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn commit_add(
         &mut self,
         new_member: Member,

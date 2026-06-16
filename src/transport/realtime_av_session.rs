@@ -381,9 +381,10 @@ impl AvSession {
         //    material to install).
         self.epoch = Epoch(self.epoch.0.saturating_add(1));
         if let Some(new_bytes) = latest_session_key {
-            // Dropping the old box zeroizes the old DEK via
-            // `EpochDek::Drop`.
-            self.dek = Box::new(EpochDek::from_bytes(new_bytes));
+            // Drop-in-place on the old EpochDek fires its zeroize
+            // via `EpochDek::Drop` before the new value moves in;
+            // the Box itself is reused (no needless allocation).
+            *self.dek = EpochDek::from_bytes(new_bytes);
         }
 
         Ok(EpochRekeyArtifacts {

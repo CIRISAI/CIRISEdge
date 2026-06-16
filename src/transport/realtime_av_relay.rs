@@ -403,7 +403,12 @@ mod tests {
         // off the edge crate's direct dep surface.
         let mut priv_bytes = [0u8; 64];
         for (i, b) in priv_bytes.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(31).wrapping_add(1);
+            // Synthetic key fill: index is bounded by `priv_bytes.len() == 64`
+            // so `u8::try_from` cannot fail here.
+            *b = u8::try_from(i)
+                .expect("index < 64")
+                .wrapping_mul(31)
+                .wrapping_add(1);
         }
         let identity = Identity::from_private_key_bytes(&priv_bytes)
             .expect("build identity from synthetic key");
@@ -451,7 +456,10 @@ mod tests {
     fn transit_key(idx: usize) -> [u8; 32] {
         let mut k = [0u8; 32];
         for (i, byte) in k.iter_mut().enumerate() {
-            *byte = ((idx + i) as u8).wrapping_mul(13).wrapping_add(7);
+            // Synthetic transit-key fill; intentional u8 wrap.
+            #[allow(clippy::cast_possible_truncation)]
+            let mixed = (idx + i) as u8;
+            *byte = mixed.wrapping_mul(13).wrapping_add(7);
         }
         k
     }
