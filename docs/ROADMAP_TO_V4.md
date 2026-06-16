@@ -47,11 +47,11 @@ The swarm collectively retains the rarest fountain symbols at every resolution. 
 
 Bohm's implicit order made explicit. Every peer periodically publishes a signed Merkle root over its CEG claim state. Other peers cross-compare; differences become reconciliation work. The architectural keystone — every other holonomic upgrade verifies against the witness chain.
 
-### Part 3: Deterministic ALM topology (CIRISEdge#NEW)
+### Part 3: Deterministic ALM topology ([CIRISEdge#136](https://github.com/CIRISAI/CIRISEdge/issues/136))
 
 Today the ALM tree depends on which RelayCapacity ads a planner saw in what order — path-dependent. v3.10.0 makes it a **pure deterministic function** of (current capacity advertisements, current trust graph, current reachability snapshot). Every peer with the same input arrives at the same tree without leader / consensus. Composes with WholenessWitness — the inputs to the topology function are themselves witness leaves.
 
-### Part 4: Recursive trust bootstrap (CIRISEdge#NEW)
+### Part 4: Recursive trust bootstrap ([CIRISEdge#137](https://github.com/CIRISAI/CIRISEdge/issues/137))
 
 Today bootstrap depends on a known set of trust roots. v3.10.0: a new peer can bootstrap from **any** signed CEG claim that chains to a trust root in its own trust graph. No special "first peer" assumption; any peer's witness suffices. Composes with WholenessWitness — bootstrap = "follow the witness chain until you find a trust-rooted claim."
 
