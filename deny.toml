@@ -47,6 +47,12 @@ allow = [
     # Transitive via persist v2.7.0's jsonschema admission gates
     # (CIRISEdge#20 persist bump) → fluent-uri → borrow-or-share.
     "MIT-0",
+    # v3.10.1 (CIRISEdge#133 codec wiring) — NCSA license, OSI-approved
+    # (University of Illinois/NCSA Open Source License). Permissive,
+    # functionally equivalent to MIT + BSD-3-Clause merged; explicitly
+    # AGPL-compatible. Transitive via rav1e → libfuzzer-sys (fuzz-
+    # harness dev-dep; ships in zero production binaries).
+    "NCSA",
 ]
 confidence-threshold = 0.85
 
@@ -133,6 +139,29 @@ ignore = [
     # in zero production binaries. Pulled transitively via openmls's
     # macro stack. Migration to manyhow / proc-macro2-diagnostics is
     # openmls-upstream's call.
+
+    # v3.10.0 (CIRISEdge#133 codec wiring + #134/#135/#136/#137 holonomic
+    # substrate) — opus + rav1e transitives pulled by the v3.9.0 codec
+    # cut surface two unmaintained advisories. Both are build-time /
+    # non-exploitable; documented here rather than carrying the bump
+    # blocker upstream.
+    "RUSTSEC-2026-0150",  # audiopus_sys (transitive: opus 0.3 → audiopus
+    # 0.3 → audiopus_sys 0.2.2). Upstream is unmaintained — last commit
+    # 5 years ago; CMake-4.0 incompatibility flagged. NOT exploitable:
+    # audiopus_sys is a build-time bindgen wrapper around libopus. We
+    # bundle libopus statically into the wheel sidecar (same discipline
+    # persist uses for libsqlite3 at v3.5.3); the bindgen surface is
+    # invoked once at compile time and never touches network or
+    # attacker-controlled bytes. No safe upgrade is available per the
+    # advisory; the codec ecosystem hasn't reconverged on a
+    # post-audiopus_sys binding yet. Bench when one ships.
+    "RUSTSEC-2024-0436",  # paste 1.0.15 (transitive: rav1e 0.8 → paste).
+    # `paste` is dtolnay's procedural-macro-helper crate; the author
+    # archived the repo and announced no longer maintaining it.
+    # NOT exploitable: paste is a procedural-macro support crate,
+    # build-time only, ships in zero production binaries. The drop-in
+    # replacement `pastey` requires rav1e upstream to migrate; tracking
+    # https://github.com/xiph/rav1e/issues for a paste→pastey swap.
 ]
 
 [sources]
@@ -144,4 +173,9 @@ unknown-git      = "warn"
 allow-git = [
     "https://github.com/CIRISAI/CIRISPersist",
     "https://github.com/CIRISAI/CIRISVerify",
+    # v3.7.0 (CIRISEdge#62 Reticulum) — leviculum is CIRIS's reticulum
+    # implementation fork (`reticulum-core` + `reticulum-std`). Tracked
+    # by exact rev pin in Cargo.toml; ships as the Reticulum transport
+    # substrate's canonical wire.
+    "https://github.com/CIRISAI/leviculum",
 ]
