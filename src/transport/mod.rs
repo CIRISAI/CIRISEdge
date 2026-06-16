@@ -41,6 +41,16 @@ pub mod realtime_av;
 /// using hybrid X25519+ML-KEM-768 wraps per remaining member.
 pub mod realtime_av_session;
 
+/// Realtime A/V — MLS (RFC 9420) group key agreement with the
+/// X-Wing post-quantum hybrid ciphersuite 0x004D (CIRISEdge#66).
+/// Thin CIRIS-shaped wrapper over openmls 0.8.1's `MlsGroup` +
+/// Cryspen's formally-verified libcrux provider. Replaces the
+/// discarded clean-room TreeKEM sketch — openmls inherits Draft-11
+/// insider fixes, Quarantined-TreeKEM discipline, SUF-CMA Ed25519,
+/// and the deployment-policy guidance the clean-room approach would
+/// have re-exposed (Wallez/Protzenko/Bhargavan IEEE S&P 2025).
+pub mod realtime_av_mls;
+
 /// Realtime A/V relay (SFU role) — addressable forwarding hop for the
 /// [`realtime_av`] profile (CIRISEdge#66). Holds per-subscriber transit
 /// keys + a per-stream roster; the relay applies the outer AEAD ONCE

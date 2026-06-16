@@ -280,6 +280,23 @@ tracing     = "0.1"
 # transitively by ciris-crypto, so no version skew risk.
 zeroize     = "1"
 
+# CIRISEdge#66 — MLS (RFC 9420) over openmls 0.8.1, with the
+# X-Wing PQ-hybrid ciphersuite 0x004D
+# (`MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519`). 0.8.1 is the
+# release that ships the X-Wing variant compiled-in unconditionally;
+# the `openmls_libcrux_crypto` provider is the ONLY provider that
+# actually implements `HpkeKemType::XWingKemDraft6` (the
+# `openmls_rust_crypto` provider panics on it). See
+# `src/transport/realtime_av_mls.rs` for the CIRIS-shaped wrapper
+# and the module-level discussion of the 0x004D code-point caveat
+# (provisional, not IANA-assigned) and the migration path when the
+# IETF draft RFCs.
+openmls                  = { version = "0.8.1", default-features = false }
+openmls_libcrux_crypto   = { version = "0.3.1" }
+openmls_basic_credential = { version = "0.5.0", features = ["clonable"] }
+openmls_traits           = { version = "0.5.0" }
+tls_codec                = { version = "0.4.2", features = ["derive"] }
+
 # Packet-radio transport frame CRC (CIRISEdge#53 N2). Only pulled in
 # when `transport-packet-radio` is on — the IEEE CRC-32 is the
 # transport-layer corruption-detection contract, NOT a security MAC
