@@ -462,6 +462,119 @@ pub enum EvictionReason {
     ConsentUnknown,
 }
 
+/// Locked-v1 safety-margin percentage above [`fountain_defaults::DEFAULT_TARGET_HOLDERS`]
+/// before [`should_eject_above_target`] returns `Eject`. 15% matches
+/// the v4.0.1 derivation (`26 × 1.15 ≈ 30`); a peer that observes
+/// `holders_observed > target_holders × (1 + 15/100)` AND finds its
+/// own symbol "not rare" is eligible to evict.
+///
+/// **Wire-determinism-critical**: locked at v1 alongside the §R-policy
+/// defaults. Any change is a coordinated CEG amendment.
+pub const EJECT_ABOVE_TARGET_SAFETY_MARGIN_PCT: u32 = 15;
+
+/// Verdict returned by [`should_eject_above_target`] — the proactive
+/// trim primitive that drives the federation toward
+/// [`fountain_defaults::DEFAULT_TARGET_HOLDERS`] convergence.
+///
+/// Without proactive trim, the federation only converges to target
+/// via rarity bias — *eventually* correct, but slow and reactive.
+/// `should_eject_above_target` lets a peer recognize "the network is
+/// over-replicated; my symbol is common; safe to free local storage."
+///
+/// Composes with the persist v8.1.0 eviction surface:
+/// - [`EjectionVerdict::EjectHardDelete`] → caller invokes
+///   `Persist::evict_fountain_content_hard_delete` (the §8.1.11.3 N5
+///   deletion-SLA path)
+/// - [`EjectionVerdict::EjectToTier`] → caller invokes
+///   `Persist::evict_fountain_content_to_tier(T2)` (DiskPressure
+///   tier eviction; the freed symbol can be re-fetched later if
+///   demand spikes)
+/// - [`EjectionVerdict::Keep`] → no action
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EjectionVerdict {
+    /// Free local storage by evicting this symbol to the tier policy.
+    /// The federation has more than [`fountain_defaults::DEFAULT_TARGET_HOLDERS`]
+    /// (× safety margin) holders, and this peer's symbol is
+    /// "common" locally — it's safe to drop. Other peers carry the load.
+    EjectToTier,
+    /// §3.2.3 revocation — call the persist hard-delete path
+    /// regardless of holder count.
+    EjectHardDelete,
+    /// Keep the symbol. Either the federation is at/below target
+    /// (this peer is needed), or this peer's symbol is rare
+    /// (network depends on it), or the safety margin hasn't been
+    /// cleared.
+    Keep,
+}
+
+/// Proactive trim primitive — the active-convergence half of swarm
+/// rarity. Reactive rarity bias only acts when a peer evaluates a
+/// fountain content; this function acts even when the local symbol
+/// passes rarity gating, because over-replicated content wastes
+/// network-wide storage that could carry additional content.
+///
+/// Inputs:
+/// - `holders_observed` — the count of distinct verified-weight
+///   holders the peer's observed claim set names (i.e. the same
+///   numerator [`compute_rarity_score`] uses).
+/// - `policy` — the [`fountain_defaults::FountainPolicy`] in force
+///   (typically [`recommended_policy()`](super::fountain_defaults::recommended_policy)).
+/// - `consent` — the [`ConsentState`] for the content. Revoked
+///   short-circuits to `EjectHardDelete` regardless of rarity.
+/// - `local_symbol_rarity` — the rarity score the peer computed for
+///   ITS own symbol; if this symbol is itself rare, KEEP it even when
+///   the network is otherwise over-replicated.
+///
+/// Threshold math (locked v1):
+/// ```text
+/// over_target_threshold = target_holders +
+///                         target_holders × EJECT_ABOVE_TARGET_SAFETY_MARGIN_PCT / 100
+///                       = 30 + 30 × 15 / 100
+///                       = 34 (default policy)
+/// ```
+///
+/// At/below 34 verified-weight holders, the peer KEEPS its symbol.
+/// At 35+, the peer ejects iff its own symbol is not rare.
+///
+/// **Wire-determinism-critical**: the threshold + the "is_common"
+/// definition (rarity score above `policy.target_holders / 2`) appear
+/// in CEG 1.0 §R conformance vectors; two peers MUST reach the same
+/// verdict from the same inputs.
+#[must_use]
+pub fn should_eject_above_target(
+    holders_observed: u32,
+    policy: &crate::holonomic::fountain_defaults::FountainPolicy,
+    consent: ConsentState,
+    local_symbol_rarity: RarityScore,
+) -> EjectionVerdict {
+    // §3.2.3 revocation dominates rarity AND target-holder counts.
+    if consent == ConsentState::Revoked {
+        return EjectionVerdict::EjectHardDelete;
+    }
+
+    let safety = policy.target_holders * EJECT_ABOVE_TARGET_SAFETY_MARGIN_PCT / 100;
+    let over_target_threshold = policy.target_holders + safety;
+
+    // Below the over-target threshold: federation still needs this
+    // peer's contribution. KEEP.
+    if holders_observed <= over_target_threshold {
+        return EjectionVerdict::Keep;
+    }
+
+    // Above the over-target threshold: only eject if the local
+    // symbol is "common" (rarity score >= target_holders / 2 — the
+    // network has substantial coverage of this symbol_id already).
+    // Otherwise the symbol is rare and this peer's copy is
+    // load-bearing for resilience; KEEP it even when the network is
+    // over-replicated on average.
+    let common_threshold = RarityScore(policy.target_holders / 2);
+    if local_symbol_rarity >= common_threshold {
+        EjectionVerdict::EjectToTier
+    } else {
+        EjectionVerdict::Keep
+    }
+}
+
 /// Locked-v1 possession-verified holding-claim weight.
 ///
 /// **Wire-determinism-critical**: these three weights
@@ -1114,5 +1227,104 @@ mod tests {
             .evict_fountain_content_hard_delete("content-X", "fountain-corpus")
             .expect_err("must surface the persist failure");
         assert!(matches!(err, FountainEvictError::HardDeleteFailed(_)));
+    }
+
+    // ─── should_eject_above_target — proactive trim primitive ──────
+
+    #[test]
+    fn eject_at_or_below_target_returns_keep() {
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        // Default: target_holders=30, safety=15% => over-threshold=34
+        for holders in [0u32, 10, 20, 30, 34] {
+            let v = should_eject_above_target(
+                holders,
+                &policy,
+                ConsentState::Active,
+                RarityScore(holders + 100), // not-rare doesn't matter at-or-below
+            );
+            assert_eq!(
+                v,
+                EjectionVerdict::Keep,
+                "at holders={holders} expected Keep"
+            );
+        }
+    }
+
+    #[test]
+    fn eject_above_target_with_common_local_returns_eject_to_tier() {
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        // 35+ holders + local symbol >= target/2 = 15 is "common"
+        let v = should_eject_above_target(
+            35,
+            &policy,
+            ConsentState::Active,
+            RarityScore(20), // >= 15, common
+        );
+        assert_eq!(v, EjectionVerdict::EjectToTier);
+    }
+
+    #[test]
+    fn eject_above_target_with_rare_local_returns_keep() {
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        // Even at 100 holders, if THIS peer's local symbol is rare
+        // (rarity < target/2 = 15), KEEP it — the network is over-
+        // replicated on average but this symbol_id is load-bearing.
+        let v = should_eject_above_target(
+            100,
+            &policy,
+            ConsentState::Active,
+            RarityScore(5), // < 15, rare
+        );
+        assert_eq!(v, EjectionVerdict::Keep);
+    }
+
+    #[test]
+    fn eject_consent_revoked_returns_hard_delete_regardless_of_count() {
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        // Revoked dominates rarity AND holder-count.
+        for (holders, rarity) in [(0u32, 0u32), (30, 30), (200, 1)] {
+            let v = should_eject_above_target(
+                holders,
+                &policy,
+                ConsentState::Revoked,
+                RarityScore(rarity),
+            );
+            assert_eq!(
+                v,
+                EjectionVerdict::EjectHardDelete,
+                "Revoked must EjectHardDelete regardless of holders={holders} rarity={rarity}"
+            );
+        }
+    }
+
+    #[test]
+    fn eject_consent_unknown_behaves_like_active() {
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        // Unknown is fail-secure (don't keep-as-rare) but is NOT
+        // hard-delete. At <= target it's Keep (no over-replication
+        // to free); at > target with common local it's EjectToTier.
+        assert_eq!(
+            should_eject_above_target(20, &policy, ConsentState::Unknown, RarityScore(50)),
+            EjectionVerdict::Keep
+        );
+        assert_eq!(
+            should_eject_above_target(50, &policy, ConsentState::Unknown, RarityScore(50)),
+            EjectionVerdict::EjectToTier
+        );
+    }
+
+    #[test]
+    fn eject_threshold_locked_at_15_percent_safety_margin() {
+        // Wire-determinism-critical: any change to the threshold math
+        // is a coordinated CEG amendment. This test pins the v1
+        // threshold for the §R conformance vectors.
+        assert_eq!(EJECT_ABOVE_TARGET_SAFETY_MARGIN_PCT, 15);
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        let safety = policy.target_holders * 15 / 100;
+        let over_target = policy.target_holders + safety;
+        assert_eq!(
+            over_target, 34,
+            "v1 over-target threshold at default policy"
+        );
     }
 }
