@@ -246,7 +246,38 @@ streams direct-mesh (49 × 50 kbps = 2.5 Mbps per publisher, easily fits the
 remaining uplink). The substrate exposes the primitives; the policy lives
 above this layer.
 
-### §4.4 Replacing the "~50" hand-wave
+### §4.4 ALM tree depth — `ceil(log_X(N))` and the rounding-up trap
+
+For an ALM mesh-tree at fanout `X` (each interior peer relays to `X` children),
+the depth required to seat `N` total participants is `ceil(log_X(N))`. The
+arithmetic rounds up; the off-by-one matters because every hop is a
+sender-side AEAD seal plus a one-way propagation delay.
+
+| N (target) | X (fanout) | log_X(N) | depth = ceil | Max N at depth-1 | Max N at this depth |
+|-----------|-----------|----------|--------------|------------------|---------------------|
+| 50        | 12        | 1.57     | **2**        | 13               | 157                 |
+| 157       | 12        | 1.99     | **2**        | 13               | 157                 |
+| 200       | 12        | **2.14** | **3**        | 13               | 1885                |
+| 1000      | 12        | 2.78     | **3**        | 13               | 1885                |
+
+**The trap**: at the 720p30 home-uplink fanout `X = floor(30 / 2.5) = 12`,
+depth-2 caps at `1 + 12 + 144 = 157` total participants. **A 200-person
+room is depth-3, not depth-2.** Each additional hop adds one outer-seal +
+one Reticulum link transit to the worst-case latency. The substrate
+absorbs this cleanly (the chunk wire is depth-blind), but release-notes
+language that quotes "~depth-2 at production scale" undercounts by one hop
+for any room over 157 at 720p30 home uplinks.
+
+The interior cost compounds: a depth-2 peer at `X=12` sustains `12 × 2.5 =
+30 Mbps` of outbound forwarding. **This is a LAN budget**, not a WAN
+budget — interior position runs over the locality's local network (wifi
+mesh, community LAN, fiber-LAN), where 100 Mbps – 1+ Gbps is routine even
+where the locality's WAN uplink to the wider internet is sub-5 Mbps. CEWP
+is locality-first by design; §9 details the locality-dividend deployment
+model and why interior position is sustainable on commodity wifi hardware
+across the full deployment envelope, not only metropolitan-fiber regions.
+
+### §4.5 Replacing the "~50" hand-wave
 
 The current docstring at [`realtime_av.rs:9`](../src/transport/realtime_av.rs#L9)
 reads "(≤ ~50 participants)". That number was always a stand-in for "the
@@ -372,7 +403,43 @@ total_mls_batched ≈ 10–20 ms (one commit covering all 20–50 joins)
 That is ~one 30fps frame. The meeting starts at one-frame latency, not
 fifteen.
 
-### §6.5 Cross-reference
+### §6.5 The MLS commit barrier as realtime tax
+
+The numbers above are *cold-join* latency. A second cost surfaces *during
+steady-state*: every roster delta (join or leave) emits a Commit; every
+peer processing that Commit pauses chunk-flow for the duration of
+`MlsGroup::process_message → merge_pending_commit`. At N=128 this is
+**~9.7 ms** — `9.7 / 33.3 ≈ 30% of the 30 fps frame budget`.
+
+```
+realtime_tax_per_commit ≈ commit_processing_ms / frame_budget_ms
+                       = 9.7 / 33.3       ≈ 30%  @ 30 fps, N=128
+                       = 9.7 / 16.6       ≈ 58%  @ 60 fps, N=128
+                       = 2.4  / 33.3       ≈  7%  @ 30 fps, N=8
+```
+
+This is a **structural floor**, not a v3.8.0 regression: any MLS-based
+realtime protocol pays a per-commit synchronization tax. The
+substrate's `RosterDelta::Batch` (L5-C) collapses commit *count* — it
+does not shorten the per-commit barrier. Two consequences for the
+deployment model:
+
+1. **Steady-state churn budget**: at N=128, a room sustaining 1 join/s
+   spends ~30% of every 30 fps frame budget on commit processing. Two
+   joins per second consumes the whole budget. `RosterDelta::Batch`
+   amortizes this when joins arrive in bursts; it does not help
+   continuous churn.
+2. **Leave handling is symmetric**: a leave forces a Commit just as a
+   join does. The "1 join/s" budget above is "1 roster delta per
+   second" in practice.
+
+The substrate exposes the Commit barrier to the policy layer via the
+existing MLS surface; what it does not do is hide it. Rooms with
+continuous churn at 60 fps and N>64 will visibly stutter regardless
+of substrate tuning. This is the realtime tax the X-Wing PQ-hybrid
+ciphersuite + the MLS state machine impose; it does not go away.
+
+### §6.6 Cross-reference
 
 This is the *rekey* side of the "at scale" claim. Once L5-C lands, the
 realtime_av_rekey bench will grow a `mls_rekey_batched` group, and this
@@ -382,22 +449,38 @@ section gets the empirical numbers folded back in.
 
 ## §7 Verdict matrix — what scales where
 
+Confidence column reads: **deriv** = derived from §2–§3 first-principles math
++ documented vendor numbers (high); **loopback** = measured against in-memory
+Criterion bench, NIC + scheduler + Reticulum substrate paths NOT included
+(divide ÷10–100 for production wire); **structural** = MLS state-machine
+floor, no implementation can amortize past it.
+
 ```
-+-----------------------------------+------------------+----------------------+---------------------------------+
-| Profile                           | N max            | Bottleneck           | Mitigation                      |
-+-----------------------------------+------------------+----------------------+---------------------------------+
-| 720p30 home-uplink full mesh      | 13               | Uplink bandwidth     | Drop to SFU or BLINKING_DOT     |
-| 1080p30 home-uplink full mesh     | 7                | Uplink bandwidth     | Drop to SFU or 720p layer       |
-| 4K home-uplink full mesh          | 2                | Uplink bandwidth     | Drop to SFU; degrade            |
-| Voice-only mesh (Opus 24 kbps)    | 1000+            | None at any real N   | None needed                     |
-| BLINKING_DOT mesh                 | 600+             | None at any real N   | None needed                     |
-| Layered mesh (mixed receivers)    | ~24 at 50/50 mix | Uplink (avg-weighted)| Push uncapped subs to SFU       |
-| 720p30 SFU per core (egress)      | ~1.2 streams     | Relay egress         | Cascade SFUs (Phase 1.x)        |
-| 720p30 SFU per core (CPU)         | ~416 streams     | Crypto AEAD          | n/a — egress dominates by ~350x |
-| Cold-join burst (20p, unbatched)  | 6 dropped frames | MLS commit serial    | L5-C RosterDelta::Batch         |
-| Cold-join burst (20p, batched)    | ~1 frame         | MLS commit overhead  | n/a — already mitigated         |
-+-----------------------------------+------------------+----------------------+---------------------------------+
++-----------------------------------+------------------+----------------------+--------------+---------------------------------+
+| Profile                           | N max            | Bottleneck           | Confidence   | Mitigation                      |
++-----------------------------------+------------------+----------------------+--------------+---------------------------------+
+| 720p30 home-uplink full mesh      | 13               | Uplink bandwidth     | deriv        | Drop to SFU or BLINKING_DOT     |
+| 1080p30 home-uplink full mesh     | 7                | Uplink bandwidth     | deriv        | Drop to SFU or 720p layer       |
+| 4K home-uplink full mesh          | 2                | Uplink bandwidth     | deriv        | Drop to SFU; degrade            |
+| Voice-only mesh (Opus 24 kbps)    | 1000+            | None at any real N   | deriv        | None needed                     |
+| BLINKING_DOT mesh                 | 600+             | None at any real N   | deriv        | None needed                     |
+| Layered mesh (mixed receivers)    | ~24 at 50/50 mix | Uplink (avg-weighted)| deriv        | Push uncapped subs to SFU       |
+| ALM tree depth @ X=12, N=200      | depth=3 (NOT 2)  | One extra hop budget | deriv        | Accept hop; see §4.4            |
+| 720p30 SFU per core (egress)      | ~1.2 streams     | Relay egress         | loopback     | Cascade SFUs (Phase 1.x)        |
+| 720p30 SFU per core (CPU)         | ~416 streams     | Crypto AEAD          | loopback     | n/a — egress dominates by ~350x |
+| Cold-join burst (20p, unbatched)  | 6 dropped frames | MLS commit serial    | loopback     | L5-C RosterDelta::Batch         |
+| Cold-join burst (20p, batched)    | ~1 frame         | MLS commit overhead  | loopback     | n/a — already mitigated         |
+| Steady-state churn @ N=128, 30fps | 1 delta/s ≈ 30%  | MLS commit barrier   | structural   | Cap churn; raise N policy floor |
+| Steady-state churn @ N=128, 60fps | 1 delta/s ≈ 58%  | MLS commit barrier   | structural   | Avoid 60 fps @ large rooms      |
++-----------------------------------+------------------+----------------------+--------------+---------------------------------+
 ```
+
+Every **loopback** row's headline number is sender-CPU under unicast in
+a Criterion microbench. NIC, kernel-side TX, RTP/RTCP machinery,
+congestion control, and Reticulum substrate paths are NOT in the
+measured path; production deployments will be NIC-bound or
+substrate-bound long before the CPU number is reached. Treat loopback
+rows as a *headroom claim*, not a deployment forecast.
 
 ---
 
@@ -438,7 +521,78 @@ the work is identified, not scheduled.
 
 ---
 
-## §9 Summary
+## §9 The locality dividend — why CEWP's substrate doesn't need WAN uplinks
+
+§4.4's depth arithmetic is correct, but reading it as a WAN
+specification mis-frames the substrate. **CEWP is locality-first by
+design.** The federation operates at the *locality* level: a village
+wifi mesh, a community LAN, a campus network, a household — places
+where peers see each other at LAN bandwidth even when the locality's
+WAN uplink is sub-5 Mbps.
+
+The bandwidth math the substrate actually relies on:
+
+- **LAN / wifi mesh / fiber-LAN**: 100 Mbps – 1+ Gbps between peers in
+  the same locality. A 720p30 stream at 2.5 Mbps is ~0.25% of a 1 Gbps
+  link; even a `X=12` relay (~30 Mbps sustained) is ~3% of that link.
+- **Local mesh / community wifi (rural / Global South)**: 5–50 Mbps
+  sustained is routine on commodity router hardware, even where the
+  WAN uplink to the wider internet is 1–5 Mbps. The locality dividend
+  is **larger** in low-WAN regions, not smaller — the local network is
+  what people actually use.
+- **Hotspot / smartphone mesh**: even a single laptop tethering to a
+  cluster of phones provides 50+ Mbps of locality bandwidth that is
+  invisible to WAN-uplink budgets.
+
+The substrate's interior position is sustained on **LAN bandwidth**,
+not WAN bandwidth. The "30 Mbps for X=12 at 720p30" budget §4.4
+derives is well inside what a single wifi router does. The federation
+of localities is the higher-scale property: each locality has its own
+interior relay tier, and inter-locality bridges are a *separate*
+concern with their own (smaller, lower-codec-tier, often
+batched-not-realtime) flows.
+
+What this means for the v3.8.0 substrate:
+
+1. **The "everyone is potentially a relay" claim is honest at locality
+   scope.** A wifi-attached peer with a $50 router seats at the
+   interior of its locality's tree without subsidy.
+2. **Trust islands ARE localities, structurally.** The recursive trust
+   bootstrap (v3.10.0 Part 4) lets a locality form its own internal
+   trust graph; the inter-locality bridges are signed claims (CEG
+   §10.5.x federation surface), not synchronous relay positions.
+3. **`SignedRelayCapacity` advertises locality-relevant capacity.** A
+   peer's `RelayCapacity { uplink_mbps: 100.0 }` is its LAN figure;
+   the substrate uses it locally. WAN-uplink budgeting lives at the
+   bridge layer, above this FSD.
+4. **Mission users in low-WAN regions are NOT structurally leaves.**
+   They are interior peers in their local trust island; their locality
+   gets the same scaling properties as a metropolitan-fiber locality.
+   The substrate does not depend on the wide-area connection being
+   fast; it depends on the *local* connection being fast, which is
+   routinely true.
+5. **"No central control plane" is the right shape because the
+   federation is locality-of-localities.** No central operator is
+   needed because each locality runs its own substrate at LAN speeds;
+   the inter-locality bridges are signed-claim federation, not
+   synchronous relay.
+
+The fact that LAN bandwidth is high *everywhere* (because LAN is
+defined by what's physically close, and physical proximity is
+abundant) is the load-bearing assumption CEWP makes. The substrate's
+v3.8.0 numbers — bandwidth-bound at ~30 Mbps per interior peer at
+720p30 — are inside the LAN budget of essentially every populated
+place on earth. WAN-uplink-pessimism is the wrong frame for this
+substrate; it would be the right frame for a different (centralized
+SFU-in-a-distant-datacenter) design that v3.8.0 explicitly is not.
+
+The §7 verdict matrix's `deriv`-confidence rows quantify the LAN-tier
+bandwidth floor. The locality dividend is the reason that floor is
+nearly always available.
+
+---
+
+## §10 Summary
 
 The "stream at scale" claim decomposes into four substantiated assertions:
 
