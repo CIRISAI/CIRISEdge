@@ -61,6 +61,18 @@ pub mod realtime_av_mls;
 #[cfg(feature = "_reticulum-module")]
 pub mod realtime_av_relay;
 
+/// Application-Layer Multicast (ALM) — mesh-tree video built on the
+/// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
+/// CIRISEdge#128 MDC). Pure-Rust, signed [`realtime_av_alm::RelayCapacity`]
+/// advertisements + stateless parent-finding planner + multi-parent
+/// dedup/heal state machine. Variable-depth MDC sub-stream commitments
+/// surface the "holographic" decomposition where any subset of
+/// sub-streams decodes at proportional fidelity. No transport-feature
+/// gate — the planner is signature-blind and the heal state machine is
+/// pure Rust; both compile against the bare federation surface so they
+/// stay reusable for HTTPS-only ALM trees.
+pub mod realtime_av_alm;
+
 /// Packet-radio transport — N2 multi-medium plug (CIRISEdge#53 Fed
 /// TM §3.3 Gap D). LoRa / AX.25 / raw-serial mediums plug in via the
 /// [`packet_radio::driver::PacketRadioDriver`] trait. Feature-gated
