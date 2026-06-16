@@ -86,6 +86,27 @@ pub const WEIGHT_TRUST: u64 = 30;
 /// wire-determinism critical.
 pub const WEIGHT_REACHABILITY: u64 = 20;
 
+/// Wire-determinism critical cap on per-identity self-asserted
+/// capacity. Any `uplink_mbps` value advertised above this is
+/// CLAMPED to this cap for scoring purposes. Locked at v1; appears
+/// in CEG 1.0 §T conformance vectors.
+///
+/// 1 Gbps is the upper bound for any commodity-hardware sustained
+/// outbound link in 2026. Production deployments with verified
+/// throughput beyond this register through a separate trusted
+/// throughput-challenge path (see RFC TBD).
+pub const MAX_SELF_ASSERTED_UPLINK_MBPS: f32 = 1000.0;
+
+/// Per-duplicate-subscriber penalty subtracted from a parent's
+/// effective score, per existing subscriber the parent already
+/// carries on the SAME `sub_stream_path` (MDC quadrant). Drives MDC
+/// sub-stream distribution across multiple parents so a single
+/// captured node cannot concentrate every sub-stream.
+///
+/// wire-determinism critical: part of the v1 scoring formula and
+/// CANNOT be tuned without bumping [`TOPOLOGY_VERSION`].
+pub const PENALTY_PER_SUB_PATH_DUP: u64 = 5;
+
 /// One trust grant within a holonomic snapshot — a directed edge in
 /// the federation's trust graph.
 ///
@@ -106,6 +127,46 @@ pub struct TrustGrant {
     /// `chain_depth > MAX_TRUST_CHAIN_DEPTH` are dropped at filter
     /// time so v1 scoring stays within the documented horizon.
     pub chain_depth: u8,
+
+    /// §13.3 per-grant trust weight (`0..=255`, max trust = 255).
+    ///
+    /// Additive wire field. Old grants minted before this field
+    /// existed deserialize to [`TrustGrant::DEFAULT_WEIGHT`] (255,
+    /// full trust) so back-compat is byte-faithful. The recursive
+    /// trust bootstrap sums these along a witness chain and refuses
+    /// admission when the sum exceeds the §13.3 aggregate-weight cap
+    /// (`0.5 × root_trust`). The canonical clean-integer form is
+    /// `weight = 255 - chain_depth * 50` (saturating at 0), so a
+    /// direct grant is 255 and a depth-5 grant is 5 — see
+    /// [`TrustGrant::canonical_weight_for_depth`].
+    #[serde(default = "TrustGrant::default_weight")]
+    pub weight: u32,
+}
+
+impl TrustGrant {
+    /// Default weight for grants minted before the `weight` wire
+    /// field existed: full trust (255). wire-determinism critical —
+    /// changing this re-scores every legacy grant.
+    pub const DEFAULT_WEIGHT: u32 = 255;
+
+    /// Canonical clean-integer weight formula:
+    /// `255 - chain_depth * 50`, saturating at 0. A direct grant
+    /// (`chain_depth = 0`) is 255; a 5-hop grant is `255 - 250 = 5`;
+    /// anything deeper saturates to 0. u8/u32 integer math only — no
+    /// floats — so the value is byte-identical across every binding.
+    /// wire-determinism critical.
+    #[must_use]
+    #[allow(clippy::cast_lossless)] // u32::from is not const-stable; u8->u32 lossless
+    pub const fn canonical_weight_for_depth(chain_depth: u8) -> u32 {
+        let decay = (chain_depth as u32).saturating_mul(50);
+        Self::DEFAULT_WEIGHT.saturating_sub(decay)
+    }
+
+    /// serde default hook for the additive `weight` field.
+    #[must_use]
+    const fn default_weight() -> u32 {
+        Self::DEFAULT_WEIGHT
+    }
 }
 
 /// One peer-to-peer reachability observation within a holonomic
@@ -153,6 +214,65 @@ pub struct TopologyInputSnapshot {
     /// epoch ids. Copied verbatim into the output topology so peers
     /// can correlate computed trees to the witness state they came
     /// from.
+    pub snapshot_epoch_id: u64,
+}
+
+/// Verification state of a capacity advertisement. Topology MUST
+/// NOT score unverified ads.
+///
+/// wire-determinism critical: the verification state selects whether
+/// an ad enters scoring (filter step) and whether its self-asserted
+/// `uplink_mbps` is clamped to [`MAX_SELF_ASSERTED_UPLINK_MBPS`]
+/// (clamp step). Both are part of the v1
+/// [`compute_alm_topology_verified`] contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityVerification {
+    /// Ad's hybrid PQC signature verified against signer's known
+    /// federation key.
+    HybridSignatureValid,
+    /// Ad's signature was not validated, or validation failed.
+    /// Topology MUST treat this peer as having zero capacity.
+    Unverified,
+    /// Ad's signature verified BUT a throughput challenge has
+    /// confirmed sustained delivery at the advertised rate.
+    /// Eligible for capacity above [`MAX_SELF_ASSERTED_UPLINK_MBPS`].
+    ThroughputChallenged,
+}
+
+/// One signed capacity ad paired with its verification state. The
+/// pair is the topology function's input unit — UNVERIFIED ads do
+/// NOT enter scoring.
+#[derive(Debug, Clone)]
+pub struct VerifiedCapacityAd {
+    /// The signed advertisement itself.
+    pub ad: SignedRelayCapacity,
+    /// Where verification of `ad` stands — drives the filter +
+    /// clamp steps in [`compute_alm_topology_verified`].
+    pub verification: CapacityVerification,
+}
+
+/// Hardened input bundle for [`compute_alm_topology_verified`].
+///
+/// Mirrors [`TopologyInputSnapshot`] but pairs every capacity ad
+/// with its [`CapacityVerification`] state so the topology function
+/// can drop unverified ads and clamp self-asserted capacity in a
+/// single step BEFORE scoring.
+#[derive(Debug, Clone)]
+pub struct VerifiedTopologyInputSnapshot {
+    /// Verification-paired capacity advertisements. Ads whose
+    /// verification is [`CapacityVerification::Unverified`] are
+    /// dropped before scoring.
+    pub capacity_ads: Vec<VerifiedCapacityAd>,
+    /// Trust grants — same semantics as
+    /// [`TopologyInputSnapshot::trust_grants`].
+    pub trust_grants: Vec<TrustGrant>,
+    /// Reachability observations — same semantics as
+    /// [`TopologyInputSnapshot::reachability_observations`].
+    pub reachability_observations: Vec<ReachabilityObservation>,
+    /// Locality this topology snapshot is for.
+    pub locality_id: String,
+    /// Monotonically-increasing epoch id; copied verbatim into the
+    /// output topology.
     pub snapshot_epoch_id: u64,
 }
 
@@ -216,6 +336,43 @@ fn f32_mbps_to_millibps_u64(mbps: f32) -> u64 {
     (mbps * 1_000.0) as u64
 }
 
+/// [`MAX_SELF_ASSERTED_UPLINK_MBPS`] expressed in u64 millibits per
+/// second via the same `* 1_000` quantization
+/// [`f32_mbps_to_millibps_u64`] uses. The `1000.0 Mbps` f32 cap
+/// converts to `1_000_000` millibps here once, at the clamp
+/// boundary, so the clamp stays integer-only downstream.
+///
+/// wire-determinism critical: the float→int conversion happens
+/// exactly here and nowhere else on the clamp path. The cast is
+/// exact — `MAX_SELF_ASSERTED_UPLINK_MBPS` is a small positive whole
+/// number — so truncation / sign-loss cannot occur.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+const MAX_SELF_ASSERTED_UPLINK_MILLIBPS: u64 =
+    (MAX_SELF_ASSERTED_UPLINK_MBPS as u64).saturating_mul(1_000);
+
+/// Apply the verification-state-dependent self-asserted-capacity cap
+/// to an already-quantized uplink (millibps).
+///
+/// - [`CapacityVerification::HybridSignatureValid`]: clamp to
+///   [`MAX_SELF_ASSERTED_UPLINK_MILLIBPS`] — a signed-but-unchallenged
+///   ad cannot be the dominant unbounded term.
+/// - [`CapacityVerification::ThroughputChallenged`]: NO clamp — the
+///   advertised rate was confirmed by observed throughput.
+/// - [`CapacityVerification::Unverified`]: never reaches this helper
+///   (dropped at the filter step), but treated as `0` defensively.
+///
+/// wire-determinism critical: integer min only; no float on this path.
+#[must_use]
+fn clamp_self_asserted_millibps(uplink_millibps: u64, verification: CapacityVerification) -> u64 {
+    match verification {
+        CapacityVerification::ThroughputChallenged => uplink_millibps,
+        CapacityVerification::HybridSignatureValid => {
+            uplink_millibps.min(MAX_SELF_ASSERTED_UPLINK_MILLIBPS)
+        }
+        CapacityVerification::Unverified => 0,
+    }
+}
+
 /// The maximum capacity-score input used to normalize each candidate
 /// parent's `uplink_mbps`. Picked to comfortably exceed real-world
 /// peer uplinks (1 Gbps = 1_000_000 millibps).
@@ -276,18 +433,33 @@ fn canonical_sub_paths(child_ad: &SignedRelayCapacity) -> Vec<SubStreamPath> {
     sub_paths
 }
 
-/// Pick the highest-scoring eligible parent for a given child, or
-/// `None` if no candidate clears the trust + reachability gates.
+/// Pick the highest-scoring eligible parent for a given child on a
+/// SPECIFIC `sub_stream_path`, or `None` if no candidate clears the
+/// trust + reachability gates.
+///
+/// The capacity term reads from `parent_cap_millibps` — the
+/// per-parent uplink that has ALREADY been verification-filtered and
+/// self-assertion-clamped upstream (so this function never sees a
+/// raw lying advertisement).
+///
+/// The score is reduced by [`PENALTY_PER_SUB_PATH_DUP`] per existing
+/// subscriber the parent already carries on `candidate_sub_path`
+/// (read from `sub_path_occupancy`). This penalty drives MDC
+/// sub-streams to spread across multiple parents so a single node
+/// cannot concentrate every quadrant.
 ///
 /// wire-determinism critical: iteration is over the canonical-sorted
 /// `candidate_peers` slice, so `>` (strict) keeps the first-seen
-/// (= lex-min) parent on score ties.
+/// (= lex-min) parent on score ties; the penalty is integer
+/// arithmetic saturating at 0.
 fn best_parent_for_child(
     child_peer_id: &str,
+    candidate_sub_path: &[u8],
     candidate_peers: &[String],
-    latest_ad: &std::collections::BTreeMap<String, SignedRelayCapacity>,
+    parent_cap_millibps: &std::collections::BTreeMap<String, u64>,
     trust_min_depth: &std::collections::BTreeMap<(String, String), u8>,
     reach_min_rtt: &std::collections::BTreeMap<(String, String), u32>,
+    sub_path_occupancy: &std::collections::BTreeMap<(String, SubStreamPath), u64>,
 ) -> Option<String> {
     let mut best_score: Option<u64> = None;
     let mut best_parent: Option<String> = None;
@@ -315,17 +487,29 @@ fn best_parent_for_child(
             continue;
         }
 
-        // Score: integer weighted sum.
-        let parent_ad = &latest_ad[parent_peer_id];
-        let cap_millibps = f32_mbps_to_millibps_u64(parent_ad.capacity.uplink_mbps);
+        // Score: integer weighted sum over the already-clamped
+        // capacity, then the sub_path duplication penalty.
+        let cap_millibps = parent_cap_millibps
+            .get(parent_peer_id)
+            .copied()
+            .unwrap_or(0);
         let cap_s = normalize_capacity_score(cap_millibps);
         let trust_s = normalize_trust_score(trust_depth);
         let reach_s = normalize_reachability_score(rtt);
 
-        let score = WEIGHT_CAPACITY
+        let base = WEIGHT_CAPACITY
             .saturating_mul(cap_s)
             .saturating_add(WEIGHT_TRUST.saturating_mul(trust_s))
             .saturating_add(WEIGHT_REACHABILITY.saturating_mul(reach_s));
+
+        // sub_path_penalty = PENALTY_PER_SUB_PATH_DUP × existing
+        // subscribers at this parent on the same sub_stream_path.
+        let existing = sub_path_occupancy
+            .get(&(parent_peer_id.clone(), candidate_sub_path.to_vec()))
+            .copied()
+            .unwrap_or(0);
+        let penalty = PENALTY_PER_SUB_PATH_DUP.saturating_mul(existing);
+        let score = base.saturating_sub(penalty);
 
         match best_score {
             None => {
@@ -386,24 +570,101 @@ fn best_parent_for_child(
 /// 7. Emit the tree in canonical output order, then the unrooted set.
 #[must_use]
 pub fn compute_alm_topology(snapshot: &TopologyInputSnapshot) -> AlmTopology {
+    // Legacy entry: every ad is treated as Unverified, so it is
+    // dropped at the filter step → no candidate peers → empty tree.
+    // This is the safe (empty) default for v4.0.x callers that have
+    // not yet migrated to `compute_alm_topology_verified` — see that
+    // function for the migration path and the F-4 rationale.
+    let verified: Vec<VerifiedCapacityAd> = snapshot
+        .capacity_ads
+        .iter()
+        .cloned()
+        .map(|ad| VerifiedCapacityAd {
+            ad,
+            verification: CapacityVerification::Unverified,
+        })
+        .collect();
+    compute_core(
+        &verified,
+        &snapshot.trust_grants,
+        &snapshot.reachability_observations,
+        snapshot.snapshot_epoch_id,
+    )
+}
+
+/// Hardened ALM topology computation — the v4.1.0
+/// production-recommended entry point and the fix for the F-4
+/// universal-eclipse gap (CIRISEdge#143).
+///
+/// Consumes verification-paired capacity ads and, BEFORE scoring:
+///
+/// 1. **Filter** — drops every ad whose verification is
+///    [`CapacityVerification::Unverified`]. An unverified peer is
+///    treated as zero capacity and NEVER enters scoring, so a liar
+///    cannot win `best_parent_for_child` for anyone.
+/// 2. **Clamp** — a [`CapacityVerification::HybridSignatureValid`]
+///    ad's `uplink_mbps` is clamped to
+///    [`MAX_SELF_ASSERTED_UPLINK_MBPS`], so self-asserted capacity
+///    is no longer the dominant unbounded term. Capacity above the
+///    cap requires [`CapacityVerification::ThroughputChallenged`]
+///    (observed-throughput confirmation, not self-assertion).
+/// 3. **Sub-path distribution** — `best_parent_for_child` scores
+///    `sub_stream_path` occupancy via [`PENALTY_PER_SUB_PATH_DUP`],
+///    so MDC sub-streams spread across multiple parents instead of
+///    concentrating on one captured node.
+///
+/// Same byte-determinism contract as [`compute_alm_topology`]: two
+/// peers with byte-equal `VerifiedTopologyInputSnapshot` inputs MUST
+/// produce byte-equal [`AlmTopology`] outputs.
+#[must_use]
+pub fn compute_alm_topology_verified(snapshot: &VerifiedTopologyInputSnapshot) -> AlmTopology {
+    compute_core(
+        &snapshot.capacity_ads,
+        &snapshot.trust_grants,
+        &snapshot.reachability_observations,
+        snapshot.snapshot_epoch_id,
+    )
+}
+
+/// Shared deterministic build core for both topology entry points.
+///
+/// The verification-paired `capacity_ads` are filtered (unverified
+/// dropped) and their scored capacity is the
+/// [`clamp_self_asserted_millibps`] of the quantized `uplink_mbps`.
+/// Everything else is the v1 algorithm verbatim.
+#[allow(clippy::too_many_lines)]
+fn compute_core(
+    capacity_ads: &[VerifiedCapacityAd],
+    trust_grants: &[TrustGrant],
+    reachability_observations: &[ReachabilityObservation],
+    snapshot_epoch_id: u64,
+) -> AlmTopology {
+    // Filter step: drop Unverified ads entirely so they never enter
+    // scoring; keep the verification state alongside the surviving
+    // ads for the clamp step below.
+    let mut ads: Vec<VerifiedCapacityAd> = capacity_ads
+        .iter()
+        .filter(|v| v.verification != CapacityVerification::Unverified)
+        .cloned()
+        .collect();
+
     // Step 1: canonical-sort the capacity ads.
     // wire-determinism critical: (signed_at_unix_ms ASC,
     // advertiser_key_id lex-min). measured_at_unix_ms is the
     // publisher's mint timestamp — same key the v3.8.0 ALM-A path
     // uses for staleness, so it's the natural canonical position.
-    let mut ads: Vec<SignedRelayCapacity> = snapshot.capacity_ads.clone();
     ads.sort_by(|a, b| {
-        a.capacity
+        a.ad.capacity
             .measured_at_unix_ms
-            .cmp(&b.capacity.measured_at_unix_ms)
-            .then_with(|| a.advertiser_key_id.cmp(&b.advertiser_key_id))
+            .cmp(&b.ad.capacity.measured_at_unix_ms)
+            .then_with(|| a.ad.advertiser_key_id.cmp(&b.ad.advertiser_key_id))
     });
 
     // Step 2: locality peer set = union of reachability endpoints.
     // wire-determinism critical: BTreeSet keeps iteration in lex
     // order without an explicit sort step.
     let mut locality_peers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for obs in &snapshot.reachability_observations {
+    for obs in reachability_observations {
         locality_peers.insert(obs.from_peer_id.clone());
         locality_peers.insert(obs.to_peer_id.clone());
     }
@@ -412,7 +673,7 @@ pub fn compute_alm_topology(snapshot: &TopologyInputSnapshot) -> AlmTopology {
     // beyond MAX_TRUST_CHAIN_DEPTH at insert time.
     let mut trust_min_depth: std::collections::BTreeMap<(String, String), u8> =
         std::collections::BTreeMap::new();
-    for g in &snapshot.trust_grants {
+    for g in trust_grants {
         if g.chain_depth > MAX_TRUST_CHAIN_DEPTH {
             continue;
         }
@@ -430,7 +691,7 @@ pub fn compute_alm_topology(snapshot: &TopologyInputSnapshot) -> AlmTopology {
     // Step 4: reachability lookup, min over observed_rtt_ms.
     let mut reach_min_rtt: std::collections::BTreeMap<(String, String), u32> =
         std::collections::BTreeMap::new();
-    for o in &snapshot.reachability_observations {
+    for o in reachability_observations {
         let key = (o.from_peer_id.clone(), o.to_peer_id.clone());
         reach_min_rtt
             .entry(key)
@@ -448,38 +709,62 @@ pub fn compute_alm_topology(snapshot: &TopologyInputSnapshot) -> AlmTopology {
     // and overwriting gives us the latest ad per peer; ties on
     // timestamp resolve by advertiser_key_id lex-min (same canonical
     // key everywhere).
-    let mut latest_ad: std::collections::BTreeMap<String, SignedRelayCapacity> =
+    let mut latest_ad: std::collections::BTreeMap<String, VerifiedCapacityAd> =
         std::collections::BTreeMap::new();
     for ad in &ads {
         // Locality filter: peer must appear in locality_peers.
-        if !locality_peers.contains(&ad.advertiser_key_id) {
+        if !locality_peers.contains(&ad.ad.advertiser_key_id) {
             continue;
         }
-        latest_ad.insert(ad.advertiser_key_id.clone(), ad.clone());
+        latest_ad.insert(ad.ad.advertiser_key_id.clone(), ad.clone());
     }
+
+    // Clamp step: quantize each surviving ad's self-asserted
+    // uplink and apply the verification-state cap ONCE, here, so the
+    // scored capacity feeding `best_parent_for_child` is already
+    // bounded. wire-determinism critical: BTreeMap iteration is lex.
+    let parent_cap_millibps: std::collections::BTreeMap<String, u64> = latest_ad
+        .iter()
+        .map(|(peer_id, v)| {
+            let quantized = f32_mbps_to_millibps_u64(v.ad.capacity.uplink_mbps);
+            (
+                peer_id.clone(),
+                clamp_self_asserted_millibps(quantized, v.verification),
+            )
+        })
+        .collect();
 
     // The candidate peer set for THIS topology = peers that (a) appear
     // in the locality and (b) have at least one valid ad.
     let candidate_peers: Vec<String> = latest_ad.keys().cloned().collect();
 
     // Step 5 + 6: greedy assignment in canonical child order.
-    // wire-determinism critical: BTreeMap iteration is lex order.
+    // wire-determinism critical: BTreeMap iteration is lex order. As
+    // edges are assigned we accrue `(parent, sub_path) → count` so
+    // later assignments see the running MDC occupancy and diversify.
     let mut tree: Vec<AlmEdge> = Vec::new();
     let mut unrooted: Vec<String> = Vec::new();
+    let mut sub_path_occupancy: std::collections::BTreeMap<(String, SubStreamPath), u64> =
+        std::collections::BTreeMap::new();
 
     for child_peer_id in &candidate_peers {
-        let child_ad = &latest_ad[child_peer_id];
+        let child_ad = &latest_ad[child_peer_id].ad;
         let sub_paths = canonical_sub_paths(child_ad);
 
         let mut any_rooted_for_child = false;
         for sub_path in &sub_paths {
             if let Some(parent) = best_parent_for_child(
                 child_peer_id,
+                sub_path,
                 &candidate_peers,
-                &latest_ad,
+                &parent_cap_millibps,
                 &trust_min_depth,
                 &reach_min_rtt,
+                &sub_path_occupancy,
             ) {
+                *sub_path_occupancy
+                    .entry((parent.clone(), sub_path.clone()))
+                    .or_insert(0) += 1;
                 tree.push(AlmEdge {
                     parent_peer_id: parent,
                     child_peer_id: child_peer_id.clone(),
@@ -494,13 +779,16 @@ pub fn compute_alm_topology(snapshot: &TopologyInputSnapshot) -> AlmTopology {
         }
     }
 
-    // Peers with capacity ads that we excluded at the locality filter
-    // step are also unrooted — they were never candidates.
-    for ad in &snapshot.capacity_ads {
-        if !locality_peers.contains(&ad.advertiser_key_id)
-            && !unrooted.contains(&ad.advertiser_key_id)
+    // Peers with surviving (verified) capacity ads that we excluded at
+    // the locality filter step are also unrooted — they were never
+    // candidates. Unverified-dropped peers are NOT listed here: they
+    // never entered scoring, matching the "treat as zero capacity"
+    // contract (the legacy entry therefore yields an empty topology).
+    for ad in &ads {
+        if !locality_peers.contains(&ad.ad.advertiser_key_id)
+            && !unrooted.contains(&ad.ad.advertiser_key_id)
         {
-            unrooted.push(ad.advertiser_key_id.clone());
+            unrooted.push(ad.ad.advertiser_key_id.clone());
         }
     }
 
@@ -519,7 +807,7 @@ pub fn compute_alm_topology(snapshot: &TopologyInputSnapshot) -> AlmTopology {
     AlmTopology {
         tree,
         unrooted_peers: unrooted,
-        snapshot_epoch_id: snapshot.snapshot_epoch_id,
+        snapshot_epoch_id,
         topology_version: TOPOLOGY_VERSION,
     }
 }
@@ -572,6 +860,33 @@ mod tests {
         }
     }
 
+    /// Wrap a legacy `TopologyInputSnapshot` into a verified one,
+    /// stamping every ad with the SAME `verification`. Lets the
+    /// migrated tests reuse the existing snapshot builders.
+    fn verified(
+        snap: &TopologyInputSnapshot,
+        verification: CapacityVerification,
+    ) -> VerifiedTopologyInputSnapshot {
+        VerifiedTopologyInputSnapshot {
+            capacity_ads: snap
+                .capacity_ads
+                .iter()
+                .cloned()
+                .map(|ad| VerifiedCapacityAd { ad, verification })
+                .collect(),
+            trust_grants: snap.trust_grants.clone(),
+            reachability_observations: snap.reachability_observations.clone(),
+            locality_id: snap.locality_id.clone(),
+            snapshot_epoch_id: snap.snapshot_epoch_id,
+        }
+    }
+
+    /// All-`HybridSignatureValid` verified snapshot — the common case
+    /// for the migrated determinism / scoring tests.
+    fn all_valid(snap: &TopologyInputSnapshot) -> VerifiedTopologyInputSnapshot {
+        verified(snap, CapacityVerification::HybridSignatureValid)
+    }
+
     fn three_peer_snapshot() -> TopologyInputSnapshot {
         // Three peers in a triangle, all observe each other, all
         // grant each other directly. peer-a has the highest uplink,
@@ -595,6 +910,7 @@ mod tests {
                     grantee_peer_id: t.to_string(),
                     granted_at_unix_ms: 1_700_000_000_000,
                     chain_depth: 0,
+                    weight: TrustGrant::DEFAULT_WEIGHT,
                 });
                 reach.push(ReachabilityObservation {
                     from_peer_id: g.to_string(),
@@ -616,9 +932,9 @@ mod tests {
 
     #[test]
     fn same_input_same_output() {
-        let snap = three_peer_snapshot();
-        let a = compute_alm_topology(&snap);
-        let b = compute_alm_topology(&snap);
+        let snap = all_valid(&three_peer_snapshot());
+        let a = compute_alm_topology_verified(&snap);
+        let b = compute_alm_topology_verified(&snap);
         let a_bytes = serde_json::to_vec(&a).expect("serialize a");
         let b_bytes = serde_json::to_vec(&b).expect("serialize b");
         assert_eq!(a_bytes, b_bytes, "deterministic byte-equal output");
@@ -628,67 +944,70 @@ mod tests {
         assert!(!a.tree.is_empty(), "three rooted peers expected");
     }
 
+    /// `wire_determinism_under_permutation` — the v3.10.0 property:
+    /// input ads in any order MUST yield byte-equal output. Verified
+    /// across ad reverse/rotate plus reachability + trust permutes.
     #[test]
-    fn permuted_capacity_ads_same_output() {
-        let snap = three_peer_snapshot();
-        let baseline = compute_alm_topology(&snap);
+    fn wire_determinism_under_permutation() {
+        let base = three_peer_snapshot();
+        let baseline = compute_alm_topology_verified(&all_valid(&base));
 
-        // Reverse order.
-        let mut permuted = snap.clone();
-        permuted.capacity_ads.reverse();
-        let p = compute_alm_topology(&permuted);
+        // Reverse capacity ads.
+        let mut p = base.clone();
+        p.capacity_ads.reverse();
         assert_eq!(
             serde_json::to_vec(&baseline).unwrap(),
-            serde_json::to_vec(&p).unwrap(),
+            serde_json::to_vec(&compute_alm_topology_verified(&all_valid(&p))).unwrap(),
             "ad permutation MUST NOT change output"
         );
 
-        // Rotate.
-        let mut permuted2 = snap.clone();
-        permuted2.capacity_ads.rotate_left(1);
-        let p2 = compute_alm_topology(&permuted2);
+        // Rotate capacity ads.
+        let mut p2 = base.clone();
+        p2.capacity_ads.rotate_left(1);
         assert_eq!(
             serde_json::to_vec(&baseline).unwrap(),
-            serde_json::to_vec(&p2).unwrap(),
+            serde_json::to_vec(&compute_alm_topology_verified(&all_valid(&p2))).unwrap(),
             "ad rotation MUST NOT change output"
         );
-    }
 
-    #[test]
-    fn permuted_reachability_same_output() {
-        let snap = three_peer_snapshot();
-        let baseline = compute_alm_topology(&snap);
-
-        let mut permuted = snap.clone();
-        permuted.reachability_observations.reverse();
-        let p = compute_alm_topology(&permuted);
+        // Permute reachability observations.
+        let mut p3 = base.clone();
+        p3.reachability_observations.reverse();
         assert_eq!(
             serde_json::to_vec(&baseline).unwrap(),
-            serde_json::to_vec(&p).unwrap(),
+            serde_json::to_vec(&compute_alm_topology_verified(&all_valid(&p3))).unwrap(),
             "reachability permutation MUST NOT change output"
         );
 
-        // Also permute trust_grants for good measure.
-        let mut permuted2 = snap.clone();
-        permuted2.trust_grants.reverse();
-        let p2 = compute_alm_topology(&permuted2);
+        // Permute trust grants.
+        let mut p4 = base.clone();
+        p4.trust_grants.reverse();
         assert_eq!(
             serde_json::to_vec(&baseline).unwrap(),
-            serde_json::to_vec(&p2).unwrap(),
+            serde_json::to_vec(&compute_alm_topology_verified(&all_valid(&p4))).unwrap(),
             "trust permutation MUST NOT change output"
+        );
+
+        // Permute the verification-paired ad vector directly.
+        let mut v = all_valid(&base);
+        v.capacity_ads.reverse();
+        assert_eq!(
+            serde_json::to_vec(&baseline).unwrap(),
+            serde_json::to_vec(&compute_alm_topology_verified(&v)).unwrap(),
+            "verified-ad permutation MUST NOT change output"
         );
     }
 
     #[test]
     fn empty_snapshot_returns_empty_topology() {
-        let snap = TopologyInputSnapshot {
+        let snap = VerifiedTopologyInputSnapshot {
             capacity_ads: vec![],
             trust_grants: vec![],
             reachability_observations: vec![],
             locality_id: "loc-empty".to_string(),
             snapshot_epoch_id: 7,
         };
-        let topo = compute_alm_topology(&snap);
+        let topo = compute_alm_topology_verified(&snap);
         assert!(topo.tree.is_empty());
         assert!(topo.unrooted_peers.is_empty());
         assert_eq!(topo.snapshot_epoch_id, 7);
@@ -711,12 +1030,14 @@ mod tests {
                 grantee_peer_id: "peer-b".into(),
                 granted_at_unix_ms: 1_700_000_000_000,
                 chain_depth: 0,
+                weight: TrustGrant::DEFAULT_WEIGHT,
             },
             TrustGrant {
                 granter_peer_id: "peer-b".into(),
                 grantee_peer_id: "peer-a".into(),
                 granted_at_unix_ms: 1_700_000_000_000,
                 chain_depth: 0,
+                weight: TrustGrant::DEFAULT_WEIGHT,
             },
         ];
         let reach = vec![
@@ -741,7 +1062,7 @@ mod tests {
             locality_id: "loc-1".into(),
             snapshot_epoch_id: 99,
         };
-        let topo = compute_alm_topology(&snap);
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
 
         assert!(
             topo.unrooted_peers.contains(&"peer-x".to_string()),
@@ -768,6 +1089,7 @@ mod tests {
             grantee_peer_id: "peer-b".into(),
             granted_at_unix_ms: 1_700_000_000_000,
             chain_depth: MAX_TRUST_CHAIN_DEPTH + 1,
+            weight: TrustGrant::DEFAULT_WEIGHT,
         }];
         let reach = vec![
             ReachabilityObservation {
@@ -791,7 +1113,7 @@ mod tests {
             locality_id: "loc-1".into(),
             snapshot_epoch_id: 1,
         };
-        let topo = compute_alm_topology(&snap);
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
 
         // No edges at all (no usable trust grants in either
         // direction).
@@ -826,6 +1148,7 @@ mod tests {
                     grantee_peer_id: t.into(),
                     granted_at_unix_ms: 1_700_000_000_000,
                     chain_depth: 0,
+                    weight: TrustGrant::DEFAULT_WEIGHT,
                 });
                 reach.push(ReachabilityObservation {
                     from_peer_id: g.into(),
@@ -843,7 +1166,7 @@ mod tests {
             locality_id: "loc-tie".into(),
             snapshot_epoch_id: 8,
         };
-        let topo = compute_alm_topology(&snap);
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
 
         let child_edge = topo
             .tree
@@ -882,12 +1205,14 @@ mod tests {
                 grantee_peer_id: "peer-child".into(),
                 granted_at_unix_ms: 1_700_000_000_000,
                 chain_depth: 0,
+                weight: TrustGrant::DEFAULT_WEIGHT,
             },
             TrustGrant {
                 granter_peer_id: "peer-child".into(),
                 grantee_peer_id: "peer-a".into(),
                 granted_at_unix_ms: 1_700_000_000_000,
                 chain_depth: 0,
+                weight: TrustGrant::DEFAULT_WEIGHT,
             },
         ];
         let reach = vec![
@@ -912,7 +1237,7 @@ mod tests {
             locality_id: "loc-mdc".into(),
             snapshot_epoch_id: 11,
         };
-        let topo = compute_alm_topology(&snap);
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
 
         // Two MDC edges for peer-child.
         let child_edges: Vec<&AlmEdge> = topo
@@ -932,5 +1257,235 @@ mod tests {
         for e in &child_edges {
             assert_eq!(e.parent_peer_id, "peer-a");
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // F-4 hardening — verification filter, self-assertion clamp,
+    // sub_path distribution (CIRISEdge#143).
+    // ─────────────────────────────────────────────────────────────
+
+    /// Snapshot with 5 ads, 2 unverified → topology built from only
+    /// the 3 verified peers; the 2 unverified peers never enter
+    /// scoring (zero capacity) and so never appear as parents.
+    #[test]
+    fn unverified_ads_dropped_before_scoring() {
+        let peers = ["peer-a", "peer-b", "peer-c", "peer-d", "peer-e"];
+        let ads: Vec<SignedRelayCapacity> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| fake_signed_ad(p, 100.0, 1_700_000_000_000 + i as u64 * 100, vec![]))
+            .collect();
+        let mut grants = Vec::new();
+        let mut reach = Vec::new();
+        for &g in &peers {
+            for &t in &peers {
+                if g == t {
+                    continue;
+                }
+                grants.push(TrustGrant {
+                    granter_peer_id: g.into(),
+                    grantee_peer_id: t.into(),
+                    granted_at_unix_ms: 1_700_000_000_000,
+                    chain_depth: 0,
+                    weight: TrustGrant::DEFAULT_WEIGHT,
+                });
+                reach.push(ReachabilityObservation {
+                    from_peer_id: g.into(),
+                    to_peer_id: t.into(),
+                    observed_rtt_ms: 50,
+                    observed_at_unix_ms: 1_700_000_000_000,
+                });
+            }
+        }
+
+        // peer-d and peer-e are Unverified → dropped.
+        let capacity_ads: Vec<VerifiedCapacityAd> = ads
+            .into_iter()
+            .map(|ad| {
+                let verification =
+                    if ad.advertiser_key_id == "peer-d" || ad.advertiser_key_id == "peer-e" {
+                        CapacityVerification::Unverified
+                    } else {
+                        CapacityVerification::HybridSignatureValid
+                    };
+                VerifiedCapacityAd { ad, verification }
+            })
+            .collect();
+
+        let snap = VerifiedTopologyInputSnapshot {
+            capacity_ads,
+            trust_grants: grants,
+            reachability_observations: reach,
+            locality_id: "loc-drop".into(),
+            snapshot_epoch_id: 5,
+        };
+        let topo = compute_alm_topology_verified(&snap);
+
+        // Only the 3 verified peers may appear as parent or child.
+        for edge in &topo.tree {
+            for id in [&edge.parent_peer_id, &edge.child_peer_id] {
+                assert!(
+                    ["peer-a", "peer-b", "peer-c"].contains(&id.as_str()),
+                    "unverified peer {id} leaked into the tree: {topo:?}"
+                );
+            }
+        }
+        // Exactly the 3 verified peers are rooted.
+        let rooted: std::collections::BTreeSet<&str> =
+            topo.tree.iter().map(|e| e.child_peer_id.as_str()).collect();
+        assert_eq!(rooted, ["peer-a", "peer-b", "peer-c"].into_iter().collect());
+        // The dropped peers do NOT appear anywhere — not even unrooted
+        // (they never entered scoring).
+        assert!(!topo.unrooted_peers.contains(&"peer-d".to_string()));
+        assert!(!topo.unrooted_peers.contains(&"peer-e".to_string()));
+    }
+
+    /// A peer advertising 10 Gbps with only a HybridSignatureValid ad
+    /// is clamped to 1 Gbps for scoring — it does NOT out-score a
+    /// peer advertising exactly the cap.
+    #[test]
+    fn clamped_capacity_at_max_self_asserted() {
+        // 10 Gbps = 10_000 Mbps → 10_000_000 millibps quantized.
+        let ten_gbps = f32_mbps_to_millibps_u64(10_000.0);
+        assert_eq!(ten_gbps, 10_000_000);
+        // HybridSignatureValid clamps to 1 Gbps = 1000 Mbps =
+        // 1_000_000 millibps.
+        let clamped =
+            clamp_self_asserted_millibps(ten_gbps, CapacityVerification::HybridSignatureValid);
+        assert_eq!(clamped, 1_000_000, "10 Gbps self-asserted clamps to 1 Gbps");
+        // An honest 1 Gbps peer quantizes to the same value → after
+        // clamp the liar gains nothing.
+        let honest = f32_mbps_to_millibps_u64(1000.0);
+        assert_eq!(
+            clamp_self_asserted_millibps(honest, CapacityVerification::HybridSignatureValid),
+            clamped,
+            "clamped liar ties an honest 1 Gbps peer"
+        );
+    }
+
+    /// A ThroughputChallenged ad advertising 10 Gbps is NOT clamped —
+    /// observed-throughput confirmation lets it exceed the
+    /// self-assertion cap.
+    #[test]
+    fn throughput_challenged_uncapped() {
+        let ten_gbps = f32_mbps_to_millibps_u64(10_000.0);
+        let challenged =
+            clamp_self_asserted_millibps(ten_gbps, CapacityVerification::ThroughputChallenged);
+        assert_eq!(challenged, 10_000_000, "throughput-challenged is uncapped");
+        assert!(
+            challenged
+                > clamp_self_asserted_millibps(
+                    ten_gbps,
+                    CapacityVerification::HybridSignatureValid
+                ),
+            "challenged out-scores merely-signed for the same advertisement"
+        );
+    }
+
+    /// Many children competing for the SAME MDC quadrant spread across
+    /// distinct equally-good parents — the [`PENALTY_PER_SUB_PATH_DUP`]
+    /// drives diversification instead of concentrating every sub-stream
+    /// subscriber on the lex-min parent (the F-4 concentration vector).
+    #[test]
+    fn sub_path_penalty_distributes_mdc() {
+        let parents = ["par-1", "par-2", "par-3", "par-4"];
+        let children = ["kid-1", "kid-2", "kid-3", "kid-4"];
+
+        let mut ads: Vec<SignedRelayCapacity> = parents
+            .iter()
+            .enumerate()
+            .map(|(i, p)| fake_signed_ad(p, 100.0, 1_700_000_000_000 + i as u64, vec![]))
+            .collect();
+        for (i, c) in children.iter().enumerate() {
+            ads.push(fake_signed_ad(
+                c,
+                10.0,
+                1_700_000_010_000 + i as u64,
+                vec![SubStreamCommitment {
+                    sub_stream_path: vec![0],
+                    uplink_budget_mbps: 5.0,
+                    max_subscribers: 4,
+                }],
+            ));
+        }
+
+        // Every peer grants + reaches every other equally, so the only
+        // differentiator is the sub_path duplication penalty.
+        let mut grants = Vec::new();
+        let mut reach = Vec::new();
+        let all: Vec<&str> = parents.iter().chain(children.iter()).copied().collect();
+        for &g in &all {
+            for &t in &all {
+                if g == t {
+                    continue;
+                }
+                grants.push(TrustGrant {
+                    granter_peer_id: g.into(),
+                    grantee_peer_id: t.into(),
+                    granted_at_unix_ms: 1_700_000_000_000,
+                    chain_depth: 0,
+                    weight: TrustGrant::DEFAULT_WEIGHT,
+                });
+                reach.push(ReachabilityObservation {
+                    from_peer_id: g.into(),
+                    to_peer_id: t.into(),
+                    observed_rtt_ms: 50,
+                    observed_at_unix_ms: 1_700_000_000_000,
+                });
+            }
+        }
+
+        let snap = TopologyInputSnapshot {
+            capacity_ads: ads,
+            trust_grants: grants,
+            reachability_observations: reach,
+            locality_id: "loc-mdc-dist".into(),
+            snapshot_epoch_id: 77,
+        };
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
+
+        // Each child rooted on path [0]; collect the chosen parents.
+        let chosen: Vec<&str> = children
+            .iter()
+            .map(|c| {
+                topo.tree
+                    .iter()
+                    .find(|e| e.child_peer_id == *c && e.sub_stream_path == vec![0u8])
+                    .unwrap_or_else(|| panic!("{c} should be rooted on path [0]: {topo:?}"))
+                    .parent_peer_id
+                    .as_str()
+            })
+            .collect();
+
+        // Four children land on four DISTINCT parents — the penalty
+        // fully diversified the quadrant's subscribers.
+        let distinct: std::collections::BTreeSet<&str> = chosen.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "sub_path penalty must spread 4 same-quadrant subscribers across 4 parents: {chosen:?}"
+        );
+    }
+
+    /// Legacy entry (`compute_alm_topology`) treats every ad as
+    /// Unverified, so it returns an EMPTY topology — the safe default
+    /// for v4.0.x callers that have not migrated to
+    /// [`compute_alm_topology_verified`].
+    #[test]
+    fn existing_compute_alm_topology_treats_all_as_unverified() {
+        let snap = three_peer_snapshot();
+        let topo = compute_alm_topology(&snap);
+        assert!(
+            topo.tree.is_empty(),
+            "legacy entry must yield an empty tree (all ads Unverified): {topo:?}"
+        );
+        // Unverified ads never enter scoring, so dropped peers are not
+        // even listed as unrooted.
+        assert!(
+            topo.unrooted_peers.is_empty(),
+            "legacy entry roots nobody and lists nobody: {topo:?}"
+        );
+        assert_eq!(topo.topology_version, TOPOLOGY_VERSION);
+        assert_eq!(topo.snapshot_epoch_id, 42);
     }
 }

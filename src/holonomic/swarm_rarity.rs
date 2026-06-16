@@ -404,6 +404,270 @@ pub fn compute_rarity_score(
     RarityScore(count)
 }
 
+/// Consent state for a given `content_id`. Mirrors the CEG §3.2.3
+/// consent surface; this is the substrate-side projection that rarity
+/// scoring consults. Sourced by the caller — the substrate resolves a
+/// `content_id`'s CEG consent state (active grant, withdraw, or
+/// unobserved) and hands it to [`compute_consent_aware_rarity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentState {
+    /// Producer has explicitly granted retention (active consent).
+    /// Rarity scoring applies normally.
+    Active,
+    /// Producer or subject has revoked. Content is EVICT-ELIGIBLE
+    /// regardless of rarity. Per §3.2.3 right-to-be-forgotten.
+    Revoked,
+    /// Unknown / unobserved consent state. Per fail-secure: NOT
+    /// retained-as-rare. Treat as evict-eligible to avoid the
+    /// "absent-evidence is consent" antipattern.
+    Unknown,
+}
+
+/// Holding-claim verification gate. A claim counts toward rarity only
+/// when its possession is challengeable (or has been verified). The
+/// weights are wire-determinism-critical — see [`claim_weight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldingClaimVerification {
+    /// Claim's hybrid PQC signature verified AND a possession
+    /// challenge (e.g. a fresh symbol-hash challenge-response) has
+    /// been answered correctly within the trust horizon.
+    PossessionVerified,
+    /// Claim's signature is valid but possession has not been
+    /// challenged (or the challenge is pending). Counts toward rarity
+    /// at DISCOUNTED weight (1/2) to bound the lying-holder
+    /// force-evict surface.
+    SignatureOnly,
+    /// Claim's signature is invalid or missing. Does NOT count.
+    Unverified,
+}
+
+/// Output of [`compute_consent_aware_rarity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentAwareRarity {
+    /// Rare and consent-active. Retain at high priority.
+    RetainRare(RarityScore),
+    /// Not-rare OR rare but consent-revoked OR consent-unknown.
+    /// Evict-eligible.
+    EvictEligible(EvictionReason),
+}
+
+/// Why a `(content_id, symbol_id)` tuple is evict-eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionReason {
+    /// Content is NOT rare (enough verified-weight holders elsewhere).
+    NotRare,
+    /// Consent state is Revoked — §3.2.3 right-to-be-forgotten.
+    ConsentRevoked,
+    /// Consent state is Unknown — fail-secure default.
+    ConsentUnknown,
+}
+
+/// Locked-v1 possession-verified holding-claim weight.
+///
+/// **Wire-determinism-critical**: these three weights
+/// (possession=2 / signature_only=1 / unverified=0) will appear in
+/// CEG 1.0 §R conformance vectors. Two peers MUST reach the same
+/// weighted holder count from the same `(claim, verification)` set, so
+/// the weights are integer-only and locked. Changing any of them is a
+/// coordinated wire break alongside [`HOLDING_CLAIM_VERSION`].
+pub const HOLDING_WEIGHT_POSSESSION_VERIFIED: u32 = 2;
+
+/// Locked-v1 signature-only holding-claim weight (half of
+/// possession-verified, integer-floored). See
+/// [`HOLDING_WEIGHT_POSSESSION_VERIFIED`].
+pub const HOLDING_WEIGHT_SIGNATURE_ONLY: u32 = 1;
+
+/// Locked-v1 unverified holding-claim weight — does NOT count. See
+/// [`HOLDING_WEIGHT_POSSESSION_VERIFIED`].
+pub const HOLDING_WEIGHT_UNVERIFIED: u32 = 0;
+
+/// The locked-v1 integer weight a claim contributes to the weighted
+/// holder count, by verification state.
+///
+/// possession=2 / signature_only=1 / unverified=0. Wire-determinism-
+/// critical (CEG 1.0 §R conformance vectors).
+#[must_use]
+pub const fn claim_weight(v: HoldingClaimVerification) -> u32 {
+    match v {
+        HoldingClaimVerification::PossessionVerified => HOLDING_WEIGHT_POSSESSION_VERIFIED,
+        HoldingClaimVerification::SignatureOnly => HOLDING_WEIGHT_SIGNATURE_ONLY,
+        HoldingClaimVerification::Unverified => HOLDING_WEIGHT_UNVERIFIED,
+    }
+}
+
+/// Consent-aware rarity computation. Composes the §3.2.3 consent gate,
+/// the possession-challengeability discount, and the rarity threshold
+/// drawn from [`crate::holonomic::fountain_defaults::DEFAULT_TARGET_HOLDERS`].
+///
+/// `claims_with_verification`: each holding claim paired with its
+/// verification state. Unverified claims do NOT count; signature-only
+/// claims count at HALF weight (the v1 weights are
+/// possession=2 / signature_only=1 / unverified=0 — integer-floored,
+/// no floats). Each DISTINCT peer (by `peer_id`) contributes the
+/// weight of its strongest verification state for this tuple; multiple
+/// claims from one peer do not multiply its contribution.
+///
+/// `consent`: the substrate's projection of the content's CEG consent
+/// state. Revoked or Unknown short-circuits to
+/// [`ConsentAwareRarity::EvictEligible`] regardless of rarity.
+///
+/// **Rarity verdict**: the weighted holder count is compared to the
+/// recommended `target_holders` survival floor. Below the floor ⇒
+/// rare ⇒ [`ConsentAwareRarity::RetainRare`] (the swarm has too few
+/// verified holders; keep this symbol). At-or-above ⇒ enough verified
+/// holders elsewhere ⇒ [`EvictionReason::NotRare`].
+///
+/// The returned [`RarityScore`] on the `RetainRare` arm carries the
+/// WEIGHTED holder count (not the raw distinct-peer count from
+/// [`compute_rarity_score`]) so the inverted-but-determinstic
+/// "lower = rarer = keep" ordering still holds under the weighting.
+#[must_use]
+pub fn compute_consent_aware_rarity(
+    content_id: &str,
+    symbol_id: u32,
+    claims_with_verification: &[(FountainHoldingClaim, HoldingClaimVerification)],
+    consent: ConsentState,
+) -> ConsentAwareRarity {
+    // CEG N6: consent_revoked OR consent_unknown SHORT-CIRCUITS to
+    // EvictEligible regardless of rarity score. The §3.2.3 right-to-be-
+    // forgotten gate dominates rarity — preserving the maximum-rare
+    // score for a withdrawn item is the exact inversion to avoid.
+    match consent {
+        ConsentState::Revoked => {
+            return ConsentAwareRarity::EvictEligible(EvictionReason::ConsentRevoked);
+        }
+        // Fail-secure: absent consent is NOT rarity protection. An
+        // unobserved content_id must be evict-eligible, never retained-
+        // as-rare on the strength of missing evidence.
+        ConsentState::Unknown => {
+            return ConsentAwareRarity::EvictEligible(EvictionReason::ConsentUnknown);
+        }
+        ConsentState::Active => {}
+    }
+
+    // CEG N7: each distinct peer contributes the weight of its STRONGEST
+    // verification state for this tuple. A peer that publishes both an
+    // unverified and a possession-verified claim counts as
+    // possession-verified — and only once. Self-asserted (Unverified)
+    // claims contribute weight 0, so they can NEVER lower another peer's
+    // retention priority (the lying-holder force-evict surface is
+    // closed at the weight gate).
+    let mut peer_weight: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for (claim, verification) in claims_with_verification {
+        if claim.content_id != content_id {
+            continue;
+        }
+        if !claim.symbol_ids.contains(&symbol_id) {
+            continue;
+        }
+        let w = claim_weight(*verification);
+        let slot = peer_weight.entry(claim.peer_id.as_str()).or_insert(0);
+        if w > *slot {
+            *slot = w;
+        }
+    }
+    let weighted_count: u32 = peer_weight
+        .values()
+        .copied()
+        .try_fold(0u32, u32::checked_add)
+        .unwrap_or(u32::MAX);
+
+    // Rare iff the weighted holder count is below the recommended
+    // survival floor. At-or-above the floor, enough verified holders
+    // exist elsewhere that local eviction does not threaten the swarm.
+    if weighted_count < crate::holonomic::fountain_defaults::DEFAULT_TARGET_HOLDERS {
+        ConsentAwareRarity::RetainRare(RarityScore(weighted_count))
+    } else {
+        ConsentAwareRarity::EvictEligible(EvictionReason::NotRare)
+    }
+}
+
+/// Verify a single fountain symbol against the signed manifest's
+/// `symbol_hashes[symbol_id]`. Returns `true` iff
+/// `lowercase_hex(SHA-256(symbol_bytes)) == manifest_symbol_hashes[symbol_id]`.
+///
+/// Reconstruction MUST call this for every symbol before trusting it
+/// (CEG N7 — substrate honesty: never silently accept unverified bytes
+/// from the swarm). An out-of-bounds `symbol_id` returns `false` (a
+/// symbol the manifest does not describe cannot be verified, so it is
+/// not trusted).
+#[must_use]
+pub fn verify_symbol_against_manifest(
+    symbol_bytes: &[u8],
+    symbol_id: u32,
+    manifest_symbol_hashes: &[String],
+) -> bool {
+    use sha2::{Digest, Sha256};
+    let Ok(idx) = usize::try_from(symbol_id) else {
+        return false;
+    };
+    let Some(expected) = manifest_symbol_hashes.get(idx) else {
+        return false;
+    };
+    let digest = Sha256::digest(symbol_bytes);
+    let mut actual = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(actual, "{byte:02x}");
+    }
+    // Constant-discipline string compare — these are public digests,
+    // not secrets, so a plain `==` is correct here.
+    actual == *expected
+}
+
+/// Failure of the §8.1.11.3 fountain hard-delete path.
+#[derive(thiserror::Error, Debug)]
+pub enum FountainEvictError {
+    /// The persist-tier hard-delete call failed. Carries the
+    /// implementation's error string so the policy layer can log /
+    /// retry; the deletion SLA is NOT satisfied until this returns
+    /// `Ok`.
+    #[error("fountain hard-delete failed: {0}")]
+    HardDeleteFailed(String),
+}
+
+/// §8.1.11.3 N5 deletion-SLA wiring (CIRISEdge#145 / persist v8.1.0).
+///
+/// The substrate-side trait the higher tiers implement against
+/// persist's `evict_fountain_content_hard_delete(content_id,
+/// corpus_kind)` API. Edge's policy layer calls into a
+/// `dyn FountainEvictHardDelete` when it observes a withdraw or a
+/// `consent:state:revoked` for a fountain `content_id`.
+///
+/// Call THIS — not a tier-T5 eviction (`evict_fountain_content_to_tier`)
+/// — on revoke. The persist hard-delete path is structurally immune to
+/// the rarity reweight in #134: no `retention_priority` value can
+/// resurrect a hard-deleted content, which closes the inversion where a
+/// maximally-rare score would otherwise pin a withdrawn item in cache.
+///
+/// # Producer-side N5 rule
+///
+/// Do NOT emit a [`FountainHoldingClaim`] for revoked content, and do
+/// NOT count revoked content toward rarity (see [`ConsentState::Revoked`]
+/// short-circuiting in [`compute_consent_aware_rarity`]). Hard-delete is
+/// the terminal step AFTER the claim/rarity surfaces have already
+/// stopped advertising the content.
+///
+/// `corpus_kind` selects the persist corpus the `content_id` lives in
+/// (the same discriminator persist's eviction API takes); edge passes
+/// it through opaquely.
+pub trait FountainEvictHardDelete {
+    /// Hard-delete `content_id` from the `corpus_kind` corpus per the
+    /// §8.1.11.3 deletion SLA. Returns `Ok(())` once the content is
+    /// irrecoverably removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FountainEvictError::HardDeleteFailed`] if the
+    /// underlying persist call fails — the deletion SLA is unmet until
+    /// a subsequent call returns `Ok`.
+    fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<(), FountainEvictError>;
+}
+
 fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
     out.extend_from_slice(bytes);
@@ -604,5 +868,251 @@ mod tests {
         let pre = FountainHoldingClaim::new("p", "X", vec![1, 2, 3], 0).canonical_bytes();
         let arb = FountainHoldingClaim::new("p", "X", vec![3, 1, 2], 0).canonical_bytes();
         assert_eq!(pre, arb);
+    }
+
+    // ---- F-3: consent-aware rarity + possession-challengeable claims ----
+
+    use crate::holonomic::fountain_defaults::DEFAULT_TARGET_HOLDERS;
+
+    fn vclaim(
+        peer: &str,
+        content: &str,
+        syms: Vec<u32>,
+        v: HoldingClaimVerification,
+    ) -> (FountainHoldingClaim, HoldingClaimVerification) {
+        (FountainHoldingClaim::new(peer, content, syms, 1_000_000), v)
+    }
+
+    #[test]
+    fn consent_active_rare_returns_retain_rare() {
+        // One possession-verified holder (weight 2) — far below the
+        // target_holders floor ⇒ rare ⇒ RetainRare.
+        let claims = vec![vclaim(
+            "peer-a",
+            "X",
+            vec![1],
+            HoldingClaimVerification::PossessionVerified,
+        )];
+        let out = compute_consent_aware_rarity("X", 1, &claims, ConsentState::Active);
+        assert_eq!(
+            out,
+            ConsentAwareRarity::RetainRare(RarityScore(HOLDING_WEIGHT_POSSESSION_VERIFIED))
+        );
+    }
+
+    #[test]
+    fn consent_revoked_rare_returns_evict_consent_revoked() {
+        // Even with zero holders (maximally rare), a revoked content_id
+        // is evict-eligible: §3.2.3 right-to-be-forgotten dominates.
+        let claims: Vec<(FountainHoldingClaim, HoldingClaimVerification)> = vec![vclaim(
+            "peer-a",
+            "X",
+            vec![1],
+            HoldingClaimVerification::PossessionVerified,
+        )];
+        let out = compute_consent_aware_rarity("X", 1, &claims, ConsentState::Revoked);
+        assert_eq!(
+            out,
+            ConsentAwareRarity::EvictEligible(EvictionReason::ConsentRevoked)
+        );
+        // And the zero-holder (MAX-rarity) case must ALSO evict.
+        let out_empty = compute_consent_aware_rarity("X", 1, &[], ConsentState::Revoked);
+        assert_eq!(
+            out_empty,
+            ConsentAwareRarity::EvictEligible(EvictionReason::ConsentRevoked)
+        );
+    }
+
+    #[test]
+    fn consent_unknown_rare_returns_evict_consent_unknown() {
+        // Fail-secure: unknown consent on a maximally-rare item is NOT
+        // retained-as-rare. Absent evidence is not consent.
+        let out = compute_consent_aware_rarity("X", 1, &[], ConsentState::Unknown);
+        assert_eq!(
+            out,
+            ConsentAwareRarity::EvictEligible(EvictionReason::ConsentUnknown)
+        );
+    }
+
+    #[test]
+    fn consent_active_not_rare_returns_evict_not_rare() {
+        // target_holders distinct possession-verified peers ⇒ weighted
+        // count = 2 * target_holders, well above the floor ⇒ NotRare.
+        let claims: Vec<(FountainHoldingClaim, HoldingClaimVerification)> = (0
+            ..DEFAULT_TARGET_HOLDERS)
+            .map(|i| {
+                vclaim(
+                    &format!("peer-{i}"),
+                    "X",
+                    vec![1],
+                    HoldingClaimVerification::PossessionVerified,
+                )
+            })
+            .collect();
+        let out = compute_consent_aware_rarity("X", 1, &claims, ConsentState::Active);
+        assert_eq!(
+            out,
+            ConsentAwareRarity::EvictEligible(EvictionReason::NotRare)
+        );
+    }
+
+    #[test]
+    fn unverified_claims_dont_count() {
+        // 10 self-asserted (unverified) claims contribute weight 0 each
+        // ⇒ weighted count 0 ⇒ still rare. This is the lying-holder
+        // force-evict defense: forged claims cannot push honest content
+        // over the not-rare threshold.
+        let claims: Vec<(FountainHoldingClaim, HoldingClaimVerification)> = (0..10)
+            .map(|i| {
+                vclaim(
+                    &format!("liar-{i}"),
+                    "X",
+                    vec![1],
+                    HoldingClaimVerification::Unverified,
+                )
+            })
+            .collect();
+        let out = compute_consent_aware_rarity("X", 1, &claims, ConsentState::Active);
+        assert_eq!(out, ConsentAwareRarity::RetainRare(RarityScore(0)));
+    }
+
+    #[test]
+    fn signature_only_claims_count_half_weight() {
+        // 4 distinct signature-only peers (weight 1 each = 4) produce
+        // the SAME weighted count as 2 distinct possession-verified
+        // peers (weight 2 each = 4).
+        let sig_only: Vec<(FountainHoldingClaim, HoldingClaimVerification)> = (0..4)
+            .map(|i| {
+                vclaim(
+                    &format!("sig-{i}"),
+                    "X",
+                    vec![1],
+                    HoldingClaimVerification::SignatureOnly,
+                )
+            })
+            .collect();
+        let possession: Vec<(FountainHoldingClaim, HoldingClaimVerification)> = (0..2)
+            .map(|i| {
+                vclaim(
+                    &format!("pos-{i}"),
+                    "X",
+                    vec![1],
+                    HoldingClaimVerification::PossessionVerified,
+                )
+            })
+            .collect();
+        let a = compute_consent_aware_rarity("X", 1, &sig_only, ConsentState::Active);
+        let b = compute_consent_aware_rarity("X", 1, &possession, ConsentState::Active);
+        assert_eq!(a, b);
+        assert_eq!(a, ConsentAwareRarity::RetainRare(RarityScore(4)));
+    }
+
+    #[test]
+    fn possession_verified_claims_count_full_weight() {
+        // N distinct possession-verified peers ⇒ exact weighted count
+        // of 2 * N, deterministically.
+        let n = 5u32;
+        let claims: Vec<(FountainHoldingClaim, HoldingClaimVerification)> = (0..n)
+            .map(|i| {
+                vclaim(
+                    &format!("pos-{i}"),
+                    "X",
+                    vec![1],
+                    HoldingClaimVerification::PossessionVerified,
+                )
+            })
+            .collect();
+        let out = compute_consent_aware_rarity("X", 1, &claims, ConsentState::Active);
+        assert_eq!(
+            out,
+            ConsentAwareRarity::RetainRare(RarityScore(n * HOLDING_WEIGHT_POSSESSION_VERIFIED))
+        );
+    }
+
+    fn hex_sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        let mut s = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    #[test]
+    fn verify_symbol_against_manifest_correct_hash_returns_true() {
+        let bytes = b"the rarest shard";
+        let manifest = vec![hex_sha256(b"other"), hex_sha256(bytes)];
+        assert!(verify_symbol_against_manifest(bytes, 1, &manifest));
+    }
+
+    #[test]
+    fn verify_symbol_against_manifest_wrong_hash_returns_false() {
+        let bytes = b"the rarest shard";
+        // manifest[0] is the hash of DIFFERENT bytes.
+        let manifest = vec![hex_sha256(b"tampered"), hex_sha256(b"unrelated")];
+        assert!(!verify_symbol_against_manifest(bytes, 0, &manifest));
+    }
+
+    #[test]
+    fn verify_symbol_against_manifest_oob_symbol_id_returns_false() {
+        let bytes = b"x";
+        let manifest = vec![hex_sha256(bytes)];
+        // symbol_id 1 is out of bounds for a 1-entry manifest.
+        assert!(!verify_symbol_against_manifest(bytes, 1, &manifest));
+        // u32::MAX is also OOB and must not panic.
+        assert!(!verify_symbol_against_manifest(bytes, u32::MAX, &manifest));
+    }
+
+    // ---- §8.1.11.3 N5 hard-delete trait wiring ----
+
+    /// A stand-in persist tier that records the hard-delete calls the
+    /// policy layer would make on revoke.
+    #[derive(Default)]
+    struct FakeEvictor {
+        calls: std::cell::RefCell<Vec<(String, String)>>,
+        fail: bool,
+    }
+
+    impl FountainEvictHardDelete for FakeEvictor {
+        fn evict_fountain_content_hard_delete(
+            &self,
+            content_id: &str,
+            corpus_kind: &str,
+        ) -> Result<(), FountainEvictError> {
+            if self.fail {
+                return Err(FountainEvictError::HardDeleteFailed("simulated".into()));
+            }
+            self.calls
+                .borrow_mut()
+                .push((content_id.to_string(), corpus_kind.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hard_delete_trait_dispatches_content_and_corpus() {
+        let evictor = FakeEvictor::default();
+        let dynref: &dyn FountainEvictHardDelete = &evictor;
+        dynref
+            .evict_fountain_content_hard_delete("content-X", "fountain-corpus")
+            .expect("hard-delete ok");
+        assert_eq!(
+            *evictor.calls.borrow(),
+            vec![("content-X".to_string(), "fountain-corpus".to_string())]
+        );
+    }
+
+    #[test]
+    fn hard_delete_trait_surfaces_failure() {
+        let evictor = FakeEvictor {
+            fail: true,
+            ..Default::default()
+        };
+        let err = evictor
+            .evict_fountain_content_hard_delete("content-X", "fountain-corpus")
+            .expect_err("must surface the persist failure");
+        assert!(matches!(err, FountainEvictError::HardDeleteFailed(_)));
     }
 }
