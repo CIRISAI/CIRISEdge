@@ -35,6 +35,44 @@ pub mod addressing;
 /// reachability-driven fan-out (CIRISEdge#62 / CEG 0.13 §10.5.8).
 pub mod realtime_av;
 
+/// Realtime A/V session state — membership-change epoch rekey baseline
+/// (CIRISEdge#129). Stateful group-key holder with `advance_epoch`
+/// driving forward-secrecy rekey on join/leave; unicast O(N) baseline
+/// using hybrid X25519+ML-KEM-768 wraps per remaining member.
+pub mod realtime_av_session;
+
+/// Realtime A/V — MLS (RFC 9420) group key agreement with the
+/// X-Wing post-quantum hybrid ciphersuite 0x004D (CIRISEdge#66).
+/// Thin CIRIS-shaped wrapper over openmls 0.8.1's `MlsGroup` +
+/// Cryspen's formally-verified libcrux provider. Replaces the
+/// discarded clean-room TreeKEM sketch — openmls inherits Draft-11
+/// insider fixes, Quarantined-TreeKEM discipline, SUF-CMA Ed25519,
+/// and the deployment-policy guidance the clean-room approach would
+/// have re-exposed (Wallez/Protzenko/Bhargavan IEEE S&P 2025).
+pub mod realtime_av_mls;
+
+/// Realtime A/V relay (SFU role) — addressable forwarding hop for the
+/// [`realtime_av`] profile (CIRISEdge#66). Holds per-subscriber transit
+/// keys + a per-stream roster; the relay applies the outer AEAD ONCE
+/// PER SUBSCRIBER over an inner-sealed chunk produced upstream. The
+/// relay never holds the epoch DEK — structurally; see the module head.
+/// Gated alongside the rest of the Reticulum surface via the internal
+/// `_reticulum-module` grouping feature.
+#[cfg(feature = "_reticulum-module")]
+pub mod realtime_av_relay;
+
+/// Application-Layer Multicast (ALM) — mesh-tree video built on the
+/// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
+/// CIRISEdge#128 MDC). Pure-Rust, signed [`realtime_av_alm::RelayCapacity`]
+/// advertisements + stateless parent-finding planner + multi-parent
+/// dedup/heal state machine. Variable-depth MDC sub-stream commitments
+/// surface the "holographic" decomposition where any subset of
+/// sub-streams decodes at proportional fidelity. No transport-feature
+/// gate — the planner is signature-blind and the heal state machine is
+/// pure Rust; both compile against the bare federation surface so they
+/// stay reusable for HTTPS-only ALM trees.
+pub mod realtime_av_alm;
+
 /// Packet-radio transport — N2 multi-medium plug (CIRISEdge#53 Fed
 /// TM §3.3 Gap D). LoRa / AX.25 / raw-serial mediums plug in via the
 /// [`packet_radio::driver::PacketRadioDriver`] trait. Feature-gated

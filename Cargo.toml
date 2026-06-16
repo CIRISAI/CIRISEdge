@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "3.7.1"
+version = "3.8.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -280,6 +280,23 @@ tracing     = "0.1"
 # transitively by ciris-crypto, so no version skew risk.
 zeroize     = "1"
 
+# CIRISEdge#66 — MLS (RFC 9420) over openmls 0.8.1, with the
+# X-Wing PQ-hybrid ciphersuite 0x004D
+# (`MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519`). 0.8.1 is the
+# release that ships the X-Wing variant compiled-in unconditionally;
+# the `openmls_libcrux_crypto` provider is the ONLY provider that
+# actually implements `HpkeKemType::XWingKemDraft6` (the
+# `openmls_rust_crypto` provider panics on it). See
+# `src/transport/realtime_av_mls.rs` for the CIRIS-shaped wrapper
+# and the module-level discussion of the 0x004D code-point caveat
+# (provisional, not IANA-assigned) and the migration path when the
+# IETF draft RFCs.
+openmls                  = { version = "0.8.1", default-features = false }
+openmls_libcrux_crypto   = { version = "0.3.1" }
+openmls_basic_credential = { version = "0.5.0", features = ["clonable"] }
+openmls_traits           = { version = "0.5.0" }
+tls_codec                = { version = "0.4.2", features = ["derive"] }
+
 # Packet-radio transport frame CRC (CIRISEdge#53 N2). Only pulled in
 # when `transport-packet-radio` is on — the IEEE CRC-32 is the
 # transport-layer corruption-detection contract, NOT a security MAC
@@ -435,8 +452,8 @@ tempfile       = { version = "3", optional = true }
 # currency with zero source-side changes on edge's side. `.recv().await`
 # unchanged. Future leviculum upstream releases land via the one-command
 # `scripts/ciris-sync-upstream.sh` rebase upstream-side now.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "ffd261d73b77acde892be766064ff9dbc956812e", version = "0.6", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "ffd261d73b77acde892be766064ff9dbc956812e", version = "0.6", optional = true }
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "6b005e9d85874d4db025c090626c29b966d94e9e", version = "0.6", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "6b005e9d85874d4db025c090626c29b966d94e9e", version = "0.6", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
@@ -844,6 +861,57 @@ required-features = ["transport-reticulum"]
 name = "transport_http_loopback"
 harness = false
 required-features = ["transport-http"]
+
+# v3.8.0 Layer 4 bench A (CIRISEdge#122 + #128) — sender CPU as a
+# function of mesh size N, frame size, and codec/layer configuration.
+# Three variants: naive seal_av_chunk × N (v3.7.0 baseline);
+# seal_av_inner × 1 + seal_av_outer × N (#122 fan-out split, ~1.93×
+# empirical win at N=64, 16 KiB — within noise of the substrate's
+# claimed ~1.98× headline at N=50); plan_layered + inner + outer for
+# admitted only (#128 layer policy composed with #122).
+[[bench]]
+name = "realtime_av_fanout"
+harness = false
+required-features = ["transport-http", "transport-reticulum"]
+
+# v3.8.0 Layer 4 bench B (CIRISEdge#129) — membership-change rekey
+# bench. Two groups: flat_unicast_rewrap (simulates the v3.7.x
+# baseline: one hybrid X25519+ML-KEM-768 KEX + AES-256-GCM wrap +
+# wire encode per remaining member) and mls_rekey
+# (AvSession::advance_epoch over the integrated MLS-backed surface
+# at openmls 0.8.1 ciphersuite 0x004D). Parameter sweep:
+# N ∈ {2, 8, 32, 128, 512, 2048} × {Join, Leave}. Empirical
+# crossover between N=32 and N=128 under SENDER-CPU-unicast (the
+# worst case for MLS). The MLS receiver-side O(log N) win +
+# multicast amortization show up in realtime_av_relay.rs (L4-C).
+[[bench]]
+name = "realtime_av_rekey"
+harness = false
+required-features = ["transport-http", "transport-reticulum"]
+
+# v3.8.0 Layer 4 bench C (CIRISEdge#66). Measures the realtime A/V
+# SFU relay end-to-end: per-subscriber fan-out cost, layer-policy
+# filter overhead, set_policy per-call cost, and the mesh-vs-relay
+# crossover. Mesh-vs-relay group splits into 3 sub-benches
+# (relay_publisher, relay_relay, relay_outer_only) so the crossover
+# can be read empirically.
+[[bench]]
+name = "realtime_av_relay"
+harness = false
+required-features = ["transport-reticulum"]
+
+# v3.8.0 holographic-mesh end-to-end bench (CIRISEdge#128 + ALM
+# composition validation). Measures the full substrate-level round-
+# trip: a 64 KiB frame decomposed into 4 × 16 KiB sub-streams at MDC
+# depth 2, fanned through 4 sub-stream relay trees, reassembled by a
+# receiver running 4 parallel MultiParentSubscription instances.
+# Empirical: 64 KiB round-trip 32.8 µs (1900 MB/s); proportional-
+# fidelity property holds (~5.2 µs per added sub-stream); planner
+# picks 4 distinct primaries across the 4 sub-stream paths.
+[[bench]]
+name = "realtime_av_mesh_e2e"
+harness = false
+required-features = ["transport-http", "transport-reticulum"]
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["full"] }
