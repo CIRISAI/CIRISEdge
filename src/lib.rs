@@ -57,6 +57,13 @@ mod edge;
 pub mod events;
 pub mod ffi;
 pub mod handler;
+// v3.9.0 Layer 1 Task D — consent-decay scheduler. Edge-side
+// orthogonal-trigger for fountain-content eviction (CEP per-content_id
+// decay clocks; persist's DiskPressure is the other trigger). See
+// `src/holonomic/consent_decay.rs` for the cross-repo handoff with
+// CIRISPersist v8.x.
+#[cfg(feature = "holonomic-consent-decay")]
+pub mod holonomic;
 pub mod identity;
 pub mod key_boundary;
 pub mod manifest;

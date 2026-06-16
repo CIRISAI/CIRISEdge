@@ -73,6 +73,20 @@ pub mod realtime_av_relay;
 /// stay reusable for HTTPS-only ALM trees.
 pub mod realtime_av_alm;
 
+/// Realtime A/V codec wiring — v3.9.0 Layer 1 (CIRISEdge#133). Wraps
+/// the production-grade Rust codec stack (raptorq fountain + rav1e /
+/// dav1d AV1 + libopus voice) into the substrate's per-symbol /
+/// per-chunk shape. Each sub-module gates on its own `codec-*`
+/// feature so substrate-only consumers pay zero binary-size cost.
+/// The umbrella `codec-default` flips all three on for the realtime
+/// A/V wheel build.
+#[cfg(any(
+    feature = "codec-fountain",
+    feature = "codec-av1",
+    feature = "codec-opus"
+))]
+pub mod realtime_av_codec;
+
 /// Packet-radio transport — N2 multi-medium plug (CIRISEdge#53 Fed
 /// TM §3.3 Gap D). LoRa / AX.25 / raw-serial mediums plug in via the
 /// [`packet_radio::driver::PacketRadioDriver`] trait. Feature-gated

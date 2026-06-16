@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "3.8.0"
+version = "3.9.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -304,6 +304,63 @@ tls_codec                = { version = "0.4.2", features = ["derive"] }
 # canonical Rust impl + hardware-accelerated on x86_64 SSE 4.2.
 crc32fast   = { version = "1", optional = true }
 
+# v3.9.0 Layer 1 (CIRISEdge#133) — RaptorQ fountain code wrap layer.
+# RFC 6330 implementation; deployed in 3GPP MBMS + DVB-H since 2012.
+# Pinned to the 2.x line (current major as of v3.9.0 work); the crate's
+# `SourceBlockEncoder` / `SourceBlockDecoder` surface is the API we
+# wrap in `src/transport/realtime_av_codec/fountain.rs`. Gated under
+# `codec-fountain` so the substrate-only build doesn't pull the codec
+# transitive surface. See `docs/V3_8_0_RECOMMENDED_STACK.md` §"Wiring"
+# for the substrate↔codec composition story.
+raptorq     = { version = "2", optional = true }
+
+# v3.9.0 Layer 1 Task B (CIRISEdge#133) — AV1 codec helpers.
+# `rav1e` is Mozilla/Xiph's pure-Rust AV1 encoder; lowest RAM
+# footprint of the production AV1 encoders (~1/4 SVT-AV1). We
+# disable default-features to drop the encoder's binary CLI surface
+# (clap, console, fern, scan_fmt, av-metrics, nom, y4m, ivf) — those
+# are useful for the rav1e standalone binary, not for the
+# library-consumer path edge takes. `threading` is kept ON: it pulls
+# `rayon/threads`, which the encoder uses for multi-core encode.
+# `asm` (the NASM-accelerated codepaths) is intentionally OFF for
+# v3.9.0 — adds a NASM build-tool requirement to every consumer of
+# the codec-av1 feature, which we'd rather not impose on the wheel
+# pipeline; revisit when sender-side encode CPU becomes the
+# bottleneck (per docs/FEDERATION_SCALING_MODEL.md §3, our 720p30 /
+# 1080p30 targets fit pure-Rust without asm headroom).
+rav1e       = { version = "0.8", optional = true, default-features = false, features = ["threading"] }
+# `dav1d` is the rust-av maintained binding (Luca Barbato; same org
+# as ffmpeg-next, av-format) to VideoLAN's libdav1d AV1 decoder.
+# dav1d is the AV1 decoder that ships in every major browser; the
+# Rust binding is actively maintained (0.11.1 published 2025-02; the
+# canonical choice over the spike/canary `shiguredo_dav1d` fork
+# which targets Rust 1.88 above our 1.75 floor). The binding pulls
+# `dav1d-sys` which requires a SYSTEM `libdav1d-dev` (pkg-config) at
+# build time — there is no vendored/bundled build option upstream.
+# Runtime + wheel CI implications:
+#   - Linux build: apt-get install libdav1d-dev (-1.4 floor; sys
+#     crate's system-deps clause asserts ≥ 1.3.0)
+#   - macOS: brew install dav1d
+#   - manylinux wheel: dav1d-dev added to the maturin-build apt step;
+#     auditwheel will pull libdav1d.so.7 into the wheel sidecar at
+#     `ciris_edge.libs/` (same auditwheel discipline persist's
+#     libsqlite3 dynamic-link uses since v3.5.3).
+# If a build host lacks libdav1d-dev the `codec-av1` feature won't
+# link — the round-trip test acknowledges this with `#[ignore]`
+# documenting the dav1d-dev requirement.
+dav1d       = { version = "0.11", optional = true }
+
+# v3.9.0 Layer 1 Task C (CIRISEdge#133) — libopus voice codec wrapper.
+# `opus` 0.3.x is the mature Rust binding to libopus (the WebRTC /
+# Discord / Mumble baseline; Opus 1.6 ships 5–26.5 ms algorithmic
+# delay). Gated under `codec-opus` so the Reticulum-only / HTTP-only
+# build doesn't drag in libopus. The system libopus library is
+# required at link time on Linux (`libopus-dev`) and macOS
+# (`brew install opus`); the `opus` crate does NOT bundle libopus and
+# does NOT pull `opus-sys`'s `static` feature — we accept the system-
+# dep cost in exchange for tracking distro security fixes.
+opus        = { version = "0.3", optional = true }
+
 # IDs
 uuid        = { version = "1", features = ["v4", "serde"] }
 
@@ -544,6 +601,20 @@ default = []
 # production.
 debug-tools = ["dep:backtrace", "dep:libc"]
 
+# v3.9.0 Layer 1 Task D — consent-decay scheduler (CIRISEdge#133
+# follow-on). Edge-side responsibility for Consensual Evolution
+# Protocol per-content_id decay walks (TEMPORARY 14-day, STANDARD
+# 90-day, PERSISTENT longer) — orthogonal to persist's DiskPressure
+# trigger. Both triggers drive the same eviction surface; this
+# scheduler computes per-content_id target tiers from (now,
+# admitted_at, consent_class, revoked_at) and pushes them to persist
+# via the `PersistHandle` FFI trait (stubbed at v3.9.0 L1, wired in
+# v3.9.x once persist exposes the matching surface). Opt-in;
+# default-off. async-trait + tokio are already in tree, so this
+# feature pulls no new dependencies — it just gates the holonomic
+# module's compilation.
+holonomic-consent-decay = []
+
 
 # Phase 1 — HTTP/HTTPS fallback for Reticulum-unreachable deployments.
 # CIRISEdge#23 (Track B / v0.13.0) — promoted to production-grade
@@ -668,6 +739,20 @@ transport-packet-radio = ["dep:crc32fast"]
 # transport-lora        = []  # specific driver atop transport-packet-radio
 # transport-serial      = []  # specific driver atop transport-packet-radio
 # transport-i2p         = []
+
+# v3.9.0 Layer 1 (CIRISEdge#133) — codec wiring feature family. Each
+# sub-feature is independently selectable so the substrate-only build
+# stays codec-free. `codec-fountain` is L1-A: RaptorQ wrap/unwrap
+# helpers that produce / consume the `FountainSymbolV1` shape
+# CIRISPersist v8.0.0 stores. `codec-av1` is L1-B (rav1e encoder +
+# dav1d decoder; build-host requires `libdav1d-dev`). `codec-opus` is
+# L1-C (libopus voice; build-host requires `libopus-dev`).
+# `codec-default` is the umbrella the Python wheel build flips on for
+# the realtime A/V profile.
+codec-fountain         = ["dep:raptorq"]
+codec-av1              = ["dep:rav1e", "dep:dav1d"]
+codec-opus             = ["dep:opus"]
+codec-default          = ["codec-fountain", "codec-av1", "codec-opus"]
 
 # pyo3 — Python bindings for the lens FastAPI cutover (Phase 1)
 # and the agent Python pipeline (Phase 2). Same FFI-shell discipline
