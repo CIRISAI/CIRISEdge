@@ -92,7 +92,9 @@ use zeroize::Zeroize;
 use reticulum_core::DestinationHash;
 use reticulum_std::driver::ReticulumNode;
 
-use super::realtime_av::{seal_av_outer, InnerSealed, RealtimeAvError, SealedAvChunk, StreamId};
+use super::realtime_av::{
+    seal_av_outer, InnerSealed, RealtimeAvError, ReceiverLayerPolicy, SealedAvChunk, StreamId,
+};
 
 /// Federation-key identifier for a relay subscriber. Same identifier
 /// space as the existing `peer_key_id: String` carried through
@@ -153,7 +155,28 @@ struct SubscriberState {
     /// [`super::realtime_av::derive_outer_nonce`] `link_seq` input.
     /// Incremented once per chunk this subscriber receives so the
     /// outer nonce is distinct per chunk per subscriber.
+    ///
+    /// Layer-policy interaction (CIRISEdge#128 / L2-C): the counter
+    /// counts ADMITTED chunks only — a chunk skipped by
+    /// `layer_policy.admits(...) == false` does NOT advance the
+    /// counter. Anti-replay state on the subscriber side therefore
+    /// stays consistent: the subscriber sees a dense `link_seq`
+    /// sequence `0, 1, 2, ...` even if the publisher emitted layers
+    /// the subscriber rejected.
     next_link_seq: u64,
+    /// Layer-admission policy for this subscriber. The relay drops a
+    /// chunk (does NOT call `seal_av_outer`, does NOT advance
+    /// `next_link_seq`) when
+    /// `layer_policy.admits(inner.layer()) == false`. The policy is
+    /// per-(subscriber, stream) and can be re-advertised via
+    /// [`RelayNode::set_policy`] without re-subscribing — e.g. when
+    /// the subscriber's bandwidth budget changes.
+    ///
+    /// This composes with the #122 fan-out split: `seal_av_outer` is
+    /// called only for the (subscriber, chunk) pairs the policy
+    /// admits. Inner-once / outer-N stays the asymptotic shape; here
+    /// the outer-N is further trimmed to outer-(admitted-subscribers).
+    pub layer_policy: ReceiverLayerPolicy,
 }
 
 impl Drop for SubscriberState {
@@ -239,22 +262,32 @@ impl RelayNode {
     }
 
     /// Register a subscriber on a stream with their pre-established
-    /// transit key. The transit key MUST have been established via
+    /// transit key + layer-admission policy. The transit key MUST
+    /// have been established via
     /// [`super::federation_session::FederationSession::initiate`]
     /// between the subscriber and the relay; for HNDL-sensitive
     /// streams the caller MUST request
     /// [`super::federation_session::KexAlgorithm::HybridRequired`]
-    /// at that call site. The relay itself is policy-blind — see
-    /// module docs § "HNDL posture".
+    /// at that call site. The relay itself is policy-blind on the
+    /// HNDL axis — see module docs § "HNDL posture".
+    ///
+    /// `layer_policy` is the per-subscriber layer-admission cap
+    /// (CIRISEdge#128). The relay forwards only the chunks whose
+    /// `inner.layer()` is admitted by this policy; chunks that
+    /// exceed it are dropped at the relay (no `seal_av_outer`
+    /// invocation, no `next_link_seq` advance for this subscriber).
+    /// Pass [`ReceiverLayerPolicy::UNCAPPED`] for previous (pre-L2)
+    /// behavior — admits every layer.
     ///
     /// Idempotent on `subscriber`: re-subscribing replaces the
-    /// transit key (the new key wins; the old key's
-    /// [`SubscriberState`] drops, zeroizing).
+    /// transit key AND the layer policy (the new state wins; the
+    /// old `SubscriberState` drops, zeroizing the old transit key).
     pub fn subscribe(
         &mut self,
         stream_id: StreamId,
         subscriber: PeerKeyId,
         transit_key: [u8; 32],
+        layer_policy: ReceiverLayerPolicy,
     ) -> Result<(), RelayError> {
         let link_id = subscriber.as_bytes().to_vec();
         self.subscribers
@@ -270,8 +303,40 @@ impl RelayNode {
                 transit_key,
                 link_id,
                 next_link_seq: 0,
+                layer_policy,
             },
         );
+        Ok(())
+    }
+
+    /// Update the layer-admission policy for an already-subscribed
+    /// (subscriber, stream) pair WITHOUT re-subscribing. The transit
+    /// key, `link_id`, and `next_link_seq` counter are preserved —
+    /// only the policy field is replaced.
+    ///
+    /// Use case (CIRISEdge#128): a subscriber re-advertises their
+    /// max-acceptable layer when their bandwidth budget shifts
+    /// (e.g. a mobile receiver moves off Wi-Fi). The relay updates
+    /// the filter without disturbing the outer-AEAD keystream.
+    ///
+    /// Returns [`RelayError::SubscriberNotFound`] if the subscriber
+    /// has no state on this stream (never subscribed, or already
+    /// unsubscribed). The roster + states are inspected jointly so
+    /// the error fires whether the inconsistency is in the roster
+    /// or in the state map.
+    pub fn set_policy(
+        &mut self,
+        stream_id: StreamId,
+        subscriber: &PeerKeyId,
+        new_policy: ReceiverLayerPolicy,
+    ) -> Result<(), RelayError> {
+        let Some(state) = self.states.get_mut(&(subscriber.clone(), stream_id)) else {
+            return Err(RelayError::SubscriberNotFound {
+                stream: stream_id,
+                subscriber: subscriber.clone(),
+            });
+        };
+        state.layer_policy = new_policy;
         Ok(())
     }
 
@@ -323,20 +388,37 @@ impl RelayNode {
             .map_or(0, std::collections::HashSet::len)
     }
 
-    /// Forward an inner-sealed chunk to every subscriber on its
-    /// stream. The relay applies [`seal_av_outer`] ONCE PER
-    /// SUBSCRIBER using their per-link transit key + monotonic
-    /// `link_seq` counter — the #122 fan-out split: one inner seal
-    /// at the publisher amortized across N outer seals at the relay.
+    /// Forward an inner-sealed chunk to every ADMITTED subscriber on
+    /// its stream. The relay applies [`seal_av_outer`] ONCE PER
+    /// ADMITTED SUBSCRIBER using their per-link transit key +
+    /// monotonic `link_seq` counter — the #122 fan-out split: one
+    /// inner seal at the publisher amortized across N outer seals at
+    /// the relay, further trimmed by per-subscriber layer policy
+    /// (CIRISEdge#128 / L2-C).
     ///
-    /// Returns the per-subscriber `(peer_key_id, sealed_chunk)`
-    /// outputs ready for Layer 2 dispatch. The integer reach count
-    /// is `out.len()`.
+    /// For each subscriber in the roster, the relay checks
+    /// `subscriber.layer_policy.admits(sealed_inner.layer())`. If
+    /// `false`, the subscriber is SKIPPED:
+    ///
+    /// - no [`seal_av_outer`] call (bandwidth saved)
+    /// - no [`SubscriberState::next_link_seq`] advance for that
+    ///   subscriber — `link_seq` counts ADMITTED chunks only, so the
+    ///   subscriber's anti-replay sequence stays dense (`0, 1, 2,
+    ///   ...` from their perspective)
+    /// - no entry in the returned [`Vec<RelayForwardOut>`]
+    ///
+    /// Returns the per-(admitted) subscriber `(peer_key_id,
+    /// sealed_chunk)` outputs ready for Layer 2 dispatch. The
+    /// integer reach count is `out.len()` — strictly `≤
+    /// subscriber_count(stream_id)`.
     ///
     /// The relay NEVER calls [`super::realtime_av::seal_av_inner`] —
     /// it only outer-seals an inner-sealed chunk produced upstream.
     /// This is the load-bearing invariant: the relay has no epoch
-    /// DEK, structurally.
+    /// DEK, structurally. The layer policy operates purely on the
+    /// clear-metadata layer header (T1 / CIRISEdge#128 documented
+    /// this is plaintext by design); admission filtering does not
+    /// compromise inner E2E secrecy.
     pub fn forward(
         &mut self,
         stream_id: StreamId,
@@ -349,6 +431,7 @@ impl RelayNode {
         // below (incrementing each subscriber's link_seq) doesn't
         // alias the immutable borrow on `subscribers`.
         let subscribers: Vec<PeerKeyId> = roster.iter().cloned().collect();
+        let inner_layer = sealed_inner.layer();
         let mut out = Vec::with_capacity(subscribers.len());
         for subscriber in subscribers {
             let state = self
@@ -358,6 +441,13 @@ impl RelayNode {
                     stream: stream_id,
                     subscriber: subscriber.clone(),
                 })?;
+            // CIRISEdge#128 — per-subscriber layer admission. A
+            // skipped chunk costs nothing on the wire AND does NOT
+            // advance `next_link_seq`, so the subscriber's
+            // anti-replay sequence stays dense.
+            if !state.layer_policy.admits(inner_layer) {
+                continue;
+            }
             let link_seq = state.next_link_seq;
             let sealed = seal_av_outer(sealed_inner, &state.transit_key, &state.link_id, link_seq)
                 .map_err(RelayError::OuterSealFailed)?;
@@ -384,7 +474,8 @@ impl RelayNode {
 mod tests {
     use super::*;
     use crate::transport::realtime_av::{
-        open_av_chunk, seal_av_inner, ChunkLayer, ChunkSeq, Epoch, EpochDek, CODEC_OPAQUE,
+        open_av_chunk, seal_av_inner, ChunkLayer, ChunkSeq, Epoch, EpochDek, ReceiverLayerPolicy,
+        CODEC_OPAQUE,
     };
 
     use reticulum_core::{DestinationHash, Identity};
@@ -475,12 +566,15 @@ mod tests {
         let dek = epoch_dek();
 
         // Register N subscribers with distinct synthetic transit
-        // keys.
+        // keys. L2-C: all-uncapped policy preserves pre-#128
+        // semantics (every chunk admitted).
         let mut keys = Vec::with_capacity(n);
         for i in 0..n {
             let sub = format!("sub-{i:04}");
             let key = transit_key(i);
-            relay.subscribe(s, sub.clone(), key).expect("subscribe");
+            relay
+                .subscribe(s, sub.clone(), key, ReceiverLayerPolicy::UNCAPPED)
+                .expect("subscribe");
             keys.push((sub, key));
         }
         assert_eq!(relay.subscriber_count(s), n);
@@ -541,7 +635,12 @@ mod tests {
         let dek = epoch_dek();
         for i in 0..5 {
             relay
-                .subscribe(s, format!("sub-{i}"), transit_key(i))
+                .subscribe(
+                    s,
+                    format!("sub-{i}"),
+                    transit_key(i),
+                    ReceiverLayerPolicy::UNCAPPED,
+                )
                 .expect("subscribe");
         }
 
@@ -607,14 +706,18 @@ mod tests {
         let key_new = transit_key(99);
         assert_ne!(key_old, key_new);
 
-        relay.subscribe(s, sub.clone(), key_old).expect("subscribe");
+        relay
+            .subscribe(s, sub.clone(), key_old, ReceiverLayerPolicy::UNCAPPED)
+            .expect("subscribe");
         assert!(relay.is_subscribed(s, &sub));
         relay.unsubscribe(s, &sub).expect("unsubscribe");
         assert!(!relay.is_subscribed(s, &sub));
         // The state map entry is gone — re-subscribe with a NEW
         // key, forward, and confirm the new key opens (old one
         // does not).
-        relay.subscribe(s, sub.clone(), key_new).expect("resub");
+        relay
+            .subscribe(s, sub.clone(), key_new, ReceiverLayerPolicy::UNCAPPED)
+            .expect("resub");
         let inner = make_inner(&dek, s, b"after resubscribe");
         let outs = relay.forward(s, &inner).expect("forward");
         assert_eq!(outs.len(), 1);
@@ -660,7 +763,9 @@ mod tests {
         let dek = epoch_dek();
         let sub: PeerKeyId = "sub-0".into();
         let key = transit_key(0);
-        relay.subscribe(s, sub.clone(), key).expect("subscribe");
+        relay
+            .subscribe(s, sub.clone(), key, ReceiverLayerPolicy::UNCAPPED)
+            .expect("subscribe");
 
         let inner_a = seal_av_inner(
             b"frame A",
@@ -708,8 +813,330 @@ mod tests {
         let mut relay = RelayNode::new(test_node(), test_address());
         let s = stream(0x07);
         let sub: PeerKeyId = "sub-0".into();
-        relay.subscribe(s, sub.clone(), transit_key(0)).expect("a");
-        relay.subscribe(s, sub.clone(), transit_key(1)).expect("b");
+        relay
+            .subscribe(
+                s,
+                sub.clone(),
+                transit_key(0),
+                ReceiverLayerPolicy::UNCAPPED,
+            )
+            .expect("a");
+        relay
+            .subscribe(
+                s,
+                sub.clone(),
+                transit_key(1),
+                ReceiverLayerPolicy::UNCAPPED,
+            )
+            .expect("b");
         assert_eq!(relay.subscriber_count(s), 1);
+    }
+
+    // ============================================================
+    // L2-C: CIRISEdge#128 layer-admission filter tests.
+    // ============================================================
+
+    /// Helper: build an inner-sealed chunk at a specific
+    /// `(stream_id, chunk_seq, layer)`. `codec_id` is left as
+    /// `CODEC_OPAQUE`-but-with-non-zero-layer in tests is a semantic
+    /// abuse (per the T1 docs, OPAQUE chunks MUST be layer
+    /// `(0,0,0)` and unconditionally admitted) — so we substitute a
+    /// non-OPAQUE codec id here to exercise the real admission path.
+    fn make_inner_layer(
+        dek: &EpochDek,
+        stream_id: StreamId,
+        chunk_seq: u64,
+        layer: ChunkLayer,
+    ) -> InnerSealed {
+        // 0x01 is a synthetic non-OPAQUE codec id — the AEAD doesn't
+        // bind codec_id (it's clear header metadata), so any value
+        // !=CODEC_OPAQUE exercises the admission path.
+        seal_av_inner(
+            b"frame payload",
+            dek,
+            stream_id,
+            Epoch(1),
+            ChunkSeq(chunk_seq),
+            0x01,
+            layer,
+        )
+        .expect("inner seal")
+    }
+
+    /// Acceptance L2-C: per-subscriber layer admission filters the
+    /// fan-out. Three subscribers with three distinct policies; the
+    /// relay forwards only to the subscribers whose policies admit
+    /// the chunk's layer.
+    #[test]
+    fn relay_forwards_to_subscribers_admitted_by_policy() {
+        let mut relay = RelayNode::new(test_node(), test_address());
+        let s = stream(0x10);
+        let dek = epoch_dek();
+        let alice: PeerKeyId = "alice".into();
+        let bob: PeerKeyId = "bob".into();
+        let carol: PeerKeyId = "carol".into();
+
+        let carol_policy = ReceiverLayerPolicy {
+            max_spatial: 1,
+            max_temporal: 1,
+            max_quality: 1,
+        };
+        relay
+            .subscribe(
+                s,
+                alice.clone(),
+                transit_key(1),
+                ReceiverLayerPolicy::UNCAPPED,
+            )
+            .expect("alice");
+        relay
+            .subscribe(
+                s,
+                bob.clone(),
+                transit_key(2),
+                ReceiverLayerPolicy::BLINKING_DOT,
+            )
+            .expect("bob");
+        relay
+            .subscribe(s, carol.clone(), transit_key(3), carol_policy)
+            .expect("carol");
+
+        // Chunk at (2,2,2) — exceeds bob (cap 0,0,0) and carol (cap
+        // 1,1,1). Only alice admitted.
+        let inner_222 = make_inner_layer(
+            &dek,
+            s,
+            0,
+            ChunkLayer {
+                spatial: 2,
+                temporal: 2,
+                quality: 2,
+            },
+        );
+        let out222 = relay.forward(s, &inner_222).expect("forward 222");
+        let subs222: std::collections::HashSet<PeerKeyId> =
+            out222.iter().map(|o| o.subscriber.clone()).collect();
+        assert_eq!(subs222.len(), 1);
+        assert!(subs222.contains(&alice));
+
+        // Chunk at (0,0,0) — admitted by all three.
+        let inner_000 = make_inner_layer(&dek, s, 1, ChunkLayer::BASE);
+        let out000 = relay.forward(s, &inner_000).expect("forward 000");
+        let subs000: std::collections::HashSet<PeerKeyId> =
+            out000.iter().map(|o| o.subscriber.clone()).collect();
+        assert_eq!(subs000.len(), 3);
+        assert!(subs000.contains(&alice));
+        assert!(subs000.contains(&bob));
+        assert!(subs000.contains(&carol));
+
+        // Chunk at (1,1,1) — admitted by alice + carol; bob's
+        // BLINKING_DOT (0,0,0 cap) rejects it.
+        let inner_111 = make_inner_layer(
+            &dek,
+            s,
+            2,
+            ChunkLayer {
+                spatial: 1,
+                temporal: 1,
+                quality: 1,
+            },
+        );
+        let out111 = relay.forward(s, &inner_111).expect("forward 111");
+        let subs111: std::collections::HashSet<PeerKeyId> =
+            out111.iter().map(|o| o.subscriber.clone()).collect();
+        assert_eq!(subs111.len(), 2);
+        assert!(subs111.contains(&alice));
+        assert!(subs111.contains(&carol));
+        assert!(!subs111.contains(&bob));
+    }
+
+    /// Acceptance L2-C: `set_policy` updates the layer filter for an
+    /// existing subscriber without re-subscribing. Bob's transit key
+    /// + `link_seq` counter survive the policy bump.
+    #[test]
+    fn relay_set_policy_updates_filter() {
+        let mut relay = RelayNode::new(test_node(), test_address());
+        let s = stream(0x11);
+        let dek = epoch_dek();
+        let bob: PeerKeyId = "bob".into();
+        relay
+            .subscribe(
+                s,
+                bob.clone(),
+                transit_key(7),
+                ReceiverLayerPolicy::BLINKING_DOT,
+            )
+            .expect("subscribe bob");
+
+        // (0,0,0) — admitted.
+        let inner_000 = make_inner_layer(&dek, s, 0, ChunkLayer::BASE);
+        let o1 = relay.forward(s, &inner_000).expect("forward 000");
+        assert_eq!(o1.len(), 1);
+        assert_eq!(o1[0].subscriber, bob);
+
+        // (1,1,1) — rejected (BLINKING_DOT cap 0,0,0).
+        let inner_111 = make_inner_layer(
+            &dek,
+            s,
+            1,
+            ChunkLayer {
+                spatial: 1,
+                temporal: 1,
+                quality: 1,
+            },
+        );
+        let o2 = relay.forward(s, &inner_111).expect("forward 111 pre");
+        assert!(o2.is_empty(), "BLINKING_DOT rejects (1,1,1)");
+
+        // Bump bob to UNCAPPED — now (1,1,1) is admitted.
+        relay
+            .set_policy(s, &bob, ReceiverLayerPolicy::UNCAPPED)
+            .expect("set_policy bob");
+        let inner_111_b = make_inner_layer(
+            &dek,
+            s,
+            2,
+            ChunkLayer {
+                spatial: 1,
+                temporal: 1,
+                quality: 1,
+            },
+        );
+        let o3 = relay.forward(s, &inner_111_b).expect("forward 111 post");
+        assert_eq!(o3.len(), 1);
+        assert_eq!(o3[0].subscriber, bob);
+    }
+
+    /// Acceptance L2-C: `link_seq` counts ADMITTED chunks only.
+    /// Bob subscribed with BLINKING_DOT; we forward `(0,0,0)`,
+    /// `(2,2,2)`, `(0,0,0)`. Bob receives exactly two outputs whose
+    /// `link_seq` values are 0 and 1 — NOT 0 and 2 — so the anti-
+    /// replay sequence on bob's side stays dense.
+    #[test]
+    fn relay_link_seq_advances_only_on_admitted_chunks() {
+        let mut relay = RelayNode::new(test_node(), test_address());
+        let s = stream(0x12);
+        let dek = epoch_dek();
+        let bob: PeerKeyId = "bob".into();
+        let key = transit_key(13);
+        relay
+            .subscribe(s, bob.clone(), key, ReceiverLayerPolicy::BLINKING_DOT)
+            .expect("subscribe bob");
+
+        // 1st: admitted at link_seq=0.
+        let inner_a = make_inner_layer(&dek, s, 0, ChunkLayer::BASE);
+        let out_a = relay.forward(s, &inner_a).expect("forward A");
+        assert_eq!(out_a.len(), 1);
+        assert_eq!(out_a[0].subscriber, bob);
+
+        // 2nd: rejected — must NOT advance link_seq.
+        let inner_skip = make_inner_layer(
+            &dek,
+            s,
+            1,
+            ChunkLayer {
+                spatial: 2,
+                temporal: 2,
+                quality: 2,
+            },
+        );
+        let out_skip = relay.forward(s, &inner_skip).expect("forward skip");
+        assert!(out_skip.is_empty(), "(2,2,2) rejected by BLINKING_DOT");
+
+        // 3rd: admitted at link_seq=1 (NOT 2).
+        let inner_b = make_inner_layer(&dek, s, 2, ChunkLayer::BASE);
+        let out_b = relay.forward(s, &inner_b).expect("forward B");
+        assert_eq!(out_b.len(), 1);
+        assert_eq!(out_b[0].subscriber, bob);
+
+        // Crypto check: both admitted chunks open under
+        // `link_seq=0` and `link_seq=1` respectively.
+        let opened_a =
+            open_av_chunk(&out_a[0].sealed, &key, bob.as_bytes(), 0, &dek).expect("open A");
+        assert_eq!(opened_a, b"frame payload");
+        let opened_b =
+            open_av_chunk(&out_b[0].sealed, &key, bob.as_bytes(), 1, &dek).expect("open B");
+        assert_eq!(opened_b, b"frame payload");
+        // And `link_seq=2` does NOT open the second chunk — proves
+        // the counter advanced to 1, not 2.
+        let bad = open_av_chunk(&out_b[0].sealed, &key, bob.as_bytes(), 2, &dek);
+        assert!(
+            bad.is_err(),
+            "link_seq=2 must NOT open — admitted-only counter advanced to 1"
+        );
+    }
+
+    /// Acceptance L2-C: a layer-skipped chunk produces NO
+    /// `RelayForwardOut` entry — no bandwidth spent, no
+    /// `seal_av_outer` call. The structural check is just "out is
+    /// empty when every subscriber rejects the chunk", which is the
+    /// observable side-effect that proves `seal_av_outer` wasn't
+    /// called.
+    #[test]
+    fn relay_layer_skipped_does_not_call_seal_outer() {
+        let mut relay = RelayNode::new(test_node(), test_address());
+        let s = stream(0x13);
+        let dek = epoch_dek();
+        // Two subscribers, both at BLINKING_DOT. A (2,2,2) chunk is
+        // rejected by both → empty out.
+        relay
+            .subscribe(
+                s,
+                "alice".into(),
+                transit_key(0),
+                ReceiverLayerPolicy::BLINKING_DOT,
+            )
+            .expect("alice");
+        relay
+            .subscribe(
+                s,
+                "bob".into(),
+                transit_key(1),
+                ReceiverLayerPolicy::BLINKING_DOT,
+            )
+            .expect("bob");
+        let inner = make_inner_layer(
+            &dek,
+            s,
+            0,
+            ChunkLayer {
+                spatial: 2,
+                temporal: 2,
+                quality: 2,
+            },
+        );
+        let out = relay.forward(s, &inner).expect("forward");
+        assert!(
+            out.is_empty(),
+            "every subscriber rejected the layer — no outer seal call must have happened"
+        );
+    }
+
+    /// Acceptance L2-C: `set_policy` for an unknown (subscriber,
+    /// stream) returns `SubscriberNotFound`.
+    #[test]
+    fn relay_set_policy_unknown_subscriber_errors() {
+        let mut relay = RelayNode::new(test_node(), test_address());
+        let s = stream(0x14);
+        let r = relay.set_policy(s, &"ghost".into(), ReceiverLayerPolicy::UNCAPPED);
+        assert!(matches!(r, Err(RelayError::SubscriberNotFound { .. })));
+
+        // Subscribe alice, then call set_policy on a DIFFERENT
+        // subscriber — still SubscriberNotFound.
+        relay
+            .subscribe(
+                s,
+                "alice".into(),
+                transit_key(0),
+                ReceiverLayerPolicy::UNCAPPED,
+            )
+            .expect("alice");
+        let r2 = relay.set_policy(s, &"ghost".into(), ReceiverLayerPolicy::BLINKING_DOT);
+        assert!(matches!(r2, Err(RelayError::SubscriberNotFound { .. })));
+
+        // And on a different stream — still SubscriberNotFound.
+        let other = stream(0x15);
+        let r3 = relay.set_policy(other, &"alice".into(), ReceiverLayerPolicy::BLINKING_DOT);
+        assert!(matches!(r3, Err(RelayError::SubscriberNotFound { .. })));
     }
 }

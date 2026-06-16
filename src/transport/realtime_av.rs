@@ -693,12 +693,41 @@ pub const REALTIME_MIN_RATIO: f64 = 0.5;
 /// identity + the per-Link transit key here; this module's fan-out
 /// planner then filters by reachability without owning identity or
 /// session state itself.
+///
+/// CIRISEdge#128 (Layer 2) — [`Self::layer_policy`] carries the
+/// per-receiver layer-admission policy advertised by the participant.
+/// The default ([`ReceiverLayerPolicy::UNCAPPED`]) preserves the
+/// pre-#128 fan-out semantics: every reachable participant receives
+/// every chunk regardless of `(codec_id, layer)`. Constructing this
+/// struct via field-init shorthand will still need an explicit
+/// `layer_policy` value; [`Self::new`] is provided as a convenience
+/// that defaults to `UNCAPPED` for callers that don't care about
+/// layer policy.
 #[derive(Debug, Clone)]
 pub struct MeshParticipant {
     pub peer_key_id: String,
     /// Bytes of the established RNS Link to this peer — the same
     /// `link_id` threaded into [`derive_outer_nonce`].
     pub link_id: Vec<u8>,
+    /// CIRISEdge#128 — per-receiver layer-admission policy. Defaults
+    /// to [`ReceiverLayerPolicy::UNCAPPED`] for compatibility with the
+    /// pre-#128 fan-out path (every reachable participant gets every
+    /// chunk).
+    pub layer_policy: ReceiverLayerPolicy,
+}
+
+impl MeshParticipant {
+    /// Construct a participant with the default
+    /// [`ReceiverLayerPolicy::UNCAPPED`] policy. Equivalent to the
+    /// pre-#128 two-field constructor.
+    #[must_use]
+    pub fn new(peer_key_id: String, link_id: Vec<u8>) -> Self {
+        Self {
+            peer_key_id,
+            link_id,
+            layer_policy: ReceiverLayerPolicy::UNCAPPED,
+        }
+    }
 }
 
 /// Stateless fan-out planner. Given the candidate participants for a
@@ -726,6 +755,86 @@ impl RealtimeFanout {
                 let snap = tracker.snapshot(&p.peer_key_id);
                 snap.get(&transport_id)
                     .is_some_and(|m| m.ratio() >= min_ratio)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// CIRISEdge#128 (Layer 2) — layer-aware fan-out filter.
+    ///
+    /// Composes the reachability rule of [`Self::plan`] with the
+    /// per-participant [`ReceiverLayerPolicy`] against the current
+    /// chunk's [`ChunkLayer`]. A participant is admitted iff BOTH:
+    ///
+    /// 1. Their `(peer_key_id, transport_id)` snapshot in the
+    ///    reachability tracker has a ratio at least `min_ratio` —
+    ///    identical to [`Self::plan`]'s filter (participants with no
+    ///    reachability history are EXCLUDED).
+    /// 2. `participant.layer_policy.admits(chunk_layer)` is `true` —
+    ///    the participant's policy accepts the chunk's
+    ///    `(spatial, temporal, quality)` cell.
+    ///
+    /// This is additive — [`Self::plan`] is unchanged. Use this when
+    /// fanning out scalable-codec chunks (AV1 SVC / JPEG XS layered /
+    /// MDC). Use [`Self::plan`] when every participant should receive
+    /// every chunk regardless of layer (e.g. CODEC_OPAQUE flows, or
+    /// non-scalable codecs).
+    ///
+    /// # Compose with the inner-once / outer-N fan-out optimization
+    ///
+    /// The intended call site composes with [`seal_av_inner`] +
+    /// [`seal_av_outer`] (CIRISEdge#122) — `seal_av_inner` runs once
+    /// per chunk regardless of receivers, then `seal_av_outer` runs
+    /// only for the participants this method admits:
+    ///
+    /// ```ignore
+    /// use ciris_edge::transport::realtime_av::{
+    ///     seal_av_inner, seal_av_outer, ChunkLayer, RealtimeFanout,
+    ///     CODEC_AV1_SVC,
+    /// };
+    ///
+    /// let layer = ChunkLayer { spatial: 1, temporal: 2, quality: 0 };
+    /// // Seal once for the whole mesh.
+    /// let inner = seal_av_inner(
+    ///     plaintext, &epoch_dek, stream_id, epoch, chunk_seq,
+    ///     CODEC_AV1_SVC, layer,
+    /// )?;
+    /// // Filter participants by reachability AND per-receiver policy.
+    /// let admitted = RealtimeFanout::plan_layered(
+    ///     &participants, layer, &tracker, transport_id, 0.5,
+    /// );
+    /// // Apply the per-Link outer seal only for admitted receivers.
+    /// for p in &admitted {
+    ///     let sealed = seal_av_outer(&inner, &transit_key(p), &p.link_id, link_seq(p))?;
+    ///     send_on_link(&p.link_id, sealed);
+    /// }
+    /// # Ok::<(), ciris_edge::transport::realtime_av::RealtimeAvError>(())
+    /// ```
+    ///
+    /// # CODEC_OPAQUE callers
+    ///
+    /// A chunk tagged with [`CODEC_OPAQUE`] carries no scalable-coding
+    /// semantics and is always `ChunkLayer::BASE` per the module
+    /// invariant. The `BASE` cell is admitted by every
+    /// [`ReceiverLayerPolicy`] (including [`ReceiverLayerPolicy::BLINKING_DOT`]),
+    /// so `plan_layered` is equivalent to [`Self::plan`] for opaque
+    /// chunks — callers may use either method.
+    #[must_use]
+    pub fn plan_layered(
+        participants: &[MeshParticipant],
+        chunk_layer: ChunkLayer,
+        tracker: &ReachabilityTracker,
+        transport_id: TransportId,
+        min_ratio: f64,
+    ) -> Vec<MeshParticipant> {
+        participants
+            .iter()
+            .filter(|p| {
+                let snap = tracker.snapshot(&p.peer_key_id);
+                let reachable = snap
+                    .get(&transport_id)
+                    .is_some_and(|m| m.ratio() >= min_ratio);
+                reachable && p.layer_policy.admits(chunk_layer)
             })
             .cloned()
             .collect()
@@ -972,18 +1081,9 @@ mod tests {
         }
         // Carol — unknown (no recorded attempts).
         let participants = vec![
-            MeshParticipant {
-                peer_key_id: "alice".into(),
-                link_id: b"link-A".to_vec(),
-            },
-            MeshParticipant {
-                peer_key_id: "bob".into(),
-                link_id: b"link-B".to_vec(),
-            },
-            MeshParticipant {
-                peer_key_id: "carol".into(),
-                link_id: b"link-C".to_vec(),
-            },
+            MeshParticipant::new("alice".into(), b"link-A".to_vec()),
+            MeshParticipant::new("bob".into(), b"link-B".to_vec()),
+            MeshParticipant::new("carol".into(), b"link-C".to_vec()),
         ];
         let plan = RealtimeFanout::plan(&participants, &tracker, transport_id, REALTIME_MIN_RATIO);
         let ids: Vec<&str> = plan.iter().map(|p| p.peer_key_id.as_str()).collect();
@@ -1115,10 +1215,7 @@ mod tests {
                 },
             );
         }
-        let participants = vec![MeshParticipant {
-            peer_key_id: "bob".into(),
-            link_id: b"l".to_vec(),
-        }];
+        let participants = vec![MeshParticipant::new("bob".into(), b"l".to_vec())];
         // At default threshold, bob is in.
         let plan_default =
             RealtimeFanout::plan(&participants, &tracker, transport_id, REALTIME_MIN_RATIO);
@@ -1344,5 +1441,248 @@ mod tests {
         assert_eq!(CODEC_JPEG_XS, 0x02);
         assert_eq!(CODEC_MDC, 0x03);
         assert_eq!(CODEC_OPAQUE, 0xFF);
+    }
+
+    // ─── CIRISEdge#128 (Layer 2 task A) — layer-aware fan-out ───
+    //
+    // `RealtimeFanout::plan_layered` filters by BOTH reachability and
+    // per-participant `ReceiverLayerPolicy` against the chunk's
+    // `ChunkLayer`. The tests below pin each leg of that AND
+    // independently, and then the joint case.
+
+    /// Build a participant with an explicit `layer_policy` — the new
+    /// field is what `plan_layered` consults.
+    fn participant_with_policy(
+        peer_key_id: &str,
+        link_id: &[u8],
+        policy: ReceiverLayerPolicy,
+    ) -> MeshParticipant {
+        MeshParticipant {
+            peer_key_id: peer_key_id.into(),
+            link_id: link_id.to_vec(),
+            layer_policy: policy,
+        }
+    }
+
+    /// Record N successful + M failed attempts so a given peer's ratio
+    /// becomes `N / (N + M)` on the supplied transport.
+    fn record_ratio(
+        tracker: &ReachabilityTracker,
+        peer: &str,
+        transport: TransportId,
+        successes: u32,
+        failures: u32,
+    ) {
+        for _ in 0..successes {
+            tracker.record_attempt(peer, transport, AttemptOutcome::SendSuccess);
+        }
+        for _ in 0..failures {
+            tracker.record_attempt(
+                peer,
+                transport,
+                AttemptOutcome::SendFailure {
+                    error_class: "x".into(),
+                },
+            );
+        }
+    }
+
+    /// Reachability leg in isolation — alice reachable, bob unreachable,
+    /// both `UNCAPPED` so the policy leg is a no-op. Only alice
+    /// admitted.
+    #[test]
+    fn fanout_layered_drops_unreachable() {
+        let tracker = ReachabilityTracker::new(60);
+        let transport_id = TransportId("reticulum");
+        // Alice — 10/10 success.
+        record_ratio(&tracker, "alice", transport_id, 10, 0);
+        // Bob — 1/10 success, well below default 0.5.
+        record_ratio(&tracker, "bob", transport_id, 1, 9);
+        let participants = vec![
+            participant_with_policy("alice", b"link-A", ReceiverLayerPolicy::UNCAPPED),
+            participant_with_policy("bob", b"link-B", ReceiverLayerPolicy::UNCAPPED),
+        ];
+        let chunk_layer = ChunkLayer {
+            spatial: 2,
+            temporal: 2,
+            quality: 2,
+        };
+        let admitted = RealtimeFanout::plan_layered(
+            &participants,
+            chunk_layer,
+            &tracker,
+            transport_id,
+            REALTIME_MIN_RATIO,
+        );
+        let ids: Vec<&str> = admitted.iter().map(|p| p.peer_key_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["alice"],
+            "bob is unreachable so plan_layered must drop bob"
+        );
+    }
+
+    /// Policy leg in isolation — both reachable, alice `UNCAPPED`,
+    /// bob `BLINKING_DOT`; chunk above (0, 0, 0). Only alice admitted.
+    #[test]
+    fn fanout_layered_drops_by_policy() {
+        let tracker = ReachabilityTracker::new(60);
+        let transport_id = TransportId("reticulum");
+        record_ratio(&tracker, "alice", transport_id, 10, 0);
+        record_ratio(&tracker, "bob", transport_id, 10, 0);
+        let participants = vec![
+            participant_with_policy("alice", b"link-A", ReceiverLayerPolicy::UNCAPPED),
+            participant_with_policy("bob", b"link-B", ReceiverLayerPolicy::BLINKING_DOT),
+        ];
+        let chunk_layer = ChunkLayer {
+            spatial: 2,
+            temporal: 2,
+            quality: 2,
+        };
+        let admitted = RealtimeFanout::plan_layered(
+            &participants,
+            chunk_layer,
+            &tracker,
+            transport_id,
+            REALTIME_MIN_RATIO,
+        );
+        let ids: Vec<&str> = admitted.iter().map(|p| p.peer_key_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["alice"],
+            "bob's BLINKING_DOT policy refuses spatial=2 chunk"
+        );
+    }
+
+    /// Joint case — alice reachable + UNCAPPED, bob reachable but
+    /// BLINKING_DOT, carol unreachable but UNCAPPED. Only alice
+    /// admitted (the other two are dropped by exactly one leg each).
+    #[test]
+    fn fanout_layered_drops_by_both() {
+        let tracker = ReachabilityTracker::new(60);
+        let transport_id = TransportId("reticulum");
+        record_ratio(&tracker, "alice", transport_id, 10, 0);
+        record_ratio(&tracker, "bob", transport_id, 10, 0);
+        // Carol — unreachable (no recorded attempts).
+        let participants = vec![
+            participant_with_policy("alice", b"link-A", ReceiverLayerPolicy::UNCAPPED),
+            participant_with_policy("bob", b"link-B", ReceiverLayerPolicy::BLINKING_DOT),
+            participant_with_policy("carol", b"link-C", ReceiverLayerPolicy::UNCAPPED),
+        ];
+        let chunk_layer = ChunkLayer {
+            spatial: 1,
+            temporal: 1,
+            quality: 0,
+        };
+        let admitted = RealtimeFanout::plan_layered(
+            &participants,
+            chunk_layer,
+            &tracker,
+            transport_id,
+            REALTIME_MIN_RATIO,
+        );
+        let ids: Vec<&str> = admitted.iter().map(|p| p.peer_key_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["alice"],
+            "joint reachability AND policy filter — only alice survives both legs"
+        );
+    }
+
+    /// `ChunkLayer::BASE` (0, 0, 0) is admitted by every policy
+    /// including `BLINKING_DOT` per the `admits` truth table. All
+    /// reachable participants receive a BASE chunk, even those with
+    /// the most restrictive policy.
+    #[test]
+    fn fanout_layered_blinking_dot_admitted_everywhere() {
+        let tracker = ReachabilityTracker::new(60);
+        let transport_id = TransportId("reticulum");
+        record_ratio(&tracker, "alice", transport_id, 10, 0);
+        record_ratio(&tracker, "bob", transport_id, 10, 0);
+        record_ratio(&tracker, "carol", transport_id, 10, 0);
+        let participants = vec![
+            participant_with_policy("alice", b"link-A", ReceiverLayerPolicy::UNCAPPED),
+            participant_with_policy("bob", b"link-B", ReceiverLayerPolicy::BLINKING_DOT),
+            participant_with_policy(
+                "carol",
+                b"link-C",
+                ReceiverLayerPolicy {
+                    max_spatial: 0,
+                    max_temporal: 0,
+                    max_quality: 0,
+                },
+            ),
+        ];
+        let admitted = RealtimeFanout::plan_layered(
+            &participants,
+            ChunkLayer::BASE,
+            &tracker,
+            transport_id,
+            REALTIME_MIN_RATIO,
+        );
+        let ids: Vec<&str> = admitted.iter().map(|p| p.peer_key_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["alice", "bob", "carol"],
+            "BASE chunk admitted by every policy (BLINKING_DOT included)"
+        );
+    }
+
+    /// `ReceiverLayerPolicy::UNCAPPED` admits every layer the codec
+    /// produces, so `plan_layered` with all participants UNCAPPED
+    /// reduces to `plan` for the same reachability inputs — modulo
+    /// `chunk_layer`, which is irrelevant when every policy is
+    /// UNCAPPED.
+    #[test]
+    fn fanout_layered_uncapped_admits_everything() {
+        let tracker = ReachabilityTracker::new(60);
+        let transport_id = TransportId("reticulum");
+        record_ratio(&tracker, "alice", transport_id, 10, 0);
+        record_ratio(&tracker, "bob", transport_id, 1, 9); // below threshold
+        record_ratio(&tracker, "dave", transport_id, 10, 0);
+        // Erin — no history, must be excluded (cold peer rule).
+        let participants = vec![
+            participant_with_policy("alice", b"link-A", ReceiverLayerPolicy::UNCAPPED),
+            participant_with_policy("bob", b"link-B", ReceiverLayerPolicy::UNCAPPED),
+            participant_with_policy("dave", b"link-D", ReceiverLayerPolicy::UNCAPPED),
+            participant_with_policy("erin", b"link-E", ReceiverLayerPolicy::UNCAPPED),
+        ];
+
+        // Walk a representative cross-section of layer cells; the
+        // admitted set must be invariant in `chunk_layer` when every
+        // participant is UNCAPPED.
+        let layer_cells = [
+            ChunkLayer::BASE,
+            ChunkLayer {
+                spatial: 2,
+                temporal: 3,
+                quality: 1,
+            },
+            ChunkLayer {
+                spatial: u8::MAX,
+                temporal: u8::MAX,
+                quality: u8::MAX,
+            },
+        ];
+        let plan_baseline =
+            RealtimeFanout::plan(&participants, &tracker, transport_id, REALTIME_MIN_RATIO);
+        let baseline_ids: Vec<&str> = plan_baseline
+            .iter()
+            .map(|p| p.peer_key_id.as_str())
+            .collect();
+        for chunk_layer in layer_cells {
+            let admitted = RealtimeFanout::plan_layered(
+                &participants,
+                chunk_layer,
+                &tracker,
+                transport_id,
+                REALTIME_MIN_RATIO,
+            );
+            let ids: Vec<&str> = admitted.iter().map(|p| p.peer_key_id.as_str()).collect();
+            assert_eq!(
+                ids, baseline_ids,
+                "UNCAPPED-everywhere plan_layered must equal plan at layer {chunk_layer:?}"
+            );
+        }
     }
 }
