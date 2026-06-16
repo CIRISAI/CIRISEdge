@@ -57,12 +57,12 @@ mod edge;
 pub mod events;
 pub mod ffi;
 pub mod handler;
-// v3.9.0 Layer 1 Task D — consent-decay scheduler. Edge-side
-// orthogonal-trigger for fountain-content eviction (CEP per-content_id
-// decay clocks; persist's DiskPressure is the other trigger). See
-// `src/holonomic/consent_decay.rs` for the cross-repo handoff with
-// CIRISPersist v8.x.
-#[cfg(feature = "holonomic-consent-decay")]
+// v3.9.0 Layer 1 Task D introduced consent-decay (gated under
+// `holonomic-consent-decay`); v3.10.0 lands the four-piece holonomic
+// substrate bundle — swarm rarity (#134), WholenessWitness (#135),
+// deterministic ALM (#136), recursive trust bootstrap (#137).  The
+// four v3.10.0 modules are always compiled; `consent_decay` keeps its
+// per-feature gate inside `holonomic::mod`.
 pub mod holonomic;
 pub mod identity;
 pub mod key_boundary;
