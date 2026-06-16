@@ -1,0 +1,10 @@
+{
+  "vector_id": "member_commitment/three_unsorted",
+  "description": "member_commitment = §19.1 WholenessWitness Merkle over SHA-256(utf8(member_id)), lexicographic.",
+  "source_member_ids": [
+    "m3",
+    "m1",
+    "m2"
+  ],
+  "expected_commitment_hex": "1bfd0a8a367f375a67ad08b3f19cf1a6d82876e753eea631a698d7dcca58226d"
+}

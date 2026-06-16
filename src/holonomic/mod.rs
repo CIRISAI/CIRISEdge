@@ -59,14 +59,23 @@
 //!   (survival floor, demand spike, locality reach). Normatively
 //!   absorbed into CEG 1.0 §R-policy via CIRISRegistry#86.
 //!
+//! - **v4.3.0** adds [`aggregation`] — the §19.7 forever-memory aggregation
+//!   pyramid producer ([`AggregationMetaV1`](aggregation::AggregationMetaV1) +
+//!   [`compute_member_commitment`](aggregation::compute_member_commitment)).
+//!   Wire shape locked at v1 per CEG 1.0-RC14 §19.7.1; cross-impl-validated
+//!   against CIRISVerify v5.10.0's authored vectors. Composes with
+//!   CIRISPersist v8.4.0's ingest gate (verify_aggregation_meta now
+//!   ENFORCED at store path).
+//!
 //! See `docs/ROADMAP_TO_V4.md` for the cut sequence and the
-//! CIRISRegistry#85 absorption gate for normative CEG status.
+//! CIRISRegistry#85 + #89 absorption gates for normative CEG status.
 //!
 //! [`TrustGrant`]: deterministic_topology::TrustGrant
 
 #[cfg(feature = "holonomic-consent-decay")]
 pub mod consent_decay;
 
+pub mod aggregation;
 pub mod deterministic_topology;
 pub mod fountain_defaults;
 pub mod recursive_trust_bootstrap;

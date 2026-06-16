@@ -1,0 +1,8 @@
+{
+  "vector_id": "member_commitment/single",
+  "description": "member_commitment = §19.1 WholenessWitness Merkle over SHA-256(utf8(member_id)), lexicographic.",
+  "source_member_ids": [
+    "m1"
+  ],
+  "expected_commitment_hex": "ca0df2c95aa144c1d0ff2ff3c8f967fdc1de9ef0c4120b3726416701b519d619"
+}
