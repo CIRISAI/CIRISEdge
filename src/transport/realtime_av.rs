@@ -686,6 +686,51 @@ pub fn open_av_chunk(
         .map_err(RealtimeAvError::InnerAead)
 }
 
+/// Open ONLY the per-link outer AEAD, recovering the still-E2E-sealed
+/// inner chunk. The relay holds no [`EpochDek`]; the inner layer is
+/// never opened here — only the outer hop is removed.
+///
+/// This is the relay→relay primitive: an interior peer in a multi-tier
+/// ALM tree receives a [`SealedAvChunk`] over its inbound link, opens
+/// the outer AEAD with the inbound transit key, recovers the
+/// [`InnerSealed`] (inner ciphertext + chunk header), then re-seals
+/// with [`seal_av_outer`] for each downstream link.
+///
+/// The chunk header (`stream_id` / `epoch` / `chunk_seq`) and the
+/// `codec_id` + `layer` clear-metadata block are carried through from
+/// the inbound wire onto the recovered [`InnerSealed`] verbatim, so a
+/// downstream [`seal_av_outer`] stamps an identical header — the
+/// inner-once / outer-N composition (CIRISEdge#122) holds across
+/// arbitrary relay hops.
+///
+/// # E2E invariant
+///
+/// The inner ciphertext bytes are NEVER mutated by this function. A
+/// publisher's inner ciphertext is byte-identical through arbitrary
+/// numbers of outer hops — relay→relay→relay→...→viewer. The inner
+/// AEAD seal (under the epoch DEK) is opaque to this function; it is
+/// the exact value [`InnerSealed::inner_ciphertext`] returns at the
+/// publisher.
+pub fn open_av_outer(
+    sealed: &SealedAvChunk,
+    transit_key: &[u8; 32],
+    link_id: &[u8],
+    link_seq: u64,
+) -> Result<InnerSealed, RealtimeAvError> {
+    let outer_nonce = derive_outer_nonce(link_id, link_seq);
+    let inner_ciphertext =
+        aes_gcm::decrypt(transit_key, &outer_nonce, &sealed.double_sealed_ciphertext)
+            .map_err(RealtimeAvError::OuterAead)?;
+    Ok(InnerSealed {
+        stream_id: sealed.stream_id,
+        epoch: sealed.epoch,
+        chunk_seq: sealed.chunk_seq,
+        codec_id: sealed.codec_id,
+        layer: sealed.layer,
+        inner_ciphertext,
+    })
+}
+
 /// Default reachability ratio below which a participant is dropped
 /// from the realtime fan-out. 0.5 = "succeeded at least half the time
 /// over the last `window_seconds`". Realtime is bursty and packet-loss

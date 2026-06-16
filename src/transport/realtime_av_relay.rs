@@ -96,7 +96,8 @@ use reticulum_core::DestinationHash;
 use reticulum_std::driver::ReticulumNode;
 
 use super::realtime_av::{
-    seal_av_outer, InnerSealed, RealtimeAvError, ReceiverLayerPolicy, SealedAvChunk, StreamId,
+    open_av_outer, seal_av_outer, InnerSealed, RealtimeAvError, ReceiverLayerPolicy, SealedAvChunk,
+    StreamId,
 };
 
 /// Federation-key identifier for a relay subscriber. Same identifier
@@ -462,6 +463,50 @@ impl RelayNode {
             out.push(RelayForwardOut { subscriber, sealed });
         }
         Ok(out)
+    }
+
+    /// Forward a chunk arriving from an UPSTREAM relay. Opens the
+    /// inbound outer AEAD with the inbound transit key, then re-seals
+    /// per downstream subscriber via the existing [`Self::forward`]
+    /// path. This is the multi-tier ALM convenience that composes the
+    /// relay→relay primitive ([`super::realtime_av::open_av_outer`])
+    /// with the per-subscriber re-seal.
+    ///
+    /// The relay does NOT hold the publisher's
+    /// [`super::realtime_av::EpochDek`]; this method works at the
+    /// outer-AEAD layer only — the inner E2E ciphertext is preserved
+    /// byte-identical from the inbound wire through to each downstream
+    /// [`RelayForwardOut`]. The structural invariant of [`RelayNode`]
+    /// (no epoch-DEK field) is unchanged: `forward_chunk` adds an
+    /// outer-open step, never an inner-open step.
+    ///
+    /// The inbound link state (`inbound_transit_key`, `inbound_link_id`,
+    /// `inbound_link_seq`) is the per-link outer-AEAD state for the
+    /// UPSTREAM hop — the transit key the relay established with its
+    /// parent in the ALM tree. The downstream re-seal uses each
+    /// subscriber's own (independent) transit key + `link_seq` counter
+    /// exactly as [`Self::forward`] does, so layer-policy admission and
+    /// the dense per-subscriber anti-replay sequence carry through
+    /// unchanged.
+    ///
+    /// Returns the same `Vec<RelayForwardOut>` the [`Self::forward`]
+    /// path returns — one entry per admitted downstream subscriber.
+    pub fn forward_chunk(
+        &mut self,
+        stream_id: StreamId,
+        sealed: &SealedAvChunk,
+        inbound_transit_key: &[u8; 32],
+        inbound_link_id: &[u8],
+        inbound_link_seq: u64,
+    ) -> Result<Vec<RelayForwardOut>, RelayError> {
+        let inner_sealed = open_av_outer(
+            sealed,
+            inbound_transit_key,
+            inbound_link_id,
+            inbound_link_seq,
+        )
+        .map_err(RelayError::OuterSealFailed)?;
+        self.forward(stream_id, &inner_sealed)
     }
 
     /// Borrow the relay's leviculum node handle. The Layer 2 wiring
