@@ -81,7 +81,10 @@
 //!   layer; the relay is the layer-1 forwarding primitive.
 //! - **Bandwidth accounting / abuse policy** — multi-tenant resource
 //!   limits and per-subscriber rate caps are followup work, tracked
-//!   separately from the substrate cut.
+//!   separately from the substrate cut. The per-core forwarding model
+//!   (egress-bound by ~350× over CPU at 720p30 / 50-sub fan-out) is
+//!   derived in `docs/FEDERATION_SCALING_MODEL.md` §5; the carved-out
+//!   resource-policy follow-ups are enumerated in §8 of that FSD.
 //! - **PyO3 surface** — the Python wrapper for `RelayNode` lands in
 //!   the Layer 3 FFI cut, not here.
 

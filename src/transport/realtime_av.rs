@@ -5,13 +5,17 @@
 //! communication** — group video, voice, desktop/screen sharing. The
 //! broadcast pull path (§10.5.5 E2) ships sealed A/V chunks at 1–10s
 //! latency: unusable for interactive calls. This module is the
-//! complementary low-latency profile that owns small/medium rooms
-//! (≤ ~50 participants) via direct RNS Links.
+//! complementary low-latency profile that owns small/medium rooms via
+//! direct RNS Links.
 //!
-//! Large rooms (≫50 participants) cross over to SFU relay at the
-//! Phase 1.x trees-of-relays surface; the per-(stream_id, epoch) DEK
-//! and chunk-seal layouts defined here are the same as that surface,
-//! only the transport profile differs.
+//! The mesh is infeasible above `N_mesh_max(uplink, codec, layer)`
+//! participants per CEG §10.5.8 / `docs/FEDERATION_SCALING_MODEL.md` §4.
+//! For 720p30 on a typical consumer connection this is ~13; for the
+//! BLINKING_DOT receiver-layer policy it is >200. Above the mesh cap a
+//! stream crosses over to the SFU relay
+//! ([`super::realtime_av_relay::RelayNode`]); the per-(stream_id,
+//! epoch) DEK and chunk-seal layouts defined here are the same as
+//! that surface, only the transport profile differs.
 //!
 //! ## Two-layer crypto
 //!
