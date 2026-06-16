@@ -862,6 +862,44 @@ name = "transport_http_loopback"
 harness = false
 required-features = ["transport-http"]
 
+# v3.8.0 Layer 4 bench A (CIRISEdge#122 + #128) — sender CPU as a
+# function of mesh size N, frame size, and codec/layer configuration.
+# Three variants: naive seal_av_chunk × N (v3.7.0 baseline);
+# seal_av_inner × 1 + seal_av_outer × N (#122 fan-out split, ~1.93×
+# empirical win at N=64, 16 KiB — within noise of the substrate's
+# claimed ~1.98× headline at N=50); plan_layered + inner + outer for
+# admitted only (#128 layer policy composed with #122).
+[[bench]]
+name = "realtime_av_fanout"
+harness = false
+required-features = ["transport-http", "transport-reticulum"]
+
+# v3.8.0 Layer 4 bench B (CIRISEdge#129) — membership-change rekey
+# bench. Two groups: flat_unicast_rewrap (simulates the v3.7.x
+# baseline: one hybrid X25519+ML-KEM-768 KEX + AES-256-GCM wrap +
+# wire encode per remaining member) and mls_rekey
+# (AvSession::advance_epoch over the integrated MLS-backed surface
+# at openmls 0.8.1 ciphersuite 0x004D). Parameter sweep:
+# N ∈ {2, 8, 32, 128, 512, 2048} × {Join, Leave}. Empirical
+# crossover between N=32 and N=128 under SENDER-CPU-unicast (the
+# worst case for MLS). The MLS receiver-side O(log N) win +
+# multicast amortization show up in realtime_av_relay.rs (L4-C).
+[[bench]]
+name = "realtime_av_rekey"
+harness = false
+required-features = ["transport-http", "transport-reticulum"]
+
+# v3.8.0 Layer 4 bench C (CIRISEdge#66). Measures the realtime A/V
+# SFU relay end-to-end: per-subscriber fan-out cost, layer-policy
+# filter overhead, set_policy per-call cost, and the mesh-vs-relay
+# crossover. Mesh-vs-relay group splits into 3 sub-benches
+# (relay_publisher, relay_relay, relay_outer_only) so the crossover
+# can be read empirically.
+[[bench]]
+name = "realtime_av_relay"
+harness = false
+required-features = ["transport-reticulum"]
+
 [dev-dependencies]
 tokio    = { version = "1", features = ["full"] }
 proptest = "1"
