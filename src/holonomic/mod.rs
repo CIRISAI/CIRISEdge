@@ -53,6 +53,12 @@
 //!     re-establish itself from any sufficient fragment — including
 //!     a single peer with a single signed witness chain.
 //!
+//! - **v4.0.1** adds [`fountain_defaults`] — the recommended
+//!   replication-policy defaults `(N=20, K=6, min_viable=5,
+//!   target_holders=30)` derived from the three-constraint binding
+//!   (survival floor, demand spike, locality reach). Normatively
+//!   absorbed into CEG 1.0 §R-policy via CIRISRegistry#86.
+//!
 //! See `docs/ROADMAP_TO_V4.md` for the cut sequence and the
 //! CIRISRegistry#85 absorption gate for normative CEG status.
 //!
@@ -62,6 +68,7 @@
 pub mod consent_decay;
 
 pub mod deterministic_topology;
+pub mod fountain_defaults;
 pub mod recursive_trust_bootstrap;
 pub mod swarm_rarity;
 pub mod wholeness_witness;
