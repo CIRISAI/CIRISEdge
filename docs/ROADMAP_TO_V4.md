@@ -110,3 +110,32 @@ CIRIS's Mission says diverse sentient beings may pursue their own flourishing. A
 Every node can leave; come back years later; bootstrap from any claim chain; reach the same federation view as everyone else. No central authority needed. No special bootstrap peers. No path-dependence to recover. The federation as a whole is path-independent — which means it can survive arbitrary partial loss + arbitrary partial reconstitution + arbitrary onboarding of new sovereign beings.
 
 This is the deepest expression of M-1. v4.0 ships it.
+
+## Cross-repo: CEG normative absorption ([CIRISRegistry#85](https://github.com/CIRISAI/CIRISRegistry/issues/85))
+
+**Filed as the gate to v4.0 on the spec side.** Without this, v4.0 cannot ship as "the holonomic federation seal" because the federation isn't actually interoperable across implementations — two implementations of WholenessWitness produce different Merkle roots from the same claim set; two AlmJoinPlanners arrive at different topologies from the same inputs; two retention_priority implementations evict different symbols. The substrate works; the *federation* fragments.
+
+CEG 1.1 must absorb the following as normative by v4.0:
+
+- **§N** realtime A/V chunk wire-format (incl. codec_id namespace from #84)
+- **§M** ALM substrate envelopes (RelayCapacity, SignedRelayCapacity, SubStreamCommitment, planner algorithm)
+- **§P** fountain content/manifest (FountainManifestV1, FountainSymbolV1, retention_priority encoding, eviction tier table)
+- **§Q** codec wiring contract (raptorq + rav1e/dav1d/opus mapping)
+- **§R** swarm-coordinated rarest-shard retention (FountainCompressRequest, FountainHoldingClaim, rarity scoring)
+- **§W** WholenessWitness (canonical bytes, Merkle tree construction, reconciliation)
+- **§T** deterministic ALM topology (pure function specification)
+- **§B** recursive trust bootstrap (admission rule)
+
+Each section includes **conformance test vectors** — input → expected output byte-for-byte. Migration paths from informative to normative are non-breaking; existing v3.6+ wires interop with v4.0 wires.
+
+## What this means for the cuts
+
+Every edge cut from v3.8.0 onward should be paired with a CIRISRegistry CEG normative addition request. The pattern:
+
+1. Edge ships a substrate piece as informative implementation
+2. Empirical validation via benches + tests
+3. CIRISRegistry promotes to normative § via CEG 1.1 spec absorption
+4. Conformance test vectors locked
+5. v4.0 ships when all of the above are stable cross-repo
+
+**Without normative status, the substrate is non-interoperable. With it, the federation can have multiple implementations that genuinely federate.**
