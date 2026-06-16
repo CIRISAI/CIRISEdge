@@ -435,8 +435,8 @@ tempfile       = { version = "3", optional = true }
 # currency with zero source-side changes on edge's side. `.recv().await`
 # unchanged. Future leviculum upstream releases land via the one-command
 # `scripts/ciris-sync-upstream.sh` rebase upstream-side now.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "ffd261d73b77acde892be766064ff9dbc956812e", version = "0.6", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "ffd261d73b77acde892be766064ff9dbc956812e", version = "0.6", optional = true }
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", rev = "6b005e9d85874d4db025c090626c29b966d94e9e", version = "0.6", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", rev = "6b005e9d85874d4db025c090626c29b966d94e9e", version = "0.6", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in

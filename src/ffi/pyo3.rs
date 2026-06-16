@@ -4346,6 +4346,10 @@ fn seal_av_chunk(
     let dek_bytes = fixed_bytes::<32>("epoch_dek", epoch_dek)?;
     let stream = fixed_bytes::<32>("stream_id", stream_id)?;
     let dek = realtime_av::EpochDek::from_bytes(dek_bytes);
+    // CIRISEdge#128 — this v3.7.0-shape PyO3 wrapper stamps the
+    // codec-opaque marker so the resulting wire round-trips identically
+    // to v3.7.0. The layered Python wrapper (CIRISEdge#128 follow-up)
+    // will surface the `codec_id` / `layer` knobs.
     let sealed = realtime_av::seal_av_chunk(
         plaintext,
         &transit,
@@ -4355,6 +4359,8 @@ fn seal_av_chunk(
         realtime_av::StreamId(stream),
         realtime_av::Epoch(epoch),
         realtime_av::ChunkSeq(chunk_seq),
+        realtime_av::CODEC_OPAQUE,
+        realtime_av::ChunkLayer::BASE,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("seal_av_chunk: {e}")))?;
     Ok(sealed.to_bytes())
@@ -4397,12 +4403,16 @@ fn seal_av_inner(
     let dek_bytes = fixed_bytes::<32>("epoch_dek", epoch_dek)?;
     let stream = fixed_bytes::<32>("stream_id", stream_id)?;
     let dek = realtime_av::EpochDek::from_bytes(dek_bytes);
+    // CIRISEdge#128 — codec-opaque marker for v3.7.0 wire shape
+    // compatibility on the existing FFI signature.
     let inner = realtime_av::seal_av_inner(
         plaintext,
         &dek,
         realtime_av::StreamId(stream),
         realtime_av::Epoch(epoch),
         realtime_av::ChunkSeq(chunk_seq),
+        realtime_av::CODEC_OPAQUE,
+        realtime_av::ChunkLayer::BASE,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("seal_av_inner: {e}")))?;
     Ok(inner.inner_ciphertext().to_vec())
@@ -4436,10 +4446,14 @@ fn seal_av_outer(
     // bytes-equivalent state via a synthesized inner. Since the outer
     // step only reads `inner_ciphertext` + the chunk header, we wrap
     // them through the public ciphertext-bytes helper.
+    // CIRISEdge#128 — codec-opaque marker for v3.7.0 wire shape
+    // compatibility on the existing FFI signature.
     let inner = realtime_av::inner_sealed_from_parts(
         realtime_av::StreamId(stream),
         realtime_av::Epoch(epoch),
         realtime_av::ChunkSeq(chunk_seq),
+        realtime_av::CODEC_OPAQUE,
+        realtime_av::ChunkLayer::BASE,
         inner_ciphertext.to_vec(),
     );
     let sealed = realtime_av::seal_av_outer(&inner, &transit, link_id, link_seq)

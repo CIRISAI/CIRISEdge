@@ -145,45 +145,230 @@ impl std::fmt::Debug for EpochDek {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkSeq(pub u64);
 
+// ─── CIRISEdge#128 — codec namespace + per-receiver layer policy ─────
+//
+// The chunk wire gains a 1-byte `codec_id` + 3-byte [`ChunkLayer`] block
+// after the 48-byte header. Each axis of [`ChunkLayer`] is monotonic:
+// layer 0 is the base — lowest fidelity along that axis, always required
+// to reconstruct anything — and each increment doubles the bandwidth
+// contribution of that axis. A chunk with `spatial = 2` IS the spatial
+// layer-2 enhancement only; receivers reconstruct from the prefix
+// `0..=max_spatial × 0..=max_temporal × 0..=max_quality`.
+//
+// SVC base-layer invariant: `ChunkLayer { 0, 0, 0 }` is the "blinking
+// dot" — the minimum a receiver can subscribe to. AV1 SVC (the default
+// codec in 2026 — Google Meet / Teams / WebRTC ship it) supports up to
+// 3 spatial × 4 temporal × multiple SNR layers concurrently.
+
+/// AV1 SVC — the production-grade scalable codec; default for realtime
+/// mesh video (CIRISEdge#128).
+pub const CODEC_AV1_SVC: u8 = 0x01;
+
+/// JPEG XS layered — reserved for low-latency intra-only / broadcast use
+/// cases. Not yet wired on edge.
+pub const CODEC_JPEG_XS: u8 = 0x02;
+
+/// Symmetric multiple-description coding — reserved for the future
+/// HNDL fragment-loss-resilient research track.
+pub const CODEC_MDC: u8 = 0x03;
+
+/// Codec-opaque — v3.7.0 wire compatibility marker. A chunk with
+/// `codec_id == CODEC_OPAQUE` carries no scalable-coding semantics; its
+/// `layer` MUST be `ChunkLayer { 0, 0, 0 }` and receivers MUST admit it
+/// unconditionally regardless of their `ReceiverLayerPolicy`. This is
+/// the value the read-side stamps when parsing a pre-#128 wire that
+/// lacks the trailing 4-byte block.
+pub const CODEC_OPAQUE: u8 = 0xFF;
+
+/// SVC layer descriptor — three monotonic axes addressing the
+/// scalable-coding cell of a single chunk.
+///
+/// Each axis is encoded as a `u8` where 0 is the base layer for that
+/// axis. Receivers reconstruct from the prefix
+/// `0..=max_spatial × 0..=max_temporal × 0..=max_quality` of cells —
+/// i.e. lower layers are *required* and higher layers are *additive*.
+/// The "blinking dot" is `ChunkLayer { spatial: 0, temporal: 0,
+/// quality: 0 }`: the lowest-fidelity keyframes at the lowest framerate
+/// and SNR, the minimum a participant can subscribe to.
+///
+/// Wire shape: 3 bytes (spatial, temporal, quality), placed in the
+/// chunk header immediately after the 1-byte `codec_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkLayer {
+    /// SVC spatial layer (0 = base resolution; each increment doubles
+    /// pixel count along the spatial axis).
+    pub spatial: u8,
+    /// SVC temporal layer (0 = base framerate; each increment doubles
+    /// the framerate contribution).
+    pub temporal: u8,
+    /// SVC SNR / quality layer (0 = base quantizer; each increment
+    /// refines the residual at the same resolution + framerate).
+    pub quality: u8,
+}
+
+impl ChunkLayer {
+    /// The base layer cell — `(0, 0, 0)`. Always required for any
+    /// reconstruction; corresponds to the "blinking dot" UX.
+    pub const BASE: Self = Self {
+        spatial: 0,
+        temporal: 0,
+        quality: 0,
+    };
+}
+
+/// Per-receiver layer-admission policy. A receiver advertises this over
+/// the existing `federation_session` / `key_grant` entitlement surface
+/// (not a new wire); the sender uses it to drop chunks above the policy
+/// without re-encoding the stream.
+///
+/// Combines cleanly with the inner-once / outer-N fan-out optimization
+/// (CIRISEdge#122): `seal_av_inner` runs once per chunk regardless of
+/// receivers, and `seal_av_outer` runs only for the (receiver, chunk)
+/// pairs the receiver's policy admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReceiverLayerPolicy {
+    /// Maximum acceptable spatial layer. A chunk with `spatial >
+    /// max_spatial` is dropped.
+    pub max_spatial: u8,
+    /// Maximum acceptable temporal layer.
+    pub max_temporal: u8,
+    /// Maximum acceptable quality (SNR) layer.
+    pub max_quality: u8,
+}
+
+impl ReceiverLayerPolicy {
+    /// "Blinking dot" — accepts only the base cell `(0, 0, 0)`. Lowest
+    /// possible bandwidth and the user-facing extreme of dyadic
+    /// degradation (CIRISEdge#128).
+    pub const BLINKING_DOT: Self = Self {
+        max_spatial: 0,
+        max_temporal: 0,
+        max_quality: 0,
+    };
+
+    /// Uncapped — admits every layer the codec produces. The default
+    /// for non-bandwidth-constrained receivers.
+    pub const UNCAPPED: Self = Self {
+        max_spatial: u8::MAX,
+        max_temporal: u8::MAX,
+        max_quality: u8::MAX,
+    };
+
+    /// Return `true` iff `layer` is within this receiver's per-axis
+    /// caps.
+    ///
+    /// Semantics — `admits` is purely the per-axis layer test. A chunk
+    /// tagged with [`CODEC_OPAQUE`] carries no scalable-coding
+    /// semantics and MUST be admitted by the caller unconditionally
+    /// regardless of policy; the fan-out filter (Layer 2 task T5)
+    /// handles that short-circuit before consulting `admits`.
+    #[must_use]
+    pub fn admits(self, layer: ChunkLayer) -> bool {
+        layer.spatial <= self.max_spatial
+            && layer.temporal <= self.max_temporal
+            && layer.quality <= self.max_quality
+    }
+}
+
 /// The wire shape that lands on each RNS Link's payload. Same shape
 /// the broadcast pull path serializes into its own delivery wire
 /// (see module docs § "What this module is NOT").
+///
+/// CIRISEdge#128 adds the `codec_id` + `layer` block. Both are clear
+/// metadata in the header, NOT inputs to the AEAD: a hop can drop a
+/// chunk based on `(codec_id, layer)` without compromising the inner
+/// DEK's end-to-end secrecy, and tampering with those fields just
+/// causes the receiver to mis-decode or drop — it can't break crypto.
+/// This is deliberate: layer-policy stripping at relay hops is the
+/// architectural use case.
 #[derive(Debug, Clone)]
 pub struct SealedAvChunk {
     pub stream_id: StreamId,
     pub epoch: Epoch,
     pub chunk_seq: ChunkSeq,
+    /// Codec discriminator — see [`CODEC_AV1_SVC`] / [`CODEC_JPEG_XS`]
+    /// / [`CODEC_MDC`] / [`CODEC_OPAQUE`]. CIRISEdge#128.
+    pub codec_id: u8,
+    /// SVC layer descriptor. For `codec_id == CODEC_OPAQUE`, this MUST
+    /// be `ChunkLayer { 0, 0, 0 }` and the chunk is admitted
+    /// unconditionally by any [`ReceiverLayerPolicy`].
+    pub layer: ChunkLayer,
     /// The double-sealed ciphertext: outer AEAD wraps inner AEAD wraps
     /// chunk plaintext. Both layers are AES-256-GCM (12B nonce + 16B
     /// tag, standard ring layout).
     pub double_sealed_ciphertext: Vec<u8>,
 }
 
+/// Length of the fixed-position chunk header (`stream_id` + `epoch` +
+/// `chunk_seq`). Stable across v3.7.0 / v3.8.0.
+pub const CHUNK_HEADER_LEN: usize = 48;
+
+/// Length of the CIRISEdge#128 codec + layer block that follows the
+/// fixed header on new wires. 1 byte `codec_id` + 3 bytes
+/// [`ChunkLayer`] = 4 bytes. Absent on a v3.7.0 wire — the read side
+/// defaults to `codec_id = CODEC_OPAQUE` + `layer = ChunkLayer::BASE`
+/// when only the 48-byte header is present.
+pub const CHUNK_CODEC_LAYER_LEN: usize = 4;
+
 impl SealedAvChunk {
-    /// Concrete wire encoding — fixed-shape header then ciphertext.
+    /// Concrete wire encoding — fixed-shape header, codec + layer
+    /// metadata, then ciphertext.
     ///
     /// ```text
-    /// 0..32  stream_id
-    /// 32..40 epoch       (big-endian u64)
-    /// 40..48 chunk_seq   (big-endian u64)
-    /// 48..   double_sealed_ciphertext
+    /// 0..32   stream_id
+    /// 32..40  epoch        (big-endian u64)
+    /// 40..48  chunk_seq    (big-endian u64)
+    /// 48..49  codec_id     (CIRISEdge#128)
+    /// 49..50  spatial      (CIRISEdge#128)
+    /// 50..51  temporal     (CIRISEdge#128)
+    /// 51..52  quality      (CIRISEdge#128)
+    /// 52..    double_sealed_ciphertext
     /// ```
+    ///
+    /// New writes always include the 4-byte codec+layer block. The
+    /// read side ([`Self::from_bytes`]) accepts the v3.7.0 wire shape
+    /// (no trailing codec+layer bytes) by defaulting to
+    /// `codec_id = CODEC_OPAQUE` + `layer = ChunkLayer::BASE`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(48 + self.double_sealed_ciphertext.len());
+        let mut out = Vec::with_capacity(
+            CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN + self.double_sealed_ciphertext.len(),
+        );
         out.extend_from_slice(&self.stream_id.0);
         out.extend_from_slice(&self.epoch.0.to_be_bytes());
         out.extend_from_slice(&self.chunk_seq.0.to_be_bytes());
+        out.push(self.codec_id);
+        out.push(self.layer.spatial);
+        out.push(self.layer.temporal);
+        out.push(self.layer.quality);
         out.extend_from_slice(&self.double_sealed_ciphertext);
         out
     }
 
     /// Inverse of [`Self::to_bytes`]. Returns `Err` if the input is
-    /// shorter than the 48-byte header.
+    /// shorter than the 48-byte fixed header.
+    ///
+    /// Backward compatibility — accepts the v3.7.0 wire shape (just
+    /// the 48-byte header, no codec+layer block) by stamping
+    /// `codec_id = CODEC_OPAQUE` + `layer = ChunkLayer::BASE` and
+    /// treating bytes 48.. as the ciphertext. The disambiguation is
+    /// purely length-based: a wire with at least
+    /// [`CHUNK_CODEC_LAYER_LEN`] bytes after the fixed header is read
+    /// as a v3.8.0+ wire (codec+layer present); a wire with fewer
+    /// trailing bytes is read as a v3.7.0 header-only wire.
+    ///
+    /// Note — real-world v3.7.0 wires always carry the AES-GCM tag
+    /// (16 bytes minimum) so they don't naturally exercise this
+    /// fallback. The production rollout path is that **every new
+    /// write** (v3.8.0+) stamps the 4-byte block, with
+    /// `codec_id = CODEC_OPAQUE` covering the v3.7.0-semantics flow
+    /// (existing PyO3 wrappers, etc.). The header-only fallback
+    /// exists for well-defined edge cases — transit probes / canary
+    /// frames generated without ciphertext.
     pub fn from_bytes(b: &[u8]) -> Result<Self, RealtimeAvError> {
-        if b.len() < 48 {
+        if b.len() < CHUNK_HEADER_LEN {
             return Err(RealtimeAvError::WireTooShort {
                 got: b.len(),
-                need: 48,
+                need: CHUNK_HEADER_LEN,
             });
         }
         let mut stream_id = [0u8; 32];
@@ -194,11 +379,35 @@ impl SealedAvChunk {
         let mut seq_bytes = [0u8; 8];
         seq_bytes.copy_from_slice(&b[40..48]);
         let chunk_seq = ChunkSeq(u64::from_be_bytes(seq_bytes));
+
+        // CIRISEdge#128 — codec+layer block is present iff we have at
+        // least 4 more bytes after the fixed header. A v3.7.0 wire (no
+        // trailing block) parses with `codec_id = CODEC_OPAQUE` and
+        // `layer = ChunkLayer::BASE`; everything after byte 48 is the
+        // ciphertext. A v3.8.0+ wire stamps the actual codec+layer and
+        // ciphertext starts at byte 52.
+        let (codec_id, layer, ciphertext_start) =
+            if b.len() >= CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN {
+                (
+                    b[48],
+                    ChunkLayer {
+                        spatial: b[49],
+                        temporal: b[50],
+                        quality: b[51],
+                    },
+                    CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN,
+                )
+            } else {
+                (CODEC_OPAQUE, ChunkLayer::BASE, CHUNK_HEADER_LEN)
+            };
+
         Ok(Self {
             stream_id: StreamId(stream_id),
             epoch,
             chunk_seq,
-            double_sealed_ciphertext: b[48..].to_vec(),
+            codec_id,
+            layer,
+            double_sealed_ciphertext: b[ciphertext_start..].to_vec(),
         })
     }
 }
@@ -267,6 +476,13 @@ pub struct InnerSealed {
     stream_id: StreamId,
     epoch: Epoch,
     chunk_seq: ChunkSeq,
+    /// CIRISEdge#128 codec discriminator carried through to the outer
+    /// seal so the resulting [`SealedAvChunk`] stamps the correct
+    /// codec_id without re-threading it through the call site.
+    codec_id: u8,
+    /// CIRISEdge#128 layer descriptor — same flow-through purpose as
+    /// `codec_id`.
+    layer: ChunkLayer,
     /// Inner AES-256-GCM ciphertext: `AEAD(epoch_dek, inner_nonce, plaintext)`.
     inner_ciphertext: Vec<u8>,
 }
@@ -285,6 +501,16 @@ impl InnerSealed {
     pub fn chunk_seq(&self) -> ChunkSeq {
         self.chunk_seq
     }
+    /// CIRISEdge#128 — codec discriminator carried through to the
+    /// outer seal.
+    pub fn codec_id(&self) -> u8 {
+        self.codec_id
+    }
+    /// CIRISEdge#128 — layer descriptor carried through to the outer
+    /// seal.
+    pub fn layer(&self) -> ChunkLayer {
+        self.layer
+    }
     /// Borrow the inner ciphertext. Still sealed under the epoch DEK —
     /// safe to ferry across the mesh.
     pub fn inner_ciphertext(&self) -> &[u8] {
@@ -301,15 +527,27 @@ impl InnerSealed {
 ///
 /// The inner nonce derivation is identical to [`seal_av_chunk`]'s
 /// inner step, so the on-wire bytes are byte-identical to N calls to
-/// `seal_av_chunk` with the same `(stream_id, epoch, chunk_seq)` and
-/// per-link `(transit_key, link_id, link_seq)` — fan-out optimization
-/// is a pure compute-side change, no wire-format implication.
+/// `seal_av_chunk` with the same `(stream_id, epoch, chunk_seq,
+/// codec_id, layer)` and per-link `(transit_key, link_id, link_seq)`
+/// — fan-out optimization is a pure compute-side change, no
+/// wire-format implication.
+///
+/// CIRISEdge#128 — `codec_id` + `layer` are clear-metadata only: they
+/// flow through to the resulting [`SealedAvChunk`] header verbatim and
+/// do NOT participate in the AEAD (`aad` is unchanged from v3.7.0).
+/// This is deliberate: layer-policy stripping at relay hops doesn't
+/// compromise the inner DEK's E2E secrecy, and tampering with those
+/// fields just causes the receiver to mis-decode or drop — not break
+/// crypto.
+#[allow(clippy::too_many_arguments)]
 pub fn seal_av_inner(
     plaintext: &[u8],
     epoch_dek: &EpochDek,
     stream_id: StreamId,
     epoch: Epoch,
     chunk_seq: ChunkSeq,
+    codec_id: u8,
+    layer: ChunkLayer,
 ) -> Result<InnerSealed, RealtimeAvError> {
     let inner_nonce = derive_inner_nonce(stream_id, epoch, chunk_seq);
     let inner_ciphertext = aes_gcm::encrypt(epoch_dek.as_bytes(), &inner_nonce, plaintext)
@@ -318,6 +556,8 @@ pub fn seal_av_inner(
         stream_id,
         epoch,
         chunk_seq,
+        codec_id,
+        layer,
         inner_ciphertext,
     })
 }
@@ -330,16 +570,21 @@ pub fn seal_av_inner(
 /// Rust callers should use [`seal_av_inner`] directly; this is the
 /// bytes-in escape hatch for the published Python wheel.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn inner_sealed_from_parts(
     stream_id: StreamId,
     epoch: Epoch,
     chunk_seq: ChunkSeq,
+    codec_id: u8,
+    layer: ChunkLayer,
     inner_ciphertext: Vec<u8>,
 ) -> InnerSealed {
     InnerSealed {
         stream_id,
         epoch,
         chunk_seq,
+        codec_id,
+        layer,
         inner_ciphertext,
     }
 }
@@ -350,6 +595,10 @@ pub fn inner_sealed_from_parts(
 /// Apply this once per mesh participant. The inner ciphertext is
 /// shared across the whole mesh; only the outer nonce + transit key
 /// differ per Link.
+///
+/// CIRISEdge#128 — the `codec_id` + `layer` carried on the
+/// [`InnerSealed`] flow through to the resulting [`SealedAvChunk`]
+/// unchanged. They are clear header metadata, NOT AEAD inputs.
 pub fn seal_av_outer(
     inner: &InnerSealed,
     transit_key: &[u8; 32],
@@ -363,6 +612,8 @@ pub fn seal_av_outer(
         stream_id: inner.stream_id,
         epoch: inner.epoch,
         chunk_seq: inner.chunk_seq,
+        codec_id: inner.codec_id,
+        layer: inner.layer,
         double_sealed_ciphertext: outer_sealed,
     })
 }
@@ -383,6 +634,14 @@ pub fn seal_av_outer(
 /// identical across the mesh and amortizes (~2× sender CPU win at
 /// N=50, CIRISEdge#122). `seal_av_chunk` remains the right call for
 /// N=1 paths and the wire-shape compose primitive.
+///
+/// CIRISEdge#128 — `codec_id` + `layer` are clear-metadata fields
+/// stamped into the resulting [`SealedAvChunk`] header. They do NOT
+/// participate in the AEAD (the inner DEK seal sees plaintext only,
+/// the outer transit-key seal sees the inner ciphertext only). Pass
+/// [`CODEC_OPAQUE`] + [`ChunkLayer::BASE`] for v3.7.0-compatible
+/// codec-opaque chunks; pass [`CODEC_AV1_SVC`] + the encoder-emitted
+/// `ChunkLayer` for AV1 SVC streams.
 #[allow(clippy::too_many_arguments)]
 pub fn seal_av_chunk(
     plaintext: &[u8],
@@ -393,8 +652,12 @@ pub fn seal_av_chunk(
     stream_id: StreamId,
     epoch: Epoch,
     chunk_seq: ChunkSeq,
+    codec_id: u8,
+    layer: ChunkLayer,
 ) -> Result<SealedAvChunk, RealtimeAvError> {
-    let inner = seal_av_inner(plaintext, epoch_dek, stream_id, epoch, chunk_seq)?;
+    let inner = seal_av_inner(
+        plaintext, epoch_dek, stream_id, epoch, chunk_seq, codec_id, layer,
+    )?;
     seal_av_outer(&inner, transit_key, link_id, link_seq)
 }
 
@@ -502,6 +765,8 @@ mod tests {
             dummy_stream(),
             Epoch(1),
             ChunkSeq(100),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
         )
         .expect("seal");
         let opened =
@@ -523,6 +788,8 @@ mod tests {
             dummy_stream(),
             Epoch(0),
             ChunkSeq(0),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
         )
         .expect("seal");
         let r = open_av_chunk(&sealed, &[99u8; 32], b"link", 0, &dek);
@@ -546,6 +813,8 @@ mod tests {
             dummy_stream(),
             Epoch(0),
             ChunkSeq(0),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
         )
         .expect("seal");
         let r = open_av_chunk(&sealed, &dummy_transit(), b"link", 0, &dek_bad);
@@ -568,6 +837,8 @@ mod tests {
             dummy_stream(),
             Epoch(0),
             ChunkSeq(0),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
         )
         .expect("seal");
         let r = open_av_chunk(&sealed, &dummy_transit(), b"link-B", 0, &dek);
@@ -588,6 +859,8 @@ mod tests {
             dummy_stream(),
             Epoch(0),
             ChunkSeq(0),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
         )
         .expect("seal");
         let r = open_av_chunk(&sealed, &dummy_transit(), b"link", 43, &dek);
@@ -595,7 +868,8 @@ mod tests {
     }
 
     /// Wire codec round-trips through bytes — header + body
-    /// preserved.
+    /// preserved. New (v3.8.0) wire shape including the codec+layer
+    /// block.
     #[test]
     fn wire_round_trip() {
         let dek = dummy_dek();
@@ -608,6 +882,12 @@ mod tests {
             StreamId([0xAB; 32]),
             Epoch(0x1234_5678_9ABC_DEF0),
             ChunkSeq(0xFEDC_BA98_7654_3210),
+            CODEC_AV1_SVC,
+            ChunkLayer {
+                spatial: 2,
+                temporal: 3,
+                quality: 1,
+            },
         )
         .expect("seal");
         let wire = sealed.to_bytes();
@@ -615,6 +895,15 @@ mod tests {
         assert_eq!(parsed.stream_id, sealed.stream_id);
         assert_eq!(parsed.epoch, sealed.epoch);
         assert_eq!(parsed.chunk_seq, sealed.chunk_seq);
+        assert_eq!(parsed.codec_id, CODEC_AV1_SVC);
+        assert_eq!(
+            parsed.layer,
+            ChunkLayer {
+                spatial: 2,
+                temporal: 3,
+                quality: 1,
+            }
+        );
         assert_eq!(
             parsed.double_sealed_ciphertext,
             sealed.double_sealed_ciphertext
@@ -715,15 +1004,26 @@ mod tests {
         let transit = dummy_transit();
         let link = b"link-A";
         let lseq = 42u64;
+        let codec = CODEC_AV1_SVC;
+        let layer = ChunkLayer {
+            spatial: 1,
+            temporal: 2,
+            quality: 0,
+        };
 
-        let single = seal_av_chunk(plaintext, &transit, link, lseq, &dek, stream, epoch, cseq)
-            .expect("single");
-        let inner = seal_av_inner(plaintext, &dek, stream, epoch, cseq).expect("inner");
+        let single = seal_av_chunk(
+            plaintext, &transit, link, lseq, &dek, stream, epoch, cseq, codec, layer,
+        )
+        .expect("single");
+        let inner =
+            seal_av_inner(plaintext, &dek, stream, epoch, cseq, codec, layer).expect("inner");
         let split = seal_av_outer(&inner, &transit, link, lseq).expect("outer");
 
         assert_eq!(single.stream_id, split.stream_id);
         assert_eq!(single.epoch, split.epoch);
         assert_eq!(single.chunk_seq, split.chunk_seq);
+        assert_eq!(single.codec_id, split.codec_id);
+        assert_eq!(single.layer, split.layer);
         assert_eq!(
             single.double_sealed_ciphertext, split.double_sealed_ciphertext,
             "fan-out split changed the wire bytes"
@@ -743,7 +1043,16 @@ mod tests {
         let cseq = ChunkSeq(10);
         let transit = dummy_transit();
 
-        let inner = seal_av_inner(plaintext, &dek, stream, epoch, cseq).expect("inner");
+        let inner = seal_av_inner(
+            plaintext,
+            &dek,
+            stream,
+            epoch,
+            cseq,
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        )
+        .expect("inner");
         let links: Vec<(&[u8], u64)> = vec![
             (b"link-A", 100),
             (b"link-B", 200),
@@ -772,10 +1081,18 @@ mod tests {
         let stream = StreamId([0xAB; 32]);
         let epoch = Epoch(0xDEAD_BEEF);
         let cseq = ChunkSeq(0x00C0_FFEE);
-        let inner = seal_av_inner(b"x", &dek, stream, epoch, cseq).expect("inner");
+        let layer = ChunkLayer {
+            spatial: 1,
+            temporal: 2,
+            quality: 3,
+        };
+        let inner =
+            seal_av_inner(b"x", &dek, stream, epoch, cseq, CODEC_AV1_SVC, layer).expect("inner");
         assert_eq!(inner.stream_id(), stream);
         assert_eq!(inner.epoch(), epoch);
         assert_eq!(inner.chunk_seq(), cseq);
+        assert_eq!(inner.codec_id(), CODEC_AV1_SVC);
+        assert_eq!(inner.layer(), layer);
         assert!(!inner.inner_ciphertext().is_empty());
     }
 
@@ -809,5 +1126,223 @@ mod tests {
         // At 0.9, bob is out.
         let plan_strict = RealtimeFanout::plan(&participants, &tracker, transport_id, 0.9);
         assert!(plan_strict.is_empty());
+    }
+
+    // ─── CIRISEdge#128 — codec + per-receiver layer policy ───────
+
+    /// v3.7.0 backward compatibility — a pre-#128 wire (just the
+    /// 48-byte header, no codec+layer block, no trailing ciphertext)
+    /// MUST parse cleanly via the read side, stamping
+    /// `codec_id = CODEC_OPAQUE` and `layer = ChunkLayer::BASE`.
+    ///
+    /// Length disambiguation — the read side requires at least
+    /// [`CHUNK_CODEC_LAYER_LEN`] trailing bytes to interpret the
+    /// codec+layer block. Any wire with `48 <= len <
+    /// 48 + CHUNK_CODEC_LAYER_LEN` is treated as a v3.7.0 header-only
+    /// wire (`codec_id = CODEC_OPAQUE` + `layer = ChunkLayer::BASE`)
+    /// and the bytes 48.. are the (possibly empty) ciphertext.
+    ///
+    /// Note: real-world v3.7.0 wires always carry the AES-GCM tag
+    /// (16 bytes minimum) so they would not exercise this fallback;
+    /// the production rollout path is the producer-side v3.8.0 stamp
+    /// of `CODEC_OPAQUE` + `ChunkLayer::BASE` on every new wire (the
+    /// existing PyO3 wrappers do exactly that). The read-side
+    /// fallback exists for the well-defined edge case of truncated /
+    /// header-only wires (e.g. probe / canary frames generated by
+    /// transit middleware before any real ciphertext is attached).
+    #[test]
+    fn from_bytes_accepts_v3_7_0_wire_shape() {
+        // Synthesize a v3.7.0-shape header-only wire: 32B stream_id +
+        // 8B epoch + 8B seq, no codec+layer block, no ciphertext.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&[0x42; 32]); // stream_id
+        legacy.extend_from_slice(&0xDEAD_BEEF_u64.to_be_bytes()); // epoch
+        legacy.extend_from_slice(&0xC0FF_EE12_u64.to_be_bytes()); // chunk_seq
+        assert_eq!(legacy.len(), CHUNK_HEADER_LEN);
+
+        let parsed = SealedAvChunk::from_bytes(&legacy).expect("parse v3.7.0 wire");
+        assert_eq!(parsed.stream_id, StreamId([0x42; 32]));
+        assert_eq!(parsed.epoch, Epoch(0xDEAD_BEEF));
+        assert_eq!(parsed.chunk_seq, ChunkSeq(0xC0FF_EE12));
+        assert_eq!(
+            parsed.codec_id, CODEC_OPAQUE,
+            "v3.7.0 wire must default to CODEC_OPAQUE"
+        );
+        assert_eq!(
+            parsed.layer,
+            ChunkLayer::BASE,
+            "v3.7.0 wire must default to ChunkLayer::BASE"
+        );
+        assert!(parsed.double_sealed_ciphertext.is_empty());
+
+        // A v3.7.0 wire with 1..3 trailing bytes still falls back to
+        // CODEC_OPAQUE — the 4-byte block is not present.
+        for partial_len in 1..=3 {
+            let mut partial = legacy.clone();
+            partial.extend(std::iter::repeat_n(0x99u8, partial_len));
+            let parsed = SealedAvChunk::from_bytes(&partial).expect("parse partial v3.7.0 wire");
+            assert_eq!(
+                parsed.codec_id, CODEC_OPAQUE,
+                "{partial_len}-byte trailer must still default to CODEC_OPAQUE"
+            );
+            assert_eq!(parsed.layer, ChunkLayer::BASE);
+            assert_eq!(parsed.double_sealed_ciphertext.len(), partial_len);
+        }
+    }
+
+    /// New-shape (v3.8.0) wire round-trips: write new → read new
+    /// preserves codec_id + layer + ciphertext.
+    #[test]
+    fn v3_8_0_wire_round_trip_new_to_new() {
+        let dek = dummy_dek();
+        let layer = ChunkLayer {
+            spatial: 1,
+            temporal: 2,
+            quality: 3,
+        };
+        let sealed = seal_av_chunk(
+            b"new-shape payload",
+            &dummy_transit(),
+            b"link-X",
+            17,
+            &dek,
+            StreamId([0x55; 32]),
+            Epoch(0x0123_4567_89AB_CDEF),
+            ChunkSeq(0xFEDC_BA98_7654_3210),
+            CODEC_JPEG_XS,
+            layer,
+        )
+        .expect("seal");
+        // The new wire is 4 bytes longer than the v3.7.0 wire for the
+        // same plaintext.
+        let wire = sealed.to_bytes();
+        assert_eq!(
+            wire.len(),
+            CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN + sealed.double_sealed_ciphertext.len()
+        );
+        // codec_id at byte 48, layer at 49..52.
+        assert_eq!(wire[48], CODEC_JPEG_XS);
+        assert_eq!(wire[49], 1);
+        assert_eq!(wire[50], 2);
+        assert_eq!(wire[51], 3);
+        let parsed = SealedAvChunk::from_bytes(&wire).expect("parse");
+        assert_eq!(parsed.codec_id, CODEC_JPEG_XS);
+        assert_eq!(parsed.layer, layer);
+        let opened = open_av_chunk(&parsed, &dummy_transit(), b"link-X", 17, &dek).expect("open");
+        assert_eq!(opened, b"new-shape payload");
+    }
+
+    /// `ReceiverLayerPolicy::admits` truth table — BLINKING_DOT
+    /// accepts only the base cell; UNCAPPED accepts everything; a
+    /// custom policy accepts the prefix-closed cube and rejects
+    /// outside.
+    #[test]
+    fn receiver_layer_policy_admits_truth_table() {
+        let base = ChunkLayer::BASE;
+        let mid = ChunkLayer {
+            spatial: 1,
+            temporal: 2,
+            quality: 0,
+        };
+        let high = ChunkLayer {
+            spatial: 2,
+            temporal: 3,
+            quality: 1,
+        };
+
+        // BLINKING_DOT — only the base cell admitted.
+        assert!(ReceiverLayerPolicy::BLINKING_DOT.admits(base));
+        assert!(!ReceiverLayerPolicy::BLINKING_DOT.admits(mid));
+        assert!(!ReceiverLayerPolicy::BLINKING_DOT.admits(high));
+
+        // UNCAPPED — everything admitted.
+        assert!(ReceiverLayerPolicy::UNCAPPED.admits(base));
+        assert!(ReceiverLayerPolicy::UNCAPPED.admits(mid));
+        assert!(ReceiverLayerPolicy::UNCAPPED.admits(high));
+        assert!(ReceiverLayerPolicy::UNCAPPED.admits(ChunkLayer {
+            spatial: u8::MAX,
+            temporal: u8::MAX,
+            quality: u8::MAX,
+        }));
+
+        // Custom policy — prefix-closed cube up to (1, 2, 0).
+        let custom = ReceiverLayerPolicy {
+            max_spatial: 1,
+            max_temporal: 2,
+            max_quality: 0,
+        };
+        assert!(custom.admits(base));
+        assert!(custom.admits(mid)); // exactly on the bound
+        assert!(!custom.admits(high)); // spatial=2 > max_spatial=1
+        assert!(!custom.admits(ChunkLayer {
+            spatial: 0,
+            temporal: 3,
+            quality: 0,
+        })); // temporal=3 > max_temporal=2
+        assert!(!custom.admits(ChunkLayer {
+            spatial: 0,
+            temporal: 0,
+            quality: 1,
+        })); // quality=1 > max_quality=0
+    }
+
+    /// `seal_av_chunk` propagates `codec_id` + `layer` to the
+    /// resulting [`SealedAvChunk`] without modification. They are
+    /// clear metadata, not AEAD inputs.
+    #[test]
+    fn seal_av_chunk_propagates_codec_id_and_layer() {
+        let dek = dummy_dek();
+        let layer = ChunkLayer {
+            spatial: 2,
+            temporal: 1,
+            quality: 3,
+        };
+        let sealed = seal_av_chunk(
+            b"x",
+            &dummy_transit(),
+            b"link",
+            0,
+            &dek,
+            dummy_stream(),
+            Epoch(0),
+            ChunkSeq(0),
+            CODEC_AV1_SVC,
+            layer,
+        )
+        .expect("seal");
+        assert_eq!(sealed.codec_id, CODEC_AV1_SVC);
+        assert_eq!(sealed.layer, layer);
+
+        // The inner-once / outer-N split must propagate identically.
+        let inner = seal_av_inner(
+            b"x",
+            &dek,
+            dummy_stream(),
+            Epoch(0),
+            ChunkSeq(0),
+            CODEC_MDC,
+            ChunkLayer {
+                spatial: 0,
+                temporal: 0,
+                quality: 1,
+            },
+        )
+        .expect("inner");
+        assert_eq!(inner.codec_id(), CODEC_MDC);
+        assert_eq!(inner.layer().quality, 1);
+        let outer = seal_av_outer(&inner, &dummy_transit(), b"link", 0).expect("outer");
+        assert_eq!(outer.codec_id, CODEC_MDC);
+        assert_eq!(outer.layer.quality, 1);
+    }
+
+    /// Codec namespace constants reflect the CEG §10.5.8 slotting
+    /// proposed in CIRISEdge#128. Locking the wire-byte values down so
+    /// a future refactor doesn't silently renumber.
+    #[test]
+    fn codec_id_namespace_values_locked() {
+        assert_eq!(CODEC_AV1_SVC, 0x01);
+        assert_eq!(CODEC_JPEG_XS, 0x02);
+        assert_eq!(CODEC_MDC, 0x03);
+        assert_eq!(CODEC_OPAQUE, 0xFF);
     }
 }

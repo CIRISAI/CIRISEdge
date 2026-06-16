@@ -35,6 +35,22 @@ pub mod addressing;
 /// reachability-driven fan-out (CIRISEdge#62 / CEG 0.13 §10.5.8).
 pub mod realtime_av;
 
+/// Realtime A/V session state — membership-change epoch rekey baseline
+/// (CIRISEdge#129). Stateful group-key holder with `advance_epoch`
+/// driving forward-secrecy rekey on join/leave; unicast O(N) baseline
+/// using hybrid X25519+ML-KEM-768 wraps per remaining member.
+pub mod realtime_av_session;
+
+/// Realtime A/V relay (SFU role) — addressable forwarding hop for the
+/// [`realtime_av`] profile (CIRISEdge#66). Holds per-subscriber transit
+/// keys + a per-stream roster; the relay applies the outer AEAD ONCE
+/// PER SUBSCRIBER over an inner-sealed chunk produced upstream. The
+/// relay never holds the epoch DEK — structurally; see the module head.
+/// Gated alongside the rest of the Reticulum surface via the internal
+/// `_reticulum-module` grouping feature.
+#[cfg(feature = "_reticulum-module")]
+pub mod realtime_av_relay;
+
 /// Packet-radio transport — N2 multi-medium plug (CIRISEdge#53 Fed
 /// TM §3.3 Gap D). LoRa / AX.25 / raw-serial mediums plug in via the
 /// [`packet_radio::driver::PacketRadioDriver`] trait. Feature-gated
