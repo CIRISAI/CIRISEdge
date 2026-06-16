@@ -1,0 +1,21 @@
+{
+  "vector_id": "signed_claim/canonical_bytes/with_owner_binding",
+  "description": "SignedClaim canonical bytes with full owner-binding trio (user_owner, delegates_to, identity_occurrence all Some). Each appended as 0x01 presence flag + length-prefixed UTF-8.",
+  "domain_separator_hex": "43495249532d434c41494d2d76310000",
+  "claim_bytes": [
+    254,
+    237,
+    250,
+    206
+  ],
+  "claim_kind": "membership_request",
+  "claim_version": 1,
+  "delegates_to": "delegated_peer_target",
+  "identity_occurrence": "occurrence_001",
+  "signature_ed25519_base64": "",
+  "signature_ml_dsa_65_base64": "",
+  "signed_at_unix_ms": 1700000002000,
+  "signer_peer_id": "test_signer_delta",
+  "user_owner": "user_root_peer",
+  "expected_canonical_bytes_hex": "43495249532d434c41494d2d763100000000018bcfe56fd00001000000126d656d626572736869705f7265717565737400000011746573745f7369676e65725f64656c7461000000086665656466616365010000000e757365725f726f6f745f70656572010000001564656c6567617465645f706565725f746172676574010000000e6f6363757272656e63655f303031"
+}

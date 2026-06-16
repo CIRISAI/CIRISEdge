@@ -1,0 +1,7 @@
+{
+  "witness_version": 1,
+  "claim_version": 1,
+  "holding_claim_version": 1,
+  "compress_request_version": 1,
+  "max_witness_chain_len": 5
+}

@@ -1,0 +1,12 @@
+{
+  "vector_id": "fountain_compress_request/canonical_bytes",
+  "description": "FountainCompressRequest canonical bytes — evicting symbol range [100, 200) with deadline at fixed unix_ms. Domain ciris-edge/compress-request/v1.",
+  "domain_separator_hex": "63697269732d656467652f636f6d70726573732d726571756573742f7631",
+  "content_id": "content_id_fixed_beta",
+  "deadline_unix_ms": 1700000004000,
+  "evicting_range_high": 200,
+  "evicting_range_low": 100,
+  "peer_id": "test_compressor_zeta",
+  "request_version": 1,
+  "expected_canonical_bytes_hex": "63697269732d656467652f636f6d70726573732d726571756573742f76310000000000000014746573745f636f6d70726573736f725f7a6574610000000000000015636f6e74656e745f69645f66697865645f6265746100000064000000c80000018bcfe577a000000001"
+}

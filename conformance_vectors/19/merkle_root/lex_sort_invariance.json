@@ -1,0 +1,10 @@
+{
+  "vector_id": "merkle_root/lex_sort_invariance",
+  "description": "Leaves alpha, beta, gamma — input order MUST NOT change the root. §19.1 WW-2 lex-sort guarantee.",
+  "leaves_hex": [
+    "616c706861",
+    "62657461",
+    "67616d6d61"
+  ],
+  "expected_root_hex": "50298939464ed02cbf2b587250a55746b3422e133ac4f09b7e2b07869023bc9e"
+}

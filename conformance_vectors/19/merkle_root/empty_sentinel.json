@@ -1,0 +1,6 @@
+{
+  "vector_id": "merkle_root/empty_sentinel",
+  "description": "Empty leaf set returns the WW-v1-empty sentinel: SHA-256(b\"WW-v1-empty\"). Verify v5.8.0's compute_merkle_root MUST emit byte-identical bytes.",
+  "leaves_hex": [],
+  "expected_root_hex": "2280d27f232100367e86211b5349fe0d6fbaee98e4c2b489a86008049563464f"
+}

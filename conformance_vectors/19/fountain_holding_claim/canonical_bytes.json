@@ -1,0 +1,17 @@
+{
+  "vector_id": "fountain_holding_claim/canonical_bytes",
+  "description": "FountainHoldingClaim canonical bytes — symbol_ids [5,1,3,2,4] sorted ascending to [1,2,3,4,5] before encoding (§19.3). Domain ciris-edge/holding-claim/v1.",
+  "domain_separator_hex": "63697269732d656467652f686f6c64696e672d636c61696d2f7631",
+  "claim_version": 1,
+  "content_id": "content_id_fixed_alpha",
+  "observed_at_unix_ms": 1700000003000,
+  "peer_id": "test_holder_epsilon",
+  "symbol_ids": [
+    5,
+    1,
+    3,
+    2,
+    4
+  ],
+  "expected_canonical_bytes_hex": "63697269732d656467652f686f6c64696e672d636c61696d2f76310000000000000013746573745f686f6c6465725f657073696c6f6e0000000000000016636f6e74656e745f69645f66697865645f616c706861000000000000000500000001000000020000000300000004000000050000018bcfe573b800000001"
+}

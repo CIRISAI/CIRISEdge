@@ -1,0 +1,10 @@
+{
+  "vector_id": "merkle_root/three_leaves_odd_dup",
+  "description": "Three leaves: layer 1 produces 2 nodes (l0 hashed, l1 hashed, l2 hashed + l2 dup); layer 2 produces 1 root. Tests odd-node duplicate-last convention.",
+  "leaves_hex": [
+    "0000000000000000",
+    "0101010101010101",
+    "0202020202020202"
+  ],
+  "expected_root_hex": "3739c8b58ef12d577cd4683fed2e824112fecda35be38e2f7da8585011f9ff12"
+}

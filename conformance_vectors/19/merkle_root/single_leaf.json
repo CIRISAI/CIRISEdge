@@ -1,0 +1,8 @@
+{
+  "vector_id": "merkle_root/single_leaf",
+  "description": "Single-leaf Merkle root: SHA-256(SHA-256(leaf_bytes)). Tests the leaf-hash-then-root degenerate case.",
+  "leaves_hex": [
+    "736f6c652d6c6561662d66697865642d696e707574"
+  ],
+  "expected_root_hex": "cf3be601031d7d6d905aa3e3a9c4332b5ab58f55b2d636caa9bdf8e2f620ee8a"
+}

@@ -1,0 +1,21 @@
+{
+  "vector_id": "signed_claim/canonical_bytes/no_owner_binding",
+  "description": "SignedClaim canonical bytes with no owner-binding fields (all-None). The CIRIS-CLAIM-v1 domain separator + locked field order applies; owner-binding trio appended as 0x00 presence flags (3 trailing zero bytes).",
+  "domain_separator_hex": "43495249532d434c41494d2d76310000",
+  "claim_bytes": [
+    1,
+    2,
+    3,
+    255
+  ],
+  "claim_kind": "trust_grant",
+  "claim_version": 1,
+  "delegates_to": null,
+  "identity_occurrence": null,
+  "signature_ed25519_base64": "",
+  "signature_ml_dsa_65_base64": "",
+  "signed_at_unix_ms": 1700000000000,
+  "signer_peer_id": "test_signer_gamma",
+  "user_owner": null,
+  "expected_canonical_bytes_hex": "43495249532d434c41494d2d763100000000018bcfe5680000010000000b74727573745f6772616e7400000011746573745f7369676e65725f67616d6d61000000083031303230336666000000"
+}
