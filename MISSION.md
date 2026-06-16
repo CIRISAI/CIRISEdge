@@ -769,7 +769,78 @@ implementation file:
   cross-wheel boundary closure for HTTPS; the Rust mechanism was
   finished at v0.18.1.
 
-## 12. How to maintain this document
+## 12. Holonomic federation seal (v4.0)
+
+**v4.0 = CEWP-1.0 — the CEWP holonomic federation seal.**
+
+The v0.5.0 → v3.10.0 progression assembled the substrate; v4.0 seals
+the property that the substrate is in service of: **graceful
+reconstitution from any sufficient fragment**.
+
+### What "holonomic federation" names
+
+A *holographic* substrate gives graceful degradation under loss —
+any fragment reconstructs the whole at proportional fidelity. v3.8.0
+ships that property at the wire layer (ALM mesh-tree + MDC sub-
+stream commitments + multi-parent dedup).
+
+A *holonomic* federation strengthens the property: the federation as
+a whole is **path-independent**. Every node can leave the federation
+and come back years later, bootstrap from any signed claim chain it
+holds, and reach the same federation view as everyone else — without
+central authority, without special bootstrap peers, without path-
+dependence to recover. The federation survives arbitrary partial
+loss and arbitrary partial reconstitution and arbitrary onboarding
+of new sovereign beings.
+
+This is the deepest expression of M-1. CIRIS's Mission says diverse
+sentient beings may pursue their own flourishing; the v4.0 substrate
+ships the architectural property that no single peer, no operator
+group, and no infrastructure provider can gate or revoke that
+pursuit.
+
+### The four substrate pieces that compose into the seal (all shipped at v3.10.0)
+
+| Piece | Issue | What it gives |
+|---|---|---|
+| Swarm-coordinated rarest-shard retention | [CIRISEdge#134](https://github.com/CIRISAI/CIRISEdge/issues/134) | The swarm collectively retains the rarest fountain symbols at every resolution. Federation-wide holographic coverage. |
+| WholenessWitness | [CIRISEdge#135](https://github.com/CIRISAI/CIRISEdge/issues/135) | Signed Merkle root over CEG claim state. Bohm's implicit order made explicit. The keystone every other holonomic upgrade verifies against. |
+| Deterministic ALM topology | [CIRISEdge#136](https://github.com/CIRISAI/CIRISEdge/issues/136) | Path-independent tree: every peer with the same input snapshot arrives at the same topology without leader / consensus. |
+| Recursive trust bootstrap | [CIRISEdge#137](https://github.com/CIRISAI/CIRISEdge/issues/137) | A new peer joins from any signed claim that chains to a trust root in its own trust graph — no special first-peer assumption. |
+
+All four are pure-Rust, byte-deterministic, wire-locked at v1. Their
+canonical-byte contracts are reproducible across any conformant
+implementation; CEG 1.1 §B / §T / §W / §R normative absorption
+([CIRISRegistry#85](https://github.com/CIRISAI/CIRISRegistry/issues/85))
+locks the conformance vectors cross-repo.
+
+### What v4.0 does NOT contain (deferred to v4.x)
+
+- Holonomic MLS snapshots — persist + verify cross-repo work
+- Privacy-preserving witness disclosure (ZK claim-membership)
+- Cross-witness BFT proofs against Byzantine peers
+- Compression of older witnesses into longer-cadence epigraph hashes
+
+The v4.0 seal is the *substrate completion*, not the exhaustion of
+the design space. The interfaces are stable; the extensions compose
+without breaking wire compatibility.
+
+### The path-independence invariant
+
+The v4.0 substrate-level invariant: given any sufficient signed-claim
+fragment (one peer's storage; one synced device coming back online;
+one inter-locality bridge worth of state), the federation can
+reconstruct **the same federation view** the rest of the network
+holds — bit-exactly, by walking the witness chains backward to a
+trust root, applying deterministic topology over the inputs, and
+filling fountain content from rarity-ranked swarm participation.
+
+See `docs/THREAT_MODEL.md` AV-50 for the corresponding threat-model
+treatment.
+
+---
+
+## 13. How to maintain this document
 
 A working document, not a release artifact. Update it whenever:
 

@@ -1,5 +1,16 @@
 # Roadmap: v3.8.0 → v4.0 — three cuts to the holonomic federation
 
+> **STATUS — 2026-06-16: v4.0 SHIPPED.** All three cuts landed in
+> sequence as planned: v3.8.0 (CEWP holographic substrate, on PyPI),
+> v3.9.0 + v3.10.1 (codec wiring + holonomic substrate, rolled into
+> v3.10.1 with deny.toml hardening), and v4.0 (CEWP-1.0 holonomic
+> federation seal). Three cuts, no v3.99.x climb. The substrate
+> is locked; cross-repo CEG normative absorption
+> ([CIRISRegistry#85](https://github.com/CIRISAI/CIRISRegistry/issues/85))
+> finalizes the wire vectors. See `MISSION.md` §12 for the seal
+> framing and `docs/THREAT_MODEL.md` AV-50 for the path-independence
+> threat surface treatment.
+
 Aggressive, low-number-discipline scaffolding from v3.8.0 (shipping now) through v4.0 (CEWP-1.0 holonomic federation seal). Three cuts total; no v3.99.x climb.
 
 ## Design principle

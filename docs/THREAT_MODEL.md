@@ -1354,6 +1354,72 @@ see the trigger fire in observability but no bytes move — the
 operator-side opt-in surface is locked; the bytes-fetching wire
 follows when persist's external-content admission lands.
 
+#### AV-50 — Path-independence threat surface (v4.0 CEWP-1.0 seal)
+
+**AV-50 — Path-independence violation in holonomic substrate**: the
+v4.0 substrate exposes a load-bearing invariant — **two peers given
+byte-equal input snapshots produce byte-equal outputs** across all
+four holonomic primitives (swarm rarity, WholenessWitness,
+deterministic ALM topology, recursive trust bootstrap). The threat is
+**substrate-implementation divergence**: a peer running a non-
+conformant implementation (different scoring constants, different
+canonicalization, different Merkle layout, different tie-break order)
+produces a different output from the same input. The federation
+fragments into split-brain partitions sharing the wire but
+disagreeing about state.
+
+**Implementation surfaces (v3.10.0, locked at v1)**:
+
+- `src/holonomic/swarm_rarity.rs` — `FountainHoldingClaim` canonical
+  field order: `(peer_id, content_id, symbol_ids, observed_at_unix_ms,
+  claim_version)`; `compute_rarity_score` deterministic by holding-
+  claim count and lex-min tie-break.
+
+- `src/holonomic/wholeness_witness.rs` — `WholenessWitness` canonical
+  field order: `(peer_id, epoch_id, merkle_root, leaf_count,
+  claim_namespaces, observed_at_unix_ms, witness_version)`;
+  `claim_namespaces` lex-sorted; `merkle_root` lowercase 64-char hex;
+  empty-input sentinel `SHA-256("WW-v1-empty") = 2280d27f...49563464f`;
+  Merkle construction: single-hash leaf domain + CT-style duplicate-
+  last on odd-count layers.
+
+- `src/holonomic/deterministic_topology.rs` — `compute_alm_topology`
+  v1 wire-determinism constants LOCKED: `TOPOLOGY_VERSION=1`,
+  `MAX_USEFUL_RTT_MS=5000`, `MAX_TRUST_CHAIN_DEPTH=4`,
+  `WEIGHT_CAPACITY=50`, `WEIGHT_TRUST=30`, `WEIGHT_REACHABILITY=20`,
+  `CAPACITY_NORMALIZER_MILLIBPS=10_000_000`. Integer (u64) scoring
+  only — NO floats; floats are non-deterministic across architectures.
+  Tie-break: parent lex-min when scores tie; child iteration order:
+  child lex-min.
+
+- `src/holonomic/recursive_trust_bootstrap.rs` — 16-byte domain
+  separator `CIRIS-CLAIM-v1` on `SignedClaim` canonical bytes
+  (distinct from `CIRISALM-CAPv2` used by `SignedRelayCapacity`);
+  prevents replay across claim types. Chain walked backwards
+  (newest first; first anchor wins); trust distance =
+  `anchor_distance + chain.len() - chain_index_of_anchor`.
+
+**Mitigation**: cross-implementation conformance is enforced via
+CIRISRegistry CEG 1.1 normative absorption ([CIRISRegistry#85](https://github.com/CIRISAI/CIRISRegistry/issues/85))
+— §B (bootstrap), §T (topology), §W (witness), §R (rarity) ratify
+byte-exact input → output test vectors. Any implementation claiming
+CEWP-1.0 conformance MUST reproduce the vectors bit-exactly.
+
+**Residual risk**: an attacker running a deliberately-non-conformant
+implementation cannot bypass admission (admission verifies hybrid
+PQC signatures + chain-to-root) but CAN cause local view drift on
+peers that trust their topology calculations. Mitigation:
+`WholenessWitness` epoch cross-comparison surfaces `Divergent`
+state, which gates reconciliation — divergent peers MUST reconcile
+before participating in subsequent rounds, blocking drift from
+propagating.
+
+**Test**: holonomic test suite (45 tests) covers (a) determinism
+under input permutation, (b) canonical-bytes locked field order,
+(c) Merkle determinism property, (d) chain-walk backwards property,
+(e) tie-break invariants. CEG 1.1 §B/§T/§W/§R conformance vectors
+make these properties cross-repo verifiable.
+
 ### 4.9 Forward-looking invariants (anchored at v0.17.1 for v0.18.x wire-up)
 
 #### Canonical-peer invariant (CIRISEdge#46 — scheduled v0.18.0)
