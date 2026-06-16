@@ -99,6 +99,40 @@ ignore = [
     # tree (pyo3 0.29 ships both fixes); the ignores that lived here
     # since v2.1.1 are removed. If `cargo deny check advisories`
     # surfaces either again, something regressed the substrate pin.
+
+    # v3.8.0 (CIRISEdge#66 / PR #131) — openmls 0.8.1 + libcrux
+    # ciphersuite 0x004D (MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519,
+    # X-Wing PQ-hybrid). Cryspen's libcrux family has four open
+    # advisories — all non-exploitable in our usage pattern; each
+    # ignore documents why.
+    "RUSTSEC-2026-0124",  # libcrux-chacha20poly1305: panic when
+    # `encrypt(ptxt, ciphertext_buffer)` is called with
+    # `ciphertext_buffer.len() > ptxt.len() + TAG_LEN`. NOT exploitable
+    # in our tree: openmls's libcrux-backed AEAD wrapper sizes the
+    # output buffer at exactly `ptxt.len() + TAG_LEN`; the buffer
+    # length is never attacker-controlled at our wire layer. The
+    # realtime_av path uses ring-backed AES-256-GCM (not libcrux's
+    # ChaCha20-Poly1305); the libcrux ChaCha lane runs only inside
+    # openmls's internal HPKE wrap for the X-Wing combiner.
+    "RUSTSEC-2026-0075",  # libcrux-ed25519 keygen samples Ed25519
+    # secret keys in a loop for ≤100 attempts; on catastrophic CSPRNG
+    # failure (100 consecutive zero samples) it silently continues
+    # with an all-zero key. P(100 zero samples | working CSPRNG)
+    # ≈ 2^-2000. OS-level CSPRNG failure is the threat model edge
+    # already addresses at the federation_session layer via
+    # ciris-crypto's RNG fail-secure latch (CIRISVerify #74, v5.6.0
+    # RC7). The libcrux-ed25519 keygen here is openmls-internal MLS
+    # signature key minting, not edge's federation signing path.
+    "RUSTSEC-2026-0073",  # libcrux-poly1305 standalone MAC panic
+    # via incorrect key-length constant. Per the advisory's own
+    # impact note: "use of libcrux-poly1305 in libcrux-chacha20poly1305
+    # is unaffected." We use it only via openmls's internal HPKE
+    # wrap (libcrux-chacha20poly1305 path), never as a standalone MAC.
+    "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained.
+    # Build-time dev-dep only (procedural-macro support crate); ships
+    # in zero production binaries. Pulled transitively via openmls's
+    # macro stack. Migration to manyhow / proc-macro2-diagnostics is
+    # openmls-upstream's call.
 ]
 
 [sources]

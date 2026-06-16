@@ -4592,6 +4592,577 @@ fn rns_destination_hash(
     Ok(*dest_hash.as_bytes())
 }
 
+// ─── CIRISEdge v3.8.0 — Layer 3 conformance surface ─────────────────
+//
+// PyO3 wrappers for the v3.8.0 realtime A/V additions:
+//   • Codec namespace constants (CODEC_AV1_SVC / JPEG_XS / MDC / OPAQUE)
+//   • MLS ciphersuite constant (0x004D X-Wing) for conformance attestation
+//   • plan_layered_by_policy — policy-only fan-out filter (CIRISEdge#128)
+//   • PyAvSession — MLS-backed stateful group session (CIRISEdge#129)
+//   • PyRelayNode — SFU forwarding hop (CIRISEdge#66, gated on
+//     `transport-reticulum` because the underlying RelayNode owns a
+//     leviculum ReticulumNode handle)
+//
+// Bytes-in / bytes-out throughout. No redacted-Debug newtype
+// (EpochDek / RootSecret / OwnKexKeys / SessionKey) escapes the Python
+// boundary; callers thread raw 32-byte slices, JSON-encoded wire bytes,
+// or per-tuple int/byte fields. AvSessionError / RelayError map to
+// PyValueError (input validation) or PyRuntimeError (operation failed).
+//
+// Threading note — PyAvSession holds an MlsSession which embeds an
+// Arc<LibcruxProvider> + an openmls MlsGroup + a SignatureKeyPair. The
+// pyclass is constructed and mutated under the GIL; we do NOT mark it
+// `unsendable` because callers may want to move the handle between
+// asyncio tasks. If the openmls upstream surfaces a !Send field in a
+// future cut, pin this with `#[pyclass(unsendable)]`.
+//
+// HNDL discipline — Member tuples with `mlkem768_pub = None` reject
+// at conversion with PyValueError("…lacks ML-KEM-768…") BEFORE any MLS
+// code runs (preserves the AvSessionError::PeerLacksMlkem semantics on
+// the Python surface).
+
+// CIRISEdge#128 — codec discriminators (re-export of
+// `realtime_av::CODEC_*` constants for the Python surface).
+const PY_CODEC_AV1_SVC: u8 = crate::transport::realtime_av::CODEC_AV1_SVC;
+const PY_CODEC_JPEG_XS: u8 = crate::transport::realtime_av::CODEC_JPEG_XS;
+const PY_CODEC_MDC: u8 = crate::transport::realtime_av::CODEC_MDC;
+const PY_CODEC_OPAQUE: u8 = crate::transport::realtime_av::CODEC_OPAQUE;
+/// CIRISEdge#129 — MLS X-Wing ciphersuite code point. Mirrors
+/// `MlsSession::ciphersuite_id()`. Exposed as a constant so
+/// CIRISConformance can attest the cohabiting wheel's MLS layer is
+/// pinned to the post-quantum hybrid ciphersuite without invoking the
+/// session constructor.
+const PY_MLS_CIPHERSUITE_XWING_ID: u16 = crate::transport::realtime_av_mls::CIPHERSUITE_ID;
+
+/// Decode a `(spatial, temporal, quality)` Python tuple into a
+/// [`ChunkLayer`]. Returns `PyValueError` on shape mismatch.
+fn chunk_layer_from_tuple(t: (u8, u8, u8)) -> crate::transport::realtime_av::ChunkLayer {
+    crate::transport::realtime_av::ChunkLayer {
+        spatial: t.0,
+        temporal: t.1,
+        quality: t.2,
+    }
+}
+
+/// Decode a `(max_spatial, max_temporal, max_quality)` Python tuple
+/// into a [`ReceiverLayerPolicy`].
+fn receiver_policy_from_tuple(
+    t: (u8, u8, u8),
+) -> crate::transport::realtime_av::ReceiverLayerPolicy {
+    crate::transport::realtime_av::ReceiverLayerPolicy {
+        max_spatial: t.0,
+        max_temporal: t.1,
+        max_quality: t.2,
+    }
+}
+
+/// CIRISEdge#128 / L2-A — policy-only layer-aware fan-out filter
+/// exposed to Python.
+///
+/// **Reachability filtering is NOT included on this surface.** The
+/// Rust-side `RealtimeFanout::plan_layered` takes a
+/// `&ReachabilityTracker`; that tracker type is not Python-friendly
+/// (cross-wheel handoff would require yet another capsule contract).
+/// The Python wrapper assumes the caller has already filtered
+/// participants by reachability via whatever mechanism is appropriate
+/// at the call site (the cohabiting agent's outbound queue tracks
+/// per-peer reachability separately, so the filter is a no-op for
+/// many cohabitation flows). This filter then drops the remaining
+/// participants whose per-receiver
+/// [`ReceiverLayerPolicy`](crate::transport::realtime_av::ReceiverLayerPolicy)
+/// does not admit the given chunk layer.
+///
+/// Equivalent to `RealtimeFanout::plan_layered` with the reachability
+/// rule passed-through (every participant treated as reachable). Use
+/// in conformance harnesses + Python-side mesh planners; for in-Rust
+/// callers, use `RealtimeFanout::plan_layered` directly.
+#[pyfunction]
+#[pyo3(signature = (participants_with_policy, chunk_layer))]
+fn plan_layered_by_policy(
+    participants_with_policy: Vec<(String, (u8, u8, u8))>,
+    chunk_layer: (u8, u8, u8),
+) -> Vec<String> {
+    let layer = chunk_layer_from_tuple(chunk_layer);
+    participants_with_policy
+        .into_iter()
+        .filter_map(|(peer_key_id, policy_t)| {
+            let policy = receiver_policy_from_tuple(policy_t);
+            if policy.admits(layer) {
+                Some(peer_key_id)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+// ─── PyAvSession (CIRISEdge#129 / L2-B) ─────────────────────────────
+
+/// Stateful MLS-backed group-key holder for one realtime stream.
+/// CIRIS-shaped wrapper around `transport::realtime_av_session::AvSession`.
+///
+/// All membership-change verbs (join / leave) round-trip through
+/// `advance_epoch_*`, returning the new epoch + MLS wire artifacts
+/// (Commit bytes, Welcome bytes on Join) + the freshly-derived 32-byte
+/// EpochDek. Existing members apply the same Commit via
+/// `process_commit` to land on the same epoch.
+///
+/// **Joiner-side bootstrap (`process_welcome`) currently returns the
+/// typed error `AvSessionError::JoinerSurfaceUnwired`** because v3.8.0
+/// ships the joiner path as a documented stub pending the L3
+/// federation-directory KeyPackage publish/fetch surface (a follow-up
+/// cut). Callers handling Welcome bytes today will see a
+/// `RuntimeError` with that message — use the test-helper round-trip
+/// path in the Rust-side `tests` module for verification until the
+/// follow-up cut lands.
+///
+/// Member tuple shape (`key_id`, `x25519_pub`, `mlkem768_pub`) mirrors
+/// the Rust `Member { key_id, kex_pubkeys: PeerKexPubkeys }`. A `None`
+/// for `mlkem768_pub` rejects at conversion with `PyValueError` (HNDL
+/// discipline — the 0x004D ciphersuite requires ML-KEM-768; the
+/// pre-check fails closed before any MLS code runs).
+#[pyclass(name = "AvSession", module = "ciris_edge")]
+pub struct PyAvSession {
+    inner: crate::transport::realtime_av_session::AvSession,
+}
+
+/// Convert a Python member tuple (`key_id`, `x25519_pub`,
+/// `mlkem768_pub`) into the Rust [`Member`] shape, enforcing the HNDL
+/// pre-check (mlkem768_pub MUST be Some). Failing here surfaces
+/// `PyValueError` before the openmls layer is invoked.
+fn member_from_py(
+    label: &str,
+    key_id: String,
+    x25519_pub: &[u8],
+    mlkem768_pub: Option<&[u8]>,
+) -> PyResult<crate::transport::realtime_av_mls::Member> {
+    use crate::transport::federation_session::PeerKexPubkeys;
+    use crate::transport::realtime_av_mls::Member;
+    let x = fixed_bytes::<32>(&format!("{label}.x25519_pub"), x25519_pub)?;
+    let Some(mlkem) = mlkem768_pub else {
+        return Err(PyValueError::new_err(format!(
+            "{label}: ML-KEM-768 pubkey required by ciphersuite 0x004D (HNDL discipline) — peer {key_id}"
+        )));
+    };
+    Ok(Member {
+        key_id,
+        kex_pubkeys: PeerKexPubkeys {
+            x25519_pub: x,
+            mlkem768_pub: Some(mlkem.to_vec()),
+        },
+    })
+}
+
+/// Map an `AvSessionError` to the appropriate `PyErr`.
+///
+/// - `PeerLacksMlkem` + `ReplaceNotSupported` are input-validation
+///   errors (`PyValueError`).
+/// - `JoinerSurfaceUnwired` + `Mls(_)` are operation failures
+///   (`PyRuntimeError`).
+fn map_av_session_err(e: &crate::transport::realtime_av_session::AvSessionError) -> PyErr {
+    use crate::transport::realtime_av_session::AvSessionError;
+    match e {
+        AvSessionError::PeerLacksMlkem(_) | AvSessionError::ReplaceNotSupported => {
+            PyValueError::new_err(format!("{e}"))
+        }
+        AvSessionError::JoinerSurfaceUnwired | AvSessionError::Mls(_) => {
+            PyRuntimeError::new_err(format!("{e}"))
+        }
+    }
+}
+
+#[pymethods]
+impl PyAvSession {
+    /// Create a fresh MLS-backed session for `stream_id`. The local
+    /// participant is identified by `own_key_id`; `initial_members` is
+    /// the peer set added at group genesis.
+    ///
+    /// Returns `(PyAvSession, initial_epoch_dek_32B)`. The DEK is the
+    /// MLS first-epoch exporter secret; every group member derives the
+    /// same 32 bytes from their own session at the same epoch.
+    ///
+    /// HNDL pre-check: any member tuple whose `mlkem768_pub` is `None`
+    /// rejects with `ValueError` before any MLS code runs.
+    #[staticmethod]
+    #[pyo3(signature = (stream_id, own_key_id, initial_members))]
+    fn create(
+        stream_id: &[u8],
+        own_key_id: &str,
+        initial_members: Vec<(String, Vec<u8>, Option<Vec<u8>>)>,
+    ) -> PyResult<(Self, [u8; 32])> {
+        let stream_bytes = fixed_bytes::<32>("stream_id", stream_id)?;
+        let stream = crate::transport::realtime_av::StreamId(stream_bytes);
+        let mut members = Vec::with_capacity(initial_members.len());
+        for (i, (key_id, x_pub, mlkem_pub)) in initial_members.into_iter().enumerate() {
+            let label = format!("initial_members[{i}]");
+            members.push(member_from_py(
+                &label,
+                key_id,
+                &x_pub,
+                mlkem_pub.as_deref(),
+            )?);
+        }
+        let (session, dek) =
+            crate::transport::realtime_av_session::AvSession::create(stream, own_key_id, members)
+                .map_err(|e| map_av_session_err(&e))?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(dek.as_bytes());
+        Ok((Self { inner: session }, out))
+    }
+
+    /// Current epoch counter (matches the underlying MLS group epoch).
+    fn epoch(&self) -> u64 {
+        self.inner.epoch().0
+    }
+
+    /// Current stream id (32 bytes).
+    fn stream_id(&self) -> [u8; 32] {
+        self.inner.stream_id().0
+    }
+
+    /// Current roster size (count of members in the MLS group,
+    /// including the local participant).
+    fn roster_size(&self) -> usize {
+        self.inner.roster_size()
+    }
+
+    /// Admit one new participant. Translates to an MLS `commit_add`
+    /// and produces both a Commit (for existing members) and a
+    /// Welcome (for the joiner) + the new 32-byte EpochDek.
+    ///
+    /// Returns `(new_epoch_u64, commit_bytes, welcome_bytes, new_dek_32B)`.
+    /// HNDL pre-check applies (mlkem768_pub required).
+    #[pyo3(signature = (new_member))]
+    #[allow(clippy::type_complexity)] // 4-tuple is the wire shape callers expect
+    fn advance_epoch_join(
+        &mut self,
+        new_member: (String, Vec<u8>, Option<Vec<u8>>),
+    ) -> PyResult<(u64, Vec<u8>, Vec<u8>, [u8; 32])> {
+        use crate::transport::realtime_av_session::RosterDelta;
+        let (key_id, x_pub, mlkem_pub) = new_member;
+        let member = member_from_py("new_member", key_id, &x_pub, mlkem_pub.as_deref())?;
+        let artifacts = self
+            .inner
+            .advance_epoch(RosterDelta::Join(member))
+            .map_err(|e| map_av_session_err(&e))?;
+        // Welcome is `Some(_)` on Join per the AvSession contract. If
+        // it ever fires `None` (would be a regression) we surface a
+        // typed RuntimeError rather than silently emitting empty
+        // bytes.
+        let welcome = artifacts.welcome_bytes.ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "advance_epoch(Join) returned no Welcome — internal invariant violated",
+            )
+        })?;
+        let mut dek_out = [0u8; 32];
+        dek_out.copy_from_slice(artifacts.new_dek.as_bytes());
+        Ok((
+            artifacts.new_epoch.0,
+            artifacts.commit_bytes,
+            welcome,
+            dek_out,
+        ))
+    }
+
+    /// Evict one participant. Translates to an MLS `commit_remove`;
+    /// the leaver is quarantined out of the group per RFC 9420 §13.4
+    /// (forward secrecy on Leave).
+    ///
+    /// Returns `(new_epoch_u64, commit_bytes, new_dek_32B)`. No
+    /// Welcome — only Join produces one.
+    #[pyo3(signature = (member_key_id))]
+    fn advance_epoch_leave(&mut self, member_key_id: &str) -> PyResult<(u64, Vec<u8>, [u8; 32])> {
+        use crate::transport::realtime_av_session::RosterDelta;
+        let artifacts = self
+            .inner
+            .advance_epoch(RosterDelta::Leave(member_key_id.to_string()))
+            .map_err(|e| map_av_session_err(&e))?;
+        let mut dek_out = [0u8; 32];
+        dek_out.copy_from_slice(artifacts.new_dek.as_bytes());
+        Ok((artifacts.new_epoch.0, artifacts.commit_bytes, dek_out))
+    }
+
+    /// Receiver-side — apply a Commit produced by another node's
+    /// `advance_epoch_*`. Advances the local MLS group to the new
+    /// epoch and returns the matching 32-byte EpochDek.
+    ///
+    /// Every existing member who applies the same commit derives the
+    /// same EpochDek (RFC 9420 §8.5).
+    #[pyo3(signature = (commit_bytes))]
+    fn process_commit(&mut self, commit_bytes: &[u8]) -> PyResult<[u8; 32]> {
+        let dek = self
+            .inner
+            .process_commit(commit_bytes)
+            .map_err(|e| map_av_session_err(&e))?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(dek.as_bytes());
+        Ok(out)
+    }
+
+    /// Joiner-side bootstrap from a Welcome.
+    ///
+    /// **v3.8.0 status: returns
+    /// `RuntimeError("joiner-side Welcome processing requires the L3
+    /// federation_directory KeyPackage publish/fetch surface; deferred
+    /// from v3.8.0")`.** This is the documented Layer 3 wiring gap —
+    /// see `AvSessionError::JoinerSurfaceUnwired` and the
+    /// `transport::realtime_av_session` module docs. The error fires
+    /// deliberately; the conformance harness should expect it and skip
+    /// the joiner-side assertion until the follow-up cut lands.
+    ///
+    /// Argument shape matches `federation_session_respond` (own
+    /// X25519 priv + optional ML-KEM-768 priv/pub pair). The HNDL
+    /// pre-check fires first: `own_mlkem768_pub == None` rejects with
+    /// `ValueError` before the deferred-surface error is reached.
+    #[staticmethod]
+    #[pyo3(signature = (welcome_bytes, own_x25519_priv, own_mlkem768_priv, own_mlkem768_pub))]
+    fn process_welcome(
+        welcome_bytes: &[u8],
+        own_x25519_priv: &[u8],
+        own_mlkem768_priv: Option<&[u8]>,
+        own_mlkem768_pub: Option<&[u8]>,
+    ) -> PyResult<(Self, [u8; 32])> {
+        use crate::transport::federation_session::OwnKexKeys;
+        let x_priv = fixed_bytes::<32>("own_x25519_priv", own_x25519_priv)?;
+        let own = OwnKexKeys {
+            x25519_priv: x_priv,
+            mlkem768_priv: own_mlkem768_priv.map(<[u8]>::to_vec),
+            mlkem768_pub: own_mlkem768_pub.map(<[u8]>::to_vec),
+        };
+        // `stream_id` is structurally unused by the deferred-surface
+        // stub (process_welcome's signature takes it for the future
+        // wiring); we pass a sentinel and let the underlying error
+        // path fire. When the L3 surface lands, this wrapper will
+        // accept a real stream_id and pipe it through.
+        let stream_id = crate::transport::realtime_av::StreamId([0u8; 32]);
+        // own_key_id is also part of the future surface; the stub
+        // checks only own.mlkem768_pub.is_some() (HNDL discipline)
+        // before falling through to JoinerSurfaceUnwired. We pass a
+        // placeholder; when the surface wires, this wrapper will take
+        // own_key_id as an explicit argument.
+        let (session, dek) = crate::transport::realtime_av_session::AvSession::process_welcome(
+            stream_id,
+            "joiner",
+            &own,
+            welcome_bytes,
+        )
+        .map_err(|e| map_av_session_err(&e))?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(dek.as_bytes());
+        Ok((Self { inner: session }, out))
+    }
+}
+
+// ─── PyRelayNode (CIRISEdge#66 / L2-C) ──────────────────────────────
+
+/// Map a `RelayError` to the appropriate `PyErr`. `StreamNotFound` /
+/// `SubscriberNotFound` are caller-input issues (PyValueError);
+/// `TransitKeyMissing` (internal invariant) + `OuterSealFailed`
+/// (crypto operation failed) map to PyRuntimeError.
+#[cfg(feature = "transport-reticulum")]
+fn map_relay_err(e: &crate::transport::realtime_av_relay::RelayError) -> PyErr {
+    use crate::transport::realtime_av_relay::RelayError;
+    match e {
+        RelayError::StreamNotFound(_) | RelayError::SubscriberNotFound { .. } => {
+            PyValueError::new_err(format!("{e}"))
+        }
+        RelayError::TransitKeyMissing { .. } | RelayError::OuterSealFailed(_) => {
+            PyRuntimeError::new_err(format!("{e}"))
+        }
+    }
+}
+
+/// SFU forwarding hop — addressable Reticulum destination + per-stream
+/// subscriber roster + per-(subscriber, stream) transit keys + per-
+/// subscriber layer-admission policy.
+///
+/// CIRIS-shaped wrapper around
+/// `transport::realtime_av_relay::RelayNode`. The relay never holds
+/// the epoch DEK — structurally: there is no field of type EpochDek on
+/// RelayNode or anything reachable from it. The plaintext invariant is
+/// enforced by construction (E2E inner-AEAD opens only at the
+/// subscriber, which holds the DEK; the relay re-seals the outer AEAD
+/// only).
+///
+/// **Conformance-only constructor**: `with_synthetic_node` builds an
+/// in-process leviculum ReticulumNode + a synthetic DestinationHash so
+/// the CIRISConformance harness can exercise the relay surface
+/// without a configured Reticulum interface. Production callers wire
+/// the relay into an existing leviculum node via the Rust-side
+/// `RelayNode::new(node: Arc<ReticulumNode>, address: DestinationHash)`
+/// constructor — that path is not exposed through PyO3 (the
+/// ReticulumNode handle is a Rust-only type).
+#[cfg(feature = "transport-reticulum")]
+#[pyclass(name = "RelayNode", module = "ciris_edge")]
+pub struct PyRelayNode {
+    inner: crate::transport::realtime_av_relay::RelayNode,
+}
+
+#[cfg(feature = "transport-reticulum")]
+#[pymethods]
+impl PyRelayNode {
+    /// Build a relay backed by an in-process synthetic ReticulumNode.
+    /// **Conformance-only**: the resulting relay has an addressable
+    /// destination but the node is not configured with any real
+    /// transport interface — `forward`'s output is the
+    /// `(subscriber_key_id, sealed_chunk_bytes)` pairs the caller is
+    /// expected to dispatch via whatever Layer 2 wiring is appropriate
+    /// (in the conformance harness, that's typically a synchronous
+    /// hand-off back to a peer's open path).
+    ///
+    /// `address_hash_bytes` is the 16-byte
+    /// [`DestinationHash`](reticulum_core::DestinationHash) value
+    /// (CEG §5.6.8.8.1.1 TRUNCATED_HASHLENGTH). Pass any synthetic
+    /// 16-byte value for harness-only use; production callers should
+    /// derive this via [`rns_destination_hash`].
+    #[staticmethod]
+    #[pyo3(signature = (address_hash_bytes))]
+    fn with_synthetic_node(address_hash_bytes: &[u8]) -> PyResult<Self> {
+        use reticulum_core::{DestinationHash, Identity};
+        use reticulum_std::driver::ReticulumNodeBuilder;
+        let addr_bytes = fixed_bytes::<16>("address_hash_bytes", address_hash_bytes)?;
+        // Synthetic 64-byte private key — deterministic, never
+        // intended for real I/O. Matches the relay's own test
+        // fixture pattern (`tests::test_node`).
+        let mut priv_bytes = [0u8; 64];
+        for (i, b) in priv_bytes.iter_mut().enumerate() {
+            *b = u8::try_from(i)
+                .expect("index < 64")
+                .wrapping_mul(31)
+                .wrapping_add(1);
+        }
+        let identity = Identity::from_private_key_bytes(&priv_bytes)
+            .map_err(|e| PyRuntimeError::new_err(format!("synthetic identity: {e:?}")))?;
+        // Per-call temp storage directory so concurrent harness runs
+        // don't collide. The node is never driven for I/O — this is
+        // a structural requirement of ReticulumNodeBuilder, not an
+        // operational one.
+        let storage =
+            std::env::temp_dir().join(format!("ciris-edge-pyrelay-{}", uuid::Uuid::new_v4()));
+        let node = ReticulumNodeBuilder::new()
+            .identity(identity)
+            .storage_path(storage)
+            .build_sync()
+            .map_err(|e| PyRuntimeError::new_err(format!("synthetic node build: {e:?}")))?;
+        let address = DestinationHash::new(addr_bytes);
+        Ok(Self {
+            inner: crate::transport::realtime_av_relay::RelayNode::new(
+                std::sync::Arc::new(node),
+                address,
+            ),
+        })
+    }
+
+    /// Register a subscriber on a stream with their pre-established
+    /// 32-byte transit key (from
+    /// [`federation_session_initiate`] / [`federation_session_respond`])
+    /// and per-subscriber layer-admission policy.
+    ///
+    /// Idempotent: re-subscribing replaces the previous state (old
+    /// transit key zeroizes on drop). `layer_policy` is `(max_spatial,
+    /// max_temporal, max_quality)`; pass `(255, 255, 255)` for
+    /// uncapped (admits every layer).
+    #[pyo3(signature = (stream_id, subscriber_key_id, transit_key, layer_policy))]
+    fn subscribe(
+        &mut self,
+        stream_id: &[u8],
+        subscriber_key_id: String,
+        transit_key: &[u8],
+        layer_policy: (u8, u8, u8),
+    ) -> PyResult<()> {
+        let stream_bytes = fixed_bytes::<32>("stream_id", stream_id)?;
+        let stream = crate::transport::realtime_av::StreamId(stream_bytes);
+        let tk = fixed_bytes::<32>("transit_key", transit_key)?;
+        let policy = receiver_policy_from_tuple(layer_policy);
+        self.inner
+            .subscribe(stream, subscriber_key_id, tk, policy)
+            .map_err(|e| map_relay_err(&e))
+    }
+
+    /// Remove a subscriber from a stream. Zeroizes the per-link
+    /// transit key on drop. Returns `ValueError` if the subscriber
+    /// wasn't registered on this stream.
+    #[pyo3(signature = (stream_id, subscriber_key_id))]
+    fn unsubscribe(&mut self, stream_id: &[u8], subscriber_key_id: &str) -> PyResult<()> {
+        let stream_bytes = fixed_bytes::<32>("stream_id", stream_id)?;
+        let stream = crate::transport::realtime_av::StreamId(stream_bytes);
+        self.inner
+            .unsubscribe(stream, &subscriber_key_id.to_string())
+            .map_err(|e| map_relay_err(&e))
+    }
+
+    /// Update the layer-admission policy for an already-subscribed
+    /// (subscriber, stream) pair without re-subscribing. Preserves the
+    /// transit key + per-link `link_seq` counter — only the policy
+    /// changes. `ValueError` if the subscriber isn't registered.
+    #[pyo3(signature = (stream_id, subscriber_key_id, new_policy))]
+    fn set_policy(
+        &mut self,
+        stream_id: &[u8],
+        subscriber_key_id: &str,
+        new_policy: (u8, u8, u8),
+    ) -> PyResult<()> {
+        let stream_bytes = fixed_bytes::<32>("stream_id", stream_id)?;
+        let stream = crate::transport::realtime_av::StreamId(stream_bytes);
+        let policy = receiver_policy_from_tuple(new_policy);
+        self.inner
+            .set_policy(stream, &subscriber_key_id.to_string(), policy)
+            .map_err(|e| map_relay_err(&e))
+    }
+
+    /// Forward an inner-sealed chunk to every ADMITTED subscriber on
+    /// its stream.
+    ///
+    /// The wrapper reconstructs the Rust `InnerSealed` from the
+    /// caller-provided ciphertext + chunk header fields (via the
+    /// `inner_sealed_from_parts` helper). The relay then applies
+    /// `seal_av_outer` once per admitted subscriber using their
+    /// transit key + monotonic `link_seq` counter.
+    ///
+    /// Returns `[(subscriber_key_id, sealed_chunk_wire_bytes), ...]`
+    /// — one entry per admitted subscriber, ready for the caller's
+    /// Layer 2 dispatch. Subscribers whose layer policy rejects the
+    /// chunk's `layer` are silently dropped (no entry in the result,
+    /// no `link_seq` advance).
+    ///
+    /// `codec_id` accepts any of the CODEC_* constants; `layer` is
+    /// `(spatial, temporal, quality)`. The chunk header invariant
+    /// from [`seal_av_chunk`] applies — `codec_id = CODEC_OPAQUE`
+    /// MUST have `layer = (0, 0, 0)` per the module contract (the
+    /// admission filter is a no-op in that case anyway).
+    #[pyo3(signature = (stream_id, inner_ciphertext, codec_id, layer, epoch_u64, chunk_seq_u64))]
+    fn forward(
+        &mut self,
+        stream_id: &[u8],
+        inner_ciphertext: &[u8],
+        codec_id: u8,
+        layer: (u8, u8, u8),
+        epoch_u64: u64,
+        chunk_seq_u64: u64,
+    ) -> PyResult<Vec<(String, Vec<u8>)>> {
+        use crate::transport::realtime_av;
+        let stream_bytes = fixed_bytes::<32>("stream_id", stream_id)?;
+        let stream = realtime_av::StreamId(stream_bytes);
+        let chunk_layer = chunk_layer_from_tuple(layer);
+        let inner = realtime_av::inner_sealed_from_parts(
+            stream,
+            realtime_av::Epoch(epoch_u64),
+            realtime_av::ChunkSeq(chunk_seq_u64),
+            codec_id,
+            chunk_layer,
+            inner_ciphertext.to_vec(),
+        );
+        let out = self
+            .inner
+            .forward(stream, &inner)
+            .map_err(|e| map_relay_err(&e))?;
+        Ok(out
+            .into_iter()
+            .map(|f| (f.subscriber, f.sealed.to_bytes()))
+            .collect())
+    }
+}
+
 #[pymodule]
 fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v1.1.7 (CIRISEdge#58) — diagnostic harness, gated under the
@@ -4663,6 +5234,36 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(federation_session_respond, m)?)?;
     #[cfg(feature = "transport-reticulum")]
     m.add_function(wrap_pyfunction!(rns_destination_hash, m)?)?;
+
+    // ─── CIRISEdge v3.8.0 — Layer 3 conformance surface ─────────────
+    //
+    // Codec namespace constants (CIRISEdge#128) — re-exported so the
+    // Python caller can build chunk headers without re-encoding the
+    // discriminator. Mirrors `transport::realtime_av::CODEC_*`.
+    m.add("CODEC_AV1_SVC", PY_CODEC_AV1_SVC)?;
+    m.add("CODEC_JPEG_XS", PY_CODEC_JPEG_XS)?;
+    m.add("CODEC_MDC", PY_CODEC_MDC)?;
+    m.add("CODEC_OPAQUE", PY_CODEC_OPAQUE)?;
+    // MLS ciphersuite code point (CIRISEdge#129) — used by
+    // CIRISConformance to attest that the cohabiting wheel's MLS
+    // layer is pinned to the post-quantum hybrid X-Wing ciphersuite.
+    m.add("MLS_CIPHERSUITE_XWING_ID", PY_MLS_CIPHERSUITE_XWING_ID)?;
+
+    // CIRISEdge#128 / L2-A — policy-only layered fan-out filter.
+    // Reachability filtering is the caller's responsibility (see the
+    // function docstring for the rationale — the in-Rust
+    // ReachabilityTracker isn't Python-friendly cross-wheel).
+    m.add_function(wrap_pyfunction!(plan_layered_by_policy, m)?)?;
+
+    // CIRISEdge#129 / L2-B — MLS-backed group session pyclass.
+    m.add_class::<PyAvSession>()?;
+
+    // CIRISEdge#66 / L2-C — SFU relay pyclass. Gated on
+    // `transport-reticulum` because RelayNode owns a leviculum
+    // ReticulumNode handle and a DestinationHash (the synthetic
+    // constructor needs both types).
+    #[cfg(feature = "transport-reticulum")]
+    m.add_class::<PyRelayNode>()?;
 
     Ok(())
 }
@@ -4839,6 +5440,237 @@ mod tests {
         let py_edge = PyEdge::for_test(Arc::new(edge), tokio::runtime::Handle::current());
         let handle: Arc<Edge> = py_edge.edge_handle();
         assert!(Arc::strong_count(&handle) >= 2);
+    }
+
+    // ─── CIRISEdge v3.8.0 — Layer 3 conformance surface tests ───────
+    //
+    // Rust-side smoke gates for the L3 PyO3 wrappers. These exercise
+    // the bytes-in / bytes-out round-trip locally without standing up
+    // an embedded Python interpreter for read-only constant checks; a
+    // shared `init_python()` helper warms up the interpreter for the
+    // wrappers that construct PyErrs (PyValueError / PyRuntimeError
+    // need an initialized interpreter to allocate the exception
+    // type). The full Python-driven coverage runs in CIRISConformance
+    // after the v3.8.0 wheel publishes.
+    fn l3_init_python() {
+        use std::sync::OnceLock;
+        static L3_INIT: OnceLock<()> = OnceLock::new();
+        L3_INIT.get_or_init(Python::initialize);
+    }
+
+    /// L3 codec constants match their Rust-side counterparts. Locks
+    /// the cross-wheel wire contract: if `transport::realtime_av`
+    /// changes a discriminator, the Python-surface constant must
+    /// follow in lockstep.
+    #[test]
+    fn pyo3_codec_constants_match_rust_side() {
+        use crate::transport::realtime_av;
+        assert_eq!(PY_CODEC_AV1_SVC, realtime_av::CODEC_AV1_SVC);
+        assert_eq!(PY_CODEC_JPEG_XS, realtime_av::CODEC_JPEG_XS);
+        assert_eq!(PY_CODEC_MDC, realtime_av::CODEC_MDC);
+        assert_eq!(PY_CODEC_OPAQUE, realtime_av::CODEC_OPAQUE);
+    }
+
+    /// L3 MLS ciphersuite constant matches `MlsSession::ciphersuite_id()`.
+    /// The conformance attestation expects 0x004D (X-Wing).
+    #[test]
+    fn pyo3_mls_ciphersuite_constant_pins_xwing() {
+        use crate::transport::realtime_av_mls::MlsSession;
+        assert_eq!(PY_MLS_CIPHERSUITE_XWING_ID, 0x004D);
+        assert_eq!(PY_MLS_CIPHERSUITE_XWING_ID, MlsSession::ciphersuite_id());
+    }
+
+    /// `plan_layered_by_policy` filters by per-receiver policy only —
+    /// the BLINKING_DOT policy admits `(0,0,0)` chunks and rejects
+    /// everything above; UNCAPPED admits every layer.
+    #[test]
+    fn pyo3_plan_layered_by_policy_filters_by_admission() {
+        let participants = vec![
+            ("uncapped".to_string(), (255, 255, 255)),
+            ("blinking_dot".to_string(), (0, 0, 0)),
+            ("spatial_capped".to_string(), (1, 255, 255)),
+        ];
+        // Base layer (0,0,0) — admitted by all three.
+        let base = plan_layered_by_policy(participants.clone(), (0, 0, 0));
+        assert_eq!(base.len(), 3);
+        // Layer (1,0,0) — admitted by uncapped + spatial_capped; rejected by blinking_dot.
+        let enhancement = plan_layered_by_policy(participants.clone(), (1, 0, 0));
+        assert!(enhancement.contains(&"uncapped".to_string()));
+        assert!(enhancement.contains(&"spatial_capped".to_string()));
+        assert!(!enhancement.contains(&"blinking_dot".to_string()));
+        // Layer (2,0,0) — only uncapped admits.
+        let high = plan_layered_by_policy(participants, (2, 0, 0));
+        assert_eq!(high, vec!["uncapped".to_string()]);
+    }
+
+    /// HNDL pre-check fires at `PyAvSession::create` for any member
+    /// with `mlkem768_pub = None`. The 0x004D ciphersuite requires
+    /// ML-KEM-768 by spec; this preserves the AvSession structural
+    /// invariant on the Python surface.
+    #[test]
+    fn pyo3_av_session_create_rejects_classical_only_member() {
+        l3_init_python();
+        let stream = [7u8; 32];
+        let initial = vec![(
+            "classical-only-peer".to_string(),
+            vec![1u8; 32],
+            None, // <- HNDL violation
+        )];
+        let Err(err) = PyAvSession::create(&stream, "creator", initial) else {
+            panic!("classical-only member should be rejected");
+        };
+        let s = format!("{err}");
+        assert!(
+            s.contains("ML-KEM-768"),
+            "expected HNDL diagnostic, got: {s}"
+        );
+    }
+
+    /// `PyAvSession::create` round-trips with hybrid members and
+    /// returns a non-zero 32-byte EpochDek (the MLS first-epoch
+    /// exporter secret).
+    #[test]
+    fn pyo3_av_session_create_round_trips_with_hybrid_members() {
+        l3_init_python();
+        let stream = [0xABu8; 32];
+        let initial = vec![(
+            "bob".to_string(),
+            vec![1u8; 32],
+            Some(vec![0xABu8; 1184]), // ML-KEM-768 pubkey size
+        )];
+        let (session, dek) = PyAvSession::create(&stream, "alice", initial)
+            .unwrap_or_else(|e| panic!("create should succeed: {e}"));
+        assert_eq!(dek.len(), 32);
+        assert_ne!(dek, [0u8; 32], "EpochDek must be non-zero");
+        assert_eq!(session.epoch(), 1, "2-member group → 1 commit → epoch 1");
+        assert_eq!(session.roster_size(), 2);
+        assert_eq!(session.stream_id(), stream);
+    }
+
+    /// `PyAvSession::create` with a malformed stream_id (wrong length)
+    /// rejects with `PyValueError` at conversion.
+    #[test]
+    fn pyo3_av_session_create_rejects_wrong_stream_id_length() {
+        l3_init_python();
+        let short_stream = [0u8; 16]; // wrong length
+        let Err(err) = PyAvSession::create(&short_stream, "alice", vec![]) else {
+            panic!("short stream_id should be rejected");
+        };
+        let s = format!("{err}");
+        assert!(s.contains("stream_id"), "expected length error, got: {s}");
+    }
+
+    /// `PyAvSession::process_welcome` returns the typed
+    /// `JoinerSurfaceUnwired` error at v3.8.0 (the joiner surface is
+    /// a documented Layer 3 follow-up). Conformance harnesses should
+    /// expect this and skip the joiner-side assertion until the
+    /// follow-up cut lands.
+    #[test]
+    fn pyo3_av_session_process_welcome_surfaces_unwired_error() {
+        l3_init_python();
+        let own_x = [2u8; 32];
+        let own_mlkem_priv = vec![0xCD; 2400];
+        let own_mlkem_pub = vec![0xAB; 1184];
+        let result = PyAvSession::process_welcome(
+            b"synthetic-welcome-bytes",
+            &own_x,
+            Some(&own_mlkem_priv),
+            Some(&own_mlkem_pub),
+        );
+        let Err(err) = result else {
+            panic!("L3 wiring gap should surface — got Ok");
+        };
+        let s = format!("{err}");
+        assert!(
+            s.contains("L3") || s.contains("federation_directory") || s.contains("KeyPackage"),
+            "expected JoinerSurfaceUnwired diagnostic, got: {s}"
+        );
+    }
+
+    /// `PyRelayNode::with_synthetic_node` builds a relay handle and
+    /// subscribe/unsubscribe cycle through the wrapper without
+    /// panicking. Smoke-tests the bytes-in conversion shapes.
+    #[test]
+    fn pyo3_relay_synthetic_node_subscribe_unsubscribe() {
+        l3_init_python();
+        let addr = [0x42u8; 16];
+        let mut relay =
+            PyRelayNode::with_synthetic_node(&addr).expect("synthetic node should build");
+        let stream = [0xA1u8; 32];
+        let transit = [0x55u8; 32];
+        relay
+            .subscribe(
+                &stream,
+                "subscriber-1".to_string(),
+                &transit,
+                (255, 255, 255),
+            )
+            .expect("subscribe");
+        relay
+            .unsubscribe(&stream, "subscriber-1")
+            .expect("unsubscribe");
+        // Re-unsubscribe rejects with PyValueError per the wrapper
+        // contract (caller-input error, not a runtime fault).
+        let err = relay
+            .unsubscribe(&stream, "subscriber-1")
+            .expect_err("re-unsubscribe should reject");
+        let s = format!("{err}");
+        assert!(
+            s.contains("not subscribed"),
+            "expected diagnostic, got: {s}"
+        );
+    }
+
+    /// `PyRelayNode::forward` produces one sealed wire bytes per
+    /// admitted subscriber. Verifies the bytes-in / bytes-out shape:
+    /// `inner_ciphertext` flows through the wrapper, the relay applies
+    /// the outer AEAD, and the result decodes as a valid
+    /// `SealedAvChunk` (round-trip via `SealedAvChunk::from_bytes`).
+    #[test]
+    fn pyo3_relay_forward_produces_decodable_wire_bytes() {
+        use crate::transport::realtime_av::{
+            seal_av_inner, ChunkLayer, ChunkSeq, Epoch, EpochDek, SealedAvChunk, StreamId,
+            CODEC_OPAQUE,
+        };
+        l3_init_python();
+        let addr = [0x42u8; 16];
+        let mut relay = PyRelayNode::with_synthetic_node(&addr).expect("synthetic node");
+        let stream_bytes = [0xA1u8; 32];
+        let transit = [0x55u8; 32];
+        relay
+            .subscribe(
+                &stream_bytes,
+                "subscriber-1".to_string(),
+                &transit,
+                (255, 255, 255),
+            )
+            .expect("subscribe");
+
+        // Build an inner-sealed chunk via the Rust API; pull its
+        // ciphertext bytes out and feed them through the Python
+        // `forward` shape.
+        let dek = EpochDek::from_bytes([0x77u8; 32]);
+        let inner = seal_av_inner(
+            b"plaintext frame",
+            &dek,
+            StreamId(stream_bytes),
+            Epoch(1),
+            ChunkSeq(0),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        )
+        .expect("inner seal");
+        let inner_ct = inner.inner_ciphertext().to_vec();
+
+        let out = relay
+            .forward(&stream_bytes, &inner_ct, CODEC_OPAQUE, (0, 0, 0), 1, 0)
+            .expect("forward");
+        assert_eq!(out.len(), 1, "1 subscriber → 1 forward output");
+        assert_eq!(out[0].0, "subscriber-1");
+        // The bytes are a valid SealedAvChunk wire encoding.
+        let decoded = SealedAvChunk::from_bytes(&out[0].1).expect("wire round-trip");
+        assert_eq!(decoded.codec_id, CODEC_OPAQUE);
+        assert_eq!(decoded.layer, ChunkLayer::BASE);
     }
 }
 
