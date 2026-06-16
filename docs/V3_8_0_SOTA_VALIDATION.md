@@ -6,6 +6,8 @@ Deep-research workflow `ws9po4ot2` (2026-06-15) validated the v3.8.0 ALM + MDC d
 
 **v3.8.0 is design-feasible but pioneering on an axis the field has not validated.** No production system has shipped ALM (peer-to-peer mesh-tree video) combined with symmetric MDC (Multiple Description Coding) at scale. The industry is converging in the opposite direction (centralized relay via MoQ). The substrate is the right shape; the codec it's designed for is a 2024 research prototype.
 
+**Locality-first scope**: the substrate operates at *locality* scale (LAN / wifi mesh / community network), where bandwidth is routinely 100 Mbps – 1 Gbps between peers even when the locality's WAN uplink is sub-5 Mbps. The "interior peer needs ~30 Mbps outbound at X=12 / 720p30" figure is a LAN budget — well inside what commodity wifi hardware sustains, anywhere on earth. CEWP's locality dividend is the reason "no centrally-operated control plane" is achievable in practice; inter-locality bridges are signed-claim federation (CEG §10.5.x), not synchronous relay over WAN. See `FEDERATION_SCALING_MODEL.md §9`.
+
 ## Findings (3-vote adversarially verified)
 
 ### Finding 1 — No production-grade symmetric MDC video codec has ever shipped
@@ -62,7 +64,7 @@ This is the upper-bound evidence that ALM alone can scale. The MDC composition i
 - **Codec-agnostic wire**: `codec_id` namespace (`CODEC_AV1_SVC = 0x01`, `CODEC_MDC = 0x03`, `CODEC_OPAQUE = 0xFF`) lets us ship the substrate without committing to one codec. If NeuralMDC matures, we use it; if not, AV1 SVC works today and maps cleanly onto MoQ Subgroups for interop.
 - **Variable-depth `SubStreamPath = Vec<u8>`**: lets us start with M=2 (the Favalli + SOTA-comfortable depth) and scale to M=4 / M=8 when codec evidence supports it. No wire revision needed.
 - **Multi-parent dedup heal (ALM-C)**: peer churn is a first-class concern in our state machine (`MultiParentSubscription::tick → HealAction::ReParent`). The Favalli precedent explicitly excluded this; we don't.
-- **No central control plane**: Reticulum substrate. Aligned with CEWP "no data centers" goal; explicitly differentiated from MoQ + the Favalli Topology Manager + every SFU baseline.
+- **Locality-first federation with the locality dividend**: Reticulum substrate + per-peer ALM relay, operating at LAN / wifi mesh / community-network scope. Differentiated from MoQ + the Favalli Topology Manager + every SFU baseline in that there is no *centrally-operated* control plane. The interior-relay bandwidth (~30 Mbps for X=12 at 720p30) is a LAN budget, sustained by commodity wifi hardware even where the locality's WAN uplink is sub-5 Mbps. The federation is locality-of-localities: each locality runs its own substrate at LAN speeds; inter-locality bridges are signed-claim federation (CEG §10.5.x), not synchronous relay over WAN. See `FEDERATION_SCALING_MODEL.md §9`.
 
 ### What the SOTA evidence recommends we adjust
 

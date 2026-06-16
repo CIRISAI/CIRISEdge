@@ -15,7 +15,7 @@ Comparisons below are framed against CIRIS Edge v3.8.0's measured numbers (see P
 | Janus videoroom | 1 publisher × 1000 viewers ≈ 200% CPU across 4 dedicated cores | [Amirante et al.](https://files.core.ac.uk/download/pdf/74316352.pdf) |
 | Pion Go data channel | 177.92 MB/s aggregate (multi-core, ~596% CPU) | [Miuda Rust-vs-Go WebRTC benchmark](https://miuda.ai/blog/webrtc-datachannel-benchmark/) |
 
-**Headline.** v3.8.0's relay sustains ~7 GiB/s AEAD per core in a tight loopback bench — roughly 500× the per-core egress observed for mediasoup-worker 3.10.6 (114.6 Mbps). This is *not* apples-to-apples: SFU production numbers include kernel↔userland packet copies, jitter buffers, RTP stack, congestion control, and NIC PCIe overhead. The honest reading: edge's relay AEAD path is no longer the bottleneck; the gating factor at deployment time will be NIC, kernel, and Reticulum substrate. That's a rare property for a hybrid-PQ SFU.
+**Headline.** v3.8.0's relay sustains ~7 GiB/s AEAD per core **in a tight in-memory loopback Criterion bench (NIC, kernel TX, congestion control, jitter buffer not included — divide by ÷10–100 for production wire)** — roughly 500× the per-core egress observed for mediasoup-worker 3.10.6 (114.6 Mbps). This is *not* apples-to-apples: SFU production numbers include kernel↔userland packet copies, jitter buffers, RTP stack, congestion control, and NIC PCIe overhead. The honest reading: edge's relay AEAD path is no longer the bottleneck; the gating factor at deployment time will be NIC, kernel, and Reticulum substrate. That's a rare property for a hybrid-PQ SFU. **What edge demonstrates is headroom, not deployed throughput.**
 
 ---
 
@@ -29,7 +29,7 @@ Comparisons below are framed against CIRIS Edge v3.8.0's measured numbers (see P
 | MLS practical analysis (2026) | 10,000 emulated clients; tree management — not crypto — dominates | [arXiv 2502.18303](https://arxiv.org/html/2502.18303) |
 | mls-rs (AWS Labs) | RFC 9420 conformant; no per-op timings in public docs | [awslabs/mls-rs](https://github.com/awslabs/mls-rs) |
 
-**Headline.** Public OpenMLS prose benchmarks describe scaling shape (linear in N) but don't enumerate per-N ms inline; raw data lives in a referenced spreadsheet. mls-rs publishes none. The 2026 arXiv analysis confirms tree management dominates over crypto — meaning the X-Wing hybrid penalty (§3) is a small fraction of total commit time at moderate N. v3.8.0's crossover at N=32–128 is the actionable number; no published competitor measures this for a hybrid-PQ ciphersuite.
+**Headline.** Public OpenMLS prose benchmarks describe scaling shape (linear in N) but don't enumerate per-N ms inline; raw data lives in a referenced spreadsheet. mls-rs publishes none. The 2026 arXiv analysis confirms tree management dominates over crypto — meaning the X-Wing hybrid penalty (§3) is a small fraction of total commit time at moderate N. v3.8.0's crossover at N=32–128 is the actionable number; no published competitor measures this for a hybrid-PQ ciphersuite. **Bench scope**: sender CPU under unicast in a Criterion microbench — the worst case for MLS in terms of competitor-comparison framing, but it isolates exactly the term (state-machine + PQ-hybrid crypto) the comparison cares about. Also: the **commit-processing barrier** at receivers (~9.7 ms @ N=128, per `realtime_av_rekey.rs`) is a structural realtime tax that no amount of batching shortens — see `FEDERATION_SCALING_MODEL.md §6.5`.
 
 ---
 
@@ -45,7 +45,7 @@ Comparisons below are framed against CIRIS Edge v3.8.0's measured numbers (see P
 | libcrux ML-KEM (Cryspen) | Among fastest portable ML-KEM; formally verified in F* via hax | [libcrux.cryspen.com](https://cryspen.com/post/ml-kem-implementation/) |
 | X-Wing KEM spec | dk 32 B, ek 1,216 B, ct 1,120 B, ss 32 B; SHA3-256 combiner | [draft-connolly-cfrg-xwing-kem-10](https://datatracker.ietf.org/doc/draft-connolly-cfrg-xwing-kem/) |
 
-**Headline.** Cryspen's Apr-2024 OpenMLS X-Wing numbers establish the floor edge inherits: hybrid PQ roughly **doubles** per-operation compute and **9×** message bytes vs classical. Edge's contribution is the *relay+rekey* layer above this floor. Cloudflare's production deployment of X25519MLKEM768 (the closest operational reference) reports +10–20 ms median latency dominated by packet-split round-trip — not the per-handshake µs cost. >60% of human-generated TLS traffic now uses hybrid ML-KEM.
+**Headline.** Cryspen's Apr-2024 OpenMLS X-Wing numbers establish the floor edge inherits: hybrid PQ roughly **doubles** per-operation compute and **9×** message bytes vs classical. Edge's contribution is the *relay+rekey* layer above this floor. Cloudflare's production deployment of X25519MLKEM768 (the closest operational reference) reports +10–20 ms median latency dominated by packet-split round-trip — not the per-handshake µs cost. >60% of human-generated TLS traffic now uses hybrid ML-KEM. **For edge: the 9× byte penalty is the deployment-relevant figure** (Welcome 5,457 B vs 716 B classical), not the µs compute — Reticulum's substrate-side bandwidth, not edge's CPU, is what bites.
 
 ---
 
@@ -59,7 +59,7 @@ Comparisons below are framed against CIRIS Edge v3.8.0's measured numbers (see P
 | OpenMLS native batch-commit | No public batch-commit microbench at N=25 in prose | [OpenMLS performance wiki](https://github.com/openmls/openmls/wiki/Performance) |
 | Signal / WhatsApp / Wire / Element | No public mass-join timing benchmarks | n/a |
 
-**Headline.** The ~6× v3.8.0 speedup (159 ms → 27 ms @ N=25) corroborates the *direction* of the APQ paper: batching/amortizing PQ-expensive proposals reduces marginal cost toward classical levels. Edge applies amortization at the wire-protocol level (`RosterDelta::Batch`) rather than at the combiner-session level; the techniques are complementary. **No major production MLS deployment publishes comparable mass-join numbers** — v3.8.0 is one of the few apples-to-itself datapoints publicly stated for hybrid-PQ MLS at this group size.
+**Headline.** The ~6× v3.8.0 speedup (159 ms → 27 ms @ N=25, **in-process bench**) corroborates the *direction* of the APQ paper: batching/amortizing PQ-expensive proposals reduces marginal cost toward classical levels. Edge applies amortization at the wire-protocol level (`RosterDelta::Batch`) rather than at the combiner-session level; the techniques are complementary. **No major production MLS deployment publishes comparable mass-join numbers** — v3.8.0 is one of the few apples-to-itself datapoints publicly stated for hybrid-PQ MLS at this group size. **What the 6× does NOT shorten**: the per-commit processing barrier at every receiver. Batching collapses *commit count*; the synchronization tax per commit (§6.5 of the scaling FSD) remains structural.
 
 ---
 
@@ -72,7 +72,7 @@ Comparisons below are framed against CIRIS Edge v3.8.0's measured numbers (see P
 | WebTorrent (peer behavior) | Diminishing returns past ~85 actively-exchanging peers per torrent; uTP ≈ 85% of TCP | UC Berkeley research summary 2022 (historical) |
 | Theta / Livepeer / PPLive | No comparable public per-node forwarding figure isolating AEAD | n/a |
 
-**Headline.** Direct apples-to-apples impossible: PeerTube measures *browser-to-browser HLS-over-WebRTC*, edge measures *AEAD-relay throughput in-process*. The honest framing: edge's relay is two orders of magnitude above a single PeerTube viewer browser, but PeerTube's number describes a real end-user link with browser overhead. Production deployments of P2P live video don't publish per-node forwarding capacity isolated from network path.
+**Headline.** Direct apples-to-apples impossible: PeerTube measures *browser-to-browser HLS-over-WebRTC over a real internet path*, edge measures *AEAD-relay throughput in-process with no network*. The honest framing: edge's relay AEAD bench is two orders of magnitude above a single PeerTube viewer browser **in a measurement that excludes the network**, but PeerTube's number describes a real end-user link with browser overhead. **A wire-level test of edge against the same network shape would land within an order of magnitude of PeerTube, not 100×.** Production deployments of P2P live video don't publish per-node forwarding capacity isolated from network path.
 
 ---
 
@@ -99,7 +99,7 @@ Comparisons below are framed against CIRIS Edge v3.8.0's measured numbers (see P
 | Yggdrasil v0.4 | Bandwidth-during-mobility ≤10 KB/s; no published Mbps in 2021 release notes | [Yggdrasil v0.4](https://yggdrasil-network.github.io/2021/06/26/v0-4-prerelease-benchmarks.html) |
 | Yggdrasil-godot (LAN, app-layer) | 60 KB packets: 129–337 MB/s | [GitHub](https://github.com/RevoluPowered/yggdrasil-multiplayer-peer-godot) |
 
-**Headline.** Reticulum's published design ceiling is ~100 Mbps per link — roughly 700× lower than edge's per-core AEAD ceiling. Practically: at the Reticulum substrate level the bottleneck is network-shape, not AEAD; v3.8.0's relay headroom exists precisely to absorb fan-out across multiple Reticulum links without becoming the bottleneck.
+**Headline.** Reticulum's published design ceiling is ~100 Mbps per link — roughly 700× lower than edge's per-core AEAD ceiling in the loopback bench. Practically: **at the Reticulum substrate level the bottleneck is network-shape, not AEAD.** v3.8.0's relay headroom exists precisely to absorb fan-out across multiple Reticulum links without becoming the bottleneck. **The 700× ratio is not a deployment forecast — it is a guarantee that crypto won't be the gating term once a real substrate runs underneath.**
 
 ---
 

@@ -62,31 +62,42 @@ Composes with v6.8.0 `Engine::serve_blob_to_peer` + `BlobError::DiskPressureProx
 
 **No published work treats fountain coding as the time-series / structured-log graceful-degradation primitive.**
 
-### Why this works for CIRIS reasoning traces
+### Why this works for CIRIS reasoning traces — persist's actual contract
 
-Reasoning traces in CIRIS already have CEG-shaped structure: signed envelopes, content hashes, deterministic byte layout. Apply RaptorQ to the content:
+Reasoning traces in CIRIS already have CEG-shaped structure: signed envelopes, content hashes, deterministic byte layout. CIRISPersist v8.0.0 ([#227](https://github.com/CIRISAI/CIRISPersist/issues/227)) ships exactly this with the `FountainContentV1` types.
 
-1. **Trace content** → N source symbols + K repair via RaptorQ
-2. **Persist stores** the (envelope, symbol_id, symbol_bytes) tuples
-3. **Under disk pressure**, evict symbols by tier:
-   - Tier 1 (no pressure): all N+K → lossless reconstruction guaranteed
-   - Tier 2 (warn): evict K repair → reconstruction still works (uses source set)
-   - Tier 3 (crit): evict source past N/2 → partial reconstruction (~70% probability)
-   - Tier 4 (stop): keep ≤N/4 → "summary-shaped fragments"
-   - Tier 5 (host_at_risk): metadata-only → "trace existed with signature X"
+**Persist's key design choice**: the signed manifest (which includes the trace's own #225 hybrid-signed envelope plus the SHA-256-per-symbol hash chain) is **always-retained**. It does not evict under disk pressure. The evictable surface is the per-symbol `FountainSymbolV1` table; the manifest is structural.
 
-4. **Read-time reconstruction**: persist returns surviving symbols; RaptorQ decoder reconstructs; consumer gets full content (lossless) or partial reconstruction with documented loss probability.
+The three degradation classes persist returns (`FountainContent` enum, [persist/src/fountain/types.rs:128](https://github.com/CIRISAI/CIRISPersist/blob/main/src/fountain/types.rs#L128)):
+
+| Class | Survivors | Persist returns | Consumer's codec sees |
+|---|---|---|---|
+| `Full` | `present ≥ n_source` | manifest + all present symbols | Lossless reconstruct guaranteed |
+| `Partial` | `min_viable_symbols ≤ present < n_source` | manifest + surviving symbols + present count | RaptorQ overhead-profile probability of decode — the genuine middle zone |
+| `EnvelopeOnly` | `present < min_viable_symbols` | manifest only | "Existed with signature X, content unavailable" — envelope still shape-valid |
+
+The producer pins `min_viable_symbols` at manifest creation as a BLINKING_DOT floor. Persist's eviction policy honors `retention_priority` (`FountainSymbolV1.retention_priority`, a u8) — the producer folds SVC `ChunkLayer.quality` AND source-vs-repair position into one byte; persist orders by it, evicts highest-value first.
+
+### What "envelope shape valid at every tier" buys CIRIS
+
+The manifest is the signed contract; it carries the trace's #225 hybrid envelope inline. At every tier:
+
+- **The envelope verifies**: `verify_hybrid` over `canonical_bytes(canonicalizer)` returns true at Full, Partial, AND EnvelopeOnly — same bytes, same signature, same key id
+- **The symbol-hash chain authenticates surviving bytes**: every `FountainSymbolV1` retrieved is SHA-256-re-verified against its `symbol_hashes[symbol_id]` entry in the manifest; bit-flips fail verification at read time, never silently
+- **The shape of the answer is the same**: persist's typed `FountainContent` return is the substrate's honest report — Full / Partial / EnvelopeOnly, not silently-degraded bytes ("substrate honesty" per persist's own module doc)
+
+This is the property the user asked about: persist preserves envelope shape validity *as a primitive*, by retaining the manifest unconditionally and authenticating every surviving symbol against the signed chain. Edge's substrate emits the chain; persist holds the chain; both sides agree on the byte-exact canonical form.
 
 ### Why this is better than TimescaleDB-style rollup
 
 TimescaleDB continuous aggregates compute pre-rolled summaries at known time buckets. Loses **specific detail**, retains **aggregate**.
 
-Fountain-code degradation:
-- Preserves **structure** of individual traces — every trace remains "a trace with content"
-- Probabilistic, not deterministic — losing K+1 symbols means losing reconstruction probability, not specific data points
-- Eviction is per-symbol, not per-time-bucket — granular under pressure
+Fountain-code degradation per persist's contract:
+- Preserves **shape-valid signed envelope at every tier** — verifiable trace-existed claim survives unconditionally
+- The `Partial` class is a genuine middle zone — RaptorQ's overhead profile maps `present/n_source` to reconstruction probability (not a hard fail like a missing index page)
+- Eviction granularity is per-symbol via `retention_priority`, not per-time-bucket — granular under pressure
 - No schema choice required — fountain codes treat content as opaque bytes
-- Pressure response is graceful — quality degrades smoothly
+- **Complement, not replacement**: TimescaleDB-style rollup gives you "aggregate answers at degraded fidelity"; fountain-coded eviction gives you "individual-trace existence + probabilistic content recovery at degraded fidelity." Pick rollup when you need aggregate queries; pick fountain when you need provable retention boundaries for audit.
 
 ### Use cases
 
@@ -96,7 +107,14 @@ Fountain-code degradation:
 
 ### Status
 
-**Genuinely novel architectural territory.** No published prior art. CIRIS would be pioneering on a real axis with **production-grade primitives**. Implementation in CIRISPersist extends the existing DiskPressureConfig + force-evict surface (v6.8.0 #149) with a per-symbol-quality eviction priority. Edge's substrate already speaks `ChunkLayer.quality`; persist just needs to honor it.
+**Novel composition, shipped in persist v8.0.0.** No published prior art applies fountain coding to structured-log graceful degradation. The composition is real, the production primitives (raptorq, ChunkLayer) are mature, and CIRISPersist v8.0.0 ([#227](https://github.com/CIRISAI/CIRISPersist/issues/227)) ships the `FountainContentV1` types as the at-rest contract. The property delivered:
+
+1. **Envelope shape valid at every degradation tier** — the signed manifest (carrying the trace's #225 hybrid envelope) is always-retained; verification works at Full, Partial, and EnvelopeOnly identically.
+2. **Genuine middle zone via RaptorQ overhead profile** — the `Partial` class returns surviving symbols and a present-count; the consumer's codec maps to a documented reconstruction probability. Not a hard fail.
+3. **Authenticated symbol-level integrity** — every surviving symbol is SHA-256-re-verified against the signed `symbol_hashes` chain at read time.
+4. **Schema-blind eviction primitive** — `retention_priority: u8` folds SVC `ChunkLayer.quality` AND fountain source-vs-repair position into one ORDER BY column.
+
+Edge's substrate already speaks `ChunkLayer.quality`; persist v8.0.0 honors it. The v3.9.0 codec wiring binds the loop end-to-end.
 
 ## Filed follow-ups
 
