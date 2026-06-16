@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "3.7.1"
+version = "3.8.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -899,6 +899,19 @@ required-features = ["transport-http", "transport-reticulum"]
 name = "realtime_av_relay"
 harness = false
 required-features = ["transport-reticulum"]
+
+# v3.8.0 holographic-mesh end-to-end bench (CIRISEdge#128 + ALM
+# composition validation). Measures the full substrate-level round-
+# trip: a 64 KiB frame decomposed into 4 × 16 KiB sub-streams at MDC
+# depth 2, fanned through 4 sub-stream relay trees, reassembled by a
+# receiver running 4 parallel MultiParentSubscription instances.
+# Empirical: 64 KiB round-trip 32.8 µs (1900 MB/s); proportional-
+# fidelity property holds (~5.2 µs per added sub-stream); planner
+# picks 4 distinct primaries across the 4 sub-stream paths.
+[[bench]]
+name = "realtime_av_mesh_e2e"
+harness = false
+required-features = ["transport-http", "transport-reticulum"]
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["full"] }
