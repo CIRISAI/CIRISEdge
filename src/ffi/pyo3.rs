@@ -2992,7 +2992,7 @@ enum LocalInstanceRole {
     clippy::needless_pass_by_value,
     clippy::too_many_lines
 )]
-fn init_edge_runtime(
+pub fn init_edge_runtime(
     py: Python<'_>,
     engine: Bound<'_, PyAny>,
     identity_path: &str,
@@ -5167,8 +5167,18 @@ impl PyRelayNode {
     }
 }
 
-#[pymodule]
-fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Register every PyO3 class + function this module exposes into the
+/// given Python module. Pub-facing one-wheel re-export hook
+/// (CIRISEdge#156) — CIRISServer's combined `ciris-server` wheel
+/// calls this on its `ciris_server.edge` submodule so that the agent
+/// imports a single `.so` registry, killing the cross-wheel
+/// type-identity bug class (`Edge.__class__ is Edge.__class__` → True
+/// across consumers).
+///
+/// Mirrors the pattern CIRISPersist v8.5.0 (#231) ships and the one
+/// `ciris-lens-core` exposes. Used by the standalone `ciris_edge`
+/// `#[pymodule]` wrapper below, and directly by re-exporting wheels.
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v1.1.7 (CIRISEdge#58) — diagnostic harness, gated under the
     // `debug-tools` Cargo feature. Default release wheels (where the
     // feature is OFF) compile NONE of this: no panic hook install,
@@ -5270,6 +5280,16 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRelayNode>()?;
 
     Ok(())
+}
+
+/// Standalone `ciris_edge` Python module — the pip-installed wheel's
+/// entry point. Delegates the full registration surface to
+/// [`register`] so the standalone wheel and the one-wheel re-export
+/// (CIRISServer's `ciris_server.edge`, CIRISEdge#156) emit identical
+/// PyO3 type registries.
+#[pymodule]
+pub fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register(m)
 }
 
 #[cfg(test)]
