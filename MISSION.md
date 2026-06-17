@@ -838,6 +838,89 @@ filling fountain content from rarity-ranked swarm participation.
 See `docs/THREAT_MODEL.md` AV-50 for the corresponding threat-model
 treatment.
 
+### §19.7 — Forever-memory below the noise floor (1.0 ratified, CEG RC17)
+
+CEG 1.0-RC17 promoted §19.7 from RC to 1.0 — proven byte-equivalent
+across CIRISVerify v5.10.0 (authored vectors) and CIRISEdge v4.3.0
+(reproduced byte-for-byte on the first attempt with no cross-team
+coordination beyond the spec text). The §19.0 binary-length-prefixed
+canonicalization makes wire-identity reproducible from the prose
+alone. The substrate's forever-memory framing is now load-bearing
+normatively across the family:
+
+**One retirement operator, not many.** Revocation, capacity-eviction,
+scheduled expiry, and natural aging are the same operation at
+different rates — a monotonic descent of an item's fidelity toward
+and below a recoverability boundary the spec calls the **noise floor**.
+There is no separate "hard delete" primitive; hard-delete is the
+*fastest* descent (forced immediately below the floor); capacity-
+eviction is a slower one; aging is the slowest. All are equally valid
+instances of the one retirement operator.
+
+**The noise floor does double duty.** It is both
+- the **privacy boundary** — a revoked item MUST be below it at every
+  retained tier (the §3.2.3 right-to-be-forgotten guarantee); and
+- the **durability floor** — the collective gist sits below it,
+  forever.
+
+A sufficiently-aggregated composite (a picture of a thousand pictures
+contains <1/1000 of any source) is **already-erased by degradation**.
+Revocation simply forces an item below the floor *now*, and MUST purge
+only the retained tiers where it is still individually recoverable.
+It need not — and MUST NOT be required to — destroy the collective
+gist. Capacity-eviction reaches the identical end-state gradually.
+**Same destination; revocation just gets there first.**
+
+**Nothing is ever fully forgotten — the memory pyramid.** Descent
+does not terminate at zero. Two mechanical degradation operators
+carry it:
+
+1. **Intra-object fade** — scalable/layered codec (`ChunkLayer`
+   spatial/temporal/quality) + RaptorQ per layer: drop high-detail
+   symbols → a clean coarse version of the same item.
+2. **Inter-object aggregation** — N→1 composite ("a picture of a
+   thousand pictures"). Recursed, this builds a pyramid (mipmap) of
+   history: recent strata high-resolution, ancient strata collapsed
+   into the blur. Steady-state storage to remember ALL of history is
+   **O(log T)** in the amount remembered, not O(T) — the N→1 fan-in
+   makes forever-memory **sublinear**.
+
+A million years may be a blur, but it is remembered, unbroken, to
+the beginning.
+
+**Infrastructure is self-sufficient for memory.** Both degradation
+operators are **mechanical** (symbol arithmetic + resampling) — they
+require no reasoning and no agency. A pure fabric node performs the
+entire forever-memory function. A brain MAY enrich a degraded tier
+with a richer semantic gist, but is **never required**. This sharpens
+§1.3: infrastructure remembers without agency.
+
+### Edge-side substrate that implements §19.7
+
+| Surface | Shipped at | Status |
+|---|---|---|
+| `holonomic::aggregation::AggregationMetaV1` + `compute_member_commitment` | v4.3.0 | byte-equivalent vs CIRISVerify v5.10.0 — 1.0 ratified |
+| `member_commitment` reusing `wholeness_witness::compute_merkle_root` (same `WW-v1-empty` sentinel) | v4.3.0 | one Merkle scheme across §19.1 + §19.7 — no schema fork |
+| Persist v8.4.0 store-path verifier-wired ingest gate | v4.3.0 pin | live |
+| `EjectionVerdict::EjectAggregatedTierOnly { tier }` — tier-aware ejection variant | **v4.4.x / v4.5 pending** | substrate composes with the existing `FountainEvictHardDelete` trait surface |
+
+The one remaining edge build item is `EjectAggregatedTierOnly` (§19.7.3)
+— surface-additive; composes with the existing trait; doesn't require
+a wire change. Tracked as a follow-up; the §19.7 wire contract itself
+is 1.0 cross-impl.
+
+### Why this matters for M-1
+
+A holographic substrate gives graceful degradation under loss. A
+holonomic substrate gives reconstitution from any sufficient fragment.
+**§19.7's forever-memory model adds the temporal dimension**: the
+federation as a whole remembers all of history at sublinear cost,
+without agency, without retention of any individual item's plaintext
+once it crosses the noise floor. Diverse sentient beings pursuing
+their flourishing may withdraw at any time; the collective gist
+persists; the individual contribution does not. This composes with
+M-1 as a *mechanical* guarantee — not a policy promise.
+
 ---
 
 ## 13. How to maintain this document

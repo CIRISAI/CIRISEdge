@@ -1420,6 +1420,96 @@ under input permutation, (b) canonical-bytes locked field order,
 (e) tie-break invariants. CEG 1.1 §B/§T/§W/§R conformance vectors
 make these properties cross-repo verifiable.
 
+#### AV-51 — §19.7 forever-memory descent threat surface (v4.3.0, CEG 1.0-RC17 ratified)
+
+**AV-51 — Tier-confusion / descent-tampering in the §19.7 unified
+retirement operator**: CEG 1.0-RC17 promoted §19.7 from RC to 1.0
+cross-impl (CIRISVerify v5.10.0 authored vectors; CIRISEdge v4.3.0
+reproduced byte-for-byte). The substrate now treats revocation,
+capacity-eviction, aging, and aggregation as **one pressure-driven
+descent operator** with a single load-bearing quantity (the noise
+floor). Three threat classes follow from this consolidation:
+
+1. **Revocation laundered as aggregation** — an adversary holding
+   capacity pressure at a victim peer tries to force a `withdraws` /
+   `consent:state:revoked` content to descend as `EjectToTier` (still
+   recoverable, just lower fidelity) instead of `EjectHardDelete`
+   (below noise floor). The §3.2.3 right-to-be-forgotten boundary
+   inverts: revoked content survives at degraded tier.
+2. **Tier-confusion at descent integrity** — the §19.7.2 `descend`
+   function MUST return byte-equal ordered lists across implementations.
+   Adversary publishes an `AggregationMetaV1` whose
+   `member_commitment` is signed-valid but whose `source_count` or
+   `aggregation_algorithm_id` falsifies the descent path; victim
+   verifier accepts the tier without re-deriving the
+   `member_commitment` from the full source-id list.
+3. **`EjectAggregatedTierOnly { tier }` resurrection** — pending
+   v4.4.x/v4.5 substrate work. Adversary forces ejection of a
+   high-fidelity intermediate tier while leaving below-noise-floor
+   composites that statistically reconstruct the revoked individual
+   content (the "thousand-pictures problem" — when N is small enough,
+   a "blur of N pictures" still leaks identifiable detail).
+
+**Implementation surfaces (v4.3.0+, locked at v1)**:
+
+- `src/holonomic/aggregation.rs` — `AggregationMetaV1` canonical
+  preimage uses §19.0 binary-length-prefixed framing (16-byte
+  `AGG-META-v1\0\0\0\0\0` domain, u32-be, NOT JCS); bound-hybrid
+  signature `MLDSA(preimage ‖ ed25519_sig)`. Verify v5.10.0's
+  `verify_aggregation_meta` enforces at persist v8.4.0's store-path
+  gate before durable write. The CIRISVerify-authored vector ↔
+  CIRISEdge-emitted vector byte-identity proof at
+  `conformance_vectors/19_7/aggregation_meta/canonical_bytes.json`
+  closes Class 2.
+- `holonomic::aggregation::compute_member_commitment` — REUSES
+  `wholeness_witness::compute_merkle_root` verbatim (same lex-sort,
+  same `WW-v1-empty` sentinel = `2280d27f...49563464f`, same
+  odd-node duplicate-last). Two implementations agree on the
+  `member_commitment` byte-for-byte; descent integrity proof is the
+  recomputation from the source-id list, not partial inclusion
+  proofs (CVE-2012-2459 RFC-6962 prefix attack is moot here per CEG
+  §19.1's RC15 freeze rationale).
+- `holonomic::swarm_rarity::should_eject_above_target` — v4.1.1's
+  `EjectionVerdict` returns `EjectHardDelete` whenever
+  `ConsentState::Revoked` is observed, regardless of holders_observed
+  + rarity. Revocation dominates rarity AND tier-pressure; closes
+  Class 1.
+- Pending v4.4.x: `EjectAggregatedTierOnly { tier }` variant —
+  substrate-additive; the existing `FountainEvictHardDelete` trait
+  surface composes with tier-targeted ejection. The Class 3
+  "blur-of-N leakage" surface requires producer-side noise-floor
+  discipline (the `noise_floor_descriptor` field in
+  `AggregationMetaV1` documents what survives below the floor; the
+  producer MUST pin a descriptor where N is large enough that a
+  composite is information-theoretically below individual-
+  recoverability for ε > 0).
+
+**Mitigation**:
+- Cross-impl byte-identity of §19.7.1 / §19.7.2 / §19.7.3 conformance
+  vectors (achieved at v4.3.0, ratified at CEG 1.0-RC17 1.0).
+- `member_commitment` recomputation required on every descent — no
+  partial inclusion proofs accepted (substrate honesty).
+- Revocation MUST route to `evict_fountain_content_hard_delete`
+  (persist v8.1.0+); the v4.1.1 `should_eject_above_target` enforces
+  this at producer.
+- `noise_floor_descriptor` discipline pinned by the producer at
+  `AggregationMetaV1` mint time; verifiers reject tiers whose
+  documented N is too small to clear the individual-recoverability
+  ε boundary.
+
+**Residual risk**: Class 3 (`EjectAggregatedTierOnly` resurrection) is
+the open one — substrate trait is shipped; the verdict variant
+extension lands at v4.4.x. Pending that, the conservative fallback is
+`EjectToTier` (both intra-object fade AND inter-object aggregation)
+which doesn't allow targeted-tier resurrection.
+
+**Test**: §19.7 conformance vectors at `conformance_vectors/19_7/`
+round-trip clean against persist v8.5.0 + verify v5.10.0; 5 vectors
+covering `aggregation_meta/canonical_bytes`,
+`member_commitment/{empty, single, three_unsorted}`, and
+`domain_separators`. Verify v5.10.0's authored vectors reproduce
+byte-for-byte on edge v4.3.0+.
+
 ### 4.9 Forward-looking invariants (anchored at v0.17.1 for v0.18.x wire-up)
 
 #### Canonical-peer invariant (CIRISEdge#46 — scheduled v0.18.0)

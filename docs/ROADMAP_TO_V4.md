@@ -1,15 +1,28 @@
 # Roadmap: v3.8.0 → v4.0 — three cuts to the holonomic federation
 
-> **STATUS — 2026-06-16: v4.0 SHIPPED.** All three cuts landed in
-> sequence as planned: v3.8.0 (CEWP holographic substrate, on PyPI),
-> v3.9.0 + v3.10.1 (codec wiring + holonomic substrate, rolled into
-> v3.10.1 with deny.toml hardening), and v4.0 (CEWP-1.0 holonomic
-> federation seal). Three cuts, no v3.99.x climb. The substrate
-> is locked; cross-repo CEG normative absorption
-> ([CIRISRegistry#85](https://github.com/CIRISAI/CIRISRegistry/issues/85))
-> finalizes the wire vectors. See `MISSION.md` §12 for the seal
-> framing and `docs/THREAT_MODEL.md` AV-50 for the path-independence
-> threat surface treatment.
+> **STATUS — 2026-06-17: v4.4 SHIPPED; §19 + §19.7 RATIFIED.**
+>
+> v4.0 → v4.4 cut chain on PyPI:
+> - **v4.0.x** (CEWP-1.0 holonomic federation seal)
+> - **v4.1.x** (RC11 §19 producer conformance + #57 freeze vectors)
+> - **v4.2.x** (persist v8.2.0/v8.3.0 adoption + relay outer-OPEN multi-tier ALM)
+> - **v4.3.x** (persist v8.4.0 + verify v5.10.0 + §19.7 AggregationMetaV1 cross-impl-validated)
+> - **v4.4.0** (realtime_av Layer-2 dispatcher + joiner process_welcome — fabric-node unblocker)
+>
+> **CEG 1.0-RC17** ratified §19 + §19.7 to 1.0 cross-impl (both
+> CIRISVerify and CIRISEdge reproduce the conformance vectors byte-
+> for-byte). §19.7's noise-floor / unified-retirement-operator /
+> forever-memory model is now load-bearing across the family.
+>
+> The substrate is locked; cross-repo CEG normative absorption is
+> closed for both §19 and §19.7. See `MISSION.md` §12 (substrate seal +
+> §19.7 forever-memory framing) and `docs/THREAT_MODEL.md` AV-50
+> (path-independence) + AV-51 (§19.7 descent threat surface).
+>
+> **One remaining substrate piece** (additive only, no wire change):
+> `EjectionVerdict::EjectAggregatedTierOnly { tier }` variant —
+> v4.4.x/v4.5 target. Composes with the existing
+> `FountainEvictHardDelete` trait surface.
 
 Aggressive, low-number-discipline scaffolding from v3.8.0 (shipping now) through v4.0 (CEWP-1.0 holonomic federation seal). Three cuts total; no v3.99.x climb.
 

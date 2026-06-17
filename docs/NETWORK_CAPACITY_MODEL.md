@@ -180,6 +180,107 @@ def survival_probability(R, N, q):
     return sum(comb(R, k) * q**k * (1-q)**(R-k) for k in range(N, R+1))
 ```
 
+## Forever-memory via §19.7 aggregation pyramid — sublinear retention
+
+The §19.7 forever-memory model (CEG 1.0-RC17 ratified to 1.0) extends
+the capacity model with a **temporal dimension**: the federation
+remembers ALL of history at sublinear cost via inter-object
+aggregation (N→1 fan-in recursed into a pyramid).
+
+### Per-tier storage
+
+Each higher tier aggregates N members from the tier below into one
+composite. With aggregation fan-in `N_agg` (typically 8–32; chosen
+per `aggregation_algorithm_id`):
+
+```
+tier_0_overhead = 1.5 × content_size           (the v4.0+ baseline)
+tier_k_overhead = tier_0_overhead × (1 / N_agg^k)
+```
+
+At `N_agg = 16`, content of size `C` bytes:
+
+| Tier | Storage per source content | Aggregation ratio |
+|---|---|---|
+| 0 | `1.5 × C` | 1:1 (source granularity) |
+| 1 | `~0.094 × C` | 16:1 |
+| 2 | `~0.006 × C` | 256:1 |
+| 3 | `~0.0004 × C` | 4,096:1 |
+| `k` | `1.5 × C × N_agg^-k` | `N_agg^k : 1` |
+
+### Aggregate forever-memory cost
+
+Total network storage to remember `T` time-units of content at full
+fidelity at tier 0 + aggregated tiers below:
+
+```
+total_overhead = 1.5 × C × N_agg / (N_agg - 1)
+              → 1.5 × C × (1 + 1/(N_agg-1))   as N_agg grows
+```
+
+For `N_agg = 16`: forever-memory adds **~6.7% overhead** vs the v4.0+
+baseline. The federation remembers all of history for
+**~1.6× content_size** vs the prior whole-copy assumption's 5× per-
+content WITHOUT any forever-memory.
+
+### The headline: O(log T) sublinear forever-memory
+
+Storage cost to remember `T` time-units of history at decreasing
+fidelity (one tier per `log_{N_agg}(T)` window):
+
+```
+forever_memory_cost(T) = O(log_{N_agg}(T)) tiers × tier_k_storage
+                       = O(log T) total bytes
+```
+
+vs naive whole-copy retention: `O(T)` bytes.
+
+**For `N_agg = 16`, 100 years of fountain content:**
+
+- Naive whole-copy (no aggregation): `100yr × content_rate × 5×` ≈ 500 yr-content-equivalent
+- §19.7 forever-memory: `~1.6 × content_rate × 100yr × 1.07` ≈ 171 yr-content-equivalent
+- Result: **~3× cheaper than whole-copy AND remembers all of history**, vs whole-copy retaining ~20 years before pressure forces wholesale loss
+
+### Pressure-driven tier transitions (the noise-floor curve)
+
+§19.7 redefines pressure tiers as points on one continuous descent
+axis:
+
+| Pressure level | What survives | Tier |
+|---|---|---|
+| None | full fidelity (N+K symbols) | tier 0; ~1.5× overhead |
+| Warn | source set (N symbols, no FEC) | tier 0; ~1.0× overhead |
+| Crit | sub-N (Partial decode) | sub-tier 0 (fade in progress) |
+| Stop | min_viable (BLINKING_DOT floor) | tier 0 → fading to tier 1 |
+| Host-at-risk | envelope + symbol_hash chain | tier 0 fully faded; tier 1 emerges |
+| Aged out tier 0 | tier 1 composite + member_commitment | tier 1 (below noise floor) |
+| Aged out tier 1 | tier 2 composite | tier 2 (deeper below noise floor) |
+| ... | the collective blur | ∞ |
+
+The descent **never terminates at zero**. Below the noise floor the
+collective gist persists; individual recovery is information-
+theoretically impossible (the §3.2.3 right-to-be-forgotten guarantee).
+Same destination as `EjectHardDelete`; aging just gets there slower.
+
+### Calculator update
+
+```python
+def forever_memory_per_content_overhead(n_agg=16):
+    """Steady-state per-content overhead with full forever-memory pyramid."""
+    return 1.5 * n_agg / (n_agg - 1)  # → 1.6× at N_agg=16
+
+def forever_memory_bytes_for_history(content_size, history_years,
+                                      content_rate_per_year, n_agg=16):
+    """O(log T) total bytes for T years of remembered history at decreasing fidelity."""
+    import math
+    tiers = max(1, int(math.log(history_years, n_agg)) + 1)
+    overhead = forever_memory_per_content_overhead(n_agg)
+    return content_size * content_rate_per_year * history_years * overhead * (n_agg / (n_agg - 1))
+
+# vs whole-copy retention: 5 × content_size × history_years × content_rate
+# Δ: ~3× more efficient AND preserves all of history vs whole-copy losing it under pressure
+```
+
 ## Cross-repo composition
 
 - **CIRISEdge v4.1.1** — sources the `FountainPolicy` defaults +
@@ -188,8 +289,14 @@ def survival_probability(R, N, q):
 - **CIRISPersist v8.1.0** — `FountainContentV1` at-rest contract;
   `evict_fountain_content_to_tier` + `evict_fountain_content_hard_delete`
   eviction surface.
-- **CIRISVerify v5.8.0** — `ciris_verify_core::holonomic` verifier
-  semantics that pin the wire shapes the model assumes.
+- **CIRISVerify v5.10.0** — `ciris_verify_core::holonomic` §19 + §19.7
+  verifiers that pin the wire shapes the model assumes.
+- **CIRISPersist v8.4.0+** — `content_aggregation` table +
+  `put_aggregated_tier` (the §19.7 pyramid storage; opaque
+  `aggregation_meta` column = wire-churn firewall).
+- **CIRISEdge v4.3.0+** — `holonomic::aggregation::AggregationMetaV1`
+  producer + `compute_member_commitment`. Tier-aware
+  `EjectAggregatedTierOnly { tier }` variant pending v4.4.x.
 - **CIRISRegistry#88** — composite operator-facing model + calculator
   built from this derivation.
 
@@ -198,9 +305,15 @@ def survival_probability(R, N, q):
 - CIRISEdge v3.10.0 holonomic substrate (PR #141)
 - CIRISEdge v4.0.1 fountain defaults (PR #142 → v4.0.x)
 - CIRISEdge v4.1.0 RC11 §19 conformance (PR #146)
+- CIRISEdge v4.3.0 §19.7 AggregationMetaV1 producer (PR #154)
+- CIRISEdge v4.4.0 realtime_av Layer-2 wire integration (PR #158)
 - CIRISPersist#227 `FountainContentV1` primitive (v8.0.0)
 - CIRISPersist v8.1.0 N5 hard-delete + verify v5.8.0 pin
+- CIRISPersist v8.4.0 §19.7 store-path verifier-wired gate
 - CEG 1.0-RC11 §19 holonomic substrate
-- CIRISRegistry#85 (CEG normative absorption), #86 (§R-policy defaults),
-  #87 (§H HSP), #88 (composite network capacity model)
+- CEG 1.0-RC14 §19.7 forever-memory aggregation pyramid
+- CEG 1.0-RC17 §19 + §19.7 1.0 ratification (proven cross-impl)
+- CIRISRegistry#85 (CEG §19 normative absorption), #86 (§R-policy defaults),
+  #87 (§H HSP), #88 (composite network capacity model),
+  #89 (§19.7 normative absorption)
 - RFC 6330 RaptorQ overhead profile
