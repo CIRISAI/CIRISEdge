@@ -61,6 +61,18 @@ pub mod realtime_av_mls;
 #[cfg(feature = "_reticulum-module")]
 pub mod realtime_av_relay;
 
+/// Realtime A/V Layer-2 wire dispatcher (CIRISEdge#155, Gap 1) — the
+/// publisher / relay / subscriber wire-driver that takes the Layer-1
+/// seal/open primitives ([`realtime_av`]) and drives them across
+/// caller-supplied async byte-stream links. Closes the deferred
+/// "outbound enqueue onto each subscriber's link" gap that
+/// [`realtime_av_relay::RelayNode::forward`] left to Layer 2. Transport-
+/// agnostic via the [`realtime_av_dispatcher::AvLinkSender`] /
+/// [`realtime_av_dispatcher::AvLinkReceiver`] traits — no leviculum /
+/// reticulum-core dependency, so it compiles for HTTP and Reticulum
+/// alike and stays ungated.
+pub mod realtime_av_dispatcher;
+
 /// Application-Layer Multicast (ALM) — mesh-tree video built on the
 /// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
 /// CIRISEdge#128 MDC). Pure-Rust, signed [`realtime_av_alm::RelayCapacity`]

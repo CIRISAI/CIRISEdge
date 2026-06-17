@@ -2992,7 +2992,7 @@ enum LocalInstanceRole {
     clippy::needless_pass_by_value,
     clippy::too_many_lines
 )]
-pub fn init_edge_runtime(
+fn init_edge_runtime(
     py: Python<'_>,
     engine: Bound<'_, PyAny>,
     identity_path: &str,
@@ -4707,14 +4707,13 @@ fn plan_layered_by_policy(
 /// EpochDek. Existing members apply the same Commit via
 /// `process_commit` to land on the same epoch.
 ///
-/// **Joiner-side bootstrap (`process_welcome`) currently returns the
-/// typed error `AvSessionError::JoinerSurfaceUnwired`** because v3.8.0
-/// ships the joiner path as a documented stub pending the L3
-/// federation-directory KeyPackage publish/fetch surface (a follow-up
-/// cut). Callers handling Welcome bytes today will see a
-/// `RuntimeError` with that message — use the test-helper round-trip
-/// path in the Rust-side `tests` module for verification until the
-/// follow-up cut lands.
+/// **Joiner-side bootstrap is wired in Rust** (CIRISEdge#155 Gap 2:
+/// `AvSession::new_joiner` + `AvSession::process_welcome`) but is not
+/// yet exposed through this PyO3 surface — the joiner's opaque
+/// `JoinerKeyMaterial` can't be rebuilt from raw KEX bytes, so the FFI
+/// `process_welcome` returns a `RuntimeError`. Exercise the joiner
+/// round-trip through the Rust-side `tests` module until the FFI
+/// redesign (opaque pending-session handle) lands.
 ///
 /// Member tuple shape (`key_id`, `x25519_pub`, `mlkem768_pub`) mirrors
 /// the Rust `Member { key_id, kex_pubkeys: PeerKexPubkeys }`. A `None`
@@ -4755,8 +4754,10 @@ fn member_from_py(
 
 /// Map an `AvSessionError` to the appropriate `PyErr`.
 ///
-/// - `PeerLacksMlkem` is an input-validation error (`PyValueError`).
-/// - `JoinerSurfaceUnwired` + `Mls(_)` are operation failures
+/// - `PeerLacksMlkem`, `WelcomeMalformed`, `JoinerKeyPackageAbsent`,
+///   and `AlreadyInitialized` are input-validation / caller-state
+///   errors (`PyValueError`).
+/// - `WelcomeRejected` + `Mls(_)` are operation failures
 ///   (`PyRuntimeError`).
 ///
 /// Note: as of L5-C (CIRISEdge#131) `ReplaceNotSupported` no longer
@@ -4765,8 +4766,11 @@ fn member_from_py(
 fn map_av_session_err(e: &crate::transport::realtime_av_session::AvSessionError) -> PyErr {
     use crate::transport::realtime_av_session::AvSessionError;
     match e {
-        AvSessionError::PeerLacksMlkem(_) => PyValueError::new_err(format!("{e}")),
-        AvSessionError::JoinerSurfaceUnwired | AvSessionError::Mls(_) => {
+        AvSessionError::PeerLacksMlkem(_)
+        | AvSessionError::WelcomeMalformed(_)
+        | AvSessionError::JoinerKeyPackageAbsent
+        | AvSessionError::AlreadyInitialized => PyValueError::new_err(format!("{e}")),
+        AvSessionError::WelcomeRejected(_) | AvSessionError::Mls(_) => {
             PyRuntimeError::new_err(format!("{e}"))
         }
     }
@@ -4905,19 +4909,26 @@ impl PyAvSession {
 
     /// Joiner-side bootstrap from a Welcome.
     ///
-    /// **v3.8.0 status: returns
-    /// `RuntimeError("joiner-side Welcome processing requires the L3
-    /// federation_directory KeyPackage publish/fetch surface; deferred
-    /// from v3.8.0")`.** This is the documented Layer 3 wiring gap —
-    /// see `AvSessionError::JoinerSurfaceUnwired` and the
-    /// `transport::realtime_av_session` module docs. The error fires
-    /// deliberately; the conformance harness should expect it and skip
-    /// the joiner-side assertion until the follow-up cut lands.
+    /// **Not exposed through this raw-bytes FFI signature.** The Rust
+    /// joiner path (CIRISEdge#155 Gap 2) is now wired via
+    /// `AvSession::new_joiner(stream_id, JoinerKeyMaterial)` +
+    /// `AvSession::process_welcome(&mut self, welcome_bytes)`. The
+    /// joiner's private leaf material lives inside an opaque openmls
+    /// provider (`JoinerKeyMaterial`, minted by
+    /// `realtime_av_mls::mint_joiner_key_material`) and cannot be
+    /// reconstructed from the raw `(x25519_priv, mlkem768_priv,
+    /// mlkem768_pub)` KEX bytes this signature accepts. Exposing the
+    /// joiner path to Python requires a redesigned FFI surface that
+    /// stages `JoinerKeyMaterial` Rust-side and hands Python an opaque
+    /// pending-session handle — tracked as a follow-up.
     ///
-    /// Argument shape matches `federation_session_respond` (own
-    /// X25519 priv + optional ML-KEM-768 priv/pub pair). The HNDL
-    /// pre-check fires first: `own_mlkem768_pub == None` rejects with
-    /// `ValueError` before the deferred-surface error is reached.
+    /// Returns a `RuntimeError` deliberately; the conformance harness
+    /// should expect it and exercise the joiner round-trip through the
+    /// Rust unit tests until the FFI redesign lands.
+    ///
+    /// Argument shape is retained for call-site compatibility; the HNDL
+    /// pre-check still fires first (`own_mlkem768_pub == None` rejects
+    /// with `ValueError`).
     #[staticmethod]
     #[pyo3(signature = (welcome_bytes, own_x25519_priv, own_mlkem768_priv, own_mlkem768_pub))]
     fn process_welcome(
@@ -4926,34 +4937,22 @@ impl PyAvSession {
         own_mlkem768_priv: Option<&[u8]>,
         own_mlkem768_pub: Option<&[u8]>,
     ) -> PyResult<(Self, [u8; 32])> {
-        use crate::transport::federation_session::OwnKexKeys;
-        let x_priv = fixed_bytes::<32>("own_x25519_priv", own_x25519_priv)?;
-        let own = OwnKexKeys {
-            x25519_priv: x_priv,
-            mlkem768_priv: own_mlkem768_priv.map(<[u8]>::to_vec),
-            mlkem768_pub: own_mlkem768_pub.map(<[u8]>::to_vec),
-        };
-        // `stream_id` is structurally unused by the deferred-surface
-        // stub (process_welcome's signature takes it for the future
-        // wiring); we pass a sentinel and let the underlying error
-        // path fire. When the L3 surface lands, this wrapper will
-        // accept a real stream_id and pipe it through.
-        let stream_id = crate::transport::realtime_av::StreamId([0u8; 32]);
-        // own_key_id is also part of the future surface; the stub
-        // checks only own.mlkem768_pub.is_some() (HNDL discipline)
-        // before falling through to JoinerSurfaceUnwired. We pass a
-        // placeholder; when the surface wires, this wrapper will take
-        // own_key_id as an explicit argument.
-        let (session, dek) = crate::transport::realtime_av_session::AvSession::process_welcome(
-            stream_id,
-            "joiner",
-            &own,
-            welcome_bytes,
-        )
-        .map_err(|e| map_av_session_err(&e))?;
-        let mut out = [0u8; 32];
-        out.copy_from_slice(dek.as_bytes());
-        Ok((Self { inner: session }, out))
+        let _ = (welcome_bytes, own_mlkem768_priv);
+        let _ = fixed_bytes::<32>("own_x25519_priv", own_x25519_priv)?;
+        // HNDL discipline mirrors `create` / `advance_epoch`: a joiner
+        // without ML-KEM-768 is out-of-spec for the 0x004D ciphersuite.
+        if own_mlkem768_pub.is_none() {
+            return Err(PyValueError::new_err(
+                "peer joiner lacks ML-KEM-768 — required by ciphersuite 0x004D (HNDL discipline)",
+            ));
+        }
+        Err(PyRuntimeError::new_err(
+            "joiner-side Welcome processing is wired in Rust \
+             (AvSession::new_joiner + process_welcome) but not yet exposed through this \
+             raw-bytes FFI signature; the joiner's KeyPackage material is opaque openmls \
+             provider state that cannot be rebuilt from raw KEX bytes. FFI redesign tracked \
+             as a follow-up.",
+        ))
     }
 }
 
@@ -5167,18 +5166,8 @@ impl PyRelayNode {
     }
 }
 
-/// Register every PyO3 class + function this module exposes into the
-/// given Python module. Pub-facing one-wheel re-export hook
-/// (CIRISEdge#156) — CIRISServer's combined `ciris-server` wheel
-/// calls this on its `ciris_server.edge` submodule so that the agent
-/// imports a single `.so` registry, killing the cross-wheel
-/// type-identity bug class (`Edge.__class__ is Edge.__class__` → True
-/// across consumers).
-///
-/// Mirrors the pattern CIRISPersist v8.5.0 (#231) ships and the one
-/// `ciris-lens-core` exposes. Used by the standalone `ciris_edge`
-/// `#[pymodule]` wrapper below, and directly by re-exporting wheels.
-pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pymodule]
+fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v1.1.7 (CIRISEdge#58) — diagnostic harness, gated under the
     // `debug-tools` Cargo feature. Default release wheels (where the
     // feature is OFF) compile NONE of this: no panic hook install,
@@ -5280,16 +5269,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRelayNode>()?;
 
     Ok(())
-}
-
-/// Standalone `ciris_edge` Python module — the pip-installed wheel's
-/// entry point. Delegates the full registration surface to
-/// [`register`] so the standalone wheel and the one-wheel re-export
-/// (CIRISServer's `ciris_server.edge`, CIRISEdge#156) emit identical
-/// PyO3 type registries.
-#[pymodule]
-pub fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    register(m)
 }
 
 #[cfg(test)]
@@ -5584,11 +5563,12 @@ mod tests {
         assert!(s.contains("stream_id"), "expected length error, got: {s}");
     }
 
-    /// `PyAvSession::process_welcome` returns the typed
-    /// `JoinerSurfaceUnwired` error at v3.8.0 (the joiner surface is
-    /// a documented Layer 3 follow-up). Conformance harnesses should
-    /// expect this and skip the joiner-side assertion until the
-    /// follow-up cut lands.
+    /// `PyAvSession::process_welcome` returns a `RuntimeError`: the
+    /// Rust joiner path is wired (CIRISEdge#155 Gap 2) but the opaque
+    /// `JoinerKeyMaterial` it needs can't be rebuilt from this
+    /// signature's raw KEX bytes, so the FFI surface defers. Conformance
+    /// harnesses exercise the joiner round-trip through the Rust unit
+    /// tests until the FFI redesign lands.
     #[test]
     fn pyo3_av_session_process_welcome_surfaces_unwired_error() {
         l3_init_python();

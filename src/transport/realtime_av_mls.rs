@@ -164,11 +164,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(test)]
 use openmls::prelude::MlsMessageBodyIn;
 use openmls::prelude::{
     BasicCredential, Ciphersuite, CredentialWithKey, KeyPackage, KeyPackageBundle, MlsGroup,
-    MlsGroupCreateConfig, MlsMessageIn, MlsMessageOut, ProcessedMessageContent, ProtocolMessage,
+    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageIn, MlsMessageOut, ProcessedMessageContent,
+    ProtocolMessage, StagedWelcome, Welcome as OpenMlsWelcome,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_libcrux_crypto::Provider as LibcruxProvider;
@@ -522,6 +522,47 @@ impl MlsSession {
         Ok((Commit(commit_bytes), Welcome(welcome_bytes), root))
     }
 
+    /// Add a member using a KeyPackage the joiner minted and published
+    /// itself (the federation-directory path), rather than minting one
+    /// locally on the inviter side.
+    ///
+    /// This is the production admit path for a real joiner: the
+    /// joiner's private leaf material lives in the joiner's OWN
+    /// provider (see [`mint_joiner_key_material`]), so the Welcome this
+    /// produces is only consumable by that joiner via
+    /// [`MlsSession::join_from_welcome`]. `key_id` is the CIRIS-side
+    /// identity stamped into the member-tracking map; it MUST match the
+    /// identity inside `key_package`'s credential (the caller is
+    /// responsible for that binding when fetching from the directory).
+    ///
+    /// Returns the [`Commit`] (for existing members), the [`Welcome`]
+    /// (for the joiner), and the new epoch's [`RootSecret`].
+    pub fn commit_add_published(
+        &mut self,
+        key_id: &str,
+        key_package: KeyPackage,
+    ) -> Result<(Commit, Welcome, RootSecret), MlsError> {
+        let sig_pub = key_package.leaf_node().signature_key().as_slice().to_vec();
+
+        let (commit_msg, welcome_msg, _group_info) = self
+            .group
+            .add_members(self.provider.as_ref(), &self.signer, &[key_package])
+            .map_err(|e| MlsError::CommitAddFailed(format!("{e:?}")))?;
+
+        self.group
+            .merge_pending_commit(self.provider.as_ref())
+            .map_err(|e| MlsError::CommitAddFailed(format!("merge_pending_commit: {e:?}")))?;
+
+        self.member_signature_keys
+            .insert(key_id.to_string(), sig_pub);
+
+        let commit_bytes = serialize_mls_message(&commit_msg)?;
+        let welcome_bytes = serialize_mls_message(&welcome_msg)?;
+        let root = export_root_secret(&self.group, self.provider.as_ref())?;
+
+        Ok((Commit(commit_bytes), Welcome(welcome_bytes), root))
+    }
+
     /// Remove a member from the group by CIRIS `key_id`. Returns the
     /// serialized [`Commit`] + the new epoch's [`RootSecret`].
     ///
@@ -829,6 +870,142 @@ impl MlsSession {
         let root = export_root_secret(&self.group, self.provider.as_ref())?;
         Ok((Commit(commit_bytes), welcomes, root))
     }
+
+    /// Joiner side — consume a [`Welcome`] against the joiner's own
+    /// pre-staged [`JoinerKeyMaterial`] and build the joiner's
+    /// [`MlsSession`] at the post-commit epoch.
+    ///
+    /// The `material` carries the provider that holds the private leaf
+    /// material matching the public KeyPackage the inviter added (the
+    /// future federation-directory publish step delivers that public
+    /// KeyPackage to the inviter; this method consumes the matching
+    /// Welcome on the joiner side). Returns the joiner's first
+    /// [`RootSecret`], which is bytewise identical to the one every
+    /// existing member derives for the same epoch (RFC 9420 §8.5).
+    ///
+    /// Surfaces [`MlsError::WireDecodeFailed`] when `welcome_bytes`
+    /// don't parse as an MLS Welcome, and [`MlsError::WelcomeFailed`]
+    /// when openmls rejects the Welcome (wrong KeyPackage, signature
+    /// mismatch, version skew, etc.).
+    pub fn join_from_welcome(
+        material: JoinerKeyMaterial,
+        welcome_bytes: &[u8],
+    ) -> Result<(Self, RootSecret), MlsError> {
+        let JoinerKeyMaterial {
+            provider,
+            signer,
+            key_id,
+            sig_pub,
+        } = material;
+
+        let msg_in = MlsMessageIn::tls_deserialize(&mut &*welcome_bytes)
+            .map_err(|e| MlsError::WireDecodeFailed(format!("welcome decode: {e:?}")))?;
+        let welcome: OpenMlsWelcome = match msg_in.extract() {
+            MlsMessageBodyIn::Welcome(w) => w,
+            other => {
+                return Err(MlsError::WireDecodeFailed(format!(
+                    "expected a Welcome body, got {other:?}"
+                )))
+            }
+        };
+
+        let join_config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+
+        let group = StagedWelcome::new_from_welcome(provider.as_ref(), &join_config, welcome, None)
+            .and_then(|sw| sw.into_group(provider.as_ref()))
+            .map_err(|e| MlsError::WelcomeFailed(format!("{e:?}")))?;
+
+        let root = export_root_secret(&group, provider.as_ref())?;
+
+        let mut member_signature_keys = HashMap::new();
+        for m in group.members() {
+            let id = String::from_utf8_lossy(m.credential.serialized_content()).into_owned();
+            member_signature_keys.insert(id, m.signature_key.clone());
+        }
+        // Ensure our own leaf is tracked even if the credential walk
+        // above didn't surface it under the same key_id spelling.
+        member_signature_keys.insert(key_id, sig_pub);
+
+        Ok((
+            Self {
+                provider,
+                signer,
+                group,
+                member_signature_keys,
+            },
+            root,
+        ))
+    }
+}
+
+/// A joiner's pre-staged MLS key material — the private side of a
+/// published KeyPackage.
+///
+/// Built by [`mint_joiner_key_material`], which mints a fresh openmls
+/// provider + Ed25519 signer + KeyPackage and stores the KeyPackage's
+/// private leaf material in that provider. The public
+/// [`KeyPackage`] (returned alongside) is what the federation-directory
+/// publish step ships to an inviter; THIS struct is what the joiner
+/// retains so [`MlsSession::join_from_welcome`] can decrypt the
+/// matching Welcome.
+///
+/// Per the module's § "Identity binding": these openmls keys are
+/// per-(member, session) and distinct from the joiner's long-term CIRIS
+/// federation identity.
+pub struct JoinerKeyMaterial {
+    provider: Arc<LibcruxProvider>,
+    signer: SignatureKeyPair,
+    key_id: String,
+    sig_pub: Vec<u8>,
+}
+
+impl std::fmt::Debug for JoinerKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinerKeyMaterial")
+            .field("key_id", &self.key_id)
+            .field("sig_pub_len", &self.sig_pub.len())
+            .field("provider", &"<opaque-libcrux>")
+            .field("signer", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Mint a joiner's KeyPackage + retained private material under the
+/// pinned ciphersuite.
+///
+/// Returns the [`JoinerKeyMaterial`] the joiner keeps (provider holds
+/// the private leaf keys) plus the public [`KeyPackage`] to publish to
+/// the federation directory so an inviter can add this joiner. The two
+/// share the same provider, so the published KeyPackage's private half
+/// is decryptable only via the retained material.
+pub fn mint_joiner_key_material(key_id: &str) -> Result<(JoinerKeyMaterial, KeyPackage), MlsError> {
+    let provider = Arc::new(LibcruxProvider::default());
+    let signer = SignatureKeyPair::new(SignatureScheme::ED25519)
+        .map_err(|e| MlsError::KeyPackageBuildFailed(format!("joiner signature key: {e:?}")))?;
+    signer.store(provider.storage()).map_err(|e| {
+        MlsError::KeyPackageBuildFailed(format!("store joiner signature key: {e:?}"))
+    })?;
+    let credential = BasicCredential::new(key_id.as_bytes().to_vec());
+    let cred_with_key = CredentialWithKey {
+        credential: credential.into(),
+        signature_key: signer.to_public_vec().into(),
+    };
+    let bundle: KeyPackageBundle = KeyPackage::builder()
+        .build(CIPHERSUITE, provider.as_ref(), &signer, cred_with_key)
+        .map_err(|e| MlsError::KeyPackageBuildFailed(format!("joiner KeyPackage: {e:?}")))?;
+    let sig_pub = signer.to_public_vec();
+    let key_package = bundle.key_package().clone();
+    Ok((
+        JoinerKeyMaterial {
+            provider,
+            signer,
+            key_id: key_id.to_string(),
+            sig_pub,
+        },
+        key_package,
+    ))
 }
 
 /// A single roster mutation inside a batched epoch advance — see

@@ -112,20 +112,23 @@
 //! - **Wire distribution.** The caller takes [`EpochRekeyArtifacts`] and
 //!   ships its `commit_bytes` + `welcome_bytes` through whichever
 //!   transport carries control-plane traffic for the stream.
-//! - **KeyPackage publish/fetch federation surface.** v3.8.0 ships the
-//!   joiner-side [`AvSession::process_welcome`] as a stub error pending
-//!   the L3 federation-directory KeyPackage publication wiring. See
-//!   [`AvSessionError::JoinerSurfaceUnwired`] for the documented
-//!   limitation and the test-helper path below for the round-trip
-//!   coverage.
+//! - **KeyPackage publish/fetch federation surface.** The joiner-side
+//!   [`AvSession::process_welcome`] is now wired (CIRISEdge#155 Gap 2):
+//!   a joiner constructed via [`AvSession::new_joiner`] with pre-staged
+//!   [`JoinerKeyMaterial`] consumes a Welcome and derives the same
+//!   epoch DEK as every existing member. What remains out of scope is
+//!   the federation-directory transport that *publishes* the joiner's
+//!   KeyPackage and *fetches* it on the inviter side — that L3 wiring
+//!   delivers the bytes; this module consumes them.
 //! - **Layer policy filtering.** That's T1 + T5; this module wraps for
 //!   the roster the caller hands in.
 
 use std::collections::HashSet;
 
-use crate::transport::federation_session::OwnKexKeys;
 use crate::transport::realtime_av::{Epoch, EpochDek, StreamId};
-use crate::transport::realtime_av_mls::{Member, MlsError, MlsSession, RosterOp};
+use crate::transport::realtime_av_mls::{
+    JoinerKeyMaterial, Member, MlsError, MlsSession, RosterOp,
+};
 
 /// Opaque identifier for a participant — the federation key_id the
 /// peer publishes alongside its KEX pubkeys.
@@ -206,15 +209,25 @@ pub enum AvSessionError {
     /// any MLS code runs. Preserves the HNDL discipline T2 had.
     #[error("peer {0} lacks ML-KEM-768 — required by ciphersuite 0x004D (HNDL discipline)")]
     PeerLacksMlkem(PeerKeyId),
-    /// Joiner-side bootstrap via [`AvSession::process_welcome`] requires
-    /// a KeyPackage that the joiner published to the federation
-    /// directory ahead of the inviter's commit. v3.8.0 documents this
-    /// as a Layer 3 follow-up; the in-memory provider used here cannot
-    /// satisfy a Welcome addressed to a leaf whose private material
-    /// lives in a separate provider. Use the test-helper round-trip
-    /// path for verification (see this module's test surface).
-    #[error("joiner-side Welcome processing requires the L3 federation_directory KeyPackage publish/fetch surface; deferred from v3.8.0")]
-    JoinerSurfaceUnwired,
+    /// Welcome bytes are empty or don't parse as an MLS Welcome message.
+    #[error("welcome bytes malformed: {0}")]
+    WelcomeMalformed(String),
+    /// The joiner has no KeyPackage material in scope to consume the
+    /// Welcome. The federation-directory KeyPackage publish/fetch is the
+    /// caller's responsibility (out of scope for this function); a
+    /// joiner must be constructed via [`AvSession::new_joiner`] with
+    /// pre-staged [`JoinerKeyMaterial`] before calling
+    /// [`AvSession::process_welcome`].
+    #[error("joiner has no pre-staged KeyPackage material — construct via AvSession::new_joiner")]
+    JoinerKeyPackageAbsent,
+    /// The openmls library rejected the Welcome (signature mismatch,
+    /// version skew, wrong KeyPackage, etc.).
+    #[error("welcome rejected by MLS layer: {0}")]
+    WelcomeRejected(String),
+    /// The session was already initialized — [`AvSession::process_welcome`]
+    /// may only be called once, on a fresh joiner-pending session.
+    #[error("session already initialized — process_welcome is single-shot")]
+    AlreadyInitialized,
     /// Underlying MLS layer surfaced an error. Wrapped through.
     #[error("MLS layer error: {0}")]
     Mls(#[from] MlsError),
@@ -235,7 +248,13 @@ pub enum AvSessionError {
 pub struct AvSession {
     stream_id: StreamId,
     epoch: Epoch,
-    mls: MlsSession,
+    /// The established MLS session. `None` only while the session is
+    /// in joiner-pending state — i.e. after [`AvSession::new_joiner`]
+    /// and before a successful [`AvSession::process_welcome`].
+    mls: Option<MlsSession>,
+    /// Pre-staged joiner key material, present only in joiner-pending
+    /// state. Consumed (taken) by [`AvSession::process_welcome`].
+    pending_joiner: Option<JoinerKeyMaterial>,
 }
 
 impl AvSession {
@@ -266,10 +285,57 @@ impl AvSession {
             Self {
                 stream_id,
                 epoch,
-                mls,
+                mls: Some(mls),
+                pending_joiner: None,
             },
             dek,
         ))
+    }
+
+    /// Construct an [`AvSession`] in joiner-pending state.
+    ///
+    /// The caller (typically the federation-directory bootstrap path)
+    /// provides the joiner's pre-generated
+    /// [`JoinerKeyMaterial`] — the private side of a KeyPackage the
+    /// joiner published ahead of the inviter's commit. The session
+    /// holds no MLS group until [`AvSession::process_welcome`] consumes
+    /// the matching Welcome bytes to complete the handshake; calling
+    /// any membership verb (`advance_epoch`, `process_commit`,
+    /// `roster_size`) before that is a misuse and panics.
+    ///
+    /// ## Why a constructor (not a `process_welcome` param)
+    ///
+    /// The joiner's private leaf material lives inside the openmls
+    /// provider wrapped by [`JoinerKeyMaterial`]; a bare public
+    /// `KeyPackage` cannot decrypt a Welcome. Staging the material at
+    /// construction keeps the `process_welcome(&mut self, welcome)`
+    /// surface symmetric with [`AvSession::process_commit`] and lets
+    /// the federation-directory bootstrap own KeyPackage minting
+    /// (via [`crate::transport::realtime_av_mls::mint_joiner_key_material`])
+    /// independently of Welcome delivery timing.
+    pub fn new_joiner(stream_id: StreamId, joiner_key_material: JoinerKeyMaterial) -> Self {
+        Self {
+            stream_id,
+            epoch: Epoch(0),
+            mls: None,
+            pending_joiner: Some(joiner_key_material),
+        }
+    }
+
+    /// Borrow the established MLS session, panicking if the session is
+    /// still joiner-pending. Internal — every public membership verb
+    /// requires an initialized session.
+    fn mls(&self) -> &MlsSession {
+        self.mls
+            .as_ref()
+            .expect("AvSession used before process_welcome completed the joiner handshake")
+    }
+
+    /// Mutable borrow of the established MLS session. See [`Self::mls`].
+    fn mls_mut(&mut self) -> &mut MlsSession {
+        self.mls
+            .as_mut()
+            .expect("AvSession used before process_welcome completed the joiner handshake")
     }
 
     /// The stream this session is keyed for.
@@ -285,7 +351,7 @@ impl AvSession {
     /// Roster size — number of members in the underlying MLS group
     /// (includes the local participant).
     pub fn roster_size(&self) -> usize {
-        self.mls.member_count()
+        self.mls().member_count()
     }
 
     /// Apply a membership change: roll the MLS epoch, derive a fresh
@@ -300,8 +366,9 @@ impl AvSession {
     ) -> Result<EpochRekeyArtifacts, AvSessionError> {
         match delta {
             RosterDelta::Join(member) => {
-                let (commit, welcome, root) = self.mls.commit_add(member).map_err(map_mls_err)?;
-                self.epoch = Epoch(self.mls.epoch());
+                let (commit, welcome, root) =
+                    self.mls_mut().commit_add(member).map_err(map_mls_err)?;
+                self.epoch = Epoch(self.mls().epoch());
                 Ok(EpochRekeyArtifacts {
                     new_epoch: self.epoch,
                     commit_bytes: commit.0,
@@ -310,8 +377,8 @@ impl AvSession {
                 })
             }
             RosterDelta::Leave(peer) => {
-                let (commit, root) = self.mls.commit_remove(&peer).map_err(map_mls_err)?;
-                self.epoch = Epoch(self.mls.epoch());
+                let (commit, root) = self.mls_mut().commit_remove(&peer).map_err(map_mls_err)?;
+                self.epoch = Epoch(self.mls().epoch());
                 Ok(EpochRekeyArtifacts {
                     new_epoch: self.epoch,
                     commit_bytes: commit.0,
@@ -336,7 +403,7 @@ impl AvSession {
                 // omits us still leaves us in-place — this is the
                 // MLS-enforced behavior, surfaced as a documented
                 // invariant rather than a runtime error.
-                let current: HashSet<String> = self.mls.member_key_ids().into_iter().collect();
+                let current: HashSet<String> = self.mls().member_key_ids().into_iter().collect();
                 let desired: HashSet<String> = roster.iter().map(|m| m.key_id.clone()).collect();
 
                 // Removes = current ∖ desired, minus self (we can
@@ -373,6 +440,36 @@ impl AvSession {
         }
     }
 
+    /// Admit a joiner who minted + published its own KeyPackage (the
+    /// federation-directory path), producing the rekey artifacts the
+    /// joiner consumes via [`AvSession::process_welcome`] and existing
+    /// members consume via [`AvSession::process_commit`].
+    ///
+    /// `key_id` is the joiner's CIRIS identity; `joiner_key_package` is
+    /// the public KeyPackage the joiner published (fetched out of band
+    /// — the federation-directory transport is #155 Layer 3, out of
+    /// scope here). Unlike `advance_epoch(Join(..))` — which mints the
+    /// added member's KeyPackage locally and therefore can't hand a
+    /// usable Welcome to a separate joiner — this path produces a
+    /// Welcome the published joiner can actually decrypt.
+    pub fn admit_published_joiner(
+        &mut self,
+        key_id: &str,
+        joiner_key_package: openmls::prelude::KeyPackage,
+    ) -> Result<EpochRekeyArtifacts, AvSessionError> {
+        let (commit, welcome, root) = self
+            .mls_mut()
+            .commit_add_published(key_id, joiner_key_package)
+            .map_err(map_mls_err)?;
+        self.epoch = Epoch(self.mls().epoch());
+        Ok(EpochRekeyArtifacts {
+            new_epoch: self.epoch,
+            commit_bytes: commit.0,
+            welcome_bytes: vec![welcome.0],
+            new_dek: EpochDek::from_bytes(*root.as_bytes()),
+        })
+    }
+
     /// Internal: drive a batched epoch advance through the MLS
     /// session and build the artifacts. Shared body for
     /// [`RosterDelta::Batch`] and [`RosterDelta::Replace`].
@@ -380,8 +477,8 @@ impl AvSession {
         &mut self,
         ops: &[RosterOp],
     ) -> Result<EpochRekeyArtifacts, AvSessionError> {
-        let (commit, welcomes, root) = self.mls.commit_batch(ops).map_err(map_mls_err)?;
-        self.epoch = Epoch(self.mls.epoch());
+        let (commit, welcomes, root) = self.mls_mut().commit_batch(ops).map_err(map_mls_err)?;
+        self.epoch = Epoch(self.mls().epoch());
         Ok(EpochRekeyArtifacts {
             new_epoch: self.epoch,
             commit_bytes: commit.0,
@@ -400,37 +497,65 @@ impl AvSession {
     /// per-epoch deterministic function of the group state).
     pub fn process_commit(&mut self, commit_bytes: &[u8]) -> Result<EpochDek, AvSessionError> {
         let commit = crate::transport::realtime_av_mls::Commit(commit_bytes.to_vec());
-        let root = self.mls.process_commit(&commit).map_err(map_mls_err)?;
-        self.epoch = Epoch(self.mls.epoch());
+        let root = self
+            .mls_mut()
+            .process_commit(&commit)
+            .map_err(map_mls_err)?;
+        self.epoch = Epoch(self.mls().epoch());
         Ok(EpochDek::from_bytes(*root.as_bytes()))
     }
 
-    /// Joiner side — bootstrap a fresh [`AvSession`] from a [`Welcome`]
-    /// addressed to `own_key_id`, returning the joiner's first
-    /// [`EpochDek`].
+    /// Joiner side — complete the MLS handshake by consuming the
+    /// `welcome_bytes` against the [`JoinerKeyMaterial`] staged at
+    /// [`AvSession::new_joiner`]. On success the session transitions
+    /// from joiner-pending to a full member: `self.mls` is initialized,
+    /// the epoch counter tracks the post-commit MLS epoch, and the
+    /// joiner's first [`EpochDek`] is returned.
     ///
-    /// **v3.8.0 status: documented stub.** The current MLS layer mints
-    /// every member's KeyPackage locally on the inviter side, so a
-    /// Welcome addressed to a leaf whose private material lives in a
-    /// SEPARATE provider cannot be processed in the standard openmls
-    /// flow without the L3 federation-directory KeyPackage
-    /// publish/fetch wiring. Returns
-    /// [`AvSessionError::JoinerSurfaceUnwired`] to surface this gap
-    /// loudly to integrators.
+    /// The returned `EpochDek` is bytewise identical to the one every
+    /// existing member derives for the same epoch (RFC 9420 §8.5 —
+    /// `exporter_secret` is epoch-deterministic across the group), so a
+    /// joiner can immediately decrypt chunks sealed under the current
+    /// epoch and may itself drive [`AvSession::advance_epoch`] like any
+    /// member.
     ///
-    /// The test surface in this module's `tests` mod exercises the
-    /// full cross-session round-trip via an openmls-direct test helper
-    /// that simulates the future L3 publish/fetch flow.
-    pub fn process_welcome(
-        _stream_id: StreamId,
-        own_key_id: &str,
-        own_keys: &OwnKexKeys,
-        _welcome_bytes: &[u8],
-    ) -> Result<(Self, EpochDek), AvSessionError> {
-        if own_keys.mlkem768_pub.is_none() {
-            return Err(AvSessionError::PeerLacksMlkem(own_key_id.to_string()));
+    /// Single-shot: a second call (or a call on a session created via
+    /// [`AvSession::create`]) returns [`AvSessionError::AlreadyInitialized`].
+    ///
+    /// ## Out of scope
+    ///
+    /// The federation-directory KeyPackage publish/fetch surface
+    /// (#155 Layer 3) is the caller's responsibility — the joiner must
+    /// have minted + published its KeyPackage (via
+    /// [`crate::transport::realtime_av_mls::mint_joiner_key_material`])
+    /// and handed the retained material to [`AvSession::new_joiner`]
+    /// before this is called.
+    pub fn process_welcome(&mut self, welcome_bytes: &[u8]) -> Result<EpochDek, AvSessionError> {
+        if self.mls.is_some() {
+            return Err(AvSessionError::AlreadyInitialized);
         }
-        Err(AvSessionError::JoinerSurfaceUnwired)
+        if welcome_bytes.is_empty() {
+            return Err(AvSessionError::WelcomeMalformed(
+                "welcome bytes are empty".to_string(),
+            ));
+        }
+        let material = self
+            .pending_joiner
+            .take()
+            .ok_or(AvSessionError::JoinerKeyPackageAbsent)?;
+
+        let (mls, root) = match MlsSession::join_from_welcome(material, welcome_bytes) {
+            Ok(ok) => ok,
+            Err(MlsError::WireDecodeFailed(msg)) => {
+                return Err(AvSessionError::WelcomeMalformed(msg))
+            }
+            Err(MlsError::WelcomeFailed(msg)) => return Err(AvSessionError::WelcomeRejected(msg)),
+            Err(other) => return Err(map_mls_err(other)),
+        };
+
+        self.epoch = Epoch(mls.epoch());
+        self.mls = Some(mls);
+        Ok(EpochDek::from_bytes(*root.as_bytes()))
     }
 }
 
@@ -440,6 +565,7 @@ impl std::fmt::Debug for AvSession {
             .field("stream_id", &self.stream_id)
             .field("epoch", &self.epoch)
             .field("mls", &self.mls)
+            .field("pending_joiner", &self.pending_joiner)
             .finish()
     }
 }
@@ -481,14 +607,6 @@ mod tests {
                 x25519_pub: [1u8; 32],
                 mlkem768_pub: None,
             },
-        }
-    }
-
-    fn hybrid_own_keys() -> OwnKexKeys {
-        OwnKexKeys {
-            x25519_priv: [2u8; 32],
-            mlkem768_priv: Some(vec![0xCD; 2400]),
-            mlkem768_pub: Some(vec![0xAB; 1184]),
         }
     }
 
@@ -950,34 +1068,147 @@ mod tests {
         );
     }
 
-    /// `process_welcome` with HNDL-degraded own_keys is refused before
-    /// the JoinerSurfaceUnwired stub fires — HNDL discipline
-    /// mirrors `create` / `advance_epoch`.
+    // ─── Joiner path (CIRISEdge#155 Gap 2) ──────────────────────────
+
+    /// End-to-end joiner handshake at the AvSession surface: alice
+    /// publishes a stream, a joiner mints + publishes a KeyPackage,
+    /// alice admits it producing a Welcome, the joiner runs
+    /// `process_welcome`, and BOTH sides derive the same epoch DEK.
     #[test]
-    fn process_welcome_classical_only_own_keys_refused() {
-        let degraded = OwnKexKeys {
-            x25519_priv: [2u8; 32],
-            mlkem768_priv: None,
-            mlkem768_pub: None,
-        };
-        let r = AvSession::process_welcome(dummy_stream(), "joiner", &degraded, &[0u8; 10]);
+    fn joiner_processes_welcome_and_derives_epoch_dek() {
+        use crate::transport::realtime_av_mls::mint_joiner_key_material;
+
+        // Publisher (alice) + one seed member so the stream exists.
+        let (mut alice, _dek0) =
+            AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
+
+        // Joiner mints + publishes its KeyPackage; retains the private
+        // material in its own provider.
+        let (joiner_material, joiner_kp) =
+            mint_joiner_key_material("carol").expect("mint joiner kp");
+
+        // Alice admits the published joiner → Commit + Welcome + DEK.
+        let artifacts = alice
+            .admit_published_joiner("carol", joiner_kp)
+            .expect("admit joiner");
+        assert_eq!(
+            artifacts.welcome_bytes.len(),
+            1,
+            "one Welcome for the joiner"
+        );
+
+        // Joiner bootstraps from the Welcome.
+        let mut carol = AvSession::new_joiner(dummy_stream(), joiner_material);
+        let carol_dek = carol
+            .process_welcome(&artifacts.welcome_bytes[0])
+            .expect("joiner process_welcome");
+
+        // The load-bearing assertion: same epoch → same exporter →
+        // same EpochDek across the mesh.
+        assert_eq!(
+            carol_dek.as_bytes(),
+            artifacts.new_dek.as_bytes(),
+            "joiner must derive the SAME epoch DEK as the publisher"
+        );
+        // The joiner is now a full member at the publisher's epoch.
+        assert_eq!(carol.epoch(), artifacts.new_epoch);
+        assert_eq!(carol.roster_size(), alice.roster_size());
+    }
+
+    /// `process_welcome` with empty bytes is rejected as malformed,
+    /// before any MLS work.
+    #[test]
+    fn process_welcome_empty_bytes_returns_welcome_malformed() {
+        use crate::transport::realtime_av_mls::mint_joiner_key_material;
+        let (material, _kp) = mint_joiner_key_material("joiner").expect("mint");
+        let mut joiner = AvSession::new_joiner(dummy_stream(), material);
+        let r = joiner.process_welcome(&[]);
         assert!(
-            matches!(r, Err(AvSessionError::PeerLacksMlkem(ref k)) if k == "joiner"),
-            "expected PeerLacksMlkem(joiner), got {r:?}"
+            matches!(r, Err(AvSessionError::WelcomeMalformed(_))),
+            "expected WelcomeMalformed, got {r:?}"
         );
     }
 
-    /// `process_welcome` with HNDL-clean own_keys but no L3 federation-
-    /// directory KeyPackage publish/fetch wiring surfaces the documented
-    /// `JoinerSurfaceUnwired` error. This is the v3.8.0 contract — the
-    /// joiner-side bootstrap is a known follow-up cut.
+    /// `process_welcome` on a session that's already an established
+    /// member (created via `create`, not `new_joiner`) returns
+    /// `AlreadyInitialized`.
     #[test]
-    fn process_welcome_without_l3_keypackage_surface_documented_gap() {
-        let own = hybrid_own_keys();
-        let r = AvSession::process_welcome(dummy_stream(), "joiner", &own, &[0u8; 10]);
+    fn process_welcome_after_already_initialized_returns_already_initialized() {
+        let (mut session, _dek) =
+            AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
+        let r = session.process_welcome(&[0u8; 64]);
         assert!(
-            matches!(r, Err(AvSessionError::JoinerSurfaceUnwired)),
-            "expected JoinerSurfaceUnwired, got {r:?}"
+            matches!(r, Err(AvSessionError::AlreadyInitialized)),
+            "expected AlreadyInitialized, got {r:?}"
+        );
+    }
+
+    /// A joiner whose staged KeyPackage is NOT the one the publisher's
+    /// commit added cannot consume the Welcome — openmls rejects it,
+    /// surfaced as `WelcomeRejected`.
+    #[test]
+    fn process_welcome_with_wrong_keypackage_returns_welcome_rejected() {
+        use crate::transport::realtime_av_mls::mint_joiner_key_material;
+
+        let (mut alice, _dek0) =
+            AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
+
+        // The joiner alice actually admits.
+        let (_admitted_material, admitted_kp) =
+            mint_joiner_key_material("carol").expect("mint admitted");
+        let artifacts = alice
+            .admit_published_joiner("carol", admitted_kp)
+            .expect("admit");
+
+        // A DIFFERENT joiner material (fresh provider/leaf) tries to
+        // consume carol's Welcome — its private leaf doesn't match any
+        // EncryptedGroupSecrets entry.
+        let (other_material, _other_kp) = mint_joiner_key_material("carol").expect("mint other");
+        let mut imposter = AvSession::new_joiner(dummy_stream(), other_material);
+        let r = imposter.process_welcome(&artifacts.welcome_bytes[0]);
+        assert!(
+            matches!(r, Err(AvSessionError::WelcomeRejected(_))),
+            "expected WelcomeRejected, got {r:?}"
+        );
+    }
+
+    /// Round-trip: after `process_welcome` the joiner is a full member
+    /// and can itself drive `advance_epoch` — proving it holds live
+    /// group state, not just a derived DEK.
+    #[test]
+    fn joiner_can_advance_epoch_after_process_welcome() {
+        use crate::transport::realtime_av_mls::mint_joiner_key_material;
+
+        let (mut alice, _dek0) =
+            AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
+        let (joiner_material, joiner_kp) = mint_joiner_key_material("carol").expect("mint joiner");
+        let artifacts = alice
+            .admit_published_joiner("carol", joiner_kp)
+            .expect("admit");
+
+        let mut carol = AvSession::new_joiner(dummy_stream(), joiner_material);
+        let carol_dek = carol
+            .process_welcome(&artifacts.welcome_bytes[0])
+            .expect("process_welcome");
+        let joined_epoch = carol.epoch();
+
+        // Carol, now a member, admits a further joiner via the normal
+        // Join verb (mints the added member's KP locally — fine, we
+        // only assert carol's own epoch rotates and produces a fresh
+        // DEK + Welcome).
+        let next = carol
+            .advance_epoch(RosterDelta::Join(hybrid_member("dave")))
+            .expect("joiner-now-member advances epoch");
+        assert_eq!(
+            next.new_epoch,
+            Epoch(joined_epoch.0 + 1),
+            "joiner-as-committer advances its epoch by 1"
+        );
+        assert_eq!(next.welcome_bytes.len(), 1, "Join → one Welcome");
+        assert_ne!(
+            next.new_dek.as_bytes(),
+            carol_dek.as_bytes(),
+            "epoch rotation yields a fresh DEK"
         );
     }
 
