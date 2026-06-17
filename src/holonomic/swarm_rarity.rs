@@ -481,7 +481,7 @@ pub const EJECT_ABOVE_TARGET_SAFETY_MARGIN_PCT: u32 = 15;
 /// `should_eject_above_target` lets a peer recognize "the network is
 /// over-replicated; my symbol is common; safe to free local storage."
 ///
-/// Composes with the persist v8.1.0 eviction surface:
+/// Composes with the persist v8.1.0+ eviction surface:
 /// - [`EjectionVerdict::EjectHardDelete`] → caller invokes
 ///   `Persist::evict_fountain_content_hard_delete` (the §8.1.11.3 N5
 ///   deletion-SLA path)
@@ -489,6 +489,10 @@ pub const EJECT_ABOVE_TARGET_SAFETY_MARGIN_PCT: u32 = 15;
 ///   `Persist::evict_fountain_content_to_tier(T2)` (DiskPressure
 ///   tier eviction; the freed symbol can be re-fetched later if
 ///   demand spikes)
+/// - [`EjectionVerdict::EjectAggregatedTierOnly { tier }`] (v4.5.0,
+///   CEG 1.0-RC17 §19.7.3) → caller invokes persist v8.6.0's tier-
+///   granular evict for the named pyramid stratum; finer AND coarser
+///   tiers stay intact
 /// - [`EjectionVerdict::Keep`] → no action
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EjectionVerdict {
@@ -496,9 +500,35 @@ pub enum EjectionVerdict {
     /// The federation has more than [`fountain_defaults::DEFAULT_TARGET_HOLDERS`]
     /// (× safety margin) holders, and this peer's symbol is
     /// "common" locally — it's safe to drop. Other peers carry the load.
+    ///
+    /// One downward step on the §19.7 descent axis: still recoverable,
+    /// lower fidelity. Composes with intra-object layer-drop OR N→1
+    /// aggregation.
     EjectToTier,
+    /// **§19.7.3 (CEG 1.0-RC17, edge v4.5.0)** — shed EXACTLY one
+    /// pyramid stratum (the tier-`tier` `AggregationMetaV1` composite),
+    /// leaving both finer AND coarser tiers intact. The tier-granular
+    /// form of [`Self::EjectToTier`], applied under *targeted*
+    /// pressure.
+    ///
+    /// Composes with [`Self::EjectHardDelete`]: a `tier` already below
+    /// the noise floor is unreachable, so this never resurrects erased
+    /// content. The substrate guarantees revocation routes through
+    /// hard-delete (§19.3 N5), not through tier-only ejection.
+    ///
+    /// Persist v8.6.0+ drives the tier-tagged evict for the named
+    /// pyramid stratum. Mirrors CIRISVerify v5.11.0's
+    /// `holonomic::aggregation::EjectionVerdict::EjectAggregatedTierOnly`
+    /// variant byte-for-byte at the verdict-shape boundary.
+    EjectAggregatedTierOnly {
+        /// The pyramid stratum (tier index) to shed. `tier = 0` is
+        /// source-granularity (a degenerate case; callers SHOULD
+        /// prefer [`Self::EjectToTier`] for source-tier pressure).
+        tier: u32,
+    },
     /// §3.2.3 revocation — call the persist hard-delete path
-    /// regardless of holder count.
+    /// regardless of holder count. The fastest descent below the
+    /// noise floor; never tier-shed.
     EjectHardDelete,
     /// Keep the symbol. Either the federation is at/below target
     /// (this peer is needed), or this peer's symbol is rare
@@ -573,6 +603,32 @@ pub fn should_eject_above_target(
     } else {
         EjectionVerdict::Keep
     }
+}
+
+/// **§19.7.3 (CEG 1.0-RC17)** — construct an
+/// [`EjectionVerdict::EjectAggregatedTierOnly`] for the named pyramid
+/// stratum. Mirrors `ciris_verify_core::holonomic::aggregation::eject_aggregated_tier`
+/// at the verdict-shape boundary.
+///
+/// Use this when applying targeted pressure to a single intermediate
+/// pyramid level — for example, a peer that wants to retain both the
+/// high-fidelity tier-0 source set AND the deepest collective gist,
+/// but shed one intermediate aggregated stratum to free local storage.
+///
+/// A pure fabric node MAY compute this mechanically: the descent
+/// step is symbol arithmetic over the pyramid; no agency required
+/// (§1.3 + §19.7 mechanical-degradation invariant).
+///
+/// ## Composition with [`EjectionVerdict::EjectHardDelete`]
+///
+/// A `tier` already below the noise floor is unreachable, so this
+/// never resurrects revoked content. The substrate routes revocation
+/// through hard-delete (§19.3 N5) regardless of any tier-only
+/// ejection; see [`should_eject_above_target`] for the dominant-
+/// revocation path.
+#[must_use]
+pub const fn eject_aggregated_tier(tier: u32) -> EjectionVerdict {
+    EjectionVerdict::EjectAggregatedTierOnly { tier }
 }
 
 /// Locked-v1 possession-verified holding-claim weight.
@@ -1326,5 +1382,55 @@ mod tests {
             over_target, 34,
             "v1 over-target threshold at default policy"
         );
+    }
+
+    // ─── §19.7.3 EjectAggregatedTierOnly (v4.5.0 / CEG 1.0-RC17) ──
+
+    #[test]
+    fn eject_aggregated_tier_constructs_at_tier() {
+        for tier in [0u32, 1, 2, 3, 7, u32::MAX] {
+            let v = eject_aggregated_tier(tier);
+            assert_eq!(
+                v,
+                EjectionVerdict::EjectAggregatedTierOnly { tier },
+                "tier={tier} must round-trip through the constructor"
+            );
+        }
+    }
+
+    #[test]
+    fn eject_aggregated_tier_distinct_from_other_verdicts() {
+        // The tier-only variant must NOT collide with EjectToTier /
+        // EjectHardDelete / Keep at any tier; it is a distinct
+        // verdict shape (§19.7.3).
+        let v1 = eject_aggregated_tier(1);
+        assert_ne!(v1, EjectionVerdict::EjectToTier);
+        assert_ne!(v1, EjectionVerdict::EjectHardDelete);
+        assert_ne!(v1, EjectionVerdict::Keep);
+    }
+
+    #[test]
+    fn eject_aggregated_tier_different_tiers_are_inequal() {
+        // Two tier-only verdicts with different `tier` values are
+        // structurally distinct — composes with persist v8.6.0's
+        // tier-granular evict so a tier-2 ejection does NOT touch
+        // tier-1 or tier-3.
+        let a = eject_aggregated_tier(1);
+        let b = eject_aggregated_tier(2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn revocation_still_dominates_over_tier_only_pressure() {
+        // §19.3 N5 invariant: even under targeted tier pressure,
+        // ConsentState::Revoked routes through hard-delete. The
+        // tier-only verdict is for capacity pressure, NOT for the
+        // §19.7 forced descent below the noise floor.
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        // 100 holders + Revoked → EjectHardDelete (NOT
+        // EjectAggregatedTierOnly), regardless of tier-pressure
+        // potential.
+        let v = should_eject_above_target(100, &policy, ConsentState::Revoked, RarityScore(50));
+        assert_eq!(v, EjectionVerdict::EjectHardDelete);
     }
 }
