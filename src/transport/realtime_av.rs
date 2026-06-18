@@ -349,30 +349,27 @@ impl SealedAvChunk {
     }
 
     /// Inverse of [`Self::to_bytes`]. Returns `Err` if the input is
-    /// shorter than the 48-byte fixed header.
+    /// shorter than the 52-byte header + codec+layer block.
     ///
-    /// Backward compatibility — accepts the v3.7.0 wire shape (just
-    /// the 48-byte header, no codec+layer block) by stamping
-    /// `codec_id = CODEC_OPAQUE` + `layer = ChunkLayer::BASE` and
-    /// treating bytes 48.. as the ciphertext. The disambiguation is
-    /// purely length-based: a wire with at least
-    /// [`CHUNK_CODEC_LAYER_LEN`] bytes after the fixed header is read
-    /// as a v3.8.0+ wire (codec+layer present); a wire with fewer
-    /// trailing bytes is read as a v3.7.0 header-only wire.
+    /// **v4.6.1 (Codex P1 fix)** — drops the prior length-only v3.7.0
+    /// "backward-compat" branch. The branch was structurally unreachable
+    /// for any real v3.7.0 wire (any AEAD-sealed chunk carries ≥16-byte
+    /// GCM tag → ≥64-byte wire → always fell into the v3.8.0+ branch and
+    /// misparsed 4 ciphertext bytes as `codec_id` + `ChunkLayer`). The
+    /// "real-world v3.7.0 wires always carry the AES-GCM tag" caveat
+    /// was correct; the branch was therefore dead code that misparsed
+    /// every wire that wasn't synthetic-header-only.
     ///
-    /// Note — real-world v3.7.0 wires always carry the AES-GCM tag
-    /// (16 bytes minimum) so they don't naturally exercise this
-    /// fallback. The production rollout path is that **every new
-    /// write** (v3.8.0+) stamps the 4-byte block, with
-    /// `codec_id = CODEC_OPAQUE` covering the v3.7.0-semantics flow
-    /// (existing PyO3 wrappers, etc.). The header-only fallback
-    /// exists for well-defined edge cases — transit probes / canary
-    /// frames generated without ciphertext.
+    /// The substrate has been at v3.8.0+ for the entire CEWP-1.0 era
+    /// (~6 months at v4.6.1); no production peers write the bare
+    /// 48-byte header shape. Wires shorter than 52 bytes are now an
+    /// explicit error.
     pub fn from_bytes(b: &[u8]) -> Result<Self, RealtimeAvError> {
-        if b.len() < CHUNK_HEADER_LEN {
+        const WIRE_HEADER_LEN: usize = CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN;
+        if b.len() < WIRE_HEADER_LEN {
             return Err(RealtimeAvError::WireTooShort {
                 got: b.len(),
-                need: CHUNK_HEADER_LEN,
+                need: WIRE_HEADER_LEN,
             });
         }
         let mut stream_id = [0u8; 32];
@@ -384,26 +381,14 @@ impl SealedAvChunk {
         seq_bytes.copy_from_slice(&b[40..48]);
         let chunk_seq = ChunkSeq(u64::from_be_bytes(seq_bytes));
 
-        // CIRISEdge#128 — codec+layer block is present iff we have at
-        // least 4 more bytes after the fixed header. A v3.7.0 wire (no
-        // trailing block) parses with `codec_id = CODEC_OPAQUE` and
-        // `layer = ChunkLayer::BASE`; everything after byte 48 is the
-        // ciphertext. A v3.8.0+ wire stamps the actual codec+layer and
-        // ciphertext starts at byte 52.
-        let (codec_id, layer, ciphertext_start) =
-            if b.len() >= CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN {
-                (
-                    b[48],
-                    ChunkLayer {
-                        spatial: b[49],
-                        temporal: b[50],
-                        quality: b[51],
-                    },
-                    CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN,
-                )
-            } else {
-                (CODEC_OPAQUE, ChunkLayer::BASE, CHUNK_HEADER_LEN)
-            };
+        // CIRISEdge#128 — codec+layer block at bytes 48..52, locked
+        // since v3.8.0. Ciphertext is bytes 52..end.
+        let codec_id = b[48];
+        let layer = ChunkLayer {
+            spatial: b[49],
+            temporal: b[50],
+            quality: b[51],
+        };
 
         Ok(Self {
             stream_id: StreamId(stream_id),
@@ -411,7 +396,7 @@ impl SealedAvChunk {
             chunk_seq,
             codec_id,
             layer,
-            double_sealed_ciphertext: b[ciphertext_start..].to_vec(),
+            double_sealed_ciphertext: b[WIRE_HEADER_LEN..].to_vec(),
         })
     }
 }
@@ -1071,13 +1056,21 @@ mod tests {
         assert_eq!(opened, b"hello, mesh");
     }
 
-    /// Truncated wire input refused cleanly.
+    /// Truncated wire input refused cleanly. v4.6.1 (Codex P1)
+    /// requires the v3.8.0+ header+codec+layer shape — minimum 52
+    /// bytes — so anything below that is now WireTooShort.
     #[test]
     fn wire_too_short_refused() {
         let r = SealedAvChunk::from_bytes(&[0u8; 47]);
         assert!(matches!(
             r,
-            Err(RealtimeAvError::WireTooShort { got: 47, need: 48 })
+            Err(RealtimeAvError::WireTooShort { got: 47, need: 52 })
+        ));
+        // Boundary: 51 bytes is also too short post v4.6.1.
+        let r = SealedAvChunk::from_bytes(&[0u8; 51]);
+        assert!(matches!(
+            r,
+            Err(RealtimeAvError::WireTooShort { got: 51, need: 52 })
         ));
     }
 
@@ -1276,10 +1269,17 @@ mod tests {
 
     // ─── CIRISEdge#128 — codec + per-receiver layer policy ───────
 
-    /// v3.7.0 backward compatibility — a pre-#128 wire (just the
-    /// 48-byte header, no codec+layer block, no trailing ciphertext)
-    /// MUST parse cleanly via the read side, stamping
-    /// `codec_id = CODEC_OPAQUE` and `layer = ChunkLayer::BASE`.
+    /// **v4.6.1 (Codex P1 fix)** — replaces the prior
+    /// `from_bytes_accepts_v3_7_0_wire_shape` test that asserted the
+    /// dead-code length-only fallback. v3.7.0-shape header-only wires
+    /// (<52 bytes total) are now rejected with `WireTooShort`. The
+    /// v3.8.0+ wire (header + codec + layer block, 52+ bytes) is the
+    /// only accepted shape.
+    ///
+    /// Rationale: the prior fallback was structurally unreachable for
+    /// any real v3.7.0 wire — real wires carry AES-GCM tag (≥16
+    /// bytes) → ≥64 bytes total → always hit the v3.8.0+ branch →
+    /// misparsed the first 4 ciphertext bytes as `codec_id` + layer.
     ///
     /// Length disambiguation — the read side requires at least
     /// [`CHUNK_CODEC_LAYER_LEN`] trailing bytes to interpret the
@@ -1288,51 +1288,33 @@ mod tests {
     /// wire (`codec_id = CODEC_OPAQUE` + `layer = ChunkLayer::BASE`)
     /// and the bytes 48.. are the (possibly empty) ciphertext.
     ///
-    /// Note: real-world v3.7.0 wires always carry the AES-GCM tag
-    /// (16 bytes minimum) so they would not exercise this fallback;
-    /// the production rollout path is the producer-side v3.8.0 stamp
-    /// of `CODEC_OPAQUE` + `ChunkLayer::BASE` on every new wire (the
-    /// existing PyO3 wrappers do exactly that). The read-side
-    /// fallback exists for the well-defined edge case of truncated /
-    /// header-only wires (e.g. probe / canary frames generated by
-    /// transit middleware before any real ciphertext is attached).
     #[test]
-    fn from_bytes_accepts_v3_7_0_wire_shape() {
-        // Synthesize a v3.7.0-shape header-only wire: 32B stream_id +
-        // 8B epoch + 8B seq, no codec+layer block, no ciphertext.
-        let mut legacy = Vec::new();
-        legacy.extend_from_slice(&[0x42; 32]); // stream_id
-        legacy.extend_from_slice(&0xDEAD_BEEF_u64.to_be_bytes()); // epoch
-        legacy.extend_from_slice(&0xC0FF_EE12_u64.to_be_bytes()); // chunk_seq
-        assert_eq!(legacy.len(), CHUNK_HEADER_LEN);
+    fn from_bytes_rejects_v3_7_0_header_only_shape_post_codex_fix() {
+        // v4.6.1: header-only wires (no codec+layer block) MUST be
+        // rejected with WireTooShort. This is the inverse of the
+        // dead-code v3.7.0 compat branch.
+        let mut header_only = Vec::new();
+        header_only.extend_from_slice(&[0x42; 32]); // stream_id
+        header_only.extend_from_slice(&0xDEAD_BEEF_u64.to_be_bytes()); // epoch
+        header_only.extend_from_slice(&0xC0FF_EE12_u64.to_be_bytes()); // chunk_seq
+        assert_eq!(header_only.len(), CHUNK_HEADER_LEN);
 
-        let parsed = SealedAvChunk::from_bytes(&legacy).expect("parse v3.7.0 wire");
-        assert_eq!(parsed.stream_id, StreamId([0x42; 32]));
-        assert_eq!(parsed.epoch, Epoch(0xDEAD_BEEF));
-        assert_eq!(parsed.chunk_seq, ChunkSeq(0xC0FF_EE12));
-        assert_eq!(
-            parsed.codec_id, CODEC_OPAQUE,
-            "v3.7.0 wire must default to CODEC_OPAQUE"
-        );
-        assert_eq!(
-            parsed.layer,
-            ChunkLayer::BASE,
-            "v3.7.0 wire must default to ChunkLayer::BASE"
-        );
-        assert!(parsed.double_sealed_ciphertext.is_empty());
+        match SealedAvChunk::from_bytes(&header_only) {
+            Err(RealtimeAvError::WireTooShort { got, need }) => {
+                assert_eq!(got, CHUNK_HEADER_LEN);
+                assert_eq!(need, CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN);
+            }
+            other => panic!("expected WireTooShort, got {other:?}"),
+        }
 
-        // A v3.7.0 wire with 1..3 trailing bytes still falls back to
-        // CODEC_OPAQUE — the 4-byte block is not present.
-        for partial_len in 1..=3 {
-            let mut partial = legacy.clone();
+        // 49..51 bytes also rejected.
+        for partial_len in 1..CHUNK_CODEC_LAYER_LEN {
+            let mut partial = header_only.clone();
             partial.extend(std::iter::repeat_n(0x99u8, partial_len));
-            let parsed = SealedAvChunk::from_bytes(&partial).expect("parse partial v3.7.0 wire");
-            assert_eq!(
-                parsed.codec_id, CODEC_OPAQUE,
-                "{partial_len}-byte trailer must still default to CODEC_OPAQUE"
-            );
-            assert_eq!(parsed.layer, ChunkLayer::BASE);
-            assert_eq!(parsed.double_sealed_ciphertext.len(), partial_len);
+            assert!(matches!(
+                SealedAvChunk::from_bytes(&partial),
+                Err(RealtimeAvError::WireTooShort { .. })
+            ));
         }
     }
 

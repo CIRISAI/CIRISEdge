@@ -452,20 +452,58 @@ fn canonical_sub_paths(child_ad: &SignedRelayCapacity) -> Vec<SubStreamPath> {
 /// `candidate_peers` slice, so `>` (strict) keeps the first-seen
 /// (= lex-min) parent on score ties; the penalty is integer
 /// arithmetic saturating at 0.
+/// **v4.6.1 P2b helper (Codex)** — compute the descendant closure of
+/// `root` in the assignment-graph state. Pure, deterministic; lex-order
+/// BTreeMap/BTreeSet iteration keeps the BFS byte-deterministic. Used
+/// by [`best_parent_for_child`] to exclude descendants from candidate
+/// parent sets (cycle prevention).
+fn descendants_of(
+    root: &str,
+    child_of: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut stack: Vec<String> = vec![root.to_string()];
+    while let Some(p) = stack.pop() {
+        if let Some(children) = child_of.get(&p) {
+            for c in children {
+                if out.insert(c.clone()) {
+                    stack.push(c.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn best_parent_for_child(
     child_peer_id: &str,
     candidate_sub_path: &[u8],
     candidate_peers: &[String],
     parent_cap_millibps: &std::collections::BTreeMap<String, u64>,
+    latest_ad: &std::collections::BTreeMap<String, VerifiedCapacityAd>,
     trust_min_depth: &std::collections::BTreeMap<(String, String), u8>,
     reach_min_rtt: &std::collections::BTreeMap<(String, String), u32>,
     sub_path_occupancy: &std::collections::BTreeMap<(String, SubStreamPath), u64>,
+    parent_total_occupancy: &std::collections::BTreeMap<String, u64>,
+    child_descendants: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     let mut best_score: Option<u64> = None;
     let mut best_parent: Option<String> = None;
 
     for parent_peer_id in candidate_peers {
         if parent_peer_id == child_peer_id {
+            continue;
+        }
+
+        // **v4.6.1 P2b cycle gate (Codex)** — a peer already in the
+        // child's descendant set in the currently-assigned tree MUST
+        // NOT be picked as a parent. Two peers A,B with mutual trust
+        // + reachability would otherwise each pick the other as
+        // parent (A processed first picks B; B processed later picks
+        // A → A→B→A cycle). This gate makes the planner's output a
+        // proper tree (acyclic) for every input snapshot.
+        if child_descendants.contains(parent_peer_id) {
             continue;
         }
 
@@ -485,6 +523,49 @@ fn best_parent_for_child(
         };
         if rtt > MAX_USEFUL_RTT_MS {
             continue;
+        }
+
+        // **v4.6.1 P2a capacity-cap gate (Codex)** — enforce the
+        // parent's declared `RelayCapacity::max_subscribers_per_stream`
+        // and its per-`SubStreamCommitment::max_subscribers` (when an
+        // MDC sub_stream_commitment exists for this path). A relay that
+        // advertised `max_subscribers_per_stream = 0` or whose
+        // commitment for this path is already saturated MUST NOT be
+        // chosen as a parent regardless of how strongly the scorer
+        // would otherwise favor it.
+        let parent_ad = match latest_ad.get(parent_peer_id) {
+            Some(v) => &v.ad.capacity,
+            None => continue,
+        };
+        let total_at_parent = parent_total_occupancy
+            .get(parent_peer_id)
+            .copied()
+            .unwrap_or(0);
+        if total_at_parent >= u64::from(parent_ad.max_subscribers_per_stream) {
+            continue;
+        }
+        // Per-sub_path commitment cap (only when the parent declared
+        // commitments — opaque-mode relays have empty commitments and
+        // the per-stream cap above is the only constraint).
+        if !parent_ad.sub_stream_commitments.is_empty() {
+            let commitment = parent_ad
+                .sub_stream_commitments
+                .iter()
+                .find(|c| c.sub_stream_path.as_slice() == candidate_sub_path);
+            match commitment {
+                Some(c) => {
+                    let existing = sub_path_occupancy
+                        .get(&(parent_peer_id.clone(), candidate_sub_path.to_vec()))
+                        .copied()
+                        .unwrap_or(0);
+                    if existing >= u64::from(c.max_subscribers) {
+                        continue;
+                    }
+                }
+                // Parent declared MDC commitments but none for THIS
+                // path — that's an explicit non-commitment; reject.
+                None => continue,
+            }
         }
 
         // Score: integer weighted sum over the already-clamped
@@ -747,9 +828,26 @@ fn compute_core(
     let mut sub_path_occupancy: std::collections::BTreeMap<(String, SubStreamPath), u64> =
         std::collections::BTreeMap::new();
 
+    // **v4.6.1 P2a Codex** — per-parent total occupancy across all
+    // sub_paths, for the `max_subscribers_per_stream` cap.
+    let mut parent_total_occupancy: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    // **v4.6.1 P2b Codex** — `child_of[parent] = set of direct
+    // children` tracks the assignment graph for cycle prevention.
+    // When picking a parent for `child`, compute the descendant closure
+    // of `child` from this map and exclude descendants from the
+    // candidate parent set.
+    let mut child_of: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+
     for child_peer_id in &candidate_peers {
         let child_ad = &latest_ad[child_peer_id].ad;
         let sub_paths = canonical_sub_paths(child_ad);
+
+        // Compute descendant closure of `child_peer_id` from the
+        // assignment-graph state. BFS over `child_of`. Lex-order
+        // iteration of BTreeMap keys keeps this byte-deterministic.
+        let descendants = descendants_of(child_peer_id, &child_of);
 
         let mut any_rooted_for_child = false;
         for sub_path in &sub_paths {
@@ -758,13 +856,21 @@ fn compute_core(
                 sub_path,
                 &candidate_peers,
                 &parent_cap_millibps,
+                &latest_ad,
                 &trust_min_depth,
                 &reach_min_rtt,
                 &sub_path_occupancy,
+                &parent_total_occupancy,
+                &descendants,
             ) {
                 *sub_path_occupancy
                     .entry((parent.clone(), sub_path.clone()))
                     .or_insert(0) += 1;
+                *parent_total_occupancy.entry(parent.clone()).or_insert(0) += 1;
+                child_of
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(child_peer_id.clone());
                 tree.push(AlmEdge {
                     parent_peer_id: parent,
                     child_peer_id: child_peer_id.clone(),
@@ -1330,10 +1436,19 @@ mod tests {
                 );
             }
         }
-        // Exactly the 3 verified peers are rooted.
+        // Verified peers may be rooted as children (or one may be
+        // tree-root under v4.6.1 P2b acyclic-tree discipline — the
+        // Codex finding). The load-bearing assertion is that ONLY
+        // verified peers appear in the tree, never the dropped
+        // peer-d / peer-e.
         let rooted: std::collections::BTreeSet<&str> =
             topo.tree.iter().map(|e| e.child_peer_id.as_str()).collect();
-        assert_eq!(rooted, ["peer-a", "peer-b", "peer-c"].into_iter().collect());
+        let verified: std::collections::BTreeSet<&str> =
+            ["peer-a", "peer-b", "peer-c"].into_iter().collect();
+        assert!(
+            rooted.is_subset(&verified),
+            "unverified peer leaked into rooted set: rooted={rooted:?}"
+        );
         // The dropped peers do NOT appear anywhere — not even unrooted
         // (they never entered scoring).
         assert!(!topo.unrooted_peers.contains(&"peer-d".to_string()));
@@ -1487,5 +1602,235 @@ mod tests {
         );
         assert_eq!(topo.topology_version, TOPOLOGY_VERSION);
         assert_eq!(topo.snapshot_epoch_id, 42);
+    }
+
+    // ─── v4.6.1 Codex fixes — P2a + P2b ──────────────────────────────
+
+    /// Custom-cap ad builder for the v4.6.1 Codex P2a tests — sets
+    /// `max_subscribers_per_stream` explicitly.
+    fn fake_signed_ad_with_max_subs(
+        peer_id: &str,
+        uplink_mbps: f32,
+        measured_at_unix_ms: u64,
+        max_subscribers_per_stream: u16,
+        commitments: Vec<SubStreamCommitment>,
+    ) -> SignedRelayCapacity {
+        let cap = if commitments.is_empty() {
+            RelayCapacity::new(
+                uplink_mbps,
+                4,
+                max_subscribers_per_stream,
+                ReceiverLayerPolicy::UNCAPPED,
+                measured_at_unix_ms,
+            )
+        } else {
+            RelayCapacity::with_substream_commitments(
+                uplink_mbps,
+                4,
+                max_subscribers_per_stream,
+                ReceiverLayerPolicy::UNCAPPED,
+                measured_at_unix_ms,
+                commitments,
+            )
+        };
+        SignedRelayCapacity {
+            advertiser_key_id: peer_id.to_string(),
+            capacity: cap,
+            stream_id: StreamId([0u8; 32]),
+            epoch: Epoch(1),
+            signature_ed25519_base64: String::new(),
+            signature_ml_dsa_65_base64: String::new(),
+        }
+    }
+
+    /// P2a — a peer advertising `max_subscribers_per_stream = 0` MUST
+    /// NOT be picked as a parent for any child, regardless of how
+    /// strongly the scorer (uplink, trust, reachability) favors it.
+    #[test]
+    fn max_subscribers_zero_blocks_parent_selection() {
+        // peer-x advertises huge uplink but 0 subscriber capacity.
+        // peer-a and peer-b are normal candidates.
+        let ads = vec![
+            fake_signed_ad_with_max_subs("peer-a", 50.0, 1_700_000_000_000, 16, vec![]),
+            fake_signed_ad_with_max_subs("peer-b", 50.0, 1_700_000_000_500, 16, vec![]),
+            fake_signed_ad_with_max_subs("peer-x", 10_000.0, 1_700_000_001_000, 0, vec![]),
+        ];
+        let peers = ["peer-a", "peer-b", "peer-x"];
+        let mut grants = Vec::new();
+        let mut reach = Vec::new();
+        for &g in &peers {
+            for &t in &peers {
+                if g == t {
+                    continue;
+                }
+                grants.push(TrustGrant {
+                    granter_peer_id: g.to_string(),
+                    grantee_peer_id: t.to_string(),
+                    granted_at_unix_ms: 1_700_000_000_000,
+                    chain_depth: 0,
+                    weight: TrustGrant::DEFAULT_WEIGHT,
+                });
+                reach.push(ReachabilityObservation {
+                    from_peer_id: g.to_string(),
+                    to_peer_id: t.to_string(),
+                    observed_rtt_ms: 50,
+                    observed_at_unix_ms: 1_700_000_000_000,
+                });
+            }
+        }
+        let snap = TopologyInputSnapshot {
+            capacity_ads: ads,
+            trust_grants: grants,
+            reachability_observations: reach,
+            locality_id: "loc-cap-zero".to_string(),
+            snapshot_epoch_id: 7,
+        };
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
+        // peer-x MUST NEVER be a parent — its cap is 0.
+        for edge in &topo.tree {
+            assert_ne!(
+                edge.parent_peer_id, "peer-x",
+                "peer-x with max_subscribers=0 was chosen as parent: {edge:?}"
+            );
+        }
+    }
+
+    /// P2a — a `SubStreamCommitment::max_subscribers` cap MUST stop
+    /// parent assignment on the saturated sub_path. Two subscribers
+    /// on the SAME path → second one rejects this parent.
+    #[test]
+    fn substream_commitment_cap_blocks_oversubscription() {
+        // peer-h is the only viable parent and commits to ONE
+        // sub_stream_path with max_subscribers = 1. peer-a and
+        // peer-b both want that path. Only one can attach.
+        let commitment = SubStreamCommitment {
+            sub_stream_path: vec![0x01],
+            max_subscribers: 1,
+            uplink_budget_mbps: 5.0,
+        };
+        let ads = vec![
+            fake_signed_ad("peer-a", 5.0, 1_700_000_000_000, vec![commitment.clone()]),
+            fake_signed_ad("peer-b", 5.0, 1_700_000_000_500, vec![commitment.clone()]),
+            fake_signed_ad_with_max_subs("peer-h", 100.0, 1_700_000_001_000, 16, vec![commitment]),
+        ];
+        let peers = ["peer-a", "peer-b", "peer-h"];
+        let mut grants = Vec::new();
+        let mut reach = Vec::new();
+        // peer-h grants to peer-a and peer-b; not the other way.
+        for &t in &["peer-a", "peer-b"] {
+            grants.push(TrustGrant {
+                granter_peer_id: "peer-h".to_string(),
+                grantee_peer_id: t.to_string(),
+                granted_at_unix_ms: 1_700_000_000_000,
+                chain_depth: 0,
+                weight: TrustGrant::DEFAULT_WEIGHT,
+            });
+            reach.push(ReachabilityObservation {
+                from_peer_id: "peer-h".to_string(),
+                to_peer_id: t.to_string(),
+                observed_rtt_ms: 50,
+                observed_at_unix_ms: 1_700_000_000_000,
+            });
+        }
+        let _ = peers;
+        let snap = TopologyInputSnapshot {
+            capacity_ads: ads,
+            trust_grants: grants,
+            reachability_observations: reach,
+            locality_id: "loc-commit-cap".to_string(),
+            snapshot_epoch_id: 8,
+        };
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
+        // peer-h is parent for AT MOST ONE child on the [0x01] path.
+        let h_on_path_01 = topo
+            .tree
+            .iter()
+            .filter(|e| e.parent_peer_id == "peer-h" && e.sub_stream_path == vec![0x01])
+            .count();
+        assert!(
+            h_on_path_01 <= 1,
+            "peer-h oversubscribed on path [0x01]: {h_on_path_01}"
+        );
+        // Exactly one of (peer-a, peer-b) is rooted on this path;
+        // the other is in unrooted.
+        let rooted_on_path: Vec<&str> = topo
+            .tree
+            .iter()
+            .filter(|e| e.sub_stream_path == vec![0x01])
+            .map(|e| e.child_peer_id.as_str())
+            .collect();
+        assert_eq!(rooted_on_path.len(), 1, "expected exactly 1 root on path");
+    }
+
+    /// P2b — mutual A↔B trust+reachability snapshot. The output MUST
+    /// be acyclic: A→B AND B→A in the same topology is a cycle, NOT
+    /// a tree. With the v4.6.1 cycle gate, when B is processed it
+    /// finds A in its descendant set (because A picked B as parent
+    /// earlier) and rejects A.
+    #[test]
+    fn mutual_ab_snapshot_produces_acyclic_tree() {
+        let ads = vec![
+            fake_signed_ad("peer-a", 50.0, 1_700_000_000_000, vec![]),
+            fake_signed_ad("peer-b", 50.0, 1_700_000_000_500, vec![]),
+        ];
+        let mut grants = Vec::new();
+        let mut reach = Vec::new();
+        for (g, t) in [("peer-a", "peer-b"), ("peer-b", "peer-a")] {
+            grants.push(TrustGrant {
+                granter_peer_id: g.to_string(),
+                grantee_peer_id: t.to_string(),
+                granted_at_unix_ms: 1_700_000_000_000,
+                chain_depth: 0,
+                weight: TrustGrant::DEFAULT_WEIGHT,
+            });
+            reach.push(ReachabilityObservation {
+                from_peer_id: g.to_string(),
+                to_peer_id: t.to_string(),
+                observed_rtt_ms: 50,
+                observed_at_unix_ms: 1_700_000_000_000,
+            });
+        }
+        let snap = TopologyInputSnapshot {
+            capacity_ads: ads,
+            trust_grants: grants,
+            reachability_observations: reach,
+            locality_id: "loc-mutual".to_string(),
+            snapshot_epoch_id: 9,
+        };
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
+
+        // Acyclic invariant: for each peer, walk parent_of chain;
+        // we must NOT visit the same peer twice.
+        let mut parent_of: std::collections::BTreeMap<&str, &str> =
+            std::collections::BTreeMap::new();
+        for edge in &topo.tree {
+            // Each child has at most ONE parent per sub_path — but
+            // for cycle-detection on a tree shape (single root per
+            // peer), we use the FIRST seen parent for each child.
+            parent_of
+                .entry(edge.child_peer_id.as_str())
+                .or_insert(edge.parent_peer_id.as_str());
+        }
+        for peer in ["peer-a", "peer-b"] {
+            let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            seen.insert(peer);
+            let mut cursor: &str = peer;
+            while let Some(&p) = parent_of.get(cursor) {
+                assert!(
+                    !seen.contains(p),
+                    "cycle detected: {peer} → ... → {p} (already seen)"
+                );
+                seen.insert(p);
+                cursor = p;
+            }
+        }
+
+        // Exactly ONE of the two peers is rooted; the other is the
+        // tree root.
+        assert_eq!(
+            topo.tree.len(),
+            1,
+            "mutual snapshot must produce exactly 1 edge (acyclic): {topo:?}"
+        );
     }
 }
