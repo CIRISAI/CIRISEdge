@@ -1420,6 +1420,113 @@ under input permutation, (b) canonical-bytes locked field order,
 (e) tie-break invariants. CEG 1.1 §B/§T/§W/§R conformance vectors
 make these properties cross-repo verifiable.
 
+#### AV-52 — Constitutional-discipline adversary surface (v5.0; CC 0.1.5)
+
+**AV-52 — Adversary tries to inject a privileged-principal shortcut
+or content-policy in violation of the Constitution's discipline**:
+the **CIRIS Constitution** (CC 0.1.5; woven CIRIS Accord 1.3-RC2 +
+CEG 1.0-RC29) places normative constraints on what the substrate is
+allowed to *be*. These are not policy constraints on the operator —
+they are structural invariants of the wire. An adversary attempts
+to subvert one of:
+
+1. **CC 1.13.1 Ubuntu commitment #5 — Recursive Golden Rule**: try
+   to land a code path that admits a "trusted bootstrap peer" via a
+   shortcut not available to ordinary peers. The substrate's
+   `recursive_trust_bootstrap` MUST walk the same chain rules
+   regardless of signer identity; founder-quorum applies only to
+   *infrastructure roots* as a structural property, never as a
+   "this signer is special" bypass.
+
+2. **CC 1.13.5 operational-language gate** (safety ≠ censorship):
+   try to add a refusal code or admission filter whose *meaning*
+   encodes preferences-about-content rather than a mechanically-
+   checkable substrate property. The discipline is that
+   `EjectionVerdict` variants name mechanism (revocation, capacity
+   pressure, tier-aggregation), never content classes. A patch that
+   introduces a content-keyed refusal MUST fail review on this
+   ground.
+
+3. **CC 1.13.4 substrate-stores-never-adjudicates**: try to make a
+   `should_eject_above_target` / `recursive_trust_bootstrap` / §19
+   primitive consult an agency-tier policy (a "decision" surface).
+   These are mechanical-degradation operators. Adding agency to them
+   is a Constitutional violation regardless of operational benefit.
+
+4. **§19.1 WW-2 / Constitution privacy**: try to land a Merkle leaf
+   walk that includes anonymous-tier or `cohort_scope: self` rows.
+   This re-attributes structurally-deniable content to a stable
+   `peer_id` — a violation of the Ubuntu privacy substrate that the
+   Constitution enforces. The producer-side filter
+   `filter_witness_leaves` is the gate.
+
+5. **§19.7 N5 / consent override**: try to make rarity weight
+   resurrect revoked content (the §19.3 N5 inversion). Any code
+   path where `ConsentState::Revoked` does not produce
+   `EjectionVerdict::EjectHardDelete` is a Constitutional violation
+   regardless of how it's spelled.
+
+6. **CC 5.3.2.4.3.1 PQC-mandatory**: try to land a non-hybrid
+   signing path or a verifier that accepts an empty/invalid
+   ML-DSA-65 half on a federation-tier object. v9.0.0 G1+G2 made
+   this a BREAKING change at persist's store gate; edge's producer
+   side must NEVER emit a federation-tier object lacking the bound
+   hybrid pair.
+
+7. **CC 5.6.8.10 TRUST≠MEMBERSHIP confusion**: try to make a
+   chain-walk return a membership verdict from
+   `recursive_trust_bootstrap`. Pre-v4.1.0 this was the F-1
+   CRITICAL — admission was conflated with trust-graph reachability.
+   The fix (v4.1.0 PR #146) was `AdmitTrustServe` only; membership
+   admission requires the destination's separate §5.6.8.10
+   owner-binding gate. A regression here re-opens the Constitutional
+   gap.
+
+**Implementation invariants (v5.0)**:
+
+- Every refusal variant in `holonomic::recursive_trust_bootstrap::AdmissionRefusal`
+  names a substrate property (`ChainExhausted`, `SignatureInvalid`,
+  `ChainTooLong`, `BudgetExceeded`, `TrustGraphCycle`,
+  `AggregateWeightCapExceeded`, `OwnerBindingMissing`). None encodes
+  content preferences.
+- Every `EjectionVerdict` variant names mechanism (`EjectHardDelete`,
+  `EjectToTier`, `EjectAggregatedTierOnly { tier }`, `Keep`). None
+  encodes content classes.
+- §19.1 `WholenessWitness::filter_witness_leaves` is structurally
+  required to be called before `compute_merkle_root` in every
+  producer path that emits a witness.
+- `swarm_rarity::should_eject_above_target` short-circuits on
+  `ConsentState::Revoked` → `EjectHardDelete` regardless of holder
+  count or rarity score. Compile-time `const _: () = assert!(...)`
+  guards in `fountain_defaults` pin the §R-policy invariants.
+- The PQC-mandatory signing discipline is enforced at the producer
+  layer (every signed object carries the bound hybrid pair) AND at
+  the persist v9.0.0+ ingest gate (verify-before-persist).
+
+**Residual risk**:
+
+- The Constitution is a living document (CC 0.1.5; future versions
+  may add invariants). The substrate's compile-time / wire-locked
+  invariants harden against *current* Constitutional adversaries;
+  future Constitutional amendments may require substrate updates
+  to maintain conformance. The CEG normative absorption process
+  (CIRISRegistry#85 / #89 family) is the formal channel.
+- Operator-tier policy above the substrate can still encode
+  content preferences; the substrate's job is to ensure those
+  preferences don't leak *into* the wire shape. An operator who
+  configures their policy layer to refuse certain content classes
+  doesn't violate the Constitution (CC 1.13.5 explicitly allows
+  this at the policy layer); the substrate's MUST is that the
+  refusal not be wire-observable as a content-keyed mechanism.
+
+**Test**: structural — every `AdmissionRefusal` and `EjectionVerdict`
+variant is documented as mechanism-only; PR review must reject any
+content-keyed addition. The compile-time invariants in
+`fountain_defaults`, the `WW-PREIMAGE-v1` domain separator + bound-
+hybrid signing tests, and the §19 + §19.7 conformance vector round-
+trip all serve as continuous Constitutional-discipline regression
+guards.
+
 ### 4.9 Forward-looking invariants (anchored at v0.17.1 for v0.18.x wire-up)
 
 #### Canonical-peer invariant (CIRISEdge#46 — scheduled v0.18.0)

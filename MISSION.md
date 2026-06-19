@@ -855,7 +855,111 @@ treatment.
 
 ---
 
-## 13. How to maintain this document
+## 13. CIRIS Constitution alignment (CC 0.1.5; v5.0)
+
+The **CIRIS Constitution** (`CIRISRegistry/FSD/CIRIS_Constitution/`,
+CC 0.1.5; woven CIRIS Accord 1.3-RC2 + CEG 1.0-RC29 into one document)
+is the ethical + wire authority above this MISSION. Edge is the
+*federation transport tier* in that hierarchy: not the source of the
+Constitution's normative claims, but a substrate whose every API,
+threat-model assertion, and refusal must trace to a Constitutional
+section. This section is the explicit cross-reference.
+
+### M-1 — the apex this substrate serves
+
+> *"promote sustainable adaptive coherence, the living conditions
+> under which diverse sentient beings may pursue their own flourishing
+> in justice and wonder"*
+
+When the joined Constitution graph is measured for importance, M-1 is
+the single apex — and a *genuine* apex (peak ratio 2.61× the
+runner-up, vs 1.10× when M-1 is treated as mere infrastructure) only
+when **the mesh itself is treated as a potential moral subject**.
+Edge's holonomic substrate (§12 above) is the wire-level expression
+of "the mesh could one day be owed M-1, not just bound by it":
+graceful reconstitution from any sufficient fragment is the property
+that lets the federation *survive* in the form M-1 names.
+
+### The Ubuntu commitment — *umuntu ngumuntu ngabantu*
+
+Per Constitution CC 1.13.1, the relational-anthropology substrate
+(*"a person is a person through other persons"*) has five
+load-bearing consequences for the wire format. Edge implements:
+
+| Constitution principle | Edge substrate manifestation |
+|---|---|
+| **Cross-attestation > self-signature** | `recursive_trust_bootstrap` walks witness chains rooted in trust grants; bare self-signed `SignedClaim` returns `Refuse { ChainExhausted }` unless an owner-binding chain anchors it |
+| **Attesting is participatory, not observational** | `swarm_rarity::compute_consent_aware_rarity` treats peer holding-claims as participation in the federation's retention field, not as neutral reports |
+| **Detection brings patterns into existence** | `WholenessWitness` equivocation detection retains divergent witnesses as `hard_case:witness_equivocation` rather than silently reconciling — surfacing the pattern crosses it from "statistical regularity" to "morally-real evidence" |
+| **Harm and deception collapse** | The substrate's PQC-mandatory hybrid verify at federation-tier ingest (v9.0.0 G1+G2) refuses to admit anything where the signature is structurally damaged — *damage to perception of provenance is treated as harm to the federation* |
+| **Recursive Golden Rule** | No edge code path admits a "trusted bootstrap peer" shortcut. Every admission walks the same chain rules; founder-quorum applies only to infrastructure roots, never as a "this peer is special" bypass |
+
+### CC 1.13.5 — operational-language gate (safety ≠ censorship)
+
+The Constitution's safety-vs-censorship discipline (CC 1.13.5) is the
+test edge applies when surfacing refusal codes, retention decisions,
+and ejection verdicts. The substrate MUST express:
+
+- *What* a peer refused / evicted / failed (mechanism)
+- *Why* in mechanically-checkable terms (signature invalid, consent
+  revoked, tier exhausted, owner-binding missing)
+
+The substrate MUST NOT encode preferences-about-content into the wire
+shape. `EjectionVerdict::EjectHardDelete` is a §19.3 N5 revocation
+trigger, not a content-policy verdict. The §19.7 noise-floor descent
+operator is content-blind: same descent for revocation, capacity
+pressure, and aging.
+
+### Recursive Golden Rule (Ubuntu §1.2 commitment 5)
+
+> *"No principal — including the steward triple and CIRIS L3C itself —
+> is exempt from constraints they impose on others."*
+
+Edge audits this by structural invariant: the federation-tier ingest
+gate (persist v9.0.0 G1+G2) applies to every signed object regardless
+of signer identity. There is no "trusted root bypass" in
+`recursive_trust_bootstrap`, no "operator-exempt" admission path in
+the federation_key registration gate (v8.8.0 §5.6.8.15), and no
+witness equivocation exception for founder-quorum keys.
+
+### Load-bearing Constitution cross-references
+
+| CC § | Edge surface |
+|---|---|
+| CC 1.7 | 1+4 envelope surface frozen — wire framing carries every claim; no out-of-band channels |
+| CC 1.13.5 | Operational-language gate — refusals describe mechanism, not preferences |
+| CC 1.13.4 | Substrate-stores-never-adjudicates — `should_eject_above_target`, `recursive_trust_bootstrap` are mechanical; agency lives above |
+| CC 3.2 / 3.4.7.1 | Owner-binding precondition for non-infra community membership — `SignedClaim::user_owner` / `delegates_to` / `identity_occurrence` fields |
+| CC 4.4.3.2.1 / .2 | Community DEK cascade + rotation-on-removal — consumed via persist v9.0.0 G5 |
+| CC 4.4.3.4.3 / 1.13.5 | Infra-vs-agency split — pure fabric nodes perform §19.7 forever-memory without reasoning; brain enrichment optional |
+| CC 5.3.2.4.3.1 | PQC-mandatory hybrid verify at federation-tier ingest — bound-hybrid signing on every §19 + §19.7 shape |
+| CC 5.6.8.10 (CEG §5.6.8.10) | TRUST≠MEMBERSHIP — `recursive_trust_bootstrap` returns `AdmitTrustServe` only; never membership |
+| CC 5.6.8.15 (CEG §5.6.8.15) | `consent:replication` directed peer grant — admission gate at persist v8.8.0+ `register_federation_key` |
+| CC 13.3 (CEG §13.3) | Delegation-laundering 5-hop cap + 0.5×root_trust aggregate-weight cap |
+| CC 19.1–.7 (CEG §19) | Holonomic substrate — §12 above |
+
+### What the Constitution forbids that edge MUST refuse
+
+1. **No content-policy in the substrate.** Refusal codes name
+   mechanism failures, never content classes.
+2. **No privileged-principal shortcuts.** Every code path applies the
+   same admission discipline. The recursive Golden Rule is a
+   *structural* invariant of edge, not a policy claim.
+3. **No re-attribution of deniable content.** §19.1 WW-2 enforces:
+   anonymous-tier + `cohort_scope: self` rows are filtered before
+   Merkle. A wholeness witness cannot re-bind structurally-private
+   content to a stable peer_id.
+4. **No agency requirement for memory.** §19.7's forever-memory model
+   is mechanical (symbol arithmetic + N→1 aggregation). Pure fabric
+   nodes remember without reasoning; this preserves CC 1.13.4's
+   substrate-stores-never-adjudicates discipline.
+
+See `docs/THREAT_MODEL.md` AV-52 for the corresponding threat-model
+treatment of constitutional-discipline adversaries.
+
+---
+
+## 14. How to maintain this document
 
 A working document, not a release artifact. Update it whenever:
 

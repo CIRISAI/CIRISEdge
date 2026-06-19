@@ -1,15 +1,29 @@
-# Roadmap: v3.8.0 → v4.0 — three cuts to the holonomic federation
+# Roadmap: v3.8.0 → v4.x → v5.0 — federation transport tier
 
-> **STATUS — 2026-06-16: v4.0 SHIPPED.** All three cuts landed in
-> sequence as planned: v3.8.0 (CEWP holographic substrate, on PyPI),
-> v3.9.0 + v3.10.1 (codec wiring + holonomic substrate, rolled into
-> v3.10.1 with deny.toml hardening), and v4.0 (CEWP-1.0 holonomic
-> federation seal). Three cuts, no v3.99.x climb. The substrate
-> is locked; cross-repo CEG normative absorption
-> ([CIRISRegistry#85](https://github.com/CIRISAI/CIRISRegistry/issues/85))
-> finalizes the wire vectors. See `MISSION.md` §12 for the seal
-> framing and `docs/THREAT_MODEL.md` AV-50 for the path-independence
-> threat surface treatment.
+> **STATUS — 2026-06-19: v4.6.4 SHIPPED; v5.0 IN FLIGHT.** All v4.x
+> cuts landed: v3.8.0 (CEWP holographic substrate), v3.10.0/v3.10.1
+> (holonomic substrate; codec wiring; deny hardening), v4.0 (CEWP-1.0
+> holonomic federation seal), v4.1.x → v4.5.x (CEG §19 + §19.7
+> producer-side conformance, ratified to 1.0 cross-impl at CEG RC17;
+> family-floor adoption through persist v8.x + verify v5.x), v4.6.x
+> (persist v9.0.0/v9.0.2 + verify v6.0.0/v6.2.0 major family floor;
+> Codex review fixes; CI publish unblock).
+>
+> **v5.0 in flight** — the §24 NAT-traversal set + Constitution-aligned
+> docs/threat-model pass:
+> - **CIRISEdge#168** — Reticulum Transport-node mode (NAT-traversal core)
+> - **CIRISEdge#169** — LXMF / store-and-forward propagation (asleep mobiles)
+> - **MISSION.md §13** (new) — CIRIS Constitution 0.1.5 alignment
+> - **THREAT_MODEL.md AV-52** (new) — Constitutional-discipline adversary
+>   surface (CC 1.13.1 Ubuntu / CC 1.13.5 op-language gate / CC 1.13.4
+>   substrate-stores-never-adjudicates / CC 5.3.2.4.3.1 PQC-mandatory /
+>   CC 5.6.8.10 TRUST≠MEMBERSHIP)
+>
+> Substrate is locked; cross-repo CEG normative absorption
+> ([CIRISRegistry#85](https://github.com/CIRISAI/CIRISRegistry/issues/85)) is closed
+> for §19 + §19.7. See `MISSION.md` §12 (holonomic seal framing),
+> §13 (Constitution alignment), and `docs/THREAT_MODEL.md` AV-50
+> (path-independence) + AV-52 (Constitutional discipline).
 
 Aggressive, low-number-discipline scaffolding from v3.8.0 (shipping now) through v4.0 (CEWP-1.0 holonomic federation seal). Three cuts total; no v3.99.x climb.
 
