@@ -487,6 +487,7 @@ fn best_parent_for_child(
     sub_path_occupancy: &std::collections::BTreeMap<(String, SubStreamPath), u64>,
     parent_total_occupancy: &std::collections::BTreeMap<String, u64>,
     child_descendants: &std::collections::BTreeSet<String>,
+    child_of: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 ) -> Option<String> {
     let mut best_score: Option<u64> = None;
     let mut best_parent: Option<String> = None;
@@ -537,11 +538,21 @@ fn best_parent_for_child(
             Some(v) => &v.ad.capacity,
             None => continue,
         };
+        // **v4.6.2 (Codex P2.2)** — `max_subscribers_per_stream` is a
+        // per-distinct-subscriber cap. If this child is ALREADY a
+        // subscriber of this parent on a different sub_path, the
+        // cap doesn't apply to this MDC edge (one viewer, multiple
+        // quadrants = one subscriber). Otherwise, the would-be new
+        // edge brings a new distinct subscriber and the cap counts.
         let total_at_parent = parent_total_occupancy
             .get(parent_peer_id)
             .copied()
             .unwrap_or(0);
-        if total_at_parent >= u64::from(parent_ad.max_subscribers_per_stream) {
+        let already_subscribed = child_of
+            .get(parent_peer_id)
+            .is_some_and(|c| c.contains(child_peer_id));
+        if !already_subscribed && total_at_parent >= u64::from(parent_ad.max_subscribers_per_stream)
+        {
             continue;
         }
         // Per-sub_path commitment cap (only when the parent declared
@@ -862,11 +873,24 @@ fn compute_core(
                 &sub_path_occupancy,
                 &parent_total_occupancy,
                 &descendants,
+                &child_of,
             ) {
                 *sub_path_occupancy
                     .entry((parent.clone(), sub_path.clone()))
                     .or_insert(0) += 1;
-                *parent_total_occupancy.entry(parent.clone()).or_insert(0) += 1;
+                // **v4.6.2 (Codex P2.2)** — `parent_total_occupancy`
+                // counts DISTINCT subscriber peers, NOT MDC edges.
+                // `RelayCapacity::max_subscribers_per_stream` is a per-
+                // SUBSCRIBER cap (a single viewer pulling 4 MDC
+                // quadrants is ONE subscriber, four edges). Increment
+                // only on the first (parent, child) edge — i.e. when
+                // this child wasn't already a child of this parent.
+                let is_new_subscriber = child_of
+                    .get(&parent)
+                    .map_or(true, |c| !c.contains(child_peer_id));
+                if is_new_subscriber {
+                    *parent_total_occupancy.entry(parent.clone()).or_insert(0) += 1;
+                }
                 child_of
                     .entry(parent.clone())
                     .or_default()
@@ -1831,6 +1855,133 @@ mod tests {
             topo.tree.len(),
             1,
             "mutual snapshot must produce exactly 1 edge (acyclic): {topo:?}"
+        );
+    }
+
+    /// **v4.6.2 (Codex P2.2)** — `max_subscribers_per_stream` is a
+    /// per-DISTINCT-SUBSCRIBER cap, not a per-MDC-edge cap. A relay
+    /// with `cap = 1` advertising two MDC sub_paths must be able to
+    /// serve ONE viewer attaching to BOTH paths (one subscriber, two
+    /// edges). Pre-v4.6.2 the per-stream cap counted every edge,
+    /// rejecting the second sub_path of the first subscriber and
+    /// leaving them with an incomplete MDC topology.
+    #[test]
+    fn distinct_subscriber_counting_under_max_subscribers_per_stream() {
+        // peer-h is the only viable parent. It commits to TWO
+        // sub_paths and declares max_subscribers_per_stream = 1.
+        // peer-a (the only child) wants both paths.
+        let commitment_a = SubStreamCommitment {
+            sub_stream_path: vec![0x01],
+            max_subscribers: 4,
+            uplink_budget_mbps: 5.0,
+        };
+        let commitment_b = SubStreamCommitment {
+            sub_stream_path: vec![0x02],
+            max_subscribers: 4,
+            uplink_budget_mbps: 5.0,
+        };
+        let ads = vec![
+            fake_signed_ad(
+                "peer-a",
+                5.0,
+                1_700_000_000_000,
+                vec![commitment_a.clone(), commitment_b.clone()],
+            ),
+            fake_signed_ad_with_max_subs(
+                "peer-h",
+                100.0,
+                1_700_000_001_000,
+                1, // ← per-distinct-subscriber cap of 1
+                vec![commitment_a, commitment_b],
+            ),
+        ];
+        let grants = vec![TrustGrant {
+            granter_peer_id: "peer-h".to_string(),
+            grantee_peer_id: "peer-a".to_string(),
+            granted_at_unix_ms: 1_700_000_000_000,
+            chain_depth: 0,
+            weight: TrustGrant::DEFAULT_WEIGHT,
+        }];
+        let reach = vec![ReachabilityObservation {
+            from_peer_id: "peer-h".to_string(),
+            to_peer_id: "peer-a".to_string(),
+            observed_rtt_ms: 50,
+            observed_at_unix_ms: 1_700_000_000_000,
+        }];
+        let snap = TopologyInputSnapshot {
+            capacity_ads: ads,
+            trust_grants: grants,
+            reachability_observations: reach,
+            locality_id: "loc-distinct".to_string(),
+            snapshot_epoch_id: 10,
+        };
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
+        // peer-a should attach to peer-h on BOTH sub_paths — they
+        // are ONE distinct subscriber under the per-stream cap of 1.
+        let edges_to_a: Vec<&[u8]> = topo
+            .tree
+            .iter()
+            .filter(|e| e.parent_peer_id == "peer-h" && e.child_peer_id == "peer-a")
+            .map(|e| e.sub_stream_path.as_slice())
+            .collect();
+        assert_eq!(
+            edges_to_a.len(),
+            2,
+            "peer-a must attach on BOTH sub_paths under peer-h (one distinct subscriber): {topo:?}"
+        );
+        // peer-a is NOT unrooted — complete MDC topology delivered.
+        assert!(
+            !topo.unrooted_peers.contains(&"peer-a".to_string()),
+            "peer-a wrongly listed as unrooted: {topo:?}"
+        );
+    }
+
+    /// **v4.6.2 (Codex P2.2)** — once a relay's per-stream cap is
+    /// exhausted by N distinct subscribers, the N+1-th distinct
+    /// subscriber is rejected.
+    #[test]
+    fn max_subscribers_per_stream_caps_distinct_count() {
+        // peer-h's cap = 1. peer-a attaches first; peer-b must NOT
+        // be admitted by peer-h (would be a 2nd distinct subscriber).
+        let ads = vec![
+            fake_signed_ad("peer-a", 5.0, 1_700_000_000_000, vec![]),
+            fake_signed_ad("peer-b", 5.0, 1_700_000_000_500, vec![]),
+            fake_signed_ad_with_max_subs("peer-h", 100.0, 1_700_000_001_000, 1, vec![]),
+        ];
+        let mut grants = Vec::new();
+        let mut reach = Vec::new();
+        for &t in &["peer-a", "peer-b"] {
+            grants.push(TrustGrant {
+                granter_peer_id: "peer-h".to_string(),
+                grantee_peer_id: t.to_string(),
+                granted_at_unix_ms: 1_700_000_000_000,
+                chain_depth: 0,
+                weight: TrustGrant::DEFAULT_WEIGHT,
+            });
+            reach.push(ReachabilityObservation {
+                from_peer_id: "peer-h".to_string(),
+                to_peer_id: t.to_string(),
+                observed_rtt_ms: 50,
+                observed_at_unix_ms: 1_700_000_000_000,
+            });
+        }
+        let snap = TopologyInputSnapshot {
+            capacity_ads: ads,
+            trust_grants: grants,
+            reachability_observations: reach,
+            locality_id: "loc-cap-1".to_string(),
+            snapshot_epoch_id: 11,
+        };
+        let topo = compute_alm_topology_verified(&all_valid(&snap));
+        let distinct_subs_at_h: std::collections::BTreeSet<&str> = topo
+            .tree
+            .iter()
+            .filter(|e| e.parent_peer_id == "peer-h")
+            .map(|e| e.child_peer_id.as_str())
+            .collect();
+        assert!(
+            distinct_subs_at_h.len() <= 1,
+            "peer-h served > cap distinct subscribers: {distinct_subs_at_h:?}"
         );
     }
 }

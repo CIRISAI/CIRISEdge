@@ -82,10 +82,14 @@ pub enum AvDispatcherError {
     /// The outer re-seal failed during fan-out.
     #[error("relay forward failed: {0}")]
     ForwardFailed(String),
-    /// The publisher / subscriber path requires an `EpochDek` and none
-    /// was provided at construction. Structural guard for the relay-vs-
-    /// endpoint role split.
-    #[error("publisher path requires epoch_dek; none provided")]
+    /// An endpoint role (publisher or subscriber) was constructed
+    /// without an `epoch_dek`. Structural guard for the relay-vs-
+    /// endpoint role split: endpoints inner-seal / inner-open under
+    /// the DEK; a subscriber with no DEK silently black-holes every
+    /// received frame, which v4.6.2 (Codex P2.1) rejects at
+    /// construction. The error name preserves backward source
+    /// compatibility; it now applies to both endpoint roles.
+    #[error("endpoint role (publisher/subscriber) requires epoch_dek; none provided")]
     PublisherMissingEpochDek,
     /// A subscriber-tier mutation referenced a subscriber the dispatcher
     /// has no downstream link for.
@@ -228,13 +232,23 @@ impl AvDispatcher {
     /// # Errors
     ///
     /// Returns [`AvDispatcherError::PublisherMissingEpochDek`] if a
-    /// [`AvRole::Publisher`] is constructed without an `epoch_dek` — the
-    /// publisher path cannot inner-seal/outer-seal without the DEK in
-    /// scope. A [`AvRole::Relay`] with an `epoch_dek` is accepted but
-    /// the DEK is dropped on construction: the relay never holds one,
+    /// [`AvRole::Publisher`] OR [`AvRole::Subscriber`] is constructed
+    /// without an `epoch_dek` — the publisher path cannot inner-seal
+    /// without the DEK, and a subscriber without a DEK silently
+    /// black-holes every received frame in `spawn_subscriber_loop`
+    /// (the inner-open call would fail and the frame would be skipped
+    /// per the per-frame resilience policy). v4.6.2 (Codex P2.1)
+    /// surfaces this at construction so the misconfiguration is
+    /// caught immediately instead of producing a silently-dropping
+    /// stream.
+    ///
+    /// A [`AvRole::Relay`] with an `epoch_dek` is accepted but the
+    /// DEK is dropped on construction: the relay never holds one,
     /// structurally (the field stays `None`).
     pub fn new(config: AvDispatcherConfig) -> Result<Self, AvDispatcherError> {
-        if config.local_role == AvRole::Publisher && config.epoch_dek.is_none() {
+        if matches!(config.local_role, AvRole::Publisher | AvRole::Subscriber)
+            && config.epoch_dek.is_none()
+        {
             return Err(AvDispatcherError::PublisherMissingEpochDek);
         }
         // Structural invariant: the relay never holds a DEK. Even if the
@@ -522,5 +536,38 @@ mod tests {
             r,
             Err(AvDispatcherError::PublisherMissingEpochDek)
         ));
+    }
+
+    /// **v4.6.2 (Codex P2.1)** — a subscriber with no `epoch_dek` would
+    /// have silently black-holed every received frame in the loop
+    /// (inner-open fails → per-frame resilience skips it). v4.6.2
+    /// rejects this at construction time.
+    #[test]
+    fn subscriber_without_dek_errors() {
+        let r = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(1),
+            local_role: AvRole::Subscriber,
+            epoch_dek: None,
+            initial_subscribers: vec![],
+            inbound_links: vec![],
+        });
+        assert!(matches!(
+            r,
+            Err(AvDispatcherError::PublisherMissingEpochDek)
+        ));
+    }
+
+    /// Subscriber WITH a DEK still constructs (the inverse of the
+    /// rejection test — pin the happy path).
+    #[test]
+    fn subscriber_with_dek_constructs() {
+        let r = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(1),
+            local_role: AvRole::Subscriber,
+            epoch_dek: Some([0x44u8; 32]),
+            initial_subscribers: vec![],
+            inbound_links: vec![],
+        });
+        assert!(r.is_ok());
     }
 }
