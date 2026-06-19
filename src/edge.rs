@@ -1687,7 +1687,12 @@ impl Edge {
         let outcome = match send_result {
             Ok(o) => {
                 let attempt_outcome = match &o {
-                    TransportSendOutcome::Delivered => AttemptOutcome::SendSuccess,
+                    // §24 NAT-traversal (#169): a queued send accepted
+                    // the bytes for later wake-up fetch — treat as a
+                    // successful attempt for reachability accounting.
+                    TransportSendOutcome::Delivered | TransportSendOutcome::Queued => {
+                        AttemptOutcome::SendSuccess
+                    }
                     TransportSendOutcome::Reject { class, .. } => AttemptOutcome::SendFailure {
                         error_class: class.clone(),
                     },
@@ -1701,7 +1706,10 @@ impl Edge {
                 // bump the sent counter on a successful delivery. A
                 // `Reject` arm counts as a send_failure with the
                 // peer-reported class.
-                if matches!(&o, TransportSendOutcome::Delivered) {
+                if matches!(
+                    &o,
+                    TransportSendOutcome::Delivered | TransportSendOutcome::Queued
+                ) {
                     self.metrics.add_bytes_out(transport.id(), envelope_size);
                     self.metrics.inc_sent(&M::TYPE);
                 } else if let TransportSendOutcome::Reject { class, .. } = &o {
@@ -1747,6 +1755,16 @@ impl Edge {
             TransportSendOutcome::Reject { class, detail } => {
                 Err(EdgeError::Unreachable(format!("reject {class}: {detail}")))
             }
+            // §24 NAT-traversal (#169): a store-and-forward queue is a
+            // durable-tier concept; ephemeral request-response cannot
+            // observe a wake-up-fetch delivery, so a queued send on the
+            // ephemeral path is a config error (callers wanting
+            // store-and-forward use the durable path).
+            TransportSendOutcome::Queued => Err(EdgeError::Config(
+                "store-and-forward queued send is not valid on the ephemeral request-response \
+                 path (use send_durable)"
+                    .into(),
+            )),
         }
     }
 

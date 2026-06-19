@@ -973,6 +973,17 @@ pub struct ReticulumTransport {
     /// Monotonic via `std::time::Instant`; transport replacement
     /// rebases the counter, which is the documented contract.
     started_at: std::time::Instant,
+    /// CIRISEdge#169 (§24 NAT-traversal) — optional store-and-forward
+    /// queue. `None` (the default) leaves `send` live-only regardless
+    /// of the per-send delivery mode. When wired (public fabric
+    /// nodes), a [`PendingDelivery::PendingOrLive`] send to an
+    /// unreachable destination is queued here instead of erroring.
+    /// Set via [`Self::with_store_and_forward`].
+    store_and_forward: Option<Arc<dyn crate::transport::store_and_forward::StoreAndForward>>,
+    /// CIRISEdge#169 — default per-send delivery discipline. Live-only
+    /// unless overridden. `send` consults this for every send (the
+    /// `Transport` trait has no per-call delivery arg in v5.0).
+    delivery: crate::transport::PendingDelivery,
 }
 
 /// Internal registry entry behind [`ReticulumTransport::interface_specs`].
@@ -1315,7 +1326,25 @@ impl ReticulumTransport {
             timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
             blackhole: blackhole_rules,
             started_at: std::time::Instant::now(),
+            store_and_forward: None,
+            delivery: crate::transport::PendingDelivery::LiveOnly,
         })
+    }
+
+    /// CIRISEdge#169 (§24 NAT-traversal) — wire a store-and-forward
+    /// queue and set the default per-send delivery discipline. A
+    /// public fabric node calls this with [`PendingDelivery::PendingOrLive`]
+    /// so sends to currently-unreachable destinations are queued for
+    /// the destination's wake-up fetch instead of failing.
+    #[must_use]
+    pub fn with_store_and_forward(
+        mut self,
+        queue: Arc<dyn crate::transport::store_and_forward::StoreAndForward>,
+        delivery: crate::transport::PendingDelivery,
+    ) -> Self {
+        self.store_and_forward = Some(queue);
+        self.delivery = delivery;
+        self
     }
 
     /// CIRISEdge#24 — snapshot every registered interface's typed
@@ -2228,12 +2257,25 @@ impl Transport for ReticulumTransport {
             });
         }
 
-        let peer = self.resolve_peer(destination_key_id).await.ok_or_else(|| {
-            TransportError::Unreachable(format!(
+        let Some(peer) = self.resolve_peer(destination_key_id).await else {
+            // §24 NAT-traversal (CIRISEdge#169): an unreachable
+            // destination under `PendingOrLive` with a wired queue is
+            // stored for the destination's wake-up fetch rather than
+            // failed. Admission-time hybrid-PQC verification is the
+            // operator's concern; the queued bytes are the byte-exact
+            // signed envelope, carried verbatim.
+            if self.delivery == crate::transport::PendingDelivery::PendingOrLive {
+                if let Some(saf) = &self.store_and_forward {
+                    saf.queue(destination_key_id, envelope_bytes)
+                        .map_err(|e| TransportError::Io(format!("store-and-forward queue: {e}")))?;
+                    return Ok(TransportSendOutcome::Queued);
+                }
+            }
+            return Err(TransportError::Unreachable(format!(
                 "no Reticulum destination known for destination_key_id={destination_key_id} \
                  (not directory-resolvable and no announce received)"
-            ))
-        })?;
+            )));
+        };
 
         // CIRISEdge#33 (v0.15.0) — operator-deny-list check BEFORE the
         // leviculum connect call. The blackhole keys on the peer's

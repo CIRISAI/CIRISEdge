@@ -511,6 +511,30 @@ async fn dispatch_one(
                 );
             }
         }
+        Ok(TransportSendOutcome::Queued) => {
+            // §24 NAT-traversal (#169): the transport accepted the
+            // bytes into a store-and-forward queue for the
+            // destination's wake-up fetch. The fabric node now holds
+            // the signed envelope, so the durable row is
+            // terminal-delivered (same as a transport-tier ack) —
+            // edge's retry loop must not keep re-dispatching it.
+            if let Some(t) = reachability {
+                t.record_attempt(
+                    &row.destination_key_id,
+                    transport.id(),
+                    AttemptOutcome::DurableDelivered,
+                );
+            }
+            if let Err(e) = queue
+                .mark_transport_delivered(&row.queue_id, transport.id().0)
+                .await
+            {
+                tracing::error!(
+                    queue_id = ?row.queue_id, error = %e,
+                    "dispatcher: mark_transport_delivered failed (store-and-forward queued)"
+                );
+            }
+        }
         Ok(TransportSendOutcome::Reject { class, detail: _ }) if class == "replay_detected" => {
             // Receiver already has the message (idempotent recovery).
             // Count as a delivered for reachability — the peer holds

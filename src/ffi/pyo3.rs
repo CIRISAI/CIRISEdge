@@ -5166,6 +5166,88 @@ impl PyRelayNode {
     }
 }
 
+// ─── PyStoreAndForward (CIRISEdge#169 / L1-B) ───────────────────────
+//
+// §24 NAT-traversal store-and-forward queue. CIRISServer (a public
+// fabric node) instantiates this and operates the queue on behalf of
+// asleep/offline mobile edges; mobile peers drain it on wake. Ungated
+// (no leviculum dependency) so the queue runs regardless of which
+// transport features a given wheel ships.
+//
+// The queued bytes are the byte-exact signed CEG envelope. Admission-
+// time hybrid-PQC verification is the operator's responsibility (run
+// the envelope through `verify` before `queue`); this surface is the
+// transport-tier queue, not the policy tier.
+#[pyclass(name = "StoreAndForward", module = "ciris_edge")]
+pub struct PyStoreAndForward {
+    inner: crate::transport::store_and_forward::MemoryStoreAndForward,
+}
+
+#[pymethods]
+impl PyStoreAndForward {
+    /// Build an in-memory queue. All three caps are optional; omitted
+    /// values take the #169 defaults (256 entries/destination, 64 MiB
+    /// total, 7-day TTL).
+    #[new]
+    #[pyo3(signature = (max_queued_per_destination=None, max_total_bytes=None, ttl_seconds=None))]
+    fn new(
+        max_queued_per_destination: Option<u32>,
+        max_total_bytes: Option<u64>,
+        ttl_seconds: Option<u64>,
+    ) -> Self {
+        use crate::transport::store_and_forward::StoreAndForwardConfig;
+        let d = StoreAndForwardConfig::default();
+        let config = StoreAndForwardConfig {
+            max_queued_per_destination: max_queued_per_destination
+                .unwrap_or(d.max_queued_per_destination),
+            max_total_bytes: max_total_bytes.unwrap_or(d.max_total_bytes),
+            ttl_seconds: ttl_seconds.unwrap_or(d.ttl_seconds),
+        };
+        Self {
+            inner: crate::transport::store_and_forward::MemoryStoreAndForward::new(config),
+        }
+    }
+
+    /// Queue a byte-exact signed envelope for a currently-unreachable
+    /// destination. Raises `ValueError` if the envelope is larger than
+    /// the entire byte budget.
+    #[pyo3(signature = (dest, envelope_bytes))]
+    fn queue(&self, dest: &str, envelope_bytes: &[u8]) -> PyResult<()> {
+        use crate::transport::store_and_forward::StoreAndForward as _;
+        self.inner
+            .queue(dest, envelope_bytes)
+            .map_err(|e| PyValueError::new_err(format!("{e}")))
+    }
+
+    /// Drain up to `limit` queued envelopes for `dest`, oldest-first.
+    /// Consumed entries are evicted. Returns the raw envelope bytes.
+    #[pyo3(signature = (dest, limit))]
+    fn drain<'py>(
+        &self,
+        py: Python<'py>,
+        dest: &str,
+        limit: u32,
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyBytes>>> {
+        use crate::transport::store_and_forward::StoreAndForward as _;
+        let drained = self
+            .inner
+            .drain(dest, limit)
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        Ok(drained
+            .into_iter()
+            .map(|d| pyo3::types::PyBytes::new(py, &d.envelope_bytes))
+            .collect())
+    }
+
+    /// Operator surface — number of envelopes currently queued for
+    /// `dest`.
+    #[pyo3(signature = (dest))]
+    fn pending_count(&self, dest: &str) -> u32 {
+        use crate::transport::store_and_forward::StoreAndForward as _;
+        self.inner.pending_count(dest)
+    }
+}
+
 #[pymodule]
 fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v1.1.7 (CIRISEdge#58) — diagnostic harness, gated under the
@@ -5267,6 +5349,11 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // constructor needs both types).
     #[cfg(feature = "transport-reticulum")]
     m.add_class::<PyRelayNode>()?;
+
+    // CIRISEdge#169 / L1-B — §24 store-and-forward queue. Ungated; a
+    // public fabric node (CIRISServer) operates it for asleep mobile
+    // edges.
+    m.add_class::<PyStoreAndForward>()?;
 
     Ok(())
 }

@@ -120,6 +120,12 @@ pub mod attestation;
 #[cfg(feature = "_reticulum-module")]
 pub mod reticulum;
 
+/// §24 NAT-traversal — store-and-forward queue for asleep mobile
+/// edges (CIRISEdge#169). CEG-native (Leviculum exposes no LXMF
+/// propagation surface); pairs with Reticulum Transport-node mode
+/// (#168). Pure-Rust, always compiled.
+pub mod store_and_forward;
+
 // Remaining implementations land in subsequent commits; trait shape
 // sealed Phase 1.
 //
@@ -155,6 +161,27 @@ pub enum TransportSendOutcome {
     /// `replay_detected` → mark_replay_resolved → delivered, per
     /// OQ-09 closure).
     Reject { class: String, detail: String },
+    /// §24 NAT-traversal (CIRISEdge#169) — the destination was
+    /// unreachable and the envelope was accepted into a
+    /// store-and-forward queue for later wake-up fetch instead of
+    /// being delivered live. Only returned when the caller opted into
+    /// [`PendingDelivery::PendingOrLive`] and a queue is wired.
+    Queued,
+}
+
+/// §24 NAT-traversal (CIRISEdge#169) — per-send delivery discipline.
+/// The default is live-only; callers explicitly opt into the
+/// store-and-forward fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PendingDelivery {
+    /// Live-only: an unreachable destination yields
+    /// [`TransportError::Unreachable`]. The pre-#169 behaviour.
+    #[default]
+    LiveOnly,
+    /// Try live first; on an unreachable destination, fall back to the
+    /// store-and-forward queue (if one is wired) and return
+    /// [`TransportSendOutcome::Queued`].
+    PendingOrLive,
 }
 
 /// Errors a transport may surface. Edge maps these to typed wire
