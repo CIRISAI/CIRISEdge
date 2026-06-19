@@ -49,12 +49,14 @@
 //! round is a missed cadence, not a fault. The next round will pick
 //! up whatever state changed in the meantime.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use super::coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
+use super::protocol::EnvelopeKind;
 use super::session::SessionRole;
 
 /// Scheduler configuration shared across all coordinators it drives.
@@ -121,9 +123,102 @@ pub enum RoundEvent {
 /// Constructing the scheduler does NOT spawn any tasks; the caller
 /// chooses when to start the run loop via
 /// [`Self::run_until_cancelled`].
+///
+/// ## Runtime control plane (CIRISEdge#173, v5.1.0)
+///
+/// Call [`Self::install_control_channel`] before starting the run
+/// loop to obtain a [`SchedulerHandle`] that lets external code add
+/// or remove Initiator coordinators *while the loop is running* —
+/// no restart required. Without that call the scheduler keeps its
+/// pre-v5.1 fixed-set semantics.
 pub struct ReplicationScheduler {
     config: SchedulerConfig,
     coordinators: Vec<Arc<ReplicationCoordinator>>,
+    command_rx: Option<mpsc::Receiver<SchedulerCommand>>,
+}
+
+/// Runtime control command for an actively-running scheduler.
+///
+/// Emitted by [`SchedulerHandle`] and consumed inside
+/// [`ReplicationScheduler::run_with_events`].
+pub enum SchedulerCommand {
+    /// Spawn a new Initiator coordinator task. The coordinator's
+    /// role must be [`SessionRole::Initiator`] (debug-asserted).
+    AddInitiator(Arc<ReplicationCoordinator>),
+    /// Stop the running task for the matching `(peer_key_id, kind)`
+    /// coordinator, if present. No-op if the pair was never added.
+    RemoveInitiator {
+        peer_key_id: String,
+        kind: EnvelopeKind,
+    },
+}
+
+impl std::fmt::Debug for SchedulerCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddInitiator(coord) => f
+                .debug_struct("AddInitiator")
+                .field("peer_key_id", &coord.peer_key_id())
+                .field("kind", &coord.kind())
+                .finish(),
+            Self::RemoveInitiator { peer_key_id, kind } => f
+                .debug_struct("RemoveInitiator")
+                .field("peer_key_id", peer_key_id)
+                .field("kind", kind)
+                .finish(),
+        }
+    }
+}
+
+/// External handle for mutating a running scheduler's Initiator set.
+///
+/// Acquired via [`ReplicationScheduler::install_control_channel`]
+/// BEFORE the run loop starts. Cheaply clonable. Sending on a closed
+/// channel (the scheduler has shut down) returns an error.
+#[derive(Clone, Debug)]
+pub struct SchedulerHandle {
+    command_tx: mpsc::Sender<SchedulerCommand>,
+}
+
+impl SchedulerHandle {
+    /// Add an Initiator coordinator to the running scheduler. The
+    /// scheduler spawns a new task on its next select iteration.
+    /// Idempotent vs. an already-active `(peer_key_id, kind)`:
+    /// duplicates are silently dropped inside the run loop.
+    pub async fn add_initiator(
+        &self,
+        coord: Arc<ReplicationCoordinator>,
+    ) -> Result<(), SchedulerCommandError> {
+        self.command_tx
+            .send(SchedulerCommand::AddInitiator(coord))
+            .await
+            .map_err(|_| SchedulerCommandError::SchedulerStopped)
+    }
+
+    /// Stop the running task for `(peer_key_id, kind)`. No-op if
+    /// that pair isn't currently active.
+    pub async fn remove_initiator(
+        &self,
+        peer_key_id: impl Into<String>,
+        kind: EnvelopeKind,
+    ) -> Result<(), SchedulerCommandError> {
+        self.command_tx
+            .send(SchedulerCommand::RemoveInitiator {
+                peer_key_id: peer_key_id.into(),
+                kind,
+            })
+            .await
+            .map_err(|_| SchedulerCommandError::SchedulerStopped)
+    }
+}
+
+/// Failure reason for [`SchedulerHandle`] command sends.
+#[derive(Debug, thiserror::Error)]
+pub enum SchedulerCommandError {
+    /// The scheduler's run loop has exited, so its command receiver
+    /// dropped. Subsequent sends will keep failing.
+    #[error("scheduler has stopped; runtime control channel is closed")]
+    SchedulerStopped,
 }
 
 impl ReplicationScheduler {
@@ -131,7 +226,23 @@ impl ReplicationScheduler {
         Self {
             config,
             coordinators: Vec::new(),
+            command_rx: None,
         }
+    }
+
+    /// Install the runtime control channel (CIRISEdge#173). Returns
+    /// the sender side as a [`SchedulerHandle`]; the scheduler keeps
+    /// the receiver. Must be called before the run loop starts to
+    /// take effect; calling twice replaces the prior receiver, which
+    /// silently invalidates any earlier handle.
+    ///
+    /// Without this call the scheduler retains its pre-v5.1 fixed-set
+    /// semantics — only coordinators added before `run_until_cancelled`
+    /// via [`Self::add_initiator`] are driven.
+    pub fn install_control_channel(&mut self) -> SchedulerHandle {
+        let (command_tx, command_rx) = mpsc::channel(32);
+        self.command_rx = Some(command_rx);
+        SchedulerHandle { command_tx }
     }
 
     /// Register an Initiator-side coordinator with the scheduler.
@@ -185,37 +296,117 @@ impl ReplicationScheduler {
     /// events; the scheduler tolerates a closed sink (the round
     /// loops continue).
     pub async fn run_with_events(
-        self,
-        cancel: watch::Receiver<bool>,
-        event_sink: Option<tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
+        mut self,
+        mut cancel: watch::Receiver<bool>,
+        event_sink: Option<mpsc::Sender<(String, RoundEvent)>>,
     ) {
+        // Per-coord cancel senders, keyed by (peer_key_id, kind).
+        // RemoveInitiator flips one entry; global cancel flips all.
+        let mut per_coord: HashMap<(String, EnvelopeKind), watch::Sender<bool>> = HashMap::new();
         let mut handles = Vec::with_capacity(self.coordinators.len());
-        for coord in self.coordinators {
-            let mut cancel_rx = cancel.clone();
-            let event_sink = event_sink.clone();
-            let cadence = self.config.cadence;
-            let round_timeout = self.config.round_timeout;
-            let h = tokio::spawn(async move {
-                run_one_coordinator_forever(
-                    coord,
-                    cadence,
-                    round_timeout,
-                    &mut cancel_rx,
-                    event_sink,
-                )
-                .await;
-            });
-            handles.push(h);
+
+        for coord in self.coordinators.drain(..) {
+            spawn_coord(
+                &mut per_coord,
+                &mut handles,
+                coord,
+                self.config.cadence,
+                self.config.round_timeout,
+                event_sink.clone(),
+            );
         }
+
+        let mut command_rx = self.command_rx.take();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        for (_, tx) in per_coord.drain() {
+                            let _ = tx.send(true);
+                        }
+                        break;
+                    }
+                }
+                Some(cmd) = async {
+                    // SAFETY of unwrap: the `if` guard below is
+                    // evaluated before this branch is polled, so
+                    // command_rx is Some when we enter.
+                    command_rx.as_mut().unwrap().recv().await
+                }, if command_rx.is_some() => {
+                    match cmd {
+                        SchedulerCommand::AddInitiator(coord) => {
+                            let key = (coord.peer_key_id().to_string(), coord.kind());
+                            if per_coord.contains_key(&key) {
+                                tracing::debug!(
+                                    peer = %key.0,
+                                    kind = ?key.1,
+                                    "scheduler: AddInitiator ignored (already active)"
+                                );
+                                continue;
+                            }
+                            spawn_coord(
+                                &mut per_coord,
+                                &mut handles,
+                                coord,
+                                self.config.cadence,
+                                self.config.round_timeout,
+                                event_sink.clone(),
+                            );
+                        }
+                        SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
+                            if let Some(tx) = per_coord.remove(&(peer_key_id, kind)) {
+                                let _ = tx.send(true);
+                            }
+                        }
+                    }
+                }
+                else => {
+                    // command_rx is None AND cancel is not changing —
+                    // wait on cancel only.
+                    let _ = cancel.changed().await;
+                    if *cancel.borrow() {
+                        for (_, tx) in per_coord.drain() {
+                            let _ = tx.send(true);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
         for h in handles {
             // join_all would be nicer but adds futures-util dep
-            // outside our current set. tokio::join! on a Vec needs
-            // boxing. Sequential .await is fine here — every task
-            // observes the same cancel signal so they all finish
-            // at about the same time anyway.
+            // outside our current set. Sequential .await is fine —
+            // tasks cancel concurrently in response to the same
+            // signal.
             let _ = h.await;
         }
     }
+}
+
+/// Spawn one coordinator task and record its per-coord cancel handle.
+fn spawn_coord(
+    per_coord: &mut HashMap<(String, EnvelopeKind), watch::Sender<bool>>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    coord: Arc<ReplicationCoordinator>,
+    cadence: Duration,
+    round_timeout: Duration,
+    event_sink: Option<mpsc::Sender<(String, RoundEvent)>>,
+) {
+    debug_assert_eq!(
+        coord.role(),
+        SessionRole::Initiator,
+        "scheduler spawns Initiator coordinators only"
+    );
+    let key = (coord.peer_key_id().to_string(), coord.kind());
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    per_coord.insert(key, cancel_tx);
+    let h = tokio::spawn(async move {
+        run_one_coordinator_forever(coord, cadence, round_timeout, &mut cancel_rx, event_sink)
+            .await;
+    });
+    handles.push(h);
 }
 
 async fn run_one_coordinator_forever(
@@ -657,6 +848,105 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), h)
             .await
             .expect("exit on cancel")
+            .expect("join");
+    }
+
+    /// CIRISEdge#173 / v5.1.0 — `SchedulerHandle::add_initiator` on
+    /// a running scheduler spawns a task that actively initiates
+    /// rounds. Proof-of-life via `RoundEvent` emission: a coord
+    /// targeting an unreachable peer produces `RoundEvent::Error`
+    /// rounds (transport Unreachable) which can only happen if the
+    /// task fired. Then `remove_initiator` stops the events.
+    #[tokio::test]
+    async fn control_channel_add_remove_drives_initiator_task() {
+        let mut sched = ReplicationScheduler::new(fast_config());
+        let control = sched.install_control_channel();
+        let (event_tx, mut event_rx) = mpsc::channel::<(String, RoundEvent)>(64);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sched_handle =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+
+        // Build an Initiator coord pointing at a peer that doesn't
+        // exist in the in-memory inbox. Every send fails with
+        // TransportError::Unreachable → RoundEvent::Error per round.
+        let transport: Arc<dyn Transport> = Arc::new(InMemTransport {
+            peer_inbox: HashMap::new(),
+        });
+        let provider: Arc<dyn StateProvider> = Arc::new(StaticProvider {
+            state: {
+                let mut s = LocalState::new();
+                s.insert(EnvelopeKind::Key, h(7), 7);
+                s
+            },
+            envelopes: HashMap::new(),
+        });
+        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
+            known: HashMap::new(),
+            local_hashes: std::collections::HashSet::new(),
+        }));
+        let coord = Arc::new(ReplicationCoordinator::new(
+            transport,
+            "ghost-peer",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        ));
+
+        control
+            .add_initiator(Arc::clone(&coord))
+            .await
+            .expect("send AddInitiator");
+
+        // Wait for at least one event for ghost-peer to confirm the
+        // task spawned + the cadence tick fired.
+        let mut saw_add = false;
+        for _ in 0..50 {
+            if let Ok(Some((peer, _))) =
+                tokio::time::timeout(Duration::from_millis(60), event_rx.recv()).await
+            {
+                if peer == "ghost-peer" {
+                    saw_add = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_add, "AddInitiator did not produce any round events");
+
+        // Idempotent re-add: send the same coord again, no panic.
+        control
+            .add_initiator(Arc::clone(&coord))
+            .await
+            .expect("idempotent re-add");
+
+        // Remove and assert events for ghost-peer eventually stop.
+        control
+            .remove_initiator("ghost-peer", EnvelopeKind::Key)
+            .await
+            .expect("send RemoveInitiator");
+
+        // Drain a quiet window; an event landed before the remove
+        // took effect is fine, but the stream must go silent for at
+        // least one full cadence after remove.
+        let drain_start = tokio::time::Instant::now();
+        let mut last_event = drain_start;
+        while drain_start.elapsed() < Duration::from_millis(400) {
+            match tokio::time::timeout(Duration::from_millis(50), event_rx.recv()).await {
+                Ok(Some((peer, _))) if peer == "ghost-peer" => {
+                    last_event = tokio::time::Instant::now();
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            last_event.elapsed() >= Duration::from_millis(100),
+            "ghost-peer events did not cease after RemoveInitiator"
+        );
+
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sched_handle)
+            .await
+            .expect("shutdown")
             .expect("join");
     }
 }

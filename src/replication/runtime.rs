@@ -45,10 +45,11 @@
 //! wires it. A v1.7 follow-up may add an opt-in
 //! `Edge::install_replication_routing(runtime)` helper.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ciris_persist::federation::FederationDirectory;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
 use super::bridge::{BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge};
@@ -56,7 +57,9 @@ use super::coordinator::ReplicationCoordinator;
 use super::directory::{DirectoryStateAdapter, MutableDirectoryStateAdapter, ReplicationDirectory};
 use super::protocol::EnvelopeKind;
 use super::registry::ReplicationRegistry;
-use super::scheduler::{ReplicationScheduler, SchedulerConfig};
+use super::scheduler::{
+    ReplicationScheduler, SchedulerCommandError, SchedulerConfig, SchedulerHandle,
+};
 use super::session::SessionRole;
 use super::summary::{StateApplier, StateProvider};
 use crate::transport::Transport;
@@ -92,6 +95,32 @@ pub struct ReplicationRuntime {
     cancel_tx: watch::Sender<bool>,
     scheduler_task: Option<JoinHandle<()>>,
     config: ReplicationRuntimeConfig,
+    /// Runtime control channel for the scheduler (CIRISEdge#173,
+    /// v5.1.0). Used by [`Self::register_initiator_peer`] /
+    /// [`Self::remove_peer`] / [`Self::set_peers`] to mutate the
+    /// scheduler's Initiator set without restart.
+    scheduler_handle: SchedulerHandle,
+    /// Current Initiator set, kept in sync with the scheduler's
+    /// live coordinator tasks. Drives [`Self::set_peers`]'s diff.
+    /// Pre-v5.1 entries (passed to `start`) populate this on init.
+    current_initiators: Arc<Mutex<HashSet<(String, EnvelopeKind)>>>,
+}
+
+/// Failure modes for the v5.1.0 runtime peer-mutation API
+/// (CIRISEdge#173).
+#[derive(Debug, thiserror::Error)]
+pub enum ReplicationRuntimeError {
+    /// The scheduler has stopped (e.g. [`ReplicationRuntime::shutdown`]
+    /// was called) — runtime control is no longer possible. Subsequent
+    /// calls will keep failing.
+    #[error("replication runtime has shut down; peer mutation is no longer accepted")]
+    SchedulerStopped,
+}
+
+impl From<SchedulerCommandError> for ReplicationRuntimeError {
+    fn from(_: SchedulerCommandError) -> Self {
+        Self::SchedulerStopped
+    }
 }
 
 impl ReplicationRuntime {
@@ -141,6 +170,7 @@ impl ReplicationRuntime {
         // session.rs's borrow story (the bridge is the same object
         // backing both).
         let mut scheduler = ReplicationScheduler::new(config.scheduler);
+        let scheduler_handle = scheduler.install_control_channel();
         let coords: Vec<Arc<ReplicationCoordinator>> = peers
             .iter()
             .map(|peer| {
@@ -161,8 +191,10 @@ impl ReplicationRuntime {
             })
             .collect();
 
+        let mut initial_initiator_set: HashSet<(String, EnvelopeKind)> = HashSet::new();
         for (peer, coord) in peers.iter().zip(coords.iter()) {
             scheduler.add_initiator(Arc::clone(coord));
+            initial_initiator_set.insert((peer.peer_key_id.clone(), peer.kind));
             // Register so the operator's listen loop can route
             // inbound replies (the Initiator side receives Summary
             // / Diff / Deliver back from the peer). Inline await
@@ -189,6 +221,8 @@ impl ReplicationRuntime {
             cancel_tx,
             scheduler_task: Some(scheduler_task),
             config,
+            scheduler_handle,
+            current_initiators: Arc::new(Mutex::new(initial_initiator_set)),
         }
     }
 
@@ -204,21 +238,139 @@ impl ReplicationRuntime {
     /// the scheduler with a dynamic-add API.
     pub async fn register_peer(&self, peer_key_id: impl Into<String>, kind: EnvelopeKind) {
         let peer_key_id = peer_key_id.into();
+        let coord = self.build_coordinator(&peer_key_id, kind, SessionRole::Responder);
+        self.registry.register(peer_key_id, kind, coord).await;
+    }
+
+    /// Hot-add a `(peer_key_id, kind)` **Initiator** coordinator —
+    /// CIRISEdge#173, v5.1.0.
+    ///
+    /// Builds a coordinator in [`SessionRole::Initiator`], registers
+    /// it with the registry (so inbound replies route correctly),
+    /// AND tells the scheduler's runtime control plane to spawn a
+    /// task that fires periodic anti-entropy rounds at the configured
+    /// cadence. Idempotent — re-adding an active `(peer, kind)` is a
+    /// no-op.
+    ///
+    /// Use this from CEG-driven reconcilers when `consent:replication`
+    /// objects materialize at runtime: the new peer begins active
+    /// pull immediately, no restart.
+    pub async fn register_initiator_peer(
+        &self,
+        peer_key_id: impl Into<String>,
+        kind: EnvelopeKind,
+    ) -> Result<(), ReplicationRuntimeError> {
+        let peer_key_id = peer_key_id.into();
+        let key = (peer_key_id.clone(), kind);
+
+        {
+            let mut active = self.current_initiators.lock().await;
+            if active.contains(&key) {
+                return Ok(());
+            }
+            active.insert(key);
+        }
+
+        let coord = self.build_coordinator(&peer_key_id, kind, SessionRole::Initiator);
+        // Register first so the inbound listen loop can route replies
+        // by the time the scheduler picks up the command.
+        self.registry
+            .register(peer_key_id, kind, Arc::clone(&coord))
+            .await;
+        self.scheduler_handle.add_initiator(coord).await?;
+        Ok(())
+    }
+
+    /// Hot-remove a `(peer_key_id, kind)` peer — CIRISEdge#173,
+    /// v5.1.0.
+    ///
+    /// Stops the matching Initiator coordinator's scheduled rounds
+    /// (if active) AND deregisters from the registry so inbound
+    /// routing for the peer ceases. Idempotent: removing a peer that
+    /// was never added is a no-op.
+    pub async fn remove_peer(
+        &self,
+        peer_key_id: impl Into<String>,
+        kind: EnvelopeKind,
+    ) -> Result<(), ReplicationRuntimeError> {
+        let peer_key_id = peer_key_id.into();
+        let key = (peer_key_id.clone(), kind);
+
+        let was_initiator = {
+            let mut active = self.current_initiators.lock().await;
+            active.remove(&key)
+        };
+        if was_initiator {
+            self.scheduler_handle
+                .remove_initiator(peer_key_id.clone(), kind)
+                .await?;
+        }
+        self.registry.deregister(&peer_key_id, kind).await;
+        Ok(())
+    }
+
+    /// Diff-and-converge the live Initiator set against `desired` —
+    /// CIRISEdge#173, v5.1.0.
+    ///
+    /// For each `(peer_key_id, kind)` in `desired` not currently
+    /// active, calls [`Self::register_initiator_peer`]. For each
+    /// currently-active pair NOT in `desired`, calls
+    /// [`Self::remove_peer`]. Net effect: after this call returns,
+    /// the runtime's Initiator coordinators exactly match `desired`.
+    ///
+    /// Atomic per individual add/remove only — partial progress is
+    /// possible if a mid-call command fails (the failed pair is
+    /// reflected by the returned error; pairs processed before the
+    /// failure stay applied). Intended driver for CEG-reconcilers:
+    /// call on every consent-object delta.
+    pub async fn set_peers(
+        &self,
+        desired: Vec<ReplicationPeer>,
+    ) -> Result<(), ReplicationRuntimeError> {
+        let desired_set: HashSet<(String, EnvelopeKind)> = desired
+            .iter()
+            .map(|p| (p.peer_key_id.clone(), p.kind))
+            .collect();
+        let current_set: HashSet<(String, EnvelopeKind)> = {
+            let active = self.current_initiators.lock().await;
+            active.iter().cloned().collect()
+        };
+
+        // Adds first; the new peers begin active pull before the
+        // departing peers' rounds stop — minimizes the convergence
+        // window during a swap.
+        for (peer_key_id, kind) in desired_set.difference(&current_set) {
+            self.register_initiator_peer(peer_key_id.clone(), *kind)
+                .await?;
+        }
+        for (peer_key_id, kind) in current_set.difference(&desired_set) {
+            self.remove_peer(peer_key_id.clone(), *kind).await?;
+        }
+        Ok(())
+    }
+
+    /// Build a [`ReplicationCoordinator`] in the requested role with
+    /// the runtime's shared transport + bridge-backed provider/applier.
+    /// Internal helper for register_peer / register_initiator_peer.
+    fn build_coordinator(
+        &self,
+        peer_key_id: &str,
+        kind: EnvelopeKind,
+        role: SessionRole,
+    ) -> Arc<ReplicationCoordinator> {
         let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&self.bridge) as _;
         let provider: Arc<dyn StateProvider> =
             Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)));
-        let applier: Arc<tokio::sync::Mutex<dyn StateApplier>> = Arc::new(tokio::sync::Mutex::new(
-            MutableDirectoryStateAdapter::new(bridge_dir),
-        ));
-        let coord = Arc::new(ReplicationCoordinator::new(
+        let applier: Arc<Mutex<dyn StateApplier>> =
+            Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
+        Arc::new(ReplicationCoordinator::new(
             Arc::clone(&self.transport),
-            peer_key_id.clone(),
+            peer_key_id.to_string(),
             kind,
-            SessionRole::Responder, // hot-add defaults to Responder; cf. doc above
+            role,
             provider,
             applier,
-        ));
-        self.registry.register(peer_key_id, kind, coord).await;
+        ))
     }
 
     /// Shared registry handle. The operator's `Transport::listen`
@@ -340,6 +492,125 @@ mod tests {
         rt.register_peer("agent-bob", EnvelopeKind::Attestation)
             .await;
         assert_eq!(rt.registry().len().await, 1);
+        rt.shutdown().await;
+    }
+
+    /// CIRISEdge#173 / v5.1.0 — `register_initiator_peer` hot-adds an
+    /// Initiator coordinator (not just Responder) and bumps the
+    /// registry. Distinct from `register_peer` (Responder-only).
+    #[tokio::test]
+    async fn register_initiator_peer_hot_adds_initiator_role() {
+        let backend = Arc::new(MemoryBackend::new());
+        let directory: Arc<dyn FederationDirectory> = backend;
+        let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
+        let mut rt = ReplicationRuntime::start(
+            directory,
+            transport,
+            Vec::new(),
+            ReplicationRuntimeConfig::default(),
+        )
+        .await;
+        rt.register_initiator_peer("agent-carol", EnvelopeKind::Key)
+            .await
+            .expect("hot-add succeeds while runtime is live");
+        assert_eq!(rt.registry().len().await, 1);
+        let coord = rt.registry().get("agent-carol", EnvelopeKind::Key).await;
+        assert!(coord.is_some());
+        assert_eq!(coord.unwrap().role(), SessionRole::Initiator);
+        // Idempotent: re-add is a no-op.
+        rt.register_initiator_peer("agent-carol", EnvelopeKind::Key)
+            .await
+            .expect("idempotent re-add");
+        assert_eq!(rt.registry().len().await, 1);
+        rt.shutdown().await;
+    }
+
+    /// CIRISEdge#173 / v5.1.0 — `remove_peer` stops the matching
+    /// coordinator's scheduled rounds AND deregisters from the
+    /// registry. Idempotent.
+    #[tokio::test]
+    async fn remove_peer_drops_initiator_and_deregisters() {
+        let backend = Arc::new(MemoryBackend::new());
+        let directory: Arc<dyn FederationDirectory> = backend;
+        let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
+        let mut rt = ReplicationRuntime::start(
+            directory,
+            transport,
+            Vec::new(),
+            ReplicationRuntimeConfig::default(),
+        )
+        .await;
+        rt.register_initiator_peer("agent-dave", EnvelopeKind::Attestation)
+            .await
+            .unwrap();
+        assert_eq!(rt.registry().len().await, 1);
+        rt.remove_peer("agent-dave", EnvelopeKind::Attestation)
+            .await
+            .expect("hot-remove succeeds while runtime is live");
+        assert!(rt.registry().is_empty().await);
+        // Idempotent: removing again is a no-op.
+        rt.remove_peer("agent-dave", EnvelopeKind::Attestation)
+            .await
+            .expect("idempotent re-remove");
+        rt.shutdown().await;
+    }
+
+    /// CIRISEdge#173 / v5.1.0 — `set_peers` converges the live
+    /// Initiator set against the desired set. Verifies that adds
+    /// and removes both apply in one call, including starting from
+    /// a non-empty pre-existing set.
+    #[tokio::test]
+    async fn set_peers_diff_converges() {
+        let backend = Arc::new(MemoryBackend::new());
+        let directory: Arc<dyn FederationDirectory> = backend;
+        let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
+        let initial = vec![
+            ReplicationPeer {
+                peer_key_id: "peer-keep".to_string(),
+                kind: EnvelopeKind::Key,
+            },
+            ReplicationPeer {
+                peer_key_id: "peer-drop".to_string(),
+                kind: EnvelopeKind::Key,
+            },
+        ];
+        let mut rt = ReplicationRuntime::start(
+            directory,
+            transport,
+            initial,
+            ReplicationRuntimeConfig::default(),
+        )
+        .await;
+        assert_eq!(rt.registry().len().await, 2);
+
+        let desired = vec![
+            ReplicationPeer {
+                peer_key_id: "peer-keep".to_string(),
+                kind: EnvelopeKind::Key,
+            },
+            ReplicationPeer {
+                peer_key_id: "peer-new".to_string(),
+                kind: EnvelopeKind::Attestation,
+            },
+        ];
+        rt.set_peers(desired).await.expect("converge succeeds");
+
+        assert_eq!(rt.registry().len().await, 2);
+        assert!(rt
+            .registry()
+            .get("peer-keep", EnvelopeKind::Key)
+            .await
+            .is_some());
+        assert!(rt
+            .registry()
+            .get("peer-new", EnvelopeKind::Attestation)
+            .await
+            .is_some());
+        assert!(rt
+            .registry()
+            .get("peer-drop", EnvelopeKind::Key)
+            .await
+            .is_none());
         rt.shutdown().await;
     }
 

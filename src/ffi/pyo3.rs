@@ -1618,10 +1618,10 @@ impl PyReplicationHandle {
         })
     }
 
-    /// Hot-add a `(peer_key_id, kind)` after start. See
-    /// `ReplicationRuntime::register_peer` for the v1 limitation
-    /// (hot-adds default to Responder role; the scheduler's
-    /// Initiator set is fixed at start in v1).
+    /// Hot-add a `(peer_key_id, kind)` after start. Defaults to
+    /// Responder role — for the CEG-driven reconciler path that
+    /// needs the new peer to actively initiate rounds, use
+    /// [`Self::register_initiator_peer`] (CIRISEdge#173 / v5.1.0).
     fn register_peer(&self, py: Python<'_>, peer_key_id: &str, kind: &str) -> PyResult<()> {
         let kind = parse_envelope_kind(kind)?;
         let peer = peer_key_id.to_string();
@@ -1636,6 +1636,94 @@ impl PyReplicationHandle {
             });
         });
         Ok(())
+    }
+
+    /// CIRISEdge#173 / v5.1.0 — hot-add an Initiator peer at runtime.
+    /// The scheduler spawns a task that fires anti-entropy rounds at
+    /// the configured cadence immediately. Idempotent.
+    ///
+    /// Raises `RuntimeError` if the runtime has been stopped.
+    fn register_initiator_peer(
+        &self,
+        py: Python<'_>,
+        peer_key_id: &str,
+        kind: &str,
+    ) -> PyResult<()> {
+        let kind = parse_envelope_kind(kind)?;
+        let peer = peer_key_id.to_string();
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                let guard = inner.lock().await;
+                match guard.as_ref() {
+                    Some(rt) => rt
+                        .register_initiator_peer(peer, kind)
+                        .await
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+                    None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "replication runtime is stopped",
+                    )),
+                }
+            })
+        })
+    }
+
+    /// CIRISEdge#173 / v5.1.0 — hot-remove a `(peer_key_id, kind)`.
+    /// Stops the matching coordinator's scheduled rounds (if active)
+    /// AND deregisters from the inbound registry. Idempotent.
+    fn remove_peer(&self, py: Python<'_>, peer_key_id: &str, kind: &str) -> PyResult<()> {
+        let kind = parse_envelope_kind(kind)?;
+        let peer = peer_key_id.to_string();
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                let guard = inner.lock().await;
+                match guard.as_ref() {
+                    Some(rt) => rt
+                        .remove_peer(peer, kind)
+                        .await
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+                    None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "replication runtime is stopped",
+                    )),
+                }
+            })
+        })
+    }
+
+    /// CIRISEdge#173 / v5.1.0 — diff-and-converge the live Initiator
+    /// set against `desired`. Adds and removes peers so that, after
+    /// the call returns, the runtime's Initiator coordinators exactly
+    /// match `desired`. The intended driver for CEG-reconcilers:
+    /// call on every consent-object delta.
+    ///
+    /// `desired` is a list of `(peer_key_id, kind)` tuples; kind is
+    /// one of the accepted [`crate::replication::protocol::EnvelopeKind`]
+    /// strings.
+    fn set_peers(&self, py: Python<'_>, desired: Vec<(String, String)>) -> PyResult<()> {
+        let mut peers = Vec::with_capacity(desired.len());
+        for (peer_key_id, kind_str) in desired {
+            let kind = parse_envelope_kind(&kind_str)?;
+            peers.push(crate::replication::runtime::ReplicationPeer { peer_key_id, kind });
+        }
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                let guard = inner.lock().await;
+                match guard.as_ref() {
+                    Some(rt) => rt
+                        .set_peers(peers)
+                        .await
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+                    None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "replication runtime is stopped",
+                    )),
+                }
+            })
+        })
     }
 
     /// Stop the replication runtime — signals the scheduler to
