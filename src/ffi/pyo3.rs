@@ -2925,6 +2925,10 @@ fn extract_local_signer(
 ///     announce_interval_seconds=300,
 ///     local_epoch=0,
 ///     hybrid_policy="strict",
+///     enable_transport=True,        # CIRISEdge#168 (v5.0) — public
+///                                   # fabric node forwards packets for
+///                                   # NAT'd mobile edges (§24); leaf
+///                                   # edges leave this False
 ///     agent_mode="server",          # v0.18.0 (CIRISEdge#45);
 ///                                   # v0.20.0 RC1 (CIRISEdge#51)
 ///                                   # extends to CEWP L0/L1 tier
@@ -2986,11 +2990,13 @@ enum LocalInstanceRole {
     local_instance_role = "auto",
     agent_occurrence_key_id = None,
     transport_identity_keyring_dir = None,
+    enable_transport = false,
 ))]
 #[allow(
     clippy::too_many_arguments,
     clippy::needless_pass_by_value,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
 )]
 fn init_edge_runtime(
     py: Python<'_>,
@@ -3091,6 +3097,16 @@ fn init_edge_runtime(
     // `None` (the default) preserves v3.0.x chmod-600 file-only
     // behavior exactly.
     transport_identity_keyring_dir: Option<&str>,
+    // CIRISEdge#168 (v5.0) — Reticulum Transport-node mode. When
+    // `True`, this node forwards inbound packets destined for
+    // non-local destinations across its warm interfaces — the
+    // load-bearing half of §24 NAT-traversal. A public fabric node
+    // (CIRISServer binding `0.0.0.0:4242`) MUST set this to `True`
+    // for NAT'd / mobile edges to route through it. Defaults to
+    // `False` (leaf-node mode; a mobile edge does not relay for
+    // strangers). Maps to `ReticulumTransportConfig::enable_transport`
+    // and through to leviculum's `enable_transport` builder knob.
+    enable_transport: bool,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -3612,6 +3628,8 @@ fn init_edge_runtime(
     transport_config.bootstrap_peers = bootstrap_peers;
     transport_config.announce_interval = Duration::from_secs(announce_interval_seconds);
     transport_config.local_epoch = local_epoch;
+    // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
+    transport_config.enable_transport = enable_transport;
 
     // v2.3.0 (CIRISEdge#100) — shared-instance leader election +
     // LocalInterfaceConfig push. Only runs when the operator supplied
@@ -6696,6 +6714,7 @@ mod pyo3_tier2_tests {
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -6788,6 +6807,7 @@ mod pyo3_tier2_tests {
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -6936,6 +6956,7 @@ mod pyo3_tier2_tests {
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
             )?;
             Ok(())
         });
@@ -7037,6 +7058,7 @@ mod pyo3_tier2_tests {
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -7192,6 +7214,7 @@ mod pyo3_tier2_tests {
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -7333,6 +7356,7 @@ mod pyo3_tier2_tests {
                 "auto", // local_instance_role
                 None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
             )?;
             Ok(edge.signer_key_id())
         });

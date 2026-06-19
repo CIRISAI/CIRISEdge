@@ -486,6 +486,21 @@ pub struct ReticulumTransportConfig {
     /// gateway-peer deployments (one edge bridging Local + TCP, e.g.)
     /// call it twice.
     pub interfaces: Vec<ReticulumInterfaceConfig>,
+    /// **CIRISEdge#168 (v5.0)** — Reticulum Transport-node mode. When
+    /// `true`, this node forwards inbound packets destined for
+    /// non-local destinations back across its warm interfaces — the
+    /// load-bearing half of §24 NAT-traversal. The default is `false`
+    /// (leaf-node mode; a mobile edge). A public fabric node binding
+    /// `0.0.0.0:4242` MUST set this to `true` for NAT'd mobile edges
+    /// to route through it.
+    ///
+    /// Maps to upstream RNS's `[reticulum] enable_transport = Yes/No`
+    /// in `reticulum.conf` and to leviculum's
+    /// `ReticulumNodeBuilder::enable_transport`. Note leviculum's
+    /// builder default when the knob is never called is `true`; edge
+    /// always calls it explicitly so this `false` default is honoured
+    /// (a leaf edge does NOT relay for strangers unless opted in).
+    pub enable_transport: bool,
 }
 
 impl ReticulumTransportConfig {
@@ -502,7 +517,19 @@ impl ReticulumTransportConfig {
             local_key_id: local_key_id.into(),
             local_epoch: 0,
             interfaces: Vec::new(),
+            enable_transport: false,
         }
+    }
+
+    /// **CIRISEdge#168** — opt this node into Reticulum Transport-node
+    /// mode (forward packets for non-local destinations across warm
+    /// interfaces). Builder-style; the default is leaf-node (`false`).
+    /// A public fabric node binding `0.0.0.0:4242` calls this with
+    /// `true` so NAT'd mobile edges can route through it (§24).
+    #[must_use]
+    pub fn with_transport_node(mut self, enabled: bool) -> Self {
+        self.enable_transport = enabled;
+        self
     }
 
     /// Append one [`ReticulumInterfaceConfig`] to [`Self::interfaces`].
@@ -1208,9 +1235,13 @@ impl ReticulumTransport {
         // what was wired so `transport_stats` + `interface_specs` can
         // surface the configured set.
         let mut interface_specs: Vec<RegisteredInterface> = Vec::new();
+        // CIRISEdge#168 (v5.0) — Transport-node mode. Called
+        // explicitly so the config's `false` default is honoured;
+        // leviculum's builder otherwise defaults the knob to `true`.
         let mut builder = ReticulumNodeBuilder::new()
             .identity(identity.clone())
-            .storage_path(storage_path);
+            .storage_path(storage_path)
+            .enable_transport(config.enable_transport);
         let mut share_instance_local: Option<String> = None;
         let mut connect_instance_local: Option<String> = None;
         if config.interfaces.is_empty() {
@@ -3434,5 +3465,47 @@ mod tests {
         assert_eq!(cfg.local_key_id, "edge-key-1");
         assert!(cfg.bootstrap_peers.is_empty());
         assert_eq!(cfg.announce_interval, Duration::from_secs(300));
+    }
+
+    // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
+
+    #[test]
+    fn enable_transport_default_false() {
+        let cfg = ReticulumTransportConfig::new(PathBuf::from("/tmp/x.id"), "edge-key-1");
+        assert!(
+            !cfg.enable_transport,
+            "a fresh config is leaf-node (does NOT relay for strangers) until opted in",
+        );
+    }
+
+    // `ReticulumTransportConfig` is not a serde type (it carries
+    // `Duration`/`SocketAddr`/`PathBuf` runtime values, not a wire
+    // shape — the Python kwarg in `init_edge_runtime` is the
+    // operator-facing surface). The serde-roundtrip contract from the
+    // spec therefore reduces to: the bool survives a structural
+    // clone, both polarities, independent of every other field.
+    #[test]
+    fn enable_transport_survives_clone_roundtrip() {
+        let off = ReticulumTransportConfig::new(PathBuf::from("/tmp/x.id"), "edge-key-1");
+        assert!(!off.clone().enable_transport);
+
+        let on = ReticulumTransportConfig::new(PathBuf::from("/tmp/x.id"), "edge-key-1")
+            .with_transport_node(true);
+        assert!(on.clone().enable_transport);
+    }
+
+    #[test]
+    fn enable_transport_propagates_through_builder() {
+        // The struct accepts both polarities via the builder and via
+        // direct field assignment; this is what `init_edge_runtime`
+        // pipes into leviculum's `ReticulumNodeBuilder::enable_transport`
+        // in `ReticulumTransport::new`.
+        let fabric = ReticulumTransportConfig::new(PathBuf::from("/tmp/x.id"), "fabric-key")
+            .with_transport_node(true);
+        assert!(fabric.enable_transport, "public fabric node forwards");
+
+        let mut leaf = ReticulumTransportConfig::new(PathBuf::from("/tmp/x.id"), "leaf-key");
+        leaf.enable_transport = false;
+        assert!(!leaf.enable_transport, "mobile leaf edge does not forward");
     }
 }

@@ -768,6 +768,21 @@ implementation file:
   **NOT** the federation seed (AV-17 preserved). v0.19.3 is the
   cross-wheel boundary closure for HTTPS; the Rust mechanism was
   finished at v0.18.1.
+- **Reticulum Transport-node mode** (v5.0 CIRISEdge#168,
+  `src/transport/reticulum.rs::ReticulumTransportConfig::enable_transport`
+  + `init_edge_runtime`'s `enable_transport` kwarg) — the load-bearing
+  half of the §24 NAT-traversal set. A NAT'd / mobile edge opens ONE
+  outbound `TCPClientInterface` to a public fabric node; when that
+  public node runs in Transport-node mode it **forwards inbound packets
+  destined for the mobile identity back down the warm outbound link**,
+  so NAT traversal actually works. The bool maps to upstream RNS's
+  `[reticulum] enable_transport` and to leviculum's
+  `ReticulumNodeBuilder::enable_transport`; edge calls the builder knob
+  explicitly so the config's leaf-node default (`false`) is honoured —
+  a mobile edge does NOT relay for strangers unless an operator opts in.
+  A public fabric node (CIRISServer binding `0.0.0.0:4242`) sets it to
+  `True`. The companion half (LXMF propagation / store-and-forward for
+  asleep mobiles, CIRISEdge#169) lands alongside it.
 
 ## 12. Holonomic federation seal (v4.0)
 
