@@ -415,268 +415,231 @@ impl FederationDirectoryReplicationBridge {
         refs
     }
 
-    async fn list_attestations(&self) -> Vec<EnvelopeRef> {
+    // ─── v6.2.0 (#179, CIRISPersist#249 Cut D) — generic cohort fan-out ──
+    //
+    // The 9 per-kind blocks below collapsed into a single
+    // [`Self::fan_out_for_member`] combinator + 9 call sites. The
+    // structural pattern is uniform across kinds (cohort iterate → per-key
+    // `list_*_for` → `persist_row_hash` decode → HashSet dedupe → wrap in
+    // `Signed*` → cache + emit `EnvelopeRef`); only the per-row
+    // projections (timestamp accessor, hash accessor) and the wrapper
+    // differ. Persist v9.3.0 keeps the `list_*_for_member` surface
+    // uniform across kinds, so one parameterized combinator replaces the
+    // hand-unrolled cases without changing wire-format behavior.
+    //
+    // `Row`-generic by inference: the closures fix the row type per call
+    // site without requiring dyn-compatibility on the directory trait.
+    // Async via boxed future on the per-key fetch (the directory trait is
+    // already `async_trait`-boxed).
+    async fn fan_out_for_member<Row, Signed, FetchFut, F, W, H>(
+        &self,
+        kind: EnvelopeKind,
+        mut fetch: F,
+        wrap: W,
+        timestamp: impl Fn(&Row) -> chrono::DateTime<chrono::Utc>,
+        hash: H,
+    ) -> Vec<EnvelopeRef>
+    where
+        F: FnMut(String) -> FetchFut,
+        FetchFut: std::future::Future<Output = Vec<Row>>,
+        W: Fn(&Row) -> Signed,
+        Signed: serde::Serialize,
+        H: Fn(&Row) -> &str,
+    {
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         for key_id in (self.cohort)() {
-            // Union: attestations ABOUT this key + attestations FROM
-            // this key. The dedupe by hash collapses cross-references.
-            let about = self
-                .directory
-                .list_attestations_for(&key_id)
-                .await
-                .unwrap_or_default();
-            let from = self
-                .directory
-                .list_attestations_by(&key_id)
-                .await
-                .unwrap_or_default();
-            for row in about.into_iter().chain(from) {
-                if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                    if !seen.insert(hash) {
-                        continue;
-                    }
-                    let bytes = serde_json::to_vec(&SignedAttestation {
-                        attestation: row.clone(),
-                    })
-                    .unwrap_or_default();
-                    self.cache_insert(EnvelopeKind::Attestation, hash, bytes)
-                        .await;
-                    refs.push(EnvelopeRef {
-                        envelope_hash: hash,
-                        seq: Self::ms_seq(row.asserted_at),
-                    });
+            let rows = fetch(key_id).await;
+            for row in rows {
+                let Some(envelope_hash) = Self::decode_hash(hash(&row)) else {
+                    continue;
+                };
+                if !seen.insert(envelope_hash) {
+                    continue;
                 }
+                let signed = wrap(&row);
+                let bytes = serde_json::to_vec(&signed).unwrap_or_default();
+                self.cache_insert(kind, envelope_hash, bytes).await;
+                refs.push(EnvelopeRef {
+                    envelope_hash,
+                    seq: Self::ms_seq(timestamp(&row)),
+                });
             }
         }
         refs
+    }
+
+    async fn list_attestations(&self) -> Vec<EnvelopeRef> {
+        // Union: attestations ABOUT this key + attestations FROM this key.
+        // The dedupe by hash collapses cross-references. This is the only
+        // kind whose per-key list is the chain of two `list_*` reads;
+        // every other kind hits one `list_*_for` surface.
+        self.fan_out_for_member(
+            EnvelopeKind::Attestation,
+            |key_id| async move {
+                let about = self
+                    .directory
+                    .list_attestations_for(&key_id)
+                    .await
+                    .unwrap_or_default();
+                let from = self
+                    .directory
+                    .list_attestations_by(&key_id)
+                    .await
+                    .unwrap_or_default();
+                about.into_iter().chain(from).collect()
+            },
+            |row| SignedAttestation {
+                attestation: row.clone(),
+            },
+            |row| row.asserted_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     async fn list_revocations(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
-            if let Ok(rows) = self.directory.revocations_for(&key_id).await {
-                for row in rows {
-                    if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                        if !seen.insert(hash) {
-                            continue;
-                        }
-                        let bytes = serde_json::to_vec(&SignedRevocation {
-                            revocation: row.clone(),
-                        })
-                        .unwrap_or_default();
-                        self.cache_insert(EnvelopeKind::Revocation, hash, bytes)
-                            .await;
-                        refs.push(EnvelopeRef {
-                            envelope_hash: hash,
-                            seq: Self::ms_seq(row.revoked_at),
-                        });
-                    }
-                }
-            }
-        }
-        refs
+        self.fan_out_for_member(
+            EnvelopeKind::Revocation,
+            |key_id| async move {
+                self.directory
+                    .revocations_for(&key_id)
+                    .await
+                    .unwrap_or_default()
+            },
+            |row| SignedRevocation {
+                revocation: row.clone(),
+            },
+            |row| row.revoked_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     async fn list_identity_occurrences(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
-            if let Ok(rows) = self.directory.list_identity_occurrences_for(&key_id).await {
-                for row in rows {
-                    if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                        if !seen.insert(hash) {
-                            continue;
-                        }
-                        let bytes = serde_json::to_vec(&SignedIdentityOccurrence {
-                            identity_occurrence: row.clone(),
-                        })
-                        .unwrap_or_default();
-                        self.cache_insert(EnvelopeKind::IdentityOccurrence, hash, bytes)
-                            .await;
-                        refs.push(EnvelopeRef {
-                            envelope_hash: hash,
-                            seq: Self::ms_seq(row.asserted_at),
-                        });
-                    }
-                }
-            }
-        }
-        refs
+        self.fan_out_for_member(
+            EnvelopeKind::IdentityOccurrence,
+            |key_id| async move {
+                self.directory
+                    .list_identity_occurrences_for(&key_id)
+                    .await
+                    .unwrap_or_default()
+            },
+            |row| SignedIdentityOccurrence {
+                identity_occurrence: row.clone(),
+            },
+            |row| row.asserted_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     async fn list_families(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
-            if let Ok(rows) = self.directory.list_families_for_member(&key_id).await {
-                for row in rows {
-                    if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                        if !seen.insert(hash) {
-                            continue;
-                        }
-                        let bytes = serde_json::to_vec(&SignedFamily {
-                            family: row.clone(),
-                        })
-                        .unwrap_or_default();
-                        self.cache_insert(EnvelopeKind::Family, hash, bytes).await;
-                        refs.push(EnvelopeRef {
-                            envelope_hash: hash,
-                            seq: Self::ms_seq(row.founded_at),
-                        });
-                    }
-                }
-            }
-        }
-        refs
+        self.fan_out_for_member(
+            EnvelopeKind::Family,
+            |key_id| async move {
+                self.directory
+                    .list_families_for_member(&key_id)
+                    .await
+                    .unwrap_or_default()
+            },
+            |row| SignedFamily {
+                family: row.clone(),
+            },
+            |row| row.founded_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     async fn list_communities(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
-            if let Ok(rows) = self.directory.list_communities_for_member(&key_id).await {
-                for row in rows {
-                    if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                        if !seen.insert(hash) {
-                            continue;
-                        }
-                        let bytes = serde_json::to_vec(&SignedCommunity {
-                            community: row.clone(),
-                        })
-                        .unwrap_or_default();
-                        self.cache_insert(EnvelopeKind::Community, hash, bytes)
-                            .await;
-                        refs.push(EnvelopeRef {
-                            envelope_hash: hash,
-                            seq: Self::ms_seq(row.founded_at),
-                        });
-                    }
-                }
-            }
-        }
-        refs
+        self.fan_out_for_member(
+            EnvelopeKind::Community,
+            |key_id| async move {
+                self.directory
+                    .list_communities_for_member(&key_id)
+                    .await
+                    .unwrap_or_default()
+            },
+            |row| SignedCommunity {
+                community: row.clone(),
+            },
+            |row| row.founded_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     async fn list_identity_occurrence_revocations(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
-            if let Ok(rows) = self
-                .directory
-                .list_identity_occurrence_revocations_for(&key_id)
-                .await
-            {
-                for row in rows {
-                    if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                        if !seen.insert(hash) {
-                            continue;
-                        }
-                        let bytes = serde_json::to_vec(&SignedIdentityOccurrenceRevocation {
-                            identity_occurrence_revocation: row.clone(),
-                        })
-                        .unwrap_or_default();
-                        self.cache_insert(EnvelopeKind::IdentityOccurrenceRevocation, hash, bytes)
-                            .await;
-                        refs.push(EnvelopeRef {
-                            envelope_hash: hash,
-                            seq: Self::ms_seq(row.revoked_at),
-                        });
-                    }
-                }
-            }
-        }
-        refs
+        self.fan_out_for_member(
+            EnvelopeKind::IdentityOccurrenceRevocation,
+            |key_id| async move {
+                self.directory
+                    .list_identity_occurrence_revocations_for(&key_id)
+                    .await
+                    .unwrap_or_default()
+            },
+            |row| SignedIdentityOccurrenceRevocation {
+                identity_occurrence_revocation: row.clone(),
+            },
+            |row| row.revoked_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     async fn list_family_membership_revocations(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
-            if let Ok(rows) = self
-                .directory
-                .list_family_membership_revocations_for(&key_id)
-                .await
-            {
-                for row in rows {
-                    if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                        if !seen.insert(hash) {
-                            continue;
-                        }
-                        let bytes = serde_json::to_vec(&SignedFamilyMembershipRevocation {
-                            family_membership_revocation: row.clone(),
-                        })
-                        .unwrap_or_default();
-                        self.cache_insert(EnvelopeKind::FamilyMembershipRevocation, hash, bytes)
-                            .await;
-                        refs.push(EnvelopeRef {
-                            envelope_hash: hash,
-                            seq: Self::ms_seq(row.removed_at),
-                        });
-                    }
-                }
-            }
-        }
-        refs
+        self.fan_out_for_member(
+            EnvelopeKind::FamilyMembershipRevocation,
+            |key_id| async move {
+                self.directory
+                    .list_family_membership_revocations_for(&key_id)
+                    .await
+                    .unwrap_or_default()
+            },
+            |row| SignedFamilyMembershipRevocation {
+                family_membership_revocation: row.clone(),
+            },
+            |row| row.removed_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     async fn list_community_membership_revocations(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
-            if let Ok(rows) = self
-                .directory
-                .list_community_membership_revocations_for(&key_id)
-                .await
-            {
-                for row in rows {
-                    if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                        if !seen.insert(hash) {
-                            continue;
-                        }
-                        let bytes = serde_json::to_vec(&SignedCommunityMembershipRevocation {
-                            community_membership_revocation: row.clone(),
-                        })
-                        .unwrap_or_default();
-                        self.cache_insert(EnvelopeKind::CommunityMembershipRevocation, hash, bytes)
-                            .await;
-                        refs.push(EnvelopeRef {
-                            envelope_hash: hash,
-                            seq: Self::ms_seq(row.removed_at),
-                        });
-                    }
-                }
-            }
-        }
-        refs
+        self.fan_out_for_member(
+            EnvelopeKind::CommunityMembershipRevocation,
+            |key_id| async move {
+                self.directory
+                    .list_community_membership_revocations_for(&key_id)
+                    .await
+                    .unwrap_or_default()
+            },
+            |row| SignedCommunityMembershipRevocation {
+                community_membership_revocation: row.clone(),
+            },
+            |row| row.removed_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     async fn list_location_proofs(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
-            if let Ok(rows) = self.directory.list_location_proofs_for(&key_id).await {
-                for row in rows {
-                    if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                        if !seen.insert(hash) {
-                            continue;
-                        }
-                        let bytes = serde_json::to_vec(&SignedLocationProof {
-                            location_proof: row.clone(),
-                        })
-                        .unwrap_or_default();
-                        self.cache_insert(EnvelopeKind::LocationProof, hash, bytes)
-                            .await;
-                        refs.push(EnvelopeRef {
-                            envelope_hash: hash,
-                            seq: Self::ms_seq(row.asserted_at),
-                        });
-                    }
-                }
-            }
-        }
-        refs
+        self.fan_out_for_member(
+            EnvelopeKind::LocationProof,
+            |key_id| async move {
+                self.directory
+                    .list_location_proofs_for(&key_id)
+                    .await
+                    .unwrap_or_default()
+            },
+            |row| SignedLocationProof {
+                location_proof: row.clone(),
+            },
+            |row| row.asserted_at,
+            |row| row.persist_row_hash.as_str(),
+        )
+        .await
     }
 
     // ── v2 operational-data list_* ─────────────────────────────────
