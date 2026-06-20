@@ -820,6 +820,78 @@ pub enum ContentResult {
     },
 }
 
+/// CIRISEdge#175 (v6.1.0, FSD §3.2) — the `PublishOutcome` returned
+/// from every `Edge::send_*` / `publish_*` PyO3 entry point so the
+/// caller observes the chosen scope ("published at scope=X to
+/// audience=Y") without silent demotion.
+///
+/// The outcome carries:
+///
+/// - `scope` — the [`CohortScope`] the substrate actually wrote
+///   the publication at. Echoed back so the operator API at the
+///   PyO3 layer can surface it in the `(scope, holder_count,
+///   record_id, ...)` tuple consumed by CIRISAgent / CIRISServer.
+/// - `holder_count` — number of holders the publication's
+///   fragments have been admitted to (or are scheduled to be
+///   admitted to). At v6.1.0 this is a best-effort static count
+///   from the §2.4 RaptorQ default (`target_holders=30`); a
+///   per-publication-actual count flows once the swarm scheduler
+///   is wired (CIRISEdge#175 follow-up).
+/// - `record_id` — the FSD §2.4 HMAC-SHA3 record_id, as
+///   lowercase hex.
+/// - `audience` — the caller's stated audience string (the
+///   `community_id`, `family_id`, or `"federation"` they targeted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishOutcome {
+    /// Scope the publication was written at — the §3.2 default-
+    /// flip resolution, or the operator's explicit scope if they
+    /// passed one. Never `None`; the §3.2 default NEVER returns
+    /// `Public` (federation is opt-in).
+    pub scope: CohortScope,
+    /// Caller-stated audience. Free-form — opaque to edge.
+    pub audience: String,
+    /// Number of holders the publication has been (or will be)
+    /// admitted to. Best-effort at v6.1.0 — see struct-level docs.
+    pub holder_count: u32,
+    /// Lowercase-hex FSD §2.4 record_id (32 bytes → 64 hex chars).
+    /// `None` if the publication path bypassed the scope-privacy
+    /// substrate (pre-v6.0.0 federation-public envelopes).
+    pub record_id_hex: Option<String>,
+}
+
+impl PublishOutcome {
+    /// Construct a scope-echo outcome with no record_id (the
+    /// pre-v6.0.0 path) — used by the `send_*` entry points that
+    /// haven't been retrofitted onto the §2.4 fountain admission
+    /// path yet.
+    #[must_use]
+    pub fn new(scope: CohortScope, audience: impl Into<String>) -> Self {
+        Self {
+            scope,
+            audience: audience.into(),
+            holder_count: 0,
+            record_id_hex: None,
+        }
+    }
+
+    /// Construct with all four fields. Used by the §2.4-wired
+    /// publication paths (the v6.1.0 retrofit completion target).
+    #[must_use]
+    pub fn with_record(
+        scope: CohortScope,
+        audience: impl Into<String>,
+        holder_count: u32,
+        record_id_hex: impl Into<String>,
+    ) -> Self {
+        Self {
+            scope,
+            audience: audience.into(),
+            holder_count,
+            record_id_hex: Some(record_id_hex.into()),
+        }
+    }
+}
+
 /// Top-level edge handle. Construct via [`Edge::builder`].
 pub struct Edge {
     verify: Arc<VerifyPipeline>,
@@ -2789,6 +2861,33 @@ impl Edge {
     #[must_use]
     pub fn outbound_queue_handle(&self) -> Arc<dyn OutboundHandle> {
         self.queue.clone()
+    }
+
+    /// CIRISEdge#175 (v6.1.0, FSD §3.2) — resolve the default
+    /// `cohort_scope` for a stated audience without actually
+    /// publishing. Callers preview the §3.2 default-flip rule
+    /// before they commit to a `send_*` call.
+    ///
+    /// The rule (per [`CohortScope::default_for_audience`]):
+    ///
+    /// - if `active_community_id` is `Some` → `Cohort { community_id }`
+    /// - else if `in_family_context` → `Family`
+    /// - else → `SelfOnly`
+    ///
+    /// Federation scope is NEVER returned — federation is opt-in
+    /// at the call site (the operator passes
+    /// `CohortScope::Public` explicitly to opt up).
+    ///
+    /// This is the wire-format invariant. The PyO3 surface
+    /// (`Edge.resolve_default_scope`) drives off this method
+    /// without re-deriving the rule.
+    #[must_use]
+    pub fn resolve_default_scope(
+        &self,
+        active_community_id: Option<&str>,
+        in_family_context: bool,
+    ) -> CohortScope {
+        CohortScope::default_for_audience(active_community_id, in_family_context)
     }
 
     /// Rust-level accessor returning a clone of the per-medium

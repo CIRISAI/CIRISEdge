@@ -957,6 +957,121 @@ impl PyEdge {
         })
     }
 
+    /// v6.1.0 (CIRISEdge#175, FSD §3.2) — resolve the default
+    /// [`crate::CohortScope`] for a stated audience without
+    /// actually publishing. Lets callers preview the §3.2
+    /// default-flip rule before they commit to a `send_*` call.
+    ///
+    /// Returns a dict shaped:
+    ///
+    /// ```python
+    /// edge.resolve_default_scope(
+    ///     active_community_id="alpha",   # or None
+    ///     in_family_context=False,
+    /// )
+    /// # {"kind": "cohort", "cohort_id": "alpha"}
+    /// # — or {"kind": "family"} when only family context is active
+    /// # — or {"kind": "self"} when neither is active.
+    /// ```
+    ///
+    /// The §3.2 rule (see [`CohortScope::default_for_audience`]):
+    ///
+    /// - `Some(community_id)` → `Cohort { community_id }`
+    /// - `None` + `in_family_context=True` → `Family`
+    /// - `None` + `in_family_context=False` → `SelfOnly`
+    ///
+    /// **Federation scope is NEVER returned.** Operators wanting
+    /// federation publication pass `CohortScope::Public`
+    /// explicitly to the send entry-points; this resolver is for
+    /// previewing the substrate's anonymity-by-default choice.
+    ///
+    /// CIRISAgent / CIRISServer adapters drive this method before
+    /// `send_*` to populate the operator-facing "published at
+    /// scope=X" surface (the §3.2 silent-demotion defense).
+    #[pyo3(signature = (active_community_id=None, in_family_context=false))]
+    fn resolve_default_scope<'py>(
+        &self,
+        py: Python<'py>,
+        active_community_id: Option<&str>,
+        in_family_context: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let scope = self
+            .inner
+            .resolve_default_scope(active_community_id, in_family_context);
+        scope_to_pydict(py, &scope)
+    }
+
+    /// v6.1.0 (CIRISEdge#175, FSD §3.2) — `PublishOutcome` shape
+    /// for `send_inline_text`. Returns a dict with the §3.2 scope
+    /// echo + the §2.4 record_id (if computed) so callers observe
+    /// the substrate's actual publication scope rather than
+    /// silently accepting the default flip.
+    ///
+    /// ```python
+    /// outcome = edge.send_inline_text_with_outcome(
+    ///     recipient_key_id="agent-bob",
+    ///     text="hello",
+    ///     active_community_id=None,
+    ///     in_family_context=False,
+    /// )
+    /// outcome == {
+    ///     "scope": {"kind": "self"},
+    ///     "audience": "agent-bob",
+    ///     "holder_count": 0,
+    ///     "record_id_hex": None,
+    ///     "body_sha256": "...",
+    /// }
+    /// ```
+    ///
+    /// The wire-level invariant is the existing
+    /// `send_inline_text` — this method shares the dispatch path
+    /// and additionally surfaces the resolved scope. Pre-v6.1.0
+    /// callers can stay on `send_inline_text` until they're ready
+    /// for the outcome shape.
+    #[pyo3(signature = (recipient_key_id, text, active_community_id=None, in_family_context=false))]
+    fn send_inline_text_with_outcome<'py>(
+        &self,
+        py: Python<'py>,
+        recipient_key_id: &str,
+        text: &str,
+        active_community_id: Option<&str>,
+        in_family_context: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        // Resolve scope BEFORE the send so the outcome's `scope`
+        // is observable even on a fail-after-resolve path. This is
+        // the §3.2 silent-demotion defense: the operator sees what
+        // scope the substrate chose regardless of whether the wire
+        // emission succeeded.
+        let scope = self
+            .inner
+            .resolve_default_scope(active_community_id, in_family_context);
+        let recipient = recipient_key_id.to_string();
+        let recipient_for_outcome = recipient.clone();
+        let text_owned = text.to_string();
+        let edge = self.inner.clone();
+        let executor = self.executor.clone();
+        let body_sha = py.detach(|| {
+            run_async(&executor, async move {
+                let msg = InlineText { text: text_owned };
+                let body_sha = compute_inline_text_body_sha(&edge, &recipient, &msg.text).await?;
+                match edge.send_inline(&recipient, msg).await {
+                    Ok(()) => Ok(body_sha),
+                    Err(crate::EdgeError::Config(s))
+                        if s.contains("ephemeral request-response correlation not wired") =>
+                    {
+                        Ok(body_sha)
+                    }
+                    Err(e) => Err(PyRuntimeError::new_err(format!(
+                        "send_inline_text_with_outcome: {e}"
+                    ))),
+                }
+            })
+        })?;
+
+        let outcome = crate::PublishOutcome::new(scope, recipient_for_outcome);
+        publish_outcome_to_pydict(py, &outcome, Some(body_sha.as_str()))
+    }
+
     /// Register an inbound inline-text handler. `callback` is invoked
     /// as `callback(sender_key_id: str, body_text: str)` for every
     /// verified inbound `MessageType::InlineText` envelope. Returns a
@@ -2012,6 +2127,63 @@ fn resolve_sas_pubkeys(
 /// The hex form is what CIRISAgent's adapter joins on (persist's
 /// `body_sha256_prefix` index is built on hex, and the existing
 /// `EdgeCommunicationAdapter` plumbing is hex-shaped).
+/// v6.1.0 (CIRISEdge#175, FSD §3.2) — shape a [`crate::CohortScope`]
+/// into the PyO3 dict form mirrored by the wire JSON. The shape is
+/// identical to `serde_json::to_string(&CohortScope)` decoded into a
+/// dict, which keeps the FFI surface and the wire surface byte-for-
+/// byte aligned.
+fn scope_to_pydict<'py>(
+    py: Python<'py>,
+    scope: &crate::CohortScope,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let dict = pyo3::types::PyDict::new(py);
+    match scope {
+        crate::CohortScope::Public => {
+            dict.set_item("kind", "public")?;
+        }
+        crate::CohortScope::SelfOnly => {
+            dict.set_item("kind", "self")?;
+        }
+        crate::CohortScope::Family => {
+            dict.set_item("kind", "family")?;
+        }
+        crate::CohortScope::Cohort { cohort_id } => {
+            dict.set_item("kind", "cohort")?;
+            dict.set_item("cohort_id", cohort_id.as_str())?;
+        }
+    }
+    Ok(dict)
+}
+
+/// v6.1.0 (CIRISEdge#175, FSD §3.2) — shape a
+/// [`crate::PublishOutcome`] into the PyO3 dict form returned by
+/// every `*_with_outcome` pymethod. Carries the §3.2 scope echo,
+/// the caller-stated audience, the §2.4 holder count, and (when
+/// the publication path computed one) the §2.4 record_id.
+///
+/// `body_sha256_hex` is an optional extra field used by the
+/// inline-text path to surface the canonical-body hash CIRISAgent's
+/// adapter joins on. Pass `None` for paths that don't compute one.
+fn publish_outcome_to_pydict<'py>(
+    py: Python<'py>,
+    outcome: &crate::PublishOutcome,
+    body_sha256_hex: Option<&str>,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let dict = pyo3::types::PyDict::new(py);
+    let scope_dict = scope_to_pydict(py, &outcome.scope)?;
+    dict.set_item("scope", scope_dict)?;
+    dict.set_item("audience", outcome.audience.as_str())?;
+    dict.set_item("holder_count", outcome.holder_count)?;
+    match &outcome.record_id_hex {
+        Some(h) => dict.set_item("record_id_hex", h.as_str())?,
+        None => dict.set_item("record_id_hex", py.None())?,
+    }
+    if let Some(sha) = body_sha256_hex {
+        dict.set_item("body_sha256", sha)?;
+    }
+    Ok(dict)
+}
+
 async fn compute_inline_text_body_sha(
     edge: &Edge,
     recipient: &str,

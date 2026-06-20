@@ -53,9 +53,20 @@ pub mod cohort_scope;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
 pub mod detector;
+// v6.1.0 (CIRISEdge#175, FSD §3.3) — announce-suppression policy
+// + edge-side registry mirroring the recommended Leviculum
+// `AnnounceControl` extension shape.
+pub mod announce_suppression;
 // v6.0.0 (CIRISEdge#175, FSD §3.3) — cached federation directory.
 pub mod directory_cache;
+// v6.1.0 (CIRISEdge#175, FSD §3.3) — federation_keys anti-entropy
+// driver: pulls DirectoryEvents off an mpsc channel and applies
+// them to the cache (the v6.1.0-promised active driver).
+pub mod directory_cache_driver;
 mod edge;
+// v6.1.0 (CIRISEdge#175, FSD §3.1) — Poisson emission discipline
+// with substrate-maintenance cover.
+pub mod emission;
 pub mod events;
 pub mod ffi;
 pub mod handler;
@@ -93,6 +104,7 @@ pub use blob_swarm::{
 };
 pub use cohort_scope::{CohortScope, CohortScopeEnforcement, CryptoTier};
 // v6.0.0 (CIRISEdge#175) — scope-native privacy surface re-exports.
+pub use announce_suppression::{should_suppress_announce, AnnounceSuppressionRegistry};
 pub use detector::{
     ConsentRole, DetectionVerdict, EdgeDetectionAdmission, ProbePatternConfig,
     ProbePatternObserver, ProbePatternState,
@@ -100,10 +112,25 @@ pub use detector::{
 pub use directory_cache::{
     DirectoryCache, DirectoryRecord, FederationKeyId, IdentityType, Reachability, XWingPublic,
 };
+// v6.1.0 (CIRISEdge#175, FSD §3.3) — anti-entropy driver surface.
+pub use directory_cache_driver::{
+    channel as directory_event_channel, DirectoryAntiEntropyDriver, DirectoryEvent,
+    DirectoryEventReceiver, DirectoryEventSender, DriverStats as DirectoryDriverStats,
+    DEFAULT_CHANNEL_CAPACITY as DIRECTORY_DRIVER_CHANNEL_CAPACITY,
+};
 pub use edge::{
     reseed_canonical_bootstrap_peers, run_blackhole_pruner, AgentMode, CanonicalBootstrapPeer,
-    ChunkResult, ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, VerifiedEnvelopeSnapshot,
-    DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
+    ChunkResult, ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, PublishOutcome,
+    VerifiedEnvelopeSnapshot, DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
+};
+// v6.1.0 (CIRISEdge#175, FSD §3.1) — Poisson emission surface.
+pub use emission::{
+    seal_envelope, unseal_envelope, BudgetMeter, BudgetState, EmissionEnvelope,
+    EmissionEnvelopeError, EmissionHeader, EnvelopeType, PoissonScheduler, Reassembler,
+    ReassemblyOutcome, Scheduler as EmissionScheduler, SchedulerConfig as EmissionSchedulerConfig,
+    SchedulerHandle as EmissionSchedulerHandle, SchedulerStats as EmissionSchedulerStats,
+    ScopeKey as EmissionScopeKey, SubmitError as EmissionSubmitError, ENVELOPE_BYTES,
+    MAX_PAYLOAD_BYTES,
 };
 pub use events::{
     EventBus, EventKind, EventSeverity, NetworkEvent, PathEvent, ResourceEvent,

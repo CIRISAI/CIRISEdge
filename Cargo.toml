@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "6.0.0"
+version = "6.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -381,6 +381,21 @@ bip39       = "2"
 # feature; the explicit pin is a single MIT-licensed surface (per
 # deny.toml § licenses.allow) and makes the dep audit-explicit.
 parking_lot = "0.12"
+
+# v6.1.0 (CIRISEdge#175, FSD §3.1) — CSPRNG-driven Poisson emission
+# discipline. `rand = "0.8"` pulls in `ChaCha20Rng` (via
+# `rand_chacha`) so each peer's per-scope `Exp(λ_scope)` timer
+# samples from a peer-local seeded stream — never from public
+# snapshot inputs (FSD §3.1 jitter-seed-source rule). Already in
+# tree transitively via verify v6.3.0; explicit pin makes the
+# dependency edge audit-visible and pins the version to the
+# verify-family-aligned major.
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+# rand_chacha 0.3.1 — pinned to the rand 0.8 family. Used by
+# `emission::poisson` for the peer-local `ChaCha20Rng` CSPRNG that
+# drives §3.1 Poisson timer sampling. Re-pinned explicitly so
+# clippy / cargo-audit can see the edge.
+rand_chacha = { version = "0.3", default-features = false, features = ["std"] }
 
 # HTTP transport — feature-gated below
 axum  = { version = "0.8", optional = true }

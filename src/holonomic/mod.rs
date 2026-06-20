@@ -81,3 +81,8 @@ pub mod fountain_defaults;
 pub mod recursive_trust_bootstrap;
 pub mod swarm_rarity;
 pub mod wholeness_witness;
+// v6.1.0 (CIRISEdge#175, FSD §3.4) — federation + per-community
+// witness chain split with the federation-side constant-tick
+// rate-smoothed counter (cover-leaf padding via verify's
+// `witness_cover_leaf`).
+pub mod witness_chain_split;
