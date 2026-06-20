@@ -74,6 +74,7 @@ pub mod outbound;
 pub mod reachability;
 pub mod replication;
 pub mod sas;
+pub mod swarm;
 pub mod transport;
 pub mod verify;
 pub mod version;

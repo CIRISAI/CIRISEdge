@@ -908,6 +908,25 @@ pub struct Edge {
     /// no replication routing, every frame goes to `dispatch_inbound`.
     replication_registry:
         Arc<std::sync::OnceLock<Arc<crate::replication::registry::ReplicationRegistry>>>,
+    /// v5.2.0 (CIRISEdge#143) — opt-in fountain swarm orchestration
+    /// runtime. Set-once via `OnceLock`; the [`Edge::install_swarm_runtime`]
+    /// post-build setter holds the runtime for the lifetime of
+    /// `Edge`. When set, the operator's dispatch path may call
+    /// [`crate::swarm::FountainSwarmRuntime::register_observed_claim`]
+    /// on verified inbound holding-claim bodies. When `None`, no
+    /// swarm orchestration runs — the substrate primitives stay
+    /// reachable for tests but no live publisher / converger fires.
+    ///
+    /// `OnceLock<Arc<_>>` because the lifecycle is `install once
+    /// before run`; cheap atomic load from the inbound side.
+    swarm_runtime: Arc<std::sync::OnceLock<Arc<crate::swarm::FountainSwarmRuntime>>>,
+    /// v5.2.0 (CIRISEdge#143) — opt-in consent-decay scheduler
+    /// shutdown handle. Same lifecycle as [`Self::swarm_runtime`];
+    /// when set, [`Edge::shutdown_swarm_runtime`] also signals the
+    /// decay scheduler to stop. `None` keeps the v5.1.0 behavior
+    /// exactly (the operator drives the scheduler manually).
+    #[cfg(feature = "holonomic-consent-decay")]
+    consent_decay_shutdown: Arc<std::sync::OnceLock<tokio::sync::watch::Sender<()>>>,
     /// Optional pipeline run on outbound inline-text envelopes
     /// (SPEAK responses, LLM prompts, WBD bodies, DSAR text). When
     /// `Some`, `send_inline` / `send_durable_inline` invoke this
@@ -1567,6 +1586,55 @@ impl Edge {
         // we ignore it: the OnceLock semantics + the lifecycle
         // (install-before-run) make this a no-op race-free guarantee.
         let _ = self.replication_registry.set(runtime.registry());
+    }
+
+    /// v5.2.0 (CIRISEdge#143) — register a
+    /// [`crate::swarm::FountainSwarmRuntime`] with `Edge`. Set-once;
+    /// the runtime is held for the lifetime of `Edge`. After
+    /// installation:
+    ///
+    /// - [`Self::swarm_runtime_handle`] returns the registered
+    ///   runtime (None until install).
+    /// - The operator's inbound dispatch path may call
+    ///   [`crate::swarm::FountainSwarmRuntime::register_observed_claim`]
+    ///   on verified holding-claim bodies. (v5.2.0 does not yet
+    ///   add a wire-tier `MessageType::FountainHoldingClaim`
+    ///   discriminator — the integration point is exposed at the
+    ///   API surface so a follow-up cut can wire the dispatch
+    ///   routing without re-touching `Edge::run`.)
+    ///
+    /// Idempotent: a second call is silently ignored (first wins).
+    pub fn install_swarm_runtime(&self, runtime: Arc<crate::swarm::FountainSwarmRuntime>) {
+        let _ = self.swarm_runtime.set(runtime);
+    }
+
+    /// v5.2.0 — return the installed
+    /// [`crate::swarm::FountainSwarmRuntime`], if any. `None` when
+    /// [`Self::install_swarm_runtime`] has not been called yet.
+    pub fn swarm_runtime_handle(&self) -> Option<Arc<crate::swarm::FountainSwarmRuntime>> {
+        self.swarm_runtime.get().cloned()
+    }
+
+    /// v5.2.0 (CIRISEdge#143) — register a consent-decay scheduler
+    /// shutdown handle. The operator spawns
+    /// [`crate::holonomic::consent_decay::ConsentDecayScheduler::run`]
+    /// against a `tokio::sync::watch::channel(())` receiver and hands
+    /// the sender to this method; [`Self::shutdown_consent_decay`]
+    /// then flips the channel on `Edge` teardown.
+    ///
+    /// Gated on the `holonomic-consent-decay` feature.
+    #[cfg(feature = "holonomic-consent-decay")]
+    pub fn install_consent_decay_shutdown(&self, shutdown_tx: tokio::sync::watch::Sender<()>) {
+        let _ = self.consent_decay_shutdown.set(shutdown_tx);
+    }
+
+    /// v5.2.0 — flip the registered consent-decay shutdown channel.
+    /// Idempotent; no-op when nothing was registered.
+    #[cfg(feature = "holonomic-consent-decay")]
+    pub fn shutdown_consent_decay(&self) {
+        if let Some(tx) = self.consent_decay_shutdown.get() {
+            let _ = tx.send(());
+        }
     }
 
     /// Register a typed handler for message type `M`. Compile-time
@@ -4886,6 +4954,9 @@ impl EdgeBuilder {
             steward_directory: self.steward_directory,
             blob_chunk_source: self.blob_chunk_source,
             replication_registry: Arc::new(std::sync::OnceLock::new()),
+            swarm_runtime: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "holonomic-consent-decay")]
+            consent_decay_shutdown: Arc::new(std::sync::OnceLock::new()),
             subscription_filter: self.subscription_filter,
             events,
             display_name: Arc::new(std::sync::RwLock::new(display_name)),
