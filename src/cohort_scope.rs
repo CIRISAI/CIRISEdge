@@ -50,6 +50,14 @@
 
 use serde::{Deserialize, Serialize};
 
+// v6.0.0 (CIRISEdge#175) — FSD §2.1 implementation note: edge
+// resolves through persist's `crypto_tier()` rather than enumerating
+// the 7-value lattice so future `affiliations` semantic changes flow
+// without wire-format churn.
+pub use ciris_persist::federation::types::cohort_scope::{
+    crypto_tier as persist_crypto_tier, CryptoTier,
+};
+
 /// Wire-form cohort-scope discriminator for the federation's locality
 /// dividend (CIRISEdge#48-A; FSD `FEDERATION_SCALING_MODEL.md`).
 ///
@@ -146,6 +154,64 @@ impl CohortScope {
             // Cohort scope: recipient must be in the same named cohort.
             (Self::Cohort { cohort_id: a }, Self::Cohort { cohort_id: b }) => a == b,
             (Self::Cohort { .. }, _) => false,
+        }
+    }
+
+    /// v6.0.0 (CIRISEdge#175, FSD §2.1) — resolve the at-rest crypto
+    /// tier this scope corresponds to via persist v9.2.0's
+    /// [`persist_crypto_tier`] (CC 4.4.3.2.1 lattice). Edge does NOT
+    /// duplicate persist's closed-set match; this method is the
+    /// single bridge so future `affiliations` semantic changes flow
+    /// without wire-format churn.
+    ///
+    /// The mapping edge's enum → persist's 7-value string lattice:
+    ///
+    /// - [`Self::Public`] → `"federation"` (Commons-tier plaintext)
+    /// - [`Self::SelfOnly`] → `"self"` (InvisibleEncrypted)
+    /// - [`Self::Family`] → `"family"` (InvisibleEncrypted)
+    /// - [`Self::Cohort`] → `"community"` with `cohort_subkind = None`
+    ///   (CommunityDek tier)
+    ///
+    /// The `cohort_subkind: "infrastructure"` opt-out (which
+    /// promotes community/affiliations to Commons-tier plaintext)
+    /// is a downstream-of-edge concern owned by persist's admission
+    /// path; edge's wire-format invariant continues to treat
+    /// `Cohort{..}` as CommunityDek at this resolution layer.
+    #[must_use]
+    pub fn crypto_tier(&self) -> CryptoTier {
+        match self {
+            Self::Public => persist_crypto_tier("federation", None),
+            Self::SelfOnly => persist_crypto_tier("self", None),
+            Self::Family => persist_crypto_tier("family", None),
+            Self::Cohort { .. } => persist_crypto_tier("community", None),
+        }
+    }
+
+    /// v6.0.0 (CIRISEdge#175, FSD §3.2) — the §3.2 default
+    /// cohort_scope flip: `cohort_scope` defaults to the smallest
+    /// scope consistent with the publisher's stated audience
+    /// context. **Federation scope is opt-in.**
+    ///
+    /// The §3.2 rule:
+    /// - if a `community_id` is active → `Cohort { community_id }`
+    /// - else if a family context is active → `Family`
+    /// - else → `SelfOnly`
+    ///
+    /// Federation publication is NEVER the default; callers must
+    /// pass `CohortScope::Public` explicitly to opt up to federation.
+    #[must_use]
+    pub fn default_for_audience(
+        active_community_id: Option<&str>,
+        in_family_context: bool,
+    ) -> Self {
+        if let Some(cid) = active_community_id {
+            Self::Cohort {
+                cohort_id: cid.to_string(),
+            }
+        } else if in_family_context {
+            Self::Family
+        } else {
+            Self::SelfOnly
         }
     }
 }
@@ -305,5 +371,72 @@ mod tests {
         assert_eq!(CohortScopeEnforcement::Strict.as_str(), "strict");
         assert_eq!(CohortScopeEnforcement::WarnOnly.as_str(), "warn_only");
         assert_eq!(CohortScopeEnforcement::Off.as_str(), "off");
+    }
+
+    // ─── v6.0.0 (CIRISEdge#175) — FSD §2.1 / §3.2 surface ───────────
+
+    #[test]
+    fn crypto_tier_resolves_through_persist() {
+        // FSD §2.1 implementation note — edge's enum maps onto
+        // persist's CC 4.4.3.2.1 lattice through `crypto_tier()`.
+        assert_eq!(
+            CohortScope::SelfOnly.crypto_tier(),
+            CryptoTier::InvisibleEncrypted
+        );
+        assert_eq!(
+            CohortScope::Family.crypto_tier(),
+            CryptoTier::InvisibleEncrypted
+        );
+        assert_eq!(
+            CohortScope::Cohort {
+                cohort_id: "alpha".into()
+            }
+            .crypto_tier(),
+            CryptoTier::CommunityDek
+        );
+        assert_eq!(CohortScope::Public.crypto_tier(), CryptoTier::Plaintext);
+    }
+
+    #[test]
+    fn default_for_audience_prefers_smallest_scope() {
+        // §3.2 — community when group context is active
+        assert_eq!(
+            CohortScope::default_for_audience(Some("alpha"), false),
+            CohortScope::Cohort {
+                cohort_id: "alpha".into()
+            }
+        );
+        // §3.2 — family when in family
+        assert_eq!(
+            CohortScope::default_for_audience(None, true),
+            CohortScope::Family
+        );
+        // §3.2 — self when no group context
+        assert_eq!(
+            CohortScope::default_for_audience(None, false),
+            CohortScope::SelfOnly
+        );
+        // Community wins over family when both signals fire
+        assert_eq!(
+            CohortScope::default_for_audience(Some("beta"), true),
+            CohortScope::Cohort {
+                cohort_id: "beta".into()
+            }
+        );
+    }
+
+    #[test]
+    fn default_never_returns_public() {
+        // §3.2 — federation is opt-in. The default flip MUST NEVER
+        // return Public — that's the entire CC 1.13.3.4 protection.
+        for (cid, fam) in [
+            (Some("c"), true),
+            (Some("c"), false),
+            (None, true),
+            (None, false),
+        ] {
+            let s = CohortScope::default_for_audience(cid, fam);
+            assert_ne!(s, CohortScope::Public, "default MUST never be Public");
+        }
     }
 }

@@ -53,6 +53,8 @@ pub mod cohort_scope;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
 pub mod detector;
+// v6.0.0 (CIRISEdge#175, FSD §3.3) — cached federation directory.
+pub mod directory_cache;
 mod edge;
 pub mod events;
 pub mod ffi;
@@ -68,12 +70,18 @@ pub mod identity;
 pub mod key_boundary;
 pub mod manifest;
 pub mod messages;
+// v6.0.0 (CIRISEdge#175, FSD §3.3 / §3.5 / §6) — substrate-tier MLS
+// state for scope-native privacy. Distinct from
+// `transport::realtime_av_mls` (per-stream AV MLS).
+pub mod mls;
 pub mod multimedia;
 pub mod observability;
 pub mod outbound;
 pub mod reachability;
 pub mod replication;
 pub mod sas;
+// v6.0.0 (CIRISEdge#175) — CC 1.13.3.4 substrate.
+pub mod scope_privacy;
 pub mod swarm;
 pub mod transport;
 pub mod verify;
@@ -83,10 +91,14 @@ pub use blob_swarm::{
     BlobChunkSource, BlobChunkVerifier, ChunkManifestLite, ChunkSourceRefusal, ChunkVerifyError,
     PeerState, SwarmConfig, SwarmError, SwarmScheduler,
 };
-pub use cohort_scope::{CohortScope, CohortScopeEnforcement};
+pub use cohort_scope::{CohortScope, CohortScopeEnforcement, CryptoTier};
+// v6.0.0 (CIRISEdge#175) — scope-native privacy surface re-exports.
 pub use detector::{
     ConsentRole, DetectionVerdict, EdgeDetectionAdmission, ProbePatternConfig,
     ProbePatternObserver, ProbePatternState,
+};
+pub use directory_cache::{
+    DirectoryCache, DirectoryRecord, FederationKeyId, IdentityType, Reachability, XWingPublic,
 };
 pub use edge::{
     reseed_canonical_bootstrap_peers, run_blackhole_pruner, AgentMode, CanonicalBootstrapPeer,
@@ -121,6 +133,11 @@ pub use messages::{
     DELIVERY_REFUSAL_ATTESTATION_DOMAIN, FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
     GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
 };
+pub use mls::{
+    unwrap_welcome, wrap_welcome, ArchiveMode, ArchiveModeError, FederationDirectoryEntry,
+    ScopeStateProvider, ScopeStateProviderError, WelcomeWrapError, WrappedWelcome,
+    DEFAULT_ROTATE_FORWARD_WINDOW_DAYS,
+};
 pub use multimedia::{
     cdn_edge_prefetch_stub, is_fast_path_legal_basis, ContributionDispatchProbe,
     ContributionSubjectKind, ExternalRefWithAcl, FastPathLegalBasis,
@@ -133,6 +150,10 @@ pub use outbound::{
     StewardKey,
 };
 pub use reachability::{AttemptOutcome, PeerMediumReachability, ReachabilityTracker};
+pub use scope_privacy::{
+    derive_record_id, derive_symbol_key, k_record_id, k_symbol, witness_cover_leaf, RecordType,
+    HPKE_SUITE_ID, LABEL_RECORD_ID, LABEL_SYMBOL,
+};
 pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 pub use verify::{
     AccordHolderKey, HybridPolicy, ProvenanceChain, ProvenanceLink, RootingDirectory,

@@ -929,6 +929,7 @@ witness equivocation exception for founder-quorum keys.
 | CC 1.7 | 1+4 envelope surface frozen — wire framing carries every claim; no out-of-band channels |
 | CC 1.13.5 | Operational-language gate — refusals describe mechanism, not preferences |
 | CC 1.13.4 | Substrate-stores-never-adjudicates — `should_eject_above_target`, `recursive_trust_bootstrap` are mechanical; agency lives above |
+| CC 1.13.3.4 (v6.0.0) | Anonymity-by-default at every scope below federation — `scope_privacy` re-exports verify v6.3.0's §2.2/§2.4/§3.4 derivations; `CohortScope::default_for_audience` flip; `mls::welcome_wrap` HPKE-Base + ML-DSA-65 §3.3 wrap; `DirectoryCache` §3.3 cached directory; `mls::scope_state` cold-state opacity via persist v9.2.0 `XChaChaKvStore`; archive_mode honest-holder forward-secrecy. CC 1.13.3.1 GPA-unobservability residual at federation scope routes to ANONYMOUS_TIER.md (opt-in tier, distinct construction) |
 | CC 3.2 / 3.4.7.1 | Owner-binding precondition for non-infra community membership — `SignedClaim::user_owner` / `delegates_to` / `identity_occurrence` fields |
 | CC 4.4.3.2.1 / .2 | Community DEK cascade + rotation-on-removal — consumed via persist v9.0.0 G5 |
 | CC 4.4.3.4.3 / 1.13.5 | Infra-vs-agency split — pure fabric nodes perform §19.7 forever-memory without reasoning; brain enrichment optional |
