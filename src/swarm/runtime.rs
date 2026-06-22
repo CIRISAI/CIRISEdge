@@ -48,15 +48,18 @@ use std::time::Duration;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
+use super::diversity::{diversity_contribution, NullRttObserver, PeerRttObserver};
 use super::persist_fountain_evict::{
     FountainEvictError, FountainEvictHardDelete, FountainHoldingsSource, FountainTierEvict,
     HeldFountainContent,
 };
 use crate::holonomic::fountain_defaults::{recommended_policy, FountainPolicy};
 use crate::holonomic::swarm_rarity::{
-    compute_rarity_score, should_eject_above_target, ConsentState, EjectionVerdict,
+    compute_rarity_score, should_eject_with_diversity, ConsentState, EjectionVerdict,
     FountainHoldingClaim, RarityScore,
 };
+use crate::identity::{build_envelope, sign_envelope, LocalSigner};
+use crate::messages::MessageType;
 use crate::transport::Transport;
 
 /// `target_holders` default — the recommended `H` from §R-policy
@@ -180,10 +183,51 @@ pub enum SwarmEvent {
 /// return quickly).
 pub type SwarmRuntimeEventSink = Arc<dyn Fn(SwarmEvent) + Send + Sync>;
 
+/// CIRISEdge#184 (v6.3.0) — optional plumbing for the swarm runtime.
+///
+/// Threaded into [`FountainSwarmRuntime::start_with_options`]; the
+/// legacy [`FountainSwarmRuntime::start`] constructs one with every
+/// field defaulted and forwards.
+///
+/// - `signer`: when `Some`, the publisher wraps each
+///   [`FountainHoldingClaim`] body in a signed
+///   [`crate::messages::EdgeEnvelope`] with discriminator
+///   [`crate::messages::MessageType::FountainHoldingClaim`]. When
+///   `None`, the publisher falls back to the v5.2.0 path that ships
+///   the substrate's `canonical_bytes` raw (tests + bootstrap nodes
+///   without a wired signer still drive the runtime).
+/// - `rtt_observer`: latency source for the diversity-aware ejection
+///   policy. `None` defaults to [`NullRttObserver`] — diversity
+///   gating then degrades to rarity-only (the substrate verdict).
+///
+/// All optionals MAY be `None`; the runtime stays operational on every
+/// combination of present/absent fields. New optionals land here
+/// without changing the public `start` signature.
+#[derive(Clone, Default)]
+pub struct SwarmRuntimeOptions {
+    /// Outbound-envelope signer. When `None`, publisher emits raw
+    /// canonical_bytes (v5.2.0 path) — used by tests and bootstrap.
+    pub signer: Option<Arc<LocalSigner>>,
+    /// Per-peer RTT source for the diversity-aware ejection policy.
+    /// `None` defaults to [`NullRttObserver`] (rarity-only fallback).
+    pub rtt_observer: Option<Arc<dyn PeerRttObserver>>,
+}
+
+impl std::fmt::Debug for SwarmRuntimeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwarmRuntimeOptions")
+            .field("signer_present", &self.signer.is_some())
+            .field("rtt_observer_present", &self.rtt_observer.is_some())
+            .finish()
+    }
+}
+
 /// Live swarm-orchestration runtime — publisher + converger tasks +
-/// shutdown handle. Construct via [`Self::start`]; hold for the
-/// lifetime of the application; call [`Self::shutdown`] to stop the
-/// background tasks.
+/// shutdown handle. Construct via [`Self::start`] (v5.2.0 minimal
+/// surface) or [`Self::start_with_options`] (v6.3.0+ for signed-
+/// envelope publishing and latency-diversity converger); hold for
+/// the lifetime of the application; call [`Self::shutdown`] to stop
+/// the background tasks.
 pub struct FountainSwarmRuntime {
     config: SwarmRuntimeConfig,
     observed: Arc<RwLock<ObservedClaims>>,
@@ -247,6 +291,32 @@ impl ObservedClaims {
     fn content_ids(&self) -> Vec<String> {
         self.inner.keys().cloned().collect()
     }
+
+    /// CIRISEdge#184 (v6.3.0) — peer ids observed holding
+    /// `content_id`. Sorted-map iteration → stable order.
+    fn peer_ids_for(&self, content_id: &str) -> Vec<String> {
+        self.inner
+            .get(content_id)
+            .map_or_else(Vec::new, |m| m.keys().cloned().collect())
+    }
+}
+
+/// CIRISEdge#184 (v6.3.0) — median diversity score across the
+/// content_ids we have RTT data for. `None` when no content has a
+/// score (every entry is `None`); the converger then falls back to
+/// rarity-only verdicts.
+fn median_diversity(scores: &BTreeMap<String, Option<f64>>) -> Option<f64> {
+    let mut present: Vec<f64> = scores.values().filter_map(|s| *s).collect();
+    if present.is_empty() {
+        return None;
+    }
+    present.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = present.len() / 2;
+    if present.len() % 2 == 1 {
+        Some(present[mid])
+    } else {
+        Some((present[mid - 1] + present[mid]) / 2.0)
+    }
 }
 
 impl FountainSwarmRuntime {
@@ -272,8 +342,44 @@ impl FountainSwarmRuntime {
         local_peer_id: String,
         sink: Option<SwarmRuntimeEventSink>,
     ) -> Self {
+        Self::start_with_options(
+            config,
+            holdings,
+            tier_evict,
+            hard_delete,
+            transport,
+            cohort,
+            local_peer_id,
+            sink,
+            SwarmRuntimeOptions::default(),
+        )
+    }
+
+    /// CIRISEdge#184 (v6.3.0) — extended constructor with optional
+    /// signer (for [`MessageType::FountainHoldingClaim`] envelope
+    /// publishing) and latency-diversity observer (for the converger's
+    /// over-target ejection heuristic). See [`SwarmRuntimeOptions`].
+    ///
+    /// When both options are `None` the runtime is byte-equivalent to
+    /// [`Self::start`].
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    pub fn start_with_options(
+        config: SwarmRuntimeConfig,
+        holdings: Arc<dyn FountainHoldingsSource>,
+        tier_evict: Arc<dyn FountainTierEvict>,
+        hard_delete: Arc<dyn FountainEvictHardDelete + Send + Sync>,
+        transport: Arc<dyn Transport>,
+        cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        local_peer_id: String,
+        sink: Option<SwarmRuntimeEventSink>,
+        options: SwarmRuntimeOptions,
+    ) -> Self {
         let observed = Arc::new(RwLock::new(ObservedClaims::default()));
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let rtt_observer: Arc<dyn PeerRttObserver> = options
+            .rtt_observer
+            .clone()
+            .unwrap_or_else(|| Arc::new(NullRttObserver));
 
         let publisher_task = {
             let holdings = Arc::clone(&holdings);
@@ -283,9 +389,10 @@ impl FountainSwarmRuntime {
             let cancel_rx = cancel_rx.clone();
             let sink = sink.clone();
             let local_peer = local_peer_id.clone();
+            let signer = options.signer.clone();
             tokio::spawn(async move {
                 run_publisher(
-                    holdings, transport, cohort, local_peer, cadence, cancel_rx, sink,
+                    holdings, transport, cohort, local_peer, cadence, cancel_rx, sink, signer,
                 )
                 .await;
             })
@@ -297,6 +404,8 @@ impl FountainSwarmRuntime {
             let tier_evict = Arc::clone(&tier_evict);
             let hard_delete = Arc::clone(&hard_delete);
             let cfg = config.clone();
+            let local_peer = local_peer_id.clone();
+            let rtt = Arc::clone(&rtt_observer);
             tokio::spawn(async move {
                 run_converger(
                     observed,
@@ -306,6 +415,8 @@ impl FountainSwarmRuntime {
                     cfg,
                     cancel_rx,
                     sink,
+                    local_peer,
+                    rtt,
                 )
                 .await;
             })
@@ -366,6 +477,7 @@ async fn run_publisher(
     cadence: Duration,
     mut cancel_rx: watch::Receiver<bool>,
     sink: Option<SwarmRuntimeEventSink>,
+    signer: Option<Arc<LocalSigner>>,
 ) {
     let mut ticker = tokio::time::interval(cadence);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -384,6 +496,7 @@ async fn run_publisher(
                     cohort.as_ref(),
                     &local_peer_id,
                     sink.as_ref(),
+                    signer.as_ref(),
                 )
                 .await
                 {
@@ -400,6 +513,7 @@ async fn publish_tick(
     cohort: &(dyn Fn() -> Vec<String> + Send + Sync),
     local_peer_id: &str,
     sink: Option<&SwarmRuntimeEventSink>,
+    signer: Option<&Arc<LocalSigner>>,
 ) -> Result<usize, FountainEvictError> {
     let held = holdings.list_held_fountain_content().await?;
     let peers = cohort();
@@ -412,18 +526,36 @@ async fn publish_tick(
             content.symbol_ids.clone(),
             observed_at_unix_ms,
         );
-        // v5.2.0: ship the wire bytes as the substrate's
-        // canonical projection (a future cut will route this through
-        // the full envelope-signing path once a `MessageType::FountainHoldingClaim`
-        // wire discriminator lands; for now the canonical_bytes is
-        // the byte-form the federation cohort consumes).
-        let envelope_bytes = claim.canonical_bytes();
         for peer in &peers {
             // Skip self — the cohort callback typically already
             // excludes the local peer, but defense in depth.
             if peer == local_peer_id {
                 continue;
             }
+            // v6.3.0 (CIRISEdge#184): when a signer is wired, ship a
+            // signed `MessageType::FountainHoldingClaim` EdgeEnvelope.
+            // When no signer (test surface or bootstrap), fall back to
+            // the v5.2.0 substrate-canonical_bytes path so existing
+            // tests + bootstrap topologies keep working.
+            let envelope_bytes = match signer {
+                Some(sig) => {
+                    match build_and_sign_holding_claim_envelope(sig, local_peer_id, peer, &claim)
+                        .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = %peer,
+                                content_id = %content.content_id,
+                                error = %e,
+                                "swarm_runtime.publisher: envelope build/sign failed; falling back to canonical_bytes",
+                            );
+                            claim.canonical_bytes()
+                        }
+                    }
+                }
+                None => claim.canonical_bytes(),
+            };
             if let Err(e) = transport.send(peer, &envelope_bytes).await {
                 tracing::warn!(
                     peer = %peer,
@@ -444,6 +576,43 @@ async fn publish_tick(
     Ok(count)
 }
 
+/// CIRISEdge#184 (v6.3.0) — build + sign a
+/// [`MessageType::FountainHoldingClaim`] envelope wrapping the
+/// `claim` body. Returns the JSON-serialized envelope bytes ready for
+/// `Transport::send`.
+async fn build_and_sign_holding_claim_envelope(
+    signer: &Arc<LocalSigner>,
+    local_peer_id: &str,
+    destination_peer_id: &str,
+    claim: &FountainHoldingClaim,
+) -> Result<Vec<u8>, FountainEvictError> {
+    // `local_peer_id` is the peer-id the runtime was constructed with;
+    // when a signer is configured, it should match `signer.key_id` —
+    // a soft mismatch is logged but not fatal (the canonical_bytes-on-
+    // failure path still keeps the runtime live).
+    if signer.key_id != local_peer_id {
+        tracing::debug!(
+            signer_key_id = %signer.key_id,
+            local_peer_id,
+            "swarm_runtime.publisher: signer key_id differs from local_peer_id",
+        );
+    }
+    let mut envelope = build_envelope(
+        MessageType::FountainHoldingClaim,
+        &signer.key_id,
+        destination_peer_id,
+        claim,
+        None,
+    )
+    .map_err(|e| FountainEvictError::HardDeleteFailed(format!("build_envelope: {e}")))?;
+    sign_envelope(signer, &mut envelope)
+        .await
+        .map_err(|e| FountainEvictError::HardDeleteFailed(format!("sign_envelope: {e}")))?;
+    serde_json::to_vec(&envelope)
+        .map_err(|e| FountainEvictError::HardDeleteFailed(format!("envelope serialize: {e}")))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_converger(
     observed: Arc<RwLock<ObservedClaims>>,
     holdings: Arc<dyn FountainHoldingsSource>,
@@ -452,6 +621,8 @@ async fn run_converger(
     config: SwarmRuntimeConfig,
     mut cancel_rx: watch::Receiver<bool>,
     sink: Option<SwarmRuntimeEventSink>,
+    local_peer_id: String,
+    rtt: Arc<dyn PeerRttObserver>,
 ) {
     let mut ticker = tokio::time::interval(config.observe_cadence);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -471,6 +642,8 @@ async fn run_converger(
                     &hard_delete,
                     &config,
                     sink.as_ref(),
+                    &local_peer_id,
+                    rtt.as_ref(),
                 )
                 .await;
             }
@@ -478,7 +651,7 @@ async fn run_converger(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn converger_tick(
     observed: &Arc<RwLock<ObservedClaims>>,
     holdings: &Arc<dyn FountainHoldingsSource>,
@@ -486,6 +659,8 @@ async fn converger_tick(
     hard_delete: &Arc<dyn FountainEvictHardDelete + Send + Sync>,
     config: &SwarmRuntimeConfig,
     sink: Option<&SwarmRuntimeEventSink>,
+    local_peer_id: &str,
+    rtt: &dyn PeerRttObserver,
 ) {
     // Prune stale claims first so the rarity math sees a live view.
     let dropped = observed
@@ -517,7 +692,50 @@ async fn converger_tick(
     let content_ids = observed_snapshot.content_ids();
     drop(observed_snapshot);
 
-    for content_id in content_ids {
+    // CIRISEdge#184 (v6.3.0) — first pass: gather per-content_id
+    // diversity contributions so the second pass can drain in
+    // ascending-diversity order (multi-content ordering: the least-
+    // diverse positions go first when ejecting under pressure).
+    let mut per_content_diversity: BTreeMap<String, Option<f64>> = BTreeMap::new();
+    for content_id in &content_ids {
+        let snapshot = observed.read().await;
+        let others: Vec<String> = snapshot
+            .peer_ids_for(content_id)
+            .into_iter()
+            .filter(|p| p != local_peer_id)
+            .collect();
+        drop(snapshot);
+        per_content_diversity.insert(content_id.clone(), diversity_contribution(rtt, &others));
+    }
+
+    // Estimate the diversity floor — the median across the contents
+    // we DID measure. Content-ids without a score (no RTT data) drop
+    // out of the median estimation; they'll still get processed in
+    // the loop below, just with rarity-only verdicts.
+    let diversity_floor = median_diversity(&per_content_diversity);
+
+    // Second pass: process content_ids in ASCENDING diversity-score
+    // order so the converger drains the least-diverse positions
+    // first under pressure. Content-ids with no diversity score sort
+    // last (they degrade to rarity-only — substrate verdict still
+    // applies, but no diversity-driven multi-content ordering).
+    let mut ordered: Vec<(String, Option<f64>)> = content_ids
+        .iter()
+        .map(|cid| {
+            (
+                cid.clone(),
+                per_content_diversity.get(cid).copied().unwrap_or(None),
+            )
+        })
+        .collect();
+    ordered.sort_by(|(_, a), (_, b)| match (a, b) {
+        (Some(x), Some(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    for (content_id, diversity_score) in ordered {
         let snapshot = observed.read().await;
         let observed_count = snapshot.distinct_holders(&content_id);
         let all_claims = snapshot.all_claims_for(&content_id);
@@ -546,8 +764,18 @@ async fn converger_tick(
             RarityScore(0)
         };
 
-        let verdict =
-            should_eject_above_target(observed_count, &config.policy, consent, local_symbol_rarity);
+        // CIRISEdge#184 (v6.3.0) — diversity refinement on top of
+        // the substrate verdict. When either the score OR the floor
+        // is None, the sibling function reduces to the substrate's
+        // `should_eject_above_target` (rarity-only fallback).
+        let verdict = should_eject_with_diversity(
+            observed_count,
+            &config.policy,
+            consent,
+            local_symbol_rarity,
+            diversity_score,
+            diversity_floor,
+        );
 
         match verdict {
             EjectionVerdict::Keep => {

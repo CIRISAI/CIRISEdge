@@ -45,13 +45,19 @@
 //!
 //! See [`runtime`] for the live runtime + scheduler.
 
+pub mod diversity;
 pub mod persist_fountain_evict;
 pub mod runtime;
 
+pub use diversity::{
+    diversity_contribution, diversity_scores_for, NullRttObserver, PeerRttObserver,
+    RttObserverHandle, TopologyRttObserver,
+};
 pub use persist_fountain_evict::{
     FountainEvictError, FountainEvictHardDelete, FountainHoldingsSource, FountainTierEvict,
     HeldFountainContent, NoopFountainHoldingsSource, PersistFountainEvictHardDelete,
 };
 pub use runtime::{
     FountainSwarmRuntime, ObservedClaim, SwarmEvent, SwarmRuntimeConfig, SwarmRuntimeEventSink,
+    SwarmRuntimeOptions,
 };
