@@ -242,6 +242,25 @@ pub enum MessageType {
     /// downweight policy in their own `PeerResolver`. Body:
     /// [`Withdraws`].
     Withdraws,
+
+    // ─── CIRISEdge#184 (v6.3.0) — swarm-converger wire-up ───────────
+    /// Federation-level fountain holding claim. Signed wire discriminator
+    /// for the substrate's
+    /// [`crate::holonomic::swarm_rarity::FountainHoldingClaim`] body
+    /// (locked v1 canonical-bytes layout per
+    /// [`crate::holonomic::swarm_rarity::HOLDING_CLAIM_DOMAIN`]). The
+    /// FountainSwarmRuntime publisher emits one envelope per held
+    /// `content_id` per cohort peer on each `publish_cadence` tick;
+    /// inbound dispatch routes verified envelopes into
+    /// [`crate::swarm::FountainSwarmRuntime::register_observed_claim`].
+    ///
+    /// Ephemeral, fire-and-forget — the substrate composes whether or
+    /// not peers respond, and stale observations age out via the
+    /// runtime's TTL prune.
+    ///
+    /// Closes the v5.2.0 wire-tier deferral (the runtime's publisher
+    /// shipped `canonical_bytes` raw until this discriminator landed).
+    FountainHoldingClaim,
 }
 
 /// CIRISEdge#37 — `testimonial_witness` envelope slot per FSD-002

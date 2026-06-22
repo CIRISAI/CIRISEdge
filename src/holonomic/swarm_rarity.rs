@@ -366,6 +366,17 @@ impl FountainCompressRequest {
     }
 }
 
+/// CIRISEdge#184 (v6.3.0) — `Message` impl tying the substrate body
+/// type to its wire discriminator [`crate::messages::MessageType::FountainHoldingClaim`].
+/// Ephemeral, fire-and-forget — the substrate composes whether or not
+/// peers respond, and stale observations age out via the runtime's
+/// TTL prune.
+impl crate::handler::Message for FountainHoldingClaim {
+    const TYPE: crate::messages::MessageType = crate::messages::MessageType::FountainHoldingClaim;
+    const DELIVERY: crate::handler::Delivery = crate::handler::Delivery::Ephemeral;
+    type Response = ();
+}
+
 /// Compute the local rarity score for a `(content_id, symbol_id)` tuple
 /// over a set of observed [`FountainHoldingClaim`]s. **Lower = rarer =
 /// keep**.
@@ -602,6 +613,87 @@ pub fn should_eject_above_target(
         EjectionVerdict::EjectToTier
     } else {
         EjectionVerdict::Keep
+    }
+}
+
+/// CIRISEdge#184 (v6.3.0) — **latency-aware diversity refinement** of
+/// [`should_eject_above_target`].
+///
+/// Layered on top of the v1 substrate verdict: this function calls
+/// [`should_eject_above_target`] first; only when the base verdict is
+/// `EjectToTier` AND a `diversity_score` is supplied does the diversity
+/// gate engage. This preserves the locked v1 byte-determinism contract
+/// on the substrate verdict (CEG 1.0 §R conformance vectors) — the
+/// diversity refinement is a *policy-tier* refinement on top of the
+/// substrate-tier verdict, not a wire break.
+///
+/// ## Inputs
+///
+/// - `holders_observed` / `policy` / `consent` / `local_symbol_rarity`
+///   — passed straight through to [`should_eject_above_target`].
+/// - `diversity_score`: the local peer's diversity contribution to
+///   the holder set, computed via
+///   [`crate::swarm::diversity::diversity_contribution`]. `None` falls
+///   back to the substrate-tier verdict (no refinement).
+/// - `diversity_floor`: the threshold below which "local position is
+///   sufficiently clustered → safe to eject." Typically the median
+///   diversity score across holders we have RTT data for; the runtime
+///   estimates this on its converger tick.
+///
+/// ## Semantics
+///
+/// - Base verdict `Keep` → return `Keep` (substrate dominates).
+/// - Base verdict `EjectHardDelete` → return `EjectHardDelete`
+///   (revocation dominates; diversity does NOT override §3.2.3).
+/// - Base verdict `EjectToTier` + `diversity_score = None` → return
+///   `EjectToTier` (rarity-only fallback).
+/// - Base verdict `EjectToTier` + `Some(score) < diversity_floor` →
+///   return `EjectToTier` (local position is clustered; ejecting
+///   preserves geographic spread).
+/// - Base verdict `EjectToTier` + `Some(score) >= diversity_floor` →
+///   return `Keep` (local position uniquely contributes diversity;
+///   retain even though the swarm is over-target).
+///
+/// **Wire-determinism note**: this function is **policy-tier**, not
+/// substrate-tier. Two peers running with different RTT observers may
+/// reach DIFFERENT verdicts from the same observed-claims input —
+/// that's the intended degree of freedom (each peer optimizes its
+/// local geographic spread). The substrate's
+/// [`should_eject_above_target`] remains the byte-determined
+/// conformance surface; CEG 1.0 §R vectors continue to apply against
+/// the substrate function unchanged.
+#[must_use]
+pub fn should_eject_with_diversity(
+    holders_observed: u32,
+    policy: &crate::holonomic::fountain_defaults::FountainPolicy,
+    consent: ConsentState,
+    local_symbol_rarity: RarityScore,
+    diversity_score: Option<f64>,
+    diversity_floor: Option<f64>,
+) -> EjectionVerdict {
+    let base = should_eject_above_target(holders_observed, policy, consent, local_symbol_rarity);
+    match base {
+        EjectionVerdict::EjectToTier => {
+            // Diversity refinement: only fire when BOTH a score AND a
+            // floor are present. Either-missing → fall back to the
+            // substrate verdict.
+            match (diversity_score, diversity_floor) {
+                (Some(score), Some(floor)) => {
+                    if score < floor {
+                        // Clustered local position → safe to eject.
+                        EjectionVerdict::EjectToTier
+                    } else {
+                        // Diverse local position → retain for spread.
+                        EjectionVerdict::Keep
+                    }
+                }
+                _ => EjectionVerdict::EjectToTier,
+            }
+        }
+        // Base verdict Keep / EjectHardDelete / EjectAggregatedTierOnly
+        // pass through unchanged. Diversity does NOT override
+        // revocation (§3.2.3) or the keep-because-rare invariant.
+        other => other,
     }
 }
 
@@ -1432,5 +1524,102 @@ mod tests {
         // potential.
         let v = should_eject_above_target(100, &policy, ConsentState::Revoked, RarityScore(50));
         assert_eq!(v, EjectionVerdict::EjectHardDelete);
+    }
+
+    // ─── CIRISEdge#184 (v6.3.0) — diversity refinement ─────────────
+
+    #[test]
+    fn diversity_none_falls_back_to_rarity_only() {
+        // No diversity score → behavior IDENTICAL to should_eject_above_target.
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        let base = should_eject_above_target(35, &policy, ConsentState::Active, RarityScore(20));
+        let with_div = should_eject_with_diversity(
+            35,
+            &policy,
+            ConsentState::Active,
+            RarityScore(20),
+            None,
+            None,
+        );
+        assert_eq!(base, with_div);
+    }
+
+    #[test]
+    fn diversity_low_score_keeps_eject() {
+        // 35 holders + common symbol + low diversity (clustered) →
+        // still EjectToTier.
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        let v = should_eject_with_diversity(
+            35,
+            &policy,
+            ConsentState::Active,
+            RarityScore(20),
+            Some(0.05), // clustered → low score
+            Some(0.30), // median floor
+        );
+        assert_eq!(v, EjectionVerdict::EjectToTier);
+    }
+
+    #[test]
+    fn diversity_high_score_flips_eject_to_keep() {
+        // 35 holders + common symbol + high diversity (topologically
+        // unique) → flip to Keep.
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        let v = should_eject_with_diversity(
+            35,
+            &policy,
+            ConsentState::Active,
+            RarityScore(20),
+            Some(0.50), // diverse → high score
+            Some(0.30), // median floor
+        );
+        assert_eq!(v, EjectionVerdict::Keep);
+    }
+
+    #[test]
+    fn diversity_does_not_override_revocation() {
+        // Revoked + sky-high diversity → still EjectHardDelete.
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        let v = should_eject_with_diversity(
+            100,
+            &policy,
+            ConsentState::Revoked,
+            RarityScore(50),
+            Some(99.0),
+            Some(0.10),
+        );
+        assert_eq!(v, EjectionVerdict::EjectHardDelete);
+    }
+
+    #[test]
+    fn diversity_does_not_override_keep_when_rare() {
+        // Rare symbol → substrate says Keep; diversity refinement
+        // can't override "preserve rare copy" invariant.
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        let v = should_eject_with_diversity(
+            35,
+            &policy,
+            ConsentState::Active,
+            RarityScore(2), // rare (below target_holders/2 = 15)
+            Some(0.01),     // clustered — would normally argue for eject
+            Some(0.50),
+        );
+        assert_eq!(v, EjectionVerdict::Keep);
+    }
+
+    #[test]
+    fn diversity_score_with_no_floor_falls_back() {
+        // Score present but floor missing → diversity gate doesn't
+        // engage; substrate verdict survives.
+        let policy = crate::holonomic::fountain_defaults::recommended_policy();
+        let v = should_eject_with_diversity(
+            35,
+            &policy,
+            ConsentState::Active,
+            RarityScore(20),
+            Some(0.99),
+            None,
+        );
+        assert_eq!(v, EjectionVerdict::EjectToTier);
     }
 }

@@ -1667,13 +1667,10 @@ impl Edge {
     ///
     /// - [`Self::swarm_runtime_handle`] returns the registered
     ///   runtime (None until install).
-    /// - The operator's inbound dispatch path may call
+    /// - The operator's inbound dispatch path routes verified
+    ///   [`MessageType::FountainHoldingClaim`] envelopes into
     ///   [`crate::swarm::FountainSwarmRuntime::register_observed_claim`]
-    ///   on verified holding-claim bodies. (v5.2.0 does not yet
-    ///   add a wire-tier `MessageType::FountainHoldingClaim`
-    ///   discriminator — the integration point is exposed at the
-    ///   API surface so a follow-up cut can wire the dispatch
-    ///   routing without re-touching `Edge::run`.)
+    ///   (CIRISEdge#184 v6.3.0 — the v5.2.0 deferral closed here).
     ///
     /// Idempotent: a second call is silently ignored (first wins).
     pub fn install_swarm_runtime(&self, runtime: Arc<crate::swarm::FountainSwarmRuntime>) {
@@ -2850,6 +2847,7 @@ impl Edge {
             self.config.delegation_graph_max_depth,
             self.canonical_peers.clone(),
             self.blob_chunk_source.as_ref(),
+            self.swarm_runtime.get(),
         )
         .await;
     }
@@ -3249,6 +3247,11 @@ impl Edge {
         let delegation_trust_roots = self.canonical_peers.clone();
         // CIRISEdge#55 v3.4.0-pre1 — server-side responder hook.
         let blob_chunk_source = self.blob_chunk_source.clone();
+        // CIRISEdge#184 (v6.3.0) — swarm-runtime inbound hook for
+        // verified `MessageType::FountainHoldingClaim` envelopes.
+        // Clone of the `Arc<OnceLock<Arc<FountainSwarmRuntime>>>`; the
+        // OnceLock load inside the dispatch is a cheap atomic.
+        let swarm_runtime = self.swarm_runtime.clone();
         // CIRISEdge#119 v3.5.1 — opt-in replication routing. When the
         // OnceLock has been populated by
         // `Edge::install_replication_routing`, the inbound loop
@@ -3328,6 +3331,7 @@ impl Edge {
                     let l1_cdn_edge_external_uri_base_clone = l1_cdn_edge_external_uri_base.clone();
                     let delegation_trust_roots_clone = delegation_trust_roots.clone();
                     let blob_chunk_source_clone = blob_chunk_source.clone();
+                    let swarm_runtime_clone = swarm_runtime.clone();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -3358,6 +3362,7 @@ impl Edge {
                             delegation_graph_max_depth,
                             delegation_trust_roots_clone,
                             blob_chunk_source_clone.as_ref(),
+                            swarm_runtime_clone.get(),
                         ).await;
                     });
                 }
@@ -3528,6 +3533,7 @@ impl Edge {
         trust_scoring,
         delegation_trust_roots,
         blob_chunk_source,
+        swarm_runtime,
     ),
     fields(
         transport_id = %frame.transport.0,
@@ -3599,6 +3605,13 @@ async fn dispatch_inbound(
     // inbound `BlobChunkFetch` envelopes. None → silently drop the
     // envelope (same posture as ContentFetch in edge#21 phase 1).
     blob_chunk_source: Option<&Arc<dyn crate::blob_swarm::BlobChunkSource>>,
+    // CIRISEdge#184 (v6.3.0) — optional swarm orchestration runtime.
+    // When set (via `Edge::install_swarm_runtime`), verified inbound
+    // `MessageType::FountainHoldingClaim` envelopes are routed into
+    // `register_observed_claim`. When None, the envelope is observed
+    // (verify still runs) but no runtime hook fires — same posture as
+    // `blob_chunk_source` for the chunked-blob swarm.
+    swarm_runtime: Option<&Arc<crate::swarm::FountainSwarmRuntime>>,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -4455,6 +4468,33 @@ async fn dispatch_inbound(
     // (the body is already a `RawValue`), and keeping the two paths
     // independent is structurally simpler than threading a parsed
     // body through the erased dispatch.
+    // CIRISEdge#184 (v6.3.0) — swarm-converger wire-up. Verified
+    // `MessageType::FountainHoldingClaim` envelopes route into the
+    // installed runtime's `register_observed_claim`. AV-9 verify-then-
+    // dispatch invariant is preserved because we're past the verify
+    // gate at this point. When no runtime is installed, the envelope
+    // is observed but no hook fires (same posture as `blob_chunk_source`
+    // for the chunked-blob swarm).
+    if envelope.message_type == MessageType::FountainHoldingClaim {
+        if let Some(runtime) = swarm_runtime {
+            match serde_json::from_str::<crate::holonomic::swarm_rarity::FountainHoldingClaim>(
+                envelope.body.get(),
+            ) {
+                Ok(claim) => {
+                    runtime.register_observed_claim(claim).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        transport = ?transport,
+                        sender_key_id = %envelope.signing_key_id,
+                        "FountainHoldingClaim body parse failed at dispatch (CIRISEdge#184)",
+                    );
+                }
+            }
+        }
+    }
+
     if envelope.message_type == MessageType::InlineText {
         match serde_json::from_str::<crate::messages::InlineText>(envelope.body.get()) {
             Ok(inline) => {
