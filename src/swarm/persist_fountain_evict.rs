@@ -1,32 +1,33 @@
-//! Production-side trait surfaces + adapter for the v5.2.0 swarm
-//! orchestration runtime.
+//! Edge-side adapter shapes for the v5.2.0 swarm orchestration runtime.
 //!
-//! Three trait surfaces participate here:
+//! ## v7.0.0 (CIRISEdge#194) collapse
 //!
-//! - [`crate::holonomic::swarm_rarity::FountainEvictHardDelete`] —
-//!   the §8.1.11.3 N5 hard-delete primitive (already defined in the
-//!   substrate module; reused here unchanged).
-//! - [`FountainTierEvict`] — the tier-eviction sibling
-//!   ([`PersistEngine::evict_fountain_content_to_tier`] is the
-//!   persist-side concrete; until it appears on the public
-//!   `Arc<dyn FederationDirectory>` trait, the runtime threads an
-//!   `Arc<dyn FountainTierEvict>` for production wiring).
-//! - [`FountainHoldingsSource`] — the operator's "what content_ids
-//!   am I currently holding?" view. Persist v9.0.x does NOT yet
-//!   expose this on its public surface; the runtime threads an
-//!   `Arc<dyn FountainHoldingsSource>` so production can wire it
-//!   once persist lands the iteration API.
+//! Persist v10.0.0 (CIRISPersist#270) promoted three methods —
+//! `list_held_fountain_content` / `evict_fountain_content_to_tier` /
+//! `evict_fountain_content_hard_delete` — to **required methods** on the
+//! public `FederationDirectory` trait. The v5.2.0-era adapter traits that
+//! bridged onto the concrete `Backend` (`FountainTierEvict`,
+//! `PersistFountainEvictHardDelete`) and the `PersistFountainEvictHardDelete`
+//! production wrapper are no longer needed: `FountainSwarmRuntime` calls
+//! the directory directly for both eviction surfaces.
 //!
-//! ## Production adapter
+//! ## What still lives here
 //!
-//! [`PersistFountainEvictHardDelete`] is a thin wrapper that holds
-//! an `Arc<dyn FountainEvictHardDelete>` (the production caller
-//! constructs this from its persist `Engine` handle). It exists so
-//! `Edge::run` / `init_edge_runtime` can pass *one* handle through
-//! the bootstrap and the runtime stays decoupled from the concrete
-//! engine type.
-
-use std::sync::Arc;
+//! [`FountainHoldingsSource`] is the ONE adapter that survives. Persist's
+//! `list_held_fountain_content` returns
+//! [`ciris_persist::fountain::FountainHeldMeta`] — manifest essentials
+//! plus a `held_symbols` *count*, but NOT the per-symbol `symbol_id` list
+//! the substrate's [`crate::holonomic::swarm_rarity::FountainHoldingClaim`]
+//! ships in its canonical bytes. The set of currently-held `symbol_ids`
+//! lives in the operator's local symbol store, not in the public directory
+//! surface — so an edge-side trait surface remains the right shape for
+//! that view.
+//!
+//! Re-exported substrate-tier [`FountainEvictHardDelete`] /
+//! [`FountainEvictError`] continue to live in
+//! [`crate::holonomic::swarm_rarity`] for the §8.1.11.3 N5 typed
+//! deletion-SLA primitive (substrate-tier policy/audit surface, not the
+//! adapter-tier surface dropped above).
 
 use async_trait::async_trait;
 
@@ -36,9 +37,10 @@ pub use crate::holonomic::swarm_rarity::{FountainEvictError, FountainEvictHardDe
 /// Returned by [`FountainHoldingsSource::list_held_fountain_content`]
 /// (the v5.2.0 publisher walks the returned vec to build claims).
 ///
-/// Mirrors the shape persist's eventual `list_fountain_holdings` API
-/// is expected to return — content_id + corpus_kind + the symbol_ids
-/// the operator currently retains for that content.
+/// Carries the per-symbol `symbol_id` list — the field persist v10.0.0's
+/// `list_held_fountain_content` does not expose (it returns
+/// `FountainHeldMeta` with counts only, not per-symbol IDs). The source
+/// trait fills that gap from whatever the operator holds locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldFountainContent {
     /// The persist `fountain_contents.content_id`. Opaque substrate
@@ -58,13 +60,21 @@ pub struct HeldFountainContent {
 /// holding?". The v5.2.0 publisher consults this on every
 /// `publish_cadence` tick.
 ///
-/// **Persist v9.0.x gap**: there is currently no public listing API
-/// on `Arc<dyn FederationDirectory>` that returns this view. Until
-/// persist v9.x lands one, production deployments implement this
-/// trait against their concrete persist `Engine` handle (or against
-/// whatever cohabitation surface their host exposes); the test
-/// surface ([`NoopFountainHoldingsSource`] + the in-tree
-/// `Vec`-backed test impls) drives the runtime in isolation.
+/// # Why this trait survived the v10.0.0 collapse
+///
+/// Persist v10.0.0 promoted `list_held_fountain_content` to the public
+/// `FederationDirectory` surface but the returned `FountainHeldMeta`
+/// carries `held_symbols` as a **count**, not the per-`symbol_id` list
+/// the [`crate::holonomic::swarm_rarity::FountainHoldingClaim`]'s
+/// canonical bytes require. The per-symbol IDs are an operator-local
+/// view (the symbol-bytes store the publisher keeps adjacent to the
+/// directory); they are not a directory-surface concern.
+///
+/// Production wires a thin impl that reads its concrete symbol-store
+/// (joining `directory.list_held_fountain_content(local_pubkey).await`
+/// with the local per-content symbol-id map for the same `(content_id,
+/// corpus_kind)` rows). [`NoopFountainHoldingsSource`] keeps tests +
+/// bootstrap nodes drivable on hosts that hold nothing yet.
 #[async_trait]
 pub trait FountainHoldingsSource: Send + Sync {
     /// Enumerate the operator's currently-held fountain content units.
@@ -94,148 +104,9 @@ impl FountainHoldingsSource for NoopFountainHoldingsSource {
     }
 }
 
-/// The tier-eviction sibling of
-/// [`FountainEvictHardDelete`]. Maps onto persist's
-/// `evict_fountain_content_to_tier(content_id, corpus_kind, tier)`
-/// concrete API. The `tier` parameter is the persist
-/// `FountainTier` discriminator as a stable string label
-/// (`"full" | "t2" | "t3" | "t4" | "t5"`) so the trait surface
-/// does NOT depend on which backend cfg-features are enabled.
-///
-/// **Persist v9.0.x gap**: like
-/// [`FountainEvictHardDelete`], not exposed on
-/// `Arc<dyn FederationDirectory>`. Production wires a concrete
-/// impl that calls into its `Engine` handle.
-#[async_trait]
-pub trait FountainTierEvict: Send + Sync {
-    /// Evict `content_id` (in the named corpus) down to the keep-
-    /// count for the named tier. The persist eviction surface
-    /// applies the change on its next maintenance pass — this call
-    /// does NOT block on the eviction itself. Returns `Ok(())` on
-    /// acceptance.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FountainEvictError::HardDeleteFailed`] (the error
-    /// type is shared across the hard-delete + tier-evict surfaces
-    /// for v5.2.0 — a future cut may split it once persist's
-    /// public surface stabilizes).
-    async fn evict_fountain_content_to_tier(
-        &self,
-        content_id: &str,
-        corpus_kind: &str,
-        tier: &str,
-    ) -> Result<(), FountainEvictError>;
-}
-
-/// Production-side adapter that satisfies [`FountainEvictHardDelete`]
-/// by delegating to an inner trait object. Constructor + the trait
-/// impl. Edge's bootstrap (`Edge::run` / `init_edge_runtime`)
-/// constructs one of these from the persist `Engine` handle the
-/// host exposes; the runtime holds the `Arc<dyn FountainEvictHardDelete>`
-/// and never sees the concrete engine type.
-///
-/// The `inner` trait object MUST be a concrete impl that calls into
-/// persist's `evict_fountain_content_hard_delete`; the v5.2.0 in-tree
-/// impl is a passthrough so production callers can substitute a real
-/// engine adapter without touching the runtime.
-pub struct PersistFountainEvictHardDelete {
-    inner: Arc<dyn FountainEvictHardDelete + Send + Sync>,
-}
-
-impl std::fmt::Debug for PersistFountainEvictHardDelete {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PersistFountainEvictHardDelete")
-            .finish_non_exhaustive()
-    }
-}
-
-impl PersistFountainEvictHardDelete {
-    /// Construct from any inner [`FountainEvictHardDelete`] impl.
-    /// The production caller passes its persist `Engine`-backed
-    /// adapter; the test surface passes the substrate module's
-    /// fake evictor.
-    #[must_use]
-    pub fn new(inner: Arc<dyn FountainEvictHardDelete + Send + Sync>) -> Self {
-        Self { inner }
-    }
-}
-
-impl FountainEvictHardDelete for PersistFountainEvictHardDelete {
-    fn evict_fountain_content_hard_delete(
-        &self,
-        content_id: &str,
-        corpus_kind: &str,
-    ) -> Result<(), FountainEvictError> {
-        self.inner
-            .evict_fountain_content_hard_delete(content_id, corpus_kind)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// In-memory `FountainEvictHardDelete` that records the calls —
-    /// the substrate-tier `swarm_rarity` tests already exercise the
-    /// trait shape, this one is for the adapter passthrough check.
-    #[derive(Default)]
-    struct Recorder {
-        calls: Mutex<Vec<(String, String)>>,
-    }
-    impl FountainEvictHardDelete for Recorder {
-        fn evict_fountain_content_hard_delete(
-            &self,
-            content_id: &str,
-            corpus_kind: &str,
-        ) -> Result<(), FountainEvictError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((content_id.to_string(), corpus_kind.to_string()));
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn adapter_delegates_to_inner() {
-        let rec: Arc<Recorder> = Arc::new(Recorder::default());
-        let adapter = PersistFountainEvictHardDelete::new(rec.clone());
-        adapter
-            .evict_fountain_content_hard_delete("c1", "fountain-corpus")
-            .expect("ok");
-        adapter
-            .evict_fountain_content_hard_delete("c2", "fountain-corpus")
-            .expect("ok");
-        let calls = rec.calls.lock().unwrap().clone();
-        assert_eq!(
-            calls,
-            vec![
-                ("c1".to_string(), "fountain-corpus".to_string()),
-                ("c2".to_string(), "fountain-corpus".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn adapter_surfaces_inner_failure() {
-        struct Failing;
-        impl FountainEvictHardDelete for Failing {
-            fn evict_fountain_content_hard_delete(
-                &self,
-                _: &str,
-                _: &str,
-            ) -> Result<(), FountainEvictError> {
-                Err(FountainEvictError::HardDeleteFailed("inner-fail".into()))
-            }
-        }
-        let adapter = PersistFountainEvictHardDelete::new(Arc::new(Failing));
-        let err = adapter
-            .evict_fountain_content_hard_delete("c1", "f")
-            .expect_err("must surface");
-        assert!(matches!(err, FountainEvictError::HardDeleteFailed(_)));
-    }
 
     #[tokio::test]
     async fn noop_holdings_source_returns_empty() {
