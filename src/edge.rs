@@ -6146,19 +6146,103 @@ mod delegation_gate_tests {
     //! `attestation_type = "delegates_to"`, envelope with
     //! `kind: "delegates_to"`, `dimension:
     //! "self:delegates_to:agent_occurrence:v1"`, `scope: [...]`.
+    //!
+    //! v6.3.2 (CIRISEdge#166): the seed builders carry **REAL** hybrid
+    //! PQC signatures so they pass the persist v9.0.0 federation-tier
+    //! ingest gate (`verify_federation_tier_ingest`, CC 5.3.2.4.3.1).
+    //! See [`fixture_sigs`] below for the deterministic-keypair pattern.
     use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use ciris_crypto::{ClassicalSigner as _, Ed25519Signer, MlDsa65Signer, PqcSigner as _};
     use ciris_persist::federation::types::{
         algorithm, attestation_type as att_type, identity_type, Attestation, KeyRecord,
         SignedAttestation, SignedKeyRecord,
     };
     use ciris_persist::store::MemoryBackend;
+    use sha2::{Digest as _, Sha256};
+
+    // ── v6.3.2 fixture-signature helpers ────────────────────────────
+    //
+    // Mirrors persist's `federation::tier_ingest::test_support` shape
+    // (`pub(crate)` over there, so we replicate here). Deterministic
+    // per-`key_id` Ed25519 + ML-DSA-65 keypair → the registered key
+    // and the signing key collapse to the same identity without
+    // threading a signer through every fixture call.
+    //
+    // Canonicalizer: persist's `ceg_produce_canonicalize` is
+    // `ciris_verify_core::jcs::canonicalize` wrapped under the V2Jcs
+    // `produce_canon_version()` gate (RFC 8785). Edge has a direct
+    // dep on `ciris-verify-core`, so we call the same function and
+    // produce byte-identical canonical bytes — no upstream surface
+    // expansion needed.
+
+    /// Deterministic 32-byte seed for `key_id` — the first ≤32 bytes
+    /// of the key_id over a `0x11` fill. Same shape persist uses for
+    /// its own tier-ingest fixtures, so corpora stay coherent.
+    fn seed_for(key_id: &str) -> [u8; 32] {
+        let mut seed = [0x11u8; 32];
+        for (i, b) in key_id.bytes().take(32).enumerate() {
+            seed[i] = b;
+        }
+        seed
+    }
+
+    /// `key_id`'s registered hybrid pubkeys, base64. Fills a
+    /// `KeyRecord`'s `pubkey_ed25519_base64` /
+    /// `pubkey_ml_dsa_65_base64` so the registered key matches what
+    /// [`sign_attestation_envelope`] signs with.
+    fn hybrid_pubkeys(key_id: &str) -> (String, Option<String>) {
+        let ed = Ed25519Signer::from_seed(&seed_for(key_id)).expect("ed seed");
+        // ML-DSA-65 secret key is multi-KiB; box it to keep async
+        // test frames small.
+        let mldsa = Box::new(MlDsa65Signer::from_seed(&seed_for(key_id)).expect("mldsa seed"));
+        let ed_pk = B64.encode(ed.public_key().expect("ed pk"));
+        let mldsa_pk = B64.encode(mldsa.public_key().expect("mldsa pk"));
+        (ed_pk, Some(mldsa_pk))
+    }
+
+    /// Hybrid-sign `envelope` (through the CEG produce canonicalizer
+    /// — JCS / RFC 8785) with `signing_key_id`'s deterministic keys.
+    /// Returns `(original_content_hash, scrub_signature_classical,
+    /// scrub_signature_pqc)` — the three fields the federation-tier
+    /// ingest gate verifies. PQC half signs the bound payload
+    /// `canonical || ed25519_sig` (CC 3.1.2.1 strip-attack guard).
+    fn sign_attestation_envelope(
+        signing_key_id: &str,
+        envelope: &serde_json::Value,
+    ) -> (String, String, Option<String>) {
+        let ed = Ed25519Signer::from_seed(&seed_for(signing_key_id)).expect("ed seed");
+        let mldsa =
+            Box::new(MlDsa65Signer::from_seed(&seed_for(signing_key_id)).expect("mldsa seed"));
+        // Same canonicalizer persist's ceg_produce_canonicalize wraps
+        // (V2Jcs gate → RFC 8785). Edge depends on ciris-verify-core
+        // directly so we hit the SAME bytes without persist exposing
+        // the helper.
+        let canonical = ciris_verify_core::jcs::canonicalize(envelope).expect("jcs canonicalize");
+        let original_content_hash = hex::encode(Sha256::digest(&canonical));
+        let ed_sig = ed.sign(&canonical).expect("ed sign");
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = mldsa.sign(&bound).expect("mldsa sign");
+        (
+            original_content_hash,
+            B64.encode(&ed_sig),
+            Some(B64.encode(&pqc_sig)),
+        )
+    }
 
     fn key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
         let now = Utc::now();
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        // KeyRecord rows are NOT subject to the attestation-tier
+        // ingest gate; persist's `put_public_key` does not
+        // hybrid-verify the registration. Only the PUBKEYS must be
+        // real, so the attestations signed by this key verify against
+        // the directory entry. The scrub fields stay placeholders.
         KeyRecord {
             key_id: key_id.into(),
-            pubkey_ed25519_base64: "0".repeat(44),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
             algorithm: algorithm::HYBRID.into(),
             identity_type: identity_type_.into(),
             identity_ref: format!("{identity_type_}-ref-{key_id}"),
@@ -6185,6 +6269,14 @@ mod delegation_gate_tests {
     #[allow(clippy::similar_names)] // granter/grantee mirrors persist's column names
     fn delegates_to_row(granter: &str, grantee: &str, scope: &[&str]) -> Attestation {
         let now = Utc::now();
+        let envelope = serde_json::json!({
+            "kind": "delegates_to",
+            "dimension": "self:delegates_to:agent_occurrence:v1",
+            "agent_occurrence_key_id": grantee,
+            "bilateral_pair_id": format!("pair-{granter}-{grantee}"),
+            "scope": scope,
+        });
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(granter, &envelope);
         Attestation {
             attestation_id: format!("att-{granter}-{grantee}"),
             attesting_key_id: granter.into(),
@@ -6193,16 +6285,10 @@ mod delegation_gate_tests {
             weight: None,
             asserted_at: now,
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "kind": "delegates_to",
-                "dimension": "self:delegates_to:agent_occurrence:v1",
-                "agent_occurrence_key_id": grantee,
-                "bilateral_pair_id": format!("pair-{granter}-{grantee}"),
-                "scope": scope,
-            }),
-            original_content_hash: "0".repeat(64),
-            scrub_signature_classical: "x".repeat(88),
-            scrub_signature_pqc: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
             scrub_key_id: granter.into(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -6217,6 +6303,12 @@ mod delegation_gate_tests {
 
     fn withdraws_row(granter: &str, target: &str) -> Attestation {
         let now = Utc::now();
+        let envelope = serde_json::json!({
+            "kind": "withdraws",
+            "dimension": "withdraws:self:delegates_to:agent_occurrence:v1",
+            "target_attestation_id": format!("att-{granter}-{target}"),
+        });
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(granter, &envelope);
         Attestation {
             attestation_id: format!("withdraws-{granter}-{target}"),
             attesting_key_id: granter.into(),
@@ -6225,14 +6317,10 @@ mod delegation_gate_tests {
             weight: None,
             asserted_at: now,
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "kind": "withdraws",
-                "dimension": "withdraws:self:delegates_to:agent_occurrence:v1",
-                "target_attestation_id": format!("att-{granter}-{target}"),
-            }),
-            original_content_hash: "0".repeat(64),
-            scrub_signature_classical: "x".repeat(88),
-            scrub_signature_pqc: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
             scrub_key_id: granter.into(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -6323,21 +6411,12 @@ mod delegation_gate_tests {
         );
     }
 
-    // v4.6.3: CIRISPersist v9.0.0's G1+G2 BREAKING change enforces
-    // PQC-mandatory hybrid verify at federation-tier ingest (CC
-    // 5.3.2.4.3.1 / persist#237). The seed builders in this module
-    // use placeholder signature data (`"x".repeat(88)` which base64-
-    // decodes to 66 bytes, ed25519 sig must be 64; and `None` for the
-    // ML-DSA-65 half which v9.0.0 now requires). The placeholder-data
-    // pattern was sufficient for v8.x but the new ingest gate
-    // correctly rejects it. Generating real hybrid signatures over
-    // the canonicalized attestation envelope is a substantial fixture
-    // rework — tracked separately. The logic these tests exercise
-    // (delegation walk-up, scope matching, retraction) is covered via
-    // integration paths and by the persist-side delegation-gate
-    // tests; ignoring here avoids a tag-publishes-fails-pyPI gate.
+    // v6.3.2 (CIRISEdge#166): real hybrid PQC fixture sigs now wired
+    // through `sign_attestation_envelope` above — these tests admit
+    // through persist v9.0.0's federation-tier ingest gate (CC
+    // 5.3.2.4.3.1). Prior to v6.3.2 they were `#[ignore]`d behind a
+    // placeholder-signature fixture pattern.
     #[tokio::test]
-    #[ignore = "v4.6.3: needs real hybrid PQC fixture sigs post-persist-v9.0.0 G1+G2"]
     async fn happy_path_admits_signer_reached_via_in_scope_chain() {
         let backend = Arc::new(MemoryBackend::new());
         seed_keys(
@@ -6394,7 +6473,6 @@ mod delegation_gate_tests {
     }
 
     #[tokio::test]
-    #[ignore = "v4.6.3: needs real hybrid PQC fixture sigs post-persist-v9.0.0 G1+G2"]
     async fn retracted_delegation_refuses_with_retracted_at_root() {
         let backend = Arc::new(MemoryBackend::new());
         seed_keys(
@@ -6430,7 +6508,6 @@ mod delegation_gate_tests {
     }
 
     #[tokio::test]
-    #[ignore = "v4.6.3: needs real hybrid PQC fixture sigs post-persist-v9.0.0 G1+G2"]
     async fn delegation_without_required_scope_refuses_with_missing_scope() {
         let backend = Arc::new(MemoryBackend::new());
         seed_keys(
