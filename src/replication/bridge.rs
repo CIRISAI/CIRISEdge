@@ -934,11 +934,15 @@ fn v2_envelope_hash<T: serde::Serialize>(value: &T) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
     use chrono::Utc;
+    use ciris_crypto::{ClassicalSigner as _, Ed25519Signer, MlDsa65Signer, PqcSigner as _};
     use ciris_persist::federation::types::{
         algorithm, identity_type, Attestation, KeyRecord, SignedAttestation, SignedKeyRecord,
     };
     use ciris_persist::store::MemoryBackend;
+    use sha2::{Digest as _, Sha256};
 
     // ── Test fixture helpers ────────────────────────────────────────
 
@@ -956,15 +960,73 @@ mod tests {
         (backend, bridge)
     }
 
+    // ── v6.3.2 (CIRISEdge#166) — real hybrid PQC fixture sigs ───────
+    //
+    // Mirrors persist's `federation::tier_ingest::test_support` shape
+    // (pub(crate) over there). Deterministic per-key_id keypair plus
+    // the same V2Jcs (RFC 8785) canonicalizer persist's
+    // `ceg_produce_canonicalize` wraps — edge depends on
+    // ciris-verify-core directly so the canonical bytes match without
+    // persist exposing the helper.
+
+    /// Deterministic 32-byte seed for `key_id`.
+    fn seed_for(key_id: &str) -> [u8; 32] {
+        let mut seed = [0x11u8; 32];
+        for (i, b) in key_id.bytes().take(32).enumerate() {
+            seed[i] = b;
+        }
+        seed
+    }
+
+    /// `key_id`'s registered hybrid pubkeys, base64.
+    fn hybrid_pubkeys(key_id: &str) -> (String, Option<String>) {
+        let ed = Ed25519Signer::from_seed(&seed_for(key_id)).expect("ed seed");
+        let mldsa = Box::new(MlDsa65Signer::from_seed(&seed_for(key_id)).expect("mldsa seed"));
+        let ed_pk = B64.encode(ed.public_key().expect("ed pk"));
+        let mldsa_pk = B64.encode(mldsa.public_key().expect("mldsa pk"));
+        (ed_pk, Some(mldsa_pk))
+    }
+
+    /// Hybrid-sign `envelope` with `signing_key_id`'s deterministic
+    /// keys; returns `(original_content_hash, ed_sig_b64,
+    /// Some(mldsa_sig_b64))`. PQC half signs the bound payload
+    /// (canonical || ed_sig).
+    fn sign_attestation_envelope(
+        signing_key_id: &str,
+        envelope: &serde_json::Value,
+    ) -> (String, String, Option<String>) {
+        let ed = Ed25519Signer::from_seed(&seed_for(signing_key_id)).expect("ed seed");
+        let mldsa =
+            Box::new(MlDsa65Signer::from_seed(&seed_for(signing_key_id)).expect("mldsa seed"));
+        let canonical = ciris_verify_core::jcs::canonicalize(envelope).expect("jcs canonicalize");
+        let original_content_hash = hex::encode(Sha256::digest(&canonical));
+        let ed_sig = ed.sign(&canonical).expect("ed sign");
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = mldsa.sign(&bound).expect("mldsa sign");
+        (
+            original_content_hash,
+            B64.encode(&ed_sig),
+            Some(B64.encode(&pqc_sig)),
+        )
+    }
+
     /// Synthesize a `KeyRecord` for testing. The `persist_row_hash`
     /// is server-computed by persist's `put_public_key`, so we
     /// pass an empty string here — persist fills it on admit.
+    ///
+    /// v6.3.2: pubkeys now derived from `hybrid_pubkeys(key_id)` so
+    /// federation-tier attestations signed by this key verify under
+    /// persist v9.0.0's `verify_federation_tier_ingest`. Scrub
+    /// fields stay placeholders — `put_public_key` does NOT
+    /// hybrid-verify the registration row.
     fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
         let now = Utc::now();
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         KeyRecord {
             key_id: key_id.to_string(),
-            pubkey_ed25519_base64: "0".repeat(44),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
             algorithm: algorithm::HYBRID.to_string(),
             identity_type: identity_type_.to_string(),
             identity_ref: format!("{identity_type_}-ref-{key_id}"),
@@ -1146,7 +1208,6 @@ mod tests {
     /// confirming the gate isn't over-restrictive: seed a federation-
     /// tier attestation via put_attestation → it appears.
     #[tokio::test]
-    #[ignore = "v4.6.3: needs real hybrid PQC fixture sigs post-persist-v9.0.0 G1+G2"]
     async fn federation_present_attestation_appears_in_list_envelope_refs() {
         let attesting_id = "agent-dave";
         let attested_id = "agent-eve";
@@ -1166,8 +1227,16 @@ mod tests {
             .await
             .expect("seed attested key");
 
-        // Build a federation-tier attestation.
+        // Build a federation-tier attestation with real hybrid sigs
+        // (v6.3.2 / CIRISEdge#166 — passes persist v9.0.0's
+        // verify_federation_tier_ingest).
         let now = Utc::now();
+        let envelope = serde_json::json!({
+            "attesting_key_id": attesting_id,
+            "attested_key_id": attested_id,
+            "attestation_type": "delegates_to",
+        });
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attesting_id, &envelope);
         let att = Attestation {
             attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: attesting_id.to_string(),
@@ -1176,14 +1245,10 @@ mod tests {
             weight: None,
             asserted_at: now,
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "attesting_key_id": attesting_id,
-                "attested_key_id": attested_id,
-                "attestation_type": "delegates_to",
-            }),
-            original_content_hash: "0".repeat(64),
-            scrub_signature_classical: "x".repeat(88),
-            scrub_signature_pqc: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
             scrub_key_id: attesting_id.to_string(),
             scrub_timestamp: now,
             pqc_completed_at: None,
