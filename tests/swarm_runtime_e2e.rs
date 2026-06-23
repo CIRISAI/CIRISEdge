@@ -23,12 +23,14 @@ use async_trait::async_trait;
 
 use ciris_edge::holonomic::swarm_rarity::FountainHoldingClaim;
 use ciris_edge::swarm::{
-    FountainEvictHardDelete, FountainHoldingsSource, FountainSwarmRuntime, FountainTierEvict,
-    HeldFountainContent, NoopFountainHoldingsSource, SwarmRuntimeConfig,
+    FountainHoldingsSource, FountainSwarmRuntime, HeldFountainContent, NoopFountainHoldingsSource,
+    SwarmRuntimeConfig,
 };
 use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
+use ciris_persist::federation::FederationDirectory;
+use ciris_persist::store::MemoryBackend;
 
 #[derive(Default)]
 struct RecordingTransport {
@@ -68,32 +70,6 @@ impl FountainHoldingsSource for VecHoldings {
     }
 }
 
-#[derive(Default)]
-struct NopTier;
-#[async_trait]
-impl FountainTierEvict for NopTier {
-    async fn evict_fountain_content_to_tier(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<(), ciris_edge::swarm::FountainEvictError> {
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct NopHard;
-impl FountainEvictHardDelete for NopHard {
-    fn evict_fountain_content_hard_delete(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> Result<(), ciris_edge::swarm::FountainEvictError> {
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn two_peer_publish_and_observe_roundtrip() {
     // Alice — has held content. Publishes claims; bob is the cohort.
@@ -104,8 +80,12 @@ async fn two_peer_publish_and_observe_roundtrip() {
             symbol_ids: vec![1, 2, 3],
         }]));
     let alice_tx = Arc::new(RecordingTransport::default());
-    let alice_tier: Arc<dyn FountainTierEvict> = Arc::new(NopTier);
-    let alice_hard: Arc<dyn FountainEvictHardDelete + Send + Sync> = Arc::new(NopHard);
+    // v7.0.0 (CIRISEdge#194): the v5.2.0 `FountainTierEvict` +
+    // `FountainEvictHardDelete` adapter args collapse onto persist
+    // v10.0.0's `FederationDirectory` (#270). MemoryBackend's evict
+    // methods are no-ops on unknown content (`Ok(0)`), exactly the
+    // shape this smoke test needs.
+    let alice_directory: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
     let alice_cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
         Arc::new(|| vec!["bob".to_string()]);
     let mut alice = FountainSwarmRuntime::start(
@@ -115,8 +95,7 @@ async fn two_peer_publish_and_observe_roundtrip() {
             ..Default::default()
         },
         alice_holdings,
-        alice_tier,
-        alice_hard,
+        alice_directory,
         alice_tx.clone() as Arc<dyn Transport>,
         alice_cohort,
         "alice".to_string(),
@@ -127,8 +106,7 @@ async fn two_peer_publish_and_observe_roundtrip() {
     // empty (bob is the listener, not the publisher).
     let bob_holdings: Arc<dyn FountainHoldingsSource> = Arc::new(NoopFountainHoldingsSource);
     let bob_tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
-    let bob_tier: Arc<dyn FountainTierEvict> = Arc::new(NopTier);
-    let bob_hard: Arc<dyn FountainEvictHardDelete + Send + Sync> = Arc::new(NopHard);
+    let bob_directory: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
     let bob_cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
     let mut bob = FountainSwarmRuntime::start(
         SwarmRuntimeConfig {
@@ -137,8 +115,7 @@ async fn two_peer_publish_and_observe_roundtrip() {
             ..Default::default()
         },
         bob_holdings,
-        bob_tier,
-        bob_hard,
+        bob_directory,
         bob_tx,
         bob_cohort,
         "bob".to_string(),

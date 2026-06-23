@@ -21,13 +21,26 @@
 //! 3. **Converge**: every `observe_cadence`, for every content_id
 //!    with observed holders:
 //!    - `should_eject_above_target` for over-`H` content → call
-//!      [`FountainTierEvict::evict_fountain_content_to_tier`] with
-//!      the "t1" label;
+//!      `FederationDirectory::evict_fountain_content_to_tier` with
+//!      the "t1" label (persist v10.0.0 #270 public-surface promotion);
 //!    - observed_count < `min_viable` → emit a
 //!      [`SwarmEvent::RepairNeeded`] telemetry record (downstream
 //!      cuts wire the blob_swarm fetch off this);
 //!    - `ConsentState::Revoked` → call
-//!      [`FountainEvictHardDelete::evict_fountain_content_hard_delete`].
+//!      `FederationDirectory::evict_fountain_content_hard_delete`
+//!      (v10.0.0 #270 promotion).
+//!
+//! ## v7.0.0 adapter collapse (CIRISEdge#194 / CIRISPersist#270)
+//!
+//! The two v5.2.0 evict-surface adapter traits (`FountainTierEvict`,
+//! `PersistFountainEvictHardDelete`) drop here — persist v10.0.0
+//! promoted both methods to required `FederationDirectory` methods,
+//! and the runtime now holds `Arc<dyn FederationDirectory>` directly
+//! (same shape as [`crate::replication::runtime::ReplicationRuntime`]).
+//! The `FountainHoldingsSource` adapter survives because the per-symbol
+//! `symbol_id` list the [`FountainHoldingClaim`] ships is an
+//! operator-local view (publisher's symbol store), NOT a directory
+//! surface concern — `FountainHeldMeta` carries only counts.
 //!
 //! ## Why no per-peer mutation API
 //!
@@ -48,10 +61,11 @@ use std::time::Duration;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
+use ciris_persist::federation::FederationDirectory;
+
 use super::diversity::{diversity_contribution, NullRttObserver, PeerRttObserver};
 use super::persist_fountain_evict::{
-    FountainEvictError, FountainEvictHardDelete, FountainHoldingsSource, FountainTierEvict,
-    HeldFountainContent,
+    FountainEvictError, FountainHoldingsSource, HeldFountainContent,
 };
 use crate::holonomic::fountain_defaults::{recommended_policy, FountainPolicy};
 use crate::holonomic::swarm_rarity::{
@@ -158,14 +172,16 @@ pub enum SwarmEvent {
         min_viable: u32,
     },
     /// `should_eject_above_target` fired; the runtime called
-    /// [`FountainTierEvict::evict_fountain_content_to_tier`].
+    /// `FederationDirectory::evict_fountain_content_to_tier`
+    /// (persist v10.0.0 #270).
     EjectedToTier {
         content_id: String,
         observed_holders: u32,
         tier_label: String,
     },
     /// Consent was revoked for `content_id`; the runtime called
-    /// [`FountainEvictHardDelete::evict_fountain_content_hard_delete`].
+    /// `FederationDirectory::evict_fountain_content_hard_delete`
+    /// (persist v10.0.0 #270).
     HardDeleted { content_id: String },
     /// Converger tick observed but took no eviction action for this
     /// content_id (Keep verdict). Surfaced so tests can assert the
@@ -331,12 +347,18 @@ impl FountainSwarmRuntime {
     /// fire-and-forget `send` path (a future cut may switch to
     /// `send_durable` for at-least-once delivery once the substrate
     /// requires it).
+    ///
+    /// v7.0.0 (CIRISEdge#194): `directory` replaces the v5.2.0
+    /// `tier_evict` + `hard_delete` adapter args — persist v10.0.0
+    /// promoted both methods to required `FederationDirectory`
+    /// methods. The runtime now calls `directory.evict_fountain_*`
+    /// directly. `holdings` survives because per-symbol-IDs are an
+    /// operator-local view, not a directory-surface concern.
     #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     pub fn start(
         config: SwarmRuntimeConfig,
         holdings: Arc<dyn FountainHoldingsSource>,
-        tier_evict: Arc<dyn FountainTierEvict>,
-        hard_delete: Arc<dyn FountainEvictHardDelete + Send + Sync>,
+        directory: Arc<dyn FederationDirectory>,
         transport: Arc<dyn Transport>,
         cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         local_peer_id: String,
@@ -345,8 +367,7 @@ impl FountainSwarmRuntime {
         Self::start_with_options(
             config,
             holdings,
-            tier_evict,
-            hard_delete,
+            directory,
             transport,
             cohort,
             local_peer_id,
@@ -366,8 +387,7 @@ impl FountainSwarmRuntime {
     pub fn start_with_options(
         config: SwarmRuntimeConfig,
         holdings: Arc<dyn FountainHoldingsSource>,
-        tier_evict: Arc<dyn FountainTierEvict>,
-        hard_delete: Arc<dyn FountainEvictHardDelete + Send + Sync>,
+        directory: Arc<dyn FederationDirectory>,
         transport: Arc<dyn Transport>,
         cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         local_peer_id: String,
@@ -401,22 +421,13 @@ impl FountainSwarmRuntime {
         let converger_task = {
             let observed = Arc::clone(&observed);
             let holdings = Arc::clone(&holdings);
-            let tier_evict = Arc::clone(&tier_evict);
-            let hard_delete = Arc::clone(&hard_delete);
+            let directory = Arc::clone(&directory);
             let cfg = config.clone();
             let local_peer = local_peer_id.clone();
             let rtt = Arc::clone(&rtt_observer);
             tokio::spawn(async move {
                 run_converger(
-                    observed,
-                    holdings,
-                    tier_evict,
-                    hard_delete,
-                    cfg,
-                    cancel_rx,
-                    sink,
-                    local_peer,
-                    rtt,
+                    observed, holdings, directory, cfg, cancel_rx, sink, local_peer, rtt,
                 )
                 .await;
             })
@@ -616,8 +627,7 @@ async fn build_and_sign_holding_claim_envelope(
 async fn run_converger(
     observed: Arc<RwLock<ObservedClaims>>,
     holdings: Arc<dyn FountainHoldingsSource>,
-    tier_evict: Arc<dyn FountainTierEvict>,
-    hard_delete: Arc<dyn FountainEvictHardDelete + Send + Sync>,
+    directory: Arc<dyn FederationDirectory>,
     config: SwarmRuntimeConfig,
     mut cancel_rx: watch::Receiver<bool>,
     sink: Option<SwarmRuntimeEventSink>,
@@ -638,8 +648,7 @@ async fn run_converger(
                 converger_tick(
                     &observed,
                     &holdings,
-                    &tier_evict,
-                    &hard_delete,
+                    directory.as_ref(),
                     &config,
                     sink.as_ref(),
                     &local_peer_id,
@@ -655,8 +664,7 @@ async fn run_converger(
 async fn converger_tick(
     observed: &Arc<RwLock<ObservedClaims>>,
     holdings: &Arc<dyn FountainHoldingsSource>,
-    tier_evict: &Arc<dyn FountainTierEvict>,
-    hard_delete: &Arc<dyn FountainEvictHardDelete + Send + Sync>,
+    directory: &dyn FederationDirectory,
     config: &SwarmRuntimeConfig,
     sink: Option<&SwarmRuntimeEventSink>,
     local_peer_id: &str,
@@ -802,14 +810,17 @@ async fn converger_tick(
             }
             EjectionVerdict::EjectToTier => {
                 let corpus_kind = corpus_kind_for(&local_by_content, &content_id);
-                // v5.2.0 ejection target: persist's "t1" label
-                // (DiskPressure::Warn-equivalent — the gentlest
-                // step that actually frees symbol rows). Future
-                // cuts may consult the per-content_id pressure
-                // window to pick a coarser tier under load.
-                let tier_label = "t1".to_string();
-                if let Err(e) = tier_evict
-                    .evict_fountain_content_to_tier(&content_id, &corpus_kind, &tier_label)
+                // v7.0.0: persist v10.0.0 promoted the tier evict to
+                // the public `FederationDirectory` surface. Target tier
+                // is `T2` (`DiskPressure::Warn`-equivalent — keep
+                // `n_source`, drop repair; the gentlest step that
+                // actually frees symbol rows). Future cuts may consult
+                // the per-content_id pressure window to pick a coarser
+                // tier under load.
+                let tier = ciris_persist::fountain::FountainTier::T2;
+                let tier_label = tier.label().to_string();
+                if let Err(e) = directory
+                    .evict_fountain_content_to_tier(&content_id, &corpus_kind, tier)
                     .await
                 {
                     tracing::warn!(
@@ -832,8 +843,12 @@ async fn converger_tick(
                 // exposes the tier-granular evict; until then the
                 // runtime maps onto the coarse tier evict).
                 let corpus_kind = corpus_kind_for(&local_by_content, &content_id);
-                if let Err(e) = tier_evict
-                    .evict_fountain_content_to_tier(&content_id, &corpus_kind, "t1")
+                if let Err(e) = directory
+                    .evict_fountain_content_to_tier(
+                        &content_id,
+                        &corpus_kind,
+                        ciris_persist::fountain::FountainTier::T2,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -845,8 +860,9 @@ async fn converger_tick(
             }
             EjectionVerdict::EjectHardDelete => {
                 let corpus_kind = corpus_kind_for(&local_by_content, &content_id);
-                if let Err(e) =
-                    hard_delete.evict_fountain_content_hard_delete(&content_id, &corpus_kind)
+                if let Err(e) = directory
+                    .evict_fountain_content_hard_delete(&content_id, &corpus_kind)
+                    .await
                 {
                     tracing::warn!(
                         content_id = %content_id,
@@ -884,9 +900,21 @@ mod tests {
     use super::*;
     use crate::transport::{InboundFrame, TransportError, TransportId, TransportSendOutcome};
     use async_trait::async_trait;
+    use ciris_persist::store::MemoryBackend;
     use std::sync::Mutex;
 
     // ─── Test fixtures ────────────────────────────────────────────
+    //
+    // v7.0.0 (CIRISEdge#194): the converger now calls
+    // `FederationDirectory::evict_fountain_content_*` directly. Tests
+    // use `MemoryBackend` (persist's in-memory FederationDirectory
+    // impl) — the evict methods return `Ok(0)` for unknown content
+    // (no manifest seeded), so a successful dispatch lights the
+    // `SwarmEvent::EjectedToTier` / `HardDeleted` sink emission and
+    // tests assert on the sink rather than on a recording stub. That
+    // collapses the v5.2.0 RecordingTierEvict + RecordingHardDelete
+    // fixtures, exercising the real persist surface instead of an
+    // adapter mock.
 
     struct VecHoldings(Vec<HeldFountainContent>);
     #[async_trait]
@@ -898,43 +926,13 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct RecordingTierEvict {
-        calls: Mutex<Vec<(String, String, String)>>,
-    }
-    #[async_trait]
-    impl FountainTierEvict for RecordingTierEvict {
-        async fn evict_fountain_content_to_tier(
-            &self,
-            content_id: &str,
-            corpus_kind: &str,
-            tier: &str,
-        ) -> Result<(), FountainEvictError> {
-            self.calls.lock().unwrap().push((
-                content_id.to_string(),
-                corpus_kind.to_string(),
-                tier.to_string(),
-            ));
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingHardDelete {
-        calls: Mutex<Vec<(String, String)>>,
-    }
-    impl FountainEvictHardDelete for RecordingHardDelete {
-        fn evict_fountain_content_hard_delete(
-            &self,
-            content_id: &str,
-            corpus_kind: &str,
-        ) -> Result<(), FountainEvictError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((content_id.to_string(), corpus_kind.to_string()));
-            Ok(())
-        }
+    /// `Arc<dyn FederationDirectory>` test handle: a fresh
+    /// `MemoryBackend`. Its `evict_fountain_content_*` surfaces no-op
+    /// (return `Ok(0)`) on unknown `content_id`, which is exactly the
+    /// behaviour the converger tests rely on — they assert on the
+    /// `SwarmEvent` sink that fires after a successful dispatch.
+    fn test_directory() -> Arc<dyn FederationDirectory> {
+        Arc::new(MemoryBackend::new())
     }
 
     #[derive(Default)]
@@ -979,16 +977,12 @@ mod tests {
     async fn empty_holdings_starts_and_shuts_down() {
         let holdings: Arc<dyn FountainHoldingsSource> =
             Arc::new(super::super::NoopFountainHoldingsSource);
-        let tier: Arc<dyn FountainTierEvict> = Arc::new(RecordingTierEvict::default());
-        let hard: Arc<dyn FountainEvictHardDelete + Send + Sync> =
-            Arc::new(RecordingHardDelete::default());
         let tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
         let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let mut rt = FountainSwarmRuntime::start(
             fast_config(),
             holdings,
-            tier,
-            hard,
+            test_directory(),
             tx,
             cohort,
             "alice".to_string(),
@@ -1012,9 +1006,6 @@ mod tests {
                 symbol_ids: vec![10, 20],
             },
         ]));
-        let tier: Arc<dyn FountainTierEvict> = Arc::new(RecordingTierEvict::default());
-        let hard: Arc<dyn FountainEvictHardDelete + Send + Sync> =
-            Arc::new(RecordingHardDelete::default());
         let recording_tx = Arc::new(RecordingTransport::default());
         let tx: Arc<dyn Transport> = recording_tx.clone();
         let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
@@ -1022,8 +1013,7 @@ mod tests {
         let mut rt = FountainSwarmRuntime::start(
             fast_config(),
             holdings,
-            tier,
-            hard,
+            test_directory(),
             tx,
             cohort,
             "alice".to_string(),
@@ -1052,9 +1042,6 @@ mod tests {
     async fn register_observed_claim_lands_in_map() {
         let holdings: Arc<dyn FountainHoldingsSource> =
             Arc::new(super::super::NoopFountainHoldingsSource);
-        let tier: Arc<dyn FountainTierEvict> = Arc::new(RecordingTierEvict::default());
-        let hard: Arc<dyn FountainEvictHardDelete + Send + Sync> =
-            Arc::new(RecordingHardDelete::default());
         let tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
         let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let rt = FountainSwarmRuntime::start(
@@ -1064,8 +1051,7 @@ mod tests {
                 ..Default::default()
             },
             holdings,
-            tier,
-            hard,
+            test_directory(),
             tx,
             cohort,
             "alice".to_string(),
@@ -1106,10 +1092,6 @@ mod tests {
                 corpus_kind: "fountain-corpus".into(),
                 symbol_ids: vec![1],
             }]));
-        let tier_recorder = Arc::new(RecordingTierEvict::default());
-        let tier: Arc<dyn FountainTierEvict> = tier_recorder.clone();
-        let hard: Arc<dyn FountainEvictHardDelete + Send + Sync> =
-            Arc::new(RecordingHardDelete::default());
         let tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
         let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<SwarmEvent>();
@@ -1119,8 +1101,7 @@ mod tests {
         let rt = FountainSwarmRuntime::start(
             fast_config(),
             holdings,
-            tier,
-            hard,
+            test_directory(),
             tx,
             cohort,
             "alice".to_string(),
@@ -1144,24 +1125,29 @@ mod tests {
         let mut rt = rt;
         rt.shutdown().await;
 
-        let calls = tier_recorder.calls.lock().unwrap().clone();
-        assert!(
-            calls
-                .iter()
-                .any(|(cid, _, tier)| cid == local_content_id && tier == "t1"),
-            "expected EjectToTier(c-popular, t1), got {calls:?}"
-        );
-        // Sanity: a Published event fired (publisher saw c-popular).
+        // v7.0.0: assert via the SwarmEvent sink (the converger emits
+        // EjectedToTier on `Ok(_)` of the directory call;
+        // MemoryBackend returns `Ok(0)` for unknown content_id). Tier
+        // label is "t2" — persist v10.0.0's `FountainTier::T2`
+        // (DiskPressure::Warn-equivalent: keep `n_source`, drop
+        // repair — the gentlest tier that actually frees symbol rows).
         let mut saw_eject = false;
         while let Ok(ev) = sink_rx.try_recv() {
-            if matches!(
-                ev,
-                SwarmEvent::EjectedToTier { ref content_id, .. } if content_id == local_content_id
-            ) {
-                saw_eject = true;
+            if let SwarmEvent::EjectedToTier {
+                content_id,
+                tier_label,
+                ..
+            } = ev
+            {
+                if content_id == local_content_id && tier_label == "t2" {
+                    saw_eject = true;
+                }
             }
         }
-        assert!(saw_eject, "expected EjectedToTier event for c-popular");
+        assert!(
+            saw_eject,
+            "expected EjectedToTier(c-popular, t2) event after converger tick"
+        );
     }
 
     #[tokio::test]
@@ -1174,9 +1160,6 @@ mod tests {
                 corpus_kind: "fountain-corpus".into(),
                 symbol_ids: vec![7],
             }]));
-        let tier: Arc<dyn FountainTierEvict> = Arc::new(RecordingTierEvict::default());
-        let hard: Arc<dyn FountainEvictHardDelete + Send + Sync> =
-            Arc::new(RecordingHardDelete::default());
         let tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
         let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<SwarmEvent>();
@@ -1186,8 +1169,7 @@ mod tests {
         let rt = FountainSwarmRuntime::start(
             fast_config(),
             holdings,
-            tier,
-            hard,
+            test_directory(),
             tx,
             cohort,
             "alice".to_string(),
