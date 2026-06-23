@@ -223,6 +223,32 @@ pub trait PeerResolver: Send + Sync + 'static {
             })
             .collect()
     }
+
+    /// v7.0.0 (CIRISEdge#191 / #195) — return the peer's 32-byte
+    /// **federation** Ed25519 public key, the load-bearing primitive
+    /// for explicit-hash routability. The dial side derives the peer's
+    /// 16-byte routable destination_hash via
+    /// [`crate::transport::addressing::reticulum_destination_for_pubkey`]
+    /// on this value. Cross-transport byte-equal parity (IP + packet
+    /// radio + HTTP) follows from every transport using the SAME
+    /// helper on the SAME pubkey.
+    ///
+    /// **Default impl** returns `None`: v0.7.x-era resolvers that only
+    /// know the transport-tier dual-key bytes fall back to the legacy
+    /// announce-bound formula
+    /// (`Destination::compute_destination_hash(name_hash, identity.hash())`).
+    /// Production wires this against persist's `federation_keys`
+    /// directory cache (the v6.0.0 `directory_cache_driver`), which
+    /// stores the federation Ed25519 pubkey alongside the key_id.
+    ///
+    /// Returning `Some(.)` opts the peer into the v7.0.0 explicit-
+    /// hash path. The resolver SHOULD coordinate so a peer either
+    /// returns `Some(.)` consistently or `None` consistently — mixing
+    /// the two between resolve calls would make the dial path
+    /// non-deterministic.
+    fn resolve_federation_pubkey(&self, _destination_key_id: &str) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 /// A `holds_bytes:sha256:*` attestation row — the `(holder_key_id,
@@ -1305,20 +1331,71 @@ impl ReticulumTransport {
             .await
             .map_err(|e| TransportError::Config(format!("reticulum node build: {e}")))?;
 
-        // Register edge's federation destination. SINGLE/IN — it
-        // receives links and can be announced. `accepts_links` must
-        // be set or inbound LINK_REQUESTs are dropped.
-        let mut dest = Destination::new(
+        // v7.0.0 (CIRISEdge#191 / #195) — Leviculum v0.7.0 explicit-
+        // hash addressing. Edge's local destination is registered under
+        // `sha256(fed_ed25519_pubkey)[..16]` — the SAME hash the
+        // packet-radio and HTTP transports derive, via the single
+        // load-bearing primitive
+        // [`crate::transport::addressing::reticulum_destination_for_pubkey`].
+        // Cross-transport byte-equal parity is the N1 closure for
+        // CIRISEdge#191.
+        //
+        // The destination's `identity` is still the transport identity
+        // (its real Ed25519 secret signs link proofs); only the 16-byte
+        // routing index is overridden. Per Leviculum's compatibility
+        // guard, explicit-hash destinations MUST NOT be announced — the
+        // installed `ScopePrivacyAnnouncePolicy` honours that contract
+        // by default-suppressing every registered destination (#195).
+        //
+        // Bootstrap requirement: a federation signer is needed to
+        // derive `fed_ed25519_pubkey`. Without one, edge has no
+        // federation identity to address by — fail honest at
+        // construction rather than fall back to a non-byte-equal
+        // legacy path (those peers' addressing would diverge, and the
+        // cohort's directory cache would never reach them).
+        let federation_ed25519_pubkey: [u8; 32] = if let Some(s) = &signer {
+            let (ed_bytes, _pqc) = s.federation_pubkeys().await.map_err(|e| {
+                TransportError::Config(format!(
+                    "federation pubkey unavailable for explicit-hash addressing: {e}"
+                ))
+            })?;
+            if ed_bytes.len() != 32 {
+                return Err(TransportError::Config(format!(
+                    "federation Ed25519 pubkey is {} bytes (expected 32)",
+                    ed_bytes.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&ed_bytes);
+            arr
+        } else {
+            return Err(TransportError::Config(
+                "Reticulum transport requires a federation signer for v7.0.0 explicit-hash \
+                 addressing — no fallback to the legacy keystore-derived destination is \
+                 supported (peers would diverge on routability)"
+                    .into(),
+            ));
+        };
+        let explicit_dest_hash = crate::transport::addressing::reticulum_destination_for_pubkey(
+            &federation_ed25519_pubkey,
+        );
+        let mut dest = Destination::with_explicit_hash(
             Some(identity),
             Direction::In,
             DestinationType::Single,
             EDGE_APP_NAME,
             &[EDGE_APP_ASPECT],
+            explicit_dest_hash,
         )
-        .map_err(|e| TransportError::Config(format!("destination build: {e}")))?;
+        .map_err(|e| TransportError::Config(format!("explicit-hash destination build: {e}")))?;
         dest.set_accepts_links(true);
         let local_dest_hash = *dest.hash();
-        node.register_destination(dest);
+        debug_assert_eq!(
+            local_dest_hash.as_bytes(),
+            &explicit_dest_hash,
+            "explicit-hash destination must index by the caller-supplied hash",
+        );
+        node.register_destination_at(local_dest_hash, dest);
 
         // Take the single event receiver before starting, then start
         // the event loop. `listen` claims the stashed receiver.
@@ -1604,6 +1681,13 @@ impl ReticulumTransport {
             )));
         };
 
+        // v7.0.0 (CIRISEdge#191): `connect` and `connect_at` are
+        // functionally identical in Leviculum v0.7.0; we use the
+        // legacy name here because the dial path serves BOTH the
+        // explicit-hash route (when `dest_hash` was derived from the
+        // peer's federation pubkey) and the legacy announce-bound
+        // route (when the peer is still on v6.x). The 16 bytes are
+        // opaque to leviculum; the receiver's index dispatches.
         let link = self
             .node
             .connect(&dest_hash, &signing_key)
@@ -2252,16 +2336,38 @@ impl ReticulumTransport {
         if let Some(rooted) = self.peers.lock().await.get(destination_key_id) {
             return Some(rooted.peer);
         }
-        let pubkey = self.resolver.as_ref()?.resolve(destination_key_id)?;
+        let resolver = self.resolver.as_ref()?;
+        let pubkey = resolver.resolve(destination_key_id)?;
         let mut x25519 = [0u8; 32];
         let mut ed25519 = [0u8; 32];
         x25519.copy_from_slice(&pubkey[..32]);
         ed25519.copy_from_slice(&pubkey[32..]);
-        let identity = Identity::from_public_keys(&x25519, &ed25519).ok()?;
-        // The peer's destination hash for its `ciris.edge` endpoint is
-        // deterministic from its identity hash + the shared app name.
-        let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
-        let dest_hash = Destination::compute_destination_hash(&name_hash, identity.hash());
+
+        // v7.0.0 (CIRISEdge#191 / #195) — Leviculum v0.7.0 explicit-
+        // hash addressing. When the resolver knows the peer's
+        // federation Ed25519 pubkey (v6.0.0 directory-cache path), we
+        // route to `sha256(fed_pubkey)[..16]` — the SAME hash the
+        // packet-radio / HTTP transports derive — and dial via
+        // `node.connect_at(dest_hash, &transport_ed25519)`. The
+        // transport-tier Ed25519 still signs link proofs (it remains
+        // the destination's structural identity); only the routing
+        // index becomes content-addressed by the federation key.
+        //
+        // When the resolver returns `None` for the federation pubkey
+        // (v0.6.x-era resolvers that only know the transport
+        // dual-key), fall back to the legacy announce-bound formula —
+        // peers that haven't yet adopted v7.0.0 stay reachable.
+        let dest_hash =
+            if let Some(fed_pubkey) = resolver.resolve_federation_pubkey(destination_key_id) {
+                DestinationHash::new(
+                    crate::transport::addressing::reticulum_destination_for_pubkey(&fed_pubkey),
+                )
+            } else {
+                let identity = Identity::from_public_keys(&x25519, &ed25519).ok()?;
+                // Legacy v0.6.x path: `sha256(name_hash || identity_hash)`.
+                let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
+                Destination::compute_destination_hash(&name_hash, identity.hash())
+            };
         Some(ResolvedPeer {
             dest_hash,
             signing_key: ed25519,

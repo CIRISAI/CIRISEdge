@@ -5819,32 +5819,35 @@ pub(crate) const SCOPE_SUB_DELEGATION: &str = "sub_delegation";
 /// non-retracted `delegates_to` edges from a trusted root to
 /// `agent_key_X` that carries `required_scope`.
 ///
-/// # Algorithm
+/// # Algorithm (v7.0.0 — CIRISEdge#194)
 ///
 /// 1. Empty trust-root set → `NoTrustRoots` (refuse; substrate not
 ///    bootstrapped for delegation-gated traffic).
-/// 2. For each trust root: walk persist's
-///    [`ciris_persist::federation::topology::build_delegation_graph`]
-///    BFS forward from the root, depth-bounded by `max_depth`.
-/// 3. Collect every `DelegationEdge.to_key == signer_key`:
-///    - If the matched edge carries a `withdrawn_by` annotation, mark
-///      "retracted-at-root" (don't admit, but remember in case no
-///      live edge surfaces — the retraction is the load-bearing
-///      forensic story).
-///    - Else inspect the raw attestation envelope: a
-///      `self_at_login`-shaped delegation writes scope as a JSON
-///      ARRAY. (Persist's `DelegationEdge.scope` field only reads
-///      `as_str()` — see persist v6.5.0
-///      `src/federation/topology.rs:457`; for set-shaped scopes the
-///      field is empty. We re-fetch the raw envelope via
-///      `directory.list_attestations_for(signer)` and check the
-///      scope set ourselves.)
-///    - If `required_scope` ∈ set → admit (`Ok(())`).
-/// 4. If at least one edge surfaced but every match was retracted →
-///    `RetractedAtRoot`.
-/// 5. If at least one edge surfaced but none carried the scope →
-///    `MissingScope`.
-/// 6. Otherwise → `SignerUnreached`.
+/// 2. For each trust root call persist v10.0.0's
+///    [`reachable_under_scope_with_reasons`] (CIRISPersist#272), which
+///    runs the §11.10 `MODERATION_DUTY` scope-bearing `delegates_to`
+///    walk and returns a typed [`ReachabilityVerdict`] discriminating
+///    *why* a non-Reachable result was reached. The first `Reachable`
+///    verdict admits.
+/// 3. If no root admits, fold the per-root verdicts into the most
+///    informative [`DelegationRefusalSubReason`] using a
+///    most-specific-wins precedence:
+///    `MissingScope > RetractedAtRoot > SubstrateUnavailable > SignerUnreached`.
+///    The persist verdict `NoTrustRoots` (issuer emitted no delegation
+///    edges at all) maps onto edge's `SignerUnreached` — the issuer
+///    simply never delegated to anyone.
+///
+/// The persist walk handles depth bounding (`max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH)`),
+/// scope-bearing-edge ⊆-attenuation, deputization past depth 1
+/// (`sub_delegation` gate), and per-edge `withdraws`/`recants`
+/// skipping — collapsing edge's prior hand-rolled multi-root walk +
+/// raw-envelope scope re-fetch onto persist's single canonical API.
+/// SubstrateUnavailable verdict short-circuits the per-root walk
+/// (persist returns it instead of `Err` so the `match` is total per
+/// the v10.0.0 contract).
+///
+/// [`reachable_under_scope_with_reasons`]: ciris_persist::federation::admission::reachable_under_scope_with_reasons
+/// [`ReachabilityVerdict`]: ciris_persist::federation::ReachabilityVerdict
 async fn verify_self_at_login_delegation(
     signer_key: &str,
     directory: &Arc<dyn ciris_persist::federation::FederationDirectory>,
@@ -5853,91 +5856,89 @@ async fn verify_self_at_login_delegation(
     max_depth: usize,
 ) -> Result<(), crate::messages::DelegationRefusalSubReason> {
     use crate::messages::DelegationRefusalSubReason;
-    use ciris_persist::federation::topology::{build_delegation_graph, MAX_DELEGATION_DEPTH};
-    use ciris_persist::federation::types::attestation_type;
+    use ciris_persist::federation::admission::reachable_under_scope_with_reasons;
+    use ciris_persist::federation::ReachabilityVerdict;
 
     if trusted_roots.is_empty() {
         return Err(DelegationRefusalSubReason::NoTrustRoots);
     }
 
-    let effective_depth = max_depth.clamp(1, MAX_DELEGATION_DEPTH);
-
-    // Track forensic state across roots — we want the most-specific
-    // refusal reason (a retraction beats "unreached", a scope-miss
-    // beats "unreached", a substrate fault preempts everything).
-    let mut substrate_fault = false;
-    let mut any_match = false;
-    let mut any_unretracted_match = false;
-    let mut any_retracted_match = false;
-
-    // Pre-fetch the signer's inbound delegations once — we need the
-    // raw envelopes to recover the set-shaped scope that persist's
-    // DelegationEdge.scope drops.
-    let signer_inbound = match directory.as_ref().list_attestations_for(signer_key).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(
-                event = "edge.delegation_gate.substrate_fault",
-                signer_key = %signer_key,
-                error = %e,
-                "list_attestations_for(signer) failed",
-            );
-            return Err(DelegationRefusalSubReason::SubstrateUnavailable);
-        }
-    };
+    // Cross-root accumulator: most-specific-wins folding. Each root's
+    // verdict maps onto one of these flags. If any root admits, we
+    // short-circuit; otherwise the precedence below picks the most
+    // informative refusal.
+    let mut saw_missing_scope = false;
+    let mut saw_retracted = false;
+    let mut saw_substrate_fault = false;
+    // Both `SignerUnreached` and persist's `NoTrustRoots` (issuer
+    // emitted no delegation edges) map onto edge's `SignerUnreached`
+    // — they're indistinguishable from the gate's vantage. We don't
+    // need a flag because it's the default fall-through.
 
     for root in trusted_roots {
-        let graph = match build_delegation_graph(directory.as_ref(), root, effective_depth).await {
-            Ok(g) => g,
+        match reachable_under_scope_with_reasons(
+            directory.as_ref(),
+            root,
+            signer_key,
+            required_scope,
+            max_depth,
+        )
+        .await
+        {
+            Ok(verdict) => match verdict {
+                ReachabilityVerdict::Reachable => return Ok(()),
+                ReachabilityVerdict::MissingScope => saw_missing_scope = true,
+                ReachabilityVerdict::RetractedAtRoot => saw_retracted = true,
+                ReachabilityVerdict::SubstrateUnavailable => {
+                    tracing::warn!(
+                        event = "edge.delegation_gate.substrate_fault",
+                        root = %root,
+                        "reachable_under_scope_with_reasons returned SubstrateUnavailable verdict",
+                    );
+                    saw_substrate_fault = true;
+                }
+                ReachabilityVerdict::SignerUnreached | ReachabilityVerdict::NoTrustRoots => {
+                    // Both fall through to the default `SignerUnreached`
+                    // refusal — the issuer's chain doesn't reach the
+                    // target, whether by absence of edges or by absence
+                    // of scoped paths.
+                }
+                // `#[non_exhaustive]` — a future persist refinement may
+                // add reasons. Treat as substrate-fault until edge is
+                // taught the new variant; refuse conservatively.
+                _ => {
+                    tracing::warn!(
+                        event = "edge.delegation_gate.unknown_verdict",
+                        root = %root,
+                        verdict = ?verdict,
+                        "ReachabilityVerdict variant unrecognized; refusing as substrate-fault",
+                    );
+                    saw_substrate_fault = true;
+                }
+            },
             Err(e) => {
+                // The with-reasons walk reserves `Err` for argument
+                // shape problems (per v10.0.0 contract: substrate read
+                // failures come back as the `SubstrateUnavailable`
+                // verdict, not `Err`). Conservative refuse.
                 tracing::warn!(
                     event = "edge.delegation_gate.substrate_fault",
                     root = %root,
                     error = %e,
-                    "build_delegation_graph failed; treating root as unreached",
+                    "reachable_under_scope_with_reasons returned Err",
                 );
-                substrate_fault = true;
-                continue;
+                saw_substrate_fault = true;
             }
-        };
-        for edge in &graph.edges {
-            if edge.to_key != signer_key {
-                continue;
-            }
-            any_match = true;
-            if edge.withdrawn_by.is_some() {
-                any_retracted_match = true;
-                continue;
-            }
-            // Look up the matching raw envelope to recover the scope
-            // set. Multiple delegates_to rows for the same
-            // (granter, grantee) are uncommon at depth-1 (one per
-            // self_at_login flow) but persist does not collapse
-            // them, so we accept ANY matching row that carries the
-            // required scope.
-            let scope_ok = signer_inbound.iter().any(|att| {
-                att.attestation_type == attestation_type::DELEGATES_TO
-                    && att.attesting_key_id == edge.from_key
-                    && envelope_scope_contains(&att.attestation_envelope, required_scope)
-            });
-            if scope_ok {
-                return Ok(());
-            }
-            any_unretracted_match = true;
         }
     }
 
-    // Forensic discrimination — most-specific wins. A successful
-    // admit short-circuits above; falling through means refuse.
-    if any_unretracted_match {
-        // We found an in-graph live edge but no scope match — clearer
-        // than calling this "unreached".
+    // Most-specific-wins precedence — a successful admit short-
+    // circuits above; falling through means refuse.
+    if saw_missing_scope {
         Err(DelegationRefusalSubReason::MissingScope)
-    } else if any_retracted_match {
+    } else if saw_retracted {
         Err(DelegationRefusalSubReason::RetractedAtRoot)
-    } else if !any_match && substrate_fault {
-        // Every root walk faulted; we cannot prove or disprove
-        // reachability. Conservative refuse.
+    } else if saw_substrate_fault {
         Err(DelegationRefusalSubReason::SubstrateUnavailable)
     } else {
         Err(DelegationRefusalSubReason::SignerUnreached)
@@ -5953,6 +5954,16 @@ async fn verify_self_at_login_delegation(
 /// other delegation writers may use a string. Handle both shapes — a
 /// non-`self_at_login` writer that emits a single string scope
 /// matches when the string equals `wanted`.
+///
+/// v7.0.0 (CIRISEdge#194): no longer used by
+/// `verify_self_at_login_delegation` (collapsed onto persist v10.0.0's
+/// [`reachable_under_scope_with_reasons`]). Retained as `pub(crate)`
+/// for its test coverage of the JSON-array vs string scope-shape
+/// dispatch — a regression here would silently re-break the gate
+/// against future delegation writers.
+///
+/// [`reachable_under_scope_with_reasons`]: ciris_persist::federation::admission::reachable_under_scope_with_reasons
+#[allow(dead_code)]
 fn envelope_scope_contains(envelope: &serde_json::Value, wanted: &str) -> bool {
     match envelope.get("scope") {
         Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(wanted)),
@@ -6169,12 +6180,14 @@ mod delegation_gate_tests {
     // and the signing key collapse to the same identity without
     // threading a signer through every fixture call.
     //
-    // Canonicalizer: persist's `ceg_produce_canonicalize` is
-    // `ciris_verify_core::jcs::canonicalize` wrapped under the V2Jcs
-    // `produce_canon_version()` gate (RFC 8785). Edge has a direct
-    // dep on `ciris-verify-core`, so we call the same function and
-    // produce byte-identical canonical bytes — no upstream surface
-    // expansion needed.
+    // Canonicalizer: persist v10.0.0 (#273) re-exports
+    // `ceg_produce_canonicalize` from its prelude — same RFC 8785 JCS
+    // bytes the federation-tier ingest gate verifies against, but
+    // routed through persist's V2Jcs `produce_canon_version()` gate so
+    // a future canon flip lands without touching this fixture surface.
+    // This replaces the v6.3.2 direct `ciris_verify_core::jcs::canonicalize`
+    // call, fixing the layering inversion where fixtures reached past
+    // persist to a sibling crate.
 
     /// Deterministic 32-byte seed for `key_id` — the first ≤32 bytes
     /// of the key_id over a `0x11` fill. Same shape persist uses for
@@ -6214,11 +6227,14 @@ mod delegation_gate_tests {
         let ed = Ed25519Signer::from_seed(&seed_for(signing_key_id)).expect("ed seed");
         let mldsa =
             Box::new(MlDsa65Signer::from_seed(&seed_for(signing_key_id)).expect("mldsa seed"));
-        // Same canonicalizer persist's ceg_produce_canonicalize wraps
-        // (V2Jcs gate → RFC 8785). Edge depends on ciris-verify-core
-        // directly so we hit the SAME bytes without persist exposing
-        // the helper.
-        let canonical = ciris_verify_core::jcs::canonicalize(envelope).expect("jcs canonicalize");
+        // v7.0.0 (CIRISEdge#194): persist v10.0.0 re-exports
+        // `ceg_produce_canonicalize` from its prelude (#273), so the
+        // fixture layering inverts back: edge calls into persist for
+        // canonicalization rather than reaching past persist to
+        // `ciris-verify-core`. Byte-identical output — both sides route
+        // through `V2Jcs::canonicalize_value` (RFC 8785 JCS).
+        let canonical =
+            ciris_persist::prelude::ceg_produce_canonicalize(envelope).expect("ceg canonicalize");
         let original_content_hash = hex::encode(Sha256::digest(&canonical));
         let ed_sig = ed.sign(&canonical).expect("ed sign");
         let mut bound = canonical.clone();
@@ -6534,6 +6550,57 @@ mod delegation_gate_tests {
             4,
         )
         .await;
+        assert_eq!(
+            out,
+            Err(crate::messages::DelegationRefusalSubReason::MissingScope),
+        );
+    }
+
+    // v7.0.0 (CIRISEdge#194): the cross-root precedence the
+    // verdict-routing fold uses (`MissingScope > RetractedAtRoot >
+    // SubstrateUnavailable > SignerUnreached`). Two trusted roots:
+    // one delegates the wrong scope (→ persist returns `MissingScope`
+    // verdict), one retracts (→ persist returns `RetractedAtRoot`).
+    // The fold must surface `MissingScope` — the most informative
+    // signal across the union.
+    #[tokio::test]
+    async fn multi_root_fold_prefers_missing_scope_over_retracted() {
+        let backend = Arc::new(MemoryBackend::new());
+        seed_keys(
+            &backend,
+            &[
+                ("user-root-A", identity_type::USER),
+                ("user-root-B", identity_type::USER),
+                ("agent", identity_type::AGENT),
+            ],
+        )
+        .await;
+        // Root A: delegate wrong-scope only — persist sees a
+        // present-but-unscoped edge → `MissingScope` verdict.
+        seed_attestation(
+            &backend,
+            delegates_to_row("user-root-A", "agent", &[SCOPE_NETWORK_PRESENCE]),
+        )
+        .await;
+        // Root B: delegate the right scope, then retract — persist
+        // sees a scope-bearing-but-retracted edge → `RetractedAtRoot`.
+        seed_attestation(
+            &backend,
+            delegates_to_row("user-root-B", "agent", &super::SELF_AT_LOGIN_SCOPE_TOKENS),
+        )
+        .await;
+        seed_attestation(&backend, withdraws_row("user-root-B", "agent")).await;
+        let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
+        let out = verify_self_at_login_delegation(
+            "agent",
+            &dir,
+            &["user-root-A".into(), "user-root-B".into()],
+            SCOPE_MESSAGE_IO,
+            4,
+        )
+        .await;
+        // Most-specific-wins precedence picks MissingScope (it carries
+        // strictly more information than RetractedAtRoot).
         assert_eq!(
             out,
             Err(crate::messages::DelegationRefusalSubReason::MissingScope),

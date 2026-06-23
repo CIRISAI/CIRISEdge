@@ -287,12 +287,13 @@ fn multi_content_ordering_evicts_least_diverse_first() {
 
 use async_trait::async_trait;
 use ciris_edge::swarm::{
-    FountainEvictHardDelete, FountainHoldingsSource, FountainSwarmRuntime, FountainTierEvict,
-    NoopFountainHoldingsSource, SwarmRuntimeConfig,
+    FountainHoldingsSource, FountainSwarmRuntime, NoopFountainHoldingsSource, SwarmRuntimeConfig,
 };
 use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
+use ciris_persist::federation::FederationDirectory;
+use ciris_persist::store::MemoryBackend;
 
 #[derive(Default)]
 struct RecordingTransport {
@@ -322,32 +323,6 @@ impl Transport for RecordingTransport {
     }
 }
 
-#[derive(Default)]
-struct NopTier;
-#[async_trait]
-impl FountainTierEvict for NopTier {
-    async fn evict_fountain_content_to_tier(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-    ) -> Result<(), ciris_edge::swarm::FountainEvictError> {
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct NopHard;
-impl FountainEvictHardDelete for NopHard {
-    fn evict_fountain_content_hard_delete(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> Result<(), ciris_edge::swarm::FountainEvictError> {
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn runtime_round_trip_with_published_claim_via_register_observed_claim() {
     // This is the same shape as the v5.2.0 e2e test, retained as a
@@ -355,10 +330,14 @@ async fn runtime_round_trip_with_published_claim_via_register_observed_claim() {
     // hook the new wire-route calls into; if the route works at the
     // dispatch layer (covered by unit tests), this end-to-end driver
     // confirms the runtime still composes after the v6.3.0 changes.
+    //
+    // v7.0.0 (CIRISEdge#194): persist v10.0.0 promoted the evict
+    // surfaces to `FederationDirectory`; the runtime now takes a
+    // single `Arc<dyn FederationDirectory>` for both. `MemoryBackend`
+    // is the in-tree directory test stand-in.
     let alice_holdings: Arc<dyn FountainHoldingsSource> = Arc::new(NoopFountainHoldingsSource);
     let alice_tx = Arc::new(RecordingTransport::default());
-    let alice_tier: Arc<dyn FountainTierEvict> = Arc::new(NopTier);
-    let alice_hard: Arc<dyn FountainEvictHardDelete + Send + Sync> = Arc::new(NopHard);
+    let alice_directory: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
     let alice_cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
     let rt = FountainSwarmRuntime::start(
         SwarmRuntimeConfig {
@@ -367,8 +346,7 @@ async fn runtime_round_trip_with_published_claim_via_register_observed_claim() {
             ..Default::default()
         },
         alice_holdings,
-        alice_tier,
-        alice_hard,
+        alice_directory,
         alice_tx as Arc<dyn Transport>,
         alice_cohort,
         "alice".to_string(),

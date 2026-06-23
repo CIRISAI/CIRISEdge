@@ -1,4 +1,5 @@
-//! §3.3 announce-suppression policy (CIRISEdge#175, v6.1.0).
+//! §3.3 announce-suppression policy (CIRISEdge#175, v6.1.0;
+//! Leviculum v0.7.0 `AnnounceControl` adoption v7.0.0 CIRISEdge#195).
 //!
 //! Per CEWP `SCOPE_PRIVACY.md` §3.3:
 //!
@@ -8,56 +9,37 @@
 //! > Leviculum extension.
 //!
 //! This module owns the **edge-side decision** "should this
-//! destination be announced mesh-wide?". The Leviculum upstream
-//! exposes per-destination announce control via a future
-//! extension surface; until that lands, edge guards every
-//! announce emission at the boundary so even a Leviculum without
-//! per-destination control honors the §3.3 suppression contract.
+//! destination be announced mesh-wide?". v7.0.0 (CIRISEdge#195) lands
+//! the upstream half: Leviculum v0.7.0 ships an `AnnounceControl`
+//! trait on `NodeCore` that consults a caller-supplied policy on every
+//! scheduled announce; the policy here installs onto the leviculum
+//! node via `NodeCore::set_announce_control`.
 //!
 //! # Decision rule
 //!
-//! [`should_suppress_announce`] returns `true` for destinations whose
-//! [`CohortScope`] is anything other than [`CohortScope::Public`].
-//! `SelfOnly`, `Family`, and `Cohort` destinations are group-scoped
-//! per the FSD §2.1 lattice and MUST NOT be announced mesh-wide;
-//! only `Public` (federation Commons) destinations announce.
+//! Suppress every destination whose [`CohortScope`] resolves to
+//! anything other than `CryptoTier::Plaintext` (i.e.
+//! [`ciris_persist::federation::types::cohort_scope::CryptoTier`])
+//! — i.e. group-scoped destinations (`SelfOnly`, `Family`, `Cohort`)
+//! whose announce would leak a membership delta. Commons-tier scopes
+//! (`Public` → federation/species/biosphere) announce normally.
 //!
-//! # Upstream gap (documented for v6.2.0 / Leviculum-next)
-//!
-//! The Leviculum repo (`~/Leviculum`, vendored as `reticulum-core` /
-//! `reticulum-std` via `CIRISAI/leviculum` fork at SHA
-//! `6b005e9d85874d4db025c090626c29b966d94e9e` in this cut's
-//! `Cargo.lock`) does NOT yet expose per-destination announce
-//! control. The current surface
-//! ([`reticulum_core::traits`]) tracks `announce_rate_table` +
-//! `get_announce` / `set_announce` keyed on destination hash, but
-//! has no "suppress-this-destination" opt-in. The recommended
-//! upstream extension shape:
-//!
-//! ```rust,ignore
-//! pub trait AnnounceControl {
-//!     /// Mark a destination hash as announce-suppressed —
-//!     /// Leviculum's announce dispatcher SKIPS announce emission
-//!     /// for marked destinations even when the periodic-announce
-//!     /// timer fires.
-//!     fn suppress_announce(&self, dest_hash: &[u8; 16]);
-//!     /// Unmark a destination hash.
-//!     fn unsuppress_announce(&self, dest_hash: &[u8; 16]);
-//!     /// Query.
-//!     fn is_announce_suppressed(&self, dest_hash: &[u8; 16]) -> bool;
-//! }
-//! ```
-//!
-//! The edge-side [`AnnounceSuppressionRegistry`] below mirrors this
-//! shape so the upstream patch is a one-line `impl AnnounceControl`
-//! delegation when it lands.
+//! The mapping `DestinationHash → CohortScope` is operator state: the
+//! [`ScopePrivacyAnnouncePolicy`] keeps an in-memory table populated
+//! as scoped destinations are created (the same table the explicit-
+//! hash routable destinations register against). Lookups are O(1) hash
+//! map probes — small enough to honor leviculum's "synchronous, must
+//! not block" contract on `should_suppress_announce`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use crate::cohort_scope::CohortScope;
+
+#[cfg(feature = "_reticulum-module")]
+use reticulum_core::{AnnounceControl, DestinationHash};
 
 /// FSD §3.3 announce-suppression decision rule. Returns `true` iff
 /// the destination's [`CohortScope`] is anything other than
@@ -75,9 +57,16 @@ pub fn should_suppress_announce(scope: &CohortScope) -> bool {
 /// Clone-cheap (`Arc<RwLock<HashSet>>` inner). Multiple Edge
 /// surfaces (announce-emission gate, scope-policy admin) share one
 /// registry.
+///
+/// v7.0.0 (CIRISEdge#195): retained as the legacy in-process side-
+/// table. Production should construct a [`ScopePrivacyAnnouncePolicy`]
+/// and install it on the leviculum node via
+/// `NodeCore::set_announce_control(...)` — the policy below carries
+/// the load-bearing scope→tier dispatch the upstream contract
+/// needs.
 #[derive(Default, Clone)]
 pub struct AnnounceSuppressionRegistry {
-    inner: Arc<RwLock<HashSet<[u8; 16]>>>,
+    inner: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
 }
 
 impl AnnounceSuppressionRegistry {
@@ -117,6 +106,114 @@ impl AnnounceSuppressionRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
+    }
+}
+
+/// v7.0.0 (CIRISEdge#195) — installs onto a Leviculum v0.7.0
+/// `NodeCore` via `NodeCore::set_announce_control(...)` and gates
+/// every scheduled announce on the destination's
+/// [`CohortScope`]-derived [`CryptoTier`]:
+///
+/// - [`CryptoTier::InvisibleEncrypted`] (`self` / `family`) → suppress
+/// - [`CryptoTier::CommunityDek`] (`community` / `affiliations`) → suppress
+/// - [`CryptoTier::Plaintext`] (Commons, infrastructure communities,
+///   unrecognized scopes) → allow
+///
+/// The mapping `DestinationHash → CohortScope` is operator state.
+/// Production wires it through [`Self::register_destination_scope`] as
+/// edge admits each scoped destination (the same scope it stamps onto
+/// the destination's outbound envelopes).
+///
+/// **Explicit-hash interop guard**: an explicit-hash destination
+/// (`Destination::with_explicit_hash`) is wire-incompatible with
+/// Python-RNS announces — leviculum returns
+/// `AnnounceError::ExplicitHashCannotAnnounce` if it ever tries to
+/// announce one. Edge's scope-privacy destinations are constructed
+/// explicit-hash, so they MUST be registered here (Commons-scope or
+/// otherwise) before the leviculum node would otherwise try to
+/// announce them. The default-suppress posture below makes the
+/// safest call: unknown destination hashes are suppressed, matching
+/// the "never try to announce an explicit hash" contract.
+///
+/// [`CryptoTier`]: ciris_persist::federation::types::cohort_scope::CryptoTier
+/// [`CryptoTier::InvisibleEncrypted`]: ciris_persist::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted
+/// [`CryptoTier::CommunityDek`]: ciris_persist::federation::types::cohort_scope::CryptoTier::CommunityDek
+/// [`CryptoTier::Plaintext`]: ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext
+#[derive(Default, Clone)]
+pub struct ScopePrivacyAnnouncePolicy {
+    /// `dest_hash → cohort scope` table. Unknown hashes fall through
+    /// to default-suppress: scope-privacy destinations MUST register
+    /// here, and a missing registration is safer-than-leak.
+    scopes: Arc<RwLock<HashMap<[u8; 16], CohortScope>>>,
+}
+
+impl ScopePrivacyAnnouncePolicy {
+    /// Construct an empty policy. Production wires
+    /// [`Self::register_destination_scope`] for each scoped
+    /// destination edge admits.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the cohort scope of `dest_hash`. The policy's
+    /// `should_suppress_announce` will subsequently dispatch on this
+    /// scope. Repeated registrations overwrite the prior scope.
+    pub fn register_destination_scope(&self, dest_hash: [u8; 16], scope: CohortScope) {
+        self.scopes.write().insert(dest_hash, scope);
+    }
+
+    /// Forget `dest_hash`. Subsequent lookups fall through to
+    /// default-suppress. Idempotent.
+    pub fn forget(&self, dest_hash: &[u8; 16]) {
+        self.scopes.write().remove(dest_hash);
+    }
+
+    /// Suppress-decision for `dest_hash`. Surface for direct testing
+    /// without a Leviculum `NodeCore` involved.
+    ///
+    /// # Decision
+    ///
+    /// - Registered + Commons-scope (`Public`) → `false` (allow).
+    /// - Registered + group-scope (`SelfOnly` / `Family` / `Cohort`)
+    ///   → `true` (suppress).
+    /// - Unregistered → `true` (default-suppress: safer-than-leak;
+    ///   explicit-hash destinations cannot be announced anyway).
+    #[must_use]
+    pub fn decide(&self, dest_hash: &[u8; 16]) -> bool {
+        match self.scopes.read().get(dest_hash) {
+            Some(scope) => {
+                use ciris_persist::federation::types::cohort_scope::CryptoTier;
+                matches!(
+                    scope.crypto_tier(),
+                    CryptoTier::InvisibleEncrypted | CryptoTier::CommunityDek
+                )
+            }
+            None => true,
+        }
+    }
+
+    /// Count of registered scopes. Test/operator surface.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.scopes.read().len()
+    }
+
+    /// `true` iff no scopes are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.scopes.read().is_empty()
+    }
+}
+
+// v7.0.0 (CIRISEdge#195) — Leviculum `AnnounceControl` adoption. The
+// impl is gated on the `_reticulum-module` feature so this module's
+// trait + decision surface is usable from features that don't pull
+// in leviculum (e.g. unit tests for the dispatch logic).
+#[cfg(feature = "_reticulum-module")]
+impl AnnounceControl for ScopePrivacyAnnouncePolicy {
+    fn should_suppress_announce(&self, destination_hash: &DestinationHash) -> bool {
+        self.decide(destination_hash.as_bytes())
     }
 }
 
@@ -162,5 +259,87 @@ mod tests {
         for i in 0..5u8 {
             assert!(r.is_suppressed(&[i; 16]));
         }
+    }
+
+    // ─── ScopePrivacyAnnouncePolicy ─────────────────────────────────
+
+    #[test]
+    fn scope_privacy_policy_allows_commons_tier() {
+        let p = ScopePrivacyAnnouncePolicy::new();
+        let h = [0x11u8; 16];
+        p.register_destination_scope(h, CohortScope::Public);
+        assert!(
+            !p.decide(&h),
+            "Commons (Public/federation) destinations must announce"
+        );
+    }
+
+    #[test]
+    fn scope_privacy_policy_suppresses_invisible_encrypted_tier() {
+        let p = ScopePrivacyAnnouncePolicy::new();
+        let h_self = [0x22u8; 16];
+        let h_family = [0x33u8; 16];
+        p.register_destination_scope(h_self, CohortScope::SelfOnly);
+        p.register_destination_scope(h_family, CohortScope::Family);
+        assert!(
+            p.decide(&h_self),
+            "SelfOnly → InvisibleEncrypted → suppress",
+        );
+        assert!(
+            p.decide(&h_family),
+            "Family → InvisibleEncrypted → suppress",
+        );
+    }
+
+    #[test]
+    fn scope_privacy_policy_suppresses_community_dek_tier() {
+        let p = ScopePrivacyAnnouncePolicy::new();
+        let h_cohort = [0x44u8; 16];
+        p.register_destination_scope(
+            h_cohort,
+            CohortScope::Cohort {
+                cohort_id: "alpha".into(),
+            },
+        );
+        assert!(p.decide(&h_cohort), "Cohort → CommunityDek → suppress");
+    }
+
+    #[test]
+    fn scope_privacy_policy_unregistered_defaults_to_suppress() {
+        // Default-suppress posture: an unregistered hash is safer-
+        // than-leak. Edge MUST register every scope-privacy
+        // destination before announce time; the policy refuses to
+        // announce anything it doesn't recognize.
+        let p = ScopePrivacyAnnouncePolicy::new();
+        let h_unknown = [0x77u8; 16];
+        assert!(
+            p.decide(&h_unknown),
+            "unregistered hash must default-suppress (explicit-hash destinations cannot be announced)",
+        );
+    }
+
+    #[test]
+    fn scope_privacy_policy_forget_clears_registration() {
+        let p = ScopePrivacyAnnouncePolicy::new();
+        let h = [0x55u8; 16];
+        p.register_destination_scope(h, CohortScope::Public);
+        assert!(!p.decide(&h), "Commons allowed before forget");
+        p.forget(&h);
+        assert!(
+            p.decide(&h),
+            "forgotten hash falls back to default-suppress",
+        );
+    }
+
+    #[test]
+    fn scope_privacy_policy_overwrite_replaces_scope() {
+        let p = ScopePrivacyAnnouncePolicy::new();
+        let h = [0x66u8; 16];
+        p.register_destination_scope(h, CohortScope::Public);
+        assert!(!p.decide(&h));
+        // Operator re-classifies the destination as group-scoped.
+        p.register_destination_scope(h, CohortScope::SelfOnly);
+        assert!(p.decide(&h), "re-registration must promote suppression");
+        assert_eq!(p.len(), 1);
     }
 }
