@@ -3755,8 +3755,48 @@ pub fn init_edge_runtime(
     // `Edge::builder().signer(...)` — `Edge::send_durable` and the
     // inbound dispatch ACK path use it for hybrid hardware-rooted
     // signatures.
+    //
+    // v7.0.6 (CIRISEdge#203 / CIRISPersist#247+#275) — the `LocalSigner`
+    // is keyed by the **derived federation key_id**
+    // (`derive_key_id(<keystore alias>, <32-byte Ed25519 pubkey>)`), NOT
+    // the bare keyring alias. Persist's hardened `register_self_federation_key`
+    // writes the `federation_keys` row under this derived id; every
+    // downstream `sender_key_id` FK target (`enqueue_outbound`,
+    // `put_blob_signing` scrub, withdraws) resolves against it. Edge
+    // computes the same value here so its scrub envelopes' `signing_key_id`
+    // is byte-equal to the registered row — closes the `enqueue_outbound:
+    // FOREIGN KEY constraint failed` regression that v7.0.5 hit on the
+    // persist v10.1.1 floor.
+    let derived_signer_key_id: String = py.detach(|| {
+        runtime.block_on(async {
+            let pubkey = signer_handle.signer.public_key().await.map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "init_edge_runtime: federation pubkey read for derive_key_id failed: {e}"
+                ))
+            })?;
+            if pubkey.len() != 32 {
+                return Err(PyRuntimeError::new_err(format!(
+                    "init_edge_runtime: federation pubkey is {} bytes, not Ed25519's 32 — \
+                     hardware-HSM-only keyring is unsupported for the cohabitation init \
+                     surface; use a software Ed25519 local_key_path on the Engine",
+                    pubkey.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&pubkey);
+            Ok::<_, PyErr>(ciris_verify_core::fedcode::derive_key_id(
+                &signer_handle.key_id,
+                &arr,
+            ))
+        })
+    })?;
+    tracing::debug!(
+        keystore_alias = %signer_handle.key_id,
+        derived_key_id = %derived_signer_key_id,
+        "init_edge_runtime: federation key_id derived (alias → derived)",
+    );
     let signer = Arc::new(LocalSigner::new(
-        signer_handle.key_id.clone(),
+        derived_signer_key_id.clone(),
         signer_handle.signer.clone(),
         signer_handle.pqc_signer.clone(),
     ));
@@ -3817,8 +3857,12 @@ pub fn init_edge_runtime(
             let adapter: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
                 ciris_persist::signing::LocalSignerHardwareAdapter::new(local_signer_arc),
             );
+            // v7.0.6 (CIRISEdge#203) — Reticulum identity signer also stamps
+            // the **derived** federation key_id, so its admission attestations
+            // FK-resolve against the same `federation_keys` row the hot-path
+            // signer's scrub envelopes target.
             Arc::new(LocalSigner::new(
-                signer_handle.key_id.clone(),
+                derived_signer_key_id.clone(),
                 adapter,
                 None,
             ))
@@ -6998,13 +7042,30 @@ mod pyo3_tier2_tests {
         match outcome {
             Ok(key_id) => {
                 // Happy path — the host's platform signer returned an
-                // Ed25519 key (software-fallback path). Verify the
-                // signer_key_id round-trip.
-                assert_eq!(
-                    key_id,
-                    signer_key_id.as_str(),
-                    "init_edge_runtime via capsule must return a PyEdge whose \
-                     signer_key_id matches the engine's signing identity"
+                // Ed25519 key (software-fallback path). v7.0.6
+                // (CIRISEdge#203) — edge's `signer_key_id` is now the
+                // **derived** federation key_id
+                // (`derive_key_id(<alias>, <pubkey>)` =
+                // `"<sanitized-alias>-<fingerprint>"`), not the bare
+                // alias. The derived form starts with the sanitized
+                // alias as prefix (FSD-003 invariant — see
+                // `ciris_verify_core::fedcode::derive_key_id`'s docstring),
+                // so we assert prefix-equality + that the derived suffix
+                // is present.
+                let sanitized_alias_prefix = signer_key_id
+                    .chars()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect::<String>();
+                assert!(
+                    key_id.starts_with(&format!("{sanitized_alias_prefix}-")),
+                    "edge.signer_key_id ({key_id:?}) must be the derived federation key_id \
+                     (`<alias>-<fingerprint>`) with the keystore alias ({signer_key_id:?}) as \
+                     prefix — v7.0.6 (CIRISEdge#203 / CIRISPersist#247+#275)"
+                );
+                assert!(
+                    key_id.len() > sanitized_alias_prefix.len() + 1,
+                    "derived key_id must carry a fingerprint suffix past the alias prefix \
+                     (got {key_id:?})"
                 );
             }
             Err(e) => {
@@ -7505,12 +7566,25 @@ mod pyo3_tier2_tests {
                 // signing identity), NOT the Reticulum-transport
                 // identity — that's a separate dual-key identity loaded
                 // from `identity_path`.
-                assert_eq!(
-                    key_id,
-                    signer_key_id.as_str(),
-                    "signer_key_id must round-trip the engine's signing identity \
-                     (the keyring/envelope identity, not the Reticulum transport \
-                     identity)"
+                //
+                // v7.0.6 (CIRISEdge#203) — signer_key_id is now the
+                // **derived** federation key_id, prefixed by the
+                // sanitized alias. See the docstring on
+                // `ciris_verify_core::fedcode::derive_key_id`.
+                let sanitized_alias_prefix = signer_key_id
+                    .chars()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect::<String>();
+                assert!(
+                    key_id.starts_with(&format!("{sanitized_alias_prefix}-")),
+                    "signer_key_id ({key_id:?}) must be the derived federation key_id \
+                     with the keystore alias ({signer_key_id:?}) as prefix — \
+                     v7.0.6 (CIRISEdge#203)"
+                );
+                assert!(
+                    key_id.len() > sanitized_alias_prefix.len() + 1,
+                    "derived key_id must carry a fingerprint suffix past the alias prefix \
+                     (got {key_id:?})"
                 );
             }
             Err(e) => {
@@ -7644,11 +7718,23 @@ mod pyo3_tier2_tests {
                 // built. The fallback warning was logged via tracing
                 // (not asserted here — would need a tracing-subscriber
                 // capture fixture for that).
-                assert_eq!(
-                    key_id,
-                    signer_key_id.as_str(),
-                    "fallback path must still round-trip signer_key_id when the \
-                     keyring signer yields a 32-byte Ed25519 pubkey"
+                //
+                // v7.0.6 (CIRISEdge#203) — signer_key_id is the
+                // **derived** federation key_id (alias prefix +
+                // fingerprint suffix).
+                let sanitized_alias_prefix = signer_key_id
+                    .chars()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect::<String>();
+                assert!(
+                    key_id.starts_with(&format!("{sanitized_alias_prefix}-")),
+                    "fallback path's signer_key_id ({key_id:?}) must be the derived \
+                     federation key_id with the keystore alias ({signer_key_id:?}) as \
+                     prefix — v7.0.6 (CIRISEdge#203)"
+                );
+                assert!(
+                    key_id.len() > sanitized_alias_prefix.len() + 1,
+                    "derived key_id must carry a fingerprint suffix (got {key_id:?})"
                 );
             }
             Err(e) => {
