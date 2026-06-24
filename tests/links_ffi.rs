@@ -38,7 +38,7 @@ use ciris_edge::transport::{InboundFrame, Transport, TransportError};
 use ciris_edge::verify::RootingDirectory;
 use tokio::sync::mpsc;
 
-use common::{directory_with, signed_record, TestFedKey};
+use common::{directory_with, prime_v7_peer_pair, signed_record, TestFedKey};
 
 /// Pick an ephemeral loopback TCP port.
 fn free_port() -> u16 {
@@ -143,20 +143,31 @@ async fn paired_transports(
     let (tx_a, rx_a) = mpsc::channel::<InboundFrame>(16);
     let (tx_b, _rx_b) = mpsc::channel::<InboundFrame>(16);
 
+    // v7.0.0 (CIRISEdge#191 / #195) — explicit-hash destinations
+    // cannot announce, so the announce-based rooting path the v6.x
+    // loopback tests relied on is wedged by design. Pre-install the
+    // `(dest_hash, transport-tier ed25519)` binding both directions —
+    // this is the test-only analogue of the v6.0.0 directory-cache
+    // anti-entropy path (CIRISEdge#175) production uses.
+    prime_v7_peer_pair(
+        &transport_a,
+        "edge-link-aaaa",
+        &transport_b,
+        "edge-link-bbbb",
+    )
+    .await;
+
     let la = transport_a.clone();
     let lb = transport_b.clone();
     let listen_a = tokio::spawn(async move { la.listen(tx_a).await });
     let listen_b = tokio::spawn(async move { lb.listen(tx_b).await });
 
-    // Wait until B has rooted A.
-    let discovered = wait_for(Duration::from_secs(30), || {
-        let t = transport_b.clone();
-        async move { t.knows_peer("edge-link-aaaa").await }
-    })
-    .await;
+    // Sanity: post-prime, B knows A (and A knows B). No await on the
+    // announce mechanism — explicit-hash destinations can't announce.
+    let discovered = transport_b.knows_peer("edge-link-aaaa").await;
     assert!(
         discovered,
-        "node B did not root node A within 30s — Reticulum loopback discovery wedged"
+        "post-prime `knows_peer` must be true — v7.0.0 explicit-hash discovery is out-of-band",
     );
 
     (
@@ -170,6 +181,7 @@ async fn paired_transports(
     )
 }
 
+#[allow(dead_code)]
 async fn wait_for<F, Fut>(timeout: Duration, mut cond: F) -> bool
 where
     F: FnMut() -> Fut,

@@ -114,3 +114,35 @@ pub async fn directory_with(records: Vec<KeyRecord>) -> Arc<SqliteBackend> {
     }
     backend
 }
+
+/// v7.0.0 (CIRISEdge#191 / #195) — cross-install each transport's
+/// `(dest_hash, transport-tier ed25519)` binding into the OTHER
+/// transport's rooted-peer map, bypassing the announce path that
+/// explicit-hash addressing forbids.
+///
+/// Production peers learn this binding via the v6.0.0 directory-cache
+/// anti-entropy path (CIRISEdge#175); this helper is the test-only
+/// analogue. After this call, each transport's `knows_peer(<peer>)`
+/// returns true and `link_open(peer_dest_hash, ..)` finds the entry —
+/// the same observable state the legacy announce-rooting produced
+/// before v7.0.0 broke the announce.
+#[cfg(feature = "transport-reticulum")]
+pub async fn prime_v7_peer_pair(
+    transport_a: &ciris_edge::transport::reticulum::ReticulumTransport,
+    key_id_a: &str,
+    transport_b: &ciris_edge::transport::reticulum::ReticulumTransport,
+    key_id_b: &str,
+) {
+    let a_dest = transport_a.local_dest_hash();
+    let b_dest = transport_b.local_dest_hash();
+    let mut a_ed = [0u8; 32];
+    a_ed.copy_from_slice(&transport_a.local_transport_pubkey()[32..64]);
+    let mut b_ed = [0u8; 32];
+    b_ed.copy_from_slice(&transport_b.local_transport_pubkey()[32..64]);
+    transport_b
+        .inject_rooted_peer_for_test(key_id_a, a_dest, a_ed)
+        .await;
+    transport_a
+        .inject_rooted_peer_for_test(key_id_b, b_dest, b_ed)
+        .await;
+}

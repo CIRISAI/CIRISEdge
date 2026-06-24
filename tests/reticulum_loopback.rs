@@ -36,7 +36,7 @@ use ciris_edge::verify::RootingDirectory;
 use serde_json::value::RawValue;
 use tokio::sync::mpsc;
 
-use common::{directory_with, signed_record, TestFedKey};
+use common::{directory_with, prime_v7_peer_pair, signed_record, TestFedKey};
 
 /// Build a representative signed-shaped envelope. The signatures here
 /// are placeholder strings — the loopback test exercises *transport*
@@ -161,6 +161,14 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
             .expect("build transport B"),
     );
 
+    // v7.0.0 (CIRISEdge#191 / #195) — explicit-hash destinations cannot
+    // announce, so the announce-based rooting path the v6.x loopback
+    // tests relied on is wedged by design. Pre-install the
+    // `(dest_hash, transport-tier ed25519)` binding both directions —
+    // production peers learn the same binding via the v6.0.0 directory-
+    // cache anti-entropy path (CIRISEdge#175).
+    prime_v7_peer_pair(&transport_a, "edge-key-aaaa", &transport_b, "edge-key-bbbb").await;
+
     // Drive both listeners. A's sink is what we assert on.
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(16);
     let (tx_b, _rx_b) = mpsc::channel::<InboundFrame>(16);
@@ -170,17 +178,11 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     let listen_a = tokio::spawn(async move { la.listen(tx_a).await });
     let listen_b = tokio::spawn(async move { lb.listen(tx_b).await });
 
-    // Wait for B to ROOT A's announce attestation — `knows_peer`
-    // returns true only once the cold-start path (root_binding +
-    // attestation verify + hybrid policy) has accepted the binding.
-    let discovered = wait_for(Duration::from_secs(30), || {
-        let t = transport_b.clone();
-        async move { t.knows_peer("edge-key-aaaa").await }
-    })
-    .await;
+    // Post-prime sanity — no await on the announce mechanism.
+    let discovered = transport_b.knows_peer("edge-key-aaaa").await;
     assert!(
         discovered,
-        "node B did not root node A's announce attestation within 30s",
+        "post-prime `knows_peer` must be true — v7.0.0 explicit-hash discovery is out-of-band",
     );
 
     // Round-trip one envelope B → A.
@@ -227,6 +229,7 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
 }
 
 /// Poll `cond` until it returns `true` or `timeout` elapses.
+#[allow(dead_code)]
 async fn wait_for<F, Fut>(timeout: Duration, mut cond: F) -> bool
 where
     F: FnMut() -> Fut,
