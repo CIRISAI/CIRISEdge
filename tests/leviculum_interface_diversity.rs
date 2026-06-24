@@ -35,18 +35,42 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ciris_edge::identity::LocalSigner;
+use ciris_edge::transport::reticulum::UdpInterfaceConfig;
 use ciris_edge::transport::reticulum::{
-    AutoInterfaceConfig, LocalInterfaceConfig, ReticulumInterfaceConfig, ReticulumTransportConfig,
-    TcpClientInterfaceConfig, TcpServerInterfaceConfig, TransportSpec, TransportStats,
-    UdpInterfaceConfig,
+    AutoInterfaceConfig, LocalInterfaceConfig, ReticulumAuth, ReticulumInterfaceConfig,
+    ReticulumTransportConfig, TcpClientInterfaceConfig, TcpServerInterfaceConfig, TransportSpec,
+    TransportStats,
 };
+use ciris_keyring::Ed25519SoftwareSigner;
 use tempfile::TempDir;
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
 fn tmp_identity_path(dir: &TempDir, name: &str) -> PathBuf {
     dir.path().join(format!("{name}.id"))
+}
+
+/// v7.0.0 (CIRISEdge#194/#195) — interface-diversity tests must supply a
+/// `LocalSigner` because the IP transport now derives its
+/// explicit-hash destination from the federation Ed25519 pubkey.
+/// Deterministic per-`key_id` 0x11-fill + ASCII-overlay seed (mirrors
+/// the persist `test_support` shape) so concurrent tests don't
+/// collide.
+fn test_auth(key_id: &str) -> ReticulumAuth {
+    let mut seed = [0x11u8; 32];
+    for (i, b) in key_id.bytes().take(32).enumerate() {
+        seed[i] = b;
+    }
+    let mut sw = Ed25519SoftwareSigner::new(key_id);
+    sw.import_key(&seed).expect("import test seed");
+    let signer = Arc::new(LocalSigner::new(key_id.to_string(), Arc::new(sw), None));
+    ReticulumAuth {
+        signer: Some(signer),
+        ..ReticulumAuth::default()
+    }
 }
 
 fn loopback_addr(port: u16) -> SocketAddr {
@@ -202,7 +226,7 @@ fn transport_stats_minimal_constructor() {
 /// test class" acceptance item.
 #[tokio::test]
 async fn tcp_server_and_tcp_client_typed_round_trip() {
-    use ciris_edge::transport::reticulum::{ReticulumAuth, ReticulumTransport};
+    use ciris_edge::transport::reticulum::ReticulumTransport;
 
     let tmp = TempDir::new().expect("tempdir");
     // Pick non-conflicting high-port pair. The test transports
@@ -216,7 +240,7 @@ async fn tcp_server_and_tcp_client_typed_round_trip() {
                 listen_addr: server_addr,
             },
         ));
-    let server = ReticulumTransport::new(server_cfg, ReticulumAuth::default())
+    let server = ReticulumTransport::new(server_cfg, test_auth("interface-diversity-server"))
         .await
         .expect("typed TCP server transport builds");
     let server_specs = server.interface_specs();
@@ -234,7 +258,7 @@ async fn tcp_server_and_tcp_client_typed_round_trip() {
                 target_addr: loopback_addr(1),
             },
         ));
-    let client = ReticulumTransport::new(client_cfg, ReticulumAuth::default())
+    let client = ReticulumTransport::new(client_cfg, test_auth("interface-diversity-client"))
         .await
         .expect("typed TCP client transport builds");
     let client_specs = client.interface_specs();
@@ -267,7 +291,7 @@ async fn tcp_server_and_tcp_client_typed_round_trip() {
 /// machine test rig also works).
 #[tokio::test]
 async fn gateway_peer_registers_multiple_interface_kinds() {
-    use ciris_edge::transport::reticulum::{ReticulumAuth, ReticulumTransport};
+    use ciris_edge::transport::reticulum::ReticulumTransport;
 
     let tmp = TempDir::new().expect("tempdir");
     let cfg = ReticulumTransportConfig::new(tmp_identity_path(&tmp, "gateway"), "key-gw")
@@ -283,7 +307,7 @@ async fn gateway_peer_registers_multiple_interface_kinds() {
             group_id: Some("test-group-cirisedge-24".to_string()),
             ..AutoInterfaceConfig::default()
         }));
-    let transport = ReticulumTransport::new(cfg, ReticulumAuth::default())
+    let transport = ReticulumTransport::new(cfg, test_auth("interface-diversity-test"))
         .await
         .expect("gateway transport builds with two interface kinds");
 
@@ -311,18 +335,26 @@ async fn gateway_peer_registers_multiple_interface_kinds() {
 /// construction path was used.
 #[tokio::test]
 async fn legacy_no_typed_interfaces_falls_back_to_tcp_server_and_bootstrap_clients() {
-    use ciris_edge::transport::reticulum::{ReticulumAuth, ReticulumTransport};
+    use ciris_edge::transport::reticulum::ReticulumTransport;
 
     let tmp = TempDir::new().expect("tempdir");
+    // v7.0.0: use an OS-assigned port (`:0`) instead of the default
+    // `0.0.0.0:4242`. The legacy fallback's listen port is not
+    // load-bearing for this test (the assertion is about the SHAPE
+    // of registered interfaces — 1 TCP server + N bootstrap clients
+    // — not the port). Pinning :4242 causes collisions on hosts where
+    // a sibling CIRIS process or another concurrent test already holds
+    // it.
     let cfg = ReticulumTransportConfig {
         bootstrap_peers: vec![loopback_addr(1), loopback_addr(2)],
+        listen_addr: loopback_addr(0),
         ..ReticulumTransportConfig::new(tmp_identity_path(&tmp, "legacy"), "key-leg")
     };
     assert!(
         cfg.interfaces.is_empty(),
         "legacy config has no typed interfaces",
     );
-    let transport = ReticulumTransport::new(cfg, ReticulumAuth::default())
+    let transport = ReticulumTransport::new(cfg, test_auth("interface-diversity-test"))
         .await
         .expect("legacy transport builds");
 
@@ -346,7 +378,7 @@ async fn legacy_no_typed_interfaces_falls_back_to_tcp_server_and_bootstrap_clien
 /// `None`.
 #[tokio::test]
 async fn transport_spec_handle_round_trips_through_transport_stats() {
-    use ciris_edge::transport::reticulum::{InterfaceHandle, ReticulumAuth, ReticulumTransport};
+    use ciris_edge::transport::reticulum::{InterfaceHandle, ReticulumTransport};
 
     let tmp = TempDir::new().expect("tempdir");
     let cfg = ReticulumTransportConfig::new(tmp_identity_path(&tmp, "spec"), "key-spec")
@@ -355,7 +387,7 @@ async fn transport_spec_handle_round_trips_through_transport_stats() {
                 listen_addr: loopback_addr(0),
             },
         ));
-    let transport = ReticulumTransport::new(cfg, ReticulumAuth::default())
+    let transport = ReticulumTransport::new(cfg, test_auth("interface-diversity-test"))
         .await
         .expect("transport builds");
 
