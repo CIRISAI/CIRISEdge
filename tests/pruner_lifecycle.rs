@@ -133,16 +133,32 @@ async fn pruner_skips_when_no_blackhole_rules_wired() {
     // `None` from `blackhole_rules_handle`, and the conditional spawn
     // site (`if let Some(rules) = ...`) is by construction skipped.
     //
-    // Build a `ReticulumTransport` with `ReticulumAuth::default()`
-    // (all fields `None`) and assert the accessor returns `None`.
+    // Build a `ReticulumTransport` with `ReticulumAuth::default()` plus a
+    // federation signer (v7.0.0 explicit-hash addressing requires one at
+    // construction — `ReticulumAuth.signer == None` rejects honest at
+    // `ReticulumTransport::new`). Every other auth field stays default,
+    // including `blackhole_rules: None`, which is the surface under test.
+    use ciris_edge::identity::LocalSigner;
     use ciris_edge::transport::reticulum::{
         ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
     };
+    use ciris_keyring::Ed25519SoftwareSigner;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let identity_path = tmp.path().join("test-identity");
     let config = ReticulumTransportConfig::new(identity_path, "test-key".to_string());
-    let auth = ReticulumAuth::default();
+
+    let mut seed = [0x11u8; 32];
+    for (i, b) in "test-key".bytes().take(32).enumerate() {
+        seed[i] = b;
+    }
+    let mut sw = Ed25519SoftwareSigner::new("test-key");
+    sw.import_key(&seed).expect("import test seed");
+    let signer = Arc::new(LocalSigner::new("test-key".to_string(), Arc::new(sw), None));
+    let auth = ReticulumAuth {
+        signer: Some(signer),
+        ..ReticulumAuth::default()
+    };
     let transport = ReticulumTransport::new(config, auth)
         .await
         .expect("build transport");

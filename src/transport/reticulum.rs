@@ -1562,6 +1562,49 @@ impl ReticulumTransport {
             .map(|p| p.dest_hash.into_bytes())
     }
 
+    /// v7.0.0 (CIRISEdge#191 / #195) test seam — install a synthetic
+    /// rooted-peer entry that bypasses the announce-rooting cold-start.
+    ///
+    /// v7.0.0 explicit-hash destinations cannot announce (Leviculum
+    /// guard: `AnnounceError::ExplicitHashCannotAnnounce`), so loopback
+    /// tests that previously waited for B to receive A's announce now
+    /// have no announce to wait for. Production peers learn each
+    /// other's `(dest_hash, transport-tier ed25519)` binding via the
+    /// v6.0.0 directory-cache anti-entropy path (CIRISEdge#175) — this
+    /// accessor is the test-only analogue that pre-installs the same
+    /// binding without depending on that out-of-band path being wired
+    /// up in the test fixture.
+    ///
+    /// `dest_hash` should be the peer's explicit-hash
+    /// (`sha256(fed_pubkey)[..16]`) and `signing_key_ed25519` the
+    /// peer's transport-tier Ed25519 verifying key (the 32 bytes that
+    /// sign link proofs). After this call, `knows_peer(key_id)` returns
+    /// true and `link_open(dest_hash, ..)` finds the entry.
+    #[doc(hidden)]
+    pub async fn inject_rooted_peer_for_test(
+        &self,
+        destination_key_id: &str,
+        dest_hash: [u8; 16],
+        signing_key_ed25519: [u8; 32],
+    ) {
+        let mut peers = self.peers.lock().await;
+        peers.insert(
+            destination_key_id.to_string(),
+            RootedPeer {
+                peer: ResolvedPeer {
+                    dest_hash: DestinationHash::new(dest_hash),
+                    signing_key: signing_key_ed25519,
+                },
+                epoch: 0,
+                chain: ProvenanceChain {
+                    key_id: destination_key_id.to_string(),
+                    chain: Vec::new(),
+                    terminates_at_steward_bootstrap: false,
+                },
+            },
+        );
+    }
+
     // ─── CIRISEdge#32 (v0.14.0) Links FFI surface ───────────────────
     //
     // The Reticulum link lifecycle is normally an internal substrate

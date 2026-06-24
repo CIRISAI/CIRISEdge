@@ -118,14 +118,20 @@ jobs:
           # artifacts; sharing the cache would cause recompile thrash).
           key: ${{ matrix.combo.name }}
       - name: cargo test --features "${{ matrix.combo.features }}"
-        # pyo3-full runs --all-targets to exercise the integration
-        # test suite (transport_http_hardening, reticulum_loopback,
-        # https_per_messagetype_roundtrip, etc.); the transport-lane
-        # entries run --lib only because the integration suites need
-        # the full pyo3 + http stack to link.
+        # pyo3-full runs --tests to exercise the integration test suite
+        # (transport_http_hardening, reticulum_loopback,
+        # https_per_messagetype_roundtrip, etc.) plus all lib tests; the
+        # transport-lane entries run --lib only because the integration
+        # suites need the full pyo3 + http stack to link.
+        #
+        # `--tests` deliberately EXCLUDES benches (criterion's measurement
+        # runs at N=2048 take 10+ minutes per Join/Leave point). Bench
+        # compile-gating is covered by the separate "cargo bench --no-run
+        # (all features)" job; actual perf measurements belong on a
+        # nightly cron, not the per-PR critical path.
         run: |
           if [ "${{ matrix.combo.all_targets }}" = "true" ]; then
-            cargo test --features "${{ matrix.combo.features }}" --all-targets
+            cargo test --features "${{ matrix.combo.features }}" --tests
           else
             cargo test --features "${{ matrix.combo.features }}" --lib
           fi

@@ -44,7 +44,7 @@ use ciris_edge::transport::{InboundFrame, Transport, TransportError};
 use ciris_edge::verify::RootingDirectory;
 use tokio::sync::mpsc;
 
-use common::{directory_with, signed_record, TestFedKey};
+use common::{directory_with, prime_v7_peer_pair, signed_record, TestFedKey};
 
 /// Pick an ephemeral loopback TCP port.
 fn free_port() -> u16 {
@@ -177,6 +177,18 @@ async fn paired_transports(
             .expect("build transport B"),
     );
 
+    // v7.0.0 (CIRISEdge#191 / #195) — explicit-hash destinations cannot
+    // announce; pre-install both directions of the rooted-peer binding
+    // out-of-band (test analogue of the v6.0.0 directory-cache anti-
+    // entropy path, CIRISEdge#175).
+    prime_v7_peer_pair(
+        &transport_a,
+        "edge-routing-aaaa",
+        &transport_b,
+        "edge-routing-bbbb",
+    )
+    .await;
+
     let (tx_a, _rx_a) = mpsc::channel::<InboundFrame>(16);
     let (tx_b, _rx_b) = mpsc::channel::<InboundFrame>(16);
 
@@ -185,20 +197,17 @@ async fn paired_transports(
     let listen_a = tokio::spawn(async move { la.listen(tx_a).await });
     let listen_b = tokio::spawn(async move { lb.listen(tx_b).await });
 
-    // Wait for B to root A.
-    let discovered = wait_for(Duration::from_secs(30), || {
-        let t = transport_b.clone();
-        async move { t.knows_peer("edge-routing-aaaa").await }
-    })
-    .await;
+    // Post-prime sanity — no announce-mechanism dependency.
+    let discovered = transport_b.knows_peer("edge-routing-aaaa").await;
     assert!(
         discovered,
-        "node B did not root node A within 30s — Reticulum loopback discovery wedged"
+        "post-prime `knows_peer` must be true — v7.0.0 explicit-hash discovery is out-of-band",
     );
 
     (transport_a, transport_b, listen_a, listen_b)
 }
 
+#[allow(dead_code)]
 async fn wait_for<F, Fut>(timeout: Duration, mut cond: F) -> bool
 where
     F: FnMut() -> Fut,

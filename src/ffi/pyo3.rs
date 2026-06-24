@@ -3258,7 +3258,7 @@ enum LocalInstanceRole {
     clippy::too_many_lines,
     clippy::fn_params_excessive_bools
 )]
-fn init_edge_runtime(
+pub fn init_edge_runtime(
     py: Python<'_>,
     engine: Bound<'_, PyAny>,
     identity_path: &str,
@@ -5526,8 +5526,16 @@ impl PyStoreAndForward {
     }
 }
 
-#[pymodule]
-fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Register the full `ciris_edge` PyO3 surface against the supplied
+/// module. Re-applies the v4.3.1 / CIRISEdge#156 one-wheel re-export
+/// mechanism the v7.x refactor dropped: sibling cdylibs (e.g.
+/// CIRISServer) call this from their own `#[pymodule]` shim to
+/// re-host edge's `#[pyclass]`es + `init_edge_runtime` without an
+/// independent `ciris_edge` import (the published wheel's pymodule
+/// shim simply delegates here so both paths emit the identical
+/// surface — same classes, same constants, same functions). Closes
+/// CIRISEdge#199.
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // v1.1.7 (CIRISEdge#58) — diagnostic harness, gated under the
     // `debug-tools` Cargo feature. Default release wheels (where the
     // feature is OFF) compile NONE of this: no panic hook install,
@@ -5634,6 +5642,14 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStoreAndForward>()?;
 
     Ok(())
+}
+
+/// `ciris_edge` `#[pymodule]` shim — delegates to [`register`] so the
+/// published wheel and any sibling cdylib that calls `register`
+/// directly emit the byte-equal pyo3 surface (CIRISEdge#199).
+#[pymodule]
+fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register(m)
 }
 
 #[cfg(test)]
