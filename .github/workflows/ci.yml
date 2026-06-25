@@ -67,6 +67,13 @@ jobs:
   linux-x86_64-test:
     name: linux-x86_64 (${{ matrix.combo.name }})
     runs-on: ubuntu-latest
+    # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — `packages: write`
+    # is needed for the main-branch save step on the pyo3-full lane.
+    # PR/tag runs don't write; the conditional on the save step gates
+    # it. Restore is anonymous and doesn't consume any permission.
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +118,15 @@ jobs:
         # Mirrors persist's `.github/workflows/ci.yml` after v3.5.3.
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
+      # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — restore the
+      # cross-repo L2 cache BEFORE the per-repo Swatinem L1. The key
+      # is derived from the substrate triple + matrix combo so every
+      # repo that pins the same triple shares the same cache bucket;
+      # rustc version is implicit in the cache contents (Swatinem
+      # invalidates on rustc change). Anonymous read — no token.
+      - uses: CIRISAI/CIRISCache/restore@v1
+        with:
+          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist10.2.2-verify7.5.0
       - uses: Swatinem/rust-cache@v2
         with:
           # Per-combo cache key so each matrix entry gets its own
@@ -135,6 +151,20 @@ jobs:
           else
             cargo test --features "${{ matrix.combo.features }}" --lib
           fi
+      # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — save the L2
+      # cache on main-branch builds of the canonical pyo3-full lane.
+      # Only ONE matrix entry saves per workflow to keep the GHCR
+      # package small + avoid mid-matrix race writes; pyo3-full is the
+      # widest feature set so its target/ subsumes the leaner lanes'
+      # contents. PR/tag runs read but don't write; the warmer is
+      # main-branch only.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: |
+          github.ref == 'refs/heads/main'
+            && matrix.combo.name == 'pyo3-full'
+        with:
+          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist10.2.2-verify7.5.0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel

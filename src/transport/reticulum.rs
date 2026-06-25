@@ -3562,20 +3562,29 @@ fn apply_interface_config(
 /// or `timeout` elapses. Returns whether the condition was met. Used
 /// by `send` to wait on link establishment + resource completion
 /// without owning the `NodeEvent` loop (which `listen` owns).
+///
+/// v7.0.12 (CIRISEdge#217) — uses `futures_timer::Delay` +
+/// `std::time::Instant` instead of `tokio::time::*` so the poll is
+/// runtime-agnostic. The cross-cdylib tokio aliasing class makes
+/// `tokio::time::sleep` panic with "no reactor running" when this
+/// helper is awaited on a thread whose tokio thread-locals belong to
+/// persist's runtime — the bootstrapping-node failure mode in #217.
+/// `cond()`'s own awaits (typically `tokio::sync::Mutex::lock`) don't
+/// need a Timer driver, just state-machine polling.
 async fn wait_until_async<F, Fut>(timeout: Duration, interval: Duration, mut cond: F) -> bool
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let start = std::time::Instant::now();
     loop {
         if cond().await {
             return true;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if start.elapsed() >= timeout {
             return false;
         }
-        tokio::time::sleep(interval).await;
+        futures_timer::Delay::new(interval).await;
     }
 }
 
