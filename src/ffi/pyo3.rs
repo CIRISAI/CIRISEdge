@@ -717,6 +717,142 @@ impl PyEdge {
         self.inner.signer_key_id().to_string()
     }
 
+    /// CIRISEdge#208 — install a runtime override for the
+    /// `dispatch_inbound` trust short-circuit threshold. Conformance
+    /// harness contract: setting forces the short-circuit ON for the
+    /// duration of the override (the operator's bootstrap-permissive
+    /// default of `trust_threshold = 0.0` is structurally bypassed). The
+    /// effective gate becomes:
+    ///
+    /// ```text
+    /// trust_score(signing_key_id, recursion_depth) < threshold
+    ///   ⇒ envelope dropped, "trust_short_circuited" event emitted
+    /// ```
+    ///
+    /// Pair with [`Self::install_trust_resolver`] so the threshold has a
+    /// scorer to consult. Pass a negative value to clear the override.
+    ///
+    /// Threshold must be finite (not NaN / not infinity) — `ValueError`
+    /// otherwise.
+    #[pyo3(signature = (threshold))]
+    fn set_trust_threshold(&self, threshold: f64) -> PyResult<()> {
+        if !threshold.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "trust_threshold must be a finite f64; got {threshold}"
+            )));
+        }
+        if threshold < 0.0 {
+            self.inner.set_trust_threshold_override(None);
+        } else {
+            self.inner.set_trust_threshold_override(Some(threshold));
+        }
+        Ok(())
+    }
+
+    /// CIRISEdge#208 — install a Python callback as the runtime
+    /// `TrustScoring` resolver consulted by the `dispatch_inbound` trust
+    /// short-circuit. The callback's signature is
+    /// `(signing_key_id: str, recursion_depth: int) -> float`; the
+    /// returned float is treated as a score in `[0.0, 1.0]` (out-of-range
+    /// values are clamped). A callback raising (or returning a non-numeric)
+    /// is treated as a `0.0` score, matching persist's `AdmissionGate`
+    /// unknown-key discipline.
+    ///
+    /// Pair with [`Self::set_trust_threshold`] to drive the conformance
+    /// intake-gate test.
+    ///
+    /// Pass `None` to clear the override (the builder-wired
+    /// `Arc<dyn TrustScoring>`, if any, is consulted instead).
+    #[pyo3(signature = (callback))]
+    fn install_trust_resolver(&self, callback: Option<Py<PyAny>>) -> PyResult<()> {
+        match callback {
+            None => {
+                self.inner.install_trust_scoring_override(None);
+                Ok(())
+            }
+            Some(cb) => {
+                Python::attach(|py| {
+                    if !cb.bind(py).is_callable() {
+                        return Err(PyTypeError::new_err(
+                            "install_trust_resolver: callback must be a Python callable",
+                        ));
+                    }
+                    Ok(())
+                })?;
+                let scoring: Arc<dyn ciris_persist::federation::TrustScoring> =
+                    Arc::new(PyTrustScoringAdapter { callback: cb });
+                self.inner.install_trust_scoring_override(Some(scoring));
+                Ok(())
+            }
+        }
+    }
+
+    /// CIRISEdge#208 — drive `envelope_bytes` through the
+    /// `dispatch_inbound` pipeline on the persist runtime, returning the
+    /// observed wire-string outcome.
+    ///
+    /// Mirrors the byte-shape `Edge::run` carries on the listener loop;
+    /// the harness builds an envelope, signs it via persist's
+    /// `Engine::sign_outbound_envelope` (or equivalent), then drives the
+    /// bytes through this surface to verify the
+    /// [`Self::set_trust_threshold`] + [`Self::install_trust_resolver`]
+    /// gates execute the refusal arm.
+    ///
+    /// Return shape:
+    ///
+    /// ```python
+    /// {
+    ///     "outcome": "trust_short_circuited" | "received" | "verify_failed",
+    /// }
+    /// ```
+    ///
+    /// `transport_id` defaults to `"http"` and accepts any of the
+    /// stable `TransportId` strings (`"http"`, `"reticulum-rs"`,
+    /// `"leviculum"`, `"lora"`, `"serial"`, `"i2p"`). Unknown values
+    /// fall through as the supplied string verbatim — the trust gate
+    /// doesn't consult `transport`; it's stamped on the verified
+    /// envelope for forensic logging.
+    #[pyo3(signature = (envelope_bytes, transport_id = "http"))]
+    fn dispatch_inbound_bytes(
+        &self,
+        py: Python<'_>,
+        envelope_bytes: &[u8],
+        transport_id: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let bytes = envelope_bytes.to_vec();
+        let inner = self.inner.clone();
+        // Map known wire-strings to `&'static str`; unknown strings
+        // collapse to the supplied default ("http") so the harness
+        // doesn't accidentally trip a leak.
+        let tid: crate::transport::TransportId = match transport_id {
+            "reticulum-rs" => crate::transport::TransportId::RETICULUM_RS,
+            "leviculum" => crate::transport::TransportId::LEVICULUM,
+            "lora" => crate::transport::TransportId::LORA,
+            "serial" => crate::transport::TransportId::SERIAL,
+            "i2p" => crate::transport::TransportId::I2P,
+            // "http" or any unknown — collapses to HTTP per the docstring.
+            _ => crate::transport::TransportId::HTTP,
+        };
+        let outcome: &'static str = py.detach(|| {
+            run_async(&self.executor, async move {
+                let frame = crate::transport::InboundFrame {
+                    envelope_bytes: bytes,
+                    transport: tid,
+                    received_at: chrono::Utc::now(),
+                    source_key_id: None,
+                };
+                inner
+                    .dispatch_inbound_observed_outcome_for_test(frame)
+                    .await
+            })
+        });
+        Python::attach(|py| {
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("outcome", outcome)?;
+            Ok(dict.into_any().unbind())
+        })
+    }
+
     /// v2.4.0 (CIRISEdge#95) — fetch a remote peer's hybrid KEM
     /// pubkeys (x25519 + ML-KEM-768) from persist's federation
     /// directory for `FederationSession::initiate` consumers
@@ -2245,6 +2381,64 @@ fn hex_encode_32(bytes: &[u8; 32]) -> String {
 /// `SubscriptionHandle::unsubscribe()` → `Edge::unregister_inline_text_subscriber`
 /// drops the registry entry's sender → this `recv()` returns `None` →
 /// drainer thread exits cleanly.
+/// CIRISEdge#208 — `Arc<dyn TrustScoring>` adapter wrapping a Python
+/// callback. Installed via [`PyEdge::install_trust_resolver`]; consulted
+/// by [`Edge::dispatch_inbound_for_test`]'s trust short-circuit when a
+/// runtime override is in place.
+///
+/// The callback runs synchronously inside the persist runtime's blocking
+/// pool via `tokio::task::block_in_place`; this is correct for the
+/// `tokio::runtime::Handle::block_on` driver `dispatch_inbound_bytes`
+/// uses (multi-threaded runtime). A callback raising or returning a
+/// non-numeric is treated as a `0.0` score (matches persist's
+/// `AdmissionGate` unknown-key discipline).
+struct PyTrustScoringAdapter {
+    callback: Py<PyAny>,
+}
+
+#[async_trait::async_trait]
+impl ciris_persist::federation::TrustScoring for PyTrustScoringAdapter {
+    async fn trust_score(
+        &self,
+        key_id: &str,
+        recursion_depth: u8,
+    ) -> Result<f64, ciris_persist::federation::TrustScoringError> {
+        let key_id_owned = key_id.to_owned();
+        // `block_in_place` keeps the dispatch_inbound future on its
+        // current worker but moves the GIL-attach into a blocking context.
+        // The persist runtime is multi-threaded by construction, which is
+        // what block_in_place requires.
+        let score = tokio::task::block_in_place(|| {
+            Python::attach(|py| {
+                let depth_i32: i32 = recursion_depth.into();
+                let bound = self.callback.bind(py);
+                match bound.call1((key_id_owned.as_str(), depth_i32)) {
+                    Ok(value) => match value.extract::<f64>() {
+                        Ok(f) if f.is_finite() => f.clamp(0.0, 1.0),
+                        Ok(_) | Err(_) => {
+                            tracing::warn!(
+                                sender_key_id = %key_id_owned,
+                                "trust_resolver callback returned non-finite / non-numeric; \
+                                 treating as 0.0",
+                            );
+                            0.0
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            sender_key_id = %key_id_owned,
+                            error = %e,
+                            "trust_resolver callback raised; treating as 0.0",
+                        );
+                        0.0
+                    }
+                }
+            })
+        });
+        Ok(score)
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)] // callback is consumed by drop at function exit
 fn drain_inline_text(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, String)>,

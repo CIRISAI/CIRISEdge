@@ -464,3 +464,122 @@ async fn typed_error_variant_carries_score_threshold() {
         "issue tag rides on the Display: {msg}"
     );
 }
+
+// ─── CIRISEdge#208 — runtime override surface ──────────────────────
+
+/// `set_trust_threshold_override(Some(t))` flips the trust short-circuit
+/// ON for the duration of the override AND raises the effective threshold
+/// even when `EdgeConfig::trust_threshold = 0.0` (the bootstrap-permissive
+/// default). The conformance harness drives the intake-gate test through
+/// this codepath via `PyEdge::set_trust_threshold`.
+#[tokio::test]
+async fn override_threshold_drops_envelope_under_zero_default_threshold() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Build with config threshold = 0.0 (bootstrap-permissive default);
+    // sender scored at 0.2. Production posture: the envelope is admitted.
+    let (edge, remote_signer, local_key_id) =
+        build_edge(&tmp, 0.0, true, &[("remote-peer", 0.2)]).await;
+    let m_before = edge.metrics().inbound_dropped_low_trust();
+
+    // Install a 0.5 override — now the envelope must drop because the
+    // override forces `trust_short_circuit_enabled = true` AND
+    // `effective_threshold = 0.5 > 0.2 (sender's score)`.
+    edge.set_trust_threshold_override(Some(0.5));
+
+    let outcome = build_outcome(&edge, &remote_signer, &local_key_id).await;
+    assert_eq!(
+        outcome, "trust_short_circuited",
+        "override threshold 0.5 must short-circuit a sender scored 0.2"
+    );
+    assert_eq!(
+        edge.metrics().inbound_dropped_low_trust(),
+        m_before + 1,
+        "override threshold drop must increment the metrics counter"
+    );
+
+    // Clearing the override restores the bootstrap-permissive posture.
+    edge.set_trust_threshold_override(None);
+    let after = build_outcome(&edge, &remote_signer, &local_key_id).await;
+    assert_eq!(
+        after, "received",
+        "clearing the override returns to config.trust_threshold = 0.0 (admit-all)"
+    );
+}
+
+/// `install_trust_scoring_override(Some(scorer))` overrides the builder-
+/// wired scorer for the duration of the override. Pairs with
+/// `set_trust_threshold_override` so the harness can drive a Python
+/// callback as the scorer without re-building the Edge.
+#[tokio::test]
+async fn override_scorer_supersedes_builder_wired_scorer() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Builder wires a scorer that VOUCHES for the remote at 0.9.
+    let (edge, remote_signer, local_key_id) =
+        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.9)]).await;
+    let m_before = edge.metrics().inbound_dropped_low_trust();
+
+    // Override with a scorer that DENIES the remote (0.1).
+    let mut overriding = MemoryTrustScoring::new();
+    overriding.set_score("remote-peer", 0.1);
+    let overriding_arc: Arc<dyn TrustScoring> = Arc::new(overriding);
+    edge.install_trust_scoring_override(Some(overriding_arc));
+
+    let outcome = build_outcome(&edge, &remote_signer, &local_key_id).await;
+    assert_eq!(
+        outcome, "trust_short_circuited",
+        "the override scorer (0.1) must supersede the builder-wired scorer (0.9)"
+    );
+    assert_eq!(
+        edge.metrics().inbound_dropped_low_trust(),
+        m_before + 1,
+        "override scorer drop must increment the metrics counter"
+    );
+
+    // Clearing the override returns to the builder-wired scorer (0.9 ≥ 0.5).
+    edge.install_trust_scoring_override(None);
+    let after = build_outcome(&edge, &remote_signer, &local_key_id).await;
+    assert_eq!(
+        after, "received",
+        "clearing the scorer override returns to the builder-wired scorer"
+    );
+}
+
+/// `dispatch_inbound_observed_outcome_for_test` returns "verify_failed"
+/// when the envelope is dropped at the verify pipeline (signature
+/// failure, misroute, replay, body-too-large) — the third arm of the
+/// wire-string outcome triple.
+#[tokio::test]
+async fn observed_outcome_returns_verify_failed_for_misrouted_envelope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (edge, remote_signer, _local_key_id) =
+        build_edge(&tmp, 0.0, true, &[("remote-peer", 0.5)]).await;
+
+    // Misroute: address an envelope to a key_id that ISN'T the local
+    // signer's. The verify pipeline rejects at AV-8 (Misrouted).
+    let outcome = build_outcome(&edge, &remote_signer, "not-the-local-key").await;
+    assert_eq!(
+        outcome, "verify_failed",
+        "misrouted envelope must surface as verify_failed (neither trust drop nor handler dispatch)"
+    );
+}
+
+/// Helper: build + sign an envelope, drive through the observed-outcome
+/// dispatcher, return the wire-string outcome.
+async fn build_outcome(edge: &Edge, sender: &LocalSigner, destination: &str) -> &'static str {
+    let body = InlineText {
+        text: "208-override-test".to_string(),
+    };
+    let mut env = build_envelope(InlineText::TYPE, &sender.key_id, destination, &body, None)
+        .expect("build envelope");
+    sign_envelope(sender, &mut env)
+        .await
+        .expect("sign envelope");
+    let bytes = serde_json::to_vec(&env).expect("serialize envelope");
+    let frame = InboundFrame {
+        envelope_bytes: bytes,
+        transport: TransportId::HTTP,
+        received_at: Utc::now(),
+        source_key_id: None,
+    };
+    edge.dispatch_inbound_observed_outcome_for_test(frame).await
+}

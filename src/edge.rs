@@ -1124,6 +1124,24 @@ pub struct Edge {
     /// wire its own scorer; tests pass `MemoryTrustScoring` for
     /// deterministic fixtures.
     pub(crate) trust_scoring: Option<Arc<dyn ciris_persist::federation::TrustScoring>>,
+    /// CIRISEdge#208 — test/conformance override for
+    /// [`EdgeConfig::trust_threshold`]. When `Some(v)` ,
+    /// [`Self::dispatch_inbound_for_test`] passes `v` to `dispatch_inbound`
+    /// instead of `self.config.trust_threshold` AND forces
+    /// `trust_short_circuit_enabled = true` so the override actually
+    /// gates a single envelope. Production paths (the `Edge::run`
+    /// listener loop) ignore this field. The PyO3 surface
+    /// `PyEdge::set_trust_threshold` mutates this slot.
+    trust_threshold_override: Arc<std::sync::RwLock<Option<f64>>>,
+    /// CIRISEdge#208 — test/conformance override for
+    /// [`Self::trust_scoring`]. When `Some(scoring)`,
+    /// [`Self::dispatch_inbound_for_test`] passes `scoring` to
+    /// `dispatch_inbound` instead of the builder-wired `self.trust_scoring`.
+    /// Production paths ignore this field. The PyO3 surface
+    /// `PyEdge::install_trust_resolver` mutates this slot with a
+    /// `Python-callback-backed` impl.
+    trust_scoring_override:
+        Arc<std::sync::RwLock<Option<Arc<dyn ciris_persist::federation::TrustScoring>>>>,
     config: EdgeConfig,
 }
 
@@ -2818,6 +2836,26 @@ impl Edge {
     /// the wire-layer gate is caught from either entry point.
     pub async fn dispatch_inbound_for_test(&self, frame: InboundFrame) {
         let directory = self.verify.directory();
+        // CIRISEdge#208 — read overrides BEFORE the await so the
+        // RwLock guards stay narrow + don't cross an await point.
+        let override_scoring = self
+            .trust_scoring_override
+            .read()
+            .expect("trust_scoring_override poisoned")
+            .clone();
+        let override_threshold = *self
+            .trust_threshold_override
+            .read()
+            .expect("trust_threshold_override poisoned");
+        let trust_scoring_arc = override_scoring.clone();
+        let trust_scoring_ref = trust_scoring_arc.as_ref().or(self.trust_scoring.as_ref());
+        let trust_threshold = override_threshold.unwrap_or(self.config.trust_threshold);
+        // When an override is set, force the short-circuit ON; the
+        // conformance harness is opting INTO gating for the duration of
+        // its test (the bootstrap-permissive operator default is
+        // structurally bypassed).
+        let trust_short_circuit_enabled =
+            override_threshold.is_some() || self.config.trust_short_circuit_enabled;
         dispatch_inbound(
             frame,
             &self.verify,
@@ -2836,9 +2874,9 @@ impl Edge {
             &self.events,
             self.federation_directory.as_ref(),
             self.config.cohort_scope_enforcement,
-            self.trust_scoring.as_ref(),
-            self.config.trust_threshold,
-            self.config.trust_short_circuit_enabled,
+            trust_scoring_ref,
+            trust_threshold,
+            trust_short_circuit_enabled,
             self.config.trust_recursion_depth,
             self.config.agent_mode,
             self.config.l1_cdn_edge_enabled,
@@ -2850,6 +2888,78 @@ impl Edge {
             self.swarm_runtime.get(),
         )
         .await;
+    }
+
+    /// CIRISEdge#208 — install a runtime override for the
+    /// `dispatch_inbound` trust threshold. Used by the PyO3 surface
+    /// `PyEdge::set_trust_threshold` to drive the conformance harness's
+    /// intake-gate test. Setting forces
+    /// `trust_short_circuit_enabled = true` at the
+    /// [`Self::dispatch_inbound_for_test`] call site so the override
+    /// actually gates a single envelope (config defaults are
+    /// bootstrap-permissive). `None` clears the override.
+    pub fn set_trust_threshold_override(&self, threshold: Option<f64>) {
+        *self
+            .trust_threshold_override
+            .write()
+            .expect("trust_threshold_override poisoned") = threshold;
+    }
+
+    /// CIRISEdge#208 — install a runtime override for the
+    /// `TrustScoring` resolver consulted by the `dispatch_inbound` trust
+    /// short-circuit. Used by the PyO3 surface
+    /// `PyEdge::install_trust_resolver` to wire a Python callback as
+    /// the scorer. `None` clears the override.
+    pub fn install_trust_scoring_override(
+        &self,
+        scoring: Option<Arc<dyn ciris_persist::federation::TrustScoring>>,
+    ) {
+        *self
+            .trust_scoring_override
+            .write()
+            .expect("trust_scoring_override poisoned") = scoring;
+    }
+
+    /// CIRISEdge#208 — counterpart to
+    /// [`Self::dispatch_inbound_for_test`] that returns a stable
+    /// wire-string outcome derived from metrics deltas around the
+    /// dispatch. The conformance harness's `test_200` intake-gate test
+    /// drives this through `PyEdge::dispatch_inbound_bytes` to verify
+    /// the trust short-circuit refusal arm executes.
+    ///
+    /// Outcomes:
+    /// - `"trust_short_circuited"` — `inbound_dropped_low_trust`
+    ///   counter incremented (the #48-B arm fired).
+    /// - `"received"` — `envelopes_received_total[mt]` incremented for
+    ///   any `MessageType` (verify passed AND the envelope reached
+    ///   handler dispatch).
+    /// - `"verify_failed"` — neither counter moved; the envelope was
+    ///   dropped at the verify pipeline (signature failure, replay,
+    ///   misroute, body-too-large, schema-invalid). The harness can
+    ///   inspect tracing / metrics in detail if a finer split is
+    ///   needed.
+    pub async fn dispatch_inbound_observed_outcome_for_test(
+        &self,
+        frame: InboundFrame,
+    ) -> &'static str {
+        let before_low_trust = self.metrics.inbound_dropped_low_trust();
+        let before_received_total: u64 = {
+            let guard = self.metrics.envelopes_received_total.read();
+            guard.values().sum()
+        };
+        self.dispatch_inbound_for_test(frame).await;
+        let after_low_trust = self.metrics.inbound_dropped_low_trust();
+        let after_received_total: u64 = {
+            let guard = self.metrics.envelopes_received_total.read();
+            guard.values().sum()
+        };
+        if after_low_trust > before_low_trust {
+            "trust_short_circuited"
+        } else if after_received_total > before_received_total {
+            "received"
+        } else {
+            "verify_failed"
+        }
     }
 
     /// Rust-level accessor returning a clone of the outbound queue
@@ -5106,6 +5216,8 @@ impl EdgeBuilder {
             detector,
             canonical_peers,
             trust_scoring: self.trust_scoring,
+            trust_threshold_override: Arc::new(std::sync::RwLock::new(None)),
+            trust_scoring_override: Arc::new(std::sync::RwLock::new(None)),
             metrics: crate::observability::EdgeMetrics::new(),
             config: self.config,
         })
