@@ -853,6 +853,122 @@ impl PyEdge {
         })
     }
 
+    /// CIRISEdge#211 — build + sign an `EdgeEnvelope` from Python so the
+    /// conformance harness can mint the byte-shape
+    /// [`Self::dispatch_inbound_bytes`] expects without reverse-engineering
+    /// the wire format. Direct counterpart to the Rust-side
+    /// `tests/trust_short_circuit.rs::build_outcome` helper — same
+    /// `build_envelope` + `sign_envelope` codepath, just exposed.
+    ///
+    /// `seed_bytes` is the 32-byte raw Ed25519 seed for the
+    /// `signing_key_id`. The harness pre-generates this, registers the
+    /// derived pubkey under `signing_key_id` in persist's
+    /// `federation_keys` directory (via `Engine::put_public_key`), and
+    /// passes the same seed bytes here so the envelope's signature
+    /// verifies against the registered row.
+    ///
+    /// `body_json` is the JSON serialization of the message-type's body
+    /// (e.g. `'{"text":"hello"}'` for `"inline_text"`). The harness can
+    /// build the body from a Python dict via `json.dumps(...)`.
+    ///
+    /// `message_type` is the wire-string `MessageType` (snake_case;
+    /// e.g. `"inline_text"`, `"accord_events_batch"`,
+    /// `"contribution_submit"`).
+    ///
+    /// Returns the byte-exact `EdgeEnvelope` JSON ready to feed into
+    /// [`Self::dispatch_inbound_bytes`]. The classical signature is
+    /// always Ed25519 over the persist-canonicalized envelope; PQC
+    /// (ML-DSA-65) is OMITTED at this surface — software-only signers
+    /// don't carry a PQC half, and the conformance intake-gate test runs
+    /// under the verify pipeline's `Ed25519Fallback` policy where the
+    /// PQC field is optional.
+    #[pyo3(signature = (signing_key_id, seed_bytes, destination_key_id, message_type, body_json))]
+    fn build_signed_inbound_envelope(
+        &self,
+        py: Python<'_>,
+        signing_key_id: &str,
+        seed_bytes: &[u8],
+        destination_key_id: &str,
+        message_type: &str,
+        body_json: &str,
+    ) -> PyResult<Py<pyo3::types::PyBytes>> {
+        if seed_bytes.len() != 32 {
+            return Err(PyValueError::new_err(format!(
+                "build_signed_inbound_envelope: seed_bytes must be 32 bytes (Ed25519); got {}",
+                seed_bytes.len()
+            )));
+        }
+        let mt: crate::messages::MessageType = serde_json::from_value(serde_json::Value::String(
+            message_type.to_string(),
+        ))
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "build_signed_inbound_envelope: message_type {message_type:?} is not a known \
+                 wire-string variant: {e}"
+            ))
+        })?;
+        let body_value: serde_json::Value = serde_json::from_str(body_json).map_err(|e| {
+            PyValueError::new_err(format!(
+                "build_signed_inbound_envelope: body_json failed to parse: {e}"
+            ))
+        })?;
+        let signing_key_id = signing_key_id.to_owned();
+        let destination_key_id = destination_key_id.to_owned();
+        let seed_owned: [u8; 32] = seed_bytes.try_into().map_err(|_| {
+            PyValueError::new_err("build_signed_inbound_envelope: seed_bytes must be 32 bytes")
+        })?;
+        let envelope_bytes: Vec<u8> = py.detach(|| {
+            run_async(&self.executor, async move {
+                // Build a fresh software signer from the seed. The seed
+                // is the wire-shape Ed25519 32-byte secret; the
+                // `Ed25519SoftwareSigner::import_key` path is the same
+                // one the persist OS-keyring fallback uses + matches the
+                // `tests/trust_short_circuit.rs::FedKey::local_signer`
+                // pattern byte-for-byte.
+                let mut sw = ciris_keyring::Ed25519SoftwareSigner::new(&signing_key_id);
+                sw.import_key(&seed_owned).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "build_signed_inbound_envelope: import_key failed: {e}"
+                    ))
+                })?;
+                let signer = crate::identity::LocalSigner::new(
+                    signing_key_id.clone(),
+                    Arc::new(sw) as Arc<dyn ciris_keyring::HardwareSigner>,
+                    None,
+                );
+
+                let mut env = crate::identity::build_envelope(
+                    mt,
+                    &signing_key_id,
+                    &destination_key_id,
+                    &body_value,
+                    None,
+                )
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "build_signed_inbound_envelope: build_envelope failed: {e}"
+                    ))
+                })?;
+                crate::identity::sign_envelope(&signer, &mut env)
+                    .await
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!(
+                            "build_signed_inbound_envelope: sign_envelope failed: {e}"
+                        ))
+                    })?;
+                serde_json::to_vec(&env).map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "build_signed_inbound_envelope: serialize failed: {e}"
+                    ))
+                })
+            })
+        })?;
+        Python::attach(|py| {
+            let bytes = pyo3::types::PyBytes::new(py, &envelope_bytes);
+            Ok(bytes.unbind())
+        })
+    }
+
     /// v2.4.0 (CIRISEdge#95) — fetch a remote peer's hybrid KEM
     /// pubkeys (x25519 + ML-KEM-768) from persist's federation
     /// directory for `FederationSession::initiate` consumers
