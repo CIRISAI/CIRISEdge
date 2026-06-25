@@ -705,6 +705,138 @@ impl PyEdge {
         }
     }
 
+    /// CIRISEdge#214 — root a peer's `(dest_hash, transport-tier
+    /// ed25519)` binding into this node's local resolver, bypassing the
+    /// announce mechanism. v7.0.0 explicit-hash destinations cannot
+    /// announce by design (Leviculum guard:
+    /// `AnnounceError::ExplicitHashCannotAnnounce`), so cold-pair
+    /// discovery is **out-of-band** — peers learn each other's
+    /// `(dest_hash, ed25519)` through the directory cache or this
+    /// stable surface.
+    ///
+    /// After this call, [`Self::knows_peer`] returns `True` and
+    /// `send_inline_text(destination_key_id, ...)` resolves to the
+    /// rooted destination.
+    ///
+    /// Mirrors the Rust-internal `ReticulumTransport::inject_rooted_peer_for_test`
+    /// that `tests/reticulum_loopback.rs::prime_v7_peer_pair` calls —
+    /// promoted to a stable (non-`_for_test`) surface so the
+    /// CIRISConformance harness can drive the v7.0.0 explicit-hash
+    /// discovery cold-start from Python.
+    ///
+    /// Args:
+    /// - `destination_key_id` — peer's federation key_id (the
+    ///   `signing_key_id` peers will see on inbound envelopes).
+    /// - `reticulum_dest_hash_hex` — 16-byte RNS destination hash as
+    ///   a 32-char lowercase hex string (the peer's
+    ///   `reticulum_dest_hash_hex()` return).
+    /// - `transport_ed25519_pubkey_b64` — peer's transport-tier 32-byte
+    ///   Ed25519 verifying key, base64-standard encoded (the
+    ///   `ed25519_pub_base64` half of `transport_identity_pubkeys()`).
+    ///
+    /// Raises:
+    /// - `ValueError` if either hex / base64 is malformed or wrong length.
+    /// - `RuntimeError` if this edge has no Reticulum transport
+    ///   (`disable_reticulum=True`, or wheel built without
+    ///   `_reticulum-module`).
+    #[pyo3(signature = (destination_key_id, reticulum_dest_hash_hex, transport_ed25519_pubkey_b64))]
+    fn prime_peer(
+        &self,
+        py: Python<'_>,
+        destination_key_id: &str,
+        reticulum_dest_hash_hex: &str,
+        transport_ed25519_pubkey_b64: &str,
+    ) -> PyResult<()> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            use base64::Engine as _;
+            let dest_hash_vec = hex::decode(reticulum_dest_hash_hex).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "prime_peer: reticulum_dest_hash_hex must be lowercase hex; got {reticulum_dest_hash_hex:?}: {e}"
+                ))
+            })?;
+            let dest_hash: [u8; 16] = dest_hash_vec.as_slice().try_into().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "prime_peer: reticulum_dest_hash_hex must decode to 16 bytes; got {} bytes",
+                    dest_hash_vec.len()
+                ))
+            })?;
+            let ed25519_vec = base64::engine::general_purpose::STANDARD
+                .decode(transport_ed25519_pubkey_b64)
+                .map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "prime_peer: transport_ed25519_pubkey_b64 must be base64-standard: {e}"
+                    ))
+                })?;
+            let ed25519: [u8; 32] = ed25519_vec.as_slice().try_into().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "prime_peer: transport_ed25519_pubkey_b64 must decode to 32 bytes; got {} bytes",
+                    ed25519_vec.len()
+                ))
+            })?;
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "prime_peer: edge has no Reticulum transport wired \
+                     (disable_reticulum=True, or wheel built without _reticulum-module)",
+                )
+            })?;
+            let destination_key_id = destination_key_id.to_owned();
+            py.detach(|| {
+                run_async(&self.executor, async move {
+                    transport
+                        .inject_rooted_peer_for_test(&destination_key_id, dest_hash, ed25519)
+                        .await;
+                });
+            });
+            Ok(())
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            let _ = (
+                destination_key_id,
+                reticulum_dest_hash_hex,
+                transport_ed25519_pubkey_b64,
+            );
+            let _ = py;
+            Err(PyRuntimeError::new_err(
+                "prime_peer: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
+    /// CIRISEdge#214 — true iff `destination_key_id` is currently
+    /// reachable via the Reticulum transport's rooted-peer map.
+    /// Returns true after a successful [`Self::prime_peer`] OR after
+    /// the announce-rooting cold-start path has confirmed the peer
+    /// (v6.x path; v7.0.0 explicit-hash peers go through `prime_peer`).
+    ///
+    /// Conformance contract: the harness can poll this between
+    /// `prime_peer` calls to verify both directions of a cold-pair
+    /// rooting completed before invoking `send_inline_text`.
+    ///
+    /// Returns `False` for HTTPS-only or transport-less builds
+    /// (`disable_reticulum=True` / no `_reticulum-module`).
+    #[pyo3(signature = (destination_key_id))]
+    fn knows_peer(&self, py: Python<'_>, destination_key_id: &str) -> bool {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let Some(transport) = self.inner.reticulum_transport() else {
+                return false;
+            };
+            let destination_key_id = destination_key_id.to_owned();
+            py.detach(|| {
+                run_async(&self.executor, async move {
+                    transport.knows_peer(&destination_key_id).await
+                })
+            })
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            let _ = (destination_key_id, py);
+            false
+        }
+    }
+
     /// Local agent's federation `key_id` — the identity peers seed
     /// into their `federation_keys` directory to root inbound traffic
     /// from this agent. CIRISAgent 2.9.4 displays this on the
