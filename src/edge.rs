@@ -2971,6 +2971,78 @@ impl Edge {
         self.queue.clone()
     }
 
+    /// CIRISEdge#220 — spawn the transport listen tasks + inbound
+    /// dispatch loop on the supplied tokio runtime handle, returning
+    /// the join handles so the caller can hold them for the lifetime
+    /// of the edge runtime.
+    ///
+    /// Use this from `init_edge_runtime` when the production code path
+    /// does NOT take ownership of `Edge` via [`Self::run`]: it spawns
+    /// the minimum-viable background tasks (one `transport.listen()`
+    /// per configured transport, plus the inbound `dispatch_inbound`
+    /// drain) so the receiver-side can accept inbound `LinkRequest`s
+    /// + drive verified envelopes to handlers.
+    ///
+    /// Out of scope: outbound dispatcher, blackhole pruner, sweeps.
+    /// Those are wired only by [`Self::run`] and aren't needed for the
+    /// from-Python `send_inline_text`/`send_durable_inline_text`
+    /// surfaces today — the send path itself runs synchronously on
+    /// the persist executor via `run_async`.
+    ///
+    /// **Runtime split:** the supplied `runtime` MUST be an edge-side
+    /// `tokio::runtime::Handle`. The listen task's
+    /// `tokio::time::interval` (announce ticker) requires an edge-tokio
+    /// Timer driver registered in edge-tokio's thread-locals — persist's
+    /// executor's runtime symbols don't satisfy that (CIRISEdge#217
+    /// closed the same class for `wait_until_async` via futures_timer;
+    /// the listener loop carries similar tokio-time primitives that
+    /// can't be runtime-agnosticised as cheaply).
+    pub fn spawn_background_listeners(
+        self: &Arc<Self>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(1024);
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // One listen task per registered transport. Each `listen()`
+        // owns its transport's NodeEvent loop — accepts inbound
+        // `LinkRequest`s, drives `LinkEstablished` bookkeeping, and
+        // pushes resource-completed envelopes onto `inbound_tx` as
+        // `InboundFrame`s.
+        for transport in &self.transports {
+            let t = transport.clone();
+            let tx = inbound_tx.clone();
+            tasks.push(runtime.spawn(async move {
+                if let Err(e) = t.listen(tx).await {
+                    tracing::error!(
+                        transport = ?t.id(),
+                        error = %e,
+                        "transport listen exited",
+                    );
+                }
+            }));
+        }
+        drop(inbound_tx);
+
+        // Inbound dispatch task — drain the InboundFrame channel,
+        // hand each frame to the same `dispatch_inbound` codepath the
+        // [`Self::dispatch_inbound_for_test`] seam already drives. The
+        // dispatch consults the override slots (CIRISEdge#208) BUT
+        // those default to `None` in production so the production-path
+        // behaviour is byte-equal to what [`Self::run`]'s inline loop
+        // would have done.
+        let edge_for_dispatch = Arc::clone(self);
+        tasks.push(runtime.spawn(async move {
+            while let Some(frame) = inbound_rx.recv().await {
+                edge_for_dispatch
+                    .dispatch_inbound_observed_outcome_for_test(frame)
+                    .await;
+            }
+        }));
+
+        tasks
+    }
+
     /// CIRISEdge#175 (v6.1.0, FSD §3.2) — resolve the default
     /// `cohort_scope` for a stated audience without actually
     /// publishing. Callers preview the §3.2 default-flip rule

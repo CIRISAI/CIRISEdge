@@ -228,6 +228,165 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     listen_b.abort();
 }
 
+/// CIRISEdge#220 — proves `Edge::spawn_background_listeners` drives
+/// the inbound dispatch loop end-to-end so a verified envelope reaches
+/// a registered inline-text handler. Mirrors the
+/// `rooted_resolution_round_trips_envelope_byte_exact` test above but
+/// instead of manually spawning `transport.listen()` per side, it
+/// uses the v7.1.0 `Edge::spawn_background_listeners` surface —
+/// the production codepath `init_edge_runtime` invokes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn spawn_background_listeners_drives_two_node_send_inline_text() {
+    use ciris_edge::verify::HybridPolicy;
+    use ciris_edge::{Edge, EdgeConfig, InlineText};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let steward = TestFedKey::new("steward-bg-listeners", 0x01);
+    let key_a = TestFedKey::new("edge-bg-aaaa", 0x2a);
+    let key_b = TestFedKey::new("edge-bg-bbbb", 0x2b);
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&key_a, &steward, "agent"),
+        signed_record(&key_b, &steward, "agent"),
+    ])
+    .await;
+
+    let port_a = free_port();
+    let cfg_a = {
+        let mut c =
+            ReticulumTransportConfig::new(tmp.path().join("a/transport.id"), "edge-bg-aaaa");
+        c.listen_addr = format!("127.0.0.1:{port_a}").parse().unwrap();
+        c.announce_interval = Duration::from_secs(2);
+        c
+    };
+    let cfg_b = {
+        let mut c =
+            ReticulumTransportConfig::new(tmp.path().join("b/transport.id"), "edge-bg-bbbb");
+        c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+        c.announce_interval = Duration::from_secs(2);
+        c
+    };
+
+    let auth_a = auth_for(&key_a, directory.clone(), tmp.path()).await;
+    let auth_b = auth_for(&key_b, directory.clone(), tmp.path()).await;
+    let transport_a = Arc::new(
+        ReticulumTransport::new(cfg_a, auth_a)
+            .await
+            .expect("build transport A"),
+    );
+    let transport_b = Arc::new(
+        ReticulumTransport::new(cfg_b, auth_b)
+            .await
+            .expect("build transport B"),
+    );
+    prime_v7_peer_pair(&transport_a, "edge-bg-aaaa", &transport_b, "edge-bg-bbbb").await;
+
+    // Build an Edge per side — same builder shape `init_edge_runtime`
+    // produces, just with the persist directory as the queue stub.
+    let signer_a = signer_for(&key_a, tmp.path()).await;
+    let signer_b = signer_for(&key_b, tmp.path()).await;
+    let queue = directory.clone();
+
+    let edge_a = Arc::new(
+        Edge::builder()
+            .directory(directory.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+            .queue(queue.clone())
+            .signer(signer_a)
+            .transport(transport_a.clone() as Arc<dyn Transport>)
+            .reticulum_transport(transport_a.clone())
+            .config(EdgeConfig {
+                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                cohort_scope_enforcement: ciris_edge::CohortScopeEnforcement::Off,
+                ..EdgeConfig::default()
+            })
+            .build()
+            .expect("build edge A"),
+    );
+    let edge_b = Arc::new(
+        Edge::builder()
+            .directory(directory.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+            .queue(queue.clone())
+            .signer(signer_b)
+            .transport(transport_b.clone() as Arc<dyn Transport>)
+            .reticulum_transport(transport_b.clone())
+            .config(EdgeConfig {
+                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                cohort_scope_enforcement: ciris_edge::CohortScopeEnforcement::Off,
+                ..EdgeConfig::default()
+            })
+            .build()
+            .expect("build edge B"),
+    );
+
+    // Register an inline-text subscriber on A — we want the receiver
+    // to observe the verified envelope through the dispatch loop, not
+    // just the raw InboundFrame on the inbound channel.
+    let (_sub_id, mut sub_rx) = edge_a.register_inline_text_subscriber();
+
+    // ── v7.1.0 surface under test ────────────────────────────────────
+    // Per-side edge-owned runtimes; spawn the listen + inbound dispatch
+    // tasks on each. Mirrors what `init_edge_runtime` does in production.
+    let rt_a = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("test-edge-a-transport")
+            .build()
+            .expect("build rt A"),
+    );
+    let rt_b = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("test-edge-b-transport")
+            .build()
+            .expect("build rt B"),
+    );
+    let _handles_a = edge_a.spawn_background_listeners(rt_a.handle());
+    let _handles_b = edge_b.spawn_background_listeners(rt_b.handle());
+
+    // Drive the send: B → A.
+    let msg = InlineText {
+        text: "v7.1.0 bg-listeners hello".to_string(),
+    };
+    // `send_inline` returns `EdgeError::Config("ephemeral
+    // request-response correlation not wired (Phase 2)")` AS the
+    // success-of-transport path — same as `PyEdge::send_inline_text`
+    // maps it. The transport accepted + shipped the bytes; the
+    // correlation channel TODO is a separate concern. Map it to Ok
+    // so the receiver-side assertion is what gates the test.
+    match edge_b.send_inline("edge-bg-aaaa", msg).await {
+        Ok(()) => {}
+        Err(ciris_edge::EdgeError::Config(s))
+            if s.contains("ephemeral request-response correlation not wired") => {}
+        Err(e) => panic!("send_inline B → A failed at transport: {e:?}"),
+    }
+
+    // A's inline-text subscriber must receive the text — proves the
+    // background-listener path drove verify + handler dispatch all the
+    // way to the application surface.
+    let (sender_key_id, body_text) = tokio::time::timeout(Duration::from_secs(30), sub_rx.recv())
+        .await
+        .expect("timed out waiting for inline-text on A")
+        .expect("inline-text channel closed without receive");
+    assert_eq!(sender_key_id, "edge-bg-bbbb");
+    assert_eq!(body_text, "v7.1.0 bg-listeners hello");
+
+    // Tokio runtimes can't be dropped from within an async context,
+    // so leak them; the test process exit will reclaim. Holding them
+    // until function exit (after the receive assertion) is the only
+    // contract we need.
+    std::mem::forget(rt_a);
+    std::mem::forget(rt_b);
+}
+
 /// Poll `cond` until it returns `true` or `timeout` elapses.
 #[allow(dead_code)]
 async fn wait_for<F, Fut>(timeout: Duration, mut cond: F) -> bool

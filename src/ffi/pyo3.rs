@@ -326,6 +326,31 @@ pub struct PyEdge {
     /// - this is a `for_test` constructor
     #[cfg(feature = "transport-reticulum-local")]
     shared_instance_cleanup: std::sync::Mutex<Option<SharedInstanceCleanup>>,
+    /// v7.1.0 (CIRISEdge#220) — edge-owned multi-thread tokio runtime
+    /// for the transport listen tasks + inbound dispatch loop. Separate
+    /// from persist's executor because edge-tokio time/spawn primitives
+    /// inside `transport.listen()` (e.g. `tokio::time::interval` for
+    /// the announce ticker) require an edge-tokio runtime context in
+    /// edge's statically-linked tokio thread-locals. Persist's
+    /// executor's tokio symbols don't satisfy that — same cross-cdylib
+    /// tokio aliasing class CIRISEdge#217 closed for `wait_until_async`
+    /// via `futures_timer`. Holding the `Arc<Runtime>` here keeps it
+    /// alive for PyEdge's lifetime; `Drop` of PyEdge drops the Arc,
+    /// dropping the Runtime, killing the spawned listen + dispatch
+    /// tasks.
+    ///
+    /// `Vec<JoinHandle<()>>` retains the spawned task handles so they
+    /// aren't immediately dropped (a dropped JoinHandle abandons the
+    /// task; tokio keeps polling it, but the abandon semantics make
+    /// shutdown reasoning fragile). Held alongside the runtime so
+    /// drop ordering is well-defined: handles drop first
+    /// (abandon-not-cancel; tokio drains the runtime queue on drop),
+    /// then the runtime drops (cancels remaining tasks).
+    ///
+    /// `None` for `for_test` builds and HTTPS-only transport
+    /// posture — there's nothing to listen on.
+    _transport_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    _transport_listener_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// v2.4.0 (CIRISEdge#103) — best-effort cleanup if the Python caller
@@ -452,6 +477,11 @@ impl PyEdge {
             _dev_cert_tmpdir: None,
             #[cfg(feature = "transport-reticulum-local")]
             shared_instance_cleanup: std::sync::Mutex::new(None),
+            // v7.1.0 (CIRISEdge#220) — `for_test` builds don't run
+            // background listeners; tests drive `dispatch_inbound_for_test`
+            // directly when they need the inbound path.
+            _transport_runtime: None,
+            _transport_listener_handles: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -5010,6 +5040,42 @@ pub fn init_edge_runtime(
     // alive at least until PyEdge drops. Cheap: one Python refcount
     // bump.
     let engine_handle = engine.clone().unbind();
+
+    // v7.1.0 (CIRISEdge#220) — spawn the transport listen tasks +
+    // inbound dispatch loop on an edge-owned tokio runtime. Without
+    // this, B's transport receives A's broadcast LINK_REQUEST but no
+    // event consumer accepts it → no LRPROOF → A's send times out.
+    // The runtime is sized to 2 worker threads — one per listen
+    // task is the worst case for the v7.0.x transport set (Reticulum
+    // + HTTPS); the dispatch loop awaits without burning a worker
+    // continuously.
+    //
+    // Skipped when `transports.is_empty()` — HTTPS-only with no
+    // transports list ends up here; same posture as the no-op test.
+    let transport_runtime: Option<Arc<tokio::runtime::Runtime>> =
+        if edge_arc.transports().is_empty() {
+            None
+        } else {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("ciris-edge-transport")
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "init_edge_runtime: failed to build edge-side transport runtime: {e}"
+                    ))
+                })?;
+            Some(Arc::new(rt))
+        };
+
+    let transport_handles: Vec<tokio::task::JoinHandle<()>> =
+        if let Some(rt) = transport_runtime.as_ref() {
+            edge_arc.spawn_background_listeners(rt.handle())
+        } else {
+            Vec::new()
+        };
+
     Ok(PyEdge {
         inner: edge_arc,
         executor,
@@ -5018,6 +5084,8 @@ pub fn init_edge_runtime(
         _dev_cert_tmpdir: https_dev_cert_tmpdir,
         #[cfg(feature = "transport-reticulum-local")]
         shared_instance_cleanup: std::sync::Mutex::new(shared_instance_cleanup),
+        _transport_runtime: transport_runtime,
+        _transport_listener_handles: std::sync::Mutex::new(transport_handles),
     })
 }
 
