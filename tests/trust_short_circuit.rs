@@ -563,6 +563,77 @@ async fn observed_outcome_returns_verify_failed_for_misrouted_envelope() {
     );
 }
 
+/// CIRISEdge#211 — the conformance harness mints senders from raw seed
+/// bytes via `Ed25519SoftwareSigner::import_key` (the same path
+/// `PyEdge::build_signed_inbound_envelope` takes). This test mirrors the
+/// Python flow EXACTLY using `Ed25519SoftwareSigner`, not the
+/// `Ed25519Signer::from_seed` path the other tests use, and verifies the
+/// trust gate fires through the same codepath the harness's
+/// `dispatch_inbound_bytes` will hit.
+#[tokio::test]
+async fn build_signed_envelope_from_software_signer_drives_trust_gate() {
+    use ciris_keyring::Ed25519SoftwareSigner;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Builder wires `remote-peer` at 0.2 (below threshold 0.5). The seed
+    // here is the same one persist's `FedKey::new("remote-peer", 0xAA)`
+    // uses (0xAA repeating × 32) so the pubkey registered in
+    // `federation_keys` matches the pubkey the software signer derives
+    // from this seed.
+    let (edge, _ignore_remote_signer, local_key_id) =
+        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.2)]).await;
+
+    // Re-build the sender via the software-signer path (the harness's
+    // path), not the `FedKey::local_signer` path.
+    let seed = [0xAAu8; 32];
+    let mut sw = Ed25519SoftwareSigner::new("remote-peer");
+    sw.import_key(&seed).expect("import seed");
+    let signer = LocalSigner::new(
+        "remote-peer".to_string(),
+        Arc::new(sw) as Arc<dyn ciris_keyring::HardwareSigner>,
+        None,
+    );
+
+    // Build → sign → serialize: byte-for-byte what
+    // `PyEdge::build_signed_inbound_envelope` produces.
+    let body = InlineText {
+        text: "211-software-signer-test".to_string(),
+    };
+    let mut env = build_envelope(InlineText::TYPE, &signer.key_id, &local_key_id, &body, None)
+        .expect("build envelope");
+    sign_envelope(&signer, &mut env)
+        .await
+        .expect("sign envelope");
+    let bytes = serde_json::to_vec(&env).expect("serialize envelope");
+
+    // Drive through `dispatch_inbound_bytes`'s underlying helper.
+    let m_before = edge.metrics().inbound_dropped_low_trust();
+    let frame = InboundFrame {
+        envelope_bytes: bytes,
+        transport: TransportId::HTTP,
+        received_at: Utc::now(),
+        source_key_id: None,
+    };
+    let outcome = edge.dispatch_inbound_observed_outcome_for_test(frame).await;
+
+    // The trust gate must fire: the harness's hand-rolled envelope (in
+    // Python) couldn't pass verify in #211's repro; THIS path proves the
+    // software-signer build pipeline DOES pass verify and reach the
+    // trust short-circuit. If this test ever regresses to
+    // "verify_failed", `build_signed_inbound_envelope` is broken at the
+    // canonicalization layer.
+    assert_eq!(
+        outcome, "trust_short_circuited",
+        "software-signer envelope must pass verify + trip the trust gate \
+         (sender 0.2 < threshold 0.5)"
+    );
+    assert_eq!(
+        edge.metrics().inbound_dropped_low_trust(),
+        m_before + 1,
+        "low-trust drop counter must increment"
+    );
+}
+
 /// Helper: build + sign an envelope, drive through the observed-outcome
 /// dispatcher, return the wire-string outcome.
 async fn build_outcome(edge: &Edge, sender: &LocalSigner, destination: &str) -> &'static str {
