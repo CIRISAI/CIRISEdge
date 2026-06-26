@@ -28,15 +28,15 @@ use std::time::Duration;
 use chrono::Utc;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::messages::{EdgeEnvelope, MessageType, SchemaVersion};
-use ciris_edge::transport::reticulum::{
-    ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
-};
+use ciris_edge::transport::reticulum::{ReticulumAuth, ReticulumTransportConfig};
 use ciris_edge::transport::{InboundFrame, Transport};
 use ciris_edge::verify::RootingDirectory;
 use serde_json::value::RawValue;
 use tokio::sync::mpsc;
 
-use common::{directory_with, prime_v7_peer_pair, signed_record, TestFedKey};
+use common::{
+    build_reticulum_with_retry, directory_with, prime_v7_peer_pair, signed_record, TestFedKey,
+};
 
 /// Build a representative signed-shaped envelope. The signatures here
 /// are placeholder strings — the loopback test exercises *transport*
@@ -127,39 +127,38 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     ])
     .await;
 
-    let port_a = free_port();
+    // Node A: the receiver. Binds an ephemeral port (retried on the
+    // `free_port()` bind/release race); no bootstrap peers.
+    let (transport_a, addr_a) = build_reticulum_with_retry(|| {
+        let key = &key_a;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-key-aaaa");
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.announce_interval = Duration::from_secs(2);
+            let auth = auth_for(key, dir, &base).await;
+            (c, auth)
+        }
+    })
+    .await;
+    let port_a = addr_a.port();
 
-    // Node A: the receiver. Listens on `port_a`; no bootstrap peers.
-    let cfg_a = {
-        let mut c =
-            ReticulumTransportConfig::new(tmp.path().join("a/transport.id"), "edge-key-aaaa");
-        c.listen_addr = format!("127.0.0.1:{port_a}").parse().unwrap();
-        c.announce_interval = Duration::from_secs(2);
-        c
-    };
-    // Node B: the sender. Dials A as a bootstrap peer.
-    let cfg_b = {
-        let mut c =
-            ReticulumTransportConfig::new(tmp.path().join("b/transport.id"), "edge-key-bbbb");
-        c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-        c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
-        c.announce_interval = Duration::from_secs(2);
-        c
-    };
-
-    let auth_a = auth_for(&key_a, directory.clone(), tmp.path()).await;
-    let auth_b = auth_for(&key_b, directory.clone(), tmp.path()).await;
-
-    let transport_a = Arc::new(
-        ReticulumTransport::new(cfg_a, auth_a)
-            .await
-            .expect("build transport A"),
-    );
-    let transport_b = Arc::new(
-        ReticulumTransport::new(cfg_b, auth_b)
-            .await
-            .expect("build transport B"),
-    );
+    // Node B: the sender. Dials A on its settled port as a bootstrap peer.
+    let (transport_b, _addr_b) = build_reticulum_with_retry(|| {
+        let key = &key_b;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-key-bbbb");
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+            c.announce_interval = Duration::from_secs(2);
+            let auth = auth_for(key, dir, &base).await;
+            (c, auth)
+        }
+    })
+    .await;
 
     // v7.0.0 (CIRISEdge#191 / #195) — explicit-hash destinations cannot
     // announce, so the announce-based rooting path the v6.x loopback
@@ -257,35 +256,34 @@ async fn spawn_background_listeners_drives_two_node_send_inline_text() {
     ])
     .await;
 
-    let port_a = free_port();
-    let cfg_a = {
-        let mut c =
-            ReticulumTransportConfig::new(tmp.path().join("a/transport.id"), "edge-bg-aaaa");
-        c.listen_addr = format!("127.0.0.1:{port_a}").parse().unwrap();
-        c.announce_interval = Duration::from_secs(2);
-        c
-    };
-    let cfg_b = {
-        let mut c =
-            ReticulumTransportConfig::new(tmp.path().join("b/transport.id"), "edge-bg-bbbb");
-        c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-        c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
-        c.announce_interval = Duration::from_secs(2);
-        c
-    };
-
-    let auth_a = auth_for(&key_a, directory.clone(), tmp.path()).await;
-    let auth_b = auth_for(&key_b, directory.clone(), tmp.path()).await;
-    let transport_a = Arc::new(
-        ReticulumTransport::new(cfg_a, auth_a)
-            .await
-            .expect("build transport A"),
-    );
-    let transport_b = Arc::new(
-        ReticulumTransport::new(cfg_b, auth_b)
-            .await
-            .expect("build transport B"),
-    );
+    let (transport_a, addr_a) = build_reticulum_with_retry(|| {
+        let key = &key_a;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-bg-aaaa");
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.announce_interval = Duration::from_secs(2);
+            let auth = auth_for(key, dir, &base).await;
+            (c, auth)
+        }
+    })
+    .await;
+    let port_a = addr_a.port();
+    let (transport_b, _addr_b) = build_reticulum_with_retry(|| {
+        let key = &key_b;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-bg-bbbb");
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+            c.announce_interval = Duration::from_secs(2);
+            let auth = auth_for(key, dir, &base).await;
+            (c, auth)
+        }
+    })
+    .await;
     prime_v7_peer_pair(&transport_a, "edge-bg-aaaa", &transport_b, "edge-bg-bbbb").await;
 
     // Build an Edge per side — same builder shape `init_edge_runtime`
