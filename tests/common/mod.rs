@@ -190,8 +190,8 @@ where
         match ReticulumTransport::new(cfg, auth).await {
             Ok(transport) => return (Arc::new(transport), addr),
             Err(err) if is_addr_in_use(&err) => {
+                // Re-pick a port and rebuild on the next loop iteration.
                 last_err = Some(err);
-                continue;
             }
             Err(err) => panic!("build reticulum transport: {err:?}"),
         }
