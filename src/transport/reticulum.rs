@@ -1482,7 +1482,11 @@ impl ReticulumTransport {
     /// runtime hot-plug of a phone-attached RNode radio. The handle
     /// is `pub(crate)` so external crates can't bypass the
     /// transport's invariants; the PyO3 wrapper lives in
-    /// `src/ffi/pyo3.rs` (same crate).
+    /// `src/ffi/pyo3.rs` (same crate). Cfg-gated on `pyo3` because
+    /// the PyEdge wrapper is the sole consumer — non-`pyo3` builds
+    /// (lib tests, the `transport-reticulum`-only matrix combo) would
+    /// trip `-D dead_code` otherwise.
+    #[cfg(feature = "pyo3")]
     #[must_use]
     pub(crate) fn node(&self) -> &Arc<ReticulumNode> {
         &self.node
