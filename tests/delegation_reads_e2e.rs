@@ -8,8 +8,10 @@
 //! was previously hand-rolling:
 //!
 //! - `reachable_under_scope(seed, scope, max_depth) -> bool`
-//! - `is_owner_bound(key_id) -> bool`
-//! - `owner_binding_chain(key_id) -> Vec<KeyId>`
+//! - `is_steward_bound(key_id) -> bool` — v11.0.0 rename of
+//!   `is_owner_bound` per CC 0.5.1 §3.2 owner→steward.
+//! - `steward_binding_chain(key_id) -> Vec<KeyId>` — v11.0.0 rename of
+//!   `owner_binding_chain`.
 //! - `moderators_of(community_id, duty) -> Vec<KeyId>`
 //! - `duty_holders_for_community(community_id, duty) -> HashSet<KeyId>`
 //! - `duty_holders_for_content(content_sha, community_id, duty) -> HashSet<KeyId>`
@@ -99,16 +101,17 @@ async fn v9_3_0_delegation_reads_callable_through_dyn_trait() {
         "empty backend → no delegation chain → reachable_under_scope false"
     );
 
-    // is_owner_bound — unknown key → not bound.
-    let bound = admission::is_owner_bound(dir.as_ref(), "unknown-key")
+    // is_steward_bound — unknown key → not bound. (v7.3.0: persist v11.0.0
+    // BREAKING owner→steward rename per CC 0.5.1 §3.2.)
+    let bound = admission::is_steward_bound(dir.as_ref(), "unknown-key")
         .await
-        .expect("is_owner_bound reachable through dyn trait");
-    assert!(!bound, "empty backend → unknown key NOT owner-bound");
+        .expect("is_steward_bound reachable through dyn trait");
+    assert!(!bound, "empty backend → unknown key NOT steward-bound");
 
-    // owner_binding_chain — unknown key → empty chain.
-    let chain = admission::owner_binding_chain(dir.as_ref(), "unknown-key")
+    // steward_binding_chain — unknown key → empty chain.
+    let chain = admission::steward_binding_chain(dir.as_ref(), "unknown-key")
         .await
-        .expect("owner_binding_chain reachable through dyn trait");
+        .expect("steward_binding_chain reachable through dyn trait");
     assert!(
         chain.is_empty(),
         "empty backend → no chain for unknown key, got {chain:?}"
