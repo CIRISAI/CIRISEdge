@@ -146,7 +146,17 @@ async fn pruner_skips_when_no_blackhole_rules_wired() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let identity_path = tmp.path().join("test-identity");
-    let config = ReticulumTransportConfig::new(identity_path, "test-key".to_string());
+    let mut config = ReticulumTransportConfig::new(identity_path, "test-key".to_string());
+    // v7.2.0 (CIRISEdge#220 follow-up): Leviculum v0.8.x is stricter
+    // about port binding — the default `0.0.0.0:4242` listen_addr
+    // collides with sibling tests when the pyo3-full lane runs `--tests`
+    // in parallel. Pick an ephemeral port instead so each test is
+    // self-isolated.
+    let ephemeral = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral")
+        .local_addr()
+        .expect("local addr");
+    config.listen_addr = ephemeral;
 
     let mut seed = [0x11u8; 32];
     for (i, b) in "test-key".bytes().take(32).enumerate() {
