@@ -1476,6 +1476,22 @@ impl ReticulumTransport {
         self.local_transport_pubkey
     }
 
+    /// v7.2.0 (CIRISEdge#219) — accessor for the internal
+    /// `ReticulumNode`. Used by `PyEdge::add_rnode_channel_interface`
+    /// to invoke `ReticulumNode::spawn_rnode_channel_interface` for
+    /// runtime hot-plug of a phone-attached RNode radio. The handle
+    /// is `pub(crate)` so external crates can't bypass the
+    /// transport's invariants; the PyO3 wrapper lives in
+    /// `src/ffi/pyo3.rs` (same crate). Cfg-gated on `pyo3` because
+    /// the PyEdge wrapper is the sole consumer — non-`pyo3` builds
+    /// (lib tests, the `transport-reticulum`-only matrix combo) would
+    /// trip `-D dead_code` otherwise.
+    #[cfg(feature = "pyo3")]
+    #[must_use]
+    pub(crate) fn node(&self) -> &Arc<ReticulumNode> {
+        &self.node
+    }
+
     /// v2.2.2 (CIRISEdge#97) — return edge's announced RNS destination
     /// hash: the 16-byte `*dest.hash()` value Reticulum computes at
     /// `Destination` construction time over the identity + app aspects
@@ -2686,24 +2702,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // trust-on-first-use (CIRISEdge#15, AV-42).
             resolve_announce_cold_start(&announce, ctx).await;
         }
-        NodeEvent::LinkRequest { link_id, .. } => {
-            match ctx.node.accept_link(&link_id).await {
-                Ok(_) => {
-                    // Auto-accept inbound resources on the link so
-                    // envelope transfers reassemble without app
-                    // intervention.
-                    let _ = ctx
-                        .node
-                        .set_resource_strategy(&link_id, ResourceStrategy::AcceptAll);
-                }
-                Err(e) => tracing::warn!(error = %e, "accept_link failed"),
-            }
-        }
+        // v7.2.0: Leviculum v0.8.x upstream auto-accepts inbound link
+        // requests internally — the v0.7.x `NodeEvent::LinkRequest` +
+        // `node.accept_link(...)` dance is gone. We now hear the
+        // already-accepted link via `LinkEstablished` directly on the
+        // responder side; the resource strategy + bookkeeping run there.
         NodeEvent::LinkEstablished { link_id, .. } => {
-            // On the responder side, ensure inbound resources are
-            // accepted (the LinkRequest branch already set this for
-            // links we accepted; this also covers initiator links so
-            // ACK envelopes pushed back are reassembled).
+            // Auto-accept inbound resources so envelope transfers
+            // reassemble without app intervention. Covers BOTH responder
+            // (the link the peer just initiated against us) and
+            // initiator (so ACK envelopes pushed back are reassembled).
             let _ = ctx
                 .node
                 .set_resource_strategy(&link_id, ResourceStrategy::AcceptAll);

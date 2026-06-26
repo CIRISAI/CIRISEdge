@@ -1131,6 +1131,133 @@ impl PyEdge {
         })
     }
 
+    /// v7.2.0 (CIRISEdge#219) — runtime hot-plug a phone-attached LoRa
+    /// (RNode-firmware) radio over a host-driven byte channel. The
+    /// caller supplies a Python `(read_cb, write_cb)` pair that bridges
+    /// to whatever bus the host OS exposes — Android USB host
+    /// (`UsbDeviceConnection.bulkTransfer`), Android BLE
+    /// (`BluetoothGatt`), iOS BLE (`CBPeripheral`). Edge wraps the
+    /// callbacks as a `leviculum::RNodeChannelFactory` and registers
+    /// the resulting RNode interface on the running `ReticulumNode`
+    /// without rebuilding the node.
+    ///
+    /// Returns an `RNodeChannelHandle` — **hold it to keep the radio
+    /// attached; let it GC or call `detach()` to tear it down.**
+    /// Dropping the handle signals the leviculum interface task to
+    /// stop; the node's event loop detaches the interface and removes
+    /// it from routing cleanly.
+    ///
+    /// Callback contract (executed inside an async tokio task on
+    /// edge's transport runtime, bridged via
+    /// `tokio::task::block_in_place` + `Python::attach`):
+    ///
+    /// - `read_cb(max_bytes: int) -> bytes` — return up to `max_bytes`
+    ///   of bytes received from the radio. Should block until at least
+    ///   one byte is available or the bus closes. Return empty bytes to
+    ///   signal channel close (triggers a reconnect attempt).
+    ///   Exceptions are logged + treated as channel close.
+    /// - `write_cb(payload: bytes) -> None` — send `payload` to the
+    ///   radio. Should block until the bytes are accepted by the bus.
+    ///   Exceptions are logged + treated as channel close.
+    ///
+    /// Both callbacks must be Send-safe — the adapter holds them
+    /// across thread boundaries.
+    ///
+    /// LoRa parameters (passed as a dict for forward compatibility):
+    /// `frequency_hz`, `bandwidth_hz`, `tx_power_dbm`, `sf`, `cr`,
+    /// optional `st_alock`, `lt_alock`, `flow_control`, `buffer_size`.
+    /// Defaults match the leviculum `RNODE_DEFAULT_BUFFER_SIZE` /
+    /// flow-control conventions.
+    ///
+    /// Raises:
+    /// - `RuntimeError` if this edge has no Reticulum transport
+    ///   (`disable_reticulum=True` / wheel built without
+    ///   `_reticulum-module`) or the node isn't running.
+    /// - `ValueError` on malformed callbacks (not callable) or
+    ///   out-of-range LoRa params.
+    #[pyo3(signature = (read_cb, write_cb, frequency_hz, bandwidth_hz, tx_power_dbm, sf, cr, *, st_alock=None, lt_alock=None, flow_control=true, buffer_size=16))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_rnode_channel_interface(
+        &self,
+        read_cb: Py<PyAny>,
+        write_cb: Py<PyAny>,
+        frequency_hz: u32,
+        bandwidth_hz: u32,
+        tx_power_dbm: u8,
+        sf: u8,
+        cr: u8,
+        st_alock: Option<u16>,
+        lt_alock: Option<u16>,
+        flow_control: bool,
+        buffer_size: usize,
+    ) -> PyResult<PyRNodeChannelHandle> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            Python::attach(|py| {
+                if !read_cb.bind(py).is_callable() || !write_cb.bind(py).is_callable() {
+                    return Err(PyTypeError::new_err(
+                        "add_rnode_channel_interface: read_cb and write_cb must be callable",
+                    ));
+                }
+                Ok(())
+            })?;
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "add_rnode_channel_interface: edge has no Reticulum transport \
+                     (disable_reticulum=True, or wheel built without _reticulum-module)",
+                )
+            })?;
+            let factory: Arc<dyn reticulum_std::interfaces::RNodeChannelFactory> =
+                Arc::new(PyRNodeChannelFactory {
+                    read_cb,
+                    write_cb,
+                    chunk_size: buffer_size.max(1) * 1024,
+                });
+            let config = reticulum_std::interfaces::RNodeChannelConfig {
+                factory,
+                frequency: frequency_hz,
+                bandwidth: bandwidth_hz,
+                tx_power: tx_power_dbm,
+                sf,
+                cr,
+                st_alock,
+                lt_alock,
+                flow_control,
+                buffer_size,
+            };
+            let handle = transport
+                .node()
+                .spawn_rnode_channel_interface(config)
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "add_rnode_channel_interface: spawn_rnode_channel_interface: {e}"
+                    ))
+                })?;
+            Ok(PyRNodeChannelHandle {
+                inner: std::sync::Mutex::new(Some(handle)),
+            })
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            let _ = (
+                read_cb,
+                write_cb,
+                frequency_hz,
+                bandwidth_hz,
+                tx_power_dbm,
+                sf,
+                cr,
+                st_alock,
+                lt_alock,
+                flow_control,
+                buffer_size,
+            );
+            Err(PyRuntimeError::new_err(
+                "add_rnode_channel_interface: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
     /// v2.4.0 (CIRISEdge#95) — fetch a remote peer's hybrid KEM
     /// pubkeys (x25519 + ML-KEM-768) from persist's federation
     /// directory for `FederationSession::initiate` consumers
@@ -2673,6 +2800,173 @@ fn hex_encode_32(bytes: &[u8; 32]) -> String {
 struct PyTrustScoringAdapter {
     callback: Py<PyAny>,
 }
+
+/// CIRISEdge#219 — `Arc<dyn RNodeChannelFactory>` adapter wrapping a
+/// pair of Python callbacks (`read_cb`, `write_cb`) as a duplex byte
+/// channel to an RNode-firmware radio.
+///
+/// On each `open()` (called per (re)connection attempt by the
+/// leviculum reconnect loop), the adapter creates a fresh
+/// `tokio::io::duplex(chunk_size)` pair and spawns two
+/// `tokio::task::spawn_blocking` adapters:
+/// - one polls `read_cb` and forwards bytes onto the duplex's WRITE
+///   half (host → leviculum direction);
+/// - one drains the duplex's READ half and pushes bytes via
+///   `write_cb` (leviculum → host direction).
+///
+/// The two adapter tasks bridge sync Python ↔ async Rust via
+/// `Python::attach`. A callback raising (or returning empty bytes
+/// from read_cb) terminates the channel + triggers leviculum's
+/// reconnect (which calls `open()` again).
+#[cfg(feature = "_reticulum-module")]
+struct PyRNodeChannelFactory {
+    read_cb: Py<PyAny>,
+    write_cb: Py<PyAny>,
+    chunk_size: usize,
+}
+
+#[cfg(feature = "_reticulum-module")]
+impl reticulum_std::interfaces::RNodeChannelFactory for PyRNodeChannelFactory {
+    fn open(&self) -> reticulum_std::interfaces::RNodeChannelOpenFuture {
+        let read_cb = Python::attach(|py| self.read_cb.clone_ref(py));
+        let write_cb = Python::attach(|py| self.write_cb.clone_ref(py));
+        let chunk = self.chunk_size;
+        Box::pin(async move {
+            // (host → leviculum half) reads from the Python callback,
+            // writes to `leviculum_rx` which the interface reads.
+            let (leviculum_rx, host_to_lev_tx) = tokio::io::duplex(chunk);
+            // (leviculum → host half) writes to `leviculum_tx` which
+            // the interface fills; the reader half feeds `write_cb`.
+            let (lev_to_host_rx, leviculum_tx) = tokio::io::duplex(chunk);
+
+            // Spawn the host→lev pump (read_cb → host_to_lev_tx).
+            let chunk_for_read = chunk;
+            tokio::task::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let mut sink = host_to_lev_tx;
+                loop {
+                    let bytes_opt = tokio::task::block_in_place(|| {
+                        Python::attach(|py| {
+                            let cb = read_cb.bind(py);
+                            match cb.call1((chunk_for_read,)) {
+                                Ok(value) => match value.extract::<Vec<u8>>() {
+                                    Ok(b) if b.is_empty() => None,
+                                    Ok(b) => Some(b),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "rnode_channel: read_cb returned non-bytes; \
+                                             treating as channel close",
+                                        );
+                                        None
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "rnode_channel: read_cb raised; \
+                                         treating as channel close",
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                    });
+                    let Some(bytes) = bytes_opt else { break };
+                    if sink.write_all(&bytes).await.is_err() {
+                        // leviculum dropped the receiver — channel torn down.
+                        break;
+                    }
+                }
+            });
+
+            // Spawn the lev→host pump (lev_to_host_rx → write_cb).
+            tokio::task::spawn(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut source = lev_to_host_rx;
+                let mut buf = vec![0u8; chunk];
+                loop {
+                    let n = match source.read(&mut buf).await {
+                        Ok(0) | Err(_) => break, // EOF or error → tear down
+                        Ok(n) => n,
+                    };
+                    let chunk_bytes = buf[..n].to_vec();
+                    let ok = tokio::task::block_in_place(|| {
+                        Python::attach(|py| {
+                            let cb = write_cb.bind(py);
+                            let py_bytes = pyo3::types::PyBytes::new(py, &chunk_bytes);
+                            match cb.call1((py_bytes,)) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        bytes_len = chunk_bytes.len(),
+                                        "rnode_channel: write_cb raised; \
+                                         treating as channel close",
+                                    );
+                                    false
+                                }
+                            }
+                        })
+                    });
+                    if !ok {
+                        break;
+                    }
+                }
+            });
+
+            Ok::<
+                reticulum_std::interfaces::RNodeChannelHalves,
+                Box<dyn std::error::Error + Send + Sync>,
+            >((Box::new(leviculum_rx), Box::new(leviculum_tx)))
+        })
+    }
+}
+
+/// CIRISEdge#219 — Python-facing handle for a runtime-attached
+/// RNode interface. Returned by
+/// [`PyEdge::add_rnode_channel_interface`]. **Hold it to keep the
+/// radio attached; let it GC or call `detach()` to tear it down.**
+///
+/// The inner `RNodeChannelHandle` lives in a `Mutex<Option<...>>` so
+/// `detach()` can take it once; subsequent `detach()` calls are
+/// no-ops. Python GC drops the pyclass which drops the inner Option,
+/// which drops the leviculum handle, which signals the interface
+/// task to stop.
+#[cfg(feature = "_reticulum-module")]
+#[pyclass(name = "RNodeChannelHandle", module = "ciris_edge", unsendable)]
+pub struct PyRNodeChannelHandle {
+    inner: std::sync::Mutex<Option<reticulum_std::interfaces::RNodeChannelHandle>>,
+}
+
+#[cfg(feature = "_reticulum-module")]
+#[pymethods]
+impl PyRNodeChannelHandle {
+    /// Detach the radio + tear down the interface now. Idempotent —
+    /// repeated calls are no-ops. Equivalent to letting the handle
+    /// GC.
+    fn detach(&self) {
+        let _ = self
+            .inner
+            .lock()
+            .expect("rnode_channel_handle poisoned")
+            .take();
+    }
+
+    /// `True` iff the radio is still attached (the handle hasn't been
+    /// dropped/detached). Read-only probe for operators.
+    #[getter]
+    fn attached(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("rnode_channel_handle poisoned")
+            .is_some()
+    }
+}
+
+#[cfg(not(feature = "_reticulum-module"))]
+#[pyclass(name = "RNodeChannelHandle", module = "ciris_edge", unsendable)]
+pub struct PyRNodeChannelHandle;
 
 #[async_trait::async_trait]
 impl ciris_persist::federation::TrustScoring for PyTrustScoringAdapter {
@@ -6194,6 +6488,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // public fabric node (CIRISServer) operates it for asleep mobile
     // edges.
     m.add_class::<PyStoreAndForward>()?;
+
+    // CIRISEdge#219 (v7.2.0) — runtime hot-plug handle for a phone-
+    // attached RNode radio (USB-CDC / BLE-bridged). Returned by
+    // `PyEdge.add_rnode_channel_interface`; holds the leviculum
+    // `RNodeChannelHandle` so dropping it cleanly detaches the radio.
+    m.add_class::<PyRNodeChannelHandle>()?;
 
     Ok(())
 }
