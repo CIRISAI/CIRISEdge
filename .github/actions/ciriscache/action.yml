@@ -2,7 +2,7 @@
 #
 # Computes the canonical key per CIRISServer#99 / CIRISVerify#126 /
 # CIRISPersist#311 (`ciris-substrate-v1-<PLAT>-release-rustc<RUSTC>-
-# p<persist>-e<edge>-v<verify>`) from `rustc -V` + `Cargo.lock`, then
+# p<persist>-e<edge>-v<verify>`) from `rustc -V` + `Cargo.toml`, then
 # runs three layered restores in widest-to-narrowest order so a cold-
 # cache edge build pulls every available upstream tarball:
 #
@@ -11,11 +11,21 @@
 #  3. edge    (densest, full superset — adds transport + reticulum)
 #
 # Later layers overlay earlier ones; last-write-wins on the small
-# overlap area. Content-addressed `~/.cargo/registry/cache` crates are
-# byte-identical so overwrite is harmless. `target/` reuse across
-# repos is fingerprint-sensitive (different feature flags); the
+# overlap area. Each restore is `continue-on-error: true` (a miss
+# isn't fatal; the cold build just produces the warmth instead).
+# Content-addressed `~/.cargo/registry/cache` crates are byte-identical
+# across layers so overlap-overwrite is harmless. `target/` reuse
+# across repos is fingerprint-sensitive (different feature flags); the
 # reliable win is the cargo registry layer, which is always feature-
 # agnostic.
+#
+# Version sourcing: Cargo.toml, NOT Cargo.lock. Edge gitignores
+# Cargo.lock — a `Cargo.lock`-keyed compute would resolve to "none"
+# (the v7.3.2 prior approach silently miss-cached on every PLAT).
+# Use `^version = ` for the package version (E), and the
+# CIRISPersist / CIRISVerify URL anchor + `tag = "v..."` for P/V.
+# Any missing version surfaces as a literal `none` in the key — the
+# eyeball notice below makes that visible in the run log.
 #
 # Emits the densest **edge** key as `outputs.key` — callers pass this
 # to a downstream `CIRISAI/CIRISCache/save@v1` step on main-branch
@@ -24,7 +34,7 @@ name: 'CIRISCache canonical layered restore'
 description: 'Layered verify → persist → edge restore on the canonical cross-repo key. Emits the edge key for downstream save.'
 inputs:
   plat:
-    description: 'Platform token (linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64, windows-x64, android-<abi>, ios-<target>).'
+    description: 'Platform token (linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64, windows-x64, android-<abi>, ios-aarch64, ios-aarch64-sim).'
     required: true
 outputs:
   key:
@@ -36,32 +46,43 @@ runs:
     - name: compute canonical cache keys
       id: cachekey
       shell: bash
-      # Composite-action `shell: bash` defaults to the action's own dir
-      # (`.github/actions/ciriscache`) where Cargo.lock does NOT live;
-      # explicit `working-directory` makes the workflow's repo root
-      # (where Cargo.lock IS) the awk cwd.
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         RUSTC=$(rustc -V | awk '{print $2}')
-        PERSIST=$(awk '/^name = "ciris-persist"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
-        EDGE=$(awk '/^name = "ciris-edge"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
-        VERIFY=$(awk '/^name = "ciris-verify-core"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
-        KEY_EDGE="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}-p${PERSIST}-e${EDGE}-v${VERIFY}"
-        KEY_PERSIST="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}-p${PERSIST}-enone-v${VERIFY}"
-        KEY_VERIFY="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}-pnone-enone-v${VERIFY}"
+        # Source from Cargo.toml — edge gitignores Cargo.lock so it
+        # isn't present after actions/checkout. The grep anchors:
+        #   `^version = `              → [package] version (E)
+        #   `CIRISPersist.*tag = "v`    → ciris-persist git tag (P)
+        #   `CIRISVerify.*tag = "v`     → ciris-verify  git tag (V)
+        E=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+        P=$(grep -m1 'CIRISPersist.*tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+        V=$(grep -m1 'CIRISVerify.*tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+        BASE="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}"
+        KEY_VERIFY="${BASE}-pnone-enone-v${V:-none}"
+        KEY_PERSIST="${BASE}-p${P:-none}-enone-v${V:-none}"
+        KEY_EDGE="${BASE}-p${P:-none}-e${E:-none}-v${V:-none}"
         {
           echo "key=${KEY_EDGE}"
           echo "key-persist=${KEY_PERSIST}"
           echo "key-verify=${KEY_VERIFY}"
         } >> "$GITHUB_OUTPUT"
-        echo "::notice::CIRISCache keys (${{ inputs.plat }}) — edge=${KEY_EDGE} persist=${KEY_PERSIST} verify=${KEY_VERIFY}"
+        # Eyeball gate: if any of E/P/V is empty, the key contains
+        # `none` and the restore will silently miss. The notice surfaces
+        # that immediately in the run log per the CIRISServer#99 recipe.
+        echo "::notice::CIRISCache (${{ inputs.plat }}): E=${E:-NONE} P=${P:-NONE} V=${V:-NONE} RUSTC=${RUSTC}"
+        echo "::notice::  verify  key: ${KEY_VERIFY}"
+        echo "::notice::  persist key: ${KEY_PERSIST}"
+        echo "::notice::  edge    key: ${KEY_EDGE}"
     - uses: CIRISAI/CIRISCache/restore@v1
+      continue-on-error: true
       with:
         key: ${{ steps.cachekey.outputs.key-verify }}
     - uses: CIRISAI/CIRISCache/restore@v1
+      continue-on-error: true
       with:
         key: ${{ steps.cachekey.outputs.key-persist }}
     - uses: CIRISAI/CIRISCache/restore@v1
+      continue-on-error: true
       with:
         key: ${{ steps.cachekey.outputs.key }}

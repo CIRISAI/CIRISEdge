@@ -612,17 +612,15 @@ jobs:
   build-ios:
     name: ios ${{ matrix.target }}
     runs-on: macos-latest
-    # CIRISEdge#229 — save edge-self-warm on main (no persist/verify
-    # upstream for ios-* PLATs).
-    permissions:
-      contents: read
-      packages: write
+    # CIRISEdge#229 — restore only; the canonical ios save happens on
+    # the ios-pyo3 lane (PyO3 + extension-module on top is the densest
+    # iOS build, subsumes this plain dylib lane's target/).
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-ios,     sdk: iphoneos }
-          - { target: aarch64-apple-ios-sim, sdk: iphonesimulator }
+          - { target: aarch64-apple-ios,     sdk: iphoneos,         plat: ios-aarch64     }
+          - { target: aarch64-apple-ios-sim, sdk: iphonesimulator,  plat: ios-aarch64-sim }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -631,7 +629,7 @@ jobs:
       - uses: ./.github/actions/ciriscache
         id: cachekey
         with:
-          plat: ios-${{ matrix.target }}
+          plat: ${{ matrix.plat }}
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
         with:
@@ -697,12 +695,6 @@ jobs:
             target/${{ matrix.target }}/release/libciris_edge.dylib
             target/${{ matrix.target }}/release/libciris_edge.a
           if-no-files-found: error
-      # CIRISEdge#229 — save edge-self-warm on main, per-target.
-      - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
-        with:
-          key: ${{ steps.cachekey.outputs.key }}
-          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── xcframework: CIRISEdge.xcframework (CIRISEdge#17) ──────────────
   #
@@ -827,8 +819,10 @@ jobs:
   ios-pyo3:
     name: ios PyO3 abi3 (${{ matrix.target }})
     runs-on: macos-14
-    # CIRISEdge#229 — save edge-self-warm on main (the densest iOS
-    # blob — adds PyO3 + extension-module on top of build-ios's plain).
+    # CIRISEdge#229 — densest iOS canonical save (PyO3 +
+    # extension-module on top of build-ios's plain dylib). PLAT
+    # tokens `ios-aarch64` / `ios-aarch64-sim` match persist's
+    # ios-build save and the CIRISServer#99 canonical scheme.
     permissions:
       contents: read
       packages: write
@@ -836,8 +830,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-ios,     dir: ios-device,    sysconfig: _sysconfigdata__ios_arm64-iphoneos.py,       xcfw_dir: ios-arm64 }
-          - { target: aarch64-apple-ios-sim, dir: ios-simulator, sysconfig: _sysconfigdata__ios_arm64-iphonesimulator.py, xcfw_dir: ios-arm64_x86_64-simulator }
+          - { target: aarch64-apple-ios,     dir: ios-device,    sysconfig: _sysconfigdata__ios_arm64-iphoneos.py,       xcfw_dir: ios-arm64,                       plat: ios-aarch64     }
+          - { target: aarch64-apple-ios-sim, dir: ios-simulator, sysconfig: _sysconfigdata__ios_arm64-iphonesimulator.py, xcfw_dir: ios-arm64_x86_64-simulator,      plat: ios-aarch64-sim }
     env:
       # Persist's pin verbatim — see job docblock above for rationale.
       PYTHON_IOS_VER: "3.10"
@@ -855,7 +849,7 @@ jobs:
       - uses: ./.github/actions/ciriscache
         id: cachekey
         with:
-          plat: ios-pyo3-${{ matrix.target }}
+          plat: ${{ matrix.plat }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -1356,14 +1350,19 @@ jobs:
           components: rust-src
       # CIRISEdge#229 — canonical CIRISCache layered restore on the
       # wheel matrix. PLAT maps wheel's `label` token to the canonical
-      # platform token persist + verify use (label `windows-x86_64`
-      # maps to canonical `windows-x64`; other labels match).
+      # platform token persist + verify save under:
+      #   wheel label       → canonical PLAT
+      #   linux-x86_64      → linux-x86_64
+      #   linux-aarch64     → linux-aarch64
+      #   darwin-aarch64    → macos-aarch64   ← rename
+      #   windows-x86_64    → windows-x64     ← rename
       - name: map matrix label to canonical PLAT
         id: plat
         shell: bash
         run: |
           case "${{ matrix.label }}" in
-            windows-x86_64) PLAT="windows-x64" ;;
+            darwin-aarch64) PLAT="macos-aarch64" ;;
+            windows-x86_64) PLAT="windows-x64"   ;;
             *)              PLAT="${{ matrix.label }}" ;;
           esac
           echo "plat=${PLAT}" >> "$GITHUB_OUTPUT"
