@@ -113,20 +113,45 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
+      # v7.3.2 (CIRISEdge#229) — compute the canonical cross-repo
+      # cache key matching the reference scheme CIRISServer uses
+      # (CIRISServer#99). Shape:
+      #   ciris-substrate-v1-<PLAT>-release-rustc<RUSTC>-p<persist>-e<edge>-v<verify>
+      # The single tag is identical across all repos pinning the same
+      # (platform, rustc, p/e/v) triple, so a compile saved by edge's
+      # main-branch warmer can be restored by CIRISServer / CIRISLensCore
+      # / sibling repos that share the substrate floor.
+      #
+      # Versions read from Cargo.lock at runtime (not hardcoded) so the
+      # key tracks substrate bumps without per-cut workflow edits.
+      # Honest caveat: the saved `target/` is fingerprint-sensitive
+      # (feature flags differ between consumers); the reliable cross-
+      # repo win is the cargo `registry/{cache,index,git}` layer, which
+      # is always feature-agnostic. `target/` reuse is best-effort.
+      - name: compute canonical cache key (CIRISEdge#229)
+        id: cachekey
+        run: |
+          set -euo pipefail
+          RUSTC=$(rustc -V | awk '{print $2}')
+          PERSIST=$(awk '/^name = "ciris-persist"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
+          EDGE=$(awk '/^name = "ciris-edge"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
+          VERIFY=$(awk '/^name = "ciris-verify-core"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
+          KEY="ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${PERSIST}-e${EDGE}-v${VERIFY}"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+          echo "::notice::canonical CIRISCache key: ${KEY}"
       # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — restore the
-      # cross-repo L2 cache BEFORE the per-repo Swatinem L1. The key
-      # is derived from the substrate triple + matrix combo so every
-      # repo that pins the same triple shares the same cache bucket;
-      # rustc version is implicit in the cache contents (Swatinem
-      # invalidates on rustc change). Anonymous read — no token.
+      # cross-repo L2 cache BEFORE the per-repo Swatinem L1. Anonymous
+      # read — no token.
       - uses: CIRISAI/CIRISCache/restore@v1
         with:
-          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist11.2.0-verify8.3.0
+          key: ${{ steps.cachekey.outputs.key }}
       - uses: Swatinem/rust-cache@v2
         with:
           # Per-combo cache key so each matrix entry gets its own
           # target dir (different feature sets compile to different
           # artifacts; sharing the cache would cause recompile thrash).
+          # This is the L1 (in-repo); CIRISCache L2 above is the
+          # cross-repo layer keyed on the substrate triple.
           key: ${{ matrix.combo.name }}
       - name: cargo test --features "${{ matrix.combo.features }}"
         # pyo3-full runs --tests to exercise the integration test suite
@@ -153,12 +178,17 @@ jobs:
       # widest feature set so its target/ subsumes the leaner lanes'
       # contents. PR/tag runs read but don't write; the warmer is
       # main-branch only.
+      #
+      # v7.3.2 (CIRISEdge#229) — saves under the canonical key
+      # computed above so sibling repos (CIRISServer, CIRISLensCore,
+      # etc.) restoring under the same (platform, rustc, p/e/v) triple
+      # land directly on the blob this lane populates.
       - uses: CIRISAI/CIRISCache/save@v1
         if: |
           github.ref == 'refs/heads/main'
             && matrix.combo.name == 'pyo3-full'
         with:
-          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist11.2.0-verify8.3.0
+          key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
