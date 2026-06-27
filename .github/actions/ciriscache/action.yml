@@ -36,6 +36,11 @@ runs:
     - name: compute canonical cache keys
       id: cachekey
       shell: bash
+      # Composite-action `shell: bash` defaults to the action's own dir
+      # (`.github/actions/ciriscache`) where Cargo.lock does NOT live;
+      # explicit `working-directory` makes the workflow's repo root
+      # (where Cargo.lock IS) the awk cwd.
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         RUSTC=$(rustc -V | awk '{print $2}')
