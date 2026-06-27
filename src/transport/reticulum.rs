@@ -893,6 +893,29 @@ pub struct ReticulumTransport {
     /// Hash of edge's own registered destination — the thing we
     /// announce on startup and on the announce timer.
     local_dest_hash: DestinationHash,
+    /// v7.4.0 (CIRISEdge#231) — Reticulum-NAMED destination registered
+    /// alongside the explicit-hash one (`local_dest_hash`). Both share
+    /// the same transport identity for link encryption; they're two
+    /// routing-table entries pointing at the same underlying crypto.
+    ///
+    /// Why the dual registration:
+    ///  - Explicit-hash (`local_dest_hash`) is `sha256(fed_pubkey)[..16]`
+    ///    — addressable by anyone who knows the federation pubkey, but
+    ///    cannot announce (Leviculum guards
+    ///    `AnnounceError::ExplicitHashCannotAnnounce`). Direct-dial /
+    ///    prime_peer path.
+    ///  - Named (`local_named_dest_hash`) is the standard RNS
+    ///    `sha256(name_hash || identity_hash)[..16]` derived from
+    ///    `(EDGE_APP_NAME, EDGE_APP_ASPECT, transport_identity)`. Fully
+    ///    announceable → any RNS fabric (CIRIS or generic) learns the
+    ///    path → multi-hop routing + transport relays work for free.
+    ///
+    /// The announce loop emits under THIS hash. Inbound links to either
+    /// hash terminate at the same identity, so federation trust on the
+    /// envelope payload is invariant. Operators see `Reticulum transport
+    /// listening on ... (dest <explicit_hash>) (named-dest
+    /// <named_hash>)` on the `transport_up` interface event.
+    local_named_dest_hash: DestinationHash,
     /// v2.1.0 (CIRISPersist `LocalIdentityAggregate` RET-transport
     /// role) — the 64-byte Reticulum dual-key public material edge
     /// minted at startup: `x25519_pub (32) ‖ ed25519_pub (32)`. The
@@ -1380,7 +1403,7 @@ impl ReticulumTransport {
             &federation_ed25519_pubkey,
         );
         let mut dest = Destination::with_explicit_hash(
-            Some(identity),
+            Some(identity.clone()),
             Direction::In,
             DestinationType::Single,
             EDGE_APP_NAME,
@@ -1396,6 +1419,27 @@ impl ReticulumTransport {
             "explicit-hash destination must index by the caller-supplied hash",
         );
         node.register_destination_at(local_dest_hash, dest);
+
+        // v7.4.0 (CIRISEdge#231) — register a NAMED destination on
+        // the SAME transport identity. Its hash is the standard RNS
+        // `sha256(name_hash || identity_hash)[..16]` (NOT the
+        // federation-rooted explicit hash above). The named dest is
+        // announceable + mesh-discoverable; the explicit-hash stays
+        // for prime_peer / direct-dial back-compat (every v7.0.0–v7.3.x
+        // peer addresses by explicit hash). Two routing-table entries,
+        // one underlying identity → either inbound path reaches the
+        // same handler set.
+        let mut named_dest = Destination::new(
+            Some(identity),
+            Direction::In,
+            DestinationType::Single,
+            EDGE_APP_NAME,
+            &[EDGE_APP_ASPECT],
+        )
+        .map_err(|e| TransportError::Config(format!("named destination build: {e}")))?;
+        named_dest.set_accepts_links(true);
+        let local_named_dest_hash = *named_dest.hash();
+        node.register_destination_at(local_named_dest_hash, named_dest);
 
         // Take the single event receiver before starting, then start
         // the event loop. `listen` claims the stashed receiver.
@@ -1416,6 +1460,7 @@ impl ReticulumTransport {
             config,
             node: Arc::new(node),
             local_dest_hash,
+            local_named_dest_hash,
             local_transport_pubkey,
             local_attestation,
             events: Mutex::new(Some(events)),
@@ -1508,6 +1553,27 @@ impl ReticulumTransport {
     #[must_use]
     pub fn local_dest_hash(&self) -> [u8; 16] {
         let bytes = self.local_dest_hash.as_bytes();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(bytes);
+        out
+    }
+
+    /// v7.4.0 (CIRISEdge#231) — the NAMED Reticulum destination hash,
+    /// `sha256(name_hash || transport_identity_hash)[..16]`. Distinct
+    /// from [`Self::local_dest_hash`] (which is the explicit-hash
+    /// `sha256(fed_pubkey)[..16]`); both terminate at the same
+    /// transport identity, so inbound links to EITHER reach the same
+    /// handler set.
+    ///
+    /// This is the value the periodic announce emits — RNS peers
+    /// receiving our announce store a path to THIS hash. For
+    /// mesh-routed delivery (multi-hop, transport relays), peers
+    /// should dial this hash. The explicit-hash stays the canonical
+    /// direct-dial / prime_peer address for back-compat with
+    /// v7.0.0–v7.3.x peers.
+    #[must_use]
+    pub fn local_named_dest_hash(&self) -> [u8; 16] {
+        let bytes = self.local_named_dest_hash.as_bytes();
         let mut out = [0u8; 16];
         out.copy_from_slice(bytes);
         out
@@ -2555,6 +2621,7 @@ impl Transport for ReticulumTransport {
         tracing::info!(
             addr = %self.config.listen_addr,
             dest = %self.local_dest_hash,
+            named_dest = %self.local_named_dest_hash,
             "Reticulum transport listening",
         );
 
@@ -2566,13 +2633,21 @@ impl Transport for ReticulumTransport {
                 crate::events::EventKind::TransportUp,
                 "reticulum-rs",
                 format!(
-                    "Reticulum transport listening on {} (dest {})",
-                    self.config.listen_addr, self.local_dest_hash
+                    "Reticulum transport listening on {} (dest {}, named-dest {})",
+                    self.config.listen_addr, self.local_dest_hash, self.local_named_dest_hash,
                 ),
             ));
         }
 
-        // Announce edge's own destination on startup, then on a timer.
+        // v7.4.0 (CIRISEdge#231) — announce edge's NAMED destination
+        // (the standard RNS `sha256(name_hash || identity_hash)`),
+        // NOT the explicit-hash. The explicit-hash is unannounceable
+        // by Leviculum guard — every v7.0.0–v7.3.x cut WARN-spammed
+        // on every tick because the announce loop was pointed at it.
+        // Now any RNS fabric learning our announce gets a routable
+        // path to `local_named_dest_hash`. The explicit-hash stays
+        // registered for direct-dial / prime_peer back-compat.
+        //
         // The app-data is edge's signed announce attestation
         // (CIRISEdge#15 send side) — a federation-key signature
         // binding this transport identity to `local_key_id`. When no
@@ -2581,10 +2656,10 @@ impl Transport for ReticulumTransport {
         let app_data: &[u8] = self.local_attestation.as_deref().unwrap_or(&[]);
         if let Err(e) = self
             .node
-            .announce_destination(&self.local_dest_hash, Some(app_data))
+            .announce_destination(&self.local_named_dest_hash, Some(app_data))
             .await
         {
-            tracing::warn!(error = %e, "initial announce failed");
+            tracing::warn!(error = %e, "initial announce (named destination) failed");
         }
         let mut announce_tick = tokio::time::interval(self.config.announce_interval);
         announce_tick.tick().await; // consume the immediate first tick
@@ -2594,10 +2669,10 @@ impl Transport for ReticulumTransport {
                 _ = announce_tick.tick() => {
                     if let Err(e) = self
                         .node
-                        .announce_destination(&self.local_dest_hash, Some(app_data))
+                        .announce_destination(&self.local_named_dest_hash, Some(app_data))
                         .await
                     {
-                        tracing::warn!(error = %e, "periodic announce failed");
+                        tracing::warn!(error = %e, "periodic announce (named destination) failed");
                     }
                 }
                 event = events.recv() => {
