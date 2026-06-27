@@ -173,12 +173,9 @@ jobs:
   darwin-aarch64-test:
     name: darwin-aarch64 (no pyo3)
     runs-on: macos-14
-    # CIRISEdge#229 — save the cross-repo cache on main-branch builds
-    # of this canonical macos-aarch64 lane. PR runs read but don't
-    # write; permissions stay minimal.
-    permissions:
-      contents: read
-      packages: write
+    # CIRISEdge#229 — restore only; canonical macos-aarch64 save lives
+    # on `pyo3-wheel` `darwin-aarch64` (release-profile target/).
+    # `packages: write` not needed here.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -222,12 +219,14 @@ jobs:
         # load-bearing (edge ships darwin wheels; the teranos fork base
         # exists for macOS compat). CIRISEdge#14.
         run: cargo test --features "transport-http transport-reticulum"
-      # CIRISEdge#229 — save warm cache to GHCR on main only.
-      - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
-        with:
-          key: ${{ steps.cachekey.outputs.key }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # CIRISEdge#229 — restore only on this lane. The canonical
+      # macos-aarch64 save site is the `pyo3-wheel` `darwin-aarch64`
+      # matrix entry (release-profile target/, matches what downstream
+      # consumers build against). Saving here would write a debug-
+      # profile target/ blob over it (same canonical key, second-
+      # writer-wins is racey). Restore happens via the composite
+      # action above unconditionally — debug builds still pick up the
+      # registry layer + warm release artifacts where they match.
 
   # ─── android-ndk: per-ABI mobile cross-compile (CIRISEdge#17) ───────
   #
