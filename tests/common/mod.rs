@@ -146,3 +146,64 @@ pub async fn prime_v7_peer_pair(
         .inject_rooted_peer_for_test(key_id_b, b_dest, b_ed)
         .await;
 }
+
+/// Build a [`ReticulumTransport`], retrying on the transient
+/// "address already in use" race.
+///
+/// The test suites pick loopback ports via `free_port()`, which binds an
+/// ephemeral port and immediately releases it. Between that release and
+/// the transport reclaiming the port, a parallel test (in this binary or
+/// another test binary cargo runs concurrently) can win the same port —
+/// surfacing as `Io("reticulum node start: ... Address already in use")`.
+/// On that error we rebuild from a freshly-picked config; any other error
+/// is a real failure and panics immediately.
+///
+/// `make` is invoked once per attempt and must return a *fresh* config
+/// (re-picking its ephemeral `listen_addr`) together with the matching
+/// [`ReticulumAuth`] — both are consumed by the build, so the auth signer
+/// is rebuilt per attempt. Returns the live transport plus the
+/// `listen_addr` that actually bound, so callers wiring a bootstrap peer
+/// can learn the settled port.
+#[cfg(feature = "transport-reticulum")]
+pub async fn build_reticulum_with_retry<F, Fut>(
+    mut make: F,
+) -> (
+    Arc<ciris_edge::transport::reticulum::ReticulumTransport>,
+    std::net::SocketAddr,
+)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = (
+            ciris_edge::transport::reticulum::ReticulumTransportConfig,
+            ciris_edge::transport::reticulum::ReticulumAuth,
+        ),
+    >,
+{
+    use ciris_edge::transport::reticulum::ReticulumTransport;
+
+    const MAX_ATTEMPTS: usize = 16;
+    let mut last_err = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let (cfg, auth) = make().await;
+        let addr = cfg.listen_addr;
+        match ReticulumTransport::new(cfg, auth).await {
+            Ok(transport) => return (Arc::new(transport), addr),
+            Err(err) if is_addr_in_use(&err) => {
+                // Re-pick a port and rebuild on the next loop iteration.
+                last_err = Some(err);
+            }
+            Err(err) => panic!("build reticulum transport: {err:?}"),
+        }
+    }
+    panic!("build reticulum transport: exhausted {MAX_ATTEMPTS} bind retries: {last_err:?}");
+}
+
+/// True if a transport build error is the transient ephemeral-port bind
+/// race from `free_port()` (see [`build_reticulum_with_retry`]) rather
+/// than a genuine configuration or crypto failure.
+#[cfg(feature = "transport-reticulum")]
+fn is_addr_in_use(err: &ciris_edge::transport::TransportError) -> bool {
+    let msg = err.to_string();
+    msg.contains("Address already in use") || msg.contains("os error 98")
+}
