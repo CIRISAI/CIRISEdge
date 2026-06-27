@@ -121,7 +121,7 @@ jobs:
       # invalidates on rustc change). Anonymous read — no token.
       - uses: CIRISAI/CIRISCache/restore@v1
         with:
-          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist11.0.0-verify8.0.0
+          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist11.2.0-verify8.3.0
       - uses: Swatinem/rust-cache@v2
         with:
           # Per-combo cache key so each matrix entry gets its own
@@ -158,7 +158,7 @@ jobs:
           github.ref == 'refs/heads/main'
             && matrix.combo.name == 'pyo3-full'
         with:
-          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist11.0.0-verify8.0.0
+          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist11.2.0-verify8.3.0
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
