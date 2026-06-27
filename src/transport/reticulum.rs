@@ -2572,34 +2572,38 @@ impl Transport for ReticulumTransport {
             ));
         }
 
-        // Announce edge's own destination on startup, then on a timer.
-        // The app-data is edge's signed announce attestation
-        // (CIRISEdge#15 send side) — a federation-key signature
-        // binding this transport identity to `local_key_id`. When no
-        // signer was supplied the announce carries empty app-data and
-        // rooting peers drop it (fail-honest).
-        let app_data: &[u8] = self.local_attestation.as_deref().unwrap_or(&[]);
-        if let Err(e) = self
-            .node
-            .announce_destination(&self.local_dest_hash, Some(app_data))
-            .await
-        {
-            tracing::warn!(error = %e, "initial announce failed");
-        }
-        let mut announce_tick = tokio::time::interval(self.config.announce_interval);
-        announce_tick.tick().await; // consume the immediate first tick
+        // v7.3.3 (CIRISEdge#231) — v7.0.0 introduced explicit-hash
+        // destination addressing: the dest_hash is derived from
+        // `sha256(fed_pubkey)[..16]` and registered via
+        // `Destination::with_explicit_hash` (see line 1382). Reticulum's
+        // announce protocol REQUIRES a named destination (app_name +
+        // aspects + identity), and explicit-hash destinations carry
+        // none of those — Leviculum guards this with
+        // `AnnounceError::ExplicitHashCannotAnnounce`. Calling
+        // `announce_destination` was a guaranteed failure on every
+        // tick + WARN-spam in the logs.
+        //
+        // Discovery for v7.0.0+ explicit-hash addressing is **out-of-
+        // band** per CIRISEdge#214: peers exchange
+        // `(fed_kid, dest_hash, transport_ed25519_pub)` via the
+        // federation directory / QR / any side channel, then call
+        // `prime_peer(...)` to install the binding into the local
+        // resolver map. After priming, `send_inline_text` resolves to
+        // the rooted destination. No mesh announce involved.
+        //
+        // Log this once at startup so operators see WHY discovery is
+        // out-of-band, drop the announce_tick branch from the select
+        // loop, and keep the NodeEvent processing arm unchanged.
+        tracing::info!(
+            dest = %self.local_dest_hash,
+            "v7.0.0+ explicit-hash destination — Reticulum announce-based discovery is \
+             disabled by design; peers root each other out-of-band via prime_peer \
+             (CIRISEdge#214). Periodic announce loop suppressed (CIRISEdge#231).",
+        );
+        let _app_data: &[u8] = self.local_attestation.as_deref().unwrap_or(&[]);
 
         loop {
             tokio::select! {
-                _ = announce_tick.tick() => {
-                    if let Err(e) = self
-                        .node
-                        .announce_destination(&self.local_dest_hash, Some(app_data))
-                        .await
-                    {
-                        tracing::warn!(error = %e, "periodic announce failed");
-                    }
-                }
                 event = events.recv() => {
                     let Some(event) = event else {
                         tracing::info!("Reticulum event channel closed; listener exiting");
