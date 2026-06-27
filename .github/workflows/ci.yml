@@ -113,72 +113,14 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
-      # v7.3.2 (CIRISEdge#229) — compute the canonical cross-repo
-      # cache key matching the reference scheme CIRISServer uses
-      # (CIRISServer#99). Shape:
-      #   ciris-substrate-v1-<PLAT>-release-rustc<RUSTC>-p<persist>-e<edge>-v<verify>
-      # The single tag is identical across all repos pinning the same
-      # (platform, rustc, p/e/v) triple, so a compile saved by edge's
-      # main-branch warmer can be restored by CIRISServer / CIRISLensCore
-      # / sibling repos that share the substrate floor.
-      #
-      # Versions read from Cargo.lock at runtime (not hardcoded) so the
-      # key tracks substrate bumps without per-cut workflow edits.
-      # Honest caveat: the saved `target/` is fingerprint-sensitive
-      # (feature flags differ between consumers); the reliable cross-
-      # repo win is the cargo `registry/{cache,index,git}` layer, which
-      # is always feature-agnostic. `target/` reuse is best-effort.
-      - name: compute canonical cache keys (CIRISEdge#229)
+      # CIRISEdge#229 — canonical layered cache restore (verify →
+      # persist → edge) via the local composite at
+      # `.github/actions/ciriscache`. Emits the densest edge key as
+      # `outputs.key` which the save step below references.
+      - uses: ./.github/actions/ciriscache
         id: cachekey
-        run: |
-          set -euo pipefail
-          RUSTC=$(rustc -V | awk '{print $2}')
-          PERSIST=$(awk '/^name = "ciris-persist"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
-          EDGE=$(awk '/^name = "ciris-edge"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
-          VERIFY=$(awk '/^name = "ciris-verify-core"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
-          # Edge owns the densest blob (full superset; consumed by
-          # downstream CIRISServer + sibling repos).
-          KEY_EDGE="ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${PERSIST}-e${EDGE}-v${VERIFY}"
-          # Persist's main-branch warmer publishes under e=none (persist
-          # has no edge dep). Its tarball already contains the cargo
-          # registry + target/ artifacts for the persist + verify
-          # crate trees — re-using them avoids re-downloading + re-
-          # compiling deps edge shares (sqlite, federation_directory,
-          # etc.).
-          KEY_PERSIST="ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${PERSIST}-enone-v${VERIFY}"
-          # Verify is the substrate leaf (no persist or edge dep).
-          # Smallest blob — covers crypto / keyring / hybrid-kex /
-          # ML-DSA-65 deps. Always worth restoring; bottom of the
-          # layering order.
-          KEY_VERIFY="ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-pnone-enone-v${VERIFY}"
-          {
-            echo "key=${KEY_EDGE}"
-            echo "key-persist=${KEY_PERSIST}"
-            echo "key-verify=${KEY_VERIFY}"
-          } >> "$GITHUB_OUTPUT"
-          echo "::notice::CIRISCache keys: edge=${KEY_EDGE} persist=${KEY_PERSIST} verify=${KEY_VERIFY}"
-      # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — restore the
-      # cross-repo L2 cache BEFORE the per-repo Swatinem L1. Anonymous
-      # read — no token.
-      #
-      # v7.3.2 (CIRISEdge#229) — layered restore: widest-to-narrowest.
-      # Verify's blob extracts first (smallest, substrate-leaf), then
-      # persist's overlay (adds persist + sqlite deps), finally edge's
-      # own (densest, adds transport + reticulum). Each subsequent layer
-      # overwrites overlapping files — last-write-wins for `target/`
-      # artifacts, content-addressed registry/cache crates are
-      # byte-identical so overwrite is harmless. All three are
-      # unconditional: a cold-cache run pulls all available upstream
-      # artifacts; a warm-cache run is no slower than a single restore.
-      - uses: CIRISAI/CIRISCache/restore@v1
         with:
-          key: ${{ steps.cachekey.outputs.key-verify }}
-      - uses: CIRISAI/CIRISCache/restore@v1
-        with:
-          key: ${{ steps.cachekey.outputs.key-persist }}
-      - uses: CIRISAI/CIRISCache/restore@v1
-        with:
-          key: ${{ steps.cachekey.outputs.key }}
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
         with:
           # Per-combo cache key so each matrix entry gets its own
@@ -231,9 +173,19 @@ jobs:
   darwin-aarch64-test:
     name: darwin-aarch64 (no pyo3)
     runs-on: macos-14
+    # CIRISEdge#229 — save the cross-repo cache on main-branch builds
+    # of this canonical macos-aarch64 lane. PR runs read but don't
+    # write; permissions stay minimal.
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: macos-aarch64
       - uses: Swatinem/rust-cache@v2
         # cache-bin: false — Swatinem/rust-cache's default cache-bin
         # restores `.cargo/bin/cargo` from older runs on macos-aarch64,
@@ -270,6 +222,12 @@ jobs:
         # load-bearing (edge ships darwin wheels; the teranos fork base
         # exists for macOS compat). CIRISEdge#14.
         run: cargo test --features "transport-http transport-reticulum"
+      # CIRISEdge#229 — save warm cache to GHCR on main only.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── android-ndk: per-ABI mobile cross-compile (CIRISEdge#17) ───────
   #
@@ -311,6 +269,11 @@ jobs:
   android-ndk:
     name: android ${{ matrix.abi }}
     runs-on: ubuntu-latest
+    # CIRISEdge#229 — save edge-self-warm on main (no persist/verify
+    # upstream for android-* PLATs; edge owns its own warm cycle).
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -331,6 +294,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: android-${{ matrix.abi }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-${{ matrix.abi }}
@@ -493,6 +460,12 @@ jobs:
         with:
           name: ciris-edge-android-${{ matrix.abi }}
           path: dist/${{ matrix.abi }}/
+      # CIRISEdge#229 — save edge-self-warm on main, per-ABI.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── android-package: collect per-ABI artifacts (CIRISEdge#17) ──────
   #
@@ -639,6 +612,11 @@ jobs:
   build-ios:
     name: ios ${{ matrix.target }}
     runs-on: macos-latest
+    # CIRISEdge#229 — save edge-self-warm on main (no persist/verify
+    # upstream for ios-* PLATs).
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -650,6 +628,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: ios-${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
         with:
@@ -715,6 +697,12 @@ jobs:
             target/${{ matrix.target }}/release/libciris_edge.dylib
             target/${{ matrix.target }}/release/libciris_edge.a
           if-no-files-found: error
+      # CIRISEdge#229 — save edge-self-warm on main, per-target.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── xcframework: CIRISEdge.xcframework (CIRISEdge#17) ──────────────
   #
@@ -839,6 +827,11 @@ jobs:
   ios-pyo3:
     name: ios PyO3 abi3 (${{ matrix.target }})
     runs-on: macos-14
+    # CIRISEdge#229 — save edge-self-warm on main (the densest iOS
+    # blob — adds PyO3 + extension-module on top of build-ios's plain).
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -859,6 +852,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: ios-pyo3-${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -977,6 +974,12 @@ jobs:
           name: ciris-edge-ios-pyo3-${{ matrix.dir }}
           path: dist/${{ matrix.dir }}/ciris_edge.abi3.so
           if-no-files-found: error
+      # CIRISEdge#229 — save edge-self-warm on main, per-target.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── ios-pyo3-package: collect device + simulator (CIRISEdge#17) ────
   #
@@ -1056,6 +1059,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # CIRISEdge#229 — restore only; the canonical linux-x86_64 save
+      # happens on the linux-x86_64-test pyo3-full lane.
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -1084,6 +1092,9 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
       - name: build uniffi_bindgen_cli
         run: cargo build --bin uniffi_bindgen_cli --features ffi-uniffi
@@ -1144,6 +1155,9 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
       - name: cargo bench --no-run (all features)
         # All three feature-gates so EVERY bench file compiles in
@@ -1196,6 +1210,12 @@ jobs:
   pyo3-wheel:
     name: maturin abi3-py310 wheel (${{ matrix.label }})
     needs: [cargo-pyproject-skew-check]
+    # CIRISEdge#229 — save the cross-repo cache on main-branch wheel
+    # builds (one per canonical PLAT: linux-x86_64, linux-aarch64,
+    # macos-aarch64, windows-x64). PR runs read but don't write.
+    permissions:
+      contents: read
+      packages: write
     # v2.1.1 — windows-x86_64 wheel is now REQUIRED (closes
     # CIRISEdge#90). All three layers landed:
     #   1. leviculum 4c15dfd — reticulum-std Windows port (leviculum#10/#11)
@@ -1334,6 +1354,23 @@ jobs:
         with:
           toolchain: ${{ env.NIGHTLY_PIN }}
           components: rust-src
+      # CIRISEdge#229 — canonical CIRISCache layered restore on the
+      # wheel matrix. PLAT maps wheel's `label` token to the canonical
+      # platform token persist + verify use (label `windows-x86_64`
+      # maps to canonical `windows-x64`; other labels match).
+      - name: map matrix label to canonical PLAT
+        id: plat
+        shell: bash
+        run: |
+          case "${{ matrix.label }}" in
+            windows-x86_64) PLAT="windows-x64" ;;
+            *)              PLAT="${{ matrix.label }}" ;;
+          esac
+          echo "plat=${PLAT}" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: ${{ steps.plat.outputs.plat }}
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below
       # actively corrects. CIRISVerify v2.1.4+ pattern; persist v0.7.2's
@@ -1580,6 +1617,18 @@ jobs:
           name: emit-edge-extras-bin
           path: target/release/emit_edge_extras
           retention-days: 7
+      # CIRISEdge#229 — save warm cache to GHCR on main only, one save
+      # per canonical PLAT. The wheel matrix is the canonical save
+      # site for linux-aarch64, macos-aarch64, windows-x64 (the
+      # linux-x86_64-test pyo3-full lane is the canonical save site
+      # for linux-x86_64).
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: |
+          github.ref == 'refs/heads/main'
+            && matrix.label != 'linux-x86_64'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── build-manifest: hybrid-signed release provenance ───────────────
   #
@@ -1615,6 +1664,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - name: extract version from Cargo.toml
         id: version
         run: |

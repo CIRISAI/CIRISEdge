@@ -1,0 +1,62 @@
+# CIRISEdge#229 — canonical cross-repo CIRISCache layered restore.
+#
+# Computes the canonical key per CIRISServer#99 / CIRISVerify#126 /
+# CIRISPersist#311 (`ciris-substrate-v1-<PLAT>-release-rustc<RUSTC>-
+# p<persist>-e<edge>-v<verify>`) from `rustc -V` + `Cargo.lock`, then
+# runs three layered restores in widest-to-narrowest order so a cold-
+# cache edge build pulls every available upstream tarball:
+#
+#  1. verify  (substrate leaf — crypto/keyring/hybrid-kex/ML-DSA-65)
+#  2. persist (adds sqlite + federation_directory + outbound deps)
+#  3. edge    (densest, full superset — adds transport + reticulum)
+#
+# Later layers overlay earlier ones; last-write-wins on the small
+# overlap area. Content-addressed `~/.cargo/registry/cache` crates are
+# byte-identical so overwrite is harmless. `target/` reuse across
+# repos is fingerprint-sensitive (different feature flags); the
+# reliable win is the cargo registry layer, which is always feature-
+# agnostic.
+#
+# Emits the densest **edge** key as `outputs.key` — callers pass this
+# to a downstream `CIRISAI/CIRISCache/save@v1` step on main-branch
+# canonical-lane runs.
+name: 'CIRISCache canonical layered restore'
+description: 'Layered verify → persist → edge restore on the canonical cross-repo key. Emits the edge key for downstream save.'
+inputs:
+  plat:
+    description: 'Platform token (linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64, windows-x64, android-<abi>, ios-<target>).'
+    required: true
+outputs:
+  key:
+    description: 'Canonical edge cache key (densest layer). Pass to CIRISAI/CIRISCache/save@v1.'
+    value: ${{ steps.cachekey.outputs.key }}
+runs:
+  using: 'composite'
+  steps:
+    - name: compute canonical cache keys
+      id: cachekey
+      shell: bash
+      run: |
+        set -euo pipefail
+        RUSTC=$(rustc -V | awk '{print $2}')
+        PERSIST=$(awk '/^name = "ciris-persist"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
+        EDGE=$(awk '/^name = "ciris-edge"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
+        VERIFY=$(awk '/^name = "ciris-verify-core"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
+        KEY_EDGE="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}-p${PERSIST}-e${EDGE}-v${VERIFY}"
+        KEY_PERSIST="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}-p${PERSIST}-enone-v${VERIFY}"
+        KEY_VERIFY="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}-pnone-enone-v${VERIFY}"
+        {
+          echo "key=${KEY_EDGE}"
+          echo "key-persist=${KEY_PERSIST}"
+          echo "key-verify=${KEY_VERIFY}"
+        } >> "$GITHUB_OUTPUT"
+        echo "::notice::CIRISCache keys (${{ inputs.plat }}) — edge=${KEY_EDGE} persist=${KEY_PERSIST} verify=${KEY_VERIFY}"
+    - uses: CIRISAI/CIRISCache/restore@v1
+      with:
+        key: ${{ steps.cachekey.outputs.key-verify }}
+    - uses: CIRISAI/CIRISCache/restore@v1
+      with:
+        key: ${{ steps.cachekey.outputs.key-persist }}
+    - uses: CIRISAI/CIRISCache/restore@v1
+      with:
+        key: ${{ steps.cachekey.outputs.key }}
