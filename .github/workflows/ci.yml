@@ -128,7 +128,7 @@ jobs:
       # (feature flags differ between consumers); the reliable cross-
       # repo win is the cargo `registry/{cache,index,git}` layer, which
       # is always feature-agnostic. `target/` reuse is best-effort.
-      - name: compute canonical cache key (CIRISEdge#229)
+      - name: compute canonical cache keys (CIRISEdge#229)
         id: cachekey
         run: |
           set -euo pipefail
@@ -136,12 +136,46 @@ jobs:
           PERSIST=$(awk '/^name = "ciris-persist"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
           EDGE=$(awk '/^name = "ciris-edge"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
           VERIFY=$(awk '/^name = "ciris-verify-core"$/{getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit}' Cargo.lock)
-          KEY="ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${PERSIST}-e${EDGE}-v${VERIFY}"
-          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
-          echo "::notice::canonical CIRISCache key: ${KEY}"
+          # Edge owns the densest blob (full superset; consumed by
+          # downstream CIRISServer + sibling repos).
+          KEY_EDGE="ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${PERSIST}-e${EDGE}-v${VERIFY}"
+          # Persist's main-branch warmer publishes under e=none (persist
+          # has no edge dep). Its tarball already contains the cargo
+          # registry + target/ artifacts for the persist + verify
+          # crate trees — re-using them avoids re-downloading + re-
+          # compiling deps edge shares (sqlite, federation_directory,
+          # etc.).
+          KEY_PERSIST="ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${PERSIST}-enone-v${VERIFY}"
+          # Verify is the substrate leaf (no persist or edge dep).
+          # Smallest blob — covers crypto / keyring / hybrid-kex /
+          # ML-DSA-65 deps. Always worth restoring; bottom of the
+          # layering order.
+          KEY_VERIFY="ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-pnone-enone-v${VERIFY}"
+          {
+            echo "key=${KEY_EDGE}"
+            echo "key-persist=${KEY_PERSIST}"
+            echo "key-verify=${KEY_VERIFY}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::CIRISCache keys: edge=${KEY_EDGE} persist=${KEY_PERSIST} verify=${KEY_VERIFY}"
       # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — restore the
       # cross-repo L2 cache BEFORE the per-repo Swatinem L1. Anonymous
       # read — no token.
+      #
+      # v7.3.2 (CIRISEdge#229) — layered restore: widest-to-narrowest.
+      # Verify's blob extracts first (smallest, substrate-leaf), then
+      # persist's overlay (adds persist + sqlite deps), finally edge's
+      # own (densest, adds transport + reticulum). Each subsequent layer
+      # overwrites overlapping files — last-write-wins for `target/`
+      # artifacts, content-addressed registry/cache crates are
+      # byte-identical so overwrite is harmless. All three are
+      # unconditional: a cold-cache run pulls all available upstream
+      # artifacts; a warm-cache run is no slower than a single restore.
+      - uses: CIRISAI/CIRISCache/restore@v1
+        with:
+          key: ${{ steps.cachekey.outputs.key-verify }}
+      - uses: CIRISAI/CIRISCache/restore@v1
+        with:
+          key: ${{ steps.cachekey.outputs.key-persist }}
       - uses: CIRISAI/CIRISCache/restore@v1
         with:
           key: ${{ steps.cachekey.outputs.key }}
