@@ -113,20 +113,21 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
-      # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — restore the
-      # cross-repo L2 cache BEFORE the per-repo Swatinem L1. The key
-      # is derived from the substrate triple + matrix combo so every
-      # repo that pins the same triple shares the same cache bucket;
-      # rustc version is implicit in the cache contents (Swatinem
-      # invalidates on rustc change). Anonymous read — no token.
-      - uses: CIRISAI/CIRISCache/restore@v1
+      # CIRISEdge#229 — canonical layered cache restore (verify →
+      # persist → edge) via the local composite at
+      # `.github/actions/ciriscache`. Emits the densest edge key as
+      # `outputs.key` which the save step below references.
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
         with:
-          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist11.2.0-verify8.3.0
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
         with:
           # Per-combo cache key so each matrix entry gets its own
           # target dir (different feature sets compile to different
           # artifacts; sharing the cache would cause recompile thrash).
+          # This is the L1 (in-repo); CIRISCache L2 above is the
+          # cross-repo layer keyed on the substrate triple.
           key: ${{ matrix.combo.name }}
       - name: cargo test --features "${{ matrix.combo.features }}"
         # pyo3-full runs --tests to exercise the integration test suite
@@ -153,12 +154,17 @@ jobs:
       # widest feature set so its target/ subsumes the leaner lanes'
       # contents. PR/tag runs read but don't write; the warmer is
       # main-branch only.
+      #
+      # v7.3.2 (CIRISEdge#229) — saves under the canonical key
+      # computed above so sibling repos (CIRISServer, CIRISLensCore,
+      # etc.) restoring under the same (platform, rustc, p/e/v) triple
+      # land directly on the blob this lane populates.
       - uses: CIRISAI/CIRISCache/save@v1
         if: |
           github.ref == 'refs/heads/main'
             && matrix.combo.name == 'pyo3-full'
         with:
-          key: ciris-edge-linux-x86_64-${{ matrix.combo.name }}-persist11.2.0-verify8.3.0
+          key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
@@ -167,9 +173,19 @@ jobs:
   darwin-aarch64-test:
     name: darwin-aarch64 (no pyo3)
     runs-on: macos-14
+    # CIRISEdge#229 — save the cross-repo cache on main-branch builds
+    # of this canonical macos-aarch64 lane. PR runs read but don't
+    # write; permissions stay minimal.
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: macos-aarch64
       - uses: Swatinem/rust-cache@v2
         # cache-bin: false — Swatinem/rust-cache's default cache-bin
         # restores `.cargo/bin/cargo` from older runs on macos-aarch64,
@@ -206,6 +222,12 @@ jobs:
         # load-bearing (edge ships darwin wheels; the teranos fork base
         # exists for macOS compat). CIRISEdge#14.
         run: cargo test --features "transport-http transport-reticulum"
+      # CIRISEdge#229 — save warm cache to GHCR on main only.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── android-ndk: per-ABI mobile cross-compile (CIRISEdge#17) ───────
   #
@@ -247,6 +269,11 @@ jobs:
   android-ndk:
     name: android ${{ matrix.abi }}
     runs-on: ubuntu-latest
+    # CIRISEdge#229 — save edge-self-warm on main (no persist/verify
+    # upstream for android-* PLATs; edge owns its own warm cycle).
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -267,6 +294,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: android-${{ matrix.abi }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-${{ matrix.abi }}
@@ -429,6 +460,12 @@ jobs:
         with:
           name: ciris-edge-android-${{ matrix.abi }}
           path: dist/${{ matrix.abi }}/
+      # CIRISEdge#229 — save edge-self-warm on main, per-ABI.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── android-package: collect per-ABI artifacts (CIRISEdge#17) ──────
   #
@@ -575,17 +612,24 @@ jobs:
   build-ios:
     name: ios ${{ matrix.target }}
     runs-on: macos-latest
+    # CIRISEdge#229 — restore only; the canonical ios save happens on
+    # the ios-pyo3 lane (PyO3 + extension-module on top is the densest
+    # iOS build, subsumes this plain dylib lane's target/).
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-ios,     sdk: iphoneos }
-          - { target: aarch64-apple-ios-sim, sdk: iphonesimulator }
+          - { target: aarch64-apple-ios,     sdk: iphoneos,         plat: ios-aarch64     }
+          - { target: aarch64-apple-ios-sim, sdk: iphonesimulator,  plat: ios-aarch64-sim }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: ${{ matrix.plat }}
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
         with:
@@ -775,12 +819,19 @@ jobs:
   ios-pyo3:
     name: ios PyO3 abi3 (${{ matrix.target }})
     runs-on: macos-14
+    # CIRISEdge#229 — densest iOS canonical save (PyO3 +
+    # extension-module on top of build-ios's plain dylib). PLAT
+    # tokens `ios-aarch64` / `ios-aarch64-sim` match persist's
+    # ios-build save and the CIRISServer#99 canonical scheme.
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-ios,     dir: ios-device,    sysconfig: _sysconfigdata__ios_arm64-iphoneos.py,       xcfw_dir: ios-arm64 }
-          - { target: aarch64-apple-ios-sim, dir: ios-simulator, sysconfig: _sysconfigdata__ios_arm64-iphonesimulator.py, xcfw_dir: ios-arm64_x86_64-simulator }
+          - { target: aarch64-apple-ios,     dir: ios-device,    sysconfig: _sysconfigdata__ios_arm64-iphoneos.py,       xcfw_dir: ios-arm64,                       plat: ios-aarch64     }
+          - { target: aarch64-apple-ios-sim, dir: ios-simulator, sysconfig: _sysconfigdata__ios_arm64-iphonesimulator.py, xcfw_dir: ios-arm64_x86_64-simulator,      plat: ios-aarch64-sim }
     env:
       # Persist's pin verbatim — see job docblock above for rationale.
       PYTHON_IOS_VER: "3.10"
@@ -795,6 +846,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: ${{ matrix.plat }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -913,6 +968,12 @@ jobs:
           name: ciris-edge-ios-pyo3-${{ matrix.dir }}
           path: dist/${{ matrix.dir }}/ciris_edge.abi3.so
           if-no-files-found: error
+      # CIRISEdge#229 — save edge-self-warm on main, per-target.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── ios-pyo3-package: collect device + simulator (CIRISEdge#17) ────
   #
@@ -992,6 +1053,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # CIRISEdge#229 — restore only; the canonical linux-x86_64 save
+      # happens on the linux-x86_64-test pyo3-full lane.
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -1020,6 +1086,9 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
       - name: build uniffi_bindgen_cli
         run: cargo build --bin uniffi_bindgen_cli --features ffi-uniffi
@@ -1080,6 +1149,9 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
       - name: cargo bench --no-run (all features)
         # All three feature-gates so EVERY bench file compiles in
@@ -1132,6 +1204,12 @@ jobs:
   pyo3-wheel:
     name: maturin abi3-py310 wheel (${{ matrix.label }})
     needs: [cargo-pyproject-skew-check]
+    # CIRISEdge#229 — save the cross-repo cache on main-branch wheel
+    # builds (one per canonical PLAT: linux-x86_64, linux-aarch64,
+    # macos-aarch64, windows-x64). PR runs read but don't write.
+    permissions:
+      contents: read
+      packages: write
     # v2.1.1 — windows-x86_64 wheel is now REQUIRED (closes
     # CIRISEdge#90). All three layers landed:
     #   1. leviculum 4c15dfd — reticulum-std Windows port (leviculum#10/#11)
@@ -1270,6 +1348,28 @@ jobs:
         with:
           toolchain: ${{ env.NIGHTLY_PIN }}
           components: rust-src
+      # CIRISEdge#229 — canonical CIRISCache layered restore on the
+      # wheel matrix. PLAT maps wheel's `label` token to the canonical
+      # platform token persist + verify save under:
+      #   wheel label       → canonical PLAT
+      #   linux-x86_64      → linux-x86_64
+      #   linux-aarch64     → linux-aarch64
+      #   darwin-aarch64    → macos-aarch64   ← rename
+      #   windows-x86_64    → windows-x64     ← rename
+      - name: map matrix label to canonical PLAT
+        id: plat
+        shell: bash
+        run: |
+          case "${{ matrix.label }}" in
+            darwin-aarch64) PLAT="macos-aarch64" ;;
+            windows-x86_64) PLAT="windows-x64"   ;;
+            *)              PLAT="${{ matrix.label }}" ;;
+          esac
+          echo "plat=${PLAT}" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: ${{ steps.plat.outputs.plat }}
       # v0.7.0 (CIRISEdge#17) — cache-bin: false on macOS to defang the
       # rustup-init shadow that the Repair-toolchain heal step below
       # actively corrects. CIRISVerify v2.1.4+ pattern; persist v0.7.2's
@@ -1516,6 +1616,18 @@ jobs:
           name: emit-edge-extras-bin
           path: target/release/emit_edge_extras
           retention-days: 7
+      # CIRISEdge#229 — save warm cache to GHCR on main only, one save
+      # per canonical PLAT. The wheel matrix is the canonical save
+      # site for linux-aarch64, macos-aarch64, windows-x64 (the
+      # linux-x86_64-test pyo3-full lane is the canonical save site
+      # for linux-x86_64).
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: |
+          github.ref == 'refs/heads/main'
+            && matrix.label != 'linux-x86_64'
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── build-manifest: hybrid-signed release provenance ───────────────
   #
@@ -1551,6 +1663,9 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - name: extract version from Cargo.toml
         id: version
         run: |
