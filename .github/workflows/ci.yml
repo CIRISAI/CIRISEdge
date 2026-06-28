@@ -141,12 +141,28 @@ jobs:
         # compile-gating is covered by the separate "cargo bench --no-run
         # (all features)" job; actual perf measurements belong on a
         # nightly cron, not the per-PR critical path.
-        run: |
-          if [ "${{ matrix.combo.all_targets }}" = "true" ]; then
-            cargo test --features "${{ matrix.combo.features }}" --tests
-          else
-            cargo test --features "${{ matrix.combo.features }}" --lib
-          fi
+        #
+        # v7.4.2 — cross-process retry via nick-fields/retry@v3. The
+        # `linux-x86_64 (reticulum)` lane flaked on v7.4.0 + v7.4.1 with
+        # `curl failed [16] HTTP2 framing layer (Send failure: Connection
+        # reset by peer)` mid-`cargo metadata` — a transient crates.io
+        # CDN edge condition. CARGO_NET_RETRY=10 covers in-process
+        # retries; this catches sustained pockets where cargo's budget
+        # exhausts. 30-min timeout matches the slowest pyo3-full
+        # --tests run; 3 attempts with 60s wait between is the same
+        # shape used on android-ndk + build-ios + ios-pyo3 + benches.
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: |
+            if [ "${{ matrix.combo.all_targets }}" = "true" ]; then
+              cargo test --features "${{ matrix.combo.features }}" --tests
+            else
+              cargo test --features "${{ matrix.combo.features }}" --lib
+            fi
       # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — save the L2
       # cache on main-branch builds of the canonical pyo3-full lane.
       # Only ONE matrix entry saves per workflow to keep the GHCR
@@ -218,7 +234,17 @@ jobs:
         # transport-reticulum on darwin too — Leviculum's macOS path is
         # load-bearing (edge ships darwin wheels; the teranos fork base
         # exists for macOS compat). CIRISEdge#14.
-        run: cargo test --features "transport-http transport-reticulum"
+        #
+        # v7.4.2 — same retry wrapper as the linux-x86_64-test matrix
+        # for the crates.io CDN flake class. macOS runners hit it
+        # at least as often as Linux.
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: cargo test --features "transport-http transport-reticulum"
       # CIRISEdge#229 — restore only on this lane. The canonical
       # macos-aarch64 save site is the `pyo3-wheel` `darwin-aarch64`
       # matrix entry (release-profile target/, matches what downstream
@@ -1060,14 +1086,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+      # v7.4.2 — clippy hits crates.io for the full graph; wrap both
+      # invocations with the same retry pattern as the test lanes.
       - name: cargo clippy (default-feature set)
-        run: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3" -- -D warnings
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3" -- -D warnings
       - name: cargo clippy (uniffi feature on)
         # v0.13.0 (CIRISEdge#36 GO) — uniffi gate. The wheel build
         # default-enables `ffi-uniffi` via `pyo3` ⇒ `ffi-uniffi`, but
         # we still keep the explicit check so a `pyo3`-less consumer
         # (mobile-only build) catches drift.
-        run: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 ffi-uniffi" -- -D warnings
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 ffi-uniffi" -- -D warnings
 
   # ─── uniffi-drift: regenerate bindings, assert no diff ──────────────
   #
@@ -1473,51 +1513,64 @@ jobs:
         # the `windows-targets` crate ships for its own
         # `windows.<N>.<M>.<P>.lib` import libs — under `-Zbuild-std`
         # the linker doesn't auto-discover them.
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            maturin build --release --strip --features "pyo3 extension-module transport-http" --auditwheel=skip
-          elif [ "${{ runner.os }}" = "Windows" ]; then
-            # Win7 build-std env vars — scoped to this shell branch so
-            # non-Windows runners never see them. Setting
-            # CARGO_BUILD_TARGET='' at step-level env breaks cargo
-            # ("target was empty"); the empty string is treated as an
-            # explicit (invalid) target rather than as unset.
-            # v2.2.2 — RUSTUP_TOOLCHAIN tracks the pinned NIGHTLY_PIN
-            # the toolchain step + Repair-toolchain step also use.
-            # Divergence between RUSTUP_TOOLCHAIN here and the actually-
-            # installed toolchain causes -Zbuild-std to look for std
-            # source in a toolchain that has no rust-src.
-            export RUSTUP_TOOLCHAIN="${NIGHTLY_PIN}"
-            export CARGO_BUILD_TARGET=x86_64-win7-windows-msvc
-            export CARGO_UNSTABLE_BUILD_STD=std,panic_abort
-            # Sanity: Tier-3 target must be in nightly's target-list
-            # (catches rustc upstream renames before the build runs).
-            if ! rustc --print target-list | grep -qx 'x86_64-win7-windows-msvc'; then
-              echo "::error::x86_64-win7-windows-msvc not in nightly target-list — target may have been renamed; check rustc release notes"
-              exit 1
-            fi
-            # LNK1181 workaround: pre-fetch the dep graph (so the
-            # windows_x86_64_msvc-* crates land under ~/.cargo/registry/src),
-            # then add each version's /lib subdir to LIB so link.exe finds
-            # the `windows.<N>.<M>.<P>.lib` import libraries
-            # `windows-targets` references inline.
-            cargo fetch
-            extra=""
-            while IFS= read -r d; do
-              extra="${extra};$(cygpath -w "$d")"
-            done < <(find "$HOME/.cargo/registry/src" -type d -path '*windows_x86_64_msvc-*/lib' 2>/dev/null | sort -u)
-            if [ -n "$extra" ]; then
-              export LIB="${LIB:-}${extra}"
-              echo "::notice::LIB augmented with windows_x86_64_msvc import-lib dirs:${extra}"
+        #
+        # v7.4.2 — cross-process retry via nick-fields/retry@v3.
+        # `cargo metadata` at the start of maturin build flaked v7.0.13
+        # + v7.3.1 with `curl failed [16] HTTP2 framing layer` mid-
+        # download. CARGO_NET_RETRY=10 doesn't cover sustained
+        # crates.io CDN pockets. 45-min timeout matches the slowest
+        # Windows wheel (build-std std-from-source compile); 3
+        # attempts with 60s wait. Same shape as the test-lane wrappers.
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: |
+            set -euo pipefail
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              maturin build --release --strip --features "pyo3 extension-module transport-http" --auditwheel=skip
+            elif [ "${{ runner.os }}" = "Windows" ]; then
+              # Win7 build-std env vars — scoped to this shell branch so
+              # non-Windows runners never see them. Setting
+              # CARGO_BUILD_TARGET='' at step-level env breaks cargo
+              # ("target was empty"); the empty string is treated as an
+              # explicit (invalid) target rather than as unset.
+              # v2.2.2 — RUSTUP_TOOLCHAIN tracks the pinned NIGHTLY_PIN
+              # the toolchain step + Repair-toolchain step also use.
+              # Divergence between RUSTUP_TOOLCHAIN here and the actually-
+              # installed toolchain causes -Zbuild-std to look for std
+              # source in a toolchain that has no rust-src.
+              export RUSTUP_TOOLCHAIN="${NIGHTLY_PIN}"
+              export CARGO_BUILD_TARGET=x86_64-win7-windows-msvc
+              export CARGO_UNSTABLE_BUILD_STD=std,panic_abort
+              # Sanity: Tier-3 target must be in nightly's target-list
+              # (catches rustc upstream renames before the build runs).
+              if ! rustc --print target-list | grep -qx 'x86_64-win7-windows-msvc'; then
+                echo "::error::x86_64-win7-windows-msvc not in nightly target-list — target may have been renamed; check rustc release notes"
+                exit 1
+              fi
+              # LNK1181 workaround: pre-fetch the dep graph (so the
+              # windows_x86_64_msvc-* crates land under ~/.cargo/registry/src),
+              # then add each version's /lib subdir to LIB so link.exe finds
+              # the `windows.<N>.<M>.<P>.lib` import libraries
+              # `windows-targets` references inline.
+              cargo fetch
+              extra=""
+              while IFS= read -r d; do
+                extra="${extra};$(cygpath -w "$d")"
+              done < <(find "$HOME/.cargo/registry/src" -type d -path '*windows_x86_64_msvc-*/lib' 2>/dev/null | sort -u)
+              if [ -n "$extra" ]; then
+                export LIB="${LIB:-}${extra}"
+                echo "::notice::LIB augmented with windows_x86_64_msvc import-lib dirs:${extra}"
+              else
+                echo "::warning::no windows_x86_64_msvc import-lib dirs found under cargo registry"
+              fi
+              maturin build --release --strip --features "pyo3 extension-module transport-http"
             else
-              echo "::warning::no windows_x86_64_msvc import-lib dirs found under cargo registry"
+              maturin build --release --strip --features "pyo3 extension-module transport-http"
             fi
-            maturin build --release --strip --features "pyo3 extension-module transport-http"
-          else
-            maturin build --release --strip --features "pyo3 extension-module transport-http"
-          fi
       - name: auditwheel repair --exclude libsqlite3.so.0 (Linux only)
         # v1.0.1 (CIRISEdge#50 re-reopen) — manual auditwheel with the
         # libsqlite3 exclude. Mirrors CIRISPersist v3.6.3's CIRISPersist#136
