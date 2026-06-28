@@ -67,13 +67,9 @@ jobs:
   linux-x86_64-test:
     name: linux-x86_64 (${{ matrix.combo.name }})
     runs-on: ubuntu-latest
-    # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — `packages: write`
-    # is needed for the main-branch save step on the pyo3-full lane.
-    # PR/tag runs don't write; the conditional on the save step gates
-    # it. Restore is anonymous and doesn't consume any permission.
-    permissions:
-      contents: read
-      packages: write
+    # v7.4.4 (CIRISEdge#238) — restore only; the canonical linux-x86_64
+    # save now lives on `pyo3-wheel linux-x86_64` (release profile).
+    # `packages: write` no longer needed here.
     strategy:
       fail-fast: false
       matrix:
@@ -163,25 +159,20 @@ jobs:
             else
               cargo test --features "${{ matrix.combo.features }}" --lib
             fi
-      # v7.0.12 (CIRISEdge#216 / CIRISCache adoption) — save the L2
-      # cache on main-branch builds of the canonical pyo3-full lane.
-      # Only ONE matrix entry saves per workflow to keep the GHCR
-      # package small + avoid mid-matrix race writes; pyo3-full is the
-      # widest feature set so its target/ subsumes the leaner lanes'
-      # contents. PR/tag runs read but don't write; the warmer is
-      # main-branch only.
+      # CIRISEdge#229 — RESTORE only on this lane. The canonical
+      # linux-x86_64 save lives on the `pyo3-wheel` `linux-x86_64`
+      # matrix entry (release-profile `target/`, ~1 GB), matching every
+      # other PLAT in the matrix.
       #
-      # v7.3.2 (CIRISEdge#229) — saves under the canonical key
-      # computed above so sibling repos (CIRISServer, CIRISLensCore,
-      # etc.) restoring under the same (platform, rustc, p/e/v) triple
-      # land directly on the blob this lane populates.
-      - uses: CIRISAI/CIRISCache/save@v1
-        if: |
-          github.ref == 'refs/heads/main'
-            && matrix.combo.name == 'pyo3-full'
-        with:
-          key: ${{ steps.cachekey.outputs.key }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # v7.4.4 (CIRISEdge#238) — the prior canonical save site was THIS
+      # lane (`linux-x86_64-test` / `pyo3-full`). That captured a debug
+      # `target/` + every feature combo's artifacts + `incremental/`,
+      # ballooning the saved blob to ~7.5 GB. Downstream release
+      # consumers (CIRISServer wheels, conformance harness) needed
+      # release artifacts; cargo refingerprinted on the wrong profile
+      # and recompiled the substrate anyway → 7.5 GB downloaded for ~
+      # nothing. Move the save to `pyo3-wheel linux-x86_64` (release
+      # profile, ~1 GB) — same canonical key, useful blob.
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
@@ -1609,14 +1600,19 @@ jobs:
           path: target/release/emit_edge_extras
           retention-days: 7
       # CIRISEdge#229 — save warm cache to GHCR on main only, one save
-      # per canonical PLAT. The wheel matrix is the canonical save
-      # site for linux-aarch64, macos-aarch64, windows-x64 (the
-      # linux-x86_64-test pyo3-full lane is the canonical save site
-      # for linux-x86_64).
+      # per canonical PLAT. The wheel matrix is now the canonical save
+      # site for EVERY desktop PLAT — linux-x86_64, linux-aarch64,
+      # macos-aarch64 (`darwin-aarch64` label), windows-x64
+      # (`windows-x86_64` label). All four save a release-profile
+      # `target/` blob (~1 GB), matching what persist + verify save
+      # and what downstream release consumers can actually reuse.
+      #
+      # v7.4.4 (CIRISEdge#238) — linux-x86_64 was previously saved on
+      # the `linux-x86_64-test` `pyo3-full` lane (debug profile + all
+      # feature combos + incremental → ~7.5 GB blob). Moved here so
+      # consumers get a release blob like every other PLAT.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: |
-          github.ref == 'refs/heads/main'
-            && matrix.label != 'linux-x86_64'
+        if: github.ref == 'refs/heads/main'
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
