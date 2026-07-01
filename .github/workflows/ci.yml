@@ -1244,6 +1244,8 @@ jobs:
     # CIRISEdge#90). All three layers landed:
     #   1. leviculum 4c15dfd — reticulum-std Windows port (leviculum#10/#11)
     #   2. vcpkg static x64-windows-static — openssl-sys link
+    #      (RETIRED in v8.1.x / CIRISPersist#328 — Windows builds
+    #      `pyo3-sqlite`, so there is no openssl-sys to link anymore)
     #   3. CIRISPersist v5.5.1 — Unix-only code paths cfg-gated (#200)
     # A regression in any of the three fails the gauntlet.
     #
@@ -1261,9 +1263,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
-          - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
-          - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
+          # v8.1.x (CIRISPersist#328) — `features` per entry. Linux/macOS
+          # keep the full `pyo3` (→ persist `pyo3` → postgres → system
+          # OpenSSL, present on those images). Windows uses `pyo3-sqlite`
+          # (persist `pyo3-sqlite`, no postgres, no openssl) so the vcpkg
+          # static-OpenSSL install step is gone — the flakiest leg of the
+          # wheel matrix. All entries keep `extension-module transport-http`.
+          - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64, features: "pyo3 extension-module transport-http" }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64, features: "pyo3 extension-module transport-http" }
+          - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64, features: "pyo3 extension-module transport-http" }
           # v2.1.1 (CIRISEdge#87 / #90 / leviculum#10) — windows-x86_64
           # wheel. Leviculum's 4c15dfd Windows port of reticulum-std
           # unblocked the FIRST layer (LocalInterface + AutoInterface
@@ -1280,7 +1288,7 @@ jobs:
           # now matches persist + verify's stable-rustc keys, so
           # downstream stable consumers restore edge's substrate layer
           # instead of cold-recompiling.
-          - { os: windows-latest,   label: windows-x86_64, tag: win_amd64 }
+          - { os: windows-latest,   label: windows-x86_64, tag: win_amd64, features: "pyo3-sqlite extension-module transport-http" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -1294,64 +1302,14 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-      # v2.1.1 (CIRISEdge#87 / #90 / leviculum#10) — Windows-only build
-      # deps. ciris-persist's `pyo3` feature force-includes its
-      # `postgres` feature, which pulls `dep:openssl` → openssl-sys.
-      # On Linux/macOS the system OpenSSL satisfies openssl-sys; on
-      # Windows there's no such system OpenSSL.
-      #
-      # Two earlier attempts failed:
-      # 1. Strawberry Perl + openssl-src vendored build: openssl-src
-      #    invokes perl/Configure, which loads modules from Git Bash's
-      #    stripped-down perl (in @INC ahead of Strawberry) and dies
-      #    on Locale::Maketext::Simple. Strawberry precedence is
-      #    non-trivial to force in the openssl-src subprocess.
-      # 2. Chocolatey OpenSSL 4.0.1 (slproweb): installs but ships libs
-      #    under `lib\VC\x64\MT\` not `lib\`, so openssl-sys 0.9.116
-      #    fails to find libssl.lib / libcrypto.lib in
-      #    `<OPENSSL_DIR>\lib`.
-      #
-      # vcpkg static install matches openssl-sys's expected layout
-      # exactly: `installed/x64-windows-static/lib/{libssl.lib,
-      # libcrypto.lib}`. vcpkg is pre-installed on the windows-latest
-      # image at `$VCPKG_INSTALLATION_ROOT` (typically `C:\vcpkg`),
-      # and the static triplet links into the cdylib so the produced
-      # wheel has zero runtime OpenSSL dependency.
-      #
-      # Stage-2 follow-up still applies: decouple persist's `pyo3`
-      # from `postgres` (mirror of CIRISEdge#87 on the persist side).
-      # Once that lands, this whole step disappears.
-      - name: install OpenSSL via vcpkg (static, x64-windows-static)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # vcpkg ships pre-installed on windows-latest. Install the
-          # static x64 triplet so openssl-sys statically links + the
-          # wheel needs no runtime OpenSSL.
-          "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:x64-windows-static --x-install-root="$VCPKG_INSTALLATION_ROOT/installed"
-          # openssl-sys reads OPENSSL_DIR (root) or OPENSSL_LIB_DIR +
-          # OPENSSL_INCLUDE_DIR (split). Use the split form because
-          # the static triplet's layout is
-          # `installed/x64-windows-static/{lib,include}` — that maps
-          # cleanly to *_LIB_DIR + *_INCLUDE_DIR. OPENSSL_STATIC=1
-          # forces static linkage; OPENSSL_NO_VENDOR=1 stops openssl-sys
-          # from falling back to openssl-src's perl/Configure build.
-          ROOT="$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static"
-          # Convert msys-style path to Windows backslashed form for the
-          # env vars (openssl-sys's build script treats them as path
-          # strings handed to MSVC).
-          win_root=$(cygpath -w "$ROOT")
-          {
-            echo "OPENSSL_DIR=${win_root}"
-            echo "OPENSSL_LIB_DIR=${win_root}\\lib"
-            echo "OPENSSL_INCLUDE_DIR=${win_root}\\include"
-            echo "OPENSSL_STATIC=1"
-            echo "OPENSSL_NO_VENDOR=1"
-          } >> "$GITHUB_ENV"
-          echo "::notice::OpenSSL_DIR=${win_root} (vcpkg static x64-windows-static)"
-          # Sanity probe — confirm the libs are where openssl-sys looks.
-          ls -la "${ROOT}/lib/libssl.lib" "${ROOT}/lib/libcrypto.lib"
+      # v8.1.x (CIRISPersist#328) — the Windows-only vcpkg static-OpenSSL
+      # install step is GONE. The Windows wheel now builds with
+      # `pyo3-sqlite` (persist's postgres-free PyEngine variant), so
+      # openssl-sys is no longer in the Windows dep tree at all. This
+      # closes the "Stage-2 follow-up" flagged here through v8.0.0 and
+      # removes the flakiest leg of the wheel matrix (the vcpkg openssl
+      # build drove the v7.4.2/v7.4.3/v7.4.4 retry+stable-rustc
+      # closures). Linux/macOS keep full `pyo3` (system OpenSSL present).
       # v7.4.3 (CIRISEdge#236) — stable rustc on every wheel matrix
       # entry, including Windows. The prior Windows-only nightly+
       # rust-src branch is gone — the wheel now targets the standard
@@ -1498,9 +1456,9 @@ jobs:
             # (CIRISEdge#50). All other platforms use the default
             # maturin auditwheel pass.
             if [ "${{ runner.os }}" = "Linux" ]; then
-              maturin build --release --strip --features "pyo3 extension-module transport-http" --auditwheel=skip
+              maturin build --release --strip --features "${{ matrix.features }}" --auditwheel=skip
             else
-              maturin build --release --strip --features "pyo3 extension-module transport-http"
+              maturin build --release --strip --features "${{ matrix.features }}"
             fi
       - name: auditwheel repair --exclude libsqlite3.so.0 (Linux only)
         # v1.0.1 (CIRISEdge#50 re-reopen) — manual auditwheel with the
