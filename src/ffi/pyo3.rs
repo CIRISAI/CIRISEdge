@@ -4130,14 +4130,61 @@ pub fn init_edge_runtime(
     }
     let executor = Arc::new(executor);
 
+    // ── v8.1.0 (CIRISEdge#245 / CIRISPersist#329 + #333) — the ABI-stable
+    // directory ops proxy REPLACES the raw-`dyn` `federation_directory_capsule`.
+    // Previously edge held an `Arc<dyn FederationDirectory>` and called its
+    // trait methods through edge's OWN statically-compiled vtable indices —
+    // the CIRISPersist#320 misdispatch class (edge's `put_transport_destination`
+    // landing on the wheel's `lookup_shared_instance_lease`). Now edge extracts
+    // the `directory_ops_capsule` (a C-ABI `Directory { data, vtable }`) and
+    // hands it to persist's `build_ops_directory`, which returns an
+    // `Arc<dyn FederationDirectory>` whose every method serializes a
+    // `DirectoryOp`, calls `vtable.build_op` (dispatching INSIDE persist's
+    // `.so`, against persist's own vtable), spawns the op-future via the same
+    // `executor_capsule`, and awaits the `DirectoryOpResult`. Version skew can
+    // no longer misdispatch. Every method `federation_directory_for_edge`
+    // touches is a covered op (the base 24 + the 6 peer-mutation ops of
+    // CIRISPersist#333 / v11.8.2: add/remove_peer_record, update_peer_*).
+    if !engine.hasattr("directory_ops_capsule").unwrap_or(false) {
+        return Err(PyRuntimeError::new_err(
+            "persist v11.8.2+ required for the ABI-stable directory ops proxy — \
+             your persist version doesn't expose directory_ops_capsule. Upgrade \
+             ciris-persist (Cargo `tag = \"v11.8.2\"`, pyproject \
+             `ciris-persist>=11.8.2,<12`). See CIRISEdge#245 / CIRISPersist#329+#333.",
+        ));
+    }
+    // The `directory_ops_capsule` stores `*mut Directory as usize` (persist's
+    // `build_capsule_with_destructor`, PyCapsule tag
+    // `ciris_persist::directory_ops_v1`) — the same shape as `executor_capsule`.
+    // Extract as `usize`, cast back, bitwise-copy the `{ data, vtable }` fields.
+    // The PyCapsule destructor (set by persist) calls `vtable.drop` at Python GC;
+    // `OpsDirectory` has NO Drop impl, so edge holds only a reference copy — never
+    // the destructor responsibility — exactly like the executor above.
     #[allow(unsafe_code)]
-    let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> = unsafe {
-        extract_capsule::<Arc<dyn ciris_persist::federation::FederationDirectory>, _, _>(
-            &engine,
-            "federation_directory_capsule",
-            Arc::clone,
-        )?
+    let directory_handle: ciris_persist::ffi::directory_capsule::Directory = unsafe {
+        extract_capsule::<usize, _, _>(&engine, "directory_ops_capsule", |raw_usize| {
+            let ptr = *raw_usize as *const ciris_persist::ffi::directory_capsule::Directory;
+            // SAFETY: `raw_usize` is the `Box::into_raw`'d `*mut Directory`
+            // persist stored; the Box is alive for the PyCapsule's lifetime
+            // (its destructor runs `Box::from_raw` + `vtable.drop` at GC),
+            // rooted in the Python `engine` object outliving this extraction.
+            let d = &*ptr;
+            ciris_persist::ffi::directory_capsule::Directory {
+                data: d.data,
+                vtable: d.vtable,
+            }
+        })?
     };
+    let directory_arc: Arc<dyn ciris_persist::federation::FederationDirectory> =
+        ciris_persist::ffi::directory_capsule::build_ops_directory(
+            directory_handle,
+            Arc::clone(&executor),
+        )
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "init_edge_runtime: build_ops_directory (directory_ops_capsule) failed: {e}"
+            ))
+        })?;
     #[allow(unsafe_code)]
     let queue_dispatch: BackendDispatch = unsafe {
         extract_capsule::<BackendDispatch, _, _>(
@@ -4173,26 +4220,30 @@ pub fn init_edge_runtime(
     // implement `FederationDirectory` AND `OutboundQueue`, so we can
     // lift them to all three trait objects edge holds.
     //
-    // `directory_arc` from the federation_directory_capsule is the
-    // already-coerced `Arc<dyn FederationDirectory>` from persist's
-    // perspective; we cross-check it points at the same backend the
-    // BackendDispatch arm carries (debug assertion only; in production
-    // persist's `*_capsule` methods are carved from the engine's one
-    // `BackendDispatch`, so the invariant holds by construction).
+    // v8.1.0 (CIRISEdge#245) — `directory_arc` is now the ops-proxy
+    // `Arc<dyn FederationDirectory>` from `build_ops_directory` (every call
+    // dispatches inside persist's `.so`), NOT the raw-`dyn`
+    // federation_directory_capsule. `verify_dir` / `rooting_dir` /
+    // `blackhole_rules` / `derived_schema` below still lift the CONCRETE
+    // `Arc<{Sqlite,Postgres}Backend>` out of the `outbound_queue_capsule`
+    // `BackendDispatch` — those edge blanket impls bind `F: Sized` so they
+    // need a concrete type, and that path is a monomorphized concrete call
+    // (NOT the raw-`dyn` vtable-index misdispatch #245/#320 targets), so it
+    // stays as-is.
     debug_assert!(
         Arc::strong_count(&directory_arc) >= 1,
-        "federation_directory_capsule produced a live Arc",
+        "build_ops_directory produced a live Arc",
     );
     // v0.15.1 (CIRISEdge#26 mutation surface) — retain the
     // `Arc<dyn FederationDirectory>` for the UniFFI peer-mutation
     // entry points (`peer_add` / `peer_remove` /
     // `peer_set_{alias,trust,notes,policy}`). These need the concrete
     // FederationDirectory trait object — distinct from `verify_dir`
-    // (which is an `Arc<dyn VerifyDirectory>` adapter). Both
-    // ultimately reference the same backend (persist's
-    // `federation_directory_capsule` is carved from the engine's one
-    // `BackendDispatch`), but the trait-object identities differ
-    // because edge holds two separate `dyn`-trait views.
+    // (which is an `Arc<dyn VerifyDirectory>` adapter). Both ultimately
+    // reach the same backend (the ops proxy and the `outbound_queue_capsule`
+    // BackendDispatch are both carved from the engine's one backend), but
+    // the trait-object identities differ because edge holds two separate
+    // `dyn`-trait views.
     let federation_directory_for_edge: Arc<dyn ciris_persist::federation::FederationDirectory> =
         directory_arc;
 
