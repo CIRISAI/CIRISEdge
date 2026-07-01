@@ -32,7 +32,7 @@ use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
 use ciris_edge::{
-    ConsentRole, DetectionVerdict, Edge, EdgeConfig, HybridPolicy, InlineText, Message,
+    ConsentRole, DetectionVerdict, Edge, EdgeConfig, HybridPolicy, Message, OpaqueEvent,
     OutboundHandle, ProbePatternConfig, ProbePatternObserver,
 };
 use ciris_persist::federation::FederationDirectory;
@@ -212,16 +212,17 @@ async fn build_edge_with_detector_disabled(
         .expect("build edge")
 }
 
-async fn build_inline_text_envelope(
+async fn build_opaque_event_envelope(
     sender: &Arc<LocalSigner>,
     recipient_key_id: &str,
     text: &str,
 ) -> Vec<u8> {
-    let msg = InlineText {
-        text: text.to_string(),
+    let msg = OpaqueEvent {
+        kind: 0x0000_0001,
+        payload: text.as_bytes().to_vec(),
     };
     let mut env = build_envelope(
-        InlineText::TYPE,
+        OpaqueEvent::TYPE,
         &sender.key_id,
         recipient_key_id,
         &msg,
@@ -281,7 +282,7 @@ async fn unconsented_external_traffic_drives_observations() {
 
     for i in 0..100 {
         let bytes =
-            build_inline_text_envelope(&attacker_signer, &me.key_id, &format!("probe-{i}")).await;
+            build_opaque_event_envelope(&attacker_signer, &me.key_id, &format!("probe-{i}")).await;
         edge.dispatch_inbound_for_test(InboundFrame {
             envelope_bytes: bytes,
             transport: TransportId::HTTP,
@@ -327,7 +328,7 @@ async fn peer_role_traffic_produces_no_observations() {
 
     for i in 0..100 {
         let bytes =
-            build_inline_text_envelope(&peer_signer, &me.key_id, &format!("ordinary-{i}")).await;
+            build_opaque_event_envelope(&peer_signer, &me.key_id, &format!("ordinary-{i}")).await;
         edge.dispatch_inbound_for_test(InboundFrame {
             envelope_bytes: bytes,
             transport: TransportId::HTTP,
@@ -370,7 +371,7 @@ async fn detector_disabled_is_a_full_noop() {
 
     let signer = any.local_signer(tmp.path()).await;
     for i in 0..100 {
-        let bytes = build_inline_text_envelope(&signer, &me.key_id, &format!("payload-{i}")).await;
+        let bytes = build_opaque_event_envelope(&signer, &me.key_id, &format!("payload-{i}")).await;
         edge.dispatch_inbound_for_test(InboundFrame {
             envelope_bytes: bytes,
             transport: TransportId::HTTP,

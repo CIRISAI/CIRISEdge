@@ -246,10 +246,10 @@ fn envelope_carries_scope_when_set() {
     let body: Box<RawValue> =
         RawValue::from_string(r#"{"text":"x"}"#.to_string()).expect("raw value");
     let env = EdgeEnvelope {
-        edge_schema_version: SchemaVersion::V1_0_0,
+        edge_schema_version: SchemaVersion::V2_0_0,
         signing_key_id: "k1".to_string(),
         destination_key_id: "k2".to_string(),
-        message_type: MessageType::InlineText,
+        message_type: MessageType::OpaqueEvent,
         sent_at: DateTime::parse_from_rfc3339("2026-05-29T00:00:00.000Z")
             .unwrap()
             .with_timezone(&Utc),

@@ -28,7 +28,9 @@ use ciris_edge::identity::LocalSigner;
 use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
-use ciris_edge::{AttemptOutcome, Edge, EdgeConfig, InlineText, MessageType, ReachabilityTracker};
+use ciris_edge::{
+    AttemptOutcome, Edge, EdgeConfig, MessageType, OpaqueRequest, ReachabilityTracker,
+};
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend;
@@ -205,7 +207,7 @@ async fn hundred_successful_sends_yield_ratio_one() {
     let transport = Arc::new(ToggleTransport::new(true));
     let edge = build_edge(&tmp, &me, &peer, transport.clone()).await;
 
-    // `InlineText` rides `Delivery::Ephemeral` so `Edge::send` is the
+    // `OpaqueRequest` rides `Delivery::Ephemeral` so `Edge::send` is the
     // right entry point. We don't actually need a response — the
     // ephemeral path returns `EdgeError::Config` "correlation not
     // wired (Phase 2)" on success, which is fine: the tracker hook is
@@ -217,8 +219,9 @@ async fn hundred_successful_sends_yield_ratio_one() {
         let _ = edge
             .send(
                 &peer.key_id,
-                InlineText {
-                    text: "hello".to_string(),
+                OpaqueRequest {
+                    kind: 0x0000_0001,
+                    payload: b"hello".to_vec(),
                 },
             )
             .await;
@@ -248,8 +251,9 @@ async fn hundred_failed_sends_yield_ratio_zero_and_error_class() {
         let _ = edge
             .send(
                 &peer.key_id,
-                InlineText {
-                    text: "hi".to_string(),
+                OpaqueRequest {
+                    kind: 0x0000_0001,
+                    payload: b"hi".to_vec(),
                 },
             )
             .await;
@@ -281,8 +285,9 @@ async fn fifty_fifty_yields_ratio_half() {
         let _ = edge
             .send(
                 &peer.key_id,
-                InlineText {
-                    text: "ok".to_string(),
+                OpaqueRequest {
+                    kind: 0x0000_0001,
+                    payload: b"ok".to_vec(),
                 },
             )
             .await;
@@ -292,8 +297,9 @@ async fn fifty_fifty_yields_ratio_half() {
         let _ = edge
             .send(
                 &peer.key_id,
-                InlineText {
-                    text: "fail".to_string(),
+                OpaqueRequest {
+                    kind: 0x0000_0001,
+                    payload: b"fail".to_vec(),
                 },
             )
             .await;
@@ -360,8 +366,9 @@ async fn reachability_tracker_arc_is_shared_with_internal_recording() {
     let _ = edge
         .send(
             &peer.key_id,
-            InlineText {
-                text: "via accessor".to_string(),
+            OpaqueRequest {
+                kind: 0x0000_0001,
+                payload: b"via accessor".to_vec(),
             },
         )
         .await;
@@ -408,8 +415,9 @@ async fn config_window_threads_to_tracker() {
     let _ = edge
         .send(
             &peer.key_id,
-            InlineText {
-                text: "window-test".to_string(),
+            OpaqueRequest {
+                kind: 0x0000_0001,
+                payload: b"window-test".to_vec(),
             },
         )
         .await;

@@ -353,7 +353,7 @@ pub fn build_envelope<M: Serialize>(
         .map_err(|e| crate::EdgeError::Config(format!("body raw: {e}")))?;
 
     Ok(EdgeEnvelope {
-        edge_schema_version: SchemaVersion::V1_0_0,
+        edge_schema_version: SchemaVersion::V2_0_0,
         signing_key_id: signing_key_id.to_string(),
         destination_key_id: destination_key_id.to_string(),
         message_type,

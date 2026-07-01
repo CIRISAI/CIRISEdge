@@ -47,10 +47,10 @@ fn sample_envelope(signing: &str, destination: &str) -> EdgeEnvelope {
         RawValue::from_string(r#"{"trace_events_inserted":7,"deduplicated":2}"#.to_string())
             .expect("raw value");
     EdgeEnvelope {
-        edge_schema_version: SchemaVersion::V1_0_0,
+        edge_schema_version: SchemaVersion::V2_0_0,
         signing_key_id: signing.to_string(),
         destination_key_id: destination.to_string(),
-        message_type: MessageType::AccordEventsBatch,
+        message_type: MessageType::OpaqueEvent,
         sent_at: Utc::now(),
         nonce: [0x5a; 16],
         body,
@@ -227,18 +227,19 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     listen_b.abort();
 }
 
-/// CIRISEdge#220 — proves `Edge::spawn_background_listeners` drives
-/// the inbound dispatch loop end-to-end so a verified envelope reaches
-/// a registered inline-text handler. Mirrors the
+/// CIRISEdge#220 / CC 0.7 (CIRISEdge#241) — proves
+/// `Edge::spawn_background_listeners` drives the inbound dispatch loop
+/// end-to-end so a verified [`MessageType::OpaqueRequest`] envelope
+/// reaches a registered opaque-request handler. Mirrors the
 /// `rooted_resolution_round_trips_envelope_byte_exact` test above but
-/// instead of manually spawning `transport.listen()` per side, it
 /// uses the v7.1.0 `Edge::spawn_background_listeners` surface —
 /// the production codepath `init_edge_runtime` invokes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
-async fn spawn_background_listeners_drives_two_node_send_inline_text() {
+async fn spawn_background_listeners_drives_two_node_opaque_request() {
+    use ciris_edge::handler::Message as _;
     use ciris_edge::verify::HybridPolicy;
-    use ciris_edge::{Edge, EdgeConfig, InlineText};
+    use ciris_edge::{Edge, EdgeConfig, OpaqueRequest};
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,ciris_edge=debug")
@@ -323,10 +324,20 @@ async fn spawn_background_listeners_drives_two_node_send_inline_text() {
             .expect("build edge B"),
     );
 
-    // Register an inline-text subscriber on A — we want the receiver
-    // to observe the verified envelope through the dispatch loop, not
-    // just the raw InboundFrame on the inbound channel.
-    let (_sub_id, mut sub_rx) = edge_a.register_inline_text_subscriber();
+    // Register an opaque-request handler on A for kind 7 — we want the
+    // receiver to observe the verified envelope through the dispatch
+    // loop, not just the raw InboundFrame on the inbound channel. The
+    // handler forwards `(sender_key_id, payload)` to a channel the test
+    // observes, and returns an OpaqueResponse (shipped back to B).
+    let (obs_tx, mut sub_rx) = mpsc::channel::<(String, Vec<u8>)>(4);
+    edge_a.register_opaque_handler(7, move |sender_key_id, payload| {
+        let _ = obs_tx.try_send((sender_key_id, payload));
+        ciris_edge::OpaqueResponse {
+            kind: 7,
+            status: 200,
+            payload: b"ok".to_vec(),
+        }
+    });
 
     // ── v7.1.0 surface under test ────────────────────────────────────
     // Per-side edge-owned runtimes; spawn the listen + inbound dispatch
@@ -350,32 +361,32 @@ async fn spawn_background_listeners_drives_two_node_send_inline_text() {
     let _handles_a = edge_a.spawn_background_listeners(rt_a.handle());
     let _handles_b = edge_b.spawn_background_listeners(rt_b.handle());
 
-    // Drive the send: B → A.
-    let msg = InlineText {
-        text: "v7.1.0 bg-listeners hello".to_string(),
+    // Drive the send: B → A. Ship an OpaqueRequest (kind 7) via the
+    // generic ephemeral `send` primitive. The transport accepts + ships
+    // the bytes; the ephemeral request/response correlation channel is
+    // the Phase-2 TODO in `Edge::send`, surfaced as `EdgeError::Config`
+    // — the receiver-side handler observation is what gates this test.
+    let req = OpaqueRequest {
+        kind: 7,
+        payload: b"v8.0.0 opaque hello".to_vec(),
     };
-    // `send_inline` returns `EdgeError::Config("ephemeral
-    // request-response correlation not wired (Phase 2)")` AS the
-    // success-of-transport path — same as `PyEdge::send_inline_text`
-    // maps it. The transport accepted + shipped the bytes; the
-    // correlation channel TODO is a separate concern. Map it to Ok
-    // so the receiver-side assertion is what gates the test.
-    match edge_b.send_inline("edge-bg-aaaa", msg).await {
-        Ok(()) => {}
+    assert_eq!(OpaqueRequest::TYPE, MessageType::OpaqueRequest);
+    match edge_b.send("edge-bg-aaaa", req).await {
+        Ok(_resp) => {}
         Err(ciris_edge::EdgeError::Config(s))
             if s.contains("ephemeral request-response correlation not wired") => {}
-        Err(e) => panic!("send_inline B → A failed at transport: {e:?}"),
+        Err(e) => panic!("send B → A failed at transport: {e:?}"),
     }
 
-    // A's inline-text subscriber must receive the text — proves the
-    // background-listener path drove verify + handler dispatch all the
-    // way to the application surface.
-    let (sender_key_id, body_text) = tokio::time::timeout(Duration::from_secs(30), sub_rx.recv())
+    // A's opaque-request handler must fire — proves the background-
+    // listener path drove verify + handler dispatch all the way to the
+    // application surface.
+    let (sender_key_id, payload) = tokio::time::timeout(Duration::from_secs(30), sub_rx.recv())
         .await
-        .expect("timed out waiting for inline-text on A")
-        .expect("inline-text channel closed without receive");
+        .expect("timed out waiting for opaque request on A")
+        .expect("opaque channel closed without receive");
     assert_eq!(sender_key_id, "edge-bg-bbbb");
-    assert_eq!(body_text, "v7.1.0 bg-listeners hello");
+    assert_eq!(payload, b"v8.0.0 opaque hello");
 
     // Tokio runtimes can't be dropped from within an async context,
     // so leak them; the test process exit will reclaim. Holding them

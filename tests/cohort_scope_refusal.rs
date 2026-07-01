@@ -31,7 +31,7 @@ use ciris_edge::transport::{
 use ciris_edge::verify::HybridPolicy;
 use ciris_edge::{
     CohortScope, CohortScopeEnforcement, Edge, EdgeConfig, EdgeError, FederationAnnouncement,
-    InlineText, InlineTextDurable, StewardDirective,
+    OpaqueEvent, OpaqueRequest, StewardDirective,
 };
 use ciris_persist::federation::types::PeerPolicyBlob;
 use ciris_persist::federation::FederationDirectory;
@@ -396,8 +396,9 @@ async fn durable_delivery_with_family_scope_to_family_recipient_allowed() {
     let handle = edge
         .send_durable_with_cohort_scope(
             &fam_recipient,
-            InlineTextDurable {
-                text: "x".to_string(),
+            OpaqueEvent {
+                kind: 0x0000_0001,
+                payload: b"x".to_vec(),
             },
             Some(CohortScope::Family),
         )
@@ -415,8 +416,9 @@ async fn durable_delivery_with_family_scope_to_non_family_recipient_rejected() {
     let err = edge
         .send_durable_with_cohort_scope(
             &pub_recipient,
-            InlineTextDurable {
-                text: "x".to_string(),
+            OpaqueEvent {
+                kind: 0x0000_0001,
+                payload: b"x".to_vec(),
             },
             Some(CohortScope::Family),
         )
@@ -446,8 +448,9 @@ async fn ephemeral_delivery_with_family_scope_to_family_recipient_allowed() {
     let err = edge
         .send_with_cohort_scope(
             &fam_recipient,
-            InlineText {
-                text: "x".to_string(),
+            OpaqueRequest {
+                kind: 0x0000_0001,
+                payload: b"x".to_vec(),
             },
             Some(CohortScope::Family),
         )
@@ -480,10 +483,11 @@ async fn dispatch_with_cohort_scope(
     destination: &str,
     cohort_scope: Option<CohortScope>,
 ) -> Result<(), EdgeError> {
-    let body = InlineText {
-        text: "scope-test".to_string(),
+    let body = OpaqueEvent {
+        kind: 0x0000_0001,
+        payload: b"scope-test".to_vec(),
     };
-    let mut env = build_envelope(InlineText::TYPE, &sender.key_id, destination, &body, None)?;
+    let mut env = build_envelope(OpaqueEvent::TYPE, &sender.key_id, destination, &body, None)?;
     env.cohort_scope = cohort_scope;
     sign_envelope(sender, &mut env).await?;
     let bytes =
@@ -683,8 +687,9 @@ async fn off_mode_disables_enforcement() {
     let _ = edge
         .send_durable_with_cohort_scope(
             &pub_recipient,
-            InlineTextDurable {
-                text: "x".to_string(),
+            OpaqueEvent {
+                kind: 0x0000_0001,
+                payload: b"x".to_vec(),
             },
             Some(CohortScope::Family),
         )

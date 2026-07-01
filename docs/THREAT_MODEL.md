@@ -320,6 +320,16 @@ AV-4 residual). Edge inherits the same exposure and the same closure
 path — a future change to persist's canonicalizer rolls out via persist
 version pin in edge's `Cargo.toml`.
 
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md v1.0.1 §3.3):** for a Tier-2
+opaque `payload` (`OpaqueRequest` / `OpaqueResponse` / `OpaqueEvent`),
+**edge canonicalizes nothing** — the `payload` is opaque bytes edge
+carries verbatim, so the AV-5 canonicalization-mismatch surface does
+not apply to the inner payload. The outer `EdgeEnvelope` still
+canonicalizes through persist as above (the envelope signature is
+transport-tier); any inner canonicalization or inner signature over
+the `payload` is the **app's** responsibility, and any mismatch there
+is the app's threat model, not edge's.
+
 #### AV-6: Reticulum destination spoofing
 
 **Attack**: Adversary attempts to claim a Reticulum destination
@@ -392,6 +402,16 @@ exception-handling boundary.
 verify under some condition. PR review + the verify_enforcement test
 category catch this; the test passes only if zero unverified
 invocations occur over N>=1M fuzz runs.
+
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md v1.0.1 §3.3):** a verified
+Tier-2 `OpaqueRequest` whose `kind: u32` has no registered handler is
+**not** silently dropped. The handler replies
+`OpaqueResponse { kind: <echo>, status: 501, payload: b"unknown kind" }`
+— a typed, sender-visible reject. This upholds the fail-loud stance
+(MISSION §1.6, §6 anti-pattern 7): an unknown `kind` is a mechanically-
+visible refusal to the sender, never a swallowed byte. Edge reasons
+about the envelope and the `kind` discriminant only; the opaque
+`payload` remains uninterpreted whether or not a handler exists.
 
 ### 4.3 Denial of Service — adversary wants edge unable to receive evidence
 
@@ -468,6 +488,13 @@ upstream of edge.
 **Residual**: until the limit is enforced symmetrically across all
 transports, body-size flood is a defense-in-depth gap on novel
 transports. Track at every new-transport PR.
+
+**v8.0.0 CC 0.7 note (WIRE_VOCABULARY.md v1.0.1 §3.3):** the
+`MAX_BODY_BYTES` cap applies to the Tier-2 opaque `payload` on
+`OpaqueRequest` / `OpaqueResponse` / `OpaqueEvent` exactly as it does
+to any Tier-1 body. Edge treats `payload` as opaque bytes and enforces
+the ceiling before handing it to a handler; a migrant `kind` cannot buy
+a larger parse buffer by riding the opaque tier.
 
 #### AV-14: Malformed canonical bytes triggering parse amplification
 

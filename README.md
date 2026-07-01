@@ -7,9 +7,10 @@ message in/out, verify-via-persist, and typed handler dispatch.
 
 **Status:** v0.2.0 — Phase 1 substrate live. Verify pipeline (hybrid
 Ed25519 + ML-DSA-65 via persist's directory lookup), durable outbound
-queue + dispatcher, typed handler dispatch, HTTP transport, outbound
-inline-text pipeline integration (Classify + Scrub + EncryptAndStore
-via `ciris-persist` v1.1.2), and a sovereign-mode convenience
+queue + dispatcher, typed handler dispatch, HTTP transport, the CC 0.7
+two-tier wire vocabulary (Tier-1 constitutional bodies + Tier-2 opaque
+app RPC — `send::<OpaqueRequest>` / `OpaqueResponse` / `OpaqueEvent`,
+`WIRE_VOCABULARY_HASH` build-gate pinned), and a sovereign-mode convenience
 constructor (`EdgeBuilder::from_keyring_seed_dir`) for Reticulum-style
 adoption with no persist Engine in-process. PyO3 surface (`Edge`
 class registration + `init_edge_runtime`) lands in v0.3.x; reticulum

@@ -45,7 +45,7 @@ fn fixture_envelope(claim: &FountainHoldingClaim) -> EdgeEnvelope {
     let body_value = serde_json::to_value(claim).expect("body serialize");
     let body = serde_json::value::to_raw_value(&body_value).expect("body raw");
     EdgeEnvelope {
-        edge_schema_version: SchemaVersion::V1_0_0,
+        edge_schema_version: SchemaVersion::V2_0_0,
         signing_key_id: "alice".to_string(),
         destination_key_id: "bob".to_string(),
         message_type: MessageType::FountainHoldingClaim,

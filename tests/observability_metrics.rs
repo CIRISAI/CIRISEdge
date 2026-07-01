@@ -27,8 +27,7 @@ use ciris_edge::transport::{
 };
 use ciris_edge::verify::HybridPolicy;
 use ciris_edge::{
-    ContentFetch, Edge, EdgeConfig, EdgeMetrics, HintShape, InlineText, InlineTextDurable,
-    MessageType,
+    ContentFetch, Edge, EdgeConfig, EdgeMetrics, HintShape, MessageType, OpaqueEvent, OpaqueRequest,
 };
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
@@ -226,7 +225,7 @@ where
 // ─── Tests ──────────────────────────────────────────────────────────
 
 /// Counter increments on a successful `Edge::send` of an ephemeral
-/// `InlineText`. Note: `Edge::send` returns Err for InlineText (the
+/// `OpaqueRequest`. Note: `Edge::send` returns Err for OpaqueRequest (the
 /// Phase-2 ephemeral request-response correlation isn't wired); we
 /// expect the transport-side counter to register regardless because the
 /// envelope DID ship before the correlation gap kicks in.
@@ -240,13 +239,19 @@ async fn metrics_counter_increments_on_send() {
     let (edge, _peer_signer, peer_key_id) = build_edge(&tmp, transport).await;
 
     let _ = edge
-        .send(&peer_key_id, InlineText { text: "hi".into() })
+        .send(
+            &peer_key_id,
+            OpaqueRequest {
+                kind: 0x0000_0001,
+                payload: b"hi".to_vec(),
+            },
+        )
         .await;
 
     let snap = edge.metrics().snapshot();
     assert_eq!(
         snap.envelopes_sent_total
-            .get(&MessageType::InlineText)
+            .get(&MessageType::OpaqueRequest)
             .copied()
             .unwrap_or(0),
         1
@@ -321,8 +326,9 @@ async fn metrics_send_failure_classified_by_transport_and_error() {
     let _ = edge
         .send(
             &peer_key_id,
-            InlineText {
-                text: "fail-me".into(),
+            OpaqueRequest {
+                kind: 0x0000_0001,
+                payload: b"fail-me".to_vec(),
             },
         )
         .await;
@@ -350,9 +356,10 @@ async fn metrics_durable_queue_depth_tracks_send_durable() {
         Arc::new(ConfigurableTransport::new(TransportId::HTTP, vec![])) as Arc<dyn Transport>;
     let (edge, _peer_signer, peer_key_id) = build_edge(&tmp, transport).await;
 
-    // `InlineTextDurable` is `Delivery::Durable { .. }`.
-    let msg = InlineTextDurable {
-        text: "durable text".to_string(),
+    // `OpaqueEvent` is `Delivery::Durable { .. }`.
+    let msg = OpaqueEvent {
+        kind: 0x0000_0001,
+        payload: b"durable text".to_vec(),
     };
     let _ = edge.send_durable(&peer_key_id, msg).await;
 
@@ -366,7 +373,7 @@ async fn metrics_durable_queue_depth_tracks_send_durable() {
     );
     assert_eq!(
         snap.envelopes_sent_total
-            .get(&MessageType::InlineText)
+            .get(&MessageType::OpaqueEvent)
             .copied()
             .unwrap_or(0),
         1
@@ -390,8 +397,9 @@ async fn metrics_transport_bytes_io_counted() {
     let _ = edge
         .send(
             &peer_key_id,
-            InlineText {
-                text: "outbound".into(),
+            OpaqueRequest {
+                kind: 0x0000_0001,
+                payload: b"outbound".to_vec(),
             },
         )
         .await;

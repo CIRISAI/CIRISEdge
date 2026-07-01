@@ -29,7 +29,7 @@ use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
 use ciris_edge::verify::HybridPolicy;
-use ciris_edge::{ContentFetch, Edge, EdgeConfig, HintShape, InlineText};
+use ciris_edge::{ContentFetch, Edge, EdgeConfig, HintShape, OpaqueEvent};
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend;
@@ -321,8 +321,9 @@ async fn send_durable_emits_attempt_n_field() {
     let _ = edge
         .send_durable(
             &peer_key_id,
-            ciris_edge::InlineTextDurable {
-                text: "durable".to_string(),
+            ciris_edge::OpaqueEvent {
+                kind: 0x0000_0001,
+                payload: b"durable".to_vec(),
             },
         )
         .await;
@@ -401,7 +402,7 @@ where
     }
 }
 
-// Suppress the unused-import warning for `InlineText` (only used as a
+// Suppress the unused-import warning for `OpaqueEvent` (only used as a
 // type-presence assertion in some compile paths).
 #[allow(dead_code)]
-fn _inline_text_witness(_t: InlineText) {}
+fn _opaque_event_witness(_t: OpaqueEvent) {}

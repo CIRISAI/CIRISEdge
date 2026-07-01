@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ciris_edge::identity::{build_envelope, sign_envelope, LocalSigner};
-use ciris_edge::messages::{InlineText, MessageType};
+use ciris_edge::messages::{MessageType, OpaqueEvent};
 use ciris_edge::verify::{HybridPolicy, VerifyDirectory, VerifyPipeline};
 use ciris_edge::TransportId;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -81,11 +81,12 @@ async fn setup() -> (Arc<VerifyPipeline>, Arc<LocalSigner>, tempfile::TempDir) {
 /// and the LRU eviction, repeated envelopes will pass).
 async fn make_signed_envelope(signer: &Arc<LocalSigner>, body_size: usize) -> Vec<u8> {
     let inner = body_size.saturating_sub(11);
-    let body = InlineText {
-        text: "x".repeat(inner),
+    let body = OpaqueEvent {
+        kind: 0x0000_0001,
+        payload: "x".repeat(inner).into_bytes(),
     };
     let mut env = build_envelope(
-        MessageType::InlineText,
+        MessageType::OpaqueEvent,
         &signer.key_id,
         &signer.key_id, // destination == self for the bench fixture
         &body,

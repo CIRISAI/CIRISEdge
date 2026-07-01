@@ -20,7 +20,7 @@ use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
 use ciris_edge::verify::HybridPolicy;
-use ciris_edge::{Edge, EdgeConfig, InlineTextDurable};
+use ciris_edge::{Edge, EdgeConfig, OpaqueEvent};
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend;
@@ -161,8 +161,9 @@ async fn subscribe_resource_events_yields_durable_queue_pressure() {
     let _ = edge
         .send_durable(
             &peer.key_id,
-            InlineTextDurable {
-                text: "queueme".into(),
+            OpaqueEvent {
+                kind: 0x0000_0001,
+                payload: b"queueme".to_vec(),
             },
         )
         .await;

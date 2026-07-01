@@ -183,7 +183,6 @@ use ciris_persist::BackendDispatch;
 use crate::edge::Edge;
 use crate::handler::{DurableOutcome, DurableStatus};
 use crate::identity::LocalSigner;
-use crate::messages::{InlineText, InlineTextDurable};
 use crate::outbound::OutboundHandle;
 #[cfg(feature = "transport-reticulum")]
 use crate::transport::reticulum::{ReticulumAuth, ReticulumTransport, ReticulumTransportConfig};
@@ -1363,139 +1362,170 @@ impl PyEdge {
         Ok(out)
     }
 
-    // ─── CIRISEdge#22 Tier 2 (v0.9.0) — CommunicationBus replacement ──
+    // ─── CC 0.7 opaque wire vocabulary (CIRISEdge#241, v8.0.0) ────────
     //
-    // The pymethods below back CIRISAgent 2.9.5's
-    // `EdgeCommunicationAdapter` (implementing the existing
-    // `CommunicationServiceProtocol`). Wire-level message type is
-    // [`MessageType::InlineText`] (one wire discriminator covers both
-    // ephemeral and durable senders — the receiver sees the same body
-    // shape regardless). The outbound `speak_pipeline`
-    // (Classify + Scrub + EncryptAndStore per FSD §1.4) runs on the
-    // caller-supplied text BEFORE signing — the load-bearing
-    // forensic-completeness invariant; the pyo3 wrappers call
-    // [`Edge::send_inline`] / [`Edge::send_durable_inline`] (not the
-    // lower-level [`Edge::send`] / [`Edge::send_durable`]) so the
-    // pipeline cannot be bypassed.
-    //
-    // GIL discipline: the methods release the GIL via `py.detach`
-    // around the tokio `block_on` call. Callback invocations from the
-    // `register_inline_text_handler` drainer thread reacquire the GIL
-    // per call via `Python::with_gil`; see the [`SubscriptionHandle`]
-    // doc for the queue + drainer-thread pattern.
+    // The generic opaque PyEdge surface downstream stewards wrap.
+    // WIRE_VOCABULARY.md v1.0.1 §3.3. Edge carries `payload` as opaque
+    // bytes; the APP owns inner canonicalization + any inner signature
+    // (MISSION §1.3 "edge is reach, not meaning"). GIL discipline mirrors
+    // the rest of PyEdge: `py.detach` around the `run_async` block; the
+    // subscriber drainer thread reacquires the GIL per callback.
 
-    /// Send an ephemeral inline-text message — fire-and-forget; no ACK,
-    /// no retry. Returns the `body_sha256` hex digest (the forensic
-    /// join key into persist's structured logs and the ACK match key
-    /// if the receiver later sends back a typed response).
-    ///
-    /// **Pipeline invariant**: the configured `speak_pipeline`
-    /// (Classify + Scrub + EncryptAndStore per FSD §1.4) runs on `text`
-    /// before signing. PII spans are scrubbed; `{SECRET:uuid:desc}`
-    /// placeholders substitute for cleartext secrets. The wire payload
-    /// never carries unredacted sensitive bytes. CIRISAgent#756 Q1.
-    ///
-    /// `recipient_key_id` is the federation `key_id`; the transport
-    /// (Reticulum) resolves it to a destination address via the
-    /// existing `PeerResolver` (AV-42 authenticated cold-start path).
+    /// Send an opaque request and await the peer's opaque response.
+    /// Returns `(status, payload)`. `kind` is an app-owned discriminator;
+    /// `payload` is opaque bytes edge never interprets. An unknown `kind`
+    /// at the receiver yields `(501, b"unknown kind")` (never a silent
+    /// drop). Requires the receiver's inbound dispatch loop to be running.
     ///
     /// # Python signature
     /// ```python
-    /// edge.send_inline_text("agent-bob", "hello") -> str  # 64-char hex
+    /// status, payload = edge.send_opaque_request("agent-bob", 7, b"...", timeout_ms=5000)
     /// ```
-    fn send_inline_text(
+    #[pyo3(signature = (recipient_key_id, kind, payload, timeout_ms = 5000))]
+    fn send_opaque_request(
         &self,
         py: Python<'_>,
         recipient_key_id: &str,
-        text: &str,
-    ) -> PyResult<String> {
+        kind: u32,
+        payload: Vec<u8>,
+        timeout_ms: u64,
+    ) -> PyResult<(u16, Py<pyo3::types::PyBytes>)> {
         let edge = self.inner.clone();
         let recipient = recipient_key_id.to_string();
-        let text_owned = text.to_string();
         let executor = self.executor.clone();
-        py.detach(|| {
+        let resp = py.detach(|| {
             run_async(&executor, async move {
-                // Build the typed body, run `send_inline` so the
-                // speak_pipeline runs + the envelope is signed + the
-                // transport ships it (or the no-op test transport
-                // accepts it). Compute body_sha256 from the
-                // post-pipeline text (the bytes that actually shipped).
-                let msg = InlineText { text: text_owned };
-                // `send_inline` consumes a Phase 2 TODO (ephemeral
-                // request-response correlation isn't wired). For
-                // fire-and-forget we expect `EdgeError::Config`
-                // "ephemeral request-response correlation not wired"
-                // as the success-of-transport path — the bytes have
-                // already shipped at that point. Map that one specific
-                // config error back to Ok, surface anything else.
-                let body_sha = compute_inline_text_body_sha(&edge, &recipient, &msg.text).await?;
-                match edge.send_inline(&recipient, msg).await {
-                    Ok(()) => Ok(body_sha),
-                    Err(crate::EdgeError::Config(s))
-                        if s.contains("ephemeral request-response correlation not wired") =>
-                    {
-                        // The transport accepted the bytes; the
-                        // unwired correlation channel is the Phase 2
-                        // TODO in `Edge::send`, not a failure of the
-                        // wire-level send. CIRISAgent's adapter
-                        // doesn't need the response struct for an
-                        // inline-text fire-and-forget.
-                        Ok(body_sha)
-                    }
-                    Err(e) => Err(PyRuntimeError::new_err(format!("send_inline_text: {e}"))),
-                }
+                edge.send_opaque_request(&recipient, kind, payload, timeout_ms)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("send_opaque_request: {e}")))
             })
-        })
+        })?;
+        Ok((
+            resp.status,
+            Python::attach(|py| pyo3::types::PyBytes::new(py, &resp.payload).unbind()),
+        ))
     }
 
-    /// Durable variant — enqueues the inline-text envelope to the
-    /// `edge_outbound_queue` with `requires_ack=true`. Returns a
-    /// [`PyDurableHandle`] the caller polls (or awaits) to observe the
-    /// eventual outcome.
-    ///
-    /// Defaults: 24h TTL, 20 attempts, 60s ACK timeout (mirrors
-    /// [`crate::DSARRequest`]; chat-tier messages don't need the
-    /// week-long `BuildManifestPublication` window). Same speak-pipeline
-    /// invariant as [`Self::send_inline_text`].
+    /// Publish an opaque event on the durable (persistent) delivery
+    /// class. Fire-and-forget; returns a [`PyDurableHandle`] the caller
+    /// polls/awaits to observe the edge-owned-queue outcome. Receivers
+    /// fan the event out to their per-`kind` `subscribe_opaque` callbacks.
     ///
     /// # Python signature
     /// ```python
-    /// handle = edge.send_durable_inline_text("agent-bob", "hello")
-    /// handle.body_sha256()           # str — 64-char hex
-    /// handle.is_acknowledged()       # bool
-    /// handle.await_ack(timeout_ms=5000)  # bool
+    /// handle = edge.send_opaque_event("agent-bob", 7, b"...")
     /// ```
-    fn send_durable_inline_text(
+    fn send_opaque_event(
         &self,
         py: Python<'_>,
         recipient_key_id: &str,
-        text: &str,
+        kind: u32,
+        payload: Vec<u8>,
     ) -> PyResult<PyDurableHandle> {
         let edge = self.inner.clone();
         let recipient = recipient_key_id.to_string();
-        let text_owned = text.to_string();
         let executor = self.executor.clone();
-        let queue_arc: Arc<dyn OutboundHandle> = edge.outbound_queue_handle();
         let executor_for_handle = executor.clone();
-        let queue_for_handle = queue_arc.clone();
+        let queue_for_handle: Arc<dyn OutboundHandle> = edge.outbound_queue_handle();
         py.detach(|| {
             run_async(&executor, async move {
-                let msg = InlineTextDurable { text: text_owned };
-                let body_sha = compute_inline_text_body_sha(&edge, &recipient, &msg.text).await?;
                 let handle = edge
-                    .send_durable_inline(&recipient, msg)
+                    .send_opaque_event(&recipient, kind, payload)
                     .await
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!("send_durable_inline_text: {e}"))
-                    })?;
+                    .map_err(|e| PyRuntimeError::new_err(format!("send_opaque_event: {e}")))?;
                 Ok(PyDurableHandle {
                     queue_id: handle.queue_id,
-                    body_sha256_hex: body_sha,
+                    body_sha256_hex: String::new(),
                     executor: executor_for_handle,
                     queue: queue_for_handle,
                 })
             })
         })
+    }
+
+    /// Register an opaque-request handler for `kind`. `callback` is
+    /// invoked as `callback(sender_key_id: str, payload: bytes)` and MUST
+    /// return `(status: int, payload: bytes)`; edge ships the resulting
+    /// [`crate::OpaqueResponse`] back to the requester. A `kind` with no
+    /// registered handler is answered with a `501` (never a silent drop).
+    /// Registering the same `kind` twice replaces the prior handler.
+    fn register_opaque_handler(
+        &self,
+        py: Python<'_>,
+        kind: u32,
+        callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        if !callback.bind(py).is_callable() {
+            return Err(PyValueError::new_err("callback must be callable"));
+        }
+        let cb = std::sync::Arc::new(callback);
+        self.inner.register_opaque_handler(kind, move |sender_key_id, payload| {
+            Python::attach(|py| {
+                let bytes = pyo3::types::PyBytes::new(py, &payload);
+                match cb.call1(py, (sender_key_id, bytes)) {
+                    Ok(ret) => match ret.extract::<(u16, Vec<u8>)>(py) {
+                        Ok((status, out)) => crate::messages::OpaqueResponse {
+                            kind,
+                            status,
+                            payload: out,
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, kind, "opaque handler returned a non-(int,bytes) value; replying 500");
+                            crate::messages::OpaqueResponse {
+                                kind,
+                                status: 500,
+                                payload: b"handler returned invalid shape".to_vec(),
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, kind, "opaque handler raised; replying 500");
+                        crate::messages::OpaqueResponse {
+                            kind,
+                            status: 500,
+                            payload: b"handler raised".to_vec(),
+                        }
+                    }
+                }
+            })
+        });
+        Ok(())
+    }
+
+    /// Subscribe to inbound opaque events for `kind`. `callback` is
+    /// invoked as `callback(sender_key_id: str, kind: int, payload: bytes)`
+    /// for every verified [`crate::MessageType::OpaqueEvent`] whose `kind`
+    /// matches. Returns a [`PySubscriptionHandle`] usable as a context
+    /// manager (`with edge.subscribe_opaque(kind, cb) as sub: ...`). The
+    /// generic successor of the ripped `register_inline_text_handler`.
+    fn subscribe_opaque(
+        &self,
+        py: Python<'_>,
+        kind: u32,
+        callback: Py<PyAny>,
+    ) -> PyResult<PySubscriptionHandle> {
+        if !callback.bind(py).is_callable() {
+            return Err(PyValueError::new_err("callback must be callable"));
+        }
+        let (id, rx) = self.inner.register_opaque_subscriber(kind);
+        let edge_weak = Arc::downgrade(&self.inner);
+        let drainer = std::thread::Builder::new()
+            .name(format!("ciris-edge-opaque-drainer-{id}"))
+            .spawn(move || {
+                drain_opaque(rx, callback);
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("spawn opaque drainer thread: {e}")))?;
+        Ok(PySubscriptionHandle {
+            id,
+            edge: edge_weak,
+            drainer_thread: std::sync::Mutex::new(Some(drainer)),
+        })
+    }
+
+    /// Snapshot count of live opaque-event subscribers. Diagnostics
+    /// helper for lifecycle tests.
+    fn opaque_subscriber_count(&self) -> usize {
+        self.inner.opaque_subscriber_count()
     }
 
     /// v6.1.0 (CIRISEdge#175, FSD §3.2) — resolve the default
@@ -1540,162 +1570,6 @@ impl PyEdge {
             .inner
             .resolve_default_scope(active_community_id, in_family_context);
         scope_to_pydict(py, &scope)
-    }
-
-    /// v6.1.0 (CIRISEdge#175, FSD §3.2) — `PublishOutcome` shape
-    /// for `send_inline_text`. Returns a dict with the §3.2 scope
-    /// echo + the §2.4 record_id (if computed) so callers observe
-    /// the substrate's actual publication scope rather than
-    /// silently accepting the default flip.
-    ///
-    /// ```python
-    /// outcome = edge.send_inline_text_with_outcome(
-    ///     recipient_key_id="agent-bob",
-    ///     text="hello",
-    ///     active_community_id=None,
-    ///     in_family_context=False,
-    /// )
-    /// outcome == {
-    ///     "scope": {"kind": "self"},
-    ///     "audience": "agent-bob",
-    ///     "holder_count": 0,
-    ///     "record_id_hex": None,
-    ///     "body_sha256": "...",
-    /// }
-    /// ```
-    ///
-    /// The wire-level invariant is the existing
-    /// `send_inline_text` — this method shares the dispatch path
-    /// and additionally surfaces the resolved scope. Pre-v6.1.0
-    /// callers can stay on `send_inline_text` until they're ready
-    /// for the outcome shape.
-    #[pyo3(signature = (recipient_key_id, text, active_community_id=None, in_family_context=false))]
-    fn send_inline_text_with_outcome<'py>(
-        &self,
-        py: Python<'py>,
-        recipient_key_id: &str,
-        text: &str,
-        active_community_id: Option<&str>,
-        in_family_context: bool,
-    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        // Resolve scope BEFORE the send so the outcome's `scope`
-        // is observable even on a fail-after-resolve path. This is
-        // the §3.2 silent-demotion defense: the operator sees what
-        // scope the substrate chose regardless of whether the wire
-        // emission succeeded.
-        let scope = self
-            .inner
-            .resolve_default_scope(active_community_id, in_family_context);
-        let recipient = recipient_key_id.to_string();
-        let recipient_for_outcome = recipient.clone();
-        let text_owned = text.to_string();
-        let edge = self.inner.clone();
-        let executor = self.executor.clone();
-        let body_sha = py.detach(|| {
-            run_async(&executor, async move {
-                let msg = InlineText { text: text_owned };
-                let body_sha = compute_inline_text_body_sha(&edge, &recipient, &msg.text).await?;
-                match edge.send_inline(&recipient, msg).await {
-                    Ok(()) => Ok(body_sha),
-                    Err(crate::EdgeError::Config(s))
-                        if s.contains("ephemeral request-response correlation not wired") =>
-                    {
-                        Ok(body_sha)
-                    }
-                    Err(e) => Err(PyRuntimeError::new_err(format!(
-                        "send_inline_text_with_outcome: {e}"
-                    ))),
-                }
-            })
-        })?;
-
-        let outcome = crate::PublishOutcome::new(scope, recipient_for_outcome);
-        publish_outcome_to_pydict(py, &outcome, Some(body_sha.as_str()))
-    }
-
-    /// Register an inbound inline-text handler. `callback` is invoked
-    /// as `callback(sender_key_id: str, body_text: str)` for every
-    /// verified inbound `MessageType::InlineText` envelope. Returns a
-    /// [`PySubscriptionHandle`] usable as a context manager:
-    ///
-    /// ```python
-    /// with edge.register_inline_text_handler(on_msg) as sub:
-    ///     ...  # subscription active for the duration of the block
-    /// # subscription torn down on block exit
-    /// ```
-    ///
-    /// # GIL + callback pattern
-    ///
-    /// The Rust-side inbound dispatcher (`dispatch_inbound`, running on
-    /// a tokio task) MUST NOT block on the GIL — that would stall the
-    /// transport listen loop. So each registration spawns a dedicated
-    /// **Python-owned drainer thread** (`std::thread::spawn`) that
-    /// receives `(sender_key_id, body_text)` tuples from an unbounded
-    /// `tokio::mpsc::UnboundedReceiver`, acquires the GIL via
-    /// `Python::with_gil` per tuple, and invokes the user callback. A
-    /// callback that raises is caught + logged; the drainer keeps
-    /// running. The Rust dispatcher's `send` is non-blocking — when
-    /// the drainer thread exits (subscription unregistered), the
-    /// channel closes and the dispatcher's `send` returns `Err`, at
-    /// which point the next dispatch lazily prunes the dead entry.
-    ///
-    /// # Lifecycle
-    ///
-    /// The returned `SubscriptionHandle` MUST be retained or used as a
-    /// context manager. Dropping the handle without calling
-    /// `unsubscribe()` or letting `__exit__` fire will eventually
-    /// tear down the subscription via the Python finalizer, but the
-    /// timing is not deterministic — production code should
-    /// `with ...:` it or explicitly `unsubscribe()`.
-    fn register_inline_text_handler(&self, callback: Py<PyAny>) -> PyResult<PySubscriptionHandle> {
-        // Validate the callback is actually callable. PyO3 doesn't
-        // enforce this at the type level — match persist's
-        // `PyEngine::subscribe` ergonomics (TypeError-equivalent).
-        // Consume `callback` into the drainer thread; the bind for
-        // validation borrows it under a GIL lease, so the move into
-        // the spawned thread below is legal.
-        Python::attach(|py| -> PyResult<()> {
-            if !callback.bind(py).is_callable() {
-                return Err(PyValueError::new_err("callback must be callable"));
-            }
-            Ok(())
-        })?;
-
-        let (id, rx) = self.inner.register_inline_text_subscriber();
-        let edge_weak = Arc::downgrade(&self.inner);
-
-        // Spawn the Python-owned drainer thread. `std::thread::spawn`
-        // (not `tokio::spawn`) because the drainer's only job is the
-        // blocking `recv()` → GIL-acquire → callback loop; a standalone
-        // OS thread acquires + releases the GIL cleanly without
-        // holding a tokio worker hostage on `Python::attach`.
-        //
-        // `Py<PyAny>` is `Send + Sync` (pyo3 0.28); refcounting on
-        // drop is handled via pyo3's pending-decref queue + GIL reacquire,
-        // so moving `callback` across the thread boundary is sound.
-        let drainer = std::thread::Builder::new()
-            .name(format!("ciris-edge-inline-text-drainer-{id}"))
-            .spawn(move || {
-                drain_inline_text(rx, callback);
-            })
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("spawn inline-text drainer thread: {e}"))
-            })?;
-
-        Ok(PySubscriptionHandle {
-            id,
-            edge: edge_weak,
-            drainer_thread: std::sync::Mutex::new(Some(drainer)),
-        })
-    }
-
-    /// Snapshot count of live inline-text subscribers. Diagnostics
-    /// helper — exposes [`Edge::inline_text_subscriber_count`] to
-    /// Python so the lifecycle tests can verify a
-    /// `SubscriptionHandle::unsubscribe` / context-manager exit
-    /// actually removed the entry.
-    fn inline_text_subscriber_count(&self) -> usize {
-        self.inner.inline_text_subscriber_count()
     }
 
     // ─── CIRISEdge#22 Tier 3 (v0.17.0) — Epistemic Commons UI ──────────
@@ -2651,23 +2525,6 @@ fn resolve_sas_pubkeys(
     Ok((local_pub, peer_pub))
 }
 
-/// Compute `body_sha256` (hex) for the inline-text payload that
-/// `send_inline_text` / `send_durable_inline_text` will actually ship —
-/// post-pipeline, so PII-scrubbed / secret-substituted bytes are what
-/// the receiver matches an ACK against.
-///
-/// Runs the `speak_pipeline` against a clone of the text (the real
-/// `send_inline` runs it against the message struct in place; we need
-/// the post-pipeline bytes for the hex return value of
-/// `send_inline_text` BEFORE the `send_inline` call consumes the
-/// struct). Yes, the pipeline runs twice — once here for the SHA,
-/// once inside `send_inline` for the wire. The pipeline is idempotent
-/// and cheap; the double-run is the cost of the Python surface
-/// returning the SHA synchronously rather than as a side-channel.
-///
-/// The hex form is what CIRISAgent's adapter joins on (persist's
-/// `body_sha256_prefix` index is built on hex, and the existing
-/// `EdgeCommunicationAdapter` plumbing is hex-shaped).
 /// v6.1.0 (CIRISEdge#175, FSD §3.2) — shape a [`crate::CohortScope`]
 /// into the PyO3 dict form mirrored by the wire JSON. The shape is
 /// identical to `serde_json::to_string(&CohortScope)` decoded into a
@@ -2696,96 +2553,6 @@ fn scope_to_pydict<'py>(
     Ok(dict)
 }
 
-/// v6.1.0 (CIRISEdge#175, FSD §3.2) — shape a
-/// [`crate::PublishOutcome`] into the PyO3 dict form returned by
-/// every `*_with_outcome` pymethod. Carries the §3.2 scope echo,
-/// the caller-stated audience, the §2.4 holder count, and (when
-/// the publication path computed one) the §2.4 record_id.
-///
-/// `body_sha256_hex` is an optional extra field used by the
-/// inline-text path to surface the canonical-body hash CIRISAgent's
-/// adapter joins on. Pass `None` for paths that don't compute one.
-fn publish_outcome_to_pydict<'py>(
-    py: Python<'py>,
-    outcome: &crate::PublishOutcome,
-    body_sha256_hex: Option<&str>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    let dict = pyo3::types::PyDict::new(py);
-    let scope_dict = scope_to_pydict(py, &outcome.scope)?;
-    dict.set_item("scope", scope_dict)?;
-    dict.set_item("audience", outcome.audience.as_str())?;
-    dict.set_item("holder_count", outcome.holder_count)?;
-    match &outcome.record_id_hex {
-        Some(h) => dict.set_item("record_id_hex", h.as_str())?,
-        None => dict.set_item("record_id_hex", py.None())?,
-    }
-    if let Some(sha) = body_sha256_hex {
-        dict.set_item("body_sha256", sha)?;
-    }
-    Ok(dict)
-}
-
-async fn compute_inline_text_body_sha(
-    edge: &Edge,
-    recipient: &str,
-    raw_text: &str,
-) -> PyResult<String> {
-    use crate::handler::InlineTextMessage as _;
-    let mut msg = InlineText {
-        text: raw_text.to_string(),
-    };
-    // Run the same pipeline `send_inline` will run. If no pipeline is
-    // configured this is a no-op. The pipeline's `run` is idempotent —
-    // double-running it (here, then inside `send_inline`) produces the
-    // same final bytes.
-    edge.run_speak_pipeline_for_external(&mut msg)
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("speak_pipeline: {e}")))?;
-
-    // Build the envelope shape that `send_inline` will ship — same
-    // canonical-body bytes feed `envelope_body_sha256`.
-    let envelope = crate::identity::build_envelope(
-        crate::messages::MessageType::InlineText,
-        edge.signer_key_id(),
-        recipient,
-        &InlineText {
-            text: msg.text().to_string(),
-        },
-        None,
-    )
-    .map_err(|e| PyRuntimeError::new_err(format!("build_envelope: {e}")))?;
-    let sha = crate::identity::envelope_body_sha256(&envelope);
-    Ok(hex_encode_32(&sha))
-}
-
-/// Hex-encode a 32-byte SHA-256 — same shape persist's
-/// `body_sha256_prefix` index uses. 64 characters lowercase, no
-/// prefix. Free function rather than via `hex` crate at the FFI
-/// layer to keep the surface minimal (the `hex` crate is a
-/// dev-dependency only).
-fn hex_encode_32(bytes: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(64);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
-/// Drainer thread body — receives `(sender_key_id, body_text)` tuples
-/// from the Rust dispatcher's unbounded sender, acquires the GIL per
-/// tuple, and invokes the Python callback. Exits when the channel
-/// closes (the `Edge`'s subscriber entry was removed via
-/// `unregister_inline_text_subscriber`).
-///
-/// Per `register_inline_text_handler`'s lifecycle contract: the
-/// dispatcher's `send` returns `Err(SendError)` when this thread has
-/// already exited (the `rx` is dropped), and the next dispatch's
-/// `fan_out_inline_text` lazy-prunes the dead entry. So the
-/// shutdown path is: caller invokes
-/// `SubscriptionHandle::unsubscribe()` → `Edge::unregister_inline_text_subscriber`
-/// drops the registry entry's sender → this `recv()` returns `None` →
-/// drainer thread exits cleanly.
 /// CIRISEdge#208 — `Arc<dyn TrustScoring>` adapter wrapping a Python
 /// callback. Installed via [`PyEdge::install_trust_resolver`]; consulted
 /// by [`Edge::dispatch_inbound_for_test`]'s trust short-circuit when a
@@ -3011,20 +2778,25 @@ impl ciris_persist::federation::TrustScoring for PyTrustScoringAdapter {
     }
 }
 
+/// CC 0.7 (CIRISEdge#241) — opaque-event drainer thread body. Receives
+/// `(sender_key_id, kind, payload)` tuples from the Rust dispatcher's
+/// unbounded sender, acquires the GIL per tuple, and invokes the Python
+/// callback as `callback(sender_key_id, kind, payload)`. Exits when the
+/// channel closes (the `Edge`'s subscriber entry was removed via
+/// `unregister_opaque_subscriber`).
 #[allow(clippy::needless_pass_by_value)] // callback is consumed by drop at function exit
-fn drain_inline_text(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+fn drain_opaque(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, u32, Vec<u8>)>,
     callback: Py<PyAny>,
 ) {
-    while let Some((sender_key_id, body_text)) = rx.blocking_recv() {
+    while let Some((sender_key_id, kind, payload)) = rx.blocking_recv() {
         Python::attach(|py| {
-            // Argument order MUST match the consumer-comment spec:
-            // `callback(sender_key_id, body_text)`.
-            if let Err(e) = callback.call1(py, (sender_key_id.clone(), body_text.clone())) {
+            let bytes = pyo3::types::PyBytes::new(py, &payload);
+            if let Err(e) = callback.call1(py, (sender_key_id.clone(), kind, bytes)) {
                 tracing::warn!(
                     sender_key_id = %sender_key_id,
                     error = %e,
-                    "inline-text callback raised; continuing",
+                    "opaque-event callback raised; continuing",
                 );
             }
         });
@@ -3355,7 +3127,7 @@ impl PySubscriptionHandle {
         // Step 1: remove from the registry. After this, no further
         // inbound dispatches will push tuples onto our channel.
         if let Some(edge) = self.edge.upgrade() {
-            edge.unregister_inline_text_subscriber(self.id);
+            edge.unregister_opaque_subscriber(self.id);
         }
         // Step 2: take the drainer thread handle. After
         // `unregister_inline_text_subscriber`, the sender is dropped
@@ -3418,7 +3190,7 @@ impl Drop for PySubscriptionHandle {
     /// of its `recv()` once the sender drops).
     fn drop(&mut self) {
         if let Some(edge) = self.edge.upgrade() {
-            edge.unregister_inline_text_subscriber(self.id);
+            edge.unregister_opaque_subscriber(self.id);
         }
         let handle_opt = {
             let mut guard = self
@@ -6949,7 +6721,6 @@ mod pyo3_tier2_tests {
     use crate::transport::{InboundFrame, TransportId, TransportSendOutcome};
 
     use std::sync::OnceLock;
-    use std::time::Duration;
 
     /// Initialize the embedded Python interpreter exactly once. Safe
     /// to call from every test; pyo3 0.28's `initialize()` is itself
@@ -7122,577 +6893,6 @@ mod pyo3_tier2_tests {
             .build()
             .expect("Edge::build");
         (Arc::new(edge), queue)
-    }
-
-    /// `PyEdge::send_inline_text` returns a 64-char lowercase hex
-    /// string — the `body_sha256` of the post-pipeline-scrub envelope
-    /// body (the ACK match key into persist's `body_sha256_prefix`
-    /// index). The agent's `EdgeCommunicationAdapter` joins on this.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn py_send_inline_text_returns_body_sha256() {
-        init_python();
-        let (edge, _queue) = build_test_edge().await;
-        let py_edge = PyEdge::for_test(edge, tokio::runtime::Handle::current());
-        let sha = Python::attach(|py| -> PyResult<String> {
-            py_edge.send_inline_text(py, "recipient-key", "hello")
-        })
-        .expect("send_inline_text");
-        assert_eq!(
-            sha.len(),
-            64,
-            "body_sha256 hex must be 64 chars, got {}: {sha:?}",
-            sha.len()
-        );
-        assert!(
-            sha.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
-            "body_sha256 must be lowercase hex"
-        );
-    }
-
-    /// `PyEdge::send_durable_inline_text` returns a `DurableHandle`
-    /// whose `body_sha256()` matches what an equivalent
-    /// `send_inline_text` call would produce (both run the same
-    /// pipeline + envelope-build path; the hex must agree).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn py_send_durable_inline_text_returns_durable_handle() {
-        init_python();
-        let (edge, _queue) = build_test_edge().await;
-        let py_edge = PyEdge::for_test(edge, tokio::runtime::Handle::current());
-        // Both calls use the same `text`; the body_sha256 depends only
-        // on the (post-pipeline) text bytes + envelope structure (the
-        // sender's `key_id` is constant), so the two SHAs must agree.
-        // EXCEPT the envelope `nonce` and `sent_at` differ between
-        // envelopes — those vary the canonical-bytes but NOT the
-        // body_sha256 (which is taken of `envelope.body` only, not
-        // of the whole envelope). So the two SHAs MUST be equal.
-        let durable_sha = Python::attach(|py| -> PyResult<String> {
-            let h = py_edge.send_durable_inline_text(py, "recipient-key", "hello")?;
-            Ok(h.body_sha256().to_string())
-        })
-        .expect("send_durable_inline_text");
-        assert_eq!(durable_sha.len(), 64, "body_sha256 hex must be 64 chars");
-        // Also verify the ephemeral path's SHA agrees (per the
-        // pipeline-idempotence property — both paths produce the
-        // same canonical body bytes).
-        let ephemeral_sha = Python::attach(|py| -> PyResult<String> {
-            py_edge.send_inline_text(py, "recipient-key", "hello")
-        })
-        .expect("send_inline_text");
-        assert_eq!(
-            durable_sha, ephemeral_sha,
-            "durable + ephemeral body_sha256 must agree for the same text"
-        );
-    }
-
-    /// `DurableHandle::await_ack` returns `False` when no ACK lands
-    /// within `timeout_ms`. Polls at 50ms; a 100ms timeout sees at
-    /// most 2-3 polls and exits cleanly.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn py_durable_handle_await_ack_times_out() {
-        init_python();
-        let (edge, _queue) = build_test_edge().await;
-        let py_edge = PyEdge::for_test(edge, tokio::runtime::Handle::current());
-        let (acked, elapsed) = Python::attach(|py| -> PyResult<(bool, Duration)> {
-            let h = py_edge.send_durable_inline_text(py, "recipient-key", "no-ack-coming")?;
-            let start = std::time::Instant::now();
-            let result = h.await_ack(py, 100)?;
-            Ok((result, start.elapsed()))
-        })
-        .expect("await_ack");
-        assert!(
-            !acked,
-            "await_ack must return False when no ACK arrives within timeout"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(100),
-            "await_ack must wait at least timeout_ms (waited {elapsed:?})"
-        );
-    }
-
-    /// `DurableHandle::await_ack` returns `True` when the underlying
-    /// outbound row reaches ACK'd-delivered terminal state. We seed
-    /// the row directly via persist's `mark_transport_delivered` so
-    /// the test doesn't depend on a real ACK envelope shape; the
-    /// post-condition tested here is "the polling loop sees
-    /// `DurableStatus::Terminal(DurableOutcome::Delivered)` and
-    /// returns True".
-    #[tokio::test(flavor = "multi_thread")]
-    async fn py_durable_handle_await_ack_succeeds_when_acked() {
-        init_python();
-        let (edge, queue) = build_test_edge().await;
-        let py_edge = PyEdge::for_test(edge, tokio::runtime::Handle::current());
-
-        // Send a durable inline-text + extract the queue_id. Run inside
-        // attach so we hold the GIL only as long as the pymethod call
-        // needs it.
-        let queue_id = Python::attach(|py| -> PyResult<String> {
-            let h = py_edge.send_durable_inline_text(py, "recipient-key", "ack-coming")?;
-            Ok(h.queue_id().to_string())
-        })
-        .expect("send_durable_inline_text");
-
-        // Drive the row to Delivered terminal state. Persist enforces
-        // the state machine; `InlineTextDurable` declares
-        // `requires_ack=true`, so the full path is:
-        //   pending → claim → sending → mark_transport_delivered
-        //           → awaiting_ack → mark_ack_received → delivered
-        let claimed = queue
-            .claim_pending_outbound(10, 30, "test-claim")
-            .await
-            .expect("claim_pending_outbound");
-        assert!(
-            claimed.iter().any(|r| r.queue_id == queue_id),
-            "newly-enqueued row must be claimable as pending"
-        );
-        queue
-            .mark_transport_delivered(&queue_id, "noop")
-            .await
-            .expect("mark_transport_delivered");
-        // Synthetic ACK envelope bytes — `mark_ack_received` doesn't
-        // re-verify the bytes; it just stamps them on the row. Persist
-        // requires NON-EMPTY bytes. The body is just bookkeeping for
-        // this test; the real ACK matching path is the inbound
-        // verify pipeline's `match_ack_to_outbound`.
-        queue
-            .mark_ack_received(&queue_id, br#"{"synthetic":"ack"}"#)
-            .await
-            .expect("mark_ack_received");
-
-        // Now await_ack should observe the terminal state on the next
-        // poll (well inside 5000ms).
-        let acked = Python::attach(|py| -> PyResult<bool> {
-            // Re-call send_durable_inline_text to get a fresh handle
-            // for THE SAME queue_id? No — we need the same handle. We
-            // can't get one back from queue_id directly; but we can
-            // build a synthetic `PyDurableHandle` for the test.
-            // Take the runtime + queue from the py_edge directly.
-            let edge_arc = py_edge.edge_handle();
-            let test_rt = std::sync::Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .worker_threads(1)
-                    .build()
-                    .expect("test handle runtime"),
-            );
-            let handle = PyDurableHandle {
-                queue_id: queue_id.clone(),
-                body_sha256_hex: "0".repeat(64),
-                executor: Arc::new(
-                    ciris_persist::ffi::executor_capsule::build_persist_executor(test_rt),
-                ),
-                queue: edge_arc.outbound_queue_handle(),
-            };
-            handle.await_ack(py, 5000)
-        })
-        .expect("await_ack");
-        assert!(
-            acked,
-            "await_ack must return True once the row is Delivered"
-        );
-    }
-
-    /// Register a Python callback, inject an inbound inline-text via
-    /// the test fan-out helper, verify the callback observes
-    /// `(sender_key_id, body_text)`. Pass criterion: a
-    /// `threading.Event` set inside the callback flips within 1 second.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn py_register_inline_text_handler_fires_on_inbound() {
-        init_python();
-        let (edge, _queue) = build_test_edge().await;
-        let py_edge = PyEdge::for_test(edge.clone(), tokio::runtime::Handle::current());
-
-        // Set up the Python side: a threading.Event + a callback that
-        // records the args + sets the event.
-        //
-        // Pass `evt` and `observed` as DEFAULT ARGUMENTS on the
-        // callback signature so the def captures them by value — a
-        // bare `def` in an exec context uses module-globals for
-        // free-variable lookup, and our globals dict doesn't carry
-        // `evt` / `observed`. Default args bind at def-time, no
-        // closure capture needed.
-        let (sub, evt, observed_holder) =
-            Python::attach(|py| -> PyResult<(PySubscriptionHandle, Py<PyAny>, Py<PyAny>)> {
-                let threading = py.import("threading")?;
-                let evt = threading.call_method0("Event")?.unbind();
-                let observed: Py<PyAny> = py.eval(c"[]", None, None)?.unbind();
-                let locals = pyo3::types::PyDict::new(py);
-                locals.set_item("evt", evt.clone_ref(py))?;
-                locals.set_item("observed", observed.clone_ref(py))?;
-                py.run(
-                    c"def _cb(sender_key_id, body_text, _evt=evt, _obs=observed):\n    _obs.append((sender_key_id, body_text))\n    _evt.set()\n",
-                    Some(&locals),
-                    Some(&locals),
-                )?;
-                let cb: Py<PyAny> = locals.get_item("_cb")?.expect("cb defined").unbind();
-                let sub = py_edge.register_inline_text_handler(cb)?;
-                Ok((sub, evt, observed))
-            })
-            .expect("register callback");
-
-        // Inject an inbound directly via the test fan-out helper
-        // (bypasses verify; the post-verify dispatch path uses the
-        // same `fan_out_inline_text` function under the hood).
-        edge.fan_out_inline_text_for_test("agent-bob", "hello from bob");
-
-        // Wait up to 1 second for the event. CRITICAL: release the
-        // GIL during the wait — the drainer thread invokes the Python
-        // callback under `Python::attach`, so holding the GIL here
-        // would starve it. `py.detach` releases the GIL for the
-        // duration of the inner closure; the drainer acquires + runs
-        // the callback + sets the event; we re-acquire on return.
-        let fired = Python::attach(|py| -> PyResult<bool> {
-            py.detach(|| {
-                // Acquire GIL briefly to call .wait, then release it
-                // by exiting the inner attach. Tricky! Instead, since
-                // we're already inside attach, do the wait via
-                // `evt.call_method1` but use `wait` which Python
-                // implements as a C-level blocking call that RELEASES
-                // the GIL internally (threading.Event.wait drops GIL).
-                Ok::<(), pyo3::PyErr>(())
-            })
-            .ok();
-            // Threading.Event.wait is a GIL-releasing call inside
-            // CPython — but pyo3's wrapper holds the GIL across the
-            // call frame. To actually release the GIL we have to use
-            // detach. Workaround: poll evt.is_set() with detach-yields.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            loop {
-                let is_set: bool = evt.call_method0(py, "is_set")?.extract(py)?;
-                if is_set {
-                    return Ok(true);
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Ok(false);
-                }
-                py.detach(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                });
-            }
-        })
-        .expect("wait on event");
-        assert!(fired, "callback must fire within 1 second");
-
-        // Inspect the captured args.
-        Python::attach(|py| {
-            let observed_bound = observed_holder.bind(py);
-            let entry = observed_bound.get_item(0).expect("first observed");
-            let (sender, body): (String, String) = entry.extract().expect("extract (sender, body)");
-            assert_eq!(sender, "agent-bob");
-            assert_eq!(body, "hello from bob");
-        });
-
-        // Cleanly tear down to avoid leaking the drainer into other
-        // tests' libpython state.
-        Python::attach(|py| {
-            sub.unsubscribe(py).expect("unsubscribe");
-        });
-    }
-
-    /// `SubscriptionHandle::unsubscribe()` stops subsequent inbounds
-    /// from invoking the callback. Pre-condition: one inbound fires
-    /// (count=1); post-unsubscribe: another inbound does NOT increment
-    /// the count.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn py_subscription_handle_unsubscribe_stops_callbacks() {
-        init_python();
-        let (edge, _queue) = build_test_edge().await;
-        let py_edge = PyEdge::for_test(edge.clone(), tokio::runtime::Handle::current());
-
-        // Callback that increments a Python list's int via append. We
-        // use a list-as-counter pattern so the callback can mutate
-        // shared state without closure capture (Python's `nonlocal`
-        // doesn't compose with PyO3's exec well). The counter is
-        // bound as a default arg on the def so it captures at
-        // def-time (a free-variable `counter` would look in
-        // module-globals at call time and miss).
-        let (sub, counter) = Python::attach(|py| -> PyResult<(PySubscriptionHandle, Py<PyAny>)> {
-            let counter: Py<PyAny> = py.eval(c"[0]", None, None)?.unbind();
-            let locals = pyo3::types::PyDict::new(py);
-            locals.set_item("counter", counter.clone_ref(py))?;
-            py.run(
-                c"def _cb(s, t, _c=counter):\n    _c[0] += 1\n",
-                Some(&locals),
-                Some(&locals),
-            )?;
-            let cb: Py<PyAny> = locals.get_item("_cb")?.expect("cb").unbind();
-            let sub = py_edge.register_inline_text_handler(cb)?;
-            Ok((sub, counter))
-        })
-        .expect("register");
-
-        edge.fan_out_inline_text_for_test("sender-a", "msg-1");
-
-        // Wait for the first call to land. The drainer thread is
-        // asynchronous; poll the counter.
-        let mut waited = Duration::ZERO;
-        let step = Duration::from_millis(20);
-        while waited < Duration::from_secs(1) {
-            let n: i64 = Python::attach(|py| {
-                let bound = counter.bind(py);
-                bound.get_item(0).unwrap().extract().unwrap()
-            });
-            if n >= 1 {
-                break;
-            }
-            tokio::time::sleep(step).await;
-            waited += step;
-        }
-        let n_before: i64 =
-            Python::attach(|py| counter.bind(py).get_item(0).unwrap().extract().unwrap());
-        assert_eq!(n_before, 1, "first inbound must fire the callback");
-
-        // Unsubscribe and verify the registry actually drops the entry.
-        Python::attach(|py| sub.unsubscribe(py).unwrap());
-        assert_eq!(
-            edge.inline_text_subscriber_count(),
-            0,
-            "unsubscribe() must remove the registry entry"
-        );
-
-        // Fire another inbound — must NOT increment the counter.
-        edge.fan_out_inline_text_for_test("sender-a", "msg-2");
-        // Give the (now-defunct) drainer time to NOT process the
-        // message — 200ms is well past any plausible scheduling delay.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let n_after: i64 =
-            Python::attach(|py| counter.bind(py).get_item(0).unwrap().extract().unwrap());
-        assert_eq!(
-            n_after, 1,
-            "post-unsubscribe inbound must NOT fire the callback"
-        );
-    }
-
-    /// Context-manager exit unsubscribes — `with edge.register_inline_text_handler(cb) as sub:`
-    /// + statements outside the block must NOT fire the callback.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn py_subscription_handle_context_manager_unsubscribes_on_exit() {
-        init_python();
-        let (edge, _queue) = build_test_edge().await;
-        let py_edge = PyEdge::for_test(edge.clone(), tokio::runtime::Handle::current());
-
-        // Build a counter + callback that increments it. Same
-        // default-arg pattern as the other lifecycle tests — captures
-        // `counter` at def-time, not via module-globals.
-        let (sub, counter) = Python::attach(|py| -> PyResult<(PySubscriptionHandle, Py<PyAny>)> {
-            let counter: Py<PyAny> = py.eval(c"[0]", None, None)?.unbind();
-            let locals = pyo3::types::PyDict::new(py);
-            locals.set_item("counter", counter.clone_ref(py))?;
-            py.run(
-                c"def _cb(s, t, _c=counter):\n    _c[0] += 1\n",
-                Some(&locals),
-                Some(&locals),
-            )?;
-            let cb: Py<PyAny> = locals.get_item("_cb")?.expect("cb").unbind();
-            let sub = py_edge.register_inline_text_handler(cb)?;
-            Ok((sub, counter))
-        })
-        .expect("register");
-
-        // Inside the "with" block — fire an inbound, expect counter=1.
-        edge.fan_out_inline_text_for_test("ctx-mgr", "inside");
-        let mut waited = Duration::ZERO;
-        while waited < Duration::from_secs(1) {
-            let n: i64 =
-                Python::attach(|py| counter.bind(py).get_item(0).unwrap().extract().unwrap());
-            if n >= 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            waited += Duration::from_millis(20);
-        }
-
-        // Now exit the "with" — call `__exit__` directly.
-        Python::attach(|py| -> PyResult<bool> {
-            let none = py.None();
-            sub.__exit__(py, none.clone_ref(py), none.clone_ref(py), none)
-        })
-        .expect("__exit__");
-
-        assert_eq!(
-            edge.inline_text_subscriber_count(),
-            0,
-            "context-manager __exit__ must remove the registry entry"
-        );
-
-        // Fire another inbound — must NOT fire the callback.
-        edge.fan_out_inline_text_for_test("ctx-mgr", "outside");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let n_final: i64 =
-            Python::attach(|py| counter.bind(py).get_item(0).unwrap().extract().unwrap());
-        assert_eq!(
-            n_final, 1,
-            "post-__exit__ inbound must NOT fire the callback"
-        );
-    }
-
-    /// The `send_inline_text` pipeline-invariant — when a `speak_pipeline`
-    /// is configured, the Python-supplied text is scrubbed BEFORE the
-    /// envelope is signed. We configure a trivial pipeline that
-    /// uppercases the text (proxy for "the pipeline ran"); the
-    /// post-call `body_sha256` must match the SHA of an envelope built
-    /// from the UPPERCASED text, not the input text.
-    ///
-    /// This pins the load-bearing forensic-completeness invariant
-    /// (FSD §1.4 — Classify + Scrub + EncryptAndStore must run before
-    /// signing).
-    /// Custom uppercase-everything stage used by [`py_inline_text_pipeline_scrub_runs`].
-    /// Stand-in for the real ScrubAndEncrypt stage — we only need to
-    /// observe "the stage ran" via a deterministic text transformation.
-    /// Module-level (not inline in the test) to satisfy clippy's
-    /// items-after-statements lint.
-    struct UppercaseStage;
-
-    impl ciris_persist::pipeline::Stage<ciris_persist::prelude::InlineTextEnvelope> for UppercaseStage {
-        fn name(&self) -> &'static str {
-            "uppercase_for_test"
-        }
-        async fn run(
-            &self,
-            env: &mut ciris_persist::prelude::InlineTextEnvelope,
-            state: &mut ciris_persist::pipeline::PipelineState,
-        ) -> Result<(), ciris_persist::pipeline::Error> {
-            env.text = env.text.to_uppercase();
-            state.fields_modified += 1;
-            state.stages_executed.push("uppercase_for_test".into());
-            Ok(())
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn py_inline_text_pipeline_scrub_runs() {
-        use ciris_persist::pipeline::{Pipeline, PipelineBuilder};
-        use ciris_persist::prelude::{
-            EdgeOutboundQueueSqlite, FederationDirectorySqlite, InlineTextEnvelope,
-        };
-
-        init_python();
-
-        let directory = FederationDirectorySqlite::open(":memory:")
-            .await
-            .expect("open directory");
-        let queue = EdgeOutboundQueueSqlite::open(":memory:")
-            .await
-            .expect("open queue");
-
-        let tmp: &'static tempfile::TempDir =
-            Box::leak(Box::new(tempfile::tempdir().expect("tempdir")));
-        let seed_path = tmp.path().join("ed25519.seed");
-        std::fs::write(&seed_path, [0x88u8; 32]).expect("write seed");
-        let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
-            key_id: "py-tier2-pipeline-edge".into(),
-            key_path: seed_path,
-            pqc_key_id: None,
-            pqc_key_path: None,
-        })
-        .await
-        .expect("load_local_seed");
-        let signer = Arc::new(LocalSigner::new("py-tier2-pipeline-edge", classical, None));
-        let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
-        let pipeline: Arc<Pipeline<InlineTextEnvelope>> = Arc::new(
-            PipelineBuilder::new()
-                .add_stage(UppercaseStage)
-                .build()
-                .expect("build uppercase pipeline"),
-        );
-
-        let edge = Edge::builder()
-            .directory(directory)
-            .queue(queue)
-            .signer(signer)
-            .transport(transport)
-            .speak_pipeline(pipeline)
-            .build()
-            .expect("Edge::build with pipeline");
-        let edge = Arc::new(edge);
-
-        let py_edge = PyEdge::for_test(edge.clone(), tokio::runtime::Handle::current());
-
-        // Send via the Python surface with lowercase input.
-        let py_sha = Python::attach(|py| -> PyResult<String> {
-            py_edge.send_inline_text(py, "recipient-key", "hello world")
-        })
-        .expect("send_inline_text");
-
-        // Compute the expected SHA — build an envelope around the
-        // UPPERCASED text (what the pipeline would have produced) and
-        // hash its body. If py_sha matches, the pipeline ran (because
-        // it transformed the body before the SHA was computed).
-        let expected_envelope = crate::identity::build_envelope(
-            crate::messages::MessageType::InlineText,
-            "py-tier2-pipeline-edge",
-            "recipient-key",
-            &crate::messages::InlineText {
-                text: "HELLO WORLD".to_string(),
-            },
-            None,
-        )
-        .expect("build expected envelope");
-        let expected_sha = crate::identity::envelope_body_sha256(&expected_envelope);
-        let expected_hex = {
-            use std::fmt::Write as _;
-            let mut s = String::with_capacity(64);
-            for b in &expected_sha {
-                let _ = write!(s, "{b:02x}");
-            }
-            s
-        };
-        assert_eq!(
-            py_sha, expected_hex,
-            "speak_pipeline MUST run on Python-supplied text before signing \
-             (CIRISAgent#756 Q1 / FSD §1.4) — body_sha256 must reflect the \
-             post-pipeline body, not the input"
-        );
-    }
-
-    /// CIRISEdge#28 (v0.19.0) — `PyEdge::metrics_snapshot` round-trips
-    /// through the PyO3 boundary as a dict of dicts. We bump a counter
-    /// via Rust-side `inc_sent`, then read it back through the Python
-    /// projection and assert the key + count survive.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn metrics_snapshot_round_trip_through_pyo3() {
-        init_python();
-        let (edge, _queue) = build_test_edge().await;
-        // Bump a counter on the live Edge metrics — exercises the
-        // same Arc<RwLock<_>> path the production send/receive sites
-        // walk.
-        edge.metrics().inc_sent(&crate::MessageType::InlineText);
-        edge.metrics().inc_sent(&crate::MessageType::InlineText);
-        edge.metrics().inc_sent(&crate::MessageType::ContentFetch);
-        edge.metrics()
-            .inc_send_failure(crate::TransportId::HTTP, "timeout");
-
-        let py_edge = PyEdge::for_test(edge.clone(), tokio::runtime::Handle::current());
-
-        Python::attach(|py| {
-            let snap = py_edge.metrics_snapshot(py).expect("metrics_snapshot");
-            let snap_bound = snap.bind(py);
-            let envelopes_sent = snap_bound
-                .get_item("envelopes_sent_total")
-                .expect("envelopes_sent_total key");
-            let inline_text_count: u64 = envelopes_sent
-                .get_item("InlineText")
-                .expect("InlineText key")
-                .extract()
-                .expect("u64 extract");
-            assert_eq!(inline_text_count, 2);
-            let content_fetch_count: u64 = envelopes_sent
-                .get_item("ContentFetch")
-                .expect("ContentFetch key")
-                .extract()
-                .expect("u64 extract");
-            assert_eq!(content_fetch_count, 1);
-
-            let send_failures = snap_bound
-                .get_item("send_failures_total")
-                .expect("send_failures_total key");
-            let http_timeout_count: u64 = send_failures
-                .get_item("http:timeout")
-                .expect("http:timeout key")
-                .extract()
-                .expect("u64 extract");
-            assert_eq!(http_timeout_count, 1);
-        });
     }
 
     // ── v0.9.2 (CIRISEdge#22 / CIRISPersist#109) — cohabitation
@@ -8645,35 +7845,30 @@ mod pyo3_tier2_tests {
     /// existing v0.19.4 binary aborts the test process before this
     /// line; the v0.19.5 fix returns a valid handle.
     #[test]
-    fn send_durable_inline_text_does_not_abort_in_sync_cohab() {
+    fn send_opaque_event_does_not_abort_in_sync_cohab() {
         init_python();
         let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
         let handle = Python::attach(|py| -> PyResult<PyDurableHandle> {
-            py_edge.send_durable_inline_text(py, "recipient-key", "hello")
+            py_edge.send_opaque_event(py, "recipient-key", 1, b"hello".to_vec())
         })
-        .expect("send_durable_inline_text must not abort in sync cohab context");
-        // body_sha256 is the load-bearing forensic join key — its
-        // presence (64-char lowercase hex) means the envelope was
-        // built, signed, hashed, and enqueued. The pymethod ran to
-        // completion.
-        assert_eq!(handle.body_sha256().len(), 64);
-        assert!(handle
-            .body_sha256()
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        .expect("send_opaque_event must not abort in sync cohab context");
+        // A non-empty queue_id means the envelope was built, signed,
+        // and enqueued — the pymethod ran to completion (the #50
+        // panic-on-drop bug shape would abort before this line).
+        assert!(!handle.queue_id().is_empty());
     }
 
     /// v0.19.5 (CIRISEdge#50) — the envelope MUST be visible in the
     /// persist outbound queue with `status=pending` after a successful
     /// `send_durable_inline_text` return.
     #[test]
-    fn send_durable_inline_text_envelope_visible_in_outbound() {
+    fn send_opaque_event_envelope_visible_in_outbound() {
         use ciris_persist::prelude::{OutboundFilter, OutboundStatus};
 
         init_python();
         let (py_edge, queue, runtime) = build_sync_cohab_fixture();
         let queue_id = Python::attach(|py| -> PyResult<String> {
-            let h = py_edge.send_durable_inline_text(py, "recipient-key", "visible-row")?;
+            let h = py_edge.send_opaque_event(py, "recipient-key", 1, b"visible-row".to_vec())?;
             Ok(h.queue_id().to_string())
         })
         .expect("send_durable_inline_text");
@@ -8708,7 +7903,7 @@ mod pyo3_tier2_tests {
     /// `metrics.inc_durable_queue(DeliveryClass::Durable)` AFTER the
     /// successful `enqueue_outbound`; the snapshot path projects it.
     #[test]
-    fn send_durable_inline_text_increments_durable_queue_depth_metric() {
+    fn send_opaque_event_increments_durable_queue_depth_metric() {
         init_python();
         let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
 
@@ -8728,7 +7923,7 @@ mod pyo3_tier2_tests {
 
         // Single enqueue.
         Python::attach(|py| -> PyResult<()> {
-            py_edge.send_durable_inline_text(py, "recipient-key", "metric-bump")?;
+            py_edge.send_opaque_event(py, "recipient-key", 1, b"metric-bump".to_vec())?;
             Ok(())
         })
         .expect("send_durable_inline_text");

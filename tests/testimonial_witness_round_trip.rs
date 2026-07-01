@@ -28,10 +28,10 @@ fn v015_envelope() -> EdgeEnvelope {
     let body: Box<RawValue> =
         RawValue::from_string(r#"{"text":"hello"}"#.to_string()).expect("raw value");
     EdgeEnvelope {
-        edge_schema_version: SchemaVersion::V1_0_0,
+        edge_schema_version: SchemaVersion::V2_0_0,
         signing_key_id: "edge-key-aaaa".to_string(),
         destination_key_id: "edge-key-bbbb".to_string(),
-        message_type: MessageType::InlineText,
+        message_type: MessageType::OpaqueEvent,
         sent_at: DateTime::parse_from_rfc3339("2026-05-29T00:00:00.000Z")
             .unwrap()
             .with_timezone(&Utc),

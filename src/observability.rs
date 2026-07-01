@@ -362,11 +362,11 @@ mod tests {
     #[test]
     fn inc_sent_accumulates_per_message_type() {
         let m = EdgeMetrics::new();
-        m.inc_sent(&MessageType::InlineText);
-        m.inc_sent(&MessageType::InlineText);
+        m.inc_sent(&MessageType::OpaqueEvent);
+        m.inc_sent(&MessageType::OpaqueEvent);
         m.inc_sent(&MessageType::FederationAnnouncement);
         let snap = m.snapshot();
-        assert_eq!(snap.envelopes_sent_total[&MessageType::InlineText], 2);
+        assert_eq!(snap.envelopes_sent_total[&MessageType::OpaqueEvent], 2);
         assert_eq!(
             snap.envelopes_sent_total[&MessageType::FederationAnnouncement],
             1

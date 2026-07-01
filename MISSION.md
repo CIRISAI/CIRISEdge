@@ -212,9 +212,11 @@ with deliberate cross-repo coordination.
 - **The `Message` / `Handler` typed contract** (`src/handler.rs`) —
   every wire message is a Rust struct with `serde::Deserialize` + a
   `MessageType` discriminant + a `Delivery` class; handlers receive the
-  parsed struct, never raw bytes. `InlineTextMessage` marks the bodies
-  the outbound pipeline scans. Different peers register different
-  handler sets; the dispatch shape is one contract.
+  parsed struct, never raw bytes — except a Tier-2 `OpaqueRequest` /
+  `OpaqueEvent` body, whose `payload` edge hands to the handler as an
+  opaque `Vec<u8>` it never parses (the app owns inner canonicalization
+  and any inner signature). Different peers register different handler
+  sets; the dispatch shape is one contract.
 - **The `EdgeEnvelope` wire format** (`src/messages/mod.rs`) — the
   signed envelope every peer emits and verifies. Its shape is the
   cross-repo contract; a change is a coordinated `SchemaVersion` break
@@ -323,7 +325,21 @@ said.
 - **`MessageType`** (`src/messages/mod.rs`) — the body discriminator;
   dispatch is keyed on it, and `Delivery` (`src/handler.rs`) lives on
   the type, not the call site, so a caller cannot pick the wrong
-  delivery class (OQ-09).
+  delivery class (OQ-09). Per **CC 0.7** the wire vocabulary is a
+  **two-tier constitutional model**: **Tier-1** is the closed
+  constitutional vocabulary — the fixed federation message shapes edge
+  knows and can reason about (DSAR stays Tier-1); **Tier-2** is the
+  opaque app-tier RPC surface — `OpaqueRequest` / `OpaqueResponse` /
+  `OpaqueEvent`, each `{kind: u32, payload: Vec<u8>}` carried as OPAQUE
+  bytes. Edge holds NO Tier-2 `kind` range and owns NO app semantics,
+  NO typed struct, NO canonical-bytes knowledge for any migrant
+  payload: it carries **reach, not meaning** (§1.3). The authoritative
+  vocabulary is `CIRISRegistry`'s `manifests/WIRE_VOCABULARY.md`
+  (v1.0.1 §3.3), pinned into the crate via the build-gate
+  `WIRE_VOCABULARY_HASH: [u8; 32]` (`src/messages/mod.rs`, a sha256
+  over the spec, guarded by the `wire_vocabulary_hash_pinned` test) —
+  crate-vs-registry drift fails the build. This IS the coordinated
+  wire break: `SchemaVersion::V2_0_0` is the new strict-flip default.
 
 **The mandate:** an `EdgeEnvelope`, `SchemaVersion`, or attestation
 encoding change is a coordinated, versioned wire break — never a casual
@@ -353,11 +369,17 @@ downstream consumers pin against tagged commits.
 - **Outbound signing** (`src/identity.rs`) — `build_envelope` assembles
   the typed body; `sign_envelope` canonicalizes and signs Ed25519
   (mandatory) + ML-DSA-65 (when the signer is hybrid-complete).
-- **`send` / `send_durable` / `send_inline`** (`src/edge.rs`) —
-  ephemeral send is caller-retry; durable send enqueues to persist's
-  `edge_outbound_queue`; `send_inline` runs the transit-touch pipeline
-  (Classify + Scrub + EncryptAndStore) over `InlineTextMessage` bodies
-  before signing — the cleartext never crosses the wire.
+- **`send` / `send_durable`** (`src/edge.rs`) — ephemeral send is
+  caller-retry; durable send enqueues to persist's
+  `edge_outbound_queue`. Tier-2 app RPC rides the same typed
+  send/response primitive: `send::<OpaqueRequest>(dest_key_id,
+  OpaqueRequest{kind, payload}) -> OpaqueResponse` (registered via
+  `register_handler::<OpaqueRequest>`), and `OpaqueEvent` rides
+  `Delivery::Persistent` fan-out to subscribers, generic over `kind`.
+  An `OpaqueRequest` handler that sees an unknown `kind` replies
+  `OpaqueResponse { kind: <echo>, status: 501, payload: b"unknown
+  kind" }` — a typed, sender-visible reject, never a silent drop
+  (§6 anti-pattern 7).
 - **The durable dispatcher** (`src/outbound.rs::run_dispatcher`,
   `run_sweeps`) — edge-owned retry/backoff over persist's queue rows;
   ACK matching by `body_sha256` (`in_reply_to`).

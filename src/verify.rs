@@ -388,7 +388,7 @@ impl VerifyPipeline {
         // means a future variant rejects at compile time until we
         // explicitly handle it.
         match envelope.edge_schema_version {
-            SchemaVersion::V1_0_0 => {}
+            SchemaVersion::V2_0_0 => {}
         }
 
         // Step 4 — destination check (AV-8).

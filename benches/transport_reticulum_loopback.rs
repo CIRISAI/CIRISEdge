@@ -198,10 +198,10 @@ fn sample_envelope(body_size: usize) -> Vec<u8> {
     let body_json = format!(r#"{{"text":"{payload}"}}"#);
     let body = RawValue::from_string(body_json).expect("raw value");
     let env = EdgeEnvelope {
-        edge_schema_version: SchemaVersion::V1_0_0,
+        edge_schema_version: SchemaVersion::V2_0_0,
         signing_key_id: "edge-key-bbbb".into(),
         destination_key_id: "edge-key-aaaa".into(),
-        message_type: MessageType::InlineText,
+        message_type: MessageType::OpaqueEvent,
         sent_at: Utc::now(),
         nonce: [0x5a; 16],
         body,

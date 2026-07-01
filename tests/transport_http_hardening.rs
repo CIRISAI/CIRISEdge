@@ -429,12 +429,12 @@ async fn https_carries_content_fetch_round_trip() {
     .await;
 }
 
-/// (6) InlineText envelope round-trip (CIRISEdge#22 Tier 2 wire shape).
+/// (6) OpaqueEvent envelope round-trip (v8.0.0 opaque wire vocabulary).
 #[tokio::test]
-async fn https_carries_inline_text_round_trip() {
+async fn https_carries_opaque_event_round_trip() {
     https_carries_arbitrary_envelope(
-        "it-test",
-        br#"{"message_type":"InlineText","payload":{"body_text":"hello world"}}"#,
+        "oe-test",
+        br#"{"message_type":"OpaqueEvent","payload":{"kind":1,"payload":[1,2,3]}}"#,
     )
     .await;
 }

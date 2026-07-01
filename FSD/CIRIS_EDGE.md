@@ -96,7 +96,8 @@ Phase 3 without future rewrites.
 
 **Outcome:** `cirislens-api`'s `POST /api/v1/accord/events` route stops
 being a FastAPI endpoint and becomes a `ciris-edge` runner registered
-to handle the `AccordEventsBatch` message type. The Python lens layer
+to handle the relevant message type (a Tier-2 `OpaqueEvent` fan-out
+under CC 0.7 §3.4.1). The Python lens layer
 keeps the operator-UI HTTP stack (Grafana proxy, OAuth, admin) but
 loses the federation-traffic responsibility.
 
@@ -128,10 +129,12 @@ ciris-edge/
 │   ├── handler.rs          ← register_handler, dispatch, error mapping
 │   ├── observability.rs    ← OTLP metrics, structured log hooks
 │   └── messages/
-│       ├── mod.rs          ← shared envelope + signed-bytes canonicalization
-│       ├── accord.rs       ← AccordEventsBatch, PublicKeyRegistration, DSARRequest
+│       ├── mod.rs          ← shared envelope + signed-bytes canonicalization;
+│       │                      WIRE_VOCABULARY_HASH build-gate pin (CC 0.7)
+│       ├── accord.rs       ← Tier-1 constitutional bodies (DSARRequest stays
+│       │                      Tier-1); PublicKeyRegistration
 │       ├── manifest.rs     ← BuildManifestPublication, ManifestQuery
-│       └── federation.rs   ← FederationKeyDirectoryQuery, AttestationGossip
+│       └── opaque.rs       ← Tier-2 OpaqueRequest / OpaqueResponse / OpaqueEvent
 ├── examples/
 │   ├── echo_peer/          ← minimal: signs + sends + receives one message
 │   └── lens_handler_set/   ← reference for what lens registers
@@ -162,18 +165,23 @@ let edge = Edge::builder()
     .build()?;
 
 // Typed handler registration. One per message type the host handles.
-edge.register_handler::<AccordEventsBatch, _>(|msg, ctx| async move {
-    // msg is the parsed, verified payload; ctx carries
+// Tier-2 app RPC: edge hands `payload` to the handler as opaque bytes;
+// the app owns inner canonicalization + any inner signature.
+edge.register_handler::<OpaqueRequest, _>(|msg, ctx| async move {
+    // msg.kind: u32; msg.payload: Vec<u8> (opaque to edge). ctx carries
     //   - sender's signing_key_id (already resolved to identity_ref)
     //   - body_sha256 (forensic join key)
     //   - transport identifier (which network medium it arrived on)
-    persist_engine.receive_and_persist(msg.canonical_bytes()).await?;
-    Ok(AccordEventsResponse { accepted: msg.events.len() as u32 })
+    match msg.kind {
+        KIND_KNOWN => Ok(OpaqueResponse { kind: msg.kind, status: 200, payload: handle(msg.payload) }),
+        // Unknown kind → typed sender-visible reject, never a silent drop.
+        _ => Ok(OpaqueResponse { kind: msg.kind, status: 501, payload: b"unknown kind".to_vec() }),
+    }
 })?;
 
 // Outbound: host sends a signed message to a destination.
 let dest = edge.resolve_destination("registry-steward").await?;
-edge.send::<BuildManifestPublication>(dest, manifest).await?;
+let resp = edge.send::<OpaqueRequest>(dest, OpaqueRequest { kind, payload }).await?;
 
 // Run loop. Spawns the transport listeners + dispatch loop.
 edge.run().await?;
@@ -216,8 +224,9 @@ pub struct EdgeEnvelope {
     /// Recipient's federation_keys.key_id; lets the peer reject
     /// misrouted messages before parsing the body.
     pub destination_key_id: String,
-    /// Discriminator for the body union (AccordEventsBatch,
-    /// BuildManifestPublication, etc.).
+    /// Discriminator for the body union — Tier-1 constitutional bodies
+    /// (BuildManifestPublication, DSARRequest, etc.) or the Tier-2
+    /// opaque RPC surface (OpaqueRequest / OpaqueResponse / OpaqueEvent).
     pub message_type: MessageType,
     /// Per-message timestamp; used in replay-protection windowing.
     pub sent_at: DateTime<Utc>,
@@ -253,6 +262,51 @@ Canonical bytes for verify use persist's
 window of recently-seen `(signing_key_id, nonce)` pairs; persist's
 existing dedup-key tuple covers application-layer replay detection.
 
+### 3.4.1 Tier-1 / Tier-2 wire vocabulary (CC 0.7, v8.0.0)
+
+CC 0.7 splits the `MessageType` body union into a **two-tier
+constitutional model**. The authoritative vocabulary lives in
+`CIRISRegistry`'s `manifests/WIRE_VOCABULARY.md` (v1.0.1 §3.3), pinned
+into the crate as the build-gate constant `WIRE_VOCABULARY_HASH:
+[u8; 32]` (`src/messages/mod.rs`) — a sha256 over the spec, guarded by
+the `wire_vocabulary_hash_pinned` test so crate-vs-registry drift fails
+the build. `SchemaVersion::V2_0_0` is the new strict-flip default; this
+IS the coordinated wire break.
+
+**Tier-1 — closed constitutional vocabulary.** The fixed federation
+message shapes edge knows and can reason about: `BuildManifestPublication`,
+`PublicKeyRegistration`, and — explicitly — **`DSARRequest` stays
+Tier-1** (data-subject-access is a constitutional obligation the
+transport tier must recognize, not an opaque app payload).
+
+**Tier-2 — opaque app-tier RPC.** Three bodies carry app-defined RPC
+that edge forwards verbatim:
+
+```rust
+OpaqueRequest  { kind: u32, payload: Vec<u8> }              // Delivery::Ephemeral; Response = OpaqueResponse
+OpaqueResponse { kind: u32, status: u16, payload: Vec<u8> } // Delivery::Ephemeral; no Response
+OpaqueEvent    { kind: u32, payload: Vec<u8> }              // Delivery::Persistent; no Response
+```
+
+- Edge carries `payload` as **OPAQUE bytes**. It holds NO typed struct,
+  NO canonical_bytes, NO Message-semantic knowledge for any migrant
+  `kind`, and owns NO Tier-2 `kind` range. The outer `EdgeEnvelope`
+  signature stays transport-tier; the **app owns inner canonicalization
+  and any inner signature**.
+- An `OpaqueRequest` handler that sees an unknown `kind` replies
+  `OpaqueResponse { kind: <echo>, status: 501, payload: b"unknown kind" }`
+  — a typed, sender-visible reject. **Never a silent drop** (MISSION §6
+  anti-pattern 7).
+- The body-size cap (AV-13, `MAX_BODY_BYTES`) applies to `payload`.
+- `OpaqueEvent` rides `Delivery::Persistent` fan-out to subscribers,
+  generic over `kind`.
+
+The Rust-level surface is the mission-load-bearing, Rust-testable API:
+`Edge::send::<OpaqueRequest>(dest_key_id, OpaqueRequest{kind, payload})
+-> OpaqueResponse` over the existing typed send/response primitive
+(`src/edge.rs`); `edge.register_handler::<OpaqueRequest>(cb)` where the
+callback returns `OpaqueResponse`.
+
 ### 3.5 Phase 1 lens cutover plan
 
 ```
@@ -272,8 +326,9 @@ existing dedup-key tuple covers application-layer replay detection.
 
 ## 4. Phase 2 — Agent + registry adoption
 
-**Outcome:** Agent's `httpx` lens-shipping code path is replaced by
-`edge.send::<AccordEventsBatch>(lens_destination, batch)`. Registry's
+**Outcome:** Agent's `httpx` lens-shipping code path is replaced by an
+`edge.send::<OpaqueEvent>(lens_destination, event)` fan-out (or a
+Tier-1 constitutional body where one applies). Registry's
 HTTPS publication endpoint is replaced by an `edge.register_handler`
 for `BuildManifestPublication`. HTTPS becomes a fallback per peer.
 

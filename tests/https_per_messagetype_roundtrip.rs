@@ -308,8 +308,11 @@ async fn https_envelope_round_trip(test_seed: u8, message_type_wire: &str, body_
 // `serde_json::to_value(MessageType::FederationAnnouncement)`).
 
 #[tokio::test]
-async fn https_round_trip_accord_events_batch() {
-    https_envelope_round_trip(0x01, "AccordEventsBatch", br#"{"events": []}"#).await;
+async fn https_round_trip_opaque_event() {
+    // v8.0.0 opaque vocabulary — `OpaqueEvent { kind, payload }`
+    // (Durable). Absorbs the removed AccordEventsBatch/InlineText
+    // migrants' HTTPS coverage under the opaque durable-event lane.
+    https_envelope_round_trip(0x01, "OpaqueEvent", br#"{"kind":1,"payload":[1,2,3]}"#).await;
 }
 
 #[tokio::test]
@@ -353,8 +356,11 @@ async fn https_round_trip_public_key_registration() {
 }
 
 #[tokio::test]
-async fn https_round_trip_federation_key_directory_query() {
-    https_envelope_round_trip(0x07, "FederationKeyDirectoryQuery", br#"{"key_id":"k"}"#).await;
+async fn https_round_trip_opaque_request() {
+    // v8.0.0 opaque vocabulary — `OpaqueRequest { kind, payload }`
+    // (Ephemeral). Absorbs the removed FederationKeyDirectoryQuery
+    // migrant's HTTPS coverage under the opaque request lane.
+    https_envelope_round_trip(0x07, "OpaqueRequest", br#"{"kind":1,"payload":[1,2,3]}"#).await;
 }
 
 #[tokio::test]
@@ -458,8 +464,17 @@ async fn https_round_trip_steward_directive() {
 }
 
 #[tokio::test]
-async fn https_round_trip_inline_text() {
-    https_envelope_round_trip(0x17, "InlineText", br#"{"text":"hello world"}"#).await;
+async fn https_round_trip_opaque_response() {
+    // v8.0.0 opaque vocabulary — `OpaqueResponse { kind, status, payload }`
+    // (Ephemeral). The third opaque type; the migrant tests are spread
+    // across all three so "every message type round-trips over HTTPS"
+    // coverage is preserved for the full opaque vocabulary.
+    https_envelope_round_trip(
+        0x17,
+        "OpaqueResponse",
+        br#"{"kind":1,"status":200,"payload":[1,2,3]}"#,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -538,12 +553,12 @@ async fn https_per_messagetype_mtls_rejects_unknown_cn() {
         .build()
         .expect("client build");
 
-    // Build a syntactically-plausible InlineText envelope; the
+    // Build a syntactically-plausible OpaqueEvent envelope; the
     // assertion is that mTLS rejects at handshake, NOT that the
     // envelope is well-formed.
     let result = client
         .post(format!("https://localhost:{}/edge/inbound", addr.port()))
-        .body(br#"{"message_type":"InlineText","body":{"text":"unknown"}}"#.to_vec())
+        .body(br#"{"message_type":"OpaqueEvent","body":{"kind":1,"payload":[1,2,3]}}"#.to_vec())
         .send()
         .await;
     assert!(
@@ -584,7 +599,7 @@ async fn https_per_messagetype_bearer_rejects_missing_token() {
     let resp = client
         .post(format!("https://localhost:{}/edge/inbound", addr.port()))
         // No Authorization header → bearer-token gate fires.
-        .body(br#"{"message_type":"InlineText","body":{"text":"no-token"}}"#.to_vec())
+        .body(br#"{"message_type":"OpaqueEvent","body":{"kind":1,"payload":[1,2,3]}}"#.to_vec())
         .send()
         .await
         .expect("send");
@@ -614,13 +629,14 @@ fn all_message_types_have_https_round_trip_test() {
     // forces this match to fail to compile until the new test lands.
     fn wire_name(t: &MessageType) -> &'static str {
         match t {
-            MessageType::AccordEventsBatch => "AccordEventsBatch",
+            MessageType::OpaqueRequest => "OpaqueRequest",
+            MessageType::OpaqueResponse => "OpaqueResponse",
+            MessageType::OpaqueEvent => "OpaqueEvent",
             MessageType::BuildManifestPublication => "BuildManifestPublication",
             MessageType::DSARRequest => "DSARRequest",
             MessageType::DSARResponse => "DSARResponse",
             MessageType::AttestationGossip => "AttestationGossip",
             MessageType::PublicKeyRegistration => "PublicKeyRegistration",
-            MessageType::FederationKeyDirectoryQuery => "FederationKeyDirectoryQuery",
             MessageType::ContributionSubmit => "ContributionSubmit",
             MessageType::VoteCast => "VoteCast",
             MessageType::ExpertiseAttestationPublish => "ExpertiseAttestationPublish",
@@ -639,7 +655,6 @@ fn all_message_types_have_https_round_trip_test() {
             MessageType::BlobChunkBody => "BlobChunkBody",
             MessageType::BlobChunkMiss => "BlobChunkMiss",
             MessageType::StewardDirective => "StewardDirective",
-            MessageType::InlineText => "InlineText",
             MessageType::GoalDeclaration => "GoalDeclaration",
             MessageType::GoalRetirement => "GoalRetirement",
             MessageType::Withdraws => "Withdraws",
@@ -652,7 +667,9 @@ fn all_message_types_have_https_round_trip_test() {
     // its identifier as a JSON string, so the round-trip suite's body
     // shapes correctly name the discriminator.
     for (variant, expected) in &[
-        (MessageType::AccordEventsBatch, "AccordEventsBatch"),
+        (MessageType::OpaqueRequest, "OpaqueRequest"),
+        (MessageType::OpaqueResponse, "OpaqueResponse"),
+        (MessageType::OpaqueEvent, "OpaqueEvent"),
         (
             MessageType::BuildManifestPublication,
             "BuildManifestPublication",
@@ -661,10 +678,6 @@ fn all_message_types_have_https_round_trip_test() {
         (MessageType::DSARResponse, "DSARResponse"),
         (MessageType::AttestationGossip, "AttestationGossip"),
         (MessageType::PublicKeyRegistration, "PublicKeyRegistration"),
-        (
-            MessageType::FederationKeyDirectoryQuery,
-            "FederationKeyDirectoryQuery",
-        ),
         (MessageType::ContributionSubmit, "ContributionSubmit"),
         (MessageType::VoteCast, "VoteCast"),
         (
@@ -701,7 +714,6 @@ fn all_message_types_have_https_round_trip_test() {
         (MessageType::BlobChunkBody, "BlobChunkBody"),
         (MessageType::BlobChunkMiss, "BlobChunkMiss"),
         (MessageType::StewardDirective, "StewardDirective"),
-        (MessageType::InlineText, "InlineText"),
         (MessageType::GoalDeclaration, "GoalDeclaration"),
         (MessageType::GoalRetirement, "GoalRetirement"),
         (MessageType::Withdraws, "Withdraws"),

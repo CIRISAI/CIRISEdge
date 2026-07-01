@@ -18,7 +18,7 @@
 //!   response-correlation isn't wired — the cost being measured is
 //!   build + sign, which IS what spec point "build envelope + sign"
 //!   covers).
-//! - `Durable` — `Edge::send_durable` over `InlineTextDurable` (the
+//! - `Durable` — `Edge::send_durable` over `OpaqueEvent` (the
 //!   canonical durable Tier 2 path; produces one outbound row).
 //! - `Federation` — `Edge::send_federation` with a 3-steward set
 //!   (representative middle of the fan-out sweep; `steward_fanout`
@@ -49,8 +49,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ciris_edge::messages::{
-    AnnouncementKind, AnnouncementPriority, AuthorityClass, FederationAnnouncement,
-    InlineTextDurable, StewardDirective,
+    AnnouncementKind, AnnouncementPriority, AuthorityClass, FederationAnnouncement, OpaqueEvent,
+    StewardDirective,
 };
 use ciris_edge::outbound::{PeerDirectory, StewardDirectory, StewardKey};
 use ciris_edge::transport::Transport;
@@ -177,8 +177,9 @@ fn bench_enqueue(c: &mut Criterion) {
             b.to_async(&rt).iter(|| {
                 let edge = edge.clone();
                 async move {
-                    let msg = InlineTextDurable {
-                        text: "bench durable text".into(),
+                    let msg = OpaqueEvent {
+                        kind: 0x0000_0001,
+                        payload: b"bench durable text".to_vec(),
                     };
                     let r = edge.send_durable(edge.signer_key_id(), msg).await;
                     black_box(r).ok();
