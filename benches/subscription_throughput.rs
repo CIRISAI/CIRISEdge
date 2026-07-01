@@ -155,7 +155,7 @@ fn bench_subscription(c: &mut Criterion) {
         let mut rxs = Vec::with_capacity(sub_count);
         let mut ids = Vec::with_capacity(sub_count);
         for _ in 0..sub_count {
-            let (id, rx) = edge.register_inline_text_subscriber();
+            let (id, rx) = edge.register_opaque_subscriber(0x0000_0001);
             ids.push(id);
             rxs.push(rx);
         }
@@ -192,7 +192,11 @@ fn bench_subscription(c: &mut Criterion) {
             |b, _| {
                 let edge = edge.clone();
                 b.iter(|| {
-                    edge.fan_out_inline_text_for_test(black_box("bench-sender"), black_box("hi"));
+                    edge.fan_out_opaque_event_for_test(
+                        black_box("bench-sender"),
+                        black_box(0x0000_0001),
+                        black_box(b"hi"),
+                    );
                 });
             },
         );
@@ -200,7 +204,7 @@ fn bench_subscription(c: &mut Criterion) {
         // Cleanup: drop subscribers so the OS-thread drainers
         // observe channel close (mpsc::recv returns None) and exit.
         for id in ids {
-            edge.unregister_inline_text_subscriber(id);
+            edge.unregister_opaque_subscriber(id);
         }
         for handle in drainer_handles {
             let _ = handle.join();

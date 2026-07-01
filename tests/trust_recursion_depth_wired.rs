@@ -26,7 +26,7 @@ use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
 use ciris_edge::verify::HybridPolicy;
-use ciris_edge::{AgentMode, Edge, EdgeConfig, InlineText};
+use ciris_edge::{AgentMode, Edge, EdgeConfig, OpaqueEvent};
 use ciris_persist::federation::{FederationDirectory, TrustScoring, TrustScoringError};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend;
@@ -226,10 +226,11 @@ async fn dispatch(
     sender: &LocalSigner,
     destination: &str,
 ) -> Result<(), ciris_edge::EdgeError> {
-    let body = InlineText {
-        text: "rec-depth-test".to_string(),
+    let body = OpaqueEvent {
+        kind: 0x0000_0001,
+        payload: b"rec-depth-test".to_vec(),
     };
-    let mut env = build_envelope(InlineText::TYPE, &sender.key_id, destination, &body, None)?;
+    let mut env = build_envelope(OpaqueEvent::TYPE, &sender.key_id, destination, &body, None)?;
     sign_envelope(sender, &mut env).await?;
     let bytes = serde_json::to_vec(&env)
         .map_err(|e| ciris_edge::EdgeError::Config(format!("serialize: {e}")))?;

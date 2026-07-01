@@ -203,7 +203,7 @@ fn sample_pubkey_b64(seed_byte: u8) -> String {
 
 fn sample_policy() -> EdgePeerPolicy {
     EdgePeerPolicy {
-        subscription_filter: vec!["SystemAnnounce".to_string(), "InlineText".to_string()],
+        subscription_filter: vec!["SystemAnnounce".to_string(), "OpaqueEvent".to_string()],
         max_queue_depth: 1024,
         ack_timeout_seconds_override: Some(60),
         priority_class: Some("normal".to_string()),

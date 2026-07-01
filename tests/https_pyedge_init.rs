@@ -348,8 +348,7 @@ async fn init_edge_runtime_https_dev_self_signed_round_trip() {
         .build()
         .expect("client build");
 
-    let body =
-        br#"{"message_type":"InlineText","body":{"text":"v0.19.3 dev-self-signed init"}}"#.to_vec();
+    let body = br#"{"message_type":"OpaqueEvent","body":{"kind":1,"payload":[1,2,3]}}"#.to_vec();
     let resp = client
         .post(format!("https://localhost:{}/edge/inbound", addr.port()))
         .body(body.clone())
@@ -410,7 +409,7 @@ async fn init_edge_runtime_https_bearer_token_succeeds() {
         .build()
         .expect("client");
 
-    let body = br#"{"message_type":"InlineText","body":{"text":"bearer init"}}"#.to_vec();
+    let body = br#"{"message_type":"OpaqueEvent","body":{"kind":1,"payload":[1,2,3]}}"#.to_vec();
     let resp = client
         .post(format!("https://localhost:{}/edge/inbound", addr.port()))
         .header("authorization", format!("Bearer {token}"))
@@ -479,7 +478,7 @@ async fn init_edge_runtime_https_mtls_required_validates_handshake() {
         .identity(known_id)
         .build()
         .expect("known client");
-    let body = br#"{"message_type":"InlineText","body":{"text":"mtls known"}}"#.to_vec();
+    let body = br#"{"message_type":"OpaqueEvent","body":{"kind":1,"payload":[4,5,6]}}"#.to_vec();
     let resp = known
         .post(format!("https://localhost:{}/edge/inbound", addr.port()))
         .body(body.clone())
@@ -563,7 +562,7 @@ async fn init_edge_runtime_https_only_disable_reticulum() {
         .build()
         .expect("client");
 
-    let body = br#"{"message_type":"InlineText","body":{"text":"https-only"}}"#.to_vec();
+    let body = br#"{"message_type":"OpaqueEvent","body":{"kind":1,"payload":[7,8,9]}}"#.to_vec();
     let resp = client
         .post(format!("https://localhost:{}/edge/inbound", addr.port()))
         .body(body.clone())
@@ -585,10 +584,10 @@ async fn init_edge_runtime_https_only_disable_reticulum() {
 // byte-transparency guarantees `tests/https_per_messagetype_roundtrip.rs`
 // pins for the direct-construction path MUST also hold when the
 // transport was constructed via the `init_edge_runtime` HTTPS init
-// plumbing. The four covered below — InlineText, FederationAnnouncement,
+// plumbing. The four covered below — OpaqueEvent, FederationAnnouncement,
 // ContentFetch, DeliveryAttestation — are the harness's "first four"
-// canary set. The Rust-layer per-MessageType file covers all 25
-// variants; this file covers the cross-init parity for the canary set.
+// canary set. The Rust-layer per-MessageType file covers the full
+// vocabulary; this file covers the cross-init parity for the canary set.
 
 async fn round_trip_through_pyedge_init(message_type: &str, body_payload: &[u8], seed_byte: u8) {
     let me = FedKey::new(&format!("mt-{message_type}-{seed_byte:02x}"), seed_byte);
@@ -648,9 +647,8 @@ async fn round_trip_through_pyedge_init(message_type: &str, body_payload: &[u8],
 }
 
 #[tokio::test]
-async fn https_inline_text_round_trip_through_pyedge() {
-    round_trip_through_pyedge_init("InlineText", br#"{"text":"hello via pyedge init"}"#, 0x51)
-        .await;
+async fn https_opaque_event_round_trip_through_pyedge() {
+    round_trip_through_pyedge_init("OpaqueEvent", br#"{"kind":1,"payload":[1,2,3]}"#, 0x51).await;
 }
 
 #[tokio::test]

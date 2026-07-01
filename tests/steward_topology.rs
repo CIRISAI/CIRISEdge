@@ -432,10 +432,10 @@ async fn federation_delivery_emits_attestation_per_recipient() {
         &MessageType::DeliveryAttestation
     ));
     assert!(!is_federation_attestation_emitting_type(
-        &MessageType::AccordEventsBatch
+        &MessageType::OpaqueEvent
     ));
     assert!(!is_federation_attestation_emitting_type(
-        &MessageType::InlineText
+        &MessageType::OpaqueRequest
     ));
 
     // End-to-end emission round-trip: build a verified StewardDirective

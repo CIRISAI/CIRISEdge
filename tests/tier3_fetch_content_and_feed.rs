@@ -22,7 +22,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_crypto::{ClassicalSigner, Ed25519Signer};
 use ciris_edge::identity::{build_envelope, sign_envelope, LocalSigner};
-use ciris_edge::messages::{ContentBody, InlineText};
+use ciris_edge::messages::{ContentBody, OpaqueEvent};
 use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
@@ -298,11 +298,12 @@ async fn tier3_subscribe_feed_observes_fanout() {
     // Build a tiny fake envelope just to populate fields; the fan-out
     // helper takes a constructed snapshot, not a verify-pipeline run.
     let env = build_envelope(
-        InlineText::TYPE,
+        OpaqueEvent::TYPE,
         &me.key_id,
         "any-recipient",
-        &InlineText {
-            text: "hello".into(),
+        &OpaqueEvent {
+            kind: 0x0000_0001,
+            payload: b"hello".to_vec(),
         },
         None,
     )
@@ -319,7 +320,7 @@ async fn tier3_subscribe_feed_observes_fanout() {
         .await
         .expect("did not lag")
         .expect("channel open");
-    assert_eq!(received.envelope.message_type, MessageType::InlineText);
+    assert_eq!(received.envelope.message_type, MessageType::OpaqueEvent);
     assert_eq!(received.transport_id, TransportId::HTTP);
     assert_eq!(received.body_sha256, [0xAA; 32]);
 }

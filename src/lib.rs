@@ -98,6 +98,36 @@ pub mod transport;
 pub mod verify;
 pub mod version;
 
+/// CC 0.7 wire-vocabulary pin (CIRISEdge#241, v8.0.0). The SHA-256 of
+/// `WIRE_VOCABULARY.md` v1.0.1 §3.3 as ratified for the opaque-payload
+/// break. Downstream conformance harnesses assert this const matches
+/// the spec byte-hash they carry, so an accidental vocabulary drift
+/// (new typed variant re-introduced, opaque contract changed) is a
+/// compile-visible pin failure rather than a silent wire skew.
+///
+/// sha256 = c6bd6aa44111b226a6f204801b1afaa7153fb43296652c1f7cbc23228ac9346c
+pub const WIRE_VOCABULARY_HASH: [u8; 32] = [
+    0xc6, 0xbd, 0x6a, 0xa4, 0x41, 0x11, 0xb2, 0x26, 0xa6, 0xf2, 0x04, 0x80, 0x1b, 0x1a, 0xfa, 0xa7,
+    0x15, 0x3f, 0xb4, 0x32, 0x96, 0x65, 0x2c, 0x1f, 0x7c, 0xbc, 0x23, 0x22, 0x8a, 0xc9, 0x34, 0x6c,
+];
+
+#[cfg(test)]
+mod wire_vocabulary_hash_tests {
+    use super::WIRE_VOCABULARY_HASH;
+
+    /// Pins the CC 0.7 wire-vocabulary hash to its hex source of truth.
+    /// A drift here is a coordinated wire-break signal, not a bug fix.
+    #[test]
+    fn wire_vocabulary_hash_pinned() {
+        const HEX: &str = "c6bd6aa44111b226a6f204801b1afaa7153fb43296652c1f7cbc23228ac9346c";
+        let mut expected = [0u8; 32];
+        for (i, byte) in expected.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&HEX[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        assert_eq!(WIRE_VOCABULARY_HASH, expected);
+    }
+}
+
 pub use blob_swarm::{
     BlobChunkSource, BlobChunkVerifier, ChunkManifestLite, ChunkSourceRefusal, ChunkVerifyError,
     PeerState, SwarmConfig, SwarmError, SwarmScheduler,
@@ -138,7 +168,7 @@ pub use events::{
 };
 pub use handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, FederationPriority,
-    Handler, HandlerContext, HandlerError, InlineTextMessage, Message,
+    Handler, HandlerContext, HandlerError, Message,
 };
 pub use identity::LocalSigner;
 pub use key_boundary::{
@@ -146,17 +176,16 @@ pub use key_boundary::{
     LEGACY_NO_SEED_IN_HEAP,
 };
 pub use messages::{
-    is_federation_attestation_emitting_type, AccordCarrier, AccordEventsBatch,
-    AccordEventsResponse, AccordSignature, AnnouncementKind, AnnouncementPriority,
-    AttestationGossip, AttestationRef, AuthorityClass, BuildManifestPublication,
-    BuildManifestPublicationResponse, ContentBody, ContentFetch, ContentMiss, DSARRequest,
-    DSARResponse, DeliveryAttestation, DeliveryAttestationError, DeliveryRefusalAttestation,
-    EdgeEnvelope, FederationAnnouncement, FederationKeyDirectoryQuery,
-    FederationKeyDirectoryQueryResponse, GoalDeclaration, GoalDeclarationResponse, GoalRetirement,
-    GoalRetirementResponse, HintShape, InlineText, InlineTextDurable, MessageType, MissReason,
-    PublicKeyRegistration, PublicKeyRegistrationResponse, RefusalReason, SchemaVersion,
-    StewardDirective, TestimonialWitness, TransportMedium, WithdrawalReason, Withdraws,
-    ACCORD_THRESHOLD_M_OF_N, DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
+    is_federation_attestation_emitting_type, AccordCarrier, AccordSignature, AnnouncementKind,
+    AnnouncementPriority, AttestationGossip, AttestationRef, AuthorityClass,
+    BuildManifestPublication, BuildManifestPublicationResponse, ContentBody, ContentFetch,
+    ContentMiss, DSARRequest, DSARResponse, DeliveryAttestation, DeliveryAttestationError,
+    DeliveryRefusalAttestation, EdgeEnvelope, FederationAnnouncement, GoalDeclaration,
+    GoalDeclarationResponse, GoalRetirement, GoalRetirementResponse, HintShape, MessageType,
+    MissReason, OpaqueEvent, OpaqueRequest, OpaqueResponse, PublicKeyRegistration,
+    PublicKeyRegistrationResponse, RefusalReason, SchemaVersion, StewardDirective,
+    TestimonialWitness, TransportMedium, WithdrawalReason, Withdraws, ACCORD_THRESHOLD_M_OF_N,
+    DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,
     DELIVERY_REFUSAL_ATTESTATION_DOMAIN, FEDERATION_ANNOUNCEMENT_ACCORD_SIG_DOMAIN,
     GOAL_DECLARATION_DOMAIN, GOAL_RETIREMENT_DOMAIN,
 };

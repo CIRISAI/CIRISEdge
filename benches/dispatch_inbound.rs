@@ -9,7 +9,7 @@
 //!
 //! # Per-MessageType slices
 //!
-//! - `InlineText` — verify → InlineText fan-out (no subscribers
+//! - `OpaqueEvent` — verify → opaque-event fan-out (no subscribers
 //!   registered → no callback cost; the per-event GIL-acquire is
 //!   benched separately in `subscription_throughput`).
 //! - `FederationAnnouncement` (non-AccordCarrier) — verify →
@@ -45,7 +45,7 @@ use chrono::Utc;
 use ciris_edge::identity::{build_envelope, sign_envelope, LocalSigner};
 use ciris_edge::messages::{
     AnnouncementKind, AnnouncementPriority, AuthorityClass, ContentFetch, FederationAnnouncement,
-    InlineText, MessageType, StewardDirective,
+    MessageType, OpaqueEvent, StewardDirective,
 };
 use ciris_edge::transport::{InboundFrame, Transport};
 use ciris_edge::verify::HybridPolicy;
@@ -106,12 +106,13 @@ async fn make_signed_envelope_bytes(
     message_type: MessageType,
 ) -> Vec<u8> {
     let mut env = match message_type {
-        MessageType::InlineText => build_envelope(
-            MessageType::InlineText,
+        MessageType::OpaqueEvent => build_envelope(
+            MessageType::OpaqueEvent,
             &signer.key_id,
             destination_key_id,
-            &InlineText {
-                text: "x".repeat(256),
+            &OpaqueEvent {
+                kind: 0x0000_0001,
+                payload: "x".repeat(256).into_bytes(),
             },
             None,
         ),
@@ -192,7 +193,7 @@ fn bench_dispatch(c: &mut Criterion) {
     const POOL: usize = 64;
     let pool_per_type: Vec<(&str, MessageType, Vec<Vec<u8>>)> = setup_rt.block_on(async {
         let types = [
-            ("InlineText", MessageType::InlineText),
+            ("OpaqueEvent", MessageType::OpaqueEvent),
             (
                 "FederationAnnouncement",
                 MessageType::FederationAnnouncement,

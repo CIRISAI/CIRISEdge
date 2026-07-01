@@ -31,7 +31,7 @@ use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
 use ciris_edge::verify::HybridPolicy;
-use ciris_edge::{Edge, EdgeConfig, InlineText};
+use ciris_edge::{Edge, EdgeConfig, OpaqueEvent};
 use ciris_persist::federation::{FederationDirectory, MemoryTrustScoring, TrustScoring};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend;
@@ -235,10 +235,11 @@ async fn dispatch(
     sender: &LocalSigner,
     destination: &str,
 ) -> Result<(), ciris_edge::EdgeError> {
-    let body = InlineText {
-        text: "trust-test".to_string(),
+    let body = OpaqueEvent {
+        kind: 1,
+        payload: b"trust-test".to_vec(),
     };
-    let mut env = build_envelope(InlineText::TYPE, &sender.key_id, destination, &body, None)?;
+    let mut env = build_envelope(OpaqueEvent::TYPE, &sender.key_id, destination, &body, None)?;
     sign_envelope(sender, &mut env).await?;
     let bytes = serde_json::to_vec(&env)
         .map_err(|e| ciris_edge::EdgeError::Config(format!("serialize: {e}")))?;
@@ -596,11 +597,18 @@ async fn build_signed_envelope_from_software_signer_drives_trust_gate() {
 
     // Build → sign → serialize: byte-for-byte what
     // `PyEdge::build_signed_inbound_envelope` produces.
-    let body = InlineText {
-        text: "211-software-signer-test".to_string(),
+    let body = OpaqueEvent {
+        kind: 1,
+        payload: b"211-software-signer-test".to_vec(),
     };
-    let mut env = build_envelope(InlineText::TYPE, &signer.key_id, &local_key_id, &body, None)
-        .expect("build envelope");
+    let mut env = build_envelope(
+        OpaqueEvent::TYPE,
+        &signer.key_id,
+        &local_key_id,
+        &body,
+        None,
+    )
+    .expect("build envelope");
     sign_envelope(&signer, &mut env)
         .await
         .expect("sign envelope");
@@ -637,10 +645,11 @@ async fn build_signed_envelope_from_software_signer_drives_trust_gate() {
 /// Helper: build + sign an envelope, drive through the observed-outcome
 /// dispatcher, return the wire-string outcome.
 async fn build_outcome(edge: &Edge, sender: &LocalSigner, destination: &str) -> &'static str {
-    let body = InlineText {
-        text: "208-override-test".to_string(),
+    let body = OpaqueEvent {
+        kind: 1,
+        payload: b"208-override-test".to_vec(),
     };
-    let mut env = build_envelope(InlineText::TYPE, &sender.key_id, destination, &body, None)
+    let mut env = build_envelope(OpaqueEvent::TYPE, &sender.key_id, destination, &body, None)
         .expect("build envelope");
     sign_envelope(sender, &mut env)
         .await

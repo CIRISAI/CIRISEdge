@@ -20,7 +20,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use crate::cohort_scope::{CohortScope, CohortScopeEnforcement};
 use crate::handler::{
     AbandonReason, Delivery, DurableHandle, DurableOutcome, DurableStatus, FederationPriority,
-    Handler, HandlerContext, HandlerError, InlineTextMessage, Message,
+    Handler, HandlerContext, HandlerError, Message,
 };
 use crate::identity::{build_envelope, envelope_body_sha256, sign_envelope, LocalSigner};
 use crate::messages::{
@@ -720,24 +720,41 @@ struct RegisteredHandler {
 
 // ─── Edge ───────────────────────────────────────────────────────────
 
-/// Inline-text inbound subscriber registry entry (CIRISEdge#22 Tier 2).
+/// CC 0.7 opaque-event inbound subscriber registry entry
+/// (CIRISEdge#241, v8.0.0 — the generic successor of the ripped
+/// inline-text subscriber).
 ///
-/// Each entry holds an unbounded sender that the inbound dispatcher
-/// pushes `(sender_key_id, body_text)` tuples onto. A Python-owned
-/// drainer thread (spawned in [`crate::ffi::pyo3`] when
-/// `register_inline_text_handler` is called) receives from the matching
-/// receiver, acquires the GIL, and invokes the user-supplied Python
-/// callback. Dropping the sender (via [`Edge::unregister_inline_text_subscriber`])
-/// causes the drainer to observe a closed channel and exit cleanly —
-/// the subscription-lifecycle invariant the Python `SubscriptionHandle`
-/// enforces.
+/// Each entry pairs a `kind` discriminator with an unbounded sender the
+/// inbound dispatcher pushes `(sender_key_id, kind, payload)` tuples
+/// onto for every verified [`crate::MessageType::OpaqueEvent`] envelope
+/// whose `kind` matches. A consumer-owned drainer (e.g. the
+/// [`crate::ffi::pyo3`] GIL drainer) receives from the matching receiver
+/// and invokes the user callback. Dropping the sender (via
+/// [`Edge::unregister_opaque_subscriber`]) causes the drainer to observe
+/// a closed channel and exit cleanly.
 ///
 /// Unbounded by design: dropping events under back-pressure would
-/// degrade the CommunicationBus-replacement semantic the Python adapter
-/// builds on. Subscribers that can't keep up must drop their handle —
-/// a closed channel removes the entry from the registry on the next
-/// dispatch (lazy cleanup, no separate sweep needed).
-pub(crate) type InlineTextSubscriber = mpsc::UnboundedSender<(String, String)>;
+/// degrade the fan-out semantic downstream consumers build on.
+/// Subscribers that can't keep up must drop their handle — a closed
+/// channel removes the entry from the registry on the next dispatch
+/// (lazy cleanup, no separate sweep needed).
+pub(crate) type OpaqueSubscriber = (u32, mpsc::UnboundedSender<(String, u32, Vec<u8>)>);
+
+/// CC 0.7 opaque-request handler (CIRISEdge#241, v8.0.0). Keyed by
+/// `kind`; invoked with `(sender_key_id, payload)` and returns the
+/// [`crate::OpaqueResponse`] edge ships back. An unknown `kind` (no
+/// registered handler) is answered by edge with a `501` response —
+/// never a silent drop (MISSION §6 anti-pattern 7).
+pub(crate) type OpaqueRequestHandlerFn =
+    Arc<dyn Fn(String, Vec<u8>) -> crate::messages::OpaqueResponse + Send + Sync>;
+
+/// CC 0.7 opaque-request→response correlation map (CIRISEdge#241).
+/// Keyed by the request envelope's `body_sha256`; the responder stamps
+/// that value into the response envelope's `in_reply_to` so the
+/// dispatcher can resolve the pending [`Edge::send_opaque_request`]
+/// oneshot. Mirrors the `content_fetch_pending` correlation pattern.
+type OpaqueRequestPendingMap =
+    std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<crate::messages::OpaqueResponse>>>;
 
 /// CIRISEdge#22 Tier 3 (v0.17.0) — projection of a verified envelope
 /// onto the wire surface the `subscribe_feed` AsyncIterator delivers.
@@ -908,18 +925,23 @@ pub struct Edge {
     local_signer: Option<Arc<LocalSigner>>,
     transports: Vec<Arc<dyn Transport>>,
     handlers: Arc<Mutex<HashMap<MessageType, RegisteredHandler>>>,
-    /// Inline-text inbound fan-out registry (CIRISEdge#22 Tier 2;
-    /// v0.9.0). Distinct from `handlers` because the typed handler
-    /// dispatch supports exactly **one** handler per [`MessageType`] —
-    /// the Python `register_inline_text_handler` surface must accept
-    /// multiple concurrent subscribers (one per `EdgeCommunicationAdapter`
-    /// consumer at minimum). Subscriptions are keyed by an
-    /// monotonically-increasing u64 (`inline_text_next_id`); the Python
-    /// `SubscriptionHandle::unsubscribe` removes by id.
-    inline_text_subscribers: Arc<std::sync::Mutex<HashMap<u64, InlineTextSubscriber>>>,
-    /// Subscription id allocator for [`Self::inline_text_subscribers`].
+    /// CC 0.7 opaque-event inbound fan-out registry (CIRISEdge#241,
+    /// v8.0.0 — generic successor of the inline-text subscriber). Keyed
+    /// by a monotonically-increasing u64 (`opaque_next_id`); each entry
+    /// carries its subscribed `kind`. Multiple concurrent subscribers
+    /// per `kind` are supported (distinct from the one-handler-per-type
+    /// `handlers` map).
+    opaque_subscribers: Arc<std::sync::Mutex<HashMap<u64, OpaqueSubscriber>>>,
+    /// Subscription id allocator for [`Self::opaque_subscribers`].
     /// `AtomicU64::fetch_add` so the allocator is lock-free.
-    inline_text_next_id: Arc<AtomicU64>,
+    opaque_next_id: Arc<AtomicU64>,
+    /// CC 0.7 opaque-request handler registry (CIRISEdge#241), keyed by
+    /// `kind`. An inbound [`crate::MessageType::OpaqueRequest`] whose
+    /// `kind` is absent here is answered with a `501` response.
+    opaque_handlers: Arc<std::sync::Mutex<HashMap<u32, OpaqueRequestHandlerFn>>>,
+    /// CC 0.7 opaque request→response correlation map (CIRISEdge#241).
+    /// Keyed by the request envelope `body_sha256`.
+    opaque_request_pending: Arc<OpaqueRequestPendingMap>,
     /// CIRISEdge#22 Tier 3 (v0.17.0) — broadcast channel carrying every
     /// verified inbound `EdgeEnvelope` for the `subscribe_feed`
     /// AsyncIterator surface. Construction is unconditional; emission
@@ -999,16 +1021,6 @@ pub struct Edge {
     /// exactly (the operator drives the scheduler manually).
     #[cfg(feature = "holonomic-consent-decay")]
     consent_decay_shutdown: Arc<std::sync::OnceLock<tokio::sync::watch::Sender<()>>>,
-    /// Optional pipeline run on outbound inline-text envelopes
-    /// (SPEAK responses, LLM prompts, WBD bodies, DSAR text). When
-    /// `Some`, `send_inline` / `send_durable_inline` invoke this
-    /// before signing — classify, scrub, encrypt-and-store secret
-    /// spans per FSD §1.4. When `None`, those methods skip the
-    /// pipeline and behave identically to `send` / `send_durable`.
-    /// Construct via `default_speak_pipeline(secrets, actor_id)` in
-    /// `ciris_persist::pipeline`. Closes CIRISAgent#756 Q1.
-    speak_pipeline:
-        Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
     /// Optional peer-enumeration adapter consumed by
     /// [`Edge::send_mandatory`] to fan out a `Delivery::Mandatory`
     /// envelope to every peer in the directory (CIRISEdge#18 / FSD
@@ -1158,8 +1170,6 @@ pub struct EdgeBuilder {
     /// v1.1.1 — see `Edge::local_signer`.
     local_signer: Option<Arc<LocalSigner>>,
     transports: Vec<Arc<dyn Transport>>,
-    speak_pipeline:
-        Option<Arc<ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>>>,
     peer_directory: Option<Arc<dyn PeerDirectory>>,
     steward_directory: Option<Arc<dyn StewardDirectory>>,
     /// CIRISEdge#55 v3.4.0-pre1 — see [`Edge::blob_chunk_source`].
@@ -1334,7 +1344,6 @@ impl Edge {
             signer: None,
             local_signer: None,
             transports: Vec::new(),
-            speak_pipeline: None,
             peer_directory: None,
             steward_directory: None,
             blob_chunk_source: None,
@@ -2052,33 +2061,91 @@ impl Edge {
         Ok(DurableHandle { queue_id })
     }
 
-    /// Send an inline-text message — runs the configured
-    /// `speak_pipeline` on the text body (classify + scrub +
-    /// encrypt-and-store) before signing + shipping. When no
-    /// pipeline is configured, behaves identically to
-    /// [`Self::send`]. Cleartext secrets are substituted with
-    /// `{SECRET:uuid:description}` placeholders before the envelope
-    /// is signed, so the wire payload never carries unredacted
-    /// sensitive spans. Per FSD §1.4 and CIRISAgent#756 Q1.
-    pub async fn send_inline<M: InlineTextMessage>(
+    /// CC 0.7 (CIRISEdge#241, v8.0.0) — send an opaque request and
+    /// await the peer's opaque response. `kind` is an app-owned
+    /// discriminator; `payload` is opaque bytes edge never interprets.
+    ///
+    /// Correlation rides the request envelope's `body_sha256`: the
+    /// responder stamps it into the response's `in_reply_to`, and the
+    /// inbound dispatcher resolves this call's pending oneshot. Requires
+    /// the edge's inbound dispatch loop to be running (so the response
+    /// envelope is observed). Times out after `timeout_ms`.
+    ///
+    /// MISSION §1.3: edge holds no typed struct for the payload; the
+    /// APP owns inner canonicalization + any inner signature.
+    pub async fn send_opaque_request(
         &self,
         destination_key_id: &str,
-        mut msg: M,
-    ) -> Result<M::Response, EdgeError> {
-        self.run_speak_pipeline(&mut msg).await?;
-        self.send(destination_key_id, msg).await
+        kind: u32,
+        payload: Vec<u8>,
+        timeout_ms: u64,
+    ) -> Result<crate::messages::OpaqueResponse, EdgeError> {
+        use crate::messages::OpaqueRequest;
+        let msg = OpaqueRequest { kind, payload };
+        // Build + sign the request envelope up front so we can key the
+        // pending map on its body_sha256 (the correlation token the
+        // responder echoes into `in_reply_to`).
+        let envelope_bytes = self
+            .build_signed_envelope_with_cohort_scope(destination_key_id, &msg, None, None)
+            .await?;
+        let envelope: EdgeEnvelope = serde_json::from_slice(&envelope_bytes)
+            .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
+        let correlation = envelope_body_sha256(&envelope);
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self
+                .opaque_request_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.insert(correlation, tx);
+        }
+
+        if self.transports.is_empty() {
+            self.opaque_request_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&correlation);
+            return Err(EdgeError::Config("no transport configured".into()));
+        }
+        let transport = &self.transports[0];
+        if let Err(e) = transport.send(destination_key_id, &envelope_bytes).await {
+            self.opaque_request_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&correlation);
+            return Err(EdgeError::Transport(e));
+        }
+        self.metrics.inc_sent(&OpaqueRequest::TYPE);
+
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_recv)) => Err(EdgeError::Config(
+                "opaque request correlation channel dropped".into(),
+            )),
+            Err(_elapsed) => {
+                self.opaque_request_pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&correlation);
+                Err(EdgeError::Unreachable(
+                    "opaque request timed out awaiting response".into(),
+                ))
+            }
+        }
     }
 
-    /// Durable variant of [`Self::send_inline`] — same pipeline-then-
-    /// sign path, but enqueues to `cirislens.edge_outbound_queue` for
-    /// edge-owned retry. Returns a [`DurableHandle`] to observe the
-    /// eventual outcome.
-    pub async fn send_durable_inline<M: InlineTextMessage>(
+    /// CC 0.7 (CIRISEdge#241, v8.0.0) — publish an opaque event on the
+    /// durable (persistent) delivery class. Fire-and-forget; the
+    /// returned [`DurableHandle`] observes the edge-owned-queue outcome.
+    /// Receivers fan the event out to their per-`kind` subscribers.
+    pub async fn send_opaque_event(
         &self,
         destination_key_id: &str,
-        mut msg: M,
+        kind: u32,
+        payload: Vec<u8>,
     ) -> Result<DurableHandle, EdgeError> {
-        self.run_speak_pipeline(&mut msg).await?;
+        let msg = crate::messages::OpaqueEvent { kind, payload };
         self.send_durable(destination_key_id, msg).await
     }
 
@@ -2479,64 +2546,78 @@ impl Edge {
         Ok(handles)
     }
 
-    /// Register an inbound inline-text subscriber (CIRISEdge#22 Tier 2;
-    /// v0.9.0). Every verified [`crate::MessageType::InlineText`]
-    /// envelope dispatched through [`Self::run`]'s inbound loop is
-    /// fanned out to every subscriber registered here, as a
-    /// `(sender_key_id, body_text)` tuple pushed onto the returned
+    /// CC 0.7 (CIRISEdge#241, v8.0.0) — register an inbound opaque-event
+    /// subscriber for a given `kind`. Every verified
+    /// [`crate::MessageType::OpaqueEvent`] envelope whose `kind` matches
+    /// is fanned out to every subscriber registered here, as a
+    /// `(sender_key_id, kind, payload)` tuple pushed onto the returned
     /// receiver.
     ///
     /// The caller owns the receiver — drop it (or call
-    /// [`Self::unregister_inline_text_subscriber`] with the returned id)
-    /// to stop the fan-out. The dispatcher lazy-prunes entries whose
-    /// `send` returns `Err(SendError)` (closed receiver), so dropping
-    /// the receiver alone is sufficient for correctness — the explicit
-    /// unregister exists for tests and for the Python
-    /// `SubscriptionHandle::unsubscribe` surface which needs synchronous
-    /// removal (so a subsequent inbound that arrives before the next
-    /// dispatch's lazy prune cannot fire a callback the consumer
-    /// considers detached).
-    ///
-    /// # Used by
-    ///
-    /// [`crate::ffi::pyo3::PyEdge::register_inline_text_handler`] — the
-    /// Python-facing surface CIRISAgent 2.9.5's `EdgeCommunicationAdapter`
-    /// consumes. The Rust-level method exists so the same fan-out is
-    /// reachable to non-Python embedders (uniffi / swift-bridge shells
-    /// landing in Phase 3).
-    pub fn register_inline_text_subscriber(
+    /// [`Self::unregister_opaque_subscriber`] with the returned id) to
+    /// stop the fan-out. The dispatcher lazy-prunes entries whose `send`
+    /// returns `Err(SendError)` (closed receiver). Generic successor of
+    /// the ripped inline-text subscriber surface.
+    pub fn register_opaque_subscriber(
         &self,
-    ) -> (u64, mpsc::UnboundedReceiver<(String, String)>) {
+        kind: u32,
+    ) -> (u64, mpsc::UnboundedReceiver<(String, u32, Vec<u8>)>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let id = self.inline_text_next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.opaque_next_id.fetch_add(1, Ordering::Relaxed);
         let mut subs = self
-            .inline_text_subscribers
+            .opaque_subscribers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        subs.insert(id, tx);
+        subs.insert(id, (kind, tx));
         (id, rx)
     }
 
-    /// Remove an inline-text subscriber by id. Idempotent — returns
-    /// `true` if the id was registered, `false` if not (matches persist
-    /// `PyEngine::unsubscribe` ergonomics).
-    pub fn unregister_inline_text_subscriber(&self, id: u64) -> bool {
+    /// Remove an opaque-event subscriber by id. Idempotent — returns
+    /// `true` if the id was registered, `false` otherwise.
+    pub fn unregister_opaque_subscriber(&self, id: u64) -> bool {
         let mut subs = self
-            .inline_text_subscribers
+            .opaque_subscribers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         subs.remove(&id).is_some()
     }
 
-    /// Snapshot count of live inline-text subscribers. Diagnostics
-    /// helper — used by the Python tests to verify the lifecycle (a
-    /// `SubscriptionHandle::unsubscribe` or `__exit__` must observe the
-    /// count drop).
-    pub fn inline_text_subscriber_count(&self) -> usize {
-        self.inline_text_subscribers
+    /// Snapshot count of live opaque-event subscribers. Diagnostics
+    /// helper for lifecycle tests.
+    #[must_use]
+    pub fn opaque_subscriber_count(&self) -> usize {
+        self.opaque_subscribers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    /// CC 0.7 (CIRISEdge#241, v8.0.0) — register an opaque-request
+    /// handler for `kind`. The inbound dispatcher invokes `f(sender_key_id,
+    /// payload)` for every verified [`crate::MessageType::OpaqueRequest`]
+    /// carrying that `kind`, then ships the returned
+    /// [`crate::messages::OpaqueResponse`] back to the sender. A `kind`
+    /// with no registered handler is answered with a `501` response —
+    /// never a silent drop (MISSION §6 anti-pattern 7). Registering the
+    /// same `kind` twice replaces the prior handler.
+    pub fn register_opaque_handler<F>(&self, kind: u32, f: F)
+    where
+        F: Fn(String, Vec<u8>) -> crate::messages::OpaqueResponse + Send + Sync + 'static,
+    {
+        let mut handlers = self
+            .opaque_handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handlers.insert(kind, Arc::new(f));
+    }
+
+    /// Remove an opaque-request handler by `kind`. Idempotent.
+    pub fn unregister_opaque_handler(&self, kind: u32) -> bool {
+        let mut handlers = self
+            .opaque_handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handlers.remove(&kind).is_some()
     }
 
     /// CIRISEdge#22 Tier 3 (v0.17.0) — subscribe to the verified-
@@ -2807,19 +2888,19 @@ impl Edge {
     /// CIRISEdge#22 Tier 3 (v0.17.0) — test-only helper to fan out a
     /// VerifiedEnvelopeSnapshot to verified-feed subscribers without
     /// running a real verify pipeline. Mirrors the
-    /// `fan_out_inline_text_for_test` pattern.
+    /// `fan_out_opaque_event_for_test` pattern.
     #[doc(hidden)]
     pub fn fan_out_verified_envelope_for_test(&self, snapshot: VerifiedEnvelopeSnapshot) {
         let _ = self.verified_envelope_tx.send(snapshot);
     }
 
-    /// Manually fan out an InlineText payload to every subscriber.
-    /// Public for tests + future non-dispatcher embedders that want to
-    /// inject a synthetic inbound without going through the verify
-    /// pipeline. The production inbound path calls the free-function
-    /// equivalent from [`dispatch_inbound`].
-    pub fn fan_out_inline_text_for_test(&self, sender_key_id: &str, body_text: &str) {
-        fan_out_inline_text(&self.inline_text_subscribers, sender_key_id, body_text);
+    /// CC 0.7 (CIRISEdge#241) — manually fan out an opaque event to
+    /// every subscriber for its `kind`. Public for tests + future
+    /// non-dispatcher embedders that want to inject a synthetic inbound
+    /// without going through the verify pipeline. The production inbound
+    /// path calls the free-function equivalent from [`dispatch_inbound`].
+    pub fn fan_out_opaque_event_for_test(&self, sender_key_id: &str, kind: u32, payload: &[u8]) {
+        fan_out_opaque_event(&self.opaque_subscribers, sender_key_id, kind, payload);
     }
 
     /// Synchronous one-shot driver for the inbound dispatch pipeline.
@@ -2862,7 +2943,10 @@ impl Edge {
             &self.handlers,
             &self.queue,
             &self.signer,
-            &self.inline_text_subscribers,
+            &self.opaque_subscribers,
+            &self.opaque_handlers,
+            &self.opaque_request_pending,
+            self.transports.first(),
             self.config.max_content_body_bytes,
             &directory,
             Some(&self.reachability),
@@ -3249,20 +3333,6 @@ impl Edge {
             .map(|t| t.local_dest_hash())
     }
 
-    /// Pub-crate variant of [`Self::run_speak_pipeline`] reachable
-    /// from `crate::ffi::pyo3`. The Python `send_inline_text` /
-    /// `send_durable_inline_text` wrappers need to run the pipeline
-    /// against a typed `InlineText` body to compute the post-pipeline
-    /// `body_sha256` BEFORE calling `send_inline` (which would consume
-    /// the message). Idempotent — running it twice produces the same
-    /// bytes.
-    pub async fn run_speak_pipeline_for_external<M: InlineTextMessage>(
-        &self,
-        msg: &mut M,
-    ) -> Result<(), EdgeError> {
-        self.run_speak_pipeline(msg).await
-    }
-
     /// Test/diagnostics helper — `true` if `peer_key_id` would be
     /// admitted by the configured [`PeerSubscriptionFilter`] for
     /// `message_type`. When no filter is configured, returns `true`
@@ -3282,30 +3352,6 @@ impl Edge {
             return true;
         };
         filter.is_subscribed(peer_key_id, message_type).await
-    }
-
-    /// Run the configured outbound `speak_pipeline` over the
-    /// message's text body. Mutates `msg` in place via
-    /// `InlineTextMessage::set_text`. No-op when no pipeline is
-    /// configured. Logs sidecar via tracing.
-    async fn run_speak_pipeline<M: InlineTextMessage>(&self, msg: &mut M) -> Result<(), EdgeError> {
-        let Some(pipeline) = self.speak_pipeline.as_ref() else {
-            return Ok(());
-        };
-        let mut env = ciris_persist::prelude::InlineTextEnvelope::new(msg.text().to_string());
-        let mut state = ciris_persist::pipeline::PipelineState::default();
-        pipeline
-            .run(&mut env, &mut state)
-            .await
-            .map_err(|e| EdgeError::Persist(format!("speak_pipeline: {e}")))?;
-        tracing::debug!(
-            stages = ?state.stages_executed,
-            fields_modified = state.fields_modified,
-            pii_scrubbed = state.pii_scrubbed,
-            "speak_pipeline ran"
-        );
-        msg.set_text(env.text);
-        Ok(())
     }
 
     /// Run the listeners + dispatch loops + outbound dispatcher.
@@ -3390,7 +3436,10 @@ impl Edge {
         let handlers = self.handlers.clone();
         let queue = self.queue.clone();
         let signer = self.signer.clone();
-        let inline_subs = self.inline_text_subscribers.clone();
+        let opaque_subs = self.opaque_subscribers.clone();
+        let opaque_handlers = self.opaque_handlers.clone();
+        let opaque_request_pending = self.opaque_request_pending.clone();
+        let response_transport = self.transports.first().cloned();
         let max_content_body_bytes = self.config.max_content_body_bytes;
         let reachability = self.reachability.clone();
         let detector = self.detector.clone();
@@ -3499,7 +3548,10 @@ impl Edge {
                     let handlers_clone = handlers.clone();
                     let queue_clone = queue.clone();
                     let signer_clone = signer.clone();
-                    let its = inline_subs.clone();
+                    let opaque_subs_clone = opaque_subs.clone();
+                    let opaque_handlers_clone = opaque_handlers.clone();
+                    let opaque_request_pending_clone = opaque_request_pending.clone();
+                    let response_transport_clone = response_transport.clone();
                     let reach_clone = reachability.clone();
                     let directory_clone = verify_clone.directory();
                     let detector_clone = detector.clone();
@@ -3521,7 +3573,10 @@ impl Edge {
                             &handlers_clone,
                             &queue_clone,
                             &signer_clone,
-                            &its,
+                            &opaque_subs_clone,
+                            &opaque_handlers_clone,
+                            &opaque_request_pending_clone,
+                            response_transport_clone.as_ref(),
                             max_content_body_bytes,
                             &directory_clone,
                             Some(&reach_clone),
@@ -3703,7 +3758,10 @@ impl Edge {
         handlers,
         queue,
         signer,
-        inline_text_subscribers,
+        opaque_subscribers,
+        opaque_handlers,
+        opaque_request_pending,
+        response_transport,
         directory,
         reachability,
         detector,
@@ -3732,7 +3790,13 @@ async fn dispatch_inbound(
     handlers: &Mutex<HashMap<MessageType, RegisteredHandler>>,
     queue: &Arc<dyn OutboundHandle>,
     signer: &Arc<LocalSigner>,
-    inline_text_subscribers: &std::sync::Mutex<HashMap<u64, InlineTextSubscriber>>,
+    opaque_subscribers: &std::sync::Mutex<HashMap<u64, OpaqueSubscriber>>,
+    // CC 0.7 (CIRISEdge#241) — opaque-request handler registry (keyed by
+    // `kind`) + request→response correlation map + the transport used to
+    // ship the OpaqueResponse back to the request sender.
+    opaque_handlers: &std::sync::Mutex<HashMap<u32, OpaqueRequestHandlerFn>>,
+    opaque_request_pending: &OpaqueRequestPendingMap,
+    response_transport: Option<&Arc<dyn Transport>>,
     max_content_body_bytes: usize,
     directory: &Arc<dyn VerifyDirectory>,
     reachability: Option<&Arc<ReachabilityTracker>>,
@@ -4531,29 +4595,40 @@ async fn dispatch_inbound(
     // ACK matching — if envelope.in_reply_to is set, this is a
     // response to one of our outbound durable rows. Look up + mark
     // ack_received before dispatching to the application handler.
-    if let Some(in_reply_to) = envelope.in_reply_to {
-        match queue.match_ack_to_outbound(&in_reply_to).await {
-            Ok(Some(row)) => {
-                if let Err(e) = queue
-                    .mark_ack_received(&row.queue_id, &frame.envelope_bytes)
-                    .await
-                {
-                    tracing::error!(error = %e, "mark_ack_received failed");
+    //
+    // CC 0.7 (CIRISEdge#241, v8.0.0) — EXCLUDE `OpaqueResponse`. It
+    // carries `in_reply_to` as its OWN Tier-2 request/response
+    // correlation token (the request envelope's `body_sha256`, resolved
+    // by the dedicated OpaqueResponse dispatch arm below), NOT as a
+    // durable-send ACK. Without this guard the `Ok(None)` "no matching
+    // outbound row; dropping" arm swallows every OpaqueResponse before
+    // it reaches its correlation — breaking `send_opaque_request`'s
+    // round-trip (the #240 mesh-control-plane response leg).
+    if envelope.message_type != MessageType::OpaqueResponse {
+        if let Some(in_reply_to) = envelope.in_reply_to {
+            match queue.match_ack_to_outbound(&in_reply_to).await {
+                Ok(Some(row)) => {
+                    if let Err(e) = queue
+                        .mark_ack_received(&row.queue_id, &frame.envelope_bytes)
+                        .await
+                    {
+                        tracing::error!(error = %e, "mark_ack_received failed");
+                    }
+                    // Don't dispatch to a handler — ACK envelopes are
+                    // bookkeeping, not application-level events.
+                    return;
                 }
-                // Don't dispatch to a handler — ACK envelopes are
-                // bookkeeping, not application-level events.
-                return;
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    in_reply_to = ?in_reply_to,
-                    "in_reply_to set but no matching outbound row; dropping",
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "match_ack_to_outbound failed");
-                return;
+                Ok(None) => {
+                    tracing::debug!(
+                        in_reply_to = ?in_reply_to,
+                        "in_reply_to set but no matching outbound row; dropping",
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "match_ack_to_outbound failed");
+                    return;
+                }
             }
         }
     }
@@ -4677,20 +4752,143 @@ async fn dispatch_inbound(
         }
     }
 
-    if envelope.message_type == MessageType::InlineText {
-        match serde_json::from_str::<crate::messages::InlineText>(envelope.body.get()) {
-            Ok(inline) => {
-                fan_out_inline_text(
-                    inline_text_subscribers,
+    // CC 0.7 opaque wire vocabulary (CIRISEdge#241, v8.0.0) — three
+    // dispatch arms. Edge treats `payload` as opaque bytes throughout;
+    // it holds no typed struct, no canonicalization, no Message-semantic
+    // knowledge for any migrant (MISSION §1.3).
+    //
+    // OpaqueEvent → fan out to every per-`kind` subscriber (the generic
+    // successor of the inline-text fan-out).
+    if envelope.message_type == MessageType::OpaqueEvent {
+        match serde_json::from_str::<crate::messages::OpaqueEvent>(envelope.body.get()) {
+            Ok(ev) => {
+                fan_out_opaque_event(
+                    opaque_subscribers,
                     &envelope.signing_key_id,
-                    &inline.text,
+                    ev.kind,
+                    &ev.payload,
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     transport = ?transport,
-                    "InlineText body parse failed at dispatch fan-out",
+                    "OpaqueEvent body parse failed at dispatch fan-out",
+                );
+            }
+        }
+    }
+
+    // OpaqueResponse → correlate back to the pending `send_opaque_request`
+    // via the envelope `in_reply_to` (the request's body_sha256).
+    if envelope.message_type == MessageType::OpaqueResponse {
+        match serde_json::from_str::<crate::messages::OpaqueResponse>(envelope.body.get()) {
+            Ok(resp) => {
+                if let Some(correlation) = envelope.in_reply_to {
+                    let tx = {
+                        let mut pending = opaque_request_pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        pending.remove(&correlation)
+                    };
+                    if let Some(tx) = tx {
+                        let _ = tx.send(resp);
+                    } else {
+                        tracing::debug!(
+                            transport = ?transport,
+                            "OpaqueResponse with no matching pending request (late/duplicate)",
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        transport = ?transport,
+                        "OpaqueResponse missing in_reply_to correlation token",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    transport = ?transport,
+                    "OpaqueResponse body parse failed at dispatch",
+                );
+            }
+        }
+    }
+
+    // OpaqueRequest → dispatch to the per-`kind` handler; an unknown
+    // `kind` is answered with a `501` OpaqueResponse (NEVER a silent
+    // drop, MISSION §6 anti-pattern 7). The response is signed +
+    // shipped back to the sender with `in_reply_to = request body_sha256`.
+    if envelope.message_type == MessageType::OpaqueRequest {
+        match serde_json::from_str::<crate::messages::OpaqueRequest>(envelope.body.get()) {
+            Ok(req) => {
+                let handler = {
+                    let handlers = opaque_handlers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    handlers.get(&req.kind).cloned()
+                };
+                let response = if let Some(h) = handler {
+                    h(envelope.signing_key_id.clone(), req.payload)
+                } else {
+                    tracing::warn!(
+                        kind = req.kind,
+                        sender_key_id = %envelope.signing_key_id,
+                        "OpaqueRequest for unknown kind; replying 501 (no silent drop)",
+                    );
+                    crate::messages::OpaqueResponse {
+                        kind: req.kind,
+                        status: 501,
+                        payload: b"unknown kind".to_vec(),
+                    }
+                };
+                // Ship the response back to the sender. Correlation rides
+                // `in_reply_to = request body_sha256`.
+                if let Some(transport) = response_transport {
+                    match build_envelope(
+                        MessageType::OpaqueResponse,
+                        &signer.key_id,
+                        &envelope.signing_key_id,
+                        &response,
+                        Some(body_sha256),
+                    ) {
+                        Ok(mut resp_env) => {
+                            if let Err(e) = sign_envelope(signer, &mut resp_env).await {
+                                tracing::warn!(error = %e, "OpaqueResponse sign failed");
+                            } else {
+                                match serde_json::to_vec(&resp_env) {
+                                    Ok(bytes) => {
+                                        if let Err(e) =
+                                            transport.send(&envelope.signing_key_id, &bytes).await
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "OpaqueResponse transport send failed",
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "OpaqueResponse serialize failed");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "OpaqueResponse envelope build failed");
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "OpaqueRequest handled but no transport to ship the response back",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    transport = ?transport,
+                    "OpaqueRequest body parse failed at dispatch",
                 );
             }
         }
@@ -4826,10 +5024,15 @@ async fn dispatch_inbound(
             .map(|h| h.erased.clone())
     };
     let Some(erased) = registered else {
-        // InlineText with no typed Rust handler is not an error — the
-        // Python fan-out above is the intended consumer. Suppress the
-        // `no handler registered` warning for that one type.
-        if envelope.message_type != MessageType::InlineText {
+        // The CC 0.7 opaque wire types are dispatched above (subscriber
+        // fan-out for OpaqueEvent, kind-keyed handler + 501 for
+        // OpaqueRequest, correlation for OpaqueResponse) — a missing
+        // typed `Handler<M>` entry for them is expected, not an error.
+        // Suppress the `no handler registered` warning for those.
+        if !matches!(
+            envelope.message_type,
+            MessageType::OpaqueEvent | MessageType::OpaqueRequest | MessageType::OpaqueResponse
+        ) {
             tracing::warn!(
                 message_type = ?envelope.message_type,
                 "no handler registered; dropping",
@@ -5082,25 +5285,6 @@ impl EdgeBuilder {
         self
     }
 
-    /// Configure the outbound inline-text pipeline. When set, edge
-    /// runs it on every `send_inline` / `send_durable_inline` call
-    /// before signing + shipping. Construct via
-    /// `ciris_persist::pipeline::default_speak_pipeline(secrets,
-    /// actor_id)` for the canonical Classify + Scrub + EncryptAndStore
-    /// stage set, or compose stages directly. Optional — when unset,
-    /// `send_inline` falls through to the ephemeral `send` path
-    /// without transit-touch.
-    #[must_use]
-    pub fn speak_pipeline(
-        mut self,
-        pipeline: Arc<
-            ciris_persist::pipeline::Pipeline<ciris_persist::prelude::InlineTextEnvelope>,
-        >,
-    ) -> Self {
-        self.speak_pipeline = Some(pipeline);
-        self
-    }
-
     /// Wire a [`PeerDirectory`] adapter for `Edge::send_mandatory`
     /// fan-out (CIRISEdge#18). Without it `send_mandatory` returns
     /// [`EdgeError::Config`] — the federation broadcast has no
@@ -5265,12 +5449,13 @@ impl EdgeBuilder {
             local_signer: self.local_signer,
             transports: self.transports,
             handlers: Arc::new(Mutex::new(HashMap::new())),
-            inline_text_subscribers: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            inline_text_next_id: Arc::new(AtomicU64::new(1)),
+            opaque_subscribers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            opaque_next_id: Arc::new(AtomicU64::new(1)),
+            opaque_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            opaque_request_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             verified_envelope_tx,
             content_fetch_pending,
             blob_chunk_fetch_pending,
-            speak_pipeline: self.speak_pipeline,
             peer_directory: self.peer_directory,
             steward_directory: self.steward_directory,
             blob_chunk_source: self.blob_chunk_source,
@@ -5368,29 +5553,32 @@ fn map_row_to_status(row: &ciris_persist::prelude::OutboundRow) -> DurableStatus
     }
 }
 
-/// Fan out an inbound InlineText payload to every subscriber in the
-/// registry. Lazily prunes entries whose `send` returns `Err` (the
-/// Python `SubscriptionHandle` has gone out of scope without an
-/// explicit `unsubscribe()` — channel-closed semantics from the
-/// drainer-thread side). Free-function form because `dispatch_inbound`
-/// is itself a free function — the `Edge::fan_out_inline_text` method
-/// (on the type) is a thin wrapper around this same logic for
+/// CC 0.7 (CIRISEdge#241) — fan out an inbound opaque event to every
+/// subscriber registered for its `kind`. Lazily prunes entries whose
+/// `send` returns `Err` (the consumer's receiver has been dropped —
+/// channel-closed semantics). Free-function form because
+/// `dispatch_inbound` is itself a free function — the
+/// `Edge::fan_out_opaque_event_for_test` method is a thin wrapper for
 /// non-dispatcher callers (tests, future embedders).
-fn fan_out_inline_text(
-    inline_text_subscribers: &std::sync::Mutex<HashMap<u64, InlineTextSubscriber>>,
+fn fan_out_opaque_event(
+    opaque_subscribers: &std::sync::Mutex<HashMap<u64, OpaqueSubscriber>>,
     sender_key_id: &str,
-    body_text: &str,
+    kind: u32,
+    payload: &[u8],
 ) {
-    let mut subs = inline_text_subscribers
+    let mut subs = opaque_subscribers
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if subs.is_empty() {
         return;
     }
-    let payload = (sender_key_id.to_string(), body_text.to_string());
     let mut dead: Vec<u64> = Vec::new();
-    for (id, tx) in subs.iter() {
-        if tx.send(payload.clone()).is_err() {
+    for (id, (sub_kind, tx)) in subs.iter() {
+        if *sub_kind != kind {
+            continue;
+        }
+        let msg = (sender_key_id.to_string(), kind, payload.to_vec());
+        if tx.send(msg).is_err() {
             dead.push(*id);
         }
     }
@@ -6158,23 +6346,24 @@ fn envelope_scope_contains(envelope: &serde_json::Value, wanted: &str) -> bool {
 
 /// CIRISEdge#108 part 2 (v3.2.0) — which scope token a given
 /// `MessageType` requires for the delegation gate. Returns `None` for
-/// MessageType variants where the gate does NOT apply at v3.2.0-pre1.
-/// The narrow-cut shape: only `InlineText` is gated; the other
-/// variants are listed here as `None` (with a comment naming the
-/// follow-up scope) so the v3.2.x extension is a one-line change per
-/// arm.
+/// MessageType variants where the gate does NOT apply.
+///
+/// CC 0.7 (CIRISEdge#241, v8.0.0): the message-io scope now gates the
+/// opaque application-payload types [`MessageType::OpaqueRequest`] +
+/// [`MessageType::OpaqueEvent`] — the successors of the migrated
+/// inline-text family. `OpaqueResponse` is un-gated (it rides back to
+/// an already-authorized requester). Every other variant returns `None`.
 pub(crate) fn delegation_scope_for_message_type(mt: &MessageType) -> Option<&'static str> {
     match mt {
-        MessageType::InlineText => Some(SCOPE_MESSAGE_IO),
-        // v3.2.x follow-ups (deferred from v3.2.0-pre1):
-        //   InlineTextDurable           → SCOPE_MESSAGE_IO
+        MessageType::OpaqueRequest | MessageType::OpaqueEvent => Some(SCOPE_MESSAGE_IO),
+        // follow-ups (deferred):
         //   FederationAnnouncement      → SCOPE_NETWORK_PRESENCE
         //   ContributionSubmit          → SCOPE_ACT_ON_BEHALF
         //   StewardDirective            → SCOPE_ACT_ON_BEHALF (TBD)
+        //   OpaqueResponse              → un-gated (reply to authorized peer)
         //   DeliveryAttestation         → un-gated (substrate-emitted)
         //   DeliveryRefusalAttestation  → un-gated (substrate-emitted)
         //   ContentMiss / ContentBody   → un-gated (content-routing)
-        //   AckEnvelope                 → un-gated (transport-tier)
         _ => None,
     }
 }
@@ -6571,12 +6760,20 @@ mod delegation_gate_tests {
     }
 
     #[test]
-    fn scope_map_starts_narrow_at_inline_text() {
-        // v3.2.0-pre1 narrow cut: only InlineText is gated. Every
-        // other variant returns None so the gate skips it.
+    fn scope_map_gates_opaque_application_types() {
+        // CC 0.7 (CIRISEdge#241): OpaqueRequest + OpaqueEvent are gated
+        // on message_io; every other variant returns None.
         assert_eq!(
-            delegation_scope_for_message_type(&MessageType::InlineText),
+            delegation_scope_for_message_type(&MessageType::OpaqueRequest),
             Some(SCOPE_MESSAGE_IO),
+        );
+        assert_eq!(
+            delegation_scope_for_message_type(&MessageType::OpaqueEvent),
+            Some(SCOPE_MESSAGE_IO),
+        );
+        assert_eq!(
+            delegation_scope_for_message_type(&MessageType::OpaqueResponse),
+            None,
         );
         assert_eq!(
             delegation_scope_for_message_type(&MessageType::FederationAnnouncement),

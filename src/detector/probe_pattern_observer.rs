@@ -817,14 +817,14 @@ fn per_message_type_buckets(deque: &VecDeque<Observation>, out: &mut [f64]) {
     debug_assert_eq!(out.len(), 12);
     for o in deque {
         let idx = match o.message_type {
-            MessageType::AccordEventsBatch => 0,
-            MessageType::FederationKeyDirectoryQuery => 1,
+            MessageType::OpaqueRequest => 0,
+            MessageType::OpaqueResponse => 1,
             MessageType::AttestationGossip => 2,
             MessageType::PublicKeyRegistration => 3,
             MessageType::ContentFetch => 4,
             MessageType::ContentBody => 5,
             MessageType::ContentMiss => 6,
-            MessageType::InlineText => 7,
+            MessageType::OpaqueEvent => 7,
             MessageType::FederationAnnouncement => 8,
             MessageType::DeliveryAttestation => 9,
             MessageType::DeliveryRefusalAttestation => 10,
@@ -840,7 +840,7 @@ fn per_message_type_buckets(deque: &VecDeque<Observation>, out: &mut [f64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::{InlineText, MessageType, SchemaVersion};
+    use crate::messages::{MessageType, OpaqueEvent, SchemaVersion};
     use crate::verify::{AccordHolderKey, HybridPolicy, VerifyError, VerifyOutcome};
     use ciris_persist::prelude::HybridVerifyError;
     use serde_json::value::RawValue;
@@ -902,9 +902,13 @@ mod tests {
     }
 
     fn envelope(signing_key_id: &str, message_type: MessageType) -> EdgeEnvelope {
-        let body = serde_json::to_string(&InlineText { text: "hi".into() }).unwrap();
+        let body = serde_json::to_string(&OpaqueEvent {
+            kind: 1,
+            payload: b"hi".to_vec(),
+        })
+        .unwrap();
         EdgeEnvelope {
-            edge_schema_version: SchemaVersion::V1_0_0,
+            edge_schema_version: SchemaVersion::V2_0_0,
             signing_key_id: signing_key_id.to_string(),
             destination_key_id: "destination".into(),
             message_type,
@@ -946,7 +950,7 @@ mod tests {
         for _ in 0..100 {
             observer
                 .observe_inbound(
-                    &envelope("attacker", MessageType::InlineText),
+                    &envelope("attacker", MessageType::OpaqueEvent),
                     TransportId::HTTP,
                 )
                 .await;
@@ -969,7 +973,7 @@ mod tests {
         for _ in 0..100 {
             observer
                 .observe_inbound(
-                    &envelope("peer-A", MessageType::InlineText),
+                    &envelope("peer-A", MessageType::OpaqueEvent),
                     TransportId::HTTP,
                 )
                 .await;
@@ -989,7 +993,7 @@ mod tests {
         for _ in 0..100 {
             observer
                 .observe_inbound(
-                    &envelope("self", MessageType::InlineText),
+                    &envelope("self", MessageType::OpaqueEvent),
                     TransportId::HTTP,
                 )
                 .await;
@@ -1009,7 +1013,7 @@ mod tests {
         for _ in 0..100 {
             observer
                 .observe_inbound(
-                    &envelope("reviewer", MessageType::InlineText),
+                    &envelope("reviewer", MessageType::OpaqueEvent),
                     TransportId::HTTP,
                 )
                 .await;
@@ -1029,7 +1033,7 @@ mod tests {
         for _ in 0..100 {
             observer
                 .observe_inbound(
-                    &envelope("researcher", MessageType::InlineText),
+                    &envelope("researcher", MessageType::OpaqueEvent),
                     TransportId::HTTP,
                 )
                 .await;
@@ -1050,7 +1054,7 @@ mod tests {
         for _ in 0..50 {
             observer
                 .observe_inbound(
-                    &envelope("attacker", MessageType::InlineText),
+                    &envelope("attacker", MessageType::OpaqueEvent),
                     TransportId::HTTP,
                 )
                 .await;
@@ -1093,11 +1097,11 @@ mod tests {
         // calibrate the rate-baseline EWMA against a specific
         // distribution.
         let types = [
-            MessageType::InlineText,
-            MessageType::FederationKeyDirectoryQuery,
+            MessageType::OpaqueEvent,
+            MessageType::OpaqueRequest,
             MessageType::ContentFetch,
             MessageType::ContentBody,
-            MessageType::AccordEventsBatch,
+            MessageType::OpaqueResponse,
             MessageType::AttestationGossip,
         ];
         for t in types {
@@ -1123,7 +1127,7 @@ mod tests {
 
         observer
             .observe_inbound(
-                &envelope("transient", MessageType::InlineText),
+                &envelope("transient", MessageType::OpaqueEvent),
                 TransportId::HTTP,
             )
             .await;
@@ -1135,7 +1139,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         observer
             .observe_inbound(
-                &envelope("transient", MessageType::InlineText),
+                &envelope("transient", MessageType::OpaqueEvent),
                 TransportId::HTTP,
             )
             .await;

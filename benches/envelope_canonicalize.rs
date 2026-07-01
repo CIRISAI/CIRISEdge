@@ -43,10 +43,10 @@ fn make_envelope(body_size: usize) -> EdgeEnvelope {
     let body = to_raw_value(&body_value).expect("raw value");
 
     EdgeEnvelope {
-        edge_schema_version: SchemaVersion::V1_0_0,
+        edge_schema_version: SchemaVersion::V2_0_0,
         signing_key_id: "bench-sender".into(),
         destination_key_id: "bench-receiver".into(),
-        message_type: MessageType::InlineText,
+        message_type: MessageType::OpaqueEvent,
         sent_at: Utc::now(),
         nonce: [0x42u8; 16],
         body,

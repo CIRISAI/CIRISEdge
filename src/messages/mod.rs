@@ -18,29 +18,19 @@ use crate::key_boundary::KeyBoundaryScope;
 
 /// Wire-format schema version. Pinned by edge release tag; downstream
 /// peers gate on a strict allowlist (AV-7).
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaVersion {
-    /// Phase 1 baseline.
-    V1_0_0,
+    /// CC 0.7 opaque-vocabulary wire break (CIRISEdge#241, v8.0.0). The
+    /// coordinated strict-flip: `V1_0_0` is REMOVED from the enum, so any
+    /// envelope carrying the legacy `"v1_0_0"` discriminator fails typed
+    /// deserialize at the verify pipeline's Step-2 gate (AV-14) — a typed
+    /// reject, not a silent downgrade. `V2_0_0` is the sole allowlisted
+    /// schema version and the crate-wide default.
+    #[default]
+    V2_0_0,
 }
 
-/// Wire discriminator for the inline-text message family (CIRISEdge#22
-/// Tier 2; v0.9.0). Both [`InlineText`] (ephemeral, fire-and-forget) and
-/// [`InlineTextDurable`] (durable, requires_ack) serialize to the same
-/// `{"text": "..."}` body shape and carry this discriminator — the
-/// delivery class lives on the sender's chosen `Message` impl, not on
-/// the receiver's wire shape (receivers see one `InlineText` MessageType
-/// regardless of how the sender shipped it). This is the canonical
-/// implementor of the [`crate::InlineTextMessage`] trait the
-/// `send_inline` / `send_durable_inline` pipeline was designed for.
-///
-/// Discriminator + concrete types both live in `messages/` so the
-/// `PyEdge::send_inline_text` / `PyEdge::send_durable_inline_text` /
-/// `PyEdge::register_inline_text_handler` Python surface (CIRISAgent
-/// 2.9.5 `EdgeCommunicationAdapter`) can reach the same wire shape from
-/// either end.
-///
 /// Discriminator for the body union. Edge dispatches on this *after*
 /// verify; handlers receive the parsed body struct, not raw bytes.
 ///
@@ -50,8 +40,27 @@ pub enum SchemaVersion {
 /// discriminates dispatch.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageType {
-    /// Trace batches from agent → lens. Ephemeral.
-    AccordEventsBatch,
+    // ─── CC 0.7 opaque wire vocabulary (CIRISEdge#241, v8.0.0) ──────
+    //
+    // WIRE_VOCABULARY.md v1.0.1 §3.3. Edge carries `payload` as OPAQUE
+    // bytes: NO typed struct, NO canonical_bytes, NO Message-semantic
+    // knowledge for any migrant. The outer `EdgeEnvelope` signature
+    // stays transport-tier; the APP owns inner canonicalization + any
+    // inner signature. MISSION §1.3 "edge is reach, not meaning".
+    /// Opaque ephemeral request. Body: [`OpaqueRequest`]
+    /// (`{kind, payload}`). `Response = OpaqueResponse`. Unknown `kind`
+    /// at the receiver → `OpaqueResponse { status: 501 }` (never a
+    /// silent drop, MISSION §6 anti-pattern 7).
+    OpaqueRequest,
+    /// Opaque ephemeral response. Body: [`OpaqueResponse`]
+    /// (`{kind, status, payload}`). No `Response`. Correlated back to
+    /// the pending [`Self::OpaqueRequest`] via the envelope `in_reply_to`.
+    OpaqueResponse,
+    /// Opaque persistent event. Body: [`OpaqueEvent`] (`{kind, payload}`).
+    /// Rides `Delivery::Durable`; fanned out to per-`kind` subscribers
+    /// on receipt (the generic successor of the ripped inline-text
+    /// subscriber pattern). No `Response`.
+    OpaqueEvent,
     /// Build-manifest publication primitive → registry. Durable.
     BuildManifestPublication,
     /// Data-subject access request — DSAR chain. Durable, requires_ack.
@@ -61,8 +70,6 @@ pub enum MessageType {
     AttestationGossip,
     /// New-peer key registration → directory. Durable, requires_ack.
     PublicKeyRegistration,
-    /// Directory query — "do you have this key_id?". Ephemeral request-response.
-    FederationKeyDirectoryQuery,
 
     // ─── CIRISNodeCore federation-consensus wire types ──────────────
     // Body structs live in `ciris-node-core` (consumer crate) per
@@ -197,21 +204,6 @@ pub enum MessageType {
     /// [`Self::FederationAnnouncement`] (FSD §3.2.1 per-peer
     /// attestation shape, reused — see CIRISEdge#20 ask #3).
     StewardDirective,
-
-    // ─── CIRISEdge#22 Tier 2 (v0.9.0) — inline-text family ──────────
-    /// CommunicationBus-replacement inline-text payload. Body shape:
-    /// `{"text": "..."}`. Used by CIRISAgent 2.9.5's
-    /// `EdgeCommunicationAdapter` via the
-    /// [`crate::ffi::pyo3::PyEdge::send_inline_text`] /
-    /// `send_durable_inline_text` / `register_inline_text_handler`
-    /// Python surface. Both [`InlineText`] (ephemeral) and
-    /// [`InlineTextDurable`] (durable, requires_ack) serialize under
-    /// this single discriminator — the delivery class is the sender's
-    /// choice, the receiver sees one wire type. This is the canonical
-    /// [`crate::InlineTextMessage`] implementor; the `speak_pipeline`
-    /// (Classify + Scrub + EncryptAndStore per FSD §1.4) runs on the
-    /// `text` field before signing.
-    InlineText,
 
     // ─── CIRISEdge#41 (v0.11.1) — typed Goal federation transport ───
     /// CIRISLensCore F-3 detector family input. Wraps the persist v2.10.0
@@ -433,30 +425,77 @@ pub struct EdgeEnvelope {
 // preserves byte-equivalence with the existing TRACE_WIRE_FORMAT and
 // federation-directory schemas.
 
-/// Trace batch from agent → lens. Ephemeral; lens's handler calls
-/// `engine.receive_and_persist` on the verified envelope bytes
-/// (which does the trace-level hash-chain verify + scrub + persist).
-///
-/// Wire shape is the existing `BatchEnvelope` from `ciris-persist`'s
-/// schema — transparent newtype preserves byte-equivalence with the
-/// agent's TRACE_WIRE_FORMAT.md emitter.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(transparent)]
-pub struct AccordEventsBatch(pub ciris_persist::schema::BatchEnvelope);
+// ─── CC 0.7 opaque wire vocabulary (CIRISEdge#241, v8.0.0) ──────────
+//
+// WIRE_VOCABULARY.md v1.0.1 §3.3. These three types are the ENTIRE
+// domain-facing message surface edge exposes after the CC 0.7 break.
+// `payload` is OPAQUE bytes — edge holds no typed struct, no
+// canonical_bytes, no Message-semantic knowledge for any migrant. The
+// APP owns inner canonicalization + any inner signature. The
+// body-size cap (AV-13, `MAX_BODY_BYTES`) applies to `payload` via the
+// outer envelope size gate. MISSION §1.3 "edge is reach, not meaning"
+// + §6 anti-pattern 2 "edge re-implements no canonicalization".
 
-/// Lens's response to an `AccordEventsBatch`. Counts the events that
-/// landed (not all may insert if scrub rejects or dedup fires).
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AccordEventsResponse {
-    pub trace_events_inserted: u32,
-    pub trace_llm_calls_inserted: u32,
-    pub deduplicated: u32,
+/// Opaque ephemeral request (`Delivery::Ephemeral`). `kind` is an
+/// app-owned discriminator; `payload` is opaque bytes edge never
+/// interprets. The receiver dispatches on `kind`; an unknown `kind`
+/// replies [`OpaqueResponse`] `{ status: 501 }` (never a silent drop).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueRequest {
+    /// App-owned message discriminator. Edge routes on it but assigns
+    /// it no meaning.
+    pub kind: u32,
+    /// Opaque application payload. Edge preserves byte-for-byte.
+    pub payload: Vec<u8>,
 }
 
-impl Message for AccordEventsBatch {
-    const TYPE: MessageType = MessageType::AccordEventsBatch;
+/// Opaque ephemeral response to an [`OpaqueRequest`]. `status` is an
+/// app-owned code (the `501` unknown-kind reject is the one edge-level
+/// reserved value). No wire `Response` — this IS the response.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueResponse {
+    /// Echoes the request `kind` (or the unknown `kind` on a 501).
+    pub kind: u32,
+    /// App-owned status code. `501` is edge's reserved unknown-kind
+    /// reject; every other value is app-defined.
+    pub status: u16,
+    /// Opaque application payload. Edge preserves byte-for-byte.
+    pub payload: Vec<u8>,
+}
+
+/// Opaque persistent event (`Delivery::Durable`, fire-and-forget). On
+/// receipt edge fans it out to every subscriber registered for its
+/// `kind` — the generic successor of the ripped inline-text subscriber
+/// subsystem.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueEvent {
+    /// App-owned event discriminator. Subscribers register per-`kind`.
+    pub kind: u32,
+    /// Opaque application payload. Edge preserves byte-for-byte.
+    pub payload: Vec<u8>,
+}
+
+impl Message for OpaqueRequest {
+    const TYPE: MessageType = MessageType::OpaqueRequest;
     const DELIVERY: Delivery = Delivery::Ephemeral;
-    type Response = AccordEventsResponse;
+    type Response = OpaqueResponse;
+}
+
+impl Message for OpaqueResponse {
+    const TYPE: MessageType = MessageType::OpaqueResponse;
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    type Response = ();
+}
+
+impl Message for OpaqueEvent {
+    const TYPE: MessageType = MessageType::OpaqueEvent;
+    const DELIVERY: Delivery = Delivery::Durable {
+        requires_ack: false,
+        max_attempts: 10,
+        ttl_seconds: 24 * 60 * 60, // 24 hours
+        ack_timeout_seconds: None,
+    };
+    type Response = ();
 }
 
 /// Hybrid-signed build manifest published to the registry. Durable;
@@ -559,103 +598,6 @@ impl Message for PublicKeyRegistration {
         ack_timeout_seconds: Some(300),
     };
     type Response = PublicKeyRegistrationResponse;
-}
-
-/// Synchronous query — "do you have this key_id?". Ephemeral
-/// request-response.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FederationKeyDirectoryQuery {
-    pub key_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FederationKeyDirectoryQueryResponse {
-    pub key_record: Option<ciris_persist::prelude::KeyRecord>,
-}
-
-impl Message for FederationKeyDirectoryQuery {
-    const TYPE: MessageType = MessageType::FederationKeyDirectoryQuery;
-    const DELIVERY: Delivery = Delivery::Ephemeral;
-    type Response = FederationKeyDirectoryQueryResponse;
-}
-
-// ─── CIRISEdge#22 Tier 2 (v0.9.0) — inline-text body types ──────────
-//
-// Two `Message` impls share the same `MessageType::InlineText`
-// discriminator on the wire: [`InlineText`] (`Delivery::Ephemeral` —
-// fire-and-forget, no retry, no ACK) and [`InlineTextDurable`]
-// (`Delivery::Durable { requires_ack: true }` — edge-owned retry +
-// observable outcome via [`crate::DurableHandle`]). Receivers see one
-// wire type regardless of which the sender chose; only the sender's
-// queuing semantics differ.
-//
-// Both implement [`crate::InlineTextMessage`] so the `speak_pipeline`
-// (Classify + Scrub + EncryptAndStore per FSD §1.4) runs on the text
-// before signing — the cleartext never leaves the process unredacted.
-// This is the load-bearing forensic-completeness invariant for the
-// CIRISAgent 2.9.5 `EdgeCommunicationAdapter` cutover.
-
-/// Inline-text payload. Wire body shape: `{"text": "..."}`. Shipped via
-/// [`crate::Edge::send_inline`] / [`crate::ffi::pyo3::PyEdge::send_inline_text`]
-/// (ephemeral; fire-and-forget). Use [`InlineTextDurable`] for
-/// edge-owned-retry semantics with a [`crate::DurableHandle`] return.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct InlineText {
-    /// The inline text body. The `speak_pipeline` mutates this in place
-    /// (PII scrub, secret span substitution) before signing.
-    pub text: String,
-}
-
-impl Message for InlineText {
-    const TYPE: MessageType = MessageType::InlineText;
-    const DELIVERY: Delivery = Delivery::Ephemeral;
-    type Response = ();
-}
-
-impl crate::handler::InlineTextMessage for InlineText {
-    fn text(&self) -> &str {
-        &self.text
-    }
-    fn set_text(&mut self, text: String) {
-        self.text = text;
-    }
-}
-
-/// Durable inline-text payload — same wire body shape and same
-/// `MessageType::InlineText` discriminator as [`InlineText`], but rides
-/// `Delivery::Durable { requires_ack: true }` so the sender gets a
-/// [`crate::DurableHandle`] and edge-owned retry. Shipped via
-/// [`crate::Edge::send_durable_inline`] /
-/// [`crate::ffi::pyo3::PyEdge::send_durable_inline_text`].
-///
-/// Defaults: 24h TTL, 20 attempts, 60s ACK timeout. Mirrors
-/// [`DSARRequest`]'s durable shape; chat-tier messages don't need the
-/// week-long `BuildManifestPublication` window.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct InlineTextDurable {
-    /// The inline text body. The `speak_pipeline` mutates this in place
-    /// (PII scrub, secret span substitution) before signing.
-    pub text: String,
-}
-
-impl Message for InlineTextDurable {
-    const TYPE: MessageType = MessageType::InlineText;
-    const DELIVERY: Delivery = Delivery::Durable {
-        requires_ack: true,
-        max_attempts: 20,
-        ttl_seconds: 24 * 60 * 60, // 24 hours
-        ack_timeout_seconds: Some(60),
-    };
-    type Response = ();
-}
-
-impl crate::handler::InlineTextMessage for InlineTextDurable {
-    fn text(&self) -> &str {
-        &self.text
-    }
-    fn set_text(&mut self, text: String) {
-        self.text = text;
-    }
 }
 
 // ─── CIRISEdge#18 — FederationAnnouncement + DeliveryAttestation ────
@@ -2590,46 +2532,55 @@ mod tests {
         assert_eq!(sha256_of(&back.bytes), back.sha256);
     }
 
-    // ─── CIRISEdge#22 Tier 2 (v0.9.0) — inline-text wire contract ───
+    // ─── CC 0.7 opaque wire vocabulary (CIRISEdge#241, v8.0.0) ──────
 
-    /// `InlineText` and `InlineTextDurable` MUST serialize to the
-    /// SAME wire body shape (`{"text": "..."}`) AND carry the SAME
-    /// `MessageType::InlineText` discriminator on the wire. Receivers
-    /// see one wire type regardless of which the sender used; only
-    /// the sender's queuing semantics differ. Pin this — a regression
-    /// that splits the wire types would break the
-    /// `EdgeCommunicationAdapter` (CIRISAgent 2.9.5) round trip.
+    /// Delivery-class pins for the three opaque wire types.
+    /// `OpaqueRequest` / `OpaqueResponse` are ephemeral; `OpaqueEvent`
+    /// is durable, fire-and-forget. A regression that flipped these
+    /// would break the request/response correlation + subscriber
+    /// fan-out contracts (WIRE_VOCABULARY.md §3.3).
     #[test]
-    fn inline_text_family_shares_wire_discriminator_and_body_shape() {
-        assert_eq!(InlineText::TYPE, MessageType::InlineText);
-        assert_eq!(InlineTextDurable::TYPE, MessageType::InlineText);
-        let a = InlineText { text: "hi".into() };
-        let b = InlineTextDurable { text: "hi".into() };
-        assert_eq!(
-            serde_json::to_string(&a).unwrap(),
-            serde_json::to_string(&b).unwrap(),
-            "InlineText and InlineTextDurable wire bodies MUST be identical"
-        );
-        assert_eq!(serde_json::to_string(&a).unwrap(), r#"{"text":"hi"}"#);
+    fn opaque_delivery_classes_pinned() {
+        assert_eq!(OpaqueRequest::TYPE, MessageType::OpaqueRequest);
+        assert_eq!(OpaqueResponse::TYPE, MessageType::OpaqueResponse);
+        assert_eq!(OpaqueEvent::TYPE, MessageType::OpaqueEvent);
+        assert!(matches!(OpaqueRequest::DELIVERY, Delivery::Ephemeral));
+        assert!(matches!(OpaqueResponse::DELIVERY, Delivery::Ephemeral));
+        match OpaqueEvent::DELIVERY {
+            Delivery::Durable { requires_ack, .. } => {
+                assert!(!requires_ack, "OpaqueEvent is fire-and-forget");
+            }
+            other => panic!("OpaqueEvent must be Durable; got {other:?}"),
+        }
     }
 
-    /// `InlineText` is ephemeral (fire-and-forget);
-    /// `InlineTextDurable` is durable with `requires_ack=true`.
-    /// Pin both — a regression that promotes `InlineText` to durable
-    /// would silently start writing every agent chat-fragment to the
-    /// outbound queue.
+    /// Opaque bodies round-trip: `payload` is preserved byte-for-byte
+    /// and edge assigns no meaning to `kind` / `status`.
     #[test]
-    fn inline_text_delivery_classes_pinned() {
-        assert!(matches!(InlineText::DELIVERY, Delivery::Ephemeral));
-        match InlineTextDurable::DELIVERY {
-            Delivery::Durable { requires_ack, .. } => {
-                assert!(
-                    requires_ack,
-                    "InlineTextDurable must declare requires_ack=true"
-                );
-            }
-            other => panic!("InlineTextDurable must be Durable; got {other:?}"),
-        }
+    fn opaque_bodies_round_trip() {
+        let req = OpaqueRequest {
+            kind: 42,
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let back: OpaqueRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(req, back);
+
+        let resp = OpaqueResponse {
+            kind: 42,
+            status: 501,
+            payload: b"unknown kind".to_vec(),
+        };
+        let back: OpaqueResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(resp, back);
+
+        let ev = OpaqueEvent {
+            kind: 7,
+            payload: vec![1, 2, 3],
+        };
+        let back: OpaqueEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(ev, back);
     }
 
     /// `ContentFetch` JSON round-trip with and without a hint.
