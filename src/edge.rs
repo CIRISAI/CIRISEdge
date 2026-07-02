@@ -3356,13 +3356,28 @@ impl Edge {
 
     /// Run the listeners + dispatch loops + outbound dispatcher.
     /// Returns when the shutdown signal fires.
+    ///
+    /// v8.2.0 (CIRISEdge#249) — takes `self: Arc<Self>` instead of `self`.
+    /// The lifecycle only *clones* fields out of the edge into its spawned
+    /// tasks (it never moves the edge apart), so an `Arc` receiver keeps
+    /// the running edge callable: a node wraps its `Edge` in an `Arc`,
+    /// spawns `Arc::clone(&edge).run(shutdown_rx)`, and keeps the other
+    /// clone to issue `&self` calls — `send_opaque_request` /
+    /// `send_opaque_event` — from a separate task (e.g. an HTTP handler)
+    /// on the SAME running edge. That is the CC-0.7 mesh control-plane
+    /// **initiator** leg (`0x0000_*`); before this it was unreachable on a
+    /// `run()`-lifecycle node because `run(self)` consumed the edge.
+    /// Distinct from CIRISEdge#243 (the `init_edge_runtime` outbound
+    /// dispatcher gap) — this is the `run()` path, and it keeps run()'s
+    /// CRPL replication pre-dispatch + sweeps intact (which
+    /// `spawn_background_listeners` alone drops).
     // v0.18.0 — function grew past clippy's 100-line cap once the #33
     // background blackhole-pruner spawn landed alongside the existing
     // listener / dispatcher / sweeps / inbound spawn graph. The
     // spawn-graph composition is the construction-time contract; extracting
     // it would fragment the lifecycle invariants without adding clarity.
     #[allow(clippy::too_many_lines)]
-    pub async fn run(self, shutdown_rx: watch::Receiver<bool>) -> Result<(), EdgeError> {
+    pub async fn run(self: Arc<Self>, shutdown_rx: watch::Receiver<bool>) -> Result<(), EdgeError> {
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(1024);
 
         // Spawn one listener per transport.
