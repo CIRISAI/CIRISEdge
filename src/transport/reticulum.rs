@@ -3138,13 +3138,30 @@ async fn resolve_announce_cold_start(
         RootingVerdict::Confirmed { chain } => chain,
         RootingVerdict::Rejected { rejection } => {
             // DirectoryError is a transient substrate fault — retryable,
-            // not a verdict on the binding. The other seven variants
-            // are terminal structural/crypto rejections: AV-42 events.
+            // not a verdict on the binding. The other terminal variants
+            // are structural/crypto rejections: AV-42 events.
             if matches!(rejection, RootingRejection::DirectoryError { .. }) {
                 tracing::warn!(
                     key_id = %key_id,
                     kind = rejection.kind(),
                     "announce rooting deferred: directory error (retryable, peer not blacklisted)",
+                );
+            } else if matches!(rejection, RootingRejection::TerminusNotInAnchor { .. }) {
+                // v8.4.0 (CIRISEdge#253 / CIRISPersist#344, v12.0.0) — the chain
+                // terminates at a real steward/accord_holder-SHAPED key whose
+                // pubkey is NOT one of the pinned HUMANITY_ACCORD holders.
+                // Distinct from `not_rooted_at_steward` (no steward terminus at
+                // all): this is the "mis-seeded anchor vs genuinely-unrooted
+                // peer" diagnostic. EXPECTED for every announce until the
+                // genesis mesh is seeded (persist v12.0.1 + the CIRISServer#140
+                // holder-app op that scrub-signs the canonical node under A1) —
+                // fail-secure, not a regression, and not a spoof by itself.
+                tracing::warn!(
+                    av = "AV-42",
+                    key_id = %key_id,
+                    kind = rejection.kind(),
+                    "announce rejected: chain terminus is not a pinned accord holder \
+                     (genesis mesh unseeded or mis-seeded anchor)",
                 );
             } else {
                 tracing::warn!(
