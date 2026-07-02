@@ -560,4 +560,97 @@ mod loopback {
         std::mem::forget(rt_a);
         std::mem::forget(rt_b);
     }
+
+    /// 5. CIRISEdge#243 — a DURABLE send (`send_opaque_event`) transmits
+    ///    from the PRODUCTION `init_edge_runtime` posture:
+    ///    `spawn_background_listeners` + `spawn_outbound_dispatcher`, with
+    ///    NO `Edge::run` fallback. Test 3 above proves the fan-out works
+    ///    when `run()` drives the dispatcher; this proves it works when the
+    ///    dispatcher is spawned the way `init_edge_runtime` now wires it.
+    ///    On `main` (before #243) the sender never transmitted (only
+    ///    listeners ran under `spawn_background_listeners`), so the
+    ///    subscriber timed out; here it must fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn opaque_event_delivers_via_spawn_background_dispatcher() {
+        use tokio::sync::watch;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().to_path_buf();
+        let steward = TestFedKey::new("steward-opaque-243", 0x01);
+        let a = TestFedKey::new("edge-a-opaque-243", 0x4a);
+        let b = TestFedKey::new("edge-b-opaque-243", 0x4b);
+        let dir = directory_with(vec![
+            signed_record(&steward, &steward, "steward"),
+            signed_record(&a, &steward, "agent"),
+            signed_record(&b, &steward, "agent"),
+        ])
+        .await;
+
+        let port_a = free_port();
+        let port_b = free_port();
+        let ta = build_sym(&a, dir.clone(), &base, port_a, port_b).await;
+        let tb = build_sym(&b, dir.clone(), &base, port_b, port_a).await;
+        prime_v7_peer_pair(&ta, &a.key_id, &tb, &b.key_id).await;
+
+        let signer_a = signer_for(&a, &base).await;
+        let signer_b = signer_for(&b, &base).await;
+
+        let cfg = || EdgeConfig {
+            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            cohort_scope_enforcement: CohortScopeEnforcement::Off,
+            ..EdgeConfig::default()
+        };
+        // A: sender on the PRODUCTION posture (Arc, no `run()`).
+        let edge_a = Arc::new(
+            Edge::builder()
+                .directory(dir.clone() as Arc<dyn VerifyDirectory>)
+                .queue(dir.clone())
+                .signer(signer_a)
+                .transport(ta.clone() as Arc<dyn Transport>)
+                .reticulum_transport(ta)
+                .config(cfg())
+                .build()
+                .expect("build edge A"),
+        );
+        let edge_b = Arc::new(
+            Edge::builder()
+                .directory(dir.clone() as Arc<dyn VerifyDirectory>)
+                .queue(dir.clone())
+                .signer(signer_b)
+                .transport(tb.clone() as Arc<dyn Transport>)
+                .reticulum_transport(tb)
+                .config(cfg())
+                .build()
+                .expect("build edge B"),
+        );
+        std::mem::forget(tmp);
+
+        let (_sub_id, mut rx) = edge_b.register_opaque_subscriber(0x0000_0001);
+        let rt_a = edge_runtime("opaque-rt-a-243");
+        let rt_b = edge_runtime("opaque-rt-b-243");
+        let _hb = edge_b.spawn_background_listeners(rt_b.handle());
+
+        // SENDER exactly as `init_edge_runtime` now wires it: listeners
+        // AND the outbound dispatcher, on the edge-side runtime. `_sd_tx`
+        // is held for the test's duration (busy-loop guard, per the
+        // `spawn_outbound_dispatcher` contract).
+        let _ha = edge_a.spawn_background_listeners(rt_a.handle());
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let _hd = edge_a.spawn_outbound_dispatcher(rt_a.handle(), &sd_rx);
+
+        edge_a
+            .send_opaque_event(&b.key_id, 0x0000_0001, b"event-bytes".to_vec())
+            .await
+            .expect("enqueue opaque event");
+
+        let (_sender, kind, payload) = tokio::time::timeout(Duration::from_secs(45), rx.recv())
+            .await
+            .expect("durable event delivered under spawn_background_dispatcher posture")
+            .expect("subscriber channel delivered a payload");
+        assert_eq!(kind, 0x0000_0001);
+        assert_eq!(payload, b"event-bytes");
+
+        std::mem::forget(rt_a);
+        std::mem::forget(rt_b);
+    }
 }

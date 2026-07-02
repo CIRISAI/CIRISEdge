@@ -84,6 +84,8 @@ async fn auth_with(
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
         hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        transport_binding_enforcement:
+            ciris_edge::transport::attestation::TransportBindingEnforcement::Advisory,
         event_bus: None,
         reachability: None,
         blackhole_rules: Some(blackhole),
@@ -829,6 +831,8 @@ async fn auth_pinned_backend(
         rooting: Some(directory as Arc<dyn RootingDirectory>),
         resolver: None,
         hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        transport_binding_enforcement:
+            ciris_edge::transport::attestation::TransportBindingEnforcement::Advisory,
         event_bus: None,
         reachability: None,
         blackhole_rules: Some(blackhole),

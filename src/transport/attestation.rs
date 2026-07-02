@@ -129,6 +129,49 @@ impl<'a> AttestationPayload<'a> {
 /// **directory-confirmed** pubkey — never against the
 /// `federation_pubkey_ed25519_base64` carried here, which is a
 /// claim. See [`crate::transport::reticulum`]'s cold-start path.
+/// CIRISEdge#205 (CIRISVerify#28 Phase 4 / AV-42) — the enforcement
+/// posture for the RNS §5.6.8.8.1.1 destination-hash consistency check on
+/// the announce cold-start path. The federation binding (`key_id →
+/// transport identity`) is ALWAYS enforced via `root_binding` + the
+/// attestation signature; this knob governs the *additional* check that
+/// the announce's own `destination_hash` recomputes from its identity
+/// pubkeys (`ReceivedAnnounce::verify_destination_hash`).
+///
+/// **`Advisory` MUST be the default.** The flip to `RequireTransportBinding`
+/// is a **dated fleet-floor coordination event** (CIRISVerify#28 Phase 4):
+/// every federation repo must emit conformant transport bindings before
+/// Edge enforces, or authentic peers get dropped. This is NOT a silent
+/// default change — operators opt in once the floor is met. Mirrors the
+/// [`crate::cohort_scope::CohortScopeEnforcement`] staged-rollout discipline.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportBindingEnforcement {
+    /// Tolerate a missing/mismatched destination-hash binding — admit the
+    /// announce (records the claimed hash). **The default** — current
+    /// v-series behavior, no silent change.
+    #[default]
+    Advisory,
+    /// Log a `tracing::warn!` on mismatch but still admit — migration aid
+    /// while the fleet floor rolls out.
+    WarnOnly,
+    /// Drop an announce whose `destination_hash` does not recompute from
+    /// its identity pubkeys — fail-secure (AV-42). The Phase-4 target,
+    /// enabled only after the dated fleet-floor coordination event.
+    RequireTransportBinding,
+}
+
+impl TransportBindingEnforcement {
+    /// Stable string-token for telemetry.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::WarnOnly => "warn_only",
+            Self::RequireTransportBinding => "require_transport_binding",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnounceAttestation {
     /// The announcer's 32-byte Reticulum transport-identity Ed25519
@@ -330,5 +373,33 @@ mod tests {
             AnnounceAttestation::from_app_data(legacy),
             Err(AttestationError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn transport_binding_enforcement_default_is_advisory() {
+        // CIRISEdge#205 — the default MUST be Advisory (no silent flip);
+        // the fleet-floor cutover to RequireTransportBinding is opt-in.
+        assert_eq!(
+            TransportBindingEnforcement::default(),
+            TransportBindingEnforcement::Advisory
+        );
+    }
+
+    #[test]
+    fn transport_binding_enforcement_serde_and_token_round_trip() {
+        for (variant, token) in [
+            (TransportBindingEnforcement::Advisory, "advisory"),
+            (TransportBindingEnforcement::WarnOnly, "warn_only"),
+            (
+                TransportBindingEnforcement::RequireTransportBinding,
+                "require_transport_binding",
+            ),
+        ] {
+            assert_eq!(variant.as_str(), token);
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{token}\""));
+            let back: TransportBindingEnforcement = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
     }
 }

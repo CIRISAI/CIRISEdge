@@ -350,6 +350,16 @@ pub struct PyEdge {
     /// posture — there's nothing to listen on.
     _transport_runtime: Option<Arc<tokio::runtime::Runtime>>,
     _transport_listener_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// CIRISEdge#243 — the `watch::Sender` for the outbound dispatcher's
+    /// shutdown signal. Held (never dropped early) so `run_dispatcher`'s
+    /// idle-poll `select!` on `shutdown.changed()` never sees a closed
+    /// channel — a dropped sender makes `changed()` return `Err`
+    /// immediately and hot-spins the claim loop. Declared AFTER
+    /// `_transport_runtime` so field drop-order tears the runtime down
+    /// first (aborting the dispatcher task) before this sender drops —
+    /// no busy-loop window at teardown, no explicit signal needed.
+    /// `None` when there's no transport runtime (`for_test` / HTTPS-only).
+    _transport_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 /// v2.4.0 (CIRISEdge#103) — best-effort cleanup if the Python caller
@@ -481,6 +491,7 @@ impl PyEdge {
             // directly when they need the inbound path.
             _transport_runtime: None,
             _transport_listener_handles: std::sync::Mutex::new(Vec::new()),
+            _transport_shutdown_tx: None,
         }
     }
 }
@@ -3789,6 +3800,7 @@ enum LocalInstanceRole {
     agent_occurrence_key_id = None,
     transport_identity_keyring_dir = None,
     enable_transport = false,
+    transport_binding_enforcement = "advisory",
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -3905,6 +3917,15 @@ pub fn init_edge_runtime(
     // strangers). Maps to `ReticulumTransportConfig::enable_transport`
     // and through to leviculum's `enable_transport` builder knob.
     enable_transport: bool,
+    // CIRISEdge#205 (CIRISVerify#28 Phase 4 / AV-42) — RNS destination-hash
+    // binding enforcement on the announce cold-start path. One of
+    // `"advisory"` (default — tolerate mismatch, current behavior),
+    // `"warn_only"` (log + admit), or `"require_transport_binding"` (drop
+    // mismatched announces, fail-secure). The flip to
+    // `require_transport_binding` is a DATED FLEET-FLOOR coordination event —
+    // enable only once every federation repo emits conformant bindings, else
+    // authentic peers are dropped. Default preserves v-series behavior.
+    transport_binding_enforcement: &str,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -4015,6 +4036,21 @@ pub fn init_edge_runtime(
             }
         };
     let hybrid_policy = parse_hybrid_policy(hybrid_policy, soft_freshness_window_seconds)?;
+
+    // CIRISEdge#205 — parse the transport-binding enforcement posture.
+    let transport_binding_enforcement = match transport_binding_enforcement {
+        "advisory" => crate::transport::attestation::TransportBindingEnforcement::Advisory,
+        "warn_only" => crate::transport::attestation::TransportBindingEnforcement::WarnOnly,
+        "require_transport_binding" => {
+            crate::transport::attestation::TransportBindingEnforcement::RequireTransportBinding
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "init_edge_runtime: transport_binding_enforcement must be one of \
+                 \"advisory\" | \"warn_only\" | \"require_transport_binding\", got {other:?}"
+            )));
+        }
+    };
 
     // ── Step 1: extract the substrate handles via PyCapsule from the
     // shared engine. Cross-module PyClass identity isn't involved —
@@ -4674,6 +4710,7 @@ pub fn init_edge_runtime(
         rooting: Some(rooting_dir.clone()),
         resolver: None,
         hybrid_policy,
+        transport_binding_enforcement,
         event_bus: Some(Arc::clone(&event_bus)),
         reachability: Some(Arc::clone(&reachability_tracker)),
         // v0.16.1 (CIRISEdge#33 durable flip / CIRISPersist#120) —
@@ -5186,12 +5223,25 @@ pub fn init_edge_runtime(
             Some(Arc::new(rt))
         };
 
-    let transport_handles: Vec<tokio::task::JoinHandle<()>> =
-        if let Some(rt) = transport_runtime.as_ref() {
-            edge_arc.spawn_background_listeners(rt.handle())
-        } else {
-            Vec::new()
-        };
+    // CIRISEdge#243 — spawn listeners AND the outbound dispatcher + sweeps on
+    // the edge-side transport runtime, so durable sends (`send_opaque_event`,
+    // DSAR, anything on `send_durable`) actually drain + transmit from the
+    // Python runtime instead of enqueuing forever. Pre-#243 only the listeners
+    // ran here (ephemeral `send_opaque_request` transmits inline, so it was
+    // unaffected). The `watch::Sender` is stashed on `PyEdge`
+    // (`_transport_shutdown_tx`) for the runtime's lifetime — see that field's
+    // busy-loop note.
+    let (transport_handles, transport_shutdown_tx): (
+        Vec<tokio::task::JoinHandle<()>>,
+        Option<tokio::sync::watch::Sender<bool>>,
+    ) = if let Some(rt) = transport_runtime.as_ref() {
+        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let mut handles = edge_arc.spawn_background_listeners(rt.handle());
+        handles.extend(edge_arc.spawn_outbound_dispatcher(rt.handle(), &sd_rx));
+        (handles, Some(sd_tx))
+    } else {
+        (Vec::new(), None)
+    };
 
     Ok(PyEdge {
         inner: edge_arc,
@@ -5203,6 +5253,7 @@ pub fn init_edge_runtime(
         shared_instance_cleanup: std::sync::Mutex::new(shared_instance_cleanup),
         _transport_runtime: transport_runtime,
         _transport_listener_handles: std::sync::Mutex::new(transport_handles),
+        _transport_shutdown_tx: transport_shutdown_tx,
     })
 }
 
@@ -7082,20 +7133,21 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
-                None,   // https_listen_addr
-                None,   // https_tls_cert_path
-                None,   // https_tls_key_path
-                false,  // https_mtls_required
-                None,   // https_bearer_secret
-                false,  // https_dev_self_signed
-                false,  // disable_reticulum
-                None,   // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
-                None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
-                None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
-                "auto", // local_instance_role
-                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
-                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
-                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
+                None,       // https_listen_addr
+                None,       // https_tls_cert_path
+                None,       // https_tls_key_path
+                false,      // https_mtls_required
+                None,       // https_bearer_secret
+                false,      // https_dev_self_signed
+                false,      // disable_reticulum
+                None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
+                None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                "auto",     // local_instance_role
+                None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,      // enable_transport (CIRISEdge#168 — leaf-node default)
+                "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -7192,20 +7244,21 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
-                None,   // https_listen_addr
-                None,   // https_tls_cert_path
-                None,   // https_tls_key_path
-                false,  // https_mtls_required
-                None,   // https_bearer_secret
-                false,  // https_dev_self_signed
-                false,  // disable_reticulum
-                None,   // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
-                None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
-                None,   // local_instance_name (v2.3.0)
-                "auto", // local_instance_role
-                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
-                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
-                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
+                None,       // https_listen_addr
+                None,       // https_tls_cert_path
+                None,       // https_tls_key_path
+                false,      // https_mtls_required
+                None,       // https_bearer_secret
+                false,      // https_dev_self_signed
+                false,      // disable_reticulum
+                None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
+                None,       // local_instance_name (v2.3.0)
+                "auto",     // local_instance_role
+                None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,      // enable_transport (CIRISEdge#168 — leaf-node default)
+                "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -7341,20 +7394,21 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
-                None,   // https_listen_addr
-                None,   // https_tls_cert_path
-                None,   // https_tls_key_path
-                false,  // https_mtls_required
-                None,   // https_bearer_secret
-                false,  // https_dev_self_signed
-                false,  // disable_reticulum
-                None,   // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
-                None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
-                None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
-                "auto", // local_instance_role
-                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
-                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
-                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
+                None,       // https_listen_addr
+                None,       // https_tls_cert_path
+                None,       // https_tls_key_path
+                false,      // https_mtls_required
+                None,       // https_bearer_secret
+                false,      // https_dev_self_signed
+                false,      // disable_reticulum
+                None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
+                None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                "auto",     // local_instance_role
+                None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,      // enable_transport (CIRISEdge#168 — leaf-node default)
+                "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
             )?;
             Ok(())
         });
@@ -7443,20 +7497,21 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
-                None,   // https_listen_addr
-                None,   // https_tls_cert_path
-                None,   // https_tls_key_path
-                false,  // https_mtls_required
-                None,   // https_bearer_secret
-                false,  // https_dev_self_signed
-                false,  // disable_reticulum
-                None,   // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
-                None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
-                None,   // local_instance_name (v2.3.0)
-                "auto", // local_instance_role
-                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
-                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
-                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
+                None,       // https_listen_addr
+                None,       // https_tls_cert_path
+                None,       // https_tls_key_path
+                false,      // https_mtls_required
+                None,       // https_bearer_secret
+                false,      // https_dev_self_signed
+                false,      // disable_reticulum
+                None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
+                None,       // local_instance_name (v2.3.0)
+                "auto",     // local_instance_role
+                None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,      // enable_transport (CIRISEdge#168 — leaf-node default)
+                "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -7599,20 +7654,21 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
-                None,   // https_listen_addr
-                None,   // https_tls_cert_path
-                None,   // https_tls_key_path
-                false,  // https_mtls_required
-                None,   // https_bearer_secret
-                false,  // https_dev_self_signed
-                false,  // disable_reticulum
-                None,   // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
-                None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
-                None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
-                "auto", // local_instance_role
-                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
-                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
-                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
+                None,       // https_listen_addr
+                None,       // https_tls_cert_path
+                None,       // https_tls_key_path
+                false,      // https_mtls_required
+                None,       // https_bearer_secret
+                false,      // https_dev_self_signed
+                false,      // disable_reticulum
+                None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
+                None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                "auto",     // local_instance_role
+                None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,      // enable_transport (CIRISEdge#168 — leaf-node default)
+                "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -7754,20 +7810,21 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
-                None,   // https_listen_addr
-                None,   // https_tls_cert_path
-                None,   // https_tls_key_path
-                false,  // https_mtls_required
-                None,   // https_bearer_secret
-                false,  // https_dev_self_signed
-                false,  // disable_reticulum
-                None,   // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
-                None,   // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
-                None,   // local_instance_name (v2.3.0 — shared-instance disabled in this test)
-                "auto", // local_instance_role
-                None,   // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
-                None,   // transport_identity_keyring_dir (v3.1.0 — file-only)
-                false,  // enable_transport (CIRISEdge#168 — leaf-node default)
+                None,       // https_listen_addr
+                None,       // https_tls_cert_path
+                None,       // https_tls_key_path
+                false,      // https_mtls_required
+                None,       // https_bearer_secret
+                false,      // https_dev_self_signed
+                false,      // disable_reticulum
+                None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
+                None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
+                None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                "auto",     // local_instance_role
+                None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
+                None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
+                false,      // enable_transport (CIRISEdge#168 — leaf-node default)
+                "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
             )?;
             Ok(edge.signer_key_id())
         });

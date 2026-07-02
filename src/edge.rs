@@ -3127,6 +3127,56 @@ impl Edge {
         tasks
     }
 
+    /// CIRISEdge#243 — spawn the outbound dispatcher + periodic sweeps on
+    /// the supplied edge-side runtime `Handle`. This is the exact spawn
+    /// block [`Self::run`] wires inline; extracting it into one method
+    /// gives [`init_edge_runtime`] (which drives transport via
+    /// [`Self::spawn_background_listeners`], NOT [`Self::run`]) a way to
+    /// go live on the durable send path — `send_durable` /
+    /// `send_opaque_event` / DSAR durable sends only *enqueue* to the
+    /// outbound queue; without this dispatcher nothing drains + transmits
+    /// them, so a `DurableHandle` never progressed past "queued" from the
+    /// Python runtime. Ephemeral sends (`send_opaque_request`,
+    /// `transport.send`) transmit inline and were unaffected.
+    ///
+    /// **Caller contract (busy-loop hazard):** the caller MUST keep the
+    /// [`watch::Sender`] paired with `shutdown_rx` alive for the runtime's
+    /// lifetime. `run_dispatcher`'s idle-poll arm `select!`s on
+    /// `shutdown.changed()`; if the sender is *dropped*, `changed()`
+    /// returns `Err` immediately and the loop hot-spins on
+    /// `claim_pending_outbound`. Signal `true` on teardown (clean exit)
+    /// rather than dropping the sender mid-flight.
+    ///
+    /// **Runtime split:** as with [`Self::spawn_background_listeners`],
+    /// `runtime` MUST be the edge-side `Handle` — `run_dispatcher` /
+    /// `run_sweeps` carry `tokio::time` primitives that need edge-tokio's
+    /// Timer driver (CIRISEdge#217 / the v7.1.0 split).
+    pub fn spawn_outbound_dispatcher(
+        self: &Arc<Self>,
+        runtime: &tokio::runtime::Handle,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        {
+            let q = self.queue.clone();
+            let ts = self.transports.clone();
+            let cfg = self.config.dispatcher.clone();
+            let sd = shutdown_rx.clone();
+            let reach = Some(self.reachability.clone());
+            tasks.push(runtime.spawn(async move {
+                run_dispatcher(q, ts, cfg, sd, reach).await;
+            }));
+        }
+        {
+            let q = self.queue.clone();
+            let sd = shutdown_rx.clone();
+            tasks.push(runtime.spawn(async move {
+                run_sweeps(q, sd).await;
+            }));
+        }
+        tasks
+    }
+
     /// CIRISEdge#175 (v6.1.0, FSD §3.2) — resolve the default
     /// `cohort_scope` for a stated audience without actually
     /// publishing. Callers preview the §3.2 default-flip rule
@@ -3394,24 +3444,15 @@ impl Edge {
         // Drop our copy of the sender; only the listeners hold it.
         drop(inbound_tx);
 
-        // Spawn outbound dispatcher + sweeps.
-        {
-            let q = self.queue.clone();
-            let ts = self.transports.clone();
-            let cfg = self.config.dispatcher.clone();
-            let sd = shutdown_rx.clone();
-            let reach = Some(self.reachability.clone());
-            tasks.push(tokio::spawn(async move {
-                run_dispatcher(q, ts, cfg, sd, reach).await;
-            }));
-        }
-        {
-            let q = self.queue.clone();
-            let sd = shutdown_rx.clone();
-            tasks.push(tokio::spawn(async move {
-                run_sweeps(q, sd).await;
-            }));
-        }
+        // Spawn outbound dispatcher + sweeps. CIRISEdge#243 — shared with
+        // `init_edge_runtime` via `spawn_outbound_dispatcher` so the durable
+        // send path is identical on both lifecycles. `run().await` is always
+        // polled inside a runtime, so `Handle::current()` is the edge runtime
+        // here; `shutdown_rx`'s sender is `run`'s own `shutdown_tx`, alive for
+        // the whole call, so no busy-loop.
+        tasks.extend(
+            self.spawn_outbound_dispatcher(&tokio::runtime::Handle::current(), &shutdown_rx),
+        );
 
         // CIRISEdge#33 background pruner (v0.18.0 lifecycle hook —
         // closes the v0.16.1 TODO documented on

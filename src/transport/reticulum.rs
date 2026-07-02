@@ -90,7 +90,9 @@ use reticulum_core::{Destination, DestinationHash, DestinationType, Direction, I
 use reticulum_std::driver::{EventReceiver, ReticulumNode, ReticulumNodeBuilder};
 use reticulum_std::NodeEvent;
 
-use super::attestation::{AnnounceAttestation, AttestationError, AttestationPayload};
+use super::attestation::{
+    AnnounceAttestation, AttestationError, AttestationPayload, TransportBindingEnforcement,
+};
 use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 use crate::identity::LocalSigner;
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
@@ -974,6 +976,9 @@ pub struct ReticulumTransport {
     /// peer's provenance chain (CIRISEdge#15 step 4). Mirrors the
     /// `HybridPolicy` edge's verify pipeline runs.
     hybrid_policy: HybridPolicy,
+    /// CIRISEdge#205 (AV-42 Phase 4) — RNS destination-hash binding
+    /// enforcement posture on the announce cold-start path.
+    transport_binding_enforcement: TransportBindingEnforcement,
     /// CIRISEdge#34 — shared event bus. Drives the AsyncIterator
     /// surface (`subscribe_announces` / `subscribe_interface_events`)
     /// in `crate::ffi::pyo3`. `None` means a transport built with no
@@ -1106,6 +1111,11 @@ pub struct ReticulumAuth {
     /// provenance chain. [`Default`] is [`HybridPolicy::Strict`] —
     /// the production posture, matching `EdgeConfig::default`.
     pub hybrid_policy: HybridPolicy,
+    /// CIRISEdge#205 (AV-42 Phase 4) — RNS destination-hash binding
+    /// enforcement on the announce cold-start path. [`Default`] is
+    /// [`TransportBindingEnforcement::Advisory`] (no behavior change); the
+    /// flip to `RequireTransportBinding` is a dated fleet-floor event.
+    pub transport_binding_enforcement: TransportBindingEnforcement,
     /// CIRISEdge#34 — optional shared event bus. When supplied, the
     /// transport emits `transport_up` / `transport_down` interface
     /// events at `listen` entry/exit, and `announce_received`
@@ -1171,6 +1181,7 @@ impl Default for ReticulumAuth {
             rooting: None,
             resolver: None,
             hybrid_policy: HybridPolicy::Strict,
+            transport_binding_enforcement: TransportBindingEnforcement::Advisory,
             event_bus: None,
             reachability: None,
             blackhole_rules: None,
@@ -1211,6 +1222,7 @@ impl ReticulumTransport {
             rooting,
             resolver,
             hybrid_policy,
+            transport_binding_enforcement,
             event_bus,
             reachability,
             blackhole_rules,
@@ -1470,6 +1482,7 @@ impl ReticulumTransport {
             resolver,
             rooting,
             hybrid_policy,
+            transport_binding_enforcement,
             event_bus,
             reachability,
             interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
@@ -2688,6 +2701,7 @@ impl Transport for ReticulumTransport {
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
                         hybrid_policy: self.hybrid_policy,
+                        transport_binding_enforcement: self.transport_binding_enforcement,
                         event_bus: self.event_bus.as_deref(),
                         reachability: self.reachability.as_ref(),
                         link_established_at: &self.link_established_at,
@@ -2727,6 +2741,9 @@ struct EventCtx<'a> {
     rooting: Option<&'a dyn RootingDirectory>,
     /// Consumer hybrid PQC policy applied to a rooted chain.
     hybrid_policy: HybridPolicy,
+    /// CIRISEdge#205 (AV-42 Phase 4) — RNS destination-hash binding
+    /// enforcement posture applied in [`resolve_announce_cold_start`].
+    transport_binding_enforcement: TransportBindingEnforcement,
     /// CIRISEdge#34 — shared event bus for announce / interface
     /// emissions. `None` → no events emitted (the transport was
     /// constructed without `ReticulumAuth::event_bus`).
@@ -3065,6 +3082,53 @@ async fn resolve_announce_cold_start(
         }
     };
     let key_id = attestation.federation_key_id.clone();
+
+    // CIRISEdge#205 (CIRISVerify#28 Phase 4 / AV-42) — RNS §5.6.8.8.1.1
+    // destination-hash consistency gate. `verify_destination_hash()`
+    // recomputes `truncated_hash(name_hash ‖ truncated_hash(public_key))`
+    // from the announce's OWN identity pubkeys (leviculum-native, already
+    // linked) and compares it to the claimed `destination_hash`. A
+    // mismatch means the announce's transport identity does not actually
+    // own the destination it claims — non-authentic. Under
+    // `RequireTransportBinding` we drop it fail-secure BEFORE spending a
+    // directory round-trip; `WarnOnly` logs + admits; `Advisory` (default)
+    // preserves the current tolerant behavior. The flip is a dated
+    // fleet-floor coordination event — see `TransportBindingEnforcement`.
+    if !announce.verify_destination_hash() {
+        match ctx.transport_binding_enforcement {
+            TransportBindingEnforcement::RequireTransportBinding => {
+                tracing::warn!(
+                    av = "AV-42",
+                    key_id = %key_id,
+                    policy = ctx.transport_binding_enforcement.as_str(),
+                    "announce dropped: destination_hash does not recompute from \
+                     the announce identity pubkeys (RNS §5.6.8.8.1.1 mismatch — \
+                     spoofed transport-identity binding)",
+                );
+                if let Some(bus) = ctx.event_bus {
+                    bus.emit_announce(crate::events::NetworkEvent::announce(
+                        Some(key_id.clone()),
+                        announce.destination_hash().as_bytes().to_vec(),
+                        announce.app_data().to_vec(),
+                        crate::events::EventSeverity::Warning,
+                        "announce dropped: destination_hash does not recompute from \
+                         announce identity (AV-42, RequireTransportBinding)",
+                    ));
+                }
+                return;
+            }
+            TransportBindingEnforcement::WarnOnly => {
+                tracing::warn!(
+                    av = "AV-42",
+                    key_id = %key_id,
+                    policy = ctx.transport_binding_enforcement.as_str(),
+                    "transport-binding destination_hash mismatch (WarnOnly: admitting \
+                     — fleet floor not yet enforced)",
+                );
+            }
+            TransportBindingEnforcement::Advisory => {}
+        }
+    }
 
     // Step 2 — root the federation key against the persist directory.
     let verdict = rooting
