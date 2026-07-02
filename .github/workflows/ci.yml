@@ -295,7 +295,7 @@ jobs:
       matrix:
         include:
           - { abi: arm64-v8a,    target: aarch64-linux-android,   clang_prefix: aarch64-linux-android24,     pointer_width: 64 }
-          - { abi: x86_64,       target: x86_64-linux-android,    clang_prefix: x86_64-linux-android24,      pointer_width: 64, needs_openssl: true }
+          - { abi: x86_64,       target: x86_64-linux-android,    clang_prefix: x86_64-linux-android24,      pointer_width: 64 }
           - { abi: armeabi-v7a,  target: armv7-linux-androideabi, clang_prefix: armv7a-linux-androideabi24,  pointer_width: 32 }
     env:
       # Edge's mobile feature set. Reticulum is the canonical cohabitation
@@ -304,7 +304,11 @@ jobs:
       # uses only `transport-reticulum`; the PyO3 build (second invocation)
       # adds `pyo3 extension-module` on top.
       MOBILE_BASE_FEATURES: "transport-reticulum"
-      MOBILE_PYO3_FEATURES: "transport-reticulum pyo3 extension-module"
+      # v8.3.0 (CIRISEdge#246 / CIRISPersist#339, v11.9.1) — pyo3-sqlite drops
+      # the postgres→openssl chain AND (via #339's refinery hygiene) the
+      # sqlite→refinery→tokio-postgres→openssl transitive, so the Android
+      # vendored-OpenSSL build is gone. Mirrors the Windows cutover (#247).
+      MOBILE_PYO3_FEATURES: "transport-reticulum pyo3-sqlite extension-module"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -335,38 +339,12 @@ jobs:
       # x86_64 only: OpenSSL 3.6.x SM4-NI workaround. AV-NN: Chaquopy
       # build path is one of the two cohabitation surfaces; an
       # assembler failure here is a hard release-blocker.
-      - name: pre-build OpenSSL for x86_64-android (SM4-NI workaround)
-        if: matrix.needs_openssl
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          OPENSSL_VERSION="3.4.1"
-          curl -sL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
-            -o openssl-src.tar.gz
-          tar xzf openssl-src.tar.gz
-          cd "openssl-${OPENSSL_VERSION}"
-          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64"
-          export PATH="${TOOLCHAIN}/bin:${PATH}"
-          export CC="x86_64-linux-android24-clang"
-          export AR="llvm-ar"
-          export RANLIB="llvm-ranlib"
-          export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
-          INSTALL_DIR="${RUNNER_TEMP}/openssl-x86_64-android"
-          ./Configure android-x86_64 \
-            no-sm4 no-shared no-stdio no-tests \
-            -D__ANDROID_API__=24 \
-            --prefix="${INSTALL_DIR}" \
-            --openssldir="${INSTALL_DIR}/ssl"
-          make -j"$(nproc)" build_libs
-          make install_dev
-          echo "✓ OpenSSL ${OPENSSL_VERSION} built for x86_64-android (no-sm4)"
-
-      - name: export pre-built OpenSSL env vars
-        if: matrix.needs_openssl
-        run: |
-          echo "OPENSSL_NO_VENDOR=1" >> "$GITHUB_ENV"
-          echo "X86_64_LINUX_ANDROID_OPENSSL_DIR=${{ runner.temp }}/openssl-x86_64-android" >> "$GITHUB_ENV"
-          echo "X86_64_LINUX_ANDROID_OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+      # v8.3.0 (CIRISEdge#246 / CIRISPersist#339) — the x86_64-android
+      # pre-build-OpenSSL-from-source step + its env export are GONE. The
+      # PyO3 lane builds `pyo3-sqlite`, and persist v11.9.1 gated the
+      # sqlite→refinery→tokio-postgres→openssl transitive behind `postgres`,
+      # so there is no openssl-sys in the Android dep tree to satisfy. The
+      # SM4-NI workaround (Configure `no-sm4`) is moot with no openssl build.
 
       # Plain .so (no PyO3) — save before the PyO3 build overwrites
       # the same target path. Native Android consumers (Rust-only,
@@ -856,7 +834,10 @@ jobs:
       # `transport-reticulum` (Cargo.toml v0.5.1 guard) so explicitly
       # naming it would be redundant — but we name it anyway for the
       # same self-documenting reason the wheel job does.
-      IOS_PYO3_FEATURES: "transport-reticulum pyo3 extension-module"
+      # v8.3.0 (CIRISEdge#246) — pyo3-sqlite drops openssl on iOS too (the
+      # target-table openssl is `optional` behind postgres as of persist
+      # v11.9.1 / #339); no vendored-openssl cross-compile on the iOS lane.
+      IOS_PYO3_FEATURES: "transport-reticulum pyo3-sqlite extension-module"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
