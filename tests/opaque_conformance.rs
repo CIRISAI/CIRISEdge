@@ -491,7 +491,8 @@ mod loopback {
             .expect("enqueue opaque event");
         let (_sd_tx, sd_rx) = watch::channel(false);
         tokio::spawn(async move {
-            let _: Result<(), EdgeError> = edge_a.run(sd_rx).await;
+            // v8.2.0 (CIRISEdge#249) — `run` takes `self: Arc<Self>`.
+            let _: Result<(), EdgeError> = std::sync::Arc::new(edge_a).run(sd_rx).await;
         });
 
         let (_sender, kind, payload) = tokio::time::timeout(Duration::from_secs(45), rx.recv())
@@ -501,6 +502,62 @@ mod loopback {
         assert_eq!(kind, 0x0000_0001);
         assert_eq!(payload, b"event-bytes");
 
+        std::mem::forget(rt_b);
+    }
+
+    /// 4. CIRISEdge#249 — the mesh control-plane INITIATOR leg works on a
+    ///    `run()`-lifecycle node. Before #249, `Edge::run(self)` consumed
+    ///    the edge, so a node that booted via `run()` had no handle left to
+    ///    issue `send_opaque_request`. Now `run(self: Arc<Self>)` lets A
+    ///    spawn the FULL run lifecycle on one `Arc` clone AND keep another
+    ///    to initiate a request from a separate task. B answers 200 via its
+    ///    own listeners. This is the `run()`-path counterpart to the
+    ///    `spawn_background_listeners`-path round-trip in test 1, and the
+    ///    exact acceptance criterion for CIRISServer#128 Phase E.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn opaque_request_initiator_works_on_run_lifecycle() {
+        use ciris_edge::EdgeError;
+        use tokio::sync::watch;
+
+        let (edge_a, edge_b, _a_id, b_id) = two_node().await;
+
+        // B answers kind 0x0000_0002 with a 200.
+        edge_b.register_opaque_handler(0x0000_0002, |_sender_key_id, payload| {
+            assert_eq!(payload, b"seed?");
+            ciris_edge::messages::OpaqueResponse {
+                kind: 0x0000_0002,
+                status: 200,
+                payload: b"seeded".to_vec(),
+            }
+        });
+
+        let rt_a = edge_runtime("opaque-rt-a-249");
+        let rt_b = edge_runtime("opaque-rt-b-249");
+
+        // A boots on the FULL `run()` lifecycle via an `Arc` clone; the
+        // original `edge_a` handle survives for the initiator send below.
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let edge_a_run = Arc::clone(&edge_a);
+        rt_a.spawn(async move {
+            let _: Result<(), EdgeError> = edge_a_run.run(sd_rx).await;
+        });
+        let _hb = edge_b.spawn_background_listeners(rt_b.handle());
+
+        // Let A's run() lifecycle claim its listeners before initiating.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Initiator leg: issue the request from the STILL-HELD `edge_a`,
+        // proving a run()-lifecycle node can drive `send_opaque_request`.
+        let resp = edge_a
+            .send_opaque_request(&b_id, 0x0000_0002, b"seed?".to_vec(), 45_000)
+            .await
+            .expect("initiator send on a run()-lifecycle node");
+
+        assert_eq!(resp.kind, 0x0000_0002);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.payload, b"seeded");
+
+        std::mem::forget(rt_a);
         std::mem::forget(rt_b);
     }
 }

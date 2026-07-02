@@ -293,7 +293,8 @@ where
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = edge.run(shutdown_rx).await;
+        // v8.2.0 (CIRISEdge#249) — `run` takes `self: Arc<Self>`.
+        let _ = std::sync::Arc::new(edge).run(shutdown_rx).await;
     });
     // Give the listener a moment to claim the receiver before the
     // test starts pushing.
