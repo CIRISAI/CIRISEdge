@@ -31,8 +31,11 @@
 //! [`StorageBudgetV1::verify`] / [`CorpusWantV1::verify`] before acting on
 //! them (CIRISEdge#258 Cut 1).
 
+use std::collections::BTreeMap;
+
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use ciris_persist::fountain::FountainHeldMeta;
 use serde::{Deserialize, Serialize};
 
 /// The `self` / `family` `cohort_scope` values that MUST NOT appear in a
@@ -438,6 +441,34 @@ fn is_sorted_dedup<'a>(it: impl Iterator<Item = &'a str>) -> bool {
     true
 }
 
+// ── B5 consumption accounting (edge-internal) ─────────────────────────
+
+/// CC 6.1.5.2 §Q **B5 consumption accounting** — sum the durable bytes
+/// actually held, grouped by `cohort_scope`, recomputed **edge-internally**
+/// from what persist holds. Consumption is NEVER trusted from the wire; it
+/// is reconciled against real bytes so a forged `StorageBudgetV1` cannot
+/// become a force-evict channel (B5 consumption-challengeability).
+///
+/// Input is persist's [`FountainHeldMeta`] rows
+/// (`FederationDirectory::list_held_fountain_content`, enriched with
+/// `content_bytes` + `cohort_scope` as of CIRISPersist v12.1.0 / #349).
+/// Content whose signed envelope declares no scope (`cohort_scope: None`)
+/// rolls up under the `None` key — **unattributed budget** (CIRISEdge#260).
+///
+/// Producers of edge-published fountain content that should draw from a
+/// scope's budget MUST set the `cohort_scope` key in the content's signed
+/// envelope; persist round-trips it verbatim (it does not infer scope), and
+/// unscoped content lands as `None` here.
+#[must_use]
+pub fn consumption_by_scope(held: &[FountainHeldMeta]) -> BTreeMap<Option<String>, u64> {
+    let mut acc: BTreeMap<Option<String>, u64> = BTreeMap::new();
+    for meta in held {
+        let bucket = acc.entry(meta.cohort_scope.clone()).or_default();
+        *bucket = bucket.saturating_add(meta.content_bytes);
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,5 +659,39 @@ mod tests {
         let mut tampered = w.clone();
         tampered.size_cap_bytes = 1;
         assert!(tampered.verify(&ed_pub, &pqc_pub).is_err());
+    }
+
+    fn held(scope: Option<&str>, content_bytes: u64) -> FountainHeldMeta {
+        FountainHeldMeta {
+            content_id: "cid".into(),
+            corpus_kind: "corpus.text".into(),
+            pqc_key_id: "pub".into(),
+            original_content_length: content_bytes,
+            n_source: 10,
+            k_repair: 5,
+            min_viable_symbols: 10,
+            symbol_size: 100,
+            held_symbols: 10,
+            content_bytes,
+            cohort_scope: scope.map(String::from),
+            recoverable: true,
+            admitted_at: "2026-07-03T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn consumption_sums_content_bytes_by_scope() {
+        let rows = vec![
+            held(Some("community"), 100),
+            held(Some("community"), 250),
+            held(Some("affiliations"), 40),
+            held(None, 7), // unscoped envelope → unattributed budget
+        ];
+        let by = consumption_by_scope(&rows);
+        assert_eq!(by.get(&Some("community".to_string())), Some(&350));
+        assert_eq!(by.get(&Some("affiliations".to_string())), Some(&40));
+        assert_eq!(by.get(&None), Some(&7));
+        assert_eq!(by.len(), 3);
+        assert!(consumption_by_scope(&[]).is_empty());
     }
 }
