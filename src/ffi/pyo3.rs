@@ -2052,12 +2052,23 @@ impl PyEdge {
     ///   transport was registered at init.
     /// - `ValueError("unknown EnvelopeKind: {token}")` if a kind
     ///   string in `peers` doesn't match the 10 wire tokens.
-    #[pyo3(signature = (peers, cadence_seconds = None))]
+    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None))]
     fn start_replication(
         &self,
         py: Python<'_>,
         peers: Vec<(String, String)>,
         cadence_seconds: Option<u64>,
+        // CIRISEdge#257 — the Key-plane publish set: the node's OWN key_id
+        // + held rooting-relevant / anchored key_ids (records whose
+        // scrub_key_id points at a trusted anchor). When `Some`, the `Key`
+        // `EnvelopeKind` advertises THESE (KERI publish-own) instead of the
+        // cohort-members'-own — the mesh-seed path (a node is never in its
+        // own consent cohort, so without this it never advertises its own
+        // scrub-signed record and no verifier can root it). The server
+        // computes the set (it holds the anchor knowledge); edge wraps it
+        // into the bridge's Key-plane selector. `None` preserves the
+        // pre-#257 cohort projection.
+        key_publish_set: Option<Vec<String>>,
     ) -> PyResult<PyReplicationHandle> {
         let directory = self
             .inner
@@ -2080,6 +2091,14 @@ impl PyEdge {
             config.scheduler.cadence = std::time::Duration::from_secs(secs);
         }
 
+        // CIRISEdge#257 — wrap the server-supplied Key-plane publish set
+        // into the bridge's Key-plane selector (a `CohortProvider`).
+        let key_selector: Option<crate::replication::bridge::CohortProvider> =
+            key_publish_set.map(|set| {
+                std::sync::Arc::new(move || set.clone())
+                    as crate::replication::bridge::CohortProvider
+            });
+
         let executor = self.executor.clone();
         let runtime = py.detach(|| {
             run_async(&executor, async move {
@@ -2088,6 +2107,7 @@ impl PyEdge {
                     transport,
                     typed_peers,
                     config,
+                    key_selector,
                 )
                 .await
             })

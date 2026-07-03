@@ -144,6 +144,13 @@ impl ReplicationRuntime {
         transport: Arc<dyn Transport>,
         peers: Vec<ReplicationPeer>,
         config: ReplicationRuntimeConfig,
+        // CIRISEdge#257 — the Key-plane publish-set selector. `Some` yields
+        // the node's OWN + held anchored records (KERI publish-own) for the
+        // `Key` `EnvelopeKind`; `None` preserves the pre-#257 cohort
+        // projection. The server computes this set (it holds the anchor
+        // knowledge) and hands it to edge alongside the consent-derived
+        // cohort — edge only provides the hook.
+        key_selector: Option<CohortProvider>,
     ) -> Self {
         // Cohort callback: yields the set of peer_key_ids we
         // anti-entropy with, snapshotted at construction. Hot-adds
@@ -157,11 +164,14 @@ impl ReplicationRuntime {
         let cohort_snapshot: Vec<String> = peers.iter().map(|p| p.peer_key_id.clone()).collect();
         let cohort: CohortProvider = Arc::new(move || cohort_snapshot.clone());
 
-        let bridge = Arc::new(FederationDirectoryReplicationBridge::with_config(
-            Arc::clone(&directory),
-            cohort,
-            config.bridge,
-        ));
+        let bridge = Arc::new(
+            FederationDirectoryReplicationBridge::with_config(
+                Arc::clone(&directory),
+                cohort,
+                config.bridge,
+            )
+            .with_key_selector(key_selector),
+        );
 
         let registry = Arc::new(ReplicationRegistry::new());
 
@@ -444,6 +454,7 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
+            None,
         )
         .await;
         assert!(rt.registry().is_empty().await);
@@ -466,6 +477,7 @@ mod tests {
             transport,
             peers,
             ReplicationRuntimeConfig::default(),
+            None,
         )
         .await;
         let registry = rt.registry();
@@ -487,6 +499,7 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
+            None,
         )
         .await;
         rt.register_peer("agent-bob", EnvelopeKind::Attestation)
@@ -508,6 +521,7 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
+            None,
         )
         .await;
         rt.register_initiator_peer("agent-carol", EnvelopeKind::Key)
@@ -538,6 +552,7 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
+            None,
         )
         .await;
         rt.register_initiator_peer("agent-dave", EnvelopeKind::Attestation)
@@ -579,6 +594,7 @@ mod tests {
             transport,
             initial,
             ReplicationRuntimeConfig::default(),
+            None,
         )
         .await;
         assert_eq!(rt.registry().len().await, 2);
@@ -625,6 +641,7 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
+            None,
         )
         .await;
         rt.shutdown().await;

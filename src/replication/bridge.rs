@@ -188,6 +188,18 @@ pub struct OperationalProviders {
 pub struct FederationDirectoryReplicationBridge {
     directory: Arc<dyn FederationDirectory>,
     cohort: CohortProvider,
+    /// CIRISEdge#257 — the Key-plane publish-set selector. When `Some`,
+    /// [`Self::list_keys`] projects THIS set (the node's OWN record + held
+    /// rooting-relevant / anchored records) instead of the `cohort`. A
+    /// node is never in its own consent cohort, so without this it would
+    /// never advertise its own scrub-signed key record and no verifier
+    /// could ever root it — the mesh-seed blocker. `None` preserves the
+    /// pre-#257 cohort-members'-own projection (back-compat). The server
+    /// supplies the selector (own + anchored) via
+    /// [`Self::with_key_selector`]; edge only provides the hook (all
+    /// replication logic lives in edge — the engine does not hard-code
+    /// the Key-plane projection).
+    key_selector: Option<CohortProvider>,
     cache: Mutex<BridgeCache>,
     config: BridgeConfig,
     /// v2 operational-data admission providers. `None` = v2 admission
@@ -215,6 +227,7 @@ impl FederationDirectoryReplicationBridge {
         Self {
             directory,
             cohort,
+            key_selector: None,
             cache,
             config,
             operational: None,
@@ -247,10 +260,25 @@ impl FederationDirectoryReplicationBridge {
         Self {
             directory,
             cohort,
+            key_selector: None,
             cache,
             config,
             operational: Some(operational),
         }
+    }
+
+    /// CIRISEdge#257 — install the Key-plane publish-set selector. When
+    /// set, [`Self::list_keys`] advertises the key_ids THIS callback yields
+    /// (the node's OWN record + held anchored records) rather than the
+    /// cohort's members'-own. `None` restores the cohort projection. The
+    /// server computes the own+anchored set (it holds the anchor knowledge);
+    /// edge just projects it through `lookup_public_key` — the KERI
+    /// publish-own model (the controller publishes its own establishment
+    /// record; verifiers pull-and-verify).
+    #[must_use]
+    pub fn with_key_selector(mut self, selector: Option<CohortProvider>) -> Self {
+        self.key_selector = selector;
+        self
     }
 
     async fn cache_insert(&self, kind: EnvelopeKind, hash: [u8; 32], bytes: Vec<u8>) {
@@ -387,14 +415,17 @@ impl FederationDirectoryReplicationBridge {
         u64::try_from(timestamp.timestamp_millis()).unwrap_or(0)
     }
 
-    /// Project the cohort-yielded key_ids through
-    /// `lookup_public_key`, emit one `EnvelopeRef` per resolved
-    /// record. The cohort callback yields the set we anti-entropy
-    /// with; each member's KeyRecord goes on the wire.
+    /// Project the Key-plane publish set through `lookup_public_key`, emit
+    /// one `EnvelopeRef` per resolved record. The set is the
+    /// [`Self::key_selector`] (CIRISEdge#257 — the node's OWN record + held
+    /// anchored records, KERI publish-own) when installed, else the
+    /// `cohort` (pre-#257 cohort-members'-own). The projection is identical
+    /// either way; only the set of key_ids differs.
     async fn list_keys(&self) -> Vec<EnvelopeRef> {
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
+        let publish_set = self.key_selector.as_ref().unwrap_or(&self.cohort);
+        for key_id in publish_set() {
             if let Ok(Some(row)) = self.directory.lookup_public_key(&key_id).await {
                 if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
                     if !seen.insert(hash) {
@@ -1116,6 +1147,49 @@ mod tests {
         // on matching content (persist returns Ok on dedup).
         let admitted = bridge.apply_envelope_bytes(EnvelopeKind::Key, &bytes).await;
         assert!(admitted, "idempotent re-apply succeeds");
+    }
+
+    /// CIRISEdge#257 — the Key-plane selector publishes the node's OWN
+    /// record + a third-party anchored record even though neither is in the
+    /// node's consent cohort (KERI publish-own). Without the selector,
+    /// `list_keys` projects the cohort and would never carry them — the
+    /// mesh-seed blocker (a verifier can't root a key it never received).
+    #[tokio::test]
+    async fn key_selector_publishes_own_and_anchored_not_cohort() {
+        let cohort_member = "peer-in-cohort";
+        let own_key = "this-node-own";
+        let anchored = "third-party-anchored";
+
+        // Cohort contains ONLY the peer — never own / anchored (a node is
+        // not in its own consent cohort).
+        let (backend, bridge) = make_bridge(&[cohort_member.to_string()]);
+        for k in [cohort_member, own_key, anchored] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+
+        // Pre-#257 projection: the cohort → only the cohort member's own.
+        let cohort_refs = bridge.list_envelope_refs(EnvelopeKind::Key).await;
+        assert_eq!(
+            cohort_refs.len(),
+            1,
+            "cohort projection advertises only cohort members' own"
+        );
+
+        // Install the Key-plane publish set {own, anchored}: publish-own.
+        let publish_set = vec![own_key.to_string(), anchored.to_string()];
+        let selector: CohortProvider = Arc::new(move || publish_set.clone());
+        let bridge = bridge.with_key_selector(Some(selector));
+        let refs = bridge.list_envelope_refs(EnvelopeKind::Key).await;
+        assert_eq!(
+            refs.len(),
+            2,
+            "selector advertises the node's own + the anchored record, not the cohort"
+        );
     }
 
     /// Bridge dedupes the same key when listed across multiple cohort
