@@ -124,6 +124,7 @@ pub mod registry;
 pub mod runtime;
 pub mod scheduler;
 pub mod session;
+pub mod storage_contention;
 pub mod summary;
 pub mod wire_frame;
 
