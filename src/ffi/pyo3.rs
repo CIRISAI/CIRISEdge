@@ -1422,26 +1422,65 @@ impl PyEdge {
     /// polls/awaits to observe the edge-owned-queue outcome. Receivers
     /// fan the event out to their per-`kind` `subscribe_opaque` callbacks.
     ///
+    /// CIRISEdge#265 / #274 — the holder **scope** selector the edge-7
+    /// inline-text send carried is restored here. `active_community_id` /
+    /// `in_family_context` resolve the [`crate::CohortScope`] via the §3.2
+    /// default-flip ([`Self::resolve_default_scope`]), and the resolved scope
+    /// rides the envelope so delivery is holder-gated per the edge's
+    /// `cohort_scope_enforcement` — a peer receives the event only when it is a
+    /// genuine holder of the published scope:
+    ///
+    ///   * `active_community_id="c"` → `Cohort{c}` — community holders only.
+    ///   * `in_family_context=True`  → `Family` — family holders only.
+    ///   * neither (**the default**) → `SelfOnly` — the publisher's own nodes
+    ///     (the owner-bound node set; #274 cross-device self-replication). This
+    ///     is anonymity-by-default (§3.2 / CC 1.13.3.4): a default send reaches
+    ///     only your own devices, and a `self`-scoped send to a *foreign*
+    ///     identity is refused under `Strict` rather than leaking. Federation
+    ///     (public) scope is the explicit opt-in — never the default.
+    ///
+    /// **Behavior change (v8.8.0):** the pre-#265 3-arg form published
+    /// unscoped (federation-visible). It now defaults to `SelfOnly`; callers
+    /// that intend a wider audience MUST pass `active_community_id` /
+    /// `in_family_context` (or use a Public-scoped path).
+    ///
     /// # Python signature
     /// ```python
-    /// handle = edge.send_opaque_event("agent-bob", 7, b"...")
+    /// # self-scoped (default — your own nodes only):
+    /// h = edge.send_opaque_event("my-laptop", 7, b"...")
+    /// # community-scoped:
+    /// h = edge.send_opaque_event("agent-bob", 7, b"...", active_community_id="alpha")
+    /// # family-scoped:
+    /// h = edge.send_opaque_event("agent-bob", 7, b"...", in_family_context=True)
     /// ```
+    #[pyo3(signature = (recipient_key_id, kind, payload, active_community_id=None, in_family_context=false))]
     fn send_opaque_event(
         &self,
         py: Python<'_>,
         recipient_key_id: &str,
         kind: u32,
         payload: Vec<u8>,
+        active_community_id: Option<&str>,
+        in_family_context: bool,
     ) -> PyResult<PyDurableHandle> {
         let edge = self.inner.clone();
         let recipient = recipient_key_id.to_string();
+        // CIRISEdge#265 — resolve the caller-selected holder scope (§3.2
+        // default-flip → SelfOnly when no audience context); it rides the
+        // envelope for holder-gated delivery.
+        let cohort_scope = edge.resolve_default_scope(active_community_id, in_family_context);
         let executor = self.executor.clone();
         let executor_for_handle = executor.clone();
         let queue_for_handle: Arc<dyn OutboundHandle> = edge.outbound_queue_handle();
         py.detach(|| {
             run_async(&executor, async move {
                 let handle = edge
-                    .send_opaque_event(&recipient, kind, payload)
+                    .send_opaque_event_with_cohort_scope(
+                        &recipient,
+                        kind,
+                        payload,
+                        Some(cohort_scope),
+                    )
                     .await
                     .map_err(|e| PyRuntimeError::new_err(format!("send_opaque_event: {e}")))?;
                 Ok(PyDurableHandle {
