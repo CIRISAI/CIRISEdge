@@ -89,6 +89,7 @@ fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
         persist_row_hash: String::new(),
         roles: Vec::new(),
         attestation_evidence: None,
+        consent_role: None,
     }
 }
 

@@ -6347,6 +6347,618 @@ impl PyStoreAndForward {
     }
 }
 
+// ─── CIRISEdge#193 — scope_privacy derivation reach-through ─────────
+//
+// Thin PyO3 wrappers over the §2.2 / §2.4 SCOPE_PRIVACY derivation
+// helpers `crate::scope_privacy` re-exports from verify's
+// `ciris_crypto::scope_privacy` (the first conformant impl per FSD
+// §9). CIRISConformance's `test_400_scope_privacy_record_id.py`
+// currently reproduces verify's KAT vectors with a clean-room Python
+// oracle; these wrappers let the suite verify edge's published wheel
+// byte-for-byte against the same vectors, closing the round-trip.
+//
+// The issue sketch named the first `derive_record_id` argument
+// `group_dek` ("the MLS exporter_secret") — that conflates the §2.2
+// and §2.4 stages. The Rust authority surface takes the §2.2
+// *subkeys* (`K_record_id` / `K_symbol`), so the wrappers mirror the
+// Rust signatures exactly and ALSO expose the §2.2 subkey expanders
+// (`k_record_id` / `k_symbol`) so Python callers can run the full
+// exporter_secret → subkey → record_id/symbol_key chain.
+//
+// Bytes in / bytes out — no redacted-Debug newtypes cross the FFI
+// (same posture as the CIRISEdge#123 realtime_av wrappers above).
+
+/// §2.2 — derive the `K_record_id` subkey from the MLS group's raw
+/// 32-byte `exporter_secret` (bare `HKDF-SHA256-Expand`, info =
+/// `LABEL_RECORD_ID`; deliberately NOT RFC 9420 `ExpandWithLabel` —
+/// see `ciris_crypto::scope_privacy` for the cross-impl warning).
+/// Returns the 32-byte subkey. CIRISEdge#193.
+#[pyfunction]
+fn k_record_id(exporter_secret: &[u8]) -> PyResult<Vec<u8>> {
+    let exporter = fixed_bytes::<32>("exporter_secret", exporter_secret)?;
+    Ok(crate::scope_privacy::k_record_id(&exporter).to_vec())
+}
+
+/// §2.2 — derive the `K_symbol` subkey from the MLS group's raw
+/// 32-byte `exporter_secret` (bare `HKDF-SHA256-Expand`, info =
+/// `LABEL_SYMBOL`). Returns the 32-byte subkey. CIRISEdge#193.
+#[pyfunction]
+fn k_symbol(exporter_secret: &[u8]) -> PyResult<Vec<u8>> {
+    let exporter = fixed_bytes::<32>("exporter_secret", exporter_secret)?;
+    Ok(crate::scope_privacy::k_symbol(&exporter).to_vec())
+}
+
+/// Map the pinned §2.4 `"typ"` integer table onto
+/// [`crate::scope_privacy::RecordType`]. `0` is reserved; out-of-set
+/// values raise `ValueError` (strict allowlist, AV-7 posture).
+fn record_type_from_uint(record_type: u64) -> PyResult<crate::scope_privacy::RecordType> {
+    use crate::scope_privacy::RecordType;
+    match record_type {
+        1 => Ok(RecordType::SelfRecord),
+        2 => Ok(RecordType::FamilyRecord),
+        3 => Ok(RecordType::CommunityRecord),
+        4 => Ok(RecordType::FederationRecord),
+        other => Err(PyValueError::new_err(format!(
+            "record_type: expected the pinned §2.4 integer table \
+             (1=self, 2=family, 3=community, 4=federation; 0 reserved), got {other}"
+        ))),
+    }
+}
+
+/// §2.4 — `record_id = HMAC-SHA3-256(K_record_id,
+/// CBOR_dCE({v, epc, iid, typ}))` (RFC 8949 §4.2.1 deterministic
+/// CBOR preimage). CIRISEdge#193.
+///
+/// - `k_record_id` — the 32-byte §2.2 subkey (see [`k_record_id`]).
+/// - `internal_id` — the caller's private record identifier bytes.
+/// - `record_type` — pinned integer table: 1=self, 2=family,
+///   3=community, 4=federation (0 reserved; `ValueError` otherwise).
+/// - `mls_group_epoch` — the MLS group epoch (`epc`).
+///
+/// Returns the 32-byte HMAC output. Reproduces verify v6.3.0's §9
+/// KAT vectors byte-for-byte (pinned in `src/scope_privacy.rs`).
+#[pyfunction]
+fn derive_record_id(
+    k_record_id: &[u8],
+    internal_id: &[u8],
+    record_type: u64,
+    mls_group_epoch: u64,
+) -> PyResult<Vec<u8>> {
+    let k = fixed_bytes::<32>("k_record_id", k_record_id)?;
+    let typ = record_type_from_uint(record_type)?;
+    Ok(crate::scope_privacy::derive_record_id(&k, internal_id, typ, mls_group_epoch).to_vec())
+}
+
+/// §2.4 — `symbol_key = HKDF-SHA3-256(salt = record_id,
+/// ikm = K_symbol, info = LABEL_SYMBOL || u16_be(symbol_index))`.
+/// CIRISEdge#193.
+///
+/// - `k_symbol` — the 32-byte §2.2 subkey (see [`k_symbol`]).
+/// - `record_id` — the 32-byte [`derive_record_id`] output (HKDF salt).
+/// - `symbol_index` — RaptorQ symbol index (u16; out-of-range raises
+///   `OverflowError` at conversion).
+///
+/// Returns the 32-byte HKDF output.
+#[pyfunction]
+fn derive_symbol_key(k_symbol: &[u8], record_id: &[u8], symbol_index: u16) -> PyResult<Vec<u8>> {
+    let ks = fixed_bytes::<32>("k_symbol", k_symbol)?;
+    let rid = fixed_bytes::<32>("record_id", record_id)?;
+    Ok(crate::scope_privacy::derive_symbol_key(&ks, &rid, symbol_index).to_vec())
+}
+
+// ─── CIRISEdge#192 — wheel-driven EmissionScheduler (virtual clock) ──
+//
+// CIRISConformance PR #19's Poisson / cluster KS-tests
+// (`test_420_scope_privacy_poisson.py`, `test_430_scope_privacy_cluster_ks.py`)
+// verify the §3.1 emission discipline against a first-principles
+// Python simulator because the production `emission::Scheduler` is
+// (a) internal to the Rust send-path and (b) driven by real tokio
+// timers — a 24 h observation window can't be fast-forwarded.
+//
+// This surface closes both gaps with ONE pyclass instead of the
+// issue's `EmissionScheduler` + `AcceleratedTimeMode` pair: a
+// process-global `std::time::Instant` substitution cannot be done
+// from a wheel (no clock-injection seam exists below tokio), so the
+// accelerated clock is scoped to the scheduler instance — `tick()`
+// JUMPS the virtual clock to the next Poisson fire instead of
+// sleeping, and `advance(ns)` exposes the `AcceleratedTimeMode.advance`
+// verb for driving budget-window rolls without emitting.
+//
+// Crucially this is NOT a reimplementation: every load-bearing
+// production primitive is the real one —
+//
+//   - `emission::PoissonScheduler` — the ChaCha20-CSPRNG `Exp(λ)`
+//     inverse-CDF sampler (seedable for deterministic KS runs),
+//   - `emission::BudgetMeter` — the §3.1 lifetime-average λ
+//     inequality book-keeper, driven through its `query_at` /
+//     `record_*_at` explicit-instant test seams,
+//   - `emission::fragment_payload` — the 1.4 KB fragmentation path,
+//   - `emission::seal_envelope` / `EmissionHeader::cover` — the
+//     uniform XChaCha20-Poly1305 AEAD framing for real AND cover.
+//
+// Only the tokio timer loop is replaced (by the virtual clock); the
+// real-vs-cover dispatch decision is a line-for-line mirror of
+// `emission::scheduler::run_scope_loop`.
+
+/// Parse the Python-facing scope string onto the scheduler-local
+/// [`crate::emission::ScopeKey`]. Accepted forms: `"federation"`,
+/// `"self"`, `"family"`, `"family:<id>"`, `"community:<id>"`.
+fn parse_emission_scope(scope: &str) -> PyResult<crate::emission::ScopeKey> {
+    use crate::emission::ScopeKey;
+    match scope {
+        "federation" => return Ok(ScopeKey::federation()),
+        "self" => return Ok(ScopeKey::self_scope()),
+        "family" => return Ok(ScopeKey::family(None)),
+        _ => {}
+    }
+    if let Some(id) = scope.strip_prefix("family:") {
+        if !id.is_empty() {
+            return Ok(ScopeKey::family(Some(id.to_string())));
+        }
+    }
+    if let Some(id) = scope.strip_prefix("community:") {
+        if !id.is_empty() {
+            return Ok(ScopeKey::community(id.to_string()));
+        }
+    }
+    Err(PyValueError::new_err(format!(
+        "scope: expected \"federation\" | \"self\" | \"family\" | \
+         \"family:<id>\" | \"community:<id>\", got {scope:?}"
+    )))
+}
+
+/// Per-scope state inside [`EmissionSimInner`].
+struct EmissionSimScope {
+    /// Scheduler-local scope key (parsed once at construction).
+    key: crate::emission::ScopeKey,
+    /// Per-scope AEAD key the envelopes are sealed under
+    /// (`[0u8; 32]` unless the caller supplied `scope_keys`).
+    aead_key: [u8; 32],
+    /// Real-fragment queue — `(header, payload)` pairs mirroring the
+    /// production scheduler's `QueuedFragment`.
+    queue: std::collections::VecDeque<(crate::emission::EmissionHeader, Vec<u8>)>,
+    /// Virtual-clock timestamp of this scope's next Poisson fire.
+    /// `None` when λ ≤ 0 (scope disabled).
+    next_fire_ns: Option<u64>,
+    /// Lifetime real-envelope count (denominator source for
+    /// `lifetime_avg_lambda`).
+    real_emitted: u64,
+    /// Lifetime cover-envelope count.
+    cover_emitted: u64,
+}
+
+/// One emission produced by [`EmissionSimInner::tick`] — the Rust
+/// shape the pymethod projects into the Python dict.
+struct SimEmission {
+    /// Scope string (as registered).
+    scope: String,
+    /// Virtual-clock fire time (nanoseconds).
+    t_ns: u64,
+    /// `true` = real publication fragment; `false` = synthetic cover.
+    real: bool,
+    /// `(fragment_id, fragment_index, fragment_count)` for real
+    /// emissions; `None` for cover.
+    fragment: Option<(u32, u32, u32)>,
+    /// The sealed 1400-byte wire envelope.
+    envelope: Vec<u8>,
+}
+
+/// Interior state of [`PyEmissionScheduler`], guarded by one mutex.
+/// The substrate logic lives here (plain Rust, unit-testable without
+/// an interpreter); the pymethods own GIL discipline + dict-shape
+/// projection only — the same split the rest of this file follows.
+struct EmissionSimInner {
+    /// The production `Exp(λ)` CSPRNG sampler.
+    poisson: crate::emission::PoissonScheduler,
+    /// The production §3.1 budget meter, driven at virtual instants.
+    budget: crate::emission::BudgetMeter,
+    /// Wall-clock anchor: virtual instant = `base + (now_ns - start_ns)`.
+    base: std::time::Instant,
+    /// Virtual-clock origin (constructor's `start_ns`).
+    start_ns: u64,
+    /// Current virtual time (nanoseconds).
+    now_ns: u64,
+    /// Per-scope state, keyed by the caller's scope string. BTreeMap
+    /// so seeded runs draw from the shared CSPRNG in a deterministic
+    /// scope order (HashMap iteration order would break
+    /// `rng_seed`-reproducibility).
+    scopes: std::collections::BTreeMap<String, EmissionSimScope>,
+}
+
+impl EmissionSimInner {
+    /// Project the virtual clock onto an `Instant` for the
+    /// `BudgetMeter` `*_at` seams.
+    fn virtual_instant(&self) -> std::time::Instant {
+        self.base + Duration::from_nanos(self.now_ns.saturating_sub(self.start_ns))
+    }
+
+    /// Enqueue a real publication — mirrors
+    /// [`crate::emission::Scheduler::submit`] on the virtual clock.
+    fn submit(
+        &mut self,
+        scope: &str,
+        record_id: [u8; 32],
+        fragment_id: u32,
+        payload: &[u8],
+    ) -> PyResult<u32> {
+        let now_ms = self.now_ns / 1_000_000;
+        let Some(state) = self.scopes.get_mut(scope) else {
+            return Err(PyValueError::new_err(format!(
+                "EmissionScheduler.submit: scope {scope:?} not registered"
+            )));
+        };
+        let set = crate::emission::fragment_payload(
+            state.key.scope,
+            record_id,
+            fragment_id,
+            now_ms,
+            payload,
+        )
+        .map_err(|e| PyValueError::new_err(format!("EmissionScheduler.submit: {e}")))?;
+        // Bounded by `fragment_payload`'s own u32 check.
+        let count = u32::try_from(set.fragments.len())
+            .expect("fragment_payload's u32 check ensures len <= u32::MAX");
+        for f in set.fragments {
+            state.queue.push_back((f.header, f.payload));
+        }
+        Ok(count)
+    }
+
+    /// Advance the virtual clock to the earliest pending Poisson fire
+    /// and emit — the accelerated-time mirror of
+    /// `emission::scheduler::run_scope_loop`'s timer-fire body.
+    fn tick(&mut self) -> PyResult<Option<SimEmission>> {
+        use crate::emission::{seal_envelope, BudgetState, EmissionHeader, MAX_PAYLOAD_BYTES};
+
+        // Earliest fire across scopes; `(t, name)` tuple ordering
+        // tie-breaks equal timestamps lexicographically so seeded
+        // runs stay deterministic.
+        let next = self
+            .scopes
+            .iter()
+            .filter_map(|(name, s)| s.next_fire_ns.map(|t| (t, name.clone())))
+            .min();
+        let Some((fire_ns, name)) = next else {
+            return Ok(None); // every scope disabled (λ ≤ 0)
+        };
+        self.now_ns = self.now_ns.max(fire_ns);
+        let now_ms = self.now_ns / 1_000_000;
+        let virt = self.virtual_instant();
+
+        let state = self.scopes.get_mut(&name).expect("scope present");
+        let scope_key = state.key.clone();
+
+        // Decide real vs. cover on timer fire — same dispatch as the
+        // production loop: real only when under budget AND queued.
+        let budget_state = self.budget.query_at(&scope_key, virt);
+        let real_head = match budget_state {
+            BudgetState::UnderBudget { .. } => state.queue.pop_front(),
+            BudgetState::OverBudget { .. } | BudgetState::Unconfigured => None,
+        };
+
+        // Nonce + cover bytes from the same peer-local CSPRNG stream
+        // the interval samples come from (FSD §3.1).
+        let mut nonce = [0u8; ciris_crypto::xchacha::NONCE_LEN];
+        self.poisson.fill_bytes(&mut nonce);
+
+        let (header, payload, real) = if let Some((header, payload)) = real_head {
+            (header, payload, true)
+        } else {
+            let header = EmissionHeader::cover(scope_key.scope, now_ms);
+            let mut cover_payload = vec![0u8; MAX_PAYLOAD_BYTES];
+            self.poisson.fill_bytes(&mut cover_payload);
+            (header, cover_payload, false)
+        };
+
+        let envelope = seal_envelope(&state.aead_key, &nonce, &header, &payload)
+            .map_err(|e| PyRuntimeError::new_err(format!("EmissionScheduler.tick: seal: {e}")))?;
+
+        if real {
+            self.budget.record_real_at(&scope_key, virt);
+            state.real_emitted += 1;
+        } else {
+            self.budget.record_cover_at(&scope_key, virt);
+            state.cover_emitted += 1;
+        }
+
+        // Re-arm this scope's timer: next fire = this fire + Exp(λ).
+        state.next_fire_ns = self
+            .poisson
+            .next_interval(&scope_key)
+            .map(|d| fire_ns.saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
+
+        let fragment = real.then_some((
+            header.fragment_id,
+            header.fragment_index,
+            header.fragment_count,
+        ));
+        Ok(Some(SimEmission {
+            scope: name,
+            t_ns: fire_ns,
+            real,
+            fragment,
+            envelope: envelope.bytes,
+        }))
+    }
+}
+
+/// v8.9.0 (CIRISEdge#192) — wheel-driven §3.1 Poisson emission
+/// scheduler on an accelerated (virtual) clock, for CIRISConformance's
+/// Poisson / cluster KS-tests and CIRISServer's SCOPE_PRIVACY
+/// operator-side observability (CIRISServer#38).
+///
+/// ```python
+/// sched = ciris_edge.EmissionScheduler(
+///     {"community:alpha": 2.0, "self": 0.5},   # λ per scope (emissions/s)
+///     rng_seed=b"\x42" * 32,                    # None → OsRng (production rule)
+///     target_real_per_window=100,
+///     window_secs=10.0,
+///     scope_keys={"community:alpha": b"\x11" * 32},  # AEAD keys; default zeros
+///     start_ns=0,
+/// )
+/// sched.submit("community:alpha", record_id, 7, b"payload")
+/// e = sched.tick()
+/// # {"scope": "community:alpha", "t_ns": 412_318_559, "kind": "real",
+/// #  "fragment_id": 7, "fragment_index": 0, "fragment_count": 1,
+/// #  "envelope": b"..." }  # 1400-byte sealed wire envelope
+/// sched.lifetime_avg_lambda("community:alpha")  # observed λ over virtual time
+/// ```
+///
+/// `tick()` advances the virtual clock to the earliest pending
+/// `Exp(λ_scope)` fire (no sleeping — a 24 h window replays in
+/// milliseconds) and emits exactly what the production
+/// `emission::Scheduler` would: a real fragment when under budget and
+/// queued, a CSPRNG-padded cover envelope otherwise, both sealed with
+/// the uniform XChaCha20-Poly1305 framing. `advance(ns)` subsumes the
+/// issue's proposed `AcceleratedTimeMode.advance` — see the section
+/// comment above for why the accelerated clock is instance-scoped
+/// rather than a process-global `Instant` substitution.
+///
+/// Seeding: `rng_seed` fixes the peer-local ChaCha20 CSPRNG so KS
+/// runs are reproducible. Production emission NEVER seeds from public
+/// inputs (FSD §3.1 jitter-seed-source rule) — the default `None`
+/// draws from `OsRng`, same as the production constructor.
+#[pyclass(name = "EmissionScheduler", module = "ciris_edge")]
+pub struct PyEmissionScheduler {
+    /// Substrate state — one lock, held only for the duration of each
+    /// synchronous pymethod (pure compute; no I/O, no awaits, so no
+    /// `py.detach` needed).
+    inner: parking_lot::Mutex<EmissionSimInner>,
+}
+
+impl std::fmt::Debug for PyEmissionScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Mirrors `emission::Scheduler`'s Debug posture: only the
+        // scope count is human-meaningful; the rest is opaque shared
+        // state (CSPRNG, budget meter, queues).
+        let g = self.inner.lock();
+        f.debug_struct("EmissionScheduler")
+            .field("scopes", &g.scopes.len())
+            .field("now_ns", &g.now_ns)
+            .finish_non_exhaustive()
+    }
+}
+
+#[pymethods]
+impl PyEmissionScheduler {
+    /// Construct a scheduler over `lambda_per_scope` (scope string →
+    /// λ in emissions/second; λ ≤ 0 registers the scope disabled).
+    /// Scope strings: `"federation"` | `"self"` | `"family"` |
+    /// `"family:<id>"` | `"community:<id>"`.
+    ///
+    /// - `rng_seed` — optional 32-byte CSPRNG seed for deterministic
+    ///   runs; `None` seeds from `OsRng` (the production rule).
+    /// - `target_real_per_window` / `window_secs` — the §3.1
+    ///   [`crate::emission::BudgetMeter`] configuration, applied to
+    ///   every scope.
+    /// - `scope_keys` — optional per-scope 32-byte AEAD keys; scopes
+    ///   without an entry seal under `[0u8; 32]` (fine for
+    ///   timing-only KS-tests; supply real keys to unseal envelopes).
+    ///   Naming an unregistered scope raises `ValueError` (typo guard).
+    /// - `start_ns` — virtual-clock origin (e.g. a unix-nanos anchor
+    ///   if the test wants realistic `emitted_at_unix_ms` headers).
+    #[new]
+    #[pyo3(signature = (lambda_per_scope, *, rng_seed=None, target_real_per_window=100, window_secs=10.0, scope_keys=None, start_ns=0))]
+    #[allow(clippy::needless_pass_by_value)] // pyo3 surface takes owned maps
+    fn new(
+        lambda_per_scope: std::collections::HashMap<String, f64>,
+        rng_seed: Option<&[u8]>,
+        target_real_per_window: u32,
+        window_secs: f64,
+        scope_keys: Option<std::collections::HashMap<String, Vec<u8>>>,
+        start_ns: u64,
+    ) -> PyResult<Self> {
+        use crate::emission::{BudgetMeter, PoissonScheduler};
+
+        if lambda_per_scope.is_empty() {
+            return Err(PyValueError::new_err(
+                "lambda_per_scope must name at least one scope",
+            ));
+        }
+        if !window_secs.is_finite() || window_secs <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "window_secs must be finite and > 0, got {window_secs}"
+            )));
+        }
+        for (name, lambda) in &lambda_per_scope {
+            if !lambda.is_finite() {
+                return Err(PyValueError::new_err(format!(
+                    "lambda_per_scope[{name:?}] must be finite, got {lambda}"
+                )));
+            }
+        }
+
+        let poisson = match rng_seed {
+            Some(seed) => PoissonScheduler::from_seed(fixed_bytes::<32>("rng_seed", seed)?),
+            None => PoissonScheduler::new(),
+        };
+        let budget = BudgetMeter::new();
+        let window = Duration::from_secs_f64(window_secs);
+
+        let mut keys_by_scope = scope_keys.unwrap_or_default();
+        let mut scopes = std::collections::BTreeMap::new();
+        // Sorted registration order — with a fixed rng_seed the
+        // per-scope draws must not depend on HashMap iteration order.
+        let mut names: Vec<&String> = lambda_per_scope.keys().collect();
+        names.sort();
+        for name in names {
+            let lambda = lambda_per_scope[name];
+            let key = parse_emission_scope(name)?;
+            let aead_key = match keys_by_scope.remove(name) {
+                Some(k) => fixed_bytes::<32>("scope_keys value", &k)?,
+                None => [0u8; 32],
+            };
+            poisson.set_rate(key.clone(), lambda);
+            budget.configure(key.clone(), target_real_per_window, window);
+            scopes.insert(
+                name.clone(),
+                EmissionSimScope {
+                    key,
+                    aead_key,
+                    queue: std::collections::VecDeque::new(),
+                    next_fire_ns: None,
+                    real_emitted: 0,
+                    cover_emitted: 0,
+                },
+            );
+        }
+        if let Some(stray) = keys_by_scope.keys().next() {
+            return Err(PyValueError::new_err(format!(
+                "scope_keys names a scope absent from lambda_per_scope: {stray:?}"
+            )));
+        }
+
+        let mut inner = EmissionSimInner {
+            poisson,
+            budget,
+            base: std::time::Instant::now(),
+            start_ns,
+            now_ns: start_ns,
+            scopes,
+        };
+        // Arm every scope's first fire (BTreeMap order → deterministic
+        // CSPRNG draw order under a fixed seed).
+        for s in inner.scopes.values_mut() {
+            s.next_fire_ns = inner
+                .poisson
+                .next_interval(&s.key)
+                .map(|d| start_ns.saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
+        }
+        Ok(Self {
+            inner: parking_lot::Mutex::new(inner),
+        })
+    }
+
+    /// Enqueue a real publication at `scope`. Fragments `payload`
+    /// into 1.4 KB envelopes exactly like the production scheduler
+    /// (`record_id` = the FSD §2.4 32-byte record_id; `fragment_id` =
+    /// the per-emitter monotonic counter). Returns the fragment
+    /// count. Raises `ValueError` for an unregistered scope or an
+    /// empty/oversized payload.
+    fn submit(
+        &self,
+        scope: &str,
+        record_id: &[u8],
+        fragment_id: u32,
+        payload: &[u8],
+    ) -> PyResult<u32> {
+        let rid = fixed_bytes::<32>("record_id", record_id)?;
+        self.inner.lock().submit(scope, rid, fragment_id, payload)
+    }
+
+    /// Advance the virtual clock to the earliest pending Poisson fire
+    /// and emit one envelope. Returns `None` iff every scope is
+    /// disabled (λ ≤ 0); otherwise a dict:
+    ///
+    /// ```python
+    /// {
+    ///   "scope": str,        # as registered, e.g. "community:alpha"
+    ///   "t_ns": int,         # virtual fire time (KS-test observable)
+    ///   "kind": "real" | "cover",
+    ///   "fragment_id": int | None,     # None for cover
+    ///   "fragment_index": int | None,
+    ///   "fragment_count": int | None,
+    ///   "envelope": bytes,   # sealed 1400-byte wire envelope
+    /// }
+    /// ```
+    fn tick<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let Some(e) = self.inner.lock().tick()? else {
+            return Ok(None);
+        };
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("scope", &e.scope)?;
+        dict.set_item("t_ns", e.t_ns)?;
+        dict.set_item("kind", if e.real { "real" } else { "cover" })?;
+        if let Some((id, index, count)) = e.fragment {
+            dict.set_item("fragment_id", id)?;
+            dict.set_item("fragment_index", index)?;
+            dict.set_item("fragment_count", count)?;
+        } else {
+            dict.set_item("fragment_id", py.None())?;
+            dict.set_item("fragment_index", py.None())?;
+            dict.set_item("fragment_count", py.None())?;
+        }
+        dict.set_item("envelope", pyo3::types::PyBytes::new(py, &e.envelope))?;
+        Ok(Some(dict))
+    }
+
+    /// Push the virtual clock forward by `ns` nanoseconds WITHOUT
+    /// emitting — the issue's `AcceleratedTimeMode.advance` verb.
+    /// Budget windows roll against the advanced clock on the next
+    /// `tick()`; pending Poisson fires whose time has been skipped
+    /// still emit (at their original `t_ns`) on subsequent ticks.
+    fn advance(&self, ns: u64) {
+        let mut g = self.inner.lock();
+        g.now_ns = g.now_ns.saturating_add(ns);
+    }
+
+    /// Current virtual-clock reading (nanoseconds).
+    fn now_ns(&self) -> u64 {
+        self.inner.lock().now_ns
+    }
+
+    /// Observed lifetime-average emission rate for `scope`:
+    /// `(real + cover) / virtual_elapsed_seconds`. The §3.1 KS-test
+    /// compares this against the configured λ. Returns `0.0` before
+    /// the first tick (zero elapsed time). Raises `ValueError` for an
+    /// unregistered scope.
+    fn lifetime_avg_lambda(&self, scope: &str) -> PyResult<f64> {
+        let g = self.inner.lock();
+        let Some(s) = g.scopes.get(scope) else {
+            return Err(PyValueError::new_err(format!(
+                "EmissionScheduler.lifetime_avg_lambda: scope {scope:?} not registered"
+            )));
+        };
+        let elapsed_ns = g.now_ns.saturating_sub(g.start_ns);
+        if elapsed_ns == 0 {
+            return Ok(0.0);
+        }
+        // f64 precision: exact for counts < 2^53 / elapsed < ~104 days
+        // of nanoseconds; KS tolerances dwarf the rounding either way.
+        #[allow(clippy::cast_precision_loss)]
+        let rate = (s.real_emitted + s.cover_emitted) as f64 / (elapsed_ns as f64 / 1e9);
+        Ok(rate)
+    }
+
+    /// Per-scope counters snapshot:
+    /// `{scope: {"real": int, "cover": int, "queue_depth": int,
+    /// "lambda": float}}`. Mirrors the production
+    /// `SchedulerHandle::stats` shape plus the configured λ.
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let g = self.inner.lock();
+        let dict = pyo3::types::PyDict::new(py);
+        for (name, s) in &g.scopes {
+            let entry = pyo3::types::PyDict::new(py);
+            entry.set_item("real", s.real_emitted)?;
+            entry.set_item("cover", s.cover_emitted)?;
+            entry.set_item("queue_depth", s.queue.len())?;
+            entry.set_item("lambda", g.poisson.rate(&s.key))?;
+            dict.set_item(name, entry)?;
+        }
+        Ok(dict)
+    }
+}
+
 /// Register the full `ciris_edge` PyO3 surface against the supplied
 /// module. Re-applies the v4.3.1 / CIRISEdge#156 one-wheel re-export
 /// mechanism the v7.x refactor dropped: sibling cdylibs (e.g.
@@ -6467,6 +7079,23 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `PyEdge.add_rnode_channel_interface`; holds the leviculum
     // `RNodeChannelHandle` so dropping it cleanly detaches the radio.
     m.add_class::<PyRNodeChannelHandle>()?;
+
+    // CIRISEdge#193 — SCOPE_PRIVACY §2.2 / §2.4 derivation
+    // reach-through. Lets CIRISConformance's record_id
+    // reproducibility suite (test_400) verify the published edge
+    // wheel byte-for-byte against verify's §9 KAT vectors instead of
+    // only the clean-room Python oracle.
+    m.add_function(wrap_pyfunction!(k_record_id, m)?)?;
+    m.add_function(wrap_pyfunction!(k_symbol, m)?)?;
+    m.add_function(wrap_pyfunction!(derive_record_id, m)?)?;
+    m.add_function(wrap_pyfunction!(derive_symbol_key, m)?)?;
+
+    // CIRISEdge#192 — wheel-driven §3.1 Poisson emission scheduler on
+    // a virtual (accelerated) clock. Lets CIRISConformance's Poisson +
+    // cluster KS-tests (test_420 / test_430) observe inter-emission
+    // intervals from the production sampler/budget/AEAD primitives
+    // instead of a first-principles Python simulator.
+    m.add_class::<PyEmissionScheduler>()?;
 
     Ok(())
 }
@@ -6884,6 +7513,300 @@ mod tests {
         assert_eq!(decoded.codec_id, CODEC_OPAQUE);
         assert_eq!(decoded.layer, ChunkLayer::BASE);
     }
+
+    // ─── CIRISEdge#193 — scope_privacy reach-through tests ──────────
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            write!(s, "{b:02x}").unwrap();
+        }
+        s
+    }
+
+    /// The #193 pyfunctions reproduce verify v6.3.0's pinned §9 KAT
+    /// vectors through the PyO3 call path — the same bytes
+    /// `src/scope_privacy.rs::tests::conformance_vectors` asserts on
+    /// the Rust re-export path. If these drift, the wheel-facing
+    /// surface has diverged from the cross-impl authority.
+    #[test]
+    fn pyo3_scope_privacy_pyfunctions_reproduce_verify_kats() {
+        // §2.2 subkeys — exporter = [0x42; 32].
+        let exporter = [0x42u8; 32];
+        assert_eq!(
+            hex(&k_record_id(&exporter).expect("k_record_id")),
+            "49209926b0439f10d73d63317758b9ec19492429368c6aa67e33232da586af99",
+        );
+        assert_eq!(
+            hex(&k_symbol(&exporter).expect("k_symbol")),
+            "3c973c828a218053dc909c51337ae256164437353bde347ee4bac6874888450f",
+        );
+        // §2.4 record_id vector 1 — CommunityRecord (typ=3), epoch=7.
+        let k = [0x11u8; 32];
+        let rid = derive_record_id(&k, b"record-0001", 3, 7).expect("derive_record_id");
+        assert_eq!(
+            hex(&rid),
+            "5428ddb514a8f8692cc4f254f3550ea75790f5069673e42afb6ef318517a0b21",
+        );
+        // §2.4 symbol_key — pyfunction output matches the Rust
+        // authority call byte-for-byte, and is index-sensitive.
+        let ks = [0x22u8; 32];
+        let rid32 = fixed_bytes::<32>("rid", &rid).expect("32-byte rid");
+        let sk0 = derive_symbol_key(&ks, &rid, 0).expect("derive_symbol_key");
+        assert_eq!(
+            sk0,
+            crate::scope_privacy::derive_symbol_key(&ks, &rid32, 0).to_vec()
+        );
+        let sk1 = derive_symbol_key(&ks, &rid, 1).expect("derive_symbol_key idx 1");
+        assert_ne!(sk0, sk1, "symbol_key must be index-sensitive");
+    }
+
+    /// #193 strict-allowlist posture: reserved / out-of-set
+    /// `record_type` integers and wrong-length keys reject with
+    /// `ValueError` diagnostics.
+    #[test]
+    fn pyo3_scope_privacy_rejects_bad_inputs() {
+        l3_init_python();
+        let k = [0x11u8; 32];
+        for bad_typ in [0u64, 5, 255] {
+            let err = derive_record_id(&k, b"x", bad_typ, 0)
+                .expect_err("reserved/unknown record_type must reject");
+            let s = format!("{err}");
+            assert!(s.contains("record_type"), "diagnostic names field: {s}");
+        }
+        let err = derive_record_id(&[0u8; 31], b"x", 1, 0).expect_err("31-byte key must reject");
+        let s = format!("{err}");
+        assert!(s.contains("k_record_id"), "diagnostic names field: {s}");
+        let err = derive_symbol_key(&k, &[0u8; 33], 0).expect_err("33-byte record_id must reject");
+        let s = format!("{err}");
+        assert!(s.contains("record_id"), "diagnostic names field: {s}");
+    }
+
+    // ─── CIRISEdge#192 — EmissionScheduler (virtual clock) tests ────
+
+    /// Build a single-scope seeded scheduler — the KS-test fixture
+    /// shape (`community:alpha`, deterministic ChaCha20 stream).
+    fn seeded_sched(lambda: f64, target_real_per_window: u32) -> PyEmissionScheduler {
+        let mut lambdas = std::collections::HashMap::new();
+        lambdas.insert("community:alpha".to_string(), lambda);
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("community:alpha".to_string(), vec![0x42u8; 32]);
+        PyEmissionScheduler::new(
+            lambdas,
+            Some(&[0x77u8; 32]),
+            target_real_per_window,
+            1_000_000.0, // one huge window — no mid-test rolls
+            Some(keys),
+            0,
+        )
+        .expect("scheduler construction")
+    }
+
+    /// Covers flow when the queue is empty; the virtual clock is
+    /// non-decreasing; the observed lifetime-average λ converges on
+    /// the configured rate — the §3.1 property the conformance
+    /// KS-test measures, here as a cheap 5%-tolerance smoke gate.
+    #[test]
+    fn pyo3_emission_scheduler_covers_and_lifetime_lambda() {
+        let sched = seeded_sched(5.0, 100);
+        let n = 5_000;
+        let mut last_t = 0u64;
+        for _ in 0..n {
+            let e = sched
+                .inner
+                .lock()
+                .tick()
+                .expect("tick")
+                .expect("enabled scope always fires");
+            assert!(!e.real, "empty queue → cover");
+            assert!(e.fragment.is_none(), "cover carries no fragment info");
+            assert_eq!(
+                e.envelope.len(),
+                crate::emission::ENVELOPE_BYTES,
+                "wire-format constant"
+            );
+            assert!(e.t_ns >= last_t, "virtual clock is non-decreasing");
+            last_t = e.t_ns;
+        }
+        let avg = sched
+            .lifetime_avg_lambda("community:alpha")
+            .expect("registered scope");
+        let rel_err = (avg - 5.0).abs() / 5.0;
+        assert!(rel_err < 0.05, "avg {avg} too far from λ=5 ({rel_err})");
+        assert_eq!(sched.now_ns(), last_t, "clock parked at the last fire");
+    }
+
+    /// A submitted publication emits as a real envelope on the next
+    /// fire, unseals as `EnvelopeType::Real` with the caller's
+    /// fragment_id under the scope AEAD key, then covers resume —
+    /// mirrors `emission::scheduler::tests::real_drains_queue_then_cover_resumes`
+    /// through the PyO3 surface.
+    #[test]
+    fn pyo3_emission_scheduler_real_then_cover_and_unseal() {
+        let sched = seeded_sched(5.0, 100);
+        let count = sched
+            .submit("community:alpha", &[0x33u8; 32], 7, b"hello world")
+            .expect("submit");
+        assert_eq!(count, 1, "single-envelope payload");
+
+        let first = sched.inner.lock().tick().expect("tick").expect("fires");
+        assert!(first.real, "queued fragment emits first");
+        assert_eq!(first.fragment, Some((7, 0, 1)));
+        let key = [0x42u8; 32];
+        let (hdr, payload) =
+            crate::emission::unseal_envelope(&key, &first.envelope).expect("unseal");
+        assert_eq!(hdr.envelope_type, crate::emission::EnvelopeType::Real);
+        assert_eq!(hdr.fragment_id, 7);
+        assert_eq!(hdr.record_id, [0x33u8; 32]);
+        assert_eq!(&payload[..11], b"hello world");
+
+        let second = sched.inner.lock().tick().expect("tick").expect("fires");
+        assert!(!second.real, "queue drained → cover resumes");
+
+        let stats = sched.inner.lock();
+        let s = stats.scopes.get("community:alpha").expect("scope");
+        assert_eq!((s.real_emitted, s.cover_emitted), (1, 1));
+    }
+
+    /// Budget back-pressure: with `target_real_per_window = 1`, the
+    /// second queued fragment stays queued and the fire emits cover
+    /// (`BudgetState::OverBudget` forces cover) — the §3.1
+    /// lifetime-average inequality enforced through the wheel path.
+    #[test]
+    fn pyo3_emission_scheduler_budget_backpressures_real() {
+        let sched = seeded_sched(5.0, 1);
+        sched
+            .submit("community:alpha", &[0x33u8; 32], 1, b"first")
+            .expect("submit 1");
+        sched
+            .submit("community:alpha", &[0x44u8; 32], 2, b"second")
+            .expect("submit 2");
+
+        let first = sched.inner.lock().tick().expect("tick").expect("fires");
+        assert!(first.real, "budget of 1 admits the first real");
+        let second = sched.inner.lock().tick().expect("tick").expect("fires");
+        assert!(!second.real, "over budget → cover despite non-empty queue");
+        let g = sched.inner.lock();
+        let s = g.scopes.get("community:alpha").expect("scope");
+        assert_eq!(s.queue.len(), 1, "second fragment back-pressured");
+    }
+
+    /// Same `rng_seed` → identical inter-emission timing sequence.
+    /// This is what lets the conformance KS-test publish its vectors.
+    #[test]
+    fn pyo3_emission_scheduler_seed_reproducible() {
+        let a = seeded_sched(5.0, 100);
+        let b = seeded_sched(5.0, 100);
+        for i in 0..10 {
+            let ta = a.inner.lock().tick().expect("tick").expect("fires").t_ns;
+            let tb = b.inner.lock().tick().expect("tick").expect("fires").t_ns;
+            assert_eq!(ta, tb, "draw {i} diverged under a fixed seed");
+        }
+    }
+
+    /// `advance` (the folded-in `AcceleratedTimeMode.advance` verb)
+    /// pushes the virtual clock without emitting, and λ ≤ 0 scopes
+    /// never fire (`tick()` → `None`).
+    #[test]
+    fn pyo3_emission_scheduler_advance_and_disabled_scope() {
+        let sched = seeded_sched(5.0, 100);
+        assert_eq!(sched.now_ns(), 0);
+        sched.advance(1_000_000_000);
+        assert_eq!(sched.now_ns(), 1_000_000_000);
+        assert!(
+            sched
+                .lifetime_avg_lambda("community:alpha")
+                .expect("registered")
+                .abs()
+                < f64::EPSILON,
+            "no emissions yet — advance alone must not fabricate rate"
+        );
+
+        let mut lambdas = std::collections::HashMap::new();
+        lambdas.insert("self".to_string(), 0.0);
+        let disabled = PyEmissionScheduler::new(lambdas, None, 100, 10.0, None, 0)
+            .expect("zero-λ construction is valid");
+        assert!(
+            disabled.inner.lock().tick().expect("tick").is_none(),
+            "λ=0 scope never fires"
+        );
+    }
+
+    /// Constructor validation: unknown scope strings, stray
+    /// `scope_keys` entries, non-positive windows, and non-finite λ
+    /// all reject with `ValueError` diagnostics.
+    #[test]
+    fn pyo3_emission_scheduler_rejects_config_errors() {
+        l3_init_python();
+        let lam = |name: &str, l: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(name.to_string(), l);
+            m
+        };
+
+        let err = PyEmissionScheduler::new(lam("bogus", 1.0), None, 100, 10.0, None, 0)
+            .expect_err("unknown scope string");
+        assert!(format!("{err}").contains("scope"));
+
+        let mut stray = std::collections::HashMap::new();
+        stray.insert("community:other".to_string(), vec![0u8; 32]);
+        let err = PyEmissionScheduler::new(lam("self", 1.0), None, 100, 10.0, Some(stray), 0)
+            .expect_err("stray scope_keys entry");
+        assert!(format!("{err}").contains("scope_keys"));
+
+        let err = PyEmissionScheduler::new(lam("self", 1.0), None, 100, 0.0, None, 0)
+            .expect_err("zero window");
+        assert!(format!("{err}").contains("window_secs"));
+
+        let err = PyEmissionScheduler::new(lam("self", f64::NAN), None, 100, 10.0, None, 0)
+            .expect_err("NaN λ");
+        assert!(format!("{err}").contains("finite"));
+
+        let err = PyEmissionScheduler::new(lam("self", 1.0), Some(&[0u8; 16]), 100, 10.0, None, 0)
+            .expect_err("16-byte seed");
+        assert!(format!("{err}").contains("rng_seed"));
+    }
+
+    /// The `tick()` pymethod's dict projection carries the documented
+    /// keys — exercised through an attached interpreter since the
+    /// substrate-level coverage above drives the Rust inner directly.
+    #[test]
+    fn pyo3_emission_scheduler_tick_dict_shape() {
+        l3_init_python();
+        let sched = seeded_sched(5.0, 100);
+        Python::attach(|py| {
+            let d = sched.tick(py).expect("tick").expect("enabled scope fires");
+            for key in [
+                "scope",
+                "t_ns",
+                "kind",
+                "fragment_id",
+                "fragment_index",
+                "fragment_count",
+                "envelope",
+            ] {
+                assert!(
+                    d.contains(key).expect("contains"),
+                    "tick dict missing {key}"
+                );
+            }
+            let kind: String = d
+                .get_item("kind")
+                .expect("get kind")
+                .expect("kind present")
+                .extract()
+                .expect("str");
+            assert_eq!(kind, "cover");
+            let scope: String = d
+                .get_item("scope")
+                .expect("get scope")
+                .expect("scope present")
+                .extract()
+                .expect("str");
+            assert_eq!(scope, "community:alpha");
+        });
+    }
 }
 
 // ─── CIRISEdge#22 Tier 2 (v0.9.0) — PyO3 integration tests ──────────
@@ -7076,6 +7999,7 @@ mod pyo3_tier2_tests {
                 // rows carry None. Steward identity_type is not
                 // accord-holder so the V048 CHECK admits None.
                 attestation_evidence: None,
+                consent_role: None,
             };
             backend
                 .put_public_key(SignedKeyRecord { record })

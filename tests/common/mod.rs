@@ -97,6 +97,7 @@ pub fn signed_record(subject: &TestFedKey, signer: &TestFedKey, identity_type: &
         // carry None; the V048 CHECK admits None for any
         // identity_type that isn't 'accord_holder'.
         attestation_evidence: None,
+        consent_role: None,
     }
 }
 
