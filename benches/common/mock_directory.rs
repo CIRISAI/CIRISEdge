@@ -142,6 +142,7 @@ pub fn signed_record(
         persist_row_hash: String::new(),
         roles: Vec::new(),
         attestation_evidence,
+        consent_role: None,
     }
 }
 
