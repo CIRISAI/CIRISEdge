@@ -4128,7 +4128,15 @@ pub fn init_edge_runtime(
     // an intermediate `.await` (e.g. registering a transport handler
     // task) immediately has a current runtime and does not regress to
     // a "no reactor running" panic.
-    let _runtime_guard = runtime.enter();
+    // CIRISPersist#320 — do NOT `runtime.enter()` here. `runtime` is
+    // persist's `tokio::runtime::Handle` from `runtime_handle_capsule`;
+    // `Handle::enter()` is edge's tokio operating on a foreign (persist-
+    // built) Handle, which sets edge's runtime-context thread-local to
+    // persist's runtime for the whole init body — a cross-cdylib tokio
+    // aliasing hazard (CIRISPersist#156/#157). All async below now goes
+    // through `run_async` (the ABI-stable executor vtable, dispatched
+    // inside persist's `.so`), so no current-runtime context is needed
+    // and entering one is actively harmful.
 
     // v1.1.8 (CIRISEdge#58 / CIRISEdge#59 / CIRISPersist#157) — the
     // ABI-stable executor capsule. Pre-v3.13.0 persist exposes only
@@ -4412,29 +4420,42 @@ pub fn init_edge_runtime(
     // is byte-equal to the registered row — closes the `enqueue_outbound:
     // FOREIGN KEY constraint failed` regression that v7.0.5 hit on the
     // persist v10.1.1 floor.
-    let derived_signer_key_id: String = py.detach(|| {
-        runtime.block_on(async {
-            let pubkey = signer_handle.signer.public_key().await.map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "init_edge_runtime: federation pubkey read for derive_key_id failed: {e}"
+    // #320: was `runtime.block_on(...)` on persist's cross-cdylib raw
+    // tokio Handle — deadlocks inside `Handle::block_on`'s park setup in
+    // release builds (foreign Handle, separate tokio static state). Route
+    // through persist's executor vtable instead (dispatch lands inside
+    // persist's .so). The future only calls persist async (signer +
+    // derive_key_id), so the #157 "no consumer tokio primitives" contract
+    // holds. `run_async`'s `T` must be `Send`, so we return
+    // `Result<String, String>` (PyErr is not Send) and lift to PyErr here.
+    let derived_signer_key_id: String = {
+        let signer_for_derive = signer_handle.signer.clone();
+        let key_id_for_derive = signer_handle.key_id.clone();
+        let derived_res: Result<String, String> = py.detach(|| {
+            run_async(&executor, async move {
+                let pubkey = signer_for_derive.public_key().await.map_err(|e| {
+                    format!(
+                        "init_edge_runtime: federation pubkey read for derive_key_id failed: {e}"
+                    )
+                })?;
+                if pubkey.len() != 32 {
+                    return Err(format!(
+                        "init_edge_runtime: federation pubkey is {} bytes, not Ed25519's 32 — \
+                         hardware-HSM-only keyring is unsupported for the cohabitation init \
+                         surface; use a software Ed25519 local_key_path on the Engine",
+                        pubkey.len()
+                    ));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&pubkey);
+                Ok::<_, String>(ciris_verify_core::fedcode::derive_key_id(
+                    &key_id_for_derive,
+                    &arr,
                 ))
-            })?;
-            if pubkey.len() != 32 {
-                return Err(PyRuntimeError::new_err(format!(
-                    "init_edge_runtime: federation pubkey is {} bytes, not Ed25519's 32 — \
-                     hardware-HSM-only keyring is unsupported for the cohabitation init \
-                     surface; use a software Ed25519 local_key_path on the Engine",
-                    pubkey.len()
-                )));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&pubkey);
-            Ok::<_, PyErr>(ciris_verify_core::fedcode::derive_key_id(
-                &signer_handle.key_id,
-                &arr,
-            ))
-        })
-    })?;
+            })
+        });
+        derived_res.map_err(PyRuntimeError::new_err)?
+    };
     tracing::debug!(
         keystore_alias = %signer_handle.key_id,
         derived_key_id = %derived_signer_key_id,
@@ -4662,22 +4683,25 @@ pub fn init_edge_runtime(
     if !canonical_peers.is_empty() {
         let directory_for_reseed = Arc::clone(&federation_directory_for_edge);
         let canonical_peers_for_reseed = canonical_peers.clone();
-        py.detach(|| {
-            runtime
-                .block_on(async move {
-                    crate::reseed_canonical_bootstrap_peers(
-                        &directory_for_reseed,
-                        &canonical_peers_for_reseed,
-                    )
-                    .await
-                })
+        // #320: was `runtime.block_on(...)` on persist's raw Handle
+        // (release deadlock). Persist-directory-bound work → executor
+        // vtable. Lift the persist error to a Send String inside.
+        let reseed_res: Result<(), String> = py.detach(|| {
+            run_async(&executor, async move {
+                crate::reseed_canonical_bootstrap_peers(
+                    &directory_for_reseed,
+                    &canonical_peers_for_reseed,
+                )
+                .await
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
+                    format!(
                         "reseed_canonical_bootstrap_peers: {e} (kind={kind})",
                         kind = e.kind()
-                    ))
+                    )
                 })
-        })?;
+            })
+        });
+        reseed_res.map_err(PyRuntimeError::new_err)?;
     }
 
     // CIRISEdge#34 (v0.14.0 wiring) — pre-construct the EventBus +
@@ -4783,15 +4807,20 @@ pub fn init_edge_runtime(
         let _ = (transport_config, auth);
         None
     } else {
-        let t: Arc<ReticulumTransport> = py.detach(|| {
-            runtime
-                .block_on(async {
-                    ReticulumTransport::new(transport_config, auth)
-                        .await
-                        .map(Arc::new)
-                })
-                .map_err(|e| PyRuntimeError::new_err(format!("ReticulumTransport::new: {e}")))
-        })?;
+        // #320: was `runtime.block_on(...)` on persist's raw Handle
+        // (release deadlock). ReticulumTransport::new performs identity
+        // + attestation crypto (persist signer) with no reactor-bound
+        // tokio primitives, so it is safe on persist's runtime via the
+        // executor vtable. Returns `Result<Arc<_>, String>` (Send).
+        let t_res: Result<Arc<ReticulumTransport>, String> = py.detach(|| {
+            run_async(&executor, async move {
+                ReticulumTransport::new(transport_config, auth)
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| format!("ReticulumTransport::new: {e}"))
+            })
+        });
+        let t = t_res.map_err(PyRuntimeError::new_err)?;
         Some(t)
     };
 
@@ -5202,9 +5231,14 @@ pub fn init_edge_runtime(
     #[cfg(feature = "ffi-uniffi")]
     crate::ffi::uniffi_impl::install_edge_handle(&edge_arc);
 
-    // Suppress unused-binding warning for `runtime` — kept in scope
-    // for the init-body `runtime.enter()` guard but not stored on
-    // PyEdge post-CIRISEdge#59 (the executor handles all spawns).
+    // Suppress unused-binding warning for `runtime` (persist's raw
+    // `tokio::runtime::Handle` from `runtime_handle_capsule`). As of
+    // CIRISPersist#320 it is no longer used at all: the init-body
+    // `runtime.enter()` guard and every `runtime.block_on(...)` were
+    // replaced by `run_async` on the ABI-stable executor vtable (raw
+    // cross-cdylib `Handle::block_on` deadlocks in release builds).
+    // Edge's own async runs on `transport_runtime` (built below). We
+    // keep extracting the capsule as the persist-version-floor probe.
     let _ = runtime;
     // v2.1.0 (CIRISEdge#85 / CIRISLensCore#43) — retain a strong
     // reference to the host engine PyObject so [`PyEdge::engine`] can
