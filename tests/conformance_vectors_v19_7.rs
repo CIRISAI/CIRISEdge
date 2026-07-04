@@ -10,7 +10,8 @@
 //! fixtures.
 
 use ciris_edge::holonomic::aggregation::{
-    compute_member_commitment, AggregationMetaV1, AGG_META_DOMAIN, AGG_META_VERSION,
+    assemble_tier_meta_v2, compute_member_commitment, AggregationMetaV1, AGG_META_DOMAIN,
+    AGG_META_VERSION, AGG_META_VERSION_V2,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -84,6 +85,10 @@ fn vector_aggregation_meta_canonical_bytes_three_source_pyramid() {
         source_count: 3,
         member_commitment,
         noise_floor_descriptor: "mean+stddev".to_string(),
+        // §19.7.1.2 (#167): a v1 tier carries n_eff as a neutral, un-signed
+        // placeholder — the v1 preimage below MUST be byte-identical to the
+        // pre-#167 layout regardless of this value.
+        n_eff: 3,
     };
     let vector = AggregationMetaCanonicalVector {
         vector_id: "aggregation_meta/canonical_bytes".to_string(),
@@ -104,6 +109,83 @@ fn vector_aggregation_meta_canonical_bytes_three_source_pyramid() {
         expected_canonical_bytes_hex: hex_encode(&meta.signing_preimage()),
     };
     emit_or_verify("aggregation_meta/canonical_bytes.json", &vector);
+}
+
+// ─────────────────── §19.7.1.2 AggregationMetaV1 v2 (CIRISVerify#167) ──
+
+/// The v2 vector shape — the v1 vector plus the signed effective source
+/// count `n_eff` (CIRISEdge#267 / CIRISVerify#167 dominance surface).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AggregationMetaCanonicalVectorV2 {
+    vector_id: String,
+    description: String,
+    domain_separator_hex: String,
+    version: u32,
+    content_id: String,
+    corpus_kind: String,
+    tier: u32,
+    aggregation_algorithm_id: String,
+    source_count: u32,
+    source_member_ids: Vec<String>,
+    member_commitment_hex: String,
+    noise_floor_descriptor: String,
+    n_eff: u32,
+    expected_canonical_bytes_hex: String,
+}
+
+#[test]
+fn vector_aggregation_meta_canonical_bytes_v2_three_source_pyramid() {
+    // Same fixed three-source pyramid as the v1 vector, assembled through the
+    // #267 producer path: version = 2, n_eff computed from balanced per-member
+    // masses (inverse-Simpson → n_eff == N == 3), preimage = v1 layout + a
+    // trailing u32_be(n_eff).
+    let source_ids: Vec<String> = ["src-001", "src-002", "src-003"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let meta = assemble_tier_meta_v2(
+        "content-root-fixed",
+        "trace",
+        2,
+        "raptorq-pyramid-v1",
+        &source_ids,
+        &[1.0, 1.0, 1.0],
+        "mean+stddev",
+    );
+    assert_eq!(meta.version, AGG_META_VERSION_V2);
+    assert_eq!(meta.n_eff, 3, "balanced 3-fold: n_eff == source_count");
+
+    // Cross-impl parity pin: verify v8.7.0's authored golden at
+    // src/ciris-verify-core/tests/vectors/holonomic_v19_7/aggregation_meta/canonical_bytes_v2.json.
+    // A v2 preimage MUST reproduce it byte-for-byte, independent of the
+    // committed edge vector below.
+    let verify_authored_hex = "4147472d4d4554412d763100000000000000000200000012636f6e74656e742d726f6f742d66697865640000000574726163650000000200000012726170746f72712d707972616d69642d763100000003a10bc0ec2399f1cd431be79a863385a4b895987dae604aaf2ec3532f3753bd9d0000000b6d65616e2b73746464657600000003";
+    let canonical_hex = hex_encode(&meta.signing_preimage());
+    assert_eq!(
+        canonical_hex, verify_authored_hex,
+        "v2 preimage MUST match CIRISVerify v8.7.0's authored vector byte-for-byte"
+    );
+
+    let vector = AggregationMetaCanonicalVectorV2 {
+        vector_id: "aggregation_meta/canonical_bytes_v2".to_string(),
+        description: "AggregationMetaV1 §19.7.1.2 v2 preimage — v1 layout followed by a \
+                      trailing big-endian u32(n_eff) (CIRISVerify#167 dominance surface). \
+                      Matches CIRISVerify v8.7.0's authored vector byte-for-byte."
+            .to_string(),
+        domain_separator_hex: hex_encode(AGG_META_DOMAIN),
+        version: meta.version,
+        content_id: meta.content_id.clone(),
+        corpus_kind: meta.corpus_kind.clone(),
+        tier: meta.tier,
+        aggregation_algorithm_id: meta.aggregation_algorithm_id.clone(),
+        source_count: meta.source_count,
+        source_member_ids: source_ids,
+        member_commitment_hex: hex_encode(&meta.member_commitment),
+        noise_floor_descriptor: meta.noise_floor_descriptor.clone(),
+        n_eff: meta.n_eff,
+        expected_canonical_bytes_hex: canonical_hex,
+    };
+    emit_or_verify("aggregation_meta/canonical_bytes_v2.json", &vector);
 }
 
 // ──────────────────────────── §19.7.1.1 member_commitment ────────────

@@ -67,6 +67,14 @@
 //!   CIRISPersist v8.4.0's ingest gate (verify_aggregation_meta now
 //!   ENFORCED at store path).
 //!
+//! - **v9.0.0** (CIRISEdge#267 / CIRISVerify#167) — [`aggregation`] adopts
+//!   verify v8.7.0's canonical §19.7.1.2 **v2 preimage + signed `n_eff`**
+//!   dominance surface (CC 6.1.2 noise floor): edge drops its standalone v1
+//!   reimplementation and re-exports verify's shapes/gates (the #269
+//!   storage-contention pattern), keeping only the producer-side
+//!   [`assemble_tier_meta_v2`](aggregation::assemble_tier_meta_v2) tier
+//!   assembly. v1 preimages stay byte-identical; new tiers emit version 2.
+//!
 //! See `docs/ROADMAP_TO_V4.md` for the cut sequence and the
 //! CIRISRegistry#85 + #89 absorption gates for normative CEG status.
 //!

@@ -1,0 +1,20 @@
+{
+  "vector_id": "aggregation_meta/canonical_bytes_v2",
+  "description": "AggregationMetaV1 §19.7.1.2 v2 preimage — v1 layout followed by a trailing big-endian u32(n_eff) (CIRISVerify#167 dominance surface). Matches CIRISVerify v8.7.0's authored vector byte-for-byte.",
+  "domain_separator_hex": "4147472d4d4554412d76310000000000",
+  "version": 2,
+  "content_id": "content-root-fixed",
+  "corpus_kind": "trace",
+  "tier": 2,
+  "aggregation_algorithm_id": "raptorq-pyramid-v1",
+  "source_count": 3,
+  "source_member_ids": [
+    "src-001",
+    "src-002",
+    "src-003"
+  ],
+  "member_commitment_hex": "a10bc0ec2399f1cd431be79a863385a4b895987dae604aaf2ec3532f3753bd9d",
+  "noise_floor_descriptor": "mean+stddev",
+  "n_eff": 3,
+  "expected_canonical_bytes_hex": "4147472d4d4554412d763100000000000000000200000012636f6e74656e742d726f6f742d66697865640000000574726163650000000200000012726170746f72712d707972616d69642d763100000003a10bc0ec2399f1cd431be79a863385a4b895987dae604aaf2ec3532f3753bd9d0000000b6d65616e2b73746464657600000003"
+}
