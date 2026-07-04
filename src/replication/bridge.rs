@@ -80,6 +80,7 @@ use tokio::sync::Mutex;
 use ciris_persist::federation::operational::{
     SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
 };
+use ciris_persist::federation::register::ReplicatedKeyOutcome;
 use ciris_persist::federation::types::{
     SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
@@ -793,8 +794,28 @@ impl FederationDirectoryReplicationBridge {
 
 impl FederationDirectoryReplicationBridge {
     async fn apply_key(&self, bytes: &[u8]) -> bool {
+        // #277 — route the replicated Key plane through persist's
+        // upgrade-aware `apply_replicated_key_record` (CIRISPersist#375,
+        // dyn-reachable on `FederationDirectory` since v13.0.1) instead of
+        // the `ON CONFLICT DO NOTHING` `put_public_key`. An anchor-scrubbed
+        // record now *upgrades* a stale self-signed row over anti-entropy
+        // (owner_of-gated, monotonic, fail-closed) rather than being
+        // silently dropped — so the KERI publish-own Key plane rides
+        // replication end-to-end (retires CIRISServer#150's adopt-scrubbed
+        // endpoint once the owner-cohort Key plane lands).
+        //
+        // `apply_envelope_bytes`'s bool means "admitted a NEW envelope that
+        // changed local state" (see `ReplicationDirectory::apply_envelope_bytes`),
+        // so only `Inserted`/`Upgraded` count as progress. `Unchanged`
+        // (byte-identical duplicate) and `Refused` (not admitted: pubkey
+        // swap, downgrade, re-scrub, ambiguous owner, unverifiable sig) are
+        // deterministic non-progress ⇒ `false`, matching the duplicate/
+        // refused contract and keeping anti-entropy convergence honest.
         match serde_json::from_slice::<SignedKeyRecord>(bytes) {
-            Ok(record) => self.directory.put_public_key(record).await.is_ok(),
+            Ok(record) => matches!(
+                self.directory.apply_replicated_key_record(record).await,
+                Ok(ReplicatedKeyOutcome::Inserted | ReplicatedKeyOutcome::Upgraded)
+            ),
             Err(_) => false,
         }
     }
@@ -1144,10 +1165,14 @@ mod tests {
             serde_json::from_slice(&bytes).expect("canonical bytes decode");
         assert_eq!(decoded.record.key_id, key_id);
 
-        // apply_envelope_bytes routes to put_public_key — idempotent
-        // on matching content (persist returns Ok on dedup).
+        // apply_envelope_bytes routes the Key plane through
+        // apply_replicated_key_record (#277). On MemoryBackend (the trait
+        // default) a matching-content apply is a first-seen Ok ⇒ Inserted
+        // ⇒ admitted; the Unchanged/Refused ⇒ false distinction only
+        // surfaces on the scrub-upgrade-aware SqliteBackend (persist owns
+        // that classification test).
         let admitted = bridge.apply_envelope_bytes(EnvelopeKind::Key, &bytes).await;
-        assert!(admitted, "idempotent re-apply succeeds");
+        assert!(admitted, "matching-content apply admits on MemoryBackend");
     }
 
     /// CIRISEdge#257 — the Key-plane selector publishes the node's OWN
