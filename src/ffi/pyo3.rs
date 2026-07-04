@@ -1423,37 +1423,35 @@ impl PyEdge {
     /// fan the event out to their per-`kind` `subscribe_opaque` callbacks.
     ///
     /// CIRISEdge#265 / #274 — the holder **scope** selector the edge-7
-    /// inline-text send carried is restored here. `active_community_id` /
-    /// `in_family_context` resolve the [`crate::CohortScope`] via the §3.2
-    /// default-flip ([`Self::resolve_default_scope`]), and the resolved scope
-    /// rides the envelope so delivery is holder-gated per the edge's
-    /// `cohort_scope_enforcement` — a peer receives the event only when it is a
-    /// genuine holder of the published scope:
+    /// inline-text send carried is restored here, as **opt-in** guards on a
+    /// targeted send. The selected [`crate::CohortScope`] rides the envelope so
+    /// delivery is holder-gated per the edge's `cohort_scope_enforcement` — a
+    /// peer receives the event only when it is a genuine holder of the scope:
     ///
     ///   * `active_community_id="c"` → `Cohort{c}` — community holders only.
     ///   * `in_family_context=True`  → `Family` — family holders only.
-    ///   * neither (**the default**) → `SelfOnly` — the publisher's own nodes
-    ///     (the owner-bound node set; #274 cross-device self-replication). This
-    ///     is anonymity-by-default (§3.2 / CC 1.13.3.4): a default send reaches
-    ///     only your own devices, and a `self`-scoped send to a *foreign*
-    ///     identity is refused under `Strict` rather than leaking. Federation
-    ///     (public) scope is the explicit opt-in — never the default.
+    ///   * `self_scoped=True`        → `SelfOnly` — the publisher's **own
+    ///     nodes** (the owner-bound node set; #274 cross-device self-
+    ///     replication). Refused to a foreign recipient under `Strict`.
+    ///   * none set (**the default**) → **unscoped / direct** — deliver to the
+    ///     named recipient with no cohort gate (the pre-#265 behavior). A
+    ///     targeted send names its audience by `recipient_key_id`, so the
+    ///     default is *direct*, NOT `SelfOnly` — defaulting to `self` would
+    ///     refuse the very recipient you named.
     ///
-    /// **Behavior change (v8.8.0):** the pre-#265 3-arg form published
-    /// unscoped (federation-visible). It now defaults to `SelfOnly`; callers
-    /// that intend a wider audience MUST pass `active_community_id` /
-    /// `in_family_context` (or use a Public-scoped path).
+    /// Precedence when several are set: community → family → self → direct.
     ///
     /// # Python signature
     /// ```python
-    /// # self-scoped (default — your own nodes only):
-    /// h = edge.send_opaque_event("my-laptop", 7, b"...")
-    /// # community-scoped:
+    /// # direct (default — deliver to the named recipient, ungated):
+    /// h = edge.send_opaque_event("agent-bob", 7, b"...")
+    /// # community / family / self scoped:
     /// h = edge.send_opaque_event("agent-bob", 7, b"...", active_community_id="alpha")
-    /// # family-scoped:
     /// h = edge.send_opaque_event("agent-bob", 7, b"...", in_family_context=True)
+    /// h = edge.send_opaque_event("my-laptop", 7, b"...", self_scoped=True)
     /// ```
-    #[pyo3(signature = (recipient_key_id, kind, payload, active_community_id=None, in_family_context=false))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (recipient_key_id, kind, payload, active_community_id=None, in_family_context=false, self_scoped=false))]
     fn send_opaque_event(
         &self,
         py: Python<'_>,
@@ -1462,25 +1460,33 @@ impl PyEdge {
         payload: Vec<u8>,
         active_community_id: Option<&str>,
         in_family_context: bool,
+        self_scoped: bool,
     ) -> PyResult<PyDurableHandle> {
         let edge = self.inner.clone();
         let recipient = recipient_key_id.to_string();
-        // CIRISEdge#265 — resolve the caller-selected holder scope (§3.2
-        // default-flip → SelfOnly when no audience context); it rides the
-        // envelope for holder-gated delivery.
-        let cohort_scope = edge.resolve_default_scope(active_community_id, in_family_context);
+        // CIRISEdge#265 — the caller-selected holder scope rides the envelope
+        // for holder-gated delivery. OPT-IN: absent any signal the send stays
+        // unscoped/direct (deliver to the named recipient), never a SelfOnly
+        // default that would refuse that recipient (§3.2 applies to broadcast
+        // publication, not a point-to-point send whose audience is named).
+        let cohort_scope = if let Some(cid) = active_community_id {
+            Some(crate::CohortScope::Cohort {
+                cohort_id: cid.to_string(),
+            })
+        } else if in_family_context {
+            Some(crate::CohortScope::Family)
+        } else if self_scoped {
+            Some(crate::CohortScope::SelfOnly)
+        } else {
+            None
+        };
         let executor = self.executor.clone();
         let executor_for_handle = executor.clone();
         let queue_for_handle: Arc<dyn OutboundHandle> = edge.outbound_queue_handle();
         py.detach(|| {
             run_async(&executor, async move {
                 let handle = edge
-                    .send_opaque_event_with_cohort_scope(
-                        &recipient,
-                        kind,
-                        payload,
-                        Some(cohort_scope),
-                    )
+                    .send_opaque_event_with_cohort_scope(&recipient, kind, payload, cohort_scope)
                     .await
                     .map_err(|e| PyRuntimeError::new_err(format!("send_opaque_event: {e}")))?;
                 Ok(PyDurableHandle {
@@ -8050,7 +8056,15 @@ mod pyo3_tier2_tests {
         init_python();
         let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
         let handle = Python::attach(|py| -> PyResult<PyDurableHandle> {
-            py_edge.send_opaque_event(py, "recipient-key", 1, b"hello".to_vec(), None, false)
+            py_edge.send_opaque_event(
+                py,
+                "recipient-key",
+                1,
+                b"hello".to_vec(),
+                None,
+                false,
+                false,
+            )
         })
         .expect("send_opaque_event must not abort in sync cohab context");
         // A non-empty queue_id means the envelope was built, signed,
@@ -8075,6 +8089,7 @@ mod pyo3_tier2_tests {
                 1,
                 b"visible-row".to_vec(),
                 None,
+                false,
                 false,
             )?;
             Ok(h.queue_id().to_string())
@@ -8137,6 +8152,7 @@ mod pyo3_tier2_tests {
                 1,
                 b"metric-bump".to_vec(),
                 None,
+                false,
                 false,
             )?;
             Ok(())
