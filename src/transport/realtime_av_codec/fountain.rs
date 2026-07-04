@@ -423,6 +423,253 @@ pub fn retention_priority(svc_quality: u8, symbol_id: u32, n_source: u32) -> u8 
 }
 
 // ─────────────────────────────────────────────────────────────────
+// N→1 aggregation / resampling operator (CIRISEdge#266)
+// ─────────────────────────────────────────────────────────────────
+
+/// Which mechanical N→1 collapse [`aggregate_symbols`] applies
+/// (CIRISEdge#266, CC 6.1.2 / §19.7 operator-2 collapse).
+///
+/// §19.7's descent axis demands that the composite be **derived
+/// from** the member payloads — erasure is only measurable against a
+/// composite that was actually computed from what it replaced. Each
+/// variant is a deterministic pure-byte operator; none consults
+/// RaptorQ state, so the composite carries no side channel back to
+/// any individual member beyond the op's own residual bound.
+///
+/// ## Seam to `AggregationMetaV1` (integrator note, #266 / #267)
+///
+/// This module does NOT touch the §19.7.1 wire shape. The producer
+/// path stamps [`Self::algorithm_id`] into
+/// [`crate::holonomic::aggregation::AggregationMetaV1::aggregation_algorithm_id`]
+/// unchanged; a sibling cut (#267) is consuming verify's
+/// AggregationMetaV1 v2 shapes, and this operator plugs into either
+/// v1 or v2 metadata via that one opaque string — no meta-type
+/// rework here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateOp {
+    /// Byte-wise rounded mean across all N members (each member
+    /// nearest-neighbor resampled to the composite length first).
+    /// Residual fidelity of any member vs the composite is
+    /// chance-level (≈ the byte-collision floor), well under `1/N`.
+    Mean,
+    /// Round-robin decimation: composite position `i` is taken from
+    /// member `i mod N` (after resampling). Each member contributes
+    /// exactly ~`1/N` of the composite's positions, so per-member
+    /// residual fidelity sits AT the `1/N_eff` bound — the canonical
+    /// worst-case-compliant operator for the §19.7 erasure gate.
+    Decimate,
+    /// Mipmap-style reduction: block-mean over all N members AND
+    /// over N adjacent positions, shrinking the composite to
+    /// `ceil(len / N)` bytes (a true N× total-data collapse, like
+    /// one mipmap level). Residual fidelity is chance-level.
+    Mipmap,
+}
+
+impl AggregateOp {
+    /// Canonical opaque codec id for this operator — the value the
+    /// producer path stamps into `AggregationMetaV1
+    /// .aggregation_algorithm_id` (§19.7.1). Locked strings; a new
+    /// collapse semantics gets a new `-vN` suffix, never a mutation.
+    #[must_use]
+    pub const fn algorithm_id(self) -> &'static str {
+        match self {
+            AggregateOp::Mean => "fountain-mean-v1",
+            AggregateOp::Decimate => "fountain-decimate-v1",
+            AggregateOp::Mipmap => "fountain-mipmap-v1",
+        }
+    }
+}
+
+/// The N→1 composite produced by [`aggregate_symbols`]
+/// (CIRISEdge#266). Carries the fan-in (`n_members`) so a
+/// conformance gate can compute its own `1/N_eff` bound, plus the
+/// operator that produced it (for `algorithm_id` stamping).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composite {
+    /// Composite payload bytes. Length = max member length for
+    /// [`AggregateOp::Mean`] / [`AggregateOp::Decimate`];
+    /// `ceil(max_len / n_members)` for [`AggregateOp::Mipmap`].
+    pub bytes: Vec<u8>,
+    /// The descent fan-in N — how many members were collapsed.
+    /// Mirrors `AggregationMetaV1.source_count`.
+    pub n_members: u32,
+    /// The operator that produced `bytes`.
+    pub op: AggregateOp,
+    /// The resample basis (max member length in bytes) the members
+    /// were normalized to before collapsing.
+    pub source_len: u64,
+}
+
+impl Composite {
+    /// The §19.7 aggregation-erasure gate bound: `max(ε, 1/N_eff)`
+    /// (CIRISEdge#266). A member is *erased* iff its
+    /// [`residual_fidelity`] vs this composite does not exceed this
+    /// bound. At `n_members == 1` the bound is `1.0` — a 1→1
+    /// "collapse" erases nothing, by construction.
+    #[must_use]
+    pub fn erasure_bound(&self, epsilon: f64) -> f64 {
+        epsilon.max(1.0 / f64::from(self.n_members.max(1)))
+    }
+}
+
+/// Errors from [`aggregate_symbols`]. Degenerate inputs are refused
+/// loudly rather than silently producing an empty composite the
+/// erasure gate would vacuously pass.
+#[derive(thiserror::Error, Debug)]
+pub enum AggregateError {
+    /// The member set is empty — there is nothing to collapse.
+    #[error("no members: N→1 aggregation requires at least one member")]
+    NoMembers,
+    /// A member has zero bytes and cannot be resampled. `0` is the
+    /// offending member's index.
+    #[error("empty member at index {0}: zero-length payloads cannot be resampled")]
+    EmptyMember(usize),
+    /// More members than `u32` can carry (the `AggregationMetaV1
+    /// .source_count` / `Composite.n_members` width). `0` is the count.
+    #[error("too many members: {0} exceeds the u32 source_count width")]
+    TooManyMembers(usize),
+}
+
+/// Nearest-neighbor 1-D resample of `src` to exactly `dst_len`
+/// bytes: output position `i` reads `src[i * src_len / dst_len]`.
+/// Identity when `dst_len == src_len`. `src` MUST be non-empty and
+/// `dst_len` non-zero (guarded by [`aggregate_symbols`]'s input
+/// validation).
+fn resample_nearest(src: &[u8], dst_len: usize) -> Vec<u8> {
+    debug_assert!(!src.is_empty() && dst_len > 0);
+    (0..dst_len)
+        .map(|i| {
+            // u128 intermediate: i * src_len can overflow usize on
+            // 32-bit targets for large payloads.
+            #[allow(clippy::cast_possible_truncation)] // result < src_len by construction
+            let idx = ((i as u128 * src.len() as u128) / dst_len as u128) as usize;
+            src[idx]
+        })
+        .collect()
+}
+
+/// Collapse N member payloads into one composite — the pub N→1
+/// aggregation/resampling operator (CIRISEdge#266, CC 6.1.2 / §19.7
+/// operator-2).
+///
+/// The composite is computed **from** the members: hard-delete the
+/// members afterwards and each one's [`residual_fidelity`] vs the
+/// composite is bounded by [`Composite::erasure_bound`]
+/// (`max(ε, 1/N_eff)`) — the measurable aggregation-erasure property
+/// the CIRISConformance noise-floor gate (CIRISConformance#55)
+/// drives. This replaces the fabricated-independent-blob modeling in
+/// CIRISServer's `tests/noise_floor.rs`, which proved `< 1/N` only
+/// by construction.
+///
+/// Members of unequal length are nearest-neighbor resampled to the
+/// max member length before collapsing (the "resampling" half of the
+/// operator). Deterministic: identical `(members, op)` inputs
+/// produce a byte-identical composite.
+///
+/// # Errors
+///
+/// - [`AggregateError::NoMembers`] — empty member set.
+/// - [`AggregateError::EmptyMember`] — a zero-length member.
+/// - [`AggregateError::TooManyMembers`] — fan-in exceeds `u32`.
+pub fn aggregate_symbols(members: &[&[u8]], op: AggregateOp) -> Result<Composite, AggregateError> {
+    if members.is_empty() {
+        return Err(AggregateError::NoMembers);
+    }
+    if let Some(idx) = members.iter().position(|m| m.is_empty()) {
+        return Err(AggregateError::EmptyMember(idx));
+    }
+    let n_members =
+        u32::try_from(members.len()).map_err(|_| AggregateError::TooManyMembers(members.len()))?;
+
+    let n = members.len();
+    let max_len = members.iter().map(|m| m.len()).max().unwrap_or(1);
+    let resampled: Vec<Vec<u8>> = members
+        .iter()
+        .map(|m| resample_nearest(m, max_len))
+        .collect();
+
+    let bytes = match op {
+        AggregateOp::Mean => {
+            // Byte-wise rounded mean. Sum fits u64: 255 * u32::MAX < 2^40.
+            let n_u64 = n as u64;
+            (0..max_len)
+                .map(|i| {
+                    let sum: u64 = resampled.iter().map(|m| u64::from(m[i])).sum();
+                    #[allow(clippy::cast_possible_truncation)] // rounded mean of u8s is <= 255
+                    let byte = ((sum + n_u64 / 2) / n_u64) as u8;
+                    byte
+                })
+                .collect()
+        }
+        AggregateOp::Decimate => {
+            // Round-robin interleave: position i comes from member i mod N.
+            (0..max_len).map(|i| resampled[i % n][i]).collect()
+        }
+        AggregateOp::Mipmap => {
+            // Block-mean over all members AND over N adjacent
+            // positions — one mipmap level: total bytes shrink N×.
+            let out_len = max_len.div_ceil(n);
+            (0..out_len)
+                .map(|i| {
+                    let start = i * n;
+                    let end = ((i + 1) * n).min(max_len);
+                    // u128 accumulator: n members × n positions × 255
+                    // can exceed u64 for pathological fan-ins.
+                    let mut sum: u128 = 0;
+                    let mut count: u128 = 0;
+                    for member in &resampled {
+                        for &b in &member[start..end] {
+                            sum += u128::from(b);
+                            count += 1;
+                        }
+                    }
+                    #[allow(clippy::cast_possible_truncation)] // rounded mean of u8s is <= 255
+                    let byte = ((sum + count / 2) / count) as u8;
+                    byte
+                })
+                .collect()
+        }
+    };
+
+    Ok(Composite {
+        bytes,
+        n_members,
+        op,
+        source_len: max_len as u64,
+    })
+}
+
+/// Canonical per-member residual-fidelity measure for the §19.7
+/// aggregation-erasure gate (CIRISEdge#266): the fraction of
+/// byte-exact matches between the member (nearest-neighbor resampled
+/// to the composite's length — the same normalization
+/// [`aggregate_symbols`] applies) and the composite bytes. Range
+/// `0.0..=1.0`; `1.0` means the member is fully recoverable from the
+/// composite (no erasure), chance-level (≈ `1/256` for
+/// high-entropy bytes) means indistinguishable from noise.
+///
+/// Takes raw byte slices (not [`Composite`]) so a conformance
+/// harness can also score arbitrary blobs — e.g. demonstrate that a
+/// fabricated independent composite scores chance-level against
+/// EVERY member, which is exactly why the fabricated version proves
+/// nothing (the #266 complaint).
+#[must_use]
+pub fn residual_fidelity(member: &[u8], composite_bytes: &[u8]) -> f64 {
+    if member.is_empty() || composite_bytes.is_empty() {
+        return 0.0;
+    }
+    let normalized = resample_nearest(member, composite_bytes.len());
+    let matches = normalized
+        .iter()
+        .zip(composite_bytes.iter())
+        .filter(|(a, b)| a == b)
+        .count();
+    #[allow(clippy::cast_precision_loss)] // lengths ≪ 2^52; exact in f64
+    let fidelity = matches as f64 / composite_bytes.len() as f64;
+    fidelity
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────
 
@@ -769,5 +1016,203 @@ mod tests {
             max_svc0 < min_svc1,
             "max_svc0={max_svc0} >= min_svc1={min_svc1}"
         );
+    }
+
+    // ─── N→1 aggregation-erasure operator (CIRISEdge#266) ────────
+
+    /// High-entropy, deterministic, per-seed-distinct member payloads.
+    /// SHA-256 in counter mode — the `deterministic_payload` linear
+    /// ramp is a degenerate input for byte-mean operators (shifted
+    /// copies of one ramp correlate), so erasure tests need real
+    /// mixing.
+    fn distinct_member(seed: u8, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 32);
+        let mut counter = 0u64;
+        while out.len() < len {
+            let mut h = Sha256::new();
+            h.update([seed]);
+            h.update(counter.to_be_bytes());
+            out.extend_from_slice(&h.finalize());
+            counter += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// The #266 gate ε — the noise-floor tolerance term in
+    /// `max(ε, 1/N_eff)`.
+    const EPSILON: f64 = 0.05;
+
+    #[test]
+    fn aggregate_mean_erases_individual_members() {
+        // The core #266 property: compute the REAL composite from N
+        // members, then per-member residual fidelity vs the
+        // composite is ≤ max(ε, 1/N_eff). Mean is chance-level.
+        let members: Vec<Vec<u8>> = (0..4).map(|k| distinct_member(k, 4096)).collect();
+        let refs: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+
+        let composite = aggregate_symbols(&refs, AggregateOp::Mean).expect("aggregate");
+        assert_eq!(composite.n_members, 4);
+        assert_eq!(composite.bytes.len(), 4096);
+
+        let bound = composite.erasure_bound(EPSILON);
+        assert!(
+            (bound - 0.25).abs() < f64::EPSILON,
+            "bound = max(0.05, 1/4)"
+        );
+        for (k, member) in members.iter().enumerate() {
+            // Self-fidelity baseline: the member IS fully
+            // recoverable from itself.
+            assert!((residual_fidelity(member, member) - 1.0).abs() < f64::EPSILON);
+            let rf = residual_fidelity(member, &composite.bytes);
+            assert!(
+                rf <= bound,
+                "member {k}: residual fidelity {rf} exceeds erasure bound {bound}"
+            );
+            // Mean is chance-level — far below even ε alone.
+            assert!(rf <= EPSILON, "member {k}: mean rf {rf} above chance-level");
+        }
+    }
+
+    #[test]
+    fn aggregate_decimate_sits_at_one_over_n() {
+        // Decimate is the worst-case-compliant operator: each member
+        // contributes exactly ~1/N of composite positions, so rf
+        // lands AT the 1/N_eff bound (plus the byte-collision floor)
+        // — and, crucially, ABOVE chance, proving the composite is
+        // genuinely derived from the members (not a fabricated blob).
+        let members: Vec<Vec<u8>> = (10..14).map(|k| distinct_member(k, 4096)).collect();
+        let refs: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+
+        let composite = aggregate_symbols(&refs, AggregateOp::Decimate).expect("aggregate");
+        let bound = composite.erasure_bound(EPSILON);
+        for (k, member) in members.iter().enumerate() {
+            let rf = residual_fidelity(member, &composite.bytes);
+            assert!(
+                rf <= bound + EPSILON,
+                "member {k}: decimate rf {rf} exceeds 1/N bound {bound} + ε"
+            );
+            assert!(
+                rf >= 1.0 / (2.0 * 4.0),
+                "member {k}: decimate rf {rf} below 1/(2N) — composite not derived from member"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_mipmap_erases_individual_members() {
+        // Mipmap collapses resolution too: composite is
+        // ceil(4096/4) = 1024 bytes of block-means. Chance-level rf.
+        let members: Vec<Vec<u8>> = (20..24).map(|k| distinct_member(k, 4096)).collect();
+        let refs: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+
+        let composite = aggregate_symbols(&refs, AggregateOp::Mipmap).expect("aggregate");
+        assert_eq!(composite.bytes.len(), 1024, "one mipmap level = N× shrink");
+        assert_eq!(composite.source_len, 4096);
+
+        let bound = composite.erasure_bound(EPSILON);
+        for (k, member) in members.iter().enumerate() {
+            let rf = residual_fidelity(member, &composite.bytes);
+            assert!(
+                rf <= bound,
+                "member {k}: mipmap rf {rf} exceeds erasure bound {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_composite_derived_and_deterministic() {
+        // Determinism: identical inputs → byte-identical composite.
+        // Sensitivity: perturbing ONE member changes the composite —
+        // the anti-fabrication property (#266: the fabricated blob
+        // was independent of the members by construction).
+        let members: Vec<Vec<u8>> = (30..34).map(|k| distinct_member(k, 2048)).collect();
+        let refs: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+
+        for op in [
+            AggregateOp::Mean,
+            AggregateOp::Decimate,
+            AggregateOp::Mipmap,
+        ] {
+            let a = aggregate_symbols(&refs, op).expect("aggregate a");
+            let b = aggregate_symbols(&refs, op).expect("aggregate b");
+            assert_eq!(a, b, "{op:?}: composite not deterministic");
+
+            // Perturb member 0 at position 0 (position 0 belongs to
+            // member 0 in the decimate round-robin) by ±128 so the
+            // delta survives mean rounding (128/4 = 32 for mean,
+            // 128/16 = 8 for mipmap block-mean).
+            let mut perturbed = members.clone();
+            perturbed[0][0] = perturbed[0][0].wrapping_add(128);
+            let refs_p: Vec<&[u8]> = perturbed.iter().map(Vec::as_slice).collect();
+            let c = aggregate_symbols(&refs_p, op).expect("aggregate perturbed");
+            assert_ne!(
+                a.bytes, c.bytes,
+                "{op:?}: composite insensitive to member content — fabricated-blob smell"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_unequal_member_lengths_resampled() {
+        // The "resampling" half of the operator: members of unequal
+        // length are nearest-neighbor normalized to the max length,
+        // and the erasure bound still holds per member.
+        let members = [
+            distinct_member(40, 4096),
+            distinct_member(41, 1000),
+            distinct_member(42, 977),
+        ];
+        let refs: Vec<&[u8]> = members.iter().map(|m| m.as_slice()).collect();
+
+        let composite = aggregate_symbols(&refs, AggregateOp::Mean).expect("aggregate");
+        assert_eq!(
+            composite.bytes.len(),
+            4096,
+            "composite at max member length"
+        );
+        assert_eq!(composite.n_members, 3);
+
+        let bound = composite.erasure_bound(EPSILON);
+        for (k, member) in members.iter().enumerate() {
+            let rf = residual_fidelity(member, &composite.bytes);
+            assert!(rf <= bound, "member {k}: rf {rf} exceeds bound {bound}");
+        }
+    }
+
+    #[test]
+    fn aggregate_single_member_no_erasure() {
+        // N_eff = 1: a 1→1 "collapse" erases nothing — mean of one
+        // member is the member, rf = 1.0, and the gate bound is 1.0
+        // (max(ε, 1/1)), so the gate is vacuously satisfied. This
+        // pins the 1/N_eff semantics from the #266 ask.
+        let member = distinct_member(50, 1024);
+        let composite =
+            aggregate_symbols(&[member.as_slice()], AggregateOp::Mean).expect("aggregate single");
+        assert_eq!(composite.bytes, member);
+        let rf = residual_fidelity(&member, &composite.bytes);
+        assert!((rf - 1.0).abs() < f64::EPSILON);
+        assert!((composite.erasure_bound(EPSILON) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn aggregate_rejects_degenerate_inputs() {
+        // Empty member set and zero-length members are refused loud
+        // — a vacuous composite would trivially pass the gate.
+        let res = aggregate_symbols(&[], AggregateOp::Mean);
+        assert!(matches!(res, Err(AggregateError::NoMembers)));
+
+        let a = distinct_member(60, 64);
+        let res = aggregate_symbols(&[a.as_slice(), &[]], AggregateOp::Decimate);
+        assert!(matches!(res, Err(AggregateError::EmptyMember(1))));
+    }
+
+    #[test]
+    fn aggregate_algorithm_ids_locked() {
+        // The AggregationMetaV1.aggregation_algorithm_id seam
+        // (§19.7.1): these strings are wire-visible and locked at v1.
+        assert_eq!(AggregateOp::Mean.algorithm_id(), "fountain-mean-v1");
+        assert_eq!(AggregateOp::Decimate.algorithm_id(), "fountain-decimate-v1");
+        assert_eq!(AggregateOp::Mipmap.algorithm_id(), "fountain-mipmap-v1");
     }
 }
