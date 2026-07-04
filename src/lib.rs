@@ -91,6 +91,7 @@ pub mod outbound;
 pub mod reachability;
 pub mod replication;
 pub mod sas;
+mod sas_wordlist;
 // v6.0.0 (CIRISEdge#175) — CC 1.13.3.4 substrate.
 pub mod scope_privacy;
 pub mod swarm;

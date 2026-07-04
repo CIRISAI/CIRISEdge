@@ -94,7 +94,9 @@ pub fn peer_sas_words(
         return Err(SasError::WordsOutOfRange(words));
     }
     let digest = peer_sas_digest(local_pub, peer_pub);
-    let wordlist = bip39::Language::English.word_list();
+    // CIRISEdge#264 — vendored BIP-39 English wordlist (see `sas_wordlist`);
+    // dropped the `bip39` crate + its bitcoin-adjacent transitives.
+    let wordlist = &crate::sas_wordlist::ENGLISH;
     let mut out = Vec::with_capacity(words);
     for i in 0..words {
         let bit_offset = i * 11;
@@ -242,11 +244,8 @@ mod tests {
         assert_eq!(words.len(), DEFAULT_SAS_WORDS);
         assert_eq!(DEFAULT_SAS_WORDS * 11, 55, "5 words × 11 bits = 55 bits");
         // All words must be from the BIP39 English wordlist.
-        let wordlist: std::collections::HashSet<&str> = bip39::Language::English
-            .word_list()
-            .iter()
-            .copied()
-            .collect();
+        let wordlist: std::collections::HashSet<&str> =
+            crate::sas_wordlist::ENGLISH.iter().copied().collect();
         for w in &words {
             assert!(
                 wordlist.contains(w.as_str()),
