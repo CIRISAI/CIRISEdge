@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "8.7.0"
+version = "8.7.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -386,7 +386,6 @@ uuid        = { version = "1", features = ["v4", "serde"] }
 # same peer identity (MITM-resistant out-of-band verification).
 # BIP39 English wordlist — 2048 words × 11 bits, 5 words ≈ 55 bits.
 # License: Apache-2.0 / MIT (resolves under deny.toml § licenses.allow).
-bip39       = "2"
 
 # CIRISEdge#29 (v0.11.0) — `parking_lot::RwLock` backs
 # `ReachabilityTracker`'s per-(peer, medium) map. Chosen over
@@ -547,7 +546,6 @@ reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.8.1+c
 # the data path). We use it ONLY for `export_qr_payload` byte
 # generation; the import side parses the structured envelope we
 # packed in via `serde_json` and does not require pixel decoding.
-qrcodegen = "1.8"
 
 # v0.11.0 (CIRISEdge#34) — Async iterator bridge. `pyo3-async-runtimes`
 # is the successor to `pyo3-asyncio` (renamed in 0.21+); pinned to
