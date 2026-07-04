@@ -123,6 +123,7 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
         // rows; admission CHECK requires Some only when identity_type
         // is 'accord_holder'.
         attestation_evidence: None,
+        consent_role: None,
     }
 }
 

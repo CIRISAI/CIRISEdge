@@ -7076,6 +7076,7 @@ mod pyo3_tier2_tests {
                 // rows carry None. Steward identity_type is not
                 // accord-holder so the V048 CHECK admits None.
                 attestation_evidence: None,
+                consent_role: None,
             };
             backend
                 .put_public_key(SignedKeyRecord { record })

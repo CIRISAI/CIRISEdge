@@ -121,6 +121,7 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
         // rows; the V048 CHECK enforces presence ONLY when
         // identity_type='accord_holder'.
         attestation_evidence: None,
+        consent_role: None,
     }
 }
 
