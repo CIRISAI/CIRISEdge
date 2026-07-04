@@ -1125,13 +1125,25 @@ jobs:
           echo "OK: bindings match the UDL."
 
   # ─── license-audit: cargo deny (license + advisories) ───────────────
+  #
+  # Runner-native (issue #242, pattern proven in CIRISVerify#158):
+  # EmbarkStudios/cargo-deny-action@v2 is a Docker container action
+  # whose musl rustup printed `error: override toolchain
+  # 'stable-x86_64-unknown-linux-musl' is not installed` on every run,
+  # and the container didn't inherit the workflow-level CARGO_NET_*
+  # flake hardening. taiki-e/install-action drops a prebuilt
+  # cargo-deny binary on the runner instead. The invocation below
+  # replicates the container action's exact defaults
+  # (`--log-level warn --all-features check` → all four gates in
+  # deny.toml: licenses, advisories, bans, sources).
   license-audit:
     name: cargo deny (license + advisories)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny --log-level warn --all-features check
 
   # ─── benches: per-PR compile gate for the criterion bench suite ─────
   #
