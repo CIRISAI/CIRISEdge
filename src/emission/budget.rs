@@ -157,18 +157,33 @@ impl BudgetMeter {
 
     /// Record one real emission against `scope`.
     pub fn record_real(&self, scope: &ScopeKey) {
+        self.record_real_at(scope, Instant::now());
+    }
+
+    /// Record one real emission at an explicit instant — test seam,
+    /// mirroring [`Self::query_at`]. The PyO3 conformance surface
+    /// (CIRISEdge#192 `EmissionScheduler`) drives the meter on a
+    /// virtual clock so a 24 h observation window collapses to
+    /// milliseconds of wall time.
+    pub fn record_real_at(&self, scope: &ScopeKey, now: Instant) {
         let mut g = self.inner.lock();
         if let Some(b) = g.get_mut(scope) {
-            b.roll_if_expired(Instant::now());
+            b.roll_if_expired(now);
             b.counters.real = b.counters.real.saturating_add(1);
         }
     }
 
     /// Record one cover emission against `scope`.
     pub fn record_cover(&self, scope: &ScopeKey) {
+        self.record_cover_at(scope, Instant::now());
+    }
+
+    /// Record one cover emission at an explicit instant — test seam,
+    /// mirroring [`Self::query_at`]. See [`Self::record_real_at`].
+    pub fn record_cover_at(&self, scope: &ScopeKey, now: Instant) {
         let mut g = self.inner.lock();
         if let Some(b) = g.get_mut(scope) {
-            b.roll_if_expired(Instant::now());
+            b.roll_if_expired(now);
             b.counters.cover = b.counters.cover.saturating_add(1);
         }
     }
