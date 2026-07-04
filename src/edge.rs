@@ -2139,14 +2139,43 @@ impl Edge {
     /// durable (persistent) delivery class. Fire-and-forget; the
     /// returned [`DurableHandle`] observes the edge-owned-queue outcome.
     /// Receivers fan the event out to their per-`kind` subscribers.
+    ///
+    /// Unscoped (`cohort_scope: None` → `Public`) — the back-compat Rust
+    /// default. Use [`Self::send_opaque_event_with_cohort_scope`] to publish
+    /// at a holder scope (`self` / `family` / `cohort`) for holder-gated
+    /// delivery (CIRISEdge#265 / #274).
     pub async fn send_opaque_event(
         &self,
         destination_key_id: &str,
         kind: u32,
         payload: Vec<u8>,
     ) -> Result<DurableHandle, EdgeError> {
+        self.send_opaque_event_with_cohort_scope(destination_key_id, kind, payload, None)
+            .await
+    }
+
+    /// CIRISEdge#265 / #274 — publish an opaque event tagged with an explicit
+    /// [`CohortScope`], so delivery is holder-gated per the edge's
+    /// `cohort_scope_enforcement` (FSD §3.2). A peer receives the event only
+    /// when it is a genuine holder of the published scope:
+    ///
+    /// - [`CohortScope::SelfOnly`] — only the publisher's **own nodes** (the
+    ///   owner-bound node set; CIRISConstitution#23 / #274 cross-device
+    ///   self-replication). A `self`-scoped send to a foreign identity is
+    ///   refused under `Strict` (the CC 1.13.3.4 anti-leak default).
+    /// - [`CohortScope::Family`] / [`CohortScope::Cohort`] — family / named-
+    ///   cohort holders only.
+    /// - [`CohortScope::Public`] / `None` — ungated (federation baseline).
+    pub async fn send_opaque_event_with_cohort_scope(
+        &self,
+        destination_key_id: &str,
+        kind: u32,
+        payload: Vec<u8>,
+        cohort_scope: Option<CohortScope>,
+    ) -> Result<DurableHandle, EdgeError> {
         let msg = crate::messages::OpaqueEvent { kind, payload };
-        self.send_durable(destination_key_id, msg).await
+        self.send_durable_with_cohort_scope(destination_key_id, msg, cohort_scope)
+            .await
     }
 
     /// Send a federation-tier authority-signed broadcast — fans the
@@ -3766,7 +3795,17 @@ impl Edge {
         }
         let allowed = match scope {
             CohortScope::Public => true,
-            CohortScope::SelfOnly => recipient_key_id == self.signer.key_id,
+            // CIRISEdge#274 — `self` spans the owner's node set, not just this
+            // key: admit iff the recipient is one of MY own nodes. Fails closed
+            // on an unresolvable/ambiguous owner (CIRISConstitution#23).
+            CohortScope::SelfOnly => {
+                key_is_own_node(
+                    self.federation_directory.as_ref(),
+                    &self.signer.key_id,
+                    recipient_key_id,
+                )
+                .await
+            }
             CohortScope::Family | CohortScope::Cohort { .. } => {
                 let recipient_scope = self.peer_cohort_scope_from_persist(recipient_key_id).await;
                 match recipient_scope.as_ref() {
@@ -3795,6 +3834,53 @@ impl Edge {
                 recipient_key_id: recipient_key_id.to_string(),
             }),
         }
+    }
+}
+
+/// CIRISConstitution#23 / CIRISEdge#274 (CC 1.13.3.3 / CC 3.2) — is
+/// `other_key_id` a member of `local_key_id`'s OWN node set? The `self` cohort
+/// boundary spans the owner's owned-node graph (distinct keys unified by the
+/// owner-binding), NOT a single signing key: CIRISServer models "nodes I own"
+/// as `nodes_stewarded_by(owner)`, and the default owner-binding is persisted
+/// `cohort_scope: self`. So a `SelfOnly` event between two of a person's own
+/// nodes is genuine self-replication, not a cross-identity leak.
+///
+/// Resolution: `local`'s owning identity is persist's single-owner
+/// [`owner_of`](ciris_persist::federation::admission::owner_of) — the
+/// dimension-precise owner (a node has at most one, enforced at admission by
+/// persist's single-owner gate) — or `local` itself when it is an unowned
+/// self-anchor (a `user`-role key owns its own node set). Membership is then
+/// `other ∈ nodes_stewarded_by(owner)`.
+///
+/// **Fails closed.** An absent directory, an ambiguous owner
+/// ([`Error::AmbiguousNodeOwner`](ciris_persist::federation::Error)), or any
+/// read error yields `false` — a `self` boundary is NEVER resolved from an
+/// ambiguous owner (CIRISConstitution#23 consumer-fail-closed rule). `other ==
+/// local` is trivially true and needs no directory.
+async fn key_is_own_node(
+    directory: Option<&Arc<dyn ciris_persist::federation::FederationDirectory>>,
+    local_key_id: &str,
+    other_key_id: &str,
+) -> bool {
+    if other_key_id == local_key_id {
+        return true;
+    }
+    let Some(directory) = directory else {
+        return false; // no directory → cannot resolve ownership → fail closed
+    };
+    let dir: &dyn ciris_persist::federation::FederationDirectory = directory.as_ref();
+    let owner = match ciris_persist::federation::admission::owner_of(dir, local_key_id).await {
+        Ok(Some(owner)) => owner,
+        // Unowned: a `user`-role self-anchor owns its own set; an unowned node
+        // owns nothing (nodes_stewarded_by → ∅), so only `other == local` (handled
+        // above) is self. Either way, anchor on `local`.
+        Ok(None) => local_key_id.to_string(),
+        // Ambiguous owner / read error → fail closed (never leak self content).
+        Err(_) => return false,
+    };
+    match ciris_persist::federation::admission::nodes_stewarded_by(dir, &owner).await {
+        Ok(nodes) => nodes.iter().any(|n| n == other_key_id),
+        Err(_) => false,
     }
 }
 
@@ -4021,9 +4107,23 @@ async fn dispatch_inbound(
                 },
                 None => None,
             };
-            let matches_directory = match recorded_scope.as_ref() {
-                Some(rs) => rs == claimed,
-                None => false,
+            // CIRISEdge#274 (CC 1.13.3.3 / CC 3.2) — a `SelfOnly` inbound is
+            // admissible iff the SENDER is one of MY own nodes (self spans the
+            // owner's node set), symmetric with the producer-side gate — NOT
+            // merely a peer whose directory-recorded scope happens to be
+            // `SelfOnly`. Family/Cohort keep the recorded-scope match.
+            let matches_directory = if claimed == &CohortScope::SelfOnly {
+                key_is_own_node(
+                    federation_directory_for_cohort,
+                    &signer.key_id,
+                    &envelope.signing_key_id,
+                )
+                .await
+            } else {
+                match recorded_scope.as_ref() {
+                    Some(rs) => rs == claimed,
+                    None => false,
+                }
             };
             if !matches_directory {
                 match cohort_enforcement {

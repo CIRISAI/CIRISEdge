@@ -435,6 +435,63 @@ async fn durable_delivery_with_family_scope_to_non_family_recipient_rejected() {
     }
 }
 
+// ─── Producer-side: SelfOnly is the OWNER'S NODE SET (CIRISEdge#274) ──
+
+/// CIRISEdge#274 (CC 1.13.3.3 / CC 3.2) — a `SelfOnly` durable to the
+/// sender's OWN key is allowed: `self` trivially includes this node (the
+/// `other == local` short-circuit, no directory read needed).
+#[tokio::test]
+async fn durable_selfonly_to_self_recipient_allowed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (edge, _fam, _pub_) =
+        build_edge_with_directories(&tmp, CohortScopeEnforcement::Strict, vec![]).await;
+    // `build_edge_with_directories` builds the local signer as "local-self".
+    let handle = edge
+        .send_durable_with_cohort_scope(
+            "local-self",
+            OpaqueEvent {
+                kind: 0x0000_0001,
+                payload: b"x".to_vec(),
+            },
+            Some(CohortScope::SelfOnly),
+        )
+        .await
+        .expect("SelfOnly to my own key MUST be allowed");
+    let _ = handle;
+}
+
+/// CIRISEdge#274 — a `SelfOnly` durable to a FOREIGN node (one NOT in my
+/// owner's node set) is refused. Here the local key is an unowned agent (no
+/// owner-binding), so its own-node set is just itself and any other recipient
+/// fails closed — the anti-leak default (CC 1.13.3.4): self-scoped content
+/// never reaches a different identity's node.
+#[tokio::test]
+async fn durable_selfonly_to_foreign_recipient_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (edge, _fam, pub_recipient) =
+        build_edge_with_directories(&tmp, CohortScopeEnforcement::Strict, vec![]).await;
+    let err = edge
+        .send_durable_with_cohort_scope(
+            &pub_recipient,
+            OpaqueEvent {
+                kind: 0x0000_0001,
+                payload: b"x".to_vec(),
+            },
+            Some(CohortScope::SelfOnly),
+        )
+        .await
+        .expect_err("SelfOnly to a foreign node MUST be refused (fail closed)");
+    match err {
+        EdgeError::CohortScopeRefusedRecipient {
+            cohort_scope: CohortScope::SelfOnly,
+            recipient_key_id,
+        } => assert_eq!(recipient_key_id, pub_recipient),
+        other => {
+            panic!("expected CohortScopeRefusedRecipient(SelfOnly, {pub_recipient}); got {other:?}")
+        }
+    }
+}
+
 #[tokio::test]
 async fn ephemeral_delivery_with_family_scope_to_family_recipient_allowed() {
     let tmp = tempfile::tempdir().expect("tempdir");
