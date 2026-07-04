@@ -8050,7 +8050,7 @@ mod pyo3_tier2_tests {
         init_python();
         let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
         let handle = Python::attach(|py| -> PyResult<PyDurableHandle> {
-            py_edge.send_opaque_event(py, "recipient-key", 1, b"hello".to_vec())
+            py_edge.send_opaque_event(py, "recipient-key", 1, b"hello".to_vec(), None, false)
         })
         .expect("send_opaque_event must not abort in sync cohab context");
         // A non-empty queue_id means the envelope was built, signed,
@@ -8069,7 +8069,14 @@ mod pyo3_tier2_tests {
         init_python();
         let (py_edge, queue, runtime) = build_sync_cohab_fixture();
         let queue_id = Python::attach(|py| -> PyResult<String> {
-            let h = py_edge.send_opaque_event(py, "recipient-key", 1, b"visible-row".to_vec())?;
+            let h = py_edge.send_opaque_event(
+                py,
+                "recipient-key",
+                1,
+                b"visible-row".to_vec(),
+                None,
+                false,
+            )?;
             Ok(h.queue_id().to_string())
         })
         .expect("send_durable_inline_text");
@@ -8124,7 +8131,14 @@ mod pyo3_tier2_tests {
 
         // Single enqueue.
         Python::attach(|py| -> PyResult<()> {
-            py_edge.send_opaque_event(py, "recipient-key", 1, b"metric-bump".to_vec())?;
+            py_edge.send_opaque_event(
+                py,
+                "recipient-key",
+                1,
+                b"metric-bump".to_vec(),
+                None,
+                false,
+            )?;
             Ok(())
         })
         .expect("send_durable_inline_text");
