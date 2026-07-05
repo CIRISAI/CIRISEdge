@@ -143,6 +143,7 @@ pub fn signed_record(
         roles: Vec::new(),
         attestation_evidence,
         consent_role: None,
+        additional_scrubs: Vec::new(),
     }
 }
 

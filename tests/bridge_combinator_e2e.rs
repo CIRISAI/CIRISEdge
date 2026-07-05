@@ -90,6 +90,7 @@ fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
         roles: Vec::new(),
         attestation_evidence: None,
         consent_role: None,
+        additional_scrubs: Vec::new(),
     }
 }
 

@@ -8000,6 +8000,7 @@ mod pyo3_tier2_tests {
                 // accord-holder so the V048 CHECK admits None.
                 attestation_evidence: None,
                 consent_role: None,
+                additional_scrubs: Vec::new(),
             };
             backend
                 .put_public_key(SignedKeyRecord { record })
