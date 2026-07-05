@@ -108,6 +108,7 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
         roles: Vec::new(),
         attestation_evidence: None,
         consent_role: None,
+        additional_scrubs: Vec::new(),
     }
 }
 

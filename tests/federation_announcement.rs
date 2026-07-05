@@ -124,6 +124,7 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
         // is 'accord_holder'.
         attestation_evidence: None,
         consent_role: None,
+        additional_scrubs: Vec::new(),
     }
 }
 
