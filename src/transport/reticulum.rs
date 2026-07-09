@@ -1643,6 +1643,17 @@ impl ReticulumTransport {
         self.resolve_peer(destination_key_id).await.is_some()
     }
 
+    /// CIRISEdge#292 — the `key_id`s currently in the live rooted-peer
+    /// map (announce-rooted or `prime_peer`'d). The operator readback for
+    /// "who can this node actually address right now": diagnosing a
+    /// zero-delivery bring-up (CIRISServer#205) previously required an
+    /// in-process snapshot of this map. Does NOT include directory-only
+    /// (`PeerResolver`) peers that `knows_peer` would resolve on demand —
+    /// this is the set that has a live `RootedPeer` entry.
+    pub async fn rooted_peers(&self) -> Vec<String> {
+        self.peers.lock().await.keys().cloned().collect()
+    }
+
     /// v0.14.0 (CIRISEdge#32) — return the 16-byte Reticulum
     /// destination hash for a rooted peer. Test seam: the Links FFI
     /// tests need `dest_hash` to drive `link_open(dest_hash)` after
@@ -2533,6 +2544,24 @@ impl Transport for ReticulumTransport {
         }
 
         let Some(peer) = self.resolve_peer(destination_key_id).await else {
+            // CIRISEdge#292 (CIRISServer#205) — an admitted replication
+            // target whose Reticulum destination we can't resolve is the
+            // silent-zero-delivery class: the round fires, this send
+            // fails, and without this line nothing in the log says why.
+            // WARN naming the actionable causes (explicit-hash peers must
+            // be `prime_peer`'d; announce-rooted peers need a received
+            // announce) so an unrooted-but-admitted peer is a log line,
+            // not a live-map interrogation. `knows_peer(key_id)` is the
+            // readback for the same condition.
+            tracing::warn!(
+                destination_key_id,
+                "replication/send: target is admitted but NOT rooted \
+                 (knows_peer=false) — no Reticulum destination resolved. \
+                 Cause: a v7 explicit-hash peer (e.g. ciris-canonical-1) that \
+                 was never prime_peer'd, or an announce-rooted peer whose \
+                 announce has not been received. This send cannot address the \
+                 peer; anti-entropy will not converge until it roots."
+            );
             // §24 NAT-traversal (CIRISEdge#169): an unreachable
             // destination under `PendingOrLive` with a wired queue is
             // stored for the destination's wake-up fetch rather than
@@ -2543,6 +2572,11 @@ impl Transport for ReticulumTransport {
                 if let Some(saf) = &self.store_and_forward {
                     saf.queue(destination_key_id, envelope_bytes)
                         .map_err(|e| TransportError::Io(format!("store-and-forward queue: {e}")))?;
+                    tracing::info!(
+                        destination_key_id,
+                        "replication/send: unrooted target queued for \
+                         store-and-forward wake-up fetch (§24)"
+                    );
                     return Ok(TransportSendOutcome::Queued);
                 }
             }
