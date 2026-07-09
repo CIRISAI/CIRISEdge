@@ -255,6 +255,14 @@ pub use ffi::uniffi_types::{
 // UDL function bodies live in `ffi::uniffi_impl` — re-exported here
 // under their UDL names. The scaffolding's marshalling shells look up
 // `crate::peer_list` etc. by bare name.
+// CIRISEdge#289 — downstream in-process accessor for the embedded Edge
+// (NOT a UDL function; the process-global handle is installed by
+// `init_edge_runtime`). Re-exported so CIRISServer's `start_federation_delivery`
+// controller can drive the live `Arc<Edge>`, mirroring persist's
+// `current_rust_engine()`. See `ffi::uniffi_impl::current_edge`.
+#[cfg(feature = "ffi-uniffi")]
+pub use ffi::uniffi_impl::current_edge;
+
 #[cfg(feature = "ffi-uniffi")]
 pub use ffi::uniffi_impl::{
     crate_version, current_ratchet_id, identity_hash, identity_pubkeys, last_rotation_at,
