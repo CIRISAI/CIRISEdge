@@ -465,7 +465,7 @@ jobs:
           path: dist/${{ matrix.abi }}/
       # CIRISEdge#229 — save edge-self-warm on main, per-ABI.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -976,7 +976,7 @@ jobs:
           if-no-files-found: error
       # CIRISEdge#229 — save edge-self-warm on main, per-target.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -1572,7 +1572,7 @@ jobs:
       # feature combos + incremental → ~7.5 GB blob). Moved here so
       # consumers get a release blob like every other PLAT.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
