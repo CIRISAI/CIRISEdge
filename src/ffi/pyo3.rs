@@ -8226,6 +8226,7 @@ mod pyo3_tier2_tests {
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
+                false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -8337,6 +8338,7 @@ mod pyo3_tier2_tests {
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
+                false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -8487,6 +8489,7 @@ mod pyo3_tier2_tests {
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
+                false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
             )?;
             Ok(())
         });
@@ -8590,6 +8593,7 @@ mod pyo3_tier2_tests {
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
+                false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -8747,6 +8751,7 @@ mod pyo3_tier2_tests {
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
+                false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -8903,6 +8908,7 @@ mod pyo3_tier2_tests {
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
+                false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
             )?;
             Ok(edge.signer_key_id())
         });
