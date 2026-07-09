@@ -76,7 +76,16 @@ pub fn install_edge_handle(edge: &Arc<Edge>) {
 /// Resolve the registered Edge to a strong `Arc`. `Err(NotInitialized)`
 /// if `install_edge_handle` was never called OR the underlying Edge
 /// has been dropped.
-pub(crate) fn current_edge() -> Result<Arc<Edge>, crate::EdgeBindingsError> {
+///
+/// **Downstream accessor (CIRISEdge#289 / CIRISServer#205).** Re-exported
+/// at the crate root as `ciris_edge::current_edge` so a downstream Rust
+/// crate (CIRISServer's `start_federation_delivery` controller) can drive
+/// the live in-process embedded edge — mirroring persist's
+/// `current_rust_engine()`. The install is done by `init_edge_runtime`
+/// (pyo3.rs, `install_edge_handle`), so any consumer sharing the same
+/// process + edge build sees the same singleton. `pyo3 ⇒ ffi-uniffi`, so
+/// the wheel that runs the agent always installs the handle.
+pub fn current_edge() -> Result<Arc<Edge>, crate::EdgeBindingsError> {
     let slot = edge_slot().read().expect("edge_slot poisoned");
     slot.upgrade()
         .ok_or(crate::EdgeBindingsError::NotInitialized)

@@ -3866,6 +3866,7 @@ enum LocalInstanceRole {
     transport_identity_keyring_dir = None,
     enable_transport = false,
     transport_binding_enforcement = "advisory",
+    require_local_signer = false,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -3991,6 +3992,21 @@ pub fn init_edge_runtime(
     // enable only once every federation repo emits conformant bindings, else
     // authentic peers are dropped. Default preserves v-series behavior.
     transport_binding_enforcement: &str,
+    // CIRISEdge#289 (CIRISServer#205, AV-42) — enforce the ATTESTED
+    // transport-identity path. The Reticulum transport-identity signer is
+    // selected from `engine.local_signer_capsule()` (the 32-byte software
+    // Ed25519 `local_signer`, v0.16.1). When that capsule is unavailable —
+    // the engine was NOT built via `Engine.from_shared_with_local`
+    // (local_key_id + local_key_path) — the init SILENTLY falls back to the
+    // hot-path keyring signer, which under `hardware_hsm_only` is a 65-byte
+    // P-256 pubkey that either fails `ReticulumTransport::new` or (on a
+    // software keyring) announces UN-attested. A bare agent that must root
+    // at Node A (AV-42) cannot tolerate that silent degrade.
+    //
+    // `True` turns the fallback into a hard `RuntimeError` at init, so the
+    // caller fails loud instead of announcing without attestation. `False`
+    // (the default) preserves the warn-and-degrade behaviour exactly.
+    require_local_signer: bool,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -4572,6 +4588,13 @@ pub fn init_edge_runtime(
             // the **derived** federation key_id, so its admission attestations
             // FK-resolve against the same `federation_keys` row the hot-path
             // signer's scrub envelopes target.
+            // CIRISEdge#289 — this is the ATTESTED (32-byte Ed25519) path a
+            // bare agent's announce needs to root at Node A (AV-42).
+            tracing::info!(
+                key_id = %derived_signer_key_id,
+                "Reticulum transport identity: attested 32-byte Ed25519 \
+                 local_signer path (engine.local_signer_capsule())"
+            );
             Arc::new(LocalSigner::new(
                 derived_signer_key_id.clone(),
                 adapter,
@@ -4579,6 +4602,23 @@ pub fn init_edge_runtime(
             ))
         }
         Err(LocalSignerCapsuleError::Unavailable) => {
+            // CIRISEdge#289 — a bare agent that must announce ATTESTED opts
+            // into `require_local_signer=True`; the silent keyring fallback
+            // (65-byte P-256 under hardware_hsm_only → unrooted announce)
+            // is a hard error instead.
+            if require_local_signer {
+                return Err(PyRuntimeError::new_err(
+                    "require_local_signer=True but ciris_persist.Engine raised \
+                     local_signer_unavailable from local_signer_capsule(): the \
+                     engine was not built with a local signer, so the Reticulum \
+                     transport identity cannot use the attested 32-byte Ed25519 \
+                     path and the announce would not carry attestation (AV-42). \
+                     Construct the engine via Engine.from_shared_with_local \
+                     (local_key_id + local_key_path, persist v2.12.0+ / #112), \
+                     or pass require_local_signer=False to allow the keyring \
+                     fallback.",
+                ));
+            }
             tracing::warn!(
                 "ciris_persist.Engine raised local_signer_unavailable from \
                  local_signer_capsule(); falling back to keyring_signer for \
@@ -4588,11 +4628,24 @@ pub fn init_edge_runtime(
                  must be 32 bytes, got 65'. Upgrade the agent's cohab-init \
                  path to construct ciris_persist.Engine with local_key_id + \
                  local_key_path (Engine.from_shared_with_local, persist \
-                 v2.12.0+ / #112)."
+                 v2.12.0+ / #112), or set require_local_signer=True to fail \
+                 loud instead of announcing un-attested."
             );
             signer.clone()
         }
         Err(LocalSignerCapsuleError::MethodAbsent) => {
+            // CIRISEdge#289 — same fail-loud opt-in as the Unavailable arm.
+            if require_local_signer {
+                return Err(PyRuntimeError::new_err(
+                    "require_local_signer=True but ciris_persist.Engine does not \
+                     expose local_signer_capsule() (persist < 3.1.1): the \
+                     Reticulum transport identity cannot use the attested \
+                     32-byte Ed25519 path and the announce would not carry \
+                     attestation (AV-42). Upgrade persist to the v3.2.0+ floor, \
+                     or pass require_local_signer=False to allow the keyring \
+                     fallback.",
+                ));
+            }
             tracing::warn!(
                 "ciris_persist.Engine does not expose local_signer_capsule() \
                  (persist < 3.1.1); falling back to keyring_signer for \
@@ -4601,7 +4654,8 @@ pub fn init_edge_runtime(
                  ReticulumTransport::new with 'federation Ed25519 pubkey \
                  must be 32 bytes, got 65'. v0.16.1's Cargo floor is \
                  `tag = \"v3.2.0\"`; this branch indicates a forced-pin \
-                 mismatch on the consumer side."
+                 mismatch on the consumer side. Set require_local_signer=True \
+                 to fail loud instead of announcing un-attested."
             );
             signer.clone()
         }
