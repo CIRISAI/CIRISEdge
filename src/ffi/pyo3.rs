@@ -821,13 +821,34 @@ impl PyEdge {
                 )
             })?;
             let destination_key_id = destination_key_id.to_owned();
-            py.detach(|| {
+            // CIRISEdge#292 — log the prime attempt + outcome so a MISSING
+            // prime (the silent-zero-delivery cause on CIRISServer#205) and
+            // a successful rooting are both visible. Today a prime that
+            // never happened produces no signal at all.
+            let reticulum_dest_hash_hex = reticulum_dest_hash_hex.to_owned();
+            let rooted = py.detach(|| {
                 run_async(&self.executor, async move {
+                    let before = transport.knows_peer(&destination_key_id).await;
                     transport
                         .inject_rooted_peer_for_test(&destination_key_id, dest_hash, ed25519)
                         .await;
-                });
+                    let after = transport.knows_peer(&destination_key_id).await;
+                    tracing::info!(
+                        destination_key_id,
+                        dest_hash = %reticulum_dest_hash_hex,
+                        knows_peer_before = before,
+                        knows_peer_after = after,
+                        "prime_peer: rooted peer binding installed"
+                    );
+                    after
+                })
             });
+            if !rooted {
+                tracing::warn!(
+                    "prime_peer: installed binding but knows_peer is still false \
+                     — the peer remains unroutable (unexpected)"
+                );
+            }
             Ok(())
         }
         #[cfg(not(feature = "_reticulum-module"))]
@@ -874,6 +895,32 @@ impl PyEdge {
         {
             let _ = (destination_key_id, py);
             false
+        }
+    }
+
+    /// CIRISEdge#292 — the `key_id`s currently in the live rooted-peer
+    /// map (announce-rooted or `prime_peer`'d). Operator readback for
+    /// triaging a zero-delivery bring-up (CIRISServer#205): an admitted
+    /// replication target absent from this list is admitted-but-unrooted
+    /// and cannot be addressed. Returns `[]` for HTTPS-only /
+    /// transport-less builds.
+    fn rooted_peers(&self, py: Python<'_>) -> Vec<String> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let Some(transport) = self.inner.reticulum_transport() else {
+                return Vec::new();
+            };
+            py.detach(|| {
+                run_async(
+                    &self.executor,
+                    async move { transport.rooted_peers().await },
+                )
+            })
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            let _ = py;
+            Vec::new()
         }
     }
 
@@ -3085,10 +3132,7 @@ impl PyDurableHandle {
                     .map_err(|e| PyRuntimeError::new_err(format!("outbound_status: {e}")))?;
                 Ok(matches!(
                     row.map(|r| crate::edge::map_outbound_row_to_status(&r)),
-                    Some(DurableStatus::Terminal(DurableOutcome::Delivered {
-                        ack: _,
-                        ..
-                    })),
+                    Some(DurableStatus::Terminal(DurableOutcome::Delivered { .. })),
                 ))
             })
         })
@@ -4961,6 +5005,17 @@ pub fn init_edge_runtime(
         let dest_hash = transport.local_dest_hash();
         {
             let destination_hex = hex::encode(dest_hash);
+            // v13.5.0 (CIRISPersist#397 / CIRISEdge#99, #214) — publish this
+            // node's transport-tier Ed25519 pubkey alongside the dest-hash so
+            // a peer can `prime_peer` this explicit-hash node (the data half
+            // of the #292 rooting story). It is the Ed25519 (signing) half of
+            // the 64-byte RNS transport identity (`[x25519||ed25519]`), NOT
+            // the identity-tier key (§5.6.8.8.2 key-separation).
+            let transport_ed25519_pubkey_base64 = {
+                use base64::Engine as _;
+                let full = transport.local_transport_pubkey();
+                base64::engine::general_purpose::STANDARD.encode(&full[32..64])
+            };
             let directory_for_register = Arc::clone(&federation_directory_for_edge);
             let row = ciris_persist::federation::self_at_login::TransportDestination {
                 occurrence_key_id: occurrence_key_id.to_string(),
@@ -4968,6 +5023,7 @@ pub fn init_edge_runtime(
                 destination: destination_hex.clone(),
                 asserted_at: chrono::Utc::now(),
                 last_seen_at: None,
+                transport_ed25519_pubkey_base64: Some(transport_ed25519_pubkey_base64),
             };
             let occurrence_for_log = occurrence_key_id.to_string();
             let register_result = run_async(&executor, async move {

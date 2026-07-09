@@ -1,0 +1,13 @@
+[toolchain]
+# CIRISEdge#291 / CIRISPersist#396 / CIRISVerify#180 — EXACT pin, not a
+# floating `stable`. The CIRISCache substrate key embeds the rustc version
+# (`ciris-substrate-v1-<PLAT>-release-rustc<VER>-…`); all four repos
+# (verify/persist/edge/server) must carry the SAME exact channel or their
+# layer blobs key on whatever stable the runner's image happened to ship
+# (GitHub bumped windows-latest 1.96→1.97.0 on 2026-07-07), so CIRISServer's
+# centipede restore misses and windows recompiles the whole substrate cold.
+# Bump this in lockstep across all four repos; the workflow `dtolnay/
+# rust-toolchain@1.97.0` refs must match (a bare `@stable` there installs
+# stable and adds cross-compile targets to *stable*, not 1.97.0 → E0463).
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
