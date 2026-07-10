@@ -4739,6 +4739,75 @@ pub fn init_edge_runtime(
     // `AgentMode` docblock.
     transport_config.listen_addr = listen_addr;
     transport_config.bootstrap_peers = bootstrap_peers;
+    // CIRISEdge#296 — auto-seed the canonical TCP dial from persist's baked
+    // `canonical_bootstrap_hints()` so a DIRECT `init_edge_runtime` consumer
+    // (the agent-embedded edge, which does NOT run ciris-server's
+    // `compose::serve`) dials the public canonical mesh and roots it. Without
+    // this the agent boots with an empty canonical dial → never receives
+    // Node A's announce → the (already-wired) rooting never fires →
+    // `knows_peer(canonical)=false` → zero delivery. `list_canonical_servers`
+    // is Engine-only (not on the `FederationDirectory` edge holds) and edge
+    // has no Rust `Engine` handle in this path, so we call the #402 pyfn
+    // wrapper on the engine PyObject cross-wheel: `canonical_bootstrap_hints()`
+    // → JSON `[{key_id, kind, destination}]`. Filter `kind == "ip"`, union the
+    // TCP dials in (dedup). Fail-soft: a missing method / parse error WARNs and
+    // continues (a caller can still pass the addr in `bootstrap_peers`) — it
+    // never breaks init.
+    {
+        #[derive(serde::Deserialize)]
+        struct CanonicalHint {
+            key_id: String,
+            kind: String,
+            destination: String,
+        }
+        match engine
+            .call_method0("canonical_bootstrap_hints")
+            .and_then(|obj| obj.extract::<String>())
+        {
+            Ok(json) => match serde_json::from_str::<Vec<CanonicalHint>>(&json) {
+                Ok(hints) => {
+                    let mut seeded = 0usize;
+                    for h in hints.iter().filter(|h| h.kind == "ip") {
+                        match h.destination.parse::<std::net::SocketAddr>() {
+                            Ok(addr) if !transport_config.bootstrap_peers.contains(&addr) => {
+                                transport_config.bootstrap_peers.push(addr);
+                                seeded += 1;
+                                tracing::info!(
+                                    canonical_key_id = %h.key_id,
+                                    dial = %addr,
+                                    "init_edge_runtime: seeded canonical TCP dial from baked \
+                                     canonical_bootstrap_hints (CIRISEdge#296)"
+                                );
+                            }
+                            Ok(_) => {} // already present — dedup
+                            Err(e) => tracing::warn!(
+                                canonical_key_id = %h.key_id,
+                                destination = %h.destination,
+                                "init_edge_runtime: canonical ip hint is not a valid SocketAddr, \
+                                 skipping: {e}"
+                            ),
+                        }
+                    }
+                    if seeded == 0 {
+                        tracing::warn!(
+                            "init_edge_runtime: canonical_bootstrap_hints yielded no NEW ip dial \
+                             (already in bootstrap_peers, or no canonical servers baked). If the \
+                             agent cannot reach the canonical mesh, check list_canonical_servers()."
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "init_edge_runtime: canonical_bootstrap_hints JSON parse failed — canonical \
+                     dial NOT auto-seeded: {e}"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                "init_edge_runtime: engine.canonical_bootstrap_hints() unavailable (persist < \
+                 v13.6.0 / #402?) — canonical dial NOT auto-seeded; a direct consumer must pass \
+                 the canonical addr in bootstrap_peers: {e}"
+            ),
+        }
+    }
     transport_config.announce_interval = Duration::from_secs(announce_interval_seconds);
     transport_config.local_epoch = local_epoch;
     // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
