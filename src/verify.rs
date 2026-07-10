@@ -234,11 +234,18 @@ pub trait RootingDirectory: Send + Sync + 'static {
     /// overwrites). Default is a no-op so non-`FederationDirectory`
     /// impls (test doubles) don't break; the blanket impl over
     /// `FederationDirectory` does the real `put_transport_destination`.
-    async fn persist_rooted_transport(
+    ///
+    /// CIRISEdge#301 — `provenance` tags the durable row `Rooted`
+    /// (authoritative, chained to a pinned steward) or `Advisory` (a
+    /// self-consistent routing hint that did not root against the local
+    /// directory, CC 3.3.6.2). Both are persisted (admit-not-drop); the
+    /// consumer composes trust from the tag downstream.
+    async fn persist_transport_binding(
         &self,
         _key_id: &str,
         _dest_hash: [u8; 16],
         _transport_pubkey: [u8; 64],
+        _provenance: ciris_persist::federation::self_at_login::BindingProvenance,
     ) {
     }
 }
@@ -257,11 +264,12 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         persist_provenance_chain(self, key_id).await
     }
 
-    async fn persist_rooted_transport(
+    async fn persist_transport_binding(
         &self,
         key_id: &str,
         dest_hash: [u8; 16],
         transport_pubkey: [u8; 64],
+        provenance: ciris_persist::federation::self_at_login::BindingProvenance,
     ) {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -274,18 +282,23 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             last_seen_at: None,
             transport_ed25519_pubkey_base64: Some(b64.encode(&transport_pubkey[32..64])),
             transport_x25519_pubkey_base64: Some(b64.encode(&transport_pubkey[0..32])),
+            // CIRISEdge#301 — Rooted (Confirmed verdict) or Advisory (CC 3.3.6.2
+            // admit-as-routing-hint); the caller decides from the verdict.
+            binding_provenance: provenance,
         };
         match FederationDirectory::put_transport_destination(self, &row).await {
             Ok(()) => tracing::info!(
                 key_id,
                 dest_hash = %row.destination,
-                "CIRISEdge#299: persisted rooted transport binding (write-through)"
+                provenance = ?provenance,
+                "CIRISEdge#299/#301: persisted transport binding (write-through)"
             ),
             Err(e) => tracing::warn!(
                 key_id,
                 error = %e,
-                "CIRISEdge#299: write-through of rooted transport binding failed (peer still \
-                 rooted in-memory this session, but will not survive a restart)"
+                provenance = ?provenance,
+                "CIRISEdge#299/#301: write-through of transport binding failed (peer still \
+                 admitted in-memory this session, but will not survive a restart)"
             ),
         }
     }

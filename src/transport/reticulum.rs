@@ -96,9 +96,7 @@ use super::attestation::{
 use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 use crate::identity::LocalSigner;
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
-use crate::verify::{
-    HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
-};
+use crate::verify::{HybridPolicy, ProvenanceChain, RootingDirectory, RootingVerdict};
 
 /// Maximum envelope body size accepted on send. Mirrors AV-13
 /// (`MAX_BODY_BYTES = 8 MiB`); oversized payloads reject before any
@@ -452,7 +450,7 @@ struct ResolvedPeer {
 /// previously-rooted peer, so `resolve_peer` (hence `knows_peer` +
 /// routing) succeeds and sealing has the KEX x25519 the instant edge
 /// comes up — zero announces. The write-through side is
-/// [`crate::verify::RootingDirectory::persist_rooted_transport`]; this is
+/// [`crate::verify::RootingDirectory::persist_transport_binding`]; this is
 /// the reload side. Snapshot semantics: loaded in full once at boot; new
 /// roots after boot land in the live `peers` map (and are write-through
 /// persisted for the next boot).
@@ -499,8 +497,16 @@ struct RootedPeer {
     /// The verified recursive-provenance chain from the rooting
     /// verdict — cached so a consumer can audit provenance without a
     /// second directory round-trip (CIRISVerify WS-4 hand-off).
+    /// CIRISEdge#301 — `None` for an `Advisory` binding (self-consistent
+    /// routing hint that did not root against the directory).
     #[allow(dead_code)]
-    chain: ProvenanceChain,
+    chain: Option<ProvenanceChain>,
+    /// CIRISEdge#301 (CC 3.3.6.2) — `Rooted` (authoritative, chained to a
+    /// pinned steward) vs `Advisory` (self-consistent routing hint;
+    /// authority composed downstream). Read by the epoch/upgrade guard so
+    /// a same-epoch re-announce that finally roots upgrades an existing
+    /// advisory binding instead of being ignored as stale.
+    provenance: ciris_persist::federation::self_at_login::BindingProvenance,
 }
 
 // ─── Configuration ──────────────────────────────────────────────────
@@ -1739,11 +1745,11 @@ impl ReticulumTransport {
                     signing_key: signing_key_ed25519,
                 },
                 epoch: 0,
-                chain: ProvenanceChain {
-                    key_id: destination_key_id.to_string(),
-                    chain: Vec::new(),
-                    terminates_at_steward_bootstrap: false,
-                },
+                // Primed bindings carry no walked provenance chain; the operator
+                // asserts them directly (e.g. the canonical), so they are
+                // authoritative — CIRISEdge#301 `Rooted`, chain `None`.
+                chain: None,
+                provenance: ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
             },
         );
     }
@@ -3205,69 +3211,61 @@ async fn resolve_announce_cold_start(
     let verdict = rooting
         .root_binding(&key_id, &attestation.federation_pubkey_ed25519_base64)
         .await;
-    let chain = match verdict {
-        RootingVerdict::Confirmed { chain } => chain,
-        RootingVerdict::Rejected { rejection } => {
-            // DirectoryError is a transient substrate fault — retryable,
-            // not a verdict on the binding. The other terminal variants
-            // are structural/crypto rejections: AV-42 events.
-            if matches!(rejection, RootingRejection::DirectoryError { .. }) {
-                tracing::warn!(
-                    key_id = %key_id,
-                    kind = rejection.kind(),
-                    "announce rooting deferred: directory error (retryable, peer not blacklisted)",
-                );
-            } else if matches!(rejection, RootingRejection::TerminusNotInAnchor { .. }) {
-                // v8.4.0 (CIRISEdge#253 / CIRISPersist#344, v12.0.0) — the chain
-                // terminates at a real steward/accord_holder-SHAPED key whose
-                // pubkey is NOT one of the pinned HUMANITY_ACCORD holders.
-                // Distinct from `not_rooted_at_steward` (no steward terminus at
-                // all): this is the "mis-seeded anchor vs genuinely-unrooted
-                // peer" diagnostic. EXPECTED for every announce until the
-                // genesis mesh is seeded (persist v12.0.1 + the CIRISServer#140
-                // holder-app op that scrub-signs the canonical node under A1) —
-                // fail-secure, not a regression, and not a spoof by itself.
-                tracing::warn!(
-                    av = "AV-42",
-                    key_id = %key_id,
-                    kind = rejection.kind(),
-                    "announce rejected: chain terminus is not a pinned accord holder \
-                     (genesis mesh unseeded or mis-seeded anchor)",
-                );
-            } else {
-                tracing::warn!(
-                    av = "AV-42",
-                    key_id = %key_id,
-                    kind = rejection.kind(),
-                    "announce rejected: federation key did not root \
-                     (spoofed transport-identity ↔ federation-key binding)",
-                );
+    // CIRISEdge#301 (CC 3.3.6.2) — `root_binding` CLASSIFIES the binding, it
+    // does NOT gate it. The AV-42 `dest_hash` crypto check already ran upstream
+    // (`verify_destination_hash`, terminal); a `Rejected` here is a TRUST verdict
+    // (unknown key / not-rooted-at-steward / genesis-unseeded / transient
+    // directory error), never a crypto failure. Per CC 3.3.6.2 a self-consistent
+    // announce is ADMITTED + recorded + KEX'd as a routing hint (`advisory`),
+    // NEVER dropped — only genuine crypto/structural failures are terminal. This
+    // is where a fresh peer FIRST-ROOTS: the binding is recorded on connect and
+    // #411/#299 persist + boot-load it. Trust is composed downstream (content
+    // gate, CC 6 N1); the manifest-validation-gated KEX (attest a trust-root-
+    // blessed build before the record is durably saved) is the post-CIRISServer-
+    // 0.6 follow-on tracked up the centipede.
+    let (chain_opt, provenance) = match verdict {
+        RootingVerdict::Confirmed { chain } => {
+            // ROOTED — verify the attestation against the directory-CONFIRMED
+            // Ed25519 (never the wire claim), then apply the hybrid PQC policy.
+            if !attestation_verifies_against_chain(&attestation, &chain, &key_id) {
+                return;
             }
-            return;
+            if !hybrid_policy_accepts(ctx.hybrid_policy, &chain) {
+                tracing::warn!(
+                    key_id = %key_id,
+                    policy = ?ctx.hybrid_policy,
+                    "announce rejected: rooted provenance chain is hybrid-pending under Strict policy",
+                );
+                return;
+            }
+            (
+                Some(chain),
+                ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+            )
+        }
+        RootingVerdict::Rejected { rejection } => {
+            // ADVISORY admit (CC 3.3.6.2). The federation key did not root in the
+            // local directory, but the announce is self-consistent. Verify the
+            // attestation SELF-signature against the CLAIMED federation key — the
+            // crypto floor (proves the announcer controls the key it claims); a
+            // forged self-claim is a crypto failure → dropped. On success, admit
+            // as an advisory routing hint (authority NOT established) — never drop.
+            if !attestation_self_verifies(&attestation, &key_id) {
+                return;
+            }
+            tracing::info!(
+                av = "AV-42",
+                key_id = %key_id,
+                reason = rejection.kind(),
+                "announce ADMITTED as advisory (CC 3.3.6.2: routing hint, authority not \
+                 established — recorded + KEX'd, not dropped)"
+            );
+            (
+                None,
+                ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
+            )
         }
     };
-
-    // Step 3 — verify the attestation signature against the Ed25519
-    // pubkey the directory just confirmed (NOT the wire claim).
-    if !attestation_verifies_against_chain(&attestation, &chain, &key_id) {
-        return;
-    }
-
-    // Step 4 — apply the consumer hybrid PQC policy to the rooted
-    // chain. `Strict` rejects a chain with any hybrid-pending link;
-    // `Ed25519Fallback` accepts the Confirmed verdict as-is;
-    // `SoftFreshness` accepts it (the freshness window is a per-row
-    // age input the announce path does not carry — consistent with
-    // verify.rs's `row_age = None` treatment, which collapses
-    // `SoftFreshness` to "accept the rooted chain").
-    if !hybrid_policy_accepts(ctx.hybrid_policy, &chain) {
-        tracing::warn!(
-            key_id = %key_id,
-            policy = ?ctx.hybrid_policy,
-            "announce rejected: rooted provenance chain is hybrid-pending under Strict policy",
-        );
-        return;
-    }
 
     // Step 5 — record the rooted resolution. A strictly-newer epoch
     // supersedes a cached binding; an equal-or-older epoch is a stale
@@ -3291,15 +3289,32 @@ async fn resolve_announce_cold_start(
     // it here from the authenticated announce.
     let announce_pubkey64: [u8; 64] = *announce.public_key();
     let dest_hash16: [u8; 16] = (*announce.destination_hash()).into_bytes();
+    // CIRISEdge#301 — a same-epoch re-announce that finally ROOTS a peer
+    // previously admitted as ADVISORY must UPGRADE the binding, not be ignored
+    // as stale (the advisory→rooted promotion is the whole point of first-root).
+    let is_advisory_to_rooted_upgrade = |existing: &RootedPeer| {
+        existing.epoch == attestation.epoch
+            && matches!(
+                existing.provenance,
+                ciris_persist::federation::self_at_login::BindingProvenance::Advisory
+            )
+            && matches!(
+                provenance,
+                ciris_persist::federation::self_at_login::BindingProvenance::Rooted
+            )
+    };
     let newly_rooted_key = {
         let mut peers = ctx.peers.lock().await;
         match peers.get(&key_id) {
-            Some(existing) if existing.epoch >= attestation.epoch => {
+            Some(existing)
+                if existing.epoch >= attestation.epoch
+                    && !is_advisory_to_rooted_upgrade(existing) =>
+            {
                 tracing::trace!(
                     key_id = %key_id,
                     cached_epoch = existing.epoch,
                     announce_epoch = attestation.epoch,
-                    "stale re-announce ignored (epoch not newer)",
+                    "stale re-announce ignored (epoch not newer, no provenance upgrade)",
                 );
                 None
             }
@@ -3308,7 +3323,9 @@ async fn resolve_announce_cold_start(
                     key_id = %key_id,
                     dest = %resolved.dest_hash,
                     epoch = attestation.epoch,
-                    "peer ROOTED via authenticated cold-start path",
+                    provenance = ?provenance,
+                    "peer ADMITTED via authenticated cold-start path (CIRISEdge#301: \
+                     rooted = authoritative, advisory = routing hint)",
                 );
                 // CIRISEdge#29 (v0.11.0) — record passive-evidence
                 // reachability against the (peer, RETICULUM_RS) tuple.
@@ -3347,7 +3364,8 @@ async fn resolve_announce_cold_start(
                     RootedPeer {
                         peer: resolved,
                         epoch: attestation.epoch,
-                        chain,
+                        chain: chain_opt,
+                        provenance,
                     },
                 );
                 Some(persisted_key)
@@ -3363,7 +3381,7 @@ async fn resolve_announce_cold_start(
     // for non-directory impls (default trait method).
     if let Some(persisted_key) = newly_rooted_key {
         rooting
-            .persist_rooted_transport(&persisted_key, dest_hash16, announce_pubkey64)
+            .persist_transport_binding(&persisted_key, dest_hash16, announce_pubkey64, provenance)
             .await;
     }
 }
@@ -3409,6 +3427,43 @@ fn attestation_verifies_against_chain(
             error = %e,
             "announce rejected: attestation signature did not verify \
              against the directory-confirmed federation key",
+        );
+        return false;
+    }
+    true
+}
+
+/// CIRISEdge#301 (CC 3.3.6.2) — verify the announce attestation's
+/// **self-signature** against the **claimed** federation Ed25519 (the wire
+/// claim, `attestation.federation_pubkey_ed25519_base64`), for an ADVISORY
+/// admit where no directory-confirmed chain exists. This is the crypto floor:
+/// it proves the announcer controls the key it claims (the announce is
+/// self-consistent), NOT that the key is authorized — authority is the rooted
+/// chain, composed downstream. A forged self-claim (signature does not verify
+/// against its own claimed key) fails here and the announce is dropped as a
+/// genuine crypto failure. Distinct from
+/// [`attestation_verifies_against_chain`], which verifies against the
+/// directory-CONFIRMED key for a `Rooted` admit.
+fn attestation_self_verifies(attestation: &AnnounceAttestation, key_id: &str) -> bool {
+    let claimed = base64::engine::general_purpose::STANDARD
+        .decode(&attestation.federation_pubkey_ed25519_base64)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let Some(claimed) = claimed else {
+        tracing::warn!(
+            av = "AV-42",
+            key_id,
+            "announce dropped: claimed federation pubkey is not 32-byte base64",
+        );
+        return false;
+    };
+    if let Err(e) = attestation.verify_signature(&claimed) {
+        tracing::warn!(
+            av = "AV-42",
+            key_id,
+            error = %e,
+            "announce dropped: attestation self-signature did not verify against the \
+             claimed federation key (forged self-claim — genuine crypto failure)",
         );
         return false;
     }
@@ -3871,7 +3926,7 @@ mod tests {
     /// CIRISEdge#299 — the full write-through → persist → boot-load →
     /// resolve round-trip through a real `FederationDirectory`
     /// (`MemoryBackend`): a rooted transport identity persisted via
-    /// `RootingDirectory::persist_rooted_transport` is read back by
+    /// `RootingDirectory::persist_transport_binding` is read back by
     /// `list_all_transport_destinations` and reconstructed into the same
     /// 64-byte `(x25519 ‖ ed25519)` a `PersistedBindingResolver` serves.
     #[tokio::test]
@@ -3922,7 +3977,14 @@ mod tests {
         .expect("seed occurrence key");
 
         // Write-through (the announce-handler path).
-        RootingDirectory::persist_rooted_transport(&backend, key_id, dest_hash, pubkey).await;
+        RootingDirectory::persist_transport_binding(
+            &backend,
+            key_id,
+            dest_hash,
+            pubkey,
+            ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+        )
+        .await;
 
         // Boot-load: read every persisted binding back.
         let rows = FederationDirectory::list_all_transport_destinations(&backend)

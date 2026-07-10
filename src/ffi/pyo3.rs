@@ -5176,6 +5176,10 @@ pub fn init_edge_runtime(
                 last_seen_at: None,
                 transport_ed25519_pubkey_base64: Some(transport_ed25519_pubkey_base64),
                 transport_x25519_pubkey_base64: Some(transport_x25519_pubkey_base64),
+                // CIRISEdge#301 — this node's OWN transport identity is
+                // authoritative (self-at-login, verified locally): Rooted.
+                binding_provenance:
+                    ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
             };
             let occurrence_for_log = occurrence_key_id.to_string();
             let register_result = run_async(&executor, async move {
