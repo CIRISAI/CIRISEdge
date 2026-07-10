@@ -4952,6 +4952,81 @@ pub fn init_edge_runtime(
             None
         };
 
+    // CIRISEdge#299 — boot-load the KEX resolver from persist. Persist is
+    // the source of truth for rooted transport identities; edge's in-memory
+    // rooted-peers map is a write-through cache. Load EVERY persisted binding
+    // (written by `RootingDirectory::persist_rooted_transport` on root) in
+    // full at startup, so a KNOWN peer is reachable-and-sealable the instant
+    // edge comes up — with zero announces (fixes CIRISServer#216: a months-old
+    // binding vanishing across a restart → 0 envelopes sealed). The persisted
+    // `TransportDestination` IS the resolver source. Fail-soft: a load error
+    // logs and leaves the resolver empty (peers re-root via announce).
+    let persisted_binding_resolver: Option<Arc<dyn crate::transport::reticulum::PeerResolver>> = {
+        let dir = Arc::clone(&federation_directory_for_edge);
+        match run_async(&executor, async move {
+            dir.list_all_transport_destinations().await
+        }) {
+            Ok(rows) => {
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::STANDARD;
+                let mut map: std::collections::HashMap<String, [u8; 64]> =
+                    std::collections::HashMap::new();
+                for row in rows {
+                    if row.transport_kind != "reticulum" {
+                        continue;
+                    }
+                    let (Some(x), Some(e)) = (
+                        row.transport_x25519_pubkey_base64.as_deref(),
+                        row.transport_ed25519_pubkey_base64.as_deref(),
+                    ) else {
+                        // Pre-#411 row with no KEX half — cannot seal; skip.
+                        continue;
+                    };
+                    match (b64.decode(x), b64.decode(e)) {
+                        (Ok(xb), Ok(eb)) if xb.len() == 32 && eb.len() == 32 => {
+                            let mut full = [0u8; 64];
+                            full[0..32].copy_from_slice(&xb);
+                            full[32..64].copy_from_slice(&eb);
+                            map.insert(row.occurrence_key_id, full);
+                        }
+                        _ => tracing::warn!(
+                            key_id = %row.occurrence_key_id,
+                            "CIRISEdge#299: persisted transport binding has malformed pubkey \
+                             base64 — skipping (peer must re-announce to root)"
+                        ),
+                    }
+                }
+                if map.is_empty() {
+                    tracing::info!(
+                        "CIRISEdge#299: boot-load found no persisted reticulum transport \
+                         bindings (fresh node, or none rooted yet)"
+                    );
+                    None
+                } else {
+                    tracing::info!(
+                        count = map.len(),
+                        "CIRISEdge#299: boot-loaded persisted transport bindings into the KEX \
+                         resolver — known peers reachable+sealable with zero announces"
+                    );
+                    Some(
+                        Arc::new(crate::transport::reticulum::PersistedBindingResolver::new(
+                            map,
+                        ))
+                            as Arc<dyn crate::transport::reticulum::PeerResolver>,
+                    )
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "CIRISEdge#299: boot-load of persisted transport bindings failed — peers \
+                     must re-announce to root this session"
+                );
+                None
+            }
+        }
+    };
+
     let auth = ReticulumAuth {
         // v0.16.1 cherry-pick (CIRISEdge#43): the Reticulum-identity
         // signer is split out from the hot-path keyring signer above.
@@ -4964,7 +5039,7 @@ pub fn init_edge_runtime(
         // for the fallback rationale.
         signer: Some(reticulum_identity_signer.clone()),
         rooting: Some(rooting_dir.clone()),
-        resolver: None,
+        resolver: persisted_binding_resolver,
         hybrid_policy,
         transport_binding_enforcement,
         event_bus: Some(Arc::clone(&event_bus)),
@@ -5080,10 +5155,17 @@ pub fn init_edge_runtime(
             // of the #292 rooting story). It is the Ed25519 (signing) half of
             // the 64-byte RNS transport identity (`[x25519||ed25519]`), NOT
             // the identity-tier key (§5.6.8.8.2 key-separation).
-            let transport_ed25519_pubkey_base64 = {
+            // v13.8.0 (CIRISPersist#411 / CIRISEdge#299) — also publish the
+            // transport-tier X25519 (KEX) half so a peer that boot-loads this
+            // binding from persist can SEAL to us without waiting for a fresh
+            // announce. Both halves come from the 64-byte RNS transport
+            // identity (`[x25519 ‖ ed25519]`): x25519 = [0..32], ed25519 =
+            // [32..64].
+            let (transport_x25519_pubkey_base64, transport_ed25519_pubkey_base64) = {
                 use base64::Engine as _;
                 let full = transport.local_transport_pubkey();
-                base64::engine::general_purpose::STANDARD.encode(&full[32..64])
+                let b64 = base64::engine::general_purpose::STANDARD;
+                (b64.encode(&full[0..32]), b64.encode(&full[32..64]))
             };
             let directory_for_register = Arc::clone(&federation_directory_for_edge);
             let row = ciris_persist::federation::self_at_login::TransportDestination {
@@ -5093,6 +5175,7 @@ pub fn init_edge_runtime(
                 asserted_at: chrono::Utc::now(),
                 last_seen_at: None,
                 transport_ed25519_pubkey_base64: Some(transport_ed25519_pubkey_base64),
+                transport_x25519_pubkey_base64: Some(transport_x25519_pubkey_base64),
             };
             let occurrence_for_log = occurrence_key_id.to_string();
             let register_result = run_async(&executor, async move {
