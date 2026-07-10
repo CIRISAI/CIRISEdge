@@ -220,6 +220,27 @@ pub trait RootingDirectory: Send + Sync + 'static {
     /// Assemble the recursive-provenance chain for `key_id` without
     /// the verifying verdict — the verify-consumable read.
     async fn provenance_chain(&self, key_id: &str) -> Result<ProvenanceChain, RootingRejection>;
+
+    /// CIRISEdge#299 — **write-through** a peer's rooted transport
+    /// identity so it survives a restart (reloaded via
+    /// `list_all_transport_destinations` on boot) and a KNOWN peer is
+    /// reachable-and-sealable with zero announces. Called by the
+    /// reticulum announce handler the moment an announce roots
+    /// (`RootingVerdict::Rooted`), with the full 64-byte transport
+    /// identity (`x25519 ‖ ed25519`) it holds. NOT TOFU — `root_binding`
+    /// already verified the peer against the anchor; this only persists
+    /// the already-verified binding. Idempotent upsert on `key_id`
+    /// (last-writer-wins → a transport-identity rotation re-roots and
+    /// overwrites). Default is a no-op so non-`FederationDirectory`
+    /// impls (test doubles) don't break; the blanket impl over
+    /// `FederationDirectory` does the real `put_transport_destination`.
+    async fn persist_rooted_transport(
+        &self,
+        _key_id: &str,
+        _dest_hash: [u8; 16],
+        _transport_pubkey: [u8; 64],
+    ) {
+    }
 }
 
 #[async_trait]
@@ -234,6 +255,39 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
 
     async fn provenance_chain(&self, key_id: &str) -> Result<ProvenanceChain, RootingRejection> {
         persist_provenance_chain(self, key_id).await
+    }
+
+    async fn persist_rooted_transport(
+        &self,
+        key_id: &str,
+        dest_hash: [u8; 16],
+        transport_pubkey: [u8; 64],
+    ) {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // The 64-byte RNS transport identity is `[x25519 ‖ ed25519]`.
+        let row = ciris_persist::federation::self_at_login::TransportDestination {
+            occurrence_key_id: key_id.to_string(),
+            transport_kind: "reticulum".to_string(),
+            destination: hex::encode(dest_hash),
+            asserted_at: chrono::Utc::now(),
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: Some(b64.encode(&transport_pubkey[32..64])),
+            transport_x25519_pubkey_base64: Some(b64.encode(&transport_pubkey[0..32])),
+        };
+        match FederationDirectory::put_transport_destination(self, &row).await {
+            Ok(()) => tracing::info!(
+                key_id,
+                dest_hash = %row.destination,
+                "CIRISEdge#299: persisted rooted transport binding (write-through)"
+            ),
+            Err(e) => tracing::warn!(
+                key_id,
+                error = %e,
+                "CIRISEdge#299: write-through of rooted transport binding failed (peer still \
+                 rooted in-memory this session, but will not survive a restart)"
+            ),
+        }
     }
 }
 

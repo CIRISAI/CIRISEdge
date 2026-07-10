@@ -446,6 +446,43 @@ struct ResolvedPeer {
     signing_key: [u8; 32],
 }
 
+/// CIRISEdge#299 — a boot-snapshot [`PeerResolver`] built from persist's
+/// `list_all_transport_destinations()` at startup. Restores the full
+/// `key_id → (x25519 ‖ ed25519)` transport identity for every
+/// previously-rooted peer, so `resolve_peer` (hence `knows_peer` +
+/// routing) succeeds and sealing has the KEX x25519 the instant edge
+/// comes up — zero announces. The write-through side is
+/// [`crate::verify::RootingDirectory::persist_rooted_transport`]; this is
+/// the reload side. Snapshot semantics: loaded in full once at boot; new
+/// roots after boot land in the live `peers` map (and are write-through
+/// persisted for the next boot).
+pub struct PersistedBindingResolver {
+    bindings: std::collections::HashMap<String, [u8; 64]>,
+}
+
+impl PersistedBindingResolver {
+    /// Build the resolver from a `key_id → 64-byte (x25519 ‖ ed25519)` map.
+    pub fn new(bindings: std::collections::HashMap<String, [u8; 64]>) -> Self {
+        Self { bindings }
+    }
+
+    /// Number of persisted bindings loaded.
+    pub fn len(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Whether any bindings were loaded.
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+}
+
+impl PeerResolver for PersistedBindingResolver {
+    fn resolve(&self, destination_key_id: &str) -> Option<[u8; 64]> {
+        self.bindings.get(destination_key_id).copied()
+    }
+}
+
 /// A peer whose `key_id → transport-identity` binding has been
 /// **rooted** against the persist `federation_keys` directory and
 /// whose announce attestation signature verified — the authenticated
@@ -3247,63 +3284,87 @@ async fn resolve_announce_cold_start(
         dest_hash: *announce.destination_hash(),
         signing_key: transport_pubkey,
     };
-    let mut peers = ctx.peers.lock().await;
-    match peers.get(&key_id) {
-        Some(existing) if existing.epoch >= attestation.epoch => {
-            tracing::trace!(
-                key_id = %key_id,
-                cached_epoch = existing.epoch,
-                announce_epoch = attestation.epoch,
-                "stale re-announce ignored (epoch not newer)",
-            );
-        }
-        _ => {
-            tracing::info!(
-                key_id = %key_id,
-                dest = %resolved.dest_hash,
-                epoch = attestation.epoch,
-                "peer ROOTED via authenticated cold-start path",
-            );
-            // CIRISEdge#29 (v0.11.0) — record passive-evidence
-            // reachability against the (peer, RETICULUM_RS) tuple.
-            // Logged BEFORE the event emission and the peer-map
-            // insert so a tracker-only consumer observes liveness
-            // even if a later panic prevents the insert; the
-            // tracker / event / peer-map writes are logically
-            // independent (the tracker is observability, the peer
-            // map is routing).
-            if let Some(tracker) = ctx.reachability {
-                tracker.record_attempt(
-                    &key_id,
-                    TransportId::RETICULUM_RS,
-                    AttemptOutcome::AnnounceReceived,
+    // CIRISEdge#299 — the full 64-byte transport identity (`x25519 ‖
+    // ed25519`) + dest-hash for the write-through below. `resolved.signing_key`
+    // is only the ed25519 half; the KEX x25519 needed to seal after a restart
+    // lives on the announce identity (`announce.public_key()`), so we capture
+    // it here from the authenticated announce.
+    let announce_pubkey64: [u8; 64] = *announce.public_key();
+    let dest_hash16: [u8; 16] = (*announce.destination_hash()).into_bytes();
+    let newly_rooted_key = {
+        let mut peers = ctx.peers.lock().await;
+        match peers.get(&key_id) {
+            Some(existing) if existing.epoch >= attestation.epoch => {
+                tracing::trace!(
+                    key_id = %key_id,
+                    cached_epoch = existing.epoch,
+                    announce_epoch = attestation.epoch,
+                    "stale re-announce ignored (epoch not newer)",
                 );
+                None
             }
-            // CIRISEdge#34 — successful root → emit announce_received
-            // event with info severity. The peer key_id is now known
-            // to be authentic; surface it on the announce stream so
-            // the UI can render "peer X joined".
-            if let Some(bus) = ctx.event_bus {
-                bus.emit_announce(crate::events::NetworkEvent::announce(
-                    Some(key_id.clone()),
-                    announce.destination_hash().as_bytes().to_vec(),
-                    announce.app_data().to_vec(),
-                    crate::events::EventSeverity::Info,
-                    format!(
-                        "peer rooted via authenticated cold-start path (epoch {})",
-                        attestation.epoch
-                    ),
-                ));
+            _ => {
+                tracing::info!(
+                    key_id = %key_id,
+                    dest = %resolved.dest_hash,
+                    epoch = attestation.epoch,
+                    "peer ROOTED via authenticated cold-start path",
+                );
+                // CIRISEdge#29 (v0.11.0) — record passive-evidence
+                // reachability against the (peer, RETICULUM_RS) tuple.
+                // Logged BEFORE the event emission and the peer-map
+                // insert so a tracker-only consumer observes liveness
+                // even if a later panic prevents the insert; the
+                // tracker / event / peer-map writes are logically
+                // independent (the tracker is observability, the peer
+                // map is routing).
+                if let Some(tracker) = ctx.reachability {
+                    tracker.record_attempt(
+                        &key_id,
+                        TransportId::RETICULUM_RS,
+                        AttemptOutcome::AnnounceReceived,
+                    );
+                }
+                // CIRISEdge#34 — successful root → emit announce_received
+                // event with info severity. The peer key_id is now known
+                // to be authentic; surface it on the announce stream so
+                // the UI can render "peer X joined".
+                if let Some(bus) = ctx.event_bus {
+                    bus.emit_announce(crate::events::NetworkEvent::announce(
+                        Some(key_id.clone()),
+                        announce.destination_hash().as_bytes().to_vec(),
+                        announce.app_data().to_vec(),
+                        crate::events::EventSeverity::Info,
+                        format!(
+                            "peer rooted via authenticated cold-start path (epoch {})",
+                            attestation.epoch
+                        ),
+                    ));
+                }
+                let persisted_key = key_id.clone();
+                peers.insert(
+                    key_id,
+                    RootedPeer {
+                        peer: resolved,
+                        epoch: attestation.epoch,
+                        chain,
+                    },
+                );
+                Some(persisted_key)
             }
-            peers.insert(
-                key_id,
-                RootedPeer {
-                    peer: resolved,
-                    epoch: attestation.epoch,
-                    chain,
-                },
-            );
         }
+    };
+    // CIRISEdge#299 — write-through the rooted binding to persist AFTER
+    // releasing the peers-map lock (the upsert is DB I/O; don't hold the
+    // map mutex across it). Only on a genuinely-new / newer-epoch root.
+    // On restart this is reloaded by the boot-load resolver, so a KNOWN
+    // peer is reachable-and-sealable with zero announces. `rooting` is the
+    // FederationDirectory-backed `RootingDirectory`; the write is a no-op
+    // for non-directory impls (default trait method).
+    if let Some(persisted_key) = newly_rooted_key {
+        rooting
+            .persist_rooted_transport(&persisted_key, dest_hash16, announce_pubkey64)
+            .await;
     }
 }
 
@@ -3789,6 +3850,122 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CIRISEdge#299 — the persisted-binding resolver returns the exact
+    /// 64-byte identity it was loaded with, and `None` for an unknown peer.
+    #[test]
+    fn persisted_binding_resolver_resolves_full_identity() {
+        let mut map = std::collections::HashMap::new();
+        let mut ident = [0u8; 64];
+        for (i, b) in ident.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap();
+        }
+        map.insert("peer-abc".to_string(), ident);
+        let r = PersistedBindingResolver::new(map);
+        assert_eq!(r.len(), 1);
+        assert!(!r.is_empty());
+        assert_eq!(r.resolve("peer-abc"), Some(ident));
+        assert_eq!(r.resolve("peer-unknown"), None);
+    }
+
+    /// CIRISEdge#299 — the full write-through → persist → boot-load →
+    /// resolve round-trip through a real `FederationDirectory`
+    /// (`MemoryBackend`): a rooted transport identity persisted via
+    /// `RootingDirectory::persist_rooted_transport` is read back by
+    /// `list_all_transport_destinations` and reconstructed into the same
+    /// 64-byte `(x25519 ‖ ed25519)` a `PersistedBindingResolver` serves.
+    #[tokio::test]
+    async fn rooted_transport_write_through_boot_load_round_trip() {
+        use crate::verify::RootingDirectory;
+        use base64::Engine as _;
+        use ciris_persist::federation::FederationDirectory;
+        use ciris_persist::store::MemoryBackend;
+
+        let backend = MemoryBackend::new();
+        let key_id = "peer-roundtrip";
+        let dest_hash = [7u8; 16];
+        let mut pubkey = [0u8; 64];
+        for (i, b) in pubkey.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap().wrapping_add(3);
+        }
+
+        // Seed the occurrence's federation_keys row — put_transport_destination
+        // is FK-gated on it (in production, rooting already confirmed this row
+        // exists before the write-through fires, so the FK always holds).
+        let record = ciris_persist::federation::KeyRecord {
+            key_id: key_id.to_string(),
+            pubkey_ed25519_base64: String::new(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: "hybrid".to_string(),
+            identity_type: "agent".to_string(),
+            identity_ref: format!("ref-{key_id}"),
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "key_id": key_id }),
+            original_content_hash: "0".repeat(64),
+            scrub_signature_classical: "x".repeat(88),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_string(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        FederationDirectory::put_public_key(
+            &backend,
+            ciris_persist::federation::SignedKeyRecord { record },
+        )
+        .await
+        .expect("seed occurrence key");
+
+        // Write-through (the announce-handler path).
+        RootingDirectory::persist_rooted_transport(&backend, key_id, dest_hash, pubkey).await;
+
+        // Boot-load: read every persisted binding back.
+        let rows = FederationDirectory::list_all_transport_destinations(&backend)
+            .await
+            .expect("list_all_transport_destinations");
+        let row = rows
+            .iter()
+            .find(|r| r.occurrence_key_id == key_id)
+            .expect("the persisted binding is present");
+        assert_eq!(row.transport_kind, "reticulum");
+        assert_eq!(row.destination, hex::encode(dest_hash));
+
+        // Reconstruct the 64-byte identity the resolver would serve.
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let xb = b64
+            .decode(
+                row.transport_x25519_pubkey_base64
+                    .as_deref()
+                    .expect("x25519"),
+            )
+            .expect("x25519 b64");
+        let eb = b64
+            .decode(
+                row.transport_ed25519_pubkey_base64
+                    .as_deref()
+                    .expect("ed25519"),
+            )
+            .expect("ed25519 b64");
+        let mut full = [0u8; 64];
+        full[0..32].copy_from_slice(&xb);
+        full[32..64].copy_from_slice(&eb);
+        assert_eq!(
+            full, pubkey,
+            "boot-loaded identity matches the write-through"
+        );
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(row.occurrence_key_id.clone(), full);
+        assert_eq!(
+            PersistedBindingResolver::new(map).resolve(key_id),
+            Some(pubkey)
+        );
+    }
 
     #[test]
     fn identity_round_trips_through_file() {
