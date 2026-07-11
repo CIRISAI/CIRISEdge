@@ -2190,22 +2190,25 @@ impl PyEdge {
             config.scheduler.cadence = std::time::Duration::from_secs(secs);
         }
 
-        // CIRISEdge#257 — wrap the server-supplied Key-plane publish set
-        // into the bridge's Key-plane selector (a `CohortProvider`).
-        let key_selector: Option<crate::replication::bridge::CohortProvider> =
-            key_publish_set.map(|set| {
-                std::sync::Arc::new(move || set.clone())
-                    as crate::replication::bridge::CohortProvider
-            });
-
-        // CIRISEdge#305 — wrap the server-supplied IdentityOccurrence-plane
-        // publish set into the bridge's occurrence selector (twin of the #257
-        // Key-plane selector above).
-        let occurrence_selector: Option<crate::replication::bridge::CohortProvider> =
-            occurrence_publish_set.map(|set| {
-                std::sync::Arc::new(move || set.clone())
-                    as crate::replication::bridge::CohortProvider
-            });
+        // CIRISEdge#311 — the #257 Key-plane set + #305 occurrence-plane set
+        // collapse into ONE `SelfOwn` provider; the unified engine advertises
+        // the node's OWN records across every `SelfOwn` kind (Key,
+        // IdentityOccurrence, TransportDestination). Both Python params are
+        // retained for back-compat with the server's call; their deduped union
+        // is the self set. `(None, None)` → `None` (pre-selector cohort
+        // projection preserved).
+        let self_provider: Option<crate::replication::bridge::CohortProvider> =
+            match (key_publish_set, occurrence_publish_set) {
+                (None, None) => None,
+                (key_set, occ_set) => {
+                    let mut set: Vec<String> = key_set.unwrap_or_default();
+                    set.extend(occ_set.unwrap_or_default());
+                    set.sort();
+                    set.dedup();
+                    Some(std::sync::Arc::new(move || set.clone())
+                        as crate::replication::bridge::CohortProvider)
+                }
+            };
 
         let executor = self.executor.clone();
         let runtime = py.detach(|| {
@@ -2215,8 +2218,7 @@ impl PyEdge {
                     transport,
                     typed_peers,
                     config,
-                    key_selector,
-                    occurrence_selector,
+                    self_provider,
                 )
                 .await
             })

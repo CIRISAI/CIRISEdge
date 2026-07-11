@@ -144,20 +144,16 @@ impl ReplicationRuntime {
         transport: Arc<dyn Transport>,
         peers: Vec<ReplicationPeer>,
         config: ReplicationRuntimeConfig,
-        // CIRISEdge#257 — the Key-plane publish-set selector. `Some` yields
-        // the node's OWN + held anchored records (KERI publish-own) for the
-        // `Key` `EnvelopeKind`; `None` preserves the pre-#257 cohort
-        // projection. The server computes this set (it holds the anchor
-        // knowledge) and hands it to edge alongside the consent-derived
-        // cohort — edge only provides the hook.
-        key_selector: Option<CohortProvider>,
-        // CIRISEdge#305 — the IdentityOccurrence-plane publish-set selector
-        // (KEX analogue of `key_selector`). `Some` yields the node's OWN key_id
-        // so `list_identity_occurrences` advertises its own occurrence (which
-        // carries the content-tier `encryption_pubkeys`) — without which peers
-        // resolve `None` KEX keys and cannot seal content to it. `None`
-        // preserves the pre-fix cohort projection. Server-supplied hook.
-        occurrence_selector: Option<CohortProvider>,
+        // CIRISEdge#311 — the SELF-plane publish set (collapses the #257
+        // key_selector + #305 occurrence_selector into one). `Some` yields the
+        // node's OWN + held anchored key_ids (KERI publish-own); the unified
+        // engine advertises them across every `SelfOwn` kind (Key,
+        // IdentityOccurrence — which carries the content-tier `encryption_pubkeys`
+        // for KEX — and TransportDestination). `None` preserves the pre-selector
+        // cohort projection. The server computes this set (it holds the anchor
+        // knowledge) and hands it to edge alongside the consent-derived cohort —
+        // edge only provides the hook.
+        self_provider: Option<CohortProvider>,
     ) -> Self {
         // Cohort callback: yields the set of peer_key_ids we
         // anti-entropy with, snapshotted at construction. Hot-adds
@@ -177,11 +173,36 @@ impl ReplicationRuntime {
                 cohort,
                 config.bridge,
             )
-            .with_key_selector(key_selector)
-            .with_occurrence_selector(occurrence_selector),
+            .with_self_provider(self_provider),
         );
 
         let registry = Arc::new(ReplicationRegistry::new());
+
+        // CIRISEdge#312 — install the responder factory so an inbound round
+        // from an admitted-but-uncoordinated peer (a #301 advisory source we
+        // don't consent-pull from, hence never built an Initiator for)
+        // auto-registers a `Responder` and is served rather than dropped at
+        // `NoCoordinatorRegistered`. Captures the shared transport + bridge;
+        // mirrors `build_coordinator` in `Responder` role.
+        {
+            let factory_transport = Arc::clone(&transport);
+            let factory_bridge = Arc::clone(&bridge);
+            registry.set_responder_factory(Arc::new(move |peer_key_id: &str, kind| {
+                let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&factory_bridge) as _;
+                let provider: Arc<dyn StateProvider> =
+                    Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)));
+                let applier: Arc<Mutex<dyn StateApplier>> =
+                    Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
+                Arc::new(ReplicationCoordinator::new(
+                    Arc::clone(&factory_transport),
+                    peer_key_id.to_string(),
+                    kind,
+                    SessionRole::Responder,
+                    provider,
+                    applier,
+                ))
+            }));
+        }
 
         // Build coordinators + scheduler. Coordinators share one
         // bridge instance; provider + applier are split-shape per
@@ -463,7 +484,6 @@ mod tests {
             Vec::new(),
             ReplicationRuntimeConfig::default(),
             None,
-            None,
         )
         .await;
         assert!(rt.registry().is_empty().await);
@@ -487,7 +507,6 @@ mod tests {
             peers,
             ReplicationRuntimeConfig::default(),
             None,
-            None,
         )
         .await;
         let registry = rt.registry();
@@ -510,7 +529,6 @@ mod tests {
             Vec::new(),
             ReplicationRuntimeConfig::default(),
             None,
-            None,
         )
         .await;
         rt.register_peer("agent-bob", EnvelopeKind::Attestation)
@@ -532,7 +550,6 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
-            None,
             None,
         )
         .await;
@@ -564,7 +581,6 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
-            None,
             None,
         )
         .await;
@@ -607,7 +623,6 @@ mod tests {
             transport,
             initial,
             ReplicationRuntimeConfig::default(),
-            None,
             None,
         )
         .await;
@@ -655,7 +670,6 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
-            None,
             None,
         )
         .await;
