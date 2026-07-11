@@ -77,10 +77,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use ciris_persist::federation::namespace::{self, AuthorityClass, Projection, ReplicatedKind};
 use ciris_persist::federation::operational::{
     SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
 };
 use ciris_persist::federation::register::ReplicatedKeyOutcome;
+use ciris_persist::federation::self_at_login::TransportDestination;
 use ciris_persist::federation::types::{
     SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
@@ -189,29 +191,17 @@ pub struct OperationalProviders {
 pub struct FederationDirectoryReplicationBridge {
     directory: Arc<dyn FederationDirectory>,
     cohort: CohortProvider,
-    /// CIRISEdge#257 — the Key-plane publish-set selector. When `Some`,
-    /// [`Self::list_keys`] projects THIS set (the node's OWN record + held
-    /// rooting-relevant / anchored records) instead of the `cohort`. A
-    /// node is never in its own consent cohort, so without this it would
-    /// never advertise its own scrub-signed key record and no verifier
-    /// could ever root it — the mesh-seed blocker. `None` preserves the
-    /// pre-#257 cohort-members'-own projection (back-compat). The server
-    /// supplies the selector (own + anchored) via
-    /// [`Self::with_key_selector`]; edge only provides the hook (all
-    /// replication logic lives in edge — the engine does not hard-code
-    /// the Key-plane projection).
-    key_selector: Option<CohortProvider>,
-    /// CIRISEdge#305 — the IdentityOccurrence-plane publish-set selector (KEX
-    /// analogue of `key_selector`). When set, [`Self::list_identity_occurrences`]
-    /// advertises the occurrences for the key_ids THIS callback yields (the
-    /// node's OWN occurrence — which carries the content-tier
-    /// `encryption_pubkeys`) rather than only cohort-members'-own. Without it,
-    /// a node never publishes its own occurrence → peers' `resolve_peer_kex_
-    /// pubkeys` stays `None` → 0 content delivery even after transport rooting.
-    /// `None` preserves the pre-fix cohort projection (back-compat, same posture
-    /// as #257). The server supplies the selector (own key_id); edge only
-    /// provides the hook.
-    occurrence_selector: Option<CohortProvider>,
+    /// CIRISEdge#311 — the SELF-plane publish set. Collapses the #257
+    /// `key_selector` + #305 `occurrence_selector` into ONE provider: both were
+    /// the same `Projection::SelfOwn` re-implemented per plane. When `Some`, the
+    /// unified engine advertises the node's OWN records for the key_ids THIS
+    /// callback yields across every `SelfOwn` kind — `KeyRecord` (#257),
+    /// `IdentityOccurrence` (#305, carries the content-tier `encryption_pubkeys`
+    /// for KEX), and `TransportDestination` (reachability). `None` preserves the
+    /// pre-#257/#305 cohort projection (back-compat). The server supplies the
+    /// set (own + anchored); edge only provides the hook — all replication
+    /// policy is resolved by persist's `namespace::projection_for`.
+    self_provider: Option<CohortProvider>,
     cache: Mutex<BridgeCache>,
     config: BridgeConfig,
     /// v2 operational-data admission providers. `None` = v2 admission
@@ -239,8 +229,7 @@ impl FederationDirectoryReplicationBridge {
         Self {
             directory,
             cohort,
-            key_selector: None,
-            occurrence_selector: None,
+            self_provider: None,
             cache,
             config,
             operational: None,
@@ -273,40 +262,26 @@ impl FederationDirectoryReplicationBridge {
         Self {
             directory,
             cohort,
-            key_selector: None,
-            occurrence_selector: None,
+            self_provider: None,
             cache,
             config,
             operational: Some(operational),
         }
     }
 
-    /// CIRISEdge#257 — install the Key-plane publish-set selector. When
-    /// set, [`Self::list_keys`] advertises the key_ids THIS callback yields
-    /// (the node's OWN record + held anchored records) rather than the
-    /// cohort's members'-own. `None` restores the cohort projection. The
-    /// server computes the own+anchored set (it holds the anchor knowledge);
-    /// edge just projects it through `lookup_public_key` — the KERI
-    /// publish-own model (the controller publishes its own establishment
-    /// record; verifiers pull-and-verify).
+    /// CIRISEdge#311 — install the SELF-plane publish set (collapses the #257
+    /// `with_key_selector` + #305 `with_occurrence_selector` into one). When
+    /// set, the unified engine advertises the key_ids THIS callback yields
+    /// across every `Projection::SelfOwn` kind (`KeyRecord`,
+    /// `IdentityOccurrence`, `TransportDestination`) — the KERI publish-own
+    /// model: the controller publishes its own establishment record + KEX
+    /// occurrence + reachability; verifiers pull-and-verify. `None` restores
+    /// the pre-#257/#305 cohort projection. The server computes the
+    /// own+anchored set (it holds the anchor knowledge); edge only provides the
+    /// hook — projection itself is resolved by persist's `projection_for`.
     #[must_use]
-    pub fn with_key_selector(mut self, selector: Option<CohortProvider>) -> Self {
-        self.key_selector = selector;
-        self
-    }
-
-    /// CIRISEdge#305 — install the IdentityOccurrence-plane publish-set
-    /// selector (KEX analogue of [`Self::with_key_selector`]). When set,
-    /// [`Self::list_identity_occurrences`] advertises the occurrences for the
-    /// key_ids this callback yields (the node's OWN occurrence, which carries
-    /// the content-tier `encryption_pubkeys`) rather than the cohort's
-    /// members'-own. `None` restores the cohort projection. The server computes
-    /// its own key_id and hands it in; edge just projects it through
-    /// `list_identity_occurrences_for` — the KERI publish-own model, so a peer
-    /// can resolve this node's KEX keys and seal content to it.
-    #[must_use]
-    pub fn with_occurrence_selector(mut self, selector: Option<CohortProvider>) -> Self {
-        self.occurrence_selector = selector;
+    pub fn with_self_provider(mut self, selector: Option<CohortProvider>) -> Self {
+        self.self_provider = selector;
         self
     }
 
@@ -377,18 +352,43 @@ impl BridgeCache {
 impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         match kind {
-            EnvelopeKind::Key => self.list_keys().await,
+            // #311 — the five `ReplicatedKind`s ride the unified engine
+            // (projection_for + list_signed_records). Key + IdentityOccurrence +
+            // TransportDestination project SelfOwn (publish-own); Attestation
+            // projects Cohort (about+by preserved); IdentityOccurrenceRevocation
+            // is a tombstone → Global (anti-rollback).
+            EnvelopeKind::Key => {
+                self.list_replicated(EnvelopeKind::Key, ReplicatedKind::KeyRecord)
+                    .await
+            }
+            EnvelopeKind::IdentityOccurrence => {
+                self.list_replicated(
+                    EnvelopeKind::IdentityOccurrence,
+                    ReplicatedKind::IdentityOccurrence,
+                )
+                .await
+            }
+            EnvelopeKind::TransportDestination => {
+                self.list_replicated(
+                    EnvelopeKind::TransportDestination,
+                    ReplicatedKind::TransportDestination,
+                )
+                .await
+            }
+            EnvelopeKind::IdentityOccurrenceRevocation => {
+                self.list_replicated(
+                    EnvelopeKind::IdentityOccurrenceRevocation,
+                    ReplicatedKind::IdentityOccurrenceRevocation,
+                )
+                .await
+            }
             EnvelopeKind::Attestation => self.list_attestations().await,
             EnvelopeKind::Revocation => self.list_revocations().await,
-            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrences().await,
             EnvelopeKind::Family => self.list_families().await,
             EnvelopeKind::Community => self.list_communities().await,
             EnvelopeKind::Organization => self.list_organizations().await,
             EnvelopeKind::OrgMembership => self.list_org_memberships().await,
             EnvelopeKind::PartnerRecord => self.list_partner_records().await,
-            EnvelopeKind::IdentityOccurrenceRevocation => {
-                self.list_identity_occurrence_revocations().await
-            }
             EnvelopeKind::FamilyMembershipRevocation => {
                 self.list_family_membership_revocations().await
             }
@@ -433,6 +433,9 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     .await
             }
             EnvelopeKind::LocationProof => self.apply_location_proof(envelope_bytes).await,
+            EnvelopeKind::TransportDestination => {
+                self.apply_transport_destination(envelope_bytes).await
+            }
         }
     }
 }
@@ -444,32 +447,153 @@ impl FederationDirectoryReplicationBridge {
         u64::try_from(timestamp.timestamp_millis()).unwrap_or(0)
     }
 
-    /// Project the Key-plane publish set through `lookup_public_key`, emit
-    /// one `EnvelopeRef` per resolved record. The set is the
-    /// [`Self::key_selector`] (CIRISEdge#257 — the node's OWN record + held
-    /// anchored records, KERI publish-own) when installed, else the
-    /// `cohort` (pre-#257 cohort-members'-own). The projection is identical
-    /// either way; only the set of key_ids differs.
-    async fn list_keys(&self) -> Vec<EnvelopeRef> {
+    // ─── #311 — the unified replication-policy engine ──────────────────
+    //
+    // One projection-driven loop replaces `list_keys` (+ #257 key_selector),
+    // `list_identity_occurrences` (+ #305 occurrence_selector), and the
+    // `list_identity_occurrence_revocations` fan-out. For each
+    // `ReplicatedKind`, persist's `projection_for` decides the subject set
+    // and `list_signed_records` reads it byte-exact; a per-kind adapter
+    // re-wraps the (sometimes bare) canonical JSON back into the existing
+    // `Signed*` wire shape so the wire bytes + `persist_row_hash` identity are
+    // unchanged for the pre-existing kinds (v9.9↔v9.10 convergence holds).
+
+    /// The projection inputs for a `ReplicatedKind` — `(cohort_scope,
+    /// authority, is_tombstone)` fed to persist's [`namespace::projection_for`]
+    /// so the policy is resolved by persist, not hard-coded here. The identity
+    /// plane (key / occurrence / transport) is `SelfIdentity`-authored `self`
+    /// scope → `SelfOwn`; attestations are `ProducerSteward` gossip → `Cohort`;
+    /// the occurrence-revocation is a tombstone → `Global` (anti-rollback, the
+    /// [`namespace::is_withdraw_or_revocation`] fix).
+    fn projection_inputs(kind: ReplicatedKind) -> (&'static str, AuthorityClass, bool) {
+        match kind {
+            ReplicatedKind::KeyRecord
+            | ReplicatedKind::IdentityOccurrence
+            | ReplicatedKind::TransportDestination => ("self", AuthorityClass::SelfIdentity, false),
+            ReplicatedKind::IdentityOccurrenceRevocation => {
+                ("self", AuthorityClass::SelfIdentity, true)
+            }
+            // `Attestation` (producer gossip → `Cohort`) and — since
+            // `ReplicatedKind` is `#[non_exhaustive]` — any future persist kind
+            // both default to the conservative `Cohort` relay (never silently
+            // SelfOwn or Global) until edge learns to handle them explicitly.
+            _ => ("community", AuthorityClass::ProducerSteward, false),
+        }
+    }
+
+    /// The subject set to sweep for a resolved [`Projection`]. `SelfOwn` uses
+    /// the node's OWN publish set ([`Self::self_provider`] — collapsing the #257
+    /// and #305 selectors, falling back to the cohort for pre-selector
+    /// back-compat); `Cohort` uses the anti-entropy cohort; `Global` uses
+    /// own-union-cohort, the widest set the node can enumerate, so a tombstone
+    /// is never dropped when its subject exits the cohort (anti-rollback).
+    fn subjects_for_projection(&self, projection: Projection) -> Vec<String> {
+        match projection {
+            Projection::SelfOwn => {
+                let set = self.self_provider.as_ref().unwrap_or(&self.cohort);
+                set()
+            }
+            Projection::Cohort => (self.cohort)(),
+            Projection::Global => {
+                let mut subjects: Vec<String> =
+                    self.self_provider.as_ref().map(|p| p()).unwrap_or_default();
+                subjects.extend((self.cohort)());
+                subjects
+            }
+        }
+    }
+
+    /// Parse an RFC3339 timestamp field out of a record's canonical JSON into
+    /// the `ms_seq` monotonic hint. Missing/unparseable is 0 (best-effort; the
+    /// `seq` is only a receiver short-circuit, persist's merge is canonical).
+    fn ms_seq_from(field: Option<&serde_json::Value>) -> u64 {
+        field
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map_or(0, |dt| Self::ms_seq(dt.with_timezone(&chrono::Utc)))
+    }
+
+    /// Adapt one `SignedReplicatedRecord`'s `canonical_json` into the tuple the
+    /// engine emits: `(wire_bytes, envelope_hash, seq)`. The re-wrap keeps the
+    /// wire shape byte-compatible with the pre-#311 per-plane emitters —
+    /// `list_signed_records` returns the BARE inner type for key / attestation /
+    /// occurrence-revocation (`lookup_public_key` → `KeyRecord`, not
+    /// `SignedKeyRecord`), so those are re-nested under their `Signed*` field;
+    /// `IdentityOccurrence` is already the signed container; the unsigned
+    /// `TransportDestination` carries no `persist_row_hash`, so it hashes over
+    /// its JCS canonical bytes like the v2 operational kinds. Returns `None`
+    /// (skip this record) if the hash field is absent/malformed.
+    fn adapt_record(
+        kind: ReplicatedKind,
+        canonical_json: &serde_json::Value,
+    ) -> Option<(Vec<u8>, [u8; 32], u64)> {
+        match kind {
+            ReplicatedKind::KeyRecord => {
+                let hash = Self::decode_hash(canonical_json.get("persist_row_hash")?.as_str()?)?;
+                let seq = Self::ms_seq_from(canonical_json.get("valid_from"));
+                let wire = serde_json::json!({ "record": canonical_json });
+                Some((serde_json::to_vec(&wire).ok()?, hash, seq))
+            }
+            ReplicatedKind::IdentityOccurrence => {
+                let inner = canonical_json.get("identity_occurrence")?;
+                let hash = Self::decode_hash(inner.get("persist_row_hash")?.as_str()?)?;
+                let seq = Self::ms_seq_from(inner.get("asserted_at"));
+                Some((serde_json::to_vec(canonical_json).ok()?, hash, seq))
+            }
+            ReplicatedKind::TransportDestination => {
+                let hash = v2_envelope_hash(canonical_json)?;
+                let seq = Self::ms_seq_from(canonical_json.get("asserted_at"));
+                Some((serde_json::to_vec(canonical_json).ok()?, hash, seq))
+            }
+            ReplicatedKind::Attestation => {
+                let hash = Self::decode_hash(canonical_json.get("persist_row_hash")?.as_str()?)?;
+                let seq = Self::ms_seq_from(canonical_json.get("asserted_at"));
+                let wire = serde_json::json!({ "attestation": canonical_json });
+                Some((serde_json::to_vec(&wire).ok()?, hash, seq))
+            }
+            ReplicatedKind::IdentityOccurrenceRevocation => {
+                let hash = Self::decode_hash(canonical_json.get("persist_row_hash")?.as_str()?)?;
+                let seq = Self::ms_seq_from(canonical_json.get("revoked_at"));
+                let wire = serde_json::json!({ "identity_occurrence_revocation": canonical_json });
+                Some((serde_json::to_vec(&wire).ok()?, hash, seq))
+            }
+            // `#[non_exhaustive]` — a kind edge doesn't yet adapt is skipped
+            // (not advertised) rather than emitted in an unknown wire shape.
+            _ => None,
+        }
+    }
+
+    /// The engine loop for one `ReplicatedKind`: resolve its projection, sweep
+    /// the subject set, `list_signed_records` per subject, then adapt, dedupe,
+    /// cache, and emit an `EnvelopeRef` for each. `edge_kind` is the wire
+    /// [`EnvelopeKind`] the refs are cached under (1:1 with `kind`).
+    async fn list_replicated(
+        &self,
+        edge_kind: EnvelopeKind,
+        kind: ReplicatedKind,
+    ) -> Vec<EnvelopeRef> {
+        let (scope, authority, is_tombstone) = Self::projection_inputs(kind);
+        let projection = namespace::projection_for(scope, authority, is_tombstone);
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        let publish_set = self.key_selector.as_ref().unwrap_or(&self.cohort);
-        for key_id in publish_set() {
-            if let Ok(Some(row)) = self.directory.lookup_public_key(&key_id).await {
-                if let Some(hash) = Self::decode_hash(&row.persist_row_hash) {
-                    if !seen.insert(hash) {
-                        continue;
-                    }
-                    let bytes = serde_json::to_vec(&SignedKeyRecord {
-                        record: row.clone(),
-                    })
-                    .unwrap_or_default();
-                    self.cache_insert(EnvelopeKind::Key, hash, bytes).await;
-                    refs.push(EnvelopeRef {
-                        envelope_hash: hash,
-                        seq: Self::ms_seq(row.valid_from),
-                    });
+        for subject in self.subjects_for_projection(projection) {
+            let records = self
+                .directory
+                .list_signed_records(kind, &subject)
+                .await
+                .unwrap_or_default();
+            for rec in records {
+                let Some((bytes, hash, seq)) = Self::adapt_record(kind, &rec.canonical_json) else {
+                    continue;
+                };
+                if !seen.insert(hash) {
+                    continue;
                 }
+                self.cache_insert(edge_kind, hash, bytes).await;
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq,
+                });
             }
         }
         refs
@@ -494,6 +618,7 @@ impl FederationDirectoryReplicationBridge {
     async fn fan_out_for_member<Row, Signed, FetchFut, F, W, H>(
         &self,
         kind: EnvelopeKind,
+        subjects: Vec<String>,
         mut fetch: F,
         wrap: W,
         timestamp: impl Fn(&Row) -> chrono::DateTime<chrono::Utc>,
@@ -508,7 +633,7 @@ impl FederationDirectoryReplicationBridge {
     {
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in (self.cohort)() {
+        for key_id in subjects {
             let rows = fetch(key_id).await;
             for row in rows {
                 let Some(envelope_hash) = Self::decode_hash(hash(&row)) else {
@@ -530,37 +655,67 @@ impl FederationDirectoryReplicationBridge {
     }
 
     async fn list_attestations(&self) -> Vec<EnvelopeRef> {
-        // Union: attestations ABOUT this key + attestations FROM this key.
-        // The dedupe by hash collapses cross-references. This is the only
-        // kind whose per-key list is the chain of two `list_*` reads;
-        // every other kind hits one `list_*_for` surface.
-        self.fan_out_for_member(
-            EnvelopeKind::Attestation,
-            |key_id| async move {
-                let about = self
-                    .directory
-                    .list_attestations_for(&key_id)
-                    .await
-                    .unwrap_or_default();
-                let from = self
-                    .directory
-                    .list_attestations_by(&key_id)
-                    .await
-                    .unwrap_or_default();
-                about.into_iter().chain(from).collect()
-            },
-            |row| SignedAttestation {
-                attestation: row.clone(),
-            },
-            |row| row.asserted_at,
-            |row| row.persist_row_hash.as_str(),
-        )
-        .await
+        // #311 — Attestation rides the engine's `Cohort` projection, but keeps
+        // the pre-#311 about+by coverage: `list_signed_records(Attestation)` is
+        // about-only (`list_attestations_for`), so the `by`-half
+        // (`list_attestations_by` — attestations this subject MADE) is
+        // supplemented explicitly, else routing it through the engine would
+        // silently narrow the gossip set. Both halves go through the same
+        // `adapt_record` re-wrap so the wire shape + `persist_row_hash` identity
+        // match the old `SignedAttestation` emitter exactly.
+        let projection = namespace::projection_for(
+            "community",
+            AuthorityClass::ProducerSteward,
+            false, // scores/grants are Live; a withdraws attestation is a
+                   // regular federation_attestations row here, tombstone
+                   // projection is the persist R1/Q1 merge's concern
+        );
+        let mut refs = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        for subject in self.subjects_for_projection(projection) {
+            // about — via the uniform signed read (`list_attestations_for`).
+            let about = self
+                .directory
+                .list_signed_records(ReplicatedKind::Attestation, &subject)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|rec| rec.canonical_json);
+            // by — supplement so coverage doesn't narrow (bare `Attestation`).
+            let by = self
+                .directory
+                .list_attestations_by(&subject)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|att| serde_json::to_value(att).ok());
+            for canonical_json in about.chain(by) {
+                let Some((bytes, hash, seq)) =
+                    Self::adapt_record(ReplicatedKind::Attestation, &canonical_json)
+                else {
+                    continue;
+                };
+                if !seen.insert(hash) {
+                    continue;
+                }
+                self.cache_insert(EnvelopeKind::Attestation, hash, bytes)
+                    .await;
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq,
+                });
+            }
+        }
+        refs
     }
 
     async fn list_revocations(&self) -> Vec<EnvelopeRef> {
+        // #311 tombstone fix — key revocations project `Global` (own ∪ cohort),
+        // not cohort-only RELAY, so a revocation is never out-run by the stale
+        // record it retracts even after the subject exits the cohort.
         self.fan_out_for_member(
             EnvelopeKind::Revocation,
+            self.subjects_for_projection(Projection::Global),
             |key_id| async move {
                 self.directory
                     .revocations_for(&key_id)
@@ -576,56 +731,10 @@ impl FederationDirectoryReplicationBridge {
         .await
     }
 
-    async fn list_identity_occurrences(&self) -> Vec<EnvelopeRef> {
-        // CIRISEdge#305 — publish-OWN occurrence (KERI publish-own; the KEX
-        // analogue of #257's Key-plane fix). The identity occurrence carries
-        // the content-tier `encryption_pubkeys` (x25519 + ML-KEM-768); if the
-        // node never advertises its OWN occurrence, no peer can resolve its KEX
-        // keys → `resolve_peer_kex_pubkeys` stays `None` → 0 content delivery
-        // even after the peer is transport-rooted. Resolve the publish set via
-        // `occurrence_selector` (own key_id, server-supplied) exactly as
-        // `list_keys` uses `key_selector`; `None` preserves the pre-fix cohort
-        // projection. Hand-rolled rather than `fan_out_for_member` because that
-        // combinator hardcodes the cohort (and mirrors `list_keys`, which is
-        // hand-rolled for the same reason).
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        let publish_set = self.occurrence_selector.as_ref().unwrap_or(&self.cohort);
-        for key_id in publish_set() {
-            // CIRISPersist#418 / v14.1.0 — read the SIGNED container
-            // (`list_signed_identity_occurrences_for`), reconstructed byte-exact
-            // from the stored `{attesting_key_id, signed_envelope, signature}`.
-            // The transport replicator re-publishes it verbatim — it holds the
-            // transport signer, NOT the identity's federation key, so it can
-            // neither re-sign nor synthesize the signature; only re-wrap what
-            // was signed-put.
-            let signed = self
-                .directory
-                .list_signed_identity_occurrences_for(&key_id)
-                .await
-                .unwrap_or_default();
-            for occ in signed {
-                let Some(envelope_hash) =
-                    Self::decode_hash(&occ.identity_occurrence.persist_row_hash)
-                else {
-                    continue;
-                };
-                if !seen.insert(envelope_hash) {
-                    continue;
-                }
-                let seq = Self::ms_seq(occ.identity_occurrence.asserted_at);
-                let bytes = serde_json::to_vec(&occ).unwrap_or_default();
-                self.cache_insert(EnvelopeKind::IdentityOccurrence, envelope_hash, bytes)
-                    .await;
-                refs.push(EnvelopeRef { envelope_hash, seq });
-            }
-        }
-        refs
-    }
-
     async fn list_families(&self) -> Vec<EnvelopeRef> {
         self.fan_out_for_member(
             EnvelopeKind::Family,
+            (self.cohort)(),
             |key_id| async move {
                 self.directory
                     .list_families_for_member(&key_id)
@@ -644,6 +753,7 @@ impl FederationDirectoryReplicationBridge {
     async fn list_communities(&self) -> Vec<EnvelopeRef> {
         self.fan_out_for_member(
             EnvelopeKind::Community,
+            (self.cohort)(),
             |key_id| async move {
                 self.directory
                     .list_communities_for_member(&key_id)
@@ -659,27 +769,11 @@ impl FederationDirectoryReplicationBridge {
         .await
     }
 
-    async fn list_identity_occurrence_revocations(&self) -> Vec<EnvelopeRef> {
-        self.fan_out_for_member(
-            EnvelopeKind::IdentityOccurrenceRevocation,
-            |key_id| async move {
-                self.directory
-                    .list_identity_occurrence_revocations_for(&key_id)
-                    .await
-                    .unwrap_or_default()
-            },
-            |row| SignedIdentityOccurrenceRevocation {
-                identity_occurrence_revocation: row.clone(),
-            },
-            |row| row.revoked_at,
-            |row| row.persist_row_hash.as_str(),
-        )
-        .await
-    }
-
     async fn list_family_membership_revocations(&self) -> Vec<EnvelopeRef> {
+        // #311 tombstone fix — membership revocation projects `Global`.
         self.fan_out_for_member(
             EnvelopeKind::FamilyMembershipRevocation,
+            self.subjects_for_projection(Projection::Global),
             |key_id| async move {
                 self.directory
                     .list_family_membership_revocations_for(&key_id)
@@ -696,8 +790,10 @@ impl FederationDirectoryReplicationBridge {
     }
 
     async fn list_community_membership_revocations(&self) -> Vec<EnvelopeRef> {
+        // #311 tombstone fix — membership revocation projects `Global`.
         self.fan_out_for_member(
             EnvelopeKind::CommunityMembershipRevocation,
+            self.subjects_for_projection(Projection::Global),
             |key_id| async move {
                 self.directory
                     .list_community_membership_revocations_for(&key_id)
@@ -716,6 +812,7 @@ impl FederationDirectoryReplicationBridge {
     async fn list_location_proofs(&self) -> Vec<EnvelopeRef> {
         self.fan_out_for_member(
             EnvelopeKind::LocationProof,
+            (self.cohort)(),
             |key_id| async move {
                 self.directory
                     .list_location_proofs_for(&key_id)
@@ -952,6 +1049,21 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// #311 — admit a replicated `TransportDestination` (reachability row).
+    /// The wire bytes are the bare (unsigned) `TransportDestination` the engine
+    /// emitted; `put_transport_destination` is idempotent/last-writer per V078
+    /// (a stale address is dropped + re-registered, never signed or revoked).
+    async fn apply_transport_destination(&self, bytes: &[u8]) -> bool {
+        match serde_json::from_slice::<TransportDestination>(bytes) {
+            Ok(dest) => self
+                .directory
+                .put_transport_destination(&dest)
+                .await
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
     // ── v2 operational-data apply_* ────────────────────────────────
     //
     // The 3 v2 operational kinds (CEG 1.0-RC2 §5.6.8.13) gate on the
@@ -1183,6 +1295,7 @@ mod tests {
             EnvelopeKind::FamilyMembershipRevocation,
             EnvelopeKind::CommunityMembershipRevocation,
             EnvelopeKind::LocationProof,
+            EnvelopeKind::TransportDestination,
         ] {
             let refs = bridge.list_envelope_refs(kind).await;
             assert!(refs.is_empty(), "expected empty refs for {kind:?}");
@@ -1239,7 +1352,7 @@ mod tests {
     /// `list_keys` projects the cohort and would never carry them — the
     /// mesh-seed blocker (a verifier can't root a key it never received).
     #[tokio::test]
-    async fn key_selector_publishes_own_and_anchored_not_cohort() {
+    async fn self_provider_publishes_own_and_anchored_not_cohort() {
         let cohort_member = "peer-in-cohort";
         let own_key = "this-node-own";
         let anchored = "third-party-anchored";
@@ -1264,15 +1377,16 @@ mod tests {
             "cohort projection advertises only cohort members' own"
         );
 
-        // Install the Key-plane publish set {own, anchored}: publish-own.
+        // Install the SELF publish set {own, anchored}: publish-own. #311 — one
+        // `self_provider` drives every SelfOwn kind (here: Key) via the engine.
         let publish_set = vec![own_key.to_string(), anchored.to_string()];
         let selector: CohortProvider = Arc::new(move || publish_set.clone());
-        let bridge = bridge.with_key_selector(Some(selector));
+        let bridge = bridge.with_self_provider(Some(selector));
         let refs = bridge.list_envelope_refs(EnvelopeKind::Key).await;
         assert_eq!(
             refs.len(),
             2,
-            "selector advertises the node's own + the anchored record, not the cohort"
+            "self_provider advertises the node's own + the anchored record, not the cohort"
         );
     }
 
@@ -1317,6 +1431,7 @@ mod tests {
             EnvelopeKind::FamilyMembershipRevocation,
             EnvelopeKind::CommunityMembershipRevocation,
             EnvelopeKind::LocationProof,
+            EnvelopeKind::TransportDestination,
         ] {
             let r = bridge
                 .apply_envelope_bytes(kind, b"{not a signed record}")
@@ -1615,5 +1730,61 @@ mod tests {
             refs.is_empty(),
             "empty backend yields empty ref set (no panics, no errors)"
         );
+    }
+
+    // ── #311 — the unified engine's policy mapping + wire-shape re-wrap ──
+
+    /// Each `ReplicatedKind`'s `projection_inputs` resolve (via persist's
+    /// `projection_for`) to the projection the concept assigns: the identity
+    /// plane publishes-own, attestations relay over the cohort, and the
+    /// occurrence-revocation tombstone gossips GLOBAL (anti-rollback — the fix
+    /// for the RELAY mis-projection).
+    #[test]
+    fn projection_inputs_resolve_to_expected_projections() {
+        type B = FederationDirectoryReplicationBridge;
+        for k in [
+            ReplicatedKind::KeyRecord,
+            ReplicatedKind::IdentityOccurrence,
+            ReplicatedKind::TransportDestination,
+        ] {
+            let (s, a, t) = B::projection_inputs(k);
+            assert_eq!(
+                namespace::projection_for(s, a, t),
+                Projection::SelfOwn,
+                "{k:?} → SelfOwn (publish-own)"
+            );
+        }
+        let (s, a, t) = B::projection_inputs(ReplicatedKind::Attestation);
+        assert_eq!(namespace::projection_for(s, a, t), Projection::Cohort);
+        let (s, a, t) = B::projection_inputs(ReplicatedKind::IdentityOccurrenceRevocation);
+        assert!(t, "occurrence-revocation is a tombstone");
+        assert_eq!(
+            namespace::projection_for(s, a, t),
+            Projection::Global,
+            "tombstone → Global (anti-rollback, never out-run by the stale record)"
+        );
+    }
+
+    /// The engine re-wraps the BARE `KeyRecord` that `list_signed_records`
+    /// returns back into the `SignedKeyRecord` (`{"record": …}`) wire shape,
+    /// and keeps `persist_row_hash` as the envelope identity — so the wire
+    /// bytes deserialize on the receiver's `apply_key` and the hash is
+    /// unchanged vs the pre-#311 emitter (v9.9↔v9.10 convergence holds).
+    #[test]
+    fn adapt_record_key_rewraps_to_signed_shape_keeping_hash() {
+        let prh = "ab".repeat(32); // 64 hex chars → 32 bytes
+        let bare = serde_json::json!({
+            "key_id": "k1",
+            "persist_row_hash": prh,
+            "valid_from": "2026-07-11T00:00:00Z",
+        });
+        let (bytes, hash, _seq) =
+            FederationDirectoryReplicationBridge::adapt_record(ReplicatedKind::KeyRecord, &bare)
+                .expect("adapt bare KeyRecord");
+        // Re-nested under "record" — deserializes as SignedKeyRecord.
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
+        assert_eq!(v["record"]["key_id"], "k1", "re-wrapped to SignedKeyRecord");
+        // Wire identity == decoded persist_row_hash (stable across versions).
+        assert_eq!(hex::encode(hash), prh, "hash stays persist_row_hash");
     }
 }

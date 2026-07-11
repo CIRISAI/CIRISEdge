@@ -30,13 +30,24 @@
 //! Initiator set.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::RwLock;
 
 use super::coordinator::{CoordinatorError, ReplicationCoordinator};
 use super::protocol::EnvelopeKind;
 use super::wire_frame;
+
+/// CIRISEdge#312 — a factory that builds a `Responder` coordinator for an
+/// inbound `(peer_key_id, kind)` that has no registered coordinator. Installed
+/// once by [`ReplicationRuntime::start`](crate::replication::ReplicationRuntime)
+/// so the registry can auto-serve a pull from a #301 advisory-admitted peer
+/// (whom this node does NOT consent-pull from, so it never built an Initiator
+/// for them) instead of dropping the round. The records served are public
+/// signed envelopes; admission is already bounded by the transport's #301
+/// advisory-admit gate, so no additional consent is required.
+pub type ResponderFactory =
+    Arc<dyn Fn(&str, EnvelopeKind) -> Arc<ReplicationCoordinator> + Send + Sync>;
 
 /// Outcome of [`ReplicationRegistry::route_inbound_bytes`].
 #[derive(Debug)]
@@ -80,13 +91,48 @@ pub enum RegistryError {
 /// path).
 pub struct ReplicationRegistry {
     by_peer_kind: RwLock<HashMap<(String, EnvelopeKind), Arc<ReplicationCoordinator>>>,
+    /// CIRISEdge#312 — set-once factory used by [`Self::route_inbound_bytes`]
+    /// to auto-register a `Responder` for an admitted-but-uncoordinated peer
+    /// (see [`ResponderFactory`]). `None` (never installed) preserves the
+    /// pre-#312 behavior: an inbound round with no coordinator returns
+    /// [`RouteOutcome::NoCoordinatorRegistered`].
+    responder_factory: OnceLock<ResponderFactory>,
 }
 
 impl ReplicationRegistry {
     pub fn new() -> Self {
         Self {
             by_peer_kind: RwLock::new(HashMap::new()),
+            responder_factory: OnceLock::new(),
         }
+    }
+
+    /// CIRISEdge#312 — install the [`ResponderFactory`] (once). Called by
+    /// [`ReplicationRuntime::start`](crate::replication::ReplicationRuntime) so
+    /// inbound rounds from advisory-admitted peers auto-register a `Responder`
+    /// instead of dropping. A second call is a no-op (the first wins).
+    pub fn set_responder_factory(&self, factory: ResponderFactory) {
+        let _ = self.responder_factory.set(factory);
+    }
+
+    /// Get the coordinator for `(peer_key_id, kind)`, or build+register one via
+    /// `build` if absent — atomically under the write lock so two concurrent
+    /// inbound rounds can't each spawn a duplicate coordinator.
+    async fn get_or_register_with<F>(
+        &self,
+        peer_key_id: &str,
+        kind: EnvelopeKind,
+        build: F,
+    ) -> Arc<ReplicationCoordinator>
+    where
+        F: FnOnce() -> Arc<ReplicationCoordinator>,
+    {
+        self.by_peer_kind
+            .write()
+            .await
+            .entry((peer_key_id.to_string(), kind))
+            .or_insert_with(build)
+            .clone()
     }
 
     /// Register a coordinator for `(peer_key_id, kind)`. Replaces
@@ -185,8 +231,23 @@ impl ReplicationRegistry {
             super::protocol::ReplicationMessage::Fetch(m) => m.kind,
             super::protocol::ReplicationMessage::Deliver(m) => m.kind,
         };
-        let Some(coord) = self.get(peer_key_id, kind).await else {
-            return Ok(RouteOutcome::NoCoordinatorRegistered { kind });
+        // CIRISEdge#312 — if no coordinator exists for this (peer, kind), this
+        // node doesn't consent-pull from the peer (so no Initiator was built),
+        // but the peer is an admitted #301 advisory source pulling PUBLIC signed
+        // envelopes. Auto-register a `Responder` and serve the round instead of
+        // dropping it — the fix that lets an advisory-admitted agent get its
+        // IdentityOccurrence round answered (so it can resolve this node's KEX
+        // pubkeys and seal). With no factory installed, fall back to the
+        // pre-#312 drop.
+        let coord = if let Some(coord) = self.get(peer_key_id, kind).await {
+            coord
+        } else {
+            let Some(factory) = self.responder_factory.get() else {
+                return Ok(RouteOutcome::NoCoordinatorRegistered { kind });
+            };
+            let factory = Arc::clone(factory);
+            self.get_or_register_with(peer_key_id, kind, || factory(peer_key_id, kind))
+                .await
         };
         coord
             .deliver_inbound(msg)
@@ -353,6 +414,44 @@ mod tests {
             }
             o => panic!("expected NoCoordinatorRegistered, got {o:?}"),
         }
+    }
+
+    /// CIRISEdge#312 — with a responder factory installed, an inbound round
+    /// from an UNregistered peer auto-registers a coordinator and routes,
+    /// instead of dropping at `NoCoordinatorRegistered`. This is the fix that
+    /// lets a #301 advisory-admitted peer's pull get served.
+    #[tokio::test]
+    async fn route_to_unregistered_peer_auto_registers_with_factory() {
+        let registry = ReplicationRegistry::new();
+        registry.set_responder_factory(Arc::new(|peer: &str, kind| make_coord(peer, kind)));
+
+        // Nothing pre-registered for "agent".
+        assert!(registry
+            .get("agent", EnvelopeKind::IdentityOccurrence)
+            .await
+            .is_none());
+
+        let msg = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::IdentityOccurrence,
+            refs: vec![],
+        });
+        let framed = wrap(&msg);
+        let r = registry
+            .route_inbound_bytes("agent", &framed)
+            .await
+            .expect("ok");
+        assert!(
+            matches!(r, RouteOutcome::Routed),
+            "factory auto-registers + routes instead of dropping"
+        );
+        // The coordinator now persists for subsequent rounds.
+        assert!(
+            registry
+                .get("agent", EnvelopeKind::IdentityOccurrence)
+                .await
+                .is_some(),
+            "auto-registered coordinator is retained"
+        );
     }
 
     #[tokio::test]

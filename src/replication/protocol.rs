@@ -142,6 +142,18 @@ pub enum EnvelopeKind {
     /// `put_partner_record(SignedPartnerRecord, steward_roster)`.
     /// REQUIRES `WIRE_PROTOCOL_VERSION = 0x02`.
     PartnerRecord,
+    /// CIRISEdge#311 — `transport_destinations` reachability row
+    /// (`TransportDestination`; V078). A member of persist v15.1.0's
+    /// `ReplicatedKind::all()`, swept by the unified replication engine as
+    /// the `SelfOwn` transport plane: a node publishes its OWN reachable
+    /// address(es) so peers can dial it (the occurrence-KEX arc). Unlike the
+    /// signed identity kinds this row carries **no signature /
+    /// `persist_row_hash`** — it is mutable + disposable reachability, so its
+    /// `envelope_hash` uses the JCS basis (`sha256(JCS(record))`) like the v2
+    /// operational kinds. A NEW post-v1 tag: `put_transport_destination`.
+    /// REQUIRES `WIRE_PROTOCOL_VERSION_V2` (v1-only peers refuse the unknown
+    /// tag at serde-decode — the additive-and-safe transition per FSD §3.7).
+    TransportDestination,
 }
 
 impl EnvelopeKind {
@@ -169,7 +181,12 @@ impl EnvelopeKind {
             | Self::FamilyMembershipRevocation
             | Self::CommunityMembershipRevocation
             | Self::LocationProof => crate::replication::wire_frame::WIRE_PROTOCOL_VERSION,
-            Self::Organization | Self::OrgMembership | Self::PartnerRecord => {
+            Self::Organization
+            | Self::OrgMembership
+            | Self::PartnerRecord
+            // #311 — a new post-v1 tag; v1-only peers don't know it and
+            // would serde-reject the body, so it rides at V2 framing.
+            | Self::TransportDestination => {
                 crate::replication::wire_frame::WIRE_PROTOCOL_VERSION_V2
             }
         }
