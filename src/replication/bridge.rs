@@ -654,25 +654,83 @@ impl FederationDirectoryReplicationBridge {
         refs
     }
 
+    /// v10 — resolve ONE attestation's replication policy dynamically from its
+    /// actual CEG fields (persist#425), then decide whether THIS node advertises
+    /// it. The `scores`/Attestation plane is the one plane whose policy varies
+    /// per record: a `dimension` (CC 2.1 — carried inside `attestation_envelope`)
+    /// selects the [`namespace::authority_for`] class across all 95 families, the
+    /// top-level `cohort_scope` selects the audience, and `attestation_type`
+    /// selects tombstone status. `namespace::projection_for` then resolves the
+    /// projection, which the list side applies exhaustively:
+    ///
+    /// - [`Global`](Projection::Global) — always advertise. Trust-root commons
+    ///   (`provenance:build_manifest:*` and any future `AccordCoScrub` family at
+    ///   a commons scope) reach the whole federation, as do every
+    ///   withdraws/recants tombstone (anti-rollback).
+    /// - [`Cohort`](Projection::Cohort) — advertise (hold-and-forward relay).
+    /// - [`SelfOwn`](Projection::SelfOwn) — advertise **iff THIS node produced
+    ///   it** (`attesting_key_id ∈ self_set`). A `self`/`family`-scoped
+    ///   attestation is published by its own subject (KERI publish-own), never
+    ///   relayed by a third party — the structural-invisibility discipline.
+    ///
+    /// Unknown/absent dimensions fall to `authority_for`'s `ProducerSteward`
+    /// default and unknown scopes to `projection_for`'s `Cohort` negative
+    /// default, so every record resolves (no panic, never silently GLOBAL).
+    fn attestation_is_advertised(
+        canonical_json: &serde_json::Value,
+        self_set: &HashSet<String>,
+    ) -> bool {
+        // CC 2.1: the `dimension` lives inside the attestation envelope; the
+        // audience + relation fields are the top-level persist columns.
+        let dimension = canonical_json
+            .pointer("/attestation_envelope/dimension")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let cohort_scope = canonical_json
+            .get("cohort_scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let attestation_type = canonical_json
+            .get("attestation_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let authority = namespace::registry::authority_for(dimension).class;
+        let is_tombstone = namespace::is_withdraw_or_revocation(attestation_type);
+        match namespace::projection_for(cohort_scope, authority, is_tombstone) {
+            Projection::Global | Projection::Cohort => true,
+            Projection::SelfOwn => canonical_json
+                .get("attesting_key_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|producer| self_set.contains(producer)),
+        }
+    }
+
     async fn list_attestations(&self) -> Vec<EnvelopeRef> {
-        // #311 — Attestation rides the engine's `Cohort` projection, but keeps
-        // the pre-#311 about+by coverage: `list_signed_records(Attestation)` is
-        // about-only (`list_attestations_for`), so the `by`-half
-        // (`list_attestations_by` — attestations this subject MADE) is
-        // supplemented explicitly, else routing it through the engine would
-        // silently narrow the gossip set. Both halves go through the same
-        // `adapt_record` re-wrap so the wire shape + `persist_row_hash` identity
-        // match the old `SignedAttestation` emitter exactly.
-        let projection = namespace::projection_for(
-            "community",
-            AuthorityClass::ProducerSteward,
-            false, // scores/grants are Live; a withdraws attestation is a
-                   // regular federation_attestations row here, tombstone
-                   // projection is the persist R1/Q1 merge's concern
-        );
+        // v10 — per-record dynamic policy for the scores/Attestation plane.
+        // Each attestation's projection is resolved from its ACTUAL dimension
+        // (across all 95 namespace families), cohort_scope, and attestation_type
+        // via [`Self::attestation_is_advertised`], NOT the coarse per-kind
+        // default #311 used — so an infra / canonical / build-manifest
+        // attestation (`AccordCoScrub` trust root) now reaches the whole
+        // federation, a self/family attestation is published-own, and a
+        // withdraws tombstone gossips GLOBAL.
+        //
+        // Sweep the WIDEST subject set (own ∪ cohort) so no record whose
+        // per-record projection would include it is missed. `list_signed_records`
+        // is about-only, so `list_attestations_by` supplements the by-half
+        // (coverage preserved from #311). Both halves ride the same
+        // `adapt_record` re-wrap → wire shape + `persist_row_hash` identity match
+        // the pre-#311 emitter exactly.
+        let self_set: HashSet<String> = self
+            .self_provider
+            .as_ref()
+            .map(|p| p())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for subject in self.subjects_for_projection(projection) {
+        for subject in self.subjects_for_projection(Projection::Global) {
             // about — via the uniform signed read (`list_attestations_for`).
             let about = self
                 .directory
@@ -690,6 +748,9 @@ impl FederationDirectoryReplicationBridge {
                 .into_iter()
                 .filter_map(|att| serde_json::to_value(att).ok());
             for canonical_json in about.chain(by) {
+                if !Self::attestation_is_advertised(&canonical_json, &self_set) {
+                    continue;
+                }
                 let Some((bytes, hash, seq)) =
                     Self::adapt_record(ReplicatedKind::Attestation, &canonical_json)
                 else {
@@ -1786,5 +1847,158 @@ mod tests {
         assert_eq!(v["record"]["key_id"], "k1", "re-wrapped to SignedKeyRecord");
         // Wire identity == decoded persist_row_hash (stable across versions).
         assert_eq!(hex::encode(hash), prh, "hash stays persist_row_hash");
+    }
+
+    // ── v10 — per-record dynamic policy for the scores/Attestation plane ──
+
+    type Bridge = FederationDirectoryReplicationBridge;
+
+    /// Build an attestation `canonical_json` with the fields the resolver reads:
+    /// `dimension` inside `attestation_envelope` (CC 2.1), the rest top-level.
+    fn att_json(
+        dimension: &str,
+        cohort_scope: &str,
+        attestation_type: &str,
+        attesting_key_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "attesting_key_id": attesting_key_id,
+            "attestation_type": attestation_type,
+            "cohort_scope": cohort_scope,
+            "attestation_envelope": { "dimension": dimension },
+        })
+    }
+
+    fn set_of(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A trust-root (`provenance:build_manifest:*` → `AccordCoScrub`) attestation
+    /// at a commons scope reaches the WHOLE federation — advertised even though
+    /// this node didn't produce it. This is the v10 fix: infra / canonical /
+    /// build-manifest attestations were stuck at coarse `Cohort` before.
+    #[test]
+    fn attestation_trust_root_commons_is_global_advertised() {
+        let a = att_json(
+            "provenance:build_manifest:linux-x86_64",
+            "federation",
+            "scores",
+            "some-builder",
+        );
+        assert!(
+            Bridge::attestation_is_advertised(&a, &HashSet::new()),
+            "trust-root build-manifest attestation reaches the whole federation regardless of producer"
+        );
+    }
+
+    /// A `self`-scoped attestation is publish-own: advertised iff THIS node
+    /// produced it, never relayed by a third party.
+    #[test]
+    fn attestation_self_scoped_advertised_only_when_produced_here() {
+        let a = att_json("trust:reliability:v1", "self", "scores", "node-own");
+        assert!(
+            Bridge::attestation_is_advertised(&a, &set_of(&["node-own"])),
+            "self-scoped: advertised when THIS node produced it (publish-own)"
+        );
+        assert!(
+            !Bridge::attestation_is_advertised(&a, &set_of(&["someone-else"])),
+            "self-scoped: NOT relayed by a third party"
+        );
+    }
+
+    /// A `community`-scoped attestation relays over the cohort — advertised
+    /// regardless of the self set.
+    #[test]
+    fn attestation_community_scoped_relays_over_cohort() {
+        let a = att_json("trust:reliability:v1", "community", "scores", "peer");
+        assert!(Bridge::attestation_is_advertised(&a, &HashSet::new()));
+    }
+
+    /// A `withdraws` tombstone gossips GLOBAL (anti-rollback) even at `self`
+    /// scope and even if this node didn't produce it — a revocation can never be
+    /// out-run by the stale record it retracts.
+    #[test]
+    fn attestation_withdraws_is_tombstone_global() {
+        let a = att_json("trust:reliability:v1", "self", "withdraws", "peer");
+        assert!(
+            Bridge::attestation_is_advertised(&a, &HashSet::new()),
+            "withdraws tombstone → Global regardless of scope/producer"
+        );
+    }
+
+    /// Every one of the 95 families resolves — an unknown or absent dimension
+    /// falls to `authority_for`'s `ProducerSteward` default and an unknown scope
+    /// to `projection_for`'s `Cohort` negative default (never a panic, never
+    /// silently Global/SelfOwn).
+    #[test]
+    fn attestation_unknown_or_absent_dimension_defaults_to_cohort() {
+        let unknown = att_json("totally:unknown:prefix", "community", "scores", "peer");
+        assert!(Bridge::attestation_is_advertised(&unknown, &HashSet::new()));
+        // Dimension absent entirely (e.g. a `delegates_to` relation).
+        let absent = serde_json::json!({
+            "attesting_key_id": "peer",
+            "attestation_type": "delegates_to",
+            "cohort_scope": "community",
+        });
+        assert!(
+            Bridge::attestation_is_advertised(&absent, &HashSet::new()),
+            "absent dimension still resolves (no panic)"
+        );
+    }
+
+    /// The resolver DISCRIMINATES — a non-trust-root producer's commons-scoped
+    /// attestation relays over the cohort (advertised), but the same producer's
+    /// `self`-scoped attestation is filtered when this node didn't make it. Only
+    /// a trust-root authority promotes a commons scope to Global.
+    #[test]
+    fn attestation_resolver_discriminates_by_authority_and_scope() {
+        let commons = att_json("trust:reliability:v1", "federation", "scores", "peer");
+        assert!(
+            Bridge::attestation_is_advertised(&commons, &HashSet::new()),
+            "non-trust-root federation scope relays over cohort"
+        );
+        let self_scoped = att_json("trust:reliability:v1", "self", "scores", "peer");
+        assert!(
+            !Bridge::attestation_is_advertised(&self_scoped, &HashSet::new()),
+            "self-scoped from a non-producer is filtered — resolver is not blanket-advertising"
+        );
+    }
+
+    /// **Exhaustiveness proof** — EVERY family in persist's vendored namespace
+    /// registry (all `VENDORED_N_FAMILIES`) resolves a projection through the
+    /// resolver at every `cohort_scope`, with no panic. This is what "all the
+    /// namespaces replicate" means concretely: replication policy is defined for
+    /// the ENTIRE namespace, not a hand-picked subset.
+    #[test]
+    fn every_registry_family_resolves_a_projection() {
+        let scopes = [
+            "self",
+            "family",
+            "community",
+            "affiliations",
+            "species",
+            "biosphere",
+            "federation",
+            "", // absent/unknown scope → Cohort negative default
+        ];
+        let families = namespace::registry::entries();
+        assert_eq!(
+            families.len(),
+            namespace::registry::VENDORED_N_FAMILIES,
+            "resolver covers the full vendored family set"
+        );
+        for entry in families {
+            for scope in scopes {
+                // Must resolve (no panic) for both a live score and a tombstone.
+                let scored = att_json(&entry.prefix, scope, "scores", "peer");
+                let tombstone = att_json(&entry.prefix, scope, "withdraws", "peer");
+                let _ = Bridge::attestation_is_advertised(&scored, &HashSet::new());
+                assert!(
+                    Bridge::attestation_is_advertised(&tombstone, &HashSet::new()),
+                    "every family's withdraws tombstone gossips Global ({})",
+                    entry.prefix
+                );
+            }
+        }
     }
 }
