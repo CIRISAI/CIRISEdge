@@ -151,6 +151,13 @@ impl ReplicationRuntime {
         // knowledge) and hands it to edge alongside the consent-derived
         // cohort — edge only provides the hook.
         key_selector: Option<CohortProvider>,
+        // CIRISEdge#305 — the IdentityOccurrence-plane publish-set selector
+        // (KEX analogue of `key_selector`). `Some` yields the node's OWN key_id
+        // so `list_identity_occurrences` advertises its own occurrence (which
+        // carries the content-tier `encryption_pubkeys`) — without which peers
+        // resolve `None` KEX keys and cannot seal content to it. `None`
+        // preserves the pre-fix cohort projection. Server-supplied hook.
+        occurrence_selector: Option<CohortProvider>,
     ) -> Self {
         // Cohort callback: yields the set of peer_key_ids we
         // anti-entropy with, snapshotted at construction. Hot-adds
@@ -170,7 +177,8 @@ impl ReplicationRuntime {
                 cohort,
                 config.bridge,
             )
-            .with_key_selector(key_selector),
+            .with_key_selector(key_selector)
+            .with_occurrence_selector(occurrence_selector),
         );
 
         let registry = Arc::new(ReplicationRegistry::new());
@@ -455,6 +463,7 @@ mod tests {
             Vec::new(),
             ReplicationRuntimeConfig::default(),
             None,
+            None,
         )
         .await;
         assert!(rt.registry().is_empty().await);
@@ -478,6 +487,7 @@ mod tests {
             peers,
             ReplicationRuntimeConfig::default(),
             None,
+            None,
         )
         .await;
         let registry = rt.registry();
@@ -500,6 +510,7 @@ mod tests {
             Vec::new(),
             ReplicationRuntimeConfig::default(),
             None,
+            None,
         )
         .await;
         rt.register_peer("agent-bob", EnvelopeKind::Attestation)
@@ -521,6 +532,7 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
+            None,
             None,
         )
         .await;
@@ -552,6 +564,7 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
+            None,
             None,
         )
         .await;
@@ -594,6 +607,7 @@ mod tests {
             transport,
             initial,
             ReplicationRuntimeConfig::default(),
+            None,
             None,
         )
         .await;
@@ -641,6 +655,7 @@ mod tests {
             transport,
             Vec::new(),
             ReplicationRuntimeConfig::default(),
+            None,
             None,
         )
         .await;
