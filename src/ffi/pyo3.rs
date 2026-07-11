@@ -2144,7 +2144,7 @@ impl PyEdge {
     ///   transport was registered at init.
     /// - `ValueError("unknown EnvelopeKind: {token}")` if a kind
     ///   string in `peers` doesn't match the 10 wire tokens.
-    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None))]
+    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None))]
     fn start_replication(
         &self,
         py: Python<'_>,
@@ -2161,6 +2161,13 @@ impl PyEdge {
         // into the bridge's Key-plane selector. `None` preserves the
         // pre-#257 cohort projection.
         key_publish_set: Option<Vec<String>>,
+        // CIRISEdge#305 — the IdentityOccurrence-plane publish set: the node's
+        // OWN key_id, so its own occurrence (carrying content-tier
+        // `encryption_pubkeys`) is advertised (KERI publish-own). Without it,
+        // peers resolve `None` KEX keys for this node → cannot seal content to
+        // it → 0 delivery even after transport rooting. `None` preserves the
+        // pre-fix cohort projection. The server supplies the set; edge wraps it.
+        occurrence_publish_set: Option<Vec<String>>,
     ) -> PyResult<PyReplicationHandle> {
         let directory = self
             .inner
@@ -2191,6 +2198,15 @@ impl PyEdge {
                     as crate::replication::bridge::CohortProvider
             });
 
+        // CIRISEdge#305 — wrap the server-supplied IdentityOccurrence-plane
+        // publish set into the bridge's occurrence selector (twin of the #257
+        // Key-plane selector above).
+        let occurrence_selector: Option<crate::replication::bridge::CohortProvider> =
+            occurrence_publish_set.map(|set| {
+                std::sync::Arc::new(move || set.clone())
+                    as crate::replication::bridge::CohortProvider
+            });
+
         let executor = self.executor.clone();
         let runtime = py.detach(|| {
             run_async(&executor, async move {
@@ -2200,6 +2216,7 @@ impl PyEdge {
                     typed_peers,
                     config,
                     key_selector,
+                    occurrence_selector,
                 )
                 .await
             })
