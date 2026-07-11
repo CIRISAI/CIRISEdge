@@ -507,6 +507,20 @@ struct RootedPeer {
     /// a same-epoch re-announce that finally roots upgrades an existing
     /// advisory binding instead of being ignored as stale.
     provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+    /// CIRISEdge#314 — the peer's 16-byte transport identity hash
+    /// (`Identity::from_public_keys(x25519, ed25519).hash()`), captured from the
+    /// authenticated announce. The inbound-link→key_id attribution
+    /// (`NodeEvent::LinkIdentified`) matches the link's proven `identity_hash`
+    /// against THIS — **form-agnostic**, so a peer that announced on an
+    /// explicit-hash dest (`sha256(fed_pubkey)[..16]`) is attributed exactly as
+    /// a named-dest peer is. The pre-#314 attribution recomputed only the NAMED
+    /// dest form (`compute_destination_hash(name_hash, identity_hash)`) and
+    /// compared it to the stored announced dest, so it missed on the
+    /// named-vs-explicit split → `source_key_id` stayed `None` → the CRPL frame
+    /// never reached `route_inbound_bytes` (and #312's responder was
+    /// unreachable). `[0u8; 16]` for a test-injected peer whose x25519 half is
+    /// unavailable (never matches a real identity hash).
+    transport_identity_hash: [u8; 16],
 }
 
 // ─── Configuration ──────────────────────────────────────────────────
@@ -1750,6 +1764,11 @@ impl ReticulumTransport {
                 // authoritative — CIRISEdge#301 `Rooted`, chain `None`.
                 chain: None,
                 provenance: ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+                // #314 — the injector has only the ed25519 half (no x25519), so
+                // the transport identity hash can't be computed; a zero sentinel
+                // never matches a real link identity (explicit-hash test peers
+                // are attributed by dest-hash, not this path).
+                transport_identity_hash: [0u8; 16],
             },
         );
     }
@@ -2928,22 +2947,29 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     "link identified",
                 ));
             }
-            // v3.5.1 (CIRISEdge#119 + #120) — populate
-            // link_to_peer_key_id. Derive the link's expected
-            // destination hash from its identity_hash + the federation
-            // name_hash (constant); scan rooted peers for a match.
-            // The rooted peer's dest_hash is the same Reticulum
-            // computes for its `peers[key_id].peer.dest_hash`, so a
-            // direct byte-equal compare resolves the link → key_id
-            // attribution. Used downstream by
-            // `Edge::install_replication_routing`.
+            // CIRISEdge#314 — attribute the link to a peer key_id by the link's
+            // PROVEN transport identity hash (form-agnostic), falling back to the
+            // legacy named-dest recompute for back-compat. The pre-#314 code
+            // matched ONLY `compute_destination_hash(name_hash, identity_hash)`
+            // (the named-dest form) against the stored announced dest, which
+            // missed whenever the peer announced on an explicit-hash dest
+            // (`sha256(fed_pubkey)[..16]`) — the same named-vs-explicit split
+            // that bit 0.5.100→0.5.101. On a miss, `source_key_id` stayed `None`,
+            // `route_inbound_bytes` was skipped, and the binary CRPL frame fell
+            // through to the JSON dispatcher (the "expected value at line 1" symptom)
+            // — leaving #312's responder unreachable. Matching the identity hash
+            // (which the advisory entry captured from the authenticated announce)
+            // is robust to whatever dest form the peer announced on.
             let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
             let expected_dest_hash =
                 Destination::compute_destination_hash(&name_hash, &identity_hash);
             let peers_guard = ctx.peers.lock().await;
             let matched_key = peers_guard
                 .iter()
-                .find(|(_, rp)| rp.peer.dest_hash == expected_dest_hash)
+                .find(|(_, rp)| {
+                    rp.transport_identity_hash == identity_hash
+                        || rp.peer.dest_hash == expected_dest_hash
+                })
                 .map(|(k, _)| k.clone());
             drop(peers_guard);
             if let Some(key_id) = matched_key {
@@ -3288,6 +3314,19 @@ async fn resolve_announce_cold_start(
     // lives on the announce identity (`announce.public_key()`), so we capture
     // it here from the authenticated announce.
     let announce_pubkey64: [u8; 64] = *announce.public_key();
+    // CIRISEdge#314 — the peer's transport identity hash (x25519 ‖ ed25519 →
+    // truncated identity hash), captured so the inbound-link→key_id attribution
+    // (`NodeEvent::LinkIdentified`) can match the link's PROVEN identity form-
+    // agnostically, rather than via the fragile named-dest recompute that missed
+    // on the named-vs-explicit split. Equals the link's `identity_hash` because
+    // both derive `Identity::from_public_keys(x25519, ed25519).hash()` from the
+    // same authenticated transport pubkeys. `[0u8; 16]` if the pubkey is
+    // malformed (that record was already crypto-verified upstream).
+    let transport_identity_hash: [u8; 16] = {
+        let x25519: [u8; 32] = announce_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
+        let ed25519: [u8; 32] = announce_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
+        Identity::from_public_keys(&x25519, &ed25519).map_or([0u8; 16], |id| *id.hash())
+    };
     let dest_hash16: [u8; 16] = (*announce.destination_hash()).into_bytes();
     // CIRISEdge#301 — a same-epoch re-announce that finally ROOTS a peer
     // previously admitted as ADVISORY must UPGRADE the binding, not be ignored
@@ -3366,6 +3405,7 @@ async fn resolve_announce_cold_start(
                         epoch: attestation.epoch,
                         chain: chain_opt,
                         provenance,
+                        transport_identity_hash,
                     },
                 );
                 Some(persisted_key)
