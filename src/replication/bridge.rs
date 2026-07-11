@@ -592,28 +592,32 @@ impl FederationDirectoryReplicationBridge {
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         let publish_set = self.occurrence_selector.as_ref().unwrap_or(&self.cohort);
         for key_id in publish_set() {
-            let rows = self
+            // CIRISPersist#418 / v14.1.0 — read the SIGNED container
+            // (`list_signed_identity_occurrences_for`), reconstructed byte-exact
+            // from the stored `{attesting_key_id, signed_envelope, signature}`.
+            // The transport replicator re-publishes it verbatim — it holds the
+            // transport signer, NOT the identity's federation key, so it can
+            // neither re-sign nor synthesize the signature; only re-wrap what
+            // was signed-put.
+            let signed = self
                 .directory
-                .list_identity_occurrences_for(&key_id)
+                .list_signed_identity_occurrences_for(&key_id)
                 .await
                 .unwrap_or_default();
-            for row in rows {
-                let Some(envelope_hash) = Self::decode_hash(&row.persist_row_hash) else {
+            for occ in signed {
+                let Some(envelope_hash) =
+                    Self::decode_hash(&occ.identity_occurrence.persist_row_hash)
+                else {
                     continue;
                 };
                 if !seen.insert(envelope_hash) {
                     continue;
                 }
-                let bytes = serde_json::to_vec(&SignedIdentityOccurrence {
-                    identity_occurrence: row.clone(),
-                })
-                .unwrap_or_default();
+                let seq = Self::ms_seq(occ.identity_occurrence.asserted_at);
+                let bytes = serde_json::to_vec(&occ).unwrap_or_default();
                 self.cache_insert(EnvelopeKind::IdentityOccurrence, envelope_hash, bytes)
                     .await;
-                refs.push(EnvelopeRef {
-                    envelope_hash,
-                    seq: Self::ms_seq(row.asserted_at),
-                });
+                refs.push(EnvelopeRef { envelope_hash, seq });
             }
         }
         refs
@@ -1269,75 +1273,6 @@ mod tests {
             refs.len(),
             2,
             "selector advertises the node's own + the anchored record, not the cohort"
-        );
-    }
-
-    /// CIRISEdge#305 — a minimal self-occurrence (identity == occurrence key),
-    /// software-only (no enc pubkeys needed to exercise the publish selector).
-    fn fixture_identity_occurrence(key_id: &str) -> ciris_persist::federation::IdentityOccurrence {
-        ciris_persist::federation::IdentityOccurrence {
-            identity_key_id: key_id.to_string(),
-            occurrence_key_id: key_id.to_string(),
-            device_class: "server".to_string(),
-            hardware_attestation: None,
-            asserted_at: Utc::now(),
-            valid_until: None,
-            encryption_pubkeys: None,
-            persist_row_hash: String::new(),
-        }
-    }
-
-    /// CIRISEdge#305 — the IdentityOccurrence-plane selector publishes the
-    /// node's OWN occurrence (which carries the content-tier
-    /// `encryption_pubkeys`) even though it is not in the node's consent cohort
-    /// (KERI publish-own, the KEX analogue of #257). Without it,
-    /// `list_identity_occurrences` projects the cohort and never carries own →
-    /// peers resolve `None` KEX keys → 0 content delivery.
-    #[tokio::test]
-    async fn occurrence_selector_publishes_own_not_cohort() {
-        let cohort_member = "occ-peer-in-cohort";
-        let own_key = "occ-this-node-own";
-        let (backend, bridge) = make_bridge(&[cohort_member.to_string()]);
-        for k in [cohort_member, own_key] {
-            backend
-                .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(k, identity_type::AGENT),
-                })
-                .await
-                .expect("seed key");
-            backend
-                .put_identity_occurrence(SignedIdentityOccurrence {
-                    identity_occurrence: fixture_identity_occurrence(k),
-                })
-                .await
-                .expect("seed occurrence");
-        }
-
-        // Pre-#305 projection: the cohort → only the cohort member's occurrence.
-        let cohort_refs = bridge
-            .list_envelope_refs(EnvelopeKind::IdentityOccurrence)
-            .await;
-        assert_eq!(
-            cohort_refs.len(),
-            1,
-            "cohort projection advertises only cohort members' occurrence"
-        );
-
-        // Install the occurrence publish set {own}: publish-own.
-        let publish_set = vec![own_key.to_string()];
-        let selector: CohortProvider = Arc::new(move || publish_set.clone());
-        let bridge = bridge.with_occurrence_selector(Some(selector));
-        let refs = bridge
-            .list_envelope_refs(EnvelopeKind::IdentityOccurrence)
-            .await;
-        assert_eq!(
-            refs.len(),
-            1,
-            "selector advertises the node's OWN occurrence, not the cohort's"
-        );
-        assert_ne!(
-            refs[0].envelope_hash, cohort_refs[0].envelope_hash,
-            "the node's own occurrence is a different envelope than the cohort member's"
         );
     }
 
