@@ -3412,6 +3412,25 @@ impl Edge {
             .map(|t| t.local_dest_hash())
     }
 
+    /// CIRISEdge#309 — the **named** destination hash
+    /// (`sha256(name_hash("ciris",["edge"]) ‖ identity_hash)[..16]`) this
+    /// node announces + listens on for mesh-routed delivery. Distinct from
+    /// [`Self::local_dest_hash`] (the *explicit* `sha256(fed_pubkey)[..16]`).
+    /// This is the value `verify_transport_binding` recomputes for a signed
+    /// occurrence's `transport_destination`, so a consumer building that
+    /// binding must use THIS authoritative accessor rather than recomputing
+    /// `compute_destination_hash` itself (byte-identical today, but drifts if
+    /// edge ever changes the app/aspects or hash shape). Returns `None` for
+    /// HTTPS-only / transport-less builds — same posture as
+    /// [`Self::local_dest_hash`].
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn local_named_dest_hash(&self) -> Option<[u8; 16]> {
+        self.reticulum_transport
+            .as_ref()
+            .map(|t| t.local_named_dest_hash())
+    }
+
     /// Test/diagnostics helper — `true` if `peer_key_id` would be
     /// admitted by the configured [`PeerSubscriptionFilter`] for
     /// `message_type`. When no filter is configured, returns `true`
