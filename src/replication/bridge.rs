@@ -552,10 +552,21 @@ impl FederationDirectoryReplicationBridge {
                 Some((serde_json::to_vec(&wire).ok()?, hash, seq))
             }
             ReplicatedKind::IdentityOccurrenceRevocation => {
-                let hash = Self::decode_hash(canonical_json.get("persist_row_hash")?.as_str()?)?;
-                let seq = Self::ms_seq_from(canonical_json.get("revoked_at"));
-                let wire = serde_json::json!({ "identity_occurrence_revocation": canonical_json });
-                Some((serde_json::to_vec(&wire).ok()?, hash, seq))
+                // CIRISEdge#326 / CIRISPersist#421 (persist v16) — the revocation
+                // kind is now the SIGNED CONTAINER (`{identity_occurrence_revocation,
+                // attesting_key_id, signed_envelope, signature}`), the same #418
+                // discipline as IdentityOccurrence — NOT a bare row. It is
+                // re-published BYTE-EXACT: edge holds the transport signer, not
+                // the identity key, so it can neither re-sign nor synthesize the
+                // signature — only re-wrap what was signed-put. (Pre-v16 this arm
+                // re-wrapped a bare row; against v16 that would double-wrap it,
+                // AND reading `persist_row_hash` at the top level now misses — it
+                // is nested — which would silently drop every revocation from the
+                // wire.)
+                let inner = canonical_json.get("identity_occurrence_revocation")?;
+                let hash = Self::decode_hash(inner.get("persist_row_hash")?.as_str()?)?;
+                let seq = Self::ms_seq_from(inner.get("revoked_at"));
+                Some((serde_json::to_vec(canonical_json).ok()?, hash, seq))
             }
             // `#[non_exhaustive]` — a kind edge doesn't yet adapt is skipped
             // (not advertised) rather than emitted in an unknown wire shape.
@@ -1847,6 +1858,45 @@ mod tests {
         assert_eq!(v["record"]["key_id"], "k1", "re-wrapped to SignedKeyRecord");
         // Wire identity == decoded persist_row_hash (stable across versions).
         assert_eq!(hex::encode(hash), prh, "hash stays persist_row_hash");
+    }
+
+    /// CIRISEdge#326 / CIRISPersist#421 (persist v16) — the revocation kind is a
+    /// SIGNED CONTAINER, re-published byte-exact (edge can't re-sign). Fences the
+    /// SILENT break: pre-v16 this arm read `persist_row_hash` at the top level
+    /// and re-wrapped a bare row; against v16's container that lookup misses, so
+    /// `adapt_record` would return `None` and every revocation would vanish from
+    /// the wire with no compile error (the engine speaks `serde_json::Value`).
+    #[test]
+    fn adapt_record_revocation_is_the_signed_container_republished_byte_exact() {
+        let prh = "cd".repeat(32); // 64 hex chars → 32 bytes
+        let container = serde_json::json!({
+            "identity_occurrence_revocation": {
+                "occurrence_key_id": "occ-1",
+                "persist_row_hash": prh,
+                "revoked_at": "2026-07-12T00:00:00Z",
+            },
+            "attesting_key_id": "signer-1",
+            "signed_envelope": { "kind": "identity_occurrence_revocation" },
+            "signature": "sig-b64",
+        });
+        let (bytes, hash, _seq) = FederationDirectoryReplicationBridge::adapt_record(
+            ReplicatedKind::IdentityOccurrenceRevocation,
+            &container,
+        )
+        .expect("adapt signed revocation container");
+
+        // Emitted BYTE-EXACT — the signature container survives (not double-wrapped).
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
+        assert_eq!(v["signature"], "sig-b64", "signature preserved");
+        assert_eq!(v["attesting_key_id"], "signer-1");
+        assert!(
+            v.get("identity_occurrence_revocation")
+                .and_then(|r| r.get("identity_occurrence_revocation"))
+                .is_none(),
+            "must NOT be double-wrapped"
+        );
+        // Hash read from the NESTED row, not the top level.
+        assert_eq!(hex::encode(hash), prh);
     }
 
     // ── v10 — per-record dynamic policy for the scores/Attestation plane ──

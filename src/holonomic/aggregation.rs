@@ -61,9 +61,10 @@
 
 // ── the canonical §19.7 shapes + verify gates (verify-owned) ──────────
 pub use ciris_verify_core::holonomic::aggregation::{
-    descend_order, effective_source_count, member_commitment, passes_dominance_gate,
-    verify_aggregation_meta, verify_member_commitment, AggregationMetaV1,
-    AggregationMetaVerification,
+    descend_order, effective_source_count, mass_commitment, mass_to_fixed, member_commitment,
+    passes_dominance_gate, passes_multiplicity_gate, verify_aggregation_meta,
+    verify_member_commitment, AggregationMetaV1, AggregationMetaVerification,
+    MASS_FIXED_POINT_SCALE,
 };
 pub use ciris_verify_core::holonomic::preimage::DOMAIN_AGG_META as AGG_META_DOMAIN;
 
@@ -81,6 +82,13 @@ pub const AGG_META_VERSION: u32 = 1;
 /// trailing big-endian `u32(n_eff)` in the signed preimage. What
 /// [`assemble_tier_meta_v2`] emits.
 pub const AGG_META_VERSION_V2: u32 = 2;
+
+/// §19.7.1.3 schema version (CIRISVerify#191 / CC 6.1.2.1.2 R9): the v2 layout
+/// plus a trailing `u32(max_source_multiplicity) ‖ mass_commitment[32]` in the
+/// signed preimage. What [`assemble_tier_meta_v3`] emits — the **go-forward**
+/// version: persist ≥ 16 fail-closes any tier below v3 at `put_aggregated_tier`
+/// (the flag-day cut; no deprecation window).
+pub const AGG_META_VERSION_V3: u32 = 3;
 
 /// §19.7.1.2 producer side (CIRISEdge#267): assemble a **version-2** tier meta
 /// from the per-member source ids and content masses — computing
@@ -137,6 +145,85 @@ pub fn assemble_tier_meta_v2(
         member_commitment: member_commitment(source_member_ids),
         noise_floor_descriptor: noise_floor_descriptor.to_string(),
         n_eff: effective_source_count(member_masses),
+        // CIRISVerify#191 v3 fields — NEUTRAL and UNSIGNED at v2: the signing
+        // preimage appends them only iff `version >= 3`, so a v2 tier's bytes
+        // (and its golden vectors) are untouched. A v2 tier fails
+        // `passes_multiplicity_gate` closed by construction — that is the
+        // flag-day cut, not a regression. Use `assemble_tier_meta_v3` to
+        // produce a tier that persist >= 16 will admit.
+        max_source_multiplicity: 0,
+        mass_commitment: [0u8; 32],
+    }
+}
+
+/// §19.7.1.3 (CIRISVerify#191 / CC 6.1.2.1.2 R9) — assemble a **v3** tier meta:
+/// the v2 surface plus the *measured* content-similarity multiplicity and the
+/// auditable mass commitment. **This is the go-forward producer**: persist ≥ 16
+/// enforces `passes_dominance_gate` AND `passes_multiplicity_gate` at
+/// `put_aggregated_tier`, and a pre-v3 tier **fails closed** at every peer.
+///
+/// `member_masses` + `max_source_multiplicity` come from the fold —
+/// `realtime_av_codec::fountain::content_multiplicity` (behind the codec
+/// feature), the only point in the pipeline holding member payloads. Pass its
+/// `ContentMultiplicity` fields straight through. The masses are a *measured*
+/// output (each member's share of content energy), so `n_eff` and
+/// `mass_commitment` are both auditable: an auditor holding the members
+/// recomputes this root and can prove a lying `n_eff` or multiplicity.
+///
+/// The gate persist applies is `max_source_multiplicity · n_min <= source_count`
+/// (`n_min` corpus-pinned persist-side, default 2) — so a fold whose largest
+/// near-duplicate cluster exceeds half the members is rejected. The 900/1000
+/// near-duplicate fold that v2 admitted (`n_eff == 1000`, honestly) is rejected
+/// here.
+///
+/// # Panics
+///
+/// If `source_member_ids` and `member_masses` lengths differ, or the fan-in
+/// exceeds `u32::MAX`.
+#[must_use]
+// The §19.7.1.3 producer is a composition site for the full signed tier surface
+// (identity + fan-in + the two measured v3 fields); grouping them into a struct
+// would just move the arity, and every field is independently supplied by the
+// caller's fold. Mirrors `assemble_tier_meta_v2`.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_tier_meta_v3(
+    content_id: &str,
+    corpus_kind: &str,
+    tier: u32,
+    aggregation_algorithm_id: &str,
+    source_member_ids: &[String],
+    member_masses: &[f64],
+    max_source_multiplicity: u32,
+    noise_floor_descriptor: &str,
+) -> AggregationMetaV1 {
+    assert_eq!(
+        source_member_ids.len(),
+        member_masses.len(),
+        "source_member_ids and measured member_masses must be index-aligned"
+    );
+    let source_count =
+        u32::try_from(source_member_ids.len()).expect("tier fan-in exceeds u32 wire range");
+
+    // §19.7.1.3 mass commitment: Merkle root over (member_id, fixed-point mass),
+    // pinned at MASS_FIXED_POINT_SCALE = 1e6 verify-side.
+    let mass_leaves: Vec<(String, u64)> = source_member_ids
+        .iter()
+        .cloned()
+        .zip(member_masses.iter().map(|m| mass_to_fixed(*m)))
+        .collect();
+
+    AggregationMetaV1 {
+        version: AGG_META_VERSION_V3,
+        content_id: content_id.to_string(),
+        corpus_kind: corpus_kind.to_string(),
+        tier,
+        aggregation_algorithm_id: aggregation_algorithm_id.to_string(),
+        source_count,
+        member_commitment: member_commitment(source_member_ids),
+        noise_floor_descriptor: noise_floor_descriptor.to_string(),
+        n_eff: effective_source_count(member_masses),
+        max_source_multiplicity,
+        mass_commitment: mass_commitment(&mass_leaves),
     }
 }
 
@@ -169,6 +256,11 @@ mod tests {
             // Neutral placeholder on a v1 tier — NOT in the v1 preimage
             // (asserted below), NOT accepted by passes_dominance_gate.
             n_eff: 3,
+            // §19.7.1.3 (#191): likewise neutral + un-signed at v1 — appended to
+            // the preimage only iff version >= 3, so the v1 golden bytes below
+            // stay byte-identical.
+            max_source_multiplicity: 0,
+            mass_commitment: [0u8; 32],
         }
     }
 
@@ -400,6 +492,96 @@ mod tests {
             m.signing_preimage(),
             base,
             "n_eff must affect the v2 preimage (§19.7.1.2 signed dominance surface)"
+        );
+    }
+
+    // ── §19.7.1.3 v3 producer (CIRISEdge#325 / CIRISVerify#191) ──────────
+
+    /// The persist-side gate, mirrored: `max_source_multiplicity * n_min <=
+    /// source_count`, `n_min` default 2 (`multiplicity_n_min_for`).
+    const N_MIN: u32 = 2;
+
+    /// The dominance-gate floor: `n_eff / source_count >= min_ratio`. Both the
+    /// balanced fold AND the R9 near-duplicate fold score 1.0 here — which is
+    /// precisely why the mass gate alone cannot see R9.
+    const DOMINANCE_MIN_RATIO: f64 = 0.5;
+
+    /// A v3 tier from a BALANCED fold (mutually distinct members, multiplicity
+    /// 1) carries the signed v3 surface and is ADMITTED by both gates.
+    #[test]
+    fn v3_meta_from_balanced_fold_passes_both_gates() {
+        let ids: Vec<String> = (0..10).map(|i| format!("src-{i:03}")).collect();
+        let masses = vec![0.1_f64; 10]; // balanced
+        let meta = assemble_tier_meta_v3(
+            "content-v3",
+            "trace",
+            2,
+            "raptorq-pyramid-v1",
+            &ids,
+            &masses,
+            1, // measured multiplicity: distinct members
+            "mean+stddev",
+        );
+        assert_eq!(meta.version, AGG_META_VERSION_V3);
+        assert_eq!(meta.max_source_multiplicity, 1);
+        assert_ne!(meta.mass_commitment, [0u8; 32], "mass commitment is bound");
+        assert!(
+            passes_dominance_gate(&meta, DOMINANCE_MIN_RATIO),
+            "balanced fold: dominance ok"
+        );
+        assert!(
+            passes_multiplicity_gate(&meta, N_MIN),
+            "balanced fold: multiplicity ok (1*2 <= 10)"
+        );
+    }
+
+    /// THE R9 CASE end-to-end: 900 near-duplicates in a 1000-member fold. The
+    /// masses are HONEST (all equal ⇒ `n_eff == 1000`), so the v2 dominance gate
+    /// ADMITS — but the measured multiplicity (900) makes the v3 gate REJECT.
+    /// This is exactly the residual CIRISVerify#191 closes.
+    #[test]
+    fn v3_meta_rejects_the_900_near_duplicate_fold_the_mass_gate_admits() {
+        let ids: Vec<String> = (0..1000).map(|i| format!("src-{i:04}")).collect();
+        let masses = vec![0.001_f64; 1000]; // equal mass — honest n_eff == 1000
+        let meta = assemble_tier_meta_v3(
+            "content-r9",
+            "trace",
+            2,
+            "raptorq-pyramid-v1",
+            &ids,
+            &masses,
+            900, // measured at fold: the near-duplicate cluster
+            "mean+stddev",
+        );
+        assert_eq!(meta.n_eff, 1000, "the mass gate sees an honest n_eff");
+        assert!(
+            passes_dominance_gate(&meta, DOMINANCE_MIN_RATIO),
+            "the v2 mass gate ADMITS this fold — that is the R9 residual"
+        );
+        assert!(
+            !passes_multiplicity_gate(&meta, N_MIN),
+            "the v3 multiplicity gate REJECTS it (900*2 > 1000)"
+        );
+    }
+
+    /// A v2 tier lacks the v3 surface and FAILS CLOSED at the multiplicity gate
+    /// — the flag-day cut (persist >= 16 rejects it at every peer).
+    #[test]
+    fn v2_meta_fails_closed_at_the_multiplicity_gate() {
+        let ids = fixed_source_ids();
+        let meta = assemble_tier_meta_v2(
+            "content-v2",
+            "trace",
+            2,
+            "raptorq-pyramid-v1",
+            &ids,
+            &[0.33, 0.33, 0.34],
+            "mean+stddev",
+        );
+        assert_eq!(meta.version, AGG_META_VERSION_V2);
+        assert!(
+            !passes_multiplicity_gate(&meta, N_MIN),
+            "a pre-v3 tier must fail closed (no deprecation window)"
         );
     }
 }
