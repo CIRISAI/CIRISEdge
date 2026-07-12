@@ -141,6 +141,7 @@ async fn av42_tampered_attestation_signature_fails_verify() {
 
     let genuine = AnnounceAttestation {
         transport_identity_pubkey: B64.encode(transport_pubkey),
+        transport_x25519_pubkey: None,
         federation_key_id: victim.key_id.clone(),
         federation_pubkey_ed25519_base64: B64.encode(victim_pubkey),
         epoch: 3,
