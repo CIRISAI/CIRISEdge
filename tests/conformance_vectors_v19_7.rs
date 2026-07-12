@@ -89,6 +89,10 @@ fn vector_aggregation_meta_canonical_bytes_three_source_pyramid() {
         // placeholder — the v1 preimage below MUST be byte-identical to the
         // pre-#167 layout regardless of this value.
         n_eff: 3,
+        // §19.7.1.3 (#191): same discipline — appended to the preimage only iff
+        // version >= 3, so the v1 golden vector stays byte-identical.
+        max_source_multiplicity: 0,
+        mass_commitment: [0u8; 32],
     };
     let vector = AggregationMetaCanonicalVector {
         vector_id: "aggregation_meta/canonical_bytes".to_string(),
