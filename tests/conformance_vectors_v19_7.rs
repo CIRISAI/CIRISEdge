@@ -10,8 +10,9 @@
 //! fixtures.
 
 use ciris_edge::holonomic::aggregation::{
-    assemble_tier_meta_v2, compute_member_commitment, AggregationMetaV1, AGG_META_DOMAIN,
-    AGG_META_VERSION, AGG_META_VERSION_V2,
+    assemble_tier_meta_v2, assemble_tier_meta_v3, compute_member_commitment, mass_commitment,
+    mass_to_fixed, AggregationMetaV1, AGG_META_DOMAIN, AGG_META_VERSION, AGG_META_VERSION_V2,
+    AGG_META_VERSION_V3, MASS_FIXED_POINT_SCALE,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -264,4 +265,114 @@ fn vector_domain_separators() {
         agg_meta_v1_len: AGG_META_DOMAIN.len(),
     };
     emit_or_verify("domain_separators.json", &seps);
+}
+
+// ─── §19.7.1.3 v3 — the R9 cross-impl pin (CIRISConformance#74) ──────────
+//
+// CIRISVerify AUTHORED `tests/vectors/holonomic_v19_7/aggregation_meta/
+// canonical_bytes_v3.json`. Edge is the SECOND impl and must reproduce it
+// byte-for-byte. The expected bytes are hard-pinned HERE (not read from a
+// shared file) so the two impls are genuinely cross-checked — a shared fixture
+// that both sides regenerate would drift silently, and this preimage backs a
+// SIGNED field (`max_source_multiplicity` + `mass_commitment`). A fork here is
+// a fork in admissibility: one impl admits a fold the other rejects.
+
+/// CIRISVerify's authored v3 vector (`aggregation_meta/canonical_bytes_v3`).
+const V3_EXPECTED_CANONICAL_BYTES_HEX: &str = "4147472d4d4554412d763100000000000000000300000012636f6e74656e742d726f6f742d66697865640000000574726163650000000200000012726170746f72712d707972616d69642d763100000003a10bc0ec2399f1cd431be79a863385a4b895987dae604aaf2ec3532f3753bd9d0000000b6d65616e2b7374646465760000000300000001a00af73b1e112530ceb7c5af8f806b45af264978e448b3810cefb3f9f79cd3c5";
+const V3_MEMBER_COMMITMENT_HEX: &str =
+    "a10bc0ec2399f1cd431be79a863385a4b895987dae604aaf2ec3532f3753bd9d";
+const V3_MASS_COMMITMENT_HEX: &str =
+    "a00af73b1e112530ceb7c5af8f806b45af264978e448b3810cefb3f9f79cd3c5";
+/// The vector's per-member masses. NOTE they do not sum to 1 — the vector pins
+/// the ENCODING, not a fold's normalization; `mass_to_fixed` is what the
+/// commitment binds.
+const V3_MASSES: [f64; 3] = [1.0, 0.5, 0.25];
+const V3_MASSES_FIXED: [u64; 3] = [1_000_000, 500_000, 250_000];
+
+fn v3_source_ids() -> Vec<String> {
+    ["src-001", "src-002", "src-003"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// The §19.7.1.3 v3 preimage reproduces CIRISVerify's authored vector
+/// byte-for-byte: v2 layout + `u32_be(max_source_multiplicity)` +
+/// `mass_commitment[32]`.
+#[test]
+fn vector_aggregation_meta_v3_canonical_bytes_matches_verify() {
+    let ids = v3_source_ids();
+    let meta = AggregationMetaV1 {
+        version: AGG_META_VERSION_V3,
+        content_id: "content-root-fixed".to_string(),
+        corpus_kind: "trace".to_string(),
+        tier: 2,
+        aggregation_algorithm_id: "raptorq-pyramid-v1".to_string(),
+        source_count: 3,
+        member_commitment: compute_member_commitment(&ids),
+        noise_floor_descriptor: "mean+stddev".to_string(),
+        n_eff: 3,
+        max_source_multiplicity: 1,
+        mass_commitment: mass_commitment(
+            &ids.iter().cloned().zip(V3_MASSES_FIXED).collect::<Vec<_>>(),
+        ),
+    };
+    assert_eq!(
+        hex_encode(&meta.signing_preimage()),
+        V3_EXPECTED_CANONICAL_BYTES_HEX,
+        "edge's v3 preimage MUST reproduce CIRISVerify's authored vector byte-for-byte \
+         — a fork here forks admissibility (CIRISConformance#74)"
+    );
+}
+
+/// The two v3 commitments edge computes match verify's authored roots, and the
+/// fixed-point mass scale is the pinned 1e6.
+#[test]
+fn vector_aggregation_meta_v3_commitments_match_verify() {
+    let ids = v3_source_ids();
+    assert_eq!(
+        hex_encode(&compute_member_commitment(&ids)),
+        V3_MEMBER_COMMITMENT_HEX,
+        "member_commitment (Merkle over ids) must match verify"
+    );
+    // mass_to_fixed is the pinned 1e6 scale — the commitment binds these.
+    let fixed: Vec<u64> = V3_MASSES.iter().map(|m| mass_to_fixed(*m)).collect();
+    assert_eq!(
+        fixed,
+        V3_MASSES_FIXED.to_vec(),
+        "mass_to_fixed must use the pinned MASS_FIXED_POINT_SCALE ({MASS_FIXED_POINT_SCALE})"
+    );
+    let leaves: Vec<(String, u64)> = ids.iter().cloned().zip(fixed).collect();
+    assert_eq!(
+        hex_encode(&mass_commitment(&leaves)),
+        V3_MASS_COMMITMENT_HEX,
+        "mass_commitment (Merkle over (member_id, mass_fixed)) must match verify"
+    );
+}
+
+/// The PRODUCER path: `assemble_tier_meta_v3` wires the measured surface into
+/// the exact slots verify's vector pins — same commitments, version 3, and the
+/// multiplicity carried through. (n_eff is derived from the masses by the
+/// producer, so it is asserted against the producer's own inverse-Simpson, not
+/// the vector's independently-authored field.)
+#[test]
+fn v3_producer_reproduces_the_vector_commitments() {
+    let ids = v3_source_ids();
+    let meta = assemble_tier_meta_v3(
+        "content-root-fixed",
+        "trace",
+        2,
+        "raptorq-pyramid-v1",
+        &ids,
+        &V3_MASSES,
+        1,
+        "mean+stddev",
+    );
+    assert_eq!(meta.version, AGG_META_VERSION_V3);
+    assert_eq!(meta.max_source_multiplicity, 1);
+    assert_eq!(
+        hex_encode(&meta.member_commitment),
+        V3_MEMBER_COMMITMENT_HEX
+    );
+    assert_eq!(hex_encode(&meta.mass_commitment), V3_MASS_COMMITMENT_HEX);
 }
