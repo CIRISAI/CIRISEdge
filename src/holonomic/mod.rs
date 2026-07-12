@@ -86,6 +86,10 @@ pub mod consent_decay;
 pub mod aggregation;
 pub mod deterministic_topology;
 pub mod fountain_defaults;
+/// §19.7.1.3 content-similarity multiplicity — the CC 6.1.2.1.2 R9 producer
+/// surface (CIRISEdge#323). Ungated: it needs no codec, and the Python wheel
+/// MUST ship it (persist >= 16 fail-closes pre-v3 tiers).
+pub mod multiplicity;
 pub mod recursive_trust_bootstrap;
 pub mod swarm_rarity;
 pub mod wholeness_witness;

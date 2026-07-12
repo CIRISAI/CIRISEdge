@@ -5976,6 +5976,118 @@ fn rns_destination_hash(
     Ok(*dest_hash.as_bytes())
 }
 
+// ─── CIRISEdge#328 — the §19.7.1.3 v3 producer, Python surface ───────
+//
+// Persist ≥ 16 fail-closes any tier below AggregationMetaV1 v3 at
+// `put_aggregated_tier` (the CIRISVerify#191 flag-day: reject token
+// `aggregation_meta_multiplicity`). Edge is the only point in the pipeline
+// holding member payloads, so the v3 fields are measured HERE — these two
+// wrappers let a Python descent driver (CIRISConformance test_541 / server /
+// agent) fold → measure → assemble → sign a tier every peer will admit.
+
+/// CIRISEdge#328 (1/2) — measure the §19.7.1.3 content-similarity multiplicity
+/// + per-member masses from the member payloads (the fold's inputs).
+///
+/// Returns `{"member_masses": [float], "max_source_multiplicity": int}` —
+/// masses are index-aligned with `members` and sum to 1.0; the multiplicity is
+/// the size of the largest cluster of members whose pairwise content similarity
+/// exceeds the `corpus_kind`-pinned threshold (integer-deterministic; see
+/// `fountain::multiplicity_similarity_threshold_milli` — the normative,
+/// wire-affecting pin). Feed both straight into [`assemble_tier_meta_v3`].
+///
+/// The 900-near-duplicates-under-distinct-ids fold yields
+/// `max_source_multiplicity ≈ 900` (rejected by persist's gate: 900·2 > 1000);
+/// a balanced fold of distinct members yields `1` (admitted).
+#[pyfunction]
+#[pyo3(signature = (members, corpus_kind))]
+#[allow(clippy::needless_pass_by_value)] // pyo3 surface takes owned Vecs
+fn content_multiplicity(
+    py: Python<'_>,
+    members: Vec<Vec<u8>>,
+    corpus_kind: &str,
+) -> PyResult<Py<PyAny>> {
+    let refs: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
+    let m = crate::holonomic::multiplicity::content_multiplicity(&refs, corpus_kind)
+        .map_err(|e| PyValueError::new_err(format!("content_multiplicity: {e}")))?;
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("member_masses", m.member_masses)?;
+    dict.set_item("max_source_multiplicity", m.max_source_multiplicity)?;
+    Ok(dict.into_any().unbind())
+}
+
+/// CIRISEdge#328 (2/2) — assemble a **version-3** `AggregationMetaV1` from the
+/// measured §19.7.1.3 surface (`member_masses` + `max_source_multiplicity`
+/// straight from [`content_multiplicity`]).
+///
+/// Returns the full meta as a dict (`member_commitment` / `mass_commitment` as
+/// 32-byte `bytes`) plus `"signing_preimage"` — the exact §19.7.1 canonical
+/// bytes the caller signs (bound-hybrid via persist) before
+/// `put_aggregated_tier`. `version` is always 3; persist's gates check
+/// `passes_dominance_gate` AND `passes_multiplicity_gate` against these fields.
+#[pyfunction]
+#[pyo3(signature = (content_id, corpus_kind, tier, aggregation_algorithm_id, source_member_ids, member_masses, max_source_multiplicity, noise_floor_descriptor))]
+#[allow(clippy::too_many_arguments)] // mirrors the Rust producer — the full signed tier surface
+#[allow(clippy::needless_pass_by_value)] // pyo3 surface takes owned Vecs
+fn assemble_tier_meta_v3(
+    py: Python<'_>,
+    content_id: &str,
+    corpus_kind: &str,
+    tier: u32,
+    aggregation_algorithm_id: &str,
+    source_member_ids: Vec<String>,
+    member_masses: Vec<f64>,
+    max_source_multiplicity: u32,
+    noise_floor_descriptor: &str,
+) -> PyResult<Py<PyAny>> {
+    // Pre-validate the Rust producer's panicking preconditions at the FFI
+    // boundary — a Python caller gets a ValueError, never a Rust panic.
+    if source_member_ids.len() != member_masses.len() {
+        return Err(PyValueError::new_err(format!(
+            "source_member_ids ({}) and member_masses ({}) must be index-aligned",
+            source_member_ids.len(),
+            member_masses.len()
+        )));
+    }
+    if u32::try_from(source_member_ids.len()).is_err() {
+        return Err(PyValueError::new_err(
+            "tier fan-in exceeds the u32 wire range",
+        ));
+    }
+    let meta = crate::holonomic::aggregation::assemble_tier_meta_v3(
+        content_id,
+        corpus_kind,
+        tier,
+        aggregation_algorithm_id,
+        &source_member_ids,
+        &member_masses,
+        max_source_multiplicity,
+        noise_floor_descriptor,
+    );
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("version", meta.version)?;
+    dict.set_item("content_id", &meta.content_id)?;
+    dict.set_item("corpus_kind", &meta.corpus_kind)?;
+    dict.set_item("tier", meta.tier)?;
+    dict.set_item("aggregation_algorithm_id", &meta.aggregation_algorithm_id)?;
+    dict.set_item("source_count", meta.source_count)?;
+    dict.set_item(
+        "member_commitment",
+        pyo3::types::PyBytes::new(py, &meta.member_commitment),
+    )?;
+    dict.set_item("noise_floor_descriptor", &meta.noise_floor_descriptor)?;
+    dict.set_item("n_eff", meta.n_eff)?;
+    dict.set_item("max_source_multiplicity", meta.max_source_multiplicity)?;
+    dict.set_item(
+        "mass_commitment",
+        pyo3::types::PyBytes::new(py, &meta.mass_commitment),
+    )?;
+    dict.set_item(
+        "signing_preimage",
+        pyo3::types::PyBytes::new(py, &meta.signing_preimage()),
+    )?;
+    Ok(dict.into_any().unbind())
+}
+
 // ─── CIRISEdge v3.8.0 — Layer 3 conformance surface ─────────────────
 //
 // PyO3 wrappers for the v3.8.0 realtime A/V additions:
@@ -7323,6 +7435,16 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(federation_session_respond, m)?)?;
     #[cfg(feature = "transport-reticulum")]
     m.add_function(wrap_pyfunction!(rns_destination_hash, m)?)?;
+
+    // CIRISEdge#328 — the §19.7.1.3 v3 producer. Persist >= 16 fail-closes
+    // pre-v3 tiers (CIRISVerify#191 flag-day), and edge is the only point
+    // holding member payloads — without these, no Python descent driver
+    // (CIRISConformance test_541 / server / agent) can produce an admissible
+    // tier. Both are UNGATED: the producer lives in `holonomic::multiplicity`
+    // and needs no codec, so the wheel ships it on every platform (raptorq —
+    // and thus `codec-fountain` — does NOT build on armeabi-v7a).
+    m.add_function(wrap_pyfunction!(content_multiplicity, m)?)?;
+    m.add_function(wrap_pyfunction!(assemble_tier_meta_v3, m)?)?;
 
     // ─── CIRISEdge v3.8.0 — Layer 3 conformance surface ─────────────
     //
