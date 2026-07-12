@@ -73,6 +73,7 @@
 //! as a `NodeEvent::ResourceCompleted`, which the listener turns into
 //! an [`InboundFrame`].
 
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -118,6 +119,35 @@ const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long [`Transport::send`] waits for a resource transfer to
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
+
+// ─── CIRISEdge#317 — throttles for attacker-triggerable log sites ────
+//
+// Announces + link establishment are unauthenticated / advisory-admitted, so a
+// peer can flood them. These bound the RCA-critical WARN/INFO lines to
+// first-N-per-window (bounded key map, front-drop) so a single broken run still
+// self-diagnoses but a flood collapses to a suppressed-count. High-volume detail
+// is demoted to DEBUG instead (out of the default INFO stream).
+
+// `OnceLock` (not `LazyLock`) per the crate MSRV 1.75 + the codebase convention.
+static PEER_ADMITTED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+static LINK_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// Point 1 — peer-admitted (INFO). Keyed on `provenance` (2 values), so the
+/// rare `Rooted` admit logs freely while a flood of junk `Advisory` admits is
+/// capped. A tiny key map suffices.
+fn peer_admitted_log() -> &'static crate::log_throttle::LogThrottle {
+    PEER_ADMITTED_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 8))
+}
+
+/// Point 2 — link-attribution miss (WARN). Keyed on the link-proven identity
+/// hash (attacker-chosen), so the key map is capped as the DoS backstop.
+fn link_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
+    LINK_ATTRIBUTION_MISS_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1024))
+}
 
 // ─── Peer resolution ────────────────────────────────────────────────
 
@@ -2947,30 +2977,95 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     "link identified",
                 ));
             }
+            // CIRISEdge#317 observability point 3 — LINKIDENTIFY fired for this
+            // link, so attribution can attempt. A frame that later arrives on a
+            // link for which get_remote_identity is None is candidate-1
+            // (LINKIDENTIFY never completed). DEBUG: this is per-link-establish
+            // and attacker-triggerable, so it stays out of the default INFO
+            // stream (available under RUST_LOG=debug) — the always-on signal is
+            // the point-2 miss WARN + point-1 admit line.
+            let remote_identity_present = ctx.node.get_remote_identity(&link_id).is_some();
+            tracing::debug!(
+                link = ?link_id,
+                remote_identity = remote_identity_present,
+                link_proven_identity_hash = %hex::encode(identity_hash),
+                "link_identified"
+            );
+
             // CIRISEdge#314 — attribute the link to a peer key_id by the link's
-            // PROVEN transport identity hash (form-agnostic), falling back to the
-            // legacy named-dest recompute for back-compat. The pre-#314 code
-            // matched ONLY `compute_destination_hash(name_hash, identity_hash)`
-            // (the named-dest form) against the stored announced dest, which
-            // missed whenever the peer announced on an explicit-hash dest
-            // (`sha256(fed_pubkey)[..16]`) — the same named-vs-explicit split
-            // that bit 0.5.100→0.5.101. On a miss, `source_key_id` stayed `None`,
-            // `route_inbound_bytes` was skipped, and the binary CRPL frame fell
-            // through to the JSON dispatcher (the "expected value at line 1" symptom)
-            // — leaving #312's responder unreachable. Matching the identity hash
-            // (which the advisory entry captured from the authenticated announce)
-            // is robust to whatever dest form the peer announced on.
+            // PROVEN transport identity hash (Branch A, form-agnostic), falling
+            // back to the legacy named-dest recompute (Branch B, fast-path). On a
+            // miss, `source_key_id` stays `None`, `route_inbound_bytes` is
+            // skipped, and the binary CRPL frame falls through to the JSON
+            // dispatcher — leaving #312's responder unreachable (CIRISEdge#317).
             let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
             let expected_dest_hash =
                 Destination::compute_destination_hash(&name_hash, &identity_hash);
             let peers_guard = ctx.peers.lock().await;
-            let matched_key = peers_guard
-                .iter()
-                .find(|(_, rp)| {
-                    rp.transport_identity_hash == identity_hash
-                        || rp.peer.dest_hash == expected_dest_hash
-                })
-                .map(|(k, _)| k.clone());
+            let matched = peers_guard.iter().find_map(|(k, rp)| {
+                if rp.transport_identity_hash == identity_hash {
+                    Some((k.clone(), "identity"))
+                } else if rp.peer.dest_hash == expected_dest_hash {
+                    Some((k.clone(), "dest"))
+                } else {
+                    None
+                }
+            });
+            // CIRISEdge#317 observability point 2 — the line that localizes the
+            // bug in one run. A MATCH is DEBUG (success is not an incident). A
+            // MISS is the RCA-critical signal, kept at WARN but THROTTLED
+            // (first-N-per-window keyed on link_id, bounded map) so an attacker
+            // flooding links can't flood logs. The four operands (link identity,
+            // expected dest, remote_identity_present, peers_len) localize the
+            // announce-vs-send identity split; the per-peer stored operands ride
+            // DEBUG + a cap so the line stays O(1), not O(peers) — closing the
+            // prior O(N·M) quadratic-log blowup. The stored side of the compare
+            // is separately visible at admit (point 1).
+            if let Some((key_id, branch)) = &matched {
+                tracing::debug!(
+                    link = ?link_id,
+                    key_id = %key_id,
+                    branch,
+                    "link_attribution matched"
+                );
+            } else {
+                let link_key = hex::encode(identity_hash);
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    link_attribution_miss_log().check(&link_key)
+                {
+                    // First few candidate peers' stored side, capped — only
+                    // materialized under DEBUG and never the whole map.
+                    let peer_sample: Vec<String> = if tracing::enabled!(tracing::Level::DEBUG) {
+                        peers_guard
+                            .iter()
+                            .take(8)
+                            .map(|(k, rp)| {
+                                format!(
+                                    "{{key_id={k} tid={} dest={}}}",
+                                    hex::encode(rp.transport_identity_hash),
+                                    hex::encode(rp.peer.dest_hash.into_bytes()),
+                                )
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    tracing::warn!(
+                        link = ?link_id,
+                        link_identity = %link_key,
+                        expected_dest = %hex::encode(expected_dest_hash.into_bytes()),
+                        remote_identity_present,
+                        peers_len = peers_guard.len(),
+                        peer_sample = %peer_sample.join(", "),
+                        suppressed_prev,
+                        "link_attribution_miss — inbound frames from this link cannot be \
+                         attributed to a peer key_id (source_key_id will be None); rounds \
+                         dropped. Both Branch A (identity) and Branch B (dest) missed \
+                         (CIRISEdge#317)"
+                    );
+                }
+            }
+            let matched_key = matched.map(|(k, _)| k);
             drop(peers_guard);
             if let Some(key_id) = matched_key {
                 ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
@@ -3398,6 +3493,36 @@ async fn resolve_announce_cold_start(
                     ));
                 }
                 let persisted_key = key_id.clone();
+                // CIRISEdge#317 observability point 1 — surface the STORED
+                // attribution operands at admit, so the later
+                // `link_attribution_miss` comparison's stored side is visible
+                // without reading the diff. `transport_identity_hash` is what
+                // Branch A matches; `dest_hash` is Branch B's stored side.
+                // THROTTLED by provenance: a rare `Rooted` admit logs, a flood of
+                // junk `Advisory` admits (attacker minting keypairs) is capped to
+                // first-N-per-window + a suppressed-count — closing the log-flood
+                // that would otherwise track advisory-pollution 1:1.
+                let provenance_key = match provenance {
+                    ciris_persist::federation::self_at_login::BindingProvenance::Rooted => "rooted",
+                    ciris_persist::federation::self_at_login::BindingProvenance::Advisory => {
+                        "advisory"
+                    }
+                };
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    peer_admitted_log().check(provenance_key)
+                {
+                    tracing::info!(
+                        key_id = %key_id,
+                        provenance = ?provenance,
+                        epoch = attestation.epoch,
+                        dest_hash = %hex::encode(resolved.dest_hash.into_bytes()),
+                        transport_identity_hash = %hex::encode(transport_identity_hash),
+                        announce_pubkey_sha256_prefix =
+                            %hex::encode(&Sha256::digest(announce_pubkey64)[..4]),
+                        suppressed_prev,
+                        "peer_admitted (attribution operands stored)"
+                    );
+                }
                 peers.insert(
                     key_id,
                     RootedPeer {
