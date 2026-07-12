@@ -73,7 +73,6 @@
 //! as a `NodeEvent::ResourceCompleted`, which the listener turns into
 //! an [`InboundFrame`].
 
-use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -3511,16 +3510,39 @@ async fn resolve_announce_cold_start(
                 if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                     peer_admitted_log().check(provenance_key)
                 {
+                    // CIRISEdge#317 disambiguator (CIRISServer#235) — is
+                    // `announce.public_key()` actually the TRANSPORT identity the
+                    // RNS link proves, or the FEDERATION announce identity? The
+                    // link-attribution match compares `transport_identity_hash`
+                    // (= truncated_hash(announce_pubkey64)) against the link's
+                    // proven `identity_hash`. If those bytes are a DIFFERENT
+                    // identity than the transport one, the match can never hold.
+                    // The conclusive test at admit: the ed25519 half of
+                    // `announce.public_key()` (what edge hashed) vs the
+                    // attestation's DECLARED transport ed25519. If they differ,
+                    // `announce.public_key()` is NOT the transport identity → an
+                    // identity-SOURCE split, and this line proves it without a
+                    // link miss (`announce_ed25519_half != attestation_transport_ed25519`).
+                    let announce_ed25519_half = hex::encode(&announce_pubkey64[32..]);
+                    let attestation_transport_ed25519 = attestation
+                        .transport_identity_pubkey_bytes()
+                        .map_or_else(|_| "decode_err".to_string(), hex::encode);
+                    let ed25519_halves_match =
+                        announce_ed25519_half == attestation_transport_ed25519;
                     tracing::info!(
                         key_id = %key_id,
                         provenance = ?provenance,
                         epoch = attestation.epoch,
                         dest_hash = %hex::encode(resolved.dest_hash.into_bytes()),
                         transport_identity_hash = %hex::encode(transport_identity_hash),
-                        announce_pubkey_sha256_prefix =
-                            %hex::encode(&Sha256::digest(announce_pubkey64)[..4]),
+                        announce_pubkey64_hex = %hex::encode(announce_pubkey64),
+                        announce_ed25519_half = %announce_ed25519_half,
+                        attestation_transport_ed25519 = %attestation_transport_ed25519,
+                        ed25519_halves_match,
                         suppressed_prev,
-                        "peer_admitted (attribution operands stored)"
+                        "peer_admitted — #317 disambiguator: ed25519_halves_match=false ⇒ \
+                         announce.public_key() is the FEDERATION identity, not the transport \
+                         one the link proves (identity-source split, CIRISServer#235)"
                     );
                 }
                 peers.insert(
