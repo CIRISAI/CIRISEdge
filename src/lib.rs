@@ -79,6 +79,7 @@ pub mod handler;
 pub mod holonomic;
 pub mod identity;
 pub mod key_boundary;
+pub mod log_throttle;
 pub mod manifest;
 pub mod messages;
 // v6.0.0 (CIRISEdge#175, FSD §3.3 / §3.5 / §6) — substrate-tier MLS

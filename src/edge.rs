@@ -3613,40 +3613,71 @@ impl Edge {
                     //     source_key_id (None = transport hasn't been
                     //     wired for peer attribution; can't safely
                     //     route to a peer-keyed coordinator)
-                    if let (Some(registry), Some(source)) = (
-                        replication_registry.get(),
-                        frame.source_key_id.as_deref(),
-                    ) {
-                        match registry
-                            .route_inbound_bytes(source, &frame.envelope_bytes)
-                            .await
+                    if let Some(registry) = replication_registry.get() {
+                        if let Some(source) = frame.source_key_id.as_deref() {
+                            match registry
+                                .route_inbound_bytes(source, &frame.envelope_bytes)
+                                .await
+                            {
+                                Ok(crate::replication::registry::RouteOutcome::Routed) => {
+                                    // Replication frame delivered; do NOT
+                                    // fall through to envelope dispatch.
+                                    continue;
+                                }
+                                Ok(crate::replication::registry::RouteOutcome::NotAReplicationFrame) => {
+                                    // No CRPL magic — fall through to the
+                                    // existing envelope dispatch path.
+                                }
+                                Ok(crate::replication::registry::RouteOutcome::NoCoordinatorRegistered { kind }) => {
+                                    tracing::debug!(
+                                        peer = %source,
+                                        ?kind,
+                                        "CRPL frame received but no coordinator registered for (peer, kind); dropping"
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        peer = %source,
+                                        error = %e,
+                                        "replication route_inbound_bytes failed; dropping frame"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else if frame
+                            .envelope_bytes
+                            .starts_with(&crate::replication::wire_frame::REPLICATION_FRAME_MAGIC)
                         {
-                            Ok(crate::replication::registry::RouteOutcome::Routed) => {
-                                // Replication frame delivered; do NOT
-                                // fall through to envelope dispatch.
-                                continue;
-                            }
-                            Ok(crate::replication::registry::RouteOutcome::NotAReplicationFrame) => {
-                                // No CRPL magic — fall through to the
-                                // existing envelope dispatch path.
-                            }
-                            Ok(crate::replication::registry::RouteOutcome::NoCoordinatorRegistered { kind }) => {
+                            // CIRISEdge#317 point 4 — a CRPL replication frame
+                            // arrived but the transport could NOT attribute it to
+                            // a peer key_id (`source_key_id=None`; see the
+                            // reticulum `link_attribution_miss` WARN upstream). It
+                            // cannot route. DROP it here rather than fall through
+                            // to the JSON verifier — feeding binary CRPL to
+                            // `verify.verify()` is what produced the misleading
+                            // `schema_invalid` in the field. This is the exact
+                            // state the whole bug lived in and it emitted nothing;
+                            // now it's a throttled WARN (attacker-triggerable, so
+                            // first-N-per-window keyed on transport).
+                            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                                inbound_unroutable_crpl_log().check(frame.transport.0)
+                            {
                                 tracing::warn!(
-                                    peer = %source,
-                                    ?kind,
-                                    "CRPL frame received but no coordinator registered for (peer, kind); dropping"
+                                    transport_id = %frame.transport.0,
+                                    bytes = frame.envelope_bytes.len(),
+                                    first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
+                                    route = "SkippedNoSourceKeyId",
+                                    suppressed_prev,
+                                    "inbound CRPL replication frame with source_key_id=None — \
+                                     transport could not attribute the sending link to a peer \
+                                     (link attribution miss upstream); dropping (CIRISEdge#317)"
                                 );
-                                continue;
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    peer = %source,
-                                    error = %e,
-                                    "replication route_inbound_bytes failed; dropping frame"
-                                );
-                                continue;
-                            }
+                            continue;
                         }
+                        // else: no source + not a CRPL frame — a normal inbound
+                        // envelope that carries no peer attribution; fall through.
                     }
                     let verify_clone = verify.clone();
                     let handlers_clone = handlers.clone();
@@ -3903,6 +3934,38 @@ async fn key_is_own_node(
     }
 }
 
+// CIRISEdge#317 — throttles for the two attacker-triggerable, per-frame inbound
+// log sites (points 4 + 5). Both are keyed on a LOW-cardinality discriminant
+// (transport id / verify-error class), so a flood of junk frames collapses to a
+// bounded first-N-per-window + suppressed-count rather than a per-frame line.
+// The always-on rate lives in `EdgeMetrics` (`inc_verify_failure`).
+static INBOUND_UNROUTABLE_CRPL_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+static INBOUND_VERIFY_REJECT_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// Point 4 — a CRPL replication frame that couldn't be attributed (no
+/// `source_key_id`). Keyed on transport id (a handful of values).
+fn inbound_unroutable_crpl_log() -> &'static crate::log_throttle::LogThrottle {
+    INBOUND_UNROUTABLE_CRPL_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+    })
+}
+
+/// Point 5 — a verify-rejected inbound frame (attacker-expected junk). Keyed on
+/// the verify-error class (a small closed set).
+fn inbound_verify_reject_log() -> &'static crate::log_throttle::LogThrottle {
+    INBOUND_VERIFY_REJECT_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 32)
+    })
+}
+
+/// Hex of the first up-to-8 bytes of a frame — distinguishes a binary CRPL frame
+/// that was misrouted to the JSON verifier from a genuinely-malformed envelope.
+fn first_bytes_hex(bytes: &[u8]) -> String {
+    hex::encode(&bytes[..bytes.len().min(8)])
+}
+
 /// Inbound dispatch: verify → maybe-ACK-match → `ContentBody`
 /// AV-13/integrity gate (CIRISEdge#21 v0.8.0) → `FederationAnnouncement`
 /// `AccordCarrier` 2-of-3 multi-sig wire-layer gate (CIRISEdge#19,
@@ -4029,16 +4092,32 @@ async fn dispatch_inbound(
     let verified = match verify.verify(&frame.envelope_bytes, transport).await {
         Ok(v) => v,
         Err(e) => {
+            // CIRISEdge#317 point 5 — a verify-rejected frame is attacker-EXPECTED
+            // traffic, not an operational error, so the always-on signal is the
+            // `verify_failures_total[class]` counter (below), and the per-event
+            // line is a THROTTLED WARN (was ERROR — always shipped). It carries
+            // `source_key_id` explicitly (log `None`, don't omit) + `first_bytes_hex`
+            // so a binary CRPL frame misrouted here vs a genuinely-malformed
+            // signed envelope is one glance. Keyed on the verify class (small
+            // closed set) so a flood of one class collapses to a suppressed-count.
             let class = crate::observability::VerifyErrorClass::from_verify_error(&e);
             metrics.inc_verify_failure(class);
             tracing::Span::current().record("verify_outcome", class.as_str());
-            tracing::error!(
-                event = "edge.dispatch_inbound.verify_rejected",
-                transport_id = %transport.0,
-                verify_error_class = class.as_str(),
-                error = %e,
-                "verify rejected",
-            );
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                inbound_verify_reject_log().check(class.as_str())
+            {
+                tracing::warn!(
+                    event = "edge.dispatch_inbound.verify_rejected",
+                    transport_id = %transport.0,
+                    verify_error_class = class.as_str(),
+                    source_key_id = ?frame.source_key_id,
+                    bytes = frame.envelope_bytes.len(),
+                    first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
+                    suppressed_prev,
+                    error = %e,
+                    "verify rejected (CIRISEdge#317)",
+                );
+            }
             return;
         }
     };
