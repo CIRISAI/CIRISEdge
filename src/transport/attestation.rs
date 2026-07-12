@@ -51,6 +51,12 @@ use serde::{Deserialize, Serialize};
 /// be replayed into the other.
 const ATTESTATION_DOMAIN: &[u8] = b"ciris-edge/announce-attestation/v1";
 
+/// Domain for the **v2** payload that also binds the transport **x25519**
+/// (encryption) half — CIRISEdge#317. Distinct from the v1 domain so a v1
+/// signature can never be replayed as v2 (or vice versa): the two payload
+/// shapes live in disjoint signature spaces.
+const ATTESTATION_DOMAIN_V2: &[u8] = b"ciris-edge/announce-attestation/v2";
+
 /// The three signed fields of an [`AnnounceAttestation`], in the
 /// canonical order the signature covers.
 ///
@@ -63,6 +69,15 @@ pub struct AttestationPayload<'a> {
     /// public key (the ed25519 half of the dual-key identity — the
     /// half `ReticulumNode::connect` needs as the `signing_key`).
     pub transport_identity_pubkey: &'a [u8; 32],
+    /// CIRISEdge#317 — the announcer's 32-byte Reticulum transport-identity
+    /// **x25519** (encryption) public key, the OTHER half of the dual-key RNS
+    /// identity. `None` for a v1 announce (the field this fix adds). When set,
+    /// the admit side reconstructs the full transport identity
+    /// (`x25519 ‖ ed25519`) and computes `Identity::hash()` = exactly what the
+    /// RNS link proves — the announce previously carried only the ed25519 half,
+    /// so admit fell back to `announce.public_key()` (the FEDERATION identity)
+    /// and never matched the transport-identity link.
+    pub transport_x25519_pubkey: Option<&'a [u8; 32]>,
     /// The announcer's federation `key_id` (`federation_keys.key_id`).
     pub federation_key_id: &'a str,
     /// The transport-identity rotation epoch. Monotonic per
@@ -72,7 +87,8 @@ pub struct AttestationPayload<'a> {
 }
 
 impl<'a> AttestationPayload<'a> {
-    /// Construct a payload from its three signed fields.
+    /// Construct a v1 payload from its three signed fields (no transport
+    /// x25519). Use [`Self::with_transport_x25519`] to bind the x25519 half.
     #[must_use]
     pub fn new(
         transport_identity_pubkey: &'a [u8; 32],
@@ -81,34 +97,64 @@ impl<'a> AttestationPayload<'a> {
     ) -> Self {
         Self {
             transport_identity_pubkey,
+            transport_x25519_pubkey: None,
             federation_key_id,
             epoch,
         }
     }
 
+    /// CIRISEdge#317 — bind the transport **x25519** half, upgrading the payload
+    /// to the v2 canonical shape (distinct signature domain).
+    #[must_use]
+    pub fn with_transport_x25519(mut self, transport_x25519_pubkey: &'a [u8; 32]) -> Self {
+        self.transport_x25519_pubkey = Some(transport_x25519_pubkey);
+        self
+    }
+
     /// The exact bytes the federation key signs / a verifier checks.
     ///
-    /// Layout (all integers big-endian):
-    /// `DOMAIN ‖ len(pubkey):u64 ‖ pubkey ‖ len(key_id):u64 ‖ key_id ‖ epoch:u64`.
-    /// Length prefixes make the encoding injective — distinct field
-    /// triples never collide on a byte string, so a signature is
-    /// bound to exactly one `(pubkey, key_id, epoch)`.
+    /// v1 layout (all integers big-endian):
+    /// `DOMAIN ‖ len(ed25519) ‖ ed25519 ‖ len(key_id) ‖ key_id ‖ epoch`.
+    ///
+    /// v2 layout (when [`Self::transport_x25519_pubkey`] is set):
+    /// `DOMAIN_V2 ‖ len(ed25519) ‖ ed25519 ‖ len(x25519) ‖ x25519 ‖ len(key_id) ‖ key_id ‖ epoch`.
+    ///
+    /// Length prefixes make each encoding injective; the distinct domain keeps
+    /// v1 and v2 signatures in disjoint spaces.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let key_id = self.federation_key_id.as_bytes();
         // Length prefixes are `u64` big-endian — wide enough that the
-        // `usize → u64` widening is lossless on every supported
-        // target (no truncation risk).
-        let pubkey_len = self.transport_identity_pubkey.len() as u64;
+        // `usize → u64` widening is lossless on every supported target.
+        let ed_len = self.transport_identity_pubkey.len() as u64;
         let key_id_len = key_id.len() as u64;
-        let mut out = Vec::with_capacity(ATTESTATION_DOMAIN.len() + 8 + 32 + 8 + key_id.len() + 8);
-        out.extend_from_slice(ATTESTATION_DOMAIN);
-        out.extend_from_slice(&pubkey_len.to_be_bytes());
-        out.extend_from_slice(self.transport_identity_pubkey);
-        out.extend_from_slice(&key_id_len.to_be_bytes());
-        out.extend_from_slice(key_id);
-        out.extend_from_slice(&self.epoch.to_be_bytes());
-        out
+        if let Some(x25519) = self.transport_x25519_pubkey {
+            // v2 — binds the FULL transport identity (ed25519 + x25519).
+            let x_len = x25519.len() as u64;
+            let mut out = Vec::with_capacity(
+                ATTESTATION_DOMAIN_V2.len() + 8 + 32 + 8 + 32 + 8 + key_id.len() + 8,
+            );
+            out.extend_from_slice(ATTESTATION_DOMAIN_V2);
+            out.extend_from_slice(&ed_len.to_be_bytes());
+            out.extend_from_slice(self.transport_identity_pubkey);
+            out.extend_from_slice(&x_len.to_be_bytes());
+            out.extend_from_slice(x25519);
+            out.extend_from_slice(&key_id_len.to_be_bytes());
+            out.extend_from_slice(key_id);
+            out.extend_from_slice(&self.epoch.to_be_bytes());
+            out
+        } else {
+            // v1 — transport ed25519 only (unchanged).
+            let mut out =
+                Vec::with_capacity(ATTESTATION_DOMAIN.len() + 8 + 32 + 8 + key_id.len() + 8);
+            out.extend_from_slice(ATTESTATION_DOMAIN);
+            out.extend_from_slice(&ed_len.to_be_bytes());
+            out.extend_from_slice(self.transport_identity_pubkey);
+            out.extend_from_slice(&key_id_len.to_be_bytes());
+            out.extend_from_slice(key_id);
+            out.extend_from_slice(&self.epoch.to_be_bytes());
+            out
+        }
     }
 }
 
@@ -177,6 +223,12 @@ pub struct AnnounceAttestation {
     /// The announcer's 32-byte Reticulum transport-identity Ed25519
     /// public key, base64 standard.
     pub transport_identity_pubkey: String,
+    /// CIRISEdge#317 — the announcer's 32-byte transport-identity **x25519**
+    /// (encryption) public key, base64 standard. `None` on a v1 announce; when
+    /// present, it is covered by the signature (v2 canonical bytes) and lets the
+    /// admit side compute the transport-identity hash the RNS link proves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_x25519_pubkey: Option<String>,
     /// The announcer's federation `key_id`.
     pub federation_key_id: String,
     /// The announcer's *claimed* federation Ed25519 public key,
@@ -214,6 +266,19 @@ impl AnnounceAttestation {
     /// base64 of exactly 32 bytes.
     pub fn transport_identity_pubkey_bytes(&self) -> Result<[u8; 32], AttestationError> {
         decode_fixed::<32>(&self.transport_identity_pubkey, "transport_identity_pubkey")
+    }
+
+    /// CIRISEdge#317 — decode the optional 32-byte transport-identity x25519
+    /// pubkey. `Ok(None)` for a v1 announce (field absent); `Ok(Some(_))` for v2.
+    ///
+    /// # Errors
+    /// [`AttestationError::FieldDecode`] when the field is present but not
+    /// base64 of exactly 32 bytes.
+    pub fn transport_x25519_pubkey_bytes(&self) -> Result<Option<[u8; 32]>, AttestationError> {
+        match &self.transport_x25519_pubkey {
+            Some(b64) => Ok(Some(decode_fixed::<32>(b64, "transport_x25519_pubkey")?)),
+            None => Ok(None),
+        }
     }
 
     /// Serialize to announce app-data bytes (JSON).
@@ -255,10 +320,17 @@ impl AnnounceAttestation {
         use ciris_crypto::ClassicalVerifier;
 
         let transport_pubkey = self.transport_identity_pubkey_bytes()?;
+        let transport_x25519 = self.transport_x25519_pubkey_bytes()?;
         let signature = decode_fixed::<64>(&self.signature, "signature")?;
 
-        let payload =
+        // CIRISEdge#317 — verify over the v2 payload (binding the x25519 half)
+        // when the announce carries it, else the v1 payload. The signature's
+        // domain is bound to the shape, so a v1 sig can't be accepted as v2.
+        let mut payload =
             AttestationPayload::new(&transport_pubkey, &self.federation_key_id, self.epoch);
+        if let Some(x25519) = &transport_x25519 {
+            payload = payload.with_transport_x25519(x25519);
+        }
         let canonical = payload.canonical_bytes();
 
         let verified = ciris_crypto::Ed25519Verifier::new()
@@ -330,6 +402,7 @@ mod tests {
         let att = AnnounceAttestation {
             transport_identity_pubkey: base64::engine::general_purpose::STANDARD
                 .encode(transport_pubkey),
+            transport_x25519_pubkey: None,
             federation_key_id: "edge-key-honest".to_string(),
             federation_pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
                 .encode(fed_pubkey),
@@ -362,6 +435,57 @@ mod tests {
             bad_sig.verify_signature(&fed_pubkey),
             Err(AttestationError::SignatureMismatch)
         ));
+    }
+
+    /// CIRISEdge#317 — a v2 attestation binding the transport x25519 verifies,
+    /// its signature is domain-separated from v1, and swapping the x25519
+    /// (a spoofed transport identity) fails verification.
+    #[test]
+    fn v2_attestation_binds_transport_x25519_and_rejects_swap() {
+        let signer = ciris_crypto::Ed25519Signer::random().unwrap();
+        let fed_pubkey: [u8; 32] = signer.public_key().unwrap().try_into().unwrap();
+        let transport_ed25519 = [0x5au8; 32];
+        let transport_x25519 = [0x77u8; 32];
+
+        let payload = AttestationPayload::new(&transport_ed25519, "edge-key-v2", 9)
+            .with_transport_x25519(&transport_x25519);
+        let sig = signer.sign(&payload.canonical_bytes()).unwrap();
+
+        let att = AnnounceAttestation {
+            transport_identity_pubkey: base64::engine::general_purpose::STANDARD
+                .encode(transport_ed25519),
+            transport_x25519_pubkey: Some(
+                base64::engine::general_purpose::STANDARD.encode(transport_x25519),
+            ),
+            federation_key_id: "edge-key-v2".to_string(),
+            federation_pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
+                .encode(fed_pubkey),
+            epoch: 9,
+            signature: base64::engine::general_purpose::STANDARD.encode(&sig),
+        };
+
+        // Round-trips through app-data + verifies.
+        let parsed = AnnounceAttestation::from_app_data(&att.to_app_data().unwrap()).unwrap();
+        assert_eq!(parsed, att);
+        assert_eq!(
+            parsed.transport_x25519_pubkey_bytes().unwrap(),
+            Some(transport_x25519)
+        );
+        parsed.verify_signature(&fed_pubkey).unwrap();
+
+        // A swapped x25519 (spoofed transport identity) fails — the x25519 is
+        // signed content in v2.
+        let mut swapped = parsed.clone();
+        swapped.transport_x25519_pubkey =
+            Some(base64::engine::general_purpose::STANDARD.encode([0x88u8; 32]));
+        assert!(matches!(
+            swapped.verify_signature(&fed_pubkey),
+            Err(AttestationError::SignatureMismatch)
+        ));
+
+        // v1 and v2 canonical bytes are domain-separated (no cross-replay).
+        let v1 = AttestationPayload::new(&transport_ed25519, "edge-key-v2", 9).canonical_bytes();
+        assert_ne!(v1, payload.canonical_bytes(), "v1/v2 domains disjoint");
     }
 
     /// A v0.3.1-style bare-`key_id` announce is not attestation JSON

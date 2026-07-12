@@ -119,6 +119,12 @@ const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// CIRISEdge#318 — cap on the in-memory `peers` (rooted + advisory bindings)
+/// map. Bounds advisory-admit pollution: at cap, an Advisory binding is evicted
+/// before a new key is inserted (Rooted bindings are never evicted for advisory
+/// churn). Far above any real cohort; the target is unbounded attacker growth.
+const MAX_PEERS: usize = 4096;
+
 // ─── CIRISEdge#317 — throttles for attacker-triggerable log sites ────
 //
 // Announces + link establishment are unauthenticated / advisory-admitted, so a
@@ -1347,11 +1353,17 @@ impl ReticulumTransport {
         // 32..64) of the dual-key identity.
         let mut transport_ed25519 = [0u8; 32];
         transport_ed25519.copy_from_slice(&local_transport_pubkey[32..64]);
+        // CIRISEdge#317 — the x25519 (encryption) half is bytes 0..32 of the
+        // dual-key identity; bind it into the announce so receivers can match
+        // the transport identity the link proves.
+        let mut transport_x25519 = [0u8; 32];
+        transport_x25519.copy_from_slice(&local_transport_pubkey[..32]);
         let local_attestation = if let Some(s) = &signer {
             Some(
                 build_local_attestation(
                     s,
                     &transport_ed25519,
+                    &transport_x25519,
                     &config.local_key_id,
                     config.local_epoch,
                 )
@@ -3402,23 +3414,34 @@ async fn resolve_announce_cold_start(
         dest_hash: *announce.destination_hash(),
         signing_key: transport_pubkey,
     };
-    // CIRISEdge#299 — the full 64-byte transport identity (`x25519 ‖
-    // ed25519`) + dest-hash for the write-through below. `resolved.signing_key`
-    // is only the ed25519 half; the KEX x25519 needed to seal after a restart
-    // lives on the announce identity (`announce.public_key()`), so we capture
-    // it here from the authenticated announce.
+    // CIRISEdge#317 — reconstruct the TRANSPORT identity (`x25519_enc ‖
+    // ed25519_sig`) the RNS link proves, from the attestation's two transport
+    // halves. The pre-#317 code hashed `announce.public_key()` — but that is the
+    // FEDERATION announce identity (same ed25519 signing half, DIFFERENT x25519),
+    // a different `Identity` than the link authenticates under, so the
+    // attribution could never match (CIRISServer#235). A v2 announce carries the
+    // transport x25519; for a v1 (legacy) announce that doesn't, we fall back to
+    // the announce identity — those peers stay unattributable until they upgrade,
+    // exactly as before, but new peers now match.
     let announce_pubkey64: [u8; 64] = *announce.public_key();
-    // CIRISEdge#314 — the peer's transport identity hash (x25519 ‖ ed25519 →
-    // truncated identity hash), captured so the inbound-link→key_id attribution
-    // (`NodeEvent::LinkIdentified`) can match the link's PROVEN identity form-
-    // agnostically, rather than via the fragile named-dest recompute that missed
-    // on the named-vs-explicit split. Equals the link's `identity_hash` because
-    // both derive `Identity::from_public_keys(x25519, ed25519).hash()` from the
-    // same authenticated transport pubkeys. `[0u8; 16]` if the pubkey is
-    // malformed (that record was already crypto-verified upstream).
+    let transport_x25519 = attestation.transport_x25519_pubkey_bytes().ok().flatten();
+    // The binding pubkey used BOTH for the attribution hash and the #299
+    // write-through (so the persisted transport binding + KEX x25519 are the
+    // transport identity, not the federation one).
+    let binding_pubkey64: [u8; 64] = match transport_x25519 {
+        Some(x25519) => {
+            let mut id = [0u8; 64];
+            id[..32].copy_from_slice(&x25519); // x25519 (encryption) half
+            id[32..].copy_from_slice(&transport_pubkey); // ed25519 (signing) half
+            id
+        }
+        None => announce_pubkey64, // v1 announce — no transport x25519 carried
+    };
+    // The identity hash the link's LINKIDENTIFY proves:
+    // `truncated_hash(x25519 ‖ ed25519)`.
     let transport_identity_hash: [u8; 16] = {
-        let x25519: [u8; 32] = announce_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
-        let ed25519: [u8; 32] = announce_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
+        let x25519: [u8; 32] = binding_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
+        let ed25519: [u8; 32] = binding_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
         Identity::from_public_keys(&x25519, &ed25519).map_or([0u8; 16], |id| *id.hash())
     };
     let dest_hash16: [u8; 16] = (*announce.destination_hash()).into_bytes();
@@ -3510,19 +3533,17 @@ async fn resolve_announce_cold_start(
                 if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                     peer_admitted_log().check(provenance_key)
                 {
-                    // CIRISEdge#317 disambiguator (CIRISServer#235) — is
-                    // `announce.public_key()` actually the TRANSPORT identity the
-                    // RNS link proves, or the FEDERATION announce identity? The
-                    // link-attribution match compares `transport_identity_hash`
-                    // (= truncated_hash(announce_pubkey64)) against the link's
-                    // proven `identity_hash`. If those bytes are a DIFFERENT
-                    // identity than the transport one, the match can never hold.
-                    // The conclusive test at admit: the ed25519 half of
-                    // `announce.public_key()` (what edge hashed) vs the
-                    // attestation's DECLARED transport ed25519. If they differ,
-                    // `announce.public_key()` is NOT the transport identity → an
-                    // identity-SOURCE split, and this line proves it without a
-                    // link miss (`announce_ed25519_half != attestation_transport_ed25519`).
+                    // CIRISEdge#317 — the stored `transport_identity_hash` is now
+                    // derived from the TRANSPORT identity (attestation x25519 ‖
+                    // ed25519) for a v2 announce (`transport_x25519_present=true`),
+                    // = exactly the identity the RNS link proves. `false` = a v1
+                    // (legacy) announce that carries no transport x25519, so admit
+                    // fell back to `announce.public_key()` (the federation
+                    // identity) and this peer stays unattributable until it
+                    // upgrades. `ed25519_halves_match` remains a diagnostic: it is
+                    // the announce identity's ed25519 half vs the attestation's
+                    // declared transport ed25519 — `false` confirms the federation-
+                    // vs-transport identity split the v2 binding fixes.
                     let announce_ed25519_half = hex::encode(&announce_pubkey64[32..]);
                     let attestation_transport_ed25519 = attestation
                         .transport_identity_pubkey_bytes()
@@ -3535,15 +3556,41 @@ async fn resolve_announce_cold_start(
                         epoch = attestation.epoch,
                         dest_hash = %hex::encode(resolved.dest_hash.into_bytes()),
                         transport_identity_hash = %hex::encode(transport_identity_hash),
-                        announce_pubkey64_hex = %hex::encode(announce_pubkey64),
+                        transport_x25519_present = transport_x25519.is_some(),
                         announce_ed25519_half = %announce_ed25519_half,
                         attestation_transport_ed25519 = %attestation_transport_ed25519,
                         ed25519_halves_match,
                         suppressed_prev,
-                        "peer_admitted — #317 disambiguator: ed25519_halves_match=false ⇒ \
-                         announce.public_key() is the FEDERATION identity, not the transport \
-                         one the link proves (identity-source split, CIRISServer#235)"
+                        "peer_admitted — #317: transport_identity_hash from \
+                         transport identity when transport_x25519_present=true \
+                         (matches the link); v1 fallback when false"
                     );
+                }
+                // CIRISEdge#318 — bound the peers map against advisory-admit
+                // pollution (an attacker minting unlimited self-signed keypairs,
+                // each admitting as a distinct `Advisory` entry). At cap, evict an
+                // Advisory binding before inserting a new key — NEVER a `Rooted`
+                // (accord-blessed, finite) binding for advisory churn. If the map
+                // is full of rooted peers (unrealistic — accord-bounded), the new
+                // entry is still admitted; the cap targets advisory growth only.
+                if !peers.contains_key(&key_id) && peers.len() >= MAX_PEERS {
+                    let evict = peers
+                        .iter()
+                        .find(|(_, rp)| {
+                            matches!(
+                                rp.provenance,
+                                ciris_persist::federation::self_at_login::BindingProvenance::Advisory
+                            )
+                        })
+                        .map(|(k, _)| k.clone());
+                    if let Some(evict) = evict {
+                        peers.remove(&evict);
+                        tracing::debug!(
+                            evicted = %evict,
+                            cap = MAX_PEERS,
+                            "peers map at cap — evicted an advisory binding (CIRISEdge#318)"
+                        );
+                    }
                 }
                 peers.insert(
                     key_id,
@@ -3567,8 +3614,11 @@ async fn resolve_announce_cold_start(
     // FederationDirectory-backed `RootingDirectory`; the write is a no-op
     // for non-directory impls (default trait method).
     if let Some(persisted_key) = newly_rooted_key {
+        // CIRISEdge#317 — persist the TRANSPORT identity (binding_pubkey64), not
+        // `announce.public_key()` (the federation identity), so the boot-reloaded
+        // binding resolves + seals to the identity the link proves.
         rooting
-            .persist_transport_binding(&persisted_key, dest_hash16, announce_pubkey64, provenance)
+            .persist_transport_binding(&persisted_key, dest_hash16, binding_pubkey64, provenance)
             .await;
     }
 }
@@ -3691,6 +3741,7 @@ fn hybrid_policy_accepts(policy: HybridPolicy, chain: &ProvenanceChain) -> bool 
 async fn build_local_attestation(
     signer: &LocalSigner,
     transport_identity_pubkey: &[u8; 32],
+    transport_x25519_pubkey: &[u8; 32],
     federation_key_id: &str,
     epoch: u64,
 ) -> Result<Vec<u8>, TransportError> {
@@ -3706,7 +3757,11 @@ async fn build_local_attestation(
         )));
     }
 
-    let payload = AttestationPayload::new(transport_identity_pubkey, federation_key_id, epoch);
+    // CIRISEdge#317 — bind the FULL transport identity (ed25519 ‖ x25519) so the
+    // receiver's admit computes `Identity::hash()` = exactly what the RNS link
+    // proves. v2 payload (distinct signature domain).
+    let payload = AttestationPayload::new(transport_identity_pubkey, federation_key_id, epoch)
+        .with_transport_x25519(transport_x25519_pubkey);
     let signature = signer
         .classical
         .sign(&payload.canonical_bytes())
@@ -3716,6 +3771,9 @@ async fn build_local_attestation(
     let attestation = AnnounceAttestation {
         transport_identity_pubkey: base64::engine::general_purpose::STANDARD
             .encode(transport_identity_pubkey),
+        transport_x25519_pubkey: Some(
+            base64::engine::general_purpose::STANDARD.encode(transport_x25519_pubkey),
+        ),
         federation_key_id: federation_key_id.to_string(),
         federation_pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
             .encode(&fed_pubkey),
