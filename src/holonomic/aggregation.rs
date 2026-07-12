@@ -163,8 +163,8 @@ pub fn assemble_tier_meta_v2(
 /// `put_aggregated_tier`, and a pre-v3 tier **fails closed** at every peer.
 ///
 /// `member_masses` + `max_source_multiplicity` come from the fold —
-/// `realtime_av_codec::fountain::content_multiplicity` (behind the codec
-/// feature), the only point in the pipeline holding member payloads. Pass its
+/// [`super::multiplicity::content_multiplicity`] — measured from the member
+/// payloads the fold collapses (ungated; no codec dep). Pass its
 /// `ContentMultiplicity` fields straight through. The masses are a *measured*
 /// output (each member's share of content energy), so `n_eff` and
 /// `mass_commitment` are both auditable: an auditor holding the members
