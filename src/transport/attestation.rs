@@ -243,7 +243,15 @@ impl TransportBindingEnforcement {
 /// The pre-#333 JSON attestation was 337 B (410 B once #317 added the x25519
 /// field): it had **never** fit, which is the root cause of the whole AV-42
 /// rooting saga (no attested announce ever propagated an RNS path).
-pub const ANNOUNCE_APP_DATA_BUDGET: usize = 300;
+///
+/// The value is **not** hardcoded here — it is leviculum's own derived budget
+/// (`MTU − IFAC − header − fixed_payload`), pulled from the source of truth so
+/// it cannot silently rot if leviculum changes a header size or the ratchet
+/// default. `with_ratchet = true`: edge announces are ratcheted, whose fixed
+/// payload (180 B) is larger than the un-ratcheted case, so 300 B (not 332 B) is
+/// the value a smaller-fits-so-does-larger argument does NOT get to assume.
+/// (leviculum#22 / v0.9.0+ciris.1 exported this; before, edge duplicated `300`.)
+pub const ANNOUNCE_APP_DATA_BUDGET: usize = reticulum_core::announce_app_data_budget(true);
 
 /// The binary wire tag for [`AnnounceAttestation::to_app_data`]. A version byte
 /// so a future shape is distinguishable rather than mis-parsed.

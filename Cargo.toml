@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "12.0.0"
+version = "12.0.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -538,8 +538,20 @@ tempfile       = { version = "3", optional = true }
 # currency with zero source-side changes on edge's side. `.recv().await`
 # unchanged. Future leviculum upstream releases land via the one-command
 # `scripts/ciris-sync-upstream.sh` rebase upstream-side now.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.8.1+ciris.1", version = "0.8", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.8.1+ciris.1", version = "0.8", optional = true }
+#
+# v0.9.0+ciris.1 (leviculum#22, CIRISEdge#333 follow-up) — bumped to
+# 793a31c which exports `announce_app_data_budget(with_ratchet)` and
+# `announce_payload_fixed_len(with_ratchet)` so edge stops hardcoding the
+# derived MTU app-data budget (it now pulls the ratcheted 300 B from the
+# source of truth in src/transport/attestation.rs — the same cross-boundary
+# duplication class as the #333 bug itself). Also carries the packed_size()
+# 3-byte over-count fix (3ebaf88) and turns AnnounceError::PacketTooLarge from
+# a unit variant into a struct carrying {packed, mtu, app_data, budget} plus a
+# new AnnounceError::Pack(PacketError) — a breaking enum change, but edge only
+# matches AnnounceError::ExplicitHashCannotAnnounce (untouched), so the bump is
+# pin currency + the budget-const rewire with no match-arm churn.
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.9.0+ciris.1", version = "0.9", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.9.0+ciris.1", version = "0.9", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
