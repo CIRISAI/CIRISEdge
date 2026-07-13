@@ -42,7 +42,6 @@
 //! verification *inputs*, not signed content — they are checked
 //! against the directory, not trusted off the wire.
 
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// Domain-separation tag prepended to the canonical signing bytes.
@@ -69,14 +68,14 @@ pub struct AttestationPayload<'a> {
     /// public key (the ed25519 half of the dual-key identity — the
     /// half `ReticulumNode::connect` needs as the `signing_key`).
     pub transport_identity_pubkey: &'a [u8; 32],
-    /// CIRISEdge#317 — the announcer's 32-byte Reticulum transport-identity
-    /// **x25519** (encryption) public key, the OTHER half of the dual-key RNS
-    /// identity. `None` for a v1 announce (the field this fix adds). When set,
-    /// the admit side reconstructs the full transport identity
-    /// (`x25519 ‖ ed25519`) and computes `Identity::hash()` = exactly what the
-    /// RNS link proves — the announce previously carried only the ed25519 half,
-    /// so admit fell back to `announce.public_key()` (the FEDERATION identity)
-    /// and never matched the transport-identity link.
+    /// CIRISEdge#333 — the announcer's 32-byte transport-identity **x25519**
+    /// (encryption) half. **SIGNED, never transmitted in `app_data`**: the
+    /// announce packet already carries the full transport identity as its
+    /// `public_key` (`x25519 ‖ ed25519`, binary — leviculum `announce.rs`
+    /// `build_announce_payload`). A verifier reads both halves from
+    /// `announce.public_key()` and re-derives this payload to check the
+    /// signature. Binding by SIGNING OVER them (not re-sending them) is what
+    /// keeps the app_data inside the MTU budget.
     pub transport_x25519_pubkey: Option<&'a [u8; 32]>,
     /// The announcer's federation `key_id` (`federation_keys.key_id`).
     pub federation_key_id: &'a str,
@@ -218,29 +217,101 @@ impl TransportBindingEnforcement {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// CIRISEdge#333 — the hard app_data budget an announce must fit inside.
+///
+/// From leviculum's own constants (`reticulum-core::constants`) and
+/// `build_announce_payload`'s layout
+/// (`public_key(64) ‖ name_hash(10) ‖ random_hash(10) ‖ [ratchet(32)] ‖
+/// signature(64) ‖ app_data`):
+///
+/// ```text
+/// MTU                                 500
+///   − HEADER_MINSIZE (2 + 1 + 16)     −19
+///   − IFAC_MIN_SIZE                    −1
+///   − public_key (x25519 ‖ ed25519)   −64
+///   − name_hash                       −10
+///   − random_hash                     −10
+///   − ratchet                         −32
+///   − signature                       −64
+/// ───────────────────────────────────────
+///   app_data budget                   300
+/// ```
+///
+/// `Node::announce_destination` packs into a fixed `[0u8; MTU]` buffer, so an
+/// oversized `app_data` makes `pack()` fail and the announce **never leaves the
+/// box** — the node becomes invisible to the mesh while looking healthy locally.
+/// The pre-#333 JSON attestation was 337 B (410 B once #317 added the x25519
+/// field): it had **never** fit, which is the root cause of the whole AV-42
+/// rooting saga (no attested announce ever propagated an RNS path).
+pub const ANNOUNCE_APP_DATA_BUDGET: usize = 300;
+
+/// The binary wire tag for [`AnnounceAttestation::to_app_data`]. A version byte
+/// so a future shape is distinguishable rather than mis-parsed.
+const ATTESTATION_WIRE_V1: u8 = 0x01;
+
+/// Fixed overhead of the packed attestation, excluding `federation_key_id`:
+/// `version(1) ‖ key_id_len(1) ‖ federation_pubkey(32) ‖ epoch(8) ‖ signature(64)`.
+const ATTESTATION_FIXED_OVERHEAD: usize = 1 + 1 + 32 + 8 + 64;
+
+/// CIRISEdge#333 — the longest `federation_key_id` that can appear in an
+/// announce. Derived, not chosen: it is whatever [`ANNOUNCE_APP_DATA_BUDGET`]
+/// leaves after the fixed overhead. A longer key_id cannot be announced at all
+/// (the packet would exceed the MTU and never transmit), so it is refused at
+/// compose time instead. Real key_ids are ~20–45 B; this is a wide margin.
+pub const MAX_FEDERATION_KEY_ID_LEN: usize = ANNOUNCE_APP_DATA_BUDGET - ATTESTATION_FIXED_OVERHEAD;
+
+// The load-bearing invariant, checked AT COMPILE TIME: the worst admissible
+// attestation fits the announce budget. Add a field to the wire shape without
+// shrinking the key_id bound and THIS fails the build — which is the whole point
+// of CIRISEdge#333 (the old shape failed silently, on the wire, at runtime).
+const _: () = assert!(
+    ATTESTATION_FIXED_OVERHEAD + MAX_FEDERATION_KEY_ID_LEN <= ANNOUNCE_APP_DATA_BUDGET,
+    "the worst-case announce attestation must fit ANNOUNCE_APP_DATA_BUDGET"
+);
+
+/// A federation-key-signed transport-identity binding, carried in the Reticulum
+/// announce app-data.
+///
+/// # Wire form: BINARY, and it does NOT carry the transport pubkeys
+///
+/// ```text
+/// u8(version=1) ‖ u8(len key_id) ‖ key_id ‖ federation_pubkey_ed25519(32)
+///               ‖ u64_be(epoch) ‖ signature(64)
+/// ```
+///
+/// Two deliberate choices, both forced by [`ANNOUNCE_APP_DATA_BUDGET`]:
+///
+/// 1. **The transport pubkeys are NOT in `app_data`.** The announce packet
+///    already transmits them, in binary, as its own `public_key` (64 B). The
+///    old JSON shape re-encoded those same bytes as base64 — ~140 B of pure
+///    duplication, *more* than the 104 B by which it overflowed. They are still
+///    **bound**: the signature covers them ([`AttestationPayload`]); a verifier
+///    supplies them from `announce.public_key()`.
+/// 2. **Binary, not JSON.** JSON key names alone cost ~110 B of a 300 B budget.
+///    A broadcast primitive under a hard MTU is the wrong place for a
+///    self-describing format. This shape is ~150 B, leaving real headroom.
+///
+/// # Authentication
+///
+/// `signature` is **not** trusted on its own — it proves only that whoever holds
+/// `federation_key_id`'s Ed25519 seed signed the
+/// `(transport identity, federation_key_id, epoch)` binding. The resolver still
+/// roots `federation_key_id` against the persist directory (`root_binding`) and
+/// verifies the signature against the **directory-confirmed** pubkey — never
+/// against the `federation_pubkey_ed25519` carried here, which is a claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnounceAttestation {
-    /// The announcer's 32-byte Reticulum transport-identity Ed25519
-    /// public key, base64 standard.
-    pub transport_identity_pubkey: String,
-    /// CIRISEdge#317 — the announcer's 32-byte transport-identity **x25519**
-    /// (encryption) public key, base64 standard. `None` on a v1 announce; when
-    /// present, it is covered by the signature (v2 canonical bytes) and lets the
-    /// admit side compute the transport-identity hash the RNS link proves.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport_x25519_pubkey: Option<String>,
     /// The announcer's federation `key_id`.
     pub federation_key_id: String,
-    /// The announcer's *claimed* federation Ed25519 public key,
-    /// base64 standard. A verification input rooted against the
-    /// directory — `root_binding`'s `claimed_pubkey_ed25519_base64`.
-    pub federation_pubkey_ed25519_base64: String,
-    /// Transport-identity rotation epoch (see
-    /// [`AttestationPayload::epoch`]).
+    /// The announcer's *claimed* federation Ed25519 public key (32 B). A
+    /// verification input rooted against the directory — never trusted as-is.
+    pub federation_pubkey_ed25519: [u8; 32],
+    /// Transport-identity rotation epoch.
     pub epoch: u64,
     /// Ed25519 signature by the federation key over
-    /// [`AttestationPayload::canonical_bytes`], base64 standard.
-    pub signature: String,
+    /// [`AttestationPayload::canonical_bytes`] (which covers the transport
+    /// identity read from the announce's own `public_key`).
+    pub signature: [u8; 64],
 }
 
 /// Errors decoding / verifying an [`AnnounceAttestation`].
@@ -256,85 +327,138 @@ pub enum AttestationError {
     /// pubkey. AV-42 — a spoofed binding fails here.
     #[error("attestation signature verification failed")]
     SignatureMismatch,
+    /// CIRISEdge#333 — the packed attestation exceeds the announce app_data
+    /// budget. Refused at COMPOSE time: an oversized announce silently fails to
+    /// transmit (leviculum packs into a fixed `[0u8; MTU]`), leaving the node
+    /// invisible to the mesh while it looks healthy locally.
+    #[error("attestation is {actual} B; the announce app_data budget is {budget} B")]
+    TooLarge { actual: usize, budget: usize },
 }
 
 impl AnnounceAttestation {
-    /// Decode the 32-byte transport-identity pubkey.
+    /// Serialize to announce app-data bytes (BINARY — see the type docs).
     ///
     /// # Errors
-    /// [`AttestationError::FieldDecode`] when the field is not
-    /// base64 of exactly 32 bytes.
-    pub fn transport_identity_pubkey_bytes(&self) -> Result<[u8; 32], AttestationError> {
-        decode_fixed::<32>(&self.transport_identity_pubkey, "transport_identity_pubkey")
-    }
-
-    /// CIRISEdge#317 — decode the optional 32-byte transport-identity x25519
-    /// pubkey. `Ok(None)` for a v1 announce (field absent); `Ok(Some(_))` for v2.
-    ///
-    /// # Errors
-    /// [`AttestationError::FieldDecode`] when the field is present but not
-    /// base64 of exactly 32 bytes.
-    pub fn transport_x25519_pubkey_bytes(&self) -> Result<Option<[u8; 32]>, AttestationError> {
-        match &self.transport_x25519_pubkey {
-            Some(b64) => Ok(Some(decode_fixed::<32>(b64, "transport_x25519_pubkey")?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Serialize to announce app-data bytes (JSON).
-    ///
-    /// # Errors
-    /// [`AttestationError::Parse`] if JSON serialization fails
-    /// (effectively unreachable for this fixed shape).
+    /// [`AttestationError::Parse`] if `federation_key_id` exceeds 255 bytes, or
+    /// if the packed form would exceed [`ANNOUNCE_APP_DATA_BUDGET`] — the latter
+    /// is the CIRISEdge#333 compose-time gate: an announce that cannot fit is
+    /// refused HERE, loudly, rather than silently failing to transmit and making
+    /// the node invisible to the mesh.
     pub fn to_app_data(&self) -> Result<Vec<u8>, AttestationError> {
-        serde_json::to_vec(self).map_err(|e| AttestationError::Parse(format!("serialize: {e}")))
+        let key_id = self.federation_key_id.as_bytes();
+        if key_id.len() > MAX_FEDERATION_KEY_ID_LEN {
+            return Err(AttestationError::TooLarge {
+                actual: ATTESTATION_FIXED_OVERHEAD + key_id.len(),
+                budget: ANNOUNCE_APP_DATA_BUDGET,
+            });
+        }
+        let key_id_len = u8::try_from(key_id.len())
+            .map_err(|_| AttestationError::Parse("federation_key_id too long".to_string()))?;
+        let mut out = Vec::with_capacity(1 + 1 + key_id.len() + 32 + 8 + 64);
+        out.push(ATTESTATION_WIRE_V1);
+        out.push(key_id_len);
+        out.extend_from_slice(key_id);
+        out.extend_from_slice(&self.federation_pubkey_ed25519);
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.signature);
+
+        if out.len() > ANNOUNCE_APP_DATA_BUDGET {
+            return Err(AttestationError::TooLarge {
+                actual: out.len(),
+                budget: ANNOUNCE_APP_DATA_BUDGET,
+            });
+        }
+        Ok(out)
     }
 
     /// Parse an [`AnnounceAttestation`] from announce app-data bytes.
     ///
     /// # Errors
-    /// [`AttestationError::Parse`] when `app_data` is not valid
-    /// attestation JSON — e.g. a v0.3.1 bare-`key_id` announce, or a
-    /// non-attestation announce from an unrelated app.
+    /// [`AttestationError::Parse`] when `app_data` is not a well-formed
+    /// attestation — e.g. an empty (unattested) announce, a legacy JSON
+    /// attestation, or a non-CIRIS app's announce.
     pub fn from_app_data(app_data: &[u8]) -> Result<Self, AttestationError> {
-        serde_json::from_slice(app_data)
-            .map_err(|e| AttestationError::Parse(format!("deserialize: {e}")))
+        let bad = |m: &str| AttestationError::Parse(m.to_string());
+        if app_data.len() < 2 {
+            return Err(bad("attestation too short"));
+        }
+        if app_data[0] != ATTESTATION_WIRE_V1 {
+            return Err(AttestationError::Parse(format!(
+                "unknown attestation wire version {:#04x}",
+                app_data[0]
+            )));
+        }
+        let key_id_len = app_data[1] as usize;
+        let want = 2 + key_id_len + 32 + 8 + 64;
+        if app_data.len() != want {
+            return Err(AttestationError::Parse(format!(
+                "attestation length {} != expected {want}",
+                app_data.len()
+            )));
+        }
+        let mut off = 2;
+        let federation_key_id = std::str::from_utf8(&app_data[off..off + key_id_len])
+            .map_err(|e| AttestationError::Parse(format!("key_id not utf-8: {e}")))?
+            .to_string();
+        off += key_id_len;
+        let federation_pubkey_ed25519: [u8; 32] = app_data[off..off + 32]
+            .try_into()
+            .map_err(|_| bad("federation pubkey"))?;
+        off += 32;
+        let epoch = u64::from_be_bytes(
+            app_data[off..off + 8]
+                .try_into()
+                .map_err(|_| bad("epoch"))?,
+        );
+        off += 8;
+        let signature: [u8; 64] = app_data[off..off + 64]
+            .try_into()
+            .map_err(|_| bad("signature"))?;
+        Ok(Self {
+            federation_key_id,
+            federation_pubkey_ed25519,
+            epoch,
+            signature,
+        })
     }
 
-    /// Verify [`Self::signature`] over the canonical attestation
-    /// bytes against `federation_pubkey_ed25519` — the **32-byte
-    /// Ed25519 public key the persist directory confirmed for
-    /// `federation_key_id`**, never the claim carried on the wire.
+    /// Verify [`Self::signature`] over the canonical attestation bytes against
+    /// `federation_pubkey_ed25519` — the **32-byte Ed25519 public key the persist
+    /// directory confirmed** for `federation_key_id`, never the claim carried on
+    /// the wire.
     ///
-    /// On `Ok(())` the binding `federation_key_id → transport
-    /// identity` is cryptographically attested by the federation key.
+    /// CIRISEdge#333: `announce_public_key` is the announce's OWN
+    /// `public_key` — the transport identity, `x25519(32) ‖ ed25519(32)` (see
+    /// leviculum `build_announce_payload`). The attestation no longer transmits
+    /// those bytes; it BINDS them, and the verifier supplies them from the packet
+    /// it just received. A spoofer cannot pair someone else's `key_id` with its
+    /// own destination: the signature covers the transport identity the packet
+    /// arrived with (AV-42).
     ///
     /// # Errors
-    /// - [`AttestationError::FieldDecode`] — a malformed base64 field.
-    /// - [`AttestationError::SignatureMismatch`] — the signature did
-    ///   not verify (AV-42: a spoofed announce is rejected here).
+    /// - [`AttestationError::SignatureMismatch`] — the signature did not verify.
+    /// - [`AttestationError::FieldDecode`] — the Ed25519 verify call failed.
     pub fn verify_signature(
         &self,
         federation_pubkey_ed25519: &[u8; 32],
+        announce_public_key: &[u8; 64],
     ) -> Result<(), AttestationError> {
         use ciris_crypto::ClassicalVerifier;
 
-        let transport_pubkey = self.transport_identity_pubkey_bytes()?;
-        let transport_x25519 = self.transport_x25519_pubkey_bytes()?;
-        let signature = decode_fixed::<64>(&self.signature, "signature")?;
+        // leviculum `Identity::public_key_bytes()` = x25519 ‖ ed25519.
+        let x25519: [u8; 32] = announce_public_key[..32]
+            .try_into()
+            .map_err(|_| AttestationError::FieldDecode("announce x25519 half".into()))?;
+        let ed25519: [u8; 32] = announce_public_key[32..]
+            .try_into()
+            .map_err(|_| AttestationError::FieldDecode("announce ed25519 half".into()))?;
 
-        // CIRISEdge#317 — verify over the v2 payload (binding the x25519 half)
-        // when the announce carries it, else the v1 payload. The signature's
-        // domain is bound to the shape, so a v1 sig can't be accepted as v2.
-        let mut payload =
-            AttestationPayload::new(&transport_pubkey, &self.federation_key_id, self.epoch);
-        if let Some(x25519) = &transport_x25519 {
-            payload = payload.with_transport_x25519(x25519);
-        }
-        let canonical = payload.canonical_bytes();
+        let canonical = AttestationPayload::new(&ed25519, &self.federation_key_id, self.epoch)
+            .with_transport_x25519(&x25519)
+            .canonical_bytes();
 
         let verified = ciris_crypto::Ed25519Verifier::new()
-            .verify(federation_pubkey_ed25519, &canonical, &signature)
+            .verify(federation_pubkey_ed25519, &canonical, &self.signature)
             .map_err(|e| AttestationError::FieldDecode(format!("ed25519 verify: {e}")))?;
 
         if verified {
@@ -345,164 +469,137 @@ impl AnnounceAttestation {
     }
 }
 
-/// Decode a base64-standard field expected to be exactly `N` bytes.
-fn decode_fixed<const N: usize>(b64: &str, field: &str) -> Result<[u8; N], AttestationError> {
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| AttestationError::FieldDecode(format!("{field}: base64: {e}")))?;
-    let arr: [u8; N] = raw.as_slice().try_into().map_err(|_| {
-        AttestationError::FieldDecode(format!("{field}: expected {N} bytes, got {}", raw.len()))
-    })?;
-    Ok(arr)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ciris_crypto::ClassicalSigner;
 
-    /// A canonical-bytes encoding must be injective: distinct
-    /// `(pubkey, key_id, epoch)` triples never collide.
+    /// The static worst-case gate: even a max-length (255 B) federation key_id
+    /// packs inside the announce app_data budget. This is the CIRISEdge#333
+    /// guarantee — *adding a field must fail the build/tests, not the mesh*.
     #[test]
-    fn canonical_bytes_are_injective() {
-        let pk_a = [0x11u8; 32];
-        let pk_b = [0x22u8; 32];
-        let a = AttestationPayload::new(&pk_a, "edge-key-a", 1).canonical_bytes();
-        let b = AttestationPayload::new(&pk_b, "edge-key-a", 1).canonical_bytes();
-        let c = AttestationPayload::new(&pk_a, "edge-key-b", 1).canonical_bytes();
-        let d = AttestationPayload::new(&pk_a, "edge-key-a", 2).canonical_bytes();
-        assert_ne!(a, b, "distinct pubkey must differ");
-        assert_ne!(a, c, "distinct key_id must differ");
-        assert_ne!(a, d, "distinct epoch must differ");
+    fn worst_case_attestation_fits_the_announce_budget() {
+        // The MAXIMUM admissible key_id must pack inside the budget — this is the
+        // compile-time invariant, re-asserted at runtime against the real packer.
+        let att = AnnounceAttestation {
+            federation_key_id: "k".repeat(MAX_FEDERATION_KEY_ID_LEN),
+            federation_pubkey_ed25519: [0; 32],
+            epoch: u64::MAX,
+            signature: [0; 64],
+        };
+        let packed = att.to_app_data().expect("worst case must fit");
+        assert_eq!(packed.len(), ANNOUNCE_APP_DATA_BUDGET);
     }
 
-    /// A length-prefixed encoding must not be confusable: the
-    /// boundary between pubkey and key_id is unambiguous, so a
-    /// `key_id` whose prefix matches another's cannot alias.
+    /// A realistic attestation is far inside budget (the old JSON shape was
+    /// 337 B — 410 B once #317 added the x25519 field — against a 300 B budget,
+    /// so it had NEVER fit).
     #[test]
-    fn canonical_bytes_resist_field_confusion() {
-        let pk = [0x33u8; 32];
-        // "ab" + "c"  vs  "a" + "bc" — without length prefixes a
-        // naive concat would collide; with prefixes it must not.
-        let x = AttestationPayload::new(&pk, "abc", 0).canonical_bytes();
-        let y = AttestationPayload::new(&pk, "ab", 0).canonical_bytes();
-        assert_ne!(x, y);
+    fn realistic_attestation_is_well_inside_budget() {
+        let att = AnnounceAttestation {
+            federation_key_id: "ciris-agent-bootstrap-vroaxowlhv-rktt5f5yyv".to_string(),
+            federation_pubkey_ed25519: [0x11; 32],
+            epoch: 7,
+            signature: [0x22; 64],
+        };
+        let packed = att.to_app_data().expect("must fit");
+        assert!(
+            packed.len() <= ANNOUNCE_APP_DATA_BUDGET,
+            "packed {} B > budget {ANNOUNCE_APP_DATA_BUDGET} B",
+            packed.len()
+        );
+        // Real headroom, not a squeaker.
+        assert!(packed.len() < 200, "expected ~150 B, got {}", packed.len());
     }
 
-    /// A legitimately signed attestation verifies; a tamper does not.
+    /// An over-budget attestation is refused at COMPOSE time — loudly — rather
+    /// than silently failing to transmit.
     #[test]
-    fn signed_attestation_round_trips_and_rejects_tamper() {
+    fn over_budget_attestation_is_refused_at_compose_time() {
+        // One byte past the bound: refused HERE, loudly — never silently
+        // transmitted-and-dropped (which is what made the node invisible).
+        let att = AnnounceAttestation {
+            federation_key_id: "k".repeat(MAX_FEDERATION_KEY_ID_LEN + 1),
+            federation_pubkey_ed25519: [0; 32],
+            epoch: 0,
+            signature: [0; 64],
+        };
+        assert!(matches!(
+            att.to_app_data(),
+            Err(AttestationError::TooLarge { .. })
+        ));
+    }
+
+    /// Round-trip + AV-42: the signature binds the transport identity the packet
+    /// ARRIVED with, even though the attestation never transmits it. A spoofer
+    /// pairing someone else's key_id with its own destination fails.
+    #[test]
+    fn binds_the_announce_transport_identity_without_transmitting_it() {
         let signer = ciris_crypto::Ed25519Signer::random().unwrap();
         let fed_pubkey: [u8; 32] = signer.public_key().unwrap().try_into().unwrap();
-        let transport_pubkey = [0x5au8; 32];
 
-        let payload = AttestationPayload::new(&transport_pubkey, "edge-key-honest", 7);
-        let sig = signer.sign(&payload.canonical_bytes()).unwrap();
+        // The announce's own public_key = transport identity (x25519 ‖ ed25519).
+        let mut announce_pk = [0u8; 64];
+        announce_pk[..32].copy_from_slice(&[0xAA; 32]); // x25519
+        announce_pk[32..].copy_from_slice(&[0xBB; 32]); // ed25519
+
+        let x: [u8; 32] = announce_pk[..32].try_into().unwrap();
+        let e: [u8; 32] = announce_pk[32..].try_into().unwrap();
+        let payload = AttestationPayload::new(&e, "edge-key-honest", 7).with_transport_x25519(&x);
+        let sig: [u8; 64] = signer
+            .sign(&payload.canonical_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
 
         let att = AnnounceAttestation {
-            transport_identity_pubkey: base64::engine::general_purpose::STANDARD
-                .encode(transport_pubkey),
-            transport_x25519_pubkey: None,
             federation_key_id: "edge-key-honest".to_string(),
-            federation_pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
-                .encode(fed_pubkey),
+            federation_pubkey_ed25519: fed_pubkey,
             epoch: 7,
-            signature: base64::engine::general_purpose::STANDARD.encode(&sig),
+            signature: sig,
         };
 
-        // Round-trip through app-data bytes.
-        let bytes = att.to_app_data().unwrap();
-        let parsed = AnnounceAttestation::from_app_data(&bytes).unwrap();
+        // Binary round-trip.
+        let parsed = AnnounceAttestation::from_app_data(&att.to_app_data().unwrap()).unwrap();
         assert_eq!(parsed, att);
 
-        // Legitimate verify.
-        parsed.verify_signature(&fed_pubkey).unwrap();
+        // Verifies against the identity the packet carried.
+        parsed.verify_signature(&fed_pubkey, &announce_pk).unwrap();
 
-        // AV-42: a spoofed key_id (different signed content) fails.
+        // AV-42: a spoofer replays this attestation on ITS OWN destination — the
+        // announce's public_key differs, so the bound signature fails.
+        let mut spoof_pk = announce_pk;
+        spoof_pk[32..].copy_from_slice(&[0xCC; 32]); // attacker's transport ed25519
+        assert!(matches!(
+            parsed.verify_signature(&fed_pubkey, &spoof_pk),
+            Err(AttestationError::SignatureMismatch)
+        ));
+
+        // AV-42: a spoofed key_id fails (signed content differs).
         let mut spoofed = parsed.clone();
         spoofed.federation_key_id = "edge-key-victim".to_string();
         assert!(matches!(
-            spoofed.verify_signature(&fed_pubkey),
-            Err(AttestationError::SignatureMismatch)
-        ));
-
-        // AV-42: a flipped signature byte fails.
-        let mut bad_sig = parsed.clone();
-        let mut sig_bytes = sig.clone();
-        sig_bytes[0] ^= 0xff;
-        bad_sig.signature = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
-        assert!(matches!(
-            bad_sig.verify_signature(&fed_pubkey),
+            spoofed.verify_signature(&fed_pubkey, &announce_pk),
             Err(AttestationError::SignatureMismatch)
         ));
     }
 
-    /// CIRISEdge#317 — a v2 attestation binding the transport x25519 verifies,
-    /// its signature is domain-separated from v1, and swapping the x25519
-    /// (a spoofed transport identity) fails verification.
+    /// An unattested (empty app_data) or legacy-JSON announce parses to a typed
+    /// error, not a panic.
     #[test]
-    fn v2_attestation_binds_transport_x25519_and_rejects_swap() {
-        let signer = ciris_crypto::Ed25519Signer::random().unwrap();
-        let fed_pubkey: [u8; 32] = signer.public_key().unwrap().try_into().unwrap();
-        let transport_ed25519 = [0x5au8; 32];
-        let transport_x25519 = [0x77u8; 32];
-
-        let payload = AttestationPayload::new(&transport_ed25519, "edge-key-v2", 9)
-            .with_transport_x25519(&transport_x25519);
-        let sig = signer.sign(&payload.canonical_bytes()).unwrap();
-
-        let att = AnnounceAttestation {
-            transport_identity_pubkey: base64::engine::general_purpose::STANDARD
-                .encode(transport_ed25519),
-            transport_x25519_pubkey: Some(
-                base64::engine::general_purpose::STANDARD.encode(transport_x25519),
-            ),
-            federation_key_id: "edge-key-v2".to_string(),
-            federation_pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
-                .encode(fed_pubkey),
-            epoch: 9,
-            signature: base64::engine::general_purpose::STANDARD.encode(&sig),
-        };
-
-        // Round-trips through app-data + verifies.
-        let parsed = AnnounceAttestation::from_app_data(&att.to_app_data().unwrap()).unwrap();
-        assert_eq!(parsed, att);
-        assert_eq!(
-            parsed.transport_x25519_pubkey_bytes().unwrap(),
-            Some(transport_x25519)
-        );
-        parsed.verify_signature(&fed_pubkey).unwrap();
-
-        // A swapped x25519 (spoofed transport identity) fails — the x25519 is
-        // signed content in v2.
-        let mut swapped = parsed.clone();
-        swapped.transport_x25519_pubkey =
-            Some(base64::engine::general_purpose::STANDARD.encode([0x88u8; 32]));
+    fn empty_or_legacy_app_data_is_rejected_cleanly() {
         assert!(matches!(
-            swapped.verify_signature(&fed_pubkey),
-            Err(AttestationError::SignatureMismatch)
+            AnnounceAttestation::from_app_data(b""),
+            Err(AttestationError::Parse(_))
         ));
-
-        // v1 and v2 canonical bytes are domain-separated (no cross-replay).
-        let v1 = AttestationPayload::new(&transport_ed25519, "edge-key-v2", 9).canonical_bytes();
-        assert_ne!(v1, payload.canonical_bytes(), "v1/v2 domains disjoint");
-    }
-
-    /// A v0.3.1-style bare-`key_id` announce is not attestation JSON
-    /// and parses to a typed error rather than a panic.
-    #[test]
-    fn legacy_bare_key_id_announce_is_rejected_cleanly() {
-        let legacy = b"edge-key-legacy";
         assert!(matches!(
-            AnnounceAttestation::from_app_data(legacy),
+            AnnounceAttestation::from_app_data(br#"{"federation_key_id":"x"}"#),
             Err(AttestationError::Parse(_))
         ));
     }
 
     #[test]
     fn transport_binding_enforcement_default_is_advisory() {
-        // CIRISEdge#205 — the default MUST be Advisory (no silent flip);
-        // the fleet-floor cutover to RequireTransportBinding is opt-in.
         assert_eq!(
             TransportBindingEnforcement::default(),
             TransportBindingEnforcement::Advisory

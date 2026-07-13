@@ -33,8 +33,6 @@
 
 mod common;
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
 use ciris_crypto::ClassicalSigner;
 use ciris_edge::transport::attestation::{
     AnnounceAttestation, AttestationError, AttestationPayload,
@@ -133,47 +131,68 @@ async fn av42_tampered_attestation_signature_fails_verify() {
     let victim = TestFedKey::new("edge-key-victim2", 0x0d);
     let victim_signer = ciris_crypto::Ed25519Signer::from_seed(&[0x0d; 32]).unwrap();
     let victim_pubkey: [u8; 32] = victim_signer.public_key().unwrap().try_into().unwrap();
-    let transport_pubkey = [0x5a; 32];
 
-    // A genuine attestation the victim itself would publish.
-    let payload = AttestationPayload::new(&transport_pubkey, &victim.key_id, 3);
-    let genuine_sig = victim_signer.sign(&payload.canonical_bytes()).unwrap();
+    // CIRISEdge#333 — the transport identity is the ANNOUNCE's own public_key
+    // (x25519 ‖ ed25519). The attestation binds it by signature and no longer
+    // transmits it, so the adversary cannot simply edit a field: it must actually
+    // announce from a destination, and THAT is what verification checks against.
+    let mut victim_announce_pk = [0u8; 64];
+    victim_announce_pk[..32].copy_from_slice(&[0x5a; 32]); // victim x25519
+    victim_announce_pk[32..].copy_from_slice(&[0x5b; 32]); // victim ed25519
+
+    let x: [u8; 32] = victim_announce_pk[..32].try_into().unwrap();
+    let e: [u8; 32] = victim_announce_pk[32..].try_into().unwrap();
+    let payload = AttestationPayload::new(&e, &victim.key_id, 3).with_transport_x25519(&x);
+    let genuine_sig: [u8; 64] = victim_signer
+        .sign(&payload.canonical_bytes())
+        .unwrap()
+        .try_into()
+        .unwrap();
 
     let genuine = AnnounceAttestation {
-        transport_identity_pubkey: B64.encode(transport_pubkey),
-        transport_x25519_pubkey: None,
         federation_key_id: victim.key_id.clone(),
-        federation_pubkey_ed25519_base64: B64.encode(victim_pubkey),
+        federation_pubkey_ed25519: victim_pubkey,
         epoch: 3,
-        signature: B64.encode(&genuine_sig),
+        signature: genuine_sig,
     };
-    // Sanity: the genuine attestation verifies.
+    // Sanity: the genuine attestation verifies against the identity it announced with.
     genuine
-        .verify_signature(&victim_pubkey)
+        .verify_signature(&victim_pubkey, &victim_announce_pk)
         .expect("genuine attestation must verify");
 
-    // Spoof A — the adversary keeps the victim's key_id + pubkey but
-    // swaps in an adversary-controlled transport identity. The
-    // signature still covers the OLD transport pubkey, so it no
-    // longer matches the announced binding.
-    let mut swapped_transport = genuine.clone();
-    swapped_transport.transport_identity_pubkey = B64.encode([0xad; 32]);
+    // Spoof A — THE AV-42 attack, in its real shape: the adversary lifts the
+    // victim's attestation verbatim and re-announces it from ITS OWN destination.
+    // The signature is bound to the victim's transport identity, so verifying it
+    // against the adversary's announce public_key fails. It cannot capture
+    // `send(victim_key_id, ..)`.
+    let mut adversary_announce_pk = victim_announce_pk;
+    adversary_announce_pk[32..].copy_from_slice(&[0xad; 32]); // adversary's transport ed25519
     assert!(
         matches!(
-            swapped_transport.verify_signature(&victim_pubkey),
+            genuine.verify_signature(&victim_pubkey, &adversary_announce_pk),
             Err(AttestationError::SignatureMismatch)
         ),
-        "AV-42 regression: a swapped transport identity must fail attestation verify",
+        "AV-42 regression: a replayed attestation on the adversary's OWN destination must fail",
+    );
+    // ...including a swap of only the encryption half.
+    let mut adversary_x = victim_announce_pk;
+    adversary_x[..32].copy_from_slice(&[0xae; 32]);
+    assert!(
+        matches!(
+            genuine.verify_signature(&victim_pubkey, &adversary_x),
+            Err(AttestationError::SignatureMismatch)
+        ),
+        "AV-42 regression: a swapped transport x25519 must fail attestation verify",
     );
 
     // Spoof B — a single flipped signature byte.
     let mut flipped = genuine.clone();
-    let mut sig = genuine_sig.clone();
+    let mut sig = genuine_sig;
     sig[10] ^= 0xff;
-    flipped.signature = B64.encode(&sig);
+    flipped.signature = sig;
     assert!(
         matches!(
-            flipped.verify_signature(&victim_pubkey),
+            flipped.verify_signature(&victim_pubkey, &victim_announce_pk),
             Err(AttestationError::SignatureMismatch)
         ),
         "AV-42 regression: a tampered signature must fail attestation verify",
@@ -183,12 +202,16 @@ async fn av42_tampered_attestation_signature_fails_verify() {
     // Verified against the victim's directory-confirmed pubkey it
     // fails: the adversary's signature is not the victim's.
     let foe_key = ciris_crypto::Ed25519Signer::from_seed(&[0xee; 32]).unwrap();
-    let foe_signature = foe_key.sign(&payload.canonical_bytes()).unwrap();
+    let foe_signature: [u8; 64] = foe_key
+        .sign(&payload.canonical_bytes())
+        .unwrap()
+        .try_into()
+        .unwrap();
     let mut foe_attestation = genuine.clone();
-    foe_attestation.signature = B64.encode(&foe_signature);
+    foe_attestation.signature = foe_signature;
     assert!(
         matches!(
-            foe_attestation.verify_signature(&victim_pubkey),
+            foe_attestation.verify_signature(&victim_pubkey, &victim_announce_pk),
             Err(AttestationError::SignatureMismatch)
         ),
         "AV-42 regression: an adversary-key signature must fail against the victim's pubkey",

@@ -1358,25 +1358,31 @@ impl ReticulumTransport {
         // the transport identity the link proves.
         let mut transport_x25519 = [0u8; 32];
         transport_x25519.copy_from_slice(&local_transport_pubkey[..32]);
-        let local_attestation = if let Some(s) = &signer {
-            Some(
-                build_local_attestation(
-                    s,
-                    &transport_ed25519,
-                    &transport_x25519,
-                    &config.local_key_id,
-                    config.local_epoch,
-                )
-                .await?,
-            )
-        } else {
-            tracing::warn!(
-                "Reticulum transport built without a federation signer; \
-                 its announce carries no attestation and rooting peers \
-                 will drop it (AV-42 fail-honest)",
-            );
-            None
+        // CIRISEdge#333 — EVERY announce is self-attested. There is no
+        // unattested branch: a node with no federation signer that announced
+        // anyway produced a routable-but-unrootable peer — a trap that looks
+        // HEALTHY (paths resolve!) yet can never be rooted, and it silently
+        // masked the fact that the attested announce was failing to transmit at
+        // all. `signer: None` is now a hard configuration error, not a
+        // degradation.
+        let Some(signer_ref) = &signer else {
+            return Err(TransportError::Config(
+                "Reticulum transport requires a federation signer: every announce must be \
+                 self-attested (CIRISEdge#333). An unattested announce yields a peer that \
+                 routes but can never root — it looks healthy and is not."
+                    .to_string(),
+            ));
         };
+        let local_attestation = Some(
+            build_local_attestation(
+                signer_ref,
+                &transport_ed25519,
+                &transport_x25519,
+                &config.local_key_id,
+                config.local_epoch,
+            )
+            .await?,
+        );
 
         // Build the node. The transport identity is the node identity;
         // a per-process storage dir alongside the identity file holds
@@ -3341,7 +3347,11 @@ async fn resolve_announce_cold_start(
 
     // Step 2 — root the federation key against the persist directory.
     let verdict = rooting
-        .root_binding(&key_id, &attestation.federation_pubkey_ed25519_base64)
+        .root_binding(
+            &key_id,
+            &base64::engine::general_purpose::STANDARD
+                .encode(attestation.federation_pubkey_ed25519),
+        )
         .await;
     // CIRISEdge#301 (CC 3.3.6.2) — `root_binding` CLASSIFIES the binding, it
     // does NOT gate it. The AV-42 `dest_hash` crypto check already ran upstream
@@ -3359,7 +3369,12 @@ async fn resolve_announce_cold_start(
         RootingVerdict::Confirmed { chain } => {
             // ROOTED — verify the attestation against the directory-CONFIRMED
             // Ed25519 (never the wire claim), then apply the hybrid PQC policy.
-            if !attestation_verifies_against_chain(&attestation, &chain, &key_id) {
+            if !attestation_verifies_against_chain(
+                &attestation,
+                &chain,
+                &key_id,
+                announce.public_key(),
+            ) {
                 return;
             }
             if !hybrid_policy_accepts(ctx.hybrid_policy, &chain) {
@@ -3382,7 +3397,7 @@ async fn resolve_announce_cold_start(
             // crypto floor (proves the announcer controls the key it claims); a
             // forged self-claim is a crypto failure → dropped. On success, admit
             // as an advisory routing hint (authority NOT established) — never drop.
-            if !attestation_self_verifies(&attestation, &key_id) {
+            if !attestation_self_verifies(&attestation, &key_id, announce.public_key()) {
                 return;
             }
             tracing::info!(
@@ -3402,40 +3417,27 @@ async fn resolve_announce_cold_start(
     // Step 5 — record the rooted resolution. A strictly-newer epoch
     // supersedes a cached binding; an equal-or-older epoch is a stale
     // re-announce and is ignored (keeps the cached chain).
-    let transport_pubkey = match attestation.transport_identity_pubkey_bytes() {
-        Ok(pk) => pk,
-        Err(e) => {
-            tracing::warn!(av = "AV-42", key_id = %key_id, error = %e,
-                "announce rejected: transport-identity pubkey malformed");
-            return;
-        }
+    // CIRISEdge#333 — the transport identity comes from the ANNOUNCE ITSELF.
+    // `announce.public_key()` IS the transport identity (`x25519 ‖ ed25519`) —
+    // leviculum's `build_announce_payload` packs `identity.public_key_bytes()`
+    // of the announcing destination. The attestation no longer re-sends those
+    // 64 bytes (that duplication is what pushed app_data over the MTU budget and
+    // meant an attested announce NEVER transmitted); it BINDS them by signature,
+    // and we read them from the packet we just received.
+    //
+    // This also retires the #317 premise: `announce.public_key()` was never the
+    // federation identity. It is, and always was, the transport identity the RNS
+    // link authenticates under — so hashing it is exactly right for attribution.
+    let announce_pubkey64: [u8; 64] = *announce.public_key();
+    let binding_pubkey64: [u8; 64] = announce_pubkey64;
+    let Ok(transport_pubkey) = <[u8; 32]>::try_from(&announce_pubkey64[32..]) else {
+        tracing::warn!(av = "AV-42", key_id = %key_id,
+            "announce rejected: transport-identity pubkey malformed");
+        return;
     };
     let resolved = ResolvedPeer {
         dest_hash: *announce.destination_hash(),
         signing_key: transport_pubkey,
-    };
-    // CIRISEdge#317 — reconstruct the TRANSPORT identity (`x25519_enc ‖
-    // ed25519_sig`) the RNS link proves, from the attestation's two transport
-    // halves. The pre-#317 code hashed `announce.public_key()` — but that is the
-    // FEDERATION announce identity (same ed25519 signing half, DIFFERENT x25519),
-    // a different `Identity` than the link authenticates under, so the
-    // attribution could never match (CIRISServer#235). A v2 announce carries the
-    // transport x25519; for a v1 (legacy) announce that doesn't, we fall back to
-    // the announce identity — those peers stay unattributable until they upgrade,
-    // exactly as before, but new peers now match.
-    let announce_pubkey64: [u8; 64] = *announce.public_key();
-    let transport_x25519 = attestation.transport_x25519_pubkey_bytes().ok().flatten();
-    // The binding pubkey used BOTH for the attribution hash and the #299
-    // write-through (so the persisted transport binding + KEX x25519 are the
-    // transport identity, not the federation one).
-    let binding_pubkey64: [u8; 64] = match transport_x25519 {
-        Some(x25519) => {
-            let mut id = [0u8; 64];
-            id[..32].copy_from_slice(&x25519); // x25519 (encryption) half
-            id[32..].copy_from_slice(&transport_pubkey); // ed25519 (signing) half
-            id
-        }
-        None => announce_pubkey64, // v1 announce — no transport x25519 carried
     };
     // The identity hash the link's LINKIDENTIFY proves:
     // `truncated_hash(x25519 ‖ ed25519)`.
@@ -3533,37 +3535,23 @@ async fn resolve_announce_cold_start(
                 if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                     peer_admitted_log().check(provenance_key)
                 {
-                    // CIRISEdge#317 — the stored `transport_identity_hash` is now
-                    // derived from the TRANSPORT identity (attestation x25519 ‖
-                    // ed25519) for a v2 announce (`transport_x25519_present=true`),
-                    // = exactly the identity the RNS link proves. `false` = a v1
-                    // (legacy) announce that carries no transport x25519, so admit
-                    // fell back to `announce.public_key()` (the federation
-                    // identity) and this peer stays unattributable until it
-                    // upgrades. `ed25519_halves_match` remains a diagnostic: it is
-                    // the announce identity's ed25519 half vs the attestation's
-                    // declared transport ed25519 — `false` confirms the federation-
-                    // vs-transport identity split the v2 binding fixes.
-                    let announce_ed25519_half = hex::encode(&announce_pubkey64[32..]);
-                    let attestation_transport_ed25519 = attestation
-                        .transport_identity_pubkey_bytes()
-                        .map_or_else(|_| "decode_err".to_string(), hex::encode);
-                    let ed25519_halves_match =
-                        announce_ed25519_half == attestation_transport_ed25519;
+                    // CIRISEdge#333 — the stored `transport_identity_hash` is derived
+                    // from the announce's OWN `public_key` (the transport identity
+                    // `x25519 ‖ ed25519`), which is exactly the identity the RNS
+                    // link proves at LINKIDENTIFY. The attestation no longer
+                    // carries those bytes — it binds them by signature — so there
+                    // is nothing left to disagree: the operands are the same 64
+                    // bytes the packet arrived with. If link attribution still
+                    // misses, `link_attribution_miss` (point 2) reports it.
                     tracing::info!(
                         key_id = %key_id,
                         provenance = ?provenance,
                         epoch = attestation.epoch,
                         dest_hash = %hex::encode(resolved.dest_hash.into_bytes()),
                         transport_identity_hash = %hex::encode(transport_identity_hash),
-                        transport_x25519_present = transport_x25519.is_some(),
-                        announce_ed25519_half = %announce_ed25519_half,
-                        attestation_transport_ed25519 = %attestation_transport_ed25519,
-                        ed25519_halves_match,
                         suppressed_prev,
-                        "peer_admitted — #317: transport_identity_hash from \
-                         transport identity when transport_x25519_present=true \
-                         (matches the link); v1 fallback when false"
+                        "peer_admitted — transport identity taken from the announce's own \
+                         public_key (CIRISEdge#333)"
                     );
                 }
                 // CIRISEdge#318 — bound the peers map against advisory-admit
@@ -3632,6 +3620,7 @@ fn attestation_verifies_against_chain(
     attestation: &AnnounceAttestation,
     chain: &ProvenanceChain,
     key_id: &str,
+    announce_public_key: &[u8; 64],
 ) -> bool {
     // The rooted chain's leaf (`chain[0]`) is the queried row; its
     // `pubkey_ed25519_base64` is the directory's confirmed pubkey.
@@ -3657,7 +3646,7 @@ fn attestation_verifies_against_chain(
         );
         return false;
     };
-    if let Err(e) = attestation.verify_signature(&confirmed_pubkey) {
+    if let Err(e) = attestation.verify_signature(&confirmed_pubkey, announce_public_key) {
         tracing::warn!(
             av = "AV-42",
             key_id,
@@ -3681,20 +3670,15 @@ fn attestation_verifies_against_chain(
 /// genuine crypto failure. Distinct from
 /// [`attestation_verifies_against_chain`], which verifies against the
 /// directory-CONFIRMED key for a `Rooted` admit.
-fn attestation_self_verifies(attestation: &AnnounceAttestation, key_id: &str) -> bool {
-    let claimed = base64::engine::general_purpose::STANDARD
-        .decode(&attestation.federation_pubkey_ed25519_base64)
-        .ok()
-        .and_then(|b| <[u8; 32]>::try_from(b).ok());
-    let Some(claimed) = claimed else {
-        tracing::warn!(
-            av = "AV-42",
-            key_id,
-            "announce dropped: claimed federation pubkey is not 32-byte base64",
-        );
-        return false;
-    };
-    if let Err(e) = attestation.verify_signature(&claimed) {
+fn attestation_self_verifies(
+    attestation: &AnnounceAttestation,
+    key_id: &str,
+    announce_public_key: &[u8; 64],
+) -> bool {
+    // CIRISEdge#333 — the transport identity is the announce's own public_key;
+    // the signature binds it without the attestation re-sending it.
+    let claimed = attestation.federation_pubkey_ed25519;
+    if let Err(e) = attestation.verify_signature(&claimed, announce_public_key) {
         tracing::warn!(
             av = "AV-42",
             key_id,
@@ -3768,17 +3752,17 @@ async fn build_local_attestation(
         .await
         .map_err(|e| TransportError::Config(format!("attestation sign: {e}")))?;
 
+    let fed_pubkey32: [u8; 32] = fed_pubkey.as_slice().try_into().map_err(|_| {
+        TransportError::Config("federation Ed25519 pubkey must be 32 bytes".to_string())
+    })?;
+    let signature64: [u8; 64] = signature.as_slice().try_into().map_err(|_| {
+        TransportError::Config("attestation signature must be 64 bytes".to_string())
+    })?;
     let attestation = AnnounceAttestation {
-        transport_identity_pubkey: base64::engine::general_purpose::STANDARD
-            .encode(transport_identity_pubkey),
-        transport_x25519_pubkey: Some(
-            base64::engine::general_purpose::STANDARD.encode(transport_x25519_pubkey),
-        ),
         federation_key_id: federation_key_id.to_string(),
-        federation_pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
-            .encode(&fed_pubkey),
+        federation_pubkey_ed25519: fed_pubkey32,
         epoch,
-        signature: base64::engine::general_purpose::STANDARD.encode(&signature),
+        signature: signature64,
     };
     attestation
         .to_app_data()
