@@ -210,6 +210,40 @@ pub enum TransportError {
         reason: Option<String>,
         until: Option<String>,
     },
+    /// CIRISEdge#336 — the LINK_REQUEST target has **no route**: the link
+    /// request was aimed at a destination the node has no path-table entry
+    /// for, and it did not establish within the no-path window (a no-path
+    /// dest is broadcast-only and answerable solely by a *directly-attached*
+    /// neighbor in a single round-trip — a relay-reachable peer would have a
+    /// path; see `NO_PATH_ESTABLISH_TIMEOUT`). This is the transport-routing
+    /// sibling of the federation-vs-transport identity split: it fires when a
+    /// peer is addressed on its **explicit-hash** dest (`sha256(fed_pubkey)`,
+    /// which is un-announceable and therefore un-routable) while it is only
+    /// reachable on its **named** dest. The message names every operand needed
+    /// to see the mismatch at a glance — the target dest, the peer key_id, and
+    /// the paths the node *does* hold — so this failure is never again a
+    /// multi-day forensic. Unlike [`Self::Timeout`], this is an
+    /// addressing/rooting fault, not a slow link.
+    #[error(
+        "no route to peer: key_id={key_id} target_dest={target_dest} \
+         has_path={has_path} known_paths=[{paths}] (CIRISEdge#336)"
+    )]
+    NoRouteToPeer {
+        /// The federation key_id the send was routed to.
+        key_id: String,
+        /// The 16-byte Reticulum destination hash the link request targeted,
+        /// lowercase hex — the un-routable dest.
+        target_dest: String,
+        /// Whether the node held a path-table entry for `target_dest` at send
+        /// time (always `false` when this error is raised — surfaced so the
+        /// log line is self-contained).
+        has_path: bool,
+        /// A compact snapshot of the node's path table at failure — each
+        /// `dest via next_hop hops=N`. The routable **named** dest for this
+        /// very peer typically appears here, making the explicit-vs-named
+        /// mismatch obvious.
+        paths: String,
+    },
 }
 
 /// One inbound frame from a transport — raw envelope bytes plus the

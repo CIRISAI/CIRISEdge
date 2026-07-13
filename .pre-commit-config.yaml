@@ -56,6 +56,21 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
 
+  # cargo <-> pyproject pin-skew — runs at commit time. Fast (<1s, pure
+  # python). Mirrors CI's `cargo <-> pyproject pin-skew check` lane so a
+  # persist/verify re-pin that forgets the pyproject runtime constraint fails
+  # at commit, not 6 minutes into CI (v13.0.0 hit exactly this). Scoped to the
+  # two manifests so it only fires when a pin could have moved.
+  - repo: local
+    hooks:
+      - id: cargo-pyproject-pin-skew
+        name: cargo <-> pyproject pin-skew check
+        entry: python3 .github/scripts/check_cargo_pyproject_skew.py
+        language: system
+        files: ^(Cargo\.toml|pyproject\.toml)$
+        pass_filenames: false
+        stages: [pre-commit]
+
   # cargo clippy — runs at push time. ~30s warm. Mirrors CI's
   # `clippy + fmt` lane feature set so failures here = failures in CI.
   - repo: local

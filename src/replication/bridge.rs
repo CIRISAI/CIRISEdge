@@ -82,7 +82,6 @@ use ciris_persist::federation::operational::{
     SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
 };
 use ciris_persist::federation::register::ReplicatedKeyOutcome;
-use ciris_persist::federation::self_at_login::TransportDestination;
 use ciris_persist::federation::types::{
     SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
@@ -541,8 +540,31 @@ impl FederationDirectoryReplicationBridge {
                 Some((serde_json::to_vec(canonical_json).ok()?, hash, seq))
             }
             ReplicatedKind::TransportDestination => {
+                // CIRISEdge#338 / CIRISPersist#443 (v17.0.0) — the route arm is now
+                // the SIGNED CONTAINER `{transport_destination, attesting_key_id,
+                // signed_envelope, signature}`, the same #418/#421 discipline as
+                // IdentityOccurrence(Revocation): edge holds the TRANSPORT signer,
+                // not the identity/federation key that signed the route, so it can
+                // only re-publish BYTE-EXACT what was signed-put — never re-sign or
+                // synthesize the signature. (Pre-v17 this arm treated
+                // `canonical_json` as a bare row; against v17 the receiver's
+                // `apply_transport_destination` deserializes the SIGNED container,
+                // so emitting a bare row here would fail to apply and silently drop
+                // every route from the wire.) The container carries no
+                // `persist_row_hash`; hash over its JCS bytes like the v2
+                // operational kinds. `seq` comes from the durable `epoch` — the
+                // monotonic supersession counter #443 gave the row — with the
+                // `asserted_at` fallback for a pre-#443 producer whose projection
+                // reads epoch 0.
+                let inner = canonical_json.get("transport_destination");
                 let hash = v2_envelope_hash(canonical_json)?;
-                let seq = Self::ms_seq_from(canonical_json.get("asserted_at"));
+                let seq = inner
+                    .and_then(|td| td.get("epoch"))
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|&e| e > 0)
+                    .unwrap_or_else(|| {
+                        Self::ms_seq_from(inner.and_then(|td| td.get("asserted_at")))
+                    });
                 Some((serde_json::to_vec(canonical_json).ok()?, hash, seq))
             }
             ReplicatedKind::Attestation => {
@@ -1121,17 +1143,62 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// #311 — admit a replicated `TransportDestination` (reachability row).
-    /// The wire bytes are the bare (unsigned) `TransportDestination` the engine
-    /// emitted; `put_transport_destination` is idempotent/last-writer per V078
-    /// (a stale address is dropped + re-registered, never signed or revoked).
+    /// CIRISEdge#338 / CIRISPersist#443 (v17.0.0) — admit a replicated route.
+    ///
+    /// The wire bytes are now the SIGNED CONTAINER `SignedTransportDestination`
+    /// (`{transport_destination, attesting_key_id, signed_envelope, signature}`),
+    /// NOT a bare row. This closes the CIRISEdge#337 CRITICAL-2 confused-deputy:
+    /// the old path deserialized a bare `TransportDestination` and wrote it with
+    /// an attacker-chosen `binding_provenance = Rooted` for ANY `occurrence_key_id`,
+    /// with no signature and no authority check. `put_signed_transport_destination`
+    /// authenticates the whole thing in persist — the hybrid signature over
+    /// `JCS(signed_envelope)` against the attesting key's PINNED federation
+    /// pubkeys, then `signer_acts_for(attesting_key_id, occurrence_key_id)` (a peer
+    /// cannot sign a victim's route with its own unrelated key), and
+    /// `binding_provenance` is read ONLY from inside the verified envelope, never
+    /// a wire field. Supersession is `(epoch, asserted_at)`-monotonic, so a
+    /// replayed older frame is `Refused`, not applied.
+    ///
+    /// `Refused { reason }` is fail-closed and re-offerable — it is NOT a
+    /// transport error (the record is simply inadmissible: older epoch, or a
+    /// same-`(epoch, asserted_at)` content conflict), so we return `true`
+    /// (the frame was handled; do not retry-storm the sender). A genuine gate
+    /// failure (bad signature / unknown attesting key / not-acts-for) surfaces
+    /// as `Err` from persist → `false` → the frame is rejected. A parse failure
+    /// (a pre-v17 bare row from an un-upgraded peer) is also `false` — such a
+    /// peer's routes simply do not replicate until it adopts v17, which is the
+    /// intended breaking behavior, not a silent bare-row admit.
     async fn apply_transport_destination(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<TransportDestination>(bytes) {
-            Ok(dest) => self
+        use ciris_persist::federation::self_at_login::{
+            SignedTransportDestination, TransportDestinationApplyOutcome,
+        };
+        match serde_json::from_slice::<SignedTransportDestination>(bytes) {
+            Ok(signed) => match self
                 .directory
-                .put_transport_destination(&dest)
+                .put_signed_transport_destination(&signed)
                 .await
-                .is_ok(),
+            {
+                Ok(TransportDestinationApplyOutcome::Refused { reason }) => {
+                    // Bounded: keyed on the low-cardinality refusal reason, never
+                    // the attacker-influenced key_id / dest (CIRISEdge#337 §4).
+                    tracing::debug!(
+                        occurrence_key_id = %signed.transport_destination.occurrence_key_id,
+                        reason = %reason,
+                        "replicated route refused (fail-closed, re-offerable): stale epoch \
+                         or content conflict — not applied (CIRISEdge#338)"
+                    );
+                    true
+                }
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "replicated route REJECTED by the authenticated apply gate — \
+                         signature / attesting-key / acts-for failure (CIRISEdge#337 CRITICAL-2)"
+                    );
+                    false
+                }
+            },
             Err(_) => false,
         }
     }
@@ -1510,6 +1577,62 @@ mod tests {
                 .await;
             assert!(!r, "expected garbage refused for {kind:?}");
         }
+    }
+
+    /// CIRISEdge#337 CRITICAL-2 — the confused-deputy closure. A WELL-FORMED
+    /// BARE `TransportDestination` (valid JSON of the bare route row — the exact
+    /// shape the pre-v17 apply path deserialized and wrote with an attacker-set
+    /// `binding_provenance = Rooted` for ANY key_id, with no signature and no
+    /// authority check) must now be REFUSED. Only a `SignedTransportDestination`
+    /// container that clears persist's hybrid-sig + `signer_acts_for` gate is
+    /// admitted. This is the route-table half of the AV-42 saga: a peer can no
+    /// longer inject a route for a victim's key_id over replication.
+    #[tokio::test]
+    async fn apply_transport_destination_refuses_a_bare_unsigned_route() {
+        use ciris_persist::federation::self_at_login::{BindingProvenance, TransportDestination};
+
+        let (backend, bridge) = make_bridge(&[]);
+
+        // A perfectly well-formed bare route claiming a Rooted binding for a
+        // victim key_id — no signature, no authority. The confused-deputy input.
+        let bare = TransportDestination {
+            occurrence_key_id: "victim-key".to_string(),
+            transport_kind: "reticulum".to_string(),
+            destination: hex::encode([0xaa; 16]),
+            asserted_at: chrono::Utc::now(),
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode([0xbb; 32]),
+            ),
+            transport_x25519_pubkey_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode([0xcc; 32]),
+            ),
+            binding_provenance: BindingProvenance::Rooted, // attacker-chosen
+            epoch: u64::MAX,                               // attacker-chosen ceiling
+            retired_at: None,
+        };
+        let bytes = serde_json::to_vec(&bare).expect("serialize bare route");
+
+        let admitted = bridge
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &bytes)
+            .await;
+
+        assert!(
+            !admitted,
+            "a bare unsigned TransportDestination must be REFUSED — admitting it is the \
+             CIRISEdge#337 CRITICAL-2 confused-deputy route-hijack",
+        );
+
+        // And nothing was written for the victim.
+        let rows = backend
+            .list_transport_destinations_for("victim-key")
+            .await
+            .expect("list");
+        assert!(
+            rows.is_empty(),
+            "a refused bare route must not touch persist; found {} row(s)",
+            rows.len(),
+        );
     }
 
     // ── FSD §7.1 federation-tier-only invariant fence ───────────────
