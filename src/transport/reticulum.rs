@@ -96,7 +96,9 @@ use super::attestation::{
 use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 use crate::identity::LocalSigner;
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
-use crate::verify::{HybridPolicy, ProvenanceChain, RootingDirectory, RootingVerdict};
+use crate::verify::{
+    HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
+};
 
 /// Maximum envelope body size accepted on send. Mirrors AV-13
 /// (`MAX_BODY_BYTES = 8 MiB`); oversized payloads reject before any
@@ -3392,9 +3394,14 @@ enum RouteSupersession {
 
 /// Decide whether an incoming announce supersedes the cached route for its
 /// key_id. `existing` is `(provenance, epoch, dest16)` of the cached entry (if
-/// any). Order is load-bearing: the Rooted-not-overridden-by-Advisory hijack
-/// gate is checked FIRST, before any epoch comparison, so a `u64::MAX`-epoch
-/// advisory cannot poison a rooted route.
+/// any). `incoming_owns_key` is whether the announcer PROVED control of the key
+/// the directory binds to this `key_id` (Confirmed, or an Advisory whose
+/// rejection was neither `UnknownKeyId` nor `PubkeyMismatch` — i.e. the pubkey
+/// matched and the announce self-verified). This is the load-bearing signal
+/// that separates the OWNER rerouting its own dest from a SPOOF.
+///
+/// Order is load-bearing: the hijack gate is checked FIRST, before any epoch
+/// comparison, so a `u64::MAX`-epoch spoof cannot poison a rooted route.
 fn route_supersession_decision(
     existing: Option<(
         ciris_persist::federation::self_at_login::BindingProvenance,
@@ -3402,6 +3409,7 @@ fn route_supersession_decision(
         [u8; 16],
     )>,
     incoming_provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+    incoming_owns_key: bool,
     incoming_epoch: u64,
     incoming_dest16: [u8; 16],
 ) -> RouteSupersession {
@@ -3410,13 +3418,22 @@ fn route_supersession_decision(
         // Fresh peer — nothing to supersede.
         return RouteSupersession::Admit;
     };
-    // CRITICAL-1, FIRST and epoch-independent: rooted is never overridden by
-    // advisory. This is the route-hijack gate.
-    if matches!(ex_prov, Rooted) && matches!(incoming_provenance, Advisory) {
+    // CRITICAL-1 (#337), FIRST and epoch-independent: a Rooted route is never
+    // superseded by an announce that CANNOT prove ownership of the key. This
+    // refuses the AV-42 spoof (`PubkeyMismatch`: the attacker's federation key ≠
+    // the directory's key for the victim's key_id, or `UnknownKeyId`) at any
+    // epoch. It does NOT refuse the OWNER re-announcing (which proves ownership
+    // via a pubkey match + self-verified signature) — that is the belt, below.
+    // #336 regression: the pre-fix gate refused on `Advisory` provenance alone,
+    // so the owner's genuine (Advisory, not-steward-rooted) announce hit this and
+    // the boot-prime never healed. Provenance is TRUST; ownership is IDENTITY —
+    // routing keys on identity, not trust (rooting≠routing, one level up).
+    if matches!(ex_prov, Rooted) && !incoming_owns_key {
         return RouteSupersession::HijackRefused;
     }
     // A strictly-newer epoch always supersedes (a genuine transport-identity
-    // rotation, or a rooted upgrade at a higher epoch).
+    // rotation, or a rooted upgrade at a higher epoch) — the hijack gate above
+    // has already excluded a non-owning announce over a rooted route.
     if incoming_epoch > ex_epoch {
         return RouteSupersession::Admit;
     }
@@ -3424,14 +3441,15 @@ fn route_supersession_decision(
         // CIRISEdge#301 — advisory→rooted first-root upgrade at equal epoch.
         let advisory_to_rooted_upgrade =
             matches!(ex_prov, Advisory) && matches!(incoming_provenance, Rooted);
-        // CIRISEdge#336 BELT — a VERIFIED (rooted) announce at the same epoch
-        // carrying a DIFFERENT dest heals the route (the explicit→named boot-
-        // prime trap). Advisory can never reroute (it would be caught above only
-        // if existing were rooted; an advisory-over-advisory reroute at equal
-        // epoch is NOT honored — epoch must advance for a non-verified change).
-        let verified_reroute =
-            matches!(incoming_provenance, Rooted) && incoming_dest16 != ex_dest16;
-        if advisory_to_rooted_upgrade || verified_reroute {
+        // CIRISEdge#336 BELT — the OWNER (ownership proven) rerouting to a
+        // DIFFERENT dest at the same epoch heals the route (the explicit→named
+        // boot-prime trap: existing Rooted@0 on the explicit dest, genuine
+        // announce Advisory@0 on the named dest — same owner, so a legitimate
+        // routing update, not a hijack). Gated on `incoming_owns_key`, NOT on
+        // provenance, so the Advisory-but-owner case (the actual field case)
+        // heals while a spoof (already refused above) cannot reach here.
+        let owner_reroute = incoming_owns_key && incoming_dest16 != ex_dest16;
+        if advisory_to_rooted_upgrade || owner_reroute {
             return RouteSupersession::Admit;
         }
     }
@@ -3544,7 +3562,7 @@ async fn resolve_announce_cold_start(
     // gate, CC 6 N1); the manifest-validation-gated KEX (attest a trust-root-
     // blessed build before the record is durably saved) is the post-CIRISServer-
     // 0.6 follow-on tracked up the centipede.
-    let (chain_opt, provenance) = match verdict {
+    let (chain_opt, provenance, owns_key) = match verdict {
         RootingVerdict::Confirmed { chain } => {
             // ROOTED — verify the attestation against the directory-CONFIRMED
             // Ed25519 (never the wire claim), then apply the hybrid PQC policy.
@@ -3567,6 +3585,10 @@ async fn resolve_announce_cold_start(
             (
                 Some(chain),
                 ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+                // Confirmed ⇒ the claimed pubkey matched the directory row AND the
+                // chain rooted at a pinned steward — the announcer provably owns
+                // the key bound to `key_id`.
+                true,
             )
         }
         RootingVerdict::Rejected { rejection } => {
@@ -3579,6 +3601,24 @@ async fn resolve_announce_cold_start(
             if !attestation_self_verifies(&attestation, &key_id, announce.public_key()) {
                 return;
             }
+            // CIRISEdge#336 (belt-heal correctness) — does this Advisory announce
+            // PROVE ownership of the key the directory binds to `key_id`? persist's
+            // `root_binding` checks in order: key_id exists (else `UnknownKeyId`),
+            // claimed pubkey matches the row (else `PubkeyMismatch`), THEN walks the
+            // chain to a steward. So a rejection that is neither `UnknownKeyId` nor
+            // `PubkeyMismatch` means the claimed pubkey MATCHED the directory row —
+            // and `attestation_self_verifies` (above) proved the announcer controls
+            // that key. That is the OWNER re-announcing (its route just isn't
+            // steward-rooted here), NOT a spoof. This is the routing≠trust
+            // distinction one level up: an identity spoof (`PubkeyMismatch`) can
+            // never reroute a Rooted peer, but a mere trust-chain gap must not block
+            // the owner from healing its OWN routing dest — which is exactly the
+            // boot-prime (#238 Rooted, epoch 0, explicit dest) → genuine-announce
+            // (Advisory, named dest) heal that #336 depends on.
+            let owns_key = !matches!(
+                rejection,
+                RootingRejection::UnknownKeyId { .. } | RootingRejection::PubkeyMismatch { .. }
+            );
             // CIRISEdge#337 §4 — advisory admits are attacker-floodable (mint
             // unlimited self-signed keypairs). DEBUG, not INFO: the always-on
             // admit signal is the THROTTLED `peer_admitted_log` point-1 line
@@ -3587,12 +3627,14 @@ async fn resolve_announce_cold_start(
                 av = "AV-42",
                 key_id = %key_id,
                 reason = rejection.kind(),
+                owns_key,
                 "announce ADMITTED as advisory (CC 3.3.6.2: routing hint, authority not \
                  established — recorded + KEX'd, not dropped)"
             );
             (
                 None,
                 ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
+                owns_key,
             )
         }
     };
@@ -3643,6 +3685,7 @@ async fn resolve_announce_cold_start(
         match route_supersession_decision(
             existing_snapshot,
             provenance,
+            owns_key,
             attestation.epoch,
             announced_dest16,
         ) {
@@ -4376,45 +4419,105 @@ mod tests {
         const EXPLICIT: [u8; 16] = [0x1f; 16]; // stand-in for the un-routable explicit-hash
         const NAMED: [u8; 16] = [0x81; 16]; // stand-in for the routable named dest
 
+        // Signature: route_supersession_decision(existing, incoming_provenance,
+        // incoming_owns_key, incoming_epoch, incoming_dest16).
+        //
+        // `owns_key` is the load-bearing signal (CIRISEdge#336 belt-heal fix): it
+        // is whether the announcer PROVED control of the key the directory binds
+        // to `key_id` — true for Confirmed, and for an Advisory whose rejection
+        // was neither UnknownKeyId nor PubkeyMismatch (pubkey matched + self-
+        // verified). It is the OWNER-vs-SPOOF discriminator, independent of the
+        // trust `provenance`.
+
         /// A fresh peer (no cached route) is always admitted.
         #[test]
         fn fresh_peer_is_admitted() {
             assert_eq!(
-                route_supersession_decision(None, Rooted, 0, NAMED),
+                route_supersession_decision(None, Rooted, true, 0, NAMED),
                 RouteSupersession::Admit
             );
             assert_eq!(
-                route_supersession_decision(None, Advisory, 7, NAMED),
+                route_supersession_decision(None, Advisory, false, 7, NAMED),
                 RouteSupersession::Admit
             );
         }
 
-        /// CIRISEdge#337 CRITICAL-1 — the route-hijack gate. An Advisory announce
-        /// can NEVER override a Rooted route, even at a wildly higher epoch. This
-        /// is the test that must never regress: it is the whole verified-only
-        /// invariant.
+        /// CIRISEdge#336 BELT — **THE FIELD CASE**, and the regression the pre-fix
+        /// test missed. The boot-prime installs a **Rooted** entry (epoch 0,
+        /// explicit dest). The peer's genuine announce arrives **Advisory** (it
+        /// self-verifies but is not steward-rooted here → `NotRootedAtSteward`),
+        /// so `owns_key = true` (pubkey matched). This MUST heal explicit→named.
+        ///
+        /// The v13.0.0 test asserted `incoming = Rooted` and passed — but the
+        /// field passes `Advisory`, which the old gate refused as a hijack, so the
+        /// belt never fired. Green test, wrong path — the saga's signature failure,
+        /// now guarded with the ACTUAL field provenance.
         #[test]
-        fn higher_epoch_advisory_cannot_override_rooted() {
+        fn belt_heals_the_owners_advisory_reroute_explicit_to_named() {
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 5, NAMED)), Advisory, u64::MAX, EXPLICIT),
+                route_supersession_decision(
+                    Some((Rooted, 0, EXPLICIT)),
+                    Advisory, // the field provenance — NOT Rooted
+                    true,     // …but the owner proved key control
+                    0,
+                    NAMED,
+                ),
+                RouteSupersession::Admit,
+                "the owner's genuine Advisory announce MUST heal a boot-primed \
+                 explicit-hash route to its named dest (#336)",
+            );
+        }
+
+        /// CIRISEdge#337 CRITICAL-1 — the route-hijack gate. An announce that
+        /// CANNOT prove key ownership (`owns_key = false`: a `PubkeyMismatch` /
+        /// `UnknownKeyId` spoof) can NEVER supersede a Rooted route, at any epoch,
+        /// any dest. This is the whole verified-only invariant — must never regress.
+        #[test]
+        fn spoof_without_key_ownership_cannot_override_rooted() {
+            // Higher epoch, different dest — the u64::MAX poison attempt.
+            assert_eq!(
+                route_supersession_decision(
+                    Some((Rooted, 5, NAMED)),
+                    Advisory,
+                    false,
+                    u64::MAX,
+                    EXPLICIT
+                ),
                 RouteSupersession::HijackRefused,
             );
-            // …and at equal epoch, and with the SAME dest — still refused.
+            // Equal epoch, same dest — still refused.
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 5, NAMED)), Advisory, 5, NAMED),
+                route_supersession_decision(Some((Rooted, 5, NAMED)), Advisory, false, 5, NAMED),
+                RouteSupersession::HijackRefused,
+            );
+            // The exact belt-shaped inputs but WITHOUT ownership → refused. This
+            // is the razor: owns_key alone separates the heal from the hijack.
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Advisory, false, 0, NAMED),
                 RouteSupersession::HijackRefused,
             );
         }
 
-        /// CIRISEdge#336 BELT — a VERIFIED (rooted) announce at the SAME epoch
-        /// carrying a DIFFERENT dest heals the route. This is the boot-prime
-        /// trap: an epoch-0 prime on the explicit-hash, healed by the peer's
-        /// genuine epoch-0 announce on its named dest. Without this the peer is
-        /// pinned to a dest no path can reach — the #336 root cause.
+        /// A Confirmed (Rooted, owns_key) reroute at equal epoch also heals — the
+        /// steward-rooted owner updating its dest.
         #[test]
-        fn equal_epoch_verified_reroute_heals_explicit_to_named() {
+        fn equal_epoch_rooted_owner_reroute_heals() {
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Rooted, 0, NAMED),
+                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Rooted, true, 0, NAMED),
+                RouteSupersession::Admit,
+            );
+        }
+
+        /// The owner rotating its transport identity (higher epoch) supersedes,
+        /// whether the new announce is Rooted or an owns-key Advisory.
+        #[test]
+        fn higher_epoch_owner_supersedes() {
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 2, NAMED)), Rooted, true, 3, EXPLICIT),
+                RouteSupersession::Admit,
+            );
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 2, NAMED)), Advisory, true, 3, EXPLICIT),
                 RouteSupersession::Admit,
             );
         }
@@ -4424,57 +4527,50 @@ mod tests {
         #[test]
         fn equal_epoch_advisory_to_rooted_upgrades() {
             assert_eq!(
-                route_supersession_decision(Some((Advisory, 3, NAMED)), Rooted, 3, NAMED),
+                route_supersession_decision(Some((Advisory, 3, NAMED)), Rooted, true, 3, NAMED),
                 RouteSupersession::Admit,
             );
         }
 
-        /// A strictly-newer epoch supersedes (genuine transport-identity
-        /// rotation) for both provenance-preserving cases.
+        /// A same-epoch re-announce with the same dest is stale — no needless
+        /// churn / persist write / replication gossip.
         #[test]
-        fn higher_epoch_supersedes() {
+        fn equal_epoch_same_dest_is_stale() {
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 2, NAMED)), Rooted, 3, EXPLICIT),
-                RouteSupersession::Admit,
-            );
-            assert_eq!(
-                route_supersession_decision(Some((Advisory, 2, NAMED)), Advisory, 3, EXPLICIT),
-                RouteSupersession::Admit,
-            );
-        }
-
-        /// A same-epoch re-announce with the same provenance and same dest is
-        /// stale — no needless churn / persist write / replication gossip.
-        #[test]
-        fn equal_epoch_same_provenance_same_dest_is_stale() {
-            assert_eq!(
-                route_supersession_decision(Some((Rooted, 4, NAMED)), Rooted, 4, NAMED),
+                route_supersession_decision(Some((Rooted, 4, NAMED)), Rooted, true, 4, NAMED),
                 RouteSupersession::IgnoreStale,
             );
             assert_eq!(
-                route_supersession_decision(Some((Advisory, 4, NAMED)), Advisory, 4, NAMED),
+                route_supersession_decision(Some((Advisory, 4, NAMED)), Advisory, true, 4, NAMED),
                 RouteSupersession::IgnoreStale,
             );
         }
 
-        /// A lower-epoch announce is stale even if it carries a different dest —
-        /// a replayed/older frame can never rewrite a newer binding (the durable
-        /// half of this is persist's `(epoch, asserted_at)` guard, #443).
+        /// A lower-epoch announce is stale even from the owner with a different
+        /// dest — a replayed/older frame can never rewrite a newer binding (the
+        /// durable half of this is persist's `(epoch, asserted_at)` guard, #443).
         #[test]
-        fn lower_epoch_is_stale_even_with_new_dest() {
+        fn lower_epoch_is_stale_even_from_owner_with_new_dest() {
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 9, NAMED)), Rooted, 2, EXPLICIT),
+                route_supersession_decision(Some((Rooted, 9, NAMED)), Rooted, true, 2, EXPLICIT),
                 RouteSupersession::IgnoreStale,
             );
         }
 
-        /// An advisory-over-advisory reroute at EQUAL epoch is NOT honored — a
-        /// non-verified route change must advance the epoch. (Only a VERIFIED
-        /// announce reroutes at equal epoch; the belt is rooted-gated.)
+        /// A non-owning advisory over an EXISTING ADVISORY hint at equal epoch is
+        /// not honored (no ownership, no upgrade) — but the hijack gate does not
+        /// apply (it protects Rooted routes only; advisory entries are unverified
+        /// hints bounded by MAX_PEERS).
         #[test]
-        fn equal_epoch_advisory_reroute_is_not_honored() {
+        fn equal_epoch_non_owner_advisory_over_advisory_is_stale() {
             assert_eq!(
-                route_supersession_decision(Some((Advisory, 1, NAMED)), Advisory, 1, EXPLICIT),
+                route_supersession_decision(
+                    Some((Advisory, 1, NAMED)),
+                    Advisory,
+                    false,
+                    1,
+                    EXPLICIT
+                ),
                 RouteSupersession::IgnoreStale,
             );
         }
