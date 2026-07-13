@@ -5879,6 +5879,11 @@ fn transport_error_class(e: &TransportError) -> &'static str {
         // unreachability. Surface it to the reachability tracker so
         // operators can disambiguate "peer down" from "peer banned".
         TransportError::PeerBlackholed { .. } => "peer_blackholed",
+        // CIRISEdge#336 — target dest has no route (un-routable dest, e.g. the
+        // explicit-hash while the peer is only reachable on its named dest). A
+        // distinct reachability class from a slow-link `timeout`: it is an
+        // addressing/rooting fault the belt heals on the next verified announce.
+        TransportError::NoRouteToPeer { .. } => "no_route_to_peer",
     }
 }
 

@@ -5199,6 +5199,13 @@ pub fn init_edge_runtime(
                 // authoritative (self-at-login, verified locally): Rooted.
                 binding_provenance:
                     ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+                // CIRISEdge#336 / CIRISPersist#443 (v17.0.0) — this is the node's
+                // own row, self-asserted once at login; epoch 0 is the correct
+                // floor (a genuine transport-identity rotation re-registers at a
+                // higher epoch). `retired_at` only ever set via the signed
+                // tombstone path, never a local self-register.
+                epoch: 0,
+                retired_at: None,
             };
             let occurrence_for_log = occurrence_key_id.to_string();
             let register_result = run_async(&executor, async move {

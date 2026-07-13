@@ -246,6 +246,7 @@ pub trait RootingDirectory: Send + Sync + 'static {
         _dest_hash: [u8; 16],
         _transport_pubkey: [u8; 64],
         _provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+        _epoch: u64,
     ) {
     }
 }
@@ -270,6 +271,7 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         dest_hash: [u8; 16],
         transport_pubkey: [u8; 64],
         provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+        epoch: u64,
     ) {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -285,18 +287,33 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             // CIRISEdge#301 — Rooted (Confirmed verdict) or Advisory (CC 3.3.6.2
             // admit-as-routing-hint); the caller decides from the verdict.
             binding_provenance: provenance,
+            // CIRISEdge#336 / CIRISPersist#443 (v17.0.0) — the durable monotonic
+            // supersession counter (the announce attestation's epoch, which is
+            // `RootedPeer.epoch`). Persist's put is `(epoch, asserted_at)`-guarded,
+            // so a replayed older frame can never clobber a newer binding — the
+            // durable half of the verified-only supersession invariant. Route
+            // retirement (`retired_at`) goes through the signed tombstone path,
+            // never a plain local write-through, so it is `None` here.
+            epoch,
+            retired_at: None,
         };
         match FederationDirectory::put_transport_destination(self, &row).await {
-            Ok(()) => tracing::info!(
+            // CIRISEdge#337 §4 — DEBUG (was INFO): one per persist write, i.e. per
+            // admit, so attacker-floodable. The failure branch stays WARN (a
+            // durable-write failure is a real incident, and it is not
+            // attacker-amplifiable beyond the admit rate the peers-map cap bounds).
+            Ok(()) => tracing::debug!(
                 key_id,
                 dest_hash = %row.destination,
                 provenance = ?provenance,
+                epoch,
                 "CIRISEdge#299/#301: persisted transport binding (write-through)"
             ),
             Err(e) => tracing::warn!(
                 key_id,
                 error = %e,
                 provenance = ?provenance,
+                epoch,
                 "CIRISEdge#299/#301: write-through of transport binding failed (peer still \
                  admitted in-memory this session, but will not survive a restart)"
             ),

@@ -112,8 +112,27 @@ const EDGE_APP_NAME: &str = "ciris";
 const EDGE_APP_ASPECT: &str = "edge";
 
 /// How long [`Transport::send`] waits for a link to establish before
-/// giving up and surfacing [`TransportError::Timeout`].
+/// giving up and surfacing [`TransportError::Timeout`]. Applies when the
+/// node **holds a path** to the target — a relayed path can legitimately be
+/// slow (LoRa, multi-hop), so it gets the full patient window.
 const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// CIRISEdge#336 — the establishment window for a target the node has **no
+/// path** to. This is not a guess: leviculum's `connect` builds a
+/// no-path link request with `hops = 1` and *broadcasts* it, so the only
+/// thing that can answer is a **directly-attached** neighbor on a live
+/// interface — which replies in a single interface round-trip. A
+/// relay-reachable peer would have produced a path-table entry (from its
+/// announce) and taken the [`LINK_ESTABLISH_TIMEOUT`] branch instead.
+/// Therefore, if a no-path link request has not established within this
+/// window, no amount of further waiting helps: there is no route. We fail
+/// fast with the self-diagnosing [`TransportError::NoRouteToPeer`] rather
+/// than stalling the full 30 s and surfacing an opaque timeout. The window
+/// is sized with a wide margin over any real direct link (localhost is
+/// sub-millisecond; internet-RTT direct TCP is tens of ms) so a genuinely
+/// directly-reachable peer — e.g. a `prime_peer`'d bootstrap peer that
+/// never announced — is never regressed.
+const NO_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long [`Transport::send`] waits for a resource transfer to
 /// complete after the link is up.
@@ -138,6 +157,9 @@ static PEER_ADMITTED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> 
     std::sync::OnceLock::new();
 static LINK_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
+// CIRISEdge#337 — route supersession decisions (verified-only gate + belt heal).
+static ROUTE_SUPERSESSION_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
 
 /// Point 1 — peer-admitted (INFO). Keyed on `provenance` (2 values), so the
 /// rare `Rooted` admit logs freely while a flood of junk `Advisory` admits is
@@ -152,6 +174,17 @@ fn peer_admitted_log() -> &'static crate::log_throttle::LogThrottle {
 fn link_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
     LINK_ATTRIBUTION_MISS_LOG
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1024))
+}
+
+/// CIRISEdge#337 — route supersession decisions (verified-only refusal + belt
+/// reroute-heal). Keyed on a fixed low-cardinality reason ("hijack_refused" /
+/// "reroute_healed", ≤4 keys), NEVER on the attacker-chosen `key_id`, so a flood
+/// of forged supersession attempts collapses to a suppressed-count instead of a
+/// per-key log line. The refusal is a genuine attack signal, so it logs the
+/// first few per window loudly then summarizes.
+fn route_supersession_log() -> &'static crate::log_throttle::LogThrottle {
+    ROUTE_SUPERSESSION_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 4))
 }
 
 // ─── Peer resolution ────────────────────────────────────────────────
@@ -2131,6 +2164,42 @@ impl ReticulumTransport {
     /// precision contract. `last_seen_at` is the call-time wall
     /// clock (path entries don't carry an insertion timestamp in
     /// leviculum's storage shape).
+    /// CIRISEdge#336 — a compact, single-line snapshot of the node's path
+    /// table for the [`TransportError::NoRouteToPeer`] diagnostic. Each entry
+    /// renders as `dest via next_hop hops=N` (or `dest direct hops=N` for a
+    /// directly-attached neighbor). Synchronous and lock-free —
+    /// `path_table_entries()` clones leviculum's rows — so it is safe to call
+    /// on the send failure path. Bounded to a handful of rows so an enormous
+    /// fabric can't turn one failure into a megabyte log line.
+    fn path_table_snapshot(&self) -> String {
+        use std::fmt::Write as _;
+        const MAX_ROWS: usize = 16;
+        let rows = self.node.path_table_entries();
+        let total = rows.len();
+        let mut out = String::new();
+        for (i, entry) in rows.iter().take(MAX_ROWS).enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let dest = hex::encode(entry.hash);
+            match entry.next_hop {
+                Some(nh) if entry.hops > 1 => {
+                    let _ = write!(out, "{dest} via {} hops={}", hex::encode(nh), entry.hops);
+                }
+                _ => {
+                    let _ = write!(out, "{dest} direct hops={}", entry.hops);
+                }
+            }
+        }
+        if total > MAX_ROWS {
+            let _ = write!(out, ", …(+{} more)", total - MAX_ROWS);
+        }
+        if total == 0 {
+            out.push_str("<empty>");
+        }
+        out
+    }
+
     #[cfg(feature = "ffi-uniffi")]
     pub async fn routing_path_table(
         &self,
@@ -2707,6 +2776,23 @@ impl Transport for ReticulumTransport {
         let dest_hash_bytes = peer.dest_hash.into_bytes();
         self.check_blackhole(&dest_hash_bytes).await?;
 
+        // CIRISEdge#336 — the no-path GUARD. Decide the establishment window
+        // from whether the node holds a path to this exact dest BEFORE dialing.
+        // A no-path dest is broadcast-only (leviculum sends the link request
+        // with hops=1) and can be answered only by a directly-attached
+        // neighbor in one round-trip — so it establishes fast or never. A
+        // relay-reachable peer has a path and gets the patient window. This is
+        // the tripwire that ends the rooting saga's whack-a-mole: a send aimed
+        // at an un-routable dest (e.g. the un-announceable explicit-hash while
+        // the peer is only reachable on its named dest) fails FAST and LOUD
+        // with every operand named, instead of a silent 30 s opaque timeout.
+        let has_path = self.node.has_path(&peer.dest_hash);
+        let establish_timeout = if has_path {
+            LINK_ESTABLISH_TIMEOUT
+        } else {
+            NO_PATH_ESTABLISH_TIMEOUT
+        };
+
         // Establish a link to the peer's destination. `connect`
         // returns immediately; the link is usable once
         // `LinkEstablished` arrives on the event channel. The event
@@ -2724,14 +2810,39 @@ impl Transport for ReticulumTransport {
         // the peer must have accepted the LINK_REQUEST or a resource
         // transfer cannot start. The event loop records established
         // link IDs in `established_links`; poll it.
-        let established = wait_until_async(
-            LINK_ESTABLISH_TIMEOUT,
-            Duration::from_millis(50),
-            || async { self.established_links.lock().await.contains(&link_id) },
-        )
-        .await;
+        let established =
+            wait_until_async(establish_timeout, Duration::from_millis(50), || async {
+                self.established_links.lock().await.contains(&link_id)
+            })
+            .await;
         if !established {
-            return Err(TransportError::Timeout(LINK_ESTABLISH_TIMEOUT));
+            // CIRISEdge#336 — a no-path target that never established is
+            // un-routable, not slow: fail fast with the self-diagnosing error
+            // (naming target dest, key_id, and the paths we DO hold — the
+            // routable named dest for this peer usually appears there, making
+            // the explicit-vs-named mismatch obvious). A had-a-path target that
+            // stalled is a genuine slow/dead link → the opaque timeout stands.
+            if !has_path {
+                let target_dest = hex::encode(peer.dest_hash.into_bytes());
+                let paths = self.path_table_snapshot();
+                tracing::error!(
+                    key_id = %destination_key_id,
+                    target_dest = %target_dest,
+                    has_path,
+                    known_paths = %paths,
+                    "link_request target has no route — un-routable dest (CIRISEdge#336). \
+                     A no-path dest is broadcast-only and no directly-attached neighbor \
+                     answered; if the peer is relay-reachable it must be addressed on its \
+                     announced (named) dest, which appears in known_paths."
+                );
+                return Err(TransportError::NoRouteToPeer {
+                    key_id: destination_key_id.to_string(),
+                    target_dest,
+                    has_path,
+                    paths,
+                });
+            }
+            return Err(TransportError::Timeout(establish_timeout));
         }
 
         // Auto-accept any resources the peer pushes back on this link
@@ -3261,11 +3372,79 @@ fn link_event(
 // fragment the cold-start verdict logic without adding clarity, so
 // the gate is allowed locally rather than refactored across the
 // merge boundary.
+/// The route-table supersession verdict for an admitted announce (CIRISEdge#336
+/// belt + CIRISEdge#337 CRITICAL-1 verified-only invariant), factored out as a
+/// PURE function so the security-critical decision is exhaustively unit-testable
+/// without the event-loop `EventCtx` scaffolding. No I/O, no logging, no clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteSupersession {
+    /// No prior entry, or a legitimate supersession / first-root upgrade /
+    /// verified reroute-heal — write the incoming route.
+    Admit,
+    /// A same-or-lower-epoch re-announce with no upgrade and no heal — ignore
+    /// (stale); the cached route stands.
+    IgnoreStale,
+    /// CIRISEdge#337 CRITICAL-1 — an Advisory announce attempting to override a
+    /// Rooted route. NEVER written: a self-signed announce (mintable for any
+    /// key_id) must not repoint a directory-rooted peer at an attacker dest.
+    HijackRefused,
+}
+
+/// Decide whether an incoming announce supersedes the cached route for its
+/// key_id. `existing` is `(provenance, epoch, dest16)` of the cached entry (if
+/// any). Order is load-bearing: the Rooted-not-overridden-by-Advisory hijack
+/// gate is checked FIRST, before any epoch comparison, so a `u64::MAX`-epoch
+/// advisory cannot poison a rooted route.
+fn route_supersession_decision(
+    existing: Option<(
+        ciris_persist::federation::self_at_login::BindingProvenance,
+        u64,
+        [u8; 16],
+    )>,
+    incoming_provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+    incoming_epoch: u64,
+    incoming_dest16: [u8; 16],
+) -> RouteSupersession {
+    use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+    let Some((ex_prov, ex_epoch, ex_dest16)) = existing else {
+        // Fresh peer — nothing to supersede.
+        return RouteSupersession::Admit;
+    };
+    // CRITICAL-1, FIRST and epoch-independent: rooted is never overridden by
+    // advisory. This is the route-hijack gate.
+    if matches!(ex_prov, Rooted) && matches!(incoming_provenance, Advisory) {
+        return RouteSupersession::HijackRefused;
+    }
+    // A strictly-newer epoch always supersedes (a genuine transport-identity
+    // rotation, or a rooted upgrade at a higher epoch).
+    if incoming_epoch > ex_epoch {
+        return RouteSupersession::Admit;
+    }
+    if incoming_epoch == ex_epoch {
+        // CIRISEdge#301 — advisory→rooted first-root upgrade at equal epoch.
+        let advisory_to_rooted_upgrade =
+            matches!(ex_prov, Advisory) && matches!(incoming_provenance, Rooted);
+        // CIRISEdge#336 BELT — a VERIFIED (rooted) announce at the same epoch
+        // carrying a DIFFERENT dest heals the route (the explicit→named boot-
+        // prime trap). Advisory can never reroute (it would be caught above only
+        // if existing were rooted; an advisory-over-advisory reroute at equal
+        // epoch is NOT honored — epoch must advance for a non-verified change).
+        let verified_reroute =
+            matches!(incoming_provenance, Rooted) && incoming_dest16 != ex_dest16;
+        if advisory_to_rooted_upgrade || verified_reroute {
+            return RouteSupersession::Admit;
+        }
+    }
+    // Lower epoch, or equal epoch with no upgrade/heal → stale.
+    RouteSupersession::IgnoreStale
+}
+
 #[allow(clippy::too_many_lines)]
 async fn resolve_announce_cold_start(
     announce: &reticulum_core::ReceivedAnnounce,
     ctx: &EventCtx<'_>,
 ) {
+    use ciris_persist::federation::self_at_login::BindingProvenance;
     // Step 0 — the cold-start path needs the persist directory. With
     // no rooting backend the announce cannot be authenticated; drop
     // it (fail-honest — never fall back to TOFU).
@@ -3400,7 +3579,11 @@ async fn resolve_announce_cold_start(
             if !attestation_self_verifies(&attestation, &key_id, announce.public_key()) {
                 return;
             }
-            tracing::info!(
+            // CIRISEdge#337 §4 — advisory admits are attacker-floodable (mint
+            // unlimited self-signed keypairs). DEBUG, not INFO: the always-on
+            // admit signal is the THROTTLED `peer_admitted_log` point-1 line
+            // below; this per-admit detail must not flood the default stream.
+            tracing::debug!(
                 av = "AV-42",
                 key_id = %key_id,
                 reason = rejection.kind(),
@@ -3447,37 +3630,78 @@ async fn resolve_announce_cold_start(
         Identity::from_public_keys(&x25519, &ed25519).map_or([0u8; 16], |id| *id.hash())
     };
     let dest_hash16: [u8; 16] = (*announce.destination_hash()).into_bytes();
-    // CIRISEdge#301 — a same-epoch re-announce that finally ROOTS a peer
-    // previously admitted as ADVISORY must UPGRADE the binding, not be ignored
-    // as stale (the advisory→rooted promotion is the whole point of first-root).
-    let is_advisory_to_rooted_upgrade = |existing: &RootedPeer| {
-        existing.epoch == attestation.epoch
-            && matches!(
-                existing.provenance,
-                ciris_persist::federation::self_at_login::BindingProvenance::Advisory
-            )
-            && matches!(
-                provenance,
-                ciris_persist::federation::self_at_login::BindingProvenance::Rooted
-            )
-    };
+    let announced_dest = *announce.destination_hash();
+    let announced_dest16 = announced_dest.into_bytes();
     let newly_rooted_key = {
         let mut peers = ctx.peers.lock().await;
-        match peers.get(&key_id) {
-            Some(existing)
-                if existing.epoch >= attestation.epoch
-                    && !is_advisory_to_rooted_upgrade(existing) =>
-            {
+        // Snapshot the existing entry's decision-relevant fields (all Copy), so
+        // the pure supersession decision runs without holding a borrow across
+        // the admit side effects (which re-borrow `peers` mutably to insert).
+        let existing_snapshot = peers
+            .get(&key_id)
+            .map(|e| (e.provenance, e.epoch, e.peer.dest_hash.into_bytes()));
+        match route_supersession_decision(
+            existing_snapshot,
+            provenance,
+            attestation.epoch,
+            announced_dest16,
+        ) {
+            // CIRISEdge#337 CRITICAL-1 — an Advisory announce cannot override a
+            // Rooted route (route-hijack refused). Attacker-floodable, so the
+            // WARN is throttled on the fixed "hijack_refused" key, never key_id.
+            RouteSupersession::HijackRefused => {
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    route_supersession_log().check("hijack_refused")
+                {
+                    let (_, ex_epoch, _) = existing_snapshot.unwrap_or_default();
+                    tracing::warn!(
+                        av = "AV-42",
+                        key_id = %key_id,
+                        existing_epoch = ex_epoch,
+                        announce_epoch = attestation.epoch,
+                        suppressed_prev,
+                        "route supersession REFUSED — an advisory (self-signed, not \
+                         directory-rooted) announce cannot override a rooted route \
+                         (CIRISEdge#337 verified-only supersession)"
+                    );
+                }
+                None
+            }
+            RouteSupersession::IgnoreStale => {
                 tracing::trace!(
                     key_id = %key_id,
-                    cached_epoch = existing.epoch,
                     announce_epoch = attestation.epoch,
-                    "stale re-announce ignored (epoch not newer, no provenance upgrade)",
+                    "stale re-announce ignored (epoch not newer, no provenance upgrade, \
+                     no verified reroute)",
                 );
                 None
             }
-            _ => {
-                tracing::info!(
+            RouteSupersession::Admit => {
+                // CIRISEdge#336 — surface a reroute-heal distinctly from a fresh
+                // admit so the explicit→named transition is visible in the log.
+                if let Some((_, _, ex_dest16)) = existing_snapshot {
+                    if ex_dest16 != announced_dest16
+                        && matches!(provenance, BindingProvenance::Rooted)
+                    {
+                        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                            route_supersession_log().check("reroute_healed")
+                        {
+                            tracing::info!(
+                                key_id = %key_id,
+                                old_dest = %hex::encode(ex_dest16),
+                                new_dest = %hex::encode(announced_dest16),
+                                epoch = attestation.epoch,
+                                suppressed_prev,
+                                "route HEALED from a verified announce — repointed to the \
+                                 announced (routable) destination (CIRISEdge#336)"
+                            );
+                        }
+                    }
+                }
+                // CIRISEdge#337 §4 — DEBUG (was INFO): attacker-floodable per
+                // admit. The throttled `peer_admitted_log` point-1 line is the
+                // always-on admit signal; this is the verbose companion.
+                tracing::debug!(
                     key_id = %key_id,
                     dest = %resolved.dest_hash,
                     epoch = attestation.epoch,
@@ -3606,7 +3830,13 @@ async fn resolve_announce_cold_start(
         // `announce.public_key()` (the federation identity), so the boot-reloaded
         // binding resolves + seals to the identity the link proves.
         rooting
-            .persist_transport_binding(&persisted_key, dest_hash16, binding_pubkey64, provenance)
+            .persist_transport_binding(
+                &persisted_key,
+                dest_hash16,
+                binding_pubkey64,
+                provenance,
+                attestation.epoch,
+            )
             .await;
     }
 }
@@ -4135,6 +4365,121 @@ where
 mod tests {
     use super::*;
 
+    // ── CIRISEdge#336/#337 route-supersession decision — the saga's tombstone ──
+    //
+    // One test per prior footgun path, over the PURE `route_supersession_decision`
+    // so a regression is a compile-fast unit failure, never a field incident.
+    mod route_supersession {
+        use super::*;
+        use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+
+        const EXPLICIT: [u8; 16] = [0x1f; 16]; // stand-in for the un-routable explicit-hash
+        const NAMED: [u8; 16] = [0x81; 16]; // stand-in for the routable named dest
+
+        /// A fresh peer (no cached route) is always admitted.
+        #[test]
+        fn fresh_peer_is_admitted() {
+            assert_eq!(
+                route_supersession_decision(None, Rooted, 0, NAMED),
+                RouteSupersession::Admit
+            );
+            assert_eq!(
+                route_supersession_decision(None, Advisory, 7, NAMED),
+                RouteSupersession::Admit
+            );
+        }
+
+        /// CIRISEdge#337 CRITICAL-1 — the route-hijack gate. An Advisory announce
+        /// can NEVER override a Rooted route, even at a wildly higher epoch. This
+        /// is the test that must never regress: it is the whole verified-only
+        /// invariant.
+        #[test]
+        fn higher_epoch_advisory_cannot_override_rooted() {
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 5, NAMED)), Advisory, u64::MAX, EXPLICIT),
+                RouteSupersession::HijackRefused,
+            );
+            // …and at equal epoch, and with the SAME dest — still refused.
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 5, NAMED)), Advisory, 5, NAMED),
+                RouteSupersession::HijackRefused,
+            );
+        }
+
+        /// CIRISEdge#336 BELT — a VERIFIED (rooted) announce at the SAME epoch
+        /// carrying a DIFFERENT dest heals the route. This is the boot-prime
+        /// trap: an epoch-0 prime on the explicit-hash, healed by the peer's
+        /// genuine epoch-0 announce on its named dest. Without this the peer is
+        /// pinned to a dest no path can reach — the #336 root cause.
+        #[test]
+        fn equal_epoch_verified_reroute_heals_explicit_to_named() {
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Rooted, 0, NAMED),
+                RouteSupersession::Admit,
+            );
+        }
+
+        /// CIRISEdge#301 — an advisory entry is upgraded to rooted at equal epoch
+        /// (first-root promotion), even with the same dest.
+        #[test]
+        fn equal_epoch_advisory_to_rooted_upgrades() {
+            assert_eq!(
+                route_supersession_decision(Some((Advisory, 3, NAMED)), Rooted, 3, NAMED),
+                RouteSupersession::Admit,
+            );
+        }
+
+        /// A strictly-newer epoch supersedes (genuine transport-identity
+        /// rotation) for both provenance-preserving cases.
+        #[test]
+        fn higher_epoch_supersedes() {
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 2, NAMED)), Rooted, 3, EXPLICIT),
+                RouteSupersession::Admit,
+            );
+            assert_eq!(
+                route_supersession_decision(Some((Advisory, 2, NAMED)), Advisory, 3, EXPLICIT),
+                RouteSupersession::Admit,
+            );
+        }
+
+        /// A same-epoch re-announce with the same provenance and same dest is
+        /// stale — no needless churn / persist write / replication gossip.
+        #[test]
+        fn equal_epoch_same_provenance_same_dest_is_stale() {
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 4, NAMED)), Rooted, 4, NAMED),
+                RouteSupersession::IgnoreStale,
+            );
+            assert_eq!(
+                route_supersession_decision(Some((Advisory, 4, NAMED)), Advisory, 4, NAMED),
+                RouteSupersession::IgnoreStale,
+            );
+        }
+
+        /// A lower-epoch announce is stale even if it carries a different dest —
+        /// a replayed/older frame can never rewrite a newer binding (the durable
+        /// half of this is persist's `(epoch, asserted_at)` guard, #443).
+        #[test]
+        fn lower_epoch_is_stale_even_with_new_dest() {
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 9, NAMED)), Rooted, 2, EXPLICIT),
+                RouteSupersession::IgnoreStale,
+            );
+        }
+
+        /// An advisory-over-advisory reroute at EQUAL epoch is NOT honored — a
+        /// non-verified route change must advance the epoch. (Only a VERIFIED
+        /// announce reroutes at equal epoch; the belt is rooted-gated.)
+        #[test]
+        fn equal_epoch_advisory_reroute_is_not_honored() {
+            assert_eq!(
+                route_supersession_decision(Some((Advisory, 1, NAMED)), Advisory, 1, EXPLICIT),
+                RouteSupersession::IgnoreStale,
+            );
+        }
+    }
+
     /// CIRISEdge#299 — the persisted-binding resolver returns the exact
     /// 64-byte identity it was loaded with, and `None` for an unknown peer.
     #[test]
@@ -4212,6 +4557,7 @@ mod tests {
             dest_hash,
             pubkey,
             ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+            0, // epoch (CIRISEdge#336 / CIRISPersist#443)
         )
         .await;
 

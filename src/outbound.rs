@@ -596,6 +596,11 @@ async fn dispatch_one(
                 // backoff budget on a peer that won't recover until the
                 // operator lifts the rule.
                 TransportError::PeerBlackholed { .. } => "peer_blackholed",
+                // CIRISEdge#336 — un-routable dest (no path); an addressing/
+                // rooting fault distinct from a slow-link timeout. The belt
+                // heals it on the next verified announce, so the dispatcher's
+                // retry will find the routable named dest.
+                TransportError::NoRouteToPeer { .. } => "no_route_to_peer",
             };
             if let Some(t) = reachability {
                 t.record_attempt(
