@@ -84,10 +84,23 @@ pub fn resample_nearest(src: &[u8], dst_len: usize) -> Vec<u8> {
 /// would be wrong here: byte vectors are all-positive, so even independent
 /// members score ≈ 0.75.)
 ///
-/// **This pin is wire-affecting** — it determines a signed field, so a producer
-/// that changes it forks the multiplicity any verifier recomputes from held
-/// evidence. Keep it in lockstep with the CC 6.1.2 conformance fixture; add
-/// per-`corpus_kind` arms HERE (one place) rather than at call sites.
+/// # ⚠️ This pin is wire-affecting AND currently UNGOVERNED
+///
+/// It determines a **signed** field (`max_source_multiplicity`), and persist
+/// gates admissibility on it — so a divergence here is not a cosmetic mismatch,
+/// it is a **fork in admissibility**: one substrate admits a fold another
+/// rejects, both with valid signatures.
+///
+/// CC pins **nothing** for this metric or threshold today (CIRISConstitution#35
+/// asks it to). Note it is a *distinct axis* from CC 6.1.2's `(R, ε)`, which is
+/// the **reconstruction** predicate ("can this item be individually recovered")
+/// — NOT similarity between members. The `(R, ε)` fixture
+/// (`test_540_noise_floor.py`) does not measure this and cannot confirm it.
+///
+/// So do **not** treat this const as free to tune: until CC pins it, cross-impl
+/// agreement is coincidence rather than conformance. Change it only in lockstep
+/// with CIRISConstitution#35, and add per-`corpus_kind` arms HERE (one place)
+/// rather than at call sites.
 #[must_use]
 pub fn multiplicity_similarity_threshold_milli(corpus_kind: &str) -> u64 {
     // Per-`corpus_kind` arms belong HERE (the single source of truth), e.g.
