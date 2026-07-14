@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "13.0.2"
+version = "13.0.3"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -566,8 +566,8 @@ tempfile       = { version = "3", optional = true }
 # new AnnounceError::Pack(PacketError) — a breaking enum change, but edge only
 # matches AnnounceError::ExplicitHashCannotAnnounce (untouched), so the bump is
 # pin currency + the budget-const rewire with no match-arm churn.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.9.0+ciris.1", version = "0.9", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.9.0+ciris.1", version = "0.9", optional = true }
+reticulum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.9.1+ciris.1", version = "0.9", optional = true }
+reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.9.1+ciris.1", version = "0.9", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
