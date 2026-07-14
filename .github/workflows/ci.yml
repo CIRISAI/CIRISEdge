@@ -1089,6 +1089,30 @@ jobs:
           retry_wait_seconds: 60
           shell: bash
           command: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 ffi-uniffi" -- -D warnings
+      # CIRISEdge#345 (ask #3) — the test-anchor lane. The compile-fenced
+      # `test-anchor` feature is what the mesh-repro harness (CIRISServer#258)
+      # enables to boot an edge/agent node under CIRIS_TESTING_MODE. Clippy it
+      # (so the harness build stays warning-clean) and run the edge-tier e2e
+      # that proves a SW-test-root-scrubbed peer ROOTS through edge's
+      # root_binding. This test is feature-gated, so it runs ONLY here — the
+      # default combos never compile it. NOT in any release lane: the wheel
+      # feature set omits `test-anchor`, so the relaxation is compiled out.
+      - name: cargo clippy (test-anchor on)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: cargo clippy --features "transport-http transport-reticulum pyo3 test-anchor" -- -D warnings
+      - name: cargo test --features test-anchor (edge-tier test-model e2e)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: cargo test --features "transport-reticulum test-anchor" --test test_anchor_e2e
 
   # ─── uniffi-drift: regenerate bindings, assert no diff ──────────────
   #
