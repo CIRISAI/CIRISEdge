@@ -3147,6 +3147,15 @@ impl Edge {
         let edge_for_dispatch = Arc::clone(self);
         tasks.push(runtime.spawn(async move {
             while let Some(frame) = inbound_rx.recv().await {
+                // CIRISEdge#348 — route CRPL replication frames to the registry
+                // FIRST (the hop `run` had but this loop was missing, so the agent
+                // never delivered round-opens to the responder). Only fall through
+                // to envelope dispatch when it's not consumed by replication.
+                if route_replication_frame(edge_for_dispatch.replication_registry.get(), &frame)
+                    .await
+                {
+                    continue;
+                }
                 edge_for_dispatch
                     .dispatch_inbound_observed_outcome_for_test(frame)
                     .await;
@@ -3605,88 +3614,14 @@ impl Edge {
                     break;
                 }
                 Some(frame) = inbound_rx.recv() => {
-                    // v3.5.1 (CIRISEdge#119) — CRPL pre-dispatch.
-                    // Routes inbound replication frames to the
-                    // registered coordinator. Gated on:
-                    //   - registry installed (OnceLock populated)
-                    //   - frame carries a transport-confirmed
-                    //     source_key_id (None = transport hasn't been
-                    //     wired for peer attribution; can't safely
-                    //     route to a peer-keyed coordinator)
-                    if let Some(registry) = replication_registry.get() {
-                        if let Some(source) = frame.source_key_id.as_deref() {
-                            match registry
-                                .route_inbound_bytes(source, &frame.envelope_bytes)
-                                .await
-                            {
-                                Ok(crate::replication::registry::RouteOutcome::Routed) => {
-                                    // Replication frame delivered; do NOT
-                                    // fall through to envelope dispatch.
-                                    continue;
-                                }
-                                Ok(crate::replication::registry::RouteOutcome::NotAReplicationFrame) => {
-                                    // No CRPL magic — fall through to the
-                                    // existing envelope dispatch path.
-                                }
-                                Ok(crate::replication::registry::RouteOutcome::NoCoordinatorRegistered { kind }) => {
-                                    // CIRISEdge#348 — WARN, not DEBUG. A dropped
-                                    // CRPL frame is a delivery failure that must
-                                    // be visible (a silent drop cost the mesh
-                                    // weeks). Unreachable when a ReplicationRuntime
-                                    // is installed (the #312 responder factory
-                                    // always serves), so this firing means the
-                                    // runtime/factory was never wired — a real
-                                    // config bug, exactly what should be loud.
-                                    tracing::warn!(
-                                        peer = %source,
-                                        ?kind,
-                                        "CRPL frame DROPPED — no coordinator and no responder factory \
-                                         for (peer, kind); the ReplicationRuntime is not wired (CIRISEdge#348)"
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        peer = %source,
-                                        error = %e,
-                                        "replication route_inbound_bytes failed; dropping frame"
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else if frame
-                            .envelope_bytes
-                            .starts_with(&crate::replication::wire_frame::REPLICATION_FRAME_MAGIC)
-                        {
-                            // CIRISEdge#317 point 4 — a CRPL replication frame
-                            // arrived but the transport could NOT attribute it to
-                            // a peer key_id (`source_key_id=None`; see the
-                            // reticulum `link_attribution_miss` WARN upstream). It
-                            // cannot route. DROP it here rather than fall through
-                            // to the JSON verifier — feeding binary CRPL to
-                            // `verify.verify()` is what produced the misleading
-                            // `schema_invalid` in the field. This is the exact
-                            // state the whole bug lived in and it emitted nothing;
-                            // now it's a throttled WARN (attacker-triggerable, so
-                            // first-N-per-window keyed on transport).
-                            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
-                                inbound_unroutable_crpl_log().check(frame.transport.0)
-                            {
-                                tracing::warn!(
-                                    transport_id = %frame.transport.0,
-                                    bytes = frame.envelope_bytes.len(),
-                                    first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
-                                    route = "SkippedNoSourceKeyId",
-                                    suppressed_prev,
-                                    "inbound CRPL replication frame with source_key_id=None — \
-                                     transport could not attribute the sending link to a peer \
-                                     (link attribution miss upstream); dropping (CIRISEdge#317)"
-                                );
-                            }
-                            continue;
-                        }
-                        // else: no source + not a CRPL frame — a normal inbound
-                        // envelope that carries no peer attribution; fall through.
+                    // CIRISEdge#348 — the SHARED transport→replication ingest hop
+                    // (v3.5.1 CIRISEdge#119 CRPL pre-dispatch), factored out so this
+                    // loop and `spawn_background_listeners` (the agent's loop) can
+                    // NEVER diverge again. Routes CRPL replication frames to the
+                    // registry; returns true when consumed (→ do not envelope-
+                    // dispatch). Every branch logs, throttled.
+                    if route_replication_frame(replication_registry.get(), &frame).await {
+                        continue;
                     }
                     let verify_clone = verify.clone();
                     let handlers_clone = handlers.clone();
@@ -3967,6 +3902,130 @@ fn inbound_verify_reject_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_VERIFY_REJECT_LOG.get_or_init(|| {
         crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 32)
     })
+}
+
+// CIRISEdge#348 — observability for the transport→replication INGEST hop. This is
+// the hand-off that silently swallowed anti-entropy round-opens (the agent's
+// `spawn_background_listeners` loop never routed CRPL frames, and NOTHING logged
+// between resource-reassembly and the drop). Both are keyed on a LOW-cardinality
+// discriminant (transport id / peer key_id with a capped map) — safe under a
+// frame flood, per the crate's LogThrottle discipline.
+static INBOUND_INGEST_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+static INBOUND_ROUTED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// A frame CROSSED transport→replication ingest. Keyed on transport id (a handful
+/// of values). Makes the previously-invisible hop VISIBLE at `ciris_edge=debug`.
+fn inbound_ingest_log() -> &'static crate::log_throttle::LogThrottle {
+    INBOUND_INGEST_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(8, std::time::Duration::from_secs(60), 16)
+    })
+}
+
+/// A CRPL frame was ROUTED to a replication responder (the success path — the one
+/// that was silent). Keyed on peer key_id (attacker-influenceable ⇒ capped map).
+fn inbound_routed_log() -> &'static crate::log_throttle::LogThrottle {
+    INBOUND_ROUTED_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(8, std::time::Duration::from_secs(60), 256)
+    })
+}
+
+/// CIRISEdge#348 — the SHARED transport→replication ingest hop.
+///
+/// Called by BOTH inbound loops ([`Edge::run`] AND
+/// [`Edge::spawn_background_listeners`], the one the agent/PyEngine actually
+/// drives) so they CANNOT diverge. They did: only `run` carried the CRPL
+/// `route_inbound_bytes` pre-dispatch, so the agent never delivered anti-entropy
+/// round-opens to the responder — the round-open reassembled, then vanished with
+/// no log. Extracting the hop into one function fixes both the divergence and the
+/// silence.
+///
+/// Returns `true` when the frame was consumed by replication ingest (routed to a
+/// coordinator, or dropped as an unroutable/failed replication frame → the caller
+/// must NOT also envelope-dispatch it); `false` when the caller should fall
+/// through to envelope dispatch. Every branch logs (throttled).
+async fn route_replication_frame(
+    registry: Option<&std::sync::Arc<crate::replication::registry::ReplicationRegistry>>,
+    frame: &InboundFrame,
+) -> bool {
+    use crate::log_throttle::ThrottleDecision;
+    use crate::replication::registry::RouteOutcome;
+
+    // The frame reached ingest — the hop that used to be invisible.
+    if let ThrottleDecision::Emit { suppressed_prev } =
+        inbound_ingest_log().check(frame.transport.0)
+    {
+        tracing::debug!(
+            transport_id = %frame.transport.0,
+            bytes = frame.envelope_bytes.len(),
+            source_key_id = ?frame.source_key_id,
+            suppressed_prev,
+            "inbound frame reached replication ingest (CIRISEdge#348)"
+        );
+    }
+
+    let Some(registry) = registry else {
+        return false; // no replication runtime installed → envelope dispatch
+    };
+    let Some(source) = frame.source_key_id.as_deref() else {
+        // No attribution: a CRPL frame here is unroutable (drop, loudly); a
+        // non-CRPL frame is a normal unattributed envelope (fall through).
+        if frame
+            .envelope_bytes
+            .starts_with(&crate::replication::wire_frame::REPLICATION_FRAME_MAGIC)
+        {
+            if let ThrottleDecision::Emit { suppressed_prev } =
+                inbound_unroutable_crpl_log().check(frame.transport.0)
+            {
+                tracing::warn!(
+                    transport_id = %frame.transport.0,
+                    bytes = frame.envelope_bytes.len(),
+                    first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
+                    route = "SkippedNoSourceKeyId",
+                    suppressed_prev,
+                    "inbound CRPL replication frame with source_key_id=None — transport could \
+                     not attribute the sending link to a peer; dropping (CIRISEdge#317)"
+                );
+            }
+            return true;
+        }
+        return false;
+    };
+
+    match registry
+        .route_inbound_bytes(source, &frame.envelope_bytes)
+        .await
+    {
+        Ok(RouteOutcome::Routed) => {
+            if let ThrottleDecision::Emit { suppressed_prev } = inbound_routed_log().check(source) {
+                tracing::debug!(
+                    peer = %source,
+                    suppressed_prev,
+                    "CRPL frame ROUTED to replication responder (CIRISEdge#348)"
+                );
+            }
+            true
+        }
+        Ok(RouteOutcome::NotAReplicationFrame) => false, // → envelope dispatch
+        Ok(RouteOutcome::NoCoordinatorRegistered { kind }) => {
+            tracing::warn!(
+                peer = %source,
+                ?kind,
+                "CRPL frame DROPPED — no coordinator and no responder factory for (peer, kind); \
+                 the ReplicationRuntime is not wired (CIRISEdge#348)"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                peer = %source,
+                error = %e,
+                "replication route_inbound_bytes failed; dropping frame (CIRISEdge#348)"
+            );
+            true
+        }
+    }
 }
 
 /// Hex of the first up-to-8 bytes of a frame — distinguishes a binary CRPL frame
@@ -7256,5 +7315,75 @@ mod delegation_gate_tests {
             out,
             Err(crate::messages::DelegationRefusalSubReason::MissingScope),
         );
+    }
+}
+
+#[cfg(test)]
+mod inbound_ingest_tests {
+    //! CIRISEdge#348 — the shared transport→replication ingest hop. These guard
+    //! the exact seam that silently swallowed anti-entropy round-opens on the
+    //! agent: a CRPL replication frame MUST be consumed by `route_replication_frame`
+    //! (routed to replication, never envelope-dispatched), and a plain envelope
+    //! MUST fall through. Both inbound loops (`run` + `spawn_background_listeners`)
+    //! call this ONE function, so they cannot diverge again.
+    use super::*;
+    use crate::replication::protocol::{EnvelopeKind, ReplicationMessage, SummaryMessage};
+    use crate::replication::registry::ReplicationRegistry;
+    use crate::transport::TransportId;
+
+    fn frame(bytes: Vec<u8>, source: Option<&str>) -> InboundFrame {
+        InboundFrame {
+            envelope_bytes: bytes,
+            transport: TransportId::RETICULUM_RS,
+            received_at: chrono::Utc::now(),
+            source_key_id: source.map(str::to_string),
+        }
+    }
+
+    /// A CRPL frame with attribution is CONSUMED by replication ingest (returns
+    /// `true` ⇒ the caller must NOT envelope-dispatch it) — even with no
+    /// coordinator (it's dropped LOUDLY, not fed to the JSON verifier). This is
+    /// exactly what the agent's loop failed to do before #348.
+    #[tokio::test]
+    async fn crpl_frame_is_consumed_by_replication_ingest() {
+        let registry = std::sync::Arc::new(ReplicationRegistry::new());
+        let crpl =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            }));
+        assert!(
+            route_replication_frame(Some(&registry), &frame(crpl, Some("agent-peer"))).await,
+            "a CRPL replication frame MUST be consumed by ingest, never envelope-dispatched (#348)",
+        );
+    }
+
+    /// A plain (non-CRPL) envelope FALLS THROUGH to envelope dispatch.
+    #[tokio::test]
+    async fn plain_envelope_falls_through_to_dispatch() {
+        let registry = std::sync::Arc::new(ReplicationRegistry::new());
+        assert!(
+            !route_replication_frame(
+                Some(&registry),
+                &frame(
+                    b"{\"edge_schema_version\":\"2.0.0\"}".to_vec(),
+                    Some("agent-peer")
+                )
+            )
+            .await,
+            "a plain envelope must fall through to envelope dispatch",
+        );
+    }
+
+    /// No replication runtime installed → always fall through (envelope dispatch
+    /// handles everything, as on a node with no replication configured).
+    #[tokio::test]
+    async fn no_registry_falls_through() {
+        let crpl =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            }));
+        assert!(!route_replication_frame(None, &frame(crpl, Some("agent-peer"))).await);
     }
 }
