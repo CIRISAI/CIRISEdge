@@ -1056,6 +1056,19 @@ pub struct ReticulumTransport {
     /// conformant source (edge owns the transport identity per
     /// `crate::identity` §"Reticulum-shape identity hash").
     local_transport_pubkey: [u8; 64],
+    /// CIRISEdge#340 — this node's full Reticulum transport identity (the
+    /// same one bound into `node`), kept so the send side can IDENTIFY an
+    /// outbound link after it establishes. A Reticulum link is anonymous by
+    /// default; only the initiator may identify it (RNS `Link.identify()`),
+    /// and identifying is what makes the responder emit `LinkIdentified` →
+    /// populate `link_to_peer_key_id` → attribute inbound replication frames.
+    /// Without this, every inbound CRPL frame dropped `SkippedNoSourceKeyId`
+    /// (#317) because the link carried no proven identity — the reason the
+    /// #314 attribution machinery, though correct, never fired in the field
+    /// (and why CIRISServer#235 was never verified end-to-end). Holds the
+    /// PRIVATE key (unlike `local_transport_pubkey`), so it can sign the
+    /// LINKIDENTIFY packet.
+    local_identity: Identity,
     /// Edge's own announce attestation app-data — built once in
     /// `new` (sign with the federation `LocalSigner`) and emitted
     /// verbatim on every announce. `None` when no signer was
@@ -1581,7 +1594,10 @@ impl ReticulumTransport {
         // one underlying identity → either inbound path reaches the
         // same handler set.
         let mut named_dest = Destination::new(
-            Some(identity),
+            // CIRISEdge#340 — clone (not move): `local_identity` on the struct
+            // keeps the full transport identity so the send side can identify
+            // outbound links after they establish.
+            Some(identity.clone()),
             Direction::In,
             DestinationType::Single,
             EDGE_APP_NAME,
@@ -1613,6 +1629,7 @@ impl ReticulumTransport {
             local_dest_hash,
             local_named_dest_hash,
             local_transport_pubkey,
+            local_identity: identity.clone(),
             local_attestation,
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -1855,6 +1872,41 @@ impl ReticulumTransport {
         );
     }
 
+    /// CIRISEdge#340 test seam — inject a rooted peer with its FULL 64-byte
+    /// transport identity (`x25519 ‖ ed25519`), computing the real
+    /// `transport_identity_hash` the way the announce path does. Unlike
+    /// [`Self::inject_rooted_peer_for_test`] (which stores a `[0u8; 16]`
+    /// sentinel because it lacks the x25519 half), this reproduces the FIELD
+    /// shape: an announce-rooted peer whose stored identity hash matches the
+    /// hash a real identified link proves — the precondition #340 attribution
+    /// needs. `dest_hash` is the peer's ROUTABLE (named) dest.
+    #[doc(hidden)]
+    pub async fn inject_rooted_peer_with_transport_identity_for_test(
+        &self,
+        destination_key_id: &str,
+        dest_hash: [u8; 16],
+        transport_pubkey64: [u8; 64],
+    ) {
+        let x25519: [u8; 32] = transport_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
+        let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
+        let transport_identity_hash =
+            Identity::from_public_keys(&x25519, &ed25519).map_or([0u8; 16], |id| *id.hash());
+        let mut peers = self.peers.lock().await;
+        peers.insert(
+            destination_key_id.to_string(),
+            RootedPeer {
+                peer: ResolvedPeer {
+                    dest_hash: DestinationHash::new(dest_hash),
+                    signing_key: ed25519,
+                },
+                epoch: 0,
+                chain: None,
+                provenance: ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+                transport_identity_hash,
+            },
+        );
+    }
+
     // ─── CIRISEdge#32 (v0.14.0) Links FFI surface ───────────────────
     //
     // The Reticulum link lifecycle is normally an internal substrate
@@ -1995,6 +2047,14 @@ impl ReticulumTransport {
         if !established {
             return Err(TransportError::Timeout(timeout));
         }
+        // CIRISEdge#340 — identify the link so the responder can attribute what
+        // arrives on it (same rationale as `send`: an anonymous link yields
+        // `source_key_id=None` → dropped). The FFI Links surface establishes
+        // links the same way, so it needs the same identify precondition.
+        self.node
+            .identify_link(&link_id, &self.local_identity)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
         Ok(link_id.into_bytes())
     }
 
@@ -2846,6 +2906,23 @@ impl Transport for ReticulumTransport {
             }
             return Err(TransportError::Timeout(establish_timeout));
         }
+
+        // CIRISEdge#340 — IDENTIFY the link before sending. A Reticulum link is
+        // anonymous by default; only the initiator may identify it, and the
+        // responder emits `LinkIdentified` (→ populates its `link_to_peer_key_id`
+        // via the #314 identity-hash match → attributes our inbound frame) ONLY
+        // if we do. Without this, every replication frame we send lands on the
+        // responder as `source_key_id=None` and is dropped `SkippedNoSourceKeyId`
+        // (#317) — the field-confirmed reason attribution never fired and
+        // CIRISServer#235 was never verified end-to-end. Ordered before
+        // `send_resource` on the same link so the LINKIDENTIFY is processed
+        // first. A failure here means the responder cannot attribute the frame,
+        // so fail the send (the durable dispatcher retries) rather than ship an
+        // unattributable resource that will be silently dropped.
+        self.node
+            .identify_link(&link_id, &self.local_identity)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
 
         // Auto-accept any resources the peer pushes back on this link
         // (e.g. an ACK envelope), and ship our envelope as a resource.

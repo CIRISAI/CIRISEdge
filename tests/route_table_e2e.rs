@@ -23,8 +23,9 @@ use std::time::{Duration, Instant};
 
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::transport::reticulum::{ReticulumAuth, ReticulumTransportConfig};
-use ciris_edge::transport::{Transport, TransportError};
+use ciris_edge::transport::{InboundFrame, Transport, TransportError};
 use ciris_edge::verify::RootingDirectory;
+use tokio::sync::mpsc;
 
 use common::{build_reticulum_with_retry, directory_with, signed_record, TestFedKey};
 
@@ -163,4 +164,111 @@ async fn no_path_send_fails_fast_and_loud_not_a_silent_30s_timeout() {
              here is the silent-failure regression the #336 guard must prevent",
         ),
     }
+}
+
+/// CIRISEdge#340 — a replication link MUST be IDENTIFIED by the initiator so the
+/// responder can attribute the inbound frame to the sender's key_id. A Reticulum
+/// link is anonymous by default; before this fix `send` established the link and
+/// shipped the resource WITHOUT identifying, so every inbound frame landed on the
+/// responder as `source_key_id=None` and dropped `SkippedNoSourceKeyId` (#317) —
+/// the field-confirmed reason the #314 attribution machinery never fired and
+/// CIRISServer#235 was never verified end-to-end.
+///
+/// The test reproduces the FIELD shape (an announce-rooted peer whose stored
+/// `transport_identity_hash` is the REAL one, not the `[0;16]` sentinel that
+/// `prime_v7_peer_pair` injects): B sends to A; A must attribute the inbound
+/// frame to `edge-key-bbbb` via the link B identified. The assertion is on
+/// `InboundFrame::source_key_id` — the exact operand that was `None` in the
+/// field logs. Delivery alone (the existing loopback test) does not catch this;
+/// attribution does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identified_link_lets_the_responder_attribute_the_inbound_frame() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let steward = TestFedKey::new("steward-340", 0x01);
+    let key_a = TestFedKey::new("edge-key-aaaa", 0x0a);
+    let key_b = TestFedKey::new("edge-key-bbbb", 0x0b);
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&key_a, &steward, "agent"),
+        signed_record(&key_b, &steward, "agent"),
+    ])
+    .await;
+
+    // Node A — the receiver.
+    let (transport_a, addr_a) = build_reticulum_with_retry(|| {
+        let key = &key_a;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-key-aaaa");
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.announce_interval = Duration::from_secs(30);
+            let auth = auth_for(key, dir, &base).await;
+            (c, auth)
+        }
+    })
+    .await;
+    let port_a = addr_a.port();
+
+    // Node B — the sender; dials A.
+    let (transport_b, _addr_b) = build_reticulum_with_retry(|| {
+        let key = &key_b;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-key-bbbb");
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+            c.announce_interval = Duration::from_secs(30);
+            let auth = auth_for(key, dir, &base).await;
+            (c, auth)
+        }
+    })
+    .await;
+
+    // A must know B by B's REAL transport identity (the field shape), so the
+    // identity B proves when it identifies the link matches A's stored hash and
+    // attribution fires. B must know A's dest so the link can establish.
+    transport_a
+        .inject_rooted_peer_with_transport_identity_for_test(
+            "edge-key-bbbb",
+            transport_b.local_dest_hash(),
+            transport_b.local_transport_pubkey(),
+        )
+        .await;
+    let mut a_ed = [0u8; 32];
+    a_ed.copy_from_slice(&transport_a.local_transport_pubkey()[32..64]);
+    transport_b
+        .inject_rooted_peer_for_test("edge-key-aaaa", transport_a.local_dest_hash(), a_ed)
+        .await;
+
+    let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(16);
+    let (tx_b, _rx_b) = mpsc::channel::<InboundFrame>(16);
+    let la = transport_a.clone();
+    let lb = transport_b.clone();
+    let _listen_a = tokio::spawn(async move { la.listen(tx_a).await });
+    let _listen_b = tokio::spawn(async move { lb.listen(tx_b).await });
+
+    // B → A. The send identifies the link before shipping the resource.
+    transport_b
+        .send("edge-key-aaaa", b"attributed-inbound-frame")
+        .await
+        .expect("send B -> A");
+
+    let frame = tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+        .await
+        .expect("frame must arrive within 60s")
+        .expect("inbound channel open");
+
+    assert_eq!(
+        frame.source_key_id.as_deref(),
+        Some("edge-key-bbbb"),
+        "the responder must ATTRIBUTE the inbound frame to the sender via the \
+         identified link — source_key_id=None is the #340 SkippedNoSourceKeyId drop",
+    );
 }
