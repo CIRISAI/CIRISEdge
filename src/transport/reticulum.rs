@@ -140,6 +140,20 @@ const NO_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// CIRISEdge#336 (fast heal) — minimum interval between EVENT-DRIVEN announces.
+///
+/// RNS reachability is on-demand, not periodic: markqvist's reference stack
+/// announces immediately on startup + on interface/link change, and treats the
+/// periodic timer as a coarse fallback (Sideband re-announces every 90–300
+/// *minutes*). Edge's 300 s [`ReticulumTransportConfig::announce_interval`] as
+/// the ONLY heal trigger is the anti-pattern: a peer that connects just after a
+/// tick waits ~5 min for the next announce before the #336 belt can heal its
+/// route. So we ALSO announce when a link establishes (a peer just connected) —
+/// which propagates our routable named dest in seconds. This gate bounds a burst
+/// of link-ups to one announce per window (RNS `ANNOUNCE_CAP` spirit), so an
+/// announce storm can't be driven by rapid link churn.
+const EVENT_ANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
 /// CIRISEdge#318 — cap on the in-memory `peers` (rooted + advisory bindings)
 /// map. Bounds advisory-admit pollution: at cap, an Advisory binding is evicted
 /// before a new key is inserted (Rooted bindings are never evicted for advisory
@@ -2040,8 +2054,11 @@ impl ReticulumTransport {
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
 
+        // CIRISEdge#342 — alias-resolving establishment poll (see `send`): a
+        // #66 re-key on a lossy path re-keys the link under a fresh id, so a raw
+        // `established_links.contains(&original_id)` misses.
         let established = wait_until_async(timeout, Duration::from_millis(50), || async {
-            self.established_links.lock().await.contains(&link_id)
+            self.node.link_is_established(&link_id)
         })
         .await;
         if !established {
@@ -2872,9 +2889,19 @@ impl Transport for ReticulumTransport {
         // the peer must have accepted the LINK_REQUEST or a resource
         // transfer cannot start. The event loop records established
         // link IDs in `established_links`; poll it.
+        // CIRISEdge#342 — poll leviculum's ALIAS-RESOLVING establishment query,
+        // not edge's own `established_links` set. On a lossy path the #66
+        // establishment retry re-keys the link under a fresh wire id; the
+        // `LinkEstablished` event (hence `established_links`) then carries the
+        // RE-KEYED id, while we hold connect's ORIGINAL id. A raw
+        // `established_links.contains(&original)` never matches → we time out →
+        // never reach `send_resource` → 0 Data frames → the link idles to a
+        // keepalive death (the field symptom on the remote/canonical path).
+        // `link_is_established` resolves the origin id through leviculum's #66
+        // alias table and gates on `LinkState::Active`.
         let established =
             wait_until_async(establish_timeout, Duration::from_millis(50), || async {
-                self.established_links.lock().await.contains(&link_id)
+                self.node.link_is_established(&link_id)
             })
             .await;
         if !established {
@@ -3010,6 +3037,11 @@ impl Transport for ReticulumTransport {
         let mut announce_tick = tokio::time::interval(self.config.announce_interval);
         announce_tick.tick().await; // consume the immediate first tick
 
+        // CIRISEdge#336 (fast heal) — rate-limit gate for event-driven announces.
+        // `None` until the first link-up, so the first connecting peer triggers an
+        // announce immediately.
+        let mut last_event_announce: Option<std::time::Instant> = None;
+
         loop {
             tokio::select! {
                 _ = announce_tick.tick() => {
@@ -3026,6 +3058,13 @@ impl Transport for ReticulumTransport {
                         tracing::info!("Reticulum event channel closed; listener exiting");
                         break;
                     };
+                    // CIRISEdge#336 (fast heal) — RNS-aligned event-driven announce.
+                    // A `LinkEstablished` means a peer just connected; re-announce so
+                    // it learns our routable NAMED dest in seconds (→ the #336 belt
+                    // heals its route now, not after the next ~5 min periodic tick).
+                    // Rate-limited so rapid link churn can't storm announces.
+                    let link_just_established =
+                        matches!(event, NodeEvent::LinkEstablished { .. });
                     let ctx = EventCtx {
                         node: &self.node,
                         peers: &self.peers,
@@ -3043,6 +3082,28 @@ impl Transport for ReticulumTransport {
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                     };
                     handle_event(event, &ctx).await;
+
+                    // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
+                    if link_just_established
+                        && last_event_announce
+                            .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
+                    {
+                        last_event_announce = Some(std::time::Instant::now());
+                        match self
+                            .node
+                            .announce_destination(&self.local_named_dest_hash, Some(app_data))
+                            .await
+                        {
+                            Ok(()) => tracing::debug!(
+                                "event-driven announce on link-up — RNS-aligned fast \
+                                 convergence (CIRISEdge#336)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "event-driven announce (link up) failed"
+                            ),
+                        }
+                    }
                 }
             }
         }
