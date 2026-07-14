@@ -3629,10 +3629,19 @@ impl Edge {
                                     // existing envelope dispatch path.
                                 }
                                 Ok(crate::replication::registry::RouteOutcome::NoCoordinatorRegistered { kind }) => {
-                                    tracing::debug!(
+                                    // CIRISEdge#348 — WARN, not DEBUG. A dropped
+                                    // CRPL frame is a delivery failure that must
+                                    // be visible (a silent drop cost the mesh
+                                    // weeks). Unreachable when a ReplicationRuntime
+                                    // is installed (the #312 responder factory
+                                    // always serves), so this firing means the
+                                    // runtime/factory was never wired — a real
+                                    // config bug, exactly what should be loud.
+                                    tracing::warn!(
                                         peer = %source,
                                         ?kind,
-                                        "CRPL frame received but no coordinator registered for (peer, kind); dropping"
+                                        "CRPL frame DROPPED — no coordinator and no responder factory \
+                                         for (peer, kind); the ReplicationRuntime is not wired (CIRISEdge#348)"
                                     );
                                     continue;
                                 }
