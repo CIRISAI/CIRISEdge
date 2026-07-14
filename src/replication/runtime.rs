@@ -53,7 +53,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
 use super::bridge::{BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge};
-use super::coordinator::ReplicationCoordinator;
+use super::coordinator::{DriveStep, ReplicationCoordinator};
 use super::directory::{DirectoryStateAdapter, MutableDirectoryStateAdapter, ReplicationDirectory};
 use super::protocol::EnvelopeKind;
 use super::registry::ReplicationRegistry;
@@ -63,6 +63,69 @@ use super::scheduler::{
 use super::session::SessionRole;
 use super::summary::{StateApplier, StateProvider};
 use crate::transport::Transport;
+
+/// CIRISEdge#348 — drive a factory-created **Responder** coordinator.
+///
+/// The registry only STORES a coordinator; the [`ReplicationScheduler`] drives
+/// **Initiators** only (`add_initiator`). A Responder spun up on-demand for an
+/// inbound round from a non-consent-pull peer (the #312 responder factory) has
+/// no other driver — so this task IS its round engine: pull each inbound
+/// replication message, step the round, and emit every reply on the transport.
+///
+/// Without it, `route_inbound_bytes` `deliver_inbound`'s the round-open into the
+/// coordinator's channel and it is NEVER processed — the responder never
+/// replies, the initiator times out forever, and (the seam that cost the mesh
+/// weeks — #348) NOTHING logs. This was the missing half of #312: it spun up +
+/// registered the Responder but never ran the drive loop. Spawned ONCE per
+/// (peer, kind) — `get_or_register_with` invokes the factory only on first
+/// insert. Every terminal / error path logs; there is no silent discard.
+fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
+    tokio::spawn(async move {
+        let peer = coord.peer_key_id().to_string();
+        let kind = coord.kind();
+        tracing::debug!(peer = %peer, ?kind, "responder driver started (CIRISEdge#348)");
+        loop {
+            // Channel closed ⇒ the coordinator was dropped; end the driver.
+            let Some(msg) = coord.recv_inbound().await else {
+                tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
+                break;
+            };
+            match coord.drive_round_step(Some(msg)).await {
+                Ok(DriveStep::SendThenWait(msgs)) => {
+                    for m in &msgs {
+                        if let Err(e) = coord.send_message(m).await {
+                            tracing::warn!(
+                                peer = %peer, ?kind, error = %e,
+                                "responder reply send failed — round will not complete (CIRISEdge#348)"
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ok(DriveStep::Complete(report)) => {
+                    tracing::debug!(
+                        peer = %peer, ?kind, ?report,
+                        "responder served an anti-entropy round to completion (CIRISEdge#348)"
+                    );
+                }
+                Ok(DriveStep::Refused) => {
+                    tracing::warn!(
+                        peer = %peer, ?kind,
+                        "responder REFUSED an inbound replication message (unexpected role/phase) \
+                         — dropped, NOT silently (CIRISEdge#348)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %peer, ?kind, error = %e,
+                        "responder drive_round_step failed; ending driver (CIRISEdge#348)"
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
 
 /// A `(peer_key_id, kind)` pair the runtime should anti-entropy with
 /// as the Initiator side. Each pair gets one [`ReplicationCoordinator`]
@@ -193,14 +256,26 @@ impl ReplicationRuntime {
                     Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)));
                 let applier: Arc<Mutex<dyn StateApplier>> =
                     Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
-                Arc::new(ReplicationCoordinator::new(
+                let coord = Arc::new(ReplicationCoordinator::new(
                     Arc::clone(&factory_transport),
                     peer_key_id.to_string(),
                     kind,
                     SessionRole::Responder,
                     provider,
                     applier,
-                ))
+                ));
+                // CIRISEdge#348 — DRIVE the responder. The registry only stores
+                // the coordinator; the scheduler drives INITIATORS only. Without
+                // a driver here the round-open is `deliver_inbound`'d into the
+                // coordinator's channel and NEVER processed — the responder never
+                // replies, the initiator times out forever, and (the seam that
+                // cost weeks) NOTHING logs. This was the missing half of the #312
+                // responder factory: it spun up + registered the Responder but
+                // never ran the recv_inbound → drive_round_step → send_message
+                // loop. Spawned ONCE per (peer, kind) — `get_or_register_with`
+                // calls the factory only on first insert.
+                spawn_responder_drive(Arc::clone(&coord));
+                coord
             }));
         }
 
@@ -469,6 +544,111 @@ mod tests {
         ) -> Result<(), TransportError> {
             unimplemented!("runtime tests don't drive listen")
         }
+    }
+
+    /// Captured `(destination_key_id, bytes)` sends.
+    type SentLog = Arc<tokio::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// A transport that RECORDS every `send` so a test can assert the responder
+    /// actually replied (CIRISEdge#348).
+    struct RecordingTransport {
+        sent: SentLog,
+    }
+    #[async_trait]
+    impl Transport for RecordingTransport {
+        fn id(&self) -> TransportId {
+            TransportId::HTTP
+        }
+        async fn send(
+            &self,
+            destination_key_id: &str,
+            envelope_bytes: &[u8],
+        ) -> Result<TransportSendOutcome, TransportError> {
+            self.sent
+                .lock()
+                .await
+                .push((destination_key_id.to_string(), envelope_bytes.to_vec()));
+            Ok(TransportSendOutcome::Delivered)
+        }
+        async fn listen(
+            &self,
+            _sink: tokio::sync::mpsc::Sender<InboundFrame>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// CIRISEdge#348 — a factory-spun **Responder** is DRIVEN: an inbound
+    /// round-open routed through the registry causes the responder to process it
+    /// and REPLY on the transport — with NO Initiator, NO scheduler entry, and NO
+    /// manual drive. Before the fix the #312 factory registered the coordinator
+    /// but never ran its `recv_inbound → drive_round_step → send_message` loop, so
+    /// `deliver_inbound` enqueued the Summary and it was never processed: the
+    /// responder never replied and the initiator timed out forever (the #348
+    /// silent stall). This asserts a reply is emitted back to the initiator.
+    // multi_thread: `DirectoryStateAdapter` uses `block_in_place` (directory.rs),
+    // which requires a multi-threaded runtime — the shape the real edge runtime
+    // always has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn factory_responder_is_driven_and_replies_to_a_round_open() {
+        use super::super::protocol::{ReplicationMessage, SummaryMessage};
+        use super::super::registry::RouteOutcome;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let directory: Arc<dyn FederationDirectory> = backend;
+        let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let transport: Arc<dyn Transport> = Arc::new(RecordingTransport {
+            sent: Arc::clone(&sent),
+        });
+        // No Initiator peers — a PURE responder node (the canonical's shape: the
+        // agent pulls from it). The ONLY way it serves a round is the #312
+        // factory spinning up a Responder AND the #348 drive running it.
+        let mut rt = ReplicationRuntime::start(
+            directory,
+            transport,
+            Vec::new(),
+            ReplicationRuntimeConfig::default(),
+            None,
+        )
+        .await;
+
+        let round_open =
+            super::super::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            }));
+        let outcome = rt
+            .registry()
+            .route_inbound_bytes("agent-alice", &round_open)
+            .await
+            .expect("route_inbound_bytes");
+        assert!(
+            matches!(outcome, RouteOutcome::Routed),
+            "the factory must spin up + route to a Responder, got {outcome:?}",
+        );
+
+        // The drive is a spawned task; poll (bounded) for the reply.
+        let replied = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !sent.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            replied.is_ok(),
+            "the factory-spun Responder MUST reply to the round-open (CIRISEdge#348) — \
+             nothing was sent, so the responder was registered but never driven",
+        );
+        assert_eq!(
+            sent.lock().await[0].0,
+            "agent-alice",
+            "the reply must go back to the initiating peer",
+        );
+
+        rt.shutdown().await;
     }
 
     /// `start` with an empty peer list builds the runtime + spawns
