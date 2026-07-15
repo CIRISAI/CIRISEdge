@@ -292,7 +292,7 @@ jobs:
   #     `sm4-x86_64.S` uses SM4-NI ISA that NDK r26b's clang
   #     assembler doesn't grok. aarch64 + armeabi-v7a unaffected.
   android-ndk:
-    name: android ${{ matrix.abi }}
+    name: android ${{ matrix.abi }} (${{ matrix.variant }})
     runs-on: ubuntu-latest
     # CIRISEdge#229 — save edge-self-warm on main (no persist/verify
     # upstream for android-* PLATs; edge owns its own warm cycle).
@@ -301,12 +301,25 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
+      # CI-time split (v13.1.x): `variant` axis parallelizes the two
+      # sequential cargo-ndk builds (plain ~5.4m + PyO3 ~6.8m serial =
+      # 12m+ per ABI job). 3 jobs → 6, each doing ONE build; the ABI
+      # legs drop from ~14-16m to ~7-8m wall. The include entries match
+      # on `abi` and enrich every {abi, variant} combination.
       matrix:
+        variant: [plain, pyo3]
+        abi: [arm64-v8a, x86_64, armeabi-v7a]
         include:
           - { abi: arm64-v8a,    target: aarch64-linux-android,   clang_prefix: aarch64-linux-android24,     pointer_width: 64 }
           - { abi: x86_64,       target: x86_64-linux-android,    clang_prefix: x86_64-linux-android24,      pointer_width: 64 }
           - { abi: armeabi-v7a,  target: armv7-linux-androideabi, clang_prefix: armv7a-linux-androideabi24,  pointer_width: 32 }
     env:
+      # CIRISEdge#216 — sccache over the GHA cache backend (the
+      # CIRISServer bench.yml pattern). Compilation-unit caching that
+      # survives the version-keyed CIRISCache misses: a persist/leviculum
+      # pin bump only recompiles the changed crates, not the dep graph.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
       # Edge's mobile feature set. Reticulum is the canonical cohabitation
       # wire (MISSION §1.4); HTTP is the cloud fallback, intentionally NOT
       # on mobile. The plain `.so` build (first cargo-ndk invocation below)
@@ -323,13 +336,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
+      - name: Set up sccache (compiler cache over GHA)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      # The pyo3 variant links against the libpython stub with different
+      # RUSTFLAGS, so its target dir is NOT interchangeable with plain's —
+      # each variant owns its cache key (plain keeps the pre-split key so
+      # existing warm layers still hit).
       - uses: ./.github/actions/ciriscache
         id: cachekey
         with:
-          plat: android-${{ matrix.abi }}
+          plat: android-${{ matrix.abi }}${{ matrix.variant == 'pyo3' && '-pyo3' || '' }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: android-${{ matrix.abi }}
+          key: android-${{ matrix.abi }}-${{ matrix.variant }}
         continue-on-error: true
       - name: setup Android NDK
         uses: nttld/setup-ndk@v1
@@ -355,11 +374,11 @@ jobs:
       # so there is no openssl-sys in the Android dep tree to satisfy. The
       # SM4-NI workaround (Configure `no-sm4`) is moot with no openssl build.
 
-      # Plain .so (no PyO3) — save before the PyO3 build overwrites
-      # the same target path. Native Android consumers (Rust-only,
-      # UniFFI/JNI) take this artifact; the Chaquopy variant below is
-      # for the Python-agent cohabitation case.
+      # Plain .so (no PyO3) — the `plain` variant job. Native Android
+      # consumers (Rust-only, UniFFI/JNI) take this artifact; the
+      # Chaquopy variant job is for the Python-agent cohabitation case.
       - name: cargo ndk build (${{ matrix.abi }} — plain, no PyO3)
+        if: matrix.variant == 'plain'
         # Cross-process retry via nick-fields/retry@v3 — catches
         # transient `index.crates.io` resolution flakes the in-process
         # CARGO_NET_RETRY=10 can't (e.g. when cargo gives up but a
@@ -377,6 +396,7 @@ jobs:
             cargo ndk -t ${{ matrix.abi }} build --release
             --features "$MOBILE_BASE_FEATURES"
       - name: save plain .so
+        if: matrix.variant == 'plain'
         run: |
           mkdir -p dist/${{ matrix.abi }}
           cp "target/${{ matrix.target }}/release/libciris_edge.so" \
@@ -389,6 +409,7 @@ jobs:
       # `-lpython3.10` via RUSTFLAGS. Chaquopy's real libpython
       # provides the symbols at runtime.
       - name: create PyO3 config + libpython stub
+        if: matrix.variant == 'pyo3'
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -421,6 +442,7 @@ jobs:
           file "${STUB_DIR}/libpython3.10.so"
 
       - name: cargo ndk build (${{ matrix.abi }} — PyO3 Chaquopy abi3)
+        if: matrix.variant == 'pyo3'
         # Cross-process retry — see plain-build step for rationale.
         uses: nick-fields/retry@v3
         env:
@@ -434,6 +456,7 @@ jobs:
             --features "$MOBILE_PYO3_FEATURES"
 
       - name: verify DT_NEEDED includes libpython3.10.so
+        if: matrix.variant == 'pyo3'
         # AV-NN: the whole point of the stub-link dance is the
         # DT_NEEDED entry. If this assertion fails the wheel will
         # silently dlopen on Chaquopy and crash on first import —
@@ -444,24 +467,31 @@ jobs:
             && echo "✓ DT_NEEDED: libpython3.10.so present" \
             || { echo "::error::libpython3.10.so missing from DT_NEEDED"; exit 1; }
 
-      - name: strip + collect artifacts
+      - name: collect PyO3 .so (Chaquopy wheels)
+        if: matrix.variant == 'pyo3'
+        run: |
+          mkdir -p dist/${{ matrix.abi }}
+          cp "target/${{ matrix.target }}/release/libciris_edge.so" \
+             "dist/${{ matrix.abi }}/libciris_edge_pyo3.so"
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: strip artifacts
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          # PyO3 .so (for Chaquopy wheels)
-          cp "target/${{ matrix.target }}/release/libciris_edge.so" \
-             "dist/${{ matrix.abi }}/libciris_edge_pyo3.so"
           if [ -x "$STRIP" ]; then
-            "$STRIP" "dist/${{ matrix.abi }}/libciris_edge.so"
-            "$STRIP" "dist/${{ matrix.abi }}/libciris_edge_pyo3.so"
+            for so in dist/${{ matrix.abi }}/*.so; do "$STRIP" "$so"; done
           fi
-          echo "=== ${{ matrix.abi }} ==="
+          echo "=== ${{ matrix.abi }} (${{ matrix.variant }}) ==="
           ls -la dist/${{ matrix.abi }}/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ciris-edge-android-${{ matrix.abi }}
+          name: ciris-edge-android-${{ matrix.abi }}-${{ matrix.variant }}
           path: dist/${{ matrix.abi }}/
       # CIRISEdge#229 — save edge-self-warm on main, per-ABI.
       - uses: CIRISAI/CIRISCache/save@v1
@@ -496,12 +526,14 @@ jobs:
           pattern: ciris-edge-android-*
           path: artifacts/
       - name: package raw android .so tarball
+        # Split-matrix artifact names (plain/pyo3 variants build in
+        # parallel jobs): the raw .so tarball takes the `-plain` half.
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p dist/android/arm64-v8a dist/android/x86_64 dist/android/armeabi-v7a
-          cp artifacts/ciris-edge-android-arm64-v8a/libciris_edge.so    dist/android/arm64-v8a/
-          cp artifacts/ciris-edge-android-x86_64/libciris_edge.so       dist/android/x86_64/
-          cp artifacts/ciris-edge-android-armeabi-v7a/libciris_edge.so  dist/android/armeabi-v7a/
+          cp artifacts/ciris-edge-android-arm64-v8a-plain/libciris_edge.so    dist/android/arm64-v8a/
+          cp artifacts/ciris-edge-android-x86_64-plain/libciris_edge.so       dist/android/x86_64/
+          cp artifacts/ciris-edge-android-armeabi-v7a-plain/libciris_edge.so  dist/android/armeabi-v7a/
           tar -czf "dist/ciris-edge-v${VERSION}-android.tar.gz" -C dist android
           echo "✓ ciris-edge-v${VERSION}-android.tar.gz"
       - name: package Chaquopy abi3 wheels
@@ -518,7 +550,7 @@ jobs:
 
             mkdir -p "${WORK}/ciris_edge" "${WORK}/ciris_edge-${VERSION}.dist-info"
 
-            cp "artifacts/ciris-edge-android-${ABI_DIR}/libciris_edge_pyo3.so" \
+            cp "artifacts/ciris-edge-android-${ABI_DIR}-pyo3/libciris_edge_pyo3.so" \
                "${WORK}/ciris_edge/ciris_edge.so"
             cp python/ciris_edge/__init__.py "${WORK}/ciris_edge/"
             # .pyi stubs are optional — copy only if present (edge has
@@ -1200,11 +1232,23 @@ jobs:
   benches:
     name: cargo bench --no-run (all features)
     runs-on: ubuntu-latest
+    # CIRISEdge#216 — sccache (see pyo3-wheel). This job is the poster
+    # child: it deliberately never SAVES a CIRISCache layer (#238 moved
+    # its save to the pyo3-wheel linux job after the 7.5 GB blob
+    # incident), but the layer it RESTORES is the wheel's release-profile
+    # target while this compiles the bench profile of the all-features
+    # union — near-zero coverage, so it cold-built ~11 min on EVERY run.
+    # sccache gives it a real cache without resurrecting the giant blob.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Set up sccache (compiler cache over GHA)
+        uses: mozilla-actions/sccache-action@v0.0.9
       - uses: ./.github/actions/ciriscache
         with:
           plat: linux-x86_64
@@ -1225,6 +1269,9 @@ jobs:
           timeout_minutes: 15
           max_attempts: 3
           command: cargo bench --no-run --features "transport-http transport-reticulum pyo3"
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   # ─── pyo3-wheel: maturin abi3-py310 wheels ──────────────────────────
   #
@@ -1316,6 +1363,15 @@ jobs:
           # instead of cold-recompiling.
           - { os: windows-latest,   label: windows-x86_64, tag: win_amd64, features: "pyo3-sqlite extension-module transport-http" }
     runs-on: ${{ matrix.os }}
+    # CIRISEdge#216 — sccache over the GHA cache backend (the CIRISServer
+    # bench.yml pattern). The CIRISCache/rust-cache layers are keyed on
+    # crate VERSIONS, so every pin bump (and every edge release — the edge
+    # version is part of the key) cold-misses them; sccache caches at the
+    # compilation-unit level, so unchanged dep sources still hit. Biggest
+    # payoff on the windows leg (14m+ maturin build, the CI critical path).
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
       # v7.3.0 (verify v8.0.0): tss-esapi removed from ciris-keyring;
@@ -1342,6 +1398,8 @@ jobs:
       # `x86_64-pc-windows-msvc` (Tier-1) so no `-Zbuild-std` is
       # needed.
       - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Set up sccache (compiler cache over GHA)
+        uses: mozilla-actions/sccache-action@v0.0.9
       # CIRISEdge#229 — canonical CIRISCache layered restore on the
       # wheel matrix. PLAT maps wheel's `label` token to the canonical
       # platform token persist + verify save under:
@@ -1486,6 +1544,10 @@ jobs:
             else
               maturin build --release --strip --features "${{ matrix.features }}"
             fi
+      - name: sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats
       - name: auditwheel repair --exclude libsqlite3.so.0 (Linux only)
         # v1.0.1 (CIRISEdge#50 re-reopen) — manual auditwheel with the
         # libsqlite3 exclude. Mirrors CIRISPersist v3.6.3's CIRISPersist#136
