@@ -203,6 +203,51 @@ fn route_supersession_log() -> &'static crate::log_throttle::LogThrottle {
         .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 4))
 }
 
+static REVERSE_PATH_FALLBACK_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+static NAT_TOPOLOGY_DIAGNOSIS_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#353 — a reverse-path (live inbound link) send failed and we fell
+/// back to an outbound dial. Keyed on the peer key_id (rooted peers only —
+/// bounded by the admit gate, capped map as backstop).
+fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
+    REVERSE_PATH_FALLBACK_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+}
+
+/// CIRISEdge#353 ask 2 — the NAT'd/initiator-only topology diagnosis. Before
+/// this, an outbound dial to an undialable phone was a bare 30 s `Timeout` per
+/// kind per round FOREVER (the field symptom: 3 WARNs every 30 s, no cause).
+/// One diagnosis per peer per window, then a suppressed-count.
+fn nat_topology_diagnosis_log() -> &'static crate::log_throttle::LogThrottle {
+    NAT_TOPOLOGY_DIAGNOSIS_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(300), 256))
+}
+
+/// CIRISEdge#353 ask 2 — emit the topology diagnosis (throttled). Fired when a
+/// dial HAD a path (the peer's announce taught us one) yet never established,
+/// and the reverse-path check found no live inbound link. The classic cause is
+/// a NAT'd / initiator-only peer (phone, emulator, CGNAT): its announce arrives
+/// over ITS outbound link, but nothing can dial it back. Name the hypothesis
+/// ONCE per window instead of an unexplained 30 s `Timeout` per kind per round
+/// forever.
+fn log_nat_topology_diagnosis(destination_key_id: &str, establish_timeout: Duration) {
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        nat_topology_diagnosis_log().check(destination_key_id)
+    {
+        tracing::warn!(
+            destination_key_id,
+            establish_timeout_secs = establish_timeout.as_secs(),
+            suppressed_prev,
+            "outbound dial had a path but never established, and the peer has NO \
+             live inbound link to ride — if this peer is NAT'd / initiator-only \
+             it is structurally unreachable outbound; delivery will succeed over \
+             the peer's NEXT inbound link (reverse path, CIRISEdge#353)"
+        );
+    }
+}
+
 // ─── Peer resolution ────────────────────────────────────────────────
 
 /// Out-of-band resolver from a federation `key_id` to a peer's
@@ -2779,6 +2824,111 @@ impl ReticulumTransport {
             signing_key: ed25519,
         })
     }
+
+    /// CIRISEdge#353 — the newest LIVE link already attributed to this peer
+    /// (the reverse path). Scans `link_to_peer_key_id` — populated by
+    /// `LinkIdentified` (the peer dialed + identified to us) — and keeps only
+    /// links leviculum still holds `Active` (`link_is_established` resolves
+    /// the #66 re-key alias, so a re-keyed inbound link still matches).
+    /// Newest-established wins when a peer holds several.
+    async fn live_attributed_link_to(&self, destination_key_id: &str) -> Option<LinkId> {
+        let candidates: Vec<LinkId> = self
+            .link_to_peer_key_id
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, peer)| peer.as_str() == destination_key_id)
+            .map(|(id, _)| *id)
+            .collect();
+        let established_at = self.link_established_at.lock().await;
+        candidates
+            .into_iter()
+            .filter(|id| self.node.link_is_established(id))
+            .max_by_key(|id| established_at.get(id).copied().unwrap_or(0))
+    }
+
+    /// CIRISEdge#353 — REVERSE PATH FIRST. If the peer holds a LIVE link to us
+    /// that it dialed + identified (a NAT'd / initiator-only peer's ONLY
+    /// connectivity), the reply rides THAT link — a fresh outbound dial to
+    /// such a peer is structurally impossible and burned 30 s per kind per
+    /// round forever in the field (Node A ↔ Android emulator, the first
+    /// mobile trace's last leg). Symmetric topologies also win: no dial
+    /// round-trip when a live link already exists. No `identify_link` here —
+    /// we are not this link's initiator (RNS permits only the initiator to
+    /// identify); the peer attributes our reply by the dest it dialed
+    /// (leviculum v0.9.2 `link_destination`, the other half of #353).
+    ///
+    /// Returns `true` iff the envelope was DELIVERED over the reverse path;
+    /// `false` means fall through to the outbound dial (no live inbound link,
+    /// or the ship failed — logged loud + throttled, since a reverse-path
+    /// failure for an initiator-only peer means the dial will likely fail too).
+    async fn send_via_reverse_path(&self, destination_key_id: &str, envelope_bytes: &[u8]) -> bool {
+        let Some(link_id) = self.live_attributed_link_to(destination_key_id).await else {
+            return false;
+        };
+        match self.ship_resource_on_link(&link_id, envelope_bytes).await {
+            Ok(()) => {
+                tracing::debug!(
+                    destination_key_id,
+                    link = ?link_id,
+                    "delivered over the peer's live inbound link (reverse path, CIRISEdge#353)"
+                );
+                true
+            }
+            Err(e) => {
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    reverse_path_fallback_log().check(destination_key_id)
+                {
+                    tracing::warn!(
+                        destination_key_id,
+                        link = ?link_id,
+                        error = %e,
+                        suppressed_prev,
+                        "reverse-path send over the peer's inbound link failed; \
+                         falling back to an outbound dial (CIRISEdge#353)"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Ship one envelope as a resource over an ALREADY-ESTABLISHED link and
+    /// wait for the sender-side `ResourceCompleted`. The shared tail of both
+    /// send paths (fresh outbound dial AND the #353 reverse path) — one body so
+    /// the two can never diverge (the #348 two-loops lesson).
+    async fn ship_resource_on_link(
+        &self,
+        link_id: &LinkId,
+        envelope_bytes: &[u8],
+    ) -> Result<(), TransportError> {
+        // Auto-accept any resources the peer pushes back on this link
+        // (e.g. an ACK envelope), and ship our envelope as a resource.
+        let _ = self
+            .node
+            .set_resource_strategy(link_id, ResourceStrategy::AcceptAll);
+        let resource_hash = self
+            .node
+            .send_resource(link_id, envelope_bytes, None, true)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum send_resource: {e}")))?;
+
+        // Wait for the sender-side `ResourceCompleted` — the driver
+        // paces + retransmits resource parts, and completion means
+        // every part was delivered + proven. If the transfer does not
+        // complete within the window, treat it as a timeout so edge's
+        // durable dispatcher retries.
+        let completed = wait_until_async(
+            RESOURCE_TRANSFER_TIMEOUT,
+            Duration::from_millis(100),
+            || async { self.sent_resources.lock().await.remove(&resource_hash) },
+        )
+        .await;
+        if !completed {
+            return Err(TransportError::Timeout(RESOURCE_TRANSFER_TIMEOUT));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2854,6 +3004,15 @@ impl Transport for ReticulumTransport {
         // semantically inert at that point).
         let dest_hash_bytes = peer.dest_hash.into_bytes();
         self.check_blackhole(&dest_hash_bytes).await?;
+
+        // CIRISEdge#353 — REVERSE PATH FIRST (see `send_via_reverse_path`).
+        // Ordered AFTER the blackhole check so an operator ban still wins.
+        if self
+            .send_via_reverse_path(destination_key_id, envelope_bytes)
+            .await
+        {
+            return Ok(TransportSendOutcome::Delivered);
+        }
 
         // CIRISEdge#336 — the no-path GUARD. Decide the establishment window
         // from whether the node holds a path to this exact dest BEFORE dialing.
@@ -2931,6 +3090,7 @@ impl Transport for ReticulumTransport {
                     paths,
                 });
             }
+            log_nat_topology_diagnosis(destination_key_id, establish_timeout);
             return Err(TransportError::Timeout(establish_timeout));
         }
 
@@ -2951,31 +3111,7 @@ impl Transport for ReticulumTransport {
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
 
-        // Auto-accept any resources the peer pushes back on this link
-        // (e.g. an ACK envelope), and ship our envelope as a resource.
-        let _ = self
-            .node
-            .set_resource_strategy(&link_id, ResourceStrategy::AcceptAll);
-        let resource_hash = self
-            .node
-            .send_resource(&link_id, envelope_bytes, None, true)
-            .await
-            .map_err(|e| TransportError::Io(format!("reticulum send_resource: {e}")))?;
-
-        // Wait for the sender-side `ResourceCompleted` — the driver
-        // paces + retransmits resource parts, and completion means
-        // every part was delivered + proven. If the transfer does not
-        // complete within the window, treat it as a timeout so edge's
-        // durable dispatcher retries.
-        let completed = wait_until_async(
-            RESOURCE_TRANSFER_TIMEOUT,
-            Duration::from_millis(100),
-            || async { self.sent_resources.lock().await.remove(&resource_hash) },
-        )
-        .await;
-        if !completed {
-            return Err(TransportError::Timeout(RESOURCE_TRANSFER_TIMEOUT));
-        }
+        self.ship_resource_on_link(&link_id, envelope_bytes).await?;
 
         Ok(TransportSendOutcome::Delivered)
     }
@@ -3384,7 +3520,39 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // from the per-link rooted-peer attribution table when
             // available. `None` falls back to v3.5.0 behavior (no
             // routing fires inside `Edge::install_replication_routing`).
-            let source_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+            let mut source_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+            // CIRISEdge#353 — INITIATOR-side attribution. The table above is
+            // fed by `LinkIdentified`, which only fires on links a PEER dialed
+            // to us; a reply arriving on a link WE dialed (the reverse path a
+            // NAT'd peer's responder now uses) has no entry and would drop as
+            // `SkippedNoSourceKeyId`. The stateless, #66-re-key-proof basis is
+            // the link's DESTINATION (leviculum v0.9.2 `link_destination`,
+            // alias-resolving): we dialed a dest resolved from the VERIFIED
+            // route table, and RNS link establishment proves the remote
+            // controls that dest's identity keys — so mapping dest → rooted
+            // peer attributes the frame on the same trust the outbound send
+            // used. A mid-link route supersession can miss here; that falls
+            // through to the existing LOUD SkippedNoSourceKeyId path, never a
+            // silent drop.
+            if source_key_id.is_none() {
+                if let Some(dest) = ctx.node.link_destination(&link_id) {
+                    source_key_id = ctx
+                        .peers
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|(_, rooted)| rooted.peer.dest_hash == dest)
+                        .map(|(key_id, _)| key_id.clone());
+                    if let Some(key_id) = &source_key_id {
+                        tracing::debug!(
+                            link = ?link_id,
+                            peer = %key_id,
+                            "inbound frame on a link WE dialed attributed via its \
+                             destination (initiator-side reverse path, CIRISEdge#353)"
+                        );
+                    }
+                }
+            }
             let frame = InboundFrame {
                 envelope_bytes: data,
                 transport: TransportId::RETICULUM_RS,
