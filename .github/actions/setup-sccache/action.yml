@@ -1,0 +1,58 @@
+# setup-sccache — sccache with a SHARED REMOTE backend when one is configured,
+# per-repo GitHub-Actions cache otherwise.
+#
+# CIRISEdge#216 / CIRISServer#285. The GHA sccache backend is repo-scoped AND
+# only visible to a job after the producing job finishes — so within one run,
+# the parallel jobs×platforms each cold-build the same edge crate (the N×
+# multiplier #285 measured). A shared remote (S3-compatible or WebDAV) is
+# written incrementally and readable cross-repo + cross-job, which collapses the
+# multiplier to 1× the first time any job compiles a given unit.
+#
+# No such backend is provisioned yet, so this action FALLS BACK to the GHA
+# backend (today's behavior, byte-for-byte) whenever the remote secret is
+# absent/empty. Activation is one org secret away — see PROVISIONING below.
+# Gating is on the caller-passed input (a composite action cannot read secrets
+# itself), so an unset secret arrives as "" and takes the GHA branch.
+#
+# PROVISIONING (lights up cross-repo dedup, no code change):
+#   Recommended: Cloudflare R2 (S3-compatible, zero egress) or any WebDAV store.
+#   Add org/repo secrets and this action switches automatically:
+#     WebDAV : SCCACHE_WEBDAV_ENDPOINT (+ SCCACHE_WEBDAV_TOKEN or _KEY_PREFIX)
+#     S3     : wire the aws-* env in a sibling input (follow-up; WebDAV is the
+#              lowest-friction first backend).
+#   Point every centipede repo (persist/verify/edge/server) at the SAME store so
+#   a unit compiled in any one is reused by all — the cross-repo half of #216.
+name: setup-sccache
+description: sccache with a shared remote backend when configured (CIRISEdge#216), GHA fallback otherwise.
+
+inputs:
+  webdav-endpoint:
+    description: "Shared WebDAV sccache endpoint (pass ${{ secrets.SCCACHE_WEBDAV_ENDPOINT }}). Empty ⇒ GHA fallback."
+    required: false
+    default: ""
+  webdav-token:
+    description: "Bearer token for the WebDAV store (pass ${{ secrets.SCCACHE_WEBDAV_TOKEN }})."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: select sccache backend
+      shell: bash
+      env:
+        WEBDAV_ENDPOINT: ${{ inputs.webdav-endpoint }}
+        WEBDAV_TOKEN: ${{ inputs.webdav-token }}
+      run: |
+        if [ -n "${WEBDAV_ENDPOINT}" ]; then
+          echo "::notice::sccache → SHARED REMOTE (webdav) — cross-repo + within-run dedup (CIRISEdge#216)"
+          {
+            echo "SCCACHE_WEBDAV_ENDPOINT=${WEBDAV_ENDPOINT}"
+            echo "SCCACHE_WEBDAV_TOKEN=${WEBDAV_TOKEN}"
+            echo "SCCACHE_GHA_ENABLED=false"
+          } >> "$GITHUB_ENV"
+        else
+          echo "::notice::sccache → per-repo GHA cache (no shared-remote secret; CIRISEdge#216 mitigation pending backend)"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+        fi
+    - uses: mozilla-actions/sccache-action@v0.0.9
