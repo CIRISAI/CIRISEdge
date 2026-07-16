@@ -92,7 +92,6 @@
 //!   drive the rotation.
 
 use ciris_crypto::aes_gcm;
-use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::reachability::ReachabilityTracker;
@@ -422,31 +421,27 @@ pub enum RealtimeAvError {
 /// where `label = b"CIRIS-AV-INNER-V1"`. The label binds the nonce
 /// to this module's purpose so a future inner-nonce derivation for a
 /// different surface cannot collide.
+///
+/// §19 re-export debt (CIRISEdge#359 F-4): the SHA-256 construction is
+/// the §10.5.8 A/V nonce shape owned by
+/// [`ciris_verify_core::holonomic::av_chunk::inner_nonce`] (KAT-locked
+/// there). This edge-newtyped wrapper delegates to it byte-for-byte —
+/// `StreamId`/`Epoch`/`ChunkSeq` are edge-only newtypes so a plain
+/// re-export is not type-compatible.
 pub fn derive_inner_nonce(stream_id: StreamId, epoch: Epoch, chunk_seq: ChunkSeq) -> [u8; 12] {
-    let mut h = Sha256::new();
-    h.update(b"CIRIS-AV-INNER-V1");
-    h.update(stream_id.0);
-    h.update(epoch.0.to_be_bytes());
-    h.update(chunk_seq.0.to_be_bytes());
-    let full = h.finalize();
-    let mut out = [0u8; 12];
-    out.copy_from_slice(&full[..12]);
-    out
+    ciris_verify_core::holonomic::av_chunk::inner_nonce(&stream_id.0, epoch.0, chunk_seq.0)
 }
 
 /// Derive the outer-AEAD nonce per Link from `(link_id, link_seq)`.
 /// The `link_seq` is monotonic per RNS Link and prevents replay across
 /// the transit hop. Construction follows the same shape as
 /// [`derive_inner_nonce`] with a distinct label.
+///
+/// §19 re-export debt (CIRISEdge#359 F-4): delegates to the shared
+/// §10.5.8 nonce owner
+/// [`ciris_verify_core::holonomic::av_chunk::outer_nonce`] byte-for-byte.
 pub fn derive_outer_nonce(link_id: &[u8], link_seq: u64) -> [u8; 12] {
-    let mut h = Sha256::new();
-    h.update(b"CIRIS-AV-OUTER-V1");
-    h.update(link_id);
-    h.update(link_seq.to_be_bytes());
-    let full = h.finalize();
-    let mut out = [0u8; 12];
-    out.copy_from_slice(&full[..12]);
-    out
+    ciris_verify_core::holonomic::av_chunk::outer_nonce(link_id, link_seq)
 }
 
 /// The inner-sealed half of a chunk — E2E ciphertext shared across the

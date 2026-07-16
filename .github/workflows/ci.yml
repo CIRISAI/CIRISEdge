@@ -1144,7 +1144,7 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 60
           shell: bash
-          command: cargo test --features "transport-reticulum test-anchor" --test test_anchor_e2e
+          command: cargo test --features "transport-reticulum test-anchor" --test test_anchor_e2e --test accord_carrier_verify
 
   # ─── uniffi-drift: regenerate bindings, assert no diff ──────────────
   #
@@ -1254,9 +1254,12 @@ jobs:
           plat: linux-x86_64
       - uses: Swatinem/rust-cache@v2
       - name: cargo bench --no-run (all features)
-        # All three feature-gates so EVERY bench file compiles in
-        # this gate — the feature-gated benches (transport-reticulum,
-        # transport-http, pyo3) cannot bit-rot silently.
+        # All feature-gates so EVERY bench file compiles in this gate —
+        # the feature-gated benches (transport-reticulum, transport-http,
+        # pyo3) cannot bit-rot silently. `test-anchor` is included so the
+        # real body of `accord_threshold_verify` (CIRISEdge#359 — seated
+        # roster injection is compile-fenced behind it) is compile-checked
+        # here, not just its inert no-feature `main`.
         #
         # Cross-process retry — same rationale as the iOS/Android
         # cross-compile lanes. PR #76 observed the `heck` index flake
@@ -1268,7 +1271,7 @@ jobs:
         with:
           timeout_minutes: 15
           max_attempts: 3
-          command: cargo bench --no-run --features "transport-http transport-reticulum pyo3"
+          command: cargo bench --no-run --features "transport-http transport-reticulum pyo3 test-anchor"
       - name: sccache stats
         if: always()
         run: sccache --show-stats

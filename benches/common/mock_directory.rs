@@ -29,7 +29,7 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use chrono::Utc;
-use ciris_crypto::{ClassicalSigner, Ed25519Signer};
+use ciris_crypto::{ClassicalSigner, Ed25519Signer, HybridSigner, MlDsa65Signer, PqcSigner};
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend;
@@ -69,6 +69,30 @@ impl BenchFedKey {
     /// Sign canonical bytes with this identity's seed.
     pub fn sign(&self, canonical: &[u8]) -> Vec<u8> {
         self.signer().sign(canonical).expect("sign")
+    }
+
+    /// The ML-DSA-65 signer over this identity's seed (CIRISEdge#359 — accord
+    /// signatures are hybrid). Same seed as the ed25519 key.
+    pub fn ml_dsa_signer(&self) -> MlDsa65Signer {
+        MlDsa65Signer::from_seed(&self.seed).expect("ml-dsa from seed")
+    }
+
+    /// Base64-standard ML-DSA-65 public key.
+    #[must_use]
+    pub fn ml_dsa_pubkey_b64(&self) -> String {
+        B64.encode(PqcSigner::public_key(&self.ml_dsa_signer()).expect("ml-dsa pubkey"))
+    }
+
+    /// Hybrid-sign canonical bytes → `(ed25519_b64, ml_dsa_65_b64)`, bound
+    /// exactly as `verify_hybrid` re-checks it (ml-dsa over `canonical ‖
+    /// ed_sig`). This is the accord-carrier signature shape post-#359.
+    pub fn hybrid_sign(&self, canonical: &[u8]) -> (String, String) {
+        let hy = HybridSigner::new(self.signer(), self.ml_dsa_signer()).expect("hybrid signer");
+        let sig = hy.sign(canonical).expect("hybrid sign");
+        (
+            B64.encode(sig.classical.signature),
+            B64.encode(sig.pqc.signature),
+        )
     }
 
     /// Write the 32-byte raw seed file edge's keyring loader reads.
@@ -123,10 +147,20 @@ pub fn signed_record(
         None
     };
 
+    // CIRISEdge#359 — accord_holder rows carry the ML-DSA-65 pubkey so the
+    // hybrid accord-carrier verify (`verify_hybrid_via_directory`,
+    // RequireHybrid) can gate both signatures. Other identity_types stay
+    // ed25519-only (unchanged).
+    let pubkey_ml_dsa_65_base64 = if identity_type == "accord_holder" {
+        Some(subject.ml_dsa_pubkey_b64())
+    } else {
+        None
+    };
+
     KeyRecord {
         key_id: subject.key_id.clone(),
         pubkey_ed25519_base64: subject.pubkey_b64(),
-        pubkey_ml_dsa_65_base64: None,
+        pubkey_ml_dsa_65_base64,
         algorithm: "hybrid".to_string(),
         identity_type: identity_type.to_string(),
         identity_ref: subject.key_id.clone(),

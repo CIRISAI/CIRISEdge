@@ -153,7 +153,7 @@ async fn test_anchor_peer_roots_through_edge_root_binding() {
                 chain.chain.len(),
             );
         }
-        other => panic!(
+        other @ RootingVerdict::Rejected { .. } => panic!(
             "test-anchor peer MUST root through edge's root_binding — the whole admit→root \
              test model rides on it (CIRISEdge#345 / CIRISPersist#451); got {other:?}",
         ),

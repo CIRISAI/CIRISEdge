@@ -13,14 +13,37 @@
 //! - **Hash**: SHA-256 (already in deps via `sha2`). No BLAKE3.
 //! - **Wordlist**: BIP39 English (2048 words = 11 bits each;
 //!   5 words ≈ 55 bits, matching CIRISEdge#47's stated entropy bar).
-//! - **Order independence**: concatenate `local_pub || peer_pub` then
-//!   `sort` before hashing so `peer_sas(A, B) == peer_sas(B, A)` —
-//!   neither operator has to know who is "local".
-//! - **Protocol constant**: [`CIRIS_SAS_PROTOCOL_CONSTANT`] — a
-//!   versioned ASCII tag. Locks the wire-spec; bump `v1 → v2` to
-//!   roll if the algorithm ever changes (algorithm + constant is the
-//!   wire shape; both must stay stable across edge versions to
-//!   preserve the verbal-comparison contract).
+//! - **Order independence**: the derivation is symmetric so
+//!   `peer_sas(A, B) == peer_sas(B, A)` — neither operator has to know
+//!   who is "local". Two constructions exist (see [`SasVersion`]):
+//!     - **v1** ([`SasVersion::V1`]) sorts the 64 individual bytes of
+//!       `local_pub || peer_pub`. This commits to the byte-*multiset*,
+//!       not the ordered key pair — a subtle weakness (CIRISEdge#359
+//!       finding 5): two different key pairs sharing the same 64-byte
+//!       multiset collide. Practically unexploitable (pubkey bytes are
+//!       not attacker-choosable) but not the construction we'd pick
+//!       fresh. Retained as the wire default for interop.
+//!     - **v2** ([`SasVersion::V2`]) orders the two keys as 32-byte
+//!       UNITS — `min(A, B) || max(A, B)` — committing to the
+//!       unordered key *pair*. Preferred construction.
+//! - **Protocol constant**: [`CIRIS_SAS_PROTOCOL_CONSTANT`] (v1) /
+//!   [`CIRIS_SAS_PROTOCOL_CONSTANT_V2`] (v2) — a versioned ASCII tag.
+//!   Locks the wire-spec; the version tag rolls with the algorithm
+//!   (algorithm + constant is the wire shape; both must stay stable
+//!   across edge versions to preserve the verbal-comparison contract).
+//!
+//! # SAS versions and coordinated rollout
+//!
+//! The SAS is compared out-of-band **by humans** and the version is
+//! NOT negotiated on the wire — each side computes independently, so
+//! **both operators must be on the same [`SasVersion`] for their
+//! strings to match**. Flipping the fleet from v1 to v2 is therefore a
+//! coordinated event (both peers simultaneously), NOT a silent
+//! per-node upgrade. v1 stays the operative default of the
+//! zero-version convenience functions ([`peer_sas_digest`],
+//! [`peer_sas_words`], [`peer_sas_digits`]); callers opt into v2
+//! explicitly via the `_versioned` entry points until the fleet-floor
+//! flip is dated.
 //!
 //! # Determinism
 //!
@@ -42,6 +65,31 @@ use sha2::{Digest, Sha256};
 /// Locked at v0.17.0; DO NOT change without bumping the version tag.
 pub const CIRIS_SAS_PROTOCOL_CONSTANT: &[u8] = b"ciris-edge::peer-sas::v1\0";
 
+/// v2 protocol-version-tagged constant (CIRISEdge#359 finding 5). Paired
+/// with the v2 key-ordering rule (32-byte units, `min || max`). Distinct
+/// from the v1 tag so a v1 digest and a v2 digest never collide even on
+/// the same key pair.
+///
+/// DO NOT change without bumping to `::v3`.
+pub const CIRIS_SAS_PROTOCOL_CONSTANT_V2: &[u8] = b"ciris-edge::peer-sas::v2\0";
+
+/// Which SAS construction to use. The version is baked into the
+/// key-ordering rule and the protocol constant; it is **not** negotiated
+/// on the wire — each side computes independently, so both operators must
+/// select the same version for their strings to match (see module docs on
+/// coordinated rollout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SasVersion {
+    /// v1 (v0.17.0): sorts the 64 individual bytes of `local || peer`
+    /// before hashing. Commits to the byte-multiset, not the ordered key
+    /// pair. Operative wire default for interop with un-upgraded peers.
+    V1,
+    /// v2 (CIRISEdge#359 finding 5): orders the two keys as 32-byte UNITS
+    /// — `min(A, B) || max(A, B)` — committing to the unordered key pair.
+    /// Preferred construction; adopt fleet-wide via a coordinated flip.
+    V2,
+}
+
 /// Default word count for [`peer_sas`]. Five BIP39 words × 11 bits each
 /// = 55 bits of entropy, the bar called out in CIRISEdge#47.
 pub const DEFAULT_SAS_WORDS: usize = 5;
@@ -51,26 +99,70 @@ pub const DEFAULT_SAS_WORDS: usize = 5;
 /// authentication code (TOTP / SAS over Signal).
 pub const DEFAULT_SAS_DIGITS: usize = 6;
 
-/// Compute the 32-byte SAS digest for a `(local_pub, peer_pub)` pair.
+/// Compute the 32-byte SAS digest for a `(local_pub, peer_pub)` pair
+/// using the **v1** construction (the operative wire default).
 ///
-/// Pure function — order-independent, deterministic.
-///
-/// 1. Concatenate the two pubkeys.
-/// 2. Sort the concatenation (so swapping the two inputs yields the
-///    same digest — neither operator has to know who is "local").
-/// 3. Append [`CIRIS_SAS_PROTOCOL_CONSTANT`].
-/// 4. SHA-256 the whole thing.
+/// Pure function — order-independent, deterministic. Delegates to
+/// [`peer_sas_digest_versioned`] with [`SasVersion::V1`]; see that
+/// function for the v1/v2 recipes.
 #[must_use]
 pub fn peer_sas_digest(local_pub: &[u8; 32], peer_pub: &[u8; 32]) -> [u8; 32] {
-    let mut buf: Vec<u8> = Vec::with_capacity(64 + CIRIS_SAS_PROTOCOL_CONSTANT.len());
-    buf.extend_from_slice(local_pub);
-    buf.extend_from_slice(peer_pub);
-    buf.sort_unstable();
-    buf.extend_from_slice(CIRIS_SAS_PROTOCOL_CONSTANT);
-    let digest = Sha256::digest(&buf);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+    peer_sas_digest_versioned(local_pub, peer_pub, SasVersion::V1)
+}
+
+/// Compute the 32-byte SAS digest for a `(local_pub, peer_pub)` pair at
+/// the requested [`SasVersion`].
+///
+/// Pure function — symmetric (`digest(A, B) == digest(B, A)`) and
+/// deterministic in both versions.
+///
+/// **v1** ([`SasVersion::V1`]):
+/// 1. Concatenate the two pubkeys.
+/// 2. Sort the 64-byte concatenation (byte-wise) so swapping the inputs
+///    yields the same digest. NB: this commits to the byte-multiset, not
+///    the ordered key pair — the weakness fixed by v2.
+/// 3. Append [`CIRIS_SAS_PROTOCOL_CONSTANT`].
+/// 4. SHA-256 the whole thing.
+///
+/// **v2** ([`SasVersion::V2`]):
+/// 1. Order the two 32-byte keys as UNITS — `min(A, B) || max(A, B)`
+///    (lexicographic compare of the full 32-byte keys). Symmetric by
+///    construction, and commits to the unordered key *pair*.
+/// 2. Append [`CIRIS_SAS_PROTOCOL_CONSTANT_V2`].
+/// 3. SHA-256 the whole thing.
+///
+/// See the module docs: v1 and v2 are NOT interchangeable across peers —
+/// both operators must select the same version.
+#[must_use]
+pub fn peer_sas_digest_versioned(
+    local_pub: &[u8; 32],
+    peer_pub: &[u8; 32],
+    version: SasVersion,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    match version {
+        SasVersion::V1 => {
+            // v1: sort the 64 individual bytes of local || peer.
+            let mut buf: Vec<u8> = Vec::with_capacity(64);
+            buf.extend_from_slice(local_pub);
+            buf.extend_from_slice(peer_pub);
+            buf.sort_unstable();
+            hasher.update(&buf);
+            hasher.update(CIRIS_SAS_PROTOCOL_CONSTANT);
+        }
+        SasVersion::V2 => {
+            // v2: order the two keys as 32-byte units — min || max.
+            let (lo, hi) = if local_pub <= peer_pub {
+                (local_pub, peer_pub)
+            } else {
+                (peer_pub, local_pub)
+            };
+            hasher.update(lo);
+            hasher.update(hi);
+            hasher.update(CIRIS_SAS_PROTOCOL_CONSTANT_V2);
+        }
+    }
+    hasher.finalize().into()
 }
 
 /// Render the SAS digest as `words` BIP39-English words. The default
@@ -90,10 +182,26 @@ pub fn peer_sas_words(
     peer_pub: &[u8; 32],
     words: usize,
 ) -> Result<Vec<String>, SasError> {
+    peer_sas_words_versioned(local_pub, peer_pub, words, SasVersion::V1)
+}
+
+/// [`peer_sas_words`] at an explicit [`SasVersion`]. See the module docs
+/// on coordinated rollout before selecting [`SasVersion::V2`].
+///
+/// # Errors
+///
+/// Returns `Err(SasError::WordsOutOfRange)` if `words == 0` or
+/// `words > 23`.
+pub fn peer_sas_words_versioned(
+    local_pub: &[u8; 32],
+    peer_pub: &[u8; 32],
+    words: usize,
+    version: SasVersion,
+) -> Result<Vec<String>, SasError> {
     if words == 0 || words > 23 {
         return Err(SasError::WordsOutOfRange(words));
     }
-    let digest = peer_sas_digest(local_pub, peer_pub);
+    let digest = peer_sas_digest_versioned(local_pub, peer_pub, version);
     // CIRISEdge#264 — vendored BIP-39 English wordlist (see `sas_wordlist`);
     // dropped the `bip39` crate + its bitcoin-adjacent transitives.
     let wordlist = &crate::sas_wordlist::ENGLISH;
@@ -135,10 +243,26 @@ pub fn peer_sas_digits(
     peer_pub: &[u8; 32],
     digits: usize,
 ) -> Result<String, SasError> {
+    peer_sas_digits_versioned(local_pub, peer_pub, digits, SasVersion::V1)
+}
+
+/// [`peer_sas_digits`] at an explicit [`SasVersion`]. See the module docs
+/// on coordinated rollout before selecting [`SasVersion::V2`].
+///
+/// # Errors
+///
+/// Returns `Err(SasError::DigitsOutOfRange)` if `digits == 0` or
+/// `digits > 19`.
+pub fn peer_sas_digits_versioned(
+    local_pub: &[u8; 32],
+    peer_pub: &[u8; 32],
+    digits: usize,
+    version: SasVersion,
+) -> Result<String, SasError> {
     if digits == 0 || digits > 19 {
         return Err(SasError::DigitsOutOfRange(digits));
     }
-    let digest = peer_sas_digest(local_pub, peer_pub);
+    let digest = peer_sas_digest_versioned(local_pub, peer_pub, version);
     // First 8 bytes → u64; mod 10^digits → decimal string.
     let mut raw = [0u8; 8];
     raw.copy_from_slice(&digest[..8]);
@@ -320,6 +444,105 @@ mod tests {
         let expected: [u8; 32] = Sha256::digest(&buf).into();
         let actual = peer_sas_digest(&a, &b);
         assert_eq!(actual, expected);
+    }
+
+    /// v2 protocol constant lock — regression guard for the v2 tag.
+    #[test]
+    fn peer_sas_protocol_constant_v2_locked() {
+        assert_eq!(
+            CIRIS_SAS_PROTOCOL_CONSTANT_V2, b"ciris-edge::peer-sas::v2\0",
+            "DO NOT change CIRIS_SAS_PROTOCOL_CONSTANT_V2 — bump v2->v3 instead",
+        );
+        assert_eq!(CIRIS_SAS_PROTOCOL_CONSTANT_V2.len(), 25);
+    }
+
+    /// v2 symmetry — the load-bearing property: swapping local↔peer
+    /// yields the same digest at v2 (the whole point of the unit
+    /// ordering). Holds at the digest, words, and digits layers.
+    #[test]
+    fn peer_sas_v2_symmetric() {
+        let a = pub_a();
+        let b = pub_b();
+        assert_eq!(
+            peer_sas_digest_versioned(&a, &b, SasVersion::V2),
+            peer_sas_digest_versioned(&b, &a, SasVersion::V2),
+            "v2 digest MUST be symmetric (min||max ordering)"
+        );
+        assert_eq!(
+            peer_sas_words_versioned(&a, &b, 5, SasVersion::V2).expect("fwd"),
+            peer_sas_words_versioned(&b, &a, 5, SasVersion::V2).expect("rev"),
+            "v2 words MUST be symmetric"
+        );
+        assert_eq!(
+            peer_sas_digits_versioned(&a, &b, 6, SasVersion::V2).expect("fwd"),
+            peer_sas_digits_versioned(&b, &a, 6, SasVersion::V2).expect("rev"),
+            "v2 digits MUST be symmetric"
+        );
+    }
+
+    /// The v1→v2 bump actually changes the bytes — a v1 digest and a v2
+    /// digest of the same pair must differ (distinct ordering rule AND
+    /// distinct protocol constant).
+    #[test]
+    fn peer_sas_v1_and_v2_differ() {
+        let a = pub_a();
+        let b = pub_b();
+        assert_ne!(
+            peer_sas_digest_versioned(&a, &b, SasVersion::V1),
+            peer_sas_digest_versioned(&a, &b, SasVersion::V2),
+            "v1 and v2 constructions MUST produce different digests"
+        );
+        // And the zero-version convenience default is still v1.
+        assert_eq!(
+            peer_sas_digest(&a, &b),
+            peer_sas_digest_versioned(&a, &b, SasVersion::V1),
+            "peer_sas_digest default MUST remain v1 (operative wire default)"
+        );
+    }
+
+    /// v2 unit-ordering canonical recipe — pins `min||max ||
+    /// v2-constant`, so a refactor that reverts to byte-sort or the v1
+    /// constant trips immediately.
+    #[test]
+    fn peer_sas_v2_matches_canonical_recipe() {
+        let a = pub_a();
+        let b = pub_b();
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&lo);
+        buf.extend_from_slice(&hi);
+        buf.extend_from_slice(CIRIS_SAS_PROTOCOL_CONSTANT_V2);
+        let expected: [u8; 32] = Sha256::digest(&buf).into();
+        assert_eq!(peer_sas_digest_versioned(&a, &b, SasVersion::V2), expected);
+    }
+
+    /// The concrete weakness v2 fixes: two DIFFERENT key pairs that share
+    /// the same 64-byte multiset collide under v1's byte-sort but are
+    /// distinguished by v2's unit ordering.
+    #[test]
+    fn peer_sas_v2_distinguishes_byte_multiset_collision() {
+        // Pair 1: all-zero local, all-0xff peer.
+        let a1 = [0x00u8; 32];
+        let b1 = [0xffu8; 32];
+        // Pair 2: same 64-byte multiset (32 zeros + 32 0xff) but a
+        // different pair — one byte migrated across the key boundary.
+        let mut a2 = [0x00u8; 32];
+        a2[31] = 0xff;
+        let mut b2 = [0xffu8; 32];
+        b2[31] = 0x00;
+
+        // v1 collides — byte-sort erases the pair distinction.
+        assert_eq!(
+            peer_sas_digest_versioned(&a1, &b1, SasVersion::V1),
+            peer_sas_digest_versioned(&a2, &b2, SasVersion::V1),
+            "v1 byte-sort collides on equal byte-multisets (the weakness)"
+        );
+        // v2 distinguishes them — unit ordering commits to the pair.
+        assert_ne!(
+            peer_sas_digest_versioned(&a1, &b1, SasVersion::V2),
+            peer_sas_digest_versioned(&a2, &b2, SasVersion::V2),
+            "v2 unit ordering MUST distinguish distinct key pairs"
+        );
     }
 
     /// Out-of-range word counts surface a typed error.

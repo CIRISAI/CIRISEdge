@@ -34,7 +34,8 @@ use crate::outbound::{
 use crate::reachability::{record_if_tracking, AttemptOutcome, ReachabilityTracker};
 use crate::transport::{InboundFrame, Transport, TransportError, TransportSendOutcome};
 use crate::verify::{
-    AccordHolderKey, HybridPolicy, VerifiedEnvelope, VerifyDirectory, VerifyError, VerifyPipeline,
+    AccordHolderKey, HybridPolicy, VerifiedEnvelope, VerifyDirectory, VerifyError, VerifyOutcome,
+    VerifyPipeline,
 };
 
 // ─── Public configuration ───────────────────────────────────────────
@@ -3315,6 +3316,23 @@ impl Edge {
         self.verify.directory()
     }
 
+    /// CIRISEdge#359 bench seam — run the `AccordCarrier` wire-layer multi-sig
+    /// gate ([`verify_accord_carrier`]) DIRECTLY on a pre-built announcement,
+    /// bypassing envelope dispatch + the replay window. The dispatch path runs
+    /// the verify pipeline (incl. the replay gate) BEFORE the accord gate, so a
+    /// benchmark that replays a pooled envelope measures replay-reject, not the
+    /// (now post-quantum, ML-DSA-65-dominated) multi-sig cost. This seam lets
+    /// the `accord_threshold_verify` bench measure the real per-signature hybrid
+    /// verify. Compile-fenced behind `test-anchor` so it never exists in a
+    /// production build.
+    #[cfg(feature = "test-anchor")]
+    pub async fn verify_accord_carrier_for_bench(
+        &self,
+        ann: &crate::messages::FederationAnnouncement,
+    ) -> Result<(), crate::messages::RefusalReason> {
+        verify_accord_carrier(ann, &self.verify_directory()).await
+    }
+
     /// CIRISEdge#26 mutation surface (v0.15.1) — concrete-typed
     /// `Arc<dyn FederationDirectory>` if the host wired one via
     /// [`EdgeBuilder::federation_directory`] (or one of the
@@ -6450,31 +6468,64 @@ async fn verify_accord_carrier(
         .canonical_bytes_for_accord_signatures()
         .map_err(|_e| RefusalReason::InvalidAccordSignature)?;
 
-    // Build a key_id → pubkey map for O(1) per-sig lookup. The holder
-    // set is small (3 by FSD spec), so a Vec scan is fine; map is
-    // future-proofing if 3-of-5 ships.
+    // Build a key_id → ed25519-pubkey map for O(1) per-sig lookup. The holder
+    // set is small (3 by FSD spec), so a Vec scan is fine.
     let by_id: std::collections::HashMap<&str, &[u8; 32]> = holders
         .iter()
         .map(|h| (h.key_id.as_str(), &h.pubkey_ed25519))
         .collect();
 
-    let mut verified_holders = std::collections::HashSet::<String>::new();
+    // CIRISEdge#359 finding 3 — the SEATED roster (one seat per human), pinned
+    // by verify. `list_accord_holders` returns EVERY `accord_holder` row incl. a
+    // human's spare (A2) as a distinct key_id, so counting distinct key_ids let
+    // one human's primary+spare meet a 2-of-N alone. Count against the pinned
+    // SEAT pubkeys instead, deduped by seat — a spare's key is not a seat, so it
+    // contributes nothing, and one seat is counted once regardless of how many
+    // of its keys sign.
+    let seated: std::collections::HashSet<[u8; 32]> =
+        ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor()
+            .into_iter()
+            .collect();
+
+    let mut verified_seats = std::collections::HashSet::<[u8; 32]>::new();
     let mut any_attempted = false;
     for sig in &ann.accord_signatures {
         any_attempted = true;
-        // The presented key_id MUST appear in the accord-holder set;
-        // a sig from a non-accord-holder counts as zero verifications
-        // toward the threshold. We don't even attempt verification
-        // against a non-accord-holder pubkey.
+        // The presented key_id MUST be a known accord holder …
         let Some(pubkey_bytes) = by_id.get(sig.key_id.as_str()) else {
             continue;
         };
-        if verify_ed25519_signature(pubkey_bytes, &canonical, &sig.signature_ed25519_base64) {
-            verified_holders.insert(sig.key_id.clone());
+        // … AND its key must occupy a pinned SEAT (finding 3 — excludes spares).
+        if !seated.contains(*pubkey_bytes) {
+            continue;
+        }
+        // CIRISEdge#359 finding 2 — verify the HYBRID (Ed25519 + ML-DSA-65)
+        // signature under the require-hybrid policy (`HybridPolicy::Strict`
+        // rejects a classical-only row: ml_dsa `None` ⇒ `HybridPendingRejected`).
+        // The accord carrier is constitutional kill-switch-class traffic; a
+        // classical-only signature must NOT count toward the quorum. The
+        // directory holds both pubkeys, so `verify_hybrid_via_directory` gates
+        // both signatures for us.
+        let outcome = directory
+            .verify_hybrid_via_directory(
+                &canonical,
+                &sig.key_id,
+                &sig.signature_ed25519_base64,
+                sig.signature_ml_dsa_65_base64.as_deref(),
+                HybridPolicy::Strict,
+                None,
+            )
+            .await;
+        // Under RequireHybrid, `HybridVerified` is the ONLY success — the
+        // Ed25519-only outcomes (`Ed25519VerifiedHybridPending` /
+        // `…Fallback`) are unreachable under this policy, so this match is the
+        // exact "both signatures verified" gate finding 2 requires.
+        if matches!(outcome, Ok(VerifyOutcome::HybridVerified)) {
+            verified_seats.insert(**pubkey_bytes);
         }
     }
 
-    let found = u32::try_from(verified_holders.len()).unwrap_or(u32::MAX);
+    let found = u32::try_from(verified_seats.len()).unwrap_or(u32::MAX);
     if found >= required {
         return Ok(());
     }
@@ -6693,29 +6744,6 @@ pub(crate) fn delegation_scope_for_message_type(mt: &MessageType) -> Option<&'st
         //   ContentMiss / ContentBody   → un-gated (content-routing)
         _ => None,
     }
-}
-
-/// Verify one Ed25519 signature against a 32-byte pubkey and the
-/// canonical bytes. Returns `false` on base64-decode failure, wrong
-/// signature length, or signature-verification failure (any error is
-/// "this signature does not pass"; the gate's job is to count
-/// confirming verifications, not surface error taxonomy).
-fn verify_ed25519_signature(pubkey: &[u8; 32], canonical: &[u8], sig_b64: &str) -> bool {
-    use ciris_crypto::ClassicalVerifier as _;
-
-    let Ok(sig_bytes) = base64::engine::general_purpose::STANDARD.decode(sig_b64.as_bytes()) else {
-        return false;
-    };
-    if sig_bytes.len() != 64 {
-        return false;
-    }
-    // Use ciris-crypto's verifier — the same primitive persist's
-    // verify_hybrid_via_directory composes (single-source-of-truth
-    // for Ed25519 verify across the federation).
-    matches!(
-        ciris_crypto::Ed25519Verifier::new().verify(pubkey, canonical, &sig_bytes),
-        Ok(true)
-    )
 }
 
 /// CIRISEdge#19 — build, sign, and enqueue a [`crate::DeliveryRefusalAttestation`]
