@@ -405,3 +405,111 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
          SkippedNoSourceKeyId drop and the round dies delivered-but-dead",
     );
 }
+
+/// CIRISEdge#353 (residual, field-found on Node A v13.1.1) — a BUSY reverse-path
+/// link RETRIES until the in-flight transfer drains, instead of falling straight
+/// back into the NAT hole via an outbound dial. Reticulum permits one resource
+/// transfer per link; the reply routinely collides with the peer's own inbound
+/// payload. The first #353 cut fell back to the dial on that collision — for a
+/// NAT'd initiator-only peer that is unreachable, so the reply died and the link
+/// closed `Timeout`.
+///
+/// Deterministic via the `force_next_sends_busy_for_test` seam (loopback drains
+/// too fast to race a real collision): A's first two ships to B return
+/// `ShipError::Busy`; the reply MUST still deliver over B's live inbound link on
+/// a later retry, NOT dial B's phantom (undialable) dest.
+#[tokio::test]
+async fn busy_reverse_path_retries_instead_of_falling_into_the_nat_hole() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let steward = TestFedKey::new("steward-353b", 0x01);
+    let key_a = TestFedKey::new("edge-key-aaaa", 0x0a);
+    let key_b = TestFedKey::new("edge-key-bbbb", 0x0b);
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&key_a, &steward, "agent"),
+        signed_record(&key_b, &steward, "agent"),
+    ])
+    .await;
+
+    let (transport_a, addr_a) = build_reticulum_with_retry(|| {
+        let key = &key_a;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-key-aaaa");
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.announce_interval = Duration::from_secs(30);
+            (c, auth_for(key, dir, &base).await)
+        }
+    })
+    .await;
+    let port_a = addr_a.port();
+
+    let (transport_b, _addr_b) = build_reticulum_with_retry(|| {
+        let key = &key_b;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-key-bbbb");
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+            c.announce_interval = Duration::from_secs(30);
+            (c, auth_for(key, dir, &base).await)
+        }
+    })
+    .await;
+
+    // A roots B on a PHANTOM (undialable) dest with B's real transport identity:
+    // the NAT model — if the reverse path falls back to a dial, it CANNOT reach B.
+    transport_a
+        .inject_rooted_peer_with_transport_identity_for_test(
+            "edge-key-bbbb",
+            [0xab; 16],
+            transport_b.local_transport_pubkey(),
+        )
+        .await;
+    let mut a_ed = [0u8; 32];
+    a_ed.copy_from_slice(&transport_a.local_transport_pubkey()[32..64]);
+    transport_b
+        .inject_rooted_peer_for_test("edge-key-aaaa", transport_a.local_dest_hash(), a_ed)
+        .await;
+
+    let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(16);
+    let (tx_b, mut rx_b) = mpsc::channel::<InboundFrame>(16);
+    let la = transport_a.clone();
+    let lb = transport_b.clone();
+    let _la = tokio::spawn(async move { la.listen(tx_a).await });
+    let _lb = tokio::spawn(async move { lb.listen(tx_b).await });
+
+    // B dials + identifies its inbound link at A (the round-open).
+    transport_b
+        .send("edge-key-aaaa", b"round-open")
+        .await
+        .expect("B -> A");
+    tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
+        .await
+        .expect("A receives B within 60s")
+        .expect("A channel open");
+
+    // The next TWO ships collide (busy); the reply must ride B's inbound link
+    // on retry #3, NOT dial B's phantom dest.
+    transport_a.force_next_sends_busy_for_test(2);
+    transport_a
+        .send("edge-key-bbbb", b"reply-after-busy-retries")
+        .await
+        .expect(
+            "reply MUST retry the BUSY reverse-path link and deliver, not fall back to the \
+             undialable outbound dial (CIRISEdge#353 residual)",
+        );
+
+    let reply = tokio::time::timeout(Duration::from_secs(60), rx_b.recv())
+        .await
+        .expect("B receives the retried reply within 60s")
+        .expect("B channel open");
+    assert_eq!(reply.envelope_bytes, b"reply-after-busy-retries");
+    assert_eq!(reply.source_key_id.as_deref(), Some("edge-key-aaaa"));
+}

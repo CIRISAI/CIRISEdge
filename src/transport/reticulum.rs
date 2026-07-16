@@ -140,6 +140,40 @@ const NO_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// CIRISEdge#353 — the classified outcome of shipping a resource on a link.
+/// `Busy` is the retryable one-transfer-per-link collision
+/// (`ResourceError::TransferInProgress`); `Other` is any other send failure.
+enum ShipError {
+    /// A resource transfer is already in progress on this link — retryable; the
+    /// link is healthy and the in-flight transfer drains in seconds.
+    Busy,
+    /// Any other send failure — not retryable on the same link.
+    Other(TransportError),
+}
+
+impl ShipError {
+    /// Collapse to a plain [`TransportError`] where the busy/other distinction
+    /// doesn't matter (the outbound-dial path — the durable dispatcher retries
+    /// either way). `Busy` maps to a resource-in-progress timeout.
+    fn into_transport(self) -> TransportError {
+        match self {
+            ShipError::Busy => {
+                TransportError::Io("reticulum send_resource: transfer in progress".to_string())
+            }
+            ShipError::Other(e) => e,
+        }
+    }
+}
+
+/// CIRISEdge#353 (residual) — how long a reverse-path send keeps retrying a
+/// BUSY link (Reticulum permits one resource transfer per link at a time; a
+/// reply usually collides with the peer's own inbound payload mid-transfer).
+/// Transfers are seconds; 8 s fits inside the 10 s anti-entropy round timeout
+/// so a drained link still completes the SAME round instead of the next one.
+const REVERSE_PATH_BUSY_RETRY_WINDOW: Duration = Duration::from_secs(8);
+/// Pause between busy-retries on the reverse path.
+const REVERSE_PATH_BUSY_BACKOFF: Duration = Duration::from_millis(500);
+
 /// CIRISEdge#336 (fast heal) — minimum interval between EVENT-DRIVEN announces.
 ///
 /// RNS reachability is on-demand, not periodic: markqvist's reference stack
@@ -1162,6 +1196,13 @@ pub struct ReticulumTransport {
     /// waits on this set so it returns `Delivered` only once the
     /// transfer has actually drained, not merely enqueued.
     sent_resources: Arc<Mutex<HashSet<[u8; 32]>>>,
+    /// CIRISEdge#353 test seam — when > 0, the next N `ship_resource_on_link`
+    /// calls return [`ShipError::Busy`] (decrementing) BEFORE touching the
+    /// network, so a test can deterministically drive the reverse-path
+    /// busy-retry loop without racing a real in-flight transfer (loopback
+    /// drains too fast to collide). Zero in production: one relaxed atomic
+    /// load per ship. Set via [`Self::force_next_sends_busy_for_test`].
+    test_force_busy: Arc<std::sync::atomic::AtomicU32>,
     /// Optional out-of-band directory-backed resolver. When `None`,
     /// only the authenticated announce cold-start path is available.
     resolver: Option<Arc<dyn PeerResolver>>,
@@ -1694,6 +1735,7 @@ impl ReticulumTransport {
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resources: Arc::new(Mutex::new(HashSet::new())),
+            test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             resolver,
             rooting,
             hybrid_policy,
@@ -1902,6 +1944,14 @@ impl ReticulumTransport {
     /// sign link proofs). After this call, `knows_peer(key_id)` returns
     /// true and `link_open(dest_hash, ..)` finds the entry.
     #[doc(hidden)]
+    /// CIRISEdge#353 test seam — force the next `n` resource ships to fail
+    /// [`ShipError::Busy`] (the one-transfer-per-link collision), so a test can
+    /// drive the reverse-path busy-retry loop deterministically.
+    pub fn force_next_sends_busy_for_test(&self, n: u32) {
+        self.test_force_busy
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn inject_rooted_peer_for_test(
         &self,
         destination_key_id: &str,
@@ -2858,37 +2908,90 @@ impl ReticulumTransport {
     /// identify); the peer attributes our reply by the dest it dialed
     /// (leviculum v0.9.2 `link_destination`, the other half of #353).
     ///
+    /// #353 residual (field-verified on Node A, v13.1.1): Reticulum allows ONE
+    /// resource transfer per link at a time, and the reply routinely collides
+    /// with the peer's own inbound payload mid-transfer. The first cut fell
+    /// back to the outbound dial on THAT error — the exact NAT hole the
+    /// reverse path exists to avoid (the field signature: links closing
+    /// `Timeout` instead of `PeerClosed`). Now a BUSY link is RETRIED with
+    /// backoff for [`REVERSE_PATH_BUSY_RETRY_WINDOW`] — transfers drain in
+    /// seconds and the link is still up — re-resolving the live link each
+    /// attempt (if the original dies and the peer re-dials mid-window, the
+    /// retry rides the fresh link). The outbound dial is the LAST resort,
+    /// reached only when retries exhaust or the failure is not `busy`.
+    ///
     /// Returns `true` iff the envelope was DELIVERED over the reverse path;
-    /// `false` means fall through to the outbound dial (no live inbound link,
-    /// or the ship failed — logged loud + throttled, since a reverse-path
-    /// failure for an initiator-only peer means the dial will likely fail too).
+    /// `false` means fall through to the outbound dial (each stage logged
+    /// distinctly + throttled so the RCA classifier can tell them apart).
     async fn send_via_reverse_path(&self, destination_key_id: &str, envelope_bytes: &[u8]) -> bool {
-        let Some(link_id) = self.live_attributed_link_to(destination_key_id).await else {
-            return false;
-        };
-        match self.ship_resource_on_link(&link_id, envelope_bytes).await {
-            Ok(()) => {
-                tracing::debug!(
-                    destination_key_id,
-                    link = ?link_id,
-                    "delivered over the peer's live inbound link (reverse path, CIRISEdge#353)"
-                );
-                true
-            }
-            Err(e) => {
-                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
-                    reverse_path_fallback_log().check(destination_key_id)
-                {
-                    tracing::warn!(
+        let deadline = tokio::time::Instant::now() + REVERSE_PATH_BUSY_RETRY_WINDOW;
+        let mut attempts: u32 = 0;
+        loop {
+            let Some(link_id) = self.live_attributed_link_to(destination_key_id).await else {
+                if attempts > 0 {
+                    // The link died mid-retry and the peer has not re-dialed.
+                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                        reverse_path_fallback_log().check(destination_key_id)
+                    {
+                        tracing::warn!(
+                            destination_key_id,
+                            attempts,
+                            suppressed_prev,
+                            "reverse-path link died during busy-retry and no fresh inbound \
+                             link exists; falling back to an outbound dial (CIRISEdge#353)"
+                        );
+                    }
+                }
+                return false;
+            };
+            attempts += 1;
+            match self.ship_resource_on_link(&link_id, envelope_bytes).await {
+                Ok(()) => {
+                    tracing::debug!(
                         destination_key_id,
                         link = ?link_id,
-                        error = %e,
-                        suppressed_prev,
-                        "reverse-path send over the peer's inbound link failed; \
-                         falling back to an outbound dial (CIRISEdge#353)"
+                        attempts,
+                        "delivered over the peer's live inbound link (reverse path, \
+                         CIRISEdge#353)"
                     );
+                    return true;
                 }
-                false
+                Err(ShipError::Busy) => {
+                    if tokio::time::Instant::now() + REVERSE_PATH_BUSY_BACKOFF >= deadline {
+                        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                            reverse_path_fallback_log().check(destination_key_id)
+                        {
+                            tracing::warn!(
+                                destination_key_id,
+                                link = ?link_id,
+                                attempts,
+                                window_secs = REVERSE_PATH_BUSY_RETRY_WINDOW.as_secs(),
+                                suppressed_prev,
+                                "reverse-path link stayed BUSY (resource transfer in \
+                                 progress) through the whole retry window; falling back \
+                                 to an outbound dial as LAST resort (CIRISEdge#353)"
+                            );
+                        }
+                        return false;
+                    }
+                    tokio::time::sleep(REVERSE_PATH_BUSY_BACKOFF).await;
+                }
+                Err(ShipError::Other(e)) => {
+                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                        reverse_path_fallback_log().check(destination_key_id)
+                    {
+                        tracing::warn!(
+                            destination_key_id,
+                            link = ?link_id,
+                            error = %e,
+                            attempts,
+                            suppressed_prev,
+                            "reverse-path send over the peer's inbound link failed \
+                             (non-busy); falling back to an outbound dial (CIRISEdge#353)"
+                        );
+                    }
+                    return false;
+                }
             }
         }
     }
@@ -2897,11 +3000,30 @@ impl ReticulumTransport {
     /// wait for the sender-side `ResourceCompleted`. The shared tail of both
     /// send paths (fresh outbound dial AND the #353 reverse path) — one body so
     /// the two can never diverge (the #348 two-loops lesson).
+    ///
+    /// Errors are classified at the TYPED leviculum seam: `ShipError::Busy` is
+    /// the Reticulum one-resource-transfer-per-link constraint
+    /// (`ResourceError::TransferInProgress`) — retryable, the link is healthy —
+    /// vs `ShipError::Other` for everything else. String-matching the Display
+    /// text would be the fragile version of this; the enum can't reword.
     async fn ship_resource_on_link(
         &self,
         link_id: &LinkId,
         envelope_bytes: &[u8],
-    ) -> Result<(), TransportError> {
+    ) -> Result<(), ShipError> {
+        // CIRISEdge#353 test seam — deterministically simulate the
+        // one-transfer-per-link collision (see `test_force_busy`).
+        if self
+            .test_force_busy
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(ShipError::Busy);
+        }
         // Auto-accept any resources the peer pushes back on this link
         // (e.g. an ACK envelope), and ship our envelope as a resource.
         let _ = self
@@ -2911,7 +3033,14 @@ impl ReticulumTransport {
             .node
             .send_resource(link_id, envelope_bytes, None, true)
             .await
-            .map_err(|e| TransportError::Io(format!("reticulum send_resource: {e}")))?;
+            .map_err(|e| match e {
+                reticulum_std::error::Error::Resource(
+                    reticulum_core::resource::ResourceError::TransferInProgress,
+                ) => ShipError::Busy,
+                other => ShipError::Other(TransportError::Io(format!(
+                    "reticulum send_resource: {other}"
+                ))),
+            })?;
 
         // Wait for the sender-side `ResourceCompleted` — the driver
         // paces + retransmits resource parts, and completion means
@@ -2925,7 +3054,9 @@ impl ReticulumTransport {
         )
         .await;
         if !completed {
-            return Err(TransportError::Timeout(RESOURCE_TRANSFER_TIMEOUT));
+            return Err(ShipError::Other(TransportError::Timeout(
+                RESOURCE_TRANSFER_TIMEOUT,
+            )));
         }
         Ok(())
     }
@@ -3111,7 +3242,12 @@ impl Transport for ReticulumTransport {
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
 
-        self.ship_resource_on_link(&link_id, envelope_bytes).await?;
+        // The outbound-dial path we just established this link; a `Busy`
+        // collision here is not the reverse-path retry case, so both variants
+        // surface as the send's transport error (the durable dispatcher retries).
+        self.ship_resource_on_link(&link_id, envelope_bytes)
+            .await
+            .map_err(ShipError::into_transport)?;
 
         Ok(TransportSendOutcome::Delivered)
     }
