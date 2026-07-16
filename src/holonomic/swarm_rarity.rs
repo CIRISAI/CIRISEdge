@@ -263,31 +263,27 @@ impl FountainHoldingClaim {
     /// `symbol_ids` is SORTED ASCENDING before encoding so two peers
     /// holding the same set in different orders produce identical
     /// signature targets. `DOMAIN` is [`HOLDING_CLAIM_DOMAIN`].
+    ///
+    /// §19 re-export debt (CIRISEdge#359 F-4): the §19.3 signed preimage
+    /// is owned by
+    /// [`ciris_verify_core::holonomic::fountain::FountainHoldingClaim::signing_preimage`]
+    /// (byte-frozen there by the §19.6 vectors). Edge's shape carries
+    /// edge-only fields (the hybrid-signature trio, serde derives, the
+    /// `Message` impl) so it cannot re-export verify's type wholesale;
+    /// instead it delegates the shared preimage byte-for-byte. `DOMAIN`
+    /// is edge-authored ([`HOLDING_CLAIM_DOMAIN`]) and verify reproduces
+    /// it, so the emitted bytes are unchanged.
     #[must_use]
+    #[allow(clippy::cast_sign_loss)] // observed_at_unix_ms is a unix-ms timestamp; i64→u64 is bit-preserving and byte-identical.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut sorted = self.symbol_ids.clone();
-        sorted.sort_unstable();
-        let mut out = Vec::with_capacity(
-            HOLDING_CLAIM_DOMAIN.len()
-                + 8
-                + self.peer_id.len()
-                + 8
-                + self.content_id.len()
-                + 8
-                + sorted.len() * 4
-                + 8
-                + 4,
-        );
-        out.extend_from_slice(HOLDING_CLAIM_DOMAIN);
-        write_len_prefixed(&mut out, self.peer_id.as_bytes());
-        write_len_prefixed(&mut out, self.content_id.as_bytes());
-        out.extend_from_slice(&(sorted.len() as u64).to_be_bytes());
-        for sym in &sorted {
-            out.extend_from_slice(&sym.to_be_bytes());
+        ciris_verify_core::holonomic::fountain::FountainHoldingClaim {
+            peer_id: self.peer_id.clone(),
+            content_id: self.content_id.clone(),
+            symbol_ids: self.symbol_ids.clone(),
+            observed_at_unix_ms: self.observed_at_unix_ms as u64,
+            claim_version: self.claim_version,
         }
-        out.extend_from_slice(&self.observed_at_unix_ms.to_be_bytes());
-        out.extend_from_slice(&self.claim_version.to_be_bytes());
-        out
+        .signing_preimage()
     }
 }
 
@@ -342,27 +338,25 @@ impl FountainCompressRequest {
     ///        ‖ u32_be(request_version)`.
     ///
     /// `DOMAIN` is [`COMPRESS_REQUEST_DOMAIN`].
+    ///
+    /// §19 re-export debt (CIRISEdge#359 F-4): delegates the shared
+    /// §19.3 preimage to
+    /// [`ciris_verify_core::holonomic::fountain::FountainCompressRequest::signing_preimage`]
+    /// byte-for-byte (same rationale as
+    /// [`FountainHoldingClaim::canonical_bytes`] — edge-only signature
+    /// fields prevent a wholesale re-export).
     #[must_use]
+    #[allow(clippy::cast_sign_loss)] // deadline_unix_ms is a unix-ms timestamp; i64→u64 is bit-preserving and byte-identical.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            COMPRESS_REQUEST_DOMAIN.len()
-                + 8
-                + self.peer_id.len()
-                + 8
-                + self.content_id.len()
-                + 4
-                + 4
-                + 8
-                + 4,
-        );
-        out.extend_from_slice(COMPRESS_REQUEST_DOMAIN);
-        write_len_prefixed(&mut out, self.peer_id.as_bytes());
-        write_len_prefixed(&mut out, self.content_id.as_bytes());
-        out.extend_from_slice(&self.evicting_range_low.to_be_bytes());
-        out.extend_from_slice(&self.evicting_range_high.to_be_bytes());
-        out.extend_from_slice(&self.deadline_unix_ms.to_be_bytes());
-        out.extend_from_slice(&self.request_version.to_be_bytes());
-        out
+        ciris_verify_core::holonomic::fountain::FountainCompressRequest {
+            peer_id: self.peer_id.clone(),
+            content_id: self.content_id.clone(),
+            evicting_range_low: self.evicting_range_low,
+            evicting_range_high: self.evicting_range_high,
+            deadline_unix_ms: self.deadline_unix_ms as u64,
+            request_version: self.request_version,
+        }
+        .signing_preimage()
     }
 }
 
@@ -927,11 +921,6 @@ pub trait FountainEvictHardDelete {
         content_id: &str,
         corpus_kind: &str,
     ) -> Result<(), FountainEvictError>;
-}
-
-fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-    out.extend_from_slice(bytes);
 }
 
 #[cfg(test)]

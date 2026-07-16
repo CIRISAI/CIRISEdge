@@ -40,9 +40,10 @@
 //!   live on the envelope wrapper, signing the canonical bytes from
 //!   outside.
 //!
-//! ## Merkle construction (CT-style, last-node duplication)
+//! ## Merkle construction (last-node duplication — NOT RFC 6962)
 //!
-//! The algorithm is byte-exact:
+//! [`compute_merkle_root`] is re-exported from the shared §19.1 owner
+//! (`ciris-verify-core`); the algorithm is byte-exact:
 //!
 //! 1. **Lex-sort the leaves** by their canonical bytes (§19.1 RC11).
 //!    The leaf order is NOT caller-controlled — the function sorts
@@ -56,15 +57,25 @@
 //!    the claim layer — we apply ONE additional SHA-256 here so the
 //!    leaf-hash domain is distinct from the inner-node domain).
 //! 4. While `layer.len() > 1`:
-//!    - If `layer.len()` is odd, push `layer.last().clone()`
-//!      (Bitcoin / RFC 6962 Certificate Transparency convention).
+//!    - If `layer.len()` is odd, duplicate the last node
+//!      (`node = SHA-256(last ‖ last)`).
 //!    - `new = layer.chunks(2).map(|p| SHA-256(p[0] || p[1])).collect()`
 //!    - `layer = new`
 //! 5. Return `layer[0]`.
 //!
+//! This deliberately does **NOT** use the RFC 6962 Certificate
+//! Transparency construction: RFC 6962 does not duplicate the odd node
+//! (it splits at the largest power of two below the leaf count) and uses
+//! `0x00`/`0x01` domain prefixes. The odd-node duplication here is the
+//! Bitcoin-merkle rule, whose CVE-2012-2459 malleability is not
+//! exploitable in this setting — every witness root is mandatorily
+//! hybrid-signed (no consumer trusts an unsigned root) and is verified
+//! by full recomputation, never partial inclusion proofs. See the
+//! `ciris-verify-core` `wholeness_witness` doc for the frozen rationale.
+//!
 //! §19.1 RC11 — leaves MUST be lex-sorted before Merkle construction,
 //! and the sort is done INSIDE [`compute_merkle_root`] (not by the
-//! caller). CIRISVerify v5.8.0's `holonomic::compute_merkle_root` sorts
+//! caller). CIRISVerify's `holonomic::compute_merkle_root` sorts
 //! and recomputes; an unsorted producer root would mismatch on the
 //! wire. The previous v1 contract ("caller controls order") is
 //! superseded — there is no legal alternative ordering. The contract
@@ -84,11 +95,16 @@
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-/// Sentinel hashed when the leaf set is empty. Documented sentinel —
-/// changing this byte sequence breaks the v1 wire-format contract.
-const EMPTY_LEAF_SENTINEL: &[u8] = b"WW-v1-empty";
+/// §19.1 WW Merkle root — CIRISEdge#359 F-4 re-export debt.
+///
+/// The construction (lexicographic leaves, `leaf = SHA-256(bytes)`,
+/// `node = SHA-256(left ‖ right)`, odd-node duplication, `WW-v1-empty`
+/// empty-tree sentinel) is genuinely identical to the shared §19.1
+/// owner and is KAT-locked there, so edge re-exports it rather than
+/// maintaining a byte-for-byte twin. See
+/// [`ciris_verify_core::holonomic::wholeness_witness::compute_merkle_root`].
+pub use ciris_verify_core::holonomic::wholeness_witness::compute_merkle_root;
 
 /// Locked v1 domain-separation tag for [`EquivocationProof`] signed
 /// bytes. This is a NEW CEG-shape claim (the `hard_case:*` namespace)
@@ -268,37 +284,27 @@ impl WholenessWitness {
     /// order does not perturb the preimage. Length prefixes make the
     /// encoding injective: no two distinct witnesses share a preimage.
     /// The signature fields are EXCLUDED (they sign this, from outside).
+    ///
+    /// §19 re-export debt (CIRISEdge#359 F-4): the §19.1 signed preimage
+    /// framing is owned by
+    /// [`ciris_verify_core::holonomic::wholeness_witness::WholenessWitness::canonical_preimage`]
+    /// (byte-frozen there by the §19.6 vectors). Edge's shape carries
+    /// edge-only fields (the hybrid-signature trio, serde derives) so it
+    /// cannot re-export verify's type wholesale; it delegates the shared
+    /// preimage byte-for-byte. [`WITNESS_PREIMAGE_DOMAIN`] is
+    /// edge-authored and verify reproduces it, so the bytes are unchanged.
     #[must_use]
-    // §19 mandates u32-BE length prefixes. The cast matches the
-    // claim-layer length-prefix convention; a witness field longer than
-    // 4 GiB is not a real input, and the encoding is injective within
-    // that bound.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn canonical_preimage_bytes(&self) -> Vec<u8> {
-        let mut namespaces = self.claim_namespaces.clone();
-        namespaces.sort();
-
-        let mut out = Vec::with_capacity(16 + 4 + self.peer_id.len() + 8 + 32 + 4 + 4 + 8 + 2);
-        out.extend_from_slice(WITNESS_PREIMAGE_DOMAIN);
-
-        let peer = self.peer_id.as_bytes();
-        out.extend_from_slice(&(peer.len() as u32).to_be_bytes());
-        out.extend_from_slice(peer);
-
-        out.extend_from_slice(&self.epoch_id.to_be_bytes());
-        out.extend_from_slice(&self.merkle_root);
-        out.extend_from_slice(&self.leaf_count.to_be_bytes());
-
-        out.extend_from_slice(&(namespaces.len() as u32).to_be_bytes());
-        for ns in &namespaces {
-            let b = ns.as_bytes();
-            out.extend_from_slice(&(b.len() as u32).to_be_bytes());
-            out.extend_from_slice(b);
+        ciris_verify_core::holonomic::wholeness_witness::WholenessWitness {
+            peer_id: self.peer_id.clone(),
+            epoch_id: self.epoch_id,
+            claim_namespaces: self.claim_namespaces.clone(),
+            merkle_root: self.merkle_root,
+            leaf_count: self.leaf_count,
+            observed_at_unix_ms: self.observed_at_unix_ms,
+            witness_version: self.witness_version,
         }
-
-        out.extend_from_slice(&self.observed_at_unix_ms.to_be_bytes());
-        out.extend_from_slice(&self.witness_version.to_be_bytes());
-        out
+        .canonical_preimage()
     }
 
     /// Build the private serialize-only canonical view. Shared by
@@ -344,68 +350,6 @@ struct CanonicalRepr<'a> {
     claim_namespaces: Vec<String>,
     observed_at_unix_ms: u64,
     witness_version: u16,
-}
-
-/// Compute the v1-locked Merkle root over the leaf set.
-///
-/// See module-level docs for the byte-exact algorithm. The function is
-/// pure: given the same leaf MULTISET, it returns the same 32-byte root
-/// on every implementation (Rust / Python / Swift / Kotlin),
-/// independent of the order the leaves are passed in.
-///
-/// # Leaf ordering (§19.1 RC11)
-///
-/// Leaves are lex-sorted by their bytes INSIDE this function — the
-/// order is NOT caller-controlled. CIRISVerify v5.8.0 sorts and
-/// recomputes, so an unsorted producer root would mismatch on the
-/// wire. The earlier "caller controls order" contract is superseded.
-///
-/// # Empty input
-///
-/// Returns `SHA-256(b"WW-v1-empty")` — the documented sentinel.
-#[must_use]
-pub fn compute_merkle_root(leaves: &[Vec<u8>]) -> [u8; 32] {
-    if leaves.is_empty() {
-        return sha256(EMPTY_LEAF_SENTINEL);
-    }
-
-    // §19.1: lex-sort the leaf bytes before hashing. Two peers with
-    // the same leaf multiset MUST land on the same root regardless of
-    // the order the leaves arrived in. The sort is total over byte
-    // slices (Vec<u8>: Ord is lexicographic), so it is deterministic
-    // and cross-impl-stable.
-    let mut sorted: Vec<&Vec<u8>> = leaves.iter().collect();
-    sorted.sort_unstable();
-
-    // Layer 0: hash each leaf. This step makes the leaf-hash domain
-    // distinct from the inner-node domain (defense against length-
-    // extension / second-preimage attacks where a forged inner node
-    // looks like a leaf and vice-versa).
-    let mut layer: Vec<[u8; 32]> = sorted.iter().map(|l| sha256(l)).collect();
-
-    // Reduce upward.
-    while layer.len() > 1 {
-        // CT / Bitcoin convention: duplicate the last node on
-        // odd-count layers so every internal node has two children.
-        if layer.len() % 2 == 1 {
-            let last = *layer.last().expect("layer non-empty");
-            layer.push(last);
-        }
-
-        // Pair-hash. `chunks(2)` is safe here — we just made the
-        // count even.
-        let mut next: Vec<[u8; 32]> = Vec::with_capacity(layer.len() / 2);
-        for pair in layer.chunks(2) {
-            let mut hasher = Sha256::new();
-            hasher.update(pair[0]);
-            hasher.update(pair[1]);
-            let out: [u8; 32] = hasher.finalize().into();
-            next.push(out);
-        }
-        layer = next;
-    }
-
-    layer[0]
 }
 
 /// §19.1 WW-2 — filter deniable / self-private leaves BEFORE Merkle
@@ -785,28 +729,9 @@ pub fn detect_equivocation(
     })
 }
 
-/// Compute a single-shot SHA-256 over a byte slice and return the
-/// 32-byte digest as a fixed-size array.
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Helper: lowercase-hex 64-char string for asserting raw roots
-    /// in tests without pulling `hex` at runtime.
-    fn hex(bytes: &[u8; 32]) -> String {
-        let mut s = String::with_capacity(64);
-        for b in bytes {
-            use std::fmt::Write as _;
-            let _ = write!(s, "{b:02x}");
-        }
-        s
-    }
 
     /// Construct a minimally-populated witness for comparison tests.
     fn witness(epoch_id: u64, root: [u8; 32]) -> WholenessWitness {
@@ -825,116 +750,22 @@ mod tests {
     }
 
     #[test]
-    fn merkle_empty_leaves_returns_sentinel() {
+    fn merkle_empty_leaves_wire_locked_via_shared_owner() {
+        // CIRISEdge#359 F-4: the algorithmic KATs (single/two/odd/order-
+        // independence) are OWNED by ciris-verify-core, whose
+        // wholeness_witness tests pin them; edge no longer duplicates
+        // them. This one cross-crate anchor guards the §19.1 re-export
+        // against a verify-side regression: the shared owner MUST still
+        // produce edge's wire-locked empty-sentinel root
+        // (`sha256("WW-v1-empty")`; recompute with
+        // `printf 'WW-v1-empty' | sha256sum`).
         let got = compute_merkle_root(&[]);
-        let want = sha256(b"WW-v1-empty");
-        assert_eq!(got, want, "empty-input root must hash the v1 sentinel");
-        // Byte-exact assertion against the known SHA-256 of the
-        // sentinel string — this anchors the wire format. The hex
-        // below is `sha256("WW-v1-empty")`; recompute with
-        // `printf 'WW-v1-empty' | sha256sum`.
-        assert_eq!(
-            hex(&got),
-            "2280d27f232100367e86211b5349fe0d6fbaee98e4c2b489a86008049563464f",
-            "empty sentinel root is wire-locked at v1"
-        );
-    }
-
-    #[test]
-    fn merkle_single_leaf() {
-        let leaf = b"alpha".to_vec();
-        let got = compute_merkle_root(std::slice::from_ref(&leaf));
-        // Single leaf: ONE hash of the leaf (no inner-node hashing
-        // because the layer is already length 1). This is the
-        // documented `layer[0]` exit.
-        let want = sha256(&leaf);
-        assert_eq!(
-            got, want,
-            "single-leaf root must be SHA-256(leaf) per the documented contract"
-        );
-    }
-
-    #[test]
-    fn merkle_two_leaves() {
-        let l0 = b"alpha".to_vec();
-        let l1 = b"beta".to_vec();
-        let got = compute_merkle_root(&[l0.clone(), l1.clone()]);
-
-        let h0 = sha256(&l0);
-        let h1 = sha256(&l1);
-        let mut hasher = Sha256::new();
-        hasher.update(h0);
-        hasher.update(h1);
-        let want: [u8; 32] = hasher.finalize().into();
-        assert_eq!(got, want, "two-leaf root must be SHA-256(H(l0) || H(l1))");
-    }
-
-    #[test]
-    fn merkle_odd_count_duplicates_last() {
-        // 3 leaves — layer 0 becomes [H(l0), H(l1), H(l2)]; odd
-        // count → duplicate last → [H(l0), H(l1), H(l2), H(l2)];
-        // pair-hash → [H(H(l0)||H(l1)), H(H(l2)||H(l2))]; pair-hash
-        // → root.
-        let l0 = b"alpha".to_vec();
-        let l1 = b"beta".to_vec();
-        let l2 = b"gamma".to_vec();
-        let got = compute_merkle_root(&[l0.clone(), l1.clone(), l2.clone()]);
-
-        let h0 = sha256(&l0);
-        let h1 = sha256(&l1);
-        let h2 = sha256(&l2);
-
-        let pair01 = {
-            let mut h = Sha256::new();
-            h.update(h0);
-            h.update(h1);
-            let o: [u8; 32] = h.finalize().into();
-            o
-        };
-        // CT-style duplicate-last: pair[H(l2), H(l2)].
-        let pair22 = {
-            let mut h = Sha256::new();
-            h.update(h2);
-            h.update(h2);
-            let o: [u8; 32] = h.finalize().into();
-            o
-        };
-        let root = {
-            let mut h = Sha256::new();
-            h.update(pair01);
-            h.update(pair22);
-            let o: [u8; 32] = h.finalize().into();
-            o
-        };
-        assert_eq!(
-            got, root,
-            "odd-count layer must duplicate the last node (CT/Bitcoin convention)"
-        );
-    }
-
-    #[test]
-    fn merkle_order_independent_after_internal_lex_sort() {
-        // §19.1 RC11: the leaf order is NOT caller-controlled — the
-        // function lex-sorts internally, so the same multiset of leaves
-        // produces the SAME root regardless of the order passed in.
-        // CIRISVerify v5.8.0 sorts and recomputes; this is the producer
-        // side of that contract.
-        let l0 = b"alpha".to_vec();
-        let l1 = b"beta".to_vec();
-
-        let ordered = compute_merkle_root(&[l0.clone(), l1.clone()]);
-        let swapped = compute_merkle_root(&[l1.clone(), l0.clone()]);
-
-        assert_eq!(
-            ordered, swapped,
-            "§19.1: Merkle root MUST be independent of input leaf order \
-             (leaves are lex-sorted internally before construction)"
-        );
-
-        // And the sorted root equals the explicit pre-sorted call.
-        let mut presorted = vec![l0, l1];
-        presorted.sort();
-        assert_eq!(ordered, compute_merkle_root(&presorted));
+        let want: [u8; 32] = [
+            0x22, 0x80, 0xd2, 0x7f, 0x23, 0x21, 0x00, 0x36, 0x7e, 0x86, 0x21, 0x1b, 0x53, 0x49,
+            0xfe, 0x0d, 0x6f, 0xba, 0xee, 0x98, 0xe4, 0xc2, 0xb4, 0x89, 0xa8, 0x60, 0x08, 0x04,
+            0x95, 0x63, 0x46, 0x4f,
+        ];
+        assert_eq!(got, want, "empty sentinel root is wire-locked at v1");
     }
 
     #[test]

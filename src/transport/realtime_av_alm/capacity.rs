@@ -58,13 +58,20 @@
 //!
 //! ## Replay protection
 //!
-//! Each [`SignedRelayCapacity`] binds:
-//! - `stream_id` — so an advertisement minted for stream A cannot be
-//!   replayed against stream B's roster;
+//! The **signed preimage** is the cross-impl canonical shape owned by
+//! Verify (§19.4 N8) — `peer_id ‖ uplink_mbps ‖ epoch` — so only these
+//! bind the hybrid signature (see
+//! [`RelayCapacity::canonical_bytes_for_signing`], CIRISEdge#359):
+//! - `advertiser_key_id` (= Verify's `peer_id`) — owner-bound identity;
 //! - `epoch` — so an advertisement minted before an MLS epoch rotation
-//!   cannot be replayed at the new epoch;
-//! - `measured_at_unix_ms` + the [`STALE_AFTER_SECS`] receive-side gate
-//!   — so an old measurement can't be replayed indefinitely.
+//!   cannot be replayed at the new epoch.
+//!
+//! `measured_at_unix_ms` + the [`STALE_AFTER_SECS`] receive-side gate
+//! still bounds how long any advert is honoured. `stream_id` and the MDC
+//! `sub_stream_commitments` remain on the wire as **unsigned** planner
+//! fields (the join planner + deterministic topology read them) but are
+//! NOT in the signed preimage — Verify's `verify_relay_capacity` is the
+//! joint source of truth and never signed over them.
 //!
 //! ## CIRISEdge#128 — Multiple Description Coding (MDC, "holographic")
 //!
@@ -84,11 +91,11 @@
 //!   depth-agnostic; the codec layer picks). Receivers compose their
 //!   quality level from the union of available sub-stream parents.
 //!
-//! Signing canonical-bytes domain separator is bumped from
-//! `CIRISALM-CAPv1` → `CIRISALM-CAPv2` so a v1 verifier cannot
-//! accidentally accept a v2 advertisement (and a v2 verifier rejects
-//! any leftover v1 signers uniformly). No v1 advertisements exist in
-//! production yet; the bump is a clean cut.
+//! Signing canonical-bytes domain separator is `CIRISALM-CAPv2\0\0` —
+//! shared byte-for-byte with Verify's
+//! [`ciris_verify_core::holonomic::preimage::DOMAIN_RELAY_CAPACITY`].
+//! The MDC `sub_stream_commitments` are additive planner state; they
+//! ride the wire unsigned and do NOT change the signed preimage.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -353,79 +360,54 @@ impl RelayCapacity {
         false
     }
 
-    /// Canonical bytes for hybrid signing — deterministic encoding
-    /// independent of serde_json formatting.
+    /// Canonical bytes for hybrid signing — **delegated verbatim to
+    /// Verify** so an edge-minted advert verifies under Verify's
+    /// [`ciris_verify_core::holonomic::alm::verify_relay_capacity`]
+    /// (§19.4 N8; CIRISEdge#359 Crypto-DRY).
     ///
-    /// Layout (all multi-byte integers BIG-ENDIAN — same convention as
-    /// [`crate::transport::realtime_av::SealedAvChunk::to_bytes`]):
+    /// Layout is Verify's canonical §19.0 preimage:
     ///
     /// ```text
-    ///   0..16   b"CIRISALM-CAPv2\0\0"   // v2 — adds substream commitments
-    ///  16..48   stream_id        (32 bytes)
-    ///  48..56   epoch            (BE u64)
-    ///
-    ///  56..60   uplink_mbps                 (BE f32)
-    ///  60..62   max_streams                 (BE u16)
-    ///  62..64   max_subscribers_per_stream  (BE u16)
-    ///  64..72   measured_at_unix_ms         (BE u64)
-    ///  72..73   max_layer_supported.max_spatial   (u8)
-    ///  73..74   max_layer_supported.max_temporal  (u8)
-    ///  74..75   max_layer_supported.max_quality   (u8)
-    ///
-    /// // MDC sub-stream commitments — length-prefixed Vec.
-    ///  75..79   commitment_count            (BE u32)
-    /// // Each commitment:
-    /// //   path_len     (BE u16)
-    /// //   path bytes
-    /// //   uplink_budget_mbps   (BE f32)
-    /// //   max_subscribers      (BE u16)
-    /// // Iteration order = vector order. Callers MUST preserve order
-    /// // between sign + verify (we never re-sort here — the sub-stream
-    /// // identity IS the path, and an in-order canonical encoding lets
-    /// // the codec layer choose a layout convention without ALM-A's
-    /// // intervention).
+    ///   b"CIRISALM-CAPv2\0\0"            // domain (16 bytes)
+    ///   u32_be(advertiser_key_id.len())  // length prefix
+    ///   advertiser_key_id bytes          // Verify's `peer_id`
+    ///   u32_be(uplink_mbps)              // f32 rounded → u32 Mbps
+    ///   u64_be(epoch)
     /// ```
     ///
-    /// The advertiser's `key_id` is NOT included — bound out-of-band by
-    /// the choice of signing key + the `advertiser_key_id` field on the
-    /// signed wrapper.
+    /// **What is NOT signed** (deliberate, per the finding): `stream_id`,
+    /// `max_streams`, `max_subscribers_per_stream`, `measured_at_unix_ms`,
+    /// `max_layer_supported`, and the MDC `sub_stream_commitments`. These
+    /// were never load-bearing for topology scoring; they remain on the
+    /// wire as **unsigned** planner fields. Edge does NOT fork a wider
+    /// preimage — Verify is the single source of truth for these bytes.
     ///
-    /// **Domain separator bumped to v2** to disambiguate from any
-    /// hypothetical v1 signers — no v1 advertisements exist in
-    /// production yet, so the bump is a clean cut.
+    /// `uplink_mbps` is edge-internal `f32` but Verify's canonical field
+    /// is `u32`, so it is rounded to the nearest integer via
+    /// [`uplink_mbps_to_u32`] before framing. Producer and verifier both
+    /// route through this method, so the rounding is symmetric.
     #[must_use]
-    pub fn canonical_bytes_for_signing(&self, stream_id: StreamId, epoch: Epoch) -> Vec<u8> {
-        const DOMAIN_SEP: &[u8; 16] = b"CIRISALM-CAPv2\0\0";
-        let mut out = Vec::with_capacity(
-            // 75 fixed bytes + 4 for commitment count + each commitment
-            75 + 4 + self.sub_stream_commitments.len() * (2 + 4 + 4 + 2),
-        );
-        out.extend_from_slice(DOMAIN_SEP);
-        out.extend_from_slice(&stream_id.0);
-        out.extend_from_slice(&epoch.0.to_be_bytes());
-        out.extend_from_slice(&self.uplink_mbps.to_be_bytes());
-        out.extend_from_slice(&self.max_streams.to_be_bytes());
-        out.extend_from_slice(&self.max_subscribers_per_stream.to_be_bytes());
-        out.extend_from_slice(&self.measured_at_unix_ms.to_be_bytes());
-        out.push(self.max_layer_supported.max_spatial);
-        out.push(self.max_layer_supported.max_temporal);
-        out.push(self.max_layer_supported.max_quality);
-
-        // MDC sub-stream commitments — length-prefixed Vec.
-        #[allow(clippy::cast_possible_truncation)]
-        let count = self.sub_stream_commitments.len() as u32;
-        out.extend_from_slice(&count.to_be_bytes());
-        for commitment in &self.sub_stream_commitments {
-            // path_len + path bytes
-            #[allow(clippy::cast_possible_truncation)]
-            let path_len = commitment.sub_stream_path.len() as u16;
-            out.extend_from_slice(&path_len.to_be_bytes());
-            out.extend_from_slice(&commitment.sub_stream_path);
-            out.extend_from_slice(&commitment.uplink_budget_mbps.to_be_bytes());
-            out.extend_from_slice(&commitment.max_subscribers.to_be_bytes());
+    pub fn canonical_bytes_for_signing(&self, advertiser_key_id: &str, epoch: Epoch) -> Vec<u8> {
+        // Single shared construction — Verify's builder, not an edge fork.
+        ciris_verify_core::holonomic::alm::SignedRelayCapacity {
+            peer_id: advertiser_key_id.to_string(),
+            uplink_mbps: uplink_mbps_to_u32(self.uplink_mbps),
+            epoch: epoch.0,
         }
-        out
+        .signing_preimage()
     }
+}
+
+/// Deterministic, saturating `f32` Mbps → `u32` Mbps for the signed
+/// preimage. Verify's canonical `uplink_mbps` field is `u32`; edge
+/// measures throughput as `f32`. Rust's `as` cast saturates (NaN → 0,
+/// negative → 0, `> u32::MAX` → `u32::MAX`), so this is total and
+/// stable. Both the signer and the verifier call it, so the rounding
+/// never diverges across the sign/verify boundary.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn uplink_mbps_to_u32(mbps: f32) -> u32 {
+    mbps.round() as u32
 }
 
 /// The advertiser's federation signing pubkeys — what the verifier
@@ -486,7 +468,7 @@ impl SignedRelayCapacity {
             .as_ref()
             .ok_or(AlmCapacityError::SignerLacksPqc)?;
 
-        let canonical = capacity.canonical_bytes_for_signing(stream_id, epoch);
+        let canonical = capacity.canonical_bytes_for_signing(&advertiser_key_id, epoch);
 
         let ed25519_sig = signer
             .classical
@@ -531,7 +513,7 @@ impl SignedRelayCapacity {
 
         let canonical = self
             .capacity
-            .canonical_bytes_for_signing(self.stream_id, self.epoch);
+            .canonical_bytes_for_signing(&self.advertiser_key_id, self.epoch);
 
         let ed25519_ok = Ed25519Verifier::new()
             .verify(&advertiser_pubkeys.ed25519_pub, &canonical, &ed25519_sig)
@@ -772,8 +754,13 @@ mod tests {
         assert!(matches!(r, Err(AlmCapacityError::SignatureInvalid)));
     }
 
+    /// CIRISEdge#359: `stream_id` is an **unsigned** planner field — it
+    /// left the signed preimage when edge adopted Verify's §19.4 layout.
+    /// Mutating it therefore does NOT break the hybrid signature (the
+    /// stream binding is enforced out-of-band by the roster, not the
+    /// advert signature).
     #[tokio::test]
-    async fn signed_capacity_cross_stream_refused() {
+    async fn signed_capacity_stream_id_is_unsigned() {
         let (signer, pubkeys) = test_signer(0xA4).await;
         let cap = test_capacity(1_700_000_000_000);
 
@@ -784,8 +771,10 @@ mod tests {
 
         signed.stream_id = stream(0xBB);
 
-        let r = signed.verify(&pubkeys);
-        assert!(matches!(r, Err(AlmCapacityError::SignatureInvalid)));
+        // Signature still verifies — stream_id is not in the preimage.
+        signed
+            .verify(&pubkeys)
+            .expect("stream_id is unsigned; verify still ok");
     }
 
     #[tokio::test]
@@ -900,20 +889,24 @@ mod tests {
         assert!(matches!(r, Err(AlmCapacityError::WireDecode(_))));
     }
 
-    /// v2 canonical encoding regression — fixed-size prefix + 4-byte
-    /// commitment count = 79 bytes when no commitments are declared.
+    /// CIRISEdge#359 canonical-length regression — Verify's §19.4 layout:
+    /// domain(16) + u32 len-prefix(4) + peer_id + u32 uplink(4) + u64
+    /// epoch(8). For a 7-byte `peer_id` that is 16+4+7+4+8 = 39 bytes,
+    /// independent of the (now-unsigned) commitments/layer/stream fields.
     #[test]
-    fn canonical_bytes_v2_no_commitments_is_79_bytes() {
-        let cap = test_capacity(1_700_000_000_000);
-        let bytes = cap.canonical_bytes_for_signing(stream(0xAB), Epoch(42));
-        assert_eq!(
-            bytes.len(),
-            79,
-            "v2 canonical layout: 75 fixed + 4 commitment count"
+    fn canonical_bytes_length_is_verify_layout() {
+        let cap = RelayCapacity::with_substream_commitments(
+            100.0,
+            4,
+            16,
+            ReceiverLayerPolicy::UNCAPPED,
+            1_700_000_000_000,
+            // Commitments present but MUST NOT change the preimage length.
+            vec![commitment(vec![0], 10.0, 4), commitment(vec![1], 12.5, 6)],
         );
+        let bytes = cap.canonical_bytes_for_signing("relay-1", Epoch(42));
+        assert_eq!(bytes.len(), 39, "verify layout: 16 + 4 + 7 + 4 + 8");
         assert_eq!(&bytes[..16], b"CIRISALM-CAPv2\0\0");
-        // Commitment count = 0.
-        assert_eq!(&bytes[75..79], &[0u8; 4]);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -1033,8 +1026,13 @@ mod tests {
         decoded.verify(&pubkeys).expect("verify v2 round-trip");
     }
 
+    /// CIRISEdge#359: MDC `sub_stream_commitments` are **unsigned**
+    /// planner state under Verify's §19.4 layout, so mutating a
+    /// commitment does NOT break the hybrid signature. (Commitment
+    /// integrity for topology admission is the planner's concern; the
+    /// advert signature only covers `peer_id ‖ uplink_mbps ‖ epoch`.)
     #[tokio::test]
-    async fn signed_capacity_v2_tamper_substream_commitment_refused() {
+    async fn signed_capacity_v2_substream_commitments_are_unsigned() {
         let (signer, pubkeys) = test_signer(0xD1).await;
         let cap = RelayCapacity::with_substream_commitments(
             100.0,
@@ -1055,10 +1053,64 @@ mod tests {
         .await
         .expect("sign");
 
-        // Bump the commitment's budget — canonical bytes change →
-        // verification fails.
+        // Bump the commitment's budget — commitments are not in the
+        // signed preimage, so verification still succeeds.
         signed.capacity.sub_stream_commitments[0].uplink_budget_mbps = 99.0;
-        let r = signed.verify(&pubkeys);
-        assert!(matches!(r, Err(AlmCapacityError::SignatureInvalid)));
+        signed
+            .verify(&pubkeys)
+            .expect("commitments are unsigned; verify still ok");
+    }
+
+    /// CIRISEdge#359 golden cross-impl preimage vector (§19.4 N8). ALM was
+    /// absent from the §19 vector set; this pins the edge-produced signing
+    /// bytes to Verify's canonical `signing_preimage()` for a fixed input,
+    /// and to a hard-coded byte literal so neither side can drift silently.
+    ///
+    /// Fixed input: `peer_id = "relay-1"`, `uplink_mbps = 500`, `epoch = 3`
+    /// (the same tuple Verify's own N8 unit test signs).
+    #[test]
+    fn golden_preimage_matches_verify_signing_bytes() {
+        // domain(16) ‖ u32_be(len "relay-1"=7) ‖ "relay-1" ‖ u32_be(500) ‖ u64_be(3)
+        const GOLDEN: &[u8] = &[
+            // b"CIRISALM-CAPv2\0\0"
+            0x43, 0x49, 0x52, 0x49, 0x53, 0x41, 0x4c, 0x4d, 0x2d, 0x43, 0x41, 0x50, 0x76, 0x32,
+            0x00, 0x00, // u32_be(7)
+            0x00, 0x00, 0x00, 0x07, // "relay-1"
+            0x72, 0x65, 0x6c, 0x61, 0x79, 0x2d, 0x31, // u32_be(500) = 0x000001F4
+            0x00, 0x00, 0x01, 0xF4, // u64_be(3)
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        ];
+
+        // Edge producer (f32 500.0 rounds to u32 500).
+        let cap = RelayCapacity::new(
+            500.0,
+            4,
+            16,
+            ReceiverLayerPolicy::UNCAPPED,
+            1_700_000_000_000,
+        );
+        let edge_bytes = cap.canonical_bytes_for_signing("relay-1", Epoch(3));
+
+        // Verify's canonical builder, constructed independently.
+        let verify_bytes = ciris_verify_core::holonomic::alm::SignedRelayCapacity {
+            peer_id: "relay-1".to_string(),
+            uplink_mbps: 500,
+            epoch: 3,
+        }
+        .signing_preimage();
+
+        assert_eq!(
+            edge_bytes, GOLDEN,
+            "edge preimage drifted from the golden vector"
+        );
+        assert_eq!(
+            verify_bytes, GOLDEN,
+            "verify preimage drifted from the golden vector"
+        );
+        assert_eq!(
+            edge_bytes, verify_bytes,
+            "edge and verify must produce byte-identical ALM preimages"
+        );
+        assert_eq!(&edge_bytes[..16], b"CIRISALM-CAPv2\0\0");
     }
 }

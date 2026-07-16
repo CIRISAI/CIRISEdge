@@ -250,6 +250,20 @@ fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
 }
 
+static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#357 — ambient third-party announces on the shared RNS network whose
+/// app-data is not a CIRIS AV-42 attestation (too short / wrong magic). On a
+/// public fabric this is high-volume NON-actionable traffic; a per-announce WARN
+/// drowns the genuinely-useful "a CIRIS peer failed to root" signal. Rolled up:
+/// a couple of DEBUG lines per minute + a suppressed-count, keyed on a single
+/// fixed discriminant (this is not a per-peer condition — it's "not us").
+fn non_ciris_announce_log() -> &'static crate::log_throttle::LogThrottle {
+    NON_CIRIS_ANNOUNCE_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(60), 4))
+}
+
 /// CIRISEdge#353 ask 2 — the NAT'd/initiator-only topology diagnosis. Before
 /// this, an outbound dial to an undialable phone was a bare 30 s `Timeout` per
 /// kind per round FOREVER (the field symptom: 3 WARNs every 30 s, no cause).
@@ -3917,19 +3931,34 @@ async fn resolve_announce_cold_start(
     let attestation = match AnnounceAttestation::from_app_data(announce.app_data()) {
         Ok(a) => a,
         Err(e) => {
-            tracing::debug!(error = %e, "announce dropped: app-data is not a valid attestation");
-            // CIRISEdge#34 — surface the parse failure on the announce
-            // stream so operators can see malformed peers without
-            // tailing logs. Severity = warning (not error): this is
-            // commonly a v0.3.1 peer sending a bare-key_id announce,
-            // not a hostile event.
+            // CIRISEdge#357 — a payload too short / without the CIRIS attestation
+            // shape is a NON-CIRIS announce (ambient shared-RNS traffic), NOT a
+            // CIRIS peer that failed to root. On a public fabric this floods, so
+            // it is a THROTTLED DEBUG rollup — never a per-announce WARN, which
+            // must stay reserved for the actionable "CIRIS-shaped attestation
+            // failed verification/rooting" case handled below. (A malformed
+            // CIRIS peer is rare and still surfaces via the destination-hash /
+            // rooting WARNs once its app-data parses.)
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                non_ciris_announce_log().check("non-ciris")
+            {
+                tracing::debug!(
+                    error = %e,
+                    suppressed_prev,
+                    "announce ignored: app-data is not a CIRIS attestation \
+                     (ambient non-CIRIS traffic on the shared RNS network, CIRISEdge#357)"
+                );
+            }
+            // CIRISEdge#34 — still surface on the announce stream for operators
+            // who subscribe, but at INFO severity: ambient non-CIRIS traffic is
+            // informational, not a warning (CIRISEdge#357).
             if let Some(bus) = ctx.event_bus {
                 bus.emit_announce(crate::events::NetworkEvent::announce(
                     None,
                     announce.destination_hash().as_bytes().to_vec(),
                     announce.app_data().to_vec(),
-                    crate::events::EventSeverity::Warning,
-                    format!("announce dropped: app-data is not a valid attestation: {e}"),
+                    crate::events::EventSeverity::Info,
+                    format!("announce ignored: app-data is not a CIRIS attestation: {e}"),
                 ));
             }
             return;

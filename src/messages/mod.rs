@@ -833,6 +833,18 @@ pub struct AccordSignature {
     /// Base64-standard Ed25519 signature (64 bytes raw, 88 chars b64)
     /// over [`FederationAnnouncement::canonical_bytes_for_accord_signatures`].
     pub signature_ed25519_base64: String,
+    /// CIRISEdge#359 finding 2 — the ML-DSA-65 half of the hybrid accord
+    /// signature (base64-standard), over the SAME
+    /// [`FederationAnnouncement::canonical_bytes_for_accord_signatures`].
+    /// The accord carrier is constitutional kill-switch-class traffic, which
+    /// verify gates at `HybridPolicy::RequireHybrid` (v5.7.0 #75) — a
+    /// classical-only signature must NOT satisfy the quorum. `None` is a
+    /// classical-only (pre-#359) signature and is REFUSED by
+    /// `verify_accord_carrier` under RequireHybrid. Additive to the wire: the
+    /// signed canonical bytes exclude `accord_signatures`, so adding this
+    /// field does not change what any holder signs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_ml_dsa_65_base64: Option<String>,
 }
 
 impl FederationAnnouncement {

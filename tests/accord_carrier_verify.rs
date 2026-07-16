@@ -24,6 +24,20 @@
 //! `EdgeEnvelope`, and asserts the outcome (acceptance attestation
 //! emitted xor refusal attestation emitted xor neither when the body
 //! is not AccordCarrier).
+//!
+//! CIRISEdge#359 (findings 2 + 3) — `verify_accord_carrier` now gates each
+//! accord signature as a HYBRID (Ed25519 + ML-DSA-65) under
+//! `HybridPolicy::Strict` (finding 2: a classical-only signature is REFUSED),
+//! and counts a signature toward the 2-of-3 threshold only if the holder's
+//! ed25519 key occupies a pinned SEAT in
+//! `accord_holder_bootstrap_anchor()` (finding 3: spares are excluded). The
+//! suite arms `ciris-verify-core`'s `test-anchor` software trust root so the
+//! synthetic holders here are "seated", so it is gated on the `test-anchor`
+//! feature (like `tests/test_anchor_e2e.rs`).
+//!
+//! `cargo test --features "transport-reticulum test-anchor" --test accord_carrier_verify`
+
+#![cfg(all(feature = "transport-reticulum", feature = "test-anchor"))]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +46,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use chrono::Utc;
-use ciris_crypto::{ClassicalSigner, Ed25519Signer};
+use ciris_crypto::{ClassicalSigner, Ed25519Signer, HybridSigner, MlDsa65Signer, PqcSigner};
 use ciris_edge::identity::{build_envelope, sign_envelope, LocalSigner};
 use ciris_edge::messages::{
     AccordSignature, AnnouncementKind, AnnouncementPriority, AuthorityClass,
@@ -70,6 +84,55 @@ fn init_tracing() {
     });
 }
 
+/// The FIXED seated accord-holder set every test uses. Their ed25519 pubkeys
+/// are what [`arm_test_anchor`] pins as the `test-anchor` software trust root
+/// (`CIRIS_TEST_TRUST_ROOT`), so `accord_holder_bootstrap_anchor()` returns
+/// exactly these three keys as the SEATED roster (CIRISEdge#359 finding 3).
+/// The seeds are deterministic, so this resolves to the same three pubkeys
+/// whether called from the arming helper or a test body.
+fn seated_holders() -> [FedKey; 3] {
+    [
+        FedKey::new("accord-holder-1", 0x11),
+        FedKey::new("accord-holder-2", 0x22),
+        FedKey::new("accord-holder-3", 0x33),
+    ]
+}
+
+/// A FOURTH accord-holder key that is deliberately NOT in the seated roster —
+/// a "spare" (CIRISEdge#359 finding 3). Registered as an `accord_holder` row
+/// in persist, but its ed25519 key is absent from `CIRIS_TEST_TRUST_ROOT`, so
+/// a signature from it must contribute NOTHING to the 2-of-3 threshold.
+fn spare_holder() -> FedKey {
+    FedKey::new("accord-holder-spare", 0x44)
+}
+
+/// Arm the `test-anchor` software trust root EXACTLY ONCE per process.
+///
+/// `#[tokio::test]`s share one process and run concurrently, and env is
+/// process-global, so the env is set a single time under a [`Once`] BEFORE any
+/// test can call dispatch — never mutated per-test. Every test uses the same
+/// [`seated_holders`] set, so the once-set `CIRIS_TEST_TRUST_ROOT` is correct
+/// for all of them. Contract mirrors `tests/test_anchor_e2e.rs`:
+/// `CIRIS_TESTING_MODE=true`, the three production env signals removed (or the
+/// anti-prod tripwire refuses the override), and `CIRIS_TEST_TRUST_ROOT` set to
+/// the comma-joined base64 ed25519 pubkeys of the seated holders.
+fn arm_test_anchor() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("CIRIS_TESTING_MODE", "true");
+        for prod in ["ENVIRONMENT", "CIRIS_ENV", "CIRIS_ENVIRONMENT"] {
+            std::env::remove_var(prod);
+        }
+        let trust_root = seated_holders()
+            .iter()
+            .map(FedKey::pubkey_b64)
+            .collect::<Vec<_>>()
+            .join(",");
+        std::env::set_var("CIRIS_TEST_TRUST_ROOT", trust_root);
+    });
+}
+
 // ─── Fixture helpers ────────────────────────────────────────────────
 
 /// A test federation identity: deterministic seed + key_id + the keys
@@ -95,6 +158,35 @@ impl FedKey {
 
     fn pubkey_b64(&self) -> String {
         B64.encode(self.signer().public_key().expect("pubkey"))
+    }
+
+    /// This identity's ML-DSA-65 signer, derived from the SAME seed as the
+    /// ed25519 key — mirrors edge's own fixture pattern
+    /// (`src/edge.rs::hybrid_pubkeys`), so the registered key and the signing
+    /// key collapse to one hybrid identity per `key_id`.
+    fn ml_dsa_signer(&self) -> MlDsa65Signer {
+        MlDsa65Signer::from_seed(&self.seed).expect("ml-dsa from seed")
+    }
+
+    /// Base64-standard ML-DSA-65 public key — what an `accord_holder` row's
+    /// `pubkey_ml_dsa_65_base64` must carry so `verify_hybrid_via_directory`
+    /// finds both halves of the hybrid pair.
+    fn ml_dsa_pubkey_b64(&self) -> String {
+        B64.encode(PqcSigner::public_key(&self.ml_dsa_signer()).expect("ml-dsa pubkey"))
+    }
+
+    /// Hybrid-sign `canonical` (CIRISEdge#359 finding 2). Returns
+    /// `(ed25519_sig_base64, ml_dsa_65_sig_base64)`. The PQC half signs the
+    /// bound payload `canonical ‖ ed25519_sig` exactly as `verify_hybrid`
+    /// re-checks it (CC 3.1.2.1 strip-attack guard), so both halves verify
+    /// against this identity's registered hybrid pubkeys.
+    fn hybrid_sign(&self, canonical: &[u8]) -> (String, String) {
+        let hybrid = HybridSigner::new(self.signer(), self.ml_dsa_signer()).expect("hybrid signer");
+        let sig = hybrid.sign(canonical).expect("hybrid sign");
+        (
+            B64.encode(&sig.classical.signature),
+            B64.encode(&sig.pqc.signature),
+        )
     }
 
     fn write_seed_dir(&self, base: &std::path::Path) -> PathBuf {
@@ -154,10 +246,19 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
     } else {
         None
     };
+    // CIRISEdge#359 finding 2 — accord_holder rows must register the ML-DSA-65
+    // half so `verify_hybrid_via_directory` can gate the HYBRID accord
+    // signature. Non-holder rows stay ed25519-only (their outer-envelope
+    // verify runs under the edge's `Ed25519Fallback` config policy).
+    let pubkey_ml_dsa_65_base64 = if identity_type == "accord_holder" {
+        Some(subject.ml_dsa_pubkey_b64())
+    } else {
+        None
+    };
     KeyRecord {
         key_id: subject.key_id.clone(),
         pubkey_ed25519_base64: subject.pubkey_b64(),
-        pubkey_ml_dsa_65_base64: None,
+        pubkey_ml_dsa_65_base64,
         algorithm: "hybrid".to_string(),
         identity_type: identity_type.to_string(),
         identity_ref: subject.key_id.clone(),
@@ -261,10 +362,11 @@ fn with_accord_sig(mut ann: FederationAnnouncement, holder: &FedKey) -> Federati
     let canonical = ann
         .canonical_bytes_for_accord_signatures()
         .expect("canonical bytes");
-    let sig = holder.sign(&canonical);
+    let (ed_sig, ml_dsa_sig) = holder.hybrid_sign(&canonical);
     ann.accord_signatures.push(AccordSignature {
         key_id: holder.key_id.clone(),
-        signature_ed25519_base64: B64.encode(sig),
+        signature_ed25519_base64: ed_sig,
+        signature_ml_dsa_65_base64: Some(ml_dsa_sig),
     });
     ann
 }
@@ -321,6 +423,7 @@ fn parse_refusal(row: &OutboundRow) -> DeliveryRefusalAttestation {
 #[tokio::test]
 async fn accord_carrier_2_of_3_valid_propagates() {
     init_tracing();
+    arm_test_anchor();
     let tmp = tempfile::tempdir().expect("tempdir");
     let steward = FedKey::new("steward-fed", 0x01);
     let me = FedKey::new("edge-self", 0xAA);
@@ -378,6 +481,7 @@ async fn accord_carrier_2_of_3_valid_propagates() {
 #[tokio::test]
 async fn accord_carrier_1_of_3_refuses_and_emits_refusal() {
     init_tracing();
+    arm_test_anchor();
     let tmp = tempfile::tempdir().expect("tempdir");
     let steward = FedKey::new("steward-fed", 0x01);
     let me = FedKey::new("edge-self", 0xAA);
@@ -439,6 +543,7 @@ async fn accord_carrier_1_of_3_refuses_and_emits_refusal() {
 #[tokio::test]
 async fn accord_carrier_3_of_3_propagates() {
     init_tracing();
+    arm_test_anchor();
     let tmp = tempfile::tempdir().expect("tempdir");
     let steward = FedKey::new("steward-fed", 0x01);
     let me = FedKey::new("edge-self", 0xAA);
@@ -494,6 +599,7 @@ async fn accord_carrier_3_of_3_propagates() {
 #[tokio::test]
 async fn accord_carrier_2_valid_1_invalid_propagates() {
     init_tracing();
+    arm_test_anchor();
     let tmp = tempfile::tempdir().expect("tempdir");
     let steward = FedKey::new("steward-fed", 0x01);
     let me = FedKey::new("edge-self", 0xAA);
@@ -518,10 +624,12 @@ async fn accord_carrier_2_valid_1_invalid_propagates() {
     let mut ann = announcement(AnnouncementPriority::AccordCarrier);
     ann = with_accord_sig(ann, &h1);
     ann = with_accord_sig(ann, &h2);
-    // Append a third entry claiming to be from h3 but with junk bytes.
+    // Append a third entry claiming to be from h3 (a seated holder) but with
+    // junk bytes for BOTH hybrid halves — the hybrid verify rejects it.
     ann.accord_signatures.push(AccordSignature {
         key_id: h3.key_id.clone(),
         signature_ed25519_base64: B64.encode([0xEEu8; 64]),
+        signature_ml_dsa_65_base64: Some(B64.encode([0xEEu8; 64])),
     });
 
     let env_bytes = build_envelope_signed_by(&sender_signer, &me.key_id, &ann).await;
@@ -554,6 +662,7 @@ async fn accord_carrier_2_valid_1_invalid_propagates() {
 #[tokio::test]
 async fn accord_carrier_0_accord_holders_in_directory_refuses_with_no_accord_holders_configured() {
     init_tracing();
+    arm_test_anchor();
     let tmp = tempfile::tempdir().expect("tempdir");
     let steward = FedKey::new("steward-fed", 0x01);
     let me = FedKey::new("edge-self", 0xAA);
@@ -607,6 +716,7 @@ async fn accord_carrier_0_accord_holders_in_directory_refuses_with_no_accord_hol
 #[tokio::test]
 async fn accord_carrier_duplicate_signatures_from_same_holder_count_once() {
     init_tracing();
+    arm_test_anchor();
     let tmp = tempfile::tempdir().expect("tempdir");
     let steward = FedKey::new("steward-fed", 0x01);
     let me = FedKey::new("edge-self", 0xAA);
@@ -639,9 +749,11 @@ async fn accord_carrier_duplicate_signatures_from_same_holder_count_once() {
     let canonical = ann
         .canonical_bytes_for_accord_signatures()
         .expect("canonical");
+    let (ed_sig, ml_dsa_sig) = h1.hybrid_sign(&canonical);
     ann.accord_signatures.push(AccordSignature {
         key_id: h1.key_id.clone(),
-        signature_ed25519_base64: B64.encode(h1.sign(&canonical)),
+        signature_ed25519_base64: ed_sig,
+        signature_ml_dsa_65_base64: Some(ml_dsa_sig),
     });
 
     let env_bytes = build_envelope_signed_by(&sender_signer, &me.key_id, &ann).await;
@@ -675,6 +787,7 @@ async fn accord_carrier_duplicate_signatures_from_same_holder_count_once() {
 #[tokio::test]
 async fn accord_carrier_non_accord_class_announcements_skip_threshold_check() {
     init_tracing();
+    arm_test_anchor();
     let tmp = tempfile::tempdir().expect("tempdir");
     let steward = FedKey::new("steward-fed", 0x01);
     let me = FedKey::new("edge-self", 0xAA);
@@ -720,6 +833,147 @@ async fn accord_carrier_non_accord_class_announcements_skip_threshold_check() {
             .await
             .len(),
         0
+    );
+}
+
+/// CIRISEdge#359 finding 2 (RequireHybrid) — two signatures from DISTINCT
+/// seated holders that carry ONLY the classical Ed25519 half
+/// (`signature_ml_dsa_65_base64: None`) must NOT satisfy the quorum.
+/// `verify_accord_carrier` gates each accord signature at
+/// `HybridPolicy::Strict`, under which a classical-only row is
+/// `HybridPendingRejected` — never `HybridVerified` — so neither signature
+/// counts. Zero verified with attempts present ⇒ refusal with
+/// `InvalidAccordSignature`. Proves the accord carrier (constitutional
+/// kill-switch traffic) refuses classical-only signatures even when they are
+/// cryptographically valid Ed25519 sigs from seated holders.
+#[tokio::test]
+async fn accord_carrier_classical_only_signatures_refused_require_hybrid() {
+    init_tracing();
+    arm_test_anchor();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let steward = FedKey::new("steward-fed", 0x01);
+    let me = FedKey::new("edge-self", 0xAA);
+    let sender = FedKey::new("steward-sender", 0xBB);
+    let [h1, h2, h3] = seated_holders();
+
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&me, &steward, "agent"),
+        signed_record(&sender, &steward, "steward"),
+        signed_record(&h1, &steward, "accord_holder"),
+        signed_record(&h2, &steward, "accord_holder"),
+        signed_record(&h3, &steward, "accord_holder"),
+    ])
+    .await;
+    let queue = directory.clone();
+
+    let edge = build_edge(&tmp, &me, directory, queue.clone()).await;
+    let sender_signer = sender.local_signer(tmp.path()).await;
+
+    // Two CLASSICAL-ONLY signatures from distinct seated holders — valid
+    // Ed25519 bytes, but `signature_ml_dsa_65_base64: None`. Under
+    // RequireHybrid these are refused, so the quorum is NOT met.
+    let mut ann = announcement(AnnouncementPriority::AccordCarrier);
+    let canonical = ann
+        .canonical_bytes_for_accord_signatures()
+        .expect("canonical");
+    for h in [&h1, &h2] {
+        ann.accord_signatures.push(AccordSignature {
+            key_id: h.key_id.clone(),
+            signature_ed25519_base64: B64.encode(h.sign(&canonical)),
+            signature_ml_dsa_65_base64: None, // classical-only ⇒ refused
+        });
+    }
+
+    let env_bytes = build_envelope_signed_by(&sender_signer, &me.key_id, &ann).await;
+    edge.dispatch_inbound_for_test(InboundFrame {
+        envelope_bytes: env_bytes,
+        transport: TransportId::HTTP,
+        received_at: Utc::now(),
+        source_key_id: None,
+    })
+    .await;
+
+    assert_eq!(
+        outbound_rows_of(&queue, "DeliveryAttestation").await.len(),
+        0,
+        "classical-only signatures must NOT propagate an AccordCarrier under RequireHybrid"
+    );
+    let refusals = outbound_rows_of(&queue, "DeliveryRefusalAttestation").await;
+    assert_eq!(
+        refusals.len(),
+        1,
+        "exactly one refusal attestation enqueued"
+    );
+    assert_eq!(
+        parse_refusal(&refusals[0]).refusal_reason,
+        RefusalReason::InvalidAccordSignature,
+        "classical-only accord signatures (ml_dsa None) must be refused under RequireHybrid — \
+         zero verified with attempts present ⇒ InvalidAccordSignature"
+    );
+}
+
+/// CIRISEdge#359 finding 3 (seated-only) — one valid hybrid signature from a
+/// SEATED holder plus one valid hybrid signature from a SPARE holder whose key
+/// is NOT in the seated roster (`CIRIS_TEST_TRUST_ROOT`) counts as ONE, not
+/// two. The spare IS a registered `accord_holder` row in persist (so the old
+/// "distinct accord_holder key_ids" rule would have counted it), but its key
+/// does not occupy a pinned seat, so it contributes nothing. Threshold not met
+/// ⇒ refuses with `InsufficientAccordSignatures { found: 1, required: 2 }`.
+/// Pins that a human's spare cannot pad the 2-of-3 quorum.
+#[tokio::test]
+async fn accord_carrier_spare_holder_not_seated_does_not_count() {
+    init_tracing();
+    arm_test_anchor();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let steward = FedKey::new("steward-fed", 0x01);
+    let me = FedKey::new("edge-self", 0xAA);
+    let sender = FedKey::new("steward-sender", 0xBB);
+    let [h1, h2, h3] = seated_holders();
+    let spare = spare_holder();
+
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&me, &steward, "agent"),
+        signed_record(&sender, &steward, "steward"),
+        signed_record(&h1, &steward, "accord_holder"),
+        signed_record(&h2, &steward, "accord_holder"),
+        signed_record(&h3, &steward, "accord_holder"),
+        // The spare is a bona-fide accord_holder ROW, but its key is not a seat.
+        signed_record(&spare, &steward, "accord_holder"),
+    ])
+    .await;
+    let queue = directory.clone();
+
+    let edge = build_edge(&tmp, &me, directory, queue.clone()).await;
+    let sender_signer = sender.local_signer(tmp.path()).await;
+    let ann = announcement(AnnouncementPriority::AccordCarrier);
+    let ann = with_accord_sig(ann, &h1); // seated ⇒ counts (1)
+    let ann = with_accord_sig(ann, &spare); // NOT seated ⇒ contributes 0
+
+    let env_bytes = build_envelope_signed_by(&sender_signer, &me.key_id, &ann).await;
+    edge.dispatch_inbound_for_test(InboundFrame {
+        envelope_bytes: env_bytes,
+        transport: TransportId::HTTP,
+        received_at: Utc::now(),
+        source_key_id: None,
+    })
+    .await;
+
+    assert_eq!(
+        outbound_rows_of(&queue, "DeliveryAttestation").await.len(),
+        0,
+        "a spare (non-seated) holder must not pad the quorum — only 1 seated signature present"
+    );
+    let refusals = outbound_rows_of(&queue, "DeliveryRefusalAttestation").await;
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(
+        parse_refusal(&refusals[0]).refusal_reason,
+        RefusalReason::InsufficientAccordSignatures {
+            found: 1,
+            required: ACCORD_THRESHOLD_M_OF_N.0,
+        },
+        "spare holder's signature must not count toward the seated 2-of-3 threshold"
     );
 }
 

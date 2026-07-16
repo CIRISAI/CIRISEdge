@@ -102,6 +102,16 @@ jobs:
           cargo bench --features "pyo3" \
             --bench subscription_throughput 2>&1 | tee -a bench-results.txt
 
+      # CIRISEdge#359 — the accord multi-sig bench measures the post-quantum
+      # (ML-DSA-65) hybrid verify cost and needs the `test-anchor` feature to
+      # seat its synthetic holders (verify's `accord_holder_bootstrap_anchor`
+      # override). Without the feature the default `cargo bench --benches` run
+      # above hits its inert `main` and skips it; this runs the real curve.
+      - name: Run test-anchor accord_threshold_verify bench (hybrid/PQ)
+        run: |
+          cargo bench --features "test-anchor" \
+            --bench accord_threshold_verify 2>&1 | tee -a bench-results.txt
+
       - name: Upload criterion report
         uses: actions/upload-artifact@v4
         with:
