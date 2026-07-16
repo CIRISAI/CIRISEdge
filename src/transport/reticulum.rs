@@ -136,6 +136,75 @@ const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 /// never announced — is never regressed.
 const NO_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// CIRISEdge#363 — the link keepalive interval edge asks leviculum to apply,
+/// node-wide, so a freshly-admitted **advisory/bootstrap** link survives long
+/// enough to complete the Key + IdentityOccurrence anti-entropy that promotes
+/// it to a KEX'd delivery target.
+///
+/// The bug (converged RCA): a mobile/container peer hears canonical A's announce
+/// → advisory admit (`owns_key=false`). To become deliverable it must
+/// anti-entropy A's Key (transport binding) *and* IdentityOccurrence (KEX
+/// enc-keys) planes over that same link. leviculum derives the keepalive
+/// interval from the measured RTT (`calculate_keepalive_from_rtt`) and, on a
+/// fast direct TCP link, clamps it to the `LINK_KEEPALIVE_MIN` floor (5 s). The
+/// stale timer is `keepalive * LINK_STALE_FACTOR` (= 2), so with no explicit
+/// override the link goes **stale at ~10 s and is reaped at ~16 s** — before the
+/// two-plane exchange lands, especially when the canonical peer is under heavy
+/// churn and its keepalive acks are starved (the field symptom: 3 keepalives
+/// sent / 1 acked, dead by `keepalive_timeout`). The enc-keys are NOT derivable
+/// from the announce (the occurrence plane carries an ML-KEM-768 PQC key absent
+/// from the 64-byte transport identity), so keeping the link alive across the
+/// exchange is the load-bearing fix — not promotion from announce data alone.
+///
+/// 30 s is chosen against the replication cadence, not guessed: the anti-entropy
+/// scheduler runs one round every 30 s with a 10 s round timeout
+/// (`SchedulerConfig` cadence / `DEFAULT_ROUND_TIMEOUT`). A 30 s keepalive yields
+/// a `stale_time` of 60 s (2× the cadence), so a bootstrap link tolerates a full
+/// quiet cadence of keepalive-ack silence and still completes the Key +
+/// IdentityOccurrence rounds.
+///
+/// BOUNDED + DoS-aware: leviculum exposes only a **node-global** keepalive knob
+/// (`ReticulumNodeBuilder::link_keepalive`), not a per-link one, so this applies
+/// to every link — but a *longer* interval means *fewer* keepalive packets (less
+/// load, not more), and leviculum still reaps a silently-dead link at
+/// `stale_time + rtt*4 + grace` (~65 s here) rather than never. A silently-dead
+/// link therefore lingers ~65 s instead of ~16 s — a bounded ~4× hold, itself
+/// backstopped by leviculum's link table and edge's `MAX_PEERS` advisory cap. It
+/// is NOT an unbounded-link amplifier. See [`effective_link_keepalive_secs`] for
+/// the clamp that keeps an operator override inside leviculum's valid band.
+const BOOTSTRAP_LINK_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// CIRISEdge#363 — leviculum's minimum keepalive interval
+/// (`reticulum_core::constants::LINK_KEEPALIVE_MIN_SECS`). leviculum clamps an
+/// override UP to this floor but does not cap the ceiling, so edge enforces both
+/// ends in [`effective_link_keepalive_secs`].
+const LINK_KEEPALIVE_MIN_SECS: u64 = 5;
+
+/// CIRISEdge#363 — leviculum's maximum / RTT-derived keepalive interval
+/// (`reticulum_core::constants::LINK_KEEPALIVE_SECS`, 6 minutes). Edge caps an
+/// operator override here so a stray large value can NOT hold a silently-dead
+/// link open longer than leviculum's own RTT-driven ceiling would — the
+/// DoS-facing upper bound (leviculum only clamps the lower end).
+const LINK_KEEPALIVE_MAX_SECS: u64 = 360;
+
+/// CIRISEdge#363 — the keepalive interval (seconds) edge actually hands
+/// leviculum's builder, or `None` to leave leviculum's RTT-derived default in
+/// place. Pure so it is unit-testable without a live node.
+///
+/// `configured` is [`ReticulumTransportConfig::link_keepalive`]. When `Some`, the
+/// requested interval is clamped into leviculum's valid band
+/// `[LINK_KEEPALIVE_MIN_SECS, LINK_KEEPALIVE_MAX_SECS]` — the lower clamp mirrors
+/// leviculum's own `set_keepalive_override` floor; the upper clamp is edge's
+/// DoS-facing ceiling (leviculum does not cap the top, so an unbounded value
+/// would hold a dead link open indefinitely). A sub-second `Duration` floors to
+/// the minimum rather than to 0.
+fn effective_link_keepalive_secs(configured: Option<Duration>) -> Option<u64> {
+    configured.map(|d| {
+        d.as_secs()
+            .clamp(LINK_KEEPALIVE_MIN_SECS, LINK_KEEPALIVE_MAX_SECS)
+    })
+}
+
 /// How long [`Transport::send`] waits for a resource transfer to
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -763,6 +832,17 @@ pub struct ReticulumTransportConfig {
     /// always calls it explicitly so this `false` default is honoured
     /// (a leaf edge does NOT relay for strangers unless opted in).
     pub enable_transport: bool,
+    /// **CIRISEdge#363** — node-wide link keepalive interval handed to
+    /// leviculum's `ReticulumNodeBuilder::link_keepalive`. `Some(interval)`
+    /// overrides leviculum's RTT-derived default; `None` leaves it in place.
+    ///
+    /// Defaults to `Some(`[`BOOTSTRAP_LINK_KEEPALIVE`]`)` (30 s) so a
+    /// freshly-admitted advisory/bootstrap link survives the Key +
+    /// IdentityOccurrence anti-entropy instead of being reaped at ~16 s by the
+    /// RTT-clamped 5 s default (stale at 10 s). The value is clamped into
+    /// leviculum's valid band by [`effective_link_keepalive_secs`] before it
+    /// reaches the builder — an operator override cannot escape the DoS bound.
+    pub link_keepalive: Option<Duration>,
 }
 
 impl ReticulumTransportConfig {
@@ -780,6 +860,9 @@ impl ReticulumTransportConfig {
             local_epoch: 0,
             interfaces: Vec::new(),
             enable_transport: false,
+            // CIRISEdge#363 — default the bootstrap keepalive ON so advisory
+            // links survive the two-plane anti-entropy out of the box.
+            link_keepalive: Some(BOOTSTRAP_LINK_KEEPALIVE),
         }
     }
 
@@ -1569,6 +1652,31 @@ impl ReticulumTransport {
             .identity(identity.clone())
             .storage_path(storage_path)
             .enable_transport(config.enable_transport);
+        // CIRISEdge#363 — apply the bootstrap link keepalive so an advisory /
+        // bootstrap link is not reaped (stale at ~10 s, dead at ~16 s under the
+        // RTT-clamped 5 s default) before the Key + IdentityOccurrence
+        // anti-entropy that promotes it to a KEX'd delivery target completes.
+        // `effective_link_keepalive_secs` clamps into leviculum's valid band so
+        // an operator override stays inside the DoS bound. The wiring decision
+        // is logged (unthrottled — one line per node build, not attacker-driven)
+        // so a silent keepalive misconfig can never again cost a trace weeks.
+        match effective_link_keepalive_secs(config.link_keepalive) {
+            Some(secs) => {
+                builder = builder.link_keepalive(secs);
+                tracing::info!(
+                    keepalive_secs = secs,
+                    stale_secs = secs.saturating_mul(2),
+                    "reticulum link keepalive pinned for advisory/bootstrap link \
+                     survival (CIRISEdge#363)"
+                );
+            }
+            None => {
+                tracing::info!(
+                    "reticulum link keepalive left at leviculum's RTT-derived default \
+                     (CIRISEdge#363: bootstrap links may reap at ~16 s)"
+                );
+            }
+        }
         let mut share_instance_local: Option<String> = None;
         let mut connect_instance_local: Option<String> = None;
         if config.interfaces.is_empty() {
@@ -5062,6 +5170,75 @@ mod tests {
                     EXPLICIT
                 ),
                 RouteSupersession::IgnoreStale,
+            );
+        }
+    }
+
+    // ── CIRISEdge#363 bootstrap-link keepalive — the delivery-convergence fix ──
+    //
+    // The advisory/bootstrap link must outlive the Key + IdentityOccurrence
+    // anti-entropy that promotes it to a KEX'd target. leviculum's RTT-derived
+    // default reaps a fast direct link at ~16 s (5 s keepalive → 10 s stale);
+    // these lock in the clamp + the shipped default over the PURE decision fn so
+    // a regression is a compile-fast unit failure, never another lost trace.
+    mod bootstrap_keepalive {
+        use super::*;
+
+        /// The shipped default keepalive (30 s) survives the clamp unchanged and
+        /// is at least 2× the 30 s anti-entropy cadence' worth of stale slack
+        /// (stale = keepalive × 2 = 60 s), so a bootstrap link tolerates a full
+        /// quiet cadence of keepalive-ack silence.
+        #[test]
+        fn shipped_default_is_thirty_seconds_and_survives_the_clamp() {
+            assert_eq!(BOOTSTRAP_LINK_KEEPALIVE, Duration::from_secs(30));
+            assert_eq!(
+                effective_link_keepalive_secs(Some(BOOTSTRAP_LINK_KEEPALIVE)),
+                Some(30),
+            );
+            // `ReticulumTransportConfig::new` ships the bootstrap keepalive ON.
+            let cfg = ReticulumTransportConfig::new(std::path::PathBuf::from("/x"), "k");
+            assert_eq!(cfg.link_keepalive, Some(BOOTSTRAP_LINK_KEEPALIVE));
+            assert_eq!(effective_link_keepalive_secs(cfg.link_keepalive), Some(30));
+        }
+
+        /// `None` leaves leviculum's RTT-derived default in place (opt-out).
+        #[test]
+        fn none_leaves_leviculum_default() {
+            assert_eq!(effective_link_keepalive_secs(None), None);
+        }
+
+        /// A below-floor / sub-second override clamps UP to leviculum's minimum
+        /// (matches leviculum's own `set_keepalive_override` floor) — never 0.
+        #[test]
+        fn below_floor_clamps_up_to_min() {
+            assert_eq!(
+                effective_link_keepalive_secs(Some(Duration::from_secs(1))),
+                Some(LINK_KEEPALIVE_MIN_SECS),
+            );
+            assert_eq!(
+                effective_link_keepalive_secs(Some(Duration::from_millis(200))),
+                Some(LINK_KEEPALIVE_MIN_SECS),
+            );
+        }
+
+        /// The DoS bound: an unbounded override is capped at leviculum's own
+        /// RTT-driven ceiling so a stray value can NOT hold a silently-dead link
+        /// open longer than leviculum itself ever would (leviculum only clamps
+        /// the lower end).
+        #[test]
+        fn above_ceiling_clamps_down_to_max() {
+            assert_eq!(
+                effective_link_keepalive_secs(Some(Duration::from_secs(86_400))),
+                Some(LINK_KEEPALIVE_MAX_SECS),
+            );
+        }
+
+        /// An in-band operator override passes through untouched.
+        #[test]
+        fn in_band_override_passes_through() {
+            assert_eq!(
+                effective_link_keepalive_secs(Some(Duration::from_secs(45))),
+                Some(45),
             );
         }
     }
