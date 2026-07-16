@@ -27,11 +27,11 @@ description: sccache with a shared remote backend when configured (CIRISEdge#216
 
 inputs:
   webdav-endpoint:
-    description: "Shared WebDAV sccache endpoint (pass ${{ secrets.SCCACHE_WEBDAV_ENDPOINT }}). Empty ⇒ GHA fallback."
+    description: "Shared WebDAV sccache endpoint (caller passes secrets.SCCACHE_WEBDAV_ENDPOINT). Empty means GHA fallback."
     required: false
     default: ""
   webdav-token:
-    description: "Bearer token for the WebDAV store (pass ${{ secrets.SCCACHE_WEBDAV_TOKEN }})."
+    description: "Bearer token for the WebDAV store (caller passes secrets.SCCACHE_WEBDAV_TOKEN)."
     required: false
     default: ""
 
