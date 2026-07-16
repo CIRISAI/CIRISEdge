@@ -4352,6 +4352,25 @@ async fn resolve_announce_cold_start(
                 attestation.epoch,
             )
             .await;
+        // CIRISEdge#362 (seeder bridge, persist v17.8.0) — also record the
+        // announced peer as a non-canonical, untrusted directory BOOKMARK so a
+        // LAN-announced peer surfaces in the server's `GET /v1/federation/peers`
+        // (`canonical=false`, `trust="unknown"`, `last_seen`). Safe on BOTH
+        // Advisory and Rooted admits: the bookmark is invisible to every
+        // admission/quorum/rooting path, and once the key roots for real persist
+        // anti-joins the bookmark away (no dup, no downgrade). The announce
+        // carries only the FEDERATION ed25519 (no PQC pubkey, no claimed
+        // identity_type) — persist COALESCE-enriches those on later announces.
+        rooting
+            .record_announced_peer(
+                &persisted_key,
+                &base64::engine::general_purpose::STANDARD
+                    .encode(attestation.federation_pubkey_ed25519),
+                None,
+                None,
+                chrono::Utc::now(),
+            )
+            .await;
     }
 }
 

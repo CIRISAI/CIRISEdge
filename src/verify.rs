@@ -249,6 +249,29 @@ pub trait RootingDirectory: Send + Sync + 'static {
         _epoch: u64,
     ) {
     }
+
+    /// CIRISEdge#362 (CIRISPersist#469, persist v17.8.0) — the seeder bridge.
+    /// Record a peer learned from a self-consistent announce as a
+    /// **non-canonical, untrusted** directory BOOKMARK (persist's separate
+    /// `announced_peers` table, V108), so a LAN-announced peer surfaces in the
+    /// server's `GET /v1/federation/peers` (`canonical=false`, `trust="unknown"`,
+    /// `last_seen`). Deliberately NOT an admission — the bookmark is invisible to
+    /// every admission / quorum / rooting path by construction; it never
+    /// satisfies an accord seat / WA / steward count. Idempotent + liveness-
+    /// refreshing; a pubkey change for the same `key_id` is a real identity
+    /// conflict (persist returns `Conflict`). Safe on BOTH Advisory and Rooted
+    /// admits — once the key roots for real, `list_announced_peers` anti-joins
+    /// the bookmark away. Default no-op so test doubles don't break; the blanket
+    /// impl over `FederationDirectory` does the real `record_announced_peer`.
+    async fn record_announced_peer(
+        &self,
+        _key_id: &str,
+        _pubkey_ed25519_base64: &str,
+        _pubkey_ml_dsa_65_base64: Option<&str>,
+        _claimed_identity_type: Option<&str>,
+        _last_seen: chrono::DateTime<chrono::Utc>,
+    ) {
+    }
 }
 
 #[async_trait]
@@ -316,6 +339,48 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
                 epoch,
                 "CIRISEdge#299/#301: write-through of transport binding failed (peer still \
                  admitted in-memory this session, but will not survive a restart)"
+            ),
+        }
+    }
+
+    async fn record_announced_peer(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
+        claimed_identity_type: Option<&str>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) {
+        match FederationDirectory::record_announced_peer(
+            self,
+            key_id,
+            pubkey_ed25519_base64,
+            pubkey_ml_dsa_65_base64,
+            claimed_identity_type,
+            last_seen,
+        )
+        .await
+        {
+            // Attacker-floodable (one per advisory admit) → DEBUG. A `Conflict`
+            // (a changed pubkey for a known key_id) is a genuine identity signal,
+            // not a churn event, so it surfaces at WARN; any other write error is
+            // a non-fatal bookmark miss (the peer is still admitted in-memory +
+            // routing-bound this session).
+            Ok(()) => tracing::debug!(
+                key_id,
+                claimed_identity_type,
+                "CIRISEdge#362: recorded announced-peer bookmark (seeder bridge)"
+            ),
+            Err(ciris_persist::federation::Error::Conflict { .. }) => tracing::warn!(
+                key_id,
+                "CIRISEdge#362: announced-peer bookmark REJECTED — a different pubkey is \
+                 already recorded for this key_id (identity conflict, not a refresh)"
+            ),
+            Err(e) => tracing::debug!(
+                key_id,
+                error = %e,
+                "CIRISEdge#362: announced-peer bookmark write failed (peer still admitted \
+                 in-memory this session; bookmark will not appear in /v1/federation/peers)"
             ),
         }
     }
