@@ -336,8 +336,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
-      - name: Set up sccache (compiler cache over GHA)
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Set up sccache (shared remote when configured, GHA otherwise)
+        uses: ./.github/actions/setup-sccache
+        with:
+          webdav-endpoint: ${{ secrets.SCCACHE_WEBDAV_ENDPOINT }}
+          webdav-token: ${{ secrets.SCCACHE_WEBDAV_TOKEN }}
       # The pyo3 variant links against the libpython stub with different
       # RUSTFLAGS, so its target dir is NOT interchangeable with plain's —
       # each variant owns its cache key (plain keeps the pre-split key so
@@ -1247,8 +1250,11 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - uses: dtolnay/rust-toolchain@1.97.0
-      - name: Set up sccache (compiler cache over GHA)
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Set up sccache (shared remote when configured, GHA otherwise)
+        uses: ./.github/actions/setup-sccache
+        with:
+          webdav-endpoint: ${{ secrets.SCCACHE_WEBDAV_ENDPOINT }}
+          webdav-token: ${{ secrets.SCCACHE_WEBDAV_TOKEN }}
       - uses: ./.github/actions/ciriscache
         with:
           plat: linux-x86_64
@@ -1398,8 +1404,11 @@ jobs:
       # `x86_64-pc-windows-msvc` (Tier-1) so no `-Zbuild-std` is
       # needed.
       - uses: dtolnay/rust-toolchain@1.97.0
-      - name: Set up sccache (compiler cache over GHA)
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Set up sccache (shared remote when configured, GHA otherwise)
+        uses: ./.github/actions/setup-sccache
+        with:
+          webdav-endpoint: ${{ secrets.SCCACHE_WEBDAV_ENDPOINT }}
+          webdav-token: ${{ secrets.SCCACHE_WEBDAV_TOKEN }}
       # CIRISEdge#229 — canonical CIRISCache layered restore on the
       # wheel matrix. PLAT maps wheel's `label` token to the canonical
       # platform token persist + verify save under:
