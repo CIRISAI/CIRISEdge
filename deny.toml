@@ -105,6 +105,23 @@ ignore = [
     "RUSTSEC-2025-0098",  # unic-* unmaintained
     "RUSTSEC-2025-0100",  # unic-* unmaintained
 
+    # 2026-07-17 — six same-day libcrux advisories, ALL from the ONE dep
+    # `openmls_libcrux_crypto v0.3.1` (RFC 9420 MLS backend, CIRISEdge#66) via
+    # hpke-rs-libcrux / libcrux-{aead,kem,ml-kem,sha3}. NONE reach the
+    # load-bearing federation path: `cargo tree -i` confirms every flagged crate
+    # roots only at openmls_libcrux_crypto, and it is the ONLY MLS provider that
+    # supports edge's PQC ciphersuite 0x004D (the rust_crypto provider panics on
+    # it), so the fix is an UPSTREAM openmls bump (libcrux-aesgcm was renamed to
+    # libcrux-aes 0.0.9 — a crate openmls 0.3.1 does not yet adopt; no in-place
+    # patch exists). Time-boxed until openmls_libcrux_crypto ships the renamed
+    # backend — tracked CIRISVerify#211 (crypto owner) + CIRISEdge#367.
+    "RUSTSEC-2026-0207",  # libcrux SHAKE incremental-squeeze incorrect output (openmls MLS only)
+    "RUSTSEC-2026-0208",  # libcrux AVX2 SHAKE-256 potential panic (openmls MLS only)
+    "RUSTSEC-2026-0209",  # libcrux AES-GCM AAD-length limit (openmls MLS only)
+    "RUSTSEC-2026-0210",  # libcrux-aesgcm renamed→libcrux-aes / unmaintained (openmls MLS only)
+    "RUSTSEC-2026-0211",  # libcrux AES-GCM non-constant-time tag check (openmls MLS only)
+    "RUSTSEC-2026-0212",  # libcrux constant-time swap/select on aarch64 (openmls MLS only)
+
     # v3.0.0 (CIRISEdge#89) — the pyo3 0.28 → 0.29 family lockstep
     # landed. RUSTSEC-2026-0176 + RUSTSEC-2026-0177 are GONE from the
     # tree (pyo3 0.29 ships both fixes); the ignores that lived here
