@@ -3733,6 +3733,33 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
             }
         }
+        // leviculum#25 (v0.9.3+ciris.1) — the driver DESTROYED frames because
+        // their interface died: it cannot re-home them (a frame is bound to its
+        // interface, and link traffic's link died with it), so the bytes are
+        // gone and the sender must re-send on a fresh link. Pre-#25 this loss
+        // was silent below us, which is precisely why an in-flight iface drop
+        // read as a permanent delivery park and misrouted debugging across three
+        // repos (CIRISServer#294 / CIRISEdge#365). Surface it LOUDLY here:
+        // edge's durable dispatcher already retries with backoff, so the
+        // operator-facing need is knowing the loss happened at all. WARN is
+        // right — for an accept-only node serving a NAT'd initiator, interface
+        // replacement is the steady state, so this is expected-but-actionable,
+        // not a fault. Unthrottled: it is bounded by real interface deaths
+        // (~1/60s per NAT rebind), not attacker-drivable.
+        NodeEvent::FramesDropped {
+            iface_id,
+            count,
+            reason,
+        } => {
+            tracing::warn!(
+                iface_id,
+                frames = count,
+                ?reason,
+                "transport DESTROYED {count} in-flight frame(s) — their interface died and the \
+                 driver cannot re-home them; the durable dispatcher will re-send on a fresh \
+                 link (leviculum#25)"
+            );
+        }
         NodeEvent::LinkStale { link_id } => {
             // Bookkeeping cleanup + emit. The link may still be in
             // `established_links` (leviculum hasn't yet seen LinkClosed
