@@ -406,20 +406,22 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
     );
 }
 
-/// CIRISEdge#353 (residual, field-found on Node A v13.1.1) — a BUSY reverse-path
-/// link RETRIES until the in-flight transfer drains, instead of falling straight
-/// back into the NAT hole via an outbound dial. Reticulum permits one resource
-/// transfer per link; the reply routinely collides with the peer's own inbound
-/// payload. The first #353 cut fell back to the dial on that collision — for a
-/// NAT'd initiator-only peer that is unreachable, so the reply died and the link
-/// closed `Timeout`.
+/// CIRISEdge#353 ask #2 (field-found on Node A; the resource-retry window was
+/// provably shorter than the transfer — 16 attempts / 8s, link busy throughout)
+/// — a BUSY reverse-path link ships the reply as a LINK PACKET that INTERLEAVES
+/// the in-flight resource transfer (leviculum#27 `send_on_link`), instead of
+/// contending as a resource and falling into the NAT hole via an outbound dial.
+/// Reticulum permits one resource transfer per link; a packet is not gated by
+/// it. The packet arrives at B as `MessageReceived` (channel-demuxed), is
+/// attributed + routed identically to a resource frame, and B receives it.
 ///
-/// Deterministic via the `force_next_sends_busy_for_test` seam (loopback drains
-/// too fast to race a real collision): A's first two ships to B return
-/// `ShipError::Busy`; the reply MUST still deliver over B's live inbound link on
-/// a later retry, NOT dial B's phantom (undialable) dest.
+/// Deterministic via `force_next_sends_busy_for_test` (the RESOURCE ship is
+/// forced Busy; the packet path is real): A's resource ship returns
+/// `ShipError::Busy`, so the reply goes as a packet over B's live inbound link
+/// and MUST arrive attributed to A — NOT dial B's phantom (undialable) dest.
+/// (End-to-end companion to leviculum#27's deterministic mechanism proof.)
 #[tokio::test]
-async fn busy_reverse_path_retries_instead_of_falling_into_the_nat_hole() {
+async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,ciris_edge=debug")
         .try_init();
@@ -499,10 +501,10 @@ async fn busy_reverse_path_retries_instead_of_falling_into_the_nat_hole() {
     // on retry #3, NOT dial B's phantom dest.
     transport_a.force_next_sends_busy_for_test(2);
     transport_a
-        .send("edge-key-bbbb", b"reply-after-busy-retries")
+        .send("edge-key-bbbb", b"reply-over-a-busy-link-as-a-packet")
         .await
         .expect(
-            "reply MUST retry the BUSY reverse-path link and deliver, not fall back to the \
+            "reply MUST interleave the BUSY reverse-path link as a packet and deliver, not fall back to the \
              undialable outbound dial (CIRISEdge#353 residual)",
         );
 
@@ -510,6 +512,6 @@ async fn busy_reverse_path_retries_instead_of_falling_into_the_nat_hole() {
         .await
         .expect("B receives the retried reply within 60s")
         .expect("B channel open");
-    assert_eq!(reply.envelope_bytes, b"reply-after-busy-retries");
+    assert_eq!(reply.envelope_bytes, b"reply-over-a-busy-link-as-a-packet");
     assert_eq!(reply.source_key_id.as_deref(), Some("edge-key-aaaa"));
 }
