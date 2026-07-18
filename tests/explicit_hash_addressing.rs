@@ -47,12 +47,12 @@ use ciris_edge::cohort_scope::CohortScope;
 use ciris_edge::transport::addressing::{
     destination_from_pubkey_bytes, reticulum_destination_for_pubkey, RETICULUM_DEST_LEN,
 };
-use rand::rngs::OsRng;
-use rand::RngCore;
-use reticulum_core::{
+use leviculum_core::{
     AnnounceControl, AnnounceError, Destination, DestinationHash, DestinationType, Direction,
     Identity,
 };
+use rand::rngs::OsRng;
+use rand::RngCore;
 
 // ─── 1. Byte-equal determinism ──────────────────────────────────────
 

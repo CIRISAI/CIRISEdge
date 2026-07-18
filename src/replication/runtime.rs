@@ -49,7 +49,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use ciris_persist::federation::FederationDirectory;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 
 use super::bridge::{BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge};
@@ -58,7 +58,7 @@ use super::directory::{DirectoryStateAdapter, MutableDirectoryStateAdapter, Repl
 use super::protocol::EnvelopeKind;
 use super::registry::ReplicationRegistry;
 use super::scheduler::{
-    ReplicationScheduler, SchedulerCommandError, SchedulerConfig, SchedulerHandle,
+    ReplicationScheduler, RoundEvent, SchedulerCommandError, SchedulerConfig, SchedulerHandle,
 };
 use super::session::SessionRole;
 use super::summary::{StateApplier, StateProvider};
@@ -127,6 +127,21 @@ fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
     });
 }
 
+/// CIRISEdge#370 — project a scheduler [`RoundEvent`] onto the
+/// metrics-facing [`crate::observability::RoundOutcome`] label. The
+/// `Completed` report payload and the `Error` string are intentionally
+/// dropped here — high-cardinality per-round detail rides the round's
+/// tracing span, not the counter key.
+fn round_outcome_of(event: &RoundEvent) -> crate::observability::RoundOutcome {
+    use crate::observability::RoundOutcome;
+    match event {
+        RoundEvent::Completed(_) => RoundOutcome::Completed,
+        RoundEvent::Refused => RoundOutcome::Refused,
+        RoundEvent::TimedOut => RoundOutcome::TimedOut,
+        RoundEvent::Error(_) => RoundOutcome::Error,
+    }
+}
+
 /// A `(peer_key_id, kind)` pair the runtime should anti-entropy with
 /// as the Initiator side. Each pair gets one [`ReplicationCoordinator`]
 /// in the Initiator role.
@@ -145,6 +160,18 @@ pub struct ReplicationRuntimeConfig {
     /// Cache + paging tuning for the bridge. Defaults to
     /// [`BridgeConfig::default`].
     pub bridge: BridgeConfig,
+    /// CIRISEdge#370 — optional live metrics handle. When `Some`,
+    /// [`ReplicationRuntime::start`] wires the scheduler's `event_sink`
+    /// to a consumer task that folds each round's
+    /// [`RoundEvent`](crate::replication::scheduler::RoundEvent) into
+    /// the [`EdgeMetrics::inc_round_outcome`](crate::observability::EdgeMetrics::inc_round_outcome)
+    /// counter — the field instrument for the transport concurrency
+    /// ceiling. `None` (the default) preserves the pre-#370
+    /// `run_until_cancelled` path with no event-sink overhead. This is a
+    /// live shared handle (its counters are `Arc`-backed), not tuning —
+    /// it rides on the config only because `start` already threads the
+    /// config through to the scheduler-spawn site.
+    pub metrics: Option<crate::observability::EdgeMetrics>,
 }
 
 /// Live replication runtime — bridge + registry + scheduler task +
@@ -319,9 +346,30 @@ impl ReplicationRuntime {
         }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let scheduler_task = tokio::spawn(async move {
-            scheduler.run_until_cancelled(cancel_rx).await;
-        });
+        // CIRISEdge#370 — when a live metrics handle is configured, route
+        // the scheduler's per-round `RoundEvent`s through the purpose-built
+        // `event_sink` into a consumer task that folds each into the
+        // `EdgeMetrics` round-outcome counter (the field instrument for the
+        // transport concurrency ceiling, leviculum#29). Absent a handle we
+        // keep the zero-overhead `run_until_cancelled` path — no channel, no
+        // consumer task. The scheduler tolerates a closed sink, and the
+        // consumer's `recv()` returns `None` when the scheduler task ends and
+        // drops the sender, so the consumer winds down without its own cancel.
+        let scheduler_task = if let Some(metrics) = config.metrics.clone() {
+            let (evt_tx, mut evt_rx) = mpsc::channel::<(String, RoundEvent)>(256);
+            tokio::spawn(async move {
+                while let Some((_peer, event)) = evt_rx.recv().await {
+                    metrics.inc_round_outcome(round_outcome_of(&event));
+                }
+            });
+            tokio::spawn(async move {
+                scheduler.run_with_events(cancel_rx, Some(evt_tx)).await;
+            })
+        } else {
+            tokio::spawn(async move {
+                scheduler.run_until_cancelled(cancel_rx).await;
+            })
+        };
 
         // `directory` is consumed by the bridge above (held inside
         // `bridge`'s Arc<dyn FederationDirectory>). Drop the local

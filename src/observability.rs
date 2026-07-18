@@ -160,6 +160,50 @@ impl DeliveryClass {
     }
 }
 
+/// Terminal outcome of a single anti-entropy replication round, as the
+/// scheduler's per-coordinator run loop observed it (the metrics-facing
+/// projection of [`crate::replication::scheduler::RoundEvent`]). It is
+/// `Copy + Eq + Hash` so it sits in the counter `HashMap` key; the
+/// [`crate::replication::RoundReport`] payload the `Completed` event
+/// carries is deliberately dropped here — high-cardinality per-round
+/// detail belongs on the tracing span, not the counter label.
+///
+/// CIRISEdge#370 — this is the instrument that makes the transport
+/// concurrency ceiling measurable in the field. Below the saturation
+/// cliff rounds `Completed`; once inbound crypto + outbound sends
+/// serialize on leviculum's single `Mutex<StdNodeCore>` past the peer
+/// count one link can service, rounds shift to `TimedOut`. A climbing
+/// `timed_out` share against a flat `completed` count is the signature
+/// of the ceiling — a throughput wall, not a per-peer latency gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RoundOutcome {
+    /// The round drove to `Complete` — the peer replied and the
+    /// diff/deliver phases finished within `round_timeout`.
+    Completed,
+    /// The coordinator refused the round (malformed / out-of-state
+    /// peer message); the scheduler reset the session.
+    Refused,
+    /// `round_timeout` elapsed waiting for the peer's reply between
+    /// SendThenWait phases — the dominant saturation signal.
+    TimedOut,
+    /// A transport / protocol / inbound-closed error aborted the round.
+    Error,
+}
+
+impl RoundOutcome {
+    /// Snake-case stable label string. Used as the dict-key on the
+    /// PyO3 `metrics_snapshot` surface.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Refused => "refused",
+            Self::TimedOut => "timed_out",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
 /// # Concurrency
@@ -233,6 +277,16 @@ pub struct EdgeMetrics {
     /// `signing_key_id` already rides on the matching
     /// `EventKind::TrustShortCircuited` event.
     pub inbound_dropped_low_trust: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#370 — per-[`RoundOutcome`] count of anti-entropy
+    /// replication rounds the scheduler has driven to a terminal state
+    /// (Completed / Refused / TimedOut / Error). Incremented once per
+    /// round by [`crate::replication::runtime::ReplicationRuntime::start`]'s
+    /// scheduler event-sink consumer, active only when a live metrics
+    /// handle is set on [`crate::replication::ReplicationRuntimeConfig`].
+    /// A `timed_out` share that climbs with active-peer count is the
+    /// field signature of the transport concurrency ceiling — the whole
+    /// reason this counter exists.
+    pub replication_round_outcomes_total: Arc<RwLock<HashMap<RoundOutcome, u64>>>,
 }
 
 impl EdgeMetrics {
@@ -287,6 +341,15 @@ impl EdgeMetrics {
         *guard.entry(class).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#370 — increment the anti-entropy round-outcome counter
+    /// for `outcome`. Called once per terminated round by the runtime's
+    /// scheduler event-sink consumer (see
+    /// [`crate::replication::runtime::ReplicationRuntime::start`]).
+    pub fn inc_round_outcome(&self, outcome: RoundOutcome) {
+        let mut guard = self.replication_round_outcomes_total.write();
+        *guard.entry(outcome).or_insert(0) += 1;
+    }
+
     /// CIRISEdge#48-B (v0.19.6) — increment the
     /// `inbound_dropped_low_trust` counter. Called from
     /// `dispatch_inbound` once per drop.
@@ -330,6 +393,7 @@ impl EdgeMetrics {
             transport_bytes_out_total: self.transport_bytes_out_total.read().clone(),
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
+            replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
         }
     }
 }
@@ -351,6 +415,10 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#48-B (v0.19.6) — cumulative count of envelopes
     /// dropped at `dispatch_inbound` due to trust short-circuit.
     pub inbound_dropped_low_trust: u64,
+    /// CIRISEdge#370 — cumulative per-outcome anti-entropy round count
+    /// (keyed by [`RoundOutcome`]). Empty until the runtime is started
+    /// with a live metrics handle configured.
+    pub replication_round_outcomes_total: HashMap<RoundOutcome, u64>,
 }
 
 #[cfg(test)]
@@ -411,6 +479,39 @@ mod tests {
         for (e, want) in cases {
             assert_eq!(VerifyErrorClass::from_verify_error(&e), want);
         }
+    }
+
+    #[test]
+    fn round_outcomes_accumulate_per_outcome() {
+        // CIRISEdge#370 — the field instrument: each terminal round outcome
+        // increments its own counter, and the snapshot renders them keyed by
+        // the stable snake-case label the PyO3 surface uses.
+        let m = EdgeMetrics::new();
+        m.inc_round_outcome(RoundOutcome::Completed);
+        m.inc_round_outcome(RoundOutcome::Completed);
+        m.inc_round_outcome(RoundOutcome::TimedOut);
+        m.inc_round_outcome(RoundOutcome::TimedOut);
+        m.inc_round_outcome(RoundOutcome::TimedOut);
+        m.inc_round_outcome(RoundOutcome::Refused);
+        let snap = m.snapshot();
+        assert_eq!(
+            snap.replication_round_outcomes_total[&RoundOutcome::Completed],
+            2
+        );
+        assert_eq!(
+            snap.replication_round_outcomes_total[&RoundOutcome::TimedOut],
+            3
+        );
+        assert_eq!(
+            snap.replication_round_outcomes_total[&RoundOutcome::Refused],
+            1
+        );
+        // Never-emitted outcome stays absent (not zero-initialised) — the map
+        // is a sparse bag, mirroring the other per-key counters.
+        assert!(!snap
+            .replication_round_outcomes_total
+            .contains_key(&RoundOutcome::Error));
+        assert_eq!(RoundOutcome::TimedOut.as_str(), "timed_out");
     }
 
     #[test]

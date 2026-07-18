@@ -124,8 +124,8 @@ use ciris_edge::transport::realtime_av_alm::{
 };
 use ciris_edge::transport::realtime_av_relay::{PeerKeyId, RelayForwardOut, RelayNode};
 
-use reticulum_core::{DestinationHash, Identity};
-use reticulum_std::driver::{ReticulumNode, ReticulumNodeBuilder};
+use leviculum_core::{DestinationHash, Identity};
+use leviculum_std::driver::{ReticulumNode, ReticulumNodeBuilder};
 
 // ─── Frame layout constants (the "8K → 2×4K → 4×2K" narrative) ─────
 

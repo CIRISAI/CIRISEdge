@@ -20,8 +20,8 @@ use ciris_edge::transport::realtime_av::{
 };
 use ciris_edge::transport::realtime_av_relay::{PeerKeyId, RelayNode};
 
-use reticulum_core::{DestinationHash, Identity};
-use reticulum_std::driver::{ReticulumNode, ReticulumNodeBuilder};
+use leviculum_core::{DestinationHash, Identity};
+use leviculum_std::driver::{ReticulumNode, ReticulumNodeBuilder};
 use std::sync::Arc;
 
 /// Distinct synthetic per-link transit key per hop — each relay→relay

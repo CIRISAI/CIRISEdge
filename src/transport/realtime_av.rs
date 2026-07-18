@@ -835,7 +835,7 @@ impl RealtimeFanout {
     /// // Apply the per-Link outer seal only for admitted receivers.
     /// for p in &admitted {
     ///     let sealed = seal_av_outer(&inner, &transit_key(p), &p.link_id, link_seq(p))?;
-    ///     send_on_link(&p.link_id, sealed);
+    ///     node.link_handle(&p.link_id).try_send(&sealed).await?; // leviculum v0.10.0 idiom
     /// }
     /// # Ok::<(), ciris_edge::transport::realtime_av::RealtimeAvError>(())
     /// ```
