@@ -3079,6 +3079,37 @@ impl ReticulumTransport {
                     return true;
                 }
                 Err(ShipError::Busy) => {
+                    // CIRISEdge#353 ask #2 (leviculum#27) — the link is
+                    // mid-transfer, so a resource reply can't get on (and the
+                    // field proved the 8 s retry window loses). A PACKET can:
+                    // `send_on_link` interleaves an in-flight resource transfer
+                    // (it goes through the link Channel, never the one-resource
+                    // gate). Ship the reply as a packet if it fits the link MDU —
+                    // the reverse path carries small control-plane replies
+                    // (Summary/Diff, the Key + IdentityOccurrence planes) that
+                    // do. This is the field-proven fix (reproduced deterministically
+                    // in leviculum#27) for the busy-window contention. If the reply
+                    // is too large or the channel itself is backpressured, fall
+                    // through to the existing resource busy-retry / dial.
+                    let mdu = self.node.link_mdu(&link_id).unwrap_or(0);
+                    if envelope_bytes.len() <= mdu
+                        && self
+                            .node
+                            .send_on_link(&link_id, envelope_bytes)
+                            .await
+                            .is_ok()
+                    {
+                        tracing::debug!(
+                            destination_key_id,
+                            link = ?link_id,
+                            attempts,
+                            mdu,
+                            bytes = envelope_bytes.len(),
+                            "delivered as a link PACKET, interleaving the busy resource \
+                             transfer (CIRISEdge#353 ask #2 / leviculum#27)"
+                        );
+                        return true;
+                    }
                     if tokio::time::Instant::now() + REVERSE_PATH_BUSY_BACKOFF >= deadline {
                         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                             reverse_path_fallback_log().check(destination_key_id)
@@ -3089,9 +3120,10 @@ impl ReticulumTransport {
                                 attempts,
                                 window_secs = REVERSE_PATH_BUSY_RETRY_WINDOW.as_secs(),
                                 suppressed_prev,
-                                "reverse-path link stayed BUSY (resource transfer in \
-                                 progress) through the whole retry window; falling back \
-                                 to an outbound dial as LAST resort (CIRISEdge#353)"
+                                "reverse-path link stayed BUSY and the reply did not fit a \
+                                 link packet (too large / channel backpressured) through the \
+                                 whole retry window; falling back to an outbound dial as LAST \
+                                 resort (CIRISEdge#353)"
                             );
                         }
                         return false;
@@ -3571,6 +3603,54 @@ struct EventCtx<'a> {
 // variant onto a side-effect (record / emit); extracting would
 // fragment the event-loop verdict across multiple helpers.
 #[allow(clippy::too_many_lines)]
+/// CIRISEdge#353/#365 — attribute an inbound link frame to its source peer and
+/// hand it to the inbound sink. Shared by BOTH the resource path
+/// (`ResourceCompleted`) and the packet path (`LinkDataReceived`, the #353 ask #2
+/// non-contending reverse-path reply) so the two can NEVER diverge in how they
+/// attribute or route a frame (the #348 two-loops lesson). Attribution order:
+/// the `LinkIdentified`-fed table first (a peer dialed us), then the link's
+/// DESTINATION (a link WE dialed — the reverse path), then `None`
+/// (SkippedNoSourceKeyId downstream, never a silent drop).
+async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8>) {
+    let mut source_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    // CIRISEdge#353 — INITIATOR-side attribution. `link_to_peer_key_id` is fed by
+    // `LinkIdentified`, which only fires on links a PEER dialed to us; a reply
+    // arriving on a link WE dialed (the reverse path a NAT'd peer's responder
+    // uses) has no entry. The stateless, #66-re-key-proof basis is the link's
+    // DESTINATION (leviculum `link_destination`): we dialed a dest resolved from
+    // the VERIFIED route table, and RNS establishment proves the remote controls
+    // that dest's keys — same trust the outbound send used.
+    if source_key_id.is_none() {
+        if let Some(dest) = ctx.node.link_destination(&link_id) {
+            source_key_id = ctx
+                .peers
+                .lock()
+                .await
+                .iter()
+                .find(|(_, rooted)| rooted.peer.dest_hash == dest)
+                .map(|(key_id, _)| key_id.clone());
+            if let Some(key_id) = &source_key_id {
+                tracing::debug!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    "inbound frame on a link WE dialed attributed via its destination \
+                     (initiator-side reverse path, CIRISEdge#353)"
+                );
+            }
+        }
+    }
+    let frame = InboundFrame {
+        envelope_bytes: data,
+        transport: TransportId::RETICULUM_RS,
+        received_at: Utc::now(),
+        source_key_id,
+    };
+    if let Err(e) = ctx.sink.send(frame).await {
+        tracing::error!(error = %e, "inbound channel send failed");
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one exhaustive NodeEvent dispatch match; splitting it hurts readability
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
     match event {
         NodeEvent::AnnounceReceived { announce, .. } => {
@@ -3801,52 +3881,36 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 bytes = data.len(),
                 "inbound envelope resource completed",
             );
-            // v3.5.1 (CIRISEdge#119 + #120) — populate source_key_id
-            // from the per-link rooted-peer attribution table when
-            // available. `None` falls back to v3.5.0 behavior (no
-            // routing fires inside `Edge::install_replication_routing`).
-            let mut source_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
-            // CIRISEdge#353 — INITIATOR-side attribution. The table above is
-            // fed by `LinkIdentified`, which only fires on links a PEER dialed
-            // to us; a reply arriving on a link WE dialed (the reverse path a
-            // NAT'd peer's responder now uses) has no entry and would drop as
-            // `SkippedNoSourceKeyId`. The stateless, #66-re-key-proof basis is
-            // the link's DESTINATION (leviculum v0.9.2 `link_destination`,
-            // alias-resolving): we dialed a dest resolved from the VERIFIED
-            // route table, and RNS link establishment proves the remote
-            // controls that dest's identity keys — so mapping dest → rooted
-            // peer attributes the frame on the same trust the outbound send
-            // used. A mid-link route supersession can miss here; that falls
-            // through to the existing LOUD SkippedNoSourceKeyId path, never a
-            // silent drop.
-            if source_key_id.is_none() {
-                if let Some(dest) = ctx.node.link_destination(&link_id) {
-                    source_key_id = ctx
-                        .peers
-                        .lock()
-                        .await
-                        .iter()
-                        .find(|(_, rooted)| rooted.peer.dest_hash == dest)
-                        .map(|(key_id, _)| key_id.clone());
-                    if let Some(key_id) = &source_key_id {
-                        tracing::debug!(
-                            link = ?link_id,
-                            peer = %key_id,
-                            "inbound frame on a link WE dialed attributed via its \
-                             destination (initiator-side reverse path, CIRISEdge#353)"
-                        );
-                    }
-                }
+            attribute_and_deliver(ctx, link_id, data).await;
+        }
+        // CIRISEdge#353 ask #2 / #363 — a reverse-path reply that arrived as a
+        // link PACKET (`send_on_link`) rather than a resource, because the link
+        // was mid-transfer. leviculum#27: a packet interleaves an in-flight
+        // resource transfer (it goes through the link Channel, never the
+        // one-resource gate), so a small anti-entropy reply (Summary/Diff — the
+        // Key + IdentityOccurrence planes) gets through a busy link instead of
+        // contending and losing the retry window. Routed EXACTLY like a resource
+        // frame (same attribution + inbound sink), so `route_replication_frame`
+        // dispatches it identically — the sender chose packet-vs-resource purely
+        // on payload size; the receiver need not care which arrived.
+        //
+        // `send_on_link` ships via the link's CHANNEL, so it arrives as
+        // `MessageReceived` (the channel-demuxed variant), NOT the raw
+        // `LinkDataReceived`. We route BOTH: any bytes delivered over an
+        // established link are candidate replication frames (CRPL-gated
+        // downstream in `route_replication_frame`; a non-CRPL message falls
+        // through to envelope dispatch, exactly as a resource frame does).
+        NodeEvent::MessageReceived { link_id, data, .. }
+        | NodeEvent::LinkDataReceived { link_id, data } => {
+            if data.is_empty() {
+                return;
             }
-            let frame = InboundFrame {
-                envelope_bytes: data,
-                transport: TransportId::RETICULUM_RS,
-                received_at: Utc::now(),
-                source_key_id,
-            };
-            if let Err(e) = ctx.sink.send(frame).await {
-                tracing::error!(error = %e, "inbound channel send failed");
-            }
+            tracing::debug!(
+                link = ?link_id,
+                bytes = data.len(),
+                "inbound link packet received (reverse-path reply, CIRISEdge#353 ask #2)",
+            );
+            attribute_and_deliver(ctx, link_id, data).await;
         }
         NodeEvent::LinkClosed {
             link_id, reason, ..
