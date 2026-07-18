@@ -1264,13 +1264,13 @@ impl PyEdge {
                      (disable_reticulum=True, or wheel built without _reticulum-module)",
                 )
             })?;
-            let factory: Arc<dyn reticulum_std::interfaces::RNodeChannelFactory> =
+            let factory: Arc<dyn leviculum_std::interfaces::RNodeChannelFactory> =
                 Arc::new(PyRNodeChannelFactory {
                     read_cb,
                     write_cb,
                     chunk_size: buffer_size.max(1) * 1024,
                 });
-            let config = reticulum_std::interfaces::RNodeChannelConfig {
+            let config = leviculum_std::interfaces::RNodeChannelConfig {
                 factory,
                 frequency: frequency_hz,
                 bandwidth: bandwidth_hz,
@@ -2110,6 +2110,16 @@ impl PyEdge {
         }
         root.set_item("peer_reachability_ratio", reachability)?;
 
+        // CIRISEdge#370 — per-outcome anti-entropy round counts
+        // (completed / refused / timed_out / error). A `timed_out` share
+        // that climbs with active-peer count is the field signature of the
+        // transport concurrency ceiling (leviculum#29).
+        let round_outcomes = pyo3::types::PyDict::new(py);
+        for (outcome, v) in &bundle.replication_round_outcomes_total {
+            round_outcomes.set_item(outcome.as_str(), *v)?;
+        }
+        root.set_item("replication_round_outcomes_total", round_outcomes)?;
+
         Ok(root.unbind().into_any())
     }
 
@@ -2189,6 +2199,11 @@ impl PyEdge {
         if let Some(secs) = cadence_seconds {
             config.scheduler.cadence = std::time::Duration::from_secs(secs);
         }
+        // CIRISEdge#370 — hand the live metrics bag to the runtime so its
+        // scheduler event-sink consumer folds each round's outcome into the
+        // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;
+        // the counters are `Arc`-backed and shared with `self.inner`.
+        config.metrics = Some(self.inner.metrics());
 
         // CIRISEdge#311 — the #257 Key-plane set + #305 occurrence-plane set
         // collapse into ONE `SelfOwn` provider; the unified engine advertises
@@ -2735,8 +2750,8 @@ struct PyRNodeChannelFactory {
 }
 
 #[cfg(feature = "_reticulum-module")]
-impl reticulum_std::interfaces::RNodeChannelFactory for PyRNodeChannelFactory {
-    fn open(&self) -> reticulum_std::interfaces::RNodeChannelOpenFuture {
+impl leviculum_std::interfaces::RNodeChannelFactory for PyRNodeChannelFactory {
+    fn open(&self) -> leviculum_std::interfaces::RNodeChannelOpenFuture {
         let read_cb = Python::attach(|py| self.read_cb.clone_ref(py));
         let write_cb = Python::attach(|py| self.write_cb.clone_ref(py));
         let chunk = self.chunk_size;
@@ -2825,7 +2840,7 @@ impl reticulum_std::interfaces::RNodeChannelFactory for PyRNodeChannelFactory {
             });
 
             Ok::<
-                reticulum_std::interfaces::RNodeChannelHalves,
+                leviculum_std::interfaces::RNodeChannelHalves,
                 Box<dyn std::error::Error + Send + Sync>,
             >((Box::new(leviculum_rx), Box::new(leviculum_tx)))
         })
@@ -2845,7 +2860,7 @@ impl reticulum_std::interfaces::RNodeChannelFactory for PyRNodeChannelFactory {
 #[cfg(feature = "_reticulum-module")]
 #[pyclass(name = "RNodeChannelHandle", module = "ciris_edge", unsendable)]
 pub struct PyRNodeChannelHandle {
-    inner: std::sync::Mutex<Option<reticulum_std::interfaces::RNodeChannelHandle>>,
+    inner: std::sync::Mutex<Option<leviculum_std::interfaces::RNodeChannelHandle>>,
 }
 
 #[cfg(feature = "_reticulum-module")]
@@ -5971,7 +5986,7 @@ fn rns_destination_hash(
     x25519_pub: &[u8],
     ed25519_pub: &[u8],
 ) -> PyResult<[u8; 16]> {
-    use reticulum_core::{Destination, Identity};
+    use leviculum_core::{Destination, Identity};
     let x_pub = fixed_bytes::<32>("x25519_pub", x25519_pub)?;
     let ed_pub = fixed_bytes::<32>("ed25519_pub", ed25519_pub)?;
     let identity = Identity::from_public_keys(&x_pub, &ed_pub)
@@ -6517,15 +6532,15 @@ impl PyRelayNode {
     /// hand-off back to a peer's open path).
     ///
     /// `address_hash_bytes` is the 16-byte
-    /// [`DestinationHash`](reticulum_core::DestinationHash) value
+    /// [`DestinationHash`](leviculum_core::DestinationHash) value
     /// (CEG §5.6.8.8.1.1 TRUNCATED_HASHLENGTH). Pass any synthetic
     /// 16-byte value for harness-only use; production callers should
     /// derive this via [`rns_destination_hash`].
     #[staticmethod]
     #[pyo3(signature = (address_hash_bytes))]
     fn with_synthetic_node(address_hash_bytes: &[u8]) -> PyResult<Self> {
-        use reticulum_core::{DestinationHash, Identity};
-        use reticulum_std::driver::ReticulumNodeBuilder;
+        use leviculum_core::{DestinationHash, Identity};
+        use leviculum_std::driver::ReticulumNodeBuilder;
         let addr_bytes = fixed_bytes::<16>("address_hash_bytes", address_hash_bytes)?;
         // Synthetic 64-byte private key — deterministic, never
         // intended for real I/O. Matches the relay's own test

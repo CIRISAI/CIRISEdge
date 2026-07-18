@@ -50,7 +50,7 @@
 //!
 //! [`RelayNode`] construction is non-trivial — the test pattern in
 //! `src/transport/realtime_av_relay.rs::tests::test_node` builds a
-//! real [`reticulum_std::driver::ReticulumNode`] (writes an identity
+//! real [`leviculum_std::driver::ReticulumNode`] (writes an identity
 //! file to a temp dir, allocates a tokio runtime, etc., via
 //! `ReticulumNodeBuilder::build_sync`). The full subscriber roster
 //! is also wired at setup time. Every `bench_with_input` group uses
@@ -149,8 +149,8 @@ use ciris_edge::transport::realtime_av::{
 };
 use ciris_edge::transport::realtime_av_relay::{PeerKeyId, RelayNode};
 
-use reticulum_core::{DestinationHash, Identity};
-use reticulum_std::driver::{ReticulumNode, ReticulumNodeBuilder};
+use leviculum_core::{DestinationHash, Identity};
+use leviculum_std::driver::{ReticulumNode, ReticulumNodeBuilder};
 
 // ─── Parameter sweep tables (held here so every group reads the
 //     same constants — keeps cross-bench results lined up). ───────────

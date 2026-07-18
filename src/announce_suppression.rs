@@ -39,7 +39,7 @@ use parking_lot::RwLock;
 use crate::cohort_scope::CohortScope;
 
 #[cfg(feature = "_reticulum-module")]
-use reticulum_core::{AnnounceControl, DestinationHash};
+use leviculum_core::{AnnounceControl, DestinationHash};
 
 /// FSD §3.3 announce-suppression decision rule. Returns `true` iff
 /// the destination's [`CohortScope`] is anything other than

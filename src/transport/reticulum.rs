@@ -84,11 +84,11 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Mutex};
 
-use reticulum_core::link::LinkId;
-use reticulum_core::resource::ResourceStrategy;
-use reticulum_core::{Destination, DestinationHash, DestinationType, Direction, Identity};
-use reticulum_std::driver::{EventReceiver, ReticulumNode, ReticulumNodeBuilder};
-use reticulum_std::NodeEvent;
+use leviculum_core::link::LinkId;
+use leviculum_core::resource::ResourceStrategy;
+use leviculum_core::{Destination, DestinationHash, DestinationType, Direction, Identity};
+use leviculum_std::driver::{EventReceiver, ReticulumNode, ReticulumNodeBuilder};
+use leviculum_std::NodeEvent;
 
 use super::attestation::{
     AnnounceAttestation, AttestationError, AttestationPayload, TransportBindingEnforcement,
@@ -175,13 +175,13 @@ const NO_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
 const BOOTSTRAP_LINK_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// CIRISEdge#363 — leviculum's minimum keepalive interval
-/// (`reticulum_core::constants::LINK_KEEPALIVE_MIN_SECS`). leviculum clamps an
+/// (`leviculum_core::constants::LINK_KEEPALIVE_MIN_SECS`). leviculum clamps an
 /// override UP to this floor but does not cap the ceiling, so edge enforces both
 /// ends in [`effective_link_keepalive_secs`].
 const LINK_KEEPALIVE_MIN_SECS: u64 = 5;
 
 /// CIRISEdge#363 — leviculum's maximum / RTT-derived keepalive interval
-/// (`reticulum_core::constants::LINK_KEEPALIVE_SECS`, 6 minutes). Edge caps an
+/// (`leviculum_core::constants::LINK_KEEPALIVE_SECS`, 6 minutes). Edge caps an
 /// operator override here so a stray large value can NOT hold a silently-dead
 /// link open longer than leviculum's own RTT-driven ceiling would — the
 /// DoS-facing upper bound (leviculum only clamps the lower end).
@@ -946,7 +946,7 @@ pub enum ReticulumInterfaceConfig {
     /// firmware. Off-grid relays + solar-powered meshes. Leviculum's
     /// Rust builder doesn't expose an `add_rnode` method yet, so the
     /// adapter pipes this config into the underlying
-    /// `reticulum_std::config::InterfaceConfig` row via
+    /// `leviculum_std::config::InterfaceConfig` row via
     /// [`ReticulumTransport::add_interface`]'s internal config path.
     #[cfg(feature = "transport-reticulum-rnode")]
     RNode(RNodeInterfaceConfig),
@@ -1788,6 +1788,14 @@ impl ReticulumTransport {
         let explicit_dest_hash = crate::transport::addressing::reticulum_destination_for_pubkey(
             &federation_ed25519_pubkey,
         );
+        // CIRISEdge#371 / leviculum#30 — `Destination::with_explicit_hash` is the
+        // ONE fork-only API with no upstream equivalent: upstream `Destination.hash`
+        // is private and `Destination::new` derives it from app_name+aspects+identity,
+        // so a node cannot otherwise listen on the federation-rooted hash peers
+        // address it by (CIRISEdge#191). Re-ported onto the leviculum-* rename in
+        // v0.10.1+ciris.1 (the other dropped fork APIs all migrated to upstream
+        // idioms: send_on_link → LinkHandle::try_send, connect_at → connect(dest_hash),
+        // register_destination_at → register_destination).
         let mut dest = Destination::with_explicit_hash(
             Some(identity.clone()),
             Direction::In,
@@ -1804,7 +1812,13 @@ impl ReticulumTransport {
             &explicit_dest_hash,
             "explicit-hash destination must index by the caller-supplied hash",
         );
-        node.register_destination_at(local_dest_hash, dest);
+        // CIRISEdge#371 — the explicit hash rides on the `Destination` itself
+        // (via `with_explicit_hash` above), and the core keys the routing table
+        // on `dest.hash()`, so upstream's native `register_destination` registers
+        // it at exactly `explicit_dest_hash` — the fork-only `register_destination_at`
+        // is unnecessary. (The debug_assert above proves `dest.hash()` == the
+        // explicit hash we asked for.)
+        node.register_destination(dest);
 
         // v7.4.0 (CIRISEdge#231) — register a NAMED destination on
         // the SAME transport identity. Its hash is the standard RNS
@@ -1828,7 +1842,9 @@ impl ReticulumTransport {
         .map_err(|e| TransportError::Config(format!("named destination build: {e}")))?;
         named_dest.set_accepts_links(true);
         let local_named_dest_hash = *named_dest.hash();
-        node.register_destination_at(local_named_dest_hash, named_dest);
+        // CIRISEdge#371 — the named dest already carries its RNS-derived hash, so
+        // `register_destination` (native) registers it at `local_named_dest_hash`.
+        node.register_destination(named_dest);
 
         // Take the single event receiver before starting, then start
         // the event loop. `listen` claims the stashed receiver.
@@ -2392,7 +2408,7 @@ impl ReticulumTransport {
     //
     // Paths / blackhole / rate / tunnels / announce / reverse. v1.1.0
     // (CIRISEdge#44) flips on the 5 Leviculum accessors that the fork
-    // now exposes publicly (`reticulum_std::driver::ReticulumNode::
+    // now exposes publicly (`leviculum_std::driver::ReticulumNode::
     // {path_table_entries, rate_table_entries, get_path_clone,
     // remove_path, drop_all_paths_via}`). The remaining 3 read
     // surfaces (`routing_tunnels`, `routing_announce_table`,
@@ -3082,20 +3098,30 @@ impl ReticulumTransport {
                     // CIRISEdge#353 ask #2 (leviculum#27) — the link is
                     // mid-transfer, so a resource reply can't get on (and the
                     // field proved the 8 s retry window loses). A PACKET can:
-                    // `send_on_link` interleaves an in-flight resource transfer
-                    // (it goes through the link Channel, never the one-resource
-                    // gate). Ship the reply as a packet if it fits the link MDU —
-                    // the reverse path carries small control-plane replies
-                    // (Summary/Diff, the Key + IdentityOccurrence planes) that
-                    // do. This is the field-proven fix (reproduced deterministically
-                    // in leviculum#27) for the busy-window contention. If the reply
-                    // is too large or the channel itself is backpressured, fall
-                    // through to the existing resource busy-retry / dial.
+                    // a link-Channel send interleaves an in-flight resource
+                    // transfer (it goes through the link Channel, never the
+                    // one-resource gate). Ship the reply as a packet if it fits
+                    // the link MDU — the reverse path carries small control-plane
+                    // replies (Summary/Diff, the Key + IdentityOccurrence planes)
+                    // that do. This is the field-proven fix (reproduced
+                    // deterministically in leviculum#27) for the busy-window
+                    // contention. If the reply is too large or the channel itself
+                    // is backpressured, fall through to the existing resource
+                    // busy-retry / dial.
+                    //
+                    // CIRISEdge#371 — since leviculum v0.10.0 the fork-only
+                    // `driver::send_on_link` wrapper is folded into upstream's
+                    // `LinkHandle`; `link_handle(&id).try_send(..)` is the same
+                    // core `send_on_link` (Channel / `RawBytesMessage`) and still
+                    // returns `Busy` non-blocking, so the interleave semantics are
+                    // unchanged. `try_send` (not `send`) keeps the one-shot
+                    // behaviour — this call is already inside the busy-retry path.
                     let mdu = self.node.link_mdu(&link_id).unwrap_or(0);
                     if envelope_bytes.len() <= mdu
                         && self
                             .node
-                            .send_on_link(&link_id, envelope_bytes)
+                            .link_handle(&link_id)
+                            .try_send(envelope_bytes)
                             .await
                             .is_ok()
                     {
@@ -3188,8 +3214,8 @@ impl ReticulumTransport {
             .send_resource(link_id, envelope_bytes, None, true)
             .await
             .map_err(|e| match e {
-                reticulum_std::error::Error::Resource(
-                    reticulum_core::resource::ResourceError::TransferInProgress,
+                leviculum_std::error::Error::Resource(
+                    leviculum_core::resource::ResourceError::TransferInProgress,
                 ) => ShipError::Busy,
                 other => ShipError::Other(TransportError::Io(format!(
                     "reticulum send_resource: {other}"
@@ -3884,8 +3910,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             attribute_and_deliver(ctx, link_id, data).await;
         }
         // CIRISEdge#353 ask #2 / #363 — a reverse-path reply that arrived as a
-        // link PACKET (`send_on_link`) rather than a resource, because the link
-        // was mid-transfer. leviculum#27: a packet interleaves an in-flight
+        // link PACKET (a link-Channel send, `LinkHandle::try_send` since
+        // CIRISEdge#371 / leviculum v0.10.0) rather than a resource, because the
+        // link was mid-transfer. leviculum#27: a packet interleaves an in-flight
         // resource transfer (it goes through the link Channel, never the
         // one-resource gate), so a small anti-entropy reply (Summary/Diff — the
         // Key + IdentityOccurrence planes) gets through a busy link instead of
@@ -3894,7 +3921,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         // dispatches it identically — the sender chose packet-vs-resource purely
         // on payload size; the receiver need not care which arrived.
         //
-        // `send_on_link` ships via the link's CHANNEL, so it arrives as
+        // The link-Channel send ships via the link's CHANNEL, so it arrives as
         // `MessageReceived` (the channel-demuxed variant), NOT the raw
         // `LinkDataReceived`. We route BOTH: any bytes delivered over an
         // established link are candidate replication frames (CRPL-gated
@@ -3925,7 +3952,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // event. Severity reflects whether the close was graceful.
             if let Some(bus) = ctx.event_bus {
                 let severity = match reason {
-                    reticulum_core::link::LinkCloseReason::Normal => {
+                    leviculum_core::link::LinkCloseReason::Normal => {
                         crate::events::EventSeverity::Info
                     }
                     _ => crate::events::EventSeverity::Warning,
@@ -4114,7 +4141,7 @@ fn route_supersession_decision(
 
 #[allow(clippy::too_many_lines)]
 async fn resolve_announce_cold_start(
-    announce: &reticulum_core::ReceivedAnnounce,
+    announce: &leviculum_core::ReceivedAnnounce,
     ctx: &EventCtx<'_>,
 ) {
     use ciris_persist::federation::self_at_login::BindingProvenance;
@@ -4757,7 +4784,7 @@ async fn build_local_attestation(
 ///    return; uses hardware RNG where the tier offers it), then
 ///    `keystore.load(key_id)` for the bytes.
 ///
-/// All branches return a constructed `reticulum_std::Identity`.
+/// All branches return a constructed `leviculum_std::Identity`.
 /// Failure to construct the Identity from the loaded bytes is a hard
 /// `TransportError::Config` — fail-loud, never a silently-misshapen
 /// identity.
@@ -4877,7 +4904,7 @@ fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, Transpo
         });
     }
 
-    let identity = reticulum_std::generate_identity();
+    let identity = leviculum_std::generate_identity();
     let bytes = identity
         .private_key_bytes()
         .map_err(|e| TransportError::Config(format!("serialize identity: {e}")))?;
@@ -4939,7 +4966,7 @@ fn apply_interface_config(
     match iface {
         #[cfg(feature = "transport-reticulum-auto")]
         ReticulumInterfaceConfig::Auto(cfg) => {
-            use reticulum_std::interfaces::auto_interface::AutoInterfaceConfig as LevAuto;
+            use leviculum_std::interfaces::auto_interface::AutoInterfaceConfig as LevAuto;
             let mut lev = LevAuto::default();
             if let Some(group_id) = &cfg.group_id {
                 lev.group_id = group_id.as_bytes().to_vec();

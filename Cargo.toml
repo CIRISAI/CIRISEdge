@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "13.4.0"
+version = "13.5.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -566,8 +566,18 @@ tempfile       = { version = "3", optional = true }
 # new AnnounceError::Pack(PacketError) — a breaking enum change, but edge only
 # matches AnnounceError::ExplicitHashCannotAnnounce (untouched), so the bump is
 # pin currency + the budget-const rewire with no match-arm churn.
-reticulum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.9.4+ciris.1", version = "0.9", optional = true }
-reticulum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.9.4+ciris.1", version = "0.9", optional = true }
+# v0.10.1+ciris.1 (CIRISEdge#371) — re-anchor on upstream leviculum/master
+# which adopts the `reticulum-* -> leviculum-*` crate rename. The fork carries
+# forward the CIRIS-only driver features (link_is_established, link_destination,
+# FramesDropped) + fork CI. Two fork APIs edge used were folded into upstream
+# idioms: `driver::send_on_link` -> `LinkHandle::try_send` (same core Channel
+# path) and `register_destination_at`/`connect_at` -> native
+# `register_destination`/`connect(dest_hash)`. v0.10.1 (leviculum#30) re-ports the
+# one remaining fork-only constructor `Destination::with_explicit_hash` — edge's
+# federation explicit-hash listen path (CIRISEdge#191) that upstream has no
+# equivalent for. The `+ciris.1` is fork build-metadata; the crate semver is 0.10.
+leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.10.1+ciris.1", version = "0.10", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.10.1+ciris.1", version = "0.10", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
@@ -725,7 +735,8 @@ transport-http        = [
 ]
 
 # Phase 1 — Reticulum canonical wire (OQ-07 first impl). Backed by
-# Leviculum's reticulum-core + reticulum-std. `TransportId::RETICULUM_RS`
+# Leviculum's leviculum-core + leviculum-std (the upstream `reticulum-* ->
+# leviculum-*` rename, adopted in CIRISEdge#371). `TransportId::RETICULUM_RS`
 # is the metrics tag; the impl lives in `src/transport/reticulum.rs`.
 #
 # v0.12.0 (CIRISEdge#24) — refactored from a single umbrella feature
@@ -784,16 +795,16 @@ transport-reticulum             = [
     "transport-reticulum-local",
     "transport-reticulum-rnode",
     "transport-reticulum-i2p",
-    "dep:reticulum-std",
-    "dep:reticulum-core",
+    "dep:leviculum-std",
+    "dep:leviculum-core",
 ]
-transport-reticulum-auto        = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
-transport-reticulum-tcp-server  = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
-transport-reticulum-tcp-client  = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
-transport-reticulum-udp         = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
-transport-reticulum-local       = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
-transport-reticulum-rnode       = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
-transport-reticulum-i2p         = ["dep:reticulum-std", "dep:reticulum-core", "_reticulum-module"]
+transport-reticulum-auto        = ["dep:leviculum-std", "dep:leviculum-core", "_reticulum-module"]
+transport-reticulum-tcp-server  = ["dep:leviculum-std", "dep:leviculum-core", "_reticulum-module"]
+transport-reticulum-tcp-client  = ["dep:leviculum-std", "dep:leviculum-core", "_reticulum-module"]
+transport-reticulum-udp         = ["dep:leviculum-std", "dep:leviculum-core", "_reticulum-module"]
+transport-reticulum-local       = ["dep:leviculum-std", "dep:leviculum-core", "_reticulum-module"]
+transport-reticulum-rnode       = ["dep:leviculum-std", "dep:leviculum-core", "_reticulum-module"]
+transport-reticulum-i2p         = ["dep:leviculum-std", "dep:leviculum-core", "_reticulum-module"]
 
 # Internal aggregator — any reticulum-* sub-feature flips this on, and
 # every cfg site in the code that needs "the Reticulum transport module

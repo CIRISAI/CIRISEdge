@@ -251,7 +251,7 @@ impl TransportBindingEnforcement {
 /// payload (180 B) is larger than the un-ratcheted case, so 300 B (not 332 B) is
 /// the value a smaller-fits-so-does-larger argument does NOT get to assume.
 /// (leviculum#22 / v0.9.0+ciris.1 exported this; before, edge duplicated `300`.)
-pub const ANNOUNCE_APP_DATA_BUDGET: usize = reticulum_core::announce_app_data_budget(true);
+pub const ANNOUNCE_APP_DATA_BUDGET: usize = leviculum_core::announce_app_data_budget(true);
 
 /// The binary wire tag for [`AnnounceAttestation::to_app_data`]. A version byte
 /// so a future shape is distinguishable rather than mis-parsed.

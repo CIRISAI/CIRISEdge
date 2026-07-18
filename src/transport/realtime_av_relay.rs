@@ -92,8 +92,8 @@ use std::collections::{HashMap, HashSet};
 
 use zeroize::Zeroize;
 
-use reticulum_core::DestinationHash;
-use reticulum_std::driver::ReticulumNode;
+use leviculum_core::DestinationHash;
+use leviculum_std::driver::ReticulumNode;
 
 use super::realtime_av::{
     open_av_outer, seal_av_outer, InnerSealed, RealtimeAvError, ReceiverLayerPolicy, SealedAvChunk,
@@ -526,8 +526,8 @@ mod tests {
         CODEC_OPAQUE,
     };
 
-    use reticulum_core::{DestinationHash, Identity};
-    use reticulum_std::driver::ReticulumNodeBuilder;
+    use leviculum_core::{DestinationHash, Identity};
+    use leviculum_std::driver::ReticulumNodeBuilder;
     use std::sync::Arc;
 
     /// A throwaway leviculum node — used to construct a `RelayNode`
