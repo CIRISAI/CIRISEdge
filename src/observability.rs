@@ -287,6 +287,15 @@ pub struct EdgeMetrics {
     /// field signature of the transport concurrency ceiling — the whole
     /// reason this counter exists.
     pub replication_round_outcomes_total: Arc<RwLock<HashMap<RoundOutcome, u64>>>,
+    /// CIRISEdge#373 — cumulative count of inbound replication frames dropped
+    /// because the target coordinator's bounded inbound channel was full
+    /// (`RegistryError::BackPressure`). Before this counter the drop was a bare
+    /// `tracing::warn!` — 100% of a churning mobile's Attestation trace was
+    /// destroyed *silently*. A non-zero value means a responder reply stalled
+    /// long enough to park the inbound drain (pairs with #370: the round would
+    /// also show `timed_out`). Single `Arc<AtomicU64>`; the offending peer + kind
+    /// ride the matching throttled WARN.
+    pub replication_inbound_backpressure_drops: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl EdgeMetrics {
@@ -350,6 +359,22 @@ impl EdgeMetrics {
         *guard.entry(outcome).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#373 — increment the inbound-backpressure-drop counter. Called
+    /// once per dropped frame at the `route_replication_frame` back-pressure
+    /// path, so the previously-silent 100% trace loss is countable.
+    pub fn inc_inbound_backpressure_drop(&self) {
+        self.replication_inbound_backpressure_drops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#373 — read the inbound-backpressure-drop counter (tests +
+    /// snapshot projection).
+    #[must_use]
+    pub fn inbound_backpressure_drops(&self) -> u64 {
+        self.replication_inbound_backpressure_drops
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// CIRISEdge#48-B (v0.19.6) — increment the
     /// `inbound_dropped_low_trust` counter. Called from
     /// `dispatch_inbound` once per drop.
@@ -394,6 +419,7 @@ impl EdgeMetrics {
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
+            replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
         }
     }
 }
@@ -419,6 +445,9 @@ pub struct EdgeMetricsBundle {
     /// (keyed by [`RoundOutcome`]). Empty until the runtime is started
     /// with a live metrics handle configured.
     pub replication_round_outcomes_total: HashMap<RoundOutcome, u64>,
+    /// CIRISEdge#373 — cumulative inbound frames dropped on coordinator
+    /// channel back-pressure (previously a silent WARN).
+    pub replication_inbound_backpressure_drops: u64,
 }
 
 #[cfg(test)]

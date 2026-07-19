@@ -242,6 +242,18 @@ impl ShipError {
 const REVERSE_PATH_BUSY_RETRY_WINDOW: Duration = Duration::from_secs(8);
 /// Pause between busy-retries on the reverse path.
 const REVERSE_PATH_BUSY_BACKOFF: Duration = Duration::from_millis(500);
+/// CIRISEdge#353b — resource-completion timeout for a REVERSE-PATH reply,
+/// deliberately far shorter than the 120 s [`RESOURCE_TRANSFER_TIMEOUT`] used on
+/// the outbound-dial path. A reply's small Summary/Diff/Deliver payload completes
+/// in a few seconds on a genuinely live link; if it hasn't in 10 s the link is a
+/// NAT-dead-but-`Active` corpse (the mobile churns links every ~30 s), and edge
+/// must NOT commit 120 s to it — the round times out and, worse, the stalled send
+/// parks the responder's inbound drain until every queued frame is dropped (#373).
+/// 10 s > the round-open RTT + transfer on a live link, but bounds the corpse case
+/// so the NEXT round rides the peer's fresh link. `link_last_inbound_at` selection
+/// (#353a) already avoids the corpse when a live link exists; this bounds the
+/// degenerate window where it is momentarily the only `Active` candidate.
+const REVERSE_PATH_RESOURCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// CIRISEdge#336 (fast heal) — minimum interval between EVENT-DRIVEN announces.
 ///
@@ -1359,6 +1371,18 @@ pub struct ReticulumTransport {
     /// been LinkIdentified yet, or when the link's remote identity
     /// doesn't match any rooted peer (pre-handshake / cold-start).
     link_to_peer_key_id: Arc<Mutex<HashMap<LinkId, String>>>,
+    /// CIRISEdge#353 — per-link last-inbound timestamp (unix seconds),
+    /// stamped by `attribute_and_deliver` on EVERY inbound frame this link
+    /// carries. This is the RNS `last_inbound` liveness signal (leviculum-core
+    /// tracks it internally for staleness — `link/mod.rs::last_inbound_secs` —
+    /// but the std driver doesn't expose it, so edge mirrors it from the frames
+    /// it sees). `live_attributed_link_to` selects the peer's link with the
+    /// FRESHEST inbound — the link the peer is actively sending its round on —
+    /// so a NAT-dead link that leviculum still reports `Active` (no recent
+    /// inbound) is never chosen as the reply target, which is exactly the #353
+    /// field failure (a 120 s resource timeout shipping into a dead-but-Active
+    /// link). Removed on `LinkClosed`.
+    link_last_inbound_at: Arc<Mutex<HashMap<LinkId, u64>>>,
     /// CIRISEdge#32 (v0.14.0) — request/response slot. The listen-loop
     /// populates this on `NodeEvent::ResponseReceived` keyed by
     /// `request_id`; [`Self::link_request`] polls + removes.
@@ -1883,6 +1907,7 @@ impl ReticulumTransport {
             interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
             link_established_at: Arc::new(Mutex::new(HashMap::new())),
             link_to_peer_key_id: Arc::new(Mutex::new(HashMap::new())),
+            link_last_inbound_at: Arc::new(Mutex::new(HashMap::new())),
             request_responses: Arc::new(Mutex::new(HashMap::new())),
             timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
             blackhole: blackhole_rules,
@@ -3028,11 +3053,26 @@ impl ReticulumTransport {
             .filter(|(_, peer)| peer.as_str() == destination_key_id)
             .map(|(id, _)| *id)
             .collect();
+        let last_inbound = self.link_last_inbound_at.lock().await;
         let established_at = self.link_established_at.lock().await;
-        candidates
+        // CIRISEdge#353 — build the (link, last_inbound, established_at) tuples
+        // for the peer's links leviculum still holds `Active`, then let the pure
+        // selector choose. `link_is_established` is a NECESSARY liveness gate but
+        // NOT sufficient (a NAT-dead link stays `Active` for the whole stale
+        // window), so the selector additionally prefers the freshest INBOUND —
+        // the link the peer is demonstrably sending on right now.
+        let live: Vec<(LinkId, u64, u64)> = candidates
             .into_iter()
             .filter(|id| self.node.link_is_established(id))
-            .max_by_key(|id| established_at.get(id).copied().unwrap_or(0))
+            .map(|id| {
+                (
+                    id,
+                    last_inbound.get(&id).copied().unwrap_or(0),
+                    established_at.get(&id).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        select_reply_link(&live)
     }
 
     /// CIRISEdge#353 — REVERSE PATH FIRST. If the peer holds a LIVE link to us
@@ -3083,7 +3123,10 @@ impl ReticulumTransport {
                 return false;
             };
             attempts += 1;
-            match self.ship_resource_on_link(&link_id, envelope_bytes).await {
+            match self
+                .ship_resource_on_link(&link_id, envelope_bytes, REVERSE_PATH_RESOURCE_TIMEOUT)
+                .await
+            {
                 Ok(()) => {
                     tracing::debug!(
                         destination_key_id,
@@ -3190,6 +3233,10 @@ impl ReticulumTransport {
         &self,
         link_id: &LinkId,
         envelope_bytes: &[u8],
+        // CIRISEdge#353b — completion timeout. The reverse-path reply passes the
+        // short [`REVERSE_PATH_RESOURCE_TIMEOUT`] (fail fast on a dead-but-Active
+        // link); the outbound-dial path passes [`RESOURCE_TRANSFER_TIMEOUT`].
+        completion_timeout: Duration,
     ) -> Result<(), ShipError> {
         // CIRISEdge#353 test seam — deterministically simulate the
         // one-transfer-per-link collision (see `test_force_busy`).
@@ -3225,17 +3272,17 @@ impl ReticulumTransport {
         // Wait for the sender-side `ResourceCompleted` — the driver
         // paces + retransmits resource parts, and completion means
         // every part was delivered + proven. If the transfer does not
-        // complete within the window, treat it as a timeout so edge's
-        // durable dispatcher retries.
-        let completed = wait_until_async(
-            RESOURCE_TRANSFER_TIMEOUT,
-            Duration::from_millis(100),
-            || async { self.sent_resources.lock().await.remove(&resource_hash) },
-        )
-        .await;
+        // complete within `completion_timeout` (short on the reverse path,
+        // #353b), treat it as a timeout so edge's durable dispatcher retries
+        // and the responder's inbound drain is not parked (#373).
+        let completed =
+            wait_until_async(completion_timeout, Duration::from_millis(100), || async {
+                self.sent_resources.lock().await.remove(&resource_hash)
+            })
+            .await;
         if !completed {
             return Err(ShipError::Other(TransportError::Timeout(
-                RESOURCE_TRANSFER_TIMEOUT,
+                completion_timeout,
             )));
         }
         Ok(())
@@ -3425,7 +3472,9 @@ impl Transport for ReticulumTransport {
         // The outbound-dial path we just established this link; a `Busy`
         // collision here is not the reverse-path retry case, so both variants
         // surface as the send's transport error (the durable dispatcher retries).
-        self.ship_resource_on_link(&link_id, envelope_bytes)
+        // Full [`RESOURCE_TRANSFER_TIMEOUT`] here — this is a freshly-dialed link
+        // we control, not the churn-prone reverse path.
+        self.ship_resource_on_link(&link_id, envelope_bytes, RESOURCE_TRANSFER_TIMEOUT)
             .await
             .map_err(ShipError::into_transport)?;
 
@@ -3532,6 +3581,7 @@ impl Transport for ReticulumTransport {
                         request_responses: &self.request_responses,
                         timed_out_requests: &self.timed_out_requests,
                         link_to_peer_key_id: &self.link_to_peer_key_id,
+                        link_last_inbound_at: &self.link_last_inbound_at,
                     };
                     handle_event(event, &ctx).await;
 
@@ -3616,6 +3666,10 @@ struct EventCtx<'a> {
     /// `InboundFrame::source_key_id` for the
     /// `Edge::install_replication_routing` lookup.
     link_to_peer_key_id: &'a Mutex<HashMap<LinkId, String>>,
+    /// CIRISEdge#353 — per-link last-inbound timestamp (RNS `last_inbound`
+    /// liveness signal); stamped in `attribute_and_deliver`, consumed by
+    /// `live_attributed_link_to` to reply over the peer's freshest live link.
+    link_last_inbound_at: &'a Mutex<HashMap<LinkId, u64>>,
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -3638,6 +3692,19 @@ struct EventCtx<'a> {
 /// DESTINATION (a link WE dialed — the reverse path), then `None`
 /// (SkippedNoSourceKeyId downstream, never a silent drop).
 async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8>) {
+    // CIRISEdge#353 — stamp last-inbound for the reverse-path link selector
+    // (RNS `last_inbound`). This frame proves the peer is ALIVE on THIS link
+    // right now, so a subsequent reply rides it rather than a dead-but-`Active`
+    // link leviculum hasn't yet flipped to Stale. Stamped for both the resource
+    // and packet inbound paths (both funnel here), so any traffic keeps the link
+    // fresh in the selector.
+    {
+        let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+        ctx.link_last_inbound_at
+            .lock()
+            .await
+            .insert(link_id, now_secs);
+    }
     let mut source_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     // CIRISEdge#353 — INITIATOR-side attribution. `link_to_peer_key_id` is fed by
     // `LinkIdentified`, which only fires on links a PEER dialed to us; a reply
@@ -3674,6 +3741,34 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     if let Err(e) = ctx.sink.send(frame).await {
         tracing::error!(error = %e, "inbound channel send failed");
     }
+}
+
+/// CIRISEdge#353 — choose which of a peer's live links a reply rides.
+///
+/// Prefer the link with the most recent INBOUND activity (RNS's `last_inbound`
+/// liveness signal, `RNS.Link.last_inbound` / leviculum `last_inbound_secs`):
+/// the peer is demonstrably sending its round on that link right now, so the
+/// reply lands. A NAT-dead link that leviculum still reports `Active` has stale
+/// inbound and loses — which stops the reply from committing to a corpse (the
+/// #353 field failure: a 120 s resource timeout shipping into a dead-but-Active
+/// link, then a NAT-blocked fallback dial). Tie-break on establishment time
+/// (newer wins) so two links opened in the same second choose deterministically.
+///
+/// Threat-model guardrail: `live` is ALREADY liveness-filtered AND attributed to
+/// the peer by the caller (identity-proof / verified-dest). This fn only ORDERS
+/// those candidates — it never widens attribution, so it can never route a reply
+/// to a link the peer did not prove control of.
+fn select_reply_link(
+    live: &[(
+        LinkId,
+        u64, /* last_inbound */
+        u64, /* established_at */
+    )],
+) -> Option<LinkId> {
+    live.iter()
+        .copied()
+        .max_by_key(|(_, last_inbound, established_at)| (*last_inbound, *established_at))
+        .map(|(id, _, _)| id)
 }
 
 #[allow(clippy::too_many_lines)] // one exhaustive NodeEvent dispatch match; splitting it hurts readability
@@ -3947,6 +4042,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // v3.5.1 (CIRISEdge#119 + #120) — drop the link's rooted
             // peer attribution when the link closes.
             ctx.link_to_peer_key_id.lock().await.remove(&link_id);
+            // CIRISEdge#353 — drop the link's last-inbound stamp too, so a
+            // closed link can never win the reverse-path selector.
+            ctx.link_last_inbound_at.lock().await.remove(&link_id);
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.
@@ -5123,6 +5221,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CIRISEdge#353 reverse-path reply-link selection — the pure decision ──
+    //
+    // Field failure (Node A ↔ mobile, edge v13.5.0): the mobile churns ~10 links
+    // /30 s; a NAT-dead link stays leviculum-`Active` for the stale window and is
+    // the NEWEST-established, so the pre-fix selector (`max_by established_at`)
+    // shipped the reply into a corpse → 120 s resource timeout → NAT-blocked dial.
+    // The fix orders by last-INBOUND (RNS `last_inbound`): a dead link receives
+    // nothing, so the peer's CURRENT live link wins. Pure fn ⇒ compile-fast guard.
+    mod reply_link_selection {
+        use super::*;
+
+        fn lid(b: u8) -> LinkId {
+            LinkId::new([b; 16])
+        }
+
+        #[test]
+        fn prefers_freshest_inbound_over_newest_established() {
+            let dead = lid(0xDE); // NEWEST established, but STALE inbound (NAT-dead, still Active)
+            let live = lid(0x11); // older established, FRESH inbound (the peer's current link)
+                                  // (link, last_inbound, established_at)
+            let candidates = [(dead, 100, 200), (live, 150, 150)];
+            // Pre-fix `max_by(established_at)` picks `dead`; the fix picks `live`.
+            assert_eq!(select_reply_link(&candidates), Some(live));
+        }
+
+        #[test]
+        fn tie_breaks_on_established_when_inbound_equal() {
+            let older = lid(0x01);
+            let newer = lid(0x02);
+            assert_eq!(
+                select_reply_link(&[(older, 100, 10), (newer, 100, 20)]),
+                Some(newer)
+            );
+        }
+
+        #[test]
+        fn only_a_corpse_left_still_returns_it_so_the_caller_can_fast_fail() {
+            // The peer's only Active link is the dead one (its fresh link is still
+            // Pending). We still return it; #353b fast-fails the send so the next
+            // round rides the fresh link — no 120 s hang on the corpse.
+            let dead = lid(0xDE);
+            assert_eq!(select_reply_link(&[(dead, 100, 200)]), Some(dead));
+            assert_eq!(select_reply_link(&[]), None);
+        }
+    }
 
     // ── CIRISEdge#336/#337 route-supersession decision — the saga's tombstone ──
     //
