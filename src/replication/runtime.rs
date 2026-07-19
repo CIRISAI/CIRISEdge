@@ -64,13 +64,15 @@ use super::session::SessionRole;
 use super::summary::{StateApplier, StateProvider};
 use crate::transport::Transport;
 
-/// CIRISEdge#373 — upper bound on a single responder reply send inside the
-/// drive loop. Chosen well under the 30 s anti-entropy cadence so a stalled
-/// reply (a reverse-path corpse + NAT-blocked dial can otherwise run ~130 s)
-/// yields the inbound drain before the capacity-8 channel overflows and starts
-/// dropping the peer's trace frames. With #353a/#353b the reply usually lands in
-/// a few seconds on the peer's live link; this only bites the degenerate case.
-const RESPONDER_REPLY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// CIRISEdge#373 — outer bound on a single responder reply send inside the drive
+/// loop, so a stalled reply can't park the inbound drain forever. Sized to sit
+/// just ABOVE the reverse-path progress-aware hard cap (`REVERSE_PATH_MAX_TRANSFER`
+/// = 45 s, v13.6.1) plus dial margin, so it never severs a LIVE, progressing
+/// large-resource transfer — that would re-open the exact live-link cut v13.6.1
+/// fixes. A DEAD link now fast-fails at the reverse-path no-progress window (~6 s),
+/// so this bound only bites a genuinely pathological send; a progressing transfer
+/// is delivering the trace, so letting it run is correct.
+const RESPONDER_REPLY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// CIRISEdge#348 — drive a factory-created **Responder** coordinator.
 ///
