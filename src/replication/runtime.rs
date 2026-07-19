@@ -64,6 +64,14 @@ use super::session::SessionRole;
 use super::summary::{StateApplier, StateProvider};
 use crate::transport::Transport;
 
+/// CIRISEdge#373 — upper bound on a single responder reply send inside the
+/// drive loop. Chosen well under the 30 s anti-entropy cadence so a stalled
+/// reply (a reverse-path corpse + NAT-blocked dial can otherwise run ~130 s)
+/// yields the inbound drain before the capacity-8 channel overflows and starts
+/// dropping the peer's trace frames. With #353a/#353b the reply usually lands in
+/// a few seconds on the peer's live link; this only bites the degenerate case.
+const RESPONDER_REPLY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// CIRISEdge#348 — drive a factory-created **Responder** coordinator.
 ///
 /// The registry only STORES a coordinator; the [`ReplicationScheduler`] drives
@@ -93,12 +101,40 @@ fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
             match coord.drive_round_step(Some(msg)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
                     for m in &msgs {
-                        if let Err(e) = coord.send_message(m).await {
-                            tracing::warn!(
-                                peer = %peer, ?kind, error = %e,
-                                "responder reply send failed — round will not complete (CIRISEdge#348)"
-                            );
-                            break;
+                        // CIRISEdge#373 — BOUND the reply send. This loop is the
+                        // responder's only inbound drain; a reply that blocks here
+                        // (a reverse-path stall to a churning NAT'd peer + the
+                        // NAT-blocked dial fallback = up to ~130 s) parks the drain
+                        // while the peer keeps pushing frames, overflowing the
+                        // capacity-8 inbound channel and silently dropping 100% of
+                        // the trace. Cap it well under the round cadence so a stalled
+                        // reply yields the drain; the abandoned send is safe (its
+                        // awaits — resource wait, dial — are cancellation-tolerant,
+                        // and the anti-entropy protocol is idempotent + retried).
+                        match tokio::time::timeout(
+                            RESPONDER_REPLY_SEND_TIMEOUT,
+                            coord.send_message(m),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    peer = %peer, ?kind, error = %e,
+                                    "responder reply send failed — round will not complete (CIRISEdge#348)"
+                                );
+                                break;
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    peer = %peer, ?kind,
+                                    timeout_secs = RESPONDER_REPLY_SEND_TIMEOUT.as_secs(),
+                                    "responder reply send TIMED OUT — abandoning it so the inbound \
+                                     drain resumes and the peer's trace is not dropped (CIRISEdge#373); \
+                                     the next round rides the peer's fresh link"
+                                );
+                                break;
+                            }
                         }
                     }
                 }

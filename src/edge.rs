@@ -3152,8 +3152,12 @@ impl Edge {
                 // FIRST (the hop `run` had but this loop was missing, so the agent
                 // never delivered round-opens to the responder). Only fall through
                 // to envelope dispatch when it's not consumed by replication.
-                if route_replication_frame(edge_for_dispatch.replication_registry.get(), &frame)
-                    .await
+                if route_replication_frame(
+                    edge_for_dispatch.replication_registry.get(),
+                    &frame,
+                    Some(&edge_for_dispatch.metrics()),
+                )
+                .await
                 {
                     continue;
                 }
@@ -3638,7 +3642,9 @@ impl Edge {
                     // NEVER diverge again. Routes CRPL replication frames to the
                     // registry; returns true when consumed (→ do not envelope-
                     // dispatch). Every branch logs, throttled.
-                    if route_replication_frame(replication_registry.get(), &frame).await {
+                    if route_replication_frame(replication_registry.get(), &frame, Some(&metrics))
+                        .await
+                    {
                         continue;
                     }
                     let verify_clone = verify.clone();
@@ -3932,6 +3938,19 @@ static INBOUND_INGEST_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle>
     std::sync::OnceLock::new();
 static INBOUND_ROUTED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
+static INBOUND_BACKPRESSURE_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#373 — an inbound frame was DROPPED because the coordinator's inbound
+/// channel was full (a stalled responder reply parked the drain). Keyed on peer
+/// key_id (attacker-influenceable ⇒ capped map). Throttled because a real stall
+/// drops one frame per ~30 s round for many rounds; the EdgeMetrics counter carries
+/// the true magnitude, the WARN just needs to name the peer + kind without flooding.
+fn inbound_backpressure_drop_log() -> &'static crate::log_throttle::LogThrottle {
+    INBOUND_BACKPRESSURE_DROP_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 256)
+    })
+}
 
 /// A frame CROSSED transport→replication ingest. Keyed on transport id (a handful
 /// of values). Makes the previously-invisible hop VISIBLE at `ciris_edge=debug`.
@@ -3966,9 +3985,12 @@ fn inbound_routed_log() -> &'static crate::log_throttle::LogThrottle {
 async fn route_replication_frame(
     registry: Option<&std::sync::Arc<crate::replication::registry::ReplicationRegistry>>,
     frame: &InboundFrame,
+    // CIRISEdge#373 — live metrics handle so the back-pressure drop is COUNTED,
+    // not just WARN'd. `None` in tests / when no metrics bag is threaded.
+    metrics: Option<&crate::observability::EdgeMetrics>,
 ) -> bool {
     use crate::log_throttle::ThrottleDecision;
-    use crate::replication::registry::RouteOutcome;
+    use crate::replication::registry::{RegistryError, RouteOutcome};
 
     // The frame reached ingest — the hop that used to be invisible.
     if let ThrottleDecision::Emit { suppressed_prev } =
@@ -4033,6 +4055,30 @@ async fn route_replication_frame(
                 "CRPL frame DROPPED — no coordinator and no responder factory for (peer, kind); \
                  the ReplicationRuntime is not wired (CIRISEdge#348)"
             );
+            true
+        }
+        Err(e @ RegistryError::BackPressure { .. }) => {
+            // CIRISEdge#373 — the coordinator's bounded inbound channel is full:
+            // a responder reply stalled and parked the drain. This was a SILENT
+            // 100%-loss WARN; now it is counted (so the field sees the magnitude)
+            // and throttled (so a multi-round stall doesn't flood the log). With
+            // #353a/#353b/#373's send bound the stall itself is bounded, but the
+            // count stays as the tripwire.
+            if let Some(m) = metrics {
+                m.inc_inbound_backpressure_drop();
+            }
+            if let ThrottleDecision::Emit { suppressed_prev } =
+                inbound_backpressure_drop_log().check(source)
+            {
+                tracing::warn!(
+                    peer = %source,
+                    error = %e,
+                    suppressed_prev,
+                    "replication inbound frame DROPPED — coordinator channel full (a responder \
+                     reply stalled and the round can't drain); counted in \
+                     EdgeMetrics.replication_inbound_backpressure_drops (CIRISEdge#373)"
+                );
+            }
             true
         }
         Err(e) => {
@@ -7381,7 +7427,7 @@ mod inbound_ingest_tests {
                 refs: vec![],
             }));
         assert!(
-            route_replication_frame(Some(&registry), &frame(crpl, Some("agent-peer"))).await,
+            route_replication_frame(Some(&registry), &frame(crpl, Some("agent-peer")), None).await,
             "a CRPL replication frame MUST be consumed by ingest, never envelope-dispatched (#348)",
         );
     }
@@ -7396,7 +7442,8 @@ mod inbound_ingest_tests {
                 &frame(
                     b"{\"edge_schema_version\":\"2.0.0\"}".to_vec(),
                     Some("agent-peer")
-                )
+                ),
+                None,
             )
             .await,
             "a plain envelope must fall through to envelope dispatch",
@@ -7412,6 +7459,104 @@ mod inbound_ingest_tests {
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
-        assert!(!route_replication_frame(None, &frame(crpl, Some("agent-peer"))).await);
+        assert!(!route_replication_frame(None, &frame(crpl, Some("agent-peer")), None).await);
+    }
+
+    /// CIRISEdge#373 — when a responder reply stalls, the coordinator's bounded
+    /// inbound channel fills and the frame is dropped. Pre-#373 that was a SILENT
+    /// `tracing::warn!` — 100% of a churning mobile's trace vanished uncounted.
+    /// Now the drop is COUNTED (and the frame still CONSUMED, never mis-dispatched
+    /// to the envelope verifier). Reproduces the exact drop condition: a full
+    /// channel with no drain (a parked responder) → `BackPressure` → counted.
+    #[tokio::test]
+    async fn backpressure_drop_is_counted_not_silent() {
+        use crate::observability::EdgeMetrics;
+        use crate::replication::coordinator::ReplicationCoordinator;
+        use crate::replication::protocol::EnvelopeRef;
+        use crate::replication::session::SessionRole;
+        use crate::replication::summary::{StateApplier, StateProvider};
+        use crate::transport::{Transport, TransportError, TransportSendOutcome};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        struct NoopTransport;
+        #[async_trait::async_trait]
+        impl Transport for NoopTransport {
+            fn id(&self) -> TransportId {
+                TransportId::RETICULUM_RS
+            }
+            async fn send(
+                &self,
+                _d: &str,
+                _b: &[u8],
+            ) -> Result<TransportSendOutcome, TransportError> {
+                Ok(TransportSendOutcome::Delivered)
+            }
+            async fn listen(
+                &self,
+                _s: tokio::sync::mpsc::Sender<InboundFrame>,
+            ) -> Result<(), TransportError> {
+                unimplemented!("this test never drives listen")
+            }
+        }
+        struct NoProvider;
+        impl StateProvider for NoProvider {
+            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+                vec![]
+            }
+            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+        }
+        struct NoApplier;
+        impl StateApplier for NoApplier {
+            fn apply_envelope(&mut self, _k: EnvelopeKind, _b: &[u8]) -> bool {
+                false
+            }
+        }
+
+        let peer = "stalled-mobile";
+        let coord = Arc::new(ReplicationCoordinator::new(
+            Arc::new(NoopTransport),
+            peer,
+            EnvelopeKind::Key,
+            SessionRole::Responder,
+            Arc::new(NoProvider) as Arc<dyn StateProvider>,
+            Arc::new(Mutex::new(NoApplier)) as Arc<Mutex<dyn StateApplier>>,
+        ));
+        // Fill the bounded inbound channel to capacity with NOTHING draining it —
+        // exactly a responder parked on a stalled reply (the #353 root of #373).
+        for _ in 0..ReplicationCoordinator::INBOUND_CHANNEL_CAPACITY {
+            coord
+                .deliver_inbound(ReplicationMessage::Summary(SummaryMessage {
+                    kind: EnvelopeKind::Key,
+                    refs: vec![],
+                }))
+                .expect("channel not yet full");
+        }
+        let registry = std::sync::Arc::new(ReplicationRegistry::new());
+        registry
+            .register(peer.to_string(), EnvelopeKind::Key, Arc::clone(&coord))
+            .await;
+
+        let metrics = EdgeMetrics::new();
+        let crpl =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            }));
+        // This frame can't fit → BackPressure. Pre-#373: a silent WARN, lost.
+        let consumed =
+            route_replication_frame(Some(&registry), &frame(crpl, Some(peer)), Some(&metrics))
+                .await;
+        assert!(
+            consumed,
+            "a back-pressure-dropped CRPL frame is still CONSUMED, never envelope-dispatched",
+        );
+        assert_eq!(
+            metrics.inbound_backpressure_drops(),
+            1,
+            "the back-pressure drop MUST be counted, not silent (CIRISEdge#373)",
+        );
     }
 }

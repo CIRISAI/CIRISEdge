@@ -2120,6 +2120,14 @@ impl PyEdge {
         }
         root.set_item("replication_round_outcomes_total", round_outcomes)?;
 
+        // CIRISEdge#373 — inbound frames dropped on coordinator channel
+        // back-pressure (a stalled responder reply parking the drain). Was a
+        // silent WARN; a non-zero value is the tripwire for the #353 reply stall.
+        root.set_item(
+            "replication_inbound_backpressure_drops",
+            bundle.replication_inbound_backpressure_drops,
+        )?;
+
         Ok(root.unbind().into_any())
     }
 
