@@ -1,0 +1,90 @@
+name: Export pipeline pubkeys (bless the CI keypair)
+
+# CIRISEdge#384 — surfaces the PUBLIC halves of the `ciris-edge-build-v1`
+# build-pipeline signing keypair so an accord holder can bless it
+# (`roles:["infra:attest"]` via the accord CI-key co-scrub → Verify can root
+# edge's build manifests to the accord). Derives from the SAME repo secrets the
+# tag run signs manifests with, decoded EXACTLY the way ci.yml's sign step
+# decodes them (`base64 -d`) — so the blessed key provably matches the signing
+# key. NEVER prints or uploads a seed byte.
+#
+# Mirrors CIRISVerify/.github/workflows/export-pipeline-pubkeys.yml, with one
+# difference: the `pubkey` subcommand is newer than the v1.9.0 prebuilt this
+# repo's tag run installs, so this workflow builds `ciris-build-sign` from a
+# CIRISVerify ref (default `main`). Secrets are scoped to the derive step only
+# — the source build never sees them.
+#
+# Manual only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      key_id:
+        description: "Pipeline key_id these pubkeys belong to"
+        required: true
+        default: "ciris-edge-build-v1"
+      verify_ref:
+        description: "CIRISVerify ref to build ciris-build-sign from (must carry the `pubkey` subcommand)"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  export-pubkeys:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout CIRISVerify (for ciris-build-tool)
+        uses: actions/checkout@v4
+        with:
+          repository: CIRISAI/CIRISVerify
+          ref: ${{ inputs.verify_ref }}
+
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Build ciris-build-sign (no secrets in scope)
+        run: cargo build --release -p ciris-build-tool --bin ciris-build-sign
+
+      - name: Derive + surface the pipeline pubkeys (no secret ever printed)
+        env:
+          CIRIS_BUILD_ED25519_SECRET: ${{ secrets.CIRIS_BUILD_ED25519_SECRET }}
+          CIRIS_BUILD_MLDSA_SECRET: ${{ secrets.CIRIS_BUILD_MLDSA_SECRET }}
+          KEY_ID: ${{ inputs.key_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CIRIS_BUILD_ED25519_SECRET:-}" ] || [ -z "${CIRIS_BUILD_MLDSA_SECRET:-}" ]; then
+            echo "::error::CIRIS_BUILD_* secrets are not set on this repo — nothing to derive."
+            echo "::error::These are the same secrets ci.yml's 'sign manifest' step uses (CIRISEdge#1)."
+            exit 1
+          fi
+
+          # Decode EXACTLY like ci.yml's sign step (base64 -d) so the derived
+          # pubkeys provably belong to the key the tag run signs with.
+          umask 077
+          ED_KEY_PATH=$(mktemp)
+          MLDSA_KEY_PATH=$(mktemp)
+          printf '%s' "${CIRIS_BUILD_ED25519_SECRET}" | base64 -d > "$ED_KEY_PATH"
+          printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
+
+          ./target/release/ciris-build-sign pubkey \
+            --ed25519-seed "$ED_KEY_PATH" \
+            --mldsa-secret "$MLDSA_KEY_PATH" \
+            --key-id "$KEY_ID" \
+            > pipeline-pubkeys.json
+
+          # Immediately destroy the seed material.
+          shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
+
+          echo "## Bless this CI keypair" >> "$GITHUB_STEP_SUMMARY"
+          echo "Public material only — feeds \`POST /v1/accord/ci-key/propose\` with \`roles:[\"infra:attest\"]\`:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat pipeline-pubkeys.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload pipeline-pubkeys.json (public material only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-pubkeys
+          path: pipeline-pubkeys.json
+          if-no-files-found: error
