@@ -232,6 +232,10 @@ pub struct ReplicationRuntime {
     /// live coordinator tasks. Drives [`Self::set_peers`]'s diff.
     /// Pre-v5.1 entries (passed to `start`) populate this on init.
     current_initiators: Arc<Mutex<HashSet<(String, EnvelopeKind)>>>,
+    /// CIRISEdge#927 — whether this node's Initiator rounds proactively deliver
+    /// their publish set (set iff `start` got a `self_provider`). Applied to
+    /// every Initiator coordinator this runtime builds, including hot-adds.
+    proactive_publish: bool,
 }
 
 /// Failure modes for the v5.1.0 runtime peer-mutation API
@@ -294,6 +298,13 @@ impl ReplicationRuntime {
         // common path.
         let cohort_snapshot: Vec<String> = peers.iter().map(|p| p.peer_key_id.clone()).collect();
         let cohort: CohortProvider = Arc::new(move || cohort_snapshot.clone());
+
+        // CIRISEdge#927 — a node started with a self-publish set (`self_provider`
+        // / `key_publish_set`) is one whose Initiator rounds should proactively
+        // DELIVER that set (initiator-first, so a carrier-NAT'd peer's round can
+        // complete without a return-path Diff). Capture before `self_provider` is
+        // moved into the bridge.
+        let proactive_publish = self_provider.is_some();
 
         let bridge = Arc::new(
             FederationDirectoryReplicationBridge::with_config(
@@ -359,14 +370,17 @@ impl ReplicationRuntime {
                 let applier: Arc<tokio::sync::Mutex<dyn StateApplier>> = Arc::new(
                     tokio::sync::Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)),
                 );
-                Arc::new(ReplicationCoordinator::new(
-                    Arc::clone(&transport),
-                    &peer.peer_key_id,
-                    peer.kind,
-                    SessionRole::Initiator,
-                    provider,
-                    applier,
-                ))
+                Arc::new(
+                    ReplicationCoordinator::new(
+                        Arc::clone(&transport),
+                        &peer.peer_key_id,
+                        peer.kind,
+                        SessionRole::Initiator,
+                        provider,
+                        applier,
+                    )
+                    .with_proactive_publish(proactive_publish),
+                )
             })
             .collect();
 
@@ -423,27 +437,37 @@ impl ReplicationRuntime {
             config,
             scheduler_handle,
             current_initiators: Arc::new(Mutex::new(initial_initiator_set)),
+            proactive_publish,
         }
     }
 
-    /// Hot-add a new `(peer_key_id, kind)` Initiator. Constructs a
-    /// coordinator, registers it, **but does NOT add to the
-    /// scheduler's Initiator set** for v1 — that requires the
-    /// scheduler to expose dynamic adds (not in the v1 API).
+    /// Hot-add a `(peer_key_id, kind)` peer this node actively replicates
+    /// with — routes inbound AND drives periodic anti-entropy rounds.
     ///
-    /// For now hot-add lets the Responder-side route inbound for
-    /// the new peer; the Initiator side would need a runtime
-    /// restart to fire periodic rounds. This is acceptable for the
-    /// hot-add-is-uncommon v1 posture; a v1.x patch will extend
-    /// the scheduler with a dynamic-add API.
-    pub async fn register_peer(&self, peer_key_id: impl Into<String>, kind: EnvelopeKind) {
-        let peer_key_id = peer_key_id.into();
-        let coord = self.build_coordinator(&peer_key_id, kind, SessionRole::Responder);
-        self.registry.register(peer_key_id, kind, coord).await;
+    /// v13.7.0 — this is now the ONE hot-add, and it does the unsurprising
+    /// thing (active replication). It previously defaulted to a passive
+    /// **Responder** (routed inbound but never pulled) — a footgun: it read
+    /// like "register this peer" but silently did no rounds, and it duplicated
+    /// the #312 responder factory, which already auto-registers a Responder on
+    /// the first inbound round from any uncoordinated peer. So **serve-only
+    /// peers need no call at all** — the factory handles them; callers who mean
+    /// "replicate with this peer" get exactly that.
+    ///
+    /// Delegates to [`Self::register_initiator_peer`] (the CIRISEdge#173 control
+    /// plane); returns its error if the scheduler has stopped.
+    pub async fn register_peer(
+        &self,
+        peer_key_id: impl Into<String>,
+        kind: EnvelopeKind,
+    ) -> Result<(), ReplicationRuntimeError> {
+        self.register_initiator_peer(peer_key_id, kind).await
     }
 
     /// Hot-add a `(peer_key_id, kind)` **Initiator** coordinator —
     /// CIRISEdge#173, v5.1.0.
+    ///
+    /// v13.7.0 — [`Self::register_peer`] now does exactly this, so this method
+    /// is a redundant alias kept for back-compat; prefer `register_peer`.
     ///
     /// Builds a coordinator in [`SessionRole::Initiator`], registers
     /// it with the registry (so inbound replies route correctly),
@@ -563,14 +587,19 @@ impl ReplicationRuntime {
             Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)));
         let applier: Arc<Mutex<dyn StateApplier>> =
             Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
-        Arc::new(ReplicationCoordinator::new(
-            Arc::clone(&self.transport),
-            peer_key_id.to_string(),
-            kind,
-            role,
-            provider,
-            applier,
-        ))
+        // CIRISEdge#927 — hot-added Initiators inherit the runtime's proactive-
+        // publish posture. Harmless for Responders (they never `start_round`).
+        Arc::new(
+            ReplicationCoordinator::new(
+                Arc::clone(&self.transport),
+                peer_key_id.to_string(),
+                kind,
+                role,
+                provider,
+                applier,
+            )
+            .with_proactive_publish(self.proactive_publish),
+        )
     }
 
     /// Shared registry handle. The operator's `Transport::listen`
@@ -782,8 +811,9 @@ mod tests {
         rt.shutdown().await;
     }
 
-    /// `register_peer` hot-adds and the registry reflects the
-    /// add immediately.
+    /// `register_peer` hot-adds an ACTIVE (Initiator) peer — routes AND
+    /// drives — and the registry reflects the add immediately (v13.7.0: it
+    /// no longer defaults to a passive Responder).
     #[tokio::test]
     async fn register_peer_hot_adds() {
         let backend = Arc::new(MemoryBackend::new());
@@ -798,7 +828,8 @@ mod tests {
         )
         .await;
         rt.register_peer("agent-bob", EnvelopeKind::Attestation)
-            .await;
+            .await
+            .expect("register_peer succeeds on a live runtime");
         assert_eq!(rt.registry().len().await, 1);
         rt.shutdown().await;
     }

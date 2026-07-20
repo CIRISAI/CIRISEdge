@@ -2313,10 +2313,15 @@ impl PyReplicationHandle {
         })
     }
 
-    /// Hot-add a `(peer_key_id, kind)` after start. Defaults to
-    /// Responder role — for the CEG-driven reconciler path that
-    /// needs the new peer to actively initiate rounds, use
-    /// [`Self::register_initiator_peer`] (CIRISEdge#173 / v5.1.0).
+    /// Hot-add a `(peer_key_id, kind)` peer this node actively replicates with
+    /// — routes inbound AND drives periodic anti-entropy rounds.
+    ///
+    /// v13.7.0 — this is the ONE hot-add and it does the unsurprising thing
+    /// (active replication). It no longer defaults to a passive Responder that
+    /// never pulls (a footgun). **Serve-only peers need no call** — the
+    /// responder factory auto-registers them on their first inbound round.
+    /// [`Self::register_initiator_peer`] is now a redundant alias (kept for
+    /// back-compat). Raises `RuntimeError` if the runtime has stopped.
     fn register_peer(&self, py: Python<'_>, peer_key_id: &str, kind: &str) -> PyResult<()> {
         let kind = parse_envelope_kind(kind)?;
         let peer = peer_key_id.to_string();
@@ -2325,12 +2330,17 @@ impl PyReplicationHandle {
         py.detach(|| {
             run_async(&executor, async move {
                 let guard = inner.lock().await;
-                if let Some(rt) = guard.as_ref() {
-                    rt.register_peer(peer, kind).await;
+                match guard.as_ref() {
+                    Some(rt) => rt
+                        .register_peer(peer, kind)
+                        .await
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+                    None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "replication runtime is stopped",
+                    )),
                 }
-            });
-        });
-        Ok(())
+            })
+        })
     }
 
     /// CIRISEdge#173 / v5.1.0 — hot-add an Initiator peer at runtime.

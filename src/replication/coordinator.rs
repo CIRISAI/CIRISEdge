@@ -155,6 +155,17 @@ impl ReplicationCoordinator {
         }
     }
 
+    /// CIRISEdge#927 — enable initiator-first proactive publish on this
+    /// coordinator's session (see [`Session::with_proactive_publish`]). Builder
+    /// form so [`Self::new`]'s signature (many call sites) stays put; the session
+    /// is fresh at construction, so replacing it is safe. Only meaningful for
+    /// Initiators — Responders never `start_round`.
+    #[must_use]
+    pub fn with_proactive_publish(self, yes: bool) -> Self {
+        let session = Mutex::new(Session::new(self.role, self.kind).with_proactive_publish(yes));
+        Self { session, ..self }
+    }
+
     /// Deliver an inbound replication message into this coordinator's
     /// queue. Called by the application's [`Transport::listen`] loop
     /// after [`Self::parse_inbound_bytes`] yields a
