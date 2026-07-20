@@ -75,6 +75,19 @@ pub trait ReplicationDirectory: Send + Sync {
     /// implementation's job.
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef>;
 
+    /// CIRISEdge#379 — RECIPIENT-AWARE enumeration: the refs `peer` may
+    /// receive. Defaults to the peer-blind [`Self::list_envelope_refs`];
+    /// implementations with per-recipient policy (the bridge's `observer`-
+    /// capability gate on the trace scores-attestation plane) override.
+    /// `None` = projection-only view (tests / diagnostics), ungated.
+    async fn list_envelope_refs_for_peer(
+        &self,
+        kind: EnvelopeKind,
+        _peer_key_id: Option<&str>,
+    ) -> Vec<EnvelopeRef> {
+        self.list_envelope_refs(kind).await
+    }
+
     /// Return the byte-exact signed envelope for `(kind,
     /// envelope_hash)`, or `None` if the envelope isn't in local state.
     /// Called during the `Deliver`-message construction step.
@@ -83,6 +96,20 @@ pub trait ReplicationDirectory: Send + Sync {
         kind: EnvelopeKind,
         envelope_hash: &[u8; 32],
     ) -> Option<Vec<u8>>;
+
+    /// CIRISEdge#379 — RECIPIENT-AWARE fetch: the serve-side twin of
+    /// [`Self::list_envelope_refs_for_peer`], so a peer excluded from the
+    /// listing cannot obtain a gated envelope anyway by Diff/Fetch-ing its
+    /// hash directly (learned out-of-band). Defaults to the peer-blind
+    /// fetch; the bridge overrides.
+    async fn fetch_envelope_bytes_for_peer(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+        _peer_key_id: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        self.fetch_envelope_bytes(kind, envelope_hash).await
+    }
 
     /// Apply one envelope to local state. The implementation verifies
     /// the signed envelope's signature + canonical-bytes hash before
@@ -116,29 +143,53 @@ pub trait ReplicationDirectory: Send + Sync {
 /// behavior as any other tokio-coupled sync interface.
 pub struct DirectoryStateAdapter {
     inner: Arc<dyn ReplicationDirectory>,
+    /// CIRISEdge#379 — the peer this provider serves. When set, listing +
+    /// fetch route through the recipient-aware trait methods so per-peer
+    /// policy (the `observer`-capability gate on trace attestations) applies
+    /// on BOTH the advertise and the serve path. `None` = peer-blind
+    /// (projection-only view; tests).
+    peer_key_id: Option<String>,
 }
 
 impl DirectoryStateAdapter {
     pub fn new(inner: Arc<dyn ReplicationDirectory>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            peer_key_id: None,
+        }
+    }
+
+    /// CIRISEdge#379 — bind this provider to the peer it serves (builder).
+    #[must_use]
+    pub fn with_peer(mut self, peer_key_id: impl Into<String>) -> Self {
+        self.peer_key_id = Some(peer_key_id.into());
+        self
     }
 }
 
 impl StateProvider for DirectoryStateAdapter {
     fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         let inner = Arc::clone(&self.inner);
+        let peer = self.peer_key_id.clone();
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { inner.list_envelope_refs(kind).await })
+            tokio::runtime::Handle::current().block_on(async move {
+                inner
+                    .list_envelope_refs_for_peer(kind, peer.as_deref())
+                    .await
+            })
         })
     }
 
     fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> Option<Vec<u8>> {
         let inner = Arc::clone(&self.inner);
         let hash = *envelope_hash;
+        let peer = self.peer_key_id.clone();
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { inner.fetch_envelope_bytes(kind, &hash).await })
+            tokio::runtime::Handle::current().block_on(async move {
+                inner
+                    .fetch_envelope_bytes_for_peer(kind, &hash, peer.as_deref())
+                    .await
+            })
         })
     }
 }

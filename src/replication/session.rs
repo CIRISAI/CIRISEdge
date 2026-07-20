@@ -36,7 +36,8 @@
 //! Delivers have been applied.
 
 use super::protocol::{
-    DeliverMessage, DiffMessage, EnvelopeKind, FetchMessage, ReplicationMessage, SummaryMessage,
+    DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
+    SummaryMessage,
 };
 use super::summary::{diff_refs, StalenessSignal, StateApplier, StateProvider};
 
@@ -58,6 +59,18 @@ pub enum ReplicationOutcome {
     /// the caller MUST emit them in order on the underlying
     /// transport.
     Send(Vec<ReplicationMessage>),
+    /// CIRISEdge#380 — INITIATOR-FINAL: send these messages, then the round is
+    /// COMPLETE without waiting for a reply. Emitted by a proactive-publish
+    /// initiator when the peer's last-known Summary shows it already holds our
+    /// full publish set (nothing left to push) and we want nothing from it —
+    /// there is nothing to wait for. This is what lets a NAT'd initiator's
+    /// rounds report `completed` instead of permanently normalizing
+    /// `error`/`timed_out` as the signature of working delivery (which poisoned
+    /// the #370 round-outcome instrument).
+    SendAndComplete {
+        msgs: Vec<ReplicationMessage>,
+        kind: EnvelopeKind,
+    },
     /// The session applied envelopes received from the peer. The
     /// caller can surface a `StalenessSignal` update at this point.
     Applied {
@@ -125,7 +138,30 @@ pub struct Session {
     /// traverse back, so the side that can reach (the initiator) pushes its
     /// key/attestation. Responders never `start_round`, so it's a no-op for them.
     proactive_publish: bool,
+    /// CIRISEdge#380 — per-envelope proactive-push ledger: hash → the
+    /// `round_counter` value when it was last pushed. Survives [`Self::reset`]
+    /// (cross-round knowledge, not round state) so an envelope is not re-pushed
+    /// every round; entries refresh after [`PROACTIVE_REFRESH_ROUNDS`] as
+    /// insurance for peers whose reverse-path Summary never arrives.
+    proactive_sent: std::collections::BTreeMap<[u8; 32], u64>,
+    /// CIRISEdge#380 — monotonic count of initiator rounds this session has
+    /// started. Basis for the `proactive_sent` refresh window.
+    round_counter: u64,
 }
+
+/// CIRISEdge#380 — per-round byte budget for the proactive Deliver. The
+/// v13.7.0 push was UNBOUNDED (full `local_refs(kind)` every round), which was
+/// tolerable for the small `SelfOwn` publish sets it was built for but breaks
+/// on the Attestation plane, where persist v18 puts inline trace payloads up
+/// to 1 MiB — a mobile would re-blast megabytes every 30 s. The plane now
+/// converges over successive rounds instead. A single envelope larger than
+/// the whole budget is still pushed (alone) — a budget must bound the batch,
+/// never strand an envelope.
+pub const PROACTIVE_PUSH_BUDGET_BYTES: usize = 256 * 1024;
+/// CIRISEdge#380 — rounds before an already-pushed envelope becomes eligible
+/// for an idempotent re-push (insurance when the peer's reverse-path Summary
+/// never arrives to confirm receipt). 20 rounds ≈ 10 min at the 30 s cadence.
+pub const PROACTIVE_REFRESH_ROUNDS: u64 = 20;
 
 impl Session {
     pub fn new(role: SessionRole, kind: EnvelopeKind) -> Self {
@@ -137,6 +173,8 @@ impl Session {
             diff_want_count: None,
             completed: false,
             proactive_publish: false,
+            proactive_sent: std::collections::BTreeMap::new(),
+            round_counter: 0,
         }
     }
 
@@ -151,9 +189,16 @@ impl Session {
     /// Clear per-round state so the session can drive a new round
     /// with the same peer. Preserves `role` + `kind`. Idempotent —
     /// calling on a fresh session is a no-op.
+    ///
+    /// CIRISEdge#380 — ALSO preserves the cross-round knowledge: the peer's
+    /// `last_remote_summary` (the delta basis for the proactive push + the
+    /// initiator-final completion test — it reflects what the peer HOLDS,
+    /// which a round boundary doesn't invalidate) and the `proactive_sent`
+    /// ledger / `round_counter` (what we already pushed). Clearing those on
+    /// every completed round would re-blast the publish set and un-complete
+    /// the next round for no reason.
     pub fn reset(&mut self) {
         self.last_summary_sent = None;
-        self.last_remote_summary = None;
         self.diff_want_count = None;
         self.completed = false;
     }
@@ -187,16 +232,77 @@ impl Session {
         // node therefore DELIVERS its advertised set proactively, alongside the
         // Summary — the responder applies whatever it lacks (idempotent; a bare
         // Deliver has no phase gate, see `responder_applies_unsolicited_bare_deliver`).
-        // `local_refs` for a self-publisher is its own publish set (for SelfOwn
-        // kinds it IS the `self_provider` set — small), so this pushes exactly the
-        // node's identity, not its whole state. Wasteful re-delivery each round is
-        // bounded (small set) + idempotent; correctness > a few duplicate bytes.
+        //
+        // CIRISEdge#380 — the push is DELTA-AWARE and BOUNDED (the v13.7.0
+        // unbounded full-set push broke on the Attestation plane, where persist
+        // v18 puts inline trace payloads up to 1 MiB):
+        //  - skip refs the peer's last reverse-path Summary shows it holds;
+        //  - skip refs already pushed within `PROACTIVE_REFRESH_ROUNDS`
+        //    (idempotent re-push insurance for a peer we never hear from);
+        //  - cap the batch at `PROACTIVE_PUSH_BUDGET_BYTES`, oldest-seq first,
+        //    spillover converging over subsequent rounds (an envelope larger
+        //    than the whole budget still ships, alone).
         if self.proactive_publish {
-            let envelopes: Vec<Vec<u8>> = refs
+            self.round_counter += 1;
+            let peer_has: std::collections::BTreeSet<[u8; 32]> = self
+                .last_remote_summary
+                .as_ref()
+                .map(|s| s.refs.iter().map(|r| r.envelope_hash).collect())
+                .unwrap_or_default();
+            let mut candidates: Vec<&EnvelopeRef> = refs
                 .iter()
-                .filter_map(|r| provider.fetch_envelope(self.kind, &r.envelope_hash))
+                .filter(|r| !peer_has.contains(&r.envelope_hash))
+                .filter(|r| {
+                    self.proactive_sent.get(&r.envelope_hash).map_or(
+                        true,
+                        // `map_or(true, …)` not `is_none_or` — MSRV 1.75.
+                        |sent| self.round_counter.saturating_sub(*sent) >= PROACTIVE_REFRESH_ROUNDS,
+                    )
+                })
                 .collect();
-            if !envelopes.is_empty() {
+            candidates.sort_by_key(|r| r.seq);
+            let mut envelopes: Vec<Vec<u8>> = Vec::new();
+            let mut budget_used = 0usize;
+            for r in candidates {
+                let Some(bytes) = provider.fetch_envelope(self.kind, &r.envelope_hash) else {
+                    continue;
+                };
+                if budget_used + bytes.len() > PROACTIVE_PUSH_BUDGET_BYTES && !envelopes.is_empty()
+                {
+                    // Spillover — the NEXT round carries it (deterministic:
+                    // candidates are seq-sorted). Not marked sent.
+                    continue;
+                }
+                budget_used += bytes.len();
+                self.proactive_sent
+                    .insert(r.envelope_hash, self.round_counter);
+                envelopes.push(bytes);
+            }
+            if envelopes.is_empty() {
+                // CIRISEdge#380 — INITIATOR-FINAL completion, strictly gated on
+                // CONFIRMED sync: the peer's own last Summary shows it holds our
+                // full advertised set (so nothing was pushed), and we lack
+                // nothing it advertises. There is nothing on the wire to wait
+                // for — the round is complete NOW, and `round_outcomes` reports
+                // `completed` instead of normalizing `error`/`timed_out` as the
+                // signature of working NAT'd delivery. Pushed-but-unconfirmed
+                // rounds do NOT complete (the peer's next reverse-path Summary
+                // is the confirmation), so `completed` keeps meaning what it
+                // says.
+                let peer_holds_all = self.last_remote_summary.is_some()
+                    && refs.iter().all(|r| peer_has.contains(&r.envelope_hash));
+                let want_nothing = self
+                    .last_remote_summary
+                    .as_ref()
+                    .is_some_and(|remote| diff_refs(&refs, &remote.refs).is_empty());
+                if peer_holds_all && want_nothing {
+                    self.completed = true;
+                    return ReplicationOutcome::SendAndComplete {
+                        msgs: outbound,
+                        kind: self.kind,
+                    };
+                }
+            } else {
                 outbound.push(ReplicationMessage::Deliver(DeliverMessage {
                     kind: self.kind,
                     envelopes,
@@ -738,6 +844,190 @@ mod tests {
             ReplicationOutcome::Send(msgs) => assert_eq!(msgs.len(), 1, "Summary only"),
             o => panic!("expected Send, got {o:?}"),
         }
+    }
+
+    // ── CIRISEdge#380 — delta-aware bounded proactive push + initiator-final ──
+
+    /// The peer's last reverse-path Summary is the delta basis: refs it
+    /// already holds are NOT re-pushed.
+    #[test]
+    fn proactive_push_skips_refs_the_peer_summary_holds() {
+        let provider = provider_with(&[
+            (EnvelopeKind::Attestation, h(1), b"env-a".to_vec(), 1),
+            (EnvelopeKind::Attestation, h(2), b"env-b".to_vec(), 2),
+        ]);
+        let mut applier = applier_for(&[]);
+        let mut s = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation)
+            .with_proactive_publish(true);
+        // The responder's reverse-path Summary arrives first: it holds h(1).
+        let _ = s.on_message(
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Attestation,
+                refs: vec![EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                }],
+            }),
+            &provider,
+            &mut applier,
+        );
+        match s.start_round(&provider) {
+            ReplicationOutcome::Send(msgs) => {
+                let deliver = msgs.iter().find_map(|m| match m {
+                    ReplicationMessage::Deliver(d) => Some(d),
+                    _ => None,
+                });
+                let d = deliver.expect("delta push fires for the ref the peer lacks");
+                assert_eq!(d.envelopes, vec![b"env-b".to_vec()], "only h(2) pushed");
+            }
+            o => panic!("expected Send, got {o:?}"),
+        }
+    }
+
+    /// An envelope pushed this round is NOT re-pushed next round (sent-cache);
+    /// it re-qualifies only after `PROACTIVE_REFRESH_ROUNDS`.
+    #[test]
+    fn proactive_push_does_not_repush_within_refresh_window() {
+        let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"env-a".to_vec(), 1)]);
+        let mut s =
+            Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
+        match s.start_round(&provider) {
+            ReplicationOutcome::Send(msgs) => assert_eq!(msgs.len(), 2, "round 1 pushes"),
+            o => panic!("expected Send, got {o:?}"),
+        }
+        match s.start_round(&provider) {
+            ReplicationOutcome::Send(msgs) => {
+                assert_eq!(
+                    msgs.len(),
+                    1,
+                    "round 2: Summary only — no re-push (v13.7.0 re-blasted)"
+                );
+            }
+            o => panic!("expected Send, got {o:?}"),
+        }
+    }
+
+    /// The per-round byte budget bounds the batch; spillover converges on the
+    /// next round (oldest seq first), and an envelope bigger than the whole
+    /// budget still ships alone.
+    #[test]
+    fn proactive_push_respects_budget_with_spillover() {
+        let big_a = vec![0xAAu8; PROACTIVE_PUSH_BUDGET_BYTES - 1024];
+        let big_b = vec![0xBBu8; PROACTIVE_PUSH_BUDGET_BYTES - 1024];
+        let oversize = vec![0xCCu8; PROACTIVE_PUSH_BUDGET_BYTES + 4096];
+        let provider = provider_with(&[
+            (EnvelopeKind::Attestation, h(1), big_a.clone(), 1),
+            (EnvelopeKind::Attestation, h(2), big_b.clone(), 2),
+            (EnvelopeKind::Attestation, h(3), oversize.clone(), 3),
+        ]);
+        let mut s = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation)
+            .with_proactive_publish(true);
+        let round_envelopes = |s: &mut Session| -> Vec<Vec<u8>> {
+            match s.start_round(&provider) {
+                ReplicationOutcome::Send(msgs) => msgs
+                    .into_iter()
+                    .find_map(|m| match m {
+                        ReplicationMessage::Deliver(d) => Some(d.envelopes),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                o => panic!("expected Send, got {o:?}"),
+            }
+        };
+        assert_eq!(
+            round_envelopes(&mut s),
+            vec![big_a],
+            "round 1: seq-1 fits, rest spills"
+        );
+        assert_eq!(round_envelopes(&mut s), vec![big_b], "round 2: seq-2");
+        assert_eq!(
+            round_envelopes(&mut s),
+            vec![oversize],
+            "round 3: the over-budget envelope still ships, alone — a budget \
+             bounds the batch, never strands an envelope"
+        );
+        assert!(
+            round_envelopes(&mut s).is_empty(),
+            "round 4: everything sent"
+        );
+    }
+
+    /// INITIATOR-FINAL: when the peer's own Summary confirms it holds our full
+    /// set and we want nothing of its, the round completes at send — no wire
+    /// wait, and `round_outcomes` reports `completed` (the #370 instrument
+    /// stops normalizing error). Pushed-but-unconfirmed rounds do NOT complete.
+    #[test]
+    fn initiator_final_completes_only_on_confirmed_sync() {
+        let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"env-a".to_vec(), 1)]);
+        let mut applier = applier_for(&[]);
+        let mut s =
+            Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
+        // Round 1: never heard the peer → pushes, must NOT complete.
+        assert!(
+            matches!(s.start_round(&provider), ReplicationOutcome::Send(_)),
+            "unconfirmed push stays Send-then-wait"
+        );
+        // The reverse-path Summary arrives: peer holds h(1) (and nothing more).
+        let _ = s.on_message(
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                }],
+            }),
+            &provider,
+            &mut applier,
+        );
+        // Round 2: confirmed sync → SendAndComplete.
+        match s.start_round(&provider) {
+            ReplicationOutcome::SendAndComplete { msgs, kind } => {
+                assert_eq!(kind, EnvelopeKind::Key);
+                assert_eq!(msgs.len(), 1, "Summary only — nothing to push");
+            }
+            o => panic!("expected SendAndComplete on confirmed sync, got {o:?}"),
+        }
+        // reset() (the coordinator's auto-reset on Complete) preserves the
+        // cross-round knowledge → the NEXT round completes too.
+        s.reset();
+        assert!(
+            matches!(
+                s.start_round(&provider),
+                ReplicationOutcome::SendAndComplete { .. }
+            ),
+            "knowledge survives reset — steady-state stays completed"
+        );
+    }
+
+    /// A peer whose Summary advertises rows WE lack blocks initiator-final —
+    /// the pull half of anti-entropy still matters when it can work.
+    #[test]
+    fn initiator_final_blocked_when_we_want_their_rows() {
+        let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"env-a".to_vec(), 1)]);
+        let mut applier = applier_for(&[]);
+        let mut s =
+            Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
+        let _ = s.on_message(
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![
+                    EnvelopeRef {
+                        envelope_hash: h(1),
+                        seq: 1,
+                    },
+                    EnvelopeRef {
+                        envelope_hash: h(9), // theirs, we lack it
+                        seq: 9,
+                    },
+                ],
+            }),
+            &provider,
+            &mut applier,
+        );
+        assert!(
+            matches!(s.start_round(&provider), ReplicationOutcome::Send(_)),
+            "wanting their rows keeps the round open"
+        );
     }
 
     /// Fetch — on-demand envelope retrieval, distinct from anti-

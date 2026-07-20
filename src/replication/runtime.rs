@@ -140,6 +140,24 @@ fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                         }
                     }
                 }
+                // CIRISEdge#380 — defensive: `SendThenComplete` is initiator-only
+                // (`start_round` emits it; responders never start rounds). If it
+                // ever appears here, honor its semantics: send, then done.
+                Ok(DriveStep::SendThenComplete(msgs, report)) => {
+                    for m in &msgs {
+                        if let Err(e) = coord.send_message(m).await {
+                            tracing::warn!(
+                                peer = %peer, ?kind, error = %e,
+                                "responder SendThenComplete send failed (CIRISEdge#380)"
+                            );
+                            break;
+                        }
+                    }
+                    tracing::debug!(
+                        peer = %peer, ?kind, ?report,
+                        "responder round complete (initiator-final path, CIRISEdge#380)"
+                    );
+                }
                 Ok(DriveStep::Complete(report)) => {
                     tracing::debug!(
                         peer = %peer, ?kind, ?report,
@@ -328,8 +346,11 @@ impl ReplicationRuntime {
             let factory_bridge = Arc::clone(&bridge);
             registry.set_responder_factory(Arc::new(move |peer_key_id: &str, kind| {
                 let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&factory_bridge) as _;
-                let provider: Arc<dyn StateProvider> =
-                    Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)));
+                // CIRISEdge#379 — peer-bound provider: the observer-capability
+                // gate on the trace attestation plane applies per recipient.
+                let provider: Arc<dyn StateProvider> = Arc::new(
+                    DirectoryStateAdapter::new(Arc::clone(&bridge_dir)).with_peer(peer_key_id),
+                );
                 let applier: Arc<Mutex<dyn StateApplier>> =
                     Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
                 let coord = Arc::new(ReplicationCoordinator::new(
@@ -365,8 +386,11 @@ impl ReplicationRuntime {
             .iter()
             .map(|peer| {
                 let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&bridge) as _;
-                let provider: Arc<dyn StateProvider> =
-                    Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)));
+                // CIRISEdge#379 — peer-bound provider (observer gate, see above).
+                let provider: Arc<dyn StateProvider> = Arc::new(
+                    DirectoryStateAdapter::new(Arc::clone(&bridge_dir))
+                        .with_peer(&peer.peer_key_id),
+                );
                 let applier: Arc<tokio::sync::Mutex<dyn StateApplier>> = Arc::new(
                     tokio::sync::Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)),
                 );
@@ -583,8 +607,9 @@ impl ReplicationRuntime {
         role: SessionRole,
     ) -> Arc<ReplicationCoordinator> {
         let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&self.bridge) as _;
+        // CIRISEdge#379 — peer-bound provider (observer gate).
         let provider: Arc<dyn StateProvider> =
-            Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)));
+            Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)).with_peer(peer_key_id));
         let applier: Arc<Mutex<dyn StateApplier>> =
             Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
         // CIRISEdge#927 — hot-added Initiators inherit the runtime's proactive-

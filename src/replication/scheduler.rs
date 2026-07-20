@@ -438,7 +438,12 @@ async fn run_one_coordinator_forever(
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
                 let _enter = span.enter();
                 let event = match run_one_round(&coord, round_timeout).await {
-                    Ok(DriveStep::Complete(report)) => RoundEvent::Completed(report),
+                    // CIRISEdge#380 — run_one_round converts SendThenComplete to
+                    // Complete after sending; the merged arm is defensive if it
+                    // ever leaks through.
+                    Ok(DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report)) => {
+                        RoundEvent::Completed(report)
+                    }
                     Ok(DriveStep::Refused) => {
                         tracing::warn!("round refused; resetting session");
                         RoundEvent::Refused
@@ -495,6 +500,18 @@ async fn run_one_round(
 ) -> Result<DriveStep, RoundError> {
     let mut step = coord.drive_round_step(None).await?;
     loop {
+        // CIRISEdge#380 — initiator-final: send the messages, then the round
+        // is complete WITHOUT waiting (the peer's last Summary confirmed full
+        // sync; there is nothing on the wire to wait for). This is what turns
+        // a NAT'd initiator's steady-state from perpetual `error`/`timed_out`
+        // into honest `completed` on the round-outcome instrument (#370).
+        if let DriveStep::SendThenComplete(ref msgs, ref report) = step {
+            let report = report.clone();
+            for m in msgs {
+                coord.send_message(m).await?;
+            }
+            return Ok(DriveStep::Complete(report));
+        }
         let msgs = match step {
             DriveStep::SendThenWait(ref msgs) => msgs.clone(),
             _ => return Ok(step),
