@@ -795,6 +795,78 @@ struct ResolvedPeer {
     signing_key: [u8; 32],
 }
 
+/// CIRISEdge#336 (v13.8.0) — provenance of a dial-candidate destination.
+/// See [`ReticulumTransport::resolve_dial_candidates`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialSource {
+    /// Announce-bound / `prime_peer`'d dest cached on the rooted entry.
+    Cached,
+    /// `sha256(fed_pubkey)[..16]` — un-announceable, broadcast-only (#191).
+    ExplicitHash,
+    /// Legacy `sha256(name_hash‖identity_hash)` from resolver transport keys —
+    /// the announceable (relay-routable) address shape.
+    ComputedNamed,
+}
+
+impl DialSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::ExplicitHash => "explicit_hash",
+            Self::ComputedNamed => "computed_named",
+        }
+    }
+}
+
+/// One dialable address for a peer, with the signing key from the SAME
+/// provenance as the dest (see `resolve_dial_candidates` on why they pair).
+#[derive(Debug, Clone, Copy)]
+struct DialCandidate {
+    dest_hash: DestinationHash,
+    signing_key: [u8; 32],
+    source: DialSource,
+}
+
+/// CIRISEdge#336 (v13.8.0) — ROUTE-TABLE-FIRST dial selection: the pure
+/// decision that makes "dial an unroutable dest while a routable one exists"
+/// impossible by construction. Input is the candidate list as
+/// `(source, has_path)`; output is the winning index.
+///
+/// * Any candidate has a path → dial the highest-provenance PATHED one:
+///   `Cached` (announce/prime provenance) > `ComputedNamed` (the announceable
+///   shape — the #336 field fix) > `ExplicitHash` (pathed ~never; last).
+/// * No candidate has a path → BOOTSTRAP broadcast, in exactly the
+///   pre-v13.8.0 single-winner order (`Cached` > `ExplicitHash` >
+///   `ComputedNamed`) so behavior is byte-identical when the route table is
+///   agnostic; the existing fast-fail + loud #336 error bound this dial.
+/// * Empty → `None` (unrooted/unresolvable — caller's existing branch).
+fn select_dial_candidate(candidates: &[(DialSource, bool)]) -> Option<usize> {
+    const PATHED_ORDER: [DialSource; 3] = [
+        DialSource::Cached,
+        DialSource::ComputedNamed,
+        DialSource::ExplicitHash,
+    ];
+    const BOOTSTRAP_ORDER: [DialSource; 3] = [
+        DialSource::Cached,
+        DialSource::ExplicitHash,
+        DialSource::ComputedNamed,
+    ];
+    for want in PATHED_ORDER {
+        if let Some(i) = candidates
+            .iter()
+            .position(|(s, pathed)| *pathed && *s == want)
+        {
+            return Some(i);
+        }
+    }
+    for want in BOOTSTRAP_ORDER {
+        if let Some(i) = candidates.iter().position(|(s, _)| *s == want) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// CIRISEdge#299 — a boot-snapshot [`PeerResolver`] built from persist's
 /// `list_all_transport_destinations()` at startup. Restores the full
 /// `key_id → (x25519 ‖ ed25519)` transport identity for every
@@ -3096,46 +3168,114 @@ impl ReticulumTransport {
     /// the **rooted** announce map first (every entry has cleared the
     /// CIRISEdge#15 cold-start path), then the out-of-band injected
     /// [`PeerResolver`]. Returns `None` if neither yields the peer.
-    async fn resolve_peer(&self, destination_key_id: &str) -> Option<ResolvedPeer> {
+    /// CIRISEdge#336 (v13.8.0, holistic) — every destination this peer could
+    /// legitimately own, so the DIAL layer can pick by ROUTABILITY instead of
+    /// identity-math preference. Pre-v13.8.0 this fn's ancestor synthesized ONE
+    /// winner (cache, else explicit-hash, else legacy formula) with no check
+    /// that anyone ever announced — or even owns — the synthesized hash; the
+    /// route table was consulted only to pick a timeout. Field failure: the
+    /// mobile dialed a pathless dest ×24 while the SAME peer's routable dest
+    /// sat in the path table with a direct 1-hop route. Candidates:
+    ///
+    ///  - `Cached` — the announce-bound / `prime_peer`'d dest on the rooted
+    ///    entry (carries reachability provenance: it was announced or the
+    ///    operator primed it), with the announce-verified signing key.
+    ///  - `ExplicitHash` — `sha256(fed_pubkey)[..16]` (#191 byte-equal
+    ///    federation addressing). Un-announceable by RNS design → broadcast-
+    ///    only: legitimate as bootstrap direct-dial, never routable via relays.
+    ///  - `ComputedNamed` — the legacy `sha256(name_hash‖identity_hash)`
+    ///    formula from the resolver's transport keys.
+    ///
+    /// Each candidate carries ITS OWN signing key (the identity from the same
+    /// provenance as the dest — a stale cache must not lend its key to a
+    /// freshly-computed dest, or the link proof fails confusingly).
+    /// Deduped by dest hash, first source wins. Empty ⇒ the peer is unrooted
+    /// and unresolvable (caller's existing store-and-forward / WARN branch).
+    async fn resolve_dial_candidates(&self, destination_key_id: &str) -> Vec<DialCandidate> {
+        let mut out: Vec<DialCandidate> = Vec::with_capacity(3);
         if let Some(rooted) = self.peers.lock().await.get(destination_key_id) {
-            return Some(rooted.peer);
+            out.push(DialCandidate {
+                dest_hash: rooted.peer.dest_hash,
+                signing_key: rooted.peer.signing_key,
+                source: DialSource::Cached,
+            });
         }
-        let resolver = self.resolver.as_ref()?;
-        let pubkey = resolver.resolve(destination_key_id)?;
-        let mut x25519 = [0u8; 32];
-        let mut ed25519 = [0u8; 32];
-        x25519.copy_from_slice(&pubkey[..32]);
-        ed25519.copy_from_slice(&pubkey[32..]);
+        if let Some(resolver) = self.resolver.as_ref() {
+            if let Some(pubkey) = resolver.resolve(destination_key_id) {
+                let mut x25519 = [0u8; 32];
+                let mut ed25519 = [0u8; 32];
+                x25519.copy_from_slice(&pubkey[..32]);
+                ed25519.copy_from_slice(&pubkey[32..]);
 
-        // v7.0.0 (CIRISEdge#191 / #195) — Leviculum v0.7.0 explicit-
-        // hash addressing. When the resolver knows the peer's
-        // federation Ed25519 pubkey (v6.0.0 directory-cache path), we
-        // route to `sha256(fed_pubkey)[..16]` — the SAME hash the
-        // packet-radio / HTTP transports derive — and dial via
-        // `node.connect_at(dest_hash, &transport_ed25519)`. The
-        // transport-tier Ed25519 still signs link proofs (it remains
-        // the destination's structural identity); only the routing
-        // index becomes content-addressed by the federation key.
-        //
-        // When the resolver returns `None` for the federation pubkey
-        // (v0.6.x-era resolvers that only know the transport
-        // dual-key), fall back to the legacy announce-bound formula —
-        // peers that haven't yet adopted v7.0.0 stay reachable.
-        let dest_hash =
-            if let Some(fed_pubkey) = resolver.resolve_federation_pubkey(destination_key_id) {
-                DestinationHash::new(
-                    crate::transport::addressing::reticulum_destination_for_pubkey(&fed_pubkey),
-                )
+                // v7.0.0 (CIRISEdge#191 / #195) — explicit-hash addressing:
+                // `sha256(fed_pubkey)[..16]`, the SAME hash the packet-radio /
+                // HTTP transports derive. The transport-tier Ed25519 still
+                // signs link proofs; only the routing index is content-
+                // addressed by the federation key.
+                if let Some(fed_pubkey) = resolver.resolve_federation_pubkey(destination_key_id) {
+                    out.push(DialCandidate {
+                        dest_hash: DestinationHash::new(
+                            crate::transport::addressing::reticulum_destination_for_pubkey(
+                                &fed_pubkey,
+                            ),
+                        ),
+                        signing_key: ed25519,
+                        source: DialSource::ExplicitHash,
+                    });
+                }
+                // Legacy v0.6.x formula — pre-v13.8.0 this was computed only
+                // when the resolver did NOT know the federation pubkey; now it
+                // is always a candidate, because it is the ANNOUNCEABLE (hence
+                // relay-routable) address shape and may be the only one the
+                // route table holds a path for (the #336 field case).
+                if let Ok(identity) = Identity::from_public_keys(&x25519, &ed25519) {
+                    let name_hash =
+                        Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
+                    out.push(DialCandidate {
+                        dest_hash: Destination::compute_destination_hash(
+                            &name_hash,
+                            identity.hash(),
+                        ),
+                        signing_key: ed25519,
+                        source: DialSource::ComputedNamed,
+                    });
+                }
+            }
+        }
+        // Dedup by dest hash — e.g. the cached dest IS the explicit-hash for a
+        // prime_peer'd target. First (highest-provenance) source wins.
+        let mut seen: Vec<DestinationHash> = Vec::with_capacity(out.len());
+        out.retain(|c| {
+            if seen.contains(&c.dest_hash) {
+                false
             } else {
-                let identity = Identity::from_public_keys(&x25519, &ed25519).ok()?;
-                // Legacy v0.6.x path: `sha256(name_hash || identity_hash)`.
-                let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
-                Destination::compute_destination_hash(&name_hash, identity.hash())
-            };
-        Some(ResolvedPeer {
-            dest_hash,
-            signing_key: ed25519,
-        })
+                seen.push(c.dest_hash);
+                true
+            }
+        });
+        out
+    }
+
+    /// Single-winner resolution, preserved for the non-dial callers
+    /// (`knows_peer` / dest readback). Legacy preference order: cached, else
+    /// explicit-hash, else computed-named — byte-identical to the pre-v13.8.0
+    /// behavior. The DIAL path does NOT use this — it selects by routability
+    /// over [`Self::resolve_dial_candidates`].
+    async fn resolve_peer(&self, destination_key_id: &str) -> Option<ResolvedPeer> {
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        for source in [
+            DialSource::Cached,
+            DialSource::ExplicitHash,
+            DialSource::ComputedNamed,
+        ] {
+            if let Some(c) = candidates.iter().find(|c| c.source == source) {
+                return Some(ResolvedPeer {
+                    dest_hash: c.dest_hash,
+                    signing_key: c.signing_key,
+                });
+            }
+        }
+        None
     }
 
     /// CIRISEdge#353 — the newest LIVE link already attributed to this peer
@@ -3490,7 +3630,12 @@ impl Transport for ReticulumTransport {
             });
         }
 
-        let Some(peer) = self.resolve_peer(destination_key_id).await else {
+        // CIRISEdge#336 (v13.8.0) — resolve the peer's FULL candidate address
+        // set; the dial target is chosen by ROUTABILITY further down, after the
+        // reverse-path attempt. See `resolve_dial_candidates` /
+        // `select_dial_candidate` for the holistic-fix rationale.
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        if candidates.is_empty() {
             // CIRISEdge#292 (CIRISServer#205) — an admitted replication
             // target whose Reticulum destination we can't resolve is the
             // silent-zero-delivery class: the round fires, this send
@@ -3531,19 +3676,22 @@ impl Transport for ReticulumTransport {
                 "no Reticulum destination known for destination_key_id={destination_key_id} \
                  (not directory-resolvable and no announce received)"
             )));
-        };
+        }
 
         // CIRISEdge#33 (v0.15.0) — operator-deny-list check BEFORE the
         // leviculum connect call. The blackhole keys on the peer's
         // 16-byte Reticulum destination_hash (the same bytes
         // `path_table` returns), so an operator that snapshots the
         // path table and decides to ban a peer can pass the hash back
-        // unchanged. Resolves `key_id → dest_hash` via `resolve_peer`
-        // above — peers not yet resolved are not blackhole-checkable
-        // (they couldn't be sent to anyway, so the check is
-        // semantically inert at that point).
-        let dest_hash_bytes = peer.dest_hash.into_bytes();
-        self.check_blackhole(&dest_hash_bytes).await?;
+        // unchanged.
+        //
+        // v13.8.0 hardening: check EVERY candidate address, not just the one we
+        // end up dialing — route-table-first selection must never let a ban on
+        // one of the peer's addresses be bypassed by dialing an alternate.
+        for candidate in &candidates {
+            self.check_blackhole(&candidate.dest_hash.into_bytes())
+                .await?;
+        }
 
         // CIRISEdge#353 — REVERSE PATH FIRST (see `send_via_reverse_path`).
         // Ordered AFTER the blackhole check so an operator ban still wins.
@@ -3554,17 +3702,64 @@ impl Transport for ReticulumTransport {
             return Ok(TransportSendOutcome::Delivered);
         }
 
-        // CIRISEdge#336 — the no-path GUARD. Decide the establishment window
-        // from whether the node holds a path to this exact dest BEFORE dialing.
-        // A no-path dest is broadcast-only (leviculum sends the link request
-        // with hops=1) and can be answered only by a directly-attached
-        // neighbor in one round-trip — so it establishes fast or never. A
-        // relay-reachable peer has a path and gets the patient window. This is
-        // the tripwire that ends the rooting saga's whack-a-mole: a send aimed
-        // at an un-routable dest (e.g. the un-announceable explicit-hash while
-        // the peer is only reachable on its named dest) fails FAST and LOUD
-        // with every operand named, instead of a silent 30 s opaque timeout.
-        let has_path = self.node.has_path(&peer.dest_hash);
+        // CIRISEdge#336 (v13.8.0) — ROUTE-TABLE-FIRST dial selection. The route
+        // table is the source of dial truth; identity math only proposed the
+        // candidates above. `select_dial_candidate` picks a PATHED candidate
+        // whenever one exists, so dialing an unroutable dest while a routable
+        // one exists is impossible by construction (the field failure this
+        // closes: ×24 no-route dials at a pathless dest while the same peer's
+        // routable dest sat in the path table, direct, 1 hop). With no pathed
+        // candidate the order degrades to the pre-v13.8.0 bootstrap dial
+        // (broadcast, fast-fail, loud) — prime_peer cold-start keeps working.
+        let flags: Vec<(DialSource, bool)> = candidates
+            .iter()
+            .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
+            .collect();
+        let Some(chosen_idx) = select_dial_candidate(&flags) else {
+            // Unreachable in practice (non-empty candidates always select) —
+            // defensive, never a silent fallthrough.
+            return Err(TransportError::Unreachable(format!(
+                "dial selection yielded no candidate for {destination_key_id}"
+            )));
+        };
+        let has_path = flags[chosen_idx].1;
+        let peer = ResolvedPeer {
+            dest_hash: candidates[chosen_idx].dest_hash,
+            signing_key: candidates[chosen_idx].signing_key,
+        };
+        {
+            // The candidate set + winner, always visible at debug; INFO when
+            // routing OVERRODE the legacy preference (the diagnosable case the
+            // field was blind to — which address won, and why).
+            let set: Vec<String> = candidates
+                .iter()
+                .zip(&flags)
+                .map(|(c, (s, p))| {
+                    format!(
+                        "{}:{}{}",
+                        s.as_str(),
+                        hex::encode(c.dest_hash.as_bytes()),
+                        if *p { " (path)" } else { "" }
+                    )
+                })
+                .collect();
+            if chosen_idx != 0 && has_path {
+                tracing::info!(
+                    destination_key_id,
+                    chosen = %set[chosen_idx],
+                    candidates = %set.join(", "),
+                    "dial target chosen by ROUTABILITY over legacy preference \
+                     (CIRISEdge#336 v13.8.0)"
+                );
+            } else {
+                tracing::debug!(
+                    destination_key_id,
+                    chosen = %set[chosen_idx],
+                    candidates = %set.join(", "),
+                    "dial candidate selection (CIRISEdge#336)"
+                );
+            }
+        }
         let establish_timeout = if has_path {
             LINK_ESTABLISH_TIMEOUT
         } else {
@@ -5516,6 +5711,66 @@ mod tests {
             let dead = lid(0xDE);
             assert_eq!(select_reply_link(&[(dead, 100, 200)]), Some(dead));
             assert_eq!(select_reply_link(&[]), None);
+        }
+    }
+
+    // ── CIRISEdge#336/v13.8.0 route-table-first dial selection — pure decision ──
+    //
+    // Field failure (mobile → canonical, edge v13.7.0): the send dialed a
+    // pathless dest ×24 (no route → round errors, envelopes_sent=0) while the
+    // SAME peer's routable dest sat in the path table with a direct 1-hop
+    // route. Root: address selection was identity-math-first; the route table
+    // only picked the timeout. These tests pin the inversion.
+    mod dial_selection {
+        use super::*;
+        use DialSource::{Cached, ComputedNamed, ExplicitHash};
+
+        #[test]
+        fn pathed_candidate_beats_pathless_legacy_preference() {
+            // THE field scenario: cached announce-bound dest is pathless (stale
+            // / unroutable), the computed-named dest holds the path. Pre-fix
+            // the legacy preference dialed index 0 into the void ×24.
+            let c = [
+                (Cached, false),
+                (ExplicitHash, false),
+                (ComputedNamed, true),
+            ];
+            assert_eq!(select_dial_candidate(&c), Some(2));
+        }
+
+        #[test]
+        fn cached_with_path_stays_the_happy_path() {
+            let c = [(Cached, true), (ExplicitHash, false), (ComputedNamed, true)];
+            assert_eq!(select_dial_candidate(&c), Some(0));
+        }
+
+        #[test]
+        fn all_pathless_degrades_to_the_legacy_bootstrap_order() {
+            // Route table agnostic → byte-identical to pre-v13.8.0 behavior:
+            // cached first; else explicit-hash (the designed broadcast
+            // bootstrap, e.g. a prime_peer'd cold-start) before computed-named.
+            let with_cache = [
+                (Cached, false),
+                (ExplicitHash, false),
+                (ComputedNamed, false),
+            ];
+            assert_eq!(select_dial_candidate(&with_cache), Some(0));
+            let no_cache = [(ExplicitHash, false), (ComputedNamed, false)];
+            assert_eq!(select_dial_candidate(&no_cache), Some(0));
+        }
+
+        #[test]
+        fn among_pathed_the_announceable_shape_beats_explicit_hash() {
+            // An explicit-hash dest with a "path" is near-impossible (it is
+            // un-announceable); if both somehow have paths, prefer the
+            // announceable computed-named shape.
+            let c = [(ExplicitHash, true), (ComputedNamed, true)];
+            assert_eq!(select_dial_candidate(&c), Some(1));
+        }
+
+        #[test]
+        fn empty_candidates_select_nothing() {
+            assert_eq!(select_dial_candidate(&[]), None);
         }
     }
 
