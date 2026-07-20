@@ -221,7 +221,13 @@ impl ReplicationCoordinator {
         let step = Self::outcome_to_step(outcome);
         // Auto-reset on round completion so the next call can drive
         // a fresh round without the caller threading state.
-        if matches!(step, DriveStep::Complete(_)) {
+        // (#380: `reset` preserves the cross-round knowledge — the peer's
+        // last Summary + the proactive-push ledger — so an initiator-final
+        // session keeps completing instead of re-blasting.)
+        if matches!(
+            step,
+            DriveStep::Complete(_) | DriveStep::SendThenComplete(_, _)
+        ) {
             session.reset();
         }
         Ok(step)
@@ -262,6 +268,18 @@ impl ReplicationCoordinator {
     fn outcome_to_step(outcome: ReplicationOutcome) -> DriveStep {
         match outcome {
             ReplicationOutcome::Send(msgs) => DriveStep::SendThenWait(msgs),
+            // CIRISEdge#380 — confirmed-sync initiator-final round: report
+            // InSync (the completion is gated on the peer's own Summary
+            // confirming it holds our full set + we want nothing of its).
+            ReplicationOutcome::SendAndComplete { msgs, kind } => DriveStep::SendThenComplete(
+                msgs,
+                RoundReport {
+                    kind,
+                    admitted: 0,
+                    refused: 0,
+                    staleness: StalenessSignal::InSync,
+                },
+            ),
             ReplicationOutcome::Applied {
                 kind,
                 admitted,
@@ -364,6 +382,11 @@ pub enum DriveStep {
     /// [`ReplicationCoordinator::send_message`], then awaits the
     /// next inbound message + calls `drive_round_step(Some(msg))`.
     SendThenWait(Vec<ReplicationMessage>),
+    /// CIRISEdge#380 — INITIATOR-FINAL: send these messages, then the round is
+    /// complete with the given report — nothing further will arrive (the peer's
+    /// last Summary confirmed full sync). The caller sends each message, then
+    /// treats the round as [`Self::Complete`] without waiting.
+    SendThenComplete(Vec<ReplicationMessage>, RoundReport),
     /// The round completed; the report is the final state.
     Complete(RoundReport),
     /// The peer sent a message that didn't make sense in this round's

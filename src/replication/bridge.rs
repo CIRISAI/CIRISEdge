@@ -381,7 +381,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 )
                 .await
             }
-            EnvelopeKind::Attestation => self.list_attestations().await,
+            EnvelopeKind::Attestation => self.list_attestations(None).await,
             EnvelopeKind::Revocation => self.list_revocations().await,
             EnvelopeKind::Family => self.list_families().await,
             EnvelopeKind::Community => self.list_communities().await,
@@ -404,6 +404,46 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         envelope_hash: &[u8; 32],
     ) -> Option<Vec<u8>> {
         self.cache.lock().await.get(kind, envelope_hash)
+    }
+
+    /// CIRISEdge#379 — recipient-aware listing: the Attestation plane routes
+    /// through the `observer`-gated sweep; every other kind is peer-invariant.
+    async fn list_envelope_refs_for_peer(
+        &self,
+        kind: EnvelopeKind,
+        peer_key_id: Option<&str>,
+    ) -> Vec<EnvelopeRef> {
+        match (kind, peer_key_id) {
+            (EnvelopeKind::Attestation, Some(peer)) => self.list_attestations(Some(peer)).await,
+            _ => self.list_envelope_refs(kind).await,
+        }
+    }
+
+    /// CIRISEdge#379 — recipient-aware fetch: the serve-side twin of the
+    /// listing gate, so a peer excluded from the listing cannot obtain a
+    /// `trace:*` envelope anyway by Diff/Fetch-ing a hash it learned
+    /// out-of-band.
+    async fn fetch_envelope_bytes_for_peer(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+        peer_key_id: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let bytes = self.fetch_envelope_bytes(kind, envelope_hash).await?;
+        if kind == EnvelopeKind::Attestation {
+            if let Some(peer) = peer_key_id {
+                if Self::envelope_requires_observer(&bytes) && !self.peer_has_observer(peer).await {
+                    tracing::debug!(
+                        peer,
+                        envelope_hash = %hex::encode(&envelope_hash[..8]),
+                        "trace attestation withheld — recipient lacks the `observer` \
+                         capability (CIRISEdge#379)"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(bytes)
     }
 
     async fn apply_envelope_bytes(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> bool {
@@ -738,7 +778,50 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    async fn list_attestations(&self) -> Vec<EnvelopeRef> {
+    /// CIRISEdge#379 — role token a peer must advertise on its federation
+    /// KeyRecord (`roles` vector, accord-conferred per CIRISPersist#441) to
+    /// receive trace scores-attestations (`dimension` = `trace:*`,
+    /// CIRISPersist#473/v18). The contextual-integrity Recipient parameter:
+    /// promotion (`attestation_promote`) consents to sharing WITH OBSERVERS,
+    /// not with every cohort peer.
+    pub const OBSERVER_ROLE: &'static str = "observer";
+
+    /// CIRISEdge#379 — does this attestation row require the recipient to
+    /// hold the `observer` capability? True iff its `dimension` (CC 2.1 —
+    /// inside `attestation_envelope`) is in the `trace:*` namespace.
+    fn attestation_requires_observer(canonical_json: &serde_json::Value) -> bool {
+        canonical_json
+            .pointer("/attestation_envelope/dimension")
+            .and_then(|v| v.as_str())
+            .is_some_and(|d| d.starts_with("trace:"))
+    }
+
+    /// CIRISEdge#379 — the fetch-path twin of
+    /// [`Self::attestation_requires_observer`], over WIRE bytes (the
+    /// `{"attestation": …}` wrap `adapt_record` produces; also accepts the
+    /// bare row for robustness). Parse failure → `false` (only `trace:*`
+    /// is gated; cached envelopes are JSON this bridge serialized).
+    fn envelope_requires_observer(bytes: &[u8]) -> bool {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return false;
+        };
+        let inner = v.get("attestation").unwrap_or(&v);
+        Self::attestation_requires_observer(inner)
+    }
+
+    /// CIRISEdge#379 — does `peer_key_id`'s federation KeyRecord advertise
+    /// the [`Self::OBSERVER_ROLE`]? Roles are accord-conferred (never
+    /// self-claimed — CIRISPersist#441 admission gate), so a `true` here is
+    /// a conferral, not a claim. Unknown peer / lookup error → `false`
+    /// (fail-closed: an unresolvable recipient gets no gated rows).
+    async fn peer_has_observer(&self, peer_key_id: &str) -> bool {
+        match self.directory.lookup_public_key(peer_key_id).await {
+            Ok(Some(rec)) => rec.roles.iter().any(|r| r == Self::OBSERVER_ROLE),
+            _ => false,
+        }
+    }
+
+    async fn list_attestations(&self, recipient: Option<&str>) -> Vec<EnvelopeRef> {
         // v10 — per-record dynamic policy for the scores/Attestation plane.
         // Each attestation's projection is resolved from its ACTUAL dimension
         // (across all 95 namespace families), cohort_scope, and attestation_type
@@ -763,6 +846,9 @@ impl FederationDirectoryReplicationBridge {
             .collect();
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        // CIRISEdge#379 — lazily-resolved recipient capability (one directory
+        // lookup per listing sweep, and only when a gated row is encountered).
+        let mut observer_allowed: Option<bool> = None;
         for subject in self.subjects_for_projection(Projection::Global) {
             // about — via the uniform signed read (`list_attestations_for`).
             let about = self
@@ -783,6 +869,23 @@ impl FederationDirectoryReplicationBridge {
             for canonical_json in about.chain(by) {
                 if !Self::attestation_is_advertised(&canonical_json, &self_set) {
                     continue;
+                }
+                // CIRISEdge#379 — RECIPIENT gate (the contextual-integrity
+                // Recipient parameter): a `trace:*` scores-attestation is
+                // listed for a peer ONLY if that peer's KeyRecord advertises
+                // the accord-conferred `observer` role. Non-trace rows are
+                // untouched; a `None` recipient (projection-only view / tests)
+                // is ungated — every production provider is peer-bound
+                // (`DirectoryStateAdapter::with_peer`).
+                if let Some(peer) = recipient {
+                    if Self::attestation_requires_observer(&canonical_json) {
+                        if observer_allowed.is_none() {
+                            observer_allowed = Some(self.peer_has_observer(peer).await);
+                        }
+                        if observer_allowed != Some(true) {
+                            continue;
+                        }
+                    }
                 }
                 let Some((bytes, hash, seq)) =
                     Self::adapt_record(ReplicatedKind::Attestation, &canonical_json)
@@ -1736,6 +1839,156 @@ mod tests {
         assert!(
             !refs.is_empty(),
             "federation-PRESENT attestation MUST appear (FSD §7.1)"
+        );
+    }
+
+    // ── CIRISEdge#379 — observer-capability recipient gate (trace plane) ──
+
+    /// Seed a `trace:complete:v1` scores-attestation + two recipients (one
+    /// whose KeyRecord advertises the `observer` role, one without), then
+    /// assert the contextual-integrity Recipient parameter on BOTH the
+    /// advertise (listing) and the serve (fetch) paths, and that non-trace
+    /// attestations are untouched by the gate.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // seed + both peers + both paths, one coherent scenario
+    async fn trace_attestation_gated_on_observer_capability() {
+        let producer = "agent-mobile";
+        let observer_peer = "canonical-observer";
+        let plain_peer = "peer-no-observer";
+        let (backend, bridge) = make_bridge(&[
+            producer.to_string(),
+            observer_peer.to_string(),
+            plain_peer.to_string(),
+        ]);
+
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fixture_key_record(producer, identity_type::AGENT),
+            })
+            .await
+            .expect("seed producer key");
+        let mut observer_rec = fixture_key_record(observer_peer, identity_type::AGENT);
+        observer_rec.roles = vec![FederationDirectoryReplicationBridge::OBSERVER_ROLE.to_string()];
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: observer_rec,
+            })
+            .await
+            .expect("seed observer key");
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fixture_key_record(plain_peer, identity_type::AGENT),
+            })
+            .await
+            .expect("seed plain key");
+
+        // A trace scores-attestation (self-subject, federation tier =
+        // promoted) + a NON-trace attestation for the control.
+        let now = Utc::now();
+        for (attestation_type, dimension) in [
+            ("scores", Some("trace:complete:v1")),
+            ("delegates_to", None),
+        ] {
+            let mut envelope = serde_json::json!({
+                "attesting_key_id": producer,
+                "attested_key_id": producer,
+                "attestation_type": attestation_type,
+            });
+            if let Some(d) = dimension {
+                // The persist v18.1.0 trace:* Information-Type validator
+                // (CIRISPersist#479) enforces the inline shape at admission:
+                // trace_id + agent_id_hash strings + a `trace` object.
+                envelope["dimension"] = serde_json::json!(d);
+                envelope["trace_id"] = serde_json::json!("t-fixture-1");
+                envelope["agent_id_hash"] = serde_json::json!("ah-fixture-1");
+                envelope["trace"] = serde_json::json!({ "steps": [] });
+            }
+            let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(producer, &envelope);
+            let att = Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: producer.to_string(),
+                attested_key_id: producer.to_string(),
+                attestation_type: attestation_type.to_string(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: hash,
+                scrub_signature_classical: ed_sig,
+                scrub_signature_pqc: pqc_sig,
+                scrub_key_id: producer.to_string(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: vec![producer.to_string()],
+                withdraws_admission_rule: None,
+                cohort_scope: "federation".to_string(),
+                tier: "federation".to_string(),
+                promoted_at: None,
+            };
+            backend
+                .put_attestation(SignedAttestation { attestation: att })
+                .await
+                .expect("seed attestation");
+        }
+
+        // Peerless (projection-only) view: both rows.
+        let all = bridge
+            .list_envelope_refs(EnvelopeKind::Attestation)
+            .await
+            .len();
+        assert_eq!(all, 2, "projection-only view lists both rows");
+
+        // Observer peer: both rows.
+        let observer_refs = bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(observer_peer))
+            .await;
+        assert_eq!(
+            observer_refs.len(),
+            2,
+            "observer-capability peer receives the trace row + the plain row"
+        );
+
+        // Non-observer peer: ONLY the non-trace row.
+        let plain_refs = bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(plain_peer))
+            .await;
+        assert_eq!(
+            plain_refs.len(),
+            1,
+            "non-observer peer must NOT be offered the trace attestation \
+             (CIRISEdge#379 — the Recipient parameter)"
+        );
+
+        // Serve-side twin: the trace row's bytes are withheld from the
+        // non-observer even by direct hash fetch, served to the observer.
+        let trace_hash = observer_refs
+            .iter()
+            .map(|r| r.envelope_hash)
+            .find(|h| !plain_refs.iter().any(|p| p.envelope_hash == *h))
+            .expect("the trace row is the one the plain peer was not offered");
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &trace_hash,
+                    Some(observer_peer)
+                )
+                .await
+                .is_some(),
+            "observer peer fetches the trace envelope"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &trace_hash,
+                    Some(plain_peer)
+                )
+                .await
+                .is_none(),
+            "non-observer peer must not obtain the trace envelope by hash \
+             (out-of-band Diff/Fetch bypass, CIRISEdge#379)"
         );
     }
 
