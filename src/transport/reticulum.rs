@@ -242,18 +242,111 @@ impl ShipError {
 const REVERSE_PATH_BUSY_RETRY_WINDOW: Duration = Duration::from_secs(8);
 /// Pause between busy-retries on the reverse path.
 const REVERSE_PATH_BUSY_BACKOFF: Duration = Duration::from_millis(500);
-/// CIRISEdge#353b — resource-completion timeout for a REVERSE-PATH reply,
-/// deliberately far shorter than the 120 s [`RESOURCE_TRANSFER_TIMEOUT`] used on
-/// the outbound-dial path. A reply's small Summary/Diff/Deliver payload completes
-/// in a few seconds on a genuinely live link; if it hasn't in 10 s the link is a
-/// NAT-dead-but-`Active` corpse (the mobile churns links every ~30 s), and edge
-/// must NOT commit 120 s to it — the round times out and, worse, the stalled send
-/// parks the responder's inbound drain until every queued frame is dropped (#373).
-/// 10 s > the round-open RTT + transfer on a live link, but bounds the corpse case
-/// so the NEXT round rides the peer's fresh link. `link_last_inbound_at` selection
-/// (#353a) already avoids the corpse when a live link exists; this bounds the
-/// degenerate window where it is momentarily the only `Active` candidate.
-const REVERSE_PATH_RESOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+/// CIRISEdge#353b/v13.6.1 — PROGRESS-AWARE reverse-path resource wait.
+///
+/// v13.6.0 used a flat 10 s cutoff, which was too blunt: a resource completes
+/// only after `advertise → accept → parts → AwaitingProof → proof` (leviculum's
+/// part/proof timeouts are RTT-scaled), so a LARGE reply (the Attestation Diff,
+/// too big for the packet fast-path) over a high-RTT NAT'd link genuinely needs
+/// well over 10 s EVEN ON A LIVE LINK. The flat timeout cut off a live, still-
+/// progressing transfer (field datum: an 11 s-old live link, non-busy, cut at
+/// exactly 10 s). The fix watches leviculum's `Resource{Advertised,TransferStarted,
+/// Progress}` events (all carry `resource_hash` + `is_sender`) and distinguishes:
+///
+/// * NO progress within [`REVERSE_PATH_NO_PROGRESS_WINDOW`] → fast-fail (dead
+///   link — even faster than the old 10 s; preserves the #373 drain protection).
+/// * Progress flowing → extend up to [`REVERSE_PATH_MAX_TRANSFER`] so a live-but-
+///   slow transfer completes.
+///
+/// Scope (per the field owner's caveat): this closes the PRESENT-mobile / first-
+/// reply case (transfer progressing over a link that survives). Burst-and-leave —
+/// the mobile gone by reply time, or the link going stale MID-transfer — remains
+/// the separate initiator-push end-state; the `LinkStale`-during-transfer path is
+/// logged distinctly so that mode stays visible.
+const REVERSE_PATH_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(6);
+/// Hard cap for a PROGRESSING reverse-path transfer (well inside a present
+/// mobile's ~90 s live window; a stalled transfer fails earlier via the
+/// no-progress window).
+const REVERSE_PATH_MAX_TRANSFER: Duration = Duration::from_secs(45);
+/// No-progress window for the OUTBOUND-dial path — a freshly-dialed link we
+/// control, so more lenient than the churn-prone reverse path.
+const DIAL_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(30);
+
+/// Where a reverse-path resource transfer had reached when it was last observed —
+/// the stall-stage that makes a failed transfer field-diagnosable (Outcome B, a
+/// live-but-slow transfer, vs Outcome A, a genuine stall — and WHERE it stalled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceSendStage {
+    /// Advertised to the peer; awaiting its accept + part requests.
+    Advertised,
+    /// Parts are flowing (`ResourceProgress` seen); may be awaiting proof.
+    Transferring,
+}
+
+impl ResourceSendStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Advertised => "advertised (awaiting peer accept/part-request)",
+            Self::Transferring => "transferring (parts flowing / awaiting proof)",
+        }
+    }
+}
+
+/// Per-sent-resource progress mirror, keyed by the `resource_hash`
+/// `send_resource` returns. Updated by the sender-side
+/// `Resource{Advertised,TransferStarted,Progress}` event arms; read by
+/// [`ReticulumTransport::ship_resource_on_link`]'s progress-aware wait.
+#[derive(Debug, Clone, Copy)]
+struct ResourceSendProgress {
+    stage: ResourceSendStage,
+    last_update: std::time::Instant,
+}
+
+/// One tick of the progress-aware reverse-path wait — a PURE decision so the
+/// timeout logic is a compile-fast unit test, not a field incident (the
+/// `select_reply_link` discipline). All time inputs are pre-measured by the
+/// async caller.
+#[derive(Debug, PartialEq, Eq)]
+enum ReverseWaitStep {
+    /// Sender-side `ResourceCompleted` observed — delivered + proven.
+    Done,
+    /// Keep polling.
+    Continue,
+    /// No transfer progress within the no-progress window → dead/undialable link.
+    StalledNoProgress,
+    /// The link went stale/closed MID-transfer (caveat: burst-and-leave churn).
+    LinkStale,
+    /// Progressing but past the hard cap — bail so the drain isn't parked forever.
+    MaxDeadline,
+}
+
+fn reverse_path_wait_step(
+    completed: bool,
+    link_live: bool,
+    since_last_progress: Duration,
+    since_start: Duration,
+    no_progress_window: Duration,
+    max_transfer: Duration,
+) -> ReverseWaitStep {
+    if completed {
+        return ReverseWaitStep::Done;
+    }
+    // Link death mid-transfer is distinct from a slow transfer — surface it so
+    // the burst-and-leave failure mode stays visible (v13.6.1 caveat 2).
+    if !link_live {
+        return ReverseWaitStep::LinkStale;
+    }
+    if since_start >= max_transfer {
+        return ReverseWaitStep::MaxDeadline;
+    }
+    // `since_last_progress` is measured from the last progress event, or from the
+    // send start if none has fired yet — so a link that never even advertises
+    // trips this at the no-progress window (fast-fail, no #373 regression).
+    if since_last_progress >= no_progress_window {
+        return ReverseWaitStep::StalledNoProgress;
+    }
+    ReverseWaitStep::Continue
+}
 
 /// CIRISEdge#336 (fast heal) — minimum interval between EVENT-DRIVEN announces.
 ///
@@ -1305,6 +1398,12 @@ pub struct ReticulumTransport {
     /// waits on this set so it returns `Delivered` only once the
     /// transfer has actually drained, not merely enqueued.
     sent_resources: Arc<Mutex<HashSet<[u8; 32]>>>,
+    /// CIRISEdge#353b/v13.6.1 — sender-side transfer progress for in-flight
+    /// resources, keyed by `resource_hash`. Populated by the
+    /// `Resource{Advertised,TransferStarted,Progress}` (`is_sender: true`) event
+    /// arms; read by `ship_resource_on_link`'s progress-aware wait so a live-but-
+    /// slow reverse-path transfer is extended while a dead link fast-fails.
+    sent_resource_progress: Arc<Mutex<HashMap<[u8; 32], ResourceSendProgress>>>,
     /// CIRISEdge#353 test seam — when > 0, the next N `ship_resource_on_link`
     /// calls return [`ShipError::Busy`] (decrementing) BEFORE touching the
     /// network, so a test can deterministically drive the reverse-path
@@ -1897,6 +1996,7 @@ impl ReticulumTransport {
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resources: Arc::new(Mutex::new(HashSet::new())),
+            sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             resolver,
             rooting,
@@ -3124,7 +3224,12 @@ impl ReticulumTransport {
             };
             attempts += 1;
             match self
-                .ship_resource_on_link(&link_id, envelope_bytes, REVERSE_PATH_RESOURCE_TIMEOUT)
+                .ship_resource_on_link(
+                    &link_id,
+                    envelope_bytes,
+                    REVERSE_PATH_NO_PROGRESS_WINDOW,
+                    REVERSE_PATH_MAX_TRANSFER,
+                )
                 .await
             {
                 Ok(()) => {
@@ -3229,14 +3334,18 @@ impl ReticulumTransport {
     /// (`ResourceError::TransferInProgress`) — retryable, the link is healthy —
     /// vs `ShipError::Other` for everything else. String-matching the Display
     /// text would be the fragile version of this; the enum can't reword.
+    #[allow(clippy::too_many_lines)] // the progress-aware wait loop (v13.6.1) is one cohesive unit
     async fn ship_resource_on_link(
         &self,
         link_id: &LinkId,
         envelope_bytes: &[u8],
-        // CIRISEdge#353b — completion timeout. The reverse-path reply passes the
-        // short [`REVERSE_PATH_RESOURCE_TIMEOUT`] (fail fast on a dead-but-Active
-        // link); the outbound-dial path passes [`RESOURCE_TRANSFER_TIMEOUT`].
-        completion_timeout: Duration,
+        // CIRISEdge#353b/v13.6.1 — progress-aware wait budget. `no_progress_window`
+        // fast-fails a transfer showing no progress (dead link); `max_transfer` is
+        // the hard cap for a progressing transfer. Reverse path passes
+        // (`REVERSE_PATH_NO_PROGRESS_WINDOW`, `REVERSE_PATH_MAX_TRANSFER`); the
+        // outbound-dial path passes (`DIAL_NO_PROGRESS_WINDOW`, `RESOURCE_TRANSFER_TIMEOUT`).
+        no_progress_window: Duration,
+        max_transfer: Duration,
     ) -> Result<(), ShipError> {
         // CIRISEdge#353 test seam — deterministically simulate the
         // one-transfer-per-link collision (see `test_force_busy`).
@@ -3269,27 +3378,100 @@ impl ReticulumTransport {
                 ))),
             })?;
 
-        // Wait for the sender-side `ResourceCompleted` — the driver
-        // paces + retransmits resource parts, and completion means
-        // every part was delivered + proven. If the transfer does not
-        // complete within `completion_timeout` (short on the reverse path,
-        // #353b), treat it as a timeout so edge's durable dispatcher retries
-        // and the responder's inbound drain is not parked (#373).
-        let completed =
-            wait_until_async(completion_timeout, Duration::from_millis(100), || async {
-                self.sent_resources.lock().await.remove(&resource_hash)
-            })
-            .await;
-        if !completed {
-            return Err(ShipError::Other(TransportError::Timeout(
-                completion_timeout,
-            )));
+        // CIRISEdge#353b/v13.6.1 — PROGRESS-AWARE wait for the sender-side
+        // `ResourceCompleted` (delivered + proven). A resource completes only
+        // after advertise → accept → parts → proof, so a large reply over a
+        // high-RTT link legitimately takes many seconds even when live. Rather
+        // than a flat cutoff (which severed live transfers), extend WHILE parts
+        // flow (`ResourceProgress` bumps `last_update`) up to `max_transfer`, but
+        // fast-fail once `no_progress_window` passes with no progress (dead link),
+        // and bail distinctly if the link dies mid-transfer. `reverse_path_wait_step`
+        // holds the (unit-tested) decision.
+        let start = std::time::Instant::now();
+        let mut poll = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            poll.tick().await;
+            let completed = self.sent_resources.lock().await.remove(&resource_hash);
+            let link_live = self.node.link_is_established(link_id);
+            let (since_last_progress, stage) = {
+                let guard = self.sent_resource_progress.lock().await;
+                guard.get(&resource_hash).map_or_else(
+                    || (start.elapsed(), None),
+                    |p| (p.last_update.elapsed(), Some(p.stage)),
+                )
+            };
+            match reverse_path_wait_step(
+                completed,
+                link_live,
+                since_last_progress,
+                start.elapsed(),
+                no_progress_window,
+                max_transfer,
+            ) {
+                ReverseWaitStep::Continue => {}
+                ReverseWaitStep::Done => {
+                    self.sent_resource_progress
+                        .lock()
+                        .await
+                        .remove(&resource_hash);
+                    return Ok(());
+                }
+                ReverseWaitStep::StalledNoProgress => {
+                    self.sent_resource_progress
+                        .lock()
+                        .await
+                        .remove(&resource_hash);
+                    tracing::debug!(
+                        resource = %hex::encode(&resource_hash[..8]),
+                        stalled_at = stage
+                            .map_or("no transfer started (peer never accepted, or advertise lost)",
+                                    ResourceSendStage::as_str),
+                        elapsed_secs = start.elapsed().as_secs(),
+                        "reverse-path resource made no progress; failing fast (CIRISEdge#353b) — the \
+                         stage names WHERE it stalled, so Outcome B (slow) vs A (stuck) is \
+                         field-answerable at DEBUG"
+                    );
+                    return Err(ShipError::Other(TransportError::Timeout(
+                        no_progress_window,
+                    )));
+                }
+                ReverseWaitStep::LinkStale => {
+                    self.sent_resource_progress
+                        .lock()
+                        .await
+                        .remove(&resource_hash);
+                    tracing::warn!(
+                        resource = %hex::encode(&resource_hash[..8]),
+                        elapsed_secs = start.elapsed().as_secs(),
+                        stalled_at = stage.map_or("pre-transfer", ResourceSendStage::as_str),
+                        "reverse-path link went STALE mid-transfer — the peer churned this link \
+                         before the resource completed (CIRISEdge#353b caveat; burst-and-leave is \
+                         the separate initiator-push end-state)"
+                    );
+                    return Err(ShipError::Other(TransportError::Timeout(max_transfer)));
+                }
+                ReverseWaitStep::MaxDeadline => {
+                    self.sent_resource_progress
+                        .lock()
+                        .await
+                        .remove(&resource_hash);
+                    tracing::warn!(
+                        resource = %hex::encode(&resource_hash[..8]),
+                        max_secs = max_transfer.as_secs(),
+                        "reverse-path resource still transferring at the hard cap; abandoning so the \
+                         responder drain is not parked forever (CIRISEdge#353b/#373)"
+                    );
+                    return Err(ShipError::Other(TransportError::Timeout(max_transfer)));
+                }
+            }
         }
-        Ok(())
     }
 }
 
 #[async_trait]
+// `send`'s reverse-path-first + dial-fallback seam crosses 100 lines; async_trait
+// attributes the lint to the impl, so the allow lives here (v13.6.1).
+#[allow(clippy::too_many_lines)]
 impl Transport for ReticulumTransport {
     fn id(&self) -> TransportId {
         TransportId::RETICULUM_RS
@@ -3472,11 +3654,16 @@ impl Transport for ReticulumTransport {
         // The outbound-dial path we just established this link; a `Busy`
         // collision here is not the reverse-path retry case, so both variants
         // surface as the send's transport error (the durable dispatcher retries).
-        // Full [`RESOURCE_TRANSFER_TIMEOUT`] here — this is a freshly-dialed link
-        // we control, not the churn-prone reverse path.
-        self.ship_resource_on_link(&link_id, envelope_bytes, RESOURCE_TRANSFER_TIMEOUT)
-            .await
-            .map_err(ShipError::into_transport)?;
+        // Freshly-dialed link we control: lenient no-progress window, full
+        // [`RESOURCE_TRANSFER_TIMEOUT`] hard cap (v13.6.1 progress-aware wait).
+        self.ship_resource_on_link(
+            &link_id,
+            envelope_bytes,
+            DIAL_NO_PROGRESS_WINDOW,
+            RESOURCE_TRANSFER_TIMEOUT,
+        )
+        .await
+        .map_err(ShipError::into_transport)?;
 
         Ok(TransportSendOutcome::Delivered)
     }
@@ -3571,6 +3758,7 @@ impl Transport for ReticulumTransport {
                         peers: &self.peers,
                         established_links: &self.established_links,
                         sent_resources: &self.sent_resources,
+                        sent_resource_progress: &self.sent_resource_progress,
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
                         hybrid_policy: self.hybrid_policy,
@@ -3631,6 +3819,9 @@ struct EventCtx<'a> {
     peers: &'a Mutex<HashMap<String, RootedPeer>>,
     established_links: &'a Mutex<HashSet<LinkId>>,
     sent_resources: &'a Mutex<HashSet<[u8; 32]>>,
+    /// CIRISEdge#353b/v13.6.1 — sender-side resource transfer progress (see the
+    /// field of the same name on [`ReticulumTransport`]).
+    sent_resource_progress: &'a Mutex<HashMap<[u8; 32], ResourceSendProgress>>,
     sink: &'a mpsc::Sender<InboundFrame>,
     /// Persist directory adapter for the authenticated cold-start
     /// path; `None` → announces are dropped (no rooting possible).
@@ -3977,6 +4168,60 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 ));
             }
         }
+        // CIRISEdge#353b/v13.6.1 — mirror sender-side transfer progress so
+        // `ship_resource_on_link` can distinguish a live-but-slow transfer
+        // (extend the deadline) from a dead link (fast-fail), and log WHERE a
+        // stalled transfer got stuck. `ResourceAdvertised` carries no `is_sender`;
+        // its entry is harmless (the wait only looks up its own hash) and is
+        // cleaned on completion/failure.
+        NodeEvent::ResourceAdvertised { resource_hash, .. } => {
+            ctx.sent_resource_progress.lock().await.insert(
+                resource_hash,
+                ResourceSendProgress {
+                    stage: ResourceSendStage::Advertised,
+                    last_update: std::time::Instant::now(),
+                },
+            );
+        }
+        // TransferStarted + Progress both mean "parts are flowing" → Transferring.
+        NodeEvent::ResourceTransferStarted {
+            resource_hash,
+            is_sender,
+            ..
+        }
+        | NodeEvent::ResourceProgress {
+            resource_hash,
+            is_sender,
+            ..
+        } => {
+            if is_sender {
+                ctx.sent_resource_progress.lock().await.insert(
+                    resource_hash,
+                    ResourceSendProgress {
+                        stage: ResourceSendStage::Transferring,
+                        last_update: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
+        NodeEvent::ResourceFailed {
+            resource_hash,
+            is_sender,
+            error,
+            ..
+        } => {
+            ctx.sent_resource_progress
+                .lock()
+                .await
+                .remove(&resource_hash);
+            if is_sender {
+                tracing::debug!(
+                    resource = %hex::encode(&resource_hash[..8]),
+                    error = %error,
+                    "reverse-path resource transfer FAILED at the driver (CIRISEdge#353b)"
+                );
+            }
+        }
         NodeEvent::ResourceCompleted {
             link_id,
             data,
@@ -3985,6 +4230,12 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             resource_hash,
             ..
         } => {
+            // CIRISEdge#353b/v13.6.1 — the transfer concluded; drop its progress
+            // mirror (bounds the map for both sent + received resources).
+            ctx.sent_resource_progress
+                .lock()
+                .await
+                .remove(&resource_hash);
             if is_sender {
                 // Our own outbound envelope finished transferring —
                 // unblock the `send` waiting on this resource hash.
@@ -5265,6 +5516,116 @@ mod tests {
             let dead = lid(0xDE);
             assert_eq!(select_reply_link(&[(dead, 100, 200)]), Some(dead));
             assert_eq!(select_reply_link(&[]), None);
+        }
+    }
+
+    // ── CIRISEdge#353b/v13.6.1 progress-aware reverse-path wait — pure decision ──
+    //
+    // v13.6.0's flat 10s cutoff SEVERED a live, still-progressing large-resource
+    // transfer (field: an 11s-old live link, non-busy, cut at exactly 10s). The
+    // fix extends while parts flow and fast-fails only on no-progress / link death.
+    mod resource_wait {
+        use super::*;
+        use ReverseWaitStep::{Continue, Done, LinkStale, MaxDeadline, StalledNoProgress};
+        const NPW: Duration = Duration::from_secs(6); // no-progress window
+        const MAX: Duration = Duration::from_secs(45); // hard cap
+
+        #[test]
+        fn completed_is_done() {
+            assert_eq!(
+                reverse_path_wait_step(
+                    true,
+                    true,
+                    Duration::ZERO,
+                    Duration::from_secs(3),
+                    NPW,
+                    MAX
+                ),
+                Done
+            );
+        }
+
+        #[test]
+        fn live_and_progressing_keeps_waiting_past_the_old_flat_cutoff() {
+            // THE regression the fix exists for: 12s in, a live link that made
+            // progress 2s ago keeps going — v13.6.0's flat 10s would have cut it.
+            assert_eq!(
+                reverse_path_wait_step(
+                    false,
+                    true,
+                    Duration::from_secs(2),
+                    Duration::from_secs(12),
+                    NPW,
+                    MAX
+                ),
+                Continue
+            );
+        }
+
+        #[test]
+        fn no_progress_past_window_fast_fails() {
+            // Dead link: no progress for >= the window → fast-fail (faster than the
+            // old 10s), preserving the #373 drain protection.
+            assert_eq!(
+                reverse_path_wait_step(
+                    false,
+                    true,
+                    Duration::from_secs(6),
+                    Duration::from_secs(6),
+                    NPW,
+                    MAX
+                ),
+                StalledNoProgress
+            );
+        }
+
+        #[test]
+        fn link_death_mid_transfer_is_distinct_not_a_generic_timeout() {
+            // Even while progressing, a dead link is LinkStale (caveat 2) — so the
+            // burst-and-leave churn mode stays field-visible.
+            assert_eq!(
+                reverse_path_wait_step(
+                    false,
+                    false,
+                    Duration::from_secs(1),
+                    Duration::from_secs(20),
+                    NPW,
+                    MAX
+                ),
+                LinkStale
+            );
+        }
+
+        #[test]
+        fn progressing_but_past_hard_cap_bails() {
+            assert_eq!(
+                reverse_path_wait_step(
+                    false,
+                    true,
+                    Duration::from_secs(1),
+                    Duration::from_secs(45),
+                    NPW,
+                    MAX
+                ),
+                MaxDeadline
+            );
+        }
+
+        #[test]
+        fn completion_wins_over_link_death() {
+            // A resource proven on its last part is Done even if the link just
+            // dropped — never turn a success into a LinkStale.
+            assert_eq!(
+                reverse_path_wait_step(
+                    true,
+                    false,
+                    Duration::ZERO,
+                    Duration::from_secs(5),
+                    NPW,
+                    MAX
+                ),
+                Done
+            );
         }
     }
 
