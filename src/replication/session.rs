@@ -117,6 +117,14 @@ pub struct Session {
     diff_want_count: Option<usize>,
     /// Whether the round has completed from this side's view.
     completed: bool,
+    /// CIRISEdge#927 — initiator-first push. When set (a self-publishing node,
+    /// i.e. the runtime was started with a `self_provider` / `key_publish_set`),
+    /// an Initiator's [`Self::start_round`] proactively DELIVERS its advertised
+    /// publish set right after the Summary, without waiting for the responder's
+    /// Diff. This is the only way to reach a carrier-NAT'd peer: the Diff can't
+    /// traverse back, so the side that can reach (the initiator) pushes its
+    /// key/attestation. Responders never `start_round`, so it's a no-op for them.
+    proactive_publish: bool,
 }
 
 impl Session {
@@ -128,7 +136,16 @@ impl Session {
             last_remote_summary: None,
             diff_want_count: None,
             completed: false,
+            proactive_publish: false,
         }
+    }
+
+    /// CIRISEdge#927 — enable initiator-first proactive publish (see the
+    /// `proactive_publish` field). Builder form so `Session::new` stays 2-arg.
+    #[must_use]
+    pub fn with_proactive_publish(mut self, yes: bool) -> Self {
+        self.proactive_publish = yes;
+        self
     }
 
     /// Clear per-round state so the session can drive a new round
@@ -159,10 +176,34 @@ impl Session {
         let refs = provider.local_refs(self.kind);
         let summary = SummaryMessage {
             kind: self.kind,
-            refs,
+            refs: refs.clone(),
         };
         self.last_summary_sent = Some(summary.clone());
-        ReplicationOutcome::Send(vec![ReplicationMessage::Summary(summary)])
+        let mut outbound = vec![ReplicationMessage::Summary(summary)];
+        // CIRISEdge#927 — initiator-first push. A carrier-NAT'd initiator's round
+        // can't complete responder-reply-first: the responder's Diff can't
+        // traverse back, so the Deliver is never solicited and the key/attestation
+        // never lands (the field's `round_outcomes {error:N}`). A self-publishing
+        // node therefore DELIVERS its advertised set proactively, alongside the
+        // Summary — the responder applies whatever it lacks (idempotent; a bare
+        // Deliver has no phase gate, see `responder_applies_unsolicited_bare_deliver`).
+        // `local_refs` for a self-publisher is its own publish set (for SelfOwn
+        // kinds it IS the `self_provider` set — small), so this pushes exactly the
+        // node's identity, not its whole state. Wasteful re-delivery each round is
+        // bounded (small set) + idempotent; correctness > a few duplicate bytes.
+        if self.proactive_publish {
+            let envelopes: Vec<Vec<u8>> = refs
+                .iter()
+                .filter_map(|r| provider.fetch_envelope(self.kind, &r.envelope_hash))
+                .collect();
+            if !envelopes.is_empty() {
+                outbound.push(ReplicationMessage::Deliver(DeliverMessage {
+                    kind: self.kind,
+                    envelopes,
+                }));
+            }
+        }
+        ReplicationOutcome::Send(outbound)
     }
 
     /// Process an inbound replication message.
@@ -631,6 +672,72 @@ mod tests {
             &mut applier,
         );
         assert_eq!(r, ReplicationOutcome::UnexpectedMessage);
+    }
+
+    /// CIRISEdge#927 / v13.7.0 — a Responder applies an UNSOLICITED bare
+    /// `Deliver` (no preceding Summary/Diff). This is the load-bearing invariant
+    /// for initiator-first delivery to a carrier-NAT'd peer: the side that can
+    /// reach (the initiator) PUSHES its key/attestation, and the responder —
+    /// which can neither dial back through NAT nor complete a resource the peer
+    /// won't pull — simply APPLIES it. `on_message` dispatches by message TYPE,
+    /// not phase, so there is NO Summary→Diff→Deliver gate that would refuse the
+    /// push. A regression here would silently re-break the mobile trace.
+    #[test]
+    fn responder_applies_unsolicited_bare_deliver() {
+        let provider = provider_with(&[]);
+        let mut applier = applier_for(&[(h(1), b"pushed-key".to_vec())]);
+        let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
+        // No Summary, no Diff — the initiator just pushes its key envelope.
+        let r = bob.on_message(
+            ReplicationMessage::Deliver(DeliverMessage {
+                kind: EnvelopeKind::Key,
+                envelopes: vec![b"pushed-key".to_vec()],
+            }),
+            &provider,
+            &mut applier,
+        );
+        match r {
+            ReplicationOutcome::Applied {
+                admitted, refused, ..
+            } => {
+                assert_eq!(admitted, 1, "the pushed key envelope MUST be applied");
+                assert_eq!(refused, 0);
+            }
+            o => panic!("a bare Deliver must be Applied (no phase gate), got {o:?}"),
+        }
+        assert!(bob.is_complete(), "the bare-Deliver round completes");
+    }
+
+    /// CIRISEdge#927 — a self-publishing Initiator's `start_round` PROACTIVELY
+    /// delivers its publish set alongside the Summary (initiator-first), so a
+    /// carrier-NAT'd peer's key/attestation lands without a return-path Diff.
+    /// The plain (non-publishing) initiator stays Summary-only — no unsolicited
+    /// dump of a large-state node's contents.
+    #[test]
+    fn proactive_publish_initiator_delivers_alongside_summary() {
+        let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"my-key-env".to_vec(), 1)]);
+        let mut m =
+            Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
+        match m.start_round(&provider) {
+            ReplicationOutcome::Send(msgs) => {
+                assert_eq!(msgs.len(), 2, "Summary + proactive Deliver");
+                assert!(matches!(msgs[0], ReplicationMessage::Summary(_)));
+                match &msgs[1] {
+                    ReplicationMessage::Deliver(d) => {
+                        assert_eq!(d.kind, EnvelopeKind::Key);
+                        assert_eq!(d.envelopes, vec![b"my-key-env".to_vec()]);
+                    }
+                    o => panic!("expected a proactive Deliver, got {o:?}"),
+                }
+            }
+            o => panic!("expected Send, got {o:?}"),
+        }
+        // Without the flag: Summary only — the default anti-entropy pull.
+        let mut plain = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        match plain.start_round(&provider) {
+            ReplicationOutcome::Send(msgs) => assert_eq!(msgs.len(), 1, "Summary only"),
+            o => panic!("expected Send, got {o:?}"),
+        }
     }
 
     /// Fetch — on-demand envelope retrieval, distinct from anti-
