@@ -77,11 +77,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use ciris_persist::federation::admission::has_effective_role;
 use ciris_persist::federation::namespace::{self, AuthorityClass, Projection, ReplicatedKind};
 use ciris_persist::federation::operational::{
     SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
 };
 use ciris_persist::federation::register::ReplicatedKeyOutcome;
+use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
     SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
@@ -407,7 +409,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#379 — recipient-aware listing: the Attestation plane routes
-    /// through the `observer`-gated sweep; every other kind is peer-invariant.
+    /// through the `infra:serve`-gated sweep; every other kind is peer-invariant.
     async fn list_envelope_refs_for_peer(
         &self,
         kind: EnvelopeKind,
@@ -432,11 +434,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         let bytes = self.fetch_envelope_bytes(kind, envelope_hash).await?;
         if kind == EnvelopeKind::Attestation {
             if let Some(peer) = peer_key_id {
-                if Self::envelope_requires_observer(&bytes) && !self.peer_has_observer(peer).await {
+                if Self::envelope_requires_serve(&bytes)
+                    && !self.peer_has_serve_capability(peer).await
+                {
                     tracing::debug!(
                         peer,
                         envelope_hash = %hex::encode(&envelope_hash[..8]),
-                        "trace attestation withheld — recipient lacks the `observer` \
+                        "trace attestation withheld — recipient lacks an effective `infra:serve` \
                          capability (CIRISEdge#379)"
                     );
                     return None;
@@ -778,18 +782,24 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// CIRISEdge#379 — role token a peer must advertise on its federation
-    /// KeyRecord (`roles` vector, accord-conferred per CIRISPersist#441) to
-    /// receive trace scores-attestations (`dimension` = `trace:*`,
-    /// CIRISPersist#473/v18). The contextual-integrity Recipient parameter:
-    /// promotion (`attestation_promote`) consents to sharing WITH OBSERVERS,
-    /// not with every cohort peer.
-    pub const OBSERVER_ROLE: &'static str = "observer";
+    /// CIRISEdge#386 — the capability a peer must hold to receive `trace:*`
+    /// scores-attestations (CIRISPersist#473/v18). The contextual-integrity
+    /// Recipient parameter: promotion (`attestation_promote`) consents to
+    /// sharing with infrastructure blessed to SERVE, not with every cohort peer.
+    ///
+    /// v13.11.0 corrects the v13.10.0 token. #379 shipped a bare `"observer"`
+    /// string, which is **not a federation capability token anywhere in the
+    /// stack** (persist's only `observer` is the unrelated `wa_cert` WA role).
+    /// The token the fleet actually confers — named by CIRISPersist#480, the
+    /// CIRISServer Trust Root card, and CC 4.4.3.4.3 — is
+    /// [`delegation_scope::INFRA_SERVE`]. Sourced from persist's const so the
+    /// two sides cannot drift again.
+    pub const SERVE_CAPABILITY: &'static str = delegation_scope::INFRA_SERVE;
 
-    /// CIRISEdge#379 — does this attestation row require the recipient to
-    /// hold the `observer` capability? True iff its `dimension` (CC 2.1 —
-    /// inside `attestation_envelope`) is in the `trace:*` namespace.
-    fn attestation_requires_observer(canonical_json: &serde_json::Value) -> bool {
+    /// CIRISEdge#379 — does this attestation row require the recipient to hold
+    /// [`Self::SERVE_CAPABILITY`]? True iff its `dimension` (CC 2.1 — inside
+    /// `attestation_envelope`) is in the `trace:*` namespace.
+    fn attestation_requires_serve(canonical_json: &serde_json::Value) -> bool {
         canonical_json
             .pointer("/attestation_envelope/dimension")
             .and_then(|v| v.as_str())
@@ -797,28 +807,48 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#379 — the fetch-path twin of
-    /// [`Self::attestation_requires_observer`], over WIRE bytes (the
+    /// [`Self::attestation_requires_serve`], over WIRE bytes (the
     /// `{"attestation": …}` wrap `adapt_record` produces; also accepts the
     /// bare row for robustness). Parse failure → `false` (only `trace:*`
     /// is gated; cached envelopes are JSON this bridge serialized).
-    fn envelope_requires_observer(bytes: &[u8]) -> bool {
+    fn envelope_requires_serve(bytes: &[u8]) -> bool {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return false;
         };
         let inner = v.get("attestation").unwrap_or(&v);
-        Self::attestation_requires_observer(inner)
+        Self::attestation_requires_serve(inner)
     }
 
-    /// CIRISEdge#379 — does `peer_key_id`'s federation KeyRecord advertise
-    /// the [`Self::OBSERVER_ROLE`]? Roles are accord-conferred (never
-    /// self-claimed — CIRISPersist#441 admission gate), so a `true` here is
-    /// a conferral, not a claim. Unknown peer / lookup error → `false`
+    /// CIRISEdge#386 — may `peer_key_id` receive `trace:*` rows?
+    ///
+    /// Resolved through persist's **self-authenticating effective-role read**
+    /// ([`has_effective_role`], CIRISPersist#440), NOT claim-presence on the
+    /// `roles` vector. The distinction is load-bearing and is why v13.10.0's
+    /// check was unsound as well as mis-tokened: persist's own doc records that
+    /// "the `roles` vector accepted arbitrary self-asserted tokens before
+    /// v17.0.0", so a `roles.contains(…)` test admits a decorative token the
+    /// write gate never saw. `has_effective_role` instead re-derives conferral
+    /// from the row's cryptography every call — the record's scrub set must
+    /// STILL verify to the accord family m-of-n against the live roster, and no
+    /// un-superseded V104 tombstone may name `(capability, key_id)`. A revoked
+    /// blessing therefore stops serving traces immediately, which a cached flag
+    /// or a claim test would never notice.
+    ///
+    /// Any error, unknown peer, or unverifiable scrub set → `false`
     /// (fail-closed: an unresolvable recipient gets no gated rows).
-    async fn peer_has_observer(&self, peer_key_id: &str) -> bool {
-        match self.directory.lookup_public_key(peer_key_id).await {
-            Ok(Some(rec)) => rec.roles.iter().any(|r| r == Self::OBSERVER_ROLE),
-            _ => false,
-        }
+    ///
+    /// STILL OPEN (#386): this validates the accord plane only. The FSD's
+    /// pluggable-trust-root leg — that the peer's capability roots to a root
+    /// THIS node trusts (`delegates_to(user → root)`, [`trust_root_valid`]) —
+    /// needs a composed persist predicate, because the walk's `scope_contains`
+    /// helper and its CEG-tombstone fold are private to `federation::trust_root`,
+    /// and re-implementing them here would fork the single authority the module
+    /// doc requires ("it lives in persist so server / edge / agent share ONE
+    /// implementation"). Tracked as CIRISPersist#483; lands as leg B.
+    async fn peer_has_serve_capability(&self, peer_key_id: &str) -> bool {
+        has_effective_role(&*self.directory, peer_key_id, Self::SERVE_CAPABILITY)
+            .await
+            .unwrap_or(false)
     }
 
     async fn list_attestations(&self, recipient: Option<&str>) -> Vec<EnvelopeRef> {
@@ -848,7 +878,7 @@ impl FederationDirectoryReplicationBridge {
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         // CIRISEdge#379 — lazily-resolved recipient capability (one directory
         // lookup per listing sweep, and only when a gated row is encountered).
-        let mut observer_allowed: Option<bool> = None;
+        let mut serve_allowed: Option<bool> = None;
         for subject in self.subjects_for_projection(Projection::Global) {
             // about — via the uniform signed read (`list_attestations_for`).
             let about = self
@@ -873,16 +903,16 @@ impl FederationDirectoryReplicationBridge {
                 // CIRISEdge#379 — RECIPIENT gate (the contextual-integrity
                 // Recipient parameter): a `trace:*` scores-attestation is
                 // listed for a peer ONLY if that peer's KeyRecord advertises
-                // the accord-conferred `observer` role. Non-trace rows are
+                // an effective `infra:serve` capability. Non-trace rows are
                 // untouched; a `None` recipient (projection-only view / tests)
                 // is ungated — every production provider is peer-bound
                 // (`DirectoryStateAdapter::with_peer`).
                 if let Some(peer) = recipient {
-                    if Self::attestation_requires_observer(&canonical_json) {
-                        if observer_allowed.is_none() {
-                            observer_allowed = Some(self.peer_has_observer(peer).await);
+                    if Self::attestation_requires_serve(&canonical_json) {
+                        if serve_allowed.is_none() {
+                            serve_allowed = Some(self.peer_has_serve_capability(peer).await);
                         }
-                        if observer_allowed != Some(true) {
+                        if serve_allowed != Some(true) {
                             continue;
                         }
                     }
@@ -1842,22 +1872,47 @@ mod tests {
         );
     }
 
-    // ── CIRISEdge#379 — observer-capability recipient gate (trace plane) ──
+    // ── CIRISEdge#386 — infra:serve recipient gate (trace plane) ──
 
-    /// Seed a `trace:complete:v1` scores-attestation + two recipients (one
-    /// whose KeyRecord advertises the `observer` role, one without), then
-    /// assert the contextual-integrity Recipient parameter on BOTH the
-    /// advertise (listing) and the serve (fetch) paths, and that non-trace
-    /// attestations are untouched by the gate.
+    /// The v13.10.0 gate this replaces was wrong TWICE, and this test is
+    /// written against the inputs the FIELD produces so it cannot be wrong the
+    /// same way again ([[feedback_test_field_provenance]] in anger):
+    ///
+    /// 1. **Wrong token** — it keyed on a bare `"observer"` string that is not
+    ///    a federation capability anywhere in the stack, so the plane was
+    ///    fail-closed DEAD for every peer. Now [`Self::SERVE_CAPABILITY`] is
+    ///    persist's own `delegation_scope::INFRA_SERVE` const — the two sides
+    ///    cannot drift apart again without a compile error.
+    /// 2. **Unsound derivation** — it read claim-presence off the `roles`
+    ///    vector, which persist documents as self-assertable on pre-v17.0.0
+    ///    rows. The `self_asserted_*` assertions below are the regression
+    ///    lock: a peer that simply WRITES `roles:["infra:serve"]` into its own
+    ///    record, with no accord co-scrub behind it, is refused. The old gate
+    ///    would have served it every trace on the node.
+    ///
+    /// **Known coverage gap (deliberate, not an oversight).** The ALLOW path is
+    /// not asserted here: a record that satisfies `has_effective_role` must
+    /// carry a live 2-of-3 accord-family co-scrub over its canonical
+    /// registration bytes, and persist's minting helpers for that
+    /// (`register_founder` / `signed_canonical_record`) are private to its own
+    /// test module. Faking it with a hand-built record would re-create exactly
+    /// the false confidence being fixed, so it is left to the layer that can
+    /// prove it: CIRISPersist#484 (export the helper) and the field acceptance
+    /// check on CIRISPersist#480 — `has_effective_role(dir, canonical,
+    /// "infra:serve") == true` read on a MOBILE edge's own directory after the
+    /// re-blessing ceremony, not on the server that minted it.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // seed + both peers + both paths, one coherent scenario
-    async fn trace_attestation_gated_on_observer_capability() {
+    async fn trace_attestation_gated_on_serve_capability() {
         let producer = "agent-mobile";
-        let observer_peer = "canonical-observer";
-        let plain_peer = "peer-no-observer";
+        // A peer that SELF-ASSERTS the capability: its record literally carries
+        // `roles:["infra:serve"]`, with no accord co-scrub behind it — the
+        // shape v13.10.0's claim-presence check would have admitted.
+        let self_asserted_peer = "peer-self-asserted-serve";
+        let plain_peer = "peer-no-capability";
         let (backend, bridge) = make_bridge(&[
             producer.to_string(),
-            observer_peer.to_string(),
+            self_asserted_peer.to_string(),
             plain_peer.to_string(),
         ]);
 
@@ -1867,14 +1922,15 @@ mod tests {
             })
             .await
             .expect("seed producer key");
-        let mut observer_rec = fixture_key_record(observer_peer, identity_type::AGENT);
-        observer_rec.roles = vec![FederationDirectoryReplicationBridge::OBSERVER_ROLE.to_string()];
+        let mut self_asserted_rec = fixture_key_record(self_asserted_peer, identity_type::AGENT);
+        self_asserted_rec.roles =
+            vec![FederationDirectoryReplicationBridge::SERVE_CAPABILITY.to_string()];
         backend
             .put_public_key(SignedKeyRecord {
-                record: observer_rec,
+                record: self_asserted_rec,
             })
             .await
-            .expect("seed observer key");
+            .expect("seed self-asserting key");
         backend
             .put_public_key(SignedKeyRecord {
                 record: fixture_key_record(plain_peer, identity_type::AGENT),
@@ -1932,63 +1988,84 @@ mod tests {
                 .expect("seed attestation");
         }
 
-        // Peerless (projection-only) view: both rows.
-        let all = bridge
-            .list_envelope_refs(EnvelopeKind::Attestation)
-            .await
-            .len();
-        assert_eq!(all, 2, "projection-only view lists both rows");
+        // Peerless (projection-only) view: both rows. The gate is a RECIPIENT
+        // policy, not a projection change — it must not alter the local view.
+        let all = bridge.list_envelope_refs(EnvelopeKind::Attestation).await;
+        assert_eq!(all.len(), 2, "projection-only view lists both rows");
 
-        // Observer peer: both rows.
-        let observer_refs = bridge
-            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(observer_peer))
+        // The self-asserting peer is REFUSED the trace row: claim-presence is
+        // not conferral. This is the v13.10.0 regression lock.
+        let self_asserted_refs = bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(self_asserted_peer))
             .await;
         assert_eq!(
-            observer_refs.len(),
-            2,
-            "observer-capability peer receives the trace row + the plain row"
+            self_asserted_refs.len(),
+            1,
+            "a peer that SELF-ASSERTS `infra:serve` with no accord co-scrub \
+             must NOT be offered the trace attestation (CIRISEdge#386 — the \
+             v13.10.0 claim-presence check admitted exactly this)"
         );
 
-        // Non-observer peer: ONLY the non-trace row.
+        // A peer with no capability at all: same — ONLY the non-trace row.
         let plain_refs = bridge
             .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(plain_peer))
             .await;
         assert_eq!(
             plain_refs.len(),
             1,
-            "non-observer peer must NOT be offered the trace attestation \
-             (CIRISEdge#379 — the Recipient parameter)"
+            "peer without the capability must NOT be offered the trace \
+             attestation (CIRISEdge#379 — the Recipient parameter)"
         );
 
-        // Serve-side twin: the trace row's bytes are withheld from the
-        // non-observer even by direct hash fetch, served to the observer.
-        let trace_hash = observer_refs
+        // The row BOTH gated peers were withheld is the trace row; the row
+        // they DID receive is the non-trace control — proving the gate is
+        // scoped to `trace:*` and has not swallowed the whole plane.
+        let served: std::collections::HashSet<[u8; 32]> =
+            plain_refs.iter().map(|r| r.envelope_hash).collect();
+        assert_eq!(
+            served,
+            self_asserted_refs
+                .iter()
+                .map(|r| r.envelope_hash)
+                .collect::<std::collections::HashSet<_>>(),
+            "both gated peers see the same non-trace row"
+        );
+        let trace_hash = all
             .iter()
             .map(|r| r.envelope_hash)
-            .find(|h| !plain_refs.iter().any(|p| p.envelope_hash == *h))
-            .expect("the trace row is the one the plain peer was not offered");
+            .find(|h| !served.contains(h))
+            .expect("exactly one row (the trace row) is withheld from gated peers");
+
+        // Serve-side twin: the trace row's bytes are withheld on the direct
+        // hash-fetch path too, so exclusion from the listing cannot be
+        // bypassed with a hash learned out-of-band.
+        for peer in [self_asserted_peer, plain_peer] {
+            assert!(
+                bridge
+                    .fetch_envelope_bytes_for_peer(
+                        EnvelopeKind::Attestation,
+                        &trace_hash,
+                        Some(peer)
+                    )
+                    .await
+                    .is_none(),
+                "{peer} must not obtain the trace envelope by hash \
+                 (out-of-band Diff/Fetch bypass, CIRISEdge#379)"
+            );
+        }
+        // The non-trace row stays fetchable for the same peers — the gate is
+        // per-row, not a blanket refusal.
+        let plain_hash = plain_refs[0].envelope_hash;
         assert!(
             bridge
                 .fetch_envelope_bytes_for_peer(
                     EnvelopeKind::Attestation,
-                    &trace_hash,
-                    Some(observer_peer)
-                )
-                .await
-                .is_some(),
-            "observer peer fetches the trace envelope"
-        );
-        assert!(
-            bridge
-                .fetch_envelope_bytes_for_peer(
-                    EnvelopeKind::Attestation,
-                    &trace_hash,
+                    &plain_hash,
                     Some(plain_peer)
                 )
                 .await
-                .is_none(),
-            "non-observer peer must not obtain the trace envelope by hash \
-             (out-of-band Diff/Fetch bypass, CIRISEdge#379)"
+                .is_some(),
+            "non-trace attestations are untouched by the recipient gate"
         );
     }
 
