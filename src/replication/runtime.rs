@@ -228,6 +228,14 @@ pub struct ReplicationRuntimeConfig {
     /// it rides on the config only because `start` already threads the
     /// config through to the scheduler-spawn site.
     pub metrics: Option<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#386 — this node's OWN federation key_id. Required for the
+    /// `trace:*` serve gate: it is the `user` half of the trust-root walk
+    /// ("does the recipient's `infra:serve` root to a root I trust?"). `None`
+    /// fail-closes that gate (and only that gate — every other plane is
+    /// unaffected), logging a WARN, because a node with no local identity
+    /// cannot evaluate its own trust. The server supplies the same
+    /// `node_key_id` it already threads into consent-peer resolution.
+    pub local_key_id: Option<String>,
 }
 
 /// Live replication runtime — bridge + registry + scheduler task +
@@ -330,7 +338,8 @@ impl ReplicationRuntime {
                 cohort,
                 config.bridge,
             )
-            .with_self_provider(self_provider),
+            .with_self_provider(self_provider)
+            .with_local_key_id(config.local_key_id.clone()),
         );
 
         let registry = Arc::new(ReplicationRegistry::new());
