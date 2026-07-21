@@ -77,11 +77,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use ciris_persist::federation::admission::has_effective_role;
 use ciris_persist::federation::namespace::{self, AuthorityClass, Projection, ReplicatedKind};
 use ciris_persist::federation::operational::{
     SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
 };
 use ciris_persist::federation::register::ReplicatedKeyOutcome;
+use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
+use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
     SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
     SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
@@ -208,6 +211,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// touching persist. Set via [`Self::with_operational`] or
     /// [`Self::with_config_and_operational`].
     operational: Option<OperationalProviders>,
+    /// CIRISEdge#386 — this node's OWN federation key_id: the `user` half of
+    /// the trust-root walk ("does the recipient's capability root to a root
+    /// *I* trust?"). `None` fail-closes the trace serve gate — without a local
+    /// identity there is no "I" whose trust could be evaluated. Supplied by
+    /// `ReplicationRuntimeConfig::local_key_id`.
+    local_key_id: Option<String>,
 }
 
 impl FederationDirectoryReplicationBridge {
@@ -229,6 +238,7 @@ impl FederationDirectoryReplicationBridge {
             directory,
             cohort,
             self_provider: None,
+            local_key_id: None,
             cache,
             config,
             operational: None,
@@ -262,6 +272,7 @@ impl FederationDirectoryReplicationBridge {
             directory,
             cohort,
             self_provider: None,
+            local_key_id: None,
             cache,
             config,
             operational: Some(operational),
@@ -281,6 +292,16 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_self_provider(mut self, selector: Option<CohortProvider>) -> Self {
         self.self_provider = selector;
+        self
+    }
+
+    /// CIRISEdge#386 — bind this node's own federation key_id (builder). The
+    /// `user` half of the trust-root walk that gates `trace:*` serving; without
+    /// it the gate fail-closes and logs a WARN, since a missing local identity
+    /// is a wiring fault rather than a policy decision.
+    #[must_use]
+    pub fn with_local_key_id(mut self, local_key_id: Option<String>) -> Self {
+        self.local_key_id = local_key_id;
         self
     }
 
@@ -407,7 +428,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#379 — recipient-aware listing: the Attestation plane routes
-    /// through the `observer`-gated sweep; every other kind is peer-invariant.
+    /// through the `infra:serve`-gated sweep; every other kind is peer-invariant.
     async fn list_envelope_refs_for_peer(
         &self,
         kind: EnvelopeKind,
@@ -432,11 +453,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         let bytes = self.fetch_envelope_bytes(kind, envelope_hash).await?;
         if kind == EnvelopeKind::Attestation {
             if let Some(peer) = peer_key_id {
-                if Self::envelope_requires_observer(&bytes) && !self.peer_has_observer(peer).await {
+                if Self::envelope_requires_serve(&bytes)
+                    && !self.peer_has_serve_capability(peer).await
+                {
                     tracing::debug!(
                         peer,
                         envelope_hash = %hex::encode(&envelope_hash[..8]),
-                        "trace attestation withheld — recipient lacks the `observer` \
+                        "trace attestation withheld — recipient lacks an effective `infra:serve` \
                          capability (CIRISEdge#379)"
                     );
                     return None;
@@ -778,18 +801,24 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// CIRISEdge#379 — role token a peer must advertise on its federation
-    /// KeyRecord (`roles` vector, accord-conferred per CIRISPersist#441) to
-    /// receive trace scores-attestations (`dimension` = `trace:*`,
-    /// CIRISPersist#473/v18). The contextual-integrity Recipient parameter:
-    /// promotion (`attestation_promote`) consents to sharing WITH OBSERVERS,
-    /// not with every cohort peer.
-    pub const OBSERVER_ROLE: &'static str = "observer";
+    /// CIRISEdge#386 — the capability a peer must hold to receive `trace:*`
+    /// scores-attestations (CIRISPersist#473/v18). The contextual-integrity
+    /// Recipient parameter: promotion (`attestation_promote`) consents to
+    /// sharing with infrastructure blessed to SERVE, not with every cohort peer.
+    ///
+    /// v13.11.0 corrects the v13.10.0 token. #379 shipped a bare `"observer"`
+    /// string, which is **not a federation capability token anywhere in the
+    /// stack** (persist's only `observer` is the unrelated `wa_cert` WA role).
+    /// The token the fleet actually confers — named by CIRISPersist#480, the
+    /// CIRISServer Trust Root card, and CC 4.4.3.4.3 — is
+    /// [`delegation_scope::INFRA_SERVE`]. Sourced from persist's const so the
+    /// two sides cannot drift again.
+    pub const SERVE_CAPABILITY: &'static str = delegation_scope::INFRA_SERVE;
 
-    /// CIRISEdge#379 — does this attestation row require the recipient to
-    /// hold the `observer` capability? True iff its `dimension` (CC 2.1 —
-    /// inside `attestation_envelope`) is in the `trace:*` namespace.
-    fn attestation_requires_observer(canonical_json: &serde_json::Value) -> bool {
+    /// CIRISEdge#379 — does this attestation row require the recipient to hold
+    /// [`Self::SERVE_CAPABILITY`]? True iff its `dimension` (CC 2.1 — inside
+    /// `attestation_envelope`) is in the `trace:*` namespace.
+    fn attestation_requires_serve(canonical_json: &serde_json::Value) -> bool {
         canonical_json
             .pointer("/attestation_envelope/dimension")
             .and_then(|v| v.as_str())
@@ -797,27 +826,118 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#379 — the fetch-path twin of
-    /// [`Self::attestation_requires_observer`], over WIRE bytes (the
+    /// [`Self::attestation_requires_serve`], over WIRE bytes (the
     /// `{"attestation": …}` wrap `adapt_record` produces; also accepts the
     /// bare row for robustness). Parse failure → `false` (only `trace:*`
     /// is gated; cached envelopes are JSON this bridge serialized).
-    fn envelope_requires_observer(bytes: &[u8]) -> bool {
+    fn envelope_requires_serve(bytes: &[u8]) -> bool {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return false;
         };
         let inner = v.get("attestation").unwrap_or(&v);
-        Self::attestation_requires_observer(inner)
+        Self::attestation_requires_serve(inner)
     }
 
-    /// CIRISEdge#379 — does `peer_key_id`'s federation KeyRecord advertise
-    /// the [`Self::OBSERVER_ROLE`]? Roles are accord-conferred (never
-    /// self-claimed — CIRISPersist#441 admission gate), so a `true` here is
-    /// a conferral, not a claim. Unknown peer / lookup error → `false`
-    /// (fail-closed: an unresolvable recipient gets no gated rows).
-    async fn peer_has_observer(&self, peer_key_id: &str) -> bool {
-        match self.directory.lookup_public_key(peer_key_id).await {
-            Ok(Some(rec)) => rec.roles.iter().any(|r| r == Self::OBSERVER_ROLE),
-            _ => false,
+    /// CIRISEdge#386 — may `peer_key_id` receive `trace:*` rows?
+    ///
+    /// **The gate is the trust root, not the bare capability.** We serve iff the
+    /// peer's [`Self::SERVE_CAPABILITY`] is granted by a root THIS node itself
+    /// trusts — persist's [`capability_roots_to_trusted_root`] (CIRISPersist#483)
+    /// walks live `delegates_to(root → peer)` edges carrying the scope and, for
+    /// each candidate root, evaluates `trust_root_valid` **from our own records**
+    /// (live `delegates_to(us → root)`, root self-declaration, fresh
+    /// `accord:lifecycle`, no halt latched).
+    ///
+    /// Two properties follow, both of which a bare-role check cannot give:
+    /// - two nodes serve each other only under a **common** trusted root, so the
+    ///   Recipient parameter is evaluated relative to the sender's own trust
+    ///   rather than a global namespace; and
+    /// - **un-trust is immediate and nuclear** — withdrawing our
+    ///   `delegates_to(us → root)` edge stops serving every peer that rooted
+    ///   through it on the very next call, with no cached flag to go stale.
+    ///
+    /// Any error, unknown peer, or absent local identity → `false` (fail-closed:
+    /// an unresolvable recipient gets no gated rows). Because a dead gate is
+    /// exactly how v13.10.0 failed, each refusal reason is logged distinctly at
+    /// DEBUG (and a missing `local_key_id` at WARN, since that one is a wiring
+    /// fault that would silently dark the whole plane).
+    ///
+    /// **Both planes are required (AND, never OR).** Alongside the trust-root
+    /// walk, the peer's record must ALSO carry an accord-conferred
+    /// `infra:serve` resolved through persist's self-authenticating read
+    /// ([`has_effective_role`], CIRISPersist#440) — the record's scrub set must
+    /// still verify to the accord family m-of-n against the live roster, with no
+    /// un-superseded V104 tombstone. The two planes are deliberately not
+    /// conflated (persist's `trust_root` module doc: a delegation SCOPE token
+    /// inside a `delegates_to` envelope is NOT the accord-conferred ROLE on a
+    /// `federation_keys` row), so requiring both means a recipient must be
+    /// blessed by the accord AND rooted in a root we personally trust. An OR
+    /// would have restored an accord-role bypass around the un-trust property.
+    ///
+    /// Consequence, accepted deliberately: the baked canonical seed still ships
+    /// `roles: []` (CIRISPersist#480), so the trace plane stays dark until the
+    /// fleet re-genesises with an `infra:serve`-blessed canonical. That is the
+    /// intended sequencing — a plane that cannot yet flow is preferable to one
+    /// that flows under a weaker gate, and unlike v13.10.0 this darkness is
+    /// deliberate, logged per-leg, and covered by an ALLOW-path test.
+    async fn peer_has_serve_capability(&self, peer_key_id: &str) -> bool {
+        // Leg A — accord plane. Re-derived from the record's own cryptography
+        // on every call, so a withdrawn blessing takes effect immediately.
+        if !has_effective_role(&*self.directory, peer_key_id, Self::SERVE_CAPABILITY)
+            .await
+            .unwrap_or(false)
+        {
+            tracing::debug!(
+                peer_key_id,
+                "trace attestation withheld — recipient has no accord-conferred, still-verifying \
+                 `infra:serve` (leg A; CIRISPersist#480 re-genesis pending)"
+            );
+            return false;
+        }
+        // Leg B — pluggable-trust-root plane.
+        let Some(local) = self.local_key_id.as_deref() else {
+            tracing::warn!(
+                peer_key_id,
+                "trace attestation withheld — replication runtime has no `local_key_id`, so the \
+                 CIRISEdge#386 trust-root gate cannot be evaluated. This darks the trace plane; \
+                 wire ReplicationRuntimeConfig::local_key_id (CIRISServer#300)."
+            );
+            return false;
+        };
+        match capability_roots_to_trusted_root(
+            &*self.directory,
+            local,
+            peer_key_id,
+            Self::SERVE_CAPABILITY,
+        )
+        .await
+        {
+            Ok(Some(grant)) => {
+                tracing::debug!(
+                    peer_key_id,
+                    root_key_id = %grant.root_key_id,
+                    grant_attestation_id = %grant.grant_attestation_id,
+                    "trace attestation permitted — recipient's `infra:serve` roots to a trusted root"
+                );
+                true
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    peer_key_id,
+                    local_key_id = local,
+                    "trace attestation withheld — recipient's `infra:serve` roots to no root this \
+                     node trusts (CIRISEdge#386)"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::debug!(
+                    peer_key_id,
+                    error = %e,
+                    "trace attestation withheld — trust-root walk failed (fail-closed)"
+                );
+                false
+            }
         }
     }
 
@@ -848,7 +968,7 @@ impl FederationDirectoryReplicationBridge {
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         // CIRISEdge#379 — lazily-resolved recipient capability (one directory
         // lookup per listing sweep, and only when a gated row is encountered).
-        let mut observer_allowed: Option<bool> = None;
+        let mut serve_allowed: Option<bool> = None;
         for subject in self.subjects_for_projection(Projection::Global) {
             // about — via the uniform signed read (`list_attestations_for`).
             let about = self
@@ -873,16 +993,16 @@ impl FederationDirectoryReplicationBridge {
                 // CIRISEdge#379 — RECIPIENT gate (the contextual-integrity
                 // Recipient parameter): a `trace:*` scores-attestation is
                 // listed for a peer ONLY if that peer's KeyRecord advertises
-                // the accord-conferred `observer` role. Non-trace rows are
+                // an effective `infra:serve` capability. Non-trace rows are
                 // untouched; a `None` recipient (projection-only view / tests)
                 // is ungated — every production provider is peer-bound
                 // (`DirectoryStateAdapter::with_peer`).
                 if let Some(peer) = recipient {
-                    if Self::attestation_requires_observer(&canonical_json) {
-                        if observer_allowed.is_none() {
-                            observer_allowed = Some(self.peer_has_observer(peer).await);
+                    if Self::attestation_requires_serve(&canonical_json) {
+                        if serve_allowed.is_none() {
+                            serve_allowed = Some(self.peer_has_serve_capability(peer).await);
                         }
-                        if observer_allowed != Some(true) {
+                        if serve_allowed != Some(true) {
                             continue;
                         }
                     }
@@ -1842,24 +1962,186 @@ mod tests {
         );
     }
 
-    // ── CIRISEdge#379 — observer-capability recipient gate (trace plane) ──
+    // ── CIRISEdge#386 — infra:serve recipient gate (trace plane) ──
 
-    /// Seed a `trace:complete:v1` scores-attestation + two recipients (one
-    /// whose KeyRecord advertises the `observer` role, one without), then
-    /// assert the contextual-integrity Recipient parameter on BOTH the
-    /// advertise (listing) and the serve (fetch) paths, and that non-trace
-    /// attestations are untouched by the gate.
+    /// Seed one `delegates_to(attester → subject)` carrying `scope`, and
+    /// return its `attestation_id` (so a test can tombstone that exact edge).
+    async fn seed_delegates_to(
+        backend: &MemoryBackend,
+        attester: &str,
+        subject: &str,
+        scope: &serde_json::Value,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": attester,
+            "attested_key_id": subject,
+            "attestation_type": "delegates_to",
+            "scope": scope,
+        });
+        seed_raw_attestation(backend, &id, attester, subject, "delegates_to", envelope).await;
+        id
+    }
+
+    /// Seed a fresh `accord:lifecycle:v1` scores row ABOUT `root` — the
+    /// liveness leg of `trust_root_valid`.
+    async fn seed_accord_lifecycle(backend: &MemoryBackend, attester: &str, root: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": attester,
+            "attested_key_id": root,
+            "attestation_type": "scores",
+            "dimension": "accord:lifecycle:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+        });
+        seed_raw_attestation(backend, &id, attester, root, "scores", envelope).await;
+    }
+
+    /// Seed a `withdraws` composer tombstoning `target_id` — the CEG un-trust
+    /// primitive. Shape mirrors persist's own `fix_withdraws` witness: the
+    /// composer references its target through `references_attestation_id`
+    /// (CEG §3.2, read by `precedence::references_attestation_id_from_envelope`)
+    /// and is attested BY the issuer ABOUT itself, since same-attester authority
+    /// is what admits a withdrawal of one's own edge.
+    #[cfg(feature = "test-anchor")]
+    async fn seed_withdraws(backend: &MemoryBackend, attester: &str, target_id: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": attester,
+            "attested_key_id": attester,
+            "attestation_type": "withdraws",
+            "references_attestation_id": target_id,
+            "withdrawal_reason": "test: operator un-trusts the root",
+        });
+        seed_raw_attestation(backend, &id, attester, attester, "withdraws", envelope).await;
+    }
+
+    /// Seed ONE `trace:complete:v1` scores row in the shape persist v18.1.0's
+    /// Information-Type validator admits (trace_id + agent_id_hash + trace).
+    #[cfg(feature = "test-anchor")]
+    async fn seed_trace_attestation(backend: &MemoryBackend, producer: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": producer,
+            "attested_key_id": producer,
+            "attestation_type": "scores",
+            "dimension": "trace:complete:v1",
+            "trace_id": "t-fixture-1",
+            "agent_id_hash": "ah-fixture-1",
+            "trace": { "steps": [] },
+        });
+        seed_raw_attestation(backend, &id, producer, producer, "scores", envelope).await;
+    }
+
+    /// Find the seeded trace row by CONTENT in the bridge's own projection —
+    /// robust to however many trust-graph rows share the plane.
+    async fn locate_trace_hash(bridge: &FederationDirectoryReplicationBridge) -> [u8; 32] {
+        let all = bridge.list_envelope_refs(EnvelopeKind::Attestation).await;
+        let mut found = None;
+        for r in &all {
+            let bytes = bridge
+                .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                .await
+                .expect("projection-only fetch");
+            if FederationDirectoryReplicationBridge::envelope_requires_serve(&bytes) {
+                assert!(found.is_none(), "exactly one trace row was seeded");
+                found = Some(r.envelope_hash);
+            }
+        }
+        found.expect("the seeded trace row appears in the local view")
+    }
+
+    async fn seed_raw_attestation(
+        backend: &MemoryBackend,
+        id: &str,
+        attester: &str,
+        subject: &str,
+        attestation_type: &str,
+        envelope: serde_json::Value,
+    ) {
+        let now = Utc::now();
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attester, &envelope);
+        let att = Attestation {
+            attestation_id: id.to_string(),
+            attesting_key_id: attester.to_string(),
+            attested_key_id: subject.to_string(),
+            attestation_type: attestation_type.to_string(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: attester.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![subject.to_string()],
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: "federation".to_string(),
+            promoted_at: None,
+        };
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .expect("seed trust-graph attestation");
+    }
+
+    /// The v13.10.0 gate this replaces was wrong TWICE, and this test is
+    /// written against the inputs the FIELD produces so it cannot be wrong the
+    /// same way again ([[feedback_test_field_provenance]] in anger):
+    ///
+    /// 1. **Wrong token** — it keyed on a bare `"observer"` string that is not
+    ///    a federation capability anywhere in the stack, so the plane was
+    ///    fail-closed DEAD for every peer. Now [`Self::SERVE_CAPABILITY`] is
+    ///    persist's own `delegation_scope::INFRA_SERVE` const — the two sides
+    ///    cannot drift apart again without a compile error.
+    /// 2. **Unsound derivation** — it read claim-presence off the `roles`
+    ///    vector, which persist documents as self-assertable on pre-v17.0.0
+    ///    rows. The `self_asserted_*` assertions below are the regression
+    ///    lock: a peer that simply WRITES `roles:["infra:serve"]` into its own
+    ///    record, with no accord co-scrub behind it, is refused. The old gate
+    ///    would have served it every trace on the node.
+    ///
+    /// **Known coverage gap (deliberate, not an oversight).** The ALLOW path is
+    /// not asserted here: a record that satisfies `has_effective_role` must
+    /// carry a live 2-of-3 accord-family co-scrub over its canonical
+    /// registration bytes, and persist's minting helpers for that
+    /// (`register_founder` / `signed_canonical_record`) are private to its own
+    /// test module. Faking it with a hand-built record would re-create exactly
+    /// the false confidence being fixed, so it is left to the layer that can
+    /// prove it: CIRISPersist#484 (export the helper) and the field acceptance
+    /// check on CIRISPersist#480 — `has_effective_role(dir, canonical,
+    /// "infra:serve") == true` read on a MOBILE edge's own directory after the
+    /// re-blessing ceremony, not on the server that minted it.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // seed + both peers + both paths, one coherent scenario
-    async fn trace_attestation_gated_on_observer_capability() {
+    async fn trace_attestation_gated_on_serve_capability() {
         let producer = "agent-mobile";
-        let observer_peer = "canonical-observer";
-        let plain_peer = "peer-no-observer";
+        // A peer that SELF-ASSERTS the capability: its record literally carries
+        // `roles:["infra:serve"]`, with no accord co-scrub behind it — the
+        // shape v13.10.0's claim-presence check would have admitted.
+        let self_asserted_peer = "peer-self-asserted-serve";
+        let plain_peer = "peer-no-capability";
+        // The trust graph: `root` grants `infra:serve`, and WE trust `root`.
+        let local = "this-node";
+        let root = "trust-root-1";
+        let lifecycle_attester = "accord-holder-1";
+        let trusted_peer = "canonical-under-our-root";
         let (backend, bridge) = make_bridge(&[
             producer.to_string(),
-            observer_peer.to_string(),
+            trusted_peer.to_string(),
+            self_asserted_peer.to_string(),
             plain_peer.to_string(),
         ]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
 
         backend
             .put_public_key(SignedKeyRecord {
@@ -1867,20 +2149,60 @@ mod tests {
             })
             .await
             .expect("seed producer key");
-        let mut observer_rec = fixture_key_record(observer_peer, identity_type::AGENT);
-        observer_rec.roles = vec![FederationDirectoryReplicationBridge::OBSERVER_ROLE.to_string()];
+        let mut self_asserted_rec = fixture_key_record(self_asserted_peer, identity_type::AGENT);
+        self_asserted_rec.roles =
+            vec![FederationDirectoryReplicationBridge::SERVE_CAPABILITY.to_string()];
         backend
             .put_public_key(SignedKeyRecord {
-                record: observer_rec,
+                record: self_asserted_rec,
             })
             .await
-            .expect("seed observer key");
+            .expect("seed self-asserting key");
         backend
             .put_public_key(SignedKeyRecord {
                 record: fixture_key_record(plain_peer, identity_type::AGENT),
             })
             .await
             .expect("seed plain key");
+        for (k, it) in [
+            (local, identity_type::NODE),
+            (root, identity_type::NODE),
+            (trusted_peer, identity_type::NODE),
+            (lifecycle_attester, identity_type::ACCORD_HOLDER),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, it),
+                })
+                .await
+                .expect("seed trust-graph key");
+        }
+
+        // The CIRISEdge#386 trust graph, in the shape persist's own #483
+        // witness uses (field provenance — these are the exact rows
+        // `capability_roots_to_trusted_root` walks):
+        //   1. delegates_to(root → root, scope infra:*)   — root self-declares
+        //   2. delegates_to(local → root)                 — WE trust the root
+        //   3. accord:lifecycle scores about root, fresh  — root is live
+        //   4. delegates_to(root → trusted_peer, infra:serve) — the grant
+        let infra_scope = serde_json::json!(["infra:attest", "infra:serve"]);
+        let trust_edge_id = seed_delegates_to(&backend, root, root, &infra_scope).await;
+        let our_trust_edge = seed_delegates_to(
+            &backend,
+            local,
+            root,
+            &serde_json::json!(["infra:attest", "infra:serve"]),
+        )
+        .await;
+        let _ = trust_edge_id;
+        seed_accord_lifecycle(&backend, lifecycle_attester, root).await;
+        seed_delegates_to(
+            &backend,
+            root,
+            trusted_peer,
+            &serde_json::json!(["infra:serve"]),
+        )
+        .await;
 
         // A trace scores-attestation (self-subject, federation tier =
         // promoted) + a NON-trace attestation for the control.
@@ -1932,63 +2254,203 @@ mod tests {
                 .expect("seed attestation");
         }
 
-        // Peerless (projection-only) view: both rows.
-        let all = bridge
-            .list_envelope_refs(EnvelopeKind::Attestation)
-            .await
-            .len();
-        assert_eq!(all, 2, "projection-only view lists both rows");
+        // Identify the trace row by CONTENT, not by counting — the trust-graph
+        // rows seeded above live in this same plane, so any count is brittle.
+        let trace_hash = locate_trace_hash(&bridge).await;
 
-        // Observer peer: both rows.
-        let observer_refs = bridge
-            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(observer_peer))
-            .await;
-        assert_eq!(
-            observer_refs.len(),
-            2,
-            "observer-capability peer receives the trace row + the plain row"
-        );
+        // Every peer WITHOUT both legs is refused the trace row, on BOTH paths,
+        // while non-trace rows keep flowing to them (the gate is per-row):
+        //   - self_asserted_peer: writes `roles:["infra:serve"]` into its own
+        //     record with no accord co-scrub — the shape v13.10.0 served.
+        //   - trust_rooted_peer:  genuinely rooted under a root we trust, but
+        //     NOT accord-conferred — proves leg A is a required conjunct.
+        //   - plain_peer:         neither.
+        for peer in [self_asserted_peer, trusted_peer, plain_peer] {
+            let refs = bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+                .await;
+            assert!(
+                !refs.iter().any(|r| r.envelope_hash == trace_hash),
+                "{peer} must NOT be offered the trace attestation — it lacks the \
+                 accord-conferred `infra:serve` (CIRISEdge#386 leg A)"
+            );
+            assert!(
+                !refs.is_empty(),
+                "{peer} still receives the non-trace rows — the gate is per-row, \
+                 not a blanket refusal"
+            );
+            assert!(
+                bridge
+                    .fetch_envelope_bytes_for_peer(
+                        EnvelopeKind::Attestation,
+                        &trace_hash,
+                        Some(peer)
+                    )
+                    .await
+                    .is_none(),
+                "{peer} must not obtain the trace envelope by hash either \
+                 (out-of-band Diff/Fetch bypass, CIRISEdge#379)"
+            );
+        }
+        let _ = our_trust_edge;
+    }
 
-        // Non-observer peer: ONLY the non-trace row.
-        let plain_refs = bridge
-            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(plain_peer))
-            .await;
-        assert_eq!(
-            plain_refs.len(),
-            1,
-            "non-observer peer must NOT be offered the trace attestation \
-             (CIRISEdge#379 — the Recipient parameter)"
-        );
+    /// CIRISEdge#386 — the ALLOW path, and the proof that BOTH legs are
+    /// required. Gated on `test-anchor` because minting a record that satisfies
+    /// `has_effective_role` needs a genuine 2-of-3 accord-family co-scrub, which
+    /// persist exports only behind that fence (CIRISPersist#484). Edge CI runs a
+    /// dedicated `test-anchor` lane, so this is real coverage — not a test that
+    /// quietly never runs.
+    ///
+    /// This is the assertion whose ABSENCE let v13.10.0 ship a permanently-dark
+    /// gate with a green suite.
+    #[cfg(feature = "test-anchor")]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // roster + trust graph + allow/deny/un-trust: one scenario
+    async fn trace_serve_requires_accord_blessing_and_trusted_root() {
+        use ciris_persist::federation::accord_test_support::{
+            register_accord_holder, signed_canonical_record_with_roles, Identity,
+        };
+        // The roster key_ids `has_effective_role` resolves against. Persist's
+        // own `accord_holder_roster_key_ids` is private, but it is derived from
+        // this public genesis accessor — so we mint identities under exactly
+        // those key_ids and the co-scrub verifies against the real roster.
+        use ciris_persist::federation::genesis::effective_accord_holder_records;
 
-        // Serve-side twin: the trace row's bytes are withheld from the
-        // non-observer even by direct hash fetch, served to the observer.
-        let trace_hash = observer_refs
+        let producer = "agent-mobile";
+        let local = "this-node";
+        let root = "trust-root-1";
+        let lifecycle_attester = "accord-holder-live";
+        // Blessed by the accord AND rooted under a root we trust → served.
+        let full_peer = "canonical-blessed-and-rooted";
+        // Blessed by the accord but rooted nowhere we trust → refused (leg B).
+        let blessed_only = "canonical-blessed-not-rooted";
+        let (backend, bridge) = make_bridge(&[
+            producer.to_string(),
+            full_peer.to_string(),
+            blessed_only.to_string(),
+        ]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+
+        // The live accord family, registered at their PINNED pubkeys so the
+        // co-scrub verifies against the real roster.
+        let holders: Vec<Identity> = effective_accord_holder_records()
             .iter()
-            .map(|r| r.envelope_hash)
-            .find(|h| !plain_refs.iter().any(|p| p.envelope_hash == *h))
-            .expect("the trace row is the one the plain peer was not offered");
+            .map(|r| Identity::new(&r.record.key_id))
+            .collect();
+        assert!(
+            holders.len() >= 2,
+            "the accord family must resolve to at least a 2-of-n roster"
+        );
+        for h in &holders {
+            register_accord_holder(&*backend, h)
+                .await
+                .expect("register accord holder");
+        }
+        let scrubbers = [&holders[0], &holders[1]];
+
+        for (k, it) in [
+            (producer, identity_type::AGENT),
+            (local, identity_type::NODE),
+            (root, identity_type::NODE),
+            (lifecycle_attester, identity_type::ACCORD_HOLDER),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, it),
+                })
+                .await
+                .expect("seed key");
+        }
+        // Both candidate recipients carry a GENUINE 2-of-3 accord co-scrub
+        // conferring `infra:serve` — leg A holds for both.
+        for peer in [full_peer, blessed_only] {
+            let rec = signed_canonical_record_with_roles(
+                peer,
+                identity_type::NODE,
+                vec![FederationDirectoryReplicationBridge::SERVE_CAPABILITY.to_string()],
+                serde_json::json!({ "key_id": peer }),
+                &scrubbers,
+            );
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .expect("seed co-scrubbed recipient");
+        }
+
+        // Trust graph: root self-declares, WE trust it, it is live, and it
+        // grants `infra:serve` to full_peer ONLY.
+        let infra = serde_json::json!(["infra:attest", "infra:serve"]);
+        seed_delegates_to(&backend, root, root, &infra).await;
+        let our_trust_edge = seed_delegates_to(&backend, local, root, &infra).await;
+        seed_accord_lifecycle(&backend, lifecycle_attester, root).await;
+        seed_delegates_to(
+            &backend,
+            root,
+            full_peer,
+            &serde_json::json!(["infra:serve"]),
+        )
+        .await;
+
+        seed_trace_attestation(&backend, producer).await;
+        let trace_hash = locate_trace_hash(&bridge).await;
+
+        // ALLOW — accord-blessed AND rooted under a root we trust.
+        assert!(
+            bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(full_peer))
+                .await
+                .iter()
+                .any(|r| r.envelope_hash == trace_hash),
+            "a recipient with an accord-conferred `infra:serve` that ALSO roots to \
+             a root this node trusts receives the trace row"
+        );
         assert!(
             bridge
                 .fetch_envelope_bytes_for_peer(
                     EnvelopeKind::Attestation,
                     &trace_hash,
-                    Some(observer_peer)
+                    Some(full_peer)
                 )
                 .await
                 .is_some(),
-            "observer peer fetches the trace envelope"
+            "...and can fetch its bytes"
+        );
+
+        // DENY — accord-blessed but rooted nowhere we trust (leg B required).
+        assert!(
+            !bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(blessed_only))
+                .await
+                .iter()
+                .any(|r| r.envelope_hash == trace_hash),
+            "an accord blessing alone is NOT sufficient — the capability must root \
+             to a root this node trusts (CIRISEdge#386 leg B)"
+        );
+
+        // NUCLEAR UN-TRUST — withdrawing OUR `delegates_to(local → root)` edge
+        // stops serving every peer that rooted through it, immediately, with
+        // nothing else in the graph changed and no cache to go stale. This is
+        // the property an OR-composition would have destroyed.
+        seed_withdraws(&backend, local, &our_trust_edge).await;
+        assert!(
+            !bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(full_peer))
+                .await
+                .iter()
+                .any(|r| r.envelope_hash == trace_hash),
+            "un-trusting the root stops serving traces to peers that rooted through it"
         );
         assert!(
             bridge
                 .fetch_envelope_bytes_for_peer(
                     EnvelopeKind::Attestation,
                     &trace_hash,
-                    Some(plain_peer)
+                    Some(full_peer)
                 )
                 .await
                 .is_none(),
-            "non-observer peer must not obtain the trace envelope by hash \
-             (out-of-band Diff/Fetch bypass, CIRISEdge#379)"
+            "un-trust closes the fetch path too, not just the listing"
         );
     }
 
