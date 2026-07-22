@@ -51,8 +51,12 @@ classifiers = [
 # the pyproject ceiling with what Cargo actually links. All co-resident
 # consumers must still share one ciris-persist version process-wide
 # (the OnceLock-backed Engine singleton; CIRISPersist#85 EPIC).
+# v13.13.0 — lockstep with the Cargo pin at persist v19.0.0 (RC3 charter
+# alignment). The bundled cdylib links persist 19; a `<19` ceiling here would
+# republish the exact v2.0.2 failure above (Requires-Dist asking for a version
+# the cdylib does not expect → ResolutionImpossible for co-resident consumers).
 dependencies = [
-    "ciris-persist>=18.0.0,<19",
+    "ciris-persist>=19.0.0,<20",
 ]
 dynamic = ["version"]
 
