@@ -1984,6 +1984,38 @@ mod tests {
         id
     }
 
+    /// Seed a root's SELF-CHARTER — `delegates_to(root → root)`. persist v19
+    /// (CIRISPersist#488) tightened this shape twice, and both are enforced at
+    /// admission, so the fixture carries what the field must carry:
+    /// `scope` must contain BOTH `infra:serve` AND `infra:attest` (the finalized
+    /// charter minimum; v18's OR is gone), and the envelope must carry a
+    /// well-formed `pre_rotation_commitment` — sha256 over the canonicalized,
+    /// sorted pre-committed successor key set — without which root-key
+    /// compromise is unrecoverable by construction (the KERI prior-art lesson).
+    /// Built with persist's own `pre_rotation_commitment` helper rather than a
+    /// hand-rolled digest, so the fixture cannot drift from the verifier.
+    async fn seed_root_charter(
+        backend: &MemoryBackend,
+        root: &str,
+        successor_keys: &[String],
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let commitment =
+            ciris_persist::federation::trust_root::pre_rotation_commitment(successor_keys)
+                .expect("pre-rotation commitment");
+        let envelope = serde_json::json!({
+            "id": id,
+            "references_attestation_id": id,
+            "attesting_key_id": root,
+            "attested_key_id": root,
+            "attestation_type": "delegates_to",
+            "scope": ["infra:serve", "infra:attest"],
+            "pre_rotation_commitment": commitment,
+        });
+        seed_raw_attestation(backend, &id, root, root, "delegates_to", envelope).await;
+        id
+    }
+
     /// Seed a fresh `accord:lifecycle:v1` scores row ABOUT `root` — the
     /// liveness leg of `trust_root_valid`.
     async fn seed_accord_lifecycle(backend: &MemoryBackend, attester: &str, root: &str) {
@@ -2185,8 +2217,7 @@ mod tests {
         //   2. delegates_to(local → root)                 — WE trust the root
         //   3. accord:lifecycle scores about root, fresh  — root is live
         //   4. delegates_to(root → trusted_peer, infra:serve) — the grant
-        let infra_scope = serde_json::json!(["infra:attest", "infra:serve"]);
-        let trust_edge_id = seed_delegates_to(&backend, root, root, &infra_scope).await;
+        let trust_edge_id = seed_root_charter(&backend, root, &[format!("{root}-successor")]).await;
         let our_trust_edge = seed_delegates_to(
             &backend,
             local,
@@ -2380,9 +2411,14 @@ mod tests {
 
         // Trust graph: root self-declares, WE trust it, it is live, and it
         // grants `infra:serve` to full_peer ONLY.
-        let infra = serde_json::json!(["infra:attest", "infra:serve"]);
-        seed_delegates_to(&backend, root, root, &infra).await;
-        let our_trust_edge = seed_delegates_to(&backend, local, root, &infra).await;
+        seed_root_charter(&backend, root, &[format!("{root}-successor")]).await;
+        let our_trust_edge = seed_delegates_to(
+            &backend,
+            local,
+            root,
+            &serde_json::json!(["infra:attest", "infra:serve"]),
+        )
+        .await;
         seed_accord_lifecycle(&backend, lifecycle_attester, root).await;
         seed_delegates_to(
             &backend,
