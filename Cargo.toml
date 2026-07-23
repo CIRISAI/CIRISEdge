@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "13.13.0"
+version = "13.14.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -213,7 +213,7 @@ publish = false
 # de-projects (retires) it — closing the "accepted-but-not-projected" gap that was
 # the #336 offline/pre-announce last mile. Edge threads the announce `epoch` into
 # the write-through and adopts the signed apply in `src/replication/bridge.rs`.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v19.0.0", version = "19", features = ["sqlite", "encrypted-kv"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v19.1.0", version = "19", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -1141,7 +1141,7 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v19.0.0", version = "19", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v19.1.0", version = "19", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3
