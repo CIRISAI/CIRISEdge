@@ -27,6 +27,19 @@ fn fresh_invitee() -> (XWingRecipientPublic, XWingRecipientSecret) {
     (pk, sk)
 }
 
+/// CIRISEdge#331 — a directory that resolves any pk_id to `inviter`'s registered
+/// ML-DSA key (the directory-resolved path unwrap now requires).
+fn directory_of(inviter: &MlDsa65Signer) -> impl Fn(&str) -> Option<FederationDirectoryEntry> {
+    let pk = inviter.public_key().unwrap();
+    move |id: &str| {
+        Some(FederationDirectoryEntry {
+            pk_id: id.to_string(),
+            ml_dsa_pk: pk.clone(),
+            x_wing_pk: None,
+        })
+    }
+}
+
 #[test]
 fn wrap_and_unwrap_round_trip() {
     let inviter = MlDsa65Signer::new().unwrap();
@@ -42,8 +55,14 @@ fn wrap_and_unwrap_round_trip() {
     )
     .unwrap();
 
-    // Directory lookup returns None — falls back to inline pk.
-    let opened = unwrap_welcome(&invitee_sk, &wrapped, b"group-id-42", |_| None).unwrap();
+    // CIRISEdge#331 — directory-resolved (no inline fallback).
+    let opened = unwrap_welcome(
+        &invitee_sk,
+        &wrapped,
+        b"group-id-42",
+        directory_of(&inviter),
+    )
+    .unwrap();
     assert_eq!(opened, welcome);
 }
 
@@ -59,7 +78,7 @@ fn signature_verification_is_precondition_to_open() {
     // Flip a byte of the inviter signature.
     wrapped.inviter_signature[0] ^= 0x01;
 
-    let err = unwrap_welcome(&invitee_sk, &wrapped, b"", |_| None).unwrap_err();
+    let err = unwrap_welcome(&invitee_sk, &wrapped, b"", directory_of(&inviter)).unwrap_err();
     assert!(
         matches!(err, WelcomeWrapError::SignatureRejected),
         "tampered inviter signature MUST be rejected"
@@ -67,7 +86,7 @@ fn signature_verification_is_precondition_to_open() {
 }
 
 #[test]
-fn directory_resolved_pk_takes_precedence_over_inline() {
+fn directory_resolved_pk_is_the_sole_trust_input() {
     let inviter = MlDsa65Signer::new().unwrap();
     let (invitee_pk, invitee_sk) = fresh_invitee();
     let welcome = b"directory-bound Welcome";
@@ -119,6 +138,21 @@ fn aad_mismatch_fails_open_after_signature_verifies() {
     let welcome = b"aad-bound Welcome";
     let wrapped = wrap_welcome(&inviter, "inv-aad", &invitee_pk, welcome, b"aad-A").unwrap();
 
-    let err = unwrap_welcome(&invitee_sk, &wrapped, b"aad-B", |_| None).unwrap_err();
+    let err = unwrap_welcome(&invitee_sk, &wrapped, b"aad-B", directory_of(&inviter)).unwrap_err();
     assert!(matches!(err, WelcomeWrapError::Crypto(_)));
+}
+
+#[test]
+fn directory_miss_is_inviter_unknown_not_tofu_accepted() {
+    // CIRISEdge#331 (E8) acceptance — an inviter the directory cannot resolve is
+    // REFUSED, not accepted by falling back to the sender-supplied inline key.
+    // Pre-#331 the attacker's self-signed inline-key Welcome was accepted.
+    let attacker = MlDsa65Signer::new().unwrap();
+    let (invitee_pk, invitee_sk) = fresh_invitee();
+    let wrapped = wrap_welcome(&attacker, "unknown-inviter", &invitee_pk, b"hostile", b"").unwrap();
+    let err = unwrap_welcome(&invitee_sk, &wrapped, b"", |_| None).unwrap_err();
+    assert!(
+        matches!(err, WelcomeWrapError::InviterUnknown(ref id) if id == "unknown-inviter"),
+        "a directory-unresolvable inviter must be InviterUnknown, never TOFU-accepted",
+    );
 }
