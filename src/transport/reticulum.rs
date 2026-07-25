@@ -4145,26 +4145,62 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     } else {
         None
     };
-    // Gate: look up the candidate's binding and admit the attribution only if it
-    // is `Rooted ∧ owns_key`. Missing peer / Advisory / non-owning → `None`.
+    // Gate (CIRISEdge#393): admit the attribution only if the candidate's binding
+    // is `Rooted ∧ owns_key` (item 1) AND its transport identity is bound by a
+    // hybrid-verified `SignedTransportDestination` (item 2, the PQ half). Any
+    // shortfall → `None` (SkippedNoSourceKeyId downstream, never served).
     let source_key_id = match candidate_key_id {
         Some(key_id) => {
-            let gated = {
+            // Item 1 — Rooted ∧ owns_key, plus capture the peer's dest for the
+            // item-2 lookup. `dest` is `None` when the peer isn't in the map.
+            let (item1, dest) = {
                 let peers = ctx.peers.lock().await;
-                peers.get(&key_id).and_then(|rooted| {
-                    crate::transport::SourceKeyId::from_rooted_binding(
-                        key_id.clone(),
-                        rooted.provenance,
-                        rooted.owns_key,
-                    )
-                })
+                match peers.get(&key_id) {
+                    Some(rooted) => (
+                        crate::transport::SourceKeyId::from_rooted_binding(
+                            key_id.clone(),
+                            rooted.provenance,
+                            rooted.owns_key,
+                        ),
+                        Some(rooted.peer.dest_hash.into_bytes()),
+                    ),
+                    None => (None, None),
+                }
+            };
+            // Item 2 — the PQ transport binding. Fail-closed without a rooting
+            // directory (can't prove the hybrid route ⇒ not attributable).
+            let gated = match (item1, dest, ctx.rooting) {
+                (Some(sid), Some(d), Some(rooting)) => {
+                    if rooting.hybrid_transport_binding_exists(&key_id, d).await {
+                        Some(sid)
+                    } else {
+                        tracing::debug!(
+                            link = ?link_id,
+                            peer = %key_id,
+                            "inbound frame NOT attributed — no hybrid-verified \
+                             TransportDestination binds this transport identity (PQ \
+                             attribution gate, CIRISEdge#393 item 2)"
+                        );
+                        None
+                    }
+                }
+                (Some(_), _, None) => {
+                    tracing::debug!(
+                        link = ?link_id,
+                        peer = %key_id,
+                        "inbound frame NOT attributed — no rooting directory to verify \
+                         the hybrid transport binding (fail-closed, CIRISEdge#393 item 2)"
+                    );
+                    None
+                }
+                _ => None,
             };
             if gated.is_none() {
                 tracing::debug!(
                     link = ?link_id,
                     peer = %key_id,
-                    "inbound frame NOT attributed — peer binding is not Rooted∧owns_key \
-                     (advisory/spoof-resistant serve gate, CIRISEdge#393)"
+                    "inbound frame NOT attributed — binding is not Rooted∧owns_key∧hybrid \
+                     (advisory/spoof/PQ-resistant serve gate, CIRISEdge#393)"
                 );
             }
             gated

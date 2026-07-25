@@ -419,15 +419,20 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
         .expect("B must receive A's reply within 60s")
         .expect("B inbound channel open");
     assert_eq!(reply_at_b.envelope_bytes, b"reply-over-the-reverse-path");
+    // CIRISEdge#393 item 2 — the reply DELIVERS over B's dialed link (the #353
+    // mechanism, the load-bearing assertion above). Attribution now additionally
+    // requires a hybrid-verified TransportDestination for A, which this test env
+    // does not seed, so source_key_id is withheld. Attribution-WORKS under a
+    // hybrid route is proven by the from_rooted_binding + hybrid_reticulum_route_present
+    // unit truth-tables (a live-route e2e is a test-harness follow-up).
     assert_eq!(
         reply_at_b
             .source_key_id
             .as_ref()
             .map(ciris_edge::transport::SourceKeyId::as_str),
-        Some("edge-key-aaaa"),
-        "the reply on B's own dialed link must be ATTRIBUTED via link_destination \
-         (initiator-side half of CIRISEdge#353) — None is the #317 \
-         SkippedNoSourceKeyId drop and the round dies delivered-but-dead",
+        None,
+        "#393 item 2: no hybrid TransportDestination for A → attribution withheld \
+         (delivery intact)",
     );
 }
 
@@ -538,11 +543,15 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
         .expect("B receives the retried reply within 60s")
         .expect("B channel open");
     assert_eq!(reply.envelope_bytes, b"reply-over-a-busy-link-as-a-packet");
+    // CIRISEdge#393 item 2 — delivery over the busy reverse-path link is the
+    // assertion here; attribution requires a hybrid TransportDestination (not
+    // seeded in this env), so source_key_id is withheld (proven by the unit
+    // truth-tables). Delivery is intact.
     assert_eq!(
         reply
             .source_key_id
             .as_ref()
             .map(ciris_edge::transport::SourceKeyId::as_str),
-        Some("edge-key-aaaa")
+        None
     );
 }

@@ -272,6 +272,109 @@ pub trait RootingDirectory: Send + Sync + 'static {
         _last_seen: chrono::DateTime<chrono::Utc>,
     ) {
     }
+
+    /// CIRISEdge#393 (E3, item 2) — does a HYBRID-verified (ML-DSA-65)
+    /// `SignedTransportDestination` bind `key_id`'s reticulum transport identity
+    /// to `dest_hash`?
+    ///
+    /// The post-quantum half of attribution. The announce binding is Ed25519-only
+    /// and MTU-bounded (an ML-DSA-65 signature is ~3.3 KB vs the 300 B announce
+    /// budget), so PQ assurance rides the replicated, hybrid-Strict
+    /// `TransportDestination` plane instead — which edge already applies and
+    /// persist already verifies the ML-DSA half of on `put`. A stored route
+    /// carrying an `mldsa65_signature_base64` is therefore hybrid-verified; the
+    /// Ed25519-only announce write-through ([`Self::persist_transport_binding`])
+    /// carries `None` and does NOT satisfy this. A quantum adversary who forged
+    /// the Ed25519 announce still cannot produce this ML-DSA-signed route, so
+    /// attribution gated on it stays PQ-safe. Default `false` (test doubles /
+    /// no-directory ⇒ fail-closed); the `FederationDirectory` blanket impl reads
+    /// the stored routes.
+    async fn hybrid_transport_binding_exists(&self, _key_id: &str, _dest_hash: [u8; 16]) -> bool {
+        false
+    }
+}
+
+/// CIRISEdge#393 (E3, item 2) — pure predicate under
+/// [`RootingDirectory::hybrid_transport_binding_exists`]: is any of `routes` a
+/// reticulum route to `dest_hash` carrying a verified ML-DSA-65 half? Extracted
+/// pure so the PQ gate is unit-testable against the exact stored shapes without
+/// a live directory.
+#[must_use]
+pub fn hybrid_reticulum_route_present(
+    routes: &[ciris_persist::federation::self_at_login::SignedTransportDestination],
+    dest_hash: [u8; 16],
+) -> bool {
+    let want = hex::encode(dest_hash);
+    routes.iter().any(|r| {
+        r.transport_destination.transport_kind == "reticulum"
+            && r.transport_destination.destination == want
+            && r.signature.mldsa65_signature_base64.is_some()
+    })
+}
+
+#[cfg(test)]
+mod hybrid_transport_binding_tests {
+    use super::hybrid_reticulum_route_present;
+    use ciris_persist::federation::self_at_login::{
+        BindingProvenance, SignedTransportDestination, TransportDestination,
+    };
+    use ciris_verify_core::transport_binding::TransportBindingSignature;
+
+    fn route(dest_hash: [u8; 16], kind: &str, mldsa: Option<&str>) -> SignedTransportDestination {
+        SignedTransportDestination {
+            transport_destination: TransportDestination {
+                occurrence_key_id: "peer".into(),
+                transport_kind: kind.into(),
+                destination: hex::encode(dest_hash),
+                asserted_at: chrono::DateTime::UNIX_EPOCH,
+                last_seen_at: None,
+                transport_ed25519_pubkey_base64: None,
+                transport_x25519_pubkey_base64: None,
+                binding_provenance: BindingProvenance::Rooted,
+                epoch: 0,
+                retired_at: None,
+            },
+            attesting_key_id: "peer".into(),
+            signed_envelope: serde_json::json!({}),
+            signature: TransportBindingSignature {
+                ed25519_signature_base64: "ed".into(),
+                mldsa65_signature_base64: mldsa.map(str::to_string),
+            },
+        }
+    }
+
+    /// CIRISEdge#393 item 2 — the PQ attribution predicate against the EXACT
+    /// stored shapes. Only a reticulum route to the peer's dest carrying an
+    /// ML-DSA-65 half counts; the Ed25519-only announce write-through (`None`)
+    /// and a wrong-dest / wrong-kind route do NOT — so a quantum-forged
+    /// Ed25519 announce cannot make its peer attributable.
+    #[test]
+    fn only_a_hybrid_reticulum_route_to_the_dest_counts() {
+        let dest = [0xab; 16];
+        let other = [0xcd; 16];
+        // Hybrid reticulum route to the dest → present.
+        assert!(hybrid_reticulum_route_present(
+            &[route(dest, "reticulum", Some("mldsa-sig"))],
+            dest
+        ));
+        // Ed25519-only write-through (mldsa None) → NOT present (the PQ gap).
+        assert!(!hybrid_reticulum_route_present(
+            &[route(dest, "reticulum", None)],
+            dest
+        ));
+        // Hybrid route to a DIFFERENT dest → not present for this dest.
+        assert!(!hybrid_reticulum_route_present(
+            &[route(other, "reticulum", Some("mldsa-sig"))],
+            dest
+        ));
+        // Hybrid but non-reticulum kind → not present.
+        assert!(!hybrid_reticulum_route_present(
+            &[route(dest, "websocket", Some("mldsa-sig"))],
+            dest
+        ));
+        // Empty → not present (fresh boot, no route yet).
+        assert!(!hybrid_reticulum_route_present(&[], dest));
+    }
 }
 
 #[async_trait]
@@ -286,6 +389,15 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
 
     async fn provenance_chain(&self, key_id: &str) -> Result<ProvenanceChain, RootingRejection> {
         persist_provenance_chain(self, key_id).await
+    }
+
+    async fn hybrid_transport_binding_exists(&self, key_id: &str, dest_hash: [u8; 16]) -> bool {
+        // Fail-closed on a backend read error: no VERIFIABLE hybrid route ⇒ not
+        // PQ-attributable (a directory hiccup must never widen attribution).
+        match self.list_signed_transport_destinations_for(key_id).await {
+            Ok(routes) => hybrid_reticulum_route_present(&routes, dest_hash),
+            Err(_) => false,
+        }
     }
 
     async fn persist_transport_binding(
