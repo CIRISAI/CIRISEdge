@@ -4008,7 +4008,11 @@ async fn route_replication_frame(
     let Some(registry) = registry else {
         return false; // no replication runtime installed → envelope dispatch
     };
-    let Some(source) = frame.source_key_id.as_deref() else {
+    let Some(source) = frame
+        .source_key_id
+        .as_ref()
+        .map(crate::transport::SourceKeyId::as_str)
+    else {
         // No attribution: a CRPL frame here is unroutable (drop, loudly); a
         // non-CRPL frame is a normal unattributed envelope (fall through).
         if frame
@@ -7410,7 +7414,7 @@ mod inbound_ingest_tests {
             envelope_bytes: bytes,
             transport: TransportId::RETICULUM_RS,
             received_at: chrono::Utc::now(),
-            source_key_id: source.map(str::to_string),
+            source_key_id: source.map(crate::transport::SourceKeyId::transport_authenticated),
         }
     }
 

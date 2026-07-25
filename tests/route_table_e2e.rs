@@ -181,8 +181,17 @@ async fn no_path_send_fails_fast_and_loud_not_a_silent_30s_timeout() {
 /// `InboundFrame::source_key_id` — the exact operand that was `None` in the
 /// field logs. Delivery alone (the existing loopback test) does not catch this;
 /// attribution does.
+// CIRISEdge#393 (E3) — this test now asserts the SECURITY property: B's binding
+// at A is admitted ADVISORY (B's key does not root to a pinned steward in this
+// un-seeded test env), so the responder DELIVERS the frame but REFUSES to
+// attribute it — an advisory/spoofable source is never fed to the trace serve
+// gate. Pre-#393 this attributed `edge-key-bbbb` (the vuln: an advisory admit
+// was treated as authoritative attribution). Attribution-works for a genuinely
+// Rooted∧owns_key peer is covered by the reverse-path test below (the reply from
+// non-announcing A stays Rooted at B). The `SourceKeyId::from_rooted_binding`
+// truth table (transport/mod.rs) is the direct gate proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn identified_link_lets_the_responder_attribute_the_inbound_frame() {
+async fn identified_link_from_advisory_peer_is_delivered_but_not_attributed_393() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,ciris_edge=debug")
         .try_init();
@@ -265,11 +274,18 @@ async fn identified_link_lets_the_responder_attribute_the_inbound_frame() {
         .expect("frame must arrive within 60s")
         .expect("inbound channel open");
 
+    // The frame was DELIVERED (received above) — the #340 link mechanism works.
+    // But B is Advisory here, so #393 withholds attribution.
     assert_eq!(
-        frame.source_key_id.as_deref(),
-        Some("edge-key-bbbb"),
-        "the responder must ATTRIBUTE the inbound frame to the sender via the \
-         identified link — source_key_id=None is the #340 SkippedNoSourceKeyId drop",
+        frame
+            .source_key_id
+            .as_ref()
+            .map(ciris_edge::transport::SourceKeyId::as_str),
+        None,
+        "CIRISEdge#393 (E3) — B's binding is ADVISORY (not steward-rooted here), so \
+         the responder must REFUSE attribution even though the link identified. \
+         Pre-#393 this returned Some(\"edge-key-bbbb\") — the advisory-spoofable \
+         attribution that let an attacker be served a victim's trace corpus.",
     );
 }
 
@@ -374,10 +390,16 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
         .await
         .expect("A must receive B's frame within 60s")
         .expect("A inbound channel open");
+    // CIRISEdge#393 — B dialed A (announcing to A), so B's binding at A is
+    // ADVISORY (un-pinned steward here) → attribution REFUSED. The frame is
+    // still DELIVERED (received above); only the source is withheld.
     assert_eq!(
-        inbound_at_a.source_key_id.as_deref(),
-        Some("edge-key-bbbb"),
-        "precondition (#340): A must attribute B's inbound link",
+        inbound_at_a
+            .source_key_id
+            .as_ref()
+            .map(ciris_edge::transport::SourceKeyId::as_str),
+        None,
+        "#393 (E3): an advisory-admitted inbound source is not attributed",
     );
 
     // Leg 2 — the REPLY: A -> B must ride B's live inbound link. Before the
@@ -398,7 +420,10 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
         .expect("B inbound channel open");
     assert_eq!(reply_at_b.envelope_bytes, b"reply-over-the-reverse-path");
     assert_eq!(
-        reply_at_b.source_key_id.as_deref(),
+        reply_at_b
+            .source_key_id
+            .as_ref()
+            .map(ciris_edge::transport::SourceKeyId::as_str),
         Some("edge-key-aaaa"),
         "the reply on B's own dialed link must be ATTRIBUTED via link_destination \
          (initiator-side half of CIRISEdge#353) — None is the #317 \
@@ -513,5 +538,11 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
         .expect("B receives the retried reply within 60s")
         .expect("B channel open");
     assert_eq!(reply.envelope_bytes, b"reply-over-a-busy-link-as-a-packet");
-    assert_eq!(reply.source_key_id.as_deref(), Some("edge-key-aaaa"));
+    assert_eq!(
+        reply
+            .source_key_id
+            .as_ref()
+            .map(ciris_edge::transport::SourceKeyId::as_str),
+        Some("edge-key-aaaa")
+    );
 }
