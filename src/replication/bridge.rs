@@ -1048,99 +1048,155 @@ impl FederationDirectoryReplicationBridge {
         .await
     }
 
+    // ── CIRISEdge#504 — the 5 E4 keyless-declaration planes advertise via
+    //    persist v21.1.0's SIGNED, since-cursor bulk reads ──────────────────
+    //
+    // v21 #502 E4 gave these planes an authority signature (`authority_key_id`
+    // + hybrid scrub sigs on the `Signed*` wrapper), which edge — NOT the
+    // authority — cannot produce. persist self-signs on write and now exposes
+    // `list_signed_<kind>_since(since, limit) -> Vec<Signed*>` (mirroring the
+    // org/orgmembership/partner reads), so edge serves those wrappers BYTE-EXACT
+    // (their JCS `v2_envelope_hash` is the wire hash, same §3.2.2 basis as the
+    // org kinds). This also retires the per-member `fan_out_for_member` for
+    // these 5: ONE paginated read per plane per round instead of O(cohort)
+    // round-trips (CIRISPersist#504 hot-path floor).
+    //
+    // ADVERTISE SCOPE is preserved from the pre-v21 fan_out per the §4.3
+    // 14-kind table: Family / Community / LocationProof are **Cohort**-scoped
+    // (filtered in-memory to rows touching a cohort member — the bulk read is
+    // over edge's OWN directory, so reading-then-filtering leaks nothing), and
+    // the two membership-revocation planes are **Global** (advertised whole,
+    // matching the pre-v21 `subjects_for_projection(Global)` subject set).
+
+    /// Advertise a bulk signed operational plane: keep rows in `in_scope`, hash
+    /// each already-signed wrapper by its JCS `v2_envelope_hash`, cache its wire
+    /// bytes, dedupe.
+    async fn advertise_signed_operational<S, TS, IN>(
+        &self,
+        kind: EnvelopeKind,
+        rows: Vec<S>,
+        seq_of: TS,
+        in_scope: IN,
+    ) -> Vec<EnvelopeRef>
+    where
+        S: serde::Serialize,
+        TS: Fn(&S) -> chrono::DateTime<chrono::Utc>,
+        IN: Fn(&S) -> bool,
+    {
+        let mut refs = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        for signed in rows.iter().filter(|s| in_scope(s)) {
+            let Some(hash) = v2_envelope_hash(signed) else {
+                continue;
+            };
+            if !seen.insert(hash) {
+                continue;
+            }
+            let bytes = serde_json::to_vec(signed).unwrap_or_default();
+            self.cache_insert(kind, hash, bytes).await;
+            refs.push(EnvelopeRef {
+                envelope_hash: hash,
+                seq: Self::ms_seq(seq_of(signed)),
+            });
+        }
+        refs
+    }
+
+    /// The operator-configured cohort as a set, for the Cohort-scoped advertise
+    /// filters.
+    fn cohort_set(&self) -> HashSet<String> {
+        (self.cohort)().into_iter().collect()
+    }
+
     async fn list_families(&self) -> Vec<EnvelopeRef> {
-        self.fan_out_for_member(
+        let cohort = self.cohort_set();
+        let rows = self
+            .directory
+            .list_signed_families_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        self.advertise_signed_operational(
             EnvelopeKind::Family,
-            (self.cohort)(),
-            |key_id| async move {
-                self.directory
-                    .list_families_for_member(&key_id)
-                    .await
-                    .unwrap_or_default()
-            },
-            |row| SignedFamily {
-                family: row.clone(),
-            },
-            |row| row.founded_at,
-            |row| row.persist_row_hash.as_str(),
+            rows,
+            |s| s.family.founded_at,
+            |s| s.family.members.iter().any(|m| cohort.contains(&m.key_id)),
         )
         .await
     }
 
     async fn list_communities(&self) -> Vec<EnvelopeRef> {
-        self.fan_out_for_member(
+        let cohort = self.cohort_set();
+        let rows = self
+            .directory
+            .list_signed_communities_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        self.advertise_signed_operational(
             EnvelopeKind::Community,
-            (self.cohort)(),
-            |key_id| async move {
-                self.directory
-                    .list_communities_for_member(&key_id)
-                    .await
-                    .unwrap_or_default()
+            rows,
+            |s| s.community.founded_at,
+            |s| {
+                s.community
+                    .members
+                    .iter()
+                    .any(|m| cohort.contains(&m.key_id))
             },
-            |row| SignedCommunity {
-                community: row.clone(),
-            },
-            |row| row.founded_at,
-            |row| row.persist_row_hash.as_str(),
         )
         .await
     }
 
     async fn list_family_membership_revocations(&self) -> Vec<EnvelopeRef> {
-        // #311 tombstone fix — membership revocation projects `Global`.
-        self.fan_out_for_member(
+        // #311 tombstone fix — membership revocation projects `Global`
+        // (advertised whole, no cohort filter).
+        let rows = self
+            .directory
+            .list_signed_family_membership_revocations_since(
+                None,
+                self.config.operational_page_limit,
+            )
+            .await
+            .unwrap_or_default();
+        self.advertise_signed_operational(
             EnvelopeKind::FamilyMembershipRevocation,
-            self.subjects_for_projection(Projection::Global),
-            |key_id| async move {
-                self.directory
-                    .list_family_membership_revocations_for(&key_id)
-                    .await
-                    .unwrap_or_default()
-            },
-            |row| SignedFamilyMembershipRevocation {
-                family_membership_revocation: row.clone(),
-            },
-            |row| row.removed_at,
-            |row| row.persist_row_hash.as_str(),
+            rows,
+            |s| s.family_membership_revocation.removed_at,
+            |_| true,
         )
         .await
     }
 
     async fn list_community_membership_revocations(&self) -> Vec<EnvelopeRef> {
-        // #311 tombstone fix — membership revocation projects `Global`.
-        self.fan_out_for_member(
+        // #311 tombstone fix — membership revocation projects `Global`
+        // (advertised whole, no cohort filter).
+        let rows = self
+            .directory
+            .list_signed_community_membership_revocations_since(
+                None,
+                self.config.operational_page_limit,
+            )
+            .await
+            .unwrap_or_default();
+        self.advertise_signed_operational(
             EnvelopeKind::CommunityMembershipRevocation,
-            self.subjects_for_projection(Projection::Global),
-            |key_id| async move {
-                self.directory
-                    .list_community_membership_revocations_for(&key_id)
-                    .await
-                    .unwrap_or_default()
-            },
-            |row| SignedCommunityMembershipRevocation {
-                community_membership_revocation: row.clone(),
-            },
-            |row| row.removed_at,
-            |row| row.persist_row_hash.as_str(),
+            rows,
+            |s| s.community_membership_revocation.removed_at,
+            |_| true,
         )
         .await
     }
 
     async fn list_location_proofs(&self) -> Vec<EnvelopeRef> {
-        self.fan_out_for_member(
+        let cohort = self.cohort_set();
+        let rows = self
+            .directory
+            .list_signed_location_proofs_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        self.advertise_signed_operational(
             EnvelopeKind::LocationProof,
-            (self.cohort)(),
-            |key_id| async move {
-                self.directory
-                    .list_location_proofs_for(&key_id)
-                    .await
-                    .unwrap_or_default()
-            },
-            |row| SignedLocationProof {
-                location_proof: row.clone(),
-            },
-            |row| row.asserted_at,
-            |row| row.persist_row_hash.as_str(),
+            rows,
+            |s| s.location_proof.asserted_at,
+            |s| cohort.contains(&s.location_proof.subject_key_id),
         )
         .await
     }
@@ -1440,48 +1496,44 @@ impl FederationDirectoryReplicationBridge {
     // commitment "merge policy stays persist-side per §10.1.6 declared
     // intents."
 
+    // CIRISEdge#504 / persist v21 #502 E9 — persist now resolves the steward
+    // roster from its OWN registered directory (never a caller-passed roster:
+    // that was itself a classical FK-existence edge). So `put_organization` /
+    // `put_org_membership` / `put_partner_record` no longer take
+    // key_directory/root_stewards/steward_roster args. The `operational` gate
+    // stays the opt-in for whether THIS edge participates in operational-kind
+    // admission at all — admission SCOPE is unchanged, only the (now
+    // persist-internal) roster plumbing is dropped. The `OperationalProviders`
+    // roster fields are vestigial post-E9; the server drops computing them when
+    // it adopts v14.
     async fn apply_organization(&self, bytes: &[u8]) -> bool {
-        let Some(ops) = self.operational.as_ref() else {
+        if self.operational.is_none() {
             return false;
-        };
+        }
         let Ok(signed) = serde_json::from_slice::<SignedOrganization>(bytes) else {
             return false;
         };
-        let key_directory = (ops.key_directory)();
-        let root_stewards = (ops.root_stewards)();
-        self.directory
-            .put_organization(signed, key_directory.as_slice(), root_stewards.as_slice())
-            .await
-            .is_ok()
+        self.directory.put_organization(signed).await.is_ok()
     }
 
     async fn apply_org_membership(&self, bytes: &[u8]) -> bool {
-        let Some(ops) = self.operational.as_ref() else {
+        if self.operational.is_none() {
             return false;
-        };
+        }
         let Ok(signed) = serde_json::from_slice::<SignedOrgMembership>(bytes) else {
             return false;
         };
-        let key_directory = (ops.key_directory)();
-        let root_stewards = (ops.root_stewards)();
-        self.directory
-            .put_org_membership(signed, key_directory.as_slice(), root_stewards.as_slice())
-            .await
-            .is_ok()
+        self.directory.put_org_membership(signed).await.is_ok()
     }
 
     async fn apply_partner_record(&self, bytes: &[u8]) -> bool {
-        let Some(ops) = self.operational.as_ref() else {
+        if self.operational.is_none() {
             return false;
-        };
+        }
         let Ok(signed) = serde_json::from_slice::<SignedPartnerRecord>(bytes) else {
             return false;
         };
-        let steward_roster = (ops.steward_roster)();
-        self.directory
-            .put_partner_record(signed, steward_roster.as_slice())
-            .await
-            .is_ok()
+        self.directory.put_partner_record(signed).await.is_ok()
     }
 }
 

@@ -130,6 +130,37 @@ mod wire_vocabulary_hash_tests {
     }
 }
 
+/// CIRISEdge#393 / persist v21 (#501/#502) — the cross-repo drift witness for
+/// the Registry-of-Record admission policy. persist owns the APPLY policy for
+/// all 14 replicated kinds and exports it as
+/// [`ciris_persist::federation::replication_policy::REPLICATION_POLICY_HASH`];
+/// edge (the SERVE/ADVERTISE half) and CIRISServer both PIN it. A persist-side
+/// change to which signer-source admits a kind — the class that silently
+/// widened trust before v21 — flips this hash, failing edge's build until the
+/// re-pin is a deliberate, reviewed act across the triple (the same posture as
+/// [`WIRE_VOCABULARY_HASH`], now for the admission surface rather than the wire
+/// vocabulary).
+pub const PERSIST_REPLICATION_POLICY_HASH: &str =
+    "351912ead0aab4847f40d2b54a7a326546c37d43507deb38ea24d6094d29d63b";
+
+#[cfg(test)]
+mod replication_policy_hash_tests {
+    /// Pins persist's `REPLICATION_POLICY_HASH` from the linked crate against
+    /// edge's expected value. A mismatch is a coordinated admission-policy
+    /// change persist made that edge's serve/advertise half must be re-reviewed
+    /// against — never a silent skew. See CIRISEdge#393 §4.3 manifest witness.
+    #[test]
+    fn persist_replication_policy_hash_pinned() {
+        assert_eq!(
+            ciris_persist::federation::replication_policy::REPLICATION_POLICY_HASH,
+            super::PERSIST_REPLICATION_POLICY_HASH,
+            "persist's REPLICATION_POLICY_HASH changed — its admission policy for \
+             one of the 14 replicated kinds moved. Re-review edge's serve/advertise \
+             half against the new policy, then re-pin deliberately (CIRISEdge#393)."
+        );
+    }
+}
+
 pub use blob_swarm::{
     BlobChunkSource, BlobChunkVerifier, ChunkManifestLite, ChunkSourceRefusal, ChunkVerifyError,
     PeerState, SwarmConfig, SwarmError, SwarmScheduler,
