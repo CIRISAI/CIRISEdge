@@ -53,12 +53,12 @@
 //! Three tests at the bottom of this module fence that invariant per
 //! FSD §7.1 acceptance criteria.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
+use super::resolved_state::{ResolvedPeerSet, ResolvedRecipient};
 use ciris_persist::federation::admission::has_effective_role;
 use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
 use ciris_persist::federation::namespace::{self, Projection};
@@ -84,15 +84,6 @@ use super::protocol::{EnvelopeKind, EnvelopeRef};
 /// Tuning knobs for the production bridge.
 #[derive(Debug, Clone, Copy)]
 pub struct BridgeConfig {
-    /// Bounded capacity of the hash→bytes cache populated by
-    /// [`FederationDirectoryReplicationBridge::list_envelope_refs`]
-    /// and consulted by
-    /// [`FederationDirectoryReplicationBridge::fetch_envelope_bytes`].
-    /// v1 mitigation for the absent persist-side
-    /// `lookup_*_by_content_hash` point-read; default 4096 entries
-    /// covers federations up to ~thousands of envelopes per kind.
-    /// FIFO eviction.
-    pub cache_capacity: usize,
     /// Page size for the v2 operational kinds' bulk-list sweep
     /// (`list_organizations_since` / `list_org_memberships_since` /
     /// `list_partner_records_since`). v2.0.0 ships unlimited single-page
@@ -104,7 +95,6 @@ pub struct BridgeConfig {
 }
 
 impl BridgeConfig {
-    pub const DEFAULT_CACHE_CAPACITY: usize = 4096;
     /// Default for [`Self::operational_page_limit`].
     pub const DEFAULT_OPERATIONAL_PAGE_LIMIT: u32 = u32::MAX;
 }
@@ -112,7 +102,6 @@ impl BridgeConfig {
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
-            cache_capacity: Self::DEFAULT_CACHE_CAPACITY,
             operational_page_limit: Self::DEFAULT_OPERATIONAL_PAGE_LIMIT,
         }
     }
@@ -187,7 +176,6 @@ pub struct FederationDirectoryReplicationBridge {
     /// set (own + anchored); edge only provides the hook — all replication
     /// policy is resolved by persist's `namespace::projection_for`.
     self_provider: Option<CohortProvider>,
-    cache: Mutex<BridgeCache>,
     config: BridgeConfig,
     /// v2 operational-data admission providers. `None` = v2 admission
     /// fail-closed; operational kinds' `apply_*` returns `false` without
@@ -216,13 +204,11 @@ impl FederationDirectoryReplicationBridge {
         cohort: CohortProvider,
         config: BridgeConfig,
     ) -> Self {
-        let cache = Mutex::new(BridgeCache::with_capacity(config.cache_capacity));
         Self {
             directory,
             cohort,
             self_provider: None,
             local_key_id: None,
-            cache,
             config,
             operational: None,
         }
@@ -250,13 +236,11 @@ impl FederationDirectoryReplicationBridge {
         config: BridgeConfig,
         operational: OperationalProviders,
     ) -> Self {
-        let cache = Mutex::new(BridgeCache::with_capacity(config.cache_capacity));
         Self {
             directory,
             cohort,
             self_provider: None,
             local_key_id: None,
-            cache,
             config,
             operational: Some(operational),
         }
@@ -288,10 +272,6 @@ impl FederationDirectoryReplicationBridge {
         self
     }
 
-    async fn cache_insert(&self, kind: EnvelopeKind, hash: [u8; 32], bytes: Vec<u8>) {
-        self.cache.lock().await.insert(kind, hash, bytes);
-    }
-
     /// Decode persist's hex-encoded `persist_row_hash` (64 chars,
     /// lowercase) into the 32-byte `envelope_hash` shape the
     /// replication protocol uses. Returns `None` if decode fails —
@@ -305,47 +285,6 @@ impl FederationDirectoryReplicationBridge {
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes);
         Some(out)
-    }
-}
-
-// ─── Cache (bounded FIFO) ───────────────────────────────────────────
-
-struct BridgeCache {
-    capacity: usize,
-    map: HashMap<(EnvelopeKind, [u8; 32]), Vec<u8>>,
-    order: VecDeque<(EnvelopeKind, [u8; 32])>,
-}
-
-impl BridgeCache {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            capacity,
-            map: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn insert(&mut self, kind: EnvelopeKind, hash: [u8; 32], bytes: Vec<u8>) {
-        let key = (kind, hash);
-        if self.map.contains_key(&key) {
-            return; // already cached; preserve FIFO insertion order
-        }
-        if self.map.len() >= self.capacity {
-            if let Some(evict) = self.order.pop_front() {
-                self.map.remove(&evict);
-            }
-        }
-        self.map.insert(key, bytes);
-        self.order.push_back(key);
-    }
-
-    fn get(&self, kind: EnvelopeKind, hash: &[u8; 32]) -> Option<Vec<u8>> {
-        self.map.get(&(kind, *hash)).cloned()
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.map.len()
     }
 }
 
@@ -397,18 +336,21 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // re-serializes that SAME row, the returned bytes hash back to
         // `envelope_hash` by construction.
         if let Some(k) = kind.persist_index_kind() {
-            if let Ok(Some(bytes)) = self
+            return self
                 .directory
                 .lookup_signed_record_by_content_hash(k, &hex::encode(envelope_hash))
                 .await
-            {
-                return Some(bytes);
-            }
+                .ok()
+                .flatten();
         }
-        // `Revocation` (unindexed) + any point-read miss → the local cache (only
-        // `Revocation` still populates it; every other plane's fetch IS the
-        // point-read).
-        self.cache.lock().await.get(kind, envelope_hash)
+        // CIRISEdge#396 item 3 — `Revocation` is the ONE kind persist does not
+        // content-hash-index; it rides the `persist_row_hash` wire. Resolve it
+        // with NO cache: this retires the last in-memory fetch cache, so every
+        // plane's fetch is now a direct persist read.
+        if kind == EnvelopeKind::Revocation {
+            return self.fetch_revocation_bytes(envelope_hash).await;
+        }
+        None
     }
 
     /// CIRISEdge#379 — recipient-aware listing: the Attestation plane routes
@@ -437,16 +379,39 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         let bytes = self.fetch_envelope_bytes(kind, envelope_hash).await?;
         if kind == EnvelopeKind::Attestation {
             if let Some(peer) = peer_key_id {
-                if Self::envelope_requires_serve(&bytes)
-                    && !self.peer_has_serve_capability(peer).await
-                {
-                    tracing::debug!(
-                        peer,
-                        envelope_hash = %hex::encode(&envelope_hash[..8]),
-                        "trace attestation withheld — recipient lacks an effective `infra:serve` \
-                         capability (CIRISEdge#379)"
-                    );
-                    return None;
+                // CIRISEdge#396 item 1 — the same consent-membership bound the
+                // listing applies, so a peer excluded from the advertise cannot
+                // obtain an attestation by fetching a hash it learned
+                // out-of-band. Fail-closed: no `ResolvedRecipient`, no bytes.
+                let recipient = self.resolve_attestation_recipient(peer).await?;
+                // #379 `infra:serve` + #396 item 6 `recipient_capability`, over
+                // the WIRE bytes — the direct-fetch twins of the listing gates,
+                // so the fetch path narrows exactly as the advertise path did.
+                // The wire is the BARE `Attestation` (§3); tolerate the legacy
+                // `{"attestation": …}` wrap for a peer still on the old wire.
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    let inner = value.get("attestation").unwrap_or(&value);
+                    if Self::attestation_requires_serve(inner)
+                        && !self.peer_has_serve_capability(recipient.as_str()).await
+                    {
+                        tracing::debug!(
+                            peer,
+                            envelope_hash = %hex::encode(&envelope_hash[..8]),
+                            "trace attestation withheld — recipient lacks an effective \
+                             `infra:serve` capability (CIRISEdge#379)"
+                        );
+                        return None;
+                    }
+                    if self
+                        .recipient_capability_withholds(
+                            inner,
+                            recipient.as_str(),
+                            &mut HashMap::new(),
+                        )
+                        .await
+                    {
+                        return None;
+                    }
                 }
             }
         }
@@ -664,20 +629,16 @@ impl FederationDirectoryReplicationBridge {
     // site without requiring dyn-compatibility on the directory trait.
     // Async via boxed future on the per-key fetch (the directory trait is
     // already `async_trait`-boxed).
-    async fn fan_out_for_member<Row, Signed, FetchFut, F, W, H>(
+    async fn fan_out_for_member<Row, FetchFut, F, H>(
         &self,
-        kind: EnvelopeKind,
         subjects: Vec<String>,
         mut fetch: F,
-        wrap: W,
         timestamp: impl Fn(&Row) -> chrono::DateTime<chrono::Utc>,
         hash: H,
     ) -> Vec<EnvelopeRef>
     where
         F: FnMut(String) -> FetchFut,
         FetchFut: std::future::Future<Output = Vec<Row>>,
-        W: Fn(&Row) -> Signed,
-        Signed: serde::Serialize,
         H: Fn(&Row) -> &str,
     {
         let mut refs = Vec::new();
@@ -691,9 +652,6 @@ impl FederationDirectoryReplicationBridge {
                 if !seen.insert(envelope_hash) {
                     continue;
                 }
-                let signed = wrap(&row);
-                let bytes = serde_json::to_vec(&signed).unwrap_or_default();
-                self.cache_insert(kind, envelope_hash, bytes).await;
                 refs.push(EnvelopeRef {
                     envelope_hash,
                     seq: Self::ms_seq(timestamp(&row)),
@@ -701,6 +659,29 @@ impl FederationDirectoryReplicationBridge {
             }
         }
         refs
+    }
+
+    /// CIRISEdge#396 item 3 — resolve a `Revocation` tombstone's wire bytes
+    /// without a cache: scan the same `Global` subject set the advertise
+    /// ([`Self::list_revocations`]) walks, match on `persist_row_hash`, and
+    /// re-serialize the `SignedRevocation` exactly as [`Self::fan_out_for_member`]
+    /// did on the advertise. A revocation is an immutable tombstone, so the
+    /// re-read can never drift from what was advertised — the byte-exactness the
+    /// point-read gives the indexed planes, achieved here by re-derivation.
+    async fn fetch_revocation_bytes(&self, envelope_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        for subject in self.subjects_for_projection(Projection::Global) {
+            let rows = self
+                .directory
+                .revocations_for(&subject)
+                .await
+                .unwrap_or_default();
+            for row in rows {
+                if Self::decode_hash(row.persist_row_hash.as_str()) == Some(*envelope_hash) {
+                    return serde_json::to_vec(&SignedRevocation { revocation: row }).ok();
+                }
+            }
+        }
+        None
     }
 
     /// v10 — resolve ONE attestation's replication policy dynamically from its
@@ -778,12 +759,13 @@ impl FederationDirectoryReplicationBridge {
             .is_some_and(|d| d.starts_with("trace:"))
     }
 
-    /// CIRISEdge#379 — the fetch-path twin of
-    /// [`Self::attestation_requires_serve`], over WIRE bytes. CIRISEdge#397's
-    /// wire is the BARE `Attestation` (the point-read's content-hash bytes), but
-    /// this still accepts the legacy `{"attestation": …}` wrap for robustness.
-    /// Parse failure → `false` (only `trace:*` is gated; the point-read serves
-    /// JSON persist round-trips).
+    /// CIRISEdge#379 — `[`Self::attestation_requires_serve`]` over WIRE bytes
+    /// (BARE `Attestation`, tolerating the legacy `{"attestation": …}` wrap;
+    /// parse failure → `false`). Since CIRISEdge#396 v14.2 the production
+    /// fetch twin ([`Self::fetch_envelope_bytes_for_peer`]) parses the wire once
+    /// and reuses the value for BOTH the #379 and item-6 gates, so this thin
+    /// re-parse survives only as a test utility (`locate_trace_hash`).
+    #[cfg(test)]
     fn envelope_requires_serve(bytes: &[u8]) -> bool {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return false;
@@ -994,6 +976,48 @@ impl FederationDirectoryReplicationBridge {
         false
     }
 
+    /// CIRISEdge#396 item 1 — resolve `peer` against this node's live consent
+    /// send-set (persist's `list_consent_peers` E7 projection, revocation-folded).
+    /// `Some(ResolvedRecipient)` iff consent includes it; `None` (fail-closed)
+    /// when there is no `local_key_id` to resolve against, the consent view
+    /// won't resolve, or the peer is not consent-included. The Attestation plane
+    /// — the only consentable plane — serves a peer ONLY with a
+    /// `ResolvedRecipient` in hand, so both the advertise ([`Self::list_attestations`])
+    /// and the direct-fetch ([`Self::fetch_envelope_bytes_for_peer`]) paths funnel
+    /// through here; a peer excluded from the listing cannot obtain an
+    /// attestation by Diff/Fetch-ing its hash out-of-band.
+    async fn resolve_attestation_recipient(&self, peer: &str) -> Option<ResolvedRecipient> {
+        let Some(local) = self.local_key_id.as_deref() else {
+            tracing::warn!(
+                peer,
+                "attestation plane withheld — no `local_key_id` to resolve the CIRISEdge#396 \
+                 consent send-set; wire ReplicationRuntimeConfig::local_key_id"
+            );
+            return None;
+        };
+        match ResolvedPeerSet::resolve(&*self.directory, local).await {
+            Ok(set) => {
+                let resolved = set.recipient(peer);
+                if resolved.is_none() {
+                    tracing::debug!(
+                        peer,
+                        "attestation plane withheld — recipient is not in this node's live \
+                         consent:replication send-set (CIRISEdge#396 item 1)"
+                    );
+                }
+                resolved
+            }
+            Err(e) => {
+                tracing::debug!(
+                    peer,
+                    error = %e,
+                    "attestation plane withheld — consent send-set unresolved (fail-closed)"
+                );
+                None
+            }
+        }
+    }
+
     async fn list_attestations(&self, recipient: Option<&str>) -> Vec<EnvelopeRef> {
         // CIRISEdge#397 §1+§2 — the scores/Attestation plane reads ONE bulk
         // `list_attestations_since(None, limit)` page per round. That surface is
@@ -1012,6 +1036,24 @@ impl FederationDirectoryReplicationBridge {
         // The wire hash is the BARE `Attestation`'s content-hash
         // ([`content_hash_of`]) — the exact bytes persist's `signed_wire_index`
         // keys on and its point-read serves; the plane no longer caches.
+        // CIRISEdge#396 item 1 — the consent-membership fan-out bound (the
+        // by-construction funnel; the Attestation plane is the ONLY consentable
+        // plane). Edge advertises attestations to a peer ONLY if persist's live
+        // consent projection includes it. Resolved once per sweep and
+        // re-resolved every sweep, so a between-round `withdraws`/`recants`
+        // takes effect at the next send (nuclear un-trust). `None` recipient =
+        // projection-only/local view (ungated; tests). A `Some(peer)` that does
+        // not resolve withholds the WHOLE plane (fail-closed). The resulting
+        // `ResolvedRecipient` (consent-membership proof) is what the per-record
+        // #379 + item-6 gates operate on — serving an unresolved peer is
+        // unrepresentable.
+        let resolved_recipient = match recipient {
+            None => None,
+            Some(peer) => match self.resolve_attestation_recipient(peer).await {
+                Some(resolved) => Some(resolved),
+                None => return Vec::new(),
+            },
+        };
         let self_set: HashSet<String> = self
             .self_provider
             .as_ref()
@@ -1046,10 +1088,13 @@ impl FederationDirectoryReplicationBridge {
             // untouched; a `None` recipient (projection-only view / tests)
             // is ungated — every production provider is peer-bound
             // (`DirectoryStateAdapter::with_peer`).
-            if let Some(peer) = recipient {
+            if let Some(peer) = resolved_recipient.as_ref() {
+                // The peer already cleared the item-1 consent-membership bound
+                // (it holds a `ResolvedRecipient`); these gates further narrow
+                // WHAT this consent-included peer receives.
                 if Self::attestation_requires_serve(&canonical_json) {
                     if serve_allowed.is_none() {
-                        serve_allowed = Some(self.peer_has_serve_capability(peer).await);
+                        serve_allowed = Some(self.peer_has_serve_capability(peer.as_str()).await);
                     }
                     if serve_allowed != Some(true) {
                         continue;
@@ -1059,7 +1104,11 @@ impl FederationDirectoryReplicationBridge {
                 // restrictions (any dimension a live grant covers, not just
                 // `trace:*`). Fail-open when the producer declared none.
                 if self
-                    .recipient_capability_withholds(&canonical_json, peer, &mut grant_cache)
+                    .recipient_capability_withholds(
+                        &canonical_json,
+                        peer.as_str(),
+                        &mut grant_cache,
+                    )
                     .await
                 {
                     continue;
@@ -1084,16 +1133,12 @@ impl FederationDirectoryReplicationBridge {
         // not cohort-only RELAY, so a revocation is never out-run by the stale
         // record it retracts even after the subject exits the cohort.
         self.fan_out_for_member(
-            EnvelopeKind::Revocation,
             self.subjects_for_projection(Projection::Global),
             |key_id| async move {
                 self.directory
                     .revocations_for(&key_id)
                     .await
                     .unwrap_or_default()
-            },
-            |row| SignedRevocation {
-                revocation: row.clone(),
             },
             |row| row.revoked_at,
             |row| row.persist_row_hash.as_str(),
@@ -1551,7 +1596,8 @@ mod tests {
     use chrono::Utc;
     use ciris_crypto::{ClassicalSigner as _, Ed25519Signer, MlDsa65Signer, PqcSigner as _};
     use ciris_persist::federation::types::{
-        algorithm, identity_type, Attestation, KeyRecord, SignedAttestation, SignedKeyRecord,
+        algorithm, identity_type, Attestation, KeyRecord, Revocation, SignedAttestation,
+        SignedKeyRecord,
     };
     use ciris_persist::store::MemoryBackend;
     use sha2::{Digest as _, Sha256};
@@ -1667,7 +1713,10 @@ mod tests {
     #[test]
     fn config_defaults_match_constants() {
         let c = BridgeConfig::default();
-        assert_eq!(c.cache_capacity, BridgeConfig::DEFAULT_CACHE_CAPACITY);
+        assert_eq!(
+            c.operational_page_limit,
+            BridgeConfig::DEFAULT_OPERATIONAL_PAGE_LIMIT
+        );
     }
 
     /// Bridge can be constructed with default config + an empty
@@ -2266,6 +2315,100 @@ mod tests {
         seed_raw_attestation(backend, &id, producer, recipient, "scores", envelope).await;
     }
 
+    /// Seed a bare `consent:replication:v1` grant (NO restrictions) by `granter`
+    /// naming `peer` — the minimum that puts `peer` in
+    /// `list_consent_peers(granter)` so it clears the CIRISEdge#396 item-1
+    /// membership bound WITHOUT a `recipient_capability` that would separately
+    /// trip item 6. Use when a test needs a peer to be consent-included but is
+    /// exercising a DIFFERENT gate.
+    async fn seed_consent_membership(backend: &MemoryBackend, granter: &str, peer: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": granter,
+            "attested_key_id": peer,
+            "attestation_type": "scores",
+            "dimension": "consent:replication:v1",
+            "payload": {
+                "grants": "transfer",
+                "attestation_prefixes": ["trace:"],
+            },
+        });
+        seed_raw_attestation(backend, &id, granter, peer, "scores", envelope).await;
+    }
+
+    /// Seed a hybrid-signed `Revocation` of `revoked` by `revoking` (both must
+    /// be registered keys). persist computes `persist_row_hash` on put — the
+    /// value the Revocation plane advertises + the cache-free fetch scan matches.
+    async fn seed_revocation(backend: &MemoryBackend, revoking: &str, revoked: &str) {
+        let now = Utc::now();
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "revocation_id": id,
+            "revoked_key_id": revoked,
+            "revoking_key_id": revoking,
+        });
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(revoking, &envelope);
+        let revocation = Revocation {
+            revocation_id: id,
+            revoked_key_id: revoked.to_string(),
+            revoking_key_id: revoking.to_string(),
+            reason: None,
+            revoked_at: now,
+            effective_at: now,
+            revocation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: revoking.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            observed_region: String::new(),
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_revocation(SignedRevocation { revocation })
+            .await
+            .expect("seed revocation");
+    }
+
+    /// CIRISEdge#396 item 3 — the Revocation plane (the one kind persist does
+    /// not content-hash-index) fetches with NO cache: `fetch_envelope_bytes`
+    /// re-derives the tombstone's bytes by scanning the same `Global` subject
+    /// set the advertise walked. A revocation advertised by `list_revocations`
+    /// must therefore fetch back byte-for-byte through the point-read surface.
+    #[tokio::test]
+    async fn revocation_fetch_is_cache_free_round_trip() {
+        let revoking = "revoker-node";
+        let revoked = "revoked-key";
+        // `revoked` must be in the cohort so the Global-projection scan reaches it.
+        let (backend, bridge) = make_bridge(&[revoking.to_string(), revoked.to_string()]);
+        for key_id in [revoking, revoked] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_revocation(&backend, revoking, revoked).await;
+
+        let refs = bridge.list_revocations().await;
+        assert!(!refs.is_empty(), "the seeded revocation is advertised");
+        for r in &refs {
+            let bytes = bridge
+                .fetch_envelope_bytes(EnvelopeKind::Revocation, &r.envelope_hash)
+                .await
+                .expect("cache-free revocation fetch resolves the advertised hash");
+            let parsed: SignedRevocation =
+                serde_json::from_slice(&bytes).expect("fetched bytes are a SignedRevocation");
+            assert_eq!(
+                parsed.revocation.revoked_key_id, revoked,
+                "the re-derived bytes are the advertised revocation"
+            );
+        }
+    }
+
     /// A `trace:complete:v1` row's canonical JSON in EXACTLY the shape
     /// `list_attestations` feeds the item-6 gate — `serde_json::to_value` over an
     /// `Attestation` ([[feedback_test_field_provenance]]: the gate reads
@@ -2385,6 +2528,115 @@ mod tests {
         );
     }
 
+    /// Seed a federation-tier `delegates_to` attestation the plane advertises —
+    /// no `trace:` dimension (so the #379 gate is inert) and no envelope
+    /// `dimension` at all (so no consent grant's `covers` can trip item 6),
+    /// leaving item 1 (consent membership) as the ONLY differentiator. Returns
+    /// the attestation id.
+    async fn seed_advertised_attestation(backend: &MemoryBackend, producer: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": producer,
+            "attested_key_id": producer,
+            "attestation_type": "delegates_to",
+            "scope": { "grant": ["infra:attest"] },
+        });
+        seed_raw_attestation(backend, &id, producer, producer, "delegates_to", envelope).await;
+        id
+    }
+
+    /// CIRISEdge#396 item 1 — the consent-membership fan-out bound. The
+    /// Attestation plane is served to a peer ONLY if persist's live consent
+    /// projection (`list_consent_peers`, E7) includes it. Asserted against the
+    /// actual advertise path: a consent-included peer receives the plane; a peer
+    /// absent from the send-set receives NOTHING (the whole plane withheld,
+    /// fail-closed) — the by-construction bound `resolved_state.rs` enforces.
+    #[tokio::test]
+    async fn consent_membership_fan_out_bound() {
+        let local = "this-node";
+        let producer = "agent-producer";
+        let peer_in = "peer-consented";
+        let peer_out = "peer-unconsented";
+        let (backend, bridge) = make_bridge(&[
+            local.to_string(),
+            producer.to_string(),
+            peer_in.to_string(),
+            peer_out.to_string(),
+        ]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        for key_id in [local, producer, peer_in, peer_out] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_advertised_attestation(&backend, producer).await;
+        // `local` consents to replicate to `peer_in` only (the grant names it →
+        // list_consent_peers(local) ∋ peer_in). Prefix "trace:" so the grant's
+        // own recipient_capability can never cover the dimensionless row above.
+        seed_consent_grant(&backend, local, peer_in, "trace:", "trace:read").await;
+
+        // Projection-only baseline (ungated) proves the row IS advertised.
+        let baseline = bridge.list_attestations(None).await;
+        assert!(
+            !baseline.is_empty(),
+            "the seeded federation attestation is advertised in the local view"
+        );
+
+        // (a) consent-INCLUDED peer → receives the advertised plane (item 1 passes).
+        let included = bridge.list_attestations(Some(peer_in)).await;
+        assert_eq!(
+            included.len(),
+            baseline.len(),
+            "a consent-included peer receives the advertised attestations"
+        );
+
+        // (b) consent-EXCLUDED peer → the WHOLE plane is withheld (item 1).
+        let excluded = bridge.list_attestations(Some(peer_out)).await;
+        assert!(
+            excluded.is_empty(),
+            "a peer absent from the consent send-set receives no attestations (CIRISEdge#396 item 1)"
+        );
+    }
+
+    /// CIRISEdge#396 item 1 — fail-closed when the send-set is unresolvable: a
+    /// bridge with no `local_key_id` cannot compute `list_consent_peers(local)`,
+    /// so it withholds the attestation plane from every peer rather than
+    /// serving unbounded (the #386 leg-B posture).
+    #[tokio::test]
+    async fn fan_out_fail_closed_without_local_key_id() {
+        let local = "this-node";
+        let producer = "agent-producer";
+        let peer = "peer-consented";
+        let (backend, bridge) =
+            make_bridge(&[local.to_string(), producer.to_string(), peer.to_string()]);
+        // NOTE: deliberately NO `with_local_key_id`.
+        for key_id in [local, producer, peer] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_advertised_attestation(&backend, producer).await;
+        seed_consent_grant(&backend, local, peer, "trace:", "trace:read").await;
+
+        // The row is advertised in the ungated view...
+        assert!(
+            !bridge.list_attestations(None).await.is_empty(),
+            "the row is advertised projection-only"
+        );
+        // ...but WITHOUT a local_key_id the peer-bound serve fails closed.
+        assert!(
+            bridge.list_attestations(Some(peer)).await.is_empty(),
+            "no local_key_id → consent send-set unresolvable → whole plane withheld (fail-closed)"
+        );
+    }
+
     /// The v13.10.0 gate this replaces was wrong TWICE, and this test is
     /// written against the inputs the FIELD produces so it cannot be wrong the
     /// same way again ([[feedback_test_field_provenance]] in anger):
@@ -2493,6 +2745,15 @@ mod tests {
             &serde_json::json!(["infra:serve"]),
         )
         .await;
+
+        // CIRISEdge#396 item 1 — this test isolates the #386 per-ROW infra:serve
+        // gate, so every peer it probes must first clear the per-PEER consent
+        // membership bound: `local` consents to replicate to each (a bare grant,
+        // no `recipient_capability`, so item 6 stays inert here). Without this,
+        // item 1 would blanket-withhold the whole plane and mask the per-row gate.
+        for peer in [self_asserted_peer, trusted_peer, plain_peer] {
+            seed_consent_membership(&backend, local, peer).await;
+        }
 
         // A trace scores-attestation (self-subject, federation tier =
         // promoted) + a NON-trace attestation for the control.
@@ -2747,43 +3008,6 @@ mod tests {
                 .is_none(),
             "un-trust closes the fetch path too, not just the listing"
         );
-    }
-
-    // ── Cache eviction ──────────────────────────────────────────────
-
-    /// The BridgeCache evicts FIFO at capacity. Tuned-small instance
-    /// for a fast test.
-    #[test]
-    fn cache_evicts_oldest_at_capacity() {
-        let mut cache = BridgeCache::with_capacity(2);
-        let h1 = [1u8; 32];
-        let h2 = [2u8; 32];
-        let h3 = [3u8; 32];
-        cache.insert(EnvelopeKind::Key, h1, b"v1".to_vec());
-        cache.insert(EnvelopeKind::Key, h2, b"v2".to_vec());
-        assert_eq!(cache.len(), 2);
-        cache.insert(EnvelopeKind::Key, h3, b"v3".to_vec());
-        assert_eq!(cache.len(), 2);
-        // h1 evicted (FIFO); h2 + h3 remain.
-        assert!(cache.get(EnvelopeKind::Key, &h1).is_none());
-        assert!(cache.get(EnvelopeKind::Key, &h2).is_some());
-        assert!(cache.get(EnvelopeKind::Key, &h3).is_some());
-    }
-
-    /// Cache insert is a no-op on duplicate hash (FIFO order
-    /// preserved, no double-eviction).
-    #[test]
-    fn cache_duplicate_insert_is_noop() {
-        let mut cache = BridgeCache::with_capacity(2);
-        let h1 = [1u8; 32];
-        let h2 = [2u8; 32];
-        cache.insert(EnvelopeKind::Key, h1, b"v1".to_vec());
-        cache.insert(EnvelopeKind::Key, h1, b"v1-again".to_vec()); // dup
-        cache.insert(EnvelopeKind::Key, h2, b"v2".to_vec());
-        // h1 still present (dup didn't push it out of FIFO order).
-        assert!(cache.get(EnvelopeKind::Key, &h1).is_some());
-        // The value is the FIRST inserted (no overwrite on dup).
-        assert_eq!(cache.get(EnvelopeKind::Key, &h1).unwrap(), b"v1");
     }
 
     // ── v2 operational-data (FSD §5.2 / CEG 1.0-RC2 §5.6.8.13) ──────

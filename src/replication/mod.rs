@@ -121,6 +121,7 @@ pub mod coordinator;
 pub mod directory;
 pub mod protocol;
 pub mod registry;
+pub mod resolved_state;
 pub mod runtime;
 pub mod scheduler;
 pub mod serve_policy;
