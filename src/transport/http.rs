@@ -601,7 +601,10 @@ async fn inbound_handler(
     // tracked in #120 § HTTPS.
     let source_key_id = if let Some(auth) = state.bearer_auth.as_ref() {
         match verify_bearer_token(headers, auth).await {
-            Ok(kid) => Some(kid),
+            // #393 — the bearer token is the channel's own attribution proof;
+            // wrap it as `transport_authenticated` (not the Reticulum rooting
+            // graph, so the E3 announce-spoof class does not apply here).
+            Ok(kid) => Some(crate::transport::SourceKeyId::transport_authenticated(kid)),
             Err(rej) => {
                 tracing::warn!(reason = %rej, "HTTPS bearer-token rejected");
                 return (StatusCode::UNAUTHORIZED, rej).into_response();

@@ -944,6 +944,16 @@ struct RootedPeer {
     /// unreachable). `[0u8; 16]` for a test-injected peer whose x25519 half is
     /// unavailable (never matches a real identity hash).
     transport_identity_hash: [u8; 16],
+    /// CIRISEdge#393 (E3) — did this binding PROVE control of the federation key
+    /// the directory binds to `key_id`? Captured at admit from the announce
+    /// verdict (`Confirmed ⇒ true`; an Advisory admit ⇒ true only when the
+    /// rejection was neither `UnknownKeyId` nor `PubkeyMismatch`, i.e. the pubkey
+    /// matched and the self-signature verified). This is the load-bearing signal
+    /// — alongside `provenance == Rooted` — that
+    /// [`crate::transport::SourceKeyId::from_rooted_binding`] gates trace-serve
+    /// attribution on: an Advisory or non-owning binding is never attributed, so
+    /// it can never be served a peer's `trace:*` corpus.
+    owns_key: bool,
 }
 
 // ─── Configuration ──────────────────────────────────────────────────
@@ -2312,6 +2322,9 @@ impl ReticulumTransport {
                 // never matches a real link identity (explicit-hash test peers
                 // are attributed by dest-hash, not this path).
                 transport_identity_hash: [0u8; 16],
+                // #393 — an operator-primed binding asserts key ownership (the
+                // operator baked it, e.g. the canonical), so it is attributable.
+                owns_key: true,
             },
         );
     }
@@ -2347,6 +2360,9 @@ impl ReticulumTransport {
                 chain: None,
                 provenance: ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
                 transport_identity_hash,
+                // #393 — full-identity test injector simulates an announce-rooted
+                // owning peer (the precondition #340 attribution needs).
+                owns_key: true,
             },
         );
     }
@@ -4091,7 +4107,15 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             .await
             .insert(link_id, now_secs);
     }
-    let mut source_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    // CIRISEdge#393 (E3) — resolve the candidate peer key_id for this link, then
+    // gate it through `SourceKeyId::from_rooted_binding`: attribution survives
+    // ONLY for a `Rooted ∧ owns_key` peer. An Advisory or non-owning binding —
+    // the announce-spoof vector (an attacker announcing a serve-capable victim's
+    // key_id under its own transport identity) — yields `None`, so the frame is
+    // delivered unattributed and dropped downstream (`SkippedNoSourceKeyId`),
+    // never reaching `peer_has_serve_capability`. Both attribution bases are
+    // gated identically (the #348 "two loops must never diverge" lesson).
+    let candidate_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
     // CIRISEdge#353 — INITIATOR-side attribution. `link_to_peer_key_id` is fed by
     // `LinkIdentified`, which only fires on links a PEER dialed to us; a reply
     // arriving on a link WE dialed (the reverse path a NAT'd peer's responder
@@ -4099,25 +4123,90 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // DESTINATION (leviculum `link_destination`): we dialed a dest resolved from
     // the VERIFIED route table, and RNS establishment proves the remote controls
     // that dest's keys — same trust the outbound send used.
-    if source_key_id.is_none() {
-        if let Some(dest) = ctx.node.link_destination(&link_id) {
-            source_key_id = ctx
-                .peers
-                .lock()
-                .await
-                .iter()
-                .find(|(_, rooted)| rooted.peer.dest_hash == dest)
-                .map(|(key_id, _)| key_id.clone());
-            if let Some(key_id) = &source_key_id {
+    let candidate_key_id = if candidate_key_id.is_some() {
+        candidate_key_id
+    } else if let Some(dest) = ctx.node.link_destination(&link_id) {
+        let via_dest = ctx
+            .peers
+            .lock()
+            .await
+            .iter()
+            .find(|(_, rooted)| rooted.peer.dest_hash == dest)
+            .map(|(key_id, _)| key_id.clone());
+        if let Some(key_id) = &via_dest {
+            tracing::debug!(
+                link = ?link_id,
+                peer = %key_id,
+                "inbound frame on a link WE dialed attributed via its destination \
+                 (initiator-side reverse path, CIRISEdge#353)"
+            );
+        }
+        via_dest
+    } else {
+        None
+    };
+    // Gate (CIRISEdge#393): admit the attribution only if the candidate's binding
+    // is `Rooted ∧ owns_key` (item 1) AND its transport identity is bound by a
+    // hybrid-verified `SignedTransportDestination` (item 2, the PQ half). Any
+    // shortfall → `None` (SkippedNoSourceKeyId downstream, never served).
+    let source_key_id = match candidate_key_id {
+        Some(key_id) => {
+            // Item 1 — Rooted ∧ owns_key, plus capture the peer's dest for the
+            // item-2 lookup. `dest` is `None` when the peer isn't in the map.
+            let (item1, dest) = {
+                let peers = ctx.peers.lock().await;
+                match peers.get(&key_id) {
+                    Some(rooted) => (
+                        crate::transport::SourceKeyId::from_rooted_binding(
+                            key_id.clone(),
+                            rooted.provenance,
+                            rooted.owns_key,
+                        ),
+                        Some(rooted.peer.dest_hash.into_bytes()),
+                    ),
+                    None => (None, None),
+                }
+            };
+            // Item 2 — the PQ transport binding. Fail-closed without a rooting
+            // directory (can't prove the hybrid route ⇒ not attributable).
+            let gated = match (item1, dest, ctx.rooting) {
+                (Some(sid), Some(d), Some(rooting)) => {
+                    if rooting.hybrid_transport_binding_exists(&key_id, d).await {
+                        Some(sid)
+                    } else {
+                        tracing::debug!(
+                            link = ?link_id,
+                            peer = %key_id,
+                            "inbound frame NOT attributed — no hybrid-verified \
+                             TransportDestination binds this transport identity (PQ \
+                             attribution gate, CIRISEdge#393 item 2)"
+                        );
+                        None
+                    }
+                }
+                (Some(_), _, None) => {
+                    tracing::debug!(
+                        link = ?link_id,
+                        peer = %key_id,
+                        "inbound frame NOT attributed — no rooting directory to verify \
+                         the hybrid transport binding (fail-closed, CIRISEdge#393 item 2)"
+                    );
+                    None
+                }
+                _ => None,
+            };
+            if gated.is_none() {
                 tracing::debug!(
                     link = ?link_id,
                     peer = %key_id,
-                    "inbound frame on a link WE dialed attributed via its destination \
-                     (initiator-side reverse path, CIRISEdge#353)"
+                    "inbound frame NOT attributed — binding is not Rooted∧owns_key∧hybrid \
+                     (advisory/spoof/PQ-resistant serve gate, CIRISEdge#393)"
                 );
             }
+            gated
         }
-    }
+        None => None,
+    };
     let frame = InboundFrame {
         envelope_bytes: data,
         transport: TransportId::RETICULUM_RS,
@@ -5096,6 +5185,10 @@ async fn resolve_announce_cold_start(
                         chain: chain_opt,
                         provenance,
                         transport_identity_hash,
+                        // #393 — captured from the admit verdict (destructured at
+                        // the `match verdict` above): Confirmed ⇒ true; Advisory ⇒
+                        // true only when the pubkey matched + self-sig verified.
+                        owns_key,
                     },
                 );
                 Some(persisted_key)

@@ -41,9 +41,11 @@ pub const WELCOME_WRAP_INFO: &[u8] = b"ciris-edge/scope-privacy/welcome-wrap/v1"
 /// Edge ships the four-tuple `(hpke_sealed, inviter_signature,
 /// inviter_pk_id, inviter_pk_bytes)`. The recipient resolves the
 /// inviter's ML-DSA-65 public key from a directory keyed by
-/// `inviter_pk_id` (and falls back to the inline `inviter_pk_bytes`
-/// when the directory has not seen the key yet, with the directory's
-/// trust gate then applied at admission time).
+/// `inviter_pk_id`. CIRISEdge#331 (E8) — the inline `inviter_pk_bytes`
+/// is NO LONGER a verification input: a directory miss is `InviterUnknown`,
+/// never a fall-through to the sender-supplied inline key (self-certifying
+/// TOFU). The field is retained for wire parity / diagnostics only and MUST
+/// NOT be trusted.
 #[derive(Debug, Clone)]
 pub struct WrappedWelcome {
     /// HPKE seal of the inner MLS Welcome bytes under the invitee's
@@ -56,9 +58,10 @@ pub struct WrappedWelcome {
     /// scoped: a fingerprint, key_id, or federation_id — edge does
     /// not interpret).
     pub inviter_pk_id: String,
-    /// Inviter's ML-DSA-65 public key bytes (the
-    /// `EncodedVerifyingKey<MlDsa65>` form, as returned by
-    /// [`PqcSigner::public_key`]).
+    /// Inviter's ML-DSA-65 public key bytes, as returned by
+    /// [`PqcSigner::public_key`]. CIRISEdge#331 — sender-supplied and NOT a
+    /// verification input; the joiner verifies only against the
+    /// directory-resolved key. Retained for wire parity / diagnostics.
     pub inviter_pk_bytes: Vec<u8>,
 }
 
@@ -131,12 +134,9 @@ pub fn wrap_welcome(
 /// supplies a closure that resolves `pk_id → bytes`; this struct is
 /// the minimal hand-off shape.
 ///
-/// `verify_inline_match` controls fallback policy when the directory
-/// returns `None` for `pk_id`:
-/// - `true` (default for v6.0.0) — fall back to the inline
-///   `inviter_pk_bytes` carried on the wrap.
-/// - `false` — refuse the unwrap with
-///   [`WelcomeWrapError::InviterUnknown`].
+/// CIRISEdge#331 (E8) — resolution is the SOLE trust input: when the
+/// closure returns `None` for `pk_id`, [`unwrap_welcome`] fails closed with
+/// [`WelcomeWrapError::InviterUnknown`] (no inline fallback).
 #[derive(Debug, Clone)]
 pub struct FederationDirectoryEntry {
     /// Inviter's federation identifier (key_id, fingerprint, or
@@ -154,14 +154,16 @@ pub struct FederationDirectoryEntry {
 /// §3.3 Welcome unwrap. Verifies the inviter signature on
 /// [`hpke::encap_signing_bytes`] FIRST, then runs HPKE `open_base`.
 ///
-/// `directory_lookup` resolves the inviter's ML-DSA-65 public key
-/// from `inviter_pk_id`; when it returns `None`, the function falls
-/// back to the inline `wrapped.inviter_pk_bytes` (v6.0.0 behaviour —
-/// the cached-directory + TOFU posture; a directory-required mode
-/// flips at the caller's discretion).
+/// `directory_lookup` resolves the inviter's ML-DSA-65 public key from
+/// `inviter_pk_id`. CIRISEdge#331 (E8) — DIRECTORY-RESOLVED ONLY: a `None`
+/// (directory miss) fails closed with [`WelcomeWrapError::InviterUnknown`],
+/// never falling back to the sender-supplied inline key. The joiner verifies
+/// the inviter signature over [`hpke::encap_signing_bytes`] against the
+/// directory-resolved key FIRST, then runs HPKE `open_base`.
 ///
 /// # Errors
 ///
+/// - Inviter not directory-resolvable → [`WelcomeWrapError::InviterUnknown`]
 /// - Signature verify fail → [`WelcomeWrapError::SignatureRejected`]
 /// - HPKE open fail → [`WelcomeWrapError::Crypto`]
 pub fn unwrap_welcome<F>(
@@ -173,11 +175,22 @@ pub fn unwrap_welcome<F>(
 where
     F: FnMut(&str) -> Option<FederationDirectoryEntry>,
 {
-    // Resolve the inviter's public key. Directory wins; inline is
-    // the v6.0.0 TOFU fallback.
+    // CIRISEdge#331 (E8) — the inviter key is DIRECTORY-RESOLVED ONLY. A
+    // directory MISS is `InviterUnknown`, NOT a fall-through to the
+    // sender-supplied inline `inviter_pk_bytes`. The old TOFU fallback was
+    // self-certifying: an attacker signs `encap_signing_bytes` with its OWN
+    // ML-DSA key, ships that key inline, and the signature verifies against it →
+    // the Welcome is accepted and the joiner cannot tell WHO actually invited it
+    // (exactly the property the X-Wing-unavailable HPKE `mode_auth` would have
+    // given, per CC 5.4.4). Fail closed: an inviter the local directory can't
+    // resolve is refused, never trusted on its own say-so.
     let inviter_pk_bytes: Vec<u8> = match directory_lookup(&wrapped.inviter_pk_id) {
         Some(entry) => entry.ml_dsa_pk,
-        None => wrapped.inviter_pk_bytes.clone(),
+        None => {
+            return Err(WelcomeWrapError::InviterUnknown(
+                wrapped.inviter_pk_id.clone(),
+            ))
+        }
     };
 
     // §3.3 PRECONDITION — verify the signature before open_base.
@@ -218,6 +231,19 @@ mod tests {
         (pk, sk)
     }
 
+    /// A directory lookup that resolves ANY `pk_id` to `inviter`'s registered
+    /// ML-DSA key — the directory-resolved path CIRISEdge#331 now requires.
+    fn directory_of(inviter: &MlDsa65Signer) -> impl Fn(&str) -> Option<FederationDirectoryEntry> {
+        let pk = inviter.public_key().unwrap();
+        move |id: &str| {
+            Some(FederationDirectoryEntry {
+                pk_id: id.to_string(),
+                ml_dsa_pk: pk.clone(),
+                x_wing_pk: None,
+            })
+        }
+    }
+
     #[test]
     fn wrap_then_unwrap_recovers_welcome_bytes() {
         let inviter = MlDsa65Signer::new().unwrap();
@@ -226,9 +252,37 @@ mod tests {
         let wrapped =
             wrap_welcome(&inviter, "inviter-key-1", &invitee_pk, welcome, b"group-42").unwrap();
 
-        // Directory has no entry — falls through to inline pk.
-        let opened = unwrap_welcome(&invitee_sk, &wrapped, b"group-42", |_| None).unwrap();
+        // CIRISEdge#331 — directory-resolved (no inline TOFU): the joiner
+        // resolves the inviter's registered ML-DSA key.
+        let opened =
+            unwrap_welcome(&invitee_sk, &wrapped, b"group-42", directory_of(&inviter)).unwrap();
         assert_eq!(opened, welcome);
+    }
+
+    /// CIRISEdge#331 (E8) acceptance — a Welcome whose inviter the local
+    /// directory cannot resolve is REFUSED (`InviterUnknown`), NOT accepted via
+    /// the old sender-supplied inline key. Closes the self-certifying TOFU: the
+    /// attacker signs the encap with its OWN ML-DSA key and ships that key
+    /// inline, but a directory miss now fails closed. (Against the pre-#331 code
+    /// this returned `Ok` — the vuln.)
+    #[test]
+    fn unknown_inviter_on_directory_miss_is_rejected_not_tofu_accepted() {
+        let attacker = MlDsa65Signer::new().unwrap();
+        let (invitee_pk, invitee_sk) = fresh_invitee();
+        let wrapped = wrap_welcome(
+            &attacker,
+            "unknown-inviter",
+            &invitee_pk,
+            b"hostile welcome",
+            b"",
+        )
+        .unwrap();
+        let err = unwrap_welcome(&invitee_sk, &wrapped, b"", |_| None).unwrap_err();
+        assert!(
+            matches!(err, WelcomeWrapError::InviterUnknown(ref id) if id == "unknown-inviter"),
+            "a directory-unresolvable inviter must be InviterUnknown, never TOFU-accepted \
+             via the inline pk (CIRISEdge#331)",
+        );
     }
 
     #[test]
@@ -262,7 +316,7 @@ mod tests {
         let mut wrapped = wrap_welcome(&inviter, "inv-x", &invitee_pk, welcome, b"").unwrap();
         // Flip a byte of the signature.
         wrapped.inviter_signature[0] ^= 0x01;
-        let err = unwrap_welcome(&invitee_sk, &wrapped, b"", |_| None).unwrap_err();
+        let err = unwrap_welcome(&invitee_sk, &wrapped, b"", directory_of(&inviter)).unwrap_err();
         assert!(matches!(err, WelcomeWrapError::SignatureRejected));
     }
 
@@ -303,7 +357,7 @@ mod tests {
                 &wrapped.hpke_sealed.encapsulation,
             ))
             .unwrap();
-        let err = unwrap_welcome(&invitee_sk, &wrapped, b"", |_| None).unwrap_err();
+        let err = unwrap_welcome(&invitee_sk, &wrapped, b"", directory_of(&inviter)).unwrap_err();
         assert!(matches!(err, WelcomeWrapError::Crypto(_)));
     }
 
@@ -317,7 +371,8 @@ mod tests {
         // Verify-side uses a different aad → AEAD open fails. The
         // signature is fine (it covers encap bytes, not aad), so the
         // failure surfaces as a CryptoError from open_base.
-        let err = unwrap_welcome(&invitee_sk, &wrapped, b"aad-2", |_| None).unwrap_err();
+        let err =
+            unwrap_welcome(&invitee_sk, &wrapped, b"aad-2", directory_of(&inviter)).unwrap_err();
         assert!(matches!(err, WelcomeWrapError::Crypto(_)));
     }
 

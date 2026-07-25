@@ -246,6 +246,104 @@ pub enum TransportError {
     },
 }
 
+/// CIRISEdge#393 (E3) — a transport-attributed source `key_id` that is
+/// TYPE-GUARANTEED to come from an attribution its transport can vouch for. The
+/// inner `String` is private, so a `SourceKeyId` is unconstructible except
+/// through one of the vetted constructors below — a code path cannot fabricate
+/// an attribution, only obtain one a transport actually proved.
+///
+/// This closes the E3 hole: the Reticulum attribution derived `source_key_id`
+/// from a link↔`RootedPeer` match with NO `provenance`/`owns_key` check, so an
+/// Advisory or non-key-owning binding (an attacker announcing a serve-capable
+/// victim's `key_id` under its own transport identity, `owns_key=false`) was
+/// attributed as the victim → `peer_has_serve_capability(victim)` → the attacker
+/// was served the victim's `trace:*` corpus. Now the Reticulum constructor
+/// ([`Self::from_rooted_binding`]) yields `Some` ONLY for a `Rooted ∧ owns_key`
+/// binding; everything else is `None`, so the frame carries no attribution and
+/// the replication router drops it (`SkippedNoSourceKeyId`) before the serve
+/// gate is ever consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceKeyId(String);
+
+impl SourceKeyId {
+    /// Reticulum attribution gate. `Some` iff the peer binding is BOTH
+    /// directory-`Rooted` AND proved control of the federation key
+    /// (`owns_key`) — the two signals that separate an authenticated owner from
+    /// a self-consistent Advisory hint or an outright announce-spoof. Any other
+    /// provenance/ownership → `None` (the frame is left unattributed and dropped
+    /// downstream, never served).
+    #[must_use]
+    pub fn from_rooted_binding(
+        key_id: impl Into<String>,
+        provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+        owns_key: bool,
+    ) -> Option<Self> {
+        use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+        (matches!(provenance, Rooted) && owns_key).then(|| SourceKeyId(key_id.into()))
+    }
+
+    /// Attribution from a transport whose CHANNEL itself authenticates the peer
+    /// — HTTPS mTLS / bearer-decoded identity, packet-radio's addressed frame,
+    /// or an FFI caller supplying an already-verified id. NOT the Reticulum
+    /// rooting graph; these transports vouch by their own means, so the E3
+    /// announce-spoof class does not apply to them.
+    #[must_use]
+    pub fn transport_authenticated(key_id: impl Into<String>) -> Self {
+        SourceKeyId(key_id.into())
+    }
+
+    /// The attributed federation `key_id`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume into the inner `key_id` string.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+#[cfg(test)]
+mod source_key_id_tests {
+    use super::SourceKeyId;
+    use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+
+    /// CIRISEdge#393 (E3) — the attribution gate truth table, tested against the
+    /// EXACT inputs the admit path produces (`BindingProvenance` × `owns_key`),
+    /// not convenient ones. The one admitting case is `Rooted ∧ owns_key`; the
+    /// three refusing cases are each a real field/attack shape:
+    ///   - `Rooted ∧ ¬owns_key`   — cannot occur post-admit, but the type must
+    ///     still refuse it (defense in depth against a future admit bug).
+    ///   - `Advisory ∧ owns_key`  — the fresh-federation owner not steward-rooted
+    ///     HERE; §4.3 refuses it for trace attribution by design.
+    ///   - `Advisory ∧ ¬owns_key` — THE ATTACK: an attacker announcing a
+    ///     serve-capable victim's key_id under its own pubkey (PubkeyMismatch ⇒
+    ///     owns_key=false). Refusing it is what closes E3.
+    #[test]
+    fn from_rooted_binding_admits_only_rooted_and_owns_key() {
+        assert_eq!(
+            SourceKeyId::from_rooted_binding("victim", Rooted, true).map(SourceKeyId::into_string),
+            Some("victim".to_string()),
+            "Rooted ∧ owns_key is the sole attributable binding",
+        );
+        assert!(
+            SourceKeyId::from_rooted_binding("victim", Rooted, false).is_none(),
+            "Rooted but non-owning must never attribute",
+        );
+        assert!(
+            SourceKeyId::from_rooted_binding("victim", Advisory, true).is_none(),
+            "an Advisory (not-steward-rooted-here) owner is not attributable for trace (§4.3)",
+        );
+        assert!(
+            SourceKeyId::from_rooted_binding("victim", Advisory, false).is_none(),
+            "THE ATTACK — advisory admit of a victim's key_id under the attacker's own \
+             pubkey (owns_key=false) — is refused (CIRISEdge#393 E3)",
+        );
+    }
+}
+
 /// One inbound frame from a transport — raw envelope bytes plus the
 /// transport-level metadata that survives across the verify pipeline.
 #[derive(Debug)]
@@ -272,7 +370,12 @@ pub struct InboundFrame {
     /// Transports that don't yet populate this field set `None`;
     /// per-transport attribution lands as separate cuts (Reticulum
     /// link-rooted lookup, HTTPS mTLS surfacing).
-    pub source_key_id: Option<String>,
+    ///
+    /// CIRISEdge#393 (E3) — now a [`SourceKeyId`], not a bare `String`: the type
+    /// guarantees every attribution came from a vetted transport constructor
+    /// (Reticulum `Rooted ∧ owns_key`, or a channel-authenticated transport),
+    /// so a spoofed/advisory attribution is unrepresentable at this boundary.
+    pub source_key_id: Option<SourceKeyId>,
 }
 
 /// The trait every transport implements. Edge holds a
