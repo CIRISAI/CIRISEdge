@@ -123,6 +123,7 @@ pub mod protocol;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;
+pub mod serve_policy;
 pub mod session;
 pub mod storage_contention;
 pub mod summary;

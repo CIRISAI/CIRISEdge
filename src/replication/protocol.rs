@@ -157,6 +157,50 @@ pub enum EnvelopeKind {
 }
 
 impl EnvelopeKind {
+    /// All 14 replicated wire kinds, in declaration order. Mirrors persist's
+    /// `replication_policy::EnvelopeKind::ALL` (same 14 names/order, pinned by
+    /// `REPLICATION_POLICY_HASH`). Basis for the serve/advertise manifest
+    /// (CIRISEdge#393 item 3).
+    pub const ALL: [EnvelopeKind; 14] = [
+        Self::Key,
+        Self::Attestation,
+        Self::Revocation,
+        Self::IdentityOccurrence,
+        Self::Family,
+        Self::Community,
+        Self::IdentityOccurrenceRevocation,
+        Self::FamilyMembershipRevocation,
+        Self::CommunityMembershipRevocation,
+        Self::LocationProof,
+        Self::Organization,
+        Self::OrgMembership,
+        Self::PartnerRecord,
+        Self::TransportDestination,
+    ];
+
+    /// Stable snake_case wire name for this kind — the manifest/witness key
+    /// (CIRISEdge#393 item 3). Stable across releases; a rename is a wire-policy
+    /// change that must flip `SERVE_ADVERTISE_POLICY_HASH`.
+    #[must_use]
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Attestation => "attestation",
+            Self::Revocation => "revocation",
+            Self::IdentityOccurrence => "identity_occurrence",
+            Self::Family => "family",
+            Self::Community => "community",
+            Self::IdentityOccurrenceRevocation => "identity_occurrence_revocation",
+            Self::FamilyMembershipRevocation => "family_membership_revocation",
+            Self::CommunityMembershipRevocation => "community_membership_revocation",
+            Self::LocationProof => "location_proof",
+            Self::Organization => "organization",
+            Self::OrgMembership => "org_membership",
+            Self::PartnerRecord => "partner_record",
+            Self::TransportDestination => "transport_destination",
+        }
+    }
+
     /// The minimum [`crate::replication::wire_frame::WIRE_PROTOCOL_VERSION`]
     /// at which this kind can be exchanged on the wire.
     ///
