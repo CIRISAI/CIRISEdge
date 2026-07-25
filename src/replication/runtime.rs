@@ -89,6 +89,18 @@ const RESPONDER_REPLY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// registered the Responder but never ran the drive loop. Spawned ONCE per
 /// (peer, kind) — `get_or_register_with` invokes the factory only on first
 /// insert. Every terminal / error path logs; there is no silent discard.
+/// CIRISEdge#397 — bring persist's `signed_wire_index` (V111) current so the
+/// content-hash point-read fetch resolves pre-existing rows. Run ONCE at
+/// startup: idempotent, and fail-soft — a backend that doesn't implement the
+/// rebuild errors (fine; that backend's fetch stays on the local cache path),
+/// and every subsequent signed put keeps the index current via persist's
+/// per-write hook.
+async fn rebuild_signed_wire_index_fail_soft(directory: &Arc<dyn FederationDirectory>) {
+    if let Ok(n) = directory.rebuild_signed_wire_index().await {
+        tracing::info!(indexed = n, "rebuilt signed_wire_index (CIRISEdge#397)");
+    }
+}
+
 fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
     tokio::spawn(async move {
         let peer = coord.peer_key_id().to_string();
@@ -331,6 +343,10 @@ impl ReplicationRuntime {
         // complete without a return-path Diff). Capture before `self_provider` is
         // moved into the bridge.
         let proactive_publish = self_provider.is_some();
+
+        // CIRISEdge#397 — bring persist's signed_wire_index current for the
+        // content-hash point-read fetch (once, idempotent, fail-soft).
+        rebuild_signed_wire_index_fail_soft(&directory).await;
 
         let bridge = Arc::new(
             FederationDirectoryReplicationBridge::with_config(

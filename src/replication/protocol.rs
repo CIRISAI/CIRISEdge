@@ -201,6 +201,33 @@ impl EnvelopeKind {
         }
     }
 
+    /// CIRISEdge#397 / persist v21.2.0 (#507) — the `kind` token persist's
+    /// `signed_wire_index` keys on for this kind's content-hash point-read
+    /// ([`ciris_persist::federation::FederationDirectory::lookup_signed_record_by_content_hash`]).
+    /// This is persist's `replication_policy::EnvelopeKind::as_str` PascalCase
+    /// token (`"Key"`, `"Attestation"`, …) — NOT [`Self::as_wire_str`]'s
+    /// snake_case. `None` for [`Self::Revocation`], the ONE kind persist
+    /// deliberately does not index (its fetch stays on the local cache).
+    #[must_use]
+    pub fn persist_index_kind(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Key => "Key",
+            Self::Attestation => "Attestation",
+            Self::Revocation => return None,
+            Self::IdentityOccurrence => "IdentityOccurrence",
+            Self::Family => "Family",
+            Self::Community => "Community",
+            Self::IdentityOccurrenceRevocation => "IdentityOccurrenceRevocation",
+            Self::FamilyMembershipRevocation => "FamilyMembershipRevocation",
+            Self::CommunityMembershipRevocation => "CommunityMembershipRevocation",
+            Self::LocationProof => "LocationProof",
+            Self::Organization => "Organization",
+            Self::OrgMembership => "OrgMembership",
+            Self::PartnerRecord => "PartnerRecord",
+            Self::TransportDestination => "TransportDestination",
+        })
+    }
+
     /// The minimum [`crate::replication::wire_frame::WIRE_PROTOCOL_VERSION`]
     /// at which this kind can be exchanged on the wire.
     ///

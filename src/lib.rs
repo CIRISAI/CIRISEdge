@@ -161,6 +161,35 @@ mod replication_policy_hash_tests {
     }
 }
 
+/// CIRISEdge#397 / persist v21.2.0 (CIRISPersist#510 P1) — the closed consent
+/// grammar's cross-repo drift witness. persist validates every
+/// `consent:replication:v1` grant against an exhaustive, fail-closed grammar
+/// (the 14 kinds, `strip_field` signed-post-transform) and exports it as
+/// [`ciris_persist::federation::consent_grammar::CONSENT_GRAMMAR_HASH`]. Edge
+/// pins it now so that when edge later implements serve-side
+/// `recipient_capability` enforcement (#396 item 6), the op vocabulary is drawn
+/// from a manifest whose drift is a BUILD failure first, a behavior change
+/// second — the same posture as [`PERSIST_REPLICATION_POLICY_HASH`].
+pub const PERSIST_CONSENT_GRAMMAR_HASH: &str =
+    "2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05";
+
+#[cfg(test)]
+mod consent_grammar_hash_tests {
+    /// Pins persist's `CONSENT_GRAMMAR_HASH` from the linked crate. A mismatch
+    /// is a consent-grammar change persist made that edge's (future) serve-side
+    /// capability enforcement must be re-reviewed against — never a silent skew.
+    #[test]
+    fn persist_consent_grammar_hash_pinned() {
+        assert_eq!(
+            ciris_persist::federation::consent_grammar::CONSENT_GRAMMAR_HASH,
+            super::PERSIST_CONSENT_GRAMMAR_HASH,
+            "persist's CONSENT_GRAMMAR_HASH changed — the closed consent grammar moved. \
+             Re-review edge's consent handling (and the future #396 capability \
+             enforcement), then re-pin deliberately (CIRISEdge#397 §5)."
+        );
+    }
+}
+
 pub use blob_swarm::{
     BlobChunkSource, BlobChunkVerifier, ChunkManifestLite, ChunkSourceRefusal, ChunkVerifyError,
     PeerState, SwarmConfig, SwarmError, SwarmScheduler,

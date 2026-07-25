@@ -19,46 +19,28 @@
 //!   federation key_ids we want to anti-entropy with. Each round
 //!   re-invokes it, so peer-set evolution is observable without
 //!   restart.
-//! - **Hash→bytes cache** — populated as a side effect of
-//!   [`Self::list_envelope_refs`]; consulted by
-//!   [`Self::fetch_envelope_bytes`]. Closes the persist substrate gap
-//!   that there is no `lookup_*_by_content_hash` point-read. v1 ships
-//!   bounded FIFO eviction at 4096 entries.
+//! - **Hash→bytes cache** — bounded FIFO (4096 entries). Since
+//!   CIRISEdge#397 it is populated + consulted ONLY for the `Revocation`
+//!   plane (the one kind persist does not index); every other plane's
+//!   fetch is the content-hash point-read below.
 //!
-//! ## Why no `ReadEngine` dependency in v1
+//! ## envelope_hash semantics — content-hash (CIRISEdge#397)
 //!
-//! Persist's `ReadEngine` bulk surface (`list_federation_keys` /
-//! `list_attestations` / `list_revocations`) uses native `async fn`
-//! (RPITIT), which makes the trait **not dyn-compatible**. Using it
-//! would require either a generic type parameter on the bridge or an
-//! `async-trait` adapter shim. Neither is hard, but neither is needed
-//! for v1: the cohort-keyed `list_*_for` paths on `FederationDirectory`
-//! cover every kind, scale O(cohort_size × records_per_key) per round,
-//! and operator-configured peer sets are small enough that this cost
-//! is negligible. A v1.x optimization can swap in `ReadEngine` for
-//! Key / Attestation / Revocation behind a generic param.
+//! The envelope identity is each row's **content-hash**:
+//! `sha256(serde_json::to_vec(row))` ([`content_hash_of`]), byte-exact
+//! with persist's `wire_index::content_hash_of`. The `row` is whatever
+//! element type the corresponding `list_signed_*_since` /
+//! `list_attestations_since` bulk read returns (the `Signed*` wrapper for
+//! most planes; the BARE `Attestation` / `Organization` / `OrgMembership`
+//! for the three persist indexes bare). Because persist's
+//! `signed_wire_index` keys `(kind, content_hash)` on the SAME bytes and
+//! its `lookup_signed_record_by_content_hash` point-read reloads +
+//! re-serializes that same row, the advertised hash equals `sha256` of the
+//! served bytes equals the point-read key — end to end, by construction.
 //!
-//! ## envelope_hash semantics — `persist_row_hash` uniformly
-//!
-//! The FSD §3.1 spec-owner review chose `original_content_hash` as
-//! the envelope identity. Implementation discovery: only 3 of the 10
-//! `Signed*Record` inner types carry that field (Key, Attestation,
-//! Revocation — the ones built around an inner `*_envelope: Value`).
-//! The 7 newer types (CEG 0.7+) carry only `persist_row_hash`. For
-//! uniform implementation v1 uses **`persist_row_hash` across all 10
-//! kinds**:
-//!
-//! - Deterministic across nodes — server-computed SHA-256 over
-//!   canonical(record minus `persist_row_hash`); persist's
-//!   `compute_persist_row_hash` makes it reproducible.
-//! - Stronger convergence than `original_content_hash` — full-record
-//!   identity (includes embedded scrub signatures). Same byte-
-//!   identical record on every peer or no convergence; Ed25519 and
-//!   ML-DSA-65 are deterministic (FIPS 204 final) so same signer +
-//!   same payload → same signature → same `persist_row_hash`.
-//! - Uniform across all 10 kinds — no special-casing.
-//!
-//! This is documented as a v1 FSD §3.1 amendment.
+//! This retires the pre-#397 `persist_row_hash` / JCS `v2_envelope_hash`
+//! bases and the per-subject `list_*_for` fan-out: each plane now reads ONE
+//! bulk since-cursor page per round.
 //!
 //! ## Federation-tier-only invariant (FSD §7.1)
 //!
@@ -78,17 +60,18 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use ciris_persist::federation::admission::has_effective_role;
-use ciris_persist::federation::namespace::{self, AuthorityClass, Projection, ReplicatedKind};
+use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
+use ciris_persist::federation::namespace::{self, Projection};
 use ciris_persist::federation::operational::{
-    SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
+    OrgMembership, Organization, SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
 };
 use ciris_persist::federation::register::ReplicatedKeyOutcome;
 use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
 use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
-    SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
-    SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
-    SignedKeyRecord, SignedLocationProof, SignedRevocation,
+    Attestation, SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation,
+    SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence,
+    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
 };
 use ciris_persist::federation::FederationDirectory;
 use ciris_verify_core::threshold::ThresholdMember;
@@ -372,35 +355,18 @@ impl BridgeCache {
 impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         match kind {
-            // #311 — the five `ReplicatedKind`s ride the unified engine
-            // (projection_for + list_signed_records). Key + IdentityOccurrence +
-            // TransportDestination project SelfOwn (publish-own); Attestation
-            // projects Cohort (about+by preserved); IdentityOccurrenceRevocation
+            // CIRISEdge#397 §1+§2 — the five primary signed planes advertise
+            // via persist v21.2.0's bulk since-cursor reads, hashing each row by
+            // its content-hash (`sha256(serde_json::to_vec(row))`) so the wire
+            // hash == the point-read key. Key + IdentityOccurrence +
+            // TransportDestination project SelfOwn (publish-own); Attestation is
+            // per-record (`attestation_is_advertised`); IdentityOccurrenceRevocation
             // is a tombstone → Global (anti-rollback).
-            EnvelopeKind::Key => {
-                self.list_replicated(EnvelopeKind::Key, ReplicatedKind::KeyRecord)
-                    .await
-            }
-            EnvelopeKind::IdentityOccurrence => {
-                self.list_replicated(
-                    EnvelopeKind::IdentityOccurrence,
-                    ReplicatedKind::IdentityOccurrence,
-                )
-                .await
-            }
-            EnvelopeKind::TransportDestination => {
-                self.list_replicated(
-                    EnvelopeKind::TransportDestination,
-                    ReplicatedKind::TransportDestination,
-                )
-                .await
-            }
+            EnvelopeKind::Key => self.list_keys().await,
+            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrences().await,
+            EnvelopeKind::TransportDestination => self.list_transport_destinations().await,
             EnvelopeKind::IdentityOccurrenceRevocation => {
-                self.list_replicated(
-                    EnvelopeKind::IdentityOccurrenceRevocation,
-                    ReplicatedKind::IdentityOccurrenceRevocation,
-                )
-                .await
+                self.list_identity_occurrence_revocations().await
             }
             EnvelopeKind::Attestation => self.list_attestations(None).await,
             EnvelopeKind::Revocation => self.list_revocations().await,
@@ -424,6 +390,24 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         kind: EnvelopeKind,
         envelope_hash: &[u8; 32],
     ) -> Option<Vec<u8>> {
+        // CIRISEdge#397 §3 — the content-hash point-read. Every indexed kind
+        // (all 13 except `Revocation`) resolves its bytes from persist's
+        // `signed_wire_index` keyed on `(kind, content_hash)`. Because edge
+        // advertised `sha256(serde_json::to_vec(row))` and persist reloads +
+        // re-serializes that SAME row, the returned bytes hash back to
+        // `envelope_hash` by construction.
+        if let Some(k) = kind.persist_index_kind() {
+            if let Ok(Some(bytes)) = self
+                .directory
+                .lookup_signed_record_by_content_hash(k, &hex::encode(envelope_hash))
+                .await
+            {
+                return Some(bytes);
+            }
+        }
+        // `Revocation` (unindexed) + any point-read miss → the local cache (only
+        // `Revocation` still populates it; every other plane's fetch IS the
+        // point-read).
         self.cache.lock().await.get(kind, envelope_hash)
     }
 
@@ -509,39 +493,18 @@ impl FederationDirectoryReplicationBridge {
         u64::try_from(timestamp.timestamp_millis()).unwrap_or(0)
     }
 
-    // ─── #311 — the unified replication-policy engine ──────────────────
+    // ─── CIRISEdge#397 §1+§2 — the primary-plane since-cursor engine ───────
     //
-    // One projection-driven loop replaces `list_keys` (+ #257 key_selector),
-    // `list_identity_occurrences` (+ #305 occurrence_selector), and the
-    // `list_identity_occurrence_revocations` fan-out. For each
-    // `ReplicatedKind`, persist's `projection_for` decides the subject set
-    // and `list_signed_records` reads it byte-exact; a per-kind adapter
-    // re-wraps the (sometimes bare) canonical JSON back into the existing
-    // `Signed*` wire shape so the wire bytes + `persist_row_hash` identity are
-    // unchanged for the pre-existing kinds (v9.9↔v9.10 convergence holds).
-
-    /// The projection inputs for a `ReplicatedKind` — `(cohort_scope,
-    /// authority, is_tombstone)` fed to persist's [`namespace::projection_for`]
-    /// so the policy is resolved by persist, not hard-coded here. The identity
-    /// plane (key / occurrence / transport) is `SelfIdentity`-authored `self`
-    /// scope → `SelfOwn`; attestations are `ProducerSteward` gossip → `Cohort`;
-    /// the occurrence-revocation is a tombstone → `Global` (anti-rollback, the
-    /// [`namespace::is_withdraw_or_revocation`] fix).
-    fn projection_inputs(kind: ReplicatedKind) -> (&'static str, AuthorityClass, bool) {
-        match kind {
-            ReplicatedKind::KeyRecord
-            | ReplicatedKind::IdentityOccurrence
-            | ReplicatedKind::TransportDestination => ("self", AuthorityClass::SelfIdentity, false),
-            ReplicatedKind::IdentityOccurrenceRevocation => {
-                ("self", AuthorityClass::SelfIdentity, true)
-            }
-            // `Attestation` (producer gossip → `Cohort`) and — since
-            // `ReplicatedKind` is `#[non_exhaustive]` — any future persist kind
-            // both default to the conservative `Cohort` relay (never silently
-            // SelfOwn or Global) until edge learns to handle them explicitly.
-            _ => ("community", AuthorityClass::ProducerSteward, false),
-        }
-    }
+    // Each of the 5 primary signed planes (Key / IdentityOccurrence /
+    // TransportDestination / IdentityOccurrenceRevocation / Attestation) reads
+    // ONE bulk `list_signed_<kind>_since(None, limit)` page per round (retiring
+    // the per-subject `list_signed_records` fan-out), filters in-memory to its
+    // projection subject set — the EXACT scoping the pre-#397 fan-out applied
+    // (Key/IdOcc/TransportDest = SelfOwn; IdOccRevocation = Global; Attestation
+    // per-record via `attestation_is_advertised`) — and advertises each row by
+    // its content-hash (`sha256(serde_json::to_vec(row))`, [`content_hash_of`]),
+    // which persist's `signed_wire_index` keys on, so the wire hash IS the
+    // point-read key. These planes no longer cache (the point-read is the fetch).
 
     /// The subject set to sweep for a resolved [`Projection`]. `SelfOwn` uses
     /// the node's OWN publish set ([`Self::self_provider`] — collapsing the #257
@@ -565,134 +528,124 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// Parse an RFC3339 timestamp field out of a record's canonical JSON into
-    /// the `ms_seq` monotonic hint. Missing/unparseable is 0 (best-effort; the
-    /// `seq` is only a receiver short-circuit, persist's merge is canonical).
-    fn ms_seq_from(field: Option<&serde_json::Value>) -> u64 {
-        field
-            .and_then(serde_json::Value::as_str)
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map_or(0, |dt| Self::ms_seq(dt.with_timezone(&chrono::Utc)))
-    }
-
-    /// Adapt one `SignedReplicatedRecord`'s `canonical_json` into the tuple the
-    /// engine emits: `(wire_bytes, envelope_hash, seq)`. The re-wrap keeps the
-    /// wire shape byte-compatible with the pre-#311 per-plane emitters —
-    /// `list_signed_records` returns the BARE inner type for key / attestation /
-    /// occurrence-revocation (`lookup_public_key` → `KeyRecord`, not
-    /// `SignedKeyRecord`), so those are re-nested under their `Signed*` field;
-    /// `IdentityOccurrence` is already the signed container; the unsigned
-    /// `TransportDestination` carries no `persist_row_hash`, so it hashes over
-    /// its JCS canonical bytes like the v2 operational kinds. Returns `None`
-    /// (skip this record) if the hash field is absent/malformed.
-    fn adapt_record(
-        kind: ReplicatedKind,
-        canonical_json: &serde_json::Value,
-    ) -> Option<(Vec<u8>, [u8; 32], u64)> {
-        match kind {
-            ReplicatedKind::KeyRecord => {
-                let hash = Self::decode_hash(canonical_json.get("persist_row_hash")?.as_str()?)?;
-                let seq = Self::ms_seq_from(canonical_json.get("valid_from"));
-                let wire = serde_json::json!({ "record": canonical_json });
-                Some((serde_json::to_vec(&wire).ok()?, hash, seq))
-            }
-            ReplicatedKind::IdentityOccurrence => {
-                let inner = canonical_json.get("identity_occurrence")?;
-                let hash = Self::decode_hash(inner.get("persist_row_hash")?.as_str()?)?;
-                let seq = Self::ms_seq_from(inner.get("asserted_at"));
-                Some((serde_json::to_vec(canonical_json).ok()?, hash, seq))
-            }
-            ReplicatedKind::TransportDestination => {
-                // CIRISEdge#338 / CIRISPersist#443 (v17.0.0) — the route arm is now
-                // the SIGNED CONTAINER `{transport_destination, attesting_key_id,
-                // signed_envelope, signature}`, the same #418/#421 discipline as
-                // IdentityOccurrence(Revocation): edge holds the TRANSPORT signer,
-                // not the identity/federation key that signed the route, so it can
-                // only re-publish BYTE-EXACT what was signed-put — never re-sign or
-                // synthesize the signature. (Pre-v17 this arm treated
-                // `canonical_json` as a bare row; against v17 the receiver's
-                // `apply_transport_destination` deserializes the SIGNED container,
-                // so emitting a bare row here would fail to apply and silently drop
-                // every route from the wire.) The container carries no
-                // `persist_row_hash`; hash over its JCS bytes like the v2
-                // operational kinds. `seq` comes from the durable `epoch` — the
-                // monotonic supersession counter #443 gave the row — with the
-                // `asserted_at` fallback for a pre-#443 producer whose projection
-                // reads epoch 0.
-                let inner = canonical_json.get("transport_destination");
-                let hash = v2_envelope_hash(canonical_json)?;
-                let seq = inner
-                    .and_then(|td| td.get("epoch"))
-                    .and_then(serde_json::Value::as_u64)
-                    .filter(|&e| e > 0)
-                    .unwrap_or_else(|| {
-                        Self::ms_seq_from(inner.and_then(|td| td.get("asserted_at")))
-                    });
-                Some((serde_json::to_vec(canonical_json).ok()?, hash, seq))
-            }
-            ReplicatedKind::Attestation => {
-                let hash = Self::decode_hash(canonical_json.get("persist_row_hash")?.as_str()?)?;
-                let seq = Self::ms_seq_from(canonical_json.get("asserted_at"));
-                let wire = serde_json::json!({ "attestation": canonical_json });
-                Some((serde_json::to_vec(&wire).ok()?, hash, seq))
-            }
-            ReplicatedKind::IdentityOccurrenceRevocation => {
-                // CIRISEdge#326 / CIRISPersist#421 (persist v16) — the revocation
-                // kind is now the SIGNED CONTAINER (`{identity_occurrence_revocation,
-                // attesting_key_id, signed_envelope, signature}`), the same #418
-                // discipline as IdentityOccurrence — NOT a bare row. It is
-                // re-published BYTE-EXACT: edge holds the transport signer, not
-                // the identity key, so it can neither re-sign nor synthesize the
-                // signature — only re-wrap what was signed-put. (Pre-v16 this arm
-                // re-wrapped a bare row; against v16 that would double-wrap it,
-                // AND reading `persist_row_hash` at the top level now misses — it
-                // is nested — which would silently drop every revocation from the
-                // wire.)
-                let inner = canonical_json.get("identity_occurrence_revocation")?;
-                let hash = Self::decode_hash(inner.get("persist_row_hash")?.as_str()?)?;
-                let seq = Self::ms_seq_from(inner.get("revoked_at"));
-                Some((serde_json::to_vec(canonical_json).ok()?, hash, seq))
-            }
-            // `#[non_exhaustive]` — a kind edge doesn't yet adapt is skipped
-            // (not advertised) rather than emitted in an unknown wire shape.
-            _ => None,
-        }
-    }
-
-    /// The engine loop for one `ReplicatedKind`: resolve its projection, sweep
-    /// the subject set, `list_signed_records` per subject, then adapt, dedupe,
-    /// cache, and emit an `EnvelopeRef` for each. `edge_kind` is the wire
-    /// [`EnvelopeKind`] the refs are cached under (1:1 with `kind`).
-    async fn list_replicated(
-        &self,
-        edge_kind: EnvelopeKind,
-        kind: ReplicatedKind,
-    ) -> Vec<EnvelopeRef> {
-        let (scope, authority, is_tombstone) = Self::projection_inputs(kind);
-        let projection = namespace::projection_for(scope, authority, is_tombstone);
+    /// CIRISEdge#397 §1+§2 — advertise a bulk since-cursor page: keep the rows
+    /// `in_scope` (the plane's projection subject filter), advertise each by its
+    /// content-hash ([`content_hash_of`] — `sha256(serde_json::to_vec(row))`,
+    /// the exact value persist's `signed_wire_index` keys on), and dedupe by
+    /// hash. No caching — [`Self::fetch_envelope_bytes`]'s point-read is the
+    /// serve path for every plane but `Revocation`.
+    fn advertise_since<S, IN, TS>(rows: &[S], in_scope: IN, seq_of: TS) -> Vec<EnvelopeRef>
+    where
+        S: serde::Serialize,
+        IN: Fn(&S) -> bool,
+        TS: Fn(&S) -> u64,
+    {
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for subject in self.subjects_for_projection(projection) {
-            let records = self
-                .directory
-                .list_signed_records(kind, &subject)
-                .await
-                .unwrap_or_default();
-            for rec in records {
-                let Some((bytes, hash, seq)) = Self::adapt_record(kind, &rec.canonical_json) else {
-                    continue;
-                };
-                if !seen.insert(hash) {
-                    continue;
-                }
-                self.cache_insert(edge_kind, hash, bytes).await;
-                refs.push(EnvelopeRef {
-                    envelope_hash: hash,
-                    seq,
-                });
+        for row in rows.iter().filter(|r| in_scope(r)) {
+            let Some((hash, _bytes)) = content_hash_of(row) else {
+                continue;
+            };
+            if !seen.insert(hash) {
+                continue;
             }
+            refs.push(EnvelopeRef {
+                envelope_hash: hash,
+                seq: seq_of(row),
+            });
         }
         refs
+    }
+
+    /// Key plane — `SelfOwn` (publish-own): the node's OWN establishment
+    /// records. Scope filter is the `SelfOwn` publish set; seq is `valid_from`.
+    async fn list_keys(&self) -> Vec<EnvelopeRef> {
+        let subjects: HashSet<String> = self
+            .subjects_for_projection(Projection::SelfOwn)
+            .into_iter()
+            .collect();
+        let rows = self
+            .directory
+            .list_signed_key_records_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        Self::advertise_since(
+            &rows,
+            |row| subjects.contains(&row.record.key_id),
+            |row| Self::ms_seq(row.record.valid_from),
+        )
+    }
+
+    /// IdentityOccurrence plane — `SelfOwn` (publish-own): the node's OWN KEX
+    /// occurrences. Scope filter is the `SelfOwn` publish set (keyed by the
+    /// occurrence key_id); seq is `asserted_at`.
+    async fn list_identity_occurrences(&self) -> Vec<EnvelopeRef> {
+        let subjects: HashSet<String> = self
+            .subjects_for_projection(Projection::SelfOwn)
+            .into_iter()
+            .collect();
+        let rows = self
+            .directory
+            .list_signed_identity_occurrences_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        Self::advertise_since(
+            &rows,
+            |row| subjects.contains(&row.identity_occurrence.occurrence_key_id),
+            |row| Self::ms_seq(row.identity_occurrence.asserted_at),
+        )
+    }
+
+    /// TransportDestination plane — `SelfOwn` (publish-own): the node's OWN
+    /// reachability routes. Scope filter is the `SelfOwn` publish set (keyed by
+    /// the occurrence key_id); seq is the durable supersession `epoch`
+    /// (CIRISPersist#443), falling back to `asserted_at` for a pre-#443
+    /// producer whose projection reads epoch 0.
+    async fn list_transport_destinations(&self) -> Vec<EnvelopeRef> {
+        let subjects: HashSet<String> = self
+            .subjects_for_projection(Projection::SelfOwn)
+            .into_iter()
+            .collect();
+        let rows = self
+            .directory
+            .list_signed_transport_destinations_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        Self::advertise_since(
+            &rows,
+            |row| subjects.contains(&row.transport_destination.occurrence_key_id),
+            |row| {
+                if row.transport_destination.epoch > 0 {
+                    row.transport_destination.epoch
+                } else {
+                    Self::ms_seq(row.transport_destination.asserted_at)
+                }
+            },
+        )
+    }
+
+    /// IdentityOccurrenceRevocation plane — tombstone → `Global` (anti-rollback,
+    /// never out-run by the stale occurrence it retracts). Scope filter is the
+    /// widest own∪cohort set (keyed by the occurrence key_id); seq is
+    /// `revoked_at`.
+    async fn list_identity_occurrence_revocations(&self) -> Vec<EnvelopeRef> {
+        let subjects: HashSet<String> = self
+            .subjects_for_projection(Projection::Global)
+            .into_iter()
+            .collect();
+        let rows = self
+            .directory
+            .list_signed_identity_occurrence_revocations_since(
+                None,
+                self.config.operational_page_limit,
+            )
+            .await
+            .unwrap_or_default();
+        Self::advertise_since(
+            &rows,
+            |row| subjects.contains(&row.identity_occurrence_revocation.occurrence_key_id),
+            |row| Self::ms_seq(row.identity_occurrence_revocation.revoked_at),
+        )
     }
 
     // ─── v6.2.0 (#179, CIRISPersist#249 Cut D) — generic cohort fan-out ──
@@ -826,10 +779,11 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#379 — the fetch-path twin of
-    /// [`Self::attestation_requires_serve`], over WIRE bytes (the
-    /// `{"attestation": …}` wrap `adapt_record` produces; also accepts the
-    /// bare row for robustness). Parse failure → `false` (only `trace:*`
-    /// is gated; cached envelopes are JSON this bridge serialized).
+    /// [`Self::attestation_requires_serve`], over WIRE bytes. CIRISEdge#397's
+    /// wire is the BARE `Attestation` (the point-read's content-hash bytes), but
+    /// this still accepts the legacy `{"attestation": …}` wrap for robustness.
+    /// Parse failure → `false` (only `trace:*` is gated; the point-read serves
+    /// JSON persist round-trips).
     fn envelope_requires_serve(bytes: &[u8]) -> bool {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return false;
@@ -941,22 +895,123 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// CIRISEdge#396 item 6 — the `recipient_capability` serve control (the
+    /// #393 gate-first pattern). True iff serving `canonical_json` to `peer`
+    /// would violate a `recipient_capability` restriction the DATA PRODUCER
+    /// attached to its own `consent:replication:v1` grant.
+    ///
+    /// **Not gated on the server.** persist's closed consent grammar
+    /// ([`consent_grammar::RestrictionOp::RecipientCapability`]) is parsed +
+    /// admitted today; the grammar itself documents this op as *"enforced at
+    /// the SERVE layer (P3), not at promotion time"* — promotion applies no
+    /// transform for it, so THIS gate is its enforcer. The server merely starts
+    /// PRODUCING such restrictions later; until it does, every grant carries an
+    /// empty `restrictions` set and this returns `false` (fail-open-when-absent)
+    /// — the row serves exactly as before, with no window where a restriction
+    /// exists but isn't enforced.
+    ///
+    /// The owner whose grant governs a row is its `attesting_key_id`; we read
+    /// that owner's LIVE grants via [`FederationDirectory::list_live_consent_grants_by`]
+    /// (persist folds `withdraws`/`recants` at write time — a revoked grant is
+    /// already gone, never re-derived here). For every grant whose
+    /// `attestation_prefixes` [`consent_grammar::covers`] this row's dimension,
+    /// the recipient must hold each named `capability` via the SAME
+    /// accord-conferred, self-re-verifying [`has_effective_role`] read the #379
+    /// serve gate's leg A uses — a self-asserted `roles:[…]` entry does not
+    /// satisfy it. Missing capability → withhold (fail-closed). A malformed
+    /// grant parses to nothing and covers nothing (persist's whole-grant
+    /// fail-closed doctrine), so it can never widen the served set.
+    ///
+    /// `grant_cache` memoizes each owner's parsed policies for the lifetime of
+    /// one listing sweep, so a plane of same-owner rows costs one grant read.
+    async fn recipient_capability_withholds(
+        &self,
+        canonical_json: &serde_json::Value,
+        peer: &str,
+        grant_cache: &mut HashMap<String, Vec<ConsentTransferPolicy>>,
+    ) -> bool {
+        // The row's dimension (CC 2.1 — inside `attestation_envelope`) and its
+        // owner. A row with neither cannot be covered by any grant → unrestricted.
+        let Some(dimension) = canonical_json
+            .pointer("/attestation_envelope/dimension")
+            .and_then(|v| v.as_str())
+        else {
+            return false;
+        };
+        let Some(owner) = canonical_json
+            .get("attesting_key_id")
+            .and_then(|v| v.as_str())
+        else {
+            return false;
+        };
+        if !grant_cache.contains_key(owner) {
+            let policies = self
+                .directory
+                .list_live_consent_grants_by(owner)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|grant| {
+                    consent_grammar::parse_grant_payload(&grant.attestation_envelope).ok()
+                })
+                .collect();
+            grant_cache.insert(owner.to_string(), policies);
+        }
+        // Collect required capabilities WITHOUT holding the cache borrow across
+        // the `has_effective_role` awaits below.
+        let required: Vec<String> = grant_cache[owner]
+            .iter()
+            .filter(|policy| consent_grammar::covers(&policy.attestation_prefixes, dimension))
+            .flat_map(|policy| {
+                policy.restrictions.iter().filter_map(|op| match op {
+                    consent_grammar::RestrictionOp::RecipientCapability { capability } => {
+                        Some(capability.clone())
+                    }
+                    // `StripField` is applied at PROMOTION (persist strips the
+                    // field before the row is promoted), so it is a no-op at the
+                    // serve layer. A future restriction variant lands here as a
+                    // compile error — the deliberate prompt to decide whether it
+                    // needs serve-side enforcement too.
+                    consent_grammar::RestrictionOp::StripField { .. } => None,
+                })
+            })
+            .collect();
+        for capability in required {
+            if !has_effective_role(&*self.directory, peer, &capability)
+                .await
+                .unwrap_or(false)
+            {
+                tracing::debug!(
+                    peer_key_id = peer,
+                    capability = %capability,
+                    dimension,
+                    "trace attestation withheld — recipient lacks a producer-required \
+                     `recipient_capability` (CIRISEdge#396 item 6)"
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     async fn list_attestations(&self, recipient: Option<&str>) -> Vec<EnvelopeRef> {
-        // v10 — per-record dynamic policy for the scores/Attestation plane.
-        // Each attestation's projection is resolved from its ACTUAL dimension
-        // (across all 95 namespace families), cohort_scope, and attestation_type
-        // via [`Self::attestation_is_advertised`], NOT the coarse per-kind
-        // default #311 used — so an infra / canonical / build-manifest
-        // attestation (`AccordCoScrub` trust root) now reaches the whole
-        // federation, a self/family attestation is published-own, and a
-        // withdraws tombstone gossips GLOBAL.
+        // CIRISEdge#397 §1+§2 — the scores/Attestation plane reads ONE bulk
+        // `list_attestations_since(None, limit)` page per round. That surface is
+        // already **federation-tier only** (the E5 invariant) and cursored on the
+        // VISIBILITY timestamp `COALESCE(promoted_at, asserted_at)` — so a
+        // consent-promoted trace (§2) is included the moment it becomes
+        // federation-visible, retiring the per-subject about/by sweep.
         //
-        // Sweep the WIDEST subject set (own ∪ cohort) so no record whose
-        // per-record projection would include it is missed. `list_signed_records`
-        // is about-only, so `list_attestations_by` supplements the by-half
-        // (coverage preserved from #311). Both halves ride the same
-        // `adapt_record` re-wrap → wire shape + `persist_row_hash` identity match
-        // the pre-#311 emitter exactly.
+        // The per-record policy is UNCHANGED: each attestation's projection is
+        // resolved from its ACTUAL dimension (all 95 families), cohort_scope, and
+        // attestation_type via [`Self::attestation_is_advertised`] — a trust-root
+        // build-manifest reaches the whole federation, a self/family attestation
+        // is published-own, a withdraws tombstone gossips GLOBAL. The #379 trace
+        // RECIPIENT serve gate is likewise preserved verbatim.
+        //
+        // The wire hash is the BARE `Attestation`'s content-hash
+        // ([`content_hash_of`]) — the exact bytes persist's `signed_wire_index`
+        // keys on and its point-read serves; the plane no longer caches.
         let self_set: HashSet<String> = self
             .self_provider
             .as_ref()
@@ -964,64 +1019,62 @@ impl FederationDirectoryReplicationBridge {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        let attestations = self
+            .directory
+            .list_attestations_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         // CIRISEdge#379 — lazily-resolved recipient capability (one directory
         // lookup per listing sweep, and only when a gated row is encountered).
         let mut serve_allowed: Option<bool> = None;
-        for subject in self.subjects_for_projection(Projection::Global) {
-            // about — via the uniform signed read (`list_attestations_for`).
-            let about = self
-                .directory
-                .list_signed_records(ReplicatedKind::Attestation, &subject)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|rec| rec.canonical_json);
-            // by — supplement so coverage doesn't narrow (bare `Attestation`).
-            let by = self
-                .directory
-                .list_attestations_by(&subject)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|att| serde_json::to_value(att).ok());
-            for canonical_json in about.chain(by) {
-                if !Self::attestation_is_advertised(&canonical_json, &self_set) {
-                    continue;
-                }
-                // CIRISEdge#379 — RECIPIENT gate (the contextual-integrity
-                // Recipient parameter): a `trace:*` scores-attestation is
-                // listed for a peer ONLY if that peer's KeyRecord advertises
-                // an effective `infra:serve` capability. Non-trace rows are
-                // untouched; a `None` recipient (projection-only view / tests)
-                // is ungated — every production provider is peer-bound
-                // (`DirectoryStateAdapter::with_peer`).
-                if let Some(peer) = recipient {
-                    if Self::attestation_requires_serve(&canonical_json) {
-                        if serve_allowed.is_none() {
-                            serve_allowed = Some(self.peer_has_serve_capability(peer).await);
-                        }
-                        if serve_allowed != Some(true) {
-                            continue;
-                        }
+        // CIRISEdge#396 item 6 — per-owner parsed consent grants, memoized for
+        // this sweep so a same-owner plane costs one grant read.
+        let mut grant_cache: HashMap<String, Vec<ConsentTransferPolicy>> = HashMap::new();
+        for att in &attestations {
+            let Ok(canonical_json) = serde_json::to_value(att) else {
+                continue;
+            };
+            if !Self::attestation_is_advertised(&canonical_json, &self_set) {
+                continue;
+            }
+            // CIRISEdge#379 — RECIPIENT gate (the contextual-integrity
+            // Recipient parameter): a `trace:*` scores-attestation is
+            // listed for a peer ONLY if that peer's KeyRecord advertises
+            // an effective `infra:serve` capability. Non-trace rows are
+            // untouched; a `None` recipient (projection-only view / tests)
+            // is ungated — every production provider is peer-bound
+            // (`DirectoryStateAdapter::with_peer`).
+            if let Some(peer) = recipient {
+                if Self::attestation_requires_serve(&canonical_json) {
+                    if serve_allowed.is_none() {
+                        serve_allowed = Some(self.peer_has_serve_capability(peer).await);
+                    }
+                    if serve_allowed != Some(true) {
+                        continue;
                     }
                 }
-                let Some((bytes, hash, seq)) =
-                    Self::adapt_record(ReplicatedKind::Attestation, &canonical_json)
-                else {
-                    continue;
-                };
-                if !seen.insert(hash) {
+                // CIRISEdge#396 item 6 — producer-declared `recipient_capability`
+                // restrictions (any dimension a live grant covers, not just
+                // `trace:*`). Fail-open when the producer declared none.
+                if self
+                    .recipient_capability_withholds(&canonical_json, peer, &mut grant_cache)
+                    .await
+                {
                     continue;
                 }
-                self.cache_insert(EnvelopeKind::Attestation, hash, bytes)
-                    .await;
-                refs.push(EnvelopeRef {
-                    envelope_hash: hash,
-                    seq,
-                });
             }
+            let Some((hash, _bytes)) = content_hash_of(att) else {
+                continue;
+            };
+            if !seen.insert(hash) {
+                continue;
+            }
+            refs.push(EnvelopeRef {
+                envelope_hash: hash,
+                seq: Self::ms_seq(att.asserted_at),
+            });
         }
         refs
     }
@@ -1055,11 +1108,14 @@ impl FederationDirectoryReplicationBridge {
     // + hybrid scrub sigs on the `Signed*` wrapper), which edge — NOT the
     // authority — cannot produce. persist self-signs on write and now exposes
     // `list_signed_<kind>_since(since, limit) -> Vec<Signed*>` (mirroring the
-    // org/orgmembership/partner reads), so edge serves those wrappers BYTE-EXACT
-    // (their JCS `v2_envelope_hash` is the wire hash, same §3.2.2 basis as the
-    // org kinds). This also retires the per-member `fan_out_for_member` for
-    // these 5: ONE paginated read per plane per round instead of O(cohort)
-    // round-trips (CIRISPersist#504 hot-path floor).
+    // org/orgmembership/partner reads), so edge serves those wrappers BYTE-EXACT.
+    // CIRISEdge#397: the wire hash is now each wrapper's content-hash
+    // ([`content_hash_of`] — `sha256(serde_json::to_vec(Signed*))`), the exact
+    // value persist's `signed_wire_index` keys on for these kinds, so the
+    // advertised hash IS the point-read key (fetch is the point-read, no cache).
+    // This also retires the per-member `fan_out_for_member` for these 5: ONE
+    // paginated read per plane per round instead of O(cohort) round-trips
+    // (CIRISPersist#504 hot-path floor).
     //
     // ADVERTISE SCOPE is preserved from the pre-v21 fan_out per the §4.3
     // 14-kind table: Family / Community / LocationProof are **Cohort**-scoped
@@ -1067,40 +1123,6 @@ impl FederationDirectoryReplicationBridge {
     // over edge's OWN directory, so reading-then-filtering leaks nothing), and
     // the two membership-revocation planes are **Global** (advertised whole,
     // matching the pre-v21 `subjects_for_projection(Global)` subject set).
-
-    /// Advertise a bulk signed operational plane: keep rows in `in_scope`, hash
-    /// each already-signed wrapper by its JCS `v2_envelope_hash`, cache its wire
-    /// bytes, dedupe.
-    async fn advertise_signed_operational<S, TS, IN>(
-        &self,
-        kind: EnvelopeKind,
-        rows: Vec<S>,
-        seq_of: TS,
-        in_scope: IN,
-    ) -> Vec<EnvelopeRef>
-    where
-        S: serde::Serialize,
-        TS: Fn(&S) -> chrono::DateTime<chrono::Utc>,
-        IN: Fn(&S) -> bool,
-    {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for signed in rows.iter().filter(|s| in_scope(s)) {
-            let Some(hash) = v2_envelope_hash(signed) else {
-                continue;
-            };
-            if !seen.insert(hash) {
-                continue;
-            }
-            let bytes = serde_json::to_vec(signed).unwrap_or_default();
-            self.cache_insert(kind, hash, bytes).await;
-            refs.push(EnvelopeRef {
-                envelope_hash: hash,
-                seq: Self::ms_seq(seq_of(signed)),
-            });
-        }
-        refs
-    }
 
     /// The operator-configured cohort as a set, for the Cohort-scoped advertise
     /// filters.
@@ -1115,13 +1137,11 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_families_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        self.advertise_signed_operational(
-            EnvelopeKind::Family,
-            rows,
-            |s| s.family.founded_at,
+        Self::advertise_since(
+            &rows,
             |s| s.family.members.iter().any(|m| cohort.contains(&m.key_id)),
+            |s| Self::ms_seq(s.family.founded_at),
         )
-        .await
     }
 
     async fn list_communities(&self) -> Vec<EnvelopeRef> {
@@ -1131,18 +1151,16 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_communities_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        self.advertise_signed_operational(
-            EnvelopeKind::Community,
-            rows,
-            |s| s.community.founded_at,
+        Self::advertise_since(
+            &rows,
             |s| {
                 s.community
                     .members
                     .iter()
                     .any(|m| cohort.contains(&m.key_id))
             },
+            |s| Self::ms_seq(s.community.founded_at),
         )
-        .await
     }
 
     async fn list_family_membership_revocations(&self) -> Vec<EnvelopeRef> {
@@ -1156,13 +1174,11 @@ impl FederationDirectoryReplicationBridge {
             )
             .await
             .unwrap_or_default();
-        self.advertise_signed_operational(
-            EnvelopeKind::FamilyMembershipRevocation,
-            rows,
-            |s| s.family_membership_revocation.removed_at,
+        Self::advertise_since(
+            &rows,
             |_| true,
+            |s| Self::ms_seq(s.family_membership_revocation.removed_at),
         )
-        .await
     }
 
     async fn list_community_membership_revocations(&self) -> Vec<EnvelopeRef> {
@@ -1176,13 +1192,11 @@ impl FederationDirectoryReplicationBridge {
             )
             .await
             .unwrap_or_default();
-        self.advertise_signed_operational(
-            EnvelopeKind::CommunityMembershipRevocation,
-            rows,
-            |s| s.community_membership_revocation.removed_at,
+        Self::advertise_since(
+            &rows,
             |_| true,
+            |s| Self::ms_seq(s.community_membership_revocation.removed_at),
         )
-        .await
     }
 
     async fn list_location_proofs(&self) -> Vec<EnvelopeRef> {
@@ -1192,13 +1206,11 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_location_proofs_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        self.advertise_signed_operational(
-            EnvelopeKind::LocationProof,
-            rows,
-            |s| s.location_proof.asserted_at,
+        Self::advertise_since(
+            &rows,
             |s| cohort.contains(&s.location_proof.subject_key_id),
+            |s| Self::ms_seq(s.location_proof.asserted_at),
         )
-        .await
     }
 
     // ── v2 operational-data list_* ─────────────────────────────────
@@ -1224,96 +1236,52 @@ impl FederationDirectoryReplicationBridge {
     // decode_hash failure).
 
     async fn list_organizations(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        let limit = self.config.operational_page_limit;
-        if let Ok(rows) = self.directory.list_organizations_since(None, limit).await {
-            for row in rows {
-                let signed = SignedOrganization {
-                    organization: row.clone(),
-                };
-                let Some(hash) = v2_envelope_hash(&signed) else {
-                    continue;
-                };
-                if !seen.insert(hash) {
-                    continue;
-                }
-                let bytes = serde_json::to_vec(&signed).unwrap_or_default();
-                self.cache_insert(EnvelopeKind::Organization, hash, bytes)
-                    .await;
-                refs.push(EnvelopeRef {
-                    envelope_hash: hash,
-                    seq: Self::ms_seq(row.asserted_at),
-                });
-            }
-        }
-        refs
+        // CIRISEdge#397 — advertise the BARE `Organization` row's content-hash.
+        // Persist's `signed_wire_index` keys `Organization` on
+        // `content_hash_of(&Organization)` (the bare row `list_organizations_since`
+        // returns — the row carries its own inline single-signer signature, so
+        // there is NO separate signed-since surface), and its point-read reloads +
+        // re-serializes that SAME bare row. Hashing the wrapper here would
+        // advertise a hash the point-read can never resolve. The receiver's
+        // `apply_organization` re-wraps the bare row for `put_organization`.
+        let rows = self
+            .directory
+            .list_organizations_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        Self::advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
     }
 
     async fn list_org_memberships(&self) -> Vec<EnvelopeRef> {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        let limit = self.config.operational_page_limit;
-        if let Ok(rows) = self.directory.list_org_memberships_since(None, limit).await {
-            for row in rows {
-                let signed = SignedOrgMembership {
-                    org_membership: row.clone(),
-                };
-                let Some(hash) = v2_envelope_hash(&signed) else {
-                    continue;
-                };
-                if !seen.insert(hash) {
-                    continue;
-                }
-                let bytes = serde_json::to_vec(&signed).unwrap_or_default();
-                self.cache_insert(EnvelopeKind::OrgMembership, hash, bytes)
-                    .await;
-                refs.push(EnvelopeRef {
-                    envelope_hash: hash,
-                    seq: Self::ms_seq(row.asserted_at),
-                });
-            }
-        }
-        refs
+        // CIRISEdge#397 — advertise the BARE `OrgMembership` row's content-hash;
+        // same bare-row basis as `list_organizations` (persist indexes + reloads
+        // the bare row). `apply_org_membership` re-wraps on the receive side.
+        let rows = self
+            .directory
+            .list_org_memberships_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        Self::advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
     }
 
     async fn list_partner_records(&self) -> Vec<EnvelopeRef> {
-        // v2.0.1 — `partner_record` is now **bidirectional**.
-        //
-        // CIRISPersist v5.2.0 (CIRISPersist#194) shipped the
-        // `list_signed_partner_records_since` surface that returns the
-        // full `SignedPartnerRecord` wrapper — row + steward_signatures
-        // + threshold — straight from persist's V072 storage. That
-        // closes the admit-only carve-out v2.0.0 documented: edge can
-        // now enumerate locally-held partner_records with a JCS hash
-        // that reproduces on every peer, completing the anti-entropy
-        // convergence loop for this kind.
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        let limit = self.config.operational_page_limit;
-        if let Ok(signed_rows) = self
+        // v2.0.1 — `partner_record` is **bidirectional**. CIRISPersist#194's
+        // `list_signed_partner_records_since` returns the full
+        // `SignedPartnerRecord` wrapper (row + steward_signatures + threshold).
+        // CIRISEdge#397 — advertise that wrapper's content-hash
+        // ([`content_hash_of`]); persist's `signed_wire_index` keys `PartnerRecord`
+        // on `content_hash_of(&SignedPartnerRecord)` and its point-read reloads +
+        // re-serializes the SAME wrapper, so advertise-hash == point-read here.
+        let rows = self
             .directory
-            .list_signed_partner_records_since(None, limit)
+            .list_signed_partner_records_since(None, self.config.operational_page_limit)
             .await
-        {
-            for signed in signed_rows {
-                let Some(hash) = v2_envelope_hash(&signed) else {
-                    continue;
-                };
-                if !seen.insert(hash) {
-                    continue;
-                }
-                let asserted_at = signed.partner_record.asserted_at;
-                let bytes = serde_json::to_vec(&signed).unwrap_or_default();
-                self.cache_insert(EnvelopeKind::PartnerRecord, hash, bytes)
-                    .await;
-                refs.push(EnvelopeRef {
-                    envelope_hash: hash,
-                    seq: Self::ms_seq(asserted_at),
-                });
-            }
-        }
-        refs
+            .unwrap_or_default();
+        Self::advertise_since(
+            &rows,
+            |_| true,
+            |s| Self::ms_seq(s.partner_record.asserted_at),
+        )
     }
 }
 
@@ -1348,7 +1316,14 @@ impl FederationDirectoryReplicationBridge {
     }
 
     async fn apply_attestation(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedAttestation>(bytes) {
+        // CIRISEdge#397 — the wire is now the BARE `Attestation` (the shape
+        // persist's content-hash index/point-read serves), so deserialize that
+        // first and re-wrap; fall back to the pre-v14.1 `SignedAttestation`
+        // `{"attestation": …}` wrap for a peer still on the old wire.
+        let signed = serde_json::from_slice::<Attestation>(bytes)
+            .map(|attestation| SignedAttestation { attestation })
+            .or_else(|_| serde_json::from_slice::<SignedAttestation>(bytes));
+        match signed {
             Ok(record) => self.directory.put_attestation(record).await.is_ok(),
             Err(_) => false,
         }
@@ -1510,20 +1485,34 @@ impl FederationDirectoryReplicationBridge {
         if self.operational.is_none() {
             return false;
         }
-        let Ok(signed) = serde_json::from_slice::<SignedOrganization>(bytes) else {
-            return false;
-        };
-        self.directory.put_organization(signed).await.is_ok()
+        // CIRISEdge#397 — the content-hash point-read serves the BARE
+        // `Organization` row (the shape `list_organizations_since` returns + the
+        // `signed_wire_index` keys on); deserialize that and re-wrap for
+        // `put_organization`, falling back to the pre-v14.1 `SignedOrganization`
+        // `{"organization": …}` wrap for a peer still on the old wire.
+        let signed = serde_json::from_slice::<Organization>(bytes)
+            .map(|organization| SignedOrganization { organization })
+            .or_else(|_| serde_json::from_slice::<SignedOrganization>(bytes));
+        match signed {
+            Ok(s) => self.directory.put_organization(s).await.is_ok(),
+            Err(_) => false,
+        }
     }
 
     async fn apply_org_membership(&self, bytes: &[u8]) -> bool {
         if self.operational.is_none() {
             return false;
         }
-        let Ok(signed) = serde_json::from_slice::<SignedOrgMembership>(bytes) else {
-            return false;
-        };
-        self.directory.put_org_membership(signed).await.is_ok()
+        // CIRISEdge#397 — same bare-row wire as `apply_organization`: deserialize
+        // the BARE `OrgMembership` and re-wrap, falling back to the pre-v14.1
+        // `SignedOrgMembership` wrap.
+        let signed = serde_json::from_slice::<OrgMembership>(bytes)
+            .map(|org_membership| SignedOrgMembership { org_membership })
+            .or_else(|_| serde_json::from_slice::<SignedOrgMembership>(bytes));
+        match signed {
+            Ok(s) => self.directory.put_org_membership(s).await.is_ok(),
+            Err(_) => false,
+        }
     }
 
     async fn apply_partner_record(&self, bytes: &[u8]) -> bool {
@@ -1537,31 +1526,19 @@ impl FederationDirectoryReplicationBridge {
     }
 }
 
-// ─── v2 envelope_hash basis — JCS (FSD §3.2.2) ──────────────────────
-//
-// v2 closes the §3.2.1 deferred-interop path: operational-kind
-// `envelope_hash` is `sha256(JCS(Signed*Record))`, edge-defined +
-// CEG-§0.9-conformant. This is the SAME computation any non-persist
-// CEG implementation can reproduce — no `persist_row_hash` dependency.
-//
-// The function lives at module scope rather than as a method so the
-// `list_organizations` / `list_org_memberships` / `list_partner_records`
-// sweeps can call it without borrowing `self`.
-
-/// Compute the v2 envelope_hash for a serde-`Serialize`-able value.
-/// Per FSD §3.2.2: `sha256(JCS(value))`. Edge calls
-/// [`ciris_verify_core::jcs::canonicalize`] for the JCS step — the
-/// canonical-bytes encoding is not edge's to define (FSD §3.2). Returns
-/// `None` if either step fails (serialization → JSON Value, JCS
-/// canonicalization); the caller skips the envelope rather than emit a
-/// non-reproducible hash.
-fn v2_envelope_hash<T: serde::Serialize>(value: &T) -> Option<[u8; 32]> {
+/// CIRISEdge#397 / persist v21.2.0 (#507) — the content-hash contract: return
+/// the wire bytes edge serves for `value` AND their sha256, computed EXACTLY as
+/// persist's `wire_index::content_hash_of`: `sha256(serde_json::to_vec(value))`
+/// (NO JCS — the raw `to_vec` bytes of the signed wrapper element the
+/// `list_signed_*_since` reads return). Serving these same bytes makes
+/// advertise-hash = served-bytes = the point-read's `content_hash`, so a Diff'd
+/// peer fetches byte-identical what was advertised
+/// ([`ciris_persist::federation::FederationDirectory::lookup_signed_record_by_content_hash`]).
+fn content_hash_of<T: serde::Serialize>(value: &T) -> Option<([u8; 32], Vec<u8>)> {
     use sha2::{Digest, Sha256};
-    let json_value = serde_json::to_value(value).ok()?;
-    let canonical = ciris_verify_core::jcs::canonicalize(&json_value).ok()?;
-    let mut hasher = Sha256::new();
-    hasher.update(&canonical);
-    Some(hasher.finalize().into())
+    let bytes = serde_json::to_vec(value).ok()?;
+    let hash: [u8; 32] = Sha256::digest(&bytes).into();
+    Some((hash, bytes))
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -2014,6 +1991,90 @@ mod tests {
         );
     }
 
+    // ── CIRISEdge#397 — the load-bearing round-trip invariant ────────
+
+    /// **The wire-critical proof.** For the Key and Attestation planes, the
+    /// `envelope_hash` `list_envelope_refs` advertises MUST equal `sha256` of the
+    /// exact bytes `fetch_envelope_bytes` returns for it — end-to-end, over the
+    /// same `MemoryBackend` the other bridge tests use (which self-indexes the
+    /// `signed_wire_index` on put, so no rebuild is needed). This closes the
+    /// advertise-hash == served-bytes == point-read loop CIRISEdge#397 establishes.
+    #[tokio::test]
+    async fn advertise_hash_equals_sha256_of_fetched_bytes() {
+        let key_id = "agent-roundtrip";
+        let attester = "agent-attester";
+        let (backend, bridge) = make_bridge(&[key_id.to_string(), attester.to_string()]);
+
+        // A signed KeyRecord via the signed put path (indexes under "Key").
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fixture_key_record(key_id, identity_type::AGENT),
+            })
+            .await
+            .expect("seed key");
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fixture_key_record(attester, identity_type::AGENT),
+            })
+            .await
+            .expect("seed attester key");
+
+        // A federation-tier (tier="federation") Attestation via put_attestation
+        // (indexes under "Attestation"; cohort_scope="federation" → advertised).
+        let now = Utc::now();
+        let envelope = serde_json::json!({
+            "attesting_key_id": attester,
+            "attested_key_id": key_id,
+            "attestation_type": "delegates_to",
+        });
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attester, &envelope);
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: Attestation {
+                    attestation_id: uuid::Uuid::new_v4().to_string(),
+                    attesting_key_id: attester.to_string(),
+                    attested_key_id: key_id.to_string(),
+                    attestation_type: "delegates_to".to_string(),
+                    weight: None,
+                    asserted_at: now,
+                    expires_at: None,
+                    attestation_envelope: envelope,
+                    original_content_hash: hash,
+                    scrub_signature_classical: ed_sig,
+                    scrub_signature_pqc: pqc_sig,
+                    scrub_key_id: attester.to_string(),
+                    scrub_timestamp: now,
+                    pqc_completed_at: None,
+                    persist_row_hash: String::new(),
+                    subject_key_ids: Vec::new(),
+                    withdraws_admission_rule: None,
+                    cohort_scope: "federation".to_string(),
+                    tier: "federation".to_string(),
+                    promoted_at: None,
+                },
+            })
+            .await
+            .expect("seed federation-tier attestation");
+
+        for kind in [EnvelopeKind::Key, EnvelopeKind::Attestation] {
+            let refs = bridge.list_envelope_refs(kind).await;
+            assert!(!refs.is_empty(), "{kind:?} advertises at least one ref");
+            for r in &refs {
+                let bytes = bridge
+                    .fetch_envelope_bytes(kind, &r.envelope_hash)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!("{kind:?} point-read must serve the advertised hash")
+                    });
+                let served: [u8; 32] = Sha256::digest(&bytes).into();
+                assert_eq!(
+                    served, r.envelope_hash,
+                    "{kind:?}: advertised envelope_hash MUST equal sha256(fetched bytes)"
+                );
+            }
+        }
+    }
+
     // ── CIRISEdge#386 — infra:serve recipient gate (trace plane) ──
 
     /// Seed one `delegates_to(attester → subject)` carrying `scope`, and
@@ -2176,6 +2237,152 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .expect("seed trust-graph attestation");
+    }
+
+    /// Seed a producer's `consent:replication:v1` grant carrying a single
+    /// `recipient_capability` restriction over `prefix`, naming `recipient` as
+    /// the consented peer — so persist's E7 projection sources a live row from
+    /// it and [`FederationDirectory::list_live_consent_grants_by`] returns it.
+    async fn seed_consent_grant(
+        backend: &MemoryBackend,
+        producer: &str,
+        recipient: &str,
+        prefix: &str,
+        capability: &str,
+    ) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": producer,
+            "attested_key_id": recipient,
+            "attestation_type": "scores",
+            "dimension": "consent:replication:v1",
+            "payload": {
+                "grants": "transfer",
+                "attestation_prefixes": [prefix],
+                "restrictions": [{ "op": "recipient_capability", "capability": capability }],
+            },
+        });
+        seed_raw_attestation(backend, &id, producer, recipient, "scores", envelope).await;
+    }
+
+    /// A `trace:complete:v1` row's canonical JSON in EXACTLY the shape
+    /// `list_attestations` feeds the item-6 gate — `serde_json::to_value` over an
+    /// `Attestation` ([[feedback_test_field_provenance]]: the gate reads
+    /// `/attestation_envelope/dimension` and `attesting_key_id` off THIS value).
+    /// Built directly rather than round-tripped through `put_attestation` because
+    /// admitting a real `trace:*` row needs persist's `test-anchor` relaxation
+    /// (a `#[cfg]`-gated lib test never runs in CI's lanes); the gate reads the
+    /// projected value, not the store, so this isolates item 6 faithfully.
+    fn trace_row_json(producer: &str) -> serde_json::Value {
+        let now = Utc::now();
+        let envelope = serde_json::json!({
+            "id": "trace-fixture-1",
+            "attesting_key_id": producer,
+            "attested_key_id": producer,
+            "attestation_type": "scores",
+            "dimension": "trace:complete:v1",
+            "trace_id": "t-fixture-1",
+            "agent_id_hash": "ah-fixture-1",
+            "trace": { "steps": [] },
+        });
+        let att = Attestation {
+            attestation_id: "trace-fixture-1".to_string(),
+            attesting_key_id: producer.to_string(),
+            attested_key_id: producer.to_string(),
+            attestation_type: "scores".to_string(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: producer.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: "federation".to_string(),
+            promoted_at: None,
+        };
+        serde_json::to_value(&att).expect("serialize trace row")
+    }
+
+    /// CIRISEdge#396 item 6 — the `recipient_capability` serve control (the #393
+    /// gate-first pattern), asserted against the inputs the serve gate actually
+    /// reads. Like the #379 gate, the ALLOW path (recipient HOLDS the capability)
+    /// needs a live accord co-scrub whose minting helper is private to persist
+    /// (CIRISPersist#484), so the load-bearing WITHHOLD path + the two SERVE
+    /// paths are locked here; the ALLOW path lands with the same fleet
+    /// re-genesis that lights the #379 ALLOW path.
+    #[tokio::test]
+    async fn recipient_capability_serve_control() {
+        let producer = "agent-producer";
+        // A recipient whose record EXISTS but carries no accord-conferred role —
+        // `has_effective_role(_, "trace:read")` is false for it. (Seeding the key
+        // means the WITHHOLD below is because the record lacks the capability, not
+        // because the key is absent — the same provenance discipline the #379
+        // test uses to refuse a self-asserted `roles:[…]` peer.)
+        let recipient = "peer-no-capability";
+        let (backend, bridge) = make_bridge(&[producer.to_string(), recipient.to_string()]);
+        // Both keys registered: the producer's so `put_attestation` can verify
+        // its grant's hybrid signature, the recipient's so `has_effective_role`
+        // reads a real (role-less) record — not a missing one.
+        for key_id in [producer, recipient] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        let trace_json = trace_row_json(producer);
+
+        // (a) No grant → no restriction → SERVE (fail-open-when-absent: the
+        //     fleet's servers emit no `recipient_capability` yet, and the plane
+        //     must flow exactly as it did before this control shipped).
+        assert!(
+            !bridge
+                .recipient_capability_withholds(&trace_json, recipient, &mut HashMap::new())
+                .await,
+            "no consent grant declares a restriction → the row must serve"
+        );
+
+        // (b) A grant COVERING `trace:` with a `recipient_capability` the
+        //     recipient lacks → WITHHOLD. This is the load-bearing case: the
+        //     instant the producer's restriction materializes, enforcement lights
+        //     up with no window where the restriction exists but isn't enforced.
+        seed_consent_grant(&backend, producer, recipient, "trace:", "trace:read").await;
+        assert!(
+            bridge
+                .recipient_capability_withholds(&trace_json, recipient, &mut HashMap::new())
+                .await,
+            "covering grant + recipient lacks the required capability → withhold"
+        );
+
+        // (c) A restriction on a grant that does NOT cover the row's dimension →
+        //     SERVE (the `covers()` gate; a `capacity:` grant never gates a
+        //     `trace:` row). Fresh backend so no `trace:`-covering grant lingers.
+        let (backend2, bridge2) = make_bridge(&[producer.to_string(), recipient.to_string()]);
+        for key_id in [producer, recipient] {
+            backend2
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        let trace_json2 = trace_row_json(producer);
+        seed_consent_grant(&backend2, producer, recipient, "capacity:", "trace:read").await;
+        assert!(
+            !bridge2
+                .recipient_capability_withholds(&trace_json2, recipient, &mut HashMap::new())
+                .await,
+            "grant prefix `capacity:` does not cover a `trace:` row → serve"
+        );
     }
 
     /// The v13.10.0 gate this replaces was wrong TWICE, and this test is
@@ -2581,60 +2788,26 @@ mod tests {
 
     // ── v2 operational-data (FSD §5.2 / CEG 1.0-RC2 §5.6.8.13) ──────
 
-    /// JCS envelope_hash is deterministic: hashing the same serializable
-    /// value twice yields identical bytes. The federation invariant —
-    /// peer A and peer B both compute the same `envelope_hash` from the
-    /// same on-wire bytes — depends on this.
+    /// CIRISEdge#397 — `content_hash_of` is `sha256(serde_json::to_vec(value))`:
+    /// deterministic (a federation invariant — two peers hash the same on-wire
+    /// bytes identically), returns those exact bytes alongside the hash, and
+    /// discriminates distinct values. Byte-exact with persist's
+    /// `wire_index::content_hash_of`, the lockstep fact the point-read depends on.
     #[test]
-    fn v2_envelope_hash_is_deterministic() {
+    fn content_hash_of_hashes_the_to_vec_bytes() {
         let value = serde_json::json!({
-            "organization": {
-                "attestation_id": "att-1",
-                "org_id": "org-acme",
-                "name": "ACME",
-                "status": "active",
-            }
+            "organization": { "attestation_id": "att-1", "org_id": "org-acme" }
         });
-        let h1 = v2_envelope_hash(&value).expect("hash 1");
-        let h2 = v2_envelope_hash(&value).expect("hash 2");
-        assert_eq!(h1, h2);
-    }
-
-    /// JCS canonicalization sorts keys lexicographically — different
-    /// key ordering in the input value produces identical canonical
-    /// bytes and thus identical hashes. This is what makes M-of-N
-    /// steward quorum admission converge per RC2 §5.6.8.13 (the
-    /// Verify-raised "byte-identical JCS" catch).
-    #[test]
-    fn v2_envelope_hash_is_key_order_invariant() {
-        let a = serde_json::json!({
-            "alpha": 1,
-            "beta": 2,
-            "gamma": 3,
-        });
-        let b = serde_json::json!({
-            "gamma": 3,
-            "alpha": 1,
-            "beta": 2,
-        });
-        let ha = v2_envelope_hash(&a).expect("hash a");
-        let hb = v2_envelope_hash(&b).expect("hash b");
-        assert_eq!(
-            ha, hb,
-            "JCS sorts keys — same logical object MUST hash identically"
-        );
-    }
-
-    /// JCS canonicalization distinguishes different values — two
-    /// envelopes with different content MUST hash to different bytes.
-    /// Sanity check that v2_envelope_hash isn't degenerate.
-    #[test]
-    fn v2_envelope_hash_differentiates_distinct_values() {
-        let a = serde_json::json!({"org_id": "alice"});
-        let b = serde_json::json!({"org_id": "bob"});
-        let ha = v2_envelope_hash(&a).expect("hash a");
-        let hb = v2_envelope_hash(&b).expect("hash b");
-        assert_ne!(ha, hb);
+        let (h1, bytes1) = content_hash_of(&value).expect("hash 1");
+        let (h2, _bytes2) = content_hash_of(&value).expect("hash 2");
+        assert_eq!(h1, h2, "deterministic");
+        // The returned bytes ARE serde_json::to_vec, and the hash is their sha256.
+        assert_eq!(bytes1, serde_json::to_vec(&value).unwrap());
+        assert_eq!(<[u8; 32]>::from(Sha256::digest(&bytes1)), h1);
+        // Distinct values → distinct hashes.
+        let (hb, _) = content_hash_of(&serde_json::json!({"org_id": "bob"})).expect("hash b");
+        let (hc, _) = content_hash_of(&serde_json::json!({"org_id": "alice"})).expect("hash c");
+        assert_ne!(hb, hc);
     }
 
     /// Without `OperationalProviders` configured, `apply_organization`
@@ -2728,101 +2901,6 @@ mod tests {
             refs.is_empty(),
             "empty backend yields empty ref set (no panics, no errors)"
         );
-    }
-
-    // ── #311 — the unified engine's policy mapping + wire-shape re-wrap ──
-
-    /// Each `ReplicatedKind`'s `projection_inputs` resolve (via persist's
-    /// `projection_for`) to the projection the concept assigns: the identity
-    /// plane publishes-own, attestations relay over the cohort, and the
-    /// occurrence-revocation tombstone gossips GLOBAL (anti-rollback — the fix
-    /// for the RELAY mis-projection).
-    #[test]
-    fn projection_inputs_resolve_to_expected_projections() {
-        type B = FederationDirectoryReplicationBridge;
-        for k in [
-            ReplicatedKind::KeyRecord,
-            ReplicatedKind::IdentityOccurrence,
-            ReplicatedKind::TransportDestination,
-        ] {
-            let (s, a, t) = B::projection_inputs(k);
-            assert_eq!(
-                namespace::projection_for(s, a, t),
-                Projection::SelfOwn,
-                "{k:?} → SelfOwn (publish-own)"
-            );
-        }
-        let (s, a, t) = B::projection_inputs(ReplicatedKind::Attestation);
-        assert_eq!(namespace::projection_for(s, a, t), Projection::Cohort);
-        let (s, a, t) = B::projection_inputs(ReplicatedKind::IdentityOccurrenceRevocation);
-        assert!(t, "occurrence-revocation is a tombstone");
-        assert_eq!(
-            namespace::projection_for(s, a, t),
-            Projection::Global,
-            "tombstone → Global (anti-rollback, never out-run by the stale record)"
-        );
-    }
-
-    /// The engine re-wraps the BARE `KeyRecord` that `list_signed_records`
-    /// returns back into the `SignedKeyRecord` (`{"record": …}`) wire shape,
-    /// and keeps `persist_row_hash` as the envelope identity — so the wire
-    /// bytes deserialize on the receiver's `apply_key` and the hash is
-    /// unchanged vs the pre-#311 emitter (v9.9↔v9.10 convergence holds).
-    #[test]
-    fn adapt_record_key_rewraps_to_signed_shape_keeping_hash() {
-        let prh = "ab".repeat(32); // 64 hex chars → 32 bytes
-        let bare = serde_json::json!({
-            "key_id": "k1",
-            "persist_row_hash": prh,
-            "valid_from": "2026-07-11T00:00:00Z",
-        });
-        let (bytes, hash, _seq) =
-            FederationDirectoryReplicationBridge::adapt_record(ReplicatedKind::KeyRecord, &bare)
-                .expect("adapt bare KeyRecord");
-        // Re-nested under "record" — deserializes as SignedKeyRecord.
-        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
-        assert_eq!(v["record"]["key_id"], "k1", "re-wrapped to SignedKeyRecord");
-        // Wire identity == decoded persist_row_hash (stable across versions).
-        assert_eq!(hex::encode(hash), prh, "hash stays persist_row_hash");
-    }
-
-    /// CIRISEdge#326 / CIRISPersist#421 (persist v16) — the revocation kind is a
-    /// SIGNED CONTAINER, re-published byte-exact (edge can't re-sign). Fences the
-    /// SILENT break: pre-v16 this arm read `persist_row_hash` at the top level
-    /// and re-wrapped a bare row; against v16's container that lookup misses, so
-    /// `adapt_record` would return `None` and every revocation would vanish from
-    /// the wire with no compile error (the engine speaks `serde_json::Value`).
-    #[test]
-    fn adapt_record_revocation_is_the_signed_container_republished_byte_exact() {
-        let prh = "cd".repeat(32); // 64 hex chars → 32 bytes
-        let container = serde_json::json!({
-            "identity_occurrence_revocation": {
-                "occurrence_key_id": "occ-1",
-                "persist_row_hash": prh,
-                "revoked_at": "2026-07-12T00:00:00Z",
-            },
-            "attesting_key_id": "signer-1",
-            "signed_envelope": { "kind": "identity_occurrence_revocation" },
-            "signature": "sig-b64",
-        });
-        let (bytes, hash, _seq) = FederationDirectoryReplicationBridge::adapt_record(
-            ReplicatedKind::IdentityOccurrenceRevocation,
-            &container,
-        )
-        .expect("adapt signed revocation container");
-
-        // Emitted BYTE-EXACT — the signature container survives (not double-wrapped).
-        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
-        assert_eq!(v["signature"], "sig-b64", "signature preserved");
-        assert_eq!(v["attesting_key_id"], "signer-1");
-        assert!(
-            v.get("identity_occurrence_revocation")
-                .and_then(|r| r.get("identity_occurrence_revocation"))
-                .is_none(),
-            "must NOT be double-wrapped"
-        );
-        // Hash read from the NESTED row, not the top level.
-        assert_eq!(hex::encode(hash), prh);
     }
 
     // ── v10 — per-record dynamic policy for the scores/Attestation plane ──
