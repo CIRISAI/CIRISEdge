@@ -1564,6 +1564,21 @@ fn v2_envelope_hash<T: serde::Serialize>(value: &T) -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
+/// CIRISEdge#397 / persist v21.2.0 (#507) — the content-hash contract: return
+/// the wire bytes edge serves for `value` AND their sha256, computed EXACTLY as
+/// persist's `wire_index::content_hash_of`: `sha256(serde_json::to_vec(value))`
+/// (NO JCS — the raw `to_vec` bytes of the signed wrapper element the
+/// `list_signed_*_since` reads return). Serving these same bytes makes
+/// advertise-hash = served-bytes = the point-read's `content_hash`, so a Diff'd
+/// peer fetches byte-identical what was advertised
+/// ([`ciris_persist::federation::FederationDirectory::lookup_signed_record_by_content_hash`]).
+fn content_hash_of<T: serde::Serialize>(value: &T) -> Option<([u8; 32], Vec<u8>)> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(value).ok()?;
+    let hash: [u8; 32] = Sha256::digest(&bytes).into();
+    Some((hash, bytes))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
