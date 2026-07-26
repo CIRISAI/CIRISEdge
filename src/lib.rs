@@ -190,6 +190,39 @@ mod consent_grammar_hash_tests {
     }
 }
 
+/// Pinned SHA-256 of persist's `YUBICO_ATTESTATION_ROOT_1_DER` — the single
+/// trust anchor the CIRISPersist#513 canonical-admission gate chains every
+/// FIPS-140-3 accord custody attestation to (a valid canonical = a co-scrub by a
+/// Yubico-attested FIPS-140-3 accord of ≥3, the hardware anti-Sybil floor on
+/// trust-root minting). Edge does NOT admit canonicals, but it pins the anchor as
+/// a cross-repo drift witness: the root of trust for the anti-Sybil floor must
+/// never move silently. A mismatch is a BUILD failure first, forcing a DELIBERATE
+/// re-pin in lockstep with persist + CIRISServer — the same posture as
+/// [`PERSIST_CONSENT_GRAMMAR_HASH`] / [`PERSIST_REPLICATION_POLICY_HASH`].
+pub const PERSIST_YUBICO_ATTESTATION_ROOT_HASH: &str =
+    "62760c6a6ef91679f454c8902b80fd009825b3f25da90f1fbace2ec6586cd5a8";
+
+#[cfg(test)]
+mod yubico_attestation_root_hash_tests {
+    use sha2::{Digest, Sha256};
+
+    /// Cross-repo lockstep witness for the CIRISPersist#513 anti-Sybil floor's
+    /// trust anchor — mirrors persist's own `yubico_root_pin_sha256_513`. If
+    /// persist ever swaps the pinned Yubico attestation root, this breaks first.
+    #[test]
+    fn persist_yubico_attestation_root_pinned() {
+        assert_eq!(
+            hex::encode(Sha256::digest(
+                ciris_persist::federation::admission::YUBICO_ATTESTATION_ROOT_1_DER
+            )),
+            super::PERSIST_YUBICO_ATTESTATION_ROOT_HASH,
+            "persist's YUBICO_ATTESTATION_ROOT_1_DER changed — the FIPS-140-3 anti-Sybil \
+             floor's root of trust moved. Re-pin DELIBERATELY, in lockstep with persist + \
+             CIRISServer (CIRISPersist#513)."
+        );
+    }
+}
+
 pub use blob_swarm::{
     BlobChunkSource, BlobChunkVerifier, ChunkManifestLite, ChunkSourceRefusal, ChunkVerifyError,
     PeerState, SwarmConfig, SwarmError, SwarmScheduler,
