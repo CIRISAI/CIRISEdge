@@ -7570,7 +7570,18 @@ mod inbound_ingest_tests {
                 Some("fresh-peer"),
             )),
             Some("fresh-peer".to_string()),
-            "IdentityOccurrence is the other self-authenticating bootstrap kind",
+            "IdentityOccurrence is a self-authenticating bootstrap kind",
+        );
+        // (b2) CIRISEdge#406 — TransportDestination + link → admitted (the signed
+        //      transport binding that satisfies #393 item 2; signer_acts_for-verified
+        //      at admission, else it is itself #317-dropped — the deadlock again).
+        assert_eq!(
+            bootstrap_carve_out_source(&with_link(
+                EnvelopeKind::TransportDestination,
+                Some("fresh-peer"),
+            )),
+            Some("fresh-peer".to_string()),
+            "TransportDestination is the item-2 bootstrap kind (CIRISEdge#406)",
         );
         // (c) THE E3 INVARIANT: an Attestation (consentable/trace) frame is NEVER
         //     carved out — the trace-serve gate stays strictly Rooted∧owns_key.
