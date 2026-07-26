@@ -290,6 +290,7 @@ async fn unconsented_external_traffic_drives_observations() {
             transport: TransportId::HTTP,
             received_at: Utc::now(),
             source_key_id: None,
+            link_key_id: None,
         })
         .await;
     }
@@ -336,6 +337,7 @@ async fn peer_role_traffic_produces_no_observations() {
             transport: TransportId::HTTP,
             received_at: Utc::now(),
             source_key_id: None,
+            link_key_id: None,
         })
         .await;
     }
@@ -379,6 +381,7 @@ async fn detector_disabled_is_a_full_noop() {
             transport: TransportId::HTTP,
             received_at: Utc::now(),
             source_key_id: None,
+            link_key_id: None,
         })
         .await;
     }

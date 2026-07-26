@@ -455,6 +455,7 @@ async fn accord_carrier_2_of_3_valid_propagates() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
@@ -512,6 +513,7 @@ async fn accord_carrier_1_of_3_refuses_and_emits_refusal() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
@@ -576,6 +578,7 @@ async fn accord_carrier_3_of_3_propagates() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
@@ -638,6 +641,7 @@ async fn accord_carrier_2_valid_1_invalid_propagates() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
@@ -694,6 +698,7 @@ async fn accord_carrier_0_accord_holders_in_directory_refuses_with_no_accord_hol
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
@@ -762,6 +767,7 @@ async fn accord_carrier_duplicate_signatures_from_same_holder_count_once() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
@@ -819,6 +825,7 @@ async fn accord_carrier_non_accord_class_announcements_skip_threshold_check() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
@@ -891,6 +898,7 @@ async fn accord_carrier_classical_only_signatures_refused_require_hybrid() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
@@ -957,6 +965,7 @@ async fn accord_carrier_spare_holder_not_seated_does_not_count() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 

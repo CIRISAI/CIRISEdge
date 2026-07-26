@@ -376,6 +376,18 @@ pub struct InboundFrame {
     /// (Reticulum `Rooted ∧ owns_key`, or a channel-authenticated transport),
     /// so a spoofed/advisory attribution is unrepresentable at this boundary.
     pub source_key_id: Option<SourceKeyId>,
+    /// CIRISEdge#402 — the link's TRANSPORT-level key_id (the self-consistent
+    /// advisory binding the link identified to), populated even when the E3
+    /// trust gate refused to attribute it (`source_key_id == None`). This is a
+    /// **routing hint, not a trust claim** — a deliberately bare `String`, never
+    /// a [`SourceKeyId`], so it CANNOT reach the trace-serve path. The only
+    /// legitimate consumer is the replication ingest's bootstrap carve-out,
+    /// which promotes it to a `transport_authenticated` `SourceKeyId` ONLY for a
+    /// self-authenticating [`EnvelopeKind::is_bootstrap`](crate::replication::EnvelopeKind::is_bootstrap)
+    /// frame (`Key`/`IdentityOccurrence`), verified at persist admission. `None`
+    /// for transports that don't carry an advisory-link identity (HTTP, packet
+    /// radio, FFI — those attribute via `source_key_id` or not at all).
+    pub link_key_id: Option<String>,
 }
 
 /// The trait every transport implements. Edge holds a

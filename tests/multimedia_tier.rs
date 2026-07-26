@@ -237,6 +237,7 @@ async fn dispatch_contribution(
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 }

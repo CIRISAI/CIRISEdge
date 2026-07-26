@@ -250,6 +250,7 @@ async fn dispatch(
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
     Ok(())
@@ -623,6 +624,7 @@ async fn build_signed_envelope_from_software_signer_drives_trust_gate() {
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     };
     let outcome = edge.dispatch_inbound_observed_outcome_for_test(frame).await;
 
@@ -662,6 +664,7 @@ async fn build_outcome(edge: &Edge, sender: &LocalSigner, destination: &str) -> 
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     };
     edge.dispatch_inbound_observed_outcome_for_test(frame).await
 }

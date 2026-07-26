@@ -3940,6 +3940,8 @@ static INBOUND_ROUTED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle>
     std::sync::OnceLock::new();
 static INBOUND_BACKPRESSURE_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
+static INBOUND_BOOTSTRAP_CARVEOUT_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
 
 /// CIRISEdge#373 — an inbound frame was DROPPED because the coordinator's inbound
 /// channel was full (a stalled responder reply parked the drain). Keyed on peer
@@ -3968,6 +3970,16 @@ fn inbound_routed_log() -> &'static crate::log_throttle::LogThrottle {
     })
 }
 
+/// CIRISEdge#402 — an un-attributed CRPL frame was admitted via the bootstrap
+/// carve-out (a self-authenticating Key/IdentityOccurrence on the link's
+/// transport identity). Keyed on transport id (bounded) so a bootstrapping
+/// peer's multi-frame round doesn't flood; verification still gates at admission.
+fn inbound_bootstrap_carveout_log() -> &'static crate::log_throttle::LogThrottle {
+    INBOUND_BOOTSTRAP_CARVEOUT_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+    })
+}
+
 /// CIRISEdge#348 — the SHARED transport→replication ingest hop.
 ///
 /// Called by BOTH inbound loops ([`Edge::run`] AND
@@ -3990,7 +4002,6 @@ async fn route_replication_frame(
     metrics: Option<&crate::observability::EdgeMetrics>,
 ) -> bool {
     use crate::log_throttle::ThrottleDecision;
-    use crate::replication::registry::{RegistryError, RouteOutcome};
 
     // The frame reached ingest — the hop that used to be invisible.
     if let ThrottleDecision::Emit { suppressed_prev } =
@@ -4008,17 +4019,25 @@ async fn route_replication_frame(
     let Some(registry) = registry else {
         return false; // no replication runtime installed → envelope dispatch
     };
-    let Some(source) = frame
-        .source_key_id
-        .as_ref()
-        .map(crate::transport::SourceKeyId::as_str)
-    else {
-        // No attribution: a CRPL frame here is unroutable (drop, loudly); a
-        // non-CRPL frame is a normal unattributed envelope (fall through).
-        if frame
+    // Resolve the routing attribution. A trust-attributed `source_key_id`
+    // (`Rooted ∧ owns_key`, CIRISEdge#393/E3) routes ANY kind. CIRISEdge#402: an
+    // un-attributed CRPL frame carrying ONLY a self-authenticating bootstrap kind
+    // (`Key`/`IdentityOccurrence`) may route on the link's TRANSPORT identity, so
+    // a fresh `UnknownKeyId` peer can introduce its own KeyRecord — the frame is
+    // verified at persist admission (`put_public_key` E2/#502) where verification
+    // belongs, grants no trust, and is served no `trace:*`. Every OTHER
+    // un-attributed CRPL frame drops (`SkippedNoSourceKeyId`); the trace-serve
+    // gate stays strictly `from_rooted_binding`.
+    let source: String = if let Some(sid) = frame.source_key_id.as_ref() {
+        sid.as_str().to_string()
+    } else {
+        if !frame
             .envelope_bytes
             .starts_with(&crate::replication::wire_frame::REPLICATION_FRAME_MAGIC)
         {
+            return false; // non-CRPL unattributed envelope → envelope dispatch
+        }
+        let Some(bootstrap_source) = bootstrap_carve_out_source(frame) else {
             if let ThrottleDecision::Emit { suppressed_prev } =
                 inbound_unroutable_crpl_log().check(frame.transport.0)
             {
@@ -4028,15 +4047,44 @@ async fn route_replication_frame(
                     first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
                     route = "SkippedNoSourceKeyId",
                     suppressed_prev,
-                    "inbound CRPL replication frame with source_key_id=None — transport could \
-                     not attribute the sending link to a peer; dropping (CIRISEdge#317)"
+                    "inbound CRPL replication frame with source_key_id=None and not a \
+                     self-authenticating bootstrap kind — transport could not attribute \
+                     the sending link to a peer; dropping (CIRISEdge#317/#402)"
                 );
             }
             return true;
+        };
+        if let ThrottleDecision::Emit { suppressed_prev } =
+            inbound_bootstrap_carveout_log().check(frame.transport.0)
+        {
+            tracing::debug!(
+                transport_id = %frame.transport.0,
+                peer = %bootstrap_source,
+                suppressed_prev,
+                "un-attributed CRPL frame ADMITTED via the bootstrap carve-out — a \
+                 self-authenticating Key/IdentityOccurrence on the link's transport identity, \
+                 verified at persist admission (CIRISEdge#402)"
+            );
         }
-        return false;
+        bootstrap_source
     };
 
+    route_attributed_frame(registry, &source, frame, metrics).await
+}
+
+/// The route-outcome half of [`route_replication_frame`] (CIRISEdge#348): hand
+/// the ATTRIBUTED CRPL bytes to the registry and map the [`RouteOutcome`] to the
+/// "frame consumed?" bool. Extracted so the ingest fn stays within clippy's line
+/// budget; the attribution decision (incl. the CIRISEdge#402 bootstrap carve-out)
+/// is resolved by the caller, so `source` here is always a vetted attribution.
+async fn route_attributed_frame(
+    registry: &std::sync::Arc<crate::replication::registry::ReplicationRegistry>,
+    source: &str,
+    frame: &InboundFrame,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) -> bool {
+    use crate::log_throttle::ThrottleDecision;
+    use crate::replication::registry::{RegistryError, RouteOutcome};
     match registry
         .route_inbound_bytes(source, &frame.envelope_bytes)
         .await
@@ -4094,6 +4142,28 @@ async fn route_replication_frame(
             true
         }
     }
+}
+
+/// CIRISEdge#402 — the bootstrap attribution carve-out. `Some(key_id)` iff the
+/// frame is a self-authenticating bootstrap kind (`Key`/`IdentityOccurrence`,
+/// [`crate::replication::EnvelopeKind::is_bootstrap`]) AND the link carried a
+/// transport-level identity (`link_key_id`). The kind is peeked from the CRPL
+/// frame; a non-bootstrap kind, an unparseable frame, or an absent link identity
+/// ⇒ `None` (the frame drops; E3's `Rooted ∧ owns_key` trace-serve gate is
+/// untouched). The returned id is the link's transport identity promoted through
+/// [`crate::transport::SourceKeyId::transport_authenticated`] — the "channel
+/// vouches by its own means" constructor, justified here precisely BECAUSE the
+/// kind is self-authenticating (verified at persist admission) and can never
+/// satisfy the trace-serve gate (which requires `from_rooted_binding`).
+fn bootstrap_carve_out_source(frame: &crate::transport::InboundFrame) -> Option<String> {
+    let link_key_id = frame.link_key_id.as_deref()?;
+    let msg = crate::replication::wire_frame::try_unwrap(&frame.envelope_bytes)
+        .ok()
+        .flatten()?;
+    if !msg.kind().is_bootstrap() {
+        return None;
+    }
+    Some(crate::transport::SourceKeyId::transport_authenticated(link_key_id).into_string())
 }
 
 /// Hex of the first up-to-8 bytes of a frame — distinguishes a binary CRPL frame
@@ -7408,6 +7478,7 @@ mod inbound_ingest_tests {
     use crate::replication::protocol::{EnvelopeKind, ReplicationMessage, SummaryMessage};
     use crate::replication::registry::ReplicationRegistry;
     use crate::transport::TransportId;
+    use proptest::prelude::*;
 
     fn frame(bytes: Vec<u8>, source: Option<&str>) -> InboundFrame {
         InboundFrame {
@@ -7415,6 +7486,7 @@ mod inbound_ingest_tests {
             transport: TransportId::RETICULUM_RS,
             received_at: chrono::Utc::now(),
             source_key_id: source.map(crate::transport::SourceKeyId::transport_authenticated),
+            link_key_id: None,
         }
     }
 
@@ -7464,6 +7536,97 @@ mod inbound_ingest_tests {
                 refs: vec![],
             }));
         assert!(!route_replication_frame(None, &frame(crpl, Some("agent-peer")), None).await);
+    }
+
+    /// CIRISEdge#402 — the bootstrap attribution carve-out truth table, tested at
+    /// the decision fn against the EXACT `(kind, link_key_id)` inputs the ingest
+    /// produces. The one E3-load-bearing case is (c): a consentable/trace-bearing
+    /// `Attestation` frame is NEVER carved out, so an advisory peer can never open
+    /// an attributed Attestation round → can never be served `trace:*`. The
+    /// carve-out admits ONLY self-authenticating bootstrap kinds, which persist
+    /// re-verifies at admission.
+    #[test]
+    fn bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds() {
+        let with_link = |kind, link: Option<&str>| InboundFrame {
+            envelope_bytes: crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
+                SummaryMessage { kind, refs: vec![] },
+            )),
+            transport: TransportId::RETICULUM_RS,
+            received_at: chrono::Utc::now(),
+            source_key_id: None,
+            link_key_id: link.map(str::to_string),
+        };
+
+        // (a) Key + link → admitted on the link's transport identity.
+        assert_eq!(
+            bootstrap_carve_out_source(&with_link(EnvelopeKind::Key, Some("fresh-peer"))),
+            Some("fresh-peer".to_string()),
+            "a self-authenticating Key frame bootstraps on the link identity",
+        );
+        // (b) IdentityOccurrence + link → admitted.
+        assert_eq!(
+            bootstrap_carve_out_source(&with_link(
+                EnvelopeKind::IdentityOccurrence,
+                Some("fresh-peer"),
+            )),
+            Some("fresh-peer".to_string()),
+            "IdentityOccurrence is the other self-authenticating bootstrap kind",
+        );
+        // (c) THE E3 INVARIANT: an Attestation (consentable/trace) frame is NEVER
+        //     carved out — the trace-serve gate stays strictly Rooted∧owns_key.
+        assert!(
+            bootstrap_carve_out_source(&with_link(EnvelopeKind::Attestation, Some("fresh-peer")))
+                .is_none(),
+            "Attestation is not a bootstrap kind — it must still drop un-attributed (E3)",
+        );
+        // (d) No transport link identity → nothing to attribute → drop even for a
+        //     bootstrap kind.
+        assert!(
+            bootstrap_carve_out_source(&with_link(EnvelopeKind::Key, None)).is_none(),
+            "no transport link identity → no carve-out",
+        );
+        // (e) An unparseable / non-CRPL frame → no carve-out.
+        let junk = InboundFrame {
+            envelope_bytes: b"not a crpl frame".to_vec(),
+            transport: TransportId::RETICULUM_RS,
+            received_at: chrono::Utc::now(),
+            source_key_id: None,
+            link_key_id: Some("fresh-peer".into()),
+        };
+        assert!(
+            bootstrap_carve_out_source(&junk).is_none(),
+            "an unparseable frame yields no carve-out",
+        );
+    }
+
+    proptest! {
+        /// CIRISEdge#402 — the carve-out decision, EXHAUSTIVELY over ALL 14 kinds
+        /// × link presence × arbitrary link ids. The security invariant, stated
+        /// as one equation: a routing source is produced IFF the frame's kind is
+        /// a self-authenticating bootstrap kind (`is_bootstrap`) AND the link
+        /// carries a transport identity. So NO consentable/trace-bearing kind is
+        /// ever attributed via the carve-out (E3 intact by construction), and no
+        /// carve-out fires without a link to attribute to. A hand-picked truth
+        /// table can miss a kind; this cannot.
+        #[test]
+        fn bootstrap_carve_out_source_holds_over_all_kinds(
+            kind_idx in 0usize..EnvelopeKind::ALL.len(),
+            link in prop::option::of("[a-z0-9-]{1,32}"),
+        ) {
+            let kind = EnvelopeKind::ALL[kind_idx];
+            let frame = InboundFrame {
+                envelope_bytes: crate::replication::wire_frame::wrap(
+                    &ReplicationMessage::Summary(SummaryMessage { kind, refs: vec![] }),
+                ),
+                transport: TransportId::RETICULUM_RS,
+                received_at: chrono::Utc::now(),
+                source_key_id: None,
+                link_key_id: link.clone(),
+            };
+            // Some(link) exactly when kind is a bootstrap kind AND a link exists.
+            let expected = link.filter(|_| kind.is_bootstrap());
+            prop_assert_eq!(bootstrap_carve_out_source(&frame), expected);
+        }
     }
 
     /// CIRISEdge#373 — when a responder reply stalls, the coordinator's bounded

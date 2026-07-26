@@ -618,6 +618,9 @@ async fn inbound_handler(
         transport: TransportId::HTTP,
         received_at: Utc::now(),
         source_key_id,
+        // CIRISEdge#402 — HTTP attributes via mTLS/bearer (`source_key_id`); it
+        // carries no advisory-link identity, so no bootstrap carve-out here.
+        link_key_id: None,
     };
     match state.sink.send(frame).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),

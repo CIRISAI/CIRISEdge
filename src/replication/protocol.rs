@@ -178,6 +178,25 @@ impl EnvelopeKind {
         Self::TransportDestination,
     ];
 
+    /// CIRISEdge#402 — the finite, self-authenticating **bootstrap** kinds a
+    /// fresh peer must deliver to introduce itself into the trust graph: its own
+    /// `KeyRecord` (`Key`) and its identity binding (`IdentityOccurrence`).
+    /// These are the ONLY kinds the attribution gate exempts from
+    /// `Rooted ∧ owns_key` (CIRISEdge#393/E3): a fresh peer is `UnknownKeyId`
+    /// until its `Key` is admitted, but the `Key` frame is exactly what admits
+    /// it — a deadlock the gate would otherwise never break. Safe because both
+    /// are hybrid-verified at persist admission (`put_public_key` E2/#502,
+    /// `put_identity_occurrence` `signer_acts_for`), so an un-attributed
+    /// delivery is *verified* at the apply layer where verification belongs; it
+    /// grants no trust and is served no `trace:*` (that plane stays strictly
+    /// `Rooted ∧ owns_key`-attributed). Consentable/structural planes are NOT
+    /// bootstrap kinds — the exemption is exactly these two, forever a compile
+    /// error to widen without touching this method.
+    #[must_use]
+    pub fn is_bootstrap(self) -> bool {
+        matches!(self, Self::Key | Self::IdentityOccurrence)
+    }
+
     /// Stable snake_case wire name for this kind — the manifest/witness key
     /// (CIRISEdge#393 item 3). Stable across releases; a rename is a wire-policy
     /// change that must flip `SERVE_ADVERTISE_POLICY_HASH`.
@@ -490,6 +509,21 @@ mod tests {
             let s = std::str::from_utf8(&bytes).unwrap();
             assert!(s.contains(wire), "expected `{wire}` in {s}");
             assert_eq!(ReplicationMessage::from_bytes(&bytes).unwrap(), m);
+        }
+    }
+
+    /// CIRISEdge#402 — `is_bootstrap` is EXACTLY `{Key, IdentityOccurrence}`.
+    /// Checked over ALL 14 kinds so widening the attribution carve-out can't slip
+    /// in unnoticed: a new bootstrap kind must be a deliberate edit here.
+    #[test]
+    fn is_bootstrap_is_exactly_key_and_identity_occurrence() {
+        for kind in EnvelopeKind::ALL {
+            let expected = matches!(kind, EnvelopeKind::Key | EnvelopeKind::IdentityOccurrence);
+            assert_eq!(
+                kind.is_bootstrap(),
+                expected,
+                "{kind:?}: is_bootstrap must be true iff Key/IdentityOccurrence",
+            );
         }
     }
 
