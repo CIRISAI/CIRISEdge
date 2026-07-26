@@ -4149,6 +4149,12 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // is `Rooted ∧ owns_key` (item 1) AND its transport identity is bound by a
     // hybrid-verified `SignedTransportDestination` (item 2, the PQ half). Any
     // shortfall → `None` (SkippedNoSourceKeyId downstream, never served).
+    // CIRISEdge#402 — the raw transport-level link key_id (the self-consistent
+    // advisory binding), captured BEFORE the E3 `Rooted∧owns_key∧hybrid` gate
+    // below narrows it to `None`. A routing hint only (see `InboundFrame::link_key_id`);
+    // the E3 attacker (`PubkeyMismatch`) never reaches `link_to_peer_key_id`, so
+    // this is `Some` only for a self-consistent binding.
+    let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {
         Some(key_id) => {
             // Item 1 — Rooted ∧ owns_key, plus capture the peer's dest for the
@@ -4212,6 +4218,7 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         transport: TransportId::RETICULUM_RS,
         received_at: Utc::now(),
         source_key_id,
+        link_key_id,
     };
     if let Err(e) = ctx.sink.send(frame).await {
         tracing::error!(error = %e, "inbound channel send failed");

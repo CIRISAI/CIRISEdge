@@ -1059,6 +1059,7 @@ impl PyEdge {
                     transport: tid,
                     received_at: chrono::Utc::now(),
                     source_key_id: None,
+                    link_key_id: None, // CIRISEdge#402
                 };
                 inner
                     .dispatch_inbound_observed_outcome_for_test(frame)

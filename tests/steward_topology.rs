@@ -496,6 +496,7 @@ async fn federation_delivery_emits_attestation_per_recipient() {
         received_at: chrono::Utc::now(),
         transport: TransportId::HTTP,
         source_key_id: None,
+        link_key_id: None,
     };
     receiver_edge.dispatch_inbound_for_test(frame).await;
 

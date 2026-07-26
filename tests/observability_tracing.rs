@@ -284,6 +284,7 @@ async fn dispatch_inbound_emits_structured_span_with_fields() {
         transport: TransportId::HTTP,
         received_at: chrono::Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -366,6 +367,7 @@ async fn verify_failure_emits_structured_error_event() {
         transport: TransportId::HTTP,
         received_at: chrono::Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 

@@ -248,6 +248,7 @@ impl Transport for PacketRadioTransport {
                         transport: self.transport_id,
                         received_at: Utc::now(),
                         source_key_id: None,
+                        link_key_id: None, // CIRISEdge#402 — no advisory-link identity
                     };
                     if sink.send(frame).await.is_err() {
                         // Sink closed — listener should exit cleanly.

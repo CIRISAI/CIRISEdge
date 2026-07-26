@@ -430,6 +430,7 @@ async fn tier3_dispatch_inbound_signals_fetch_content() {
         transport: TransportId::HTTP,
         received_at: chrono::Utc::now(),
         source_key_id: None,
+        link_key_id: None,
     })
     .await;
 
