@@ -4159,7 +4159,11 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         Some(key_id) => {
             // Item 1 — Rooted ∧ owns_key, plus capture the peer's dest for the
             // item-2 lookup. `dest` is `None` when the peer isn't in the map.
-            let (item1, dest) = {
+            // CIRISEdge#404 — ALSO snapshot the RESOLVED binding's operands
+            // (provenance, owns_key, epoch) so the attribution-miss log can name
+            // WHICH conjunct failed (a `provenance=Advisory ∧ owns_key=true` is a
+            // churn downgrade, indistinguishable from an owns_key failure without it).
+            let (item1, dest, resolved) = {
                 let peers = ctx.peers.lock().await;
                 match peers.get(&key_id) {
                     Some(rooted) => (
@@ -4169,8 +4173,9 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                             rooted.owns_key,
                         ),
                         Some(rooted.peer.dest_hash.into_bytes()),
+                        Some((rooted.provenance, rooted.owns_key, rooted.epoch)),
                     ),
-                    None => (None, None),
+                    None => (None, None, None),
                 }
             };
             // Item 2 — the PQ transport binding. Fail-closed without a rooting
@@ -4202,12 +4207,38 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                 _ => None,
             };
             if gated.is_none() {
-                tracing::debug!(
-                    link = ?link_id,
-                    peer = %key_id,
-                    "inbound frame NOT attributed — binding is not Rooted∧owns_key∧hybrid \
-                     (advisory/spoof/PQ-resistant serve gate, CIRISEdge#393)"
-                );
+                // CIRISEdge#404 — the attribution decision now has a voice. INFO
+                // (testing-visible) + throttled by key_id (the 1024-cap map bounds
+                // an attacker-chosen flood). The operands turn "binding is not
+                // Rooted∧owns_key" from three candidates into a verdict: a
+                // `provenance=Advisory ∧ owns_key=true` is a churn DOWNGRADE (owner
+                // reroute overwrote a Rooted binding), NOT an owns_key failure.
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    link_attribution_miss_log().check(key_id.as_str())
+                {
+                    if let Some((provenance, owns_key, epoch)) = resolved {
+                        tracing::info!(
+                            link = ?link_id,
+                            peer = %key_id,
+                            resolved_provenance = ?provenance,
+                            resolved_owns_key = owns_key,
+                            resolved_epoch = epoch,
+                            suppressed_prev,
+                            "inbound frame NOT attributed — resolved binding fails \
+                             Rooted∧owns_key; these are the ACTUAL operands (CIRISEdge#404). \
+                             provenance=Advisory + owns_key=true ⇒ a churn downgrade, not an \
+                             owns_key failure"
+                        );
+                    } else {
+                        tracing::info!(
+                            link = ?link_id,
+                            peer = %key_id,
+                            suppressed_prev,
+                            "inbound frame NOT attributed — NO binding in the peers map for \
+                             this link's key_id (CIRISEdge#404 link-resolution miss)"
+                        );
+                    }
+                }
             }
             gated
         }
@@ -4703,8 +4734,17 @@ fn link_event(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteSupersession {
     /// No prior entry, or a legitimate supersession / first-root upgrade /
-    /// verified reroute-heal — write the incoming route.
+    /// verified reroute-heal — write the incoming route AND its trust classification.
     Admit,
+    /// CIRISEdge#404 — the OWNER (ownership proven) re-announced over an existing
+    /// **Rooted** binding but its own announce only classified **Advisory** (a
+    /// transient rooting-walk gap under churn), on a new dest/epoch. Heal the
+    /// ROUTE (dest/epoch/transport-identity) but PRESERVE the established
+    /// `Rooted ∧ owns_key` trust — a churn blip must never de-attribute a rooted
+    /// peer. Safe: only the SAME owner reaches here (CRITICAL-1 refused the
+    /// non-owning case first), and the serve gate re-roots live, so a genuine
+    /// de-rooting is still refused downstream regardless of this transport-tier hint.
+    AdmitRouteKeepTrust,
     /// A same-or-lower-epoch re-announce with no upgrade and no heal — ignore
     /// (stale); the cached route stands.
     IgnoreStale,
@@ -4752,6 +4792,23 @@ fn route_supersession_decision(
     // routing keys on identity, not trust (rooting≠routing, one level up).
     if matches!(ex_prov, Rooted) && !incoming_owns_key {
         return RouteSupersession::HijackRefused;
+    }
+    // CIRISEdge#404 — an OWNER's (owns_key proven; the non-owning case was just
+    // refused) **Advisory** announce over an existing **Rooted** binding is a
+    // transient rooting-walk gap under churn, NOT a de-rooting. It must HEAL the
+    // route (owner moved dest / rotated epoch) WITHOUT downgrading the established
+    // trust. Pre-#404, this fell through to `Admit` and overwrote the binding with
+    // the Advisory verdict → `from_rooted_binding` then failed on the *provenance*
+    // conjunct (mis-read as an `owns_key` failure) → every inbound trace frame
+    // dropped `SkippedNoSourceKeyId`. If nothing about the route changed, it is a
+    // plain stale re-announce (keep everything). This sits BEFORE the epoch checks
+    // so it also covers a higher-epoch transport rotation whose walk transiently
+    // fell to Advisory.
+    if matches!(ex_prov, Rooted) && matches!(incoming_provenance, Advisory) {
+        if incoming_epoch > ex_epoch || incoming_dest16 != ex_dest16 {
+            return RouteSupersession::AdmitRouteKeepTrust;
+        }
+        return RouteSupersession::IgnoreStale;
     }
     // A strictly-newer epoch always supersedes (a genuine transport-identity
     // rotation, or a rooted upgrade at a higher epoch) — the hijack gate above
@@ -5011,6 +5068,11 @@ async fn resolve_announce_cold_start(
     let dest_hash16: [u8; 16] = (*announce.destination_hash()).into_bytes();
     let announced_dest = *announce.destination_hash();
     let announced_dest16 = announced_dest.into_bytes();
+    // CIRISEdge#404 — the provenance actually WRITTEN + persisted. Normally the
+    // incoming verdict, but an `AdmitRouteKeepTrust` route-heal preserves the
+    // existing Rooted trust (set inside that arm), so the boot-reloaded binding
+    // keeps its Rooted classification rather than the transient Advisory.
+    let mut persist_provenance = provenance;
     let newly_rooted_key = {
         let mut peers = ctx.peers.lock().await;
         // Snapshot the existing entry's decision-relevant fields (all Copy), so
@@ -5055,6 +5117,35 @@ async fn resolve_announce_cold_start(
                      no verified reroute)",
                 );
                 None
+            }
+            // CIRISEdge#404 — heal the ROUTE of a Rooted binding whose owner's
+            // re-announce transiently classified Advisory, WITHOUT downgrading the
+            // trust. Update the route fields in place; provenance/owns_key/chain
+            // stand. This is the fix for the epoch-0-churn de-attribution that
+            // stalled the ladder at `4.ship=0`.
+            RouteSupersession::AdmitRouteKeepTrust => {
+                if let Some(existing) = peers.get_mut(&key_id) {
+                    existing.peer = resolved;
+                    existing.epoch = attestation.epoch;
+                    existing.transport_identity_hash = transport_identity_hash;
+                    // Persist the PRESERVED Rooted provenance, not the incoming
+                    // Advisory verdict, so a boot-reload keeps the binding rooted.
+                    persist_provenance = existing.provenance;
+                }
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    route_supersession_log().check("reroute_healed_keep_trust")
+                {
+                    tracing::info!(
+                        key_id = %key_id,
+                        new_dest = %hex::encode(announced_dest16),
+                        epoch = attestation.epoch,
+                        suppressed_prev,
+                        "route HEALED, trust PRESERVED — an owner's Advisory re-announce \
+                         updated a Rooted binding's route without downgrading it \
+                         (CIRISEdge#404); inbound frames stay attributed under churn"
+                    );
+                }
+                Some(key_id.clone())
             }
             RouteSupersession::Admit => {
                 // CIRISEdge#336 — surface a reroute-heal distinctly from a fresh
@@ -5218,7 +5309,9 @@ async fn resolve_announce_cold_start(
                 &persisted_key,
                 dest_hash16,
                 binding_pubkey64,
-                provenance,
+                // CIRISEdge#404 — the EFFECTIVE provenance (an AdmitRouteKeepTrust
+                // heal preserves the existing Rooted, not the incoming Advisory).
+                persist_provenance,
                 attestation.epoch,
             )
             .await;
@@ -6028,6 +6121,13 @@ mod tests {
         /// field passes `Advisory`, which the old gate refused as a hijack, so the
         /// belt never fired. Green test, wrong path — the saga's signature failure,
         /// now guarded with the ACTUAL field provenance.
+        ///
+        /// CIRISEdge#404 REFINEMENT: the heal now returns `AdmitRouteKeepTrust`,
+        /// not `Admit`. #336 healed the ROUTE but overwrote the binding with the
+        /// incoming Advisory verdict — a provenance DOWNGRADE that left the peer
+        /// reachable-but-UNATTRIBUTED (`from_rooted_binding` fails on provenance),
+        /// which under epoch-0 churn dropped every inbound trace frame. The route
+        /// still heals (explicit→named); the established Rooted trust is preserved.
         #[test]
         fn belt_heals_the_owners_advisory_reroute_explicit_to_named() {
             assert_eq!(
@@ -6038,9 +6138,40 @@ mod tests {
                     0,
                     NAMED,
                 ),
-                RouteSupersession::Admit,
+                RouteSupersession::AdmitRouteKeepTrust,
                 "the owner's genuine Advisory announce MUST heal a boot-primed \
-                 explicit-hash route to its named dest (#336)",
+                 explicit-hash route to its named dest WITHOUT downgrading the \
+                 Rooted trust (#336 heal + #404 keep-trust)",
+            );
+        }
+
+        /// CIRISEdge#404 — the epoch-0-churn de-attribution, at the decision fn.
+        /// An owner's Advisory re-announce over a Rooted binding NEVER downgrades:
+        /// it heals the route (new dest / higher epoch) or is a no-op stale
+        /// re-announce (same dest) — never `Admit` (which would write Advisory).
+        #[test]
+        fn owner_advisory_never_downgrades_a_rooted_binding() {
+            // Equal-epoch reroute (the churn case) → heal route, keep trust.
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Advisory, true, 0, NAMED),
+                RouteSupersession::AdmitRouteKeepTrust,
+            );
+            // Higher-epoch (transport rotation) whose walk fell to Advisory →
+            // heal route, keep trust (the key_id is still rooted in the directory).
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 2, NAMED)), Advisory, true, 3, EXPLICIT),
+                RouteSupersession::AdmitRouteKeepTrust,
+            );
+            // SAME dest, same epoch → nothing to heal; a plain stale re-announce
+            // that must NOT rewrite (and must NOT downgrade) the Rooted binding.
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 4, NAMED)), Advisory, true, 4, NAMED),
+                RouteSupersession::IgnoreStale,
+            );
+            // The razor still holds: WITHOUT ownership it is a hijack, refused.
+            assert_eq!(
+                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Advisory, false, 0, NAMED),
+                RouteSupersession::HijackRefused,
             );
         }
 
@@ -6084,8 +6215,10 @@ mod tests {
             );
         }
 
-        /// The owner rotating its transport identity (higher epoch) supersedes,
-        /// whether the new announce is Rooted or an owns-key Advisory.
+        /// The owner rotating its transport identity (higher epoch) supersedes.
+        /// A Rooted incoming takes the route + trust (`Admit`); a same-owner
+        /// Advisory incoming heals the route but PRESERVES the Rooted trust
+        /// (`AdmitRouteKeepTrust`, CIRISEdge#404) — never a downgrade.
         #[test]
         fn higher_epoch_owner_supersedes() {
             assert_eq!(
@@ -6094,7 +6227,7 @@ mod tests {
             );
             assert_eq!(
                 route_supersession_decision(Some((Rooted, 2, NAMED)), Advisory, true, 3, EXPLICIT),
-                RouteSupersession::Admit,
+                RouteSupersession::AdmitRouteKeepTrust,
             );
         }
 
