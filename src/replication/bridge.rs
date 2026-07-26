@@ -54,7 +54,8 @@
 //! FSD §7.1 acceptance criteria.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -188,7 +189,23 @@ pub struct FederationDirectoryReplicationBridge {
     /// identity there is no "I" whose trust could be evaluated. Supplied by
     /// `ReplicationRuntimeConfig::local_key_id`.
     local_key_id: Option<String>,
+    /// CIRISEdge#400 — memoized consent send-set (`list_consent_peers(local)`),
+    /// with the [`Instant`] it was resolved. The item-1 fan-out bound must
+    /// re-resolve *per round* but NOT *per envelope*: v14.2.0 called
+    /// `resolve_attestation_recipient` inside `fetch_envelope_bytes_for_peer`,
+    /// so an N-envelope Deliver did N `list_consent_peers` reads inside the
+    /// unbounded reply assembly and blew the 10 s round budget (100% round
+    /// timeouts). This memo collapses a round's advertise + N fetches to ONE
+    /// read; the [`CONSENT_SEND_SET_MEMO_TTL`] window sits under the anti-entropy
+    /// cadence so a between-round withdraw still takes effect next round.
+    consent_memo: Mutex<Option<(ResolvedPeerSet, Instant)>>,
 }
+
+/// CIRISEdge#400 — how long a memoized consent send-set stays fresh. Chosen to
+/// span one anti-entropy round's assembly steps (advertise → Diff → Deliver,
+/// bounded by the scheduler's 10 s round budget) while staying well under the
+/// default 30 s cadence, so the item-1 bound still re-resolves every round.
+const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
 
 impl FederationDirectoryReplicationBridge {
     /// Construct with default [`BridgeConfig`], **v1-only** (no v2
@@ -211,6 +228,7 @@ impl FederationDirectoryReplicationBridge {
             local_key_id: None,
             config,
             operational: None,
+            consent_memo: Mutex::new(None),
         }
     }
 
@@ -243,6 +261,7 @@ impl FederationDirectoryReplicationBridge {
             local_key_id: None,
             config,
             operational: Some(operational),
+            consent_memo: Mutex::new(None),
         }
     }
 
@@ -995,27 +1014,53 @@ impl FederationDirectoryReplicationBridge {
             );
             return None;
         };
-        match ResolvedPeerSet::resolve(&*self.directory, local).await {
-            Ok(set) => {
-                let resolved = set.recipient(peer);
-                if resolved.is_none() {
-                    tracing::debug!(
-                        peer,
-                        "attestation plane withheld — recipient is not in this node's live \
-                         consent:replication send-set (CIRISEdge#396 item 1)"
-                    );
+        let Some(set) = self.resolved_peer_set(local).await else {
+            tracing::debug!(
+                peer,
+                "attestation plane withheld — consent send-set unresolved (fail-closed)"
+            );
+            return None;
+        };
+        let resolved = set.recipient(peer);
+        if resolved.is_none() {
+            tracing::debug!(
+                peer,
+                "attestation plane withheld — recipient is not in this node's live \
+                 consent:replication send-set (CIRISEdge#396 item 1)"
+            );
+        }
+        resolved
+    }
+
+    /// CIRISEdge#400 — the memoized consent send-set. Returns the live
+    /// `list_consent_peers(local)` projection, re-reading persist only when the
+    /// memo is empty or older than [`CONSENT_SEND_SET_MEMO_TTL`]. A round's
+    /// advertise + N `fetch_envelope_bytes_for_peer` calls therefore share ONE
+    /// read instead of N (the v14.2.0 regression that blew the round budget),
+    /// while a between-round withdraw still re-resolves next round. `None` (the
+    /// caller fails closed) only on a directory error. The `Arc`-backed
+    /// [`ResolvedPeerSet`] makes the memo-hit clone O(1); the `std` mutex is
+    /// never held across the `await`.
+    async fn resolved_peer_set(&self, local: &str) -> Option<ResolvedPeerSet> {
+        if let Ok(memo) = self.consent_memo.lock() {
+            if let Some((set, resolved_at)) = memo.as_ref() {
+                if resolved_at.elapsed() < CONSENT_SEND_SET_MEMO_TTL {
+                    return Some(set.clone());
                 }
-                resolved
-            }
-            Err(e) => {
-                tracing::debug!(
-                    peer,
-                    error = %e,
-                    "attestation plane withheld — consent send-set unresolved (fail-closed)"
-                );
-                None
             }
         }
+        let peers = match self.directory.list_consent_peers(local).await {
+            Ok(peers) => peers,
+            Err(e) => {
+                tracing::debug!(error = %e, "consent send-set read failed (fail-closed)");
+                return None;
+            }
+        };
+        let set = ResolvedPeerSet::from_consent_peers(peers);
+        if let Ok(mut memo) = self.consent_memo.lock() {
+            *memo = Some((set.clone(), Instant::now()));
+        }
+        Some(set)
     }
 
     async fn list_attestations(&self, recipient: Option<&str>) -> Vec<EnvelopeRef> {
@@ -2634,6 +2679,41 @@ mod tests {
         assert!(
             bridge.list_attestations(Some(peer)).await.is_empty(),
             "no local_key_id → consent send-set unresolvable → whole plane withheld (fail-closed)"
+        );
+    }
+
+    /// CIRISEdge#400 — the consent send-set is memoized across a round window,
+    /// so a round's advertise + N fetches share ONE `list_consent_peers` read
+    /// instead of N. This is the regression witness: v14.2.0 re-read persist
+    /// per envelope inside the unbounded reply assembly, blowing the 10 s round
+    /// budget (100% round timeouts). Two resolves within the TTL must return the
+    /// SAME `Arc`-backed set — a re-read would allocate a distinct one.
+    #[tokio::test]
+    async fn consent_send_set_is_memoized_within_the_round_window() {
+        let local = "this-node";
+        let peer = "peer-consented";
+        let (backend, bridge) = make_bridge(&[local.to_string(), peer.to_string()]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        for key_id in [local, peer] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_consent_membership(&backend, local, peer).await;
+
+        let set1 = bridge.resolved_peer_set(local).await.expect("resolve 1");
+        let set2 = bridge.resolved_peer_set(local).await.expect("resolve 2");
+        assert!(
+            set1.ptr_eq(&set2),
+            "second resolve within the TTL is a memo HIT, not a per-envelope re-read (CIRISEdge#400)"
+        );
+        // ...and the memoized set is the real consent membership.
+        assert!(
+            set1.recipient(peer).is_some(),
+            "the memoized set resolves the consent-included peer"
         );
     }
 

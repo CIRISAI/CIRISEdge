@@ -43,33 +43,29 @@
 //! leaves structural replication untouched.
 
 use std::collections::HashSet;
-
-use ciris_persist::federation::{Error, FederationDirectory};
+use std::sync::Arc;
 
 /// The consent-resolved set of peers this node may SEND consentable claims to
 /// this round — persist's live `consent:replication` peer projection for
-/// `local_key_id` (E7, revocation-folded). Re-resolve every round; never cache
-/// across rounds (a between-round withdraw must take effect at the next send).
+/// `local_key_id` (E7, revocation-folded). `Arc`-backed so the bridge can
+/// memoize ONE read across a round's advertise + N fetches (CIRISEdge#400: a
+/// per-envelope re-read blew the round budget); the memo TTL stays under the
+/// anti-entropy cadence, so a between-round withdraw still takes effect at the
+/// next round (nuclear un-trust preserved at round granularity).
+#[derive(Clone)]
 pub(crate) struct ResolvedPeerSet {
-    send_set: HashSet<String>,
+    send_set: Arc<HashSet<String>>,
 }
 
 impl ResolvedPeerSet {
-    /// Resolve `local_key_id`'s live consent send-set from persist's E7
-    /// projection. The operator-addressing half of the intersection is applied
-    /// by the caller's serve path (only a connected peer is ever tested), so
-    /// this reads the consent side alone. Propagates the directory error so the
-    /// caller can fail **closed** (an unresolved consent view withholds).
-    pub(crate) async fn resolve(
-        directory: &dyn FederationDirectory,
-        local_key_id: &str,
-    ) -> Result<Self, Error> {
-        let send_set = directory
-            .list_consent_peers(local_key_id)
-            .await?
-            .into_iter()
-            .collect();
-        Ok(Self { send_set })
+    /// Build from persist's `list_consent_peers(local)` result. The
+    /// operator-addressing half of the intersection is applied by the caller's
+    /// serve path (only a connected peer is ever tested), so this holds the
+    /// consent side alone. The `Arc` makes [`Clone`] O(1) for the memo.
+    pub(crate) fn from_consent_peers(peers: Vec<String>) -> Self {
+        Self {
+            send_set: Arc::new(peers.into_iter().collect()),
+        }
     }
 
     /// A send-authorization for `peer_key_id`, IFF consent includes it. `None`
@@ -82,6 +78,14 @@ impl ResolvedPeerSet {
         self.send_set
             .contains(peer_key_id)
             .then(|| ResolvedRecipient(peer_key_id.to_owned()))
+    }
+
+    /// Test-only: do two handles share the SAME memoized set (the O(1)
+    /// `Arc` clone)? The regression witness for CIRISEdge#400 — a memo HIT
+    /// returns a clone of the same `Arc`; a re-read would allocate a new one.
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.send_set, &other.send_set)
     }
 }
 
