@@ -1,87 +1,92 @@
 # `ciris-edge`
 
-Reticulum-native federation transport for the CIRIS stack. Replaces
-the Python edge across CIRISLens (FastAPI), CIRISAgent (httpx),
-CIRISRegistry (HTTPS) with a single Rust crate that does signed
-message in/out, verify-via-persist, and typed handler dispatch.
+**The transport and replication layer of the CIRIS Epistemic Web
+([CEWP](https://ciris.ai/cewp)).** A single Rust crate that moves the 14 signed
+envelope kinds of the CEG grammar between federation peers over any medium —
+Reticulum mesh, HTTPS, packet radio — decides *who is allowed to learn a claim
+exists*, and attributes every inbound byte to a cryptographic identity **before
+any handler sees it**.
 
-**Status:** v0.2.0 — Phase 1 substrate live. Verify pipeline (hybrid
-Ed25519 + ML-DSA-65 via persist's directory lookup), durable outbound
-queue + dispatcher, typed handler dispatch, HTTP transport, the CC 0.7
-two-tier wire vocabulary (Tier-1 constitutional bodies + Tier-2 opaque
-app RPC — `send::<OpaqueRequest>` / `OpaqueResponse` / `OpaqueEvent`,
-`WIRE_VOCABULARY_HASH` build-gate pinned), and a sovereign-mode convenience
-constructor (`EdgeBuilder::from_keyring_seed_dir`) for Reticulum-style
-adoption with no persist Engine in-process. PyO3 surface (`Edge`
-class registration + `init_edge_runtime`) lands in v0.3.x; reticulum
-+ multi-medium transports follow per Phase 3 of the FSD.
+Edge is the operational realization of
+**[Constitution Part 5 — Transport & Substrate](../CIRISConstitution/constitution/part_5_transport_substrate.md)**,
+built on two disciplines: **fail-secure** (a missing key or unresolved consent
+resolves to *less* access, never a silent downgrade) and **integrity through
+structure** (privacy and authenticity are properties the wire format *cannot
+violate*, not promises an operator makes). Its design thesis, from
+[contextual integrity](https://ciris.ai/contextual-integrity/):
+**"the strongest flow rule is one the network cannot express breaking."**
 
-## Read in this order
+> **📖 The protocol spec: [`FSD/CIRIS_EDGE_TRANSPORT.md`](FSD/CIRIS_EDGE_TRANSPORT.md)** —
+> the 14 EnvelopeKinds, the cohort/namespace projections, the anti-entropy state
+> machine, the transport attribution pipeline, the serve/consent gates, and the
+> CEG-vs-OSI layering, with diagrams and code anchors. Start there.
 
-1. **[`MISSION.md`](MISSION.md)** — the WHY. Mission Driven Development
-   alignment to CIRIS Accord Meta-Goal M-1; per-module mission
-   statements; anti-patterns that violate the mission; failure modes.
-
-2. **[`FSD/CIRIS_EDGE.md`](FSD/CIRIS_EDGE.md)** — the WHAT. Architecture
-   spec, three-phase delivery plan, crate shape, public API surface,
-   verify-via-persist contract, wire-format envelope, test categories.
-
-3. **[`FSD/OPEN_QUESTIONS.md`](FSD/OPEN_QUESTIONS.md)** — the HOW.
-   Thirteen design forks needing owner input before Phase 1 starts.
-   Each question states the choice, the trade-off, and a lens-side
-   default; resolutions land at the bottom in `CLOSED`.
-
-## TL;DR
-
-The CIRIS architecture has three peers (agent, lens, registry) each
-maintaining their own network edge. Three parallel HTTP shims, three
-retry policies, three cert-management stories. The Proof-of-Benefit
-Federation FSD ([`~/CIRISAgent/FSD/PROOF_OF_BENEFIT_FEDERATION.md`](../CIRISAgent/FSD/PROOF_OF_BENEFIT_FEDERATION.md)
-§3.2) names Reticulum-rs as the transport that closes the federation
-loop: addressing IS identity, multi-medium reach, fork-survivable Rust.
-
-`ciris-edge` is the crate that operationalizes that proposal. Each
-peer becomes:
+## What edge does
 
 ```
 host application code
-    │ registers handlers
-    ▼
-ciris-edge       ←── Reticulum link sessions (TCP / LoRa / serial / I²P)
-    │ verify via persist
-    ▼
-ciris-persist    ←── steward identity, federation_keys, trace storage
+    │ registers handlers                    ┌─ Reticulum mesh (TCP / LoRa / serial / I²P)
+    ▼                                        │
+ciris-edge  ──── anti-entropy replication ───┼─ HTTPS (bearer / mTLS)
+    │ attribute at the wire · serve by consent │
+    ▼                                        └─ packet radio
+ciris-persist  ──── keys · attestations · trace · admission
 ```
 
-One shape, many peers. Library, not sidecar. Verify happens at the
-wire, before any handler sees a byte. Key seeds never cross the FFI
-boundary. HTTP fallback ships in Phase 1 so cloud deployments can
-participate today; Reticulum is canonical and Phase 3 productionizes
-LoRa + serial + I²P for the deployments that need M-1 most.
+One shape, many peers. **Library, not sidecar.** Verify happens at the wire,
+before any handler sees a byte. Key seeds never cross the FFI boundary. Every
+transport is a projection of one `Transport` trait; Reticulum is canonical, HTTPS
+is the production fallback so cloud deployments participate today.
 
-## Phases
+## Read in this order
 
-| Phase | Outcome |
-|---|---|
-| **1** (immediate) | Crate skeleton; HTTP transport + Reticulum behind a feature flag; Ed25519 verify via persist; typed handler dispatch; lens cuts over from FastAPI to embedded edge runner |
-| **2** | Agent + registry adopt edge; HTTPS becomes per-peer fallback |
-| **3** | LoRa, packet-radio, serial transports productionized; off-grid CIRIS deployments tractable |
+1. **[`MISSION.md`](MISSION.md)** — the WHY. Mission-Driven Development alignment to
+   CIRIS Accord Meta-Goal M-1; per-module missions; anti-patterns; failure modes.
+2. **[`FSD/CIRIS_EDGE_TRANSPORT.md`](FSD/CIRIS_EDGE_TRANSPORT.md)** — the protocol.
+   State machines, the 14 kinds, namespaces, attribution, consent-routing, CEG↔OSI.
+3. **[`FSD/CIRIS_EDGE.md`](FSD/CIRIS_EDGE.md)** — the architecture spec, crate shape,
+   public API surface, verify-via-persist contract, test categories.
+
+## The shape of the protocol (one-paragraph tour)
+
+Every claim is one of **14 signed [`EnvelopeKind`s](FSD/CIRIS_EDGE_TRANSPORT.md#2-the-14-envelopekinds)**,
+each its own anti-entropy stream. A claim's **`cohort_scope`** (`self` → `family`
+→ `community` → `affiliations` → `species` → `biosphere` → `federation`) resolves
+to a **projection** — `SelfOwn` (publish-your-own, *structurally invisible* — no
+directory advertisement), `Cohort` (roster hold-and-forward), or `Global`
+(commons + anti-rollback tombstones). Peers reconcile per `(peer, kind)` via a
+bidirectional **Summary → Diff → Deliver** round. Every inbound frame is
+**attributed** at ingest to a `Rooted ∧ owns_key` federation identity (a fresh
+peer bootstraps via a narrow, self-authenticating `{Key, IdentityOccurrence,
+TransportDestination}` carve-out); an unattributable frame is dropped before any
+serve gate is consulted. Only the `Attestation` plane is **consent-gated** — a
+consentable claim flows to a peer only if the producer's consent grant includes
+it, the recipient holds `infra:serve`, and it satisfies any `recipient_capability`
+restriction. The recipient axis *cannot exceed* the transmission principle,
+by construction.
+
+## Status
+
+**v14.x** — production CEG-native transport. Reticulum + HTTPS + packet-radio
+transports; the anti-entropy replication engine; the `#393` two-item attribution
+gate (Rooted∧owns_key + hybrid transport binding); the `#402` bootstrap carve-out;
+the `#396` consent-resolved fan-out + serve gates; hybrid Ed25519 + ML-DSA-65
+throughout; PyO3 + UniFFI mobile surfaces. Pinned in lockstep to `ciris-persist`
+(Registry-of-Record admission) via drift-witnessed policy hashes.
 
 ## Sister repos
 
-- [`CIRISAgent`](../CIRISAgent) — agent reasoning loop; emits signed
-  traces. Wire-format spec lives at `FSD/TRACE_WIRE_FORMAT.md`.
-- [`CIRISPersist`](../CIRISPersist) — substrate. Owns the federation
-  keys directory, steward identity, canonical-bytes canonicalization,
-  trace storage. Edge calls into persist for sign + verify.
-- [`CIRISLens`](../CIRISLens) — analytical observatory. First peer to
-  adopt edge in Phase 1 (cuts over from FastAPI ingest).
-- [`CIRISRegistry`](../CIRISRegistry) — identity / build / license /
-  revocation directory. Adopts edge in Phase 2.
-- [`CIRISVerify`](../CIRISVerify) — cryptographic primitives library.
-  Edge depends transitively via persist.
+- [`CIRISConstitution`](../CIRISConstitution) — the canonical CEG spec (Part 5 is
+  edge's transport substrate; Part 2 the grammar; Part 3 the namespace).
+- [`CIRISPersist`](../CIRISPersist) — substrate: federation keys, attestations,
+  trace storage, admission (the `put_*` surface edge replicates onto).
+- [`CIRISVerify`](../CIRISVerify) — hybrid crypto primitives (Ed25519 + ML-DSA-65,
+  X-Wing), consumed transitively via persist.
+- [`CIRISAgent`](../CIRISAgent) — reasoning loop; emits signed traces edge replicates.
+- [`CIRISRegistry`](../CIRISRegistry) · [`CIRISLens`](../CIRISLens) — identity/build
+  directory · analytical observatory; federation peers.
 
 ## License
 
-AGPL-3.0, matching the rest of the CIRIS federation stack. License-
-locked mission preservation per [`MISSION.md`](MISSION.md) §6.
+AGPL-3.0, matching the CIRIS stack. License-locked mission preservation per
+[`MISSION.md`](MISSION.md) §6.
