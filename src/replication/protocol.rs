@@ -178,23 +178,33 @@ impl EnvelopeKind {
         Self::TransportDestination,
     ];
 
-    /// CIRISEdge#402 — the finite, self-authenticating **bootstrap** kinds a
-    /// fresh peer must deliver to introduce itself into the trust graph: its own
-    /// `KeyRecord` (`Key`) and its identity binding (`IdentityOccurrence`).
+    /// CIRISEdge#402/#406 — the finite, self-authenticating **bootstrap** kinds a
+    /// fresh peer must deliver to introduce itself into the trust graph AND make
+    /// itself attributable:
+    /// - `Key` — its own `KeyRecord` (the `owns_key` half of #393 item 1);
+    /// - `IdentityOccurrence` — its identity binding;
+    /// - `TransportDestination` — its hybrid-signed transport binding, the ONLY
+    ///   thing that satisfies #393 **item 2** (`hybrid_transport_binding_exists`).
+    ///
     /// These are the ONLY kinds the attribution gate exempts from
-    /// `Rooted ∧ owns_key` (CIRISEdge#393/E3): a fresh peer is `UnknownKeyId`
-    /// until its `Key` is admitted, but the `Key` frame is exactly what admits
-    /// it — a deadlock the gate would otherwise never break. Safe because both
-    /// are hybrid-verified at persist admission (`put_public_key` E2/#502,
-    /// `put_identity_occurrence` `signer_acts_for`), so an un-attributed
-    /// delivery is *verified* at the apply layer where verification belongs; it
-    /// grants no trust and is served no `trace:*` (that plane stays strictly
-    /// `Rooted ∧ owns_key`-attributed). Consentable/structural planes are NOT
-    /// bootstrap kinds — the exemption is exactly these two, forever a compile
-    /// error to widen without touching this method.
+    /// `Rooted ∧ owns_key` (CIRISEdge#393/E3). The deadlock the exemption breaks:
+    /// a fresh peer is `UnknownKeyId` until its `Key` is admitted, but the `Key`
+    /// frame is exactly what admits it; and (CIRISEdge#406) its signed
+    /// `TransportDestination` is exactly what item 2 requires, but item 2 would
+    /// drop that frame too — the deadlock, once more. Safe because ALL THREE are
+    /// hybrid-verified at persist admission (`put_public_key` E2/#502,
+    /// `put_identity_occurrence` + `put_signed_transport_destination`,
+    /// `signer_acts_for`), so an un-attributed delivery is *verified* at the apply
+    /// layer where verification belongs; each grants no trust and is served no
+    /// `trace:*` (that plane stays strictly `Rooted ∧ owns_key`-attributed).
+    /// Consentable/other-structural planes are NOT bootstrap kinds — the
+    /// exemption is exactly these three, a deliberate compile-fenced edit to widen.
     #[must_use]
     pub fn is_bootstrap(self) -> bool {
-        matches!(self, Self::Key | Self::IdentityOccurrence)
+        matches!(
+            self,
+            Self::Key | Self::IdentityOccurrence | Self::TransportDestination
+        )
     }
 
     /// Stable snake_case wire name for this kind — the manifest/witness key
@@ -512,19 +522,27 @@ mod tests {
         }
     }
 
-    /// CIRISEdge#402 — `is_bootstrap` is EXACTLY `{Key, IdentityOccurrence}`.
-    /// Checked over ALL 14 kinds so widening the attribution carve-out can't slip
-    /// in unnoticed: a new bootstrap kind must be a deliberate edit here.
+    /// CIRISEdge#402/#406 — `is_bootstrap` is EXACTLY
+    /// `{Key, IdentityOccurrence, TransportDestination}`. Checked over ALL 14
+    /// kinds so widening the attribution carve-out can't slip in unnoticed: a new
+    /// bootstrap kind must be a deliberate edit here.
     #[test]
-    fn is_bootstrap_is_exactly_key_and_identity_occurrence() {
+    fn is_bootstrap_is_exactly_the_three_bootstrap_kinds() {
         for kind in EnvelopeKind::ALL {
-            let expected = matches!(kind, EnvelopeKind::Key | EnvelopeKind::IdentityOccurrence);
+            let expected = matches!(
+                kind,
+                EnvelopeKind::Key
+                    | EnvelopeKind::IdentityOccurrence
+                    | EnvelopeKind::TransportDestination
+            );
             assert_eq!(
                 kind.is_bootstrap(),
                 expected,
-                "{kind:?}: is_bootstrap must be true iff Key/IdentityOccurrence",
+                "{kind:?}: is_bootstrap must be true iff Key/IdentityOccurrence/TransportDestination",
             );
         }
+        // The load-bearing E3 negative: the trace-bearing plane is never bootstrap.
+        assert!(!EnvelopeKind::Attestation.is_bootstrap());
     }
 
     /// Wire-stability sanity: confirm no two kinds collide on their
