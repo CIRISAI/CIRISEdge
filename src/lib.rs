@@ -52,6 +52,7 @@ pub mod blob_swarm;
 pub mod cohort_scope;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
+pub mod delivery_mode;
 pub mod detector;
 // v6.1.0 (CIRISEdge#175, FSD §3.3) — announce-suppression policy
 // + edge-side registry mirroring the recommended Leviculum
@@ -69,6 +70,7 @@ mod edge;
 pub mod emission;
 pub mod events;
 pub mod ffi;
+pub mod field_conformance;
 pub mod handler;
 // v3.9.0 Layer 1 Task D introduced consent-decay (gated under
 // `holonomic-consent-decay`); v3.10.0 lands the four-piece holonomic
@@ -96,6 +98,7 @@ mod sas_wordlist;
 // v6.0.0 (CIRISEdge#175) — CC 1.13.3.4 substrate.
 pub mod scope_privacy;
 pub mod swarm;
+pub mod touch_claim;
 pub mod transport;
 pub mod verify;
 pub mod version;
@@ -219,6 +222,55 @@ mod yubico_attestation_root_hash_tests {
             "persist's YUBICO_ATTESTATION_ROOT_1_DER changed — the FIPS-140-3 anti-Sybil \
              floor's root of trust moved. Re-pin DELIBERATELY, in lockstep with persist + \
              CIRISServer (CIRISPersist#513)."
+        );
+    }
+}
+
+/// Pinned namespace-manifest version (CIRISPersist#519 / manifest `0.3.0`). The
+/// `field_processor_matrix`, the per-family transform algebra, and the cohort
+/// namespace all version together under this string; edge's field processors
+/// (CIRISEdge#411 §1) and its transform application (§3) are written against
+/// exactly this manifest revision. A bump edge has not re-reviewed must fail the
+/// build — the same WIRE_VOCABULARY discipline as the hash pins below.
+pub const PERSIST_NAMESPACE_MANIFEST_VERSION: &str = "0.3.0";
+
+/// Pinned SHA-256 of persist's closed **transform algebra** (CIRISPersist#519,
+/// `transform::TRANSFORM_ALGEBRA_HASH`). Edge applies the per-family declared
+/// transforms (`strip_field` + shape ops) at the serve/projection path from the
+/// manifest, never a hand-rolled op list (CIRISEdge#411 §3). Pinning the algebra
+/// hash makes a persist change to the op vocabulary — a new strip, a changed
+/// shape op — a BUILD failure at edge first, forcing a deliberate re-review of
+/// edge's serve-time transform application before the wire behavior can drift.
+pub const PERSIST_TRANSFORM_ALGEBRA_HASH: &str =
+    "b7bd779468f4ad1ab551a5fd2dc0392df01e6f2e0ed393f924a806ed49686b4b";
+
+#[cfg(test)]
+mod manifest_and_transform_pin_tests {
+    /// Pins the namespace-manifest version from the linked crate. A mismatch is a
+    /// manifest revision persist shipped that edge's field processors + transform
+    /// application must be re-reviewed against (CIRISEdge#411) — never a silent skew.
+    #[test]
+    fn persist_namespace_manifest_version_pinned() {
+        assert_eq!(
+            ciris_persist::federation::namespace::supersets::VENDORED_MANIFEST_VERSION,
+            super::PERSIST_NAMESPACE_MANIFEST_VERSION,
+            "persist's VENDORED_MANIFEST_VERSION changed — the namespace manifest \
+             (field_processor_matrix + transform algebra + cohort namespace) moved. \
+             Re-review edge's field processors + transform application, then re-pin \
+             deliberately (CIRISEdge#411 §0)."
+        );
+    }
+
+    /// Pins persist's `TRANSFORM_ALGEBRA_HASH`. A mismatch is a change to the closed
+    /// transform op vocabulary edge applies at serve — re-review §3, then re-pin.
+    #[test]
+    fn persist_transform_algebra_hash_pinned() {
+        assert_eq!(
+            ciris_persist::federation::transform::TRANSFORM_ALGEBRA_HASH,
+            super::PERSIST_TRANSFORM_ALGEBRA_HASH,
+            "persist's TRANSFORM_ALGEBRA_HASH changed — the closed transform algebra \
+             moved. Re-review edge's serve-time transform application (CIRISEdge#411 §3), \
+             then re-pin deliberately."
         );
     }
 }
