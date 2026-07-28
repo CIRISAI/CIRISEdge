@@ -82,10 +82,27 @@ impl LocalState {
 /// `list_attestations` / `list_federation_keys` / `list_revocations`
 /// surfaces.
 pub trait StateProvider: Send + Sync {
-    /// Snapshot local state for the given kind. Implementations
-    /// should be cheap (the state is read once per anti-entropy
-    /// round); callers don't memoize.
+    /// Snapshot the refs this node OFFERS to the round's peer for `kind` — the
+    /// SEND axis. On the Attestation plane this is CIRISEdge#396-send-gated (a
+    /// peer outside this node's live `consent:replication` send-set is offered
+    /// nothing). Read once per round; callers don't memoize.
     fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef>;
+
+    /// CIRISEdge#414 — the refs this node actually HOLDS for `kind` — the
+    /// RECEIVE axis. Used ONLY to compute what the node still LACKS
+    /// (`want = remote ∖ local_holdings`) so an inbound round is serviced from
+    /// the node's real state, NOT from its (send-gated, possibly empty) offer.
+    ///
+    /// This split fixes the axis-fusion where the #396 SEND gate darkened the
+    /// RECEIVE side: a responder holding `infra:serve` but no consent to SEND to
+    /// the initiator must still receive the initiator's offered rows. Holdings
+    /// never leave the node — the offer ([`Self::local_refs`]) and delivery
+    /// (`fetch_envelope_bytes_for_peer`) stay independently send-gated, so send
+    /// fail-secure is unchanged. Defaults to [`Self::local_refs`] for providers
+    /// with no peer-gating (every non-Attestation plane, and the test providers).
+    fn local_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        self.local_refs(kind)
+    }
 
     /// Return the byte-exact signed envelope for the given content
     /// hash, or `None` if the envelope isn't in local state. Called
