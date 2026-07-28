@@ -348,7 +348,13 @@ impl Session {
             return ReplicationOutcome::UnexpectedMessage;
         }
         self.last_remote_summary = Some(remote.clone());
-        let local = provider.local_refs(self.kind);
+        // CIRISEdge#414 — RECEIVE axis: what this node still LACKS is computed
+        // from its REAL holdings, not from its (send-gated) offer. Using
+        // `local_refs` here fused the #396 SEND gate onto the RECEIVE side — a
+        // responder with no consent to send to the initiator saw an empty offer,
+        // so `want` became "everything" or the round went dark. `local_holdings`
+        // is the node's peer-blind own-state; the offer + delivery stay send-gated.
+        let local = provider.local_holdings(self.kind);
         let want = diff_refs(&local, &remote.refs);
         let mut outbound = Vec::new();
         // Responder ALSO needs to send its Summary so the
@@ -696,6 +702,80 @@ mod tests {
         match bob.on_message(m_alice_deliver, &b_provider, &mut b_applier) {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
+        }
+    }
+
+    /// CIRISEdge#414 — the RECEIVE axis is computed from the node's real
+    /// HOLDINGS, not its (send-gated) OFFER. A responder that holds `infra:serve`
+    /// but has NO consent to SEND to the initiator advertises nothing (its offer
+    /// is empty), yet must still service the round — requesting exactly the rows
+    /// it LACKS. Before the split, `want` was computed from the empty offer, which
+    /// fused the #396 send gate onto the receive side and darkened the plane.
+    #[test]
+    fn receive_uses_holdings_not_the_send_gated_offer() {
+        // A provider whose OFFER (local_refs) is empty — the responder has no
+        // consent to SEND to this peer — but whose real HOLDINGS (local_holdings)
+        // contain {A}. The initiator offers {A, B}.
+        struct SplitProvider {
+            holdings: Vec<super::super::protocol::EnvelopeRef>,
+        }
+        impl StateProvider for SplitProvider {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<super::super::protocol::EnvelopeRef> {
+                Vec::new() // send-gated: this node offers NOTHING to the peer
+            }
+            fn local_holdings(
+                &self,
+                _kind: EnvelopeKind,
+            ) -> Vec<super::super::protocol::EnvelopeRef> {
+                self.holdings.clone() // the node's REAL state, peer-blind
+            }
+            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+        }
+        let provider = SplitProvider {
+            holdings: vec![EnvelopeRef {
+                envelope_hash: h(1),
+                seq: 1,
+            }],
+        };
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let mut applier = applier_for(&[]);
+
+        let remote_summary = ReplicationMessage::Summary(SummaryMessage {
+            kind: EnvelopeKind::Attestation,
+            refs: vec![
+                EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                },
+                EnvelopeRef {
+                    envelope_hash: h(2),
+                    seq: 2,
+                },
+            ],
+        });
+        let out = match responder.on_message(remote_summary, &provider, &mut applier) {
+            ReplicationOutcome::Send(m) => m,
+            o => panic!("unexpected: {o:?}"),
+        };
+        // Outbound = [Summary(EMPTY — the send-gated offer), Diff(want)].
+        let (summary, diff) = (out[0].clone(), out[1].clone());
+        match summary {
+            ReplicationMessage::Summary(s) => assert!(
+                s.refs.is_empty(),
+                "the responder's OFFER must stay send-gated-empty (#396) even while it receives"
+            ),
+            o => panic!("expected Summary first: {o:?}"),
+        }
+        match diff {
+            ReplicationMessage::Diff(d) => assert_eq!(
+                d.want,
+                vec![h(2)],
+                "want must be remote ∖ HOLDINGS = only the lacked row {{B}}, NOT all of \
+                 remote (which the pre-#414 empty-offer diff would have produced)"
+            ),
+            o => panic!("expected Diff: {o:?}"),
         }
     }
 

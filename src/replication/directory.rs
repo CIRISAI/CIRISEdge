@@ -180,6 +180,20 @@ impl StateProvider for DirectoryStateAdapter {
         })
     }
 
+    /// CIRISEdge#414 — the node's REAL holdings for the round's RECEIVE diff: the
+    /// PEER-BLIND [`ReplicationDirectory::list_envelope_refs`] (recipient `None` —
+    /// the ungated projection view), NEVER `list_envelope_refs_for_peer`. The
+    /// per-peer #396 send gate belongs on the offer + delivery, not on the node's
+    /// knowledge of what it itself holds; using the peer-gated view here darkened
+    /// the receive side of a round with a peer this node has no consent to SEND to.
+    fn local_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async move { inner.list_envelope_refs(kind).await })
+        })
+    }
+
     fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> Option<Vec<u8>> {
         let inner = Arc::clone(&self.inner);
         let hash = *envelope_hash;
