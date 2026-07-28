@@ -98,6 +98,7 @@ mod sas_wordlist;
 // v6.0.0 (CIRISEdge#175) — CC 1.13.3.4 substrate.
 pub mod scope_privacy;
 pub mod swarm;
+pub mod touch_claim;
 pub mod transport;
 pub mod verify;
 pub mod version;

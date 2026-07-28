@@ -1723,6 +1723,75 @@ impl PyEdge {
         Ok(dict.unbind())
     }
 
+    /// CIRISEdge#411 §2 — emit this node's `ownership_binding` **self-touch**
+    /// (the dead-man's-switch that arms the CC 3.2 ownerless-lock reclaim
+    /// floor: absent floor = never reclaimable, fail-safe). Opt-in — the
+    /// caller invokes it on its own cadence; edge wires NO background
+    /// scheduler here. Returns `"advanced"` (the floor moved) or
+    /// `"not_fresher"` (a same-bucket anti-rollback no-op). Raises
+    /// `RuntimeError` if no federation directory is wired, or on a
+    /// signature / admission fault.
+    fn produce_ownership_self_touch(&self, py: Python<'_>) -> PyResult<String> {
+        let signer = self.inner.signer();
+        let Some(directory) = self.inner.federation_directory() else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "edge has no federation directory wired; cannot emit a touch-claim",
+            ));
+        };
+        let executor = self.executor.clone();
+        let outcome = py
+            .detach(|| {
+                run_async(&executor, async move {
+                    let producer = crate::touch_claim::TouchClaimProducer::new(signer, directory);
+                    producer.produce_ownership_self_touch().await
+                })
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(match outcome {
+            ciris_persist::federation::TouchApplyOutcome::Advanced => "advanced".to_string(),
+            ciris_persist::federation::TouchApplyOutcome::NotFresher => "not_fresher".to_string(),
+        })
+    }
+
+    /// CIRISEdge#411 §2 — **witness** `peer_key_id`'s liveness off the
+    /// in-process reachability tracker, flooring `fresh_as_of` from the
+    /// peer's most recent successful attempt. Scoped `family` — as tightly
+    /// as a peer relationship allows (NEVER an ungated read-receipt trail).
+    /// Returns `"advanced"` / `"not_fresher"`, or `None` when the tracker
+    /// holds no liveness evidence for the peer (no touch is produced —
+    /// a witness requires an actual observed event). Raises `RuntimeError`
+    /// on a missing directory or a signature / admission fault.
+    fn produce_witness_touch(&self, py: Python<'_>, peer_key_id: &str) -> PyResult<Option<String>> {
+        let signer = self.inner.signer();
+        let Some(directory) = self.inner.federation_directory() else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "edge has no federation directory wired; cannot emit a touch-claim",
+            ));
+        };
+        let tracker = self.inner.reachability_tracker();
+        let peer = peer_key_id.to_string();
+        let executor = self.executor.clone();
+        let outcome = py
+            .detach(|| {
+                run_async(&executor, async move {
+                    let producer = crate::touch_claim::TouchClaimProducer::new(signer, directory);
+                    producer
+                        .produce_witness_touch_from_tracker(
+                            &tracker,
+                            &peer,
+                            crate::touch_claim::NODE_LIVENESS_TARGET_KIND,
+                            ciris_persist::federation::types::cohort_scope::FAMILY,
+                        )
+                        .await
+                })
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(outcome.map(|o| match o {
+            ciris_persist::federation::TouchApplyOutcome::Advanced => "advanced".to_string(),
+            ciris_persist::federation::TouchApplyOutcome::NotFresher => "not_fresher".to_string(),
+        }))
+    }
+
     /// Fetch content addressed by `sha256` (hex string) from
     /// `peer_key_id`. Returns a dict that is either:
     ///
@@ -6826,6 +6895,27 @@ fn k_symbol(exporter_secret: &[u8]) -> PyResult<Vec<u8>> {
     Ok(crate::scope_privacy::k_symbol(&exporter).to_vec())
 }
 
+/// CIRISEdge#411 §5 — the manifest-driven field-conformance harness, mirroring
+/// persist's `persist_field_conformance()`. Returns the list of `"{field}: {reason}"`
+/// violation strings (empty ⇒ conformant) so the shared CIRISConformance harness
+/// (CIRISConformance#83) can drive a real edge wheel against exactly the
+/// `field_processor_matrix` fields edge is tagged to own. Every violation is a
+/// value-semantics failure in an edge routing processor.
+#[pyfunction]
+fn edge_field_conformance() -> Vec<String> {
+    crate::field_conformance::run_edge_field_conformance()
+        .err()
+        .unwrap_or_default()
+}
+
+/// CIRISEdge#410 §3 — emit edge's routing-processor evidence rows (the
+/// `CIRISEdge.cc_impl.tsv` lines the Constitution's `check_evidence.py` vendors),
+/// generated from the live, tested `EDGE_FIELD_CONFORMANCE` table.
+#[pyfunction]
+fn edge_evidence_rows() -> Vec<String> {
+    crate::field_conformance::edge_evidence_rows()
+}
+
 /// Map the pinned §2.4 `"typ"` integer table onto
 /// [`crate::scope_privacy::RecordType`]. `0` is reserved; out-of-set
 /// values raise `ValueError` (strict allowlist, AV-7 posture).
@@ -7469,6 +7559,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the RNS dest-hash wrapper requires the leviculum reticulum-core
     // dep that ships under `transport-reticulum`.
     m.add_function(wrap_pyfunction!(seal_av_chunk, m)?)?;
+    m.add_function(wrap_pyfunction!(edge_field_conformance, m)?)?;
+    m.add_function(wrap_pyfunction!(edge_evidence_rows, m)?)?;
     m.add_function(wrap_pyfunction!(open_av_chunk, m)?)?;
     m.add_function(wrap_pyfunction!(seal_av_inner, m)?)?;
     m.add_function(wrap_pyfunction!(seal_av_outer, m)?)?;

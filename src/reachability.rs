@@ -452,6 +452,21 @@ impl ReachabilityTracker {
         }
         out
     }
+
+    /// CIRISEdge#411 §2 — the most recent SUCCESSFUL-attempt instant across
+    /// every medium for `peer_key_id` within the rolling window, or `None`
+    /// if the tracker holds no liveness evidence for the peer. A successful
+    /// [`AttemptOutcome`] is a witnessed liveness event; the touch-claim
+    /// producer ([`crate::touch_claim::TouchClaimProducer::produce_witness_touch_from_tracker`])
+    /// floors a `witness_touch`'s `fresh_as_of` from this instant. Read-only
+    /// — composes [`Self::snapshot`], mutates nothing.
+    #[must_use]
+    pub fn last_liveness(&self, peer_key_id: &str) -> Option<DateTime<Utc>> {
+        self.snapshot(peer_key_id)
+            .into_values()
+            .filter_map(|s| s.last_success_at)
+            .max()
+    }
 }
 
 impl std::fmt::Debug for ReachabilityTracker {
