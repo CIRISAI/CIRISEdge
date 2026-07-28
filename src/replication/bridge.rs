@@ -385,6 +385,18 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
+    /// CIRISEdge#416 — RAW holdings for the RECEIVE-diff axis. The Attestation
+    /// plane uses the unfiltered [`Self::list_attestation_holdings`] ("what I
+    /// hold"), NOT the projection-filtered advertise view; every other plane's
+    /// advertise view equals its holdings for round convergence, so they keep the
+    /// default ([`Self::list_envelope_refs`]).
+    async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        match kind {
+            EnvelopeKind::Attestation => self.list_attestation_holdings().await,
+            _ => self.list_envelope_refs(kind).await,
+        }
+    }
+
     /// CIRISEdge#379 — recipient-aware fetch: the serve-side twin of the
     /// listing gate, so a peer excluded from the listing cannot obtain a
     /// `trace:*` envelope anyway by Diff/Fetch-ing a hash it learned
@@ -1061,6 +1073,42 @@ impl FederationDirectoryReplicationBridge {
             *memo = Some((set.clone(), Instant::now()));
         }
         Some(set)
+    }
+
+    /// CIRISEdge#416 — the RAW Attestation holdings: the content-hash of EVERY
+    /// federation-tier attestation in local state, with NO `attestation_is_advertised`
+    /// projection filter, NO `self_set`, NO recipient gates. This is the RECEIVE
+    /// axis's "what do I hold" — distinct from [`Self::list_attestations`]'s "what
+    /// would I advertise". Using the advertise view for the round's
+    /// `want = remote ∖ holdings` diff meant a held-but-not-advertised row (a
+    /// `self`/`family` attestation from ANOTHER producer, which projects `SelfOwn`
+    /// and is advertised only by its own producer) was permanently absent from the
+    /// node's own holdings view — so it stayed in `want` every round and the round
+    /// never converged (CIRISAgent#932 responder-driver stall). The convergence
+    /// invariant this restores: after admitting an attestation, its hash is here.
+    /// Cheaper than the advertise sweep — it drops the per-row projection resolution.
+    async fn list_attestation_holdings(&self) -> Vec<EnvelopeRef> {
+        let attestations = self
+            .directory
+            .list_attestations_since(None, self.config.operational_page_limit)
+            .await
+            .unwrap_or_default();
+        let mut refs = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        for att in &attestations {
+            // Skip only an unparseable/unhashable row (never a projection filter).
+            let Some((hash, _bytes)) = content_hash_of(att) else {
+                continue;
+            };
+            if !seen.insert(hash) {
+                continue;
+            }
+            refs.push(EnvelopeRef {
+                envelope_hash: hash,
+                seq: Self::ms_seq(att.asserted_at),
+            });
+        }
+        refs
     }
 
     async fn list_attestations(&self, recipient: Option<&str>) -> Vec<EnvelopeRef> {
@@ -1872,6 +1920,88 @@ mod tests {
             refs.len(),
             2,
             "self_provider advertises the node's own + the anchored record, not the cohort"
+        );
+    }
+
+    /// CIRISEdge#416 — the RECEIVE-diff convergence invariant: an attestation the
+    /// node HOLDS must appear in `list_attestation_holdings()` (holdings) EVEN
+    /// WHEN it is not in `list_attestations(None)` (the advertise view). The
+    /// load-bearing case is a `self`-scoped row from ANOTHER producer: it projects
+    /// `SelfOwn` and is advertised only by its own producer, so on this node it is
+    /// held-but-not-advertised. Before #416 the receive diff used the advertise
+    /// view, so this row stayed in `want` forever and the round never converged.
+    #[tokio::test]
+    async fn holdings_include_held_but_not_advertised_rows() {
+        let this_node = "this-node";
+        let other_producer = "other-producer";
+        let (backend, bridge) = make_bridge(&[this_node.to_string(), other_producer.to_string()]);
+        for k in [this_node, other_producer] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        // A federation-tier, SELF-scoped attestation authored by `other_producer`
+        // — held here, advertisable only by its own producer.
+        let now = Utc::now();
+        let envelope = serde_json::json!({
+            "attesting_key_id": other_producer,
+            "attested_key_id": other_producer,
+            "attestation_type": "scores",
+            "dimension": "capacity:example:v1",
+            "cohort_scope": "self",
+        });
+        let (hash_hex, ed_sig, pqc_sig) = sign_attestation_envelope(other_producer, &envelope);
+        let att = Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: other_producer.to_string(),
+            attested_key_id: other_producer.to_string(),
+            attestation_type: "scores".to_string(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash_hex,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: other_producer.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![other_producer.to_string()],
+            withdraws_admission_rule: None,
+            cohort_scope: "self".to_string(),
+            tier: "federation".to_string(),
+            promoted_at: None,
+        };
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .expect("seed self-scoped attestation");
+        // This node publishes only its OWN — NOT other_producer's. (The single
+        // seeded row is the only attestation in local state.)
+        let publish_set = vec![this_node.to_string()];
+        let selector: CohortProvider = Arc::new(move || publish_set.clone());
+        let bridge = bridge.with_self_provider(Some(selector));
+
+        // The ADVERTISE view (projection-filtered) EXCLUDES the row — a self-scoped
+        // row from another producer is held-but-not-own, so it is not advertised.
+        let advertised = bridge.list_attestations(None).await;
+        assert!(
+            advertised.is_empty(),
+            "a self-scoped row from another producer must NOT be advertised here, got {advertised:?}"
+        );
+        // The HOLDINGS view (raw, #416) INCLUDES it — the convergence invariant:
+        // the round's `want = remote ∖ holdings` can now shrink for this row after
+        // admission, where the pre-#416 advertise-filtered view left it stuck.
+        let holdings = bridge.list_attestation_holdings().await;
+        assert_eq!(
+            holdings.len(),
+            1,
+            "list_attestation_holdings MUST contain the held row (#416 convergence \
+             invariant) even though the advertise view excludes it"
         );
     }
 

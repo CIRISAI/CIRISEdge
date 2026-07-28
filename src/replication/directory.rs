@@ -88,6 +88,21 @@ pub trait ReplicationDirectory: Send + Sync {
         self.list_envelope_refs(kind).await
     }
 
+    /// CIRISEdge#416 — the RAW holdings for `kind`: the content-hash of EVERY
+    /// row present in local state, with NO projection / advertise filtering and
+    /// NO recipient reasoning. This is the RECEIVE axis's set — "what do I hold"
+    /// — as distinct from [`Self::list_envelope_refs`] ("what would I advertise",
+    /// projection-filtered). The anti-entropy `want = remote ∖ holdings` diff
+    /// depends on the convergence invariant *after admitting an envelope, its hash
+    /// appears here*; a projection-filtered listing breaks it, so a held-but-not-
+    /// advertised row (e.g. a `self`/`family` attestation from another producer,
+    /// on the Attestation plane) would stay in `want` forever and stall the round.
+    /// Defaults to [`Self::list_envelope_refs`] for planes whose advertise view
+    /// equals their holdings; the bridge overrides the Attestation plane.
+    async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        self.list_envelope_refs(kind).await
+    }
+
     /// Return the byte-exact signed envelope for `(kind,
     /// envelope_hash)`, or `None` if the envelope isn't in local state.
     /// Called during the `Deliver`-message construction step.
@@ -180,17 +195,19 @@ impl StateProvider for DirectoryStateAdapter {
         })
     }
 
-    /// CIRISEdge#414 — the node's REAL holdings for the round's RECEIVE diff: the
-    /// PEER-BLIND [`ReplicationDirectory::list_envelope_refs`] (recipient `None` —
-    /// the ungated projection view), NEVER `list_envelope_refs_for_peer`. The
-    /// per-peer #396 send gate belongs on the offer + delivery, not on the node's
-    /// knowledge of what it itself holds; using the peer-gated view here darkened
-    /// the receive side of a round with a peer this node has no consent to SEND to.
+    /// CIRISEdge#414 + #416 — the node's REAL holdings for the round's RECEIVE
+    /// diff: [`ReplicationDirectory::list_holdings`], the RAW per-kind
+    /// content-hash set with NO projection / advertise filtering and NO recipient
+    /// reasoning. #414 correctly moved the SEND gate off the receive axis but
+    /// wired this to `list_envelope_refs` — still the *advertise* view; #416 fixes
+    /// it to true holdings, so `want` shrinks after admission and the round
+    /// converges. The per-peer #396 send gate + projection stay on the offer
+    /// ([`Self::local_refs`]) and delivery (`fetch_envelope_bytes_for_peer`).
     fn local_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         let inner = Arc::clone(&self.inner);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(async move { inner.list_envelope_refs(kind).await })
+                .block_on(async move { inner.list_holdings(kind).await })
         })
     }
 
