@@ -52,6 +52,7 @@ pub mod blob_swarm;
 pub mod cohort_scope;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
+pub mod delivery_mode;
 pub mod detector;
 // v6.1.0 (CIRISEdge#175, FSD §3.3) — announce-suppression policy
 // + edge-side registry mirroring the recommended Leviculum
@@ -69,6 +70,7 @@ mod edge;
 pub mod emission;
 pub mod events;
 pub mod ffi;
+pub mod field_conformance;
 pub mod handler;
 // v3.9.0 Layer 1 Task D introduced consent-decay (gated under
 // `holonomic-consent-decay`); v3.10.0 lands the four-piece holonomic
