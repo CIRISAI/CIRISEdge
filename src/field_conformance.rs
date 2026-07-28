@@ -28,6 +28,15 @@ pub struct FieldConformance {
     pub property: &'static str,
     /// The check — `Ok(())` conformant, `Err(reason)` a violation.
     pub check: fn() -> Result<(), String>,
+    /// CIRISEdge#410 Ask 3 — the Constitution CC section this routing processor
+    /// serves (the `CC-<section>` the `evidence/CIRISEdge.cc_impl.tsv` row keys on).
+    pub cc: &'static str,
+    /// The `CLM-nsproc-*` claim name this row resolves (CIRISEdge#410 §3).
+    pub clm: &'static str,
+    /// The `path#symbol` evidence anchor — the LIVE processor the check exercises,
+    /// so the evidence registry is generated from the tested code, never a
+    /// hand-maintained string that can drift from it.
+    pub evidence: &'static str,
 }
 
 /// Every edge-tagged field edge PROCESSES, with a check that verifies the value
@@ -39,36 +48,57 @@ pub const EDGE_FIELD_CONFORMANCE: &[FieldConformance] = &[
         field: "delivery_mode",
         property: "the typed value drives a fail-secure path decision (mandatory + no path ⇒ never a silent drop)",
         check: check_delivery_mode,
+        cc: "5.3.3",
+        clm: "CLM-nsproc-delivery-mode",
+        evidence: "src/delivery_mode.rs#decide",
     },
     FieldConformance {
         field: "cohort_scope",
         property: "projection is a total function of the cohort_scope VALUE (offer/projection filter)",
         check: check_cohort_scope_projection,
+        cc: "3.3.6",
+        clm: "CLM-nsproc-cohort-scope",
+        evidence: "src/replication/bridge.rs#attestation_is_advertised",
     },
     FieldConformance {
         field: "dimension",
         property: "the record's projection authority is resolved from the dimension VALUE (per-record projection)",
         check: check_dimension_projection,
+        cc: "3.1",
+        clm: "CLM-nsproc-dimension",
+        evidence: "src/replication/bridge.rs#attestation_is_advertised",
     },
     FieldConformance {
         field: "key_boundary_scope",
         property: "every scope variant round-trips through its wire form (typed discriminator, opaque id)",
         check: check_key_boundary_scope,
+        cc: "3.4",
+        clm: "CLM-nsproc-key-boundary-scope",
+        evidence: "src/key_boundary.rs#KeyBoundaryScope",
     },
     FieldConformance {
         field: "recipient_serve_capability",
         property: "the serve gate keys on persist's INFRA_SERVE const, never a hand-rolled token (the #379 value-provenance lock)",
         check: check_recipient_serve_capability_token,
+        cc: "5.3.3.5",
+        clm: "CLM-nsproc-recipient-serve-capability",
+        evidence: "src/replication/bridge.rs#peer_has_serve_capability",
     },
     FieldConformance {
         field: "restrictions[].op=recipient_capability",
         property: "a recipient_capability restriction is honored as a WITHHOLD, never routed through the strip pipeline",
         check: check_recipient_capability_is_withhold_not_strip,
+        cc: "5.3.2.4",
+        clm: "CLM-nsproc-recipient-capability",
+        evidence: "src/replication/bridge.rs#recipient_capability_withholds",
     },
     FieldConformance {
         field: "attestation_prefixes",
         property: "a grant's prefix gates a dimension by str::starts_with (covers), the exact predicate the serve gate applies",
         check: check_attestation_prefixes_covers,
+        cc: "5.3.2.4",
+        clm: "CLM-nsproc-attestation-prefixes",
+        evidence: "src/replication/bridge.rs#recipient_capability_withholds",
     },
 ];
 
@@ -159,6 +189,29 @@ pub const DEFERRED_PENDING_PLANE: &[(&str, &str)] = &[
       reticulum holder-policy tests, an async path.",
     ),
 ];
+
+/// CIRISEdge#410 §3 — emit edge's routing-processor evidence rows in the
+/// `CIRISEdge.cc_impl.tsv` format the Constitution's `check_evidence.py` vendors
+/// (`<cc>\t<clm>\tCIRISEdge\t<path#symbol>\tciris-edge@v<version>`). Generated
+/// from [`EDGE_FIELD_CONFORMANCE`] — the SAME table the completeness witness
+/// checks — so every published evidence row anchors a LIVE, tested processor and
+/// can never drift from the code. The vendored `evidence/CIRISEdge.cc_impl.tsv`
+/// is regenerated from this and kept in sync by `evidence_tsv_matches_emitted`.
+#[must_use]
+pub fn edge_evidence_rows() -> Vec<String> {
+    EDGE_FIELD_CONFORMANCE
+        .iter()
+        .map(|c| {
+            format!(
+                "{}\t{}\tCIRISEdge\t{}\tciris-edge@v{}",
+                c.cc,
+                c.clm,
+                c.evidence,
+                env!("CARGO_PKG_VERSION"),
+            )
+        })
+        .collect()
+}
 
 /// Run the harness: `Ok(())` iff every [`EDGE_FIELD_CONFORMANCE`] check passes.
 /// The FFI (`edge_field_conformance()`) returns the violation list; empty = pass.
@@ -383,6 +436,51 @@ mod tests {
              (carried-but-unprocessed, #315) — add each to EDGE_FIELD_CONFORMANCE or \
              DEFERRED_PENDING_PLANE with a reason: {gaps:#?}"
         );
+    }
+
+    /// CIRISEdge#410 §3 — the vendored `evidence/CIRISEdge.cc_impl.tsv` (what the
+    /// Constitution's `check_evidence.py` consumes) is EXACTLY what the live code
+    /// emits from `EDGE_FIELD_CONFORMANCE`. A processor rename, a version bump, or
+    /// a hand-edit to the TSV that diverges from the tested table is a BUILD
+    /// failure — the evidence registry can never drift from the code it attests.
+    #[test]
+    fn evidence_tsv_matches_emitted() {
+        let vendored: Vec<&str> = include_str!("../evidence/CIRISEdge.cc_impl.tsv")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .collect();
+        let emitted = edge_evidence_rows();
+        assert_eq!(
+            vendored,
+            emitted.iter().map(String::as_str).collect::<Vec<_>>(),
+            "evidence/CIRISEdge.cc_impl.tsv drifted from EDGE_FIELD_CONFORMANCE — \
+             regenerate it from field_conformance::edge_evidence_rows() (CIRISEdge#410 §3)"
+        );
+    }
+
+    /// CIRISEdge#410 §4 — the serve-gate/routing completeness witness: the five CI
+    /// routing axes #410 enumerates each resolve to a LIVE edge processor evidence
+    /// row (not merely present — anchored to a `path#symbol` the checks exercise).
+    #[test]
+    fn every_routing_axis_has_a_live_processor_evidence_row() {
+        for axis in [
+            "cohort_scope",                           // recipient_see
+            "delivery_mode",                          // recipient_receive
+            "restrictions[].op=recipient_capability", // information-type restriction
+            "attestation_prefixes",                   // transmission principle (grant grammar)
+            "recipient_serve_capability",             // serve gate
+        ] {
+            let row = EDGE_FIELD_CONFORMANCE
+                .iter()
+                .find(|c| c.field == axis)
+                .unwrap_or_else(|| {
+                    panic!("routing axis {axis:?} has no live processor row (#410)")
+                });
+            assert!(
+                !row.evidence.is_empty() && row.evidence.contains('#'),
+                "routing axis {axis:?} carries no path#symbol evidence anchor"
+            );
+        }
     }
 
     /// No stale entries: every field edge claims to process/defer is STILL an
