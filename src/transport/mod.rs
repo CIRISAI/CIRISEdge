@@ -29,6 +29,7 @@ pub mod federation_session;
 /// + sliding-window replay protection per peer (CIRISEdge#53). Medium-
 /// agnostic primitives consumed by every transport.
 pub mod addressing;
+pub mod frame_fragment;
 
 /// Realtime A/V mesh profile — direct RNS Link low-latency push with
 /// two-layer hybrid-PQC crypto (transit key under epoch DEK) and

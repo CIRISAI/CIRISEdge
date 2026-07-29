@@ -126,6 +126,8 @@ pub mod runtime;
 pub mod scheduler;
 pub mod serve_policy;
 pub mod session;
+#[cfg(test)]
+mod sim;
 pub mod storage_contention;
 pub mod summary;
 pub mod wire_frame;

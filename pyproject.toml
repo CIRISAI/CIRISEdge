@@ -56,7 +56,7 @@ classifiers = [
 # republish the exact v2.0.2 failure above (Requires-Dist asking for a version
 # the cdylib does not expect → ResolutionImpossible for co-resident consumers).
 dependencies = [
-    "ciris-persist>=21.16.0,<22",
+    "ciris-persist>=21.17.0,<22",
 ]
 dynamic = ["version"]
 

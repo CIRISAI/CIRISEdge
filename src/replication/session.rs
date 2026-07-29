@@ -49,6 +49,29 @@ pub enum SessionRole {
     Responder,
 }
 
+/// CIRISEdge#414 / CIRISAgent#932 — the maximum RAW envelope bytes a single
+/// `Deliver` may carry. A round's diff can want an unbounded number of envelopes;
+/// packing them ALL into one `Deliver` produces one frame whose size is unbounded
+/// in the peer's holdings (the observed amplification: a busy reverse-path link's
+/// oversized Deliver was silently dropped — #932). The transport now fragments any
+/// oversized frame onto the packet path, but a frame needing tens of thousands of
+/// fragments cannot reassemble under any packet loss (whole-frame retry). Bounding
+/// the Deliver here caps the per-round frame — the fragment count per frame stays
+/// reassemblable, and the **remainder is carried by the next round's re-diff**
+/// (the wanted-but-undelivered hashes stay in `want` because they were never
+/// admitted, so the existing periodic anti-entropy round re-requests them). This
+/// is semantics-preserving: still ONE `Deliver` per round, and the `BoundedBy`
+/// staleness it yields is HONEST (envelopes genuinely remain). A Deliver always
+/// carries at least one envelope, so a single envelope larger than the budget is
+/// still sent whole (fragmentation carries it; the budget only bounds how many
+/// whole envelopes ride together).
+///
+/// 512 KiB raw → ~1.8 MB JSON-wire → a bounded (not unbounded-in-holdings) frame,
+/// while leaving the common small-holdings round a single unfragmented/­lightly-
+/// fragmented Deliver. Tuning against real link-loss telemetry is a follow-up; the
+/// DST (`replication::sim`) is the harness for it.
+pub const MAX_DELIVER_ENVELOPE_BYTES: usize = 512 * 1024;
+
 /// What the session yielded after processing one inbound message
 /// (or starting a round). The caller (Transport glue) reads this
 /// and decides whether to send the next outbound message, apply
@@ -383,11 +406,30 @@ impl Session {
         if diff.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
-        let envelopes: Vec<Vec<u8>> = diff
-            .want
-            .iter()
-            .filter_map(|h| provider.fetch_envelope(self.kind, h))
-            .collect();
+        // CIRISEdge#414/#932 — pack a byte-BOUNDED prefix of the wanted envelopes,
+        // not the whole (unbounded-in-holdings) set. Fetch in `want` order and stop
+        // once the running raw-byte total would exceed MAX_DELIVER_ENVELOPE_BYTES —
+        // but ALWAYS include at least one envelope (a single envelope larger than
+        // the budget rides whole; the transport fragments it). The undelivered
+        // remainder is NOT lost: those hashes stay in the peer's `want` next round
+        // (never admitted → still missing from its holdings), so the periodic
+        // anti-entropy re-diff carries them, one bounded Deliver per round, until
+        // InSync. This bounds the per-round wire frame so its fragment count stays
+        // reassemblable under packet loss.
+        let mut envelopes: Vec<Vec<u8>> = Vec::new();
+        let mut packed_bytes = 0usize;
+        for h in &diff.want {
+            let Some(bytes) = provider.fetch_envelope(self.kind, h) else {
+                continue;
+            };
+            // Stop BEFORE exceeding the budget, but never emit an empty Deliver:
+            // the first envelope always goes in regardless of its size.
+            if !envelopes.is_empty() && packed_bytes + bytes.len() > MAX_DELIVER_ENVELOPE_BYTES {
+                break;
+            }
+            packed_bytes += bytes.len();
+            envelopes.push(bytes);
+        }
         ReplicationOutcome::Send(vec![ReplicationMessage::Deliver(DeliverMessage {
             kind: self.kind,
             envelopes,
@@ -1195,5 +1237,91 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
+    }
+
+    /// CIRISEdge#414/#932 — `on_diff` packs a byte-BOUNDED prefix of the wanted
+    /// envelopes into one Deliver, never the whole (unbounded-in-holdings) set. The
+    /// undelivered remainder stays in the peer's `want` and is carried by the next
+    /// round's re-diff. This bounds the per-round wire frame so its fragment count
+    /// stays reassemblable under packet loss — the belt to the transport
+    /// fragmenter's suspenders.
+    #[test]
+    fn on_diff_bounds_the_deliver_by_byte_budget() {
+        // Eight 100 KiB envelopes = 800 KiB wanted, well over the 512 KiB budget.
+        let env_size = 100 * 1024;
+        let n = 8u8;
+        let mut entries = Vec::new();
+        let mut wanted = Vec::new();
+        for i in 0..n {
+            let hash = h(i + 1);
+            entries.push((
+                EnvelopeKind::Attestation,
+                hash,
+                vec![i; env_size],
+                u64::from(i) + 1,
+            ));
+            wanted.push(hash);
+        }
+        let provider = provider_with(&entries);
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let diff = DiffMessage {
+            kind: EnvelopeKind::Attestation,
+            want: wanted,
+        };
+        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider) else {
+            panic!("on_diff must Send a Deliver");
+        };
+        let ReplicationMessage::Deliver(deliver) = &msgs[0] else {
+            panic!("expected a Deliver, got {:?}", msgs[0]);
+        };
+        let packed: usize = deliver.envelopes.iter().map(Vec::len).sum();
+        // The budget cut the set — NOT the whole 800 KiB in one frame.
+        assert!(
+            deliver.envelopes.len() < usize::from(n),
+            "budget must cut the set: packed {} of {n}",
+            deliver.envelopes.len()
+        );
+        assert!(
+            !deliver.envelopes.is_empty(),
+            "a Deliver always carries ≥1 envelope"
+        );
+        // Exactly five 100 KiB envelopes fit (5 × 100 = 500 KiB < 512 KiB; the 6th
+        // would cross), and the packed total never exceeds the budget.
+        assert_eq!(
+            deliver.envelopes.len(),
+            5,
+            "five 100 KiB envelopes fit under the 512 KiB budget; the 6th would exceed"
+        );
+        assert!(
+            packed <= MAX_DELIVER_ENVELOPE_BYTES,
+            "packed {packed} exceeds the budget {MAX_DELIVER_ENVELOPE_BYTES}"
+        );
+    }
+
+    /// The always-≥1 rule: a SINGLE envelope larger than the whole budget still
+    /// ships whole (the transport fragments it) — the budget bounds how many whole
+    /// envelopes ride together, never splits one.
+    #[test]
+    fn on_diff_ships_a_single_oversize_envelope_whole() {
+        let big = MAX_DELIVER_ENVELOPE_BYTES + 4096;
+        let hash = h(42);
+        let provider = provider_with(&[(EnvelopeKind::Attestation, hash, vec![7u8; big], 1)]);
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let diff = DiffMessage {
+            kind: EnvelopeKind::Attestation,
+            want: vec![hash],
+        };
+        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider) else {
+            panic!("on_diff must Send a Deliver");
+        };
+        let ReplicationMessage::Deliver(deliver) = &msgs[0] else {
+            panic!("expected a Deliver");
+        };
+        assert_eq!(
+            deliver.envelopes.len(),
+            1,
+            "the one oversize envelope ships whole"
+        );
+        assert_eq!(deliver.envelopes[0].len(), big);
     }
 }

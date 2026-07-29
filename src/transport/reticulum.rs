@@ -424,6 +424,21 @@ fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
 }
 
+static OVERSIZED_FRAME_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#414 / CIRISAgent#932 — an oversized reverse-path reply could NOT be
+/// fragmented onto the busy link's packet channel (degenerate MDU below
+/// [`crate::transport::frame_fragment::MIN_FRAGMENTABLE_MDU`], or the link Channel
+/// backpressured mid-fragment-send). This is the exact class that used to be a
+/// SILENT drop onto the one-per-link resource `Busy` gate — the #932 stall. It is
+/// now LOUD (throttled WARN, keyed per peer) so the fragmentation gap is a log
+/// line, never an interrogation. Bounded like the reverse-path fallback log.
+fn oversized_frame_drop_log() -> &'static crate::log_throttle::LogThrottle {
+    OVERSIZED_FRAME_DROP_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+}
+
 static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 
@@ -1564,6 +1579,15 @@ pub struct ReticulumTransport {
     /// field failure (a 120 s resource timeout shipping into a dead-but-Active
     /// link). Removed on `LinkClosed`.
     link_last_inbound_at: Arc<Mutex<HashMap<LinkId, u64>>>,
+    /// CIRISEdge#414 / CIRISAgent#932 — inbound fragment reassembler. Every frame
+    /// arriving over an established link (resource OR packet path — both funnel
+    /// through `attribute_and_deliver`) is fed here first: a whole (`CRPL…`) frame
+    /// passes straight through; a `CFRG` fragment is buffered until its siblings
+    /// complete the frame. This is the receive half of the #932 fix — the send
+    /// side fragments an oversized reverse-path reply onto the packet path, and
+    /// this reassembles it before it reaches the replication router. Bounded by an
+    /// LRU cap on in-flight frames so lost fragments / floods cannot grow memory.
+    inbound_reasm: Arc<Mutex<crate::transport::frame_fragment::Reassembler>>,
     /// CIRISEdge#32 (v0.14.0) — request/response slot. The listen-loop
     /// populates this on `NodeEvent::ResponseReceived` keyed by
     /// `request_id`; [`Self::link_request`] polls + removes.
@@ -2090,6 +2114,9 @@ impl ReticulumTransport {
             link_established_at: Arc::new(Mutex::new(HashMap::new())),
             link_to_peer_key_id: Arc::new(Mutex::new(HashMap::new())),
             link_last_inbound_at: Arc::new(Mutex::new(HashMap::new())),
+            inbound_reasm: Arc::new(Mutex::new(
+                crate::transport::frame_fragment::Reassembler::new(),
+            )),
             request_responses: Arc::new(Mutex::new(HashMap::new())),
             timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
             blackhole: blackhole_rules,
@@ -3357,6 +3384,12 @@ impl ReticulumTransport {
     /// Returns `true` iff the envelope was DELIVERED over the reverse path;
     /// `false` means fall through to the outbound dial (each stage logged
     /// distinctly + throttled so the RCA classifier can tell them apart).
+    // CIRISEdge#414/#932 — grew past clippy's 100-line cap when the Busy arm's
+    // single-packet interleave became the fragment-aware interleave (fragment the
+    // oversized reply onto the packet path + the two loud fallback logs). The body
+    // is one linear retry loop with a single match; extracting the Busy arm would
+    // split the retry/deadline state across a helper for no readability gain.
+    #[allow(clippy::too_many_lines)]
     async fn send_via_reverse_path(&self, destination_key_id: &str, envelope_bytes: &[u8]) -> bool {
         let deadline = tokio::time::Instant::now() + REVERSE_PATH_BUSY_RETRY_WINDOW;
         let mut attempts: u32 = 0;
@@ -3420,25 +3453,89 @@ impl ReticulumTransport {
                     // returns `Busy` non-blocking, so the interleave semantics are
                     // unchanged. `try_send` (not `send`) keeps the one-shot
                     // behaviour — this call is already inside the busy-retry path.
+                    //
+                    // CIRISEdge#414 / CIRISAgent#932 — FRAGMENT the reply so it
+                    // ALWAYS rides the packet path, not just when it fits the MDU.
+                    // Before this, a frame larger than the link MDU (the observed
+                    // ~19 KB Attestation Deliver, or a ~1 MiB inline-trace envelope)
+                    // failed the `len() <= mdu` gate and fell to the resource path's
+                    // one-per-link `Busy` gate — silently dropped on a NAT'd
+                    // reverse-path-only peer, so the responder-driven round never
+                    // converged. `fragment()` returns the frame in ONE unwrapped
+                    // piece when it already fits (identical to the old fast path) and
+                    // as N sub-MDU `CFRG` fragments otherwise; each fragment
+                    // interleaves the busy resource transfer via the same
+                    // non-contending link Channel, and the receiver reassembles in
+                    // `attribute_and_deliver`. A best-effort lost fragment just means
+                    // the frame re-fragments next round — the same whole-frame retry
+                    // unit anti-entropy already relies on.
                     let mdu = self.node.link_mdu(&link_id).unwrap_or(0);
-                    if envelope_bytes.len() <= mdu
-                        && self
-                            .node
-                            .link_handle(&link_id)
-                            .try_send(envelope_bytes)
-                            .await
-                            .is_ok()
+                    if let Some(fragments) =
+                        crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
                     {
-                        tracing::debug!(
-                            destination_key_id,
-                            link = ?link_id,
-                            attempts,
-                            mdu,
-                            bytes = envelope_bytes.len(),
-                            "delivered as a link PACKET, interleaving the busy resource \
-                             transfer (CIRISEdge#353 ask #2 / leviculum#27)"
-                        );
-                        return true;
+                        let total = fragments.len();
+                        let mut sent = 0usize;
+                        for frag in &fragments {
+                            if self.node.link_handle(&link_id).try_send(frag).await.is_ok() {
+                                sent += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if sent == total {
+                            tracing::debug!(
+                                destination_key_id,
+                                link = ?link_id,
+                                attempts,
+                                mdu,
+                                bytes = envelope_bytes.len(),
+                                fragments = total,
+                                "delivered as {total} link PACKET(s), interleaving the busy \
+                                 resource transfer (CIRISEdge#353 ask #2 / leviculum#27, \
+                                 fragmented per CIRISEdge#414/#932)"
+                            );
+                            return true;
+                        }
+                        // Channel backpressured mid-send: some fragments landed but
+                        // not all, so this frame will NOT reassemble this round.
+                        // Loud (the #932 silent-drop class) — the round re-diffs and
+                        // re-fragments, so this is recoverable, not fatal.
+                        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                            oversized_frame_drop_log().check(destination_key_id)
+                        {
+                            tracing::warn!(
+                                destination_key_id,
+                                link = ?link_id,
+                                attempts,
+                                mdu,
+                                bytes = envelope_bytes.len(),
+                                fragments = total,
+                                fragments_sent = sent,
+                                suppressed_prev,
+                                "reverse-path link Channel backpressured mid-fragment-send \
+                                 ({sent}/{total} landed); frame will re-fragment next round \
+                                 (CIRISEdge#414/#932) — falling back to resource busy-retry"
+                            );
+                        }
+                    } else {
+                        // fragment() == None only for a degenerate MDU below
+                        // MIN_FRAGMENTABLE_MDU — a pathologically tiny link. Loud, not
+                        // silent (this is the #932 class).
+                        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                            oversized_frame_drop_log().check(destination_key_id)
+                        {
+                            tracing::warn!(
+                                destination_key_id,
+                                link = ?link_id,
+                                attempts,
+                                mdu,
+                                bytes = envelope_bytes.len(),
+                                suppressed_prev,
+                                "reverse-path link MDU too small to fragment \
+                                 (< MIN_FRAGMENTABLE_MDU); cannot use the packet path \
+                                 (CIRISEdge#414/#932) — falling back to resource busy-retry"
+                            );
+                        }
                     }
                     if tokio::time::Instant::now() + REVERSE_PATH_BUSY_BACKOFF >= deadline {
                         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
@@ -3981,6 +4078,7 @@ impl Transport for ReticulumTransport {
                         timed_out_requests: &self.timed_out_requests,
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                         link_last_inbound_at: &self.link_last_inbound_at,
+                        inbound_reasm: &self.inbound_reasm,
                     };
                     handle_event(event, &ctx).await;
 
@@ -4072,6 +4170,11 @@ struct EventCtx<'a> {
     /// liveness signal); stamped in `attribute_and_deliver`, consumed by
     /// `live_attributed_link_to` to reply over the peer's freshest live link.
     link_last_inbound_at: &'a Mutex<HashMap<LinkId, u64>>,
+    /// CIRISEdge#414/#932 — inbound fragment reassembler (see the field of the
+    /// same name on [`ReticulumTransport`]). `attribute_and_deliver` feeds every
+    /// inbound frame through it; a fragment that does not yet complete its frame
+    /// buffers here and produces no `InboundFrame`.
+    inbound_reasm: &'a Mutex<crate::transport::frame_fragment::Reassembler>,
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -4107,6 +4210,26 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             .await
             .insert(link_id, now_secs);
     }
+    // CIRISEdge#414 / CIRISAgent#932 — REASSEMBLE before attributing/routing. A
+    // whole (`CRPL…`) frame passes straight through unchanged; a `CFRG` fragment
+    // (the send side split an oversized reverse-path reply onto the packet path)
+    // is buffered until its siblings arrive, at which point the reassembled frame
+    // is routed exactly as if it had crossed whole. An incomplete/malformed
+    // fragment produces NO `InboundFrame` — the last-inbound stamp above already
+    // recorded the packet as link liveness, and anti-entropy re-diffs + re-sends
+    // the frame next round. This is the receive twin of the send-side fragmenter;
+    // both inbound paths (resource + packet) funnel here so neither can bypass it.
+    let data = {
+        let Some(frame) = ctx.inbound_reasm.lock().await.accept(&data) else {
+            tracing::trace!(
+                link = ?link_id,
+                bytes = data.len(),
+                "inbound fragment buffered; frame not yet complete (CIRISEdge#414/#932)"
+            );
+            return;
+        };
+        frame
+    };
     // CIRISEdge#393 (E3) — resolve the candidate peer key_id for this link, then
     // gate it through `SourceKeyId::from_rooted_binding`: attribution survives
     // ONLY for a `Rooted ∧ owns_key` peer. An Advisory or non-owning binding —
