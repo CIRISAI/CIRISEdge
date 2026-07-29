@@ -80,6 +80,83 @@ use ciris_verify_core::threshold::ThresholdMember;
 use super::directory::ReplicationDirectory;
 use super::protocol::{EnvelopeKind, EnvelopeRef};
 
+// ─── CIRISEdge#423 — loud apply diagnostics ──────────────────────────
+//
+// The `apply_*` family used to collapse BOTH failure arms of "deserialize the
+// delivered bytes, then admit the record" to a silent `false`: a malformed
+// envelope was dropped with `Err(_) => false` (reason discarded), and an
+// admission REFUSAL — with its deliberately-named typed reason
+// (`FederationTierUnverified`, `TraceDimensionInvalid`, …) — collapsed to `false`
+// too. Net: a delivered envelope could vanish with zero diagnostic output while
+// the round still reported `admitted: N` for whatever else landed, so from
+// outside a stalled plane looked like a healthy round that simply carried less.
+// This is the exact silent-refusal class the trace-flow arc kept hitting —
+// CIRISEdge#414 (send gate darkening receive), #416 (`local_holdings`
+// advertise-vs-hold), #932 (oversized Deliver dropped while reporting
+// `Delivered`). These two helpers make every apply arm LOUD; the round's
+// `refused` count (already incremented on a `false` return in
+// `session::on_deliver`) then has a matching log explaining WHY.
+
+/// A delivered envelope that fails to DESERIALIZE — dropped, never applied. Logs
+/// the plane, byte length, and a hash of the raw wire bytes (correlates the log
+/// with the delivered frame) plus the serde error. An offered+wanted+delivered
+/// ref that lands here is a producer/consumer wire-shape skew, not absence of work.
+fn log_apply_deser_failure(plane: &str, bytes: &[u8], err: &serde_json::Error) {
+    use sha2::{Digest, Sha256};
+    tracing::warn!(
+        plane,
+        bytes = bytes.len(),
+        wire_hash = %hex::encode(Sha256::digest(bytes)),
+        error = %err,
+        "delivered envelope failed to DESERIALIZE — dropped, NOT applied (CIRISEdge#423)"
+    );
+}
+
+/// A delivered, well-formed envelope REFUSED at admission — not applied. Logs the
+/// plane, the record's content hash (the value persist's `signed_wire_index` keys
+/// on, so it correlates with the offered `EnvelopeRef` and a direct `put_*` of the
+/// same row), and the typed refusal token ([`ciris_persist::federation::Error::kind`]:
+/// `federation_federation_tier_unverified`, `federation_trace_dimension_invalid`, …)
+/// so a consumer can act on it.
+fn log_apply_admission_refusal(
+    plane: &str,
+    content_hash: &str,
+    err: &ciris_persist::federation::Error,
+) {
+    tracing::warn!(
+        plane,
+        content_hash,
+        refusal = err.kind(),
+        error = %err,
+        "delivered envelope REFUSED at admission — NOT applied (CIRISEdge#423)"
+    );
+}
+
+/// CIRISEdge#423 — a single-shape plane: deserialize `$ty`, admit via `$put`, and
+/// be LOUD on BOTH failure arms (see [`log_apply_deser_failure`] /
+/// [`log_apply_admission_refusal`]). `true` iff the record was admitted.
+macro_rules! apply_signed_plane {
+    ($self:expr, $plane:literal, $bytes:expr, $ty:ty, $put:ident) => {
+        match serde_json::from_slice::<$ty>($bytes) {
+            Ok(record) => {
+                let content_hash =
+                    content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
+                match $self.directory.$put(record).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log_apply_admission_refusal($plane, &content_hash, &e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log_apply_deser_failure($plane, $bytes, &e);
+                false
+            }
+        }
+    };
+}
+
 // ─── Configuration ───────────────────────────────────────────────────
 
 /// Tuning knobs for the production bridge.
@@ -1445,11 +1522,37 @@ impl FederationDirectoryReplicationBridge {
         // deterministic non-progress ⇒ `false`, matching the duplicate/
         // refused contract and keeping anti-entropy convergence honest.
         match serde_json::from_slice::<SignedKeyRecord>(bytes) {
-            Ok(record) => matches!(
-                self.directory.apply_replicated_key_record(record).await,
-                Ok(ReplicatedKeyOutcome::Inserted | ReplicatedKeyOutcome::Upgraded)
-            ),
-            Err(_) => false,
+            Ok(record) => {
+                let content_hash =
+                    content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
+                match self.directory.apply_replicated_key_record(record).await {
+                    Ok(ReplicatedKeyOutcome::Inserted | ReplicatedKeyOutcome::Upgraded) => true,
+                    // Unchanged (byte-identical dup) / Refused (pubkey swap, downgrade,
+                    // re-scrub, ambiguous owner, unverifiable sig) are DELIBERATE
+                    // deterministic non-progress ⇒ `false`, NOT an error — DEBUG (not
+                    // WARN) so a "why didn't this key land?" probe is answerable
+                    // without making an expected duplicate loud (CIRISEdge#423).
+                    Ok(_) => {
+                        tracing::debug!(
+                            plane = "Key",
+                            content_hash = %content_hash,
+                            "replicated Key record not admitted as progress \
+                             (duplicate / refused non-progress) (CIRISEdge#423)"
+                        );
+                        false
+                    }
+                    // A genuine persist error (not a deterministic non-progress
+                    // outcome) — LOUD with the typed token.
+                    Err(e) => {
+                        log_apply_admission_refusal("Key", &content_hash, &e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log_apply_deser_failure("Key", bytes, &e);
+                false
+            }
         }
     }
 
@@ -1462,77 +1565,88 @@ impl FederationDirectoryReplicationBridge {
             .map(|attestation| SignedAttestation { attestation })
             .or_else(|_| serde_json::from_slice::<SignedAttestation>(bytes));
         match signed {
-            Ok(record) => self.directory.put_attestation(record).await.is_ok(),
-            Err(_) => false,
+            Ok(record) => {
+                // Hash the BARE attestation — the value persist's content-hash
+                // index (and edge's `advertise_since`) keys on (#397), so the log
+                // correlates with the offered `EnvelopeRef` AND a direct
+                // `put_attestation` of the same row.
+                let content_hash = content_hash_of(&record.attestation)
+                    .map_or_else(String::new, |(h, _)| hex::encode(h));
+                match self.directory.put_attestation(record).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log_apply_admission_refusal("Attestation", &content_hash, &e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log_apply_deser_failure("Attestation", bytes, &e);
+                false
+            }
         }
     }
 
     async fn apply_revocation(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedRevocation>(bytes) {
-            Ok(record) => self.directory.put_revocation(record).await.is_ok(),
-            Err(_) => false,
-        }
+        apply_signed_plane!(self, "Revocation", bytes, SignedRevocation, put_revocation)
     }
 
     async fn apply_identity_occurrence(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedIdentityOccurrence>(bytes) {
-            Ok(record) => self.directory.put_identity_occurrence(record).await.is_ok(),
-            Err(_) => false,
-        }
+        apply_signed_plane!(
+            self,
+            "IdentityOccurrence",
+            bytes,
+            SignedIdentityOccurrence,
+            put_identity_occurrence
+        )
     }
 
     async fn apply_family(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedFamily>(bytes) {
-            Ok(record) => self.directory.put_family(record).await.is_ok(),
-            Err(_) => false,
-        }
+        apply_signed_plane!(self, "Family", bytes, SignedFamily, put_family)
     }
 
     async fn apply_community(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedCommunity>(bytes) {
-            Ok(record) => self.directory.put_community(record).await.is_ok(),
-            Err(_) => false,
-        }
+        apply_signed_plane!(self, "Community", bytes, SignedCommunity, put_community)
     }
 
     async fn apply_identity_occurrence_revocation(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedIdentityOccurrenceRevocation>(bytes) {
-            Ok(record) => self
-                .directory
-                .put_identity_occurrence_revocation(record)
-                .await
-                .is_ok(),
-            Err(_) => false,
-        }
+        apply_signed_plane!(
+            self,
+            "IdentityOccurrenceRevocation",
+            bytes,
+            SignedIdentityOccurrenceRevocation,
+            put_identity_occurrence_revocation
+        )
     }
 
     async fn apply_family_membership_revocation(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedFamilyMembershipRevocation>(bytes) {
-            Ok(record) => self
-                .directory
-                .put_family_membership_revocation(record)
-                .await
-                .is_ok(),
-            Err(_) => false,
-        }
+        apply_signed_plane!(
+            self,
+            "FamilyMembershipRevocation",
+            bytes,
+            SignedFamilyMembershipRevocation,
+            put_family_membership_revocation
+        )
     }
 
     async fn apply_community_membership_revocation(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedCommunityMembershipRevocation>(bytes) {
-            Ok(record) => self
-                .directory
-                .put_community_membership_revocation(record)
-                .await
-                .is_ok(),
-            Err(_) => false,
-        }
+        apply_signed_plane!(
+            self,
+            "CommunityMembershipRevocation",
+            bytes,
+            SignedCommunityMembershipRevocation,
+            put_community_membership_revocation
+        )
     }
 
     async fn apply_location_proof(&self, bytes: &[u8]) -> bool {
-        match serde_json::from_slice::<SignedLocationProof>(bytes) {
-            Ok(record) => self.directory.put_location_proof(record).await.is_ok(),
-            Err(_) => false,
-        }
+        apply_signed_plane!(
+            self,
+            "LocationProof",
+            bytes,
+            SignedLocationProof,
+            put_location_proof
+        )
     }
 
     /// CIRISEdge#338 / CIRISPersist#443 (v17.0.0) — admit a replicated route.
@@ -1591,7 +1705,12 @@ impl FederationDirectoryReplicationBridge {
                     false
                 }
             },
-            Err(_) => false,
+            Err(e) => {
+                // A pre-v17 bare row from an un-upgraded peer (intended breaking
+                // behavior) — but no longer SILENT (CIRISEdge#423).
+                log_apply_deser_failure("TransportDestination", bytes, &e);
+                false
+            }
         }
     }
 
@@ -1632,8 +1751,21 @@ impl FederationDirectoryReplicationBridge {
             .map(|organization| SignedOrganization { organization })
             .or_else(|_| serde_json::from_slice::<SignedOrganization>(bytes));
         match signed {
-            Ok(s) => self.directory.put_organization(s).await.is_ok(),
-            Err(_) => false,
+            Ok(s) => {
+                let content_hash = content_hash_of(&s.organization)
+                    .map_or_else(String::new, |(h, _)| hex::encode(h));
+                match self.directory.put_organization(s).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log_apply_admission_refusal("Organization", &content_hash, &e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log_apply_deser_failure("Organization", bytes, &e);
+                false
+            }
         }
     }
 
@@ -1648,8 +1780,21 @@ impl FederationDirectoryReplicationBridge {
             .map(|org_membership| SignedOrgMembership { org_membership })
             .or_else(|_| serde_json::from_slice::<SignedOrgMembership>(bytes));
         match signed {
-            Ok(s) => self.directory.put_org_membership(s).await.is_ok(),
-            Err(_) => false,
+            Ok(s) => {
+                let content_hash = content_hash_of(&s.org_membership)
+                    .map_or_else(String::new, |(h, _)| hex::encode(h));
+                match self.directory.put_org_membership(s).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log_apply_admission_refusal("OrgMembership", &content_hash, &e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                log_apply_deser_failure("OrgMembership", bytes, &e);
+                false
+            }
         }
     }
 
@@ -1657,10 +1802,13 @@ impl FederationDirectoryReplicationBridge {
         if self.operational.is_none() {
             return false;
         }
-        let Ok(signed) = serde_json::from_slice::<SignedPartnerRecord>(bytes) else {
-            return false;
-        };
-        self.directory.put_partner_record(signed).await.is_ok()
+        apply_signed_plane!(
+            self,
+            "PartnerRecord",
+            bytes,
+            SignedPartnerRecord,
+            put_partner_record
+        )
     }
 }
 
