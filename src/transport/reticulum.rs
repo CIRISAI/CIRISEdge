@@ -400,6 +400,20 @@ fn link_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1024))
 }
 
+static INITIATOR_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#424 — the initiator-side attribution arm could not resolve a source
+/// for an inbound frame's link: either NO destination is known for the link
+/// (`link_destination`=None AND no dialed-dest record — the bug's silent outer
+/// `else`) or a known dest matches no rooted peer. LOUD (throttled, keyed per
+/// link, capped map as the backstop) so the miss can NEVER again read as absence
+/// of work — the #414/#416/#932/#423/#424 silent-refusal class.
+fn initiator_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
+    INITIATOR_ATTRIBUTION_MISS_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+}
+
 /// CIRISEdge#337 — route supersession decisions (verified-only refusal + belt
 /// reroute-heal). Keyed on a fixed low-cardinality reason ("hijack_refused" /
 /// "reroute_healed", ≤4 keys), NEVER on the attacker-chosen `key_id`, so a flood
@@ -1588,6 +1602,16 @@ pub struct ReticulumTransport {
     /// this reassembles it before it reaches the replication router. Bounded by an
     /// LRU cap on in-flight frames so lost fragments / floods cannot grow memory.
     inbound_reasm: Arc<Mutex<crate::transport::frame_fragment::Reassembler>>,
+    /// CIRISEdge#424 — the destination edge dialed for each link it INITIATED,
+    /// recorded at `connect` time. leviculum's `link_destination` returns `None`
+    /// for a node's own dialed (initiator) links (its `link()` registry lookup
+    /// misses for the initiator direction / after a #66 re-key), so the #353
+    /// initiator-side attribution arm — which maps an inbound reply's link back to
+    /// its peer via the link's destination — exited at step one and dropped every
+    /// reply `source_key_id=None`. This map is edge's own re-key-independent record
+    /// of "I dialed link L to dest D", consulted when `link_destination` is `None`.
+    /// Removed on `LinkClosed`.
+    dialed_link_dest: Arc<Mutex<HashMap<LinkId, DestinationHash>>>,
     /// CIRISEdge#32 (v0.14.0) — request/response slot. The listen-loop
     /// populates this on `NodeEvent::ResponseReceived` keyed by
     /// `request_id`; [`Self::link_request`] polls + removes.
@@ -2117,6 +2141,7 @@ impl ReticulumTransport {
             inbound_reasm: Arc::new(Mutex::new(
                 crate::transport::frame_fragment::Reassembler::new(),
             )),
+            dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
             request_responses: Arc::new(Mutex::new(HashMap::new())),
             timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
             blackhole: blackhole_rules,
@@ -2526,6 +2551,12 @@ impl ReticulumTransport {
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
+        // CIRISEdge#424 — record the dialed dest for own-dialed-link attribution
+        // (see `send`); uniform across every link edge initiates.
+        self.dialed_link_dest
+            .lock()
+            .await
+            .insert(link_id, dest_hash);
 
         // CIRISEdge#342 — alias-resolving establishment poll (see `send`): a
         // #66 re-key on a lossy path re-keys the link under a fresh id, so a raw
@@ -3891,6 +3922,14 @@ impl Transport for ReticulumTransport {
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
+        // CIRISEdge#424 — record the dest we dialed for THIS link so an inbound
+        // reply arriving over it (the initiator-side reverse path a NAT'd peer's
+        // responder uses) attributes to this peer even though leviculum's
+        // `link_destination` returns `None` for our own dialed links.
+        self.dialed_link_dest
+            .lock()
+            .await
+            .insert(link_id, peer.dest_hash);
 
         // Wait for the link to reach `LinkEstablished` on BOTH ends —
         // the peer must have accepted the LINK_REQUEST or a resource
@@ -4079,6 +4118,7 @@ impl Transport for ReticulumTransport {
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                         link_last_inbound_at: &self.link_last_inbound_at,
                         inbound_reasm: &self.inbound_reasm,
+                        dialed_link_dest: &self.dialed_link_dest,
                     };
                     handle_event(event, &ctx).await;
 
@@ -4175,6 +4215,52 @@ struct EventCtx<'a> {
     /// inbound frame through it; a fragment that does not yet complete its frame
     /// buffers here and produces no `InboundFrame`.
     inbound_reasm: &'a Mutex<crate::transport::frame_fragment::Reassembler>,
+    /// CIRISEdge#424 — dest edge dialed per initiated link (see the field of the
+    /// same name on [`ReticulumTransport`]). Consulted in `attribute_and_deliver`
+    /// when leviculum's `link_destination` is `None` for an own-dialed link.
+    dialed_link_dest: &'a Mutex<HashMap<LinkId, DestinationHash>>,
+}
+
+/// CIRISEdge#424 — the classified result of attributing an inbound frame's link to
+/// a source peer. Every arm is explicit so a `None` attribution can NEVER again be
+/// a silent fall-through: #424 was diagnosed precisely because the instrumented
+/// miss-branch never fired — execution exited an un-instrumented outer `else`.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkAttribution {
+    /// A peer dialed us; attributed via the `LinkIdentified`-fed table.
+    ViaIdentified(String),
+    /// We dialed the link; attributed via the destination edge recorded at
+    /// `connect` (the #353/#424 initiator reverse path). This is the arm the bug
+    /// could not reach because leviculum's `link_destination` is `None` here.
+    ViaDialedDest(String),
+    /// NO destination is known for this link — not `LinkIdentified` (no peer dialed
+    /// us) AND no dialed-dest record (`link_destination`=None for own-dialed links,
+    /// and edge never recorded a dial). THE #424 class; loudly logged, not silent.
+    NoDest,
+    /// A destination IS known but matches no rooted peer in the map (e.g. the peer
+    /// has not rooted yet).
+    DestUnmatched(DestinationHash),
+}
+
+/// Pure attribution decision (unit-tested — the layer the server's loopback round
+/// harness cannot reach, per CIRISEdge#424). The `LinkIdentified` table wins; else
+/// the link's known destination is mapped back to a rooted peer; else a CLASSIFIED
+/// miss (never an unlabelled `None`). `peer_for_dest` closes over the live peer map.
+fn resolve_link_attribution(
+    identified: Option<String>,
+    dest: Option<DestinationHash>,
+    peer_for_dest: impl FnOnce(DestinationHash) -> Option<String>,
+) -> LinkAttribution {
+    if let Some(key_id) = identified {
+        return LinkAttribution::ViaIdentified(key_id);
+    }
+    match dest {
+        None => LinkAttribution::NoDest,
+        Some(d) => match peer_for_dest(d) {
+            Some(key_id) => LinkAttribution::ViaDialedDest(key_id),
+            None => LinkAttribution::DestUnmatched(d),
+        },
+    }
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -4238,35 +4324,73 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // delivered unattributed and dropped downstream (`SkippedNoSourceKeyId`),
     // never reaching `peer_has_serve_capability`. Both attribution bases are
     // gated identically (the #348 "two loops must never diverge" lesson).
-    let candidate_key_id = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
-    // CIRISEdge#353 — INITIATOR-side attribution. `link_to_peer_key_id` is fed by
-    // `LinkIdentified`, which only fires on links a PEER dialed to us; a reply
-    // arriving on a link WE dialed (the reverse path a NAT'd peer's responder
-    // uses) has no entry. The stateless, #66-re-key-proof basis is the link's
-    // DESTINATION (leviculum `link_destination`): we dialed a dest resolved from
-    // the VERIFIED route table, and RNS establishment proves the remote controls
-    // that dest's keys — same trust the outbound send used.
-    let candidate_key_id = if candidate_key_id.is_some() {
-        candidate_key_id
-    } else if let Some(dest) = ctx.node.link_destination(&link_id) {
-        let via_dest = ctx
-            .peers
-            .lock()
-            .await
-            .iter()
-            .find(|(_, rooted)| rooted.peer.dest_hash == dest)
-            .map(|(key_id, _)| key_id.clone());
-        if let Some(key_id) = &via_dest {
-            tracing::debug!(
-                link = ?link_id,
-                peer = %key_id,
-                "inbound frame on a link WE dialed attributed via its destination \
-                 (initiator-side reverse path, CIRISEdge#353)"
-            );
+    let identified = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    // CIRISEdge#353/#424 — INITIATOR-side attribution. `link_to_peer_key_id` is fed
+    // by `LinkIdentified`, which only fires on links a PEER dialed to us; a reply
+    // arriving on a link WE dialed (the reverse path a NAT'd peer's responder uses)
+    // has no entry. The basis is the link's DESTINATION: we dialed a dest resolved
+    // from the VERIFIED route table, and RNS establishment proves the remote
+    // controls that dest's keys — same trust the outbound send used.
+    //
+    // leviculum's `link_destination` answers this for links a peer dialed to us,
+    // but returns `None` for our OWN dialed links (its `link()` registry misses the
+    // initiator direction / a #66 re-key). That `None` is exactly what dropped
+    // every initiator-side reply `source_key_id=None` (CIRISEdge#424): the arm
+    // exited at step one into an un-instrumented `else`. Fall back to edge's own
+    // connect-time record (`dialed_link_dest`), which is re-key-independent.
+    let dest = match ctx.node.link_destination(&link_id) {
+        Some(d) => Some(d),
+        None => ctx.dialed_link_dest.lock().await.get(&link_id).copied(),
+    };
+    let candidate_key_id = {
+        let peers = ctx.peers.lock().await;
+        let outcome = resolve_link_attribution(identified, dest, |d| {
+            peers
+                .iter()
+                .find(|(_, rooted)| rooted.peer.dest_hash == d)
+                .map(|(key_id, _)| key_id.clone())
+        });
+        drop(peers);
+        match outcome {
+            LinkAttribution::ViaIdentified(key_id) => Some(key_id),
+            LinkAttribution::ViaDialedDest(key_id) => {
+                tracing::debug!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    "inbound frame on a link WE dialed attributed via its recorded \
+                     destination (initiator-side reverse path, CIRISEdge#353/#424)"
+                );
+                Some(key_id)
+            }
+            // The #424 class — now LOUD, never a silent outer `else`. Throttled per
+            // link (capped map = DoS backstop). If this fires POST-fix, edge got a
+            // frame on a link it neither accepted nor recorded dialing.
+            LinkAttribution::NoDest => {
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    initiator_attribution_miss_log().check(&format!("{link_id:?}"))
+                {
+                    tracing::warn!(
+                        link = ?link_id,
+                        suppressed_prev,
+                        "inbound frame's link has NO known destination — not \
+                         LinkIdentified (no peer dialed us) and no dialed-dest record \
+                         (leviculum `link_destination`=None for own-dialed links). The \
+                         #353 initiator arm cannot resolve a source; frame dropped \
+                         unattributed (CIRISEdge#424)"
+                    );
+                }
+                None
+            }
+            LinkAttribution::DestUnmatched(d) => {
+                tracing::debug!(
+                    link = ?link_id,
+                    dest = %hex::encode(d.into_bytes()),
+                    "inbound frame's link destination matches no rooted peer — frame \
+                     dropped unattributed (peer not yet rooted? CIRISEdge#424)"
+                );
+                None
+            }
         }
-        via_dest
-    } else {
-        None
     };
     // Gate (CIRISEdge#393): admit the attribution only if the candidate's binding
     // is `Rooted ∧ owns_key` (item 1) AND its transport identity is bound by a
@@ -4741,6 +4865,8 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // CIRISEdge#353 — drop the link's last-inbound stamp too, so a
             // closed link can never win the reverse-path selector.
             ctx.link_last_inbound_at.lock().await.remove(&link_id);
+            // CIRISEdge#424 — drop the dialed-dest record for the closed link.
+            ctx.dialed_link_dest.lock().await.remove(&link_id);
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.
@@ -5983,6 +6109,61 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CIRISEdge#424 initiator-side link attribution — the pure decision ──
+    //
+    // leviculum's `link_destination` returns `None` for a node's OWN dialed links,
+    // so the #353 initiator arm exited at step one and dropped every inbound reply
+    // `source_key_id=None` (13 reproductions/run). The failure was invisible
+    // because execution took an un-instrumented outer `else`. The fix records the
+    // dialed dest at connect and consults it; the decision is extracted here so it
+    // is unit-testable — the layer the server's loopback round harness cannot reach.
+    mod initiator_attribution {
+        use super::*;
+
+        fn dh(b: u8) -> DestinationHash {
+            DestinationHash::new([b; 16])
+        }
+
+        #[test]
+        fn identified_table_wins_even_with_a_dest() {
+            // A peer dialed us: the `LinkIdentified` table is authoritative and the
+            // dest map is not even consulted.
+            let out = resolve_link_attribution(Some("peer-a".into()), Some(dh(1)), |_| {
+                panic!("peer_for_dest must not be consulted when identified")
+            });
+            assert_eq!(out, LinkAttribution::ViaIdentified("peer-a".into()));
+        }
+
+        #[test]
+        fn own_dialed_link_resolves_via_recorded_dest() {
+            // THE #424 FIX: no `LinkIdentified` (we dialed the link), but the dest
+            // edge recorded at connect maps back to the peer — attribution now
+            // succeeds where leviculum's `link_destination`=None used to drop it.
+            let out = resolve_link_attribution(None, Some(dh(7)), |d| {
+                (d == dh(7)).then(|| "canonical-1".to_string())
+            });
+            assert_eq!(out, LinkAttribution::ViaDialedDest("canonical-1".into()));
+        }
+
+        #[test]
+        fn no_dest_is_classified_not_a_silent_else() {
+            // THE #424 BUG CONDITION, now a NAMED outcome: `link_destination`=None
+            // AND no dialed-dest record. Must never again be an unlabelled `None`.
+            let out = resolve_link_attribution(None, None, |_| {
+                panic!("peer_for_dest must not be consulted with no dest")
+            });
+            assert_eq!(out, LinkAttribution::NoDest);
+        }
+
+        #[test]
+        fn known_dest_with_no_rooted_peer_is_dest_unmatched() {
+            // A dest is known but no peer matches it (not yet rooted) — a distinct,
+            // logged outcome from "no dest at all".
+            let out = resolve_link_attribution(None, Some(dh(9)), |_| None);
+            assert_eq!(out, LinkAttribution::DestUnmatched(dh(9)));
+        }
+    }
 
     // ── CIRISEdge#353 reverse-path reply-link selection — the pure decision ──
     //
