@@ -220,6 +220,17 @@ async fn sign_bound_hybrid(
             .map_err(|e| TouchClaimError::Sign(format!("ml-dsa-65: {e}")))?;
         Some(B64.encode(&sig))
     } else {
+        // CIRISEdge#425 — the signer has NO PQC half (hybrid-pending), so this touch
+        // is CLASSICAL-ONLY and will be REFUSED at persist's federation-tier
+        // RequireHybrid gate — surfacing later as a generic `Put` error with the
+        // cause lost. Name it HERE, at the source, so "the touch didn't admit" is a
+        // one-line read, not an investigation.
+        tracing::warn!(
+            key_id = %signer.key_id,
+            "touch claim signed CLASSICAL-ONLY — signer has no ML-DSA-65 (PQC) half \
+             (hybrid-pending). This claim will NOT admit at RequireHybrid; provision the \
+             PQC signer half to emit an admissible hybrid touch (CIRISEdge#425)"
+        );
         None
     };
     Ok((ed_b64, mldsa_b64))

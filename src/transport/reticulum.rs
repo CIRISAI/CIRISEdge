@@ -438,6 +438,38 @@ fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
 }
 
+static INBOUND_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#425 — throttle backing [`drop_inbound`]. Keyed on the low-cardinality
+/// reason TAG (a fixed set), a floor per window (periodic repeat), never silence.
+fn inbound_drop_log() -> &'static crate::log_throttle::LogThrottle {
+    INBOUND_DROP_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 64))
+}
+
+/// CIRISEdge#425 structural-2 — the ONE blessed way for the listen loop to NOT
+/// deliver an inbound frame. Owns the throttled `warn!`, so a receive-side drop is
+/// never a bare `return;` that vanishes at default log levels (the #932/#424 class
+/// on the receive path). `reason_tag` is the low-cardinality throttle key; `detail`
+/// is the free-text context. The `inbound_drop_choke_points_are_instrumented`
+/// characterization pin greps `handle_event` / `attribute_and_deliver` for
+/// `return;` / `continue;` NOT adjacent to a `drop_inbound` or `tracing::` call, so
+/// a NEW silent drop fails the build.
+fn drop_inbound(link_id: Option<LinkId>, reason_tag: &str, detail: &str) {
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        inbound_drop_log().check(reason_tag)
+    {
+        tracing::warn!(
+            link = ?link_id,
+            reason = reason_tag,
+            detail,
+            suppressed_prev,
+            "inbound frame DROPPED — not delivered (CIRISEdge#425 receive-side choke point)"
+        );
+    }
+}
+
 static OVERSIZED_FRAME_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 
@@ -4382,12 +4414,22 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                 None
             }
             LinkAttribution::DestUnmatched(d) => {
-                tracing::debug!(
-                    link = ?link_id,
-                    dest = %hex::encode(d.into_bytes()),
-                    "inbound frame's link destination matches no rooted peer — frame \
-                     dropped unattributed (peer not yet rooted? CIRISEdge#424)"
-                );
+                // A DROP, so it speaks at WARN — at debug this was invisible at the
+                // level a harness actually runs, which is how a dropped frame kept
+                // reading as absence-of-work (CIRISAgent#932/#425). Throttled per
+                // link (floor, not silence, not per-frame flood).
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    initiator_attribution_miss_log().check(&format!("{link_id:?}"))
+                {
+                    tracing::warn!(
+                        link = ?link_id,
+                        dest = %hex::encode(d.into_bytes()),
+                        suppressed_prev,
+                        "inbound frame DROPPED unattributed — the link's destination \
+                         matches NO rooted peer (dest resolved, peers-map lookup missed; \
+                         peer not yet rooted, or rooted under a different dest) (CIRISEdge#425)"
+                    );
+                }
                 None
             }
         }
@@ -4431,24 +4473,41 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                 (Some(sid), Some(d), Some(rooting)) => {
                     if rooting.hybrid_transport_binding_exists(&key_id, d).await {
                         Some(sid)
-                    } else {
-                        tracing::debug!(
+                    } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                        link_attribution_miss_log().check(key_id.as_str())
+                    {
+                        tracing::warn!(
                             link = ?link_id,
                             peer = %key_id,
-                            "inbound frame NOT attributed — no hybrid-verified \
-                             TransportDestination binds this transport identity (PQ \
-                             attribution gate, CIRISEdge#393 item 2)"
+                            dest = %hex::encode(d),
+                            suppressed_prev,
+                            "inbound frame DROPPED — item 1 PASSED (Rooted∧owns_key) but \
+                             item 2 FAILED: no hybrid-verified SignedTransportDestination \
+                             binds this (peer, dest) pair (CIRISEdge#393 item 2). This is \
+                             the ONLY failing conjunct"
                         );
+                        None
+                    } else {
                         None
                     }
                 }
                 (Some(_), _, None) => {
-                    tracing::debug!(
-                        link = ?link_id,
-                        peer = %key_id,
-                        "inbound frame NOT attributed — no rooting directory to verify \
-                         the hybrid transport binding (fail-closed, CIRISEdge#393 item 2)"
-                    );
+                    // A CONFIG condition that nulls EVERY attribution — throttled on a
+                    // FIXED discriminant (one condition, not per-peer) so a misconfig
+                    // reminds periodically without one-warn-per-frame flooding.
+                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                        link_attribution_miss_log().check("no-rooting-directory")
+                    {
+                        tracing::warn!(
+                            link = ?link_id,
+                            peer = %key_id,
+                            suppressed_prev,
+                            "inbound frame DROPPED — NO ROOTING DIRECTORY wired on this \
+                             transport, so item 2 can never be evaluated (fail-closed). This \
+                             nulls EVERY attribution regardless of kind or path — check the \
+                             Edge builder wires a RootingDirectory (CIRISEdge#393 item 2)"
+                        );
+                    }
                     None
                 }
                 _ => None,
@@ -4464,7 +4523,7 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                     link_attribution_miss_log().check(key_id.as_str())
                 {
                     if let Some((provenance, owns_key, epoch)) = resolved {
-                        tracing::info!(
+                        tracing::warn!(
                             link = ?link_id,
                             peer = %key_id,
                             resolved_provenance = ?provenance,
@@ -4477,18 +4536,25 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                              owns_key failure"
                         );
                     } else {
-                        tracing::info!(
+                        tracing::warn!(
                             link = ?link_id,
                             peer = %key_id,
                             suppressed_prev,
-                            "inbound frame NOT attributed — NO binding in the peers map for \
-                             this link's key_id (CIRISEdge#404 link-resolution miss)"
+                            "inbound frame DROPPED — item 1 has NO binding in the peers map \
+                             for this link's key_id (candidate resolved, peers-map miss) \
+                             (CIRISEdge#404 link-resolution miss)"
                         );
                     }
                 }
             }
             gated
         }
+        // NO candidate key_id at all — the frame is dropped unattributed. This is
+        // NOT a silent drop: the specific cause (`NoDest` / `DestUnmatched`) was
+        // ALREADY logged loudly + throttled by the `resolve_link_attribution` arm
+        // above (CIRISEdge#424/#425), so this terminal arm just forwards the `None`
+        // without re-logging (a second per-frame log here would double-flood the
+        // exact condition already stated upstream).
         None => None,
     };
     let frame = InboundFrame {
@@ -4789,6 +4855,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     error = %error,
                     "reverse-path resource transfer FAILED at the driver (CIRISEdge#353b)"
                 );
+            } else {
+                // CIRISEdge#425 — an INBOUND envelope resource that began arriving
+                // and never completed used to leave no trace on the receive side.
+                drop_inbound(
+                    None,
+                    "inbound-resource-failed",
+                    &format!(
+                        "an inbound envelope resource transfer failed mid-flight \
+                         (resource={}): {error}",
+                        hex::encode(&resource_hash[..8])
+                    ),
+                );
             }
         }
         NodeEvent::ResourceCompleted {
@@ -4806,15 +4884,34 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 .await
                 .remove(&resource_hash);
             if is_sender {
-                // Our own outbound envelope finished transferring —
-                // unblock the `send` waiting on this resource hash.
+                // choke-ok: sender-side completion, NOT an inbound drop — our own
+                // outbound envelope finished transferring; unblock the `send`
+                // waiting on this resource hash (CIRISEdge#425).
                 ctx.sent_resources.lock().await.insert(resource_hash);
                 return;
             }
-            // Receiver side: the first segment carries the full
-            // envelope (edge envelopes are single-segment for the
-            // MVP — an 8 MiB cap fits one Reticulum resource).
-            if data.is_empty() || segment_index != 1 {
+            // Receiver side: the first segment carries the full envelope (edge
+            // envelopes are single-segment for the MVP — an 8 MiB cap fits one
+            // Reticulum resource). CIRISEdge#425 — these two causes used to fuse
+            // into ONE silent `return`; split + loud (a multi-segment resource is a
+            // real assumption break if leviculum ever chunks a large transfer).
+            if data.is_empty() {
+                drop_inbound(
+                    Some(link_id),
+                    "empty-resource",
+                    "receiver-side resource completed with no data",
+                );
+                return;
+            }
+            if segment_index != 1 {
+                drop_inbound(
+                    Some(link_id),
+                    "multi-segment-resource",
+                    &format!(
+                        "segment_index={segment_index} — edge assumes single-segment \
+                         envelopes (MVP); segments >1 are NOT reassembled and are dropped"
+                    ),
+                );
                 return;
             }
             tracing::debug!(
@@ -4845,6 +4942,13 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         NodeEvent::MessageReceived { link_id, data, .. }
         | NodeEvent::LinkDataReceived { link_id, data } => {
             if data.is_empty() {
+                // CIRISEdge#425 — an empty packet on the link-Channel path was a
+                // silent `return` too; route it through the choke point.
+                drop_inbound(
+                    Some(link_id),
+                    "empty-packet",
+                    "inbound link packet had no data",
+                );
                 return;
             }
             tracing::debug!(
@@ -5095,7 +5199,20 @@ async fn resolve_announce_cold_start(
     // no rooting backend the announce cannot be authenticated; drop
     // it (fail-honest — never fall back to TOFU).
     let Some(rooting) = ctx.rooting else {
-        tracing::debug!("announce dropped: no rooting directory configured");
+        // CIRISEdge#425 — no rooting directory means EVERY announce is dropped, so
+        // no peer can ever root: the mesh silently never forms. A floored WARN
+        // (fixed discriminant — one config condition) so a misconfigured node says
+        // so periodically instead of dropping every announce at debug.
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            link_attribution_miss_log().check("announce-no-rooting-directory")
+        {
+            tracing::warn!(
+                suppressed_prev,
+                "announce DROPPED — no rooting directory configured on this transport, so \
+                 NO peer can ever root (the mesh cannot form). Wire a RootingDirectory on \
+                 the Edge builder (CIRISEdge#425)"
+            );
+        }
         return;
     };
 
@@ -6118,6 +6235,56 @@ mod tests {
     // because execution took an un-instrumented outer `else`. The fix records the
     // dialed dest at connect and consults it; the decision is extracted here so it
     // is unit-testable — the layer the server's loopback round harness cannot reach.
+    /// CIRISEdge#425 structural-2 — the STRUCTURAL guard for the receive-side drop
+    /// choke point. Every `return;` / `continue;` inside `attribute_and_deliver` /
+    /// `handle_event` must be adjacent (≤8 lines) to a `drop_inbound(` call, a
+    /// `tracing::` log, or an explicit `// choke-ok:` marker justifying a non-drop
+    /// exit. A NEW bare `return;` that vanishes at default log levels — the silent
+    /// receive-side drop class that cost this arc days (#414/#416/#932/#424/#425) —
+    /// FAILS this pin. This is what makes the cure structural, not a convention that
+    /// has now failed review five times (the issue's own argument).
+    #[test]
+    fn inbound_exits_are_instrumented_or_marked() {
+        let src = include_str!("reticulum.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut violations: Vec<String> = Vec::new();
+        for sig in ["async fn attribute_and_deliver(", "async fn handle_event("] {
+            let start = lines
+                .iter()
+                .position(|l| l.starts_with(sig))
+                .unwrap_or_else(|| panic!("characterization pin: fn not found: {sig}"));
+            // Body ends at the next column-0 closing brace.
+            let end = lines[start + 1..]
+                .iter()
+                .position(|l| l.starts_with('}'))
+                .map_or(lines.len(), |p| start + 1 + p);
+            for (offset, raw) in lines[start..end].iter().enumerate() {
+                let line = raw.trim();
+                if line.starts_with("//") {
+                    continue; // comments that mention `return;` are not exits
+                }
+                if line != "return;" && line != "continue;" {
+                    continue;
+                }
+                let idx = start + offset;
+                let lo = idx.saturating_sub(8);
+                let window = lines[lo..=idx].join("\n");
+                let instrumented = window.contains("drop_inbound(")
+                    || window.contains("tracing::")
+                    || window.contains("choke-ok");
+                if !instrumented {
+                    violations.push(format!("{sig} @ line {}: `{line}`", idx + 1));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "CIRISEdge#425 — un-instrumented inbound exit(s); route through `drop_inbound(...)` \
+             or a `tracing::` log, or annotate `// choke-ok: <why it is not a silent drop>`:\n{}",
+            violations.join("\n")
+        );
+    }
+
     mod initiator_attribution {
         use super::*;
 

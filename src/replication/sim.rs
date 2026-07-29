@@ -24,7 +24,7 @@
 
 use crate::replication::protocol::{EnvelopeKind, EnvelopeRef};
 use crate::replication::session::{ReplicationOutcome, Session, SessionRole};
-use crate::replication::summary::{StateApplier, StateProvider};
+use crate::replication::summary::{ApplyOutcome, StateApplier, StateProvider};
 use crate::replication::{wire_frame, LocalState};
 use crate::transport::frame_fragment::{fragment, Reassembler};
 use sha2::{Digest, Sha256};
@@ -131,15 +131,15 @@ struct SimApplier<'a> {
     applied: Vec<[u8; 32]>,
 }
 impl StateApplier for SimApplier<'_> {
-    fn apply_envelope(&mut self, kind: EnvelopeKind, bytes: &[u8]) -> bool {
+    fn apply_envelope(&mut self, kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
         let hash: [u8; 32] = Sha256::digest(bytes).into();
         if self.store.holds(kind, &hash) {
-            return false; // duplicate
+            return ApplyOutcome::Duplicate;
         }
         let seq = self.store.state.by_kind.get(&kind).map_or(0, BTreeMap::len) as u64 + 1;
         self.store.insert(kind, bytes.to_vec(), seq);
         self.applied.push(hash);
-        true
+        ApplyOutcome::Admitted
     }
 }
 

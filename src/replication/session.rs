@@ -39,7 +39,7 @@ use super::protocol::{
     DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
     SummaryMessage,
 };
-use super::summary::{diff_refs, StalenessSignal, StateApplier, StateProvider};
+use super::summary::{diff_refs, ApplyOutcome, StalenessSignal, StateApplier, StateProvider};
 
 /// What role a session is playing in this round. Initiator emits
 /// the first Summary; Responder waits for one.
@@ -462,11 +462,43 @@ impl Session {
         }
         let mut admitted = 0usize;
         let mut refused = 0usize;
+        // CIRISEdge#425 — THE single apply choke point. Every delivered envelope's
+        // outcome is counted AND, when it is not `Admitted`, logged with its reason
+        // right here. Because `apply_envelope` now yields a `#[must_use]`
+        // `ApplyOutcome`, an `apply_*` branch that wanted to `return false` silently
+        // cannot — it must produce a reason this loop surfaces. A refusal that
+        // withholds carriage can therefore never again read as absence of work; the
+        // `refused` count in the `RoundReport` always has a matching WARN saying WHY.
         for env_bytes in &deliver.envelopes {
-            if applier.apply_envelope(self.kind, env_bytes) {
-                admitted += 1;
-            } else {
-                refused += 1;
+            match applier.apply_envelope(self.kind, env_bytes) {
+                ApplyOutcome::Admitted => admitted += 1,
+                // Routine non-progress (a re-delivered held row) — quiet by design;
+                // WARN-ing every duplicate would drown the genuine refusals.
+                ApplyOutcome::Duplicate => {
+                    refused += 1;
+                    tracing::debug!(
+                        kind = ?self.kind,
+                        "delivered envelope was a duplicate the node already held (CIRISEdge#425)"
+                    );
+                }
+                // A gate REFUSED a well-formed envelope — the darkens-carriage class.
+                ApplyOutcome::Refused(reason) => {
+                    refused += 1;
+                    tracing::warn!(
+                        kind = ?self.kind,
+                        reason = %reason,
+                        "delivered envelope REFUSED — not applied (CIRISEdge#425 apply choke point)"
+                    );
+                }
+                ApplyOutcome::Deserialize(err) => {
+                    refused += 1;
+                    tracing::warn!(
+                        kind = ?self.kind,
+                        error = %err,
+                        "delivered envelope failed to DESERIALIZE — dropped, not applied \
+                         (CIRISEdge#425 apply choke point)"
+                    );
+                }
             }
         }
         // Compute staleness from what we asked for vs what we admitted.
@@ -542,19 +574,19 @@ mod tests {
     }
 
     impl StateApplier for TestApplier {
-        fn apply_envelope(&mut self, kind: EnvelopeKind, bytes: &[u8]) -> bool {
+        fn apply_envelope(&mut self, kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
             // In production: verify sig + recompute hash. Here we
             // look up the precomputed hash for these bytes.
             if let Some(hash) = self.hash_lookup.get(bytes).copied() {
                 let kind_set = self.local_state.by_kind.entry(kind).or_default();
                 if kind_set.contains_key(&hash) {
-                    return false; // duplicate
+                    return ApplyOutcome::Duplicate;
                 }
                 kind_set.insert(hash, 1);
                 self.admitted.push(bytes.to_vec());
-                true
+                ApplyOutcome::Admitted
             } else {
-                false
+                ApplyOutcome::refused("unknown bytes (test fixture)")
             }
         }
     }
@@ -1236,6 +1268,36 @@ mod tests {
                 assert_eq!(staleness, StalenessSignal::BoundedBy { missing: 2 });
             }
             o => panic!("{o:?}"),
+        }
+    }
+
+    /// CIRISEdge#425 — the apply CHOKE POINT. A stub applier returns a NAMED
+    /// `Refused` for every envelope; `on_deliver` must count them ALL as `refused`
+    /// (never silently reduce `admitted`) — the reason is what it logs. The
+    /// compiler already forbids a silent `return false` (`ApplyOutcome` is
+    /// `#[must_use]` with no `bool`); this locks the counting half so a refusal can
+    /// never again read as absence of work.
+    #[test]
+    fn on_deliver_counts_every_refusal_at_the_choke_point() {
+        struct RefusingApplier;
+        impl StateApplier for RefusingApplier {
+            fn apply_envelope(&mut self, _k: EnvelopeKind, _b: &[u8]) -> ApplyOutcome {
+                ApplyOutcome::refused("gate refused this row")
+            }
+        }
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+        };
+        match responder.on_deliver(&deliver, &mut RefusingApplier) {
+            ReplicationOutcome::Applied {
+                admitted, refused, ..
+            } => {
+                assert_eq!(admitted, 0, "nothing admitted");
+                assert_eq!(refused, 3, "every refused envelope is counted, not dropped");
+            }
+            o => panic!("expected Applied, got {o:?}"),
         }
     }
 

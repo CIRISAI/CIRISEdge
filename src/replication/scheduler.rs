@@ -534,7 +534,9 @@ mod tests {
     use crate::replication::coordinator::ReplicationCoordinator;
     use crate::replication::protocol::{EnvelopeKind, EnvelopeRef};
     use crate::replication::session::SessionRole;
-    use crate::replication::summary::{LocalState, StalenessSignal, StateApplier, StateProvider};
+    use crate::replication::summary::{
+        ApplyOutcome, LocalState, StalenessSignal, StateApplier, StateProvider,
+    };
     use crate::transport::{
         InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
     };
@@ -600,15 +602,15 @@ mod tests {
         local_hashes: std::collections::HashSet<[u8; 32]>,
     }
     impl StateApplier for RecordingApplier {
-        fn apply_envelope(&mut self, _kind: EnvelopeKind, bytes: &[u8]) -> bool {
+        fn apply_envelope(&mut self, _kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
             let Some(hash) = self.known.get(bytes).copied() else {
-                return false;
+                return ApplyOutcome::refused("unknown bytes (test)");
             };
             if self.local_hashes.contains(&hash) {
-                return false;
+                return ApplyOutcome::Duplicate;
             }
             self.local_hashes.insert(hash);
-            true
+            ApplyOutcome::Admitted
         }
     }
 

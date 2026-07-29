@@ -213,7 +213,10 @@ async fn key_round_trips_across_combinator_refactor() {
     // 4. apply_envelope_bytes is idempotent on matching content
     //    (persist returns Ok on dedup).
     let admitted = bridge.apply_envelope_bytes(EnvelopeKind::Key, &bytes).await;
-    assert!(admitted, "idempotent re-apply succeeds");
+    assert!(
+        admitted.is_admitted(),
+        "idempotent re-apply succeeds, got {admitted:?}"
+    );
 }
 
 // ─── Invariant 5 — no key in cohort means no refs ───────────────────

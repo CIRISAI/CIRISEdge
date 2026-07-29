@@ -110,21 +110,67 @@ pub trait StateProvider: Send + Sync {
     fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> Option<Vec<u8>>;
 }
 
+/// CIRISEdge#425 — the typed result of applying ONE delivered envelope.
+///
+/// Replaces the old `bool` return of [`StateApplier::apply_envelope`] so a refusal
+/// can NEVER be a silent `return false`. Every non-[`Admitted`](ApplyOutcome::Admitted)
+/// variant carries a reason, and the SINGLE choke point — `Session::on_deliver` —
+/// logs it as it counts the envelope `refused`. This kills the silent-apply
+/// subclass BY CONSTRUCTION (`#[must_use]`): a new `apply_*` branch cannot drop the
+/// outcome on the floor, so it cannot add a silent refusal — it must yield a reason
+/// the loop logs. The failure mode this closes is the #414/#416/#423/#424/#932
+/// class: a real refusal quiet enough to look like absence of work (the round
+/// still reports a healthy `admitted`/`refused` split, but the *why* was gone).
+#[must_use = "an apply outcome carries a refusal reason that on_deliver must log — do not drop it"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The envelope was admitted and changed local state — the anti-entropy
+    /// progress signal (`Inserted`/`Upgraded` on the Key plane; a fresh `put_*`
+    /// elsewhere).
+    Admitted,
+    /// A byte-identical envelope the node already held. EXPECTED non-progress: the
+    /// diff isn't perfect and a re-run / the #927 proactive push re-delivers held
+    /// rows all the time, so this is routine — `on_deliver` logs it at DEBUG, never
+    /// WARN (WARN-ing every duplicate would drown the genuine refusals). Counts as
+    /// non-admitted, exactly like the old `false`.
+    Duplicate,
+    /// The envelope was well-formed but a GATE refused it — persist's typed
+    /// `Error::kind()`, a missing operational provider, a downgrade/ambiguous-owner
+    /// rejection, … This is the class that DARKENS carriage: `on_deliver` logs it
+    /// at WARN with `reason` (a short, stable, low-cardinality label). NEVER silent.
+    Refused(String),
+    /// The delivered bytes failed to deserialize into the plane's record type — a
+    /// producer/consumer wire-shape skew, not absence of work. WARN with the error.
+    Deserialize(String),
+}
+
+impl ApplyOutcome {
+    /// Did this outcome admit a NEW envelope (the convergence progress signal that
+    /// `on_deliver` counts as `admitted`)?
+    #[must_use]
+    pub fn is_admitted(&self) -> bool {
+        matches!(self, ApplyOutcome::Admitted)
+    }
+
+    /// A `Refused` with a borrowed-then-owned reason — ergonomic constructor.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        ApplyOutcome::Refused(reason.into())
+    }
+}
+
 /// Trait the live Session calls to apply received envelopes. Wraps
 /// persist's `put_*` admit surface; the impl is responsible for
 /// validating the envelope (signature + canonical-bytes hash) before
-/// committing to local state. Errors NOT surfaced by this trait —
-/// the apply path is idempotent (a duplicate apply hits persist's
-/// R1/Q1 dedupe and returns no-op).
+/// committing to local state. The merge layer in persist is the
+/// canonical anti-rollback authority; a duplicate apply hits its R1/Q1
+/// dedupe and returns a `Refused` no-op.
 pub trait StateApplier: Send + Sync {
-    /// Apply one envelope to local state. The receiver MUST verify
-    /// the signed envelope's signature + canonical-bytes hash before
-    /// admitting; if validation fails the apply silently no-ops
-    /// (the merge layer in persist is the canonical anti-rollback
-    /// authority). Returns `true` if the apply admitted a new
-    /// envelope (changed local state), `false` if it was a duplicate
-    /// or refused.
-    fn apply_envelope(&mut self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> bool;
+    /// Apply one envelope to local state. The receiver MUST verify the signed
+    /// envelope's signature + canonical-bytes hash before admitting. Returns an
+    /// [`ApplyOutcome`]: `Admitted` if a NEW envelope changed local state, else a
+    /// `Refused`/`Deserialize` carrying WHY — `on_deliver` logs the reason (the
+    /// #425 single choke point). Never a silent drop.
+    fn apply_envelope(&mut self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> ApplyOutcome;
 }
 
 /// Compute the diff between two summaries — which hashes the LOCAL

@@ -4847,6 +4847,22 @@ async fn dispatch_inbound(
                             .await;
                     }
                 }
+            } else {
+                // CIRISEdge#425 — the fetch was validly DELIVERED but its body did
+                // not deserialize to a `BlobChunkFetch`. It was dropped with NO
+                // reply, so the requester just times out with no stated cause. Name
+                // it here (re-parse only on this rare error path for the message).
+                let err =
+                    serde_json::from_str::<crate::messages::BlobChunkFetch>(envelope.body.get())
+                        .err()
+                        .map(|e| e.to_string());
+                tracing::warn!(
+                    signing_key_id = %envelope.signing_key_id,
+                    error = ?err,
+                    "BlobChunkFetch responder: a validly-delivered but MALFORMED \
+                     BlobChunkFetch body was dropped with no reply — the requester will \
+                     time out (CIRISEdge#425)"
+                );
             }
         } else {
             tracing::debug!(
@@ -7652,7 +7668,7 @@ mod inbound_ingest_tests {
         use crate::replication::coordinator::ReplicationCoordinator;
         use crate::replication::protocol::EnvelopeRef;
         use crate::replication::session::SessionRole;
-        use crate::replication::summary::{StateApplier, StateProvider};
+        use crate::replication::summary::{ApplyOutcome, StateApplier, StateProvider};
         use crate::transport::{Transport, TransportError, TransportSendOutcome};
         use std::sync::Arc;
         use tokio::sync::Mutex;
@@ -7688,8 +7704,8 @@ mod inbound_ingest_tests {
         }
         struct NoApplier;
         impl StateApplier for NoApplier {
-            fn apply_envelope(&mut self, _k: EnvelopeKind, _b: &[u8]) -> bool {
-                false
+            fn apply_envelope(&mut self, _k: EnvelopeKind, _b: &[u8]) -> ApplyOutcome {
+                ApplyOutcome::refused("no-op applier (test)")
             }
         }
 

@@ -5289,6 +5289,39 @@ pub fn init_edge_runtime(
                 let b64 = base64::engine::general_purpose::STANDARD;
                 (b64.encode(&full[0..32]), b64.encode(&full[32..64]))
             };
+            // CIRISEdge#425 — no-recompute belt (#541 defense-in-depth). Read the
+            // existing self row FIRST: if it already carries the SAME destination +
+            // both transport pubkeys, do NOT rewrite it. A rewrite bumps
+            // `asserted_at` to `now()`, which could outrace persist's own SIGNED
+            // transport_destination row on the `(epoch, asserted_at)` monotonic
+            // guard and desync it (the #541 shape). Mirrors #406's named-dest-hash
+            // no-recompute idiom; a genuine transport-identity rotation changes a
+            // pubkey and still re-registers. A read error (e.g. a backend without
+            // the point-read) falls through to register, exactly as before.
+            let unchanged = {
+                let dir = Arc::clone(&federation_directory_for_edge);
+                let occ = occurrence_key_id.to_string();
+                match run_async(&executor, async move {
+                    dir.list_transport_destinations_for(&occ).await
+                }) {
+                    Ok(rows) => rows.iter().any(|r| {
+                        r.transport_kind == "reticulum"
+                            && r.destination == destination_hex
+                            && r.transport_ed25519_pubkey_base64.as_deref()
+                                == Some(transport_ed25519_pubkey_base64.as_str())
+                            && r.transport_x25519_pubkey_base64.as_deref()
+                                == Some(transport_x25519_pubkey_base64.as_str())
+                    }),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "self-at-login: transport_destination readback unavailable; \
+                             registering (no-recompute belt inactive here) (CIRISEdge#425)"
+                        );
+                        false
+                    }
+                }
+            };
             let directory_for_register = Arc::clone(&federation_directory_for_edge);
             let row = ciris_persist::federation::self_at_login::TransportDestination {
                 occurrence_key_id: occurrence_key_id.to_string(),
@@ -5311,27 +5344,38 @@ pub fn init_edge_runtime(
                 retired_at: None,
             };
             let occurrence_for_log = occurrence_key_id.to_string();
-            let register_result = run_async(&executor, async move {
-                directory_for_register.put_transport_destination(&row).await
-            });
-            match register_result {
-                Ok(()) => {
-                    tracing::info!(
-                        occurrence_key_id = %occurrence_for_log,
-                        transport_kind = "reticulum",
-                        destination = %destination_hex,
-                        "transport_destination registered (self-at-login)"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        occurrence_key_id = %occurrence_for_log,
-                        transport_kind = "reticulum",
-                        destination = %destination_hex,
-                        error = %e,
-                        "transport_destination registration failed; peers may need \
-                         to retry reachability lookup"
-                    );
+            if unchanged {
+                tracing::debug!(
+                    occurrence_key_id = %occurrence_for_log,
+                    transport_kind = "reticulum",
+                    destination = %destination_hex,
+                    "self-at-login: transport_destination unchanged (same dest + keys); \
+                     skipping re-register to avoid an asserted_at recompute racing the \
+                     signed row (CIRISEdge#425 / CIRISPersist#541)"
+                );
+            } else {
+                let register_result = run_async(&executor, async move {
+                    directory_for_register.put_transport_destination(&row).await
+                });
+                match register_result {
+                    Ok(()) => {
+                        tracing::info!(
+                            occurrence_key_id = %occurrence_for_log,
+                            transport_kind = "reticulum",
+                            destination = %destination_hex,
+                            "transport_destination registered (self-at-login)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            occurrence_key_id = %occurrence_for_log,
+                            transport_kind = "reticulum",
+                            destination = %destination_hex,
+                            error = %e,
+                            "transport_destination registration failed; peers may need \
+                             to retry reachability lookup"
+                        );
+                    }
                 }
             }
         }

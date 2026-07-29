@@ -155,7 +155,7 @@ pub use scheduler::{ReplicationScheduler, RoundEvent, SchedulerConfig};
 #[doc(inline)]
 pub use session::{ReplicationOutcome, Session, SessionRole};
 #[doc(inline)]
-pub use summary::{LocalState, StalenessSignal, StateApplier, StateProvider};
+pub use summary::{ApplyOutcome, LocalState, StalenessSignal, StateApplier, StateProvider};
 #[doc(inline)]
 pub use wire_frame::{
     try_unwrap as try_unwrap_replication_frame, wrap as wrap_replication_frame,

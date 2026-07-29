@@ -79,62 +79,68 @@ use ciris_verify_core::threshold::ThresholdMember;
 
 use super::directory::ReplicationDirectory;
 use super::protocol::{EnvelopeKind, EnvelopeRef};
+use super::summary::ApplyOutcome;
 
-// ─── CIRISEdge#423 — loud apply diagnostics ──────────────────────────
+// ─── CIRISEdge#423 → #425 — apply-refusal diagnostics, now by construction ──
 //
-// The `apply_*` family used to collapse BOTH failure arms of "deserialize the
+// The `apply_*` family once collapsed BOTH failure arms of "deserialize the
 // delivered bytes, then admit the record" to a silent `false`: a malformed
-// envelope was dropped with `Err(_) => false` (reason discarded), and an
-// admission REFUSAL — with its deliberately-named typed reason
-// (`FederationTierUnverified`, `TraceDimensionInvalid`, …) — collapsed to `false`
-// too. Net: a delivered envelope could vanish with zero diagnostic output while
-// the round still reported `admitted: N` for whatever else landed, so from
-// outside a stalled plane looked like a healthy round that simply carried less.
-// This is the exact silent-refusal class the trace-flow arc kept hitting —
-// CIRISEdge#414 (send gate darkening receive), #416 (`local_holdings`
-// advertise-vs-hold), #932 (oversized Deliver dropped while reporting
-// `Delivered`). These two helpers make every apply arm LOUD; the round's
-// `refused` count (already incremented on a `false` return in
-// `session::on_deliver`) then has a matching log explaining WHY.
+// envelope was dropped with `Err(_) => false` (reason discarded), and an admission
+// REFUSAL — with its typed reason (`FederationTierUnverified`, …) — collapsed to
+// `false` too. #423 made each arm log LOUDLY at the bridge; but that fix MISSED
+// three sites in this very file (the `if self.operational.is_none() { return
+// false }` early returns sit ABOVE the helpers), which is the argument for a
+// STRUCTURAL cure. #425: every `apply_*` now returns an [`ApplyOutcome`] carrying
+// its reason, and the SINGLE choke point `session::on_deliver` logs it. A future
+// `apply_*` branch cannot add a silent `return false` — `ApplyOutcome` is
+// `#[must_use]` and there is no `false` to return. These helpers just BUILD the
+// reason string (the logging lives at the choke point, so no double-log).
 
-/// A delivered envelope that fails to DESERIALIZE — dropped, never applied. Logs
-/// the plane, byte length, and a hash of the raw wire bytes (correlates the log
-/// with the delivered frame) plus the serde error. An offered+wanted+delivered
-/// ref that lands here is a producer/consumer wire-shape skew, not absence of work.
-fn log_apply_deser_failure(plane: &str, bytes: &[u8], err: &serde_json::Error) {
+/// The `Deserialize` reason for a delivered envelope that failed to parse: the
+/// wire-bytes hash (correlates with the delivered frame) + the serde error.
+fn apply_deser_reason(plane: &str, bytes: &[u8], err: &serde_json::Error) -> String {
     use sha2::{Digest, Sha256};
-    tracing::warn!(
-        plane,
-        bytes = bytes.len(),
-        wire_hash = %hex::encode(Sha256::digest(bytes)),
-        error = %err,
-        "delivered envelope failed to DESERIALIZE — dropped, NOT applied (CIRISEdge#423)"
-    );
+    format!(
+        "{plane}: deserialize failed (bytes={}, wire_hash={}): {err}",
+        bytes.len(),
+        hex::encode(Sha256::digest(bytes)),
+    )
 }
 
-/// A delivered, well-formed envelope REFUSED at admission — not applied. Logs the
-/// plane, the record's content hash (the value persist's `signed_wire_index` keys
-/// on, so it correlates with the offered `EnvelopeRef` and a direct `put_*` of the
-/// same row), and the typed refusal token ([`ciris_persist::federation::Error::kind`]:
-/// `federation_federation_tier_unverified`, `federation_trace_dimension_invalid`, …)
-/// so a consumer can act on it.
-fn log_apply_admission_refusal(
+/// The `Refused` reason for a well-formed envelope a gate declined: the record's
+/// content hash (the value persist's `signed_wire_index` keys on — correlates with
+/// the offered `EnvelopeRef` + a direct `put_*`) + the typed refusal token
+/// ([`ciris_persist::federation::Error::kind`]).
+fn apply_refusal_reason(
     plane: &str,
     content_hash: &str,
     err: &ciris_persist::federation::Error,
-) {
-    tracing::warn!(
-        plane,
-        content_hash,
-        refusal = err.kind(),
-        error = %err,
-        "delivered envelope REFUSED at admission — NOT applied (CIRISEdge#423)"
-    );
+) -> String {
+    format!(
+        "{plane}: admission refused (content_hash={content_hash}, refusal={}): {err}",
+        err.kind(),
+    )
 }
 
-/// CIRISEdge#423 — a single-shape plane: deserialize `$ty`, admit via `$put`, and
-/// be LOUD on BOTH failure arms (see [`log_apply_deser_failure`] /
-/// [`log_apply_admission_refusal`]). `true` iff the record was admitted.
+static SERVE_GATE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#425 Exhibit A — a serve-gate refusal WITHHOLDS an entire plane (every
+/// `trace:*` attestation) from a peer. That is a `warn!`, never `debug!`: a node at
+/// default log levels was silently withholding every trace FOREVER, indistinguishable
+/// from "there was nothing to send" (the round reported `completed`, `envelopes_sent=0`
+/// — perfect health, zero carriage). Throttled to a FLOOR — a few per five minutes
+/// per (peer, reason), a PERIODIC repeat that resets each window, NEVER to silence:
+/// a persistently-dark plane is exactly the failure you must not go quiet about.
+fn serve_gate_withheld_log() -> &'static crate::log_throttle::LogThrottle {
+    SERVE_GATE_WITHHELD_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(300), 256))
+}
+
+/// CIRISEdge#425 — a single-shape plane: deserialize `$ty`, admit via `$put`, and
+/// yield an [`ApplyOutcome`] (never a silent `false`). `Ok(())` from persist means
+/// admitted-or-idempotent-dedupe (matching the old `is_ok()`); a gate `Err`
+/// becomes `Refused(reason)`; a parse failure becomes `Deserialize(reason)`.
 macro_rules! apply_signed_plane {
     ($self:expr, $plane:literal, $bytes:expr, $ty:ty, $put:ident) => {
         match serde_json::from_slice::<$ty>($bytes) {
@@ -142,17 +148,13 @@ macro_rules! apply_signed_plane {
                 let content_hash =
                     content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
                 match $self.directory.$put(record).await {
-                    Ok(()) => true,
+                    Ok(()) => ApplyOutcome::Admitted,
                     Err(e) => {
-                        log_apply_admission_refusal($plane, &content_hash, &e);
-                        false
+                        ApplyOutcome::Refused(apply_refusal_reason($plane, &content_hash, &e))
                     }
                 }
             }
-            Err(e) => {
-                log_apply_deser_failure($plane, $bytes, &e);
-                false
-            }
+            Err(e) => ApplyOutcome::Deserialize(apply_deser_reason($plane, $bytes, &e)),
         }
     };
 }
@@ -526,7 +528,11 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         Some(bytes)
     }
 
-    async fn apply_envelope_bytes(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> bool {
+    async fn apply_envelope_bytes(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+    ) -> ApplyOutcome {
         match kind {
             EnvelopeKind::Key => self.apply_key(envelope_bytes).await,
             EnvelopeKind::Attestation => self.apply_attestation(envelope_bytes).await,
@@ -617,6 +623,15 @@ impl FederationDirectoryReplicationBridge {
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         for row in rows.iter().filter(|r| in_scope(r)) {
             let Some((hash, _bytes)) = content_hash_of(row) else {
+                // CIRISEdge#425 — a row that will not serialize is silently absent
+                // from the advertise set (peers never learn it exists, so it never
+                // replicates). Near-impossible for these types, but a real
+                // silent-withhold if it ever fires — so it speaks.
+                tracing::warn!(
+                    "advertise_since: a row could not be serialized to its content \
+                     hash and is OMITTED from the advertise set — it will not replicate \
+                     (CIRISEdge#425)"
+                );
                 continue;
             };
             if !seen.insert(hash) {
@@ -925,26 +940,55 @@ impl FederationDirectoryReplicationBridge {
     /// that flows under a weaker gate, and unlike v13.10.0 this darkness is
     /// deliberate, logged per-leg, and covered by an ALLOW-path test.
     async fn peer_has_serve_capability(&self, peer_key_id: &str) -> bool {
-        // Leg A — accord plane. Re-derived from the record's own cryptography
-        // on every call, so a withdrawn blessing takes effect immediately.
-        if !has_effective_role(&*self.directory, peer_key_id, Self::SERVE_CAPABILITY)
-            .await
-            .unwrap_or(false)
-        {
-            tracing::debug!(
-                peer_key_id,
-                "trace attestation withheld — recipient has no accord-conferred, still-verifying \
-                 `infra:serve` (leg A; CIRISPersist#480 re-genesis pending)"
-            );
-            return false;
+        // CIRISEdge#425 Exhibit A/C — every arm below WITHHOLDS the whole trace
+        // plane; each is a throttled `warn!` (a floor, not silence), and — Exhibit
+        // C — a directory READ ERROR is reported as such, NOT folded into "no role"
+        // (a transient failure reported as a confident statement about the peer's
+        // blessing is worse than silence: it sends you looking in the wrong place).
+        let withhold = |reason_tag: &str, msg: String| {
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                serve_gate_withheld_log().check(&format!("{peer_key_id}:{reason_tag}"))
+            {
+                tracing::warn!(peer_key_id, suppressed_prev, "{msg}");
+            }
+        };
+
+        // Leg A — accord plane. Re-derived from the record's own cryptography on
+        // every call, so a withdrawn blessing takes effect immediately. Exhibit C:
+        // split `Err` (transient read failure) from `Ok(false)` (genuinely no role).
+        match has_effective_role(&*self.directory, peer_key_id, Self::SERVE_CAPABILITY).await {
+            Ok(true) => {}
+            Ok(false) => {
+                withhold(
+                    "legA-no-role",
+                    "trace attestation WITHHELD (leg A) — recipient has no accord-conferred, \
+                     still-verifying `infra:serve`. The fleet must re-genesis with an \
+                     infra:serve-blessed canonical (CIRISPersist#480)."
+                        .to_string(),
+                );
+                return false;
+            }
+            Err(e) => {
+                withhold(
+                    "legA-read-error",
+                    format!(
+                        "trace attestation WITHHELD (leg A) — the `infra:serve` DIRECTORY READ \
+                         FAILED (fail-closed). This is a transient read error, NOT a statement \
+                         that the peer lacks the role: {e}"
+                    ),
+                );
+                return false;
+            }
         }
+
         // Leg B — pluggable-trust-root plane.
         let Some(local) = self.local_key_id.as_deref() else {
-            tracing::warn!(
-                peer_key_id,
-                "trace attestation withheld — replication runtime has no `local_key_id`, so the \
-                 CIRISEdge#386 trust-root gate cannot be evaluated. This darks the trace plane; \
-                 wire ReplicationRuntimeConfig::local_key_id (CIRISServer#300)."
+            withhold(
+                "legB-no-local-key",
+                "trace attestation WITHHELD (leg B) — replication runtime has no `local_key_id`, \
+                 so the CIRISEdge#386 trust-root gate cannot be evaluated. This darks the trace \
+                 plane; wire ReplicationRuntimeConfig::local_key_id (CIRISServer#300)."
+                    .to_string(),
             );
             return false;
         };
@@ -957,6 +1001,7 @@ impl FederationDirectoryReplicationBridge {
         .await
         {
             Ok(Some(grant)) => {
+                // The SUCCESS path — routine, quiet.
                 tracing::debug!(
                     peer_key_id,
                     root_key_id = %grant.root_key_id,
@@ -966,19 +1011,27 @@ impl FederationDirectoryReplicationBridge {
                 true
             }
             Ok(None) => {
-                tracing::debug!(
-                    peer_key_id,
-                    local_key_id = local,
-                    "trace attestation withheld — recipient's `infra:serve` roots to no root this \
-                     node trusts (CIRISEdge#386)"
+                // The walk needs THREE inputs; `Ok(None)` doesn't say which is
+                // absent, so enumerate them as an actionable checklist (CIRISEdge#425).
+                withhold(
+                    "legB-no-trusted-root",
+                    format!(
+                        "trace attestation WITHHELD (leg B) — recipient's `infra:serve` roots to \
+                         no root this node (local_key_id={local}) trusts. One of THREE inputs is \
+                         missing: (1) a scoped `delegates_to(root → {peer_key_id})` grant, (2) \
+                         this node's own `delegates_to({local} → root)` trust edge, or (3) a live \
+                         root charter with a pre-rotation commitment (CIRISEdge#386)."
+                    ),
                 );
                 false
             }
             Err(e) => {
-                tracing::debug!(
-                    peer_key_id,
-                    error = %e,
-                    "trace attestation withheld — trust-root walk failed (fail-closed)"
+                withhold(
+                    "legB-walk-error",
+                    format!(
+                        "trace attestation WITHHELD (leg B) — the trust-root walk FAILED \
+                         (fail-closed). Transient read/verify error, not a trust verdict: {e}"
+                    ),
                 );
                 false
             }
@@ -1503,7 +1556,7 @@ impl FederationDirectoryReplicationBridge {
 // ─── apply_envelope_bytes — per-kind dispatch ───────────────────────
 
 impl FederationDirectoryReplicationBridge {
-    async fn apply_key(&self, bytes: &[u8]) -> bool {
+    async fn apply_key(&self, bytes: &[u8]) -> ApplyOutcome {
         // #277 — route the replicated Key plane through persist's
         // upgrade-aware `apply_replicated_key_record` (CIRISPersist#375,
         // dyn-reachable on `FederationDirectory` since v13.0.1) instead of
@@ -1514,49 +1567,36 @@ impl FederationDirectoryReplicationBridge {
         // replication end-to-end (retires CIRISServer#150's adopt-scrubbed
         // endpoint once the owner-cohort Key plane lands).
         //
-        // `apply_envelope_bytes`'s bool means "admitted a NEW envelope that
-        // changed local state" (see `ReplicationDirectory::apply_envelope_bytes`),
-        // so only `Inserted`/`Upgraded` count as progress. `Unchanged`
-        // (byte-identical duplicate) and `Refused` (not admitted: pubkey
-        // swap, downgrade, re-scrub, ambiguous owner, unverifiable sig) are
-        // deterministic non-progress ⇒ `false`, matching the duplicate/
-        // refused contract and keeping anti-entropy convergence honest.
+        // CIRISEdge#425 — the typed `ReplicatedKeyOutcome` maps cleanly to
+        // `ApplyOutcome`: `Inserted`/`Upgraded`/`Superseded` changed local state
+        // (progress); `Unchanged` is a byte-identical duplicate (routine, quiet);
+        // `Refused` (pubkey swap, downgrade, re-scrub, ambiguous owner, unverifiable
+        // sig) is a REAL refusal that darkens the Key plane — LOUD, not the silent
+        // `false` it used to fold into. A persist `Err` / deserialize failure carry
+        // their reason. The choke point (`on_deliver`) logs every non-`Admitted`.
         match serde_json::from_slice::<SignedKeyRecord>(bytes) {
             Ok(record) => {
                 let content_hash =
                     content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
                 match self.directory.apply_replicated_key_record(record).await {
-                    Ok(ReplicatedKeyOutcome::Inserted | ReplicatedKeyOutcome::Upgraded) => true,
-                    // Unchanged (byte-identical dup) / Refused (pubkey swap, downgrade,
-                    // re-scrub, ambiguous owner, unverifiable sig) are DELIBERATE
-                    // deterministic non-progress ⇒ `false`, NOT an error — DEBUG (not
-                    // WARN) so a "why didn't this key land?" probe is answerable
-                    // without making an expected duplicate loud (CIRISEdge#423).
-                    Ok(_) => {
-                        tracing::debug!(
-                            plane = "Key",
-                            content_hash = %content_hash,
-                            "replicated Key record not admitted as progress \
-                             (duplicate / refused non-progress) (CIRISEdge#423)"
-                        );
-                        false
-                    }
-                    // A genuine persist error (not a deterministic non-progress
-                    // outcome) — LOUD with the typed token.
-                    Err(e) => {
-                        log_apply_admission_refusal("Key", &content_hash, &e);
-                        false
-                    }
+                    Ok(
+                        ReplicatedKeyOutcome::Inserted
+                        | ReplicatedKeyOutcome::Upgraded
+                        | ReplicatedKeyOutcome::Superseded,
+                    ) => ApplyOutcome::Admitted,
+                    Ok(ReplicatedKeyOutcome::Unchanged) => ApplyOutcome::Duplicate,
+                    Ok(ReplicatedKeyOutcome::Refused) => ApplyOutcome::Refused(format!(
+                        "Key: admission refused (content_hash={content_hash}; pubkey swap / \
+                         downgrade / re-scrub / ambiguous owner / unverifiable sig)"
+                    )),
+                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason("Key", &content_hash, &e)),
                 }
             }
-            Err(e) => {
-                log_apply_deser_failure("Key", bytes, &e);
-                false
-            }
+            Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Key", bytes, &e)),
         }
     }
 
-    async fn apply_attestation(&self, bytes: &[u8]) -> bool {
+    async fn apply_attestation(&self, bytes: &[u8]) -> ApplyOutcome {
         // CIRISEdge#397 — the wire is now the BARE `Attestation` (the shape
         // persist's content-hash index/point-read serves), so deserialize that
         // first and re-wrap; fall back to the pre-v14.1 `SignedAttestation`
@@ -1567,31 +1607,29 @@ impl FederationDirectoryReplicationBridge {
         match signed {
             Ok(record) => {
                 // Hash the BARE attestation — the value persist's content-hash
-                // index (and edge's `advertise_since`) keys on (#397), so the log
+                // index (and edge's `advertise_since`) keys on (#397), so the reason
                 // correlates with the offered `EnvelopeRef` AND a direct
                 // `put_attestation` of the same row.
                 let content_hash = content_hash_of(&record.attestation)
                     .map_or_else(String::new, |(h, _)| hex::encode(h));
                 match self.directory.put_attestation(record).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log_apply_admission_refusal("Attestation", &content_hash, &e);
-                        false
-                    }
+                    Ok(()) => ApplyOutcome::Admitted,
+                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
+                        "Attestation",
+                        &content_hash,
+                        &e,
+                    )),
                 }
             }
-            Err(e) => {
-                log_apply_deser_failure("Attestation", bytes, &e);
-                false
-            }
+            Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Attestation", bytes, &e)),
         }
     }
 
-    async fn apply_revocation(&self, bytes: &[u8]) -> bool {
+    async fn apply_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(self, "Revocation", bytes, SignedRevocation, put_revocation)
     }
 
-    async fn apply_identity_occurrence(&self, bytes: &[u8]) -> bool {
+    async fn apply_identity_occurrence(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(
             self,
             "IdentityOccurrence",
@@ -1601,15 +1639,15 @@ impl FederationDirectoryReplicationBridge {
         )
     }
 
-    async fn apply_family(&self, bytes: &[u8]) -> bool {
+    async fn apply_family(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(self, "Family", bytes, SignedFamily, put_family)
     }
 
-    async fn apply_community(&self, bytes: &[u8]) -> bool {
+    async fn apply_community(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(self, "Community", bytes, SignedCommunity, put_community)
     }
 
-    async fn apply_identity_occurrence_revocation(&self, bytes: &[u8]) -> bool {
+    async fn apply_identity_occurrence_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(
             self,
             "IdentityOccurrenceRevocation",
@@ -1619,7 +1657,7 @@ impl FederationDirectoryReplicationBridge {
         )
     }
 
-    async fn apply_family_membership_revocation(&self, bytes: &[u8]) -> bool {
+    async fn apply_family_membership_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(
             self,
             "FamilyMembershipRevocation",
@@ -1629,7 +1667,7 @@ impl FederationDirectoryReplicationBridge {
         )
     }
 
-    async fn apply_community_membership_revocation(&self, bytes: &[u8]) -> bool {
+    async fn apply_community_membership_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(
             self,
             "CommunityMembershipRevocation",
@@ -1639,7 +1677,7 @@ impl FederationDirectoryReplicationBridge {
         )
     }
 
-    async fn apply_location_proof(&self, bytes: &[u8]) -> bool {
+    async fn apply_location_proof(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(
             self,
             "LocationProof",
@@ -1674,7 +1712,7 @@ impl FederationDirectoryReplicationBridge {
     /// (a pre-v17 bare row from an un-upgraded peer) is also `false` — such a
     /// peer's routes simply do not replicate until it adopts v17, which is the
     /// intended breaking behavior, not a silent bare-row admit.
-    async fn apply_transport_destination(&self, bytes: &[u8]) -> bool {
+    async fn apply_transport_destination(&self, bytes: &[u8]) -> ApplyOutcome {
         use ciris_persist::federation::self_at_login::{
             SignedTransportDestination, TransportDestinationApplyOutcome,
         };
@@ -1685,31 +1723,40 @@ impl FederationDirectoryReplicationBridge {
                 .await
             {
                 Ok(TransportDestinationApplyOutcome::Refused { reason }) => {
-                    // Bounded: keyed on the low-cardinality refusal reason, never
-                    // the attacker-influenced key_id / dest (CIRISEdge#337 §4).
-                    tracing::debug!(
-                        occurrence_key_id = %signed.transport_destination.occurrence_key_id,
-                        reason = %reason,
-                        "replicated route refused (fail-closed, re-offerable): stale epoch \
-                         or content conflict — not applied (CIRISEdge#338)"
-                    );
-                    true
+                    // Fail-closed + re-offerable: a stale epoch is routine, but a
+                    // same-`(epoch, asserted_at)` CONTENT conflict is a split-truth
+                    // signal that must be loud (CIRISEdge#425 MEDIUM). We keep the
+                    // frame "handled" (return `Admitted`) either way so it does not
+                    // retry-storm the sender, but a conflict WARNs while a stale
+                    // epoch DEBUGs. Keyed on the low-cardinality reason, never the
+                    // attacker-influenced key_id / dest (CIRISEdge#337 §4).
+                    if reason.contains("conflict") {
+                        tracing::warn!(
+                            occurrence_key_id = %signed.transport_destination.occurrence_key_id,
+                            reason = %reason,
+                            "replicated route CONTENT CONFLICT at same (epoch, asserted_at) — \
+                             split-truth signal, not applied (CIRISEdge#338/#425)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            occurrence_key_id = %signed.transport_destination.occurrence_key_id,
+                            reason = %reason,
+                            "replicated route refused (fail-closed, re-offerable): stale epoch \
+                             — not applied (CIRISEdge#338)"
+                        );
+                    }
+                    ApplyOutcome::Admitted
                 }
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "replicated route REJECTED by the authenticated apply gate — \
-                         signature / attesting-key / acts-for failure (CIRISEdge#337 CRITICAL-2)"
-                    );
-                    false
-                }
+                Ok(_) => ApplyOutcome::Admitted,
+                Err(e) => ApplyOutcome::Refused(format!(
+                    "TransportDestination: authenticated apply gate rejected (signature / \
+                     attesting-key / acts-for, CIRISEdge#337 CRITICAL-2): {e}"
+                )),
             },
+            // A pre-v17 bare row from an un-upgraded peer (intended breaking
+            // behavior) — no longer silent (CIRISEdge#425).
             Err(e) => {
-                // A pre-v17 bare row from an un-upgraded peer (intended breaking
-                // behavior) — but no longer SILENT (CIRISEdge#423).
-                log_apply_deser_failure("TransportDestination", bytes, &e);
-                false
+                ApplyOutcome::Deserialize(apply_deser_reason("TransportDestination", bytes, &e))
             }
         }
     }
@@ -1738,9 +1785,16 @@ impl FederationDirectoryReplicationBridge {
     // persist-internal) roster plumbing is dropped. The `OperationalProviders`
     // roster fields are vestigial post-E9; the server drops computing them when
     // it adopts v14.
-    async fn apply_organization(&self, bytes: &[u8]) -> bool {
+    async fn apply_organization(&self, bytes: &[u8]) -> ApplyOutcome {
+        // CIRISEdge#425 Exhibit B — this early return was one of the THREE sites
+        // #423 missed because it sits ABOVE the loud helpers. An edge built without
+        // `OperationalProviders` silently declined every delivered Organization,
+        // while the round reported healthy. Now it yields a reason the choke logs.
         if self.operational.is_none() {
-            return false;
+            return ApplyOutcome::refused(
+                "Organization: operational providers not configured on this edge — \
+                 operational-kind admission is opted out",
+            );
         }
         // CIRISEdge#397 — the content-hash point-read serves the BARE
         // `Organization` row (the shape `list_organizations_since` returns + the
@@ -1755,23 +1809,25 @@ impl FederationDirectoryReplicationBridge {
                 let content_hash = content_hash_of(&s.organization)
                     .map_or_else(String::new, |(h, _)| hex::encode(h));
                 match self.directory.put_organization(s).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log_apply_admission_refusal("Organization", &content_hash, &e);
-                        false
-                    }
+                    Ok(()) => ApplyOutcome::Admitted,
+                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
+                        "Organization",
+                        &content_hash,
+                        &e,
+                    )),
                 }
             }
-            Err(e) => {
-                log_apply_deser_failure("Organization", bytes, &e);
-                false
-            }
+            Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Organization", bytes, &e)),
         }
     }
 
-    async fn apply_org_membership(&self, bytes: &[u8]) -> bool {
+    async fn apply_org_membership(&self, bytes: &[u8]) -> ApplyOutcome {
+        // CIRISEdge#425 Exhibit B — the second escaped early return.
         if self.operational.is_none() {
-            return false;
+            return ApplyOutcome::refused(
+                "OrgMembership: operational providers not configured on this edge — \
+                 operational-kind admission is opted out",
+            );
         }
         // CIRISEdge#397 — same bare-row wire as `apply_organization`: deserialize
         // the BARE `OrgMembership` and re-wrap, falling back to the pre-v14.1
@@ -1784,23 +1840,25 @@ impl FederationDirectoryReplicationBridge {
                 let content_hash = content_hash_of(&s.org_membership)
                     .map_or_else(String::new, |(h, _)| hex::encode(h));
                 match self.directory.put_org_membership(s).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log_apply_admission_refusal("OrgMembership", &content_hash, &e);
-                        false
-                    }
+                    Ok(()) => ApplyOutcome::Admitted,
+                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
+                        "OrgMembership",
+                        &content_hash,
+                        &e,
+                    )),
                 }
             }
-            Err(e) => {
-                log_apply_deser_failure("OrgMembership", bytes, &e);
-                false
-            }
+            Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("OrgMembership", bytes, &e)),
         }
     }
 
-    async fn apply_partner_record(&self, bytes: &[u8]) -> bool {
+    async fn apply_partner_record(&self, bytes: &[u8]) -> ApplyOutcome {
+        // CIRISEdge#425 Exhibit B — the third escaped early return.
         if self.operational.is_none() {
-            return false;
+            return ApplyOutcome::refused(
+                "PartnerRecord: operational providers not configured on this edge — \
+                 operational-kind admission is opted out",
+            );
         }
         apply_signed_plane!(
             self,
@@ -2024,7 +2082,10 @@ mod tests {
         // surfaces on the scrub-upgrade-aware SqliteBackend (persist owns
         // that classification test).
         let admitted = bridge.apply_envelope_bytes(EnvelopeKind::Key, &bytes).await;
-        assert!(admitted, "matching-content apply admits on MemoryBackend");
+        assert!(
+            admitted.is_admitted(),
+            "matching-content apply admits on MemoryBackend, got {admitted:?}"
+        );
     }
 
     /// CIRISEdge#257 — the Key-plane selector publishes the node's OWN
@@ -2199,7 +2260,16 @@ mod tests {
             let r = bridge
                 .apply_envelope_bytes(kind, b"{not a signed record}")
                 .await;
-            assert!(!r, "expected garbage refused for {kind:?}");
+            assert!(
+                !r.is_admitted(),
+                "expected garbage refused for {kind:?}, got {r:?}"
+            );
+            // CIRISEdge#425 — garbage must classify as a NAMED non-admit (a reason
+            // the choke point logs), never a bare drop.
+            assert!(
+                matches!(r, ApplyOutcome::Refused(_) | ApplyOutcome::Deserialize(_)),
+                "garbage must be a named Refused/Deserialize for {kind:?}, got {r:?}"
+            );
         }
     }
 
@@ -2242,7 +2312,7 @@ mod tests {
             .await;
 
         assert!(
-            !admitted,
+            !admitted.is_admitted(),
             "a bare unsigned TransportDestination must be REFUSED — admitting it is the \
              CIRISEdge#337 CRITICAL-2 confused-deputy route-hijack",
         );
@@ -3413,12 +3483,15 @@ mod tests {
             "signed_envelope": {},
             "ed25519_signature_base64": ""
         }}"#;
-        let admitted = bridge
+        let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Organization, bytes)
             .await;
+        // CIRISEdge#425 — fail-closed AND named: the escaped early return now yields
+        // a `Refused` reason the choke point logs, not a silent `false`.
         assert!(
-            !admitted,
-            "v2 operational admission MUST fail-close without OperationalProviders"
+            matches!(&outcome, ApplyOutcome::Refused(r) if r.contains("operational providers")),
+            "v2 operational admission MUST fail-close with a NAMED refusal without \
+             OperationalProviders, got {outcome:?}"
         );
     }
 
@@ -3437,10 +3510,13 @@ mod tests {
             "signed_envelope": {},
             "ed25519_signature_base64": ""
         }}"#;
-        let admitted = bridge
+        let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::OrgMembership, bytes)
             .await;
-        assert!(!admitted);
+        assert!(
+            matches!(&outcome, ApplyOutcome::Refused(r) if r.contains("operational providers")),
+            "org_membership must fail-close with a named refusal, got {outcome:?}"
+        );
     }
 
     /// Same fail-closed invariant for `partner_record`.
@@ -3458,10 +3534,13 @@ mod tests {
             "steward_signatures": [],
             "threshold": 0
         }"#;
-        let admitted = bridge
+        let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::PartnerRecord, bytes)
             .await;
-        assert!(!admitted);
+        assert!(
+            matches!(&outcome, ApplyOutcome::Refused(r) if r.contains("operational providers")),
+            "partner_record must fail-close with a named refusal, got {outcome:?}"
+        );
     }
 
     /// v2.0.1 — bidirectional `partner_record` replication lights up.

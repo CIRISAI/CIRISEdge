@@ -401,7 +401,7 @@ mod tests {
     use crate::replication::protocol::{
         DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, SummaryMessage,
     };
-    use crate::replication::summary::LocalState;
+    use crate::replication::summary::{ApplyOutcome, LocalState};
     use crate::transport::{InboundFrame, TransportId, TransportSendOutcome};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -485,16 +485,16 @@ mod tests {
         local_hashes: std::collections::HashSet<[u8; 32]>,
     }
     impl StateApplier for RecordingApplier {
-        fn apply_envelope(&mut self, _kind: EnvelopeKind, bytes: &[u8]) -> bool {
+        fn apply_envelope(&mut self, _kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
             if let Some(hash) = self.known.get(bytes).copied() {
                 if self.local_hashes.contains(&hash) {
-                    return false;
+                    return ApplyOutcome::Duplicate;
                 }
                 self.local_hashes.insert(hash);
                 self.admitted_bytes.push(bytes.to_vec());
-                true
+                ApplyOutcome::Admitted
             } else {
-                false
+                ApplyOutcome::refused("unknown bytes (test)")
             }
         }
     }
