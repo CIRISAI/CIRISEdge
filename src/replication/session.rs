@@ -351,13 +351,17 @@ impl Session {
         msg: ReplicationMessage,
         provider: &dyn StateProvider,
         applier: &mut dyn StateApplier,
+        // CIRISEdge#426 — the authenticated sender of this message, forwarded to
+        // the apply path so a per-peer RECEIVE decision is expressible. Pure
+        // pass-through: only the Deliver arm (the sole write path) consults it.
+        source_peer: Option<&str>,
     ) -> ReplicationOutcome {
         match msg {
             ReplicationMessage::Summary(remote_summary) => {
                 self.on_summary(&remote_summary, provider)
             }
             ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider),
-            ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier),
+            ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier, source_peer),
             ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider),
         }
     }
@@ -456,9 +460,46 @@ impl Session {
         &mut self,
         deliver: &DeliverMessage,
         applier: &mut dyn StateApplier,
+        source_peer: Option<&str>,
     ) -> ReplicationOutcome {
         if deliver.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
+        }
+        // CIRISEdge#426 — distinguish a SOLICITED Deliver (it answers a `Diff` we
+        // sent this round — `diff_want_count` is set) from an UNSOLICITED one (a
+        // bare push with no in-flight round we invited — the #927 proactive-publish
+        // shape AND the Sybil-injection shape). The session used to dispatch on TYPE
+        // only and could not tell them apart. We do NOT hard-refuse unsolicited
+        // here: #927 legitimately pushes unsolicited bootstrap rows, and the actual
+        // Sybil-write vectors are closed by persist v22's put-gates + AV-76 per-peer
+        // quota. Instead we make the phase + peer VISIBLE (a bare unsolicited push on
+        // a non-bootstrap plane from a peer is the row to watch), and the threaded
+        // `source_peer` lets the applier/persist make the per-peer call.
+        let solicited = self.diff_want_count.is_some();
+        if !solicited && !deliver.envelopes.is_empty() {
+            let bootstrap_plane = matches!(
+                self.kind,
+                EnvelopeKind::Key | EnvelopeKind::IdentityOccurrence
+            );
+            if bootstrap_plane {
+                tracing::debug!(
+                    kind = ?self.kind,
+                    source_peer = source_peer.unwrap_or("<unattributed>"),
+                    envelopes = deliver.envelopes.len(),
+                    "unsolicited Deliver on a BOOTSTRAP plane — admitted (peer/canonical \
+                     seeding; #927 proactive push) (CIRISEdge#426)"
+                );
+            } else {
+                tracing::warn!(
+                    kind = ?self.kind,
+                    source_peer = source_peer.unwrap_or("<unattributed>"),
+                    envelopes = deliver.envelopes.len(),
+                    "UNSOLICITED Deliver on a non-bootstrap plane (no in-flight round) — \
+                     admitted subject to persist v22 put-gates + AV-76 per-peer quota; the \
+                     per-peer receive decision is now expressible via source_peer \
+                     (CIRISEdge#426)"
+                );
+            }
         }
         let mut admitted = 0usize;
         let mut refused = 0usize;
@@ -470,7 +511,7 @@ impl Session {
         // withholds carriage can therefore never again read as absence of work; the
         // `refused` count in the `RoundReport` always has a matching WARN saying WHY.
         for env_bytes in &deliver.envelopes {
-            match applier.apply_envelope(self.kind, env_bytes) {
+            match applier.apply_envelope(self.kind, env_bytes, source_peer) {
                 ApplyOutcome::Admitted => admitted += 1,
                 // Routine non-progress (a re-delivered held row) — quiet by design;
                 // WARN-ing every duplicate would drown the genuine refusals.
@@ -574,7 +615,12 @@ mod tests {
     }
 
     impl StateApplier for TestApplier {
-        fn apply_envelope(&mut self, kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
+        fn apply_envelope(
+            &mut self,
+            kind: EnvelopeKind,
+            bytes: &[u8],
+            _source_peer: Option<&str>,
+        ) -> ApplyOutcome {
             // In production: verify sig + recompute hash. Here we
             // look up the precomputed hash for these bytes.
             if let Some(hash) = self.hash_lookup.get(bytes).copied() {
@@ -645,7 +691,7 @@ mod tests {
         };
 
         // 2. Bob receives Alice's Summary → emits {Summary, Diff}.
-        let bob_step1 = bob.on_message(alice_summary, &b_provider, &mut b_applier);
+        let bob_step1 = bob.on_message(alice_summary, &b_provider, &mut b_applier, None);
         let (bob_summary, bob_diff) = match bob_step1 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 2);
@@ -656,7 +702,7 @@ mod tests {
 
         // 3. Alice receives Bob's Summary → emits Diff. (Then
         //    receives Bob's Diff → emits Deliver.)
-        let alice_step2 = alice.on_message(bob_summary, &a_provider, &mut a_applier);
+        let alice_step2 = alice.on_message(bob_summary, &a_provider, &mut a_applier, None);
         let alice_diff = match alice_step2 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -666,7 +712,7 @@ mod tests {
         };
 
         // 4. Bob receives Alice's Diff → emits Deliver(env_1, env_2).
-        let bob_step2 = bob.on_message(alice_diff, &b_provider, &mut b_applier);
+        let bob_step2 = bob.on_message(alice_diff, &b_provider, &mut b_applier, None);
         let bob_deliver = match bob_step2 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -676,7 +722,7 @@ mod tests {
         };
 
         // 5. Alice receives Bob's Diff → emits Deliver(env_3, env_4).
-        let alice_step3 = alice.on_message(bob_diff, &a_provider, &mut a_applier);
+        let alice_step3 = alice.on_message(bob_diff, &a_provider, &mut a_applier, None);
         let alice_deliver = match alice_step3 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -686,7 +732,7 @@ mod tests {
         };
 
         // 6. Alice applies Bob's Deliver → admitted env_3 + env_4.
-        let alice_final = alice.on_message(bob_deliver, &a_provider, &mut a_applier);
+        let alice_final = alice.on_message(bob_deliver, &a_provider, &mut a_applier, None);
         match alice_final {
             ReplicationOutcome::Applied {
                 admitted,
@@ -702,7 +748,7 @@ mod tests {
         }
 
         // 7. Bob applies Alice's Deliver → admitted env_1 + env_2.
-        let bob_final = bob.on_message(alice_deliver, &b_provider, &mut b_applier);
+        let bob_final = bob.on_message(alice_deliver, &b_provider, &mut b_applier, None);
         match bob_final {
             ReplicationOutcome::Applied {
                 admitted,
@@ -753,27 +799,29 @@ mod tests {
             _ => panic!(),
         };
         let (m_bob_summary, m_bob_diff) =
-            match bob.on_message(m_alice_summary, &b_provider, &mut b_applier) {
+            match bob.on_message(m_alice_summary, &b_provider, &mut b_applier, None) {
                 ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
                 _ => panic!(),
             };
-        let m_alice_diff = match alice.on_message(m_bob_summary, &a_provider, &mut a_applier) {
+        let m_alice_diff = match alice.on_message(m_bob_summary, &a_provider, &mut a_applier, None)
+        {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let m_bob_deliver = match bob.on_message(m_alice_diff, &b_provider, &mut b_applier) {
+        let m_bob_deliver = match bob.on_message(m_alice_diff, &b_provider, &mut b_applier, None) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let m_alice_deliver = match alice.on_message(m_bob_diff, &a_provider, &mut a_applier) {
+        let m_alice_deliver = match alice.on_message(m_bob_diff, &a_provider, &mut a_applier, None)
+        {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        match alice.on_message(m_bob_deliver, &a_provider, &mut a_applier) {
+        match alice.on_message(m_bob_deliver, &a_provider, &mut a_applier, None) {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
         }
-        match bob.on_message(m_alice_deliver, &b_provider, &mut b_applier) {
+        match bob.on_message(m_alice_deliver, &b_provider, &mut b_applier, None) {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
         }
@@ -829,7 +877,7 @@ mod tests {
                 },
             ],
         });
-        let out = match responder.on_message(remote_summary, &provider, &mut applier) {
+        let out = match responder.on_message(remote_summary, &provider, &mut applier, None) {
             ReplicationOutcome::Send(m) => m,
             o => panic!("unexpected: {o:?}"),
         };
@@ -877,33 +925,36 @@ mod tests {
             _ => panic!(),
         };
         let (bob_summary_resp, bob_diff_msg) =
-            match bob.on_message(alice_summary, &b_provider, &mut b_applier) {
+            match bob.on_message(alice_summary, &b_provider, &mut b_applier, None) {
                 ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
                 _ => panic!(),
             };
-        let alice_diff_msg = match alice.on_message(bob_summary_resp, &a_provider, &mut a_applier) {
-            ReplicationOutcome::Send(m) => m[0].clone(),
-            _ => panic!(),
-        };
+        let alice_diff_msg =
+            match alice.on_message(bob_summary_resp, &a_provider, &mut a_applier, None) {
+                ReplicationOutcome::Send(m) => m[0].clone(),
+                _ => panic!(),
+            };
         // Bob's Deliver from Alice's Diff should be empty (Alice has
         // everything Bob has).
-        let bob_deliver_msg = match bob.on_message(alice_diff_msg, &b_provider, &mut b_applier) {
-            ReplicationOutcome::Send(m) => m[0].clone(),
-            _ => panic!(),
-        };
+        let bob_deliver_msg =
+            match bob.on_message(alice_diff_msg, &b_provider, &mut b_applier, None) {
+                ReplicationOutcome::Send(m) => m[0].clone(),
+                _ => panic!(),
+            };
         if let ReplicationMessage::Deliver(d) = &bob_deliver_msg {
             assert!(d.envelopes.is_empty(), "bob should deliver nothing");
         }
         // Same for Alice's Deliver from Bob's Diff.
-        let alice_deliver_msg = match alice.on_message(bob_diff_msg, &a_provider, &mut a_applier) {
-            ReplicationOutcome::Send(m) => m[0].clone(),
-            _ => panic!(),
-        };
+        let alice_deliver_msg =
+            match alice.on_message(bob_diff_msg, &a_provider, &mut a_applier, None) {
+                ReplicationOutcome::Send(m) => m[0].clone(),
+                _ => panic!(),
+            };
         if let ReplicationMessage::Deliver(d) = &alice_deliver_msg {
             assert!(d.envelopes.is_empty(), "alice should deliver nothing");
         }
         // Applied with 0 admitted, InSync staleness.
-        match alice.on_message(bob_deliver_msg, &a_provider, &mut a_applier) {
+        match alice.on_message(bob_deliver_msg, &a_provider, &mut a_applier, None) {
             ReplicationOutcome::Applied {
                 admitted,
                 staleness,
@@ -930,6 +981,7 @@ mod tests {
             }),
             &provider,
             &mut applier,
+            None,
         );
         assert_eq!(r, ReplicationOutcome::UnexpectedMessage);
     }
@@ -955,6 +1007,7 @@ mod tests {
             }),
             &provider,
             &mut applier,
+            None,
         );
         match r {
             ReplicationOutcome::Applied {
@@ -1024,6 +1077,7 @@ mod tests {
             }),
             &provider,
             &mut applier,
+            None,
         );
         match s.start_round(&provider) {
             ReplicationOutcome::Send(msgs) => {
@@ -1132,6 +1186,7 @@ mod tests {
             }),
             &provider,
             &mut applier,
+            None,
         );
         // Round 2: confirmed sync → SendAndComplete.
         match s.start_round(&provider) {
@@ -1177,6 +1232,7 @@ mod tests {
             }),
             &provider,
             &mut applier,
+            None,
         );
         assert!(
             matches!(s.start_round(&provider), ReplicationOutcome::Send(_)),
@@ -1202,6 +1258,7 @@ mod tests {
             }),
             &provider,
             &mut applier,
+            None,
         );
         match r {
             ReplicationOutcome::Send(msgs) => {
@@ -1247,7 +1304,7 @@ mod tests {
             ],
         });
         alice.start_round(&a_provider);
-        let _ = alice.on_message(bob_summary, &a_provider, &mut a_applier);
+        let _ = alice.on_message(bob_summary, &a_provider, &mut a_applier, None);
         let bob_deliver = ReplicationMessage::Deliver(DeliverMessage {
             kind: EnvelopeKind::Key,
             envelopes: vec![
@@ -1256,7 +1313,7 @@ mod tests {
                 b"unknown_e3".to_vec(),
             ],
         });
-        match alice.on_message(bob_deliver, &a_provider, &mut a_applier) {
+        match alice.on_message(bob_deliver, &a_provider, &mut a_applier, None) {
             ReplicationOutcome::Applied {
                 admitted,
                 refused,
@@ -1281,7 +1338,12 @@ mod tests {
     fn on_deliver_counts_every_refusal_at_the_choke_point() {
         struct RefusingApplier;
         impl StateApplier for RefusingApplier {
-            fn apply_envelope(&mut self, _k: EnvelopeKind, _b: &[u8]) -> ApplyOutcome {
+            fn apply_envelope(
+                &mut self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _source_peer: Option<&str>,
+            ) -> ApplyOutcome {
                 ApplyOutcome::refused("gate refused this row")
             }
         }
@@ -1290,7 +1352,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
         };
-        match responder.on_deliver(&deliver, &mut RefusingApplier) {
+        match responder.on_deliver(&deliver, &mut RefusingApplier, Some("peer-x")) {
             ReplicationOutcome::Applied {
                 admitted, refused, ..
             } => {
@@ -1299,6 +1361,44 @@ mod tests {
             }
             o => panic!("expected Applied, got {o:?}"),
         }
+    }
+
+    /// CIRISEdge#426 — the authenticated sender must REACH the applier so a
+    /// per-peer RECEIVE decision is expressible (it was dropped before the apply
+    /// path, which made the consent plane send-only — an admitted peer could write
+    /// with no per-peer check because the identity was gone). A recording applier
+    /// captures what `on_deliver` hands it: every applied envelope carries the peer.
+    #[test]
+    fn on_deliver_threads_source_peer_to_the_applier() {
+        struct PeerRecordingApplier {
+            seen: Vec<Option<String>>,
+        }
+        impl StateApplier for PeerRecordingApplier {
+            fn apply_envelope(
+                &mut self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                source_peer: Option<&str>,
+            ) -> ApplyOutcome {
+                self.seen.push(source_peer.map(str::to_owned));
+                ApplyOutcome::Admitted
+            }
+        }
+        let mut applier = PeerRecordingApplier { seen: Vec::new() };
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![b"x".to_vec(), b"y".to_vec()],
+        };
+        responder.on_deliver(&deliver, &mut applier, Some("canonical-1"));
+        assert_eq!(
+            applier.seen,
+            vec![
+                Some("canonical-1".to_string()),
+                Some("canonical-1".to_string())
+            ],
+            "each applied envelope carries the authenticated source peer (CIRISEdge#426)"
+        );
     }
 
     /// CIRISEdge#414/#932 — `on_diff` packs a byte-BOUNDED prefix of the wanted

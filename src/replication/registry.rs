@@ -43,9 +43,18 @@ use super::wire_frame;
 /// once by [`ReplicationRuntime::start`](crate::replication::ReplicationRuntime)
 /// so the registry can auto-serve a pull from a #301 advisory-admitted peer
 /// (whom this node does NOT consent-pull from, so it never built an Initiator
-/// for them) instead of dropping the round. The records served are public
-/// signed envelopes; admission is already bounded by the transport's #301
-/// advisory-admit gate, so no additional consent is required.
+/// for them) instead of dropping the round.
+///
+/// CIRISEdge#426 — scope of the "no additional consent" claim: it holds for the
+/// SERVE direction ONLY. The records this Responder *serves* are public signed
+/// envelopes whose outbound consent is already gated (resolve_attestation_recipient
+/// / peer_has_serve_capability / recipient_capability_withholds), so serving them
+/// to a #301-admitted peer needs no further consent. It says NOTHING about what
+/// this Responder *accepts*: the same coordinator also carries the RECEIVE path,
+/// and an admitted peer's writes are bounded by persist v22's put-gates + AV-76
+/// per-peer quota (the actual Sybil-write defense), with the authenticated
+/// `source_peer` now threaded to the apply layer (#426) so a per-peer receive
+/// decision is expressible rather than structurally impossible.
 pub type ResponderFactory =
     Arc<dyn Fn(&str, EnvelopeKind) -> Arc<ReplicationCoordinator> + Send + Sync>;
 

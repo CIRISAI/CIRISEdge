@@ -131,8 +131,16 @@ pub trait ReplicationDirectory: Send + Sync {
     /// layer in persist is the canonical anti-rollback authority. Returns an
     /// [`ApplyOutcome`] (CIRISEdge#425): `Admitted` if a NEW envelope changed local
     /// state, else a `Refused`/`Deserialize` carrying WHY — never a silent drop.
-    async fn apply_envelope_bytes(&self, kind: EnvelopeKind, envelope_bytes: &[u8])
-        -> ApplyOutcome;
+    ///
+    /// CIRISEdge#426 — `source_peer` is the authenticated sender (E3-gated
+    /// upstream). The consent plane was send-only because this identity never
+    /// reached here; carrying it makes a per-peer RECEIVE decision expressible.
+    async fn apply_envelope_bytes(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+        source_peer: Option<&str>,
+    ) -> ApplyOutcome;
 }
 
 /// Adapter that lifts an `Arc<dyn ReplicationDirectory>` into the
@@ -225,7 +233,12 @@ impl StateProvider for DirectoryStateAdapter {
 }
 
 impl StateApplier for DirectoryStateAdapter {
-    fn apply_envelope(&mut self, _kind: EnvelopeKind, _envelope_bytes: &[u8]) -> ApplyOutcome {
+    fn apply_envelope(
+        &mut self,
+        _kind: EnvelopeKind,
+        _envelope_bytes: &[u8],
+        _source_peer: Option<&str>,
+    ) -> ApplyOutcome {
         // NOTE: This impl is the *read* half of the adapter — the
         // `Session` machinery currently borrows the applier `&mut`,
         // which conflicts with the borrow-checker on a shared
@@ -260,12 +273,21 @@ impl MutableDirectoryStateAdapter {
 }
 
 impl StateApplier for MutableDirectoryStateAdapter {
-    fn apply_envelope(&mut self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> ApplyOutcome {
+    fn apply_envelope(
+        &mut self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+        source_peer: Option<&str>,
+    ) -> ApplyOutcome {
         let inner = Arc::clone(&self.inner);
         let bytes = envelope_bytes.to_vec();
+        let peer = source_peer.map(str::to_owned);
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { inner.apply_envelope_bytes(kind, &bytes).await })
+            tokio::runtime::Handle::current().block_on(async move {
+                inner
+                    .apply_envelope_bytes(kind, &bytes, peer.as_deref())
+                    .await
+            })
         })
     }
 }
@@ -356,6 +378,7 @@ impl ReplicationDirectory for MockReplicationDirectory {
         &self,
         kind: EnvelopeKind,
         envelope_bytes: &[u8],
+        _source_peer: Option<&str>,
     ) -> ApplyOutcome {
         use sha2::{Digest, Sha256};
         // Production directories validate the signed envelope's
@@ -439,19 +462,19 @@ mod tests {
         let dir = MockReplicationDirectory::new();
         // First apply admits.
         let first = dir
-            .apply_envelope_bytes(EnvelopeKind::Key, b"envelope_one")
+            .apply_envelope_bytes(EnvelopeKind::Key, b"envelope_one", None)
             .await;
         assert!(first.is_admitted());
         assert_eq!(dir.count(EnvelopeKind::Key).await, 1);
         // Same bytes again — duplicate.
         let second = dir
-            .apply_envelope_bytes(EnvelopeKind::Key, b"envelope_one")
+            .apply_envelope_bytes(EnvelopeKind::Key, b"envelope_one", None)
             .await;
         assert!(!second.is_admitted(), "duplicate must not admit");
         assert_eq!(dir.count(EnvelopeKind::Key).await, 1);
         // Different bytes — admitted.
         let third = dir
-            .apply_envelope_bytes(EnvelopeKind::Key, b"envelope_two")
+            .apply_envelope_bytes(EnvelopeKind::Key, b"envelope_two", None)
             .await;
         assert!(third.is_admitted());
         assert_eq!(dir.count(EnvelopeKind::Key).await, 2);
@@ -470,7 +493,7 @@ mod tests {
             .await;
         // Apply identical bytes → duplicate.
         let r = dir
-            .apply_envelope_bytes(EnvelopeKind::Attestation, payload)
+            .apply_envelope_bytes(EnvelopeKind::Attestation, payload, None)
             .await;
         assert!(!r.is_admitted(), "matching-hash re-apply is a duplicate");
         assert_eq!(dir.count(EnvelopeKind::Attestation).await, 1);
@@ -500,7 +523,7 @@ mod tests {
         let mock = Arc::new(MockReplicationDirectory::new());
         let dir: Arc<dyn ReplicationDirectory> = Arc::clone(&mock) as Arc<dyn ReplicationDirectory>;
         let mut adapter = MutableDirectoryStateAdapter::new(dir);
-        let admitted = adapter.apply_envelope(EnvelopeKind::Revocation, b"rev_bytes");
+        let admitted = adapter.apply_envelope(EnvelopeKind::Revocation, b"rev_bytes", None);
         assert!(admitted.is_admitted());
         assert_eq!(mock.count(EnvelopeKind::Revocation).await, 1);
     }
@@ -518,12 +541,12 @@ mod tests {
         // Initial list shows the seed.
         assert_eq!(provider.local_refs(EnvelopeKind::Attestation).len(), 1);
         // Apply a new envelope.
-        let admitted = applier.apply_envelope(EnvelopeKind::Attestation, b"e_new");
+        let admitted = applier.apply_envelope(EnvelopeKind::Attestation, b"e_new", None);
         assert!(admitted.is_admitted());
         // List now shows two.
         assert_eq!(provider.local_refs(EnvelopeKind::Attestation).len(), 2);
         // Duplicate apply refused.
-        let dup = applier.apply_envelope(EnvelopeKind::Attestation, b"e_new");
+        let dup = applier.apply_envelope(EnvelopeKind::Attestation, b"e_new", None);
         assert!(!dup.is_admitted(), "duplicate apply must not admit");
         assert_eq!(provider.local_refs(EnvelopeKind::Attestation).len(), 2);
     }

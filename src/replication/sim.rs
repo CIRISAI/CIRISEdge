@@ -131,7 +131,12 @@ struct SimApplier<'a> {
     applied: Vec<[u8; 32]>,
 }
 impl StateApplier for SimApplier<'_> {
-    fn apply_envelope(&mut self, kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
+    fn apply_envelope(
+        &mut self,
+        kind: EnvelopeKind,
+        bytes: &[u8],
+        _source_peer: Option<&str>,
+    ) -> ApplyOutcome {
         let hash: [u8; 32] = Sha256::digest(bytes).into();
         if self.store.holds(kind, &hash) {
             return ApplyOutcome::Duplicate;
@@ -278,7 +283,7 @@ impl Scenario {
                     store,
                     applied: Vec::new(),
                 };
-                let outcome = session.on_message(msg, &provider_snapshot, &mut applier);
+                let outcome = session.on_message(msg, &provider_snapshot, &mut applier, None);
                 self.emit(
                     from_peer(from),
                     outcome,

@@ -53,11 +53,32 @@ pub fn delivery_mode_of(envelope: &serde_json::Value) -> Option<String> {
 }
 
 /// The delivery requirement the envelope's `delivery_mode` VALUE imposes.
+///
+/// CIRISEdge#428 — the ratified wire vocabulary is `{absent, "mandatory"}` (absent
+/// = best-effort; there is no explicit best-effort token). persist v22 REFUSES any
+/// other value at the wire (closed-vocabulary admission gate), so a mesh-admitted
+/// row can only carry a legal value. A locally-minted / legacy / TYPO'd row still
+/// can, though — and this used to degrade silently: `delivery_mode: "manditory"`
+/// or `"Mandatory"` fell through `_ => BestEffort`, so a producer that believed it
+/// demanded delivery quietly lost the guarantee. We keep the tolerant BestEffort
+/// backstop (defense in depth — #428 ask 2 recommended) but make an unrecognized
+/// PRESENT value LOUD (the #425 silent-refusal class, delivery flavor).
 #[must_use]
 pub fn requirement_of(envelope: &serde_json::Value) -> DeliveryRequirement {
     match delivery_mode_of(envelope).as_deref() {
+        None => DeliveryRequirement::BestEffort,
         Some(DELIVERY_MODE_MANDATORY) => DeliveryRequirement::Mandatory,
-        _ => DeliveryRequirement::BestEffort,
+        Some(other) => {
+            tracing::warn!(
+                delivery_mode = %other,
+                "unrecognized `delivery_mode` value — NOT in the ratified vocabulary \
+                 {{absent, \"mandatory\"}} (CIRISEdge#428). Treating as BestEffort (MAY DROP): \
+                 a typo of \"mandatory\" silently loses the delivery guarantee — fix the \
+                 producer. persist v22 refuses this value at the wire, so this row is \
+                 locally-minted / legacy."
+            );
+            DeliveryRequirement::BestEffort
+        }
     }
 }
 
@@ -123,15 +144,41 @@ mod tests {
         assert_eq!(requirement_of(&env), DeliveryRequirement::BestEffort);
     }
 
-    /// A non-`mandatory` value is best-effort — the check is on the VALUE, not on
-    /// the field being present.
+    /// A present-but-unrecognized value degrades to best-effort (the tolerant
+    /// backstop) — the check is on the VALUE, not field presence. CIRISEdge#428:
+    /// this is now the LOUD path (a `warn!` fires), but the requirement is still
+    /// BestEffort so a legacy/local row is not hard-rejected.
     #[test]
-    fn other_value_is_best_effort() {
+    fn unrecognized_value_is_best_effort_backstop() {
         let env = json!({
             "attesting_key_id": "a", "attested_key_id": "a",
             "attestation_type": "scores", "delivery_mode": "best_effort",
         });
         assert_eq!(requirement_of(&env), DeliveryRequirement::BestEffort);
+    }
+
+    /// CIRISEdge#428 — the hazard by name: a TYPO of `"mandatory"` must not be
+    /// mistaken for the mandatory guarantee. It degrades to BestEffort (the loud
+    /// backstop), NEVER silently to Mandatory — and case matters (`"Mandatory"` is
+    /// NOT `"mandatory"`). The `warn!` in `requirement_of` is what makes the
+    /// silent-guarantee-loss visible; the return value stays fail-safe.
+    #[test]
+    fn a_typo_of_mandatory_does_not_become_mandatory() {
+        for typo in ["manditory", "Mandatory", "MANDATORY", "mandatory "] {
+            let env = json!({
+                "attesting_key_id": "a", "attested_key_id": "a",
+                "attestation_type": "scores", "delivery_mode": typo,
+            });
+            assert_eq!(
+                requirement_of(&env),
+                DeliveryRequirement::BestEffort,
+                "typo {typo:?} must NOT be read as Mandatory"
+            );
+            // And it must NOT bypass the fail-loud branch — with no path it is a
+            // permissible best-effort drop, not FailLoudNoPath (the producer's typo
+            // means the guarantee was never actually demanded on the wire).
+            assert_eq!(decide(&env, false), DeliveryDecision::DropBestEffort);
+        }
     }
 
     /// The fail-secure truth table: the ONE case that must never silently drop is

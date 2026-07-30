@@ -6868,7 +6868,15 @@ mod tests {
         // exists before the write-through fires, so the FK always holds).
         let record = ciris_persist::federation::KeyRecord {
             key_id: key_id.to_string(),
-            pubkey_ed25519_base64: String::new(),
+            // CIRISPersist v22 (#543) — federation_keys now reject a pubkey that
+            // doesn't decode to a 32-byte Ed25519 key (the fixture used to seed an
+            // EMPTY string). A real occurrence carries its real 32-byte key; the
+            // round-trip under test doesn't depend on the key's value, only its
+            // presence, so any valid 32-byte encoding satisfies the gate.
+            pubkey_ed25519_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+            },
             pubkey_ml_dsa_65_base64: None,
             algorithm: "hybrid".to_string(),
             identity_type: "agent".to_string(),

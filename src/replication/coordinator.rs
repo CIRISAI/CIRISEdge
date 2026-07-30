@@ -215,7 +215,15 @@ impl ReplicationCoordinator {
             None => session.start_round(self.provider.as_ref()),
             Some(m) => {
                 let mut applier = self.applier.lock().await;
-                session.on_message(m, self.provider.as_ref(), &mut *applier)
+                // CIRISEdge#426 — this coordinator IS per-peer, so its `peer_key_id`
+                // is the authenticated sender of anything it applies this round.
+                // Forward it so the apply path can make a per-peer receive decision.
+                session.on_message(
+                    m,
+                    self.provider.as_ref(),
+                    &mut *applier,
+                    Some(self.peer_key_id.as_str()),
+                )
             }
         };
         let step = Self::outcome_to_step(outcome);
@@ -485,7 +493,12 @@ mod tests {
         local_hashes: std::collections::HashSet<[u8; 32]>,
     }
     impl StateApplier for RecordingApplier {
-        fn apply_envelope(&mut self, _kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
+        fn apply_envelope(
+            &mut self,
+            _kind: EnvelopeKind,
+            bytes: &[u8],
+            _source_peer: Option<&str>,
+        ) -> ApplyOutcome {
             if let Some(hash) = self.known.get(bytes).copied() {
                 if self.local_hashes.contains(&hash) {
                     return ApplyOutcome::Duplicate;

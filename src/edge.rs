@@ -7704,7 +7704,12 @@ mod inbound_ingest_tests {
         }
         struct NoApplier;
         impl StateApplier for NoApplier {
-            fn apply_envelope(&mut self, _k: EnvelopeKind, _b: &[u8]) -> ApplyOutcome {
+            fn apply_envelope(
+                &mut self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _source_peer: Option<&str>,
+            ) -> ApplyOutcome {
                 ApplyOutcome::refused("no-op applier (test)")
             }
         }

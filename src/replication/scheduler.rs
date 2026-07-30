@@ -602,7 +602,12 @@ mod tests {
         local_hashes: std::collections::HashSet<[u8; 32]>,
     }
     impl StateApplier for RecordingApplier {
-        fn apply_envelope(&mut self, _kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
+        fn apply_envelope(
+            &mut self,
+            _kind: EnvelopeKind,
+            bytes: &[u8],
+            _source_peer: Option<&str>,
+        ) -> ApplyOutcome {
             let Some(hash) = self.known.get(bytes).copied() else {
                 return ApplyOutcome::refused("unknown bytes (test)");
             };

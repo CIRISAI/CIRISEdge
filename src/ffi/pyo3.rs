@@ -4688,6 +4688,45 @@ pub fn init_edge_runtime(
         derived_key_id = %derived_signer_key_id,
         "init_edge_runtime: federation key_id derived (alias → derived)",
     );
+    // CIRISEdge#427 §3 / CIRISPersist#543 (AV-77) — declare THIS node's federation
+    // identity to the shared persist Engine so in-band peer de-admission
+    // (`revocation:peer_admission:v1`) is reachable. Without it the gate is dormant
+    // and edge has NO in-band response to an abusive peer (only the whole-node
+    // accord kill-switch). Best-effort + LOUD (never a failed init): a pre-v22
+    // engine lacks the method → the gate stays dormant (fail-open by design), but
+    // it says so. The read-back assert catches a silently-ignored setter — the
+    // exact "witness reached past the Engine" blind spot #427 §3 was fixed for.
+    match engine.call_method1("set_self_key_id", (derived_signer_key_id.clone(),)) {
+        Ok(_) => {
+            let readback: Option<String> = engine
+                .call_method0("self_key_id")
+                .ok()
+                .and_then(|v| v.extract().ok())
+                .flatten();
+            if readback.as_deref() == Some(derived_signer_key_id.as_str()) {
+                tracing::info!(
+                    self_key_id = %derived_signer_key_id,
+                    "de-admission gate ARMED — engine.self_key_id set + read back \
+                     (CIRISEdge#427 §3 / AV-77)"
+                );
+            } else {
+                tracing::warn!(
+                    self_key_id = %derived_signer_key_id,
+                    readback = ?readback,
+                    "engine.set_self_key_id did NOT read back — in-band de-admission may be \
+                     DORMANT; a peer sanction will not enforce (CIRISEdge#427 §3)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "engine.set_self_key_id unavailable (pre-v22 persist Engine?) — in-band \
+                 de-admission is DORMANT (fail-open); an abusive peer has no in-band \
+                 response beyond the accord kill-switch (CIRISEdge#427 §3)"
+            );
+        }
+    }
     let signer = Arc::new(LocalSigner::new(
         derived_signer_key_id.clone(),
         signer_handle.signer.clone(),

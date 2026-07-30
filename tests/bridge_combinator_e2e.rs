@@ -212,7 +212,9 @@ async fn key_round_trips_across_combinator_refactor() {
 
     // 4. apply_envelope_bytes is idempotent on matching content
     //    (persist returns Ok on dedup).
-    let admitted = bridge.apply_envelope_bytes(EnvelopeKind::Key, &bytes).await;
+    let admitted = bridge
+        .apply_envelope_bytes(EnvelopeKind::Key, &bytes, Some("self"))
+        .await;
     assert!(
         admitted.is_admitted(),
         "idempotent re-apply succeeds, got {admitted:?}"

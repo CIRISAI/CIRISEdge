@@ -532,7 +532,20 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         &self,
         kind: EnvelopeKind,
         envelope_bytes: &[u8],
+        source_peer: Option<&str>,
     ) -> ApplyOutcome {
+        // CIRISEdge#426 — the authenticated sender now REACHES the apply layer (it
+        // was dropped upstream, which made the consent plane send-only). The actual
+        // per-peer write enforcement lives in persist v22's put-gates + AV-76
+        // per-peer quota (a Sybil's forged/self-emitted rows are refused there and
+        // surface as a loud `Refused` via the #425 choke point); this trace records
+        // that the receive is attributed, so a per-peer edge policy is now
+        // expressible on top of a peer that is present rather than discarded.
+        tracing::trace!(
+            kind = ?kind,
+            source_peer = source_peer.unwrap_or("<unattributed>"),
+            "apply_envelope_bytes: receiving from attributed peer (CIRISEdge#426)"
+        );
         match kind {
             EnvelopeKind::Key => self.apply_key(envelope_bytes).await,
             EnvelopeKind::Attestation => self.apply_attestation(envelope_bytes).await,
@@ -2081,7 +2094,9 @@ mod tests {
         // ⇒ admitted; the Unchanged/Refused ⇒ false distinction only
         // surfaces on the scrub-upgrade-aware SqliteBackend (persist owns
         // that classification test).
-        let admitted = bridge.apply_envelope_bytes(EnvelopeKind::Key, &bytes).await;
+        let admitted = bridge
+            .apply_envelope_bytes(EnvelopeKind::Key, &bytes, None)
+            .await;
         assert!(
             admitted.is_admitted(),
             "matching-content apply admits on MemoryBackend, got {admitted:?}"
@@ -2153,13 +2168,18 @@ mod tests {
                 .expect("seed key");
         }
         // A federation-tier, SELF-scoped attestation authored by `other_producer`
-        // — held here, advertisable only by its own producer.
+        // — held here, advertisable only by its own producer. The dimension is
+        // incidental to this test (it asserts SCOPE projection, not dimension), so
+        // it uses a self-descriptive `identity:*` dimension: CIRISPersist v22's
+        // AV-62 anti-Goodhart gate forbids a SELF-attested `capacity:*` row (you
+        // can't rate your own reputation), which the old `capacity:example:v1`
+        // fixture tripped — but self-attesting one's own identity is legitimate.
         let now = Utc::now();
         let envelope = serde_json::json!({
             "attesting_key_id": other_producer,
             "attested_key_id": other_producer,
             "attestation_type": "scores",
-            "dimension": "capacity:example:v1",
+            "dimension": "identity:example:v1",
             "cohort_scope": "self",
         });
         let (hash_hex, ed_sig, pqc_sig) = sign_attestation_envelope(other_producer, &envelope);
@@ -2258,7 +2278,7 @@ mod tests {
             EnvelopeKind::TransportDestination,
         ] {
             let r = bridge
-                .apply_envelope_bytes(kind, b"{not a signed record}")
+                .apply_envelope_bytes(kind, b"{not a signed record}", None)
                 .await;
             assert!(
                 !r.is_admitted(),
@@ -2308,7 +2328,7 @@ mod tests {
         let bytes = serde_json::to_vec(&bare).expect("serialize bare route");
 
         let admitted = bridge
-            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &bytes)
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &bytes, None)
             .await;
 
         assert!(
@@ -3141,10 +3161,32 @@ mod tests {
             (trusted_peer, identity_type::NODE),
             (lifecycle_attester, identity_type::ACCORD_HOLDER),
         ] {
+            let mut record = fixture_key_record(k, it);
+            // CIRISPersist v22 (#543 / the FIPS anti-Sybil floor #513) — an
+            // `accord:*` attestation now requires its attester to be a hardware-
+            // attested ACCORD_HOLDER: the key must carry `attestation_evidence` at
+            // registration AND the attester's identity_type must be ACCORD_HOLDER
+            // (so the lifecycle attester cannot be downgraded to a plain NODE). Seed
+            // the exact fresh Android/Strongbox blob persist's
+            // `test_support::fresh_accord_holder_evidence` emits — inlined so this
+            // test does not have to gate on the `test-anchor` feature.
+            if it == identity_type::ACCORD_HOLDER {
+                record.attestation_evidence = Some(serde_json::json!({
+                    "platform_attestation": {
+                        "Android": {
+                            "key_attestation_chain": [
+                                [0x30, 0x82, 0x01, 0x00],
+                                [0x30, 0x82, 0x02, 0x00],
+                            ],
+                            "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                            "strongbox_backed": true,
+                        }
+                    },
+                    "nonce_captured_at": Utc::now().to_rfc3339(),
+                }));
+            }
             backend
-                .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(k, it),
-                })
+                .put_public_key(SignedKeyRecord { record })
                 .await
                 .expect("seed trust-graph key");
         }
@@ -3484,7 +3526,7 @@ mod tests {
             "ed25519_signature_base64": ""
         }}"#;
         let outcome = bridge
-            .apply_envelope_bytes(EnvelopeKind::Organization, bytes)
+            .apply_envelope_bytes(EnvelopeKind::Organization, bytes, None)
             .await;
         // CIRISEdge#425 — fail-closed AND named: the escaped early return now yields
         // a `Refused` reason the choke point logs, not a silent `false`.
@@ -3511,7 +3553,7 @@ mod tests {
             "ed25519_signature_base64": ""
         }}"#;
         let outcome = bridge
-            .apply_envelope_bytes(EnvelopeKind::OrgMembership, bytes)
+            .apply_envelope_bytes(EnvelopeKind::OrgMembership, bytes, None)
             .await;
         assert!(
             matches!(&outcome, ApplyOutcome::Refused(r) if r.contains("operational providers")),
@@ -3535,7 +3577,7 @@ mod tests {
             "threshold": 0
         }"#;
         let outcome = bridge
-            .apply_envelope_bytes(EnvelopeKind::PartnerRecord, bytes)
+            .apply_envelope_bytes(EnvelopeKind::PartnerRecord, bytes, None)
             .await;
         assert!(
             matches!(&outcome, ApplyOutcome::Refused(r) if r.contains("operational providers")),

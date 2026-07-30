@@ -170,7 +170,20 @@ pub trait StateApplier: Send + Sync {
     /// [`ApplyOutcome`]: `Admitted` if a NEW envelope changed local state, else a
     /// `Refused`/`Deserialize` carrying WHY — `on_deliver` logs the reason (the
     /// #425 single choke point). Never a silent drop.
-    fn apply_envelope(&mut self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> ApplyOutcome;
+    ///
+    /// CIRISEdge#426 — `source_peer` is the AUTHENTICATED sender of these bytes
+    /// (`InboundFrame::source_key_id`, already E3-gated `Rooted∧owns_key∧hybrid` in
+    /// `attribute_and_deliver`), forwarded so a per-peer RECEIVE decision is
+    /// expressible at the apply layer — the consent plane used to be send-only
+    /// because this identity was dropped before reaching the applier. `None` for
+    /// non-peer-attributed applies (tests / self-seed). The receiver is transport-
+    /// blind otherwise; this is pass-through metadata, not a protocol input.
+    fn apply_envelope(
+        &mut self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+        source_peer: Option<&str>,
+    ) -> ApplyOutcome;
 }
 
 /// Compute the diff between two summaries — which hashes the LOCAL
