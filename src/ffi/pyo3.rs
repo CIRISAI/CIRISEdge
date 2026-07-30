@@ -8617,7 +8617,7 @@ mod pyo3_tier2_tests {
                 scrub_timestamp: ts,
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
-                roles: Vec::new(),
+                capability_roles: Vec::new(),
                 // v2.5.0 (CIRISPersist#102 Ask 8) — non-accord-holder
                 // rows carry None. Steward identity_type is not
                 // accord-holder so the V048 CHECK admits None.

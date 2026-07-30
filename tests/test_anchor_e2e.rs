@@ -113,7 +113,7 @@ async fn test_anchor_peer_roots_through_edge_root_binding() {
         scrub_timestamp: ts,
         pqc_completed_at: Some(ts),
         persist_row_hash: String::new(),
-        roles: Vec::new(),
+        capability_roles: Vec::new(),
         attestation_evidence: None,
         consent_role: None,
         additional_scrubs: Vec::new(),

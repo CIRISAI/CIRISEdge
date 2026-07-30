@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::resolved_state::{ResolvedPeerSet, ResolvedRecipient};
-use ciris_persist::federation::admission::has_effective_role;
+use ciris_persist::federation::admission::has_accord_conferred_role;
 use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
 use ciris_persist::federation::namespace::{self, Projection};
 use ciris_persist::federation::operational::{
@@ -937,7 +937,7 @@ impl FederationDirectoryReplicationBridge {
     /// **Both planes are required (AND, never OR).** Alongside the trust-root
     /// walk, the peer's record must ALSO carry an accord-conferred
     /// `infra:serve` resolved through persist's self-authenticating read
-    /// ([`has_effective_role`], CIRISPersist#440) — the record's scrub set must
+    /// ([`has_accord_conferred_role`], CIRISPersist#440) — the record's scrub set must
     /// still verify to the accord family m-of-n against the live roster, with no
     /// un-superseded V104 tombstone. The two planes are deliberately not
     /// conflated (persist's `trust_root` module doc: a delegation SCOPE token
@@ -969,7 +969,8 @@ impl FederationDirectoryReplicationBridge {
         // Leg A — accord plane. Re-derived from the record's own cryptography on
         // every call, so a withdrawn blessing takes effect immediately. Exhibit C:
         // split `Err` (transient read failure) from `Ok(false)` (genuinely no role).
-        match has_effective_role(&*self.directory, peer_key_id, Self::SERVE_CAPABILITY).await {
+        match has_accord_conferred_role(&*self.directory, peer_key_id, Self::SERVE_CAPABILITY).await
+        {
             Ok(true) => {}
             Ok(false) => {
                 withhold(
@@ -1072,7 +1073,7 @@ impl FederationDirectoryReplicationBridge {
     /// already gone, never re-derived here). For every grant whose
     /// `attestation_prefixes` [`consent_grammar::covers`] this row's dimension,
     /// the recipient must hold each named `capability` via the SAME
-    /// accord-conferred, self-re-verifying [`has_effective_role`] read the #379
+    /// accord-conferred, self-re-verifying [`has_accord_conferred_role`] read the #379
     /// serve gate's leg A uses — a self-asserted `roles:[…]` entry does not
     /// satisfy it. Missing capability → withhold (fail-closed). A malformed
     /// grant parses to nothing and covers nothing (persist's whole-grant
@@ -1114,7 +1115,7 @@ impl FederationDirectoryReplicationBridge {
             grant_cache.insert(owner.to_string(), policies);
         }
         // Collect required capabilities WITHOUT holding the cache borrow across
-        // the `has_effective_role` awaits below.
+        // the `has_accord_conferred_role` awaits below.
         let required: Vec<String> = grant_cache[owner]
             .iter()
             .filter(|policy| consent_grammar::covers(&policy.attestation_prefixes, dimension))
@@ -1133,7 +1134,7 @@ impl FederationDirectoryReplicationBridge {
             })
             .collect();
         for capability in required {
-            if !has_effective_role(&*self.directory, peer, &capability)
+            if !has_accord_conferred_role(&*self.directory, peer, &capability)
                 .await
                 .unwrap_or(false)
             {
@@ -2013,7 +2014,7 @@ mod tests {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -2878,14 +2879,14 @@ mod tests {
     async fn recipient_capability_serve_control() {
         let producer = "agent-producer";
         // A recipient whose record EXISTS but carries no accord-conferred role —
-        // `has_effective_role(_, "trace:read")` is false for it. (Seeding the key
+        // `has_accord_conferred_role(_, "trace:read")` is false for it. (Seeding the key
         // means the WITHHOLD below is because the record lacks the capability, not
         // because the key is absent — the same provenance discipline the #379
         // test uses to refuse a self-asserted `roles:[…]` peer.)
         let recipient = "peer-no-capability";
         let (backend, bridge) = make_bridge(&[producer.to_string(), recipient.to_string()]);
         // Both keys registered: the producer's so `put_attestation` can verify
-        // its grant's hybrid signature, the recipient's so `has_effective_role`
+        // its grant's hybrid signature, the recipient's so `has_accord_conferred_role`
         // reads a real (role-less) record — not a missing one.
         for key_id in [producer, recipient] {
             backend
@@ -3102,14 +3103,14 @@ mod tests {
     ///    would have served it every trace on the node.
     ///
     /// **Known coverage gap (deliberate, not an oversight).** The ALLOW path is
-    /// not asserted here: a record that satisfies `has_effective_role` must
+    /// not asserted here: a record that satisfies `has_accord_conferred_role` must
     /// carry a live 2-of-3 accord-family co-scrub over its canonical
     /// registration bytes, and persist's minting helpers for that
     /// (`register_founder` / `signed_canonical_record`) are private to its own
     /// test module. Faking it with a hand-built record would re-create exactly
     /// the false confidence being fixed, so it is left to the layer that can
     /// prove it: CIRISPersist#484 (export the helper) and the field acceptance
-    /// check on CIRISPersist#480 — `has_effective_role(dir, canonical,
+    /// check on CIRISPersist#480 — `has_accord_conferred_role(dir, canonical,
     /// "infra:serve") == true` read on a MOBILE edge's own directory after the
     /// re-blessing ceremony, not on the server that minted it.
     #[tokio::test]
@@ -3141,7 +3142,7 @@ mod tests {
             .await
             .expect("seed producer key");
         let mut self_asserted_rec = fixture_key_record(self_asserted_peer, identity_type::AGENT);
-        self_asserted_rec.roles =
+        self_asserted_rec.capability_roles =
             vec![FederationDirectoryReplicationBridge::SERVE_CAPABILITY.to_string()];
         backend
             .put_public_key(SignedKeyRecord {
@@ -3318,7 +3319,7 @@ mod tests {
 
     /// CIRISEdge#386 — the ALLOW path, and the proof that BOTH legs are
     /// required. Gated on `test-anchor` because minting a record that satisfies
-    /// `has_effective_role` needs a genuine 2-of-3 accord-family co-scrub, which
+    /// `has_accord_conferred_role` needs a genuine 2-of-3 accord-family co-scrub, which
     /// persist exports only behind that fence (CIRISPersist#484). Edge CI runs a
     /// dedicated `test-anchor` lane, so this is real coverage — not a test that
     /// quietly never runs.
@@ -3332,7 +3333,7 @@ mod tests {
         use ciris_persist::federation::accord_test_support::{
             register_accord_holder, signed_canonical_record_with_roles, Identity,
         };
-        // The roster key_ids `has_effective_role` resolves against. Persist's
+        // The roster key_ids `has_accord_conferred_role` resolves against. Persist's
         // own `accord_holder_roster_key_ids` is private, but it is derived from
         // this public genesis accessor — so we mint identities under exactly
         // those key_ids and the co-scrub verifies against the real roster.
