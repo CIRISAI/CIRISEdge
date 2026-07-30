@@ -69,7 +69,14 @@ fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
     let now = chrono::Utc::now();
     KeyRecord {
         key_id: key_id.to_string(),
-        pubkey_ed25519_base64: "0".repeat(44),
+        // CIRISPersist v22 (#543) rejects a pubkey that doesn't decode to a 32-byte
+        // Ed25519 key. `"0".repeat(44)` was 44 base64 chars → 33 bytes; encode
+        // exactly 32 bytes instead (the round-trip under test doesn't depend on the
+        // key's value, only that it is a well-formed 32-byte key).
+        pubkey_ed25519_base64: {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+        },
         pubkey_ml_dsa_65_base64: None,
         algorithm: algorithm::HYBRID.to_string(),
         identity_type: identity_type_.to_string(),

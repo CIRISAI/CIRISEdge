@@ -183,6 +183,56 @@ jobs:
       # nothing. Move the save to `pyo3-wheel linux-x86_64` (release
       # profile, ~1 GB) — same canonical key, useful blob.
 
+  # ─── network gauntlet — the adversarial-wire + on-wire suite ────────
+  # CIRISEdge#932/#414/#426: the transport apply / attribution / fragment path
+  # is the arc's most-regressed surface. The 256-case DST proptest runs in every
+  # --lib lane, but the HIGH-VOLUME DST soak (`replication::sim::dst_soak`) is
+  # `#[ignore]`'d and, before this job, NOTHING in CI ran it — the network-fault
+  # gauntlet (fragmentation × MDU-drop × loss × reorder × dup, asserting RESPONDER
+  # convergence) was ungated. This job runs it on every push/PR, plus the on-wire
+  # integration suite (fragmentation/reassembly, the wire proptest, reticulum
+  # loopback + AV-42, multi-tier relay byte-identity, leviculum interface
+  # diversity, reachability, route table). Non-pyo3 (transport-reticulum) so it is
+  # a distinct, leaner lane from pyo3-full's `--tests`.
+  network-gauntlet:
+    name: network gauntlet (DST fault-soak + on-wire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libsqlite3-dev (sqlite build dep)
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: network-gauntlet
+      - name: DST network-fault soak + on-wire integration gauntlet
+        env:
+          # High-volume seeded soak (proptest gate is 256 cases in --lib; this is
+          # the volume tier). Any non-convergence prints its reproduction seed.
+          CIRIS_DST_SOAK: "20000"
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 60
+          shell: bash
+          command: |
+            set -euo pipefail
+            cargo test --features "transport-http transport-reticulum" --lib \
+              dst_soak -- --ignored --nocapture
+            cargo test --features "transport-http transport-reticulum" \
+              --test fragmentation_reassembly \
+              --test replication_wire_proptest \
+              --test reticulum_loopback \
+              --test reticulum_av42 \
+              --test relay_multi_tier_inner_byte_identity \
+              --test leviculum_interface_diversity \
+              --test reachability_integration \
+              --test route_table_e2e \
+              --test explicit_hash_addressing
+
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
   # build for darwin runs via the pyo3-wheel matrix entry below.
