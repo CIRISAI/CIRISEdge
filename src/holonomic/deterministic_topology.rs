@@ -20,7 +20,7 @@
 //! outputs — this is the load-bearing property and the reason the
 //! existing planner is left untouched.
 //!
-//! ## Wire-determinism contract (LOCKED at `topology_version = 1`)
+//! ## Wire-determinism contract (LOCKED at `topology_version = 2`)
 //!
 //! - ALL sorts use canonical key ordering with explicit tie-break
 //!   documentation; see each sort site for the key.
@@ -33,8 +33,17 @@
 //!   BEFORE scoring; any non-finite or negative input is clamped to
 //!   `0` so scoring never depends on the architecture's NaN bit
 //!   pattern.
-//! - Tie-break (parent score): if two parents score equally for the
-//!   same child, choose by `parent_peer_id` lex-min.
+//! - Parent selection is a strict lexicographic ordering (v2):
+//!   1. **depth-primary** — prefer the shallowest feasible parent (its
+//!      current rooted distance from a source root), filling each parent
+//!      to its attested fan-out `k` breadth-first → `depth ≈ ⌈log_k N⌉`;
+//!   2. **score-secondary** — the integer capacity/trust/reachability
+//!      weighted sum breaks depth ties (higher wins);
+//!   3. **diversity-tertiary** — [`PENALTY_PER_SUB_PATH_DUP`] breaks
+//!      score ties (MDC spread);
+//!   4. **lex-final** — `parent_peer_id` lex-min breaks all remaining
+//!      ties (iteration is over the canonical-sorted candidate slice, so
+//!      strict improvement keeps the first-seen = lex-min parent).
 //! - Greedy iteration order over children is by `child_peer_id`
 //!   lex-min.
 //! - Greedy iteration order over MDC sub-stream paths within a child
@@ -58,7 +67,34 @@ use crate::transport::realtime_av_alm::capacity::SubStreamPath;
 /// Pinned topology wire version. Bump only when the determinism
 /// contract changes (e.g. a new sort key, a new scoring weight, a new
 /// filter step). v1 is the holonomic Part 3 cut.
-pub const TOPOLOGY_VERSION: u16 = 1;
+///
+/// ## v2 — degree-bounded minimum-depth (breadth-first) tree
+///
+/// v1's single-pass greedy scored parents on capacity/trust/reachability
+/// with a [`PENALTY_PER_SUB_PATH_DUP`] diversity term but had NO depth
+/// term. On a homogeneous fleet the penalty pushed each new child OFF any
+/// already-loaded parent onto a fresh (newest = deepest) node, so the tree
+/// degenerated to a near-linear chain (depth 50 at N=100, k=2) even though
+/// every node had spare fan-out — the tree math the whole ALM design rests
+/// on (`depth ≈ ⌈log_k N⌉`) collapsed and worst-case hop latency exploded.
+///
+/// v2 makes parent selection **depth-primary**: among the feasible parents
+/// (those clearing the trust / reachability / capacity gates) the planner
+/// prefers the SHALLOWEST, filling each parent to its attested fan-out `k`
+/// breadth-first before descending → `depth ≈ ⌈log_k N⌉`. The
+/// capacity/trust/reachability score is the SECONDARY key (breaks ties
+/// among equal-depth parents), the MDC diversity penalty is TERTIARY, and
+/// `parent_peer_id` lex-min is the final tie-break — so determinism,
+/// acyclicity (the descendant-closure gate) and the per-stream capacity cap
+/// are all preserved verbatim.
+///
+/// This changes the emitted tree SHAPE for byte-equal inputs, so it is a
+/// wire-break: a v1 peer and a v2 peer compute DIFFERENT trees from the same
+/// snapshot and would not reconcile. The bump is therefore a **coordinated
+/// fleet event** — every peer in a locality must cut over together (the
+/// `topology_version` field on [`AlmTopology`] lets a peer detect and refuse
+/// a mixed-version reconcile).
+pub const TOPOLOGY_VERSION: u16 = 2;
 
 /// Reachability-observation max RTT in milliseconds beyond which a
 /// peer-pair is treated as unreachable for scoring purposes. Picked
@@ -98,13 +134,26 @@ pub const WEIGHT_REACHABILITY: u64 = 20;
 pub const MAX_SELF_ASSERTED_UPLINK_MBPS: f32 = 1000.0;
 
 /// Per-duplicate-subscriber penalty subtracted from a parent's
-/// effective score, per existing subscriber the parent already
-/// carries on the SAME `sub_stream_path` (MDC quadrant). Drives MDC
-/// sub-stream distribution across multiple parents so a single
-/// captured node cannot concentrate every sub-stream.
+/// effective score to drive MDC diversity. Applied in TWO ways, both
+/// keyed at this same weight:
 ///
-/// wire-determinism critical: part of the v1 scoring formula and
-/// CANNOT be tuned without bumping [`TOPOLOGY_VERSION`].
+/// 1. **Per-`(parent, sub_stream_path)`** — per existing subscriber the
+///    parent already carries on the SAME sub-stream path (MDC quadrant).
+///    Spreads a GIVEN quadrant's subscribers across parents so a single
+///    captured node cannot concentrate every subscriber of one quadrant.
+/// 2. **Per-`(parent, consumer)`** — per edge THIS consumer already holds
+///    to the same parent on a DIFFERENT sub-path. Spreads a SINGLE
+///    consumer's `K` quadrants across DIFFERENT parents so no one parent
+///    serves the majority of a consumer's descriptions (the MDC capture
+///    surface). Local to the consumer's own sub-path fan-out.
+///
+/// wire-determinism critical: part of the scoring formula and CANNOT be
+/// tuned without bumping [`TOPOLOGY_VERSION`].
+///
+/// v2 note: this diversity term is now a TERTIARY tie-break, subordinate
+/// to the depth-primary + score-secondary parent selection (see
+/// [`TOPOLOGY_VERSION`]) — it only decides among parents that already tie
+/// on depth AND on the capacity/trust/reachability score.
 pub const PENALTY_PER_SUB_PATH_DUP: u64 = 5;
 
 /// One trust grant within a holonomic snapshot — a directed edge in
@@ -433,25 +482,35 @@ fn canonical_sub_paths(child_ad: &SignedRelayCapacity) -> Vec<SubStreamPath> {
     sub_paths
 }
 
-/// Pick the highest-scoring eligible parent for a given child on a
-/// SPECIFIC `sub_stream_path`, or `None` if no candidate clears the
-/// trust + reachability gates.
+/// Pick the best eligible parent for a given child on a SPECIFIC
+/// `sub_stream_path`, or `None` if no candidate clears the trust +
+/// reachability + capacity gates.
 ///
-/// The capacity term reads from `parent_cap_millibps` — the
-/// per-parent uplink that has ALREADY been verification-filtered and
-/// self-assertion-clamped upstream (so this function never sees a
-/// raw lying advertisement).
-///
-/// The score is reduced by [`PENALTY_PER_SUB_PATH_DUP`] per existing
-/// subscriber the parent already carries on `candidate_sub_path`
-/// (read from `sub_path_occupancy`). This penalty drives MDC
-/// sub-streams to spread across multiple parents so a single node
-/// cannot concentrate every quadrant.
+/// Selection is the v2 strict lexicographic ordering (see
+/// [`TOPOLOGY_VERSION`]):
+///   1. **depth-primary** — prefer the shallowest feasible parent, its
+///      `effective_depth` read from `depth_of` (a source root sits at 0;
+///      a not-yet-rooted candidate is [`usize::MAX`], never a shallow
+///      slot). Filling shallow parents to their fan-out cap first yields
+///      the `≈ ⌈log_k N⌉` breadth-first tree.
+///   2. **score-secondary** — the integer capacity/trust/reachability
+///      weighted sum. The capacity term reads from `parent_cap_millibps`,
+///      the per-parent uplink ALREADY verification-filtered and
+///      self-assertion-clamped upstream (so this function never sees a
+///      raw lying advertisement); higher score wins a depth tie.
+///   3. **diversity-tertiary** — the score is reduced by
+///      [`PENALTY_PER_SUB_PATH_DUP`] per existing subscriber the parent
+///      carries on `candidate_sub_path` (from `sub_path_occupancy`) AND
+///      per edge this same consumer already holds to the parent on a
+///      different sub-path (from `this_child_parent_occ`). The first term
+///      spreads a quadrant's subscribers across parents; the second
+///      spreads ONE consumer's `K` quadrants across parents. Both only
+///      decide among parents already tied on depth AND score.
 ///
 /// wire-determinism critical: iteration is over the canonical-sorted
-/// `candidate_peers` slice, so `>` (strict) keeps the first-seen
-/// (= lex-min) parent on score ties; the penalty is integer
-/// arithmetic saturating at 0.
+/// `candidate_peers` slice, so a STRICT improvement (shallower, or equal
+/// depth + higher score) keeps the first-seen (= lex-min) parent on a
+/// full tie; all penalty arithmetic is integer, saturating at 0.
 /// **v4.6.1 P2b helper (Codex)** — compute the descendant closure of
 /// `root` in the assignment-graph state. Pure, deterministic; lex-order
 /// BTreeMap/BTreeSet iteration keeps the BFS byte-deterministic. Used
@@ -488,7 +547,18 @@ fn best_parent_for_child(
     parent_total_occupancy: &std::collections::BTreeMap<String, u64>,
     child_descendants: &std::collections::BTreeSet<String>,
     child_of: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    // v2 depth-primary selection: current rooted depth of each in-tree
+    // peer (source roots seeded at 0; absent = not-yet-rooted = MAX).
+    depth_of: &std::collections::BTreeMap<String, usize>,
+    // v2 per-(parent, THIS consumer) occupancy — edges this child already
+    // holds to each parent across its other sub-paths (MDC diversity).
+    this_child_parent_occ: &std::collections::BTreeMap<String, u64>,
 ) -> Option<String> {
+    // Composite selection key, best-first: (effective_depth ASC, score
+    // DESC). A candidate replaces the incumbent only on a STRICT
+    // improvement, so canonical (lex) iteration keeps the lex-min parent
+    // on a full tie. wire-determinism critical.
+    let mut best_depth: Option<usize> = None;
     let mut best_score: Option<u64> = None;
     let mut best_parent: Option<String> = None;
 
@@ -579,8 +649,17 @@ fn best_parent_for_child(
             }
         }
 
-        // Score: integer weighted sum over the already-clamped
-        // capacity, then the sub_path duplication penalty.
+        // v2 PRIMARY key — the parent's current rooted depth. A source
+        // root is seeded at 0; a peer already attached carries its
+        // parent-depth + 1; a not-yet-rooted candidate is absent from
+        // `depth_of` and treated as `usize::MAX` so it is NEVER preferred
+        // as a shallow slot (attaching a child under an un-rooted peer
+        // would sink with it — the v1 near-linear-chain failure mode).
+        let depth = depth_of.get(parent_peer_id).copied().unwrap_or(usize::MAX);
+
+        // v2 SECONDARY key — integer weighted sum over the already-clamped
+        // capacity, then the MDC diversity penalty (TERTIARY within the
+        // score).
         let cap_millibps = parent_cap_millibps
             .get(parent_peer_id)
             .copied()
@@ -594,25 +673,35 @@ fn best_parent_for_child(
             .saturating_add(WEIGHT_TRUST.saturating_mul(trust_s))
             .saturating_add(WEIGHT_REACHABILITY.saturating_mul(reach_s));
 
-        // sub_path_penalty = PENALTY_PER_SUB_PATH_DUP × existing
-        // subscribers at this parent on the same sub_stream_path.
-        let existing = sub_path_occupancy
+        // Diversity penalty, both axes at PENALTY_PER_SUB_PATH_DUP:
+        //   (a) per-(parent, sub_path) — spread a quadrant's subscribers
+        //       across parents (across DIFFERENT consumers);
+        //   (b) per-(parent, this consumer) — spread ONE consumer's K
+        //       quadrants across DIFFERENT parents (the MDC M6 diversity).
+        let sub_path_dups = sub_path_occupancy
             .get(&(parent_peer_id.clone(), candidate_sub_path.to_vec()))
             .copied()
             .unwrap_or(0);
-        let penalty = PENALTY_PER_SUB_PATH_DUP.saturating_mul(existing);
+        let consumer_dups = this_child_parent_occ
+            .get(parent_peer_id)
+            .copied()
+            .unwrap_or(0);
+        let penalty =
+            PENALTY_PER_SUB_PATH_DUP.saturating_mul(sub_path_dups.saturating_add(consumer_dups));
         let score = base.saturating_sub(penalty);
 
-        match best_score {
-            None => {
-                best_score = Some(score);
-                best_parent = Some(parent_peer_id.clone());
-            }
-            Some(prev) if score > prev => {
-                best_score = Some(score);
-                best_parent = Some(parent_peer_id.clone());
-            }
-            _ => {}
+        // Composite (depth ASC, score DESC) with strict-improvement only,
+        // so lex iteration keeps the lex-min parent on a full tie.
+        let improves = match (best_depth, best_score) {
+            (None, _) => true,
+            (Some(bd), _) if depth < bd => true,
+            (Some(bd), Some(bs)) if depth == bd && score > bs => true,
+            _ => false,
+        };
+        if improves {
+            best_depth = Some(depth);
+            best_score = Some(score);
+            best_parent = Some(parent_peer_id.clone());
         }
     }
 
@@ -851,6 +940,41 @@ fn compute_core(
     let mut child_of: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
 
+    // **v2 depth-primary** — `depth_of[peer] = rooted distance from a
+    // source root`. Seeded with the SOURCE ROOTS (candidate peers with no
+    // eligible incoming parent edge — trust grant + in-horizon
+    // reachability from another candidate) at depth 0; every other peer
+    // gets its depth on attachment (`parent_depth + 1`). A peer absent
+    // from this map is not-yet-rooted and reads as `usize::MAX` in the
+    // selector, so a child is never attached under a peer that has not
+    // itself joined the tree — the fix for the v1 near-linear chain.
+    //
+    // wire-determinism critical: source roots are derived from the lex
+    // BTreeMap lookups (`trust_min_depth`, `reach_min_rtt`), so the seed
+    // set is a pure function of the snapshot, independent of input order.
+    let mut has_eligible_parent: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for (granter, grantee) in trust_min_depth.keys() {
+        if granter == grantee
+            || !latest_ad.contains_key(granter)
+            || !latest_ad.contains_key(grantee)
+        {
+            continue;
+        }
+        if reach_min_rtt
+            .get(&(granter.clone(), grantee.clone()))
+            .is_some_and(|rtt| *rtt <= MAX_USEFUL_RTT_MS)
+        {
+            has_eligible_parent.insert(grantee.clone());
+        }
+    }
+    let mut depth_of: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for peer in &candidate_peers {
+        if !has_eligible_parent.contains(peer) {
+            depth_of.insert(peer.clone(), 0);
+        }
+    }
+
     for child_peer_id in &candidate_peers {
         let child_ad = &latest_ad[child_peer_id].ad;
         let sub_paths = canonical_sub_paths(child_ad);
@@ -859,6 +983,12 @@ fn compute_core(
         // assignment-graph state. BFS over `child_of`. Lex-order
         // iteration of BTreeMap keys keeps this byte-deterministic.
         let descendants = descendants_of(child_peer_id, &child_of);
+
+        // v2 — per-(parent, THIS child) edge count across this child's
+        // sub-paths, so a consumer's K quadrants diversify across parents.
+        // Local to this child; reset each iteration.
+        let mut this_child_parent_occ: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
 
         let mut any_rooted_for_child = false;
         for sub_path in &sub_paths {
@@ -874,7 +1004,24 @@ fn compute_core(
                 &parent_total_occupancy,
                 &descendants,
                 &child_of,
+                &depth_of,
+                &this_child_parent_occ,
             ) {
+                *this_child_parent_occ.entry(parent.clone()).or_insert(0) += 1;
+                // v2 — record the child's rooted depth = parent's depth + 1
+                // (min across its MDC edges, so it is a pure function of the
+                // canonical assignment). A not-yet-rooted parent is
+                // `usize::MAX`; saturating_add keeps the child at MAX until
+                // its parent roots, never overflowing.
+                let child_depth = depth_of
+                    .get(&parent)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1);
+                depth_of
+                    .entry(child_peer_id.clone())
+                    .and_modify(|d| *d = (*d).min(child_depth))
+                    .or_insert(child_depth);
                 *sub_path_occupancy
                     .entry((parent.clone(), sub_path.clone()))
                     .or_insert(0) += 1;
