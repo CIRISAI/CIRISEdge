@@ -125,9 +125,13 @@
 
 use std::collections::HashSet;
 
+use ciris_crypto::MlDsa65Signer;
+
+use crate::mls::welcome_wrap::FederationDirectoryEntry;
+use crate::transport::federation_session::{OwnKexKeys, PeerKexPubkeys};
 use crate::transport::realtime_av::{Epoch, EpochDek, StreamId};
 use crate::transport::realtime_av_mls::{
-    JoinerKeyMaterial, Member, MlsError, MlsSession, RosterOp,
+    JoinerKeyMaterial, Member, MlsError, MlsSession, RosterOp, SignedWelcome,
 };
 
 /// Opaque identifier for a participant — the federation key_id the
@@ -224,6 +228,17 @@ pub enum AvSessionError {
     /// version skew, wrong KeyPackage, etc.).
     #[error("welcome rejected by MLS layer: {0}")]
     WelcomeRejected(String),
+    /// CIRISEdge#331 (CC 5.4.4) — the realtime Welcome's inviter is not
+    /// resolvable in the joiner's federation directory. Fail-closed with
+    /// NO inline-key TOFU fallback; membership is refused.
+    #[error("welcome inviter not directory-resolvable: {0}")]
+    InviterUnknown(PeerKeyId),
+    /// CIRISEdge#331 (CC 5.4.4) — the realtime Welcome's ML-DSA-65
+    /// inviter signature failed to verify against the directory-resolved
+    /// key (unsigned, forged, or re-signed by a non-inviter). The joiner
+    /// cannot prove who invited it, so membership is refused.
+    #[error("welcome inviter signature rejected (CC 5.4.4)")]
+    WelcomeSignatureRejected,
     /// The session was already initialized — [`AvSession::process_welcome`]
     /// may only be called once, on a fresh joiner-pending session.
     #[error("session already initialized — process_welcome is single-shot")]
@@ -452,20 +467,49 @@ impl AvSession {
     /// added member's KeyPackage locally and therefore can't hand a
     /// usable Welcome to a separate joiner — this path produces a
     /// Welcome the published joiner can actually decrypt.
+    ///
+    /// ## Sender authentication (CIRISEdge#331 / CC 5.4.4)
+    ///
+    /// The emitted `welcome_bytes[0]` is a **signed** realtime Welcome
+    /// ([`SignedWelcome`]): the inner openmls Welcome wrapped under the
+    /// joiner's static X-Wing key with an ML-DSA-65 signature by the
+    /// inviter over the encapsulation bytes. Under the 0x004D X-Wing
+    /// ciphersuite HPKE `mode_auth` is structurally unavailable, so this
+    /// signature is the mandated compensating control that lets the
+    /// joiner authenticate WHO invited it. The joiner verifies it in
+    /// [`AvSession::process_welcome`] before accepting membership.
+    ///
+    /// - `invitee_kex` — the joiner's advertised static X-Wing public
+    ///   key (the HPKE recipient key). A classical-only advertisement is
+    ///   [`AvSessionError::PeerLacksMlkem`].
+    /// - `inviter_signer` — the local node's long-term ML-DSA-65
+    ///   federation signer (whatever the joiner's directory holds for
+    ///   `inviter_pk_id`).
+    /// - `inviter_pk_id` — the directory identifier the joiner resolves
+    ///   `inviter_signer`'s public key by.
     pub fn admit_published_joiner(
         &mut self,
         key_id: &str,
         joiner_key_package: openmls::prelude::KeyPackage,
+        invitee_kex: &PeerKexPubkeys,
+        inviter_signer: &MlDsa65Signer,
+        inviter_pk_id: &str,
     ) -> Result<EpochRekeyArtifacts, AvSessionError> {
-        let (commit, welcome, root) = self
+        let (commit, signed, root) = self
             .mls_mut()
-            .commit_add_published(key_id, joiner_key_package)
+            .commit_add_published_signed(
+                key_id,
+                joiner_key_package,
+                invitee_kex,
+                inviter_signer,
+                inviter_pk_id,
+            )
             .map_err(map_mls_err)?;
         self.epoch = Epoch(self.mls().epoch());
         Ok(EpochRekeyArtifacts {
             new_epoch: self.epoch,
             commit_bytes: commit.0,
-            welcome_bytes: vec![welcome.0],
+            welcome_bytes: vec![signed.0],
             new_dek: EpochDek::from_bytes(*root.as_bytes()),
         })
     }
@@ -522,6 +566,25 @@ impl AvSession {
     /// Single-shot: a second call (or a call on a session created via
     /// [`AvSession::create`]) returns [`AvSessionError::AlreadyInitialized`].
     ///
+    /// ## Sender authentication (CIRISEdge#331 / CC 5.4.4)
+    ///
+    /// `signed_welcome_bytes` is a [`SignedWelcome`] (the wire form
+    /// [`AvSession::admit_published_joiner`] emits). Before ANY group
+    /// membership is accepted, the inviter's ML-DSA-65 signature is
+    /// verified against the key `directory_lookup` resolves for the
+    /// wrapped Welcome's `inviter_pk_id`:
+    ///
+    /// - directory miss ⇒ [`AvSessionError::InviterUnknown`]
+    ///   (fail-closed, NO inline-key TOFU);
+    /// - signature mismatch (unsigned / forged / re-signed by a
+    ///   non-inviter) ⇒ [`AvSessionError::WelcomeSignatureRejected`].
+    ///
+    /// Only an authenticated Welcome reaches the openmls join. Every
+    /// refusal is LOUD at the MLS layer (`tracing::warn!`).
+    ///
+    /// `invitee_keys` is the joiner's own static X-Wing secret — the pair
+    /// of the public half the inviter wrapped under.
+    ///
     /// ## Out of scope
     ///
     /// The federation-directory KeyPackage publish/fetch surface
@@ -530,11 +593,19 @@ impl AvSession {
     /// [`crate::transport::realtime_av_mls::mint_joiner_key_material`])
     /// and handed the retained material to [`AvSession::new_joiner`]
     /// before this is called.
-    pub fn process_welcome(&mut self, welcome_bytes: &[u8]) -> Result<EpochDek, AvSessionError> {
+    pub fn process_welcome<F>(
+        &mut self,
+        signed_welcome_bytes: &[u8],
+        invitee_keys: &OwnKexKeys,
+        directory_lookup: F,
+    ) -> Result<EpochDek, AvSessionError>
+    where
+        F: FnMut(&str) -> Option<FederationDirectoryEntry>,
+    {
         if self.mls.is_some() {
             return Err(AvSessionError::AlreadyInitialized);
         }
-        if welcome_bytes.is_empty() {
+        if signed_welcome_bytes.is_empty() {
             return Err(AvSessionError::WelcomeMalformed(
                 "welcome bytes are empty".to_string(),
             ));
@@ -544,10 +615,25 @@ impl AvSession {
             .take()
             .ok_or(AvSessionError::JoinerKeyPackageAbsent)?;
 
-        let (mls, root) = match MlsSession::join_from_welcome(material, welcome_bytes) {
+        let signed = SignedWelcome(signed_welcome_bytes.to_vec());
+        let (mls, root) = match MlsSession::join_from_signed_welcome(
+            material,
+            invitee_keys,
+            &signed,
+            directory_lookup,
+        ) {
             Ok(ok) => ok,
-            Err(MlsError::WireDecodeFailed(msg)) => {
+            // A malformed wrapped-welcome envelope or a raw/undecodable
+            // frame — treat as malformed input (not an auth failure).
+            Err(MlsError::WireDecodeFailed(msg) | MlsError::WelcomeWrapFailed(msg)) => {
                 return Err(AvSessionError::WelcomeMalformed(msg))
+            }
+            // Sender-authentication refusals (CC 5.4.4) — dedicated
+            // variants so a caller can tell them apart from a corrupt
+            // frame or an openmls-layer rejection.
+            Err(MlsError::InviterUnknown(id)) => return Err(AvSessionError::InviterUnknown(id)),
+            Err(MlsError::WelcomeSignatureRejected) => {
+                return Err(AvSessionError::WelcomeSignatureRejected)
             }
             Err(MlsError::WelcomeFailed(msg)) => return Err(AvSessionError::WelcomeRejected(msg)),
             Err(other) => return Err(map_mls_err(other)),
@@ -576,16 +662,64 @@ impl std::fmt::Debug for AvSession {
 fn map_mls_err(e: MlsError) -> AvSessionError {
     match e {
         MlsError::PeerLacksMlkem(k) => AvSessionError::PeerLacksMlkem(k),
+        // CIRISEdge#331 — surface the sender-authentication failures as
+        // their dedicated AvSession variants rather than the opaque `Mls`
+        // catch-all, so callers can distinguish "who invited me?" refusals.
+        MlsError::InviterUnknown(id) => AvSessionError::InviterUnknown(id),
+        MlsError::WelcomeSignatureRejected => AvSessionError::WelcomeSignatureRejected,
         other => AvSessionError::Mls(other),
     }
 }
 
 #[cfg(test)]
+// `x_sk`/`x_pk`, `mlkem_sk`/`mlkem_pk` in the X-Wing keygen fixture are
+// intrinsically close-named; same allow welcome_wrap's tests use.
+#[allow(clippy::similar_names)]
 mod tests {
     use super::*;
-    use crate::transport::federation_session::PeerKexPubkeys;
+    use ciris_crypto::{ml_kem, x25519, PqcSigner};
 
     // ─── Fixtures ───────────────────────────────────────────────────
+
+    /// A fresh, matched X-Wing keypair split into the joiner's advertised
+    /// public half (what the inviter wraps under) and its retained secret
+    /// half (what the joiner unwraps with). Real keys — HPKE seal/open
+    /// actually consumes them, unlike the synthetic HNDL-only bytes.
+    fn fresh_joiner_xwing() -> (PeerKexPubkeys, OwnKexKeys) {
+        let (x_sk, x_pk) = x25519::generate_ephemeral_keypair().unwrap();
+        let (mlkem_sk, mlkem_pk) = ml_kem::generate_keypair().unwrap();
+        (
+            PeerKexPubkeys {
+                x25519_pub: x_pk,
+                mlkem768_pub: Some(mlkem_pk.clone()),
+            },
+            OwnKexKeys {
+                x25519_priv: x_sk,
+                mlkem768_priv: Some(mlkem_sk),
+                mlkem768_pub: Some(mlkem_pk),
+            },
+        )
+    }
+
+    /// A federation-directory closure resolving exactly `pk_id` →
+    /// `ml_dsa_pk`, every other id → `None` (fail-closed).
+    fn directory_resolving(
+        pk_id: &str,
+        ml_dsa_pk: Vec<u8>,
+    ) -> impl FnMut(&str) -> Option<FederationDirectoryEntry> {
+        let want = pk_id.to_string();
+        move |id: &str| {
+            if id == want {
+                Some(FederationDirectoryEntry {
+                    pk_id: id.to_string(),
+                    ml_dsa_pk: ml_dsa_pk.clone(),
+                    x_wing_pk: None,
+                })
+            } else {
+                None
+            }
+        }
+    }
 
     /// Build a hybrid-ready `Member` with synthetic KEX pubkeys. The
     /// bytes are not consumed by openmls; only the HNDL pre-check
@@ -1082,14 +1216,26 @@ mod tests {
         let (mut alice, _dek0) =
             AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
 
+        // Alice's long-term ML-DSA-65 federation identity (CC 5.4.4).
+        let alice_signer = MlDsa65Signer::new().expect("alice signer");
+        let alice_pk = alice_signer.public_key().expect("alice pk");
+
         // Joiner mints + publishes its KeyPackage; retains the private
-        // material in its own provider.
+        // material in its own provider. It also holds a static X-Wing
+        // keypair advertised to the inviter.
         let (joiner_material, joiner_kp) =
             mint_joiner_key_material("carol").expect("mint joiner kp");
+        let (joiner_kex_pub, joiner_kex_secret) = fresh_joiner_xwing();
 
-        // Alice admits the published joiner → Commit + Welcome + DEK.
+        // Alice admits the published joiner → Commit + signed Welcome + DEK.
         let artifacts = alice
-            .admit_published_joiner("carol", joiner_kp)
+            .admit_published_joiner(
+                "carol",
+                joiner_kp,
+                &joiner_kex_pub,
+                &alice_signer,
+                "alice-fed",
+            )
             .expect("admit joiner");
         assert_eq!(
             artifacts.welcome_bytes.len(),
@@ -1097,10 +1243,15 @@ mod tests {
             "one Welcome for the joiner"
         );
 
-        // Joiner bootstraps from the Welcome.
+        // Joiner bootstraps from the Welcome — verifying alice's inviter
+        // signature against the directory-resolved key before joining.
         let mut carol = AvSession::new_joiner(dummy_stream(), joiner_material);
         let carol_dek = carol
-            .process_welcome(&artifacts.welcome_bytes[0])
+            .process_welcome(
+                &artifacts.welcome_bytes[0],
+                &joiner_kex_secret,
+                directory_resolving("alice-fed", alice_pk),
+            )
             .expect("joiner process_welcome");
 
         // The load-bearing assertion: same epoch → same exporter →
@@ -1121,8 +1272,9 @@ mod tests {
     fn process_welcome_empty_bytes_returns_welcome_malformed() {
         use crate::transport::realtime_av_mls::mint_joiner_key_material;
         let (material, _kp) = mint_joiner_key_material("joiner").expect("mint");
+        let (_pub, kex_secret) = fresh_joiner_xwing();
         let mut joiner = AvSession::new_joiner(dummy_stream(), material);
-        let r = joiner.process_welcome(&[]);
+        let r = joiner.process_welcome(&[], &kex_secret, directory_resolving("x", vec![1, 2, 3]));
         assert!(
             matches!(r, Err(AvSessionError::WelcomeMalformed(_))),
             "expected WelcomeMalformed, got {r:?}"
@@ -1136,7 +1288,12 @@ mod tests {
     fn process_welcome_after_already_initialized_returns_already_initialized() {
         let (mut session, _dek) =
             AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
-        let r = session.process_welcome(&[0u8; 64]);
+        let (_pub, kex_secret) = fresh_joiner_xwing();
+        let r = session.process_welcome(
+            &[0u8; 64],
+            &kex_secret,
+            directory_resolving("x", vec![1, 2, 3]),
+        );
         assert!(
             matches!(r, Err(AvSessionError::AlreadyInitialized)),
             "expected AlreadyInitialized, got {r:?}"
@@ -1152,23 +1309,83 @@ mod tests {
 
         let (mut alice, _dek0) =
             AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
+        let alice_signer = MlDsa65Signer::new().expect("alice signer");
+        let alice_pk = alice_signer.public_key().expect("alice pk");
 
-        // The joiner alice actually admits.
+        // The joiner alice actually admits, plus carol's X-Wing keypair.
         let (_admitted_material, admitted_kp) =
             mint_joiner_key_material("carol").expect("mint admitted");
+        let (carol_kex_pub, carol_kex_secret) = fresh_joiner_xwing();
         let artifacts = alice
-            .admit_published_joiner("carol", admitted_kp)
+            .admit_published_joiner(
+                "carol",
+                admitted_kp,
+                &carol_kex_pub,
+                &alice_signer,
+                "alice-fed",
+            )
             .expect("admit");
 
         // A DIFFERENT joiner material (fresh provider/leaf) tries to
-        // consume carol's Welcome — its private leaf doesn't match any
-        // EncryptedGroupSecrets entry.
+        // consume carol's Welcome. It holds carol's X-Wing SECRET (so the
+        // inviter signature verifies and HPKE opens), but its openmls
+        // private leaf doesn't match any EncryptedGroupSecrets entry — so
+        // the failure is an openmls-layer rejection, NOT an auth failure.
         let (other_material, _other_kp) = mint_joiner_key_material("carol").expect("mint other");
         let mut imposter = AvSession::new_joiner(dummy_stream(), other_material);
-        let r = imposter.process_welcome(&artifacts.welcome_bytes[0]);
+        let r = imposter.process_welcome(
+            &artifacts.welcome_bytes[0],
+            &carol_kex_secret,
+            directory_resolving("alice-fed", alice_pk),
+        );
         assert!(
             matches!(r, Err(AvSessionError::WelcomeRejected(_))),
             "expected WelcomeRejected, got {r:?}"
+        );
+    }
+
+    /// CIRISEdge#331 (CC 5.4.4) at the AvSession surface: a joiner whose
+    /// directory cannot resolve the inviter refuses the Welcome
+    /// (`InviterUnknown`) — no TOFU — and a Welcome signed by a
+    /// non-inviter is `WelcomeSignatureRejected`. Membership is never
+    /// accepted in either case.
+    #[test]
+    fn process_welcome_rejects_unknown_and_forged_inviter() {
+        use crate::transport::realtime_av_mls::mint_joiner_key_material;
+
+        let (mut alice, _dek0) =
+            AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
+        let attacker = MlDsa65Signer::new().expect("attacker signer");
+        let genuine = MlDsa65Signer::new().expect("genuine signer");
+
+        // ── directory miss ⇒ InviterUnknown (no TOFU) ──
+        let (material1, kp1) = mint_joiner_key_material("carol").expect("mint");
+        let (kex_pub1, kex_secret1) = fresh_joiner_xwing();
+        let artifacts1 = alice
+            .admit_published_joiner("carol", kp1, &kex_pub1, &attacker, "unknown-inviter")
+            .expect("admit");
+        let mut carol1 = AvSession::new_joiner(dummy_stream(), material1);
+        let r1 = carol1.process_welcome(&artifacts1.welcome_bytes[0], &kex_secret1, |_| None);
+        assert!(
+            matches!(r1, Err(AvSessionError::InviterUnknown(ref id)) if id == "unknown-inviter"),
+            "expected InviterUnknown, got {r1:?}"
+        );
+
+        // ── signed by a non-inviter ⇒ WelcomeSignatureRejected ──
+        let (material2, kp2) = mint_joiner_key_material("dave").expect("mint");
+        let (kex_pub2, kex_secret2) = fresh_joiner_xwing();
+        let artifacts2 = alice
+            .admit_published_joiner("dave", kp2, &kex_pub2, &attacker, "genuine-inviter")
+            .expect("admit");
+        let mut dave = AvSession::new_joiner(dummy_stream(), material2);
+        let r2 = dave.process_welcome(
+            &artifacts2.welcome_bytes[0],
+            &kex_secret2,
+            directory_resolving("genuine-inviter", genuine.public_key().unwrap()),
+        );
+        assert!(
+            matches!(r2, Err(AvSessionError::WelcomeSignatureRejected)),
+            "expected WelcomeSignatureRejected, got {r2:?}"
         );
     }
 
@@ -1181,14 +1398,27 @@ mod tests {
 
         let (mut alice, _dek0) =
             AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
+        let alice_signer = MlDsa65Signer::new().expect("alice signer");
+        let alice_pk = alice_signer.public_key().expect("alice pk");
         let (joiner_material, joiner_kp) = mint_joiner_key_material("carol").expect("mint joiner");
+        let (joiner_kex_pub, joiner_kex_secret) = fresh_joiner_xwing();
         let artifacts = alice
-            .admit_published_joiner("carol", joiner_kp)
+            .admit_published_joiner(
+                "carol",
+                joiner_kp,
+                &joiner_kex_pub,
+                &alice_signer,
+                "alice-fed",
+            )
             .expect("admit");
 
         let mut carol = AvSession::new_joiner(dummy_stream(), joiner_material);
         let carol_dek = carol
-            .process_welcome(&artifacts.welcome_bytes[0])
+            .process_welcome(
+                &artifacts.welcome_bytes[0],
+                &joiner_kex_secret,
+                directory_resolving("alice-fed", alice_pk),
+            )
             .expect("process_welcome");
         let joined_epoch = carol.epoch();
 

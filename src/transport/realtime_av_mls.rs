@@ -177,6 +177,11 @@ use openmls_traits::OpenMlsProvider;
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use zeroize::Zeroize;
 
+use ciris_crypto::hpke::{HpkeSealed, XWingRecipientPublic, XWingRecipientSecret};
+use ciris_crypto::hybrid_kex::HybridHandshakeMsg;
+use ciris_crypto::MlDsa65Signer;
+
+use crate::mls::welcome_wrap::{self, FederationDirectoryEntry, WelcomeWrapError, WrappedWelcome};
 use crate::transport::federation_session::{OwnKexKeys, PeerKexPubkeys};
 
 /// The MLS ciphersuite this module pins to. `0x004D` — X-Wing
@@ -235,8 +240,48 @@ pub struct Commit(pub Vec<u8>);
 /// Serialized MLS Welcome message — TLS-encoded per RFC 9420 §12.4.
 /// Same wire shape as [`Commit`], distinct type so callers can route
 /// "needs to join" vs "is a member" without sniffing bytes.
+///
+/// This is the **bare** openmls Welcome — it carries NO sender
+/// authentication. Under the 0x004D X-Wing ciphersuite HPKE `mode_auth`
+/// is structurally unavailable (X-Wing has no `AuthEncap`), so a bare
+/// Welcome cannot tell the joiner WHO invited it. The cross-node admit
+/// path MUST instead ship a [`SignedWelcome`] (CIRISEdge#331 / CC 5.4.4);
+/// this type is retained for the inviter-local skeleton paths
+/// ([`MlsSession::commit_add`] / [`MlsSession::commit_batch`], which mint
+/// the joiner's KeyPackage locally and therefore never hand a Welcome to
+/// a *separate* joiner) and as the inner payload a [`SignedWelcome`]
+/// wraps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Welcome(pub Vec<u8>);
+
+/// A realtime MLS Welcome carrying the CC 5.4.4 sender-authentication:
+/// the inner openmls [`Welcome`] bytes HPKE `mode_base`-wrapped under the
+/// joiner's static X-Wing public key, plus an **ML-DSA-65 signature by
+/// the inviter** over the encapsulation bytes
+/// ([`ciris_crypto::hpke::encap_signing_bytes`]). Produced by
+/// [`MlsSession::commit_add_published_signed`], consumed by
+/// [`MlsSession::join_from_signed_welcome`].
+///
+/// ## Why this exists (CIRISEdge#331)
+///
+/// CC 5.4.4 (`CLM-welcome-wrap`): because HPKE `mode_auth` cannot be used
+/// with X-Wing, sender authentication for the Welcome **MUST be an
+/// ML-DSA-65 signature from the inviter over the encapsulation bytes**.
+/// The realtime path previously produced a bare openmls [`Welcome`] with
+/// no such signature — a joiner could not tell who invited it. This type
+/// routes the realtime Welcome through the exact same
+/// [`crate::mls::welcome_wrap`] machinery §3.3 uses, so the signature is
+/// verified (directory-resolved key, fail-closed, NO TOFU) **before**
+/// group membership is accepted.
+///
+/// The wire bytes are a self-describing, versioned length-prefixed
+/// encoding of the underlying [`WrappedWelcome`] (see
+/// [`encode_wrapped_welcome`]); the newtype mirrors [`Welcome`] /
+/// [`Commit`] so it can travel on the existing byte-oriented
+/// [`crate::transport::realtime_av_session::EpochRekeyArtifacts::welcome_bytes`]
+/// surface without a schema change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedWelcome(pub Vec<u8>);
 
 /// The current epoch's MLS exporter secret, derived under
 /// [`ROOT_SECRET_LABEL`]. Consumed by the Layer 2 key_grant wrap as
@@ -329,6 +374,34 @@ pub enum MlsError {
     /// verb, and there is no rotation to perform on an empty batch.
     #[error("commit_batch called with empty ops — no roster mutation requested")]
     EmptyBatch,
+    /// CIRISEdge#331 (CC 5.4.4) — the realtime Welcome's ML-DSA-65
+    /// inviter signature failed to verify against the
+    /// **directory-resolved** inviter key. Fail-closed: group
+    /// membership is REFUSED, never TOFU-accepted on the sender's own
+    /// say-so. Under the X-Wing ciphersuite HPKE `mode_auth` is
+    /// structurally unavailable, so this signature is the SOLE sender-
+    /// authentication for the Welcome — a failure here means the joiner
+    /// cannot prove WHO invited it, exactly the property CC 5.4.4
+    /// mandates.
+    #[error("realtime Welcome inviter ML-DSA-65 signature rejected (CC 5.4.4)")]
+    WelcomeSignatureRejected,
+    /// CIRISEdge#331 (CC 5.4.4) — the inviter that signed the realtime
+    /// Welcome (`inviter_pk_id`) is not resolvable in the joiner's
+    /// federation directory. Fail-closed with NO inline-key fallback:
+    /// the sender-supplied `inviter_pk_bytes` is never a verification
+    /// input (that fallback was the self-certifying TOFU that
+    /// [`crate::mls::welcome_wrap`] already closed). An inviter the
+    /// local directory can't vouch for is refused.
+    #[error("realtime Welcome inviter pk_id {0:?} not in federation directory")]
+    InviterUnknown(String),
+    /// CIRISEdge#331 — HPKE `mode_base` wrap/unwrap of the realtime
+    /// Welcome failed: a seal/open crypto error, or a malformed
+    /// wrapped-welcome envelope that could not be decoded. Distinct
+    /// from [`Self::WelcomeSignatureRejected`] (a valid envelope whose
+    /// signature did not verify) so callers can tell a corrupt frame
+    /// from an authentication failure.
+    #[error("realtime Welcome wrap/unwrap failed: {0}")]
+    WelcomeWrapFailed(String),
 }
 
 /// A CIRIS-shaped wrapper around an [`openmls::prelude::MlsGroup`]
@@ -561,6 +634,78 @@ impl MlsSession {
         let root = export_root_secret(&self.group, self.provider.as_ref())?;
 
         Ok((Commit(commit_bytes), Welcome(welcome_bytes), root))
+    }
+
+    /// CIRISEdge#331 (CC 5.4.4) — the **cross-node admit** path: like
+    /// [`Self::commit_add_published`], but the produced Welcome is a
+    /// [`SignedWelcome`] carrying the inviter's ML-DSA-65 signature over
+    /// the encapsulation bytes, so the joiner can authenticate WHO
+    /// invited it before accepting membership.
+    ///
+    /// The bare openmls Welcome is wrapped through the exact same §3.3
+    /// [`crate::mls::welcome_wrap`] machinery used elsewhere in the stack
+    /// (HPKE `mode_base` under the joiner's static X-Wing key + inviter
+    /// ML-DSA-65 signature over
+    /// [`ciris_crypto::hpke::encap_signing_bytes`], bound to the pinned
+    /// `HPKE_SUITE_ID`). We do NOT invent a signing path — `wrap_welcome`
+    /// is imported and reused verbatim.
+    ///
+    /// ## Inputs beyond [`Self::commit_add_published`]
+    ///
+    /// - `invitee_kex` — the joiner's advertised static X-Wing public key
+    ///   (`x25519_pub` + `mlkem768_pub`), the HPKE recipient key `pkR`.
+    ///   Lacking the ML-KEM-768 half is [`MlsError::PeerLacksMlkem`]
+    ///   (same HNDL discipline as the roster gates).
+    /// - `inviter_signer` — the inviter's long-term ML-DSA-65 federation
+    ///   signer. Its public key is what the joiner resolves from the
+    ///   federation directory keyed by `inviter_pk_id`; a fresh
+    ///   per-session key would be meaningless to the directory.
+    /// - `inviter_pk_id` — the directory identifier the joiner uses to
+    ///   resolve `inviter_signer`'s public key.
+    ///
+    /// The wrap binds `aad = key_id` so the wrapped Welcome is
+    /// cryptographically pinned to the joiner it was minted for.
+    ///
+    /// # Errors
+    ///
+    /// - `invitee_kex` lacks ML-KEM-768 → [`MlsError::PeerLacksMlkem`]
+    /// - openmls add/serialize failures → as [`Self::commit_add_published`]
+    /// - HPKE seal / ML-DSA sign failure → [`MlsError::WelcomeWrapFailed`]
+    pub fn commit_add_published_signed(
+        &mut self,
+        key_id: &str,
+        key_package: KeyPackage,
+        invitee_kex: &PeerKexPubkeys,
+        inviter_signer: &MlDsa65Signer,
+        inviter_pk_id: &str,
+    ) -> Result<(Commit, SignedWelcome, RootSecret), MlsError> {
+        // Bridge the joiner's CIRIS-side KEX advertisement to the HPKE
+        // recipient key BEFORE touching the group, so a classical-only
+        // joiner is refused without a partial epoch advance.
+        let invitee_pk = xwing_public_from_kex(key_id, invitee_kex)?;
+
+        // Produce the bare openmls Commit + Welcome via the existing
+        // (unsigned) path — this owns the roster mutation + epoch advance.
+        let (commit, welcome, root) = self.commit_add_published(key_id, key_package)?;
+
+        // Wrap + sign the inner openmls Welcome through the shared §3.3
+        // machinery. `wrap_welcome` signs `encap_signing_bytes` with the
+        // inviter's ML-DSA-65 key — the CC 5.4.4 compensating control.
+        // AAD binds the wrap to the intended joiner's `key_id`.
+        let wrapped = welcome_wrap::wrap_welcome(
+            inviter_signer,
+            inviter_pk_id,
+            &invitee_pk,
+            &welcome.0,
+            key_id.as_bytes(),
+        )
+        .map_err(map_wrap_err)?;
+
+        Ok((
+            commit,
+            SignedWelcome(encode_wrapped_welcome(&wrapped)),
+            root,
+        ))
     }
 
     /// Remove a member from the group by CIRIS `key_id`. Returns the
@@ -938,6 +1083,114 @@ impl MlsSession {
             root,
         ))
     }
+
+    /// CIRISEdge#331 (CC 5.4.4) — the **cross-node join** path: verify the
+    /// inviter's ML-DSA-65 signature on a [`SignedWelcome`] FIRST, then —
+    /// and only then — feed the recovered inner openmls Welcome to
+    /// [`Self::join_from_welcome`] to accept group membership.
+    ///
+    /// This is the joiner-side complement of
+    /// [`Self::commit_add_published_signed`]. It routes through the exact
+    /// §3.3 [`crate::mls::welcome_wrap::unwrap_welcome`] discipline:
+    ///
+    /// 1. Resolve the inviter's ML-DSA-65 public key **directory-only**
+    ///    via `directory_lookup`. A miss is [`MlsError::InviterUnknown`]
+    ///    — fail-closed, NO fall-through to the sender-supplied inline
+    ///    `inviter_pk_bytes` (that was the self-certifying TOFU
+    ///    welcome_wrap already closed).
+    /// 2. Verify the inviter signature over the encapsulation bytes. A
+    ///    mismatch (unsigned, forged, or re-signed by a non-inviter) is
+    ///    [`MlsError::WelcomeSignatureRejected`].
+    /// 3. HPKE `open_base` recovers the inner openmls Welcome bytes.
+    /// 4. Hand those authenticated bytes to [`Self::join_from_welcome`].
+    ///
+    /// Every rejection is LOUD (`tracing::warn!` with the offending
+    /// `inviter_pk_id`) — this repo just killed an entire silent-refusal
+    /// arc (CIRISEdge#423-#429); an admission refusal must never be a
+    /// silent deny.
+    ///
+    /// `invitee_keys` is the joiner's static X-Wing secret (the HPKE
+    /// recipient key `skR`); it MUST be the pair of the `invitee_kex`
+    /// public the inviter wrapped under. The `aad` is reconstructed from
+    /// the joiner's own `key_id` (carried in `material`), matching the
+    /// bind the inviter used.
+    ///
+    /// # Errors
+    ///
+    /// - joiner X-Wing secret lacks ML-KEM-768 → [`MlsError::PeerLacksMlkem`]
+    /// - malformed [`SignedWelcome`] envelope → [`MlsError::WelcomeWrapFailed`]
+    /// - inviter not directory-resolvable → [`MlsError::InviterUnknown`]
+    /// - signature verify fail → [`MlsError::WelcomeSignatureRejected`]
+    /// - HPKE open fail → [`MlsError::WelcomeWrapFailed`]
+    /// - openmls Welcome rejected → [`MlsError::WelcomeFailed`] (via
+    ///   [`Self::join_from_welcome`])
+    pub fn join_from_signed_welcome<F>(
+        material: JoinerKeyMaterial,
+        invitee_keys: &OwnKexKeys,
+        signed: &SignedWelcome,
+        directory_lookup: F,
+    ) -> Result<(Self, RootSecret), MlsError>
+    where
+        F: FnMut(&str) -> Option<FederationDirectoryEntry>,
+    {
+        // Bridge the joiner's CIRIS-side KEX secret to the HPKE recipient
+        // secret. A classical-only joiner is out-of-spec for 0x004D.
+        let invitee_sk = xwing_secret_from_own(&material.key_id, invitee_keys)?;
+
+        // Decode the wrapped-welcome envelope. A frame that isn't a valid
+        // envelope (e.g. a bare openmls Welcome shipped on the signed
+        // path, or a truncated/garbled frame) is refused here — it never
+        // reaches the MLS layer unauthenticated.
+        let wrapped = decode_wrapped_welcome(&signed.0)?;
+
+        // AAD must match the inviter's bind: the joiner's own key_id.
+        let aad = material.key_id.as_bytes().to_vec();
+
+        // §3.3 unwrap: verify the inviter signature (directory-resolved,
+        // fail-closed) BEFORE HPKE open. Reuse welcome_wrap verbatim; do
+        // not replicate its verify logic.
+        let inner = match welcome_wrap::unwrap_welcome(
+            &invitee_sk,
+            &wrapped,
+            &aad,
+            directory_lookup,
+        ) {
+            Ok(inner) => inner,
+            Err(WelcomeWrapError::InviterUnknown(id)) => {
+                tracing::warn!(
+                    target: "ciris_edge::realtime_av_mls",
+                    inviter_key_id = %id,
+                    "CC 5.4.4: realtime MLS Welcome REFUSED — inviter not directory-resolvable; \
+                     fail-closed with no inline-key TOFU fallback (CIRISEdge#331)",
+                );
+                return Err(MlsError::InviterUnknown(id));
+            }
+            Err(WelcomeWrapError::SignatureRejected) => {
+                tracing::warn!(
+                    target: "ciris_edge::realtime_av_mls",
+                    inviter_key_id = %wrapped.inviter_pk_id,
+                    "CC 5.4.4: realtime MLS Welcome REFUSED — inviter ML-DSA-65 signature failed \
+                     to verify against the directory key (unsigned / forged / re-signed by a \
+                     non-inviter); membership NOT accepted (CIRISEdge#331)",
+                );
+                return Err(MlsError::WelcomeSignatureRejected);
+            }
+            Err(WelcomeWrapError::Crypto(e)) => {
+                tracing::warn!(
+                    target: "ciris_edge::realtime_av_mls",
+                    inviter_key_id = %wrapped.inviter_pk_id,
+                    error = %e,
+                    "CC 5.4.4: realtime MLS Welcome REFUSED — HPKE open of the wrapped Welcome \
+                     failed (CIRISEdge#331)",
+                );
+                return Err(MlsError::WelcomeWrapFailed(format!("{e}")));
+            }
+        };
+
+        // Signature verified + Welcome decrypted: only now accept
+        // membership from the authenticated inner openmls Welcome.
+        Self::join_from_welcome(material, &inner)
+    }
 }
 
 /// A joiner's pre-staged MLS key material — the private side of a
@@ -1052,6 +1305,178 @@ fn serialize_mls_message(msg: &MlsMessageOut) -> Result<Vec<u8>, MlsError> {
         .map_err(|e| MlsError::WireDecodeFailed(format!("serialize: {e:?}")))
 }
 
+// ─── CIRISEdge#331 (CC 5.4.4) signed-Welcome helpers ─────────────────
+
+/// Bridge a joiner's CIRIS-side KEX advertisement ([`PeerKexPubkeys`]) to
+/// the HPKE recipient public key ([`XWingRecipientPublic`], `pkR`) the
+/// §3.3 wrap seals under. The X-Wing KEM requires ML-KEM-768; a
+/// classical-only advertisement is refused with the same HNDL discipline
+/// the roster gates use.
+fn xwing_public_from_kex(
+    key_id: &str,
+    kex: &PeerKexPubkeys,
+) -> Result<XWingRecipientPublic, MlsError> {
+    let mlkem768_pub = kex
+        .mlkem768_pub
+        .clone()
+        .ok_or_else(|| MlsError::PeerLacksMlkem(key_id.to_string()))?;
+    Ok(XWingRecipientPublic {
+        x25519_pub: kex.x25519_pub,
+        mlkem768_pub,
+    })
+}
+
+/// Bridge a joiner's own CIRIS KEX secret ([`OwnKexKeys`]) to the HPKE
+/// recipient secret ([`XWingRecipientSecret`], `skR`). Both ML-KEM-768
+/// halves (priv + pub, the latter bound into the X-Wing shared-secret
+/// salt) are required; a classical-only key is out-of-spec for 0x004D.
+fn xwing_secret_from_own(key_id: &str, own: &OwnKexKeys) -> Result<XWingRecipientSecret, MlsError> {
+    let mlkem768_priv = own
+        .mlkem768_priv
+        .clone()
+        .ok_or_else(|| MlsError::PeerLacksMlkem(key_id.to_string()))?;
+    let mlkem768_pub = own
+        .mlkem768_pub
+        .clone()
+        .ok_or_else(|| MlsError::PeerLacksMlkem(key_id.to_string()))?;
+    Ok(XWingRecipientSecret {
+        x25519_priv: own.x25519_priv,
+        mlkem768_priv,
+        mlkem768_pub,
+    })
+}
+
+/// Fold a wrap-side [`WelcomeWrapError`] into the MLS surface. On the
+/// producer side only the `Crypto` variant is reachable (seal + sign);
+/// the directory/verify variants are joiner-side and mapped inline at
+/// [`MlsSession::join_from_signed_welcome`] so each can carry a LOUD
+/// `tracing::warn!`.
+fn map_wrap_err(e: WelcomeWrapError) -> MlsError {
+    match e {
+        WelcomeWrapError::Crypto(c) => MlsError::WelcomeWrapFailed(format!("{c}")),
+        WelcomeWrapError::SignatureRejected => MlsError::WelcomeSignatureRejected,
+        WelcomeWrapError::InviterUnknown(id) => MlsError::InviterUnknown(id),
+    }
+}
+
+/// Version tag for the [`SignedWelcome`] wire encoding. Bumped only on a
+/// wire-breaking change to [`encode_wrapped_welcome`].
+const SIGNED_WELCOME_WIRE_V1: u8 = 0x01;
+
+/// Append a `u32`-big-endian length prefix + `field` to `out`.
+///
+/// The realtime Welcome's inner MLS Welcome + ML-KEM ciphertext are the
+/// large fields (≤ a few KiB); `u32` is comfortably wide. A length that
+/// somehow exceeded `u32::MAX` would saturate — but that is unreachable
+/// for MLS/HPKE frames and asserted in debug builds.
+fn push_lp(out: &mut Vec<u8>, field: &[u8]) {
+    debug_assert!(
+        u32::try_from(field.len()).is_ok(),
+        "signed-welcome field fits u32"
+    );
+    let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(field);
+}
+
+/// Read one `u32`-big-endian length-prefixed field from `buf` at
+/// `*cursor`, advancing the cursor past it. Fails closed on truncation.
+fn read_lp<'a>(buf: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], MlsError> {
+    let start = *cursor;
+    let len_end = start
+        .checked_add(4)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| MlsError::WelcomeWrapFailed("truncated length prefix".to_string()))?;
+    let mut len_bytes = [0u8; 4];
+    len_bytes.copy_from_slice(&buf[start..len_end]);
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    let field_end = len_end
+        .checked_add(len)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| MlsError::WelcomeWrapFailed("length prefix exceeds frame".to_string()))?;
+    *cursor = field_end;
+    Ok(&buf[len_end..field_end])
+}
+
+/// Serialize a [`WrappedWelcome`] to the self-describing [`SignedWelcome`]
+/// wire bytes. The layout is a version byte followed by length-prefixed
+/// fields in a fixed order; the 32-byte X25519 ephemeral pubkey is the
+/// one fixed-width field. `HpkeSealed` does not derive `serde`, so this
+/// is a small hand-rolled codec rather than a blanket serialization —
+/// its inverse is [`decode_wrapped_welcome`], round-trip-tested.
+fn encode_wrapped_welcome(w: &WrappedWelcome) -> Vec<u8> {
+    let enc = &w.hpke_sealed.encapsulation;
+    let mut out = Vec::new();
+    out.push(SIGNED_WELCOME_WIRE_V1);
+    push_lp(&mut out, enc.algorithm.as_bytes());
+    out.extend_from_slice(&enc.x25519_ephemeral_pub); // fixed 32 B
+    push_lp(&mut out, &enc.mlkem768_ciphertext);
+    push_lp(&mut out, &w.hpke_sealed.ciphertext);
+    push_lp(&mut out, &w.inviter_signature);
+    push_lp(&mut out, w.inviter_pk_id.as_bytes());
+    push_lp(&mut out, &w.inviter_pk_bytes);
+    out
+}
+
+/// Parse [`SignedWelcome`] wire bytes back into a [`WrappedWelcome`].
+/// Fails closed ([`MlsError::WelcomeWrapFailed`]) on any structural
+/// problem — wrong version, truncation, non-UTF-8 string field, wrong
+/// ephemeral-pubkey width, or trailing bytes — so a malformed frame is
+/// never handed to the crypto layer as if authenticated.
+fn decode_wrapped_welcome(buf: &[u8]) -> Result<WrappedWelcome, MlsError> {
+    let mut cursor = 0usize;
+    let version = *buf
+        .first()
+        .ok_or_else(|| MlsError::WelcomeWrapFailed("empty signed-welcome frame".to_string()))?;
+    if version != SIGNED_WELCOME_WIRE_V1 {
+        return Err(MlsError::WelcomeWrapFailed(format!(
+            "unsupported signed-welcome wire version 0x{version:02X}"
+        )));
+    }
+    cursor += 1;
+
+    let algorithm = std::str::from_utf8(read_lp(buf, &mut cursor)?)
+        .map_err(|e| MlsError::WelcomeWrapFailed(format!("algorithm not UTF-8: {e}")))?
+        .to_string();
+
+    let eph_end = cursor
+        .checked_add(32)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| MlsError::WelcomeWrapFailed("truncated x25519 ephemeral pub".to_string()))?;
+    let mut x25519_ephemeral_pub = [0u8; 32];
+    x25519_ephemeral_pub.copy_from_slice(&buf[cursor..eph_end]);
+    cursor = eph_end;
+
+    let mlkem768_ciphertext = read_lp(buf, &mut cursor)?.to_vec();
+    let ciphertext = read_lp(buf, &mut cursor)?.to_vec();
+    let inviter_signature = read_lp(buf, &mut cursor)?.to_vec();
+    let inviter_pk_id = std::str::from_utf8(read_lp(buf, &mut cursor)?)
+        .map_err(|e| MlsError::WelcomeWrapFailed(format!("inviter_pk_id not UTF-8: {e}")))?
+        .to_string();
+    let inviter_pk_bytes = read_lp(buf, &mut cursor)?.to_vec();
+
+    if cursor != buf.len() {
+        return Err(MlsError::WelcomeWrapFailed(format!(
+            "trailing bytes after signed-welcome frame ({} unread)",
+            buf.len() - cursor
+        )));
+    }
+
+    Ok(WrappedWelcome {
+        hpke_sealed: HpkeSealed {
+            encapsulation: HybridHandshakeMsg {
+                algorithm,
+                x25519_ephemeral_pub,
+                mlkem768_ciphertext,
+            },
+            ciphertext,
+        },
+        inviter_signature,
+        inviter_pk_id,
+        inviter_pk_bytes,
+    })
+}
+
 /// Derive the current epoch's [`RootSecret`] from the group's
 /// exporter secret under [`ROOT_SECRET_LABEL`].
 fn export_root_secret(
@@ -1080,6 +1505,9 @@ fn export_root_secret(
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// `signer`/`signed`, `x_sk`/`x_pk`, `mlkem_sk`/`mlkem_pk` — the crypto
+// vocabulary is intrinsically close-named; same allow welcome_wrap uses.
+#[allow(clippy::similar_names)]
 mod tests {
     use super::*;
 
@@ -1590,5 +2018,331 @@ mod tests {
         // check; avoids the cast_precision_loss lint on u128→f64.
         let ratio = seq_ms / batch_ms.max(1);
         eprintln!("[L5-C empirical] N={N}: seq={seq_ms}ms batch={batch_ms}ms speedup~={ratio}x");
+    }
+
+    // ─── CIRISEdge#331 (CC 5.4.4) signed-Welcome adversarial suite ──────
+    //
+    // Mirrors the adversarial discipline of `src/mls/welcome_wrap.rs`
+    // (its tests at the `wrap_welcome`/`unwrap_welcome` layer), lifted to
+    // the realtime MLS admit/join path: genuine inviter accepted;
+    // directory miss fails closed (InviterUnknown, NO inline-key TOFU); a
+    // Welcome signed by a non-inviter is rejected; the wrong directory key
+    // is rejected; a tampered signature is rejected; an unsigned/bare or
+    // malformed frame is rejected. The signing path is welcome_wrap's own
+    // ML-DSA-65 over `encap_signing_bytes` — imported, never reinvented.
+
+    use ciris_crypto::{ml_kem, x25519, PqcSigner};
+
+    /// A fresh, matched X-Wing keypair split into the joiner's advertised
+    /// public half ([`PeerKexPubkeys`] — what the inviter wraps under) and
+    /// its retained secret half ([`OwnKexKeys`] — what the joiner unwraps
+    /// with). Real keys (not the synthetic bytes the HNDL-only fixtures
+    /// use) because these are actually consumed by HPKE seal/open.
+    fn fresh_joiner_xwing() -> (PeerKexPubkeys, OwnKexKeys) {
+        let (x_sk, x_pk) = x25519::generate_ephemeral_keypair().unwrap();
+        let (mlkem_sk, mlkem_pk) = ml_kem::generate_keypair().unwrap();
+        let pubs = PeerKexPubkeys {
+            x25519_pub: x_pk,
+            mlkem768_pub: Some(mlkem_pk.clone()),
+        };
+        let secret = OwnKexKeys {
+            x25519_priv: x_sk,
+            mlkem768_priv: Some(mlkem_sk),
+            mlkem768_pub: Some(mlkem_pk),
+        };
+        (pubs, secret)
+    }
+
+    /// A federation-directory closure resolving exactly `pk_id` →
+    /// `ml_dsa_pk`, every other id → `None` (fail-closed). The realtime
+    /// join's SOLE trust input.
+    fn directory_resolving(
+        pk_id: &str,
+        ml_dsa_pk: Vec<u8>,
+    ) -> impl FnMut(&str) -> Option<FederationDirectoryEntry> {
+        let want = pk_id.to_string();
+        move |id: &str| {
+            if id == want {
+                Some(FederationDirectoryEntry {
+                    pk_id: id.to_string(),
+                    ml_dsa_pk: ml_dsa_pk.clone(),
+                    x_wing_pk: None,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    /// A minimal inviter-side group (creator + one seed member).
+    fn inviter_session() -> MlsSession {
+        MlsSession::create("inviter", vec![hybrid_member("seed")])
+            .expect("create inviter group")
+            .0
+    }
+
+    /// Genuine end-to-end: inviter admits + signs, the joiner resolves the
+    /// inviter's registered ML-DSA key from the directory, verifies, and
+    /// joins. Both sides derive the identical epoch root (RFC 9420 §8.5),
+    /// which also proves the wrap/unwrap recovered the exact inner
+    /// openmls Welcome bytes.
+    #[test]
+    fn signed_welcome_round_trip_genuine_inviter_accepted() {
+        let mut inviter = inviter_session();
+        let signer = MlDsa65Signer::new().unwrap();
+        let inviter_pk = signer.public_key().unwrap();
+
+        let (material, kp) = mint_joiner_key_material("carol").unwrap();
+        let (kex_pub, kex_secret) = fresh_joiner_xwing();
+
+        let (_commit, signed, root_inviter) = inviter
+            .commit_add_published_signed("carol", kp, &kex_pub, &signer, "inviter-fed-id")
+            .expect("signed admit");
+        assert!(!signed.0.is_empty(), "SignedWelcome must be non-empty");
+
+        let (joiner, root_joiner) = MlsSession::join_from_signed_welcome(
+            material,
+            &kex_secret,
+            &signed,
+            directory_resolving("inviter-fed-id", inviter_pk),
+        )
+        .expect("genuine inviter must be accepted");
+
+        assert_eq!(
+            root_inviter.as_bytes(),
+            root_joiner.as_bytes(),
+            "joiner must derive the SAME epoch root as the inviter"
+        );
+        assert!(joiner.is_active());
+    }
+
+    /// Directory MISS ⇒ `InviterUnknown`, NEVER TOFU-accepted via the
+    /// sender-supplied inline key. An attacker signs the Welcome with its
+    /// OWN ML-DSA key and ships that key inline — the classic self-
+    /// certifying TOFU — but an unresolvable inviter is refused. (This is
+    /// the exact hole CIRISEdge#331 closes.)
+    #[test]
+    fn signed_welcome_directory_miss_is_inviter_unknown_not_tofu() {
+        let mut inviter = inviter_session();
+        let attacker = MlDsa65Signer::new().unwrap();
+        let (material, kp) = mint_joiner_key_material("carol").unwrap();
+        let (kex_pub, kex_secret) = fresh_joiner_xwing();
+
+        let (_c, signed, _r) = inviter
+            .commit_add_published_signed("carol", kp, &kex_pub, &attacker, "unknown-inviter")
+            .expect("admit");
+
+        let err = MlsSession::join_from_signed_welcome(material, &kex_secret, &signed, |_| None)
+            .unwrap_err();
+        assert!(
+            matches!(err, MlsError::InviterUnknown(ref id) if id == "unknown-inviter"),
+            "a directory-unresolvable inviter must be InviterUnknown, never TOFU-accepted \
+             via the inline pk (got {err:?})",
+        );
+    }
+
+    /// A Welcome signed by a NON-inviter is rejected. The attacker forges
+    /// a Welcome while claiming a known inviter's `pk_id`; the directory
+    /// resolves that id to the GENUINE inviter's key, so the attacker's
+    /// signature cannot verify. Membership is refused.
+    #[test]
+    fn signed_welcome_signed_by_non_inviter_is_rejected() {
+        let mut inviter = inviter_session();
+        let attacker = MlDsa65Signer::new().unwrap();
+        let genuine = MlDsa65Signer::new().unwrap();
+        let (material, kp) = mint_joiner_key_material("carol").unwrap();
+        let (kex_pub, kex_secret) = fresh_joiner_xwing();
+
+        let (_c, signed, _r) = inviter
+            .commit_add_published_signed("carol", kp, &kex_pub, &attacker, "genuine-inviter")
+            .expect("admit");
+
+        let err = MlsSession::join_from_signed_welcome(
+            material,
+            &kex_secret,
+            &signed,
+            directory_resolving("genuine-inviter", genuine.public_key().unwrap()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MlsError::WelcomeSignatureRejected),
+            "a Welcome signed by a non-inviter must be rejected (got {err:?})",
+        );
+    }
+
+    /// The directory returns the WRONG (bystander) key for the inviter's
+    /// id — a substitution attempt — so the genuine signature verifies
+    /// against the wrong key and fails.
+    #[test]
+    fn signed_welcome_wrong_directory_key_is_rejected() {
+        let mut inviter = inviter_session();
+        let signer = MlDsa65Signer::new().unwrap();
+        let bystander = MlDsa65Signer::new().unwrap();
+        let (material, kp) = mint_joiner_key_material("carol").unwrap();
+        let (kex_pub, kex_secret) = fresh_joiner_xwing();
+
+        let (_c, signed, _r) = inviter
+            .commit_add_published_signed("carol", kp, &kex_pub, &signer, "inviter-fed-id")
+            .expect("admit");
+
+        let err = MlsSession::join_from_signed_welcome(
+            material,
+            &kex_secret,
+            &signed,
+            directory_resolving("inviter-fed-id", bystander.public_key().unwrap()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MlsError::WelcomeSignatureRejected),
+            "got {err:?}"
+        );
+    }
+
+    /// A valid envelope whose signature byte was flipped is rejected —
+    /// mirrors welcome_wrap's `tampered_signature_is_rejected`.
+    #[test]
+    fn signed_welcome_tampered_signature_is_rejected() {
+        let mut inviter = inviter_session();
+        let signer = MlDsa65Signer::new().unwrap();
+        let (material, kp) = mint_joiner_key_material("carol").unwrap();
+        let (kex_pub, kex_secret) = fresh_joiner_xwing();
+
+        let (_c, signed, _r) = inviter
+            .commit_add_published_signed("carol", kp, &kex_pub, &signer, "inviter-fed-id")
+            .expect("admit");
+
+        let mut wrapped = decode_wrapped_welcome(&signed.0).unwrap();
+        wrapped.inviter_signature[0] ^= 0x01;
+        let tampered = SignedWelcome(encode_wrapped_welcome(&wrapped));
+
+        let err = MlsSession::join_from_signed_welcome(
+            material,
+            &kex_secret,
+            &tampered,
+            directory_resolving("inviter-fed-id", signer.public_key().unwrap()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MlsError::WelcomeSignatureRejected),
+            "got {err:?}"
+        );
+    }
+
+    /// An UNSIGNED bare openmls Welcome fed on the signed path does not
+    /// decode as a wrapped envelope — it is refused before any crypto,
+    /// never accepted as an unauthenticated Welcome.
+    #[test]
+    fn signed_welcome_unsigned_bare_welcome_is_rejected() {
+        let mut inviter = inviter_session();
+        let signer = MlDsa65Signer::new().unwrap();
+        let (material, kp) = mint_joiner_key_material("carol").unwrap();
+        let (_kex_pub, kex_secret) = fresh_joiner_xwing();
+
+        let (_c, bare, _r) = inviter
+            .commit_add_published("carol", kp)
+            .expect("bare admit");
+        let unsigned = SignedWelcome(bare.0);
+
+        let err = MlsSession::join_from_signed_welcome(
+            material,
+            &kex_secret,
+            &unsigned,
+            directory_resolving("inviter-fed-id", signer.public_key().unwrap()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MlsError::WelcomeWrapFailed(_)),
+            "an unsigned bare Welcome must not decode as a signed envelope (got {err:?})",
+        );
+    }
+
+    /// HNDL discipline, joiner side: a classical-only `OwnKexKeys` (no
+    /// ML-KEM-768 secret) can't be an X-Wing recipient, so the join is
+    /// refused before any unwrap.
+    #[test]
+    fn signed_welcome_joiner_without_mlkem_refused() {
+        let mut inviter = inviter_session();
+        let signer = MlDsa65Signer::new().unwrap();
+        let (material, kp) = mint_joiner_key_material("carol").unwrap();
+        let (kex_pub, _kex_secret) = fresh_joiner_xwing();
+
+        let (_c, signed, _r) = inviter
+            .commit_add_published_signed("carol", kp, &kex_pub, &signer, "inviter-fed-id")
+            .expect("admit");
+
+        let classical_only = OwnKexKeys {
+            x25519_priv: [7u8; 32],
+            mlkem768_priv: None,
+            mlkem768_pub: None,
+        };
+        let err = MlsSession::join_from_signed_welcome(
+            material,
+            &classical_only,
+            &signed,
+            directory_resolving("inviter-fed-id", signer.public_key().unwrap()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MlsError::PeerLacksMlkem(ref k) if k == "carol"),
+            "got {err:?}"
+        );
+    }
+
+    /// HNDL discipline, producer side: a classical-only invitee KEX is
+    /// refused BEFORE the roster mutation, so the group epoch does not
+    /// advance (no partial state).
+    #[test]
+    fn signed_welcome_producer_rejects_classical_only_invitee() {
+        let mut inviter = inviter_session();
+        let pre_epoch = inviter.epoch();
+        let signer = MlDsa65Signer::new().unwrap();
+        let (_material, kp) = mint_joiner_key_material("carol").unwrap();
+        let classical_kex = PeerKexPubkeys {
+            x25519_pub: [1u8; 32],
+            mlkem768_pub: None,
+        };
+
+        let err = inviter
+            .commit_add_published_signed("carol", kp, &classical_kex, &signer, "inviter-fed-id")
+            .unwrap_err();
+        assert!(
+            matches!(err, MlsError::PeerLacksMlkem(ref k) if k == "carol"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            inviter.epoch(),
+            pre_epoch,
+            "no partial epoch advance on producer HNDL refusal"
+        );
+    }
+
+    /// The [`SignedWelcome`] wire codec is a faithful round trip, and
+    /// fails closed on truncation / bad version.
+    #[test]
+    fn signed_welcome_wire_codec_round_trips() {
+        let mut inviter = inviter_session();
+        let signer = MlDsa65Signer::new().unwrap();
+        let (_material, kp) = mint_joiner_key_material("carol").unwrap();
+        let (kex_pub, _kex_secret) = fresh_joiner_xwing();
+
+        let (_c, signed, _r) = inviter
+            .commit_add_published_signed("carol", kp, &kex_pub, &signer, "inviter-fed-id")
+            .expect("admit");
+
+        let wrapped = decode_wrapped_welcome(&signed.0).expect("decode");
+        let reencoded = encode_wrapped_welcome(&wrapped);
+        assert_eq!(reencoded, signed.0, "codec must be a faithful round trip");
+        assert_eq!(wrapped.inviter_pk_id, "inviter-fed-id");
+        assert_eq!(wrapped.inviter_pk_bytes, signer.public_key().unwrap());
+
+        // Truncated frame → fail closed.
+        let truncated = signed.0[..signed.0.len() / 2].to_vec();
+        assert!(decode_wrapped_welcome(&truncated).is_err());
+        // Bad version byte → fail closed.
+        let mut bad_ver = signed.0.clone();
+        bad_ver[0] = 0xFF;
+        assert!(decode_wrapped_welcome(&bad_ver).is_err());
+        // Empty frame → fail closed.
+        assert!(decode_wrapped_welcome(&[]).is_err());
     }
 }
