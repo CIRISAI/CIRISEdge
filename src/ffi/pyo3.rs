@@ -6446,8 +6446,9 @@ fn member_from_py(
 /// - `PeerLacksMlkem`, `WelcomeMalformed`, `JoinerKeyPackageAbsent`,
 ///   and `AlreadyInitialized` are input-validation / caller-state
 ///   errors (`PyValueError`).
-/// - `WelcomeRejected` + `Mls(_)` are operation failures
-///   (`PyRuntimeError`).
+/// - `WelcomeRejected`, `Mls(_)`, and the #331 signed-Welcome trust
+///   rejections `InviterUnknown(_)` + `WelcomeSignatureRejected` are
+///   operation failures (`PyRuntimeError`).
 ///
 /// Note: as of L5-C (CIRISEdge#131) `ReplaceNotSupported` no longer
 /// exists — `RosterDelta::Replace` is implemented via batched
@@ -6459,9 +6460,10 @@ fn map_av_session_err(e: &crate::transport::realtime_av_session::AvSessionError)
         | AvSessionError::WelcomeMalformed(_)
         | AvSessionError::JoinerKeyPackageAbsent
         | AvSessionError::AlreadyInitialized => PyValueError::new_err(format!("{e}")),
-        AvSessionError::WelcomeRejected(_) | AvSessionError::Mls(_) => {
-            PyRuntimeError::new_err(format!("{e}"))
-        }
+        AvSessionError::WelcomeRejected(_)
+        | AvSessionError::Mls(_)
+        | AvSessionError::InviterUnknown(_)
+        | AvSessionError::WelcomeSignatureRejected => PyRuntimeError::new_err(format!("{e}")),
     }
 }
 

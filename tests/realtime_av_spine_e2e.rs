@@ -41,6 +41,49 @@ use ciris_edge::transport::realtime_av_dispatcher::{
 use ciris_edge::transport::realtime_av_mls::{mint_joiner_key_material, Member};
 use ciris_edge::transport::realtime_av_runtime::{AvPublisher, AvRelay, AvSubscriber};
 use ciris_edge::transport::realtime_av_session::AvSession;
+// CIRISEdge#331 (CC-5.4.4) — the realtime Welcome now carries a verifiable
+// ML-DSA-65 inviter signature; the spine e2e builds the inviter signer + the
+// joiner's X-Wing kex + a directory closure so the signed-Welcome path exercises.
+use ciris_crypto::{ml_kem, x25519, MlDsa65Signer, PqcSigner};
+use ciris_edge::mls::welcome_wrap::FederationDirectoryEntry;
+use ciris_edge::transport::federation_session::OwnKexKeys;
+
+/// A fresh joiner X-Wing kex pair: public half advertised to the inviter,
+/// secret half retained by the joiner to open the wrapped Welcome.
+// `x_sk`/`x_pk` + `mlkem_sk`/`mlkem_pk` are the conventional secret/public
+// kex-material names; the deliberate `_sk`/`_pk` suffixing is what reads.
+#[allow(clippy::similar_names)]
+fn fresh_joiner_xwing() -> (PeerKexPubkeys, OwnKexKeys) {
+    let (x_sk, x_pk) = x25519::generate_ephemeral_keypair().expect("x25519 keypair");
+    let (mlkem_sk, mlkem_pk) = ml_kem::generate_keypair().expect("ml-kem keypair");
+    (
+        PeerKexPubkeys {
+            x25519_pub: x_pk,
+            mlkem768_pub: Some(mlkem_pk.clone()),
+        },
+        OwnKexKeys {
+            x25519_priv: x_sk,
+            mlkem768_priv: Some(mlkem_sk),
+            mlkem768_pub: Some(mlkem_pk),
+        },
+    )
+}
+
+/// A federation-directory closure resolving exactly `pk_id` → `ml_dsa_pk`
+/// (every other id → `None`, fail-closed — no TOFU on the joiner side).
+fn directory_resolving(
+    pk_id: &str,
+    ml_dsa_pk: Vec<u8>,
+) -> impl FnMut(&str) -> Option<FederationDirectoryEntry> {
+    let want = pk_id.to_string();
+    move |id: &str| {
+        (id == want).then(|| FederationDirectoryEntry {
+            pk_id: id.to_string(),
+            ml_dsa_pk: ml_dsa_pk.clone(),
+            x_wing_pk: None,
+        })
+    }
+}
 
 // ─── in-memory transport stubs (the dispatcher's trait seam) ────────
 
@@ -163,9 +206,21 @@ async fn spine_publisher_relay_subscriber_glass_to_glass() {
     let (joiner_material, joiner_kp) =
         mint_joiner_key_material(sub_key_id).expect("mint joiner key material");
 
-    // Publisher admits the joiner → Commit + Welcome + rotated DEK.
+    // CIRISEdge#331 — the inviter (publisher) signs the Welcome with its long-term
+    // ML-DSA-65 federation identity; the joiner verifies it directory-only (no TOFU).
+    let inviter_signer = MlDsa65Signer::new().expect("inviter signer");
+    let inviter_pk = inviter_signer.public_key().expect("inviter pk");
+    let (joiner_kex_pub, joiner_kex_secret) = fresh_joiner_xwing();
+
+    // Publisher admits the joiner → Commit + signed Welcome + rotated DEK.
     let artifacts = publisher_session
-        .admit_published_joiner(sub_key_id, joiner_kp)
+        .admit_published_joiner(
+            sub_key_id,
+            joiner_kp,
+            &joiner_kex_pub,
+            &inviter_signer,
+            "publisher-fed",
+        )
         .expect("publisher admit joiner");
     assert_eq!(
         artifacts.welcome_bytes.len(),
@@ -176,10 +231,15 @@ async fn spine_publisher_relay_subscriber_glass_to_glass() {
         ciris_edge::transport::realtime_av::EpochDek::from_bytes(*artifacts.new_dek.as_bytes());
     let pub_epoch = artifacts.new_epoch;
 
-    // Subscriber bootstraps from the Welcome → derives its epoch DEK.
+    // Subscriber bootstraps from the Welcome → verifies the inviter signature
+    // against the directory-resolved key, then derives its epoch DEK.
     let mut sub_session = AvSession::new_joiner(s, joiner_material);
     let sub_dek = sub_session
-        .process_welcome(&artifacts.welcome_bytes[0])
+        .process_welcome(
+            &artifacts.welcome_bytes[0],
+            &joiner_kex_secret,
+            directory_resolving("publisher-fed", inviter_pk),
+        )
         .expect("subscriber process_welcome");
     assert_eq!(
         sub_dek.as_bytes(),
@@ -258,14 +318,27 @@ async fn spine_two_chunks_keep_counters_aligned() {
     let (mut publisher_session, _dek0) =
         AvSession::create(s, "publisher", vec![hybrid_member("seed")]).expect("create");
     let (joiner_material, joiner_kp) = mint_joiner_key_material(sub_key_id).expect("mint");
+    let inviter_signer = MlDsa65Signer::new().expect("inviter signer");
+    let inviter_pk = inviter_signer.public_key().expect("inviter pk");
+    let (joiner_kex_pub, joiner_kex_secret) = fresh_joiner_xwing();
     let artifacts = publisher_session
-        .admit_published_joiner(sub_key_id, joiner_kp)
+        .admit_published_joiner(
+            sub_key_id,
+            joiner_kp,
+            &joiner_kex_pub,
+            &inviter_signer,
+            "publisher-fed",
+        )
         .expect("admit");
     let pub_dek =
         ciris_edge::transport::realtime_av::EpochDek::from_bytes(*artifacts.new_dek.as_bytes());
     let mut sub_session = AvSession::new_joiner(s, joiner_material);
     let sub_dek = sub_session
-        .process_welcome(&artifacts.welcome_bytes[0])
+        .process_welcome(
+            &artifacts.welcome_bytes[0],
+            &joiner_kex_secret,
+            directory_resolving("publisher-fed", inviter_pk),
+        )
         .expect("welcome");
 
     let up_key = [0x33u8; 32];

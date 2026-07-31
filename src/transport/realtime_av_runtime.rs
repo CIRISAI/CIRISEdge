@@ -93,7 +93,12 @@ use super::realtime_av_dispatcher::{
 };
 use super::realtime_av_session::{AvSession, AvSessionError, EpochRekeyArtifacts, RosterDelta};
 use crate::transport::realtime_av::ReceiverLayerPolicy;
+// CIRISEdge#331 (CC-5.4.4) — admitting a published joiner now signs the Welcome
+// with the inviter's long-term ML-DSA-65 federation identity, so the spine must
+// thread that signer (+ the invitee's kex + the inviter's pk_id) into the admit.
+use crate::transport::federation_session::PeerKexPubkeys;
 use crate::transport::realtime_av_mls::Member;
+use ciris_crypto::MlDsa65Signer;
 
 /// Errors the runtime spine can surface. Each variant wraps the
 /// underlying layer's error so a caller can pattern-match on the tier
@@ -333,10 +338,20 @@ impl AvPublisher {
         &mut self,
         key_id: &str,
         joiner_key_package: openmls::prelude::KeyPackage,
+        // CIRISEdge#331 — the invitee's kex pubkeys, and the inviter's long-term
+        // ML-DSA-65 federation signer + its directory pk_id, so the emitted Welcome
+        // carries a verifiable inviter signature (no TOFU on the joiner side).
+        invitee_kex: &PeerKexPubkeys,
+        inviter_signer: &MlDsa65Signer,
+        inviter_pk_id: &str,
     ) -> Result<EpochRekeyArtifacts, AvRuntimeError> {
-        let artifacts = self
-            .session
-            .admit_published_joiner(key_id, joiner_key_package)?;
+        let artifacts = self.session.admit_published_joiner(
+            key_id,
+            joiner_key_package,
+            invitee_kex,
+            inviter_signer,
+            inviter_pk_id,
+        )?;
         // Copy the bytes into a fresh DEK so the returned artifacts keep
         // their `new_dek` for the caller's records; we rotate to our own
         // copy.
