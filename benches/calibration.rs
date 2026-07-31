@@ -53,6 +53,10 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 /// 64-bit integer arithmetic + multiplies, both of which every modern
 /// x86_64/aarch64 CPU executes at roughly the same per-cycle throughput
 /// regardless of microarchitecture.
+// The calibration anchor's inner loop MUST inline for a stable per-op wall-time —
+// that stability IS the anchor (clippy's inline_always caution is about general
+// code, not a deliberate timing reference). Edge's pre-push hook lints benches.
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn splitmix64(z: &mut u64) -> u64 {
     *z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
