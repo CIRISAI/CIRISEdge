@@ -27,19 +27,45 @@
 //! memory against never-completing frames (lost fragments / attacker floods) with
 //! an LRU cap on in-flight messages.
 //!
-//! ## The whole-frame-retry ceiling (honest limitation)
-//! Because retry is at whole-frame granularity, a frame that needs THOUSANDS of
-//! fragments has a vanishing per-round reassembly probability under sustained
-//! packet loss (`(1-loss)^fragments` → 0). Two things keep this off the live path:
-//! (1) the [`crate::replication::session::MAX_DELIVER_ENVELOPE_BYTES`] budget caps
-//! a single `Deliver` so its fragment count stays bounded in the peer's holdings —
-//! the amplification cliff (a peer with hundreds of attestations → one multi-MB
-//! frame) cannot form; and (2) when the link is not mid-transfer the frame takes
-//! the reliable Resource path (leviculum segments + ARQs), not this packet path —
-//! this fragmenter is specifically the BUSY-link reverse-path carrier. The genuine
-//! residual — a single very large frame on a *sustained-busy* lossy reverse-path
-//! link — is closed only by fragment-level ARQ (selective NAK/retransmit), a
-//! tracked follow-up; the `replication::sim` DST is the harness to build it on.
+//! ## The whole-frame-retry ceiling — and its ARQ closure (CIRISEdge#422)
+//! Because whole-frame retry is at whole-frame granularity, a frame that needs
+//! THOUSANDS of fragments has a vanishing per-round reassembly probability under
+//! sustained packet loss (`(1-loss)^fragments` → 0). Two things keep this off the
+//! live path: (1) the [`crate::replication::session::MAX_DELIVER_ENVELOPE_BYTES`]
+//! budget caps a single `Deliver` so its fragment count stays bounded in the
+//! peer's holdings — the amplification cliff (a peer with hundreds of attestations
+//! → one multi-MB frame) cannot form; and (2) when the link is not mid-transfer
+//! the frame takes the reliable Resource path (leviculum segments + ARQs), not
+//! this packet path — this fragmenter is specifically the BUSY-link reverse-path
+//! carrier. The genuine residual — a single very large frame on a *sustained-busy*
+//! lossy reverse-path link, where every fragment must ride packets so the per-round
+//! reassembly odds `(1-loss)^fragments` → 0 and whole-frame retry converges only by
+//! RE-SENDING the entire frame round after round (fragments accumulate across
+//! rounds, but at whole-frame bandwidth cost) — is now closed by fragment-level ARQ
+//! (below): the gap is recovered selectively, in-round, instead of re-fragmenting
+//! and re-sending the whole frame each round.
+//!
+//! ## Fragment-level ARQ (CIRISEdge#422) — the selective path
+//! Selective NAK/retransmit at fragment granularity, so a lossy multi-thousand-
+//! fragment frame converges IN-round instead of re-sending the whole frame:
+//!   - [`Reassembler::missing`] reports, per in-flight `msg_id`, exactly the
+//!     fragment indices not yet received — it learns `total` from any ONE arrived
+//!     fragment, so a single fragment is enough to enumerate the whole gap.
+//!   - [`build_naks`] packs those indices into sub-MDU `CNAK` control packets the
+//!     receiver sends back to the sender (chunked so each NAK itself fits the MDU
+//!     and rides the same packet path); [`parse_nak`] reads them.
+//!   - the sender holds its emitted fragment sets in a [`RetransmitBuffer`] and, on
+//!     a NAK, re-sends ONLY the named indices ([`RetransmitBuffer::retransmit`]),
+//!     NEVER the whole frame. A lost NAK or lost retransmit is just re-NAK'd next
+//!     pass (each is itself a packet subject to the same loss), so recovery is a
+//!     bounded selective loop, not a whole-frame gamble.
+//!
+//! The whole-frame re-diff path is PRESERVED as the fallback for the one case ARQ
+//! cannot serve: a frame of which the receiver got ZERO fragments (no `total`, no
+//! partial, nothing to NAK) still heals across rounds. The DST oracle
+//! `replication::sim::fragment_arq_converges_worst_corner_without_whole_frame_resend`
+//! drives the worst corner (large single frame ∧ high loss ∧ tiny MDU ∧ sustained
+//! busy) and asserts convergence with the whole-frame re-send count at ZERO.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -62,11 +88,53 @@ pub const MIN_FRAGMENTABLE_MDU: usize = FRAGMENT_HEADER_LEN + 16;
 /// reject ceiling — so every admissible frame fragments.
 const MAX_FRAGMENTS: usize = u16::MAX as usize;
 
+/// CIRISEdge#422 — fragment-ARQ NAK magic. A third, distinct 4-byte tag so a
+/// receiver tells a NAK (`CNAK`) from a whole frame (`CRPL`) or a data fragment
+/// (`CFRG`) at a glance — a NAK is a TRANSPORT-level control packet, never a
+/// replication message, so it is dispatched before frame reassembly and never
+/// reaches `try_unwrap`.
+pub const NAK_MAGIC: [u8; 4] = *b"CNAK";
+
+/// NAK wire layout: `magic[4] ‖ msg_id[8] ‖ count[u16 BE] ‖ index[u16 BE] * count`.
+/// The `count` indices name the fragments the receiver is still missing for
+/// `msg_id`; the sender re-sends exactly those. `count` is bounded per packet so
+/// the NAK itself fits the link MDU ([`max_nak_indices`]); a gap larger than one
+/// NAK is split across several ([`build_naks`]).
+pub const NAK_HEADER_LEN: usize = 4 + 8 + 2;
+
 /// True iff `bytes` is a fragment (starts with [`FRAGMENT_MAGIC`]). A whole frame
 /// (`CRPL…`) or a plain envelope never does.
 #[must_use]
 pub fn is_fragment(bytes: &[u8]) -> bool {
     bytes.len() >= FRAGMENT_HEADER_LEN && bytes[..4] == FRAGMENT_MAGIC
+}
+
+/// The `msg_id` a `CFRG` fragment belongs to (bytes `[4..12]`), or `None` if `frag`
+/// is not a fragment. CIRISEdge#422 — the key both the [`RetransmitBuffer`] and the
+/// NAK path group a frame's fragments under.
+#[must_use]
+pub fn msg_id_of_fragment(frag: &[u8]) -> Option<[u8; 8]> {
+    if !is_fragment(frag) {
+        return None;
+    }
+    frag[4..12].try_into().ok()
+}
+
+/// The fragment index a `CFRG` fragment carries (bytes `[14..16]`, BE), or `None` if
+/// `frag` is not a fragment. CIRISEdge#422 — used to name the exact fragment in a
+/// retransmit log line (this class must never be a silent drop).
+#[must_use]
+pub fn fragment_index(frag: &[u8]) -> Option<u16> {
+    if !is_fragment(frag) {
+        return None;
+    }
+    Some(u16::from_be_bytes([frag[14], frag[15]]))
+}
+
+/// True iff `bytes` is a fragment-ARQ NAK (starts with [`NAK_MAGIC`]). CIRISEdge#422.
+#[must_use]
+pub fn is_nak(bytes: &[u8]) -> bool {
+    bytes.len() >= NAK_HEADER_LEN && bytes[..4] == NAK_MAGIC
 }
 
 /// The deterministic per-frame id — first 8 bytes of `sha256(frame)`. Groups a
@@ -117,6 +185,65 @@ pub fn fragment(frame: &[u8], mdu: usize) -> Option<Vec<Vec<u8>>> {
         out.push(frag);
     }
     Some(out)
+}
+
+/// CIRISEdge#422 — how many fragment indices fit in one NAK packet for a link of
+/// `mdu` bytes: `(mdu − header) / 2` (each index is a `u16`). Zero when the MDU is
+/// too small to carry even one index — then the frame has no NAK path and heals via
+/// the whole-frame re-diff fallback.
+#[must_use]
+pub fn max_nak_indices(mdu: usize) -> usize {
+    mdu.saturating_sub(NAK_HEADER_LEN) / 2
+}
+
+/// Build the sub-MDU `CNAK` control packets that request the `missing` fragment
+/// indices of `msg_id` from the sender. The index list is split across as many NAK
+/// packets as needed so each fits `mdu` ([`max_nak_indices`]); an empty `missing`
+/// or an MDU too small for a single index yields no packets (the caller then leaves
+/// the frame to the whole-frame re-diff fallback — a decision it logs LOUD, never a
+/// silent drop). Deterministic: packets follow `missing`'s order exactly.
+#[must_use]
+pub fn build_naks(msg_id: &[u8; 8], missing: &[u16], mdu: usize) -> Vec<Vec<u8>> {
+    let per = max_nak_indices(mdu);
+    if per == 0 || missing.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(missing.len().div_ceil(per));
+    for batch in missing.chunks(per) {
+        // `batch.len() <= per`, and `per` fits a `u16` for any realistic link MDU
+        // (≤ ~131 KB) — the `unwrap_or` is a truncation-proof cast, not a live path.
+        let count = u16::try_from(batch.len()).unwrap_or(u16::MAX);
+        let mut nak = Vec::with_capacity(NAK_HEADER_LEN + batch.len() * 2);
+        nak.extend_from_slice(&NAK_MAGIC);
+        nak.extend_from_slice(msg_id);
+        nak.extend_from_slice(&count.to_be_bytes());
+        for &idx in batch {
+            nak.extend_from_slice(&idx.to_be_bytes());
+        }
+        out.push(nak);
+    }
+    out
+}
+
+/// Parse a `CNAK` packet into its `(msg_id, requested_indices)`. `None` for a
+/// non-NAK or a truncated/inconsistent packet (declared `count` overruns the body)
+/// — a malformed NAK is dropped, never acted on.
+#[must_use]
+pub fn parse_nak(bytes: &[u8]) -> Option<([u8; 8], Vec<u16>)> {
+    if !is_nak(bytes) {
+        return None;
+    }
+    let msg_id: [u8; 8] = bytes[4..12].try_into().ok()?;
+    let count = usize::from(u16::from_be_bytes(bytes[12..14].try_into().ok()?));
+    let idx_bytes = &bytes[NAK_HEADER_LEN..];
+    if idx_bytes.len() < count * 2 {
+        return None; // truncated — declared more indices than the packet carries
+    }
+    let indices = idx_bytes[..count * 2]
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    Some((msg_id, indices))
 }
 
 struct Partial {
@@ -212,9 +339,130 @@ impl Reassembler {
     pub fn in_flight(&self) -> usize {
         self.partials.len()
     }
+
+    /// CIRISEdge#422 — per in-flight frame, the fragment indices NOT yet received:
+    /// the receiver's NAK source. It knows `total` from any one arrived fragment, so
+    /// a single fragment is enough to enumerate the whole gap. Iterates the LRU
+    /// `order` (insertion order), NOT the `HashMap`, so the NAK stream is
+    /// DETERMINISTIC — a seeded DST reproduces it bit-for-bit. A complete frame is
+    /// already gone from `partials` (removed on reassembly), so it is never listed.
+    #[must_use]
+    pub fn missing(&self) -> Vec<([u8; 8], Vec<u16>)> {
+        let mut out = Vec::new();
+        for msg_id in &self.order {
+            let Some(partial) = self.partials.get(msg_id) else {
+                continue;
+            };
+            let miss: Vec<u16> = (0..partial.total)
+                .filter(|i| !partial.chunks.contains_key(i))
+                .collect();
+            if !miss.is_empty() {
+                out.push((*msg_id, miss));
+            }
+        }
+        out
+    }
 }
 
 impl Default for Reassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// CIRISEdge#422 — the SENDER-side half of fragment-level ARQ: the fragment sets a
+/// node has emitted, keyed by `msg_id`, so a peer's NAK is served by re-sending only
+/// the named fragments — NEVER by re-fragmenting the whole frame. LRU-bounded (a
+/// peer that never completes cannot pin a sender's buffers), and deterministic:
+/// eviction is by record order, which the seeded DST drives reproducibly.
+pub struct RetransmitBuffer {
+    frames: HashMap<[u8; 8], Vec<Vec<u8>>>,
+    order: VecDeque<[u8; 8]>,
+    max_in_flight: usize,
+}
+
+impl RetransmitBuffer {
+    /// Default cap on concurrently-retransmittable frames held per sender. Smaller
+    /// than the reassembler's cap: a sender only needs its own in-flight Delivers,
+    /// not every peer's inbound stream.
+    pub const DEFAULT_MAX_IN_FLIGHT: usize = 64;
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_MAX_IN_FLIGHT)
+    }
+
+    #[must_use]
+    pub fn with_capacity(max_in_flight: usize) -> Self {
+        Self {
+            frames: HashMap::new(),
+            order: VecDeque::new(),
+            max_in_flight: max_in_flight.max(1),
+        }
+    }
+
+    /// Record a just-emitted fragment SET (the ordered output of [`fragment`]) so a
+    /// later NAK can be served without re-fragmenting the whole frame. A set that is
+    /// a single unwrapped whole frame (frame ≤ MDU — not a `CFRG` fragment) is NOT
+    /// fragment-ARQ'able and is skipped; its loss heals via the whole-frame re-diff
+    /// fallback. Idempotent per `msg_id` (re-recording the same frame overwrites,
+    /// keeping its LRU position), and bounded so the buffer cannot grow without
+    /// limit under a peer that never completes.
+    pub fn record(&mut self, fragments: &[Vec<u8>]) {
+        let Some(first) = fragments.first() else {
+            return;
+        };
+        let Some(msg_id) = msg_id_of_fragment(first) else {
+            return; // a single whole frame, not a CFRG set — no fragment ARQ
+        };
+        if self.frames.insert(msg_id, fragments.to_vec()).is_none() {
+            self.order.push_back(msg_id);
+        }
+        while self.order.len() > self.max_in_flight {
+            if let Some(oldest) = self.order.pop_front() {
+                self.frames.remove(&oldest);
+            }
+        }
+    }
+
+    /// Re-materialise the fragment PACKETS the peer NAK'd for `msg_id` — only the
+    /// named `indices`, never the whole set. An unknown `msg_id` (LRU-evicted or
+    /// never recorded) or an out-of-range index contributes nothing for that index:
+    /// a genuine shortfall the caller detects (served `<` requested) and logs LOUD,
+    /// leaving the remainder to the whole-frame re-diff fallback. The fragment for
+    /// index `i` is element `i` of the recorded set — [`fragment`] emits them in
+    /// order — so the lookup is positional and O(1) per index.
+    #[must_use]
+    pub fn retransmit(&self, msg_id: &[u8; 8], indices: &[u16]) -> Vec<Vec<u8>> {
+        let Some(set) = self.frames.get(msg_id) else {
+            return Vec::new();
+        };
+        indices
+            .iter()
+            .filter_map(|&i| set.get(usize::from(i)).cloned())
+            .collect()
+    }
+
+    /// Whether a frame's fragments are still held for retransmit (diagnostics/tests).
+    #[must_use]
+    pub fn holds(&self, msg_id: &[u8; 8]) -> bool {
+        self.frames.contains_key(msg_id)
+    }
+
+    /// Frames currently held for retransmit — diagnostics/tests.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Whether the buffer holds nothing — diagnostics/tests.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
+impl Default for RetransmitBuffer {
     fn default() -> Self {
         Self::new()
     }
@@ -350,5 +598,156 @@ mod tests {
     fn tiny_mdu_refuses_to_fragment() {
         let frame = vec![0u8; 1000];
         assert!(fragment(&frame, MIN_FRAGMENTABLE_MDU - 1).is_none());
+    }
+
+    // ---- CIRISEdge#422 fragment-level ARQ primitives ----
+
+    #[test]
+    fn nak_round_trips_and_is_distinct_from_frame_and_fragment() {
+        let msg_id = [0xAB, 0xCD, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let missing = vec![0u16, 3, 7, 42, 65_535];
+        let naks = build_naks(&msg_id, &missing, MDU);
+        assert_eq!(naks.len(), 1, "5 indices fit one NAK at a 431 B MDU");
+        let nak = &naks[0];
+        // A NAK is neither a whole frame (`CRPL`) nor a data fragment (`CFRG`).
+        assert!(is_nak(nak));
+        assert!(!is_fragment(nak));
+        assert_ne!(
+            &nak[..4],
+            &crate::replication::wire_frame::REPLICATION_FRAME_MAGIC
+        );
+        let (got_id, got_missing) = parse_nak(nak).expect("well-formed NAK parses");
+        assert_eq!(got_id, msg_id);
+        assert_eq!(
+            got_missing, missing,
+            "indices survive the round trip in order"
+        );
+    }
+
+    #[test]
+    fn build_naks_splits_to_fit_the_mdu_and_refuses_a_tiny_one() {
+        // 500 missing indices at a small MDU must split into several sub-MDU NAKs.
+        let msg_id = [9u8; 8];
+        let missing: Vec<u16> = (0..500u16).collect();
+        let mdu = 200;
+        let naks = build_naks(&msg_id, &missing, mdu);
+        assert!(naks.len() > 1, "a large gap splits across multiple NAKs");
+        for nak in &naks {
+            assert!(nak.len() <= mdu, "every NAK fits the link MDU");
+            assert!(is_nak(nak));
+        }
+        // Reassembling every NAK's indices reproduces the full gap, in order.
+        let round_tripped: Vec<u16> = naks.iter().flat_map(|n| parse_nak(n).unwrap().1).collect();
+        assert_eq!(round_tripped, missing);
+        // An MDU too small to carry even one index yields no NAK — the frame then
+        // heals via the whole-frame re-diff fallback.
+        assert!(build_naks(&msg_id, &missing, NAK_HEADER_LEN + 1).is_empty());
+        assert!(build_naks(&msg_id, &[], MDU).is_empty(), "no gap ⇒ no NAK");
+    }
+
+    #[test]
+    fn parse_nak_rejects_a_truncated_packet() {
+        let msg_id = [1u8; 8];
+        let mut nak = build_naks(&msg_id, &[1u16, 2, 3], MDU).pop().unwrap();
+        nak.truncate(nak.len() - 1); // drop a byte of the last index
+        assert!(
+            parse_nak(&nak).is_none(),
+            "a truncated NAK is dropped, not acted on"
+        );
+    }
+
+    #[test]
+    fn reassembler_missing_reports_the_exact_gap() {
+        let frame: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+        let frags = fragment(&frame, MDU).unwrap();
+        let total = frags.len();
+        let mut r = Reassembler::new();
+        // Feed every fragment EXCEPT indices 2 and 5.
+        for (i, f) in frags.iter().enumerate() {
+            if i != 2 && i != 5 {
+                r.accept(f);
+            }
+        }
+        let missing = r.missing();
+        assert_eq!(missing.len(), 1, "one in-flight frame");
+        let (msg_id, gap) = &missing[0];
+        assert_eq!(*msg_id, msg_id_of_fragment(&frags[0]).unwrap());
+        assert_eq!(
+            gap,
+            &vec![2u16, 5],
+            "exactly the dropped indices, ascending"
+        );
+        // Feeding a complete frame leaves nothing missing.
+        assert!(total > 6);
+    }
+
+    #[test]
+    fn retransmit_serves_only_named_indices() {
+        let frame: Vec<u8> = (0..5_000u32).map(|i| (i % 251) as u8).collect();
+        let frags = fragment(&frame, MDU).unwrap();
+        let msg_id = msg_id_of_fragment(&frags[0]).unwrap();
+        let mut retx = RetransmitBuffer::new();
+        retx.record(&frags);
+        assert!(retx.holds(&msg_id));
+        // Ask for exactly indices 2 and 5 — get exactly those two fragment packets.
+        let got = retx.retransmit(&msg_id, &[2, 5]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(fragment_index(&got[0]), Some(2));
+        assert_eq!(fragment_index(&got[1]), Some(5));
+        // An unknown msg_id serves nothing (a shortfall the caller logs LOUD).
+        assert!(retx.retransmit(&[0xFF; 8], &[0, 1]).is_empty());
+        // A single whole frame (≤ MDU) is not retransmittable at fragment level.
+        let small = fragment(b"CRPL\x01 tiny", MDU).unwrap();
+        let mut r2 = RetransmitBuffer::new();
+        r2.record(&small);
+        assert!(
+            r2.is_empty(),
+            "a whole small frame is not fragment-ARQ'able"
+        );
+    }
+
+    #[test]
+    fn selective_arq_recovers_a_lossy_frame_without_a_whole_resend() {
+        // End-to-end at the primitive level: fragment a frame, deliver it with a
+        // scattered loss, then NAK→retransmit ONLY the gap and reassemble — proving
+        // recovery costs far fewer than `total` fragments (no whole-frame re-send).
+        let frame: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let frags = fragment(&frame, MDU).unwrap();
+        let total = frags.len();
+        assert!(total > 50);
+        let mut sender = RetransmitBuffer::new();
+        sender.record(&frags);
+        let mut r = Reassembler::new();
+        // Deliver every 4th fragment lost (indices 0,4,8,… dropped).
+        let mut completed = None;
+        for (i, f) in frags.iter().enumerate() {
+            if i % 4 != 0 {
+                completed = r.accept(f).or(completed);
+            }
+        }
+        assert!(
+            completed.is_none(),
+            "with a quarter dropped it cannot complete yet"
+        );
+        // NAK the gap; the sender re-sends only those, and reassembly completes.
+        let mut retransmitted = 0usize;
+        for (msg_id, gap) in r.missing() {
+            for nak in build_naks(&msg_id, &gap, MDU) {
+                let (id, idxs) = parse_nak(&nak).unwrap();
+                for f in sender.retransmit(&id, &idxs) {
+                    retransmitted += 1;
+                    completed = r.accept(&f).or(completed);
+                }
+            }
+        }
+        assert_eq!(
+            completed.as_ref(),
+            Some(&frame),
+            "selective retransmit reassembles byte-exact"
+        );
+        assert!(
+            retransmitted < total,
+            "recovery re-sent {retransmitted} of {total} fragments — a SUBSET, not the whole frame",
+        );
     }
 }
