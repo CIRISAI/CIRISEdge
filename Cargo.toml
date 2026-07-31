@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "15.6.1"
+version = "15.6.2"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -578,8 +578,8 @@ tempfile       = { version = "3", optional = true }
 # ~32% to ~1% (bench-measured), directly relieving the CIRISEdge#370 reply-stall
 # component — the round-outcome instrument (v13.5.0) observes it in the field.
 # The `+ciris.1` is fork build-metadata; the crate semver is 0.10.
-leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.10.2+ciris.1", version = "0.10", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.10.2+ciris.1", version = "0.10", optional = true }
+leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.12.0+ciris.1", version = "0.12", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.12.0+ciris.1", version = "0.12", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
