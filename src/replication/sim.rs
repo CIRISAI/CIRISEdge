@@ -651,4 +651,99 @@ mod tests {
             }
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // VALUE-EMITTING DUMP (CIRISEdge#430 bench-superset) — the replication-
+    // plane half of the honest publishing lane (twin of
+    // realtime_av_alm::sim::tests::bench_dump_mesh_metrics). PRINTS each
+    // anti-entropy metric's VALUE as a sentinel-prefixed libtest-bencher line
+    // so `benchmark-action/github-action-benchmark` trends it per-release.
+    // Never asserts.
+    //
+    // Wire contract with `.github/workflows/bench.yml`: lines are
+    //   `SIMBENCH test replication/<name> ... bench: <int> ns/iter (+/- 0)`
+    // appended UN-normalized (rounds/ratios are semantic, not wall-time). The
+    // `ns/iter` unit is a libtest artifact; the scale is in the name suffix
+    // (`_x1000` ⇒ value×1000, `_x100000` ⇒ ratio×100000).
+    //
+    // Run: cargo test --release --lib bench_dump_replication_metrics -- --nocapture
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn bench_dump_replication_metrics() {
+        fn dump(name: &str, value: i64) {
+            println!("SIMBENCH test {name} ... bench: {value} ns/iter (+/- 0)");
+        }
+
+        // Build a converging anti-entropy scenario at a fixed operating point:
+        // `num_i` initiator envelopes + 2 responder envelopes of `raw_size`,
+        // fragmentation ON, `loss`% per-packet loss, ample re-diff budget.
+        let scenario = |seed: u64, num_i: usize, raw_size: usize, loss_pct: u32| Scenario {
+            kind: EnvelopeKind::Attestation,
+            seed,
+            faults: SimFaults {
+                loss_per_mille: loss_pct * 10,
+                reorder_per_mille: 20,
+                dup_per_mille: 10,
+                max_rounds: 40,         // transient loss heals across re-diffs
+                ..SimFaults::default()  // fragment = true, mdu = 431
+            },
+            initiator_payloads: payloads(num_i, raw_size, 0),
+            responder_payloads: payloads(2, 800, 9),
+        };
+
+        // ── Lane A — fixed-operating-point replication metrics ───────────
+
+        // Anti-entropy rounds @ fixed loss (replication/summary) — mean
+        // rounds-to-converge over 200 seeds at 2 % loss, 6-envelope fat
+        // corpus. ×1000 to preserve the fractional mean.
+        let rounds: Vec<f64> = (0..200u64)
+            .map(|s| scenario(s, 6, 5_000, 2).run().rounds_used as f64)
+            .collect();
+        dump(
+            "replication/antientropy_rounds_loss2pct_mean_x1000",
+            (mean(&rounds) * 1_000.0).round() as i64,
+        );
+
+        // Reassembly delivery ratio @ fixed loss (replication/wire_frame) —
+        // fraction of scenarios that fully converged (both sides hold the
+        // union — the fragment-reassembly + re-diff loop delivered every
+        // oversized Deliver) at 3 % loss over 200 seeds. ×100000.
+        let converged = (0..200u64)
+            .filter(|&s| scenario(s, 6, 5_000, 3).run().converged())
+            .count();
+        dump(
+            "replication/reassembly_delivery_ratio_loss3pct_x100000",
+            ((converged as f64 / 200.0) * 100_000.0).round() as i64,
+        );
+
+        // ── Lane B — convergence-rounds vs corpus size (one name per N) ──
+
+        // rounds-to-converge as the initiator corpus grows (bigger union ⇒
+        // larger Deliver ⇒ more fragments ⇒ more re-diff pressure under loss).
+        // N = initiator envelope count; fixed 2 % loss, raw_size 3000, mean
+        // over 40 seeds, ×1000.
+        for &n in &[1usize, 8, 32, 128] {
+            let r: Vec<f64> = (0..40u64)
+                .map(|s| scenario(s, n, 3_000, 2).run().rounds_used as f64)
+                .collect();
+            dump(
+                &format!("replication/convergence_rounds/N{n}_x1000"),
+                (mean(&r) * 1_000.0).round() as i64,
+            );
+        }
+    }
+
+    /// Arithmetic mean of a sample set (0.0 on empty).
+    #[allow(clippy::cast_precision_loss)]
+    fn mean(xs: &[f64]) -> f64 {
+        if xs.is_empty() {
+            0.0
+        } else {
+            xs.iter().sum::<f64>() / xs.len() as f64
+        }
+    }
 }

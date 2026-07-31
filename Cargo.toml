@@ -1013,6 +1013,20 @@ required-features = ["ffi-uniffi"]
 # (.github/workflows/bench.yml) drives all three feature sets in
 # sequence.
 
+# v15.7.0 (CIRISEdge#430 bench-superset) — runner-noise calibration
+# anchor. Pure-compute SplitMix64 (CPU) + DRAM-random-walk (memory) micro-
+# benches whose `ns/iter` capture THIS runner's wall-time-per-op rate; the
+# bench workflow's normalization step divides every wall-clock micro-bench
+# by the matching anchor so the gh-pages trend is runner-independent.
+# Default features (no transport) so the anchor is available to every
+# feature-set variant of the suite. Mirrors CIRISPersist's benches/
+# calibration.rs verbatim (shared substrate ⇒ shared noise model). Runs
+# FIRST in the workflow. See benches/calibration.rs for the anchor names +
+# the "do not touch the inner loops" invariant.
+[[bench]]
+name = "calibration"
+harness = false
+
 [[bench]]
 name = "envelope_canonicalize"
 harness = false
