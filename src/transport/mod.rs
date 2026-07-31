@@ -74,6 +74,17 @@ pub mod realtime_av_relay;
 /// alike and stays ungated.
 pub mod realtime_av_dispatcher;
 
+/// Realtime A/V mesh integrating runtime — "the spine" (CIRISEdge#155,
+/// Gap 3). Composes the dormant Layer-1/Layer-2/MLS/ALM primitives into
+/// live publisher / relay / subscriber role objects that run ONE stream
+/// end-to-end. Transport-blind over the [`realtime_av_dispatcher`]
+/// [`realtime_av_dispatcher::AvLinkSender`] /
+/// [`realtime_av_dispatcher::AvLinkReceiver`] seam, so the spine stays
+/// ungated; the real-RNS [`realtime_av_runtime::LeviculumAvSender`] /
+/// [`realtime_av_runtime::LinkDataPump`] over leviculum links are gated
+/// behind `_reticulum-module` (their only leviculum dependency).
+pub mod realtime_av_runtime;
+
 /// Application-Layer Multicast (ALM) — mesh-tree video built on the
 /// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
 /// CIRISEdge#128 MDC). Pure-Rust, signed [`realtime_av_alm::RelayCapacity`]
