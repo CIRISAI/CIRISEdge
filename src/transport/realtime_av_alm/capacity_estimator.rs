@@ -955,6 +955,9 @@ mod tests {
             (state >> 33) as u32
         };
         for _ in 0..5_000 {
+            // `next() % 100` is ≤ 99, exact in an f32 mantissa — the
+            // cast_precision_loss lint is about large u32, not this bounded value.
+            #[allow(clippy::cast_precision_loss)]
             let mbps = 1.0 + (next() % 100) as f32; // 1..=100 Mbps
             let app_limited = next() % 4 != 0; // ~25% congestion-limited
             let sample = CapacitySample {

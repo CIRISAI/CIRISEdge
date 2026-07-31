@@ -212,6 +212,9 @@ jobs:
           # High-volume seeded soak (proptest gate is 256 cases in --lib; this is
           # the volume tier). Any non-convergence prints its reproduction seed.
           CIRIS_DST_SOAK: "20000"
+          # A/V ALM mesh soak (the #[ignore]'d high-volume tier of the ALM perf
+          # suite — 256-case proptest gate runs in --lib; this is the volume tier).
+          CIRIS_ALM_SOAK: "20000"
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 30
@@ -222,6 +225,11 @@ jobs:
             set -euo pipefail
             cargo test --features "transport-http transport-reticulum" --lib \
               dst_soak -- --ignored --nocapture
+            # A/V ALM mesh soak (topology + heal + capacity under seeded churn/
+            # bandwidth-change — the volume tier of the perf suite; a failure
+            # prints its reproduction seed).
+            cargo test --features "transport-http transport-reticulum" --lib \
+              realtime_av_alm::sim::tests::alm_soak -- --ignored --nocapture
             cargo test --features "transport-http transport-reticulum" \
               --test fragmentation_reassembly \
               --test replication_wire_proptest \
@@ -231,7 +239,8 @@ jobs:
               --test leviculum_interface_diversity \
               --test reachability_integration \
               --test route_table_e2e \
-              --test explicit_hash_addressing
+              --test explicit_hash_addressing \
+              --test realtime_av_spine_e2e
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
