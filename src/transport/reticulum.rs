@@ -2527,6 +2527,38 @@ impl ReticulumTransport {
         self.established_links.lock().await.len()
     }
 
+    /// ALM-A(cap) passive capacity-estimator seam (leviculum#35,
+    /// `docs/AV_ALM_DESIGN.md` §5.1). Snapshot every active link's
+    /// cumulative delivery telemetry via leviculum v0.12.0's
+    /// [`ReticulumNode::link_stats`] and hand it to the estimator's pure
+    /// core as [`LinkCounters`]. This is the ENTIRE impure/leviculum-reading
+    /// surface — the sampler differences these against the previous snapshot
+    /// ([`capacity_estimator::diff_link`]), aggregates
+    /// ([`capacity_estimator::aggregate`]), and feeds
+    /// [`CapacityEstimator::observe`]; a ~1 Hz caller re-signs only on a
+    /// returned bucket crossing.
+    ///
+    /// Read-only, one `link_stats` call per active link, zero added wire
+    /// bytes, no new task — the design's "one stat read per link per second,
+    /// no battery hit".
+    #[must_use]
+    pub async fn capacity_link_counters(
+        &self,
+    ) -> Vec<(
+        LinkId,
+        crate::transport::realtime_av_alm::capacity_estimator::LinkCounters,
+    )> {
+        use crate::transport::realtime_av_alm::capacity_estimator::LinkCounters;
+        let established = self.established_links.lock().await;
+        let mut out = Vec::with_capacity(established.len());
+        for link_id in established.iter() {
+            if let Some(stats) = self.node.link_stats(link_id) {
+                out.push((*link_id, LinkCounters::from(&stats)));
+            }
+        }
+        out
+    }
+
     /// Explicitly open a Reticulum Link to `destination_hash`. The
     /// underlying [`ReticulumNode::connect`] is invoked; this method
     /// then polls until the link reaches `LinkEstablished` on both

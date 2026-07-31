@@ -23,6 +23,14 @@
 //!   relay willingness + uplink budget + (new in v3.8.0) MDC
 //!   sub-stream commitments. Signed for HNDL discipline, ready to be
 //!   written to the federation directory.
+//! - **ALM-A(cap)** ([`capacity_estimator`]) — the passive
+//!   upload-capacity estimator (`docs/AV_ALM_DESIGN.md` §5.1 + §6;
+//!   leviculum#35) that PRODUCES the `uplink_mbps` / servable-layers a
+//!   relay is allowed to sign. Reads per-link delivery telemetry, filters
+//!   it into a demonstrated-sustainable floor (over-claim impossible by
+//!   construction), quantizes to whole servable layers, and coalesces a
+//!   "capacity changed" signal so re-attestation fires only on a bucket
+//!   crossing. Pure core; the leviculum read is one thin gated adapter.
 //! - **ALM-B** ([`join`]) — parent-finding: given a stream and the set
 //!   of fresh [`capacity::SignedRelayCapacity`] advertisements, select
 //!   a parent for THIS peer that respects fan-out budgets, locality,
@@ -57,12 +65,19 @@
 //!   multi-parent cost.
 
 pub mod capacity;
+pub mod capacity_estimator;
 pub mod heal;
 pub mod join;
 
 pub use capacity::{
     AlmCapacityError, PeerKeyId, PeerSigningPubkeys, RelayCapacity, SignedRelayCapacity,
     SubStreamCommitment, SubStreamPath, MEASUREMENT_WINDOW_SECS, STALE_AFTER_SECS,
+};
+pub use capacity_estimator::{
+    aggregate, bucketize, diff_link, CapacityChange, CapacityEstimator, CapacitySample,
+    DemonstratedCapacity, EstimatorArm, EstimatorConfig, LinkCounters, LinkInterval,
+    CEILING_DECAY_SPAN_SECS, CEILING_STALE_SECS, FLOOR_PERCENTILE, FLOOR_WINDOW_SECS,
+    SAFETY_MARGIN, UPGRADE_HOLD_WINDOWS,
 };
 pub use heal::{
     DedupRing, HealAction, HealApplyOutcome, MultiParentSubscription, ObserveOutcome,
