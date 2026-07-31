@@ -26,9 +26,37 @@ use crate::replication::protocol::{EnvelopeKind, EnvelopeRef};
 use crate::replication::session::{ReplicationOutcome, Session, SessionRole};
 use crate::replication::summary::{ApplyOutcome, StateApplier, StateProvider};
 use crate::replication::{wire_frame, LocalState};
-use crate::transport::frame_fragment::{fragment, Reassembler};
+use crate::transport::frame_fragment::{self, fragment, Reassembler, RetransmitBuffer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+
+/// CIRISEdge#422 — max fragment-ARQ recovery passes per anti-entropy round before
+/// the round is abandoned to the whole-frame re-diff fallback. Each pass re-NAKs
+/// whatever is still missing and the sender re-sends ONLY those; a lost NAK or
+/// retransmit just costs a pass. Sized so a worst-corner frame (thousands of
+/// fragments at 15 %+ loss) recovers IN-round with overwhelming margin — per-pass
+/// per-fragment recovery is ~`(1-loss)²` ≈ 0.7, so the chance a fragment survives
+/// this many passes un-recovered is ~0; the bound only guarantees termination, it
+/// never bites a correct run.
+const MAX_ARQ_PASSES: usize = 256;
+
+/// Backstop on packets processed per round (a real stall shows as non-convergence,
+/// not a hang). Raised from the pre-ARQ 100 000 because an ARQ round legitimately
+/// processes (initial fragments + up to `MAX_ARQ_PASSES` × per-pass NAK/retransmit)
+/// packets for a multi-thousand-fragment frame.
+const MAX_ROUND_STEPS: usize = 5_000_000;
+
+/// Render an 8-byte `msg_id` as hex for structured logs — CIRISEdge#422: every NAK
+/// and retransmit names the frame it is about, so this class is greppable in a live
+/// log, never a silent drop (honoring the #423–#429 silent-refusal arc).
+fn hex8(id: [u8; 8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(16);
+    for b in id {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
 
 /// A tiny deterministic PRNG (SplitMix64) — no external RNG, no clock, so a seed
 /// reproduces a scenario bit-for-bit.
@@ -64,6 +92,15 @@ pub struct SimFaults {
     /// Whether the transport fragments oversized frames to sub-MDU packets (the
     /// FIX). `false` reproduces the stall; `true` proves the fix converges.
     pub fragment: bool,
+    /// CIRISEdge#422 — whether the receiver NAKs missing fragment indices and the
+    /// sender selectively retransmits them (fragment-level ARQ). `true` recovers a
+    /// lossy large frame IN-round, re-sending only the gap; `false` falls back to
+    /// pure whole-frame re-diff — the frame still reassembles (the receiver's
+    /// reassembler accumulates fragments across rounds), but ONLY by re-sending the
+    /// WHOLE frame every round until the last fragment lands: the slow, bandwidth-
+    /// wasteful pre-#422 behavior. Independent of [`Self::fragment`]: ARQ needs
+    /// fragments to exist, so it is a no-op when `fragment` is `false`.
+    pub arq: bool,
     /// Per-packet loss probability, per mille (out of 1000).
     pub loss_per_mille: u32,
     /// Per-packet reorder probability, per mille (delays the packet in the queue).
@@ -80,6 +117,7 @@ impl Default for SimFaults {
         Self {
             mdu: 431, // realistic encrypted Reticulum link MDU
             fragment: true,
+            arq: true,
             loss_per_mille: 0,
             reorder_per_mille: 0,
             dup_per_mille: 0,
@@ -148,12 +186,14 @@ impl StateApplier for SimApplier<'_> {
     }
 }
 
-/// One node in the pairwise anti-entropy: a `Session`, its store, and its inbound
-/// fragment reassembler.
+/// One node in the pairwise anti-entropy: a `Session`, its store, its inbound
+/// fragment reassembler, and (CIRISEdge#422) its sender-side retransmit buffer so a
+/// peer's NAK is served by re-sending only the named fragments.
 struct SimNode {
     session: Session,
     store: SimStore,
     reasm: Reassembler,
+    retx: RetransmitBuffer,
 }
 impl SimNode {
     fn new(role: SessionRole, kind: EnvelopeKind) -> Self {
@@ -161,8 +201,25 @@ impl SimNode {
             session: Session::new(role, kind),
             store: SimStore::new(),
             reasm: Reassembler::new(),
+            retx: RetransmitBuffer::new(),
         }
     }
+}
+
+/// CIRISEdge#422 — the wire-level instrumentation the oracle asserts on. `max_frame_bytes`
+/// preserves the pre-#422 "the payload really exceeded the MDU" evidence; the ARQ
+/// counters prove the selective path ENGAGED, and `whole_frame_resends` is the
+/// load-bearing invariant: fragment-ARQ must carry a frame IN-round, so a frame's
+/// complete fragment set is emitted at most ONCE.
+#[derive(Default)]
+struct SimMetrics {
+    max_frame_bytes: usize,
+    naks_sent: usize,
+    fragments_retransmitted: usize,
+    whole_frame_resends: usize,
+    /// `msg_id`s already emitted as a COMPLETE fragment set — a second full emission
+    /// of the same id is a whole-frame re-send (what selective ARQ makes needless).
+    fully_emitted: std::collections::HashSet<[u8; 8]>,
 }
 
 /// A packet on the wire, tagged with its destination (0 = to initiator, 1 = to
@@ -188,6 +245,16 @@ pub struct Outcome {
     /// The largest single wire frame the round produced (asserts the payload
     /// really exceeded the MDU — so a shrunk fixture re-derives the hypothesis).
     pub max_frame_bytes: usize,
+    /// CIRISEdge#422 — NAK control packets the receivers emitted (0 ⇒ the selective
+    /// path never engaged — no gap to recover).
+    pub naks_sent: usize,
+    /// CIRISEdge#422 — individual fragments a sender selectively re-sent in answer to
+    /// a NAK (a SUBSET of a frame, never the whole frame).
+    pub fragments_retransmitted: usize,
+    /// CIRISEdge#422 — times a frame's COMPLETE fragment set was re-emitted after its
+    /// first send (a whole-frame re-send). The oracle demands this be 0: fragment-ARQ
+    /// must carry the frame in-round, so it is never re-fragmented and re-sent whole.
+    pub whole_frame_resends: usize,
 }
 impl Outcome {
     /// Full convergence — the ONLY acceptable terminal state. Requires the
@@ -215,18 +282,23 @@ impl Scenario {
     #[must_use]
     pub fn run(&self) -> Outcome {
         let mut rng = Rng(self.seed ^ 0xD1B5_4A32_D192_ED03);
-        let mut initiator = SimNode::new(SessionRole::Initiator, self.kind);
-        let mut responder = SimNode::new(SessionRole::Responder, self.kind);
+        // Node 0 = initiator, node 1 = responder. An array (not two named locals)
+        // keeps the ARQ index math — `nodes[to]` receives, `nodes[1 - to]` is the
+        // peer — a single disjoint borrow, which the NAK/retransmit paths need.
+        let mut nodes = [
+            SimNode::new(SessionRole::Initiator, self.kind),
+            SimNode::new(SessionRole::Responder, self.kind),
+        ];
         // Seed each side's holdings. Track the full expected union for the oracle.
         let mut expected: Vec<[u8; 32]> = Vec::new();
         for (i, p) in self.initiator_payloads.iter().enumerate() {
-            expected.push(initiator.store.insert(self.kind, p.clone(), i as u64 + 1));
+            expected.push(nodes[0].store.insert(self.kind, p.clone(), i as u64 + 1));
         }
         for (i, p) in self.responder_payloads.iter().enumerate() {
-            expected.push(responder.store.insert(self.kind, p.clone(), i as u64 + 1));
+            expected.push(nodes[1].store.insert(self.kind, p.clone(), i as u64 + 1));
         }
 
-        let mut max_frame_bytes = 0usize;
+        let mut metrics = SimMetrics::default();
         let mut wire: Vec<Packet> = Vec::new();
         let mut rounds_used = 0usize;
 
@@ -240,74 +312,166 @@ impl Scenario {
             // Deliver is never re-sent — a single lost fragment would then be fatal.
             // reset() preserves cross-round knowledge (the peer's last summary).
             if round > 0 {
-                initiator.session.reset();
-                responder.session.reset();
+                nodes[0].session.reset();
+                nodes[1].session.reset();
             }
             // Initiator (node 0) opens the round — its Summary goes TO the
-            // responder (node 1).
-            let out = initiator.session.start_round(&initiator.store);
-            self.emit(1, out, &mut wire, &mut max_frame_bytes, &mut rng);
+            // responder (node 1). It records its own emitted fragments for ARQ.
+            let out = nodes[0].session.start_round(&nodes[0].store);
+            self.emit(
+                1,
+                out,
+                &mut wire,
+                &mut metrics,
+                &mut nodes[0].retx,
+                &mut rng,
+            );
 
-            // Drain the wire to quiescence for this round (bounded step budget).
+            // Drive the round: drain the wire to quiescence, then (CIRISEdge#422)
+            // run fragment-ARQ recovery passes until nothing is in flight or the
+            // pass budget is spent — only THEN fall to the next round's re-diff.
             let mut steps = 0usize;
-            while let Some(pkt) = Self::dequeue(&mut wire) {
-                steps += 1;
-                if steps > 100_000 {
-                    break; // safety — a real stall shows as non-convergence below
+            let mut arq_pass = 0usize;
+            'round: loop {
+                while let Some(pkt) = Self::dequeue(&mut wire) {
+                    steps += 1;
+                    if steps > MAX_ROUND_STEPS {
+                        break 'round; // safety — a real stall shows as non-convergence
+                    }
+                    let to = pkt.to;
+                    // A NAK is a TRANSPORT-level control packet (served selectively);
+                    // anything else is a fragment/whole frame routed to the session.
+                    if frame_fragment::is_nak(&pkt.bytes) {
+                        self.serve_nak(&nodes, to, &pkt.bytes, &mut wire, &mut metrics, &mut rng);
+                    } else {
+                        self.deliver_frame(
+                            &mut nodes,
+                            to,
+                            &pkt.bytes,
+                            &mut wire,
+                            &mut metrics,
+                            &mut rng,
+                        );
+                    }
                 }
-                let (node, from) = if pkt.to == 0 {
-                    (&mut initiator, 0)
-                } else {
-                    (&mut responder, 1)
-                };
-                // Reassemble; a fragment that doesn't complete yields nothing.
-                let Some(frame) = node.reasm.accept(&pkt.bytes) else {
-                    continue;
-                };
-                let Ok(Some(msg)) = wire_frame::try_unwrap(&frame) else {
-                    continue;
-                };
-                // Apply against this node's own store. `on_message` reads the
-                // PROVIDER (this node's pre-message state) and writes the APPLIER.
-                // We take an immutable snapshot for the provider (so `want` diffs
-                // against the state BEFORE this Deliver), then let the applier
-                // mutate the real store — the snapshot's borrow ends before the
-                // applier's mutable borrow begins. The applier commits admitted
-                // envelopes into `store` directly (no separate commit step).
-                let SimNode { session, store, .. } = node;
-                let provider_snapshot = SimStore {
-                    state: store_clone(store),
-                    bytes: store.bytes.clone(),
-                };
-                let mut applier = SimApplier {
-                    store,
-                    applied: Vec::new(),
-                };
-                let outcome = session.on_message(msg, &provider_snapshot, &mut applier, None);
-                self.emit(
-                    from_peer(from),
-                    outcome,
-                    &mut wire,
-                    &mut max_frame_bytes,
-                    &mut rng,
-                );
+
+                // Wire quiesced. CIRISEdge#422 — try fragment-ARQ before the round
+                // ends. `false` when ARQ is off or nothing is in flight.
+                if !self.faults.arq {
+                    break 'round;
+                }
+                arq_pass += 1;
+                if arq_pass > MAX_ARQ_PASSES {
+                    break 'round; // exhausted — the whole-frame re-diff takes over
+                }
+                if !self.inject_naks(&nodes, &mut wire, &mut metrics, &mut rng) {
+                    break 'round; // nothing missing — the round is genuinely done
+                }
             }
 
-            if self.both_hold_all(&initiator, &responder, &expected) {
+            if self.both_hold_all(&nodes[0], &nodes[1], &expected) {
                 break;
             }
         }
 
-        let all_present = self.both_hold_all(&initiator, &responder, &expected);
+        let all_present = self.both_hold_all(&nodes[0], &nodes[1], &expected);
         Outcome {
             kind: self.kind,
             seed: self.seed,
-            initiator_complete: initiator.session.is_complete() || all_present,
-            responder_complete: responder.session.is_complete() || all_present,
+            initiator_complete: nodes[0].session.is_complete() || all_present,
+            responder_complete: nodes[1].session.is_complete() || all_present,
             all_envelopes_present_both_sides: all_present,
             rounds_used,
-            max_frame_bytes,
+            max_frame_bytes: metrics.max_frame_bytes,
+            naks_sent: metrics.naks_sent,
+            fragments_retransmitted: metrics.fragments_retransmitted,
+            whole_frame_resends: metrics.whole_frame_resends,
         }
+    }
+
+    /// CIRISEdge#422 — serve one inbound NAK. Node `to` is the ORIGINAL SENDER of the
+    /// frame; re-send ONLY the requested indices from its retransmit buffer to the
+    /// requester (`1 - to`) — never the whole frame, never through the session. A
+    /// shortfall (the sender no longer holds a requested index) and a bounded sample
+    /// of the served fragments are logged LOUD (this class must never be silent).
+    fn serve_nak(
+        &self,
+        nodes: &[SimNode; 2],
+        to: usize,
+        bytes: &[u8],
+        wire: &mut Vec<Packet>,
+        metrics: &mut SimMetrics,
+        rng: &mut Rng,
+    ) {
+        let Some((msg_id, indices)) = frame_fragment::parse_nak(bytes) else {
+            return; // malformed NAK — dropped, never acted on
+        };
+        let requester = 1 - to;
+        let frags = nodes[to].retx.retransmit(&msg_id, &indices);
+        let served = frags.len();
+        if served < indices.len() {
+            tracing::warn!(
+                msg_id = %hex8(msg_id),
+                sender = to,
+                requester,
+                requested = indices.len(),
+                served,
+                "CIRISEdge#422 retransmit SHORTFALL — sender cannot serve all NAK'd \
+                 fragments; remainder falls to whole-frame re-diff"
+            );
+        }
+        for f in frags.iter().take(8) {
+            tracing::debug!(
+                msg_id = %hex8(msg_id),
+                fragment = frame_fragment::fragment_index(f).unwrap_or_default(),
+                sender = to,
+                requester,
+                "CIRISEdge#422 selective retransmit (sender → requester)"
+            );
+        }
+        metrics.fragments_retransmitted += served;
+        for f in frags {
+            self.send_packet(wire, requester, f, rng);
+        }
+    }
+
+    /// Feed one non-NAK packet to node `to`'s reassembler; if it completes a frame,
+    /// route it through the session and emit the reply FROM node `to` (recording its
+    /// own emitted fragments for later NAK service). A fragment that does not yet
+    /// complete a frame is buffered and yields nothing.
+    fn deliver_frame(
+        &self,
+        nodes: &mut [SimNode; 2],
+        to: usize,
+        bytes: &[u8],
+        wire: &mut Vec<Packet>,
+        metrics: &mut SimMetrics,
+        rng: &mut Rng,
+    ) {
+        let Some(frame) = nodes[to].reasm.accept(bytes) else {
+            return;
+        };
+        let Ok(Some(msg)) = wire_frame::try_unwrap(&frame) else {
+            return;
+        };
+        // `on_message` reads the PROVIDER (this node's pre-message state) and writes
+        // the APPLIER. Snapshot for the provider (so `want` diffs against the state
+        // BEFORE this Deliver), then let the applier mutate the real store; the
+        // snapshot's borrow ends before the applier's begins.
+        let provider_snapshot = SimStore {
+            state: store_clone(&nodes[to].store),
+            bytes: nodes[to].store.bytes.clone(),
+        };
+        let outcome = {
+            let node = &mut nodes[to];
+            let mut applier = SimApplier {
+                store: &mut node.store,
+                applied: Vec::new(),
+            };
+            node.session
+                .on_message(msg, &provider_snapshot, &mut applier, None)
+        };
+        self.emit(1 - to, outcome, wire, metrics, &mut nodes[to].retx, rng);
     }
 
     fn both_hold_all(&self, i: &SimNode, r: &SimNode, expected: &[[u8; 32]]) -> bool {
@@ -316,15 +480,77 @@ impl Scenario {
             .all(|h| i.store.holds(self.kind, h) && r.store.holds(self.kind, h))
     }
 
+    /// CIRISEdge#422 — one fragment-ARQ recovery pass: for each node holding an
+    /// incomplete frame, NAK exactly its missing indices back to the peer (the
+    /// sender). Returns whether any NAK was injected (`false` ⇒ nothing in flight ⇒
+    /// the round has quiesced). Every NAK is logged LOUD (msg_id + peer + gap size);
+    /// this class must NEVER be a silent drop (the #423–#429 silent-refusal arc).
+    fn inject_naks(
+        &self,
+        nodes: &[SimNode; 2],
+        wire: &mut Vec<Packet>,
+        metrics: &mut SimMetrics,
+        rng: &mut Rng,
+    ) -> bool {
+        let mut injected = false;
+        for (recv, node) in nodes.iter().enumerate() {
+            let peer = 1 - recv;
+            for (msg_id, miss) in node.reasm.missing() {
+                let naks = frame_fragment::build_naks(&msg_id, &miss, self.faults.mdu);
+                if naks.is_empty() {
+                    // MDU too small for even a one-index NAK — the whole-frame re-diff
+                    // fallback must cover this frame; make the refusal loud, not silent.
+                    tracing::warn!(
+                        msg_id = %hex8(msg_id),
+                        recv,
+                        peer,
+                        missing = miss.len(),
+                        mdu = self.faults.mdu,
+                        "CIRISEdge#422 cannot NAK — MDU too small for a CNAK packet; \
+                         falling back to whole-frame re-diff"
+                    );
+                    continue;
+                }
+                for &idx in miss.iter().take(8) {
+                    tracing::debug!(
+                        msg_id = %hex8(msg_id),
+                        fragment = idx,
+                        recv,
+                        peer,
+                        "CIRISEdge#422 NAK fragment (receiver → sender)"
+                    );
+                }
+                tracing::warn!(
+                    msg_id = %hex8(msg_id),
+                    recv,
+                    peer,
+                    missing = miss.len(),
+                    naks = naks.len(),
+                    "CIRISEdge#422 selective NAK — missing fragment(s) requested from peer"
+                );
+                metrics.naks_sent += naks.len();
+                for nak in naks {
+                    self.send_packet(wire, peer, nak, rng);
+                }
+                injected = true;
+            }
+        }
+        injected
+    }
+
     /// Wrap each message of an outcome into a wire frame, fragment it (if the fix
     /// is on), and enqueue the packets toward `to` — applying MDU-drop, loss,
-    /// reorder, and duplication as the wire's fault model.
+    /// reorder, and duplication as the wire's fault model. `sender_retx` is the
+    /// EMITTING node's retransmit buffer: a multi-fragment set is recorded there so
+    /// a later NAK is served selectively (CIRISEdge#422), and a SECOND full emission
+    /// of the same `msg_id` is counted as a whole-frame re-send.
     fn emit(
         &self,
         to: usize,
         outcome: ReplicationOutcome,
         wire: &mut Vec<Packet>,
-        max_frame_bytes: &mut usize,
+        metrics: &mut SimMetrics,
+        sender_retx: &mut RetransmitBuffer,
         rng: &mut Rng,
     ) {
         let msgs = match outcome {
@@ -334,25 +560,54 @@ impl Scenario {
         };
         for m in msgs {
             let frame = wire_frame::wrap_for_kind(&m);
-            *max_frame_bytes = (*max_frame_bytes).max(frame.len());
+            metrics.max_frame_bytes = metrics.max_frame_bytes.max(frame.len());
             let packets = if self.faults.fragment {
                 fragment(&frame, self.faults.mdu).unwrap_or_else(|| vec![frame.clone()])
             } else {
                 vec![frame] // no fragmentation — the oversized frame stays whole
             };
-            for p in packets {
-                // The wire cannot carry a packet larger than the MDU (#932 fault).
-                if p.len() > self.faults.mdu {
-                    continue; // DROPPED
-                }
-                if rng.chance(self.faults.loss_per_mille) {
-                    continue; // lost
-                }
-                self.enqueue(wire, to, p.clone(), rng);
-                if rng.chance(self.faults.dup_per_mille) {
-                    self.enqueue(wire, to, p, rng);
+            // CIRISEdge#422 — a MULTI-fragment set is retransmittable: cache it for
+            // selective NAK service, and count a SECOND full emission of the same
+            // msg_id as a whole-frame re-send (the ceiling ARQ exists to avoid). A
+            // single unwrapped packet (frame ≤ MDU) has no fragment ARQ.
+            if !packets.is_empty() && frame_fragment::is_fragment(&packets[0]) {
+                if let Some(msg_id) = frame_fragment::msg_id_of_fragment(&packets[0]) {
+                    if !metrics.fully_emitted.insert(msg_id) {
+                        metrics.whole_frame_resends += 1;
+                        tracing::warn!(
+                            msg_id = %hex8(msg_id),
+                            to,
+                            fragments = packets.len(),
+                            "CIRISEdge#422 WHOLE-FRAME RE-SEND — the frame was re-fragmented \
+                             and re-emitted in full (fragment-ARQ did not carry it in-round)"
+                        );
+                    }
+                    sender_retx.record(&packets);
                 }
             }
+            for p in packets {
+                self.send_packet(wire, to, p, rng);
+            }
+        }
+    }
+
+    /// Push one already-built packet onto the wire under the fault model: DROP if it
+    /// exceeds the MDU (the #932 fault), else drop with `loss`, else enqueue (with
+    /// `reorder`) and possibly duplicate. Shared by the initial fragment send, NAK
+    /// control packets, AND selective retransmits — so NAKs and retransmits are just
+    /// as lossy as data (fragment-ARQ must survive its own losses). The rng-draw
+    /// order is byte-identical to the pre-#422 inline path (loss → reorder →
+    /// duplication), so a seeded scenario with ARQ idle reproduces exactly.
+    fn send_packet(&self, wire: &mut Vec<Packet>, to: usize, p: Vec<u8>, rng: &mut Rng) {
+        if p.len() > self.faults.mdu {
+            return; // DROPPED — the wire cannot carry a > MDU packet (#932 fault)
+        }
+        if rng.chance(self.faults.loss_per_mille) {
+            return; // lost
+        }
+        self.enqueue(wire, to, p.clone(), rng);
+        if rng.chance(self.faults.dup_per_mille) {
+            self.enqueue(wire, to, p, rng);
         }
     }
 
@@ -373,10 +628,6 @@ impl Scenario {
             Some(wire.remove(0))
         }
     }
-}
-
-fn from_peer(from: usize) -> usize {
-    usize::from(from == 0)
 }
 
 /// Shallow-clone a `LocalState` (its `by_kind` map). Small — one round's refs.
@@ -504,8 +755,9 @@ mod tests {
     /// which is the observable signature of the budget engaging. Driven on a
     /// LOSSLESS wire on purpose: this isolates the budget/re-diff MECHANISM from the
     /// whole-frame-retry loss ceiling (a frame needing thousands of fragments will
-    /// not reassemble under sustained loss — that is a separate limitation whose fix
-    /// is fragment-level ARQ, tracked as a follow-up; see the module notes).
+    /// not reassemble under sustained loss on the pure re-diff path — the separate
+    /// limitation now closed by fragment-level ARQ, CIRISEdge#422, exercised by
+    /// `fragment_arq_converges_worst_corner_without_whole_frame_resend` below).
     #[test]
     fn oversized_holdings_chunk_across_rounds_via_deliver_budget() {
         use crate::replication::session::MAX_DELIVER_ENVELOPE_BYTES;
@@ -519,6 +771,7 @@ mod tests {
             faults: SimFaults {
                 mdu: 431,
                 fragment: true,
+                arq: true,
                 loss_per_mille: 0, // isolate the budget mechanism from the loss ceiling
                 reorder_per_mille: 40,
                 dup_per_mille: 0,
@@ -552,6 +805,150 @@ mod tests {
         );
     }
 
+    /// The worst-corner fault set the module's "whole-frame-retry ceiling" names:
+    /// one very large single-envelope frame (thousands of fragments), a TINY MDU,
+    /// HIGH per-packet loss, and sustained-busy ⇒ everything on the packet path
+    /// (`fragment = true`, no reliable resource path). `arq` selects the two arms.
+    fn worst_corner(seed: u64, arq: bool) -> Scenario {
+        Scenario {
+            kind: EnvelopeKind::Attestation,
+            seed,
+            faults: SimFaults {
+                mdu: 300,            // a tiny link MDU
+                fragment: true,      // sustained-busy: every frame rides packets
+                arq,                 // the fix under test
+                loss_per_mille: 150, // 15 % per-packet loss — high
+                reorder_per_mille: 60,
+                dup_per_mille: 0,
+                max_rounds: 40,
+            },
+            // ONE ~120 KB raw envelope → ~430 KB JSON-wire → ~1400 fragments at a
+            // 300 B MDU. Per round `(1-0.15)^1400 ≈ 10⁻⁹⁹`, so pure whole-frame retry
+            // reassembles ONLY by re-sending the entire frame round after round until
+            // the last straggler lands (fragments accumulate across rounds) — the
+            // slow, wasteful ceiling. Selective retransmit recovers the gap in-round.
+            initiator_payloads: vec![payloads(1, 120_000, 0).pop().unwrap()],
+            responder_payloads: vec![],
+        }
+    }
+
+    /// CIRISEdge#422 — the pre-fix behavior, reproduced: the worst corner with ARQ
+    /// OFF still converges (the reassembler accumulates fragments across rounds) but
+    /// ONLY by RE-SENDING THE WHOLE ~430 KB frame every round until the last fragment
+    /// lands — `whole_frame_resends > 0`, and zero NAKs. This is the slow, bandwidth-
+    /// wasteful path #422's selective retransmit replaces; the paired oracle below
+    /// recovers the SAME corner with `whole_frame_resends == 0`. (The twin of the
+    /// #932 fragment on/off pair.)
+    #[test]
+    fn fragment_arq_worst_corner_retries_whole_frame_without_arq() {
+        let sc = worst_corner(0x0422_D15A_B1E0, false);
+        let out = sc.run();
+        assert!(
+            out.converged(),
+            "the pre-#422 path still converges by accumulation (reproduce: seed={:#x}): {out:?}",
+            out.seed,
+        );
+        assert!(
+            out.whole_frame_resends > 0,
+            "without ARQ the WHOLE frame is re-sent each round (the slow path #422 fixes) — \
+             expected >0 resends (seed={:#x}): {out:?}",
+            out.seed,
+        );
+        assert_eq!(
+            out.naks_sent, 0,
+            "ARQ off ⇒ no selective NAKs (seed={:#x}): {out:?}",
+            out.seed,
+        );
+    }
+
+    /// CIRISEdge#422 — THE ORACLE. The SAME worst corner with fragment-ARQ ON
+    /// converges (RESPONDER included), the selective path demonstrably ENGAGED
+    /// (NAKs + retransmits > 0), and — the load-bearing invariant — the frame's
+    /// COMPLETE fragment set is NEVER re-sent (`whole_frame_resends == 0`): recovery
+    /// is selective retransmit of the gap, in-round, not a whole-frame gamble across
+    /// rounds. Deterministic: the fixed seed reproduces the whole run from one
+    /// command, and the assert messages echo it.
+    #[test]
+    fn fragment_arq_converges_worst_corner_without_whole_frame_resend() {
+        let sc = worst_corner(0x0422_D15A_B1E0, true);
+        let out = sc.run();
+        assert!(
+            out.converged(),
+            "fragment-ARQ must converge the worst corner (reproduce: seed={:#x}): {out:?}",
+            out.seed,
+        );
+        assert!(
+            out.naks_sent > 0 && out.fragments_retransmitted > 0,
+            "the selective path must have ENGAGED (naks={} retransmits={}) — else this proves \
+             nothing (seed={:#x}): {out:?}",
+            out.naks_sent,
+            out.fragments_retransmitted,
+            out.seed,
+        );
+        assert_eq!(
+            out.whole_frame_resends, 0,
+            "the whole frame must NEVER be re-sent — selective retransmit only \
+             (seed={:#x}): {out:?}",
+            out.seed,
+        );
+        assert!(
+            out.max_frame_bytes > sc.faults.mdu,
+            "the frame must exceed the MDU or the corner is not being exercised \
+             (seed={:#x}): {out:?}",
+            out.seed,
+        );
+    }
+
+    /// CIRISEdge#422 — a seeded SEARCH over the worst-corner window: large single
+    /// frames × tiny MDUs × HIGH-but-recoverable loss must ALWAYS converge via
+    /// fragment-ARQ with NO whole-frame re-send. Deterministic (seed-driven, not
+    /// `proptest`'s RNG) so any failure prints the exact `seed` for one-command
+    /// reproduction, and cheap enough to gate every build. A regression that breaks
+    /// in-round selective recovery makes the frame get re-sent whole next round →
+    /// `whole_frame_resends > 0` → a reproducible failure here.
+    #[test]
+    fn fragment_arq_search_high_loss_tiny_mdu_no_whole_resend() {
+        let mut rng = Rng(0x0422_5EA5_C0DE_0001);
+        for _ in 0..64 {
+            let s = rng.next_u64();
+            let seed = s;
+            let raw = 20_000 + (s % 40_000) as usize; // ~80–240 KB wire: hundreds+ frags
+            let mdu = 260 + ((s >> 20) % 300) as usize; // tiny link MDUs
+            let loss = 80 + ((s >> 40) % 140) as u32; // 8–22 % loss (high, recoverable)
+            let reorder = ((s >> 52) % 120) as u32;
+            let sc = Scenario {
+                kind: EnvelopeKind::Attestation,
+                seed,
+                faults: SimFaults {
+                    mdu,
+                    fragment: true,
+                    arq: true,
+                    loss_per_mille: loss,
+                    reorder_per_mille: reorder,
+                    dup_per_mille: 0,
+                    max_rounds: 40,
+                },
+                initiator_payloads: vec![payloads(1, raw, 0).pop().unwrap()],
+                responder_payloads: vec![],
+            };
+            let out = sc.run();
+            assert!(
+                out.converged(),
+                "fragment-ARQ non-convergence (seed={seed:#x} raw={raw} mdu={mdu} loss={loss} \
+                 reorder={reorder}): {out:?}",
+            );
+            assert!(
+                out.fragments_retransmitted > 0,
+                "high loss must engage selective retransmit (seed={seed:#x}): {out:?}",
+            );
+            assert_eq!(
+                out.whole_frame_resends, 0,
+                "selective ARQ must carry the frame in-round — no whole-frame re-send \
+                 (seed={seed:#x} raw={raw} mdu={mdu} loss={loss}): {out:?}",
+            );
+        }
+    }
+
     /// Drive one generated scenario with fragmentation ON and assert the
     /// RESPONDER converges. Shared by the CI proptest gate and the soak runner.
     fn assert_scenario_converges(
@@ -569,6 +966,7 @@ mod tests {
             faults: SimFaults {
                 mdu,
                 fragment: true,
+                arq: true,
                 loss_per_mille: loss,
                 reorder_per_mille: reorder,
                 dup_per_mille: loss / 2,
