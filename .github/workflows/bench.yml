@@ -1,127 +1,365 @@
 name: Bench
 
-# Runs the criterion benchmark suite (docs/BENCHMARKS.md) on every
-# push to main + on manual dispatch, and publishes the criterion HTML
-# report + a text summary as artifacts. NOT a pass/fail gate —
-# GitHub's shared runners are too noisy for pass/fail regression
-# detection. This job answers "what are our numbers" and surfaces
-# unexplained curve shapes (a step-function on `dispatch_inbound`'s
-# MessageType slope would be the AV-22 regression-shape the doc calls
-# out). The allocation-stability leak guarantee is a regular test
-# (`alloc_stability`) that DOES gate, in ci.yml.
+# v15.7.0 (CIRISEdge#430 bench-superset) — performance TREND tracking across
+# the three planes edge owns: RNS/transport, realtime A/V mesh (ALM), and the
+# anti-entropy replication plane. Replaces the pre-v15.7.0 artifacts-only
+# bench.yml (criterion HTML upload, no trend). Modeled on CIRISPersist's
+# bench.yml (criterion `--output-format bencher` → calibration-anchor
+# normalization → benchmark-action/github-action-benchmark → gh-pages trend
+# charts) and extends it with the SUPERSET the siblings don't have:
 #
-# The ci.yml `benches` job stays as the fast per-PR compile gate
-# (`cargo bench --no-run`). This workflow is the slow, actually-run
-# pass — same cadence as CIRISVerify's bench.yml (push-to-main +
-# workflow_dispatch).
+#   Lane A — single-value trends (one scalar per release):
+#     · criterion micro-benches (envelope_verify/_canonicalize, dispatch_inbound,
+#       transport_{reticulum,http}_loopback, realtime_av_{fanout,relay,rekey,
+#       mesh_e2e}) — wall-clock, NORMALIZED against the calibration anchor.
+#     · fixed-operating-point SIM metrics (ALM M1/M2/M8 + replication
+#       anti-entropy rounds / reassembly-delivery-ratio) — semantic values
+#       (ratios/ms/rounds), published UN-normalized. Below-bar grades publish
+#       their NUMBER loud (docs/BENCHMARKS.md "named honesty").
+#
+#   Lane B — scaling/sweep curves EXPLODED into one benchmark name per point
+#     (github-action-benchmark can't draw a curve, so each point trends on its
+#     own and the set forms the curve): mesh/depth/N{10,100,1000} vs the
+#     ⌈log_k N⌉ reference, mesh/continuity/loss{0..20}, mesh/m3_heal_gap_p95/
+#     churn{0..20}, relay_streams_per_core/N_{32,100} (from the criterion relay
+#     bench's own BenchmarkId sweep), replication/convergence_rounds/N{1..128}.
+#     Names are `plane/…`-prefixed so the gh-pages page groups by plane.
+#
+# Publish target (push-to-main only): https://cirisai.github.io/CIRISEdge/dev/bench/
+#
+# ⚠️ ONE-TIME HUMAN STEP: enabling GitHub Pages is a repo SETTING this workflow
+# cannot flip. Before the first main-push publish renders, a maintainer must set
+# Settings → Pages → Build and deployment → Source = "Deploy from a branch",
+# Branch = `gh-pages` / `/ (root)`. Until then benchmark-action still pushes the
+# per-bench JSON history to the gh-pages branch (so no data is lost); only the
+# rendered site 404s. (The gh-pages ROOT has no index.html by design — the bare
+# Pages URL 404s; the data lives under /dev/bench/.)
 
 on:
-  # Daily regression cadence — catches drift within 24h without
-  # burning CI minutes on every main-push. The fast inner-loop
-  # bit-rot check is the `cargo bench --no-run` gate in ci.yml.
   schedule:
-    - cron: "23 5 * * *"
-  # On-demand: run the suite against an arbitrary commit (PR review,
-  # post-refactor curve check, etc.).
+    # Monday 06:00 UTC — weekly regression cadence. One hour ahead of persist's
+    # Monday 07:00 run so a single coffee surveys the whole substrate's health.
+    - cron: '0 6 * * 1'
+  # On-demand: run against an arbitrary commit (PR review, post-refactor curve
+  # check). Does NOT publish (the publish step guards on push-to-main).
   workflow_dispatch:
-  # Tag pushes always record numbers so each release's curves are
-  # captured in the GH Actions artifact set alongside the manifest.
+  # Every main push records a trend point so each release's curves are captured.
   push:
-    tags: ['v*']
+    branches: [main]
+  # PR runs on the paths that move the benched numbers — the action saves
+  # results locally + comments the regression analysis, but the default
+  # ephemeral token can't push to gh-pages, so no publish (handled gracefully).
+  pull_request:
+    paths:
+      - 'benches/**'
+      - 'src/transport/**'
+      - 'src/replication/**'
+      - 'Cargo.toml'
+      - '.github/workflows/bench.yml'
 
+permissions:
+  # benchmark-action needs `contents: write` to push to the gh-pages branch.
+  # PR runs use the default ephemeral token which cannot push; the action
+  # handles that gracefully (saves results locally, comments the PR, no publish).
+  contents: write
+  # PR comment for regression alerts.
+  pull-requests: write
+
+# CIRISPersist#297 — same crates.io registry-flake resilience as ci.yml so the
+# bench suite's `cargo metadata` / git-dep fetch doesn't fail fast on a sparse-
+# index / HTTP2 download hiccup. Edge pins six CIRIS git deps (persist + three
+# verify crates + two leviculum crates), so the git-fetch-with-cli path matters
+# more here than in a crates.io-only crate.
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: '10'                 # retry registry/network requests (default 3)
+  CARGO_HTTP_MULTIPLEXING: 'false'      # HTTP/1.1 — sidesteps the HTTP/2 framing flake
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'  # git CLI for the CIRIS git-dep pins
 
 jobs:
   bench:
-    name: Criterion Benchmark Suite
+    name: Transport / A-V-mesh / replication bench suite
     runs-on: ubuntu-latest
-    # Benches are long; don't let a hung run burn the hour budget.
-    # The Reticulum loopback alone is ~30 s of cold-start discovery
-    # before the bench iter starts; plus all 11 benches × ~30 s
-    # measurement budget each ≈ ~10 min realistic, 45 min hard cap.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
+    # HEAVY: nine criterion micro-benches across four feature-set compilations
+    # (default, +reticulum, +http, +both) — the realtime_av_* benches carry
+    # internal frame-size × N sweeps (relay alone is 7 groups) — PLUS the two
+    # value-emitting sim dumps. The A/V benches + the sim are the slow tail the
+    # doc warns about; 120 min hard cap gives the runner headroom. Bump if the
+    # relay/mesh_e2e sweeps grow.
+    timeout-minutes: 120
 
-      # v7.3.0 (verify v8.0.0): tss-esapi removed from ciris-keyring;
-      # libsqlite3-dev is the sole remaining system build dep.
+    steps:
+      - uses: actions/checkout@v6
+
+      # Reclaim ~21 GB of unused preinstalled toolchains before the release-mode
+      # multi-feature build (same rationale + safety as persist's bench job and
+      # edge's ci.yml test job — the openmls/libcrux + ML-DSA/ML-KEM + leviculum
+      # graph is a large release compile).
+      - name: Free runner disk (reclaim unused preinstalled toolchains)
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "after:"; df -h / | tail -1
+
+      # ciris-persist pins `features = ["sqlite", …]`; the sqlite backend links
+      # the system libsqlite3 dynamically (persist v3.5.3+). Sole remaining
+      # system build dep — the A/V codec sys-deps (libdav1d/libopus) are NOT
+      # needed: none of the benched targets enable the `codec-*` features.
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
 
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
-        # CI hardening: cache restore is a speedup, not a correctness
-        # gate. A flaky runner / Actions infra hiccup should downgrade
-        # to "build from scratch this run", not abort the job
-        # (CIRISVerify v2.1.1+ pattern).
-        continue-on-error: true
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          # Exclude ~/.cargo/bin to prevent rustup-init shadow
-          # poisoning. See CIRISVerify v2.1.4 / CIRISPersist v0.7.3
-          # for the full rationale.
-          cache-bin: false
+          # EXACT 1.97.0 pin, lockstep with rust-toolchain.toml. The CIRISCache
+          # substrate blob is keyed on `rustc -V`; a floating `stable` would
+          # re-key and miss the restore. Bump in lockstep with the toolchain file.
+          toolchain: '1.97.0'
 
-      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
-        shell: bash
+      # CIRISCache (#229) — warm the substrate registry/target from the
+      # verify→persist→edge layers so the bench build doesn't cold-compile the
+      # ML-DSA / ML-KEM / keyring / openmls / leviculum graph every run. ubuntu ⇒
+      # PLAT=linux-x86_64. Restore-only (anonymous pull, no save). Runs BEFORE the
+      # criterion actions/cache below.
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+
+      - name: Cache criterion baseline
+        uses: actions/cache@v5
+        with:
+          # Cache ONLY the criterion baseline (the per-bench `base` snapshot the
+          # regression analysis compares against) + the cargo registry/git, NOT
+          # the full compiled `target/` — the heavy dep artifacts are warmed by
+          # the GHCR ciriscache restore above (which lives outside the 10 GB
+          # GitHub-cache budget), so caching all of `target/` here would be pure
+          # redundancy that LRU-evicts the smaller high-value blobs. Cargo.lock
+          # is gitignored (library convention), so the key hashes Cargo.toml —
+          # version bumps + new deps invalidate cleanly.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/criterion
+          key: bench-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            bench-${{ runner.os }}-
+
+      - name: System info
         run: |
-          if cargo build --help 2>&1 | grep -q "rustup-init"; then
-            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
-            rm -rf "$HOME/.cargo/bin"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
-            export PATH="$HOME/.cargo/bin:$PATH"
+          {
+            echo "## System info"
+            echo '```'
+            echo "Rust:  $(rustc --version)"
+            echo "OS:    $(uname -a)"
+            echo "RAM:   $(free -h | grep Mem | awk '{print $2}')"
+            echo "CPU:   $(nproc) cores ($(lscpu | grep 'Model name' | head -1 | sed 's/Model name:\s*//'))"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Calibration anchor (runs FIRST) ───────────────────────────────────
+      # Pure-compute SplitMix64 (CPU) + DRAM-random-walk (MEM) micro-benches
+      # produce this runner's wall-time-per-op rate. The normalization step
+      # below divides every WALL-CLOCK criterion bench by the matching anchor so
+      # published trends are runner-independent — absolute ns/iter on shared
+      # runners is too noisy for a 1.1× alert threshold (a pin-currency cut that
+      # touches no hot path would otherwise trip a wall of false alerts). See
+      # benches/calibration.rs for the anchor invariants.
+      - name: Run calibration anchor
+        env:
+          MALLOC_ARENA_MAX: '4'
+        run: |
+          set -o pipefail
+          echo "::group::bench calibration"
+          cargo bench --bench calibration -- --output-format bencher | tee calibration-output.txt
+          echo "::endgroup::"
+          CAL_CPU_NS=$(grep -E '^test calibration/splitmix64_10m' calibration-output.txt \
+            | sed -E 's/.*bench:[[:space:]]+([0-9]+) ns\/iter.*/\1/' | head -1)
+          CAL_MEM_NS=$(grep -E '^test calibration/dram_random_walk_500k' calibration-output.txt \
+            | sed -E 's/.*bench:[[:space:]]+([0-9]+) ns\/iter.*/\1/' | head -1)
+          if [ -z "$CAL_CPU_NS" ] || [ "$CAL_CPU_NS" = "0" ]; then
+            echo "::error::failed to extract CPU calibration ns/iter"; cat calibration-output.txt; exit 1
           fi
-          rustup default stable
-          cargo --version
-          cargo build --help >/dev/null
+          if [ -z "$CAL_MEM_NS" ] || [ "$CAL_MEM_NS" = "0" ]; then
+            echo "::error::failed to extract MEM calibration ns/iter"; cat calibration-output.txt; exit 1
+          fi
+          echo "CALIBRATION_CPU_NS=$CAL_CPU_NS" >> "$GITHUB_ENV"
+          echo "CALIBRATION_MEM_NS=$CAL_MEM_NS" >> "$GITHUB_ENV"
+          echo "Runner calibration: CPU=$CAL_CPU_NS ns/iter (splitmix64_10m), MEM=$CAL_MEM_NS ns/iter (dram_random_walk_500k)"
+          {
+            echo "## Runner calibration"
+            echo '```'
+            echo "splitmix64_10m:        $CAL_CPU_NS ns/iter  (CPU anchor — applied to every wall-clock bench)"
+            echo "dram_random_walk_500k: $CAL_MEM_NS ns/iter  (DRAM anchor — published as its own series; reclassify a"
+            echo "                                             throughput-bound family onto it in the normalize step)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      # Default-feature benches per BENCHMARKS.md "Running":
-      #   envelope_canonicalize, envelope_verify, dispatch_inbound,
-      #   outbound_enqueue, accord_threshold_verify, steward_fanout,
-      #   content_fetch_roundtrip, inline_text_pipeline.
-      - name: Run default-feature benches
-        run: cargo bench --benches 2>&1 | tee bench-results.txt
-
-      # Feature-gated benches — invoked separately per BENCHMARKS.md
-      # "Running" section (the same surface the human running locally
-      # invokes). Splitting them out keeps the curve labels grouped
-      # per-transport in the HTML report rather than interleaved.
-      - name: Run transport-http loopback bench
+      # ── Lane A + Lane-B(streams_per_core) — criterion WALL-CLOCK micro-benches ─
+      # Collect-all with per-bench ::group:: + a `::error title=…::` naming the
+      # exact bench + feature set on failure (ATTRIBUTION HARDENING — the historic
+      # `cargo bench | tee -a` masked cargo's exit code behind tee's; here
+      # `set -o pipefail` + per-bench rc capture makes a broken bench the step's
+      # status and one run surfaces EVERY break). Feature sets are each bench's
+      # `required-features` from Cargo.toml — respected exactly. The relay bench's
+      # `relay_streams_per_core` group emits the Lane-B streams-per-core curve as
+      # its own BenchmarkId sweep (N_{32,100} × S_{1,4,16,64}) — no extra code.
+      - name: Run criterion micro-benches (normalized lane)
+        env:
+          MALLOC_ARENA_MAX: '4'
         run: |
-          cargo bench --features "transport-http" \
-            --bench transport_http_loopback 2>&1 | tee -a bench-results.txt
+          set -o pipefail
+          : > bench-output-raw.txt
+          failed_benches=""
+          run_bench() {
+            local features="$1" bench="$2"
+            echo "::group::bench ${bench} (features: ${features:-default})"
+            local rc=0
+            if [ -n "$features" ]; then
+              cargo bench --features "$features" --bench "$bench" -- --output-format bencher | tee -a bench-output-raw.txt || rc=$?
+            else
+              cargo bench --bench "$bench" -- --output-format bencher | tee -a bench-output-raw.txt || rc=$?
+            fi
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error title=bench failed::${bench} (features: ${features:-default}) failed to build or run (exit ${rc})"
+              failed_benches="${failed_benches} ${bench}"
+            fi
+          }
+          # RNS/transport + envelope plane (default features)
+          run_bench "" envelope_verify
+          run_bench "" envelope_canonicalize
+          run_bench "" dispatch_inbound
+          # transport loopbacks
+          run_bench "transport-reticulum" transport_reticulum_loopback
+          run_bench "transport-http"      transport_http_loopback
+          # realtime A/V mesh plane
+          run_bench "transport-http,transport-reticulum" realtime_av_fanout
+          run_bench "transport-reticulum"                realtime_av_relay
+          run_bench "transport-http,transport-reticulum" realtime_av_rekey
+          run_bench "transport-http,transport-reticulum" realtime_av_mesh_e2e
+          if [ -n "${failed_benches}" ]; then
+            echo "::error title=bench job failed::broken benches:${failed_benches}"
+            exit 1
+          fi
 
-      - name: Run transport-reticulum loopback bench
+      # Normalize every wall-clock ns/iter against the calibration anchor. Output
+      # value is scaled so 1 calibration tick = 1,000,000 normalized units (keeps
+      # numbers readable AND a 2× bench change still shows as a 2× chart change —
+      # the scaling is uniform). The calibration line itself is preserved raw at
+      # the top so the trend chart tracks runner-noise drift as its own series.
+      # The name→anchor classifier defaults everything to the CPU anchor (edge's
+      # hot paths are crypto/compute-bound); the `case` block is where a
+      # throughput-bound family (e.g. a large-frame content sweep) gets moved onto
+      # the DRAM anchor if it starts showing memory-axis false positives.
+      - name: Normalize criterion output against calibration anchor
         run: |
-          cargo bench --features "transport-reticulum" \
-            --bench transport_reticulum_loopback 2>&1 | tee -a bench-results.txt
+          SCALE=1000000
+          : > bench-output-normalized.txt
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^test\ ([^[:space:]]+)\ \.\.\.\ bench:[[:space:]]+([0-9]+)\ ns/iter[[:space:]]+\(\+/-[[:space:]]+([0-9]+)\) ]]; then
+              bench_name="${BASH_REMATCH[1]}"
+              val_ns="${BASH_REMATCH[2]}"
+              dev_ns="${BASH_REMATCH[3]}"
+              case "$bench_name" in
+                # (reserved) memory-bandwidth-bound families → DRAM anchor. None
+                # today; add a prefix here + a note in benches/calibration.rs when
+                # reclassifying, e.g.  content_fetch_roundtrip/*)  anchor_ns=$CALIBRATION_MEM_NS ;;
+                *)
+                  anchor_ns="$CALIBRATION_CPU_NS"
+                  ;;
+              esac
+              val_norm=$(( val_ns * SCALE / anchor_ns ))
+              dev_norm=$(( dev_ns * SCALE / anchor_ns ))
+              prefix="${line%bench:*}bench:"
+              printf '%s %d ns/iter (+/- %d)\n' "$prefix" "$val_norm" "$dev_norm" >> bench-output-normalized.txt
+            else
+              printf '%s\n' "$line" >> bench-output-normalized.txt
+            fi
+          done < bench-output-raw.txt
+          echo "First 20 normalized test lines:"
+          grep -E '^test ' bench-output-normalized.txt | head -20 || true
 
-      - name: Run pyo3 subscription_throughput bench
+      # ── Lane A + Lane B — value-emitting SIM dumps (UN-normalized) ─────────
+      # The two `#[cfg(test)] mod sim` dump tests PRINT each mesh/replication
+      # metric's VALUE as `SIMBENCH test <plane/name> ... bench: <int> ns/iter`.
+      # These are semantic values (RTT-stretch ratios, ms, delivery ratios,
+      # depths, rounds) — NOT wall-time — so they must NOT be normalized. Run
+      # under default features (both sim modules are feature-clean) in the same
+      # release profile the criterion benches used, so the lib compile is reused.
+      # `--test-threads=1` keeps the SIMBENCH lines un-interleaved.
+      - name: Run sim value dumps (un-normalized lane)
         run: |
-          cargo bench --features "pyo3" \
-            --bench subscription_throughput 2>&1 | tee -a bench-results.txt
+          set -o pipefail
+          echo "::group::sim dumps (ALM mesh + replication anti-entropy)"
+          cargo test --release --lib bench_dump -- --nocapture --test-threads=1 | tee sim-dump-raw.txt
+          echo "::endgroup::"
+          # `grep -o 'SIMBENCH test .*'` (NOT an `^SIMBENCH` anchor): under
+          # `--test-threads=1 --nocapture` libtest prints `test <path> ... `
+          # WITHOUT a trailing newline, so the FIRST SIMBENCH line of each dump
+          # test is glued onto that prefix and would be missed by a line-anchored
+          # grep. `-o` extracts from the sentinel to EOL on every line that
+          # contains it (glued or not); the sed strips the sentinel to leave the
+          # clean `test <plane/name> ... bench: <int> ns/iter` line.
+          grep -o 'SIMBENCH test .*' sim-dump-raw.txt | sed 's/^SIMBENCH //' > sim-metrics.txt
+          if [ ! -s sim-metrics.txt ]; then
+            echo "::error::no SIMBENCH lines captured — the sim dump tests did not emit (renamed? filtered out?)"
+            cat sim-dump-raw.txt; exit 1
+          fi
+          echo "Sim metric lines captured: $(wc -l < sim-metrics.txt)"
 
-      # CIRISEdge#359 — the accord multi-sig bench measures the post-quantum
-      # (ML-DSA-65) hybrid verify cost and needs the `test-anchor` feature to
-      # seat its synthetic holders (verify's `accord_holder_bootstrap_anchor`
-      # override). Without the feature the default `cargo bench --benches` run
-      # above hits its inert `main` and skips it; this runs the real curve.
-      - name: Run test-anchor accord_threshold_verify bench (hybrid/PQ)
+      # Final publish input: calibration (raw) + normalized criterion + raw sim.
+      - name: Assemble bench-output.txt
         run: |
-          cargo bench --features "test-anchor" \
-            --bench accord_threshold_verify 2>&1 | tee -a bench-results.txt
+          cat calibration-output.txt bench-output-normalized.txt sim-metrics.txt > bench-output.txt
+          {
+            echo "## Bench top-line (published series)"
+            echo '```'
+            grep -E '^test ' bench-output.txt || cat bench-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload criterion report
-        uses: actions/upload-artifact@v4
+      - name: Publish to gh-pages trend chart
+        # Only on push to main — no PR pushes (the action's perm check handles
+        # this, but skipping early avoids noise). benchmark-action writes per-
+        # bench history to the gh-pages branch under dev/bench/; the site at
+        # https://cirisai.github.io/CIRISEdge/dev/bench/ shows a trend chart per
+        # bench name (grouped by the `plane/…` name prefix).
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@v1
         with:
-          name: criterion-report
-          path: target/criterion/
-          if-no-files-found: warn
+          name: ciris-edge transport / A-V-mesh / replication benchmarks
+          tool: 'cargo'
+          output-file-path: bench-output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          # 110% = a bench got 10% slower than its previous-best on this branch.
+          # Below 110% is the shared-runner noise floor (post-normalization);
+          # above is worth a look.
+          alert-threshold: '110%'
+          # Comment-only — do NOT fail the build on regression. Flip to
+          # fail-on-alert: true once the trend shows the runner's noise floor.
+          fail-on-alert: false
+          comment-on-alert: true
+          alert-comment-cc-users: '@CIRISAI/cirisedge-maintainers'
 
-      - name: Upload results summary
+      - name: Save raw criterion + sim dump as artifact
+        # 90-day retention. The raw target/criterion/ tree + the raw/normalized/
+        # calibration/sim files are ground truth for any post-hoc analysis past
+        # what gh-pages exposes (e.g. "did the runner shift uniformly or was a
+        # real per-bench regression buried under normalization").
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: bench-results-txt
-          path: bench-results.txt
-          if-no-files-found: warn
+          name: bench-${{ github.run_id }}
+          path: |
+            target/criterion/**
+            bench-output.txt
+            bench-output-raw.txt
+            bench-output-normalized.txt
+            calibration-output.txt
+            sim-metrics.txt
+            sim-dump-raw.txt
+          retention-days: 90

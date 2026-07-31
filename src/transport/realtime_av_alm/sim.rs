@@ -1801,4 +1801,149 @@ mod tests {
             }
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // VALUE-EMITTING DUMP (CIRISEdge#430 bench-superset) — the honest
+    // publishing lane. The metric `#[test]`s above ASSERT (green/red) and
+    // eprintln the human `[ALM-METRIC]` line; this dump instead PRINTS each
+    // metric's VALUE as a sentinel-prefixed libtest-bencher line to stdout,
+    // so `benchmark-action/github-action-benchmark` (cargo tool) trends it
+    // per-release. It NEVER asserts — a BELOW-BAR grade (M4 depth, M5/M6)
+    // publishes its number loud rather than hiding behind a red gate
+    // (docs/BENCHMARKS.md "named honesty").
+    //
+    // Wire contract with `.github/workflows/bench.yml`:
+    //   - each line is `SIMBENCH test <plane/name> ... bench: <int> ns/iter (+/- 0)`;
+    //     the workflow greps `^SIMBENCH `, strips the sentinel, and appends
+    //     the clean bencher line to bench-output.txt UN-normalized (these
+    //     are semantic sim values — ratios/ms/depths/rounds — NOT wall-time,
+    //     so the calibration anchor must NOT divide them).
+    //   - the `ns/iter` unit is a libtest-format artifact, not nanoseconds;
+    //     the integer scale is baked into each name suffix so the trend
+    //     chart is self-documenting: `_x1000` = value×1000 (1000 ⇒ 1.000),
+    //     `_x100000` = value×100000 (100000 ⇒ ratio 1.0), `_ms` = raw ms,
+    //     bare depth/bound = integer node count.
+    //
+    // Run (values are opt-level-independent — pure deterministic sim):
+    //   cargo test --release --lib bench_dump_mesh_metrics -- --nocapture
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_wrap
+    )]
+    fn bench_dump_mesh_metrics() {
+        // Sentinel-prefixed bencher emitter. `value` is the metric's
+        // integer-scaled magnitude (see the module note above).
+        fn dump(name: &str, value: i64) {
+            println!("SIMBENCH test {name} ... bench: {value} ns/iter (+/- 0)");
+        }
+
+        // ── Lane A — fixed-operating-point mesh metrics ──────────────────
+
+        // M1 selection RTT-stretch p95 (mesh/join). Ratio of planner-chosen
+        // parent RTT to the independent min-over-feasible optimum; 1.0 =
+        // planner picks the optimal parent. ×1000 to keep sub-percent
+        // stretch legible on the trend (1000 ⇒ 1.000×).
+        let m1: Vec<f64> = (0..1_000).filter_map(|s| m1_ratio(s as u64)).collect();
+        dump(
+            "mesh/m1_rtt_stretch_p95_x1000",
+            (percentile(&m1, 95.0) * 1_000.0).round() as i64,
+        );
+
+        // M2 time-to-reparent p99 (mesh/heal), ms. Single-parent-death
+        // reparent latency; bar is p99 < 2500 ms.
+        let m2: Vec<f64> = (0..1_000).map(|s| m2_reparent_latency(s as u64)).collect();
+        dump(
+            "mesh/m2_reparent_p99_ms",
+            percentile(&m2, 99.0).round() as i64,
+        );
+
+        // M8 continuity index @ 5 % loss (mesh/heal dedup) — the literal M8
+        // config: primary + MAX_BACKUPS parents, 5 % per-link loss + realistic
+        // reorder/dup, 5000 chunks. First-delivery ratio; ×100000 (100000 ⇒
+        // 1.0). Bar is >= 0.999 at full redundancy.
+        let m8_faults = SimFaults {
+            loss_per_mille: 50,
+            reorder_per_mille: 30,
+            dup_per_mille: 20,
+            ..SimFaults::default()
+        };
+        let m8_mean = mean(
+            &(0..300)
+                .map(|s| m8_first_delivery_ratio(s as u64, 1 + MAX_BACKUPS, m8_faults, 5_000))
+                .collect::<Vec<_>>(),
+        );
+        dump(
+            "mesh/m8_continuity_first_delivery_loss5pct_x100000",
+            (m8_mean * 100_000.0).round() as i64,
+        );
+
+        // ── Lane B — scaling / sweep curves (one name per point) ─────────
+
+        // M4 tree depth vs the ⌈log_k N⌉+2 reference (mesh/topology). BELOW
+        // BAR by N=100 for a homogeneous fleet — published loud as its own
+        // series alongside the reference bound so the gap trends per-release.
+        let k: u16 = 4;
+        for &n in &[10usize, 100, 1_000] {
+            let snap = homogeneous_tree_snapshot(n, k);
+            let topo = compute_alm_topology_verified(&snap);
+            let stats = TreeStats::from_opaque(&topo);
+            dump(&format!("mesh/depth/N{n}"), stats.max_depth as i64);
+            dump(
+                &format!("mesh/depth_bound/N{n}"),
+                log_k_depth_bound(n, usize::from(k)) as i64,
+            );
+        }
+
+        // M8 loss sweep (mesh/continuity) — 3-parent first-delivery ratio
+        // across the loss axis (reorder/dup isolated out for a clean curve),
+        // ×100000. loss{0,5,10,15,20}%.
+        for &loss_pct in &[0u32, 5, 10, 15, 20] {
+            let faults = SimFaults {
+                loss_per_mille: loss_pct * 10,
+                ..SimFaults::default()
+            };
+            let r = mean(
+                &(0..300)
+                    .map(|s| m8_first_delivery_ratio(s as u64, 1 + MAX_BACKUPS, faults, 5_000))
+                    .collect::<Vec<_>>(),
+            );
+            dump(
+                &format!("mesh/continuity/loss{loss_pct}pct_x100000"),
+                (r * 100_000.0).round() as i64,
+            );
+        }
+
+        // M3 heal-under-churn sweep (mesh/heal) — delivery-gap p95 (ms) as
+        // the per-second parent-churn rate climbs. This is the task's
+        // "reparent_p95/churn" curve; the value is M3's delivery-gap p95 (M3
+        // is the only churn-parameterized scenario — M2's reparent latency has
+        // no churn axis). churn{0,5,10,15,20}%/s over 30 s runs.
+        for &churn_pct in &[0u32, 5, 10, 15, 20] {
+            let faults = SimFaults {
+                churn_per_mille_per_sec: churn_pct * 10,
+                ..SimFaults::default()
+            };
+            let gaps: Vec<f64> = (0..200)
+                .map(|s| m3_churn_run(s as u64, 30, faults).0)
+                .collect();
+            dump(
+                &format!("mesh/m3_heal_gap_p95/churn{churn_pct}pct_ms"),
+                percentile(&gaps, 95.0).round() as i64,
+            );
+        }
+    }
+
+    /// Arithmetic mean of a sample set (0.0 on empty — the dump reports a
+    /// value, never panics).
+    #[allow(clippy::cast_precision_loss)]
+    fn mean(xs: &[f64]) -> f64 {
+        if xs.is_empty() {
+            0.0
+        } else {
+            xs.iter().sum::<f64>() / xs.len() as f64
+        }
+    }
 }

@@ -4,12 +4,129 @@ The criterion benchmark suite — what it measures, how to read the
 curves, the leak guarantee behind them, and where we stand against the
 state of the art.
 
-> **Status (v0.10.0):** the bench suite proposed below is the *contract*
-> for v1.0. A `benches/` directory is **not yet present in-tree** — the
-> first measurements land in a follow-up cut (see
-> [v1.0 baseline — pending](#v100-baseline--pending)). This document
-> is the bench surface specification: when `benches/` lands, it lands
-> against this shape, not a different one.
+> **Status (v15.7.0):** the `benches/` suite is **in-tree and running**,
+> and — new in v15.7.0 (CIRISEdge#430 bench-superset) — it publishes a
+> **release-over-release trend page**:
+>
+> ### 📈 https://cirisai.github.io/CIRISEdge/dev/bench/
+>
+> `.github/workflows/bench.yml` runs the suite on a weekly cron +
+> `workflow_dispatch` + every push to `main` + PRs touching `benches/**`,
+> `src/transport/**`, `src/replication/**`, or `Cargo.toml`, and publishes
+> to gh-pages **on push-to-main only** (mirrors persist). It is **not** a
+> pass/fail gate — shared runners are too noisy — but it normalizes against
+> a calibration anchor so a real regression is legible above the noise, and
+> it comments the regression analysis on PRs (`alert-threshold: 110%`,
+> `fail-on-alert: false`).
+>
+> **⚠️ One-time human step:** enabling GitHub Pages is a repo *setting* the
+> workflow cannot flip. A maintainer must set **Settings → Pages → Source =
+> "Deploy from a branch", Branch = `gh-pages` / `/ (root)`** once. Until
+> then benchmark-action still pushes the per-bench JSON history to the
+> gh-pages branch (no data lost); only the rendered site 404s. (The
+> gh-pages root has no index.html by design — the bare Pages URL 404s; the
+> charts live under `/dev/bench/`.)
+
+## The two publishing lanes
+
+The trend page carries two kinds of series, both consumed by the same
+`benchmark-action/github-action-benchmark@v1` publish:
+
+**Lane A — single-value trends** (one scalar per release):
+
+- **Criterion micro-benches** (wall-clock, **normalized** against the
+  calibration anchor — `benches/calibration.rs`, a SplitMix64 CPU anchor +
+  a DRAM-random-walk MEM anchor, adopted verbatim from persist so the two
+  repos share a runner-noise model): `envelope_verify`,
+  `envelope_canonicalize`, `dispatch_inbound`,
+  `transport_reticulum_loopback`, `transport_http_loopback`,
+  `realtime_av_fanout` (seal cost), `realtime_av_relay`,
+  `realtime_av_rekey`, `realtime_av_mesh_e2e`. Each bench's
+  `required-features` (see `Cargo.toml`) is honored.
+- **Fixed-operating-point SIM metrics** (semantic values — ratios / ms /
+  rounds — published **un-normalized**, emitted by the two
+  `#[cfg(test)] mod sim` value dumps
+  `realtime_av_alm::sim::tests::bench_dump_mesh_metrics` +
+  `replication::sim::tests::bench_dump_replication_metrics`):
+  `mesh/m1_rtt_stretch_p95_x1000` (M1),
+  `mesh/m2_reparent_p99_ms` (M2),
+  `mesh/m8_continuity_first_delivery_loss5pct_x100000` (M8),
+  `replication/antientropy_rounds_loss2pct_mean_x1000`,
+  `replication/reassembly_delivery_ratio_loss3pct_x100000`.
+
+**Lane B — scaling/sweep curves** (the superset gap — no sibling repo has
+these). `github-action-benchmark` can't draw a curve, so each curve is
+**exploded into one benchmark name per point**; each point trends on its
+own and the set forms the curve:
+
+| Curve (`plane/…` prefix) | Points | Source |
+|---|---|---|
+| `mesh/depth/N{n}` + `mesh/depth_bound/N{n}` | N ∈ {10, 100, 1000} | ALM sim **M4** — measured tree depth vs the ⌈log_k N⌉+2 reference (both published so the gap trends) |
+| `mesh/continuity/loss{p}pct_x100000` | loss ∈ {0, 5, 10, 15, 20}% | ALM sim **M8** — 3-parent first-delivery ratio across the loss axis |
+| `mesh/m3_heal_gap_p95/churn{p}pct_ms` | churn ∈ {0, 5, 10, 15, 20}%/s | ALM sim **M3** — delivery-gap p95 under sustained churn (the task's "reparent_p95/churn" curve; M3 is the only churn-parameterized scenario) |
+| `relay_streams_per_core/N_{n}/S_{s}` | N ∈ {32, 100} × S ∈ {1, 4, 16, 64} | criterion `realtime_av_relay` — the bench's own `BenchmarkId` sweep (no extra code) |
+| `replication/convergence_rounds/N{n}_x1000` | N ∈ {1, 8, 32, 128} | replication sim — mean `rounds_used` vs initiator-corpus size at 2% loss |
+
+**Scale suffixes** (the `ns/iter` unit on the SIM series is a libtest-format
+artifact, *not* nanoseconds — the integer scale is baked into the name so
+the chart is self-documenting): `_x1000` = value × 1000 (1000 ⇒ 1.000×),
+`_x100000` = ratio × 100000 (100000 ⇒ ratio 1.0), `_ms` = raw milliseconds,
+bare depth/bound = integer node count.
+
+## Named honesty (grades publish loud — above or below bar)
+
+The SIM dumps **never assert** — every grade publishes its NUMBER rather
+than hiding behind a red gate, so a below-SOTA-bar release shows its value
+loud and a regression that crosses the bar shows as a trend break, not a
+silent pass. The load-bearing cases:
+
+- **M4 tree depth vs the ⌈log_k N⌉+2 reference** — the page publishes BOTH
+  the measured `mesh/depth/N{n}` AND the `mesh/depth_bound/N{n}` reference as
+  paired series, so the depth-vs-bound gap trends per-release regardless of
+  which side of the bar a given cut lands. At v15.7.0 the new **log-depth
+  topology** (the "log-depth topology + mesh spine" cut) holds a homogeneous
+  fleet *within* bound — measured depth `N10/N100/N1000 = 2/4/5` against
+  bound `4/6/7`. Earlier cuts were BELOW bar here (the deterministic
+  planner's MDC sub-path duplication penalty steered a homogeneous fleet into
+  a near-linear tree, depth ~25 at N=100); publishing the paired series is
+  precisely what makes such a regression legible if it ever returns.
+  Structural invariants (acyclic + per-stream cap) are hard-asserted
+  separately in the M4 gate `#[test]`.
+- **M5 balance / M6 MDC distribution** — documented BELOW-BAR graded findings
+  in the `realtime_av_alm::sim` module header (same root cause: mean fan-out
+  ≈ 1; a single consumer's K quadrants are not diversified across parents).
+  These are recorded by their asserting gate tests but are **not yet Lane-B
+  published series** in this cut — adding `mesh/balance/*` + `mesh/mdc_hhi/*`
+  dumps is a noted follow-on.
+- **Structural PQC verify ceiling** — `envelope_verify` is ~280 µs
+  (ML-DSA-65-dominated), a ~14× constant-factor gap vs Ed25519-only peers.
+  This is the price of hybrid PQC on every envelope by design
+  (`HYBRID_REQUIRED`, THREAT_MODEL Assumption 10); it is *measured*, not
+  closed — a first-class normalized Lane-A series, never hidden. See
+  [State of the art](#state-of-the-art).
+
+Every metric prints its N + the fixed operating point in its name/comment,
+and the sim scenarios are deterministic on `(seed, commit)` — a below-bar
+point reproduces exactly. Local repro:
+
+```bash
+# the value dumps (opt-level-independent — pure deterministic sim):
+cargo test --release --lib bench_dump -- --nocapture
+# a single normalized criterion micro-bench (proves the bencher output):
+cargo bench --bench envelope_canonicalize -- --output-format bencher
+```
+
+> **Follow-ons (acceptable, noted):** a custom overlaid-curve renderer (the
+> gh-pages page trends each Lane-B point separately — it does not draw the
+> curve as one overlaid line yet); cachegrind "twins" (instruction-count
+> companions to the wall-clock benches, immune to runner noise);
+> change-point / step-detection alerting (richer than the flat 110%
+> threshold). None block the v15.7.0 cut.
+
+> **Historical note (pre-v15.7.0):** the tables below were authored at
+> v0.10.0 as the bench-surface *contract* before `benches/` existed. They
+> remain the shape spec + expected-curve reference; the live numbers are on
+> the trend page above.
 
 ## Running
 
@@ -32,14 +149,14 @@ cargo bench --features "pyo3" --bench subscription_throughput
 
 ## CI integration
 
-- **Proposed `.github/workflows/bench.yml`** (lands with the bench
-  suite) runs the full set on every push to `main` and on manual
-  dispatch, publishing the criterion HTML report (`criterion-report`)
-  and a text summary (`bench-results-txt`) as artifacts. **Not** a
-  pass/fail gate — GitHub's shared runners are too noisy — it answers
-  "what are our numbers" and surfaces unexplained curve shapes. This
-  mirrors CIRISVerify's `bench.yml` cadence verbatim (daily +
-  workflow_dispatch).
+- **`.github/workflows/bench.yml`** (v15.7.0) runs the full suite on a
+  weekly cron + `workflow_dispatch` + push-to-`main` + path-scoped PRs, and
+  publishes the **trend page** ([above](#-httpscirisaigithubiocirisedgedevbench))
+  on push-to-main. It also saves the raw `target/criterion/**` tree + the
+  calibration/normalized/sim files as a 90-day artifact. **Not** a
+  pass/fail gate — GitHub's shared runners are too noisy — it answers "what
+  are our numbers over time" and surfaces unexplained curve shapes. See
+  [The two publishing lanes](#the-two-publishing-lanes) for what it emits.
 - **`ci.yml`'s `benches` job** (proposed) is the fast per-PR gate: it
   compiles every bench (`--no-run`, including the feature-gated
   transports + pyo3 subscription) so they cannot bit-rot, without
@@ -300,7 +417,10 @@ roadmap; *being measured against it* is.
 
 ---
 
-**Document Status:** v0.10.0 baseline — bench suite proposed; first
-measurements pending. Update on every bench-suite cut.
-**Next Review:** when `benches/` directory lands (follow-up to
-v0.10.0).
+**Document Status:** v15.7.0 — bench suite in-tree + trend page live
+(CIRISEdge#430). The v0.10.0 target tables below the fold are the
+expected-curve contract; live numbers are on the
+[trend page](#-httpscirisaigithubiocirisedgedevbench). Update on every
+bench-suite cut.
+**Next Review:** when the overlaid-curve renderer / cachegrind twins
+follow-on lands, or on the next plane added to the suite.
