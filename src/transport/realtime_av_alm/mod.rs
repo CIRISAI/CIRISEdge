@@ -60,6 +60,14 @@ pub mod capacity;
 pub mod heal;
 pub mod join;
 
+// CIRISEdge ALM A/V performance-testing suite (Track A / criteria foundation).
+// Deterministic, clock-stepped, N-node A/V mesh simulator + 10-metric SOTA
+// grader that drives the REAL ALM primitives (ALM-A/B/C + the holonomic
+// deterministic topology) read-only. Test-only, mirroring the replication DST's
+// `#[cfg(test)] mod sim;` — see the module docs for the fault model + metrics.
+#[cfg(test)]
+mod sim;
+
 pub use capacity::{
     AlmCapacityError, PeerKeyId, PeerSigningPubkeys, RelayCapacity, SignedRelayCapacity,
     SubStreamCommitment, SubStreamPath, MEASUREMENT_WINDOW_SECS, STALE_AFTER_SECS,
