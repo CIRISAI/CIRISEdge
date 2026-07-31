@@ -360,9 +360,9 @@ impl Session {
             ReplicationMessage::Summary(remote_summary) => {
                 self.on_summary(&remote_summary, provider)
             }
-            ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider),
+            ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider, source_peer),
             ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier, source_peer),
-            ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider),
+            ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider, source_peer),
         }
     }
 
@@ -406,24 +406,38 @@ impl Session {
         ReplicationOutcome::Send(outbound)
     }
 
-    fn on_diff(&mut self, diff: &DiffMessage, provider: &dyn StateProvider) -> ReplicationOutcome {
-        if diff.kind != self.kind {
-            return ReplicationOutcome::UnexpectedMessage;
-        }
-        // CIRISEdge#414/#932 — pack a byte-BOUNDED prefix of the wanted envelopes,
-        // not the whole (unbounded-in-holdings) set. Fetch in `want` order and stop
-        // once the running raw-byte total would exceed MAX_DELIVER_ENVELOPE_BYTES —
-        // but ALWAYS include at least one envelope (a single envelope larger than
-        // the budget rides whole; the transport fragments it). The undelivered
-        // remainder is NOT lost: those hashes stay in the peer's `want` next round
-        // (never admitted → still missing from its holdings), so the periodic
-        // anti-entropy re-diff carries them, one bounded Deliver per round, until
-        // InSync. This bounds the per-round wire frame so its fragment count stays
-        // reassemblable under packet loss.
+    /// CIRISEdge#414/#932 — pack a byte-BOUNDED prefix of the wanted envelopes,
+    /// not the whole (unbounded-in-holdings) set. Fetch in `want` order and stop
+    /// once the running raw-byte total would exceed MAX_DELIVER_ENVELOPE_BYTES —
+    /// but ALWAYS include at least one envelope (a single envelope larger than
+    /// the budget rides whole; the transport fragments it). The undelivered
+    /// remainder is NOT lost: those hashes stay in the peer's `want` next round
+    /// (never admitted → still missing from its holdings), so the periodic
+    /// anti-entropy re-diff carries them, one bounded Deliver per round, until
+    /// InSync. This bounds the per-round wire frame so its fragment count stays
+    /// reassemblable under packet loss.
+    ///
+    /// CIRISEdge#429 — returns, alongside the packed envelopes, the hashes that
+    /// were advertised-but-UNFETCHABLE (a `want` the provider could not serve).
+    /// These are NOT swallowed: the requester asked for something we just claimed
+    /// to hold, so an unfetchable want is the single most diagnostic event at this
+    /// point (stale wire-index, pruned row, hash skew). Returning the set — rather
+    /// than a bare `continue` that vanishes — is the send-side twin of #425's
+    /// "never a silent drop" on apply, and lets the caller log each miss LOUD and a
+    /// test assert the drop directly instead of inferring it from a byte count. The
+    /// budget-`break` remainder is deliberately NOT counted here: that is honest
+    /// deferral to the next round, a categorically different thing from unfetchable.
+    fn pack_bounded_deliver(
+        &self,
+        want: &[[u8; 32]],
+        provider: &dyn StateProvider,
+    ) -> (Vec<Vec<u8>>, Vec<[u8; 32]>) {
         let mut envelopes: Vec<Vec<u8>> = Vec::new();
+        let mut dropped: Vec<[u8; 32]> = Vec::new();
         let mut packed_bytes = 0usize;
-        for h in &diff.want {
+        for h in want {
             let Some(bytes) = provider.fetch_envelope(self.kind, h) else {
+                dropped.push(*h);
                 continue;
             };
             // Stop BEFORE exceeding the budget, but never emit an empty Deliver:
@@ -433,6 +447,43 @@ impl Session {
             }
             packed_bytes += bytes.len();
             envelopes.push(bytes);
+        }
+        (envelopes, dropped)
+    }
+
+    fn on_diff(
+        &mut self,
+        diff: &DiffMessage,
+        provider: &dyn StateProvider,
+        source_peer: Option<&str>,
+    ) -> ReplicationOutcome {
+        if diff.kind != self.kind {
+            return ReplicationOutcome::UnexpectedMessage;
+        }
+        let (envelopes, dropped) = self.pack_bounded_deliver(&diff.want, provider);
+        // CIRISEdge#429 — an advertised want we cannot serve must NEVER be inferred
+        // from a short byte count. Say so, per-miss and in aggregate. NOT fatal: the
+        // round still ships what it could, and the remainder re-diffs next round —
+        // but the responder KNOWS it shipped short, so it says so.
+        if !dropped.is_empty() {
+            let peer = source_peer.unwrap_or("<unattributed>");
+            for h in &dropped {
+                tracing::warn!(
+                    kind = ?self.kind,
+                    envelope_hash = %hex::encode(h),
+                    peer,
+                    "Deliver packing: advertised want is unfetchable — skipped \
+                     (#429 advertised-then-unfetchable: stale wire-index / pruned row / hash skew)"
+                );
+            }
+            tracing::warn!(
+                kind = ?self.kind,
+                wanted = diff.want.len(),
+                packed = envelopes.len(),
+                dropped = dropped.len(),
+                peer,
+                "Deliver ships short — the requester's want was only partially served (#429)"
+            );
         }
         ReplicationOutcome::Send(vec![ReplicationMessage::Deliver(DeliverMessage {
             kind: self.kind,
@@ -444,6 +495,7 @@ impl Session {
         &mut self,
         fetch: &FetchMessage,
         provider: &dyn StateProvider,
+        source_peer: Option<&str>,
     ) -> ReplicationOutcome {
         // Fetch is structurally identical to Diff on the responder
         // side — both ask "give me these specific envelopes."
@@ -453,6 +505,7 @@ impl Session {
                 want: fetch.want.clone(),
             },
             provider,
+            source_peer,
         )
     }
 
@@ -1430,7 +1483,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             want: wanted,
         };
-        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider) else {
+        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None) else {
             panic!("on_diff must Send a Deliver");
         };
         let ReplicationMessage::Deliver(deliver) = &msgs[0] else {
@@ -1473,7 +1526,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             want: vec![hash],
         };
-        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider) else {
+        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None) else {
             panic!("on_diff must Send a Deliver");
         };
         let ReplicationMessage::Deliver(deliver) = &msgs[0] else {
@@ -1485,5 +1538,67 @@ mod tests {
             "the one oversize envelope ships whole"
         );
         assert_eq!(deliver.envelopes[0].len(), big);
+    }
+
+    /// CIRISEdge#429 — an advertised `want` the responder cannot fetch is NOT
+    /// silently swallowed. `pack_bounded_deliver` RETURNS the unfetchable hash in
+    /// its `dropped` set (so the caller logs it loud and this test asserts it
+    /// directly — infer nothing from a byte count), and the round still ships what
+    /// it COULD: short, not fatal. The send-side twin of #425's "never a silent
+    /// drop" on the apply path.
+    #[test]
+    fn on_diff_surfaces_an_advertised_but_unfetchable_want() {
+        let fetchable = h(1);
+        let unfetchable = h(2); // deliberately never seeded into the provider
+        let provider = provider_with(&[(EnvelopeKind::Attestation, fetchable, vec![9u8; 128], 1)]);
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+
+        // The helper RETURNS the unfetchable hash rather than vanishing it.
+        let (envelopes, dropped) =
+            responder.pack_bounded_deliver(&[fetchable, unfetchable], &provider);
+        assert_eq!(
+            dropped,
+            vec![unfetchable],
+            "the advertised-but-unfetchable want must be RETURNED, not swallowed"
+        );
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "the fetchable want still packs — the round ships short, never empty"
+        );
+
+        // And on_diff still Sends the (short) Deliver — a drop is loud, never fatal.
+        let diff = DiffMessage {
+            kind: EnvelopeKind::Attestation,
+            want: vec![fetchable, unfetchable],
+        };
+        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, Some("peer-x"))
+        else {
+            panic!("a partially-unfetchable Diff must still Send a short Deliver, not fail");
+        };
+        let ReplicationMessage::Deliver(deliver) = &msgs[0] else {
+            panic!("expected a Deliver");
+        };
+        assert_eq!(
+            deliver.envelopes.len(),
+            1,
+            "ships the one fetchable envelope; the unfetchable want re-diffs next round"
+        );
+    }
+
+    /// The #429 loud path stays silent on the happy path: a fully-fetchable Diff
+    /// records NO drops, so no false-positive "ships short" warn fires.
+    #[test]
+    fn on_diff_records_no_drop_when_every_want_is_fetchable() {
+        let a = h(1);
+        let b = h(2);
+        let provider = provider_with(&[
+            (EnvelopeKind::Attestation, a, vec![1u8; 64], 1),
+            (EnvelopeKind::Attestation, b, vec![2u8; 64], 2),
+        ]);
+        let responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let (envelopes, dropped) = responder.pack_bounded_deliver(&[a, b], &provider);
+        assert!(dropped.is_empty(), "no unfetchable want → no drop");
+        assert_eq!(envelopes.len(), 2, "both fetchable wants pack");
     }
 }
