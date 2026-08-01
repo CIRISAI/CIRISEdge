@@ -3509,11 +3509,18 @@ mod tests {
     /// required. Gated on `test-anchor` because minting a record that satisfies
     /// `has_accord_conferred_role` needs a genuine 2-of-3 accord-family co-scrub, which
     /// persist exports only behind that fence (CIRISPersist#484). Edge CI runs a
-    /// dedicated `test-anchor` lane, so this is real coverage — not a test that
-    /// quietly never runs.
+    /// dedicated `test-anchor` lane (#435), so this is real coverage — not a
+    /// test that quietly never runs. (#435 is the proof that clause must be a
+    /// CI job, not a doc claim: while no lane ran it, this test silently missed
+    /// TWO fixture waves — the v22 ACCORD_HOLDER evidence blob and the #396
+    /// item-1 consent-membership bound — and sat broken at HEAD.)
     ///
     /// This is the assertion whose ABSENCE let v13.10.0 ship a permanently-dark
     /// gate with a green suite.
+    ///
+    /// Also asserts the #433 ledger's leg-B arm: the blessed-but-not-rooted
+    /// DENY books `ServeCapabilityNotRooted` — the one WithholdReason only
+    /// reachable through this lane (leg A must PASS first).
     #[cfg(feature = "test-anchor")]
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // roster + trust graph + allow/deny/un-trust: one scenario
@@ -3535,7 +3542,7 @@ mod tests {
         let full_peer = "canonical-blessed-and-rooted";
         // Blessed by the accord but rooted nowhere we trust → refused (leg B).
         let blessed_only = "canonical-blessed-not-rooted";
-        let (backend, bridge) = make_bridge(&[
+        let (backend, bridge, metrics) = make_metered_bridge(&[
             producer.to_string(),
             full_peer.to_string(),
             blessed_only.to_string(),
@@ -3565,10 +3572,28 @@ mod tests {
             (root, identity_type::NODE),
             (lifecycle_attester, identity_type::ACCORD_HOLDER),
         ] {
+            let mut record = fixture_key_record(k, it);
+            // CIRISPersist v22 (#543/#513) — an ACCORD_HOLDER key must carry
+            // `attestation_evidence` at registration. Same inlined Android/
+            // Strongbox blob as the sibling non-anchored test above (#435: the
+            // v22 adopt fixed the sibling and missed this anchored twin).
+            if it == identity_type::ACCORD_HOLDER {
+                record.attestation_evidence = Some(serde_json::json!({
+                    "platform_attestation": {
+                        "Android": {
+                            "key_attestation_chain": [
+                                [0x30, 0x82, 0x01, 0x00],
+                                [0x30, 0x82, 0x02, 0x00],
+                            ],
+                            "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                            "strongbox_backed": true,
+                        }
+                    },
+                    "nonce_captured_at": Utc::now().to_rfc3339(),
+                }));
+            }
             backend
-                .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(k, it),
-                })
+                .put_public_key(SignedKeyRecord { record })
                 .await
                 .expect("seed key");
         }
@@ -3607,6 +3632,16 @@ mod tests {
         )
         .await;
 
+        // CIRISEdge#396 item 1 — this test isolates the #386 per-ROW infra:serve
+        // gate, so both probed peers must first clear the per-PEER consent
+        // membership bound (a bare grant, no `recipient_capability`, so item 6
+        // stays inert here). The sibling deny-path test gained this block when
+        // #396 landed; this anchored twin missed it while no CI lane ran it —
+        // half of #435's failure 2.
+        for peer in [full_peer, blessed_only] {
+            seed_consent_membership(&backend, local, peer).await;
+        }
+
         seed_trace_attestation(&backend, producer).await;
         let trace_hash = locate_trace_hash(&bridge).await;
 
@@ -3641,6 +3676,15 @@ mod tests {
                 .any(|r| r.envelope_hash == trace_hash),
             "an accord blessing alone is NOT sufficient — the capability must root \
              to a root this node trusts (CIRISEdge#386 leg B)"
+        );
+        // #433 — that leg-B DENY is a WITHHOLD, booked at its branch. This is
+        // the only test that can reach `ServeCapabilityNotRooted` (leg A must
+        // pass first, which needs the co-scrub this lane mints), so the ledger
+        // arm is proven here or nowhere.
+        assert!(
+            metrics.withholds(crate::observability::WithholdReason::ServeCapabilityNotRooted) >= 1,
+            "the blessed-but-not-rooted deny must book ServeCapabilityNotRooted \
+             in the withhold ledger (CIRISEdge#433)"
         );
 
         // NUCLEAR UN-TRUST — withdrawing OUR `delegates_to(local → root)` edge

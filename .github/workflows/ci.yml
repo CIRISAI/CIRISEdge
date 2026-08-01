@@ -242,6 +242,36 @@ jobs:
               --test explicit_hash_addressing \
               --test realtime_av_spine_e2e
 
+  # ─── test-anchor lane — the #386 ALLOW-path coverage ────────────────
+  # CIRISEdge#435: `trace_serve_requires_accord_blessing_and_trusted_root` is
+  # the ONLY test that can mint a genuine 2-of-3 accord co-scrub (persist
+  # exports the minting support behind the `test-anchor` fence, CIRISPersist#484)
+  # — hence the only coverage of the trace-serve ALLOW path AND the only test
+  # that can reach the #433 ledger's `serve_capability_not_rooted` arm (leg A
+  # must PASS before leg B can refuse). Before this job, NO lane compiled the
+  # feature: the test sat broken at HEAD through two fixture waves (the v22
+  # ACCORD_HOLDER evidence blob, the #396 item-1 consent bound) with a green
+  # board — the exact v13.10.0 dark-gate class it exists to prevent. A gate is
+  # only as good as the CI job that runs it (the v15.4.1 gauntlet lesson, one
+  # lane over).
+  test-anchor-lane:
+    name: test-anchor lane (#386 ALLOW path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libsqlite3-dev (sqlite build dep)
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-anchor-lane
+      - name: bridge suite under test-anchor (ALLOW + deny + un-trust + leg-B ledger)
+        # The whole bridge module, not just the anchored test: the feature must
+        # not silently break the 35 always-on bridge tests either.
+        run: cargo test --lib --features test-anchor replication::bridge
+
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel
   # build for darwin runs via the pyo3-wheel matrix entry below.
