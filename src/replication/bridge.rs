@@ -66,7 +66,7 @@ use ciris_persist::federation::namespace::{self, Projection};
 use ciris_persist::federation::operational::{
     OrgMembership, Organization, SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
 };
-use ciris_persist::federation::register::ReplicatedKeyOutcome;
+use ciris_persist::federation::register::{KeyRefusalReason, ReplicatedKeyOutcome};
 use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
 use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
@@ -120,6 +120,54 @@ fn apply_refusal_reason(
         "{plane}: admission refused (content_hash={content_hash}, refusal={}): {err}",
         err.kind(),
     )
+}
+
+/// persist v24.2.0 (CIRISPersist#565) — map the typed Key-plane apply outcome to
+/// edge's [`ApplyOutcome`], returning alongside it the stable refusal TOKEN to
+/// count on the receive-plane mirror ledger (`None` when nothing was refused).
+///
+/// Pure so the whole mapping is unit-testable over [`KeyRefusalReason::ALL`]
+/// without a backend. Two load-bearing decisions:
+///
+/// - **Both duplicate halves map to `Duplicate`** (persist's #565 finding, not
+///   just the ask): a byte-identical re-offer already resolved `Unchanged` at
+///   the `persist_row_hash` comparison, and `AlreadyAnchoredIdentical` is its
+///   sibling — a same-envelope-DIFFERENT-BYTES legitimate re-encoding of a
+///   record this node already anchors (every baked-seed node re-offered the
+///   canonical's own record hits it). Before v24.2.0 that read as a
+///   security-shaped refusal on the COMMON path. Neither half counts on the
+///   refusal ledger: the receiver already holds what was offered.
+/// - **The reason is the branch**: the refusal message carries persist's stable
+///   token (`pubkey_swap`, `downgrade`, …) — the #565 twin of the #433 rule.
+///   Consumers key on the token constant, never on message prose.
+fn key_outcome_to_apply(
+    result: Result<ReplicatedKeyOutcome, ciris_persist::federation::Error>,
+    content_hash: &str,
+) -> (ApplyOutcome, Option<&'static str>) {
+    match result {
+        Ok(
+            ReplicatedKeyOutcome::Inserted
+            | ReplicatedKeyOutcome::Upgraded
+            | ReplicatedKeyOutcome::Superseded,
+        ) => (ApplyOutcome::Admitted, None),
+        Ok(
+            ReplicatedKeyOutcome::Unchanged
+            | ReplicatedKeyOutcome::Refused {
+                reason: KeyRefusalReason::AlreadyAnchoredIdentical,
+            },
+        ) => (ApplyOutcome::Duplicate, None),
+        Ok(ReplicatedKeyOutcome::Refused { reason }) => (
+            ApplyOutcome::Refused(format!(
+                "Key: admission refused ({}; content_hash={content_hash})",
+                reason.as_str()
+            )),
+            Some(reason.as_str()),
+        ),
+        Err(e) => (
+            ApplyOutcome::Refused(apply_refusal_reason("Key", content_hash, &e)),
+            None,
+        ),
+    }
 }
 
 static SERVE_GATE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -635,6 +683,25 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             source_peer = source_peer.unwrap_or("<unattributed>"),
             "apply_envelope_bytes: receiving from attributed peer (CIRISEdge#426)"
         );
+        // persist v24.2.0 / #565 — the receive-plane mirror's kind axis: every
+        // `Refused` leaving this choke is counted per envelope kind (the #425
+        // choke already logs it; now it is also a metrics-scrape fact). The
+        // typed Key-plane token axis books inside `apply_key`.
+        let outcome = self.dispatch_apply(kind, envelope_bytes).await;
+        if matches!(outcome, ApplyOutcome::Refused(_)) {
+            if let Some(m) = &self.metrics {
+                m.inc_apply_refusal_kind(kind);
+            }
+        }
+        outcome
+    }
+}
+
+impl FederationDirectoryReplicationBridge {
+    /// The per-kind apply dispatch behind the #425 choke —
+    /// [`StateApplier::apply_envelope_bytes`] wraps this with the #426
+    /// source-peer trace and the #565 refusal counter.
+    async fn dispatch_apply(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> ApplyOutcome {
         match kind {
             EnvelopeKind::Key => self.apply_key(envelope_bytes).await,
             EnvelopeKind::Attestation => self.apply_attestation(envelope_bytes).await,
@@ -1764,28 +1831,30 @@ impl FederationDirectoryReplicationBridge {
         //
         // CIRISEdge#425 — the typed `ReplicatedKeyOutcome` maps cleanly to
         // `ApplyOutcome`: `Inserted`/`Upgraded`/`Superseded` changed local state
-        // (progress); `Unchanged` is a byte-identical duplicate (routine, quiet);
-        // `Refused` (pubkey swap, downgrade, re-scrub, ambiguous owner, unverifiable
-        // sig) is a REAL refusal that darkens the Key plane — LOUD, not the silent
-        // `false` it used to fold into. A persist `Err` / deserialize failure carry
-        // their reason. The choke point (`on_deliver`) logs every non-`Admitted`.
+        // (progress); `Unchanged` is a byte-identical duplicate (routine, quiet).
+        //
+        // persist v24.2.0 (CIRISPersist#565) — `Refused { reason }` now NAMES the
+        // branch that fired (a closed, append-only 9-token enum), so the message
+        // carries the verdict's evidence instead of the whole five-cause
+        // disjunction we used to print. We key on the enum constant, never the
+        // message string (the two-lists-that-disagree rule). A persist `Err` /
+        // deserialize failure carry their reason. The choke point (`on_deliver`)
+        // logs every non-`Admitted`; the receive-plane mirror of the #433 withhold
+        // ledger counts every refusal by its token.
         match serde_json::from_slice::<SignedKeyRecord>(bytes) {
             Ok(record) => {
                 let content_hash =
                     content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
-                match self.directory.apply_replicated_key_record(record).await {
-                    Ok(
-                        ReplicatedKeyOutcome::Inserted
-                        | ReplicatedKeyOutcome::Upgraded
-                        | ReplicatedKeyOutcome::Superseded,
-                    ) => ApplyOutcome::Admitted,
-                    Ok(ReplicatedKeyOutcome::Unchanged) => ApplyOutcome::Duplicate,
-                    Ok(ReplicatedKeyOutcome::Refused) => ApplyOutcome::Refused(format!(
-                        "Key: admission refused (content_hash={content_hash}; pubkey swap / \
-                         downgrade / re-scrub / ambiguous owner / unverifiable sig)"
-                    )),
-                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason("Key", &content_hash, &e)),
+                let (outcome, refusal_token) = key_outcome_to_apply(
+                    self.directory.apply_replicated_key_record(record).await,
+                    &content_hash,
+                );
+                if let Some(token) = refusal_token {
+                    if let Some(m) = &self.metrics {
+                        m.inc_key_apply_refusal(token);
+                    }
                 }
+                outcome
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Key", bytes, &e)),
         }
@@ -2438,6 +2507,120 @@ mod tests {
     }
 
     // ── apply_envelope_bytes refuses garbage ────────────────────────
+
+    /// persist v24.2.0 / CIRISPersist#565 — the pure outcome mapping, exhaustive
+    /// over `KeyRefusalReason::ALL`: both duplicate halves (`Unchanged` AND
+    /// `already_anchored_identical`) map to `Duplicate` with NO ledger token
+    /// (mapping only the new variant would leave the common baked-seed re-offer
+    /// path misreported); every other reason maps to `Refused` whose message
+    /// carries the stable token, which is also returned for the receive-plane
+    /// mirror to count.
+    #[test]
+    fn key_outcome_mapping_is_exhaustive_and_names_the_branch() {
+        // The three progress outcomes admit, no token.
+        for o in [
+            ReplicatedKeyOutcome::Inserted,
+            ReplicatedKeyOutcome::Upgraded,
+            ReplicatedKeyOutcome::Superseded,
+        ] {
+            let (a, t) = key_outcome_to_apply(Ok(o), "h");
+            assert!(matches!(a, ApplyOutcome::Admitted), "{a:?}");
+            assert!(t.is_none());
+        }
+        // Both duplicate halves: Duplicate, never counted as a refusal.
+        let (a, t) = key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Unchanged), "h");
+        assert!(matches!(a, ApplyOutcome::Duplicate), "{a:?}");
+        assert!(t.is_none());
+        let (a, t) = key_outcome_to_apply(
+            Ok(ReplicatedKeyOutcome::Refused {
+                reason: KeyRefusalReason::AlreadyAnchoredIdentical,
+            }),
+            "h",
+        );
+        assert!(
+            matches!(a, ApplyOutcome::Duplicate),
+            "already_anchored_identical is the receiver ALREADY HOLDING what was \
+             offered (a re-encoding of an anchored record) — Duplicate, not a \
+             security-shaped refusal; got {a:?}"
+        );
+        assert!(t.is_none());
+        // Every OTHER reason: Refused carrying the stable token, token returned.
+        for &reason in KeyRefusalReason::ALL {
+            if matches!(reason, KeyRefusalReason::AlreadyAnchoredIdentical) {
+                continue;
+            }
+            let (a, t) = key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h");
+            let ApplyOutcome::Refused(msg) = &a else {
+                panic!("{} must map to Refused, got {a:?}", reason.as_str());
+            };
+            assert!(
+                msg.contains(reason.as_str()),
+                "the refusal message must carry the branch token {}: {msg}",
+                reason.as_str()
+            );
+            assert_eq!(t, Some(reason.as_str()), "the mirror counts the token");
+        }
+    }
+
+    /// persist v24.2.0 / #565 — the wire drive: a pubkey swap offered through
+    /// the real apply choke books on BOTH receive-plane mirror axes (kind +
+    /// stable token) and surfaces the branch in the refusal message.
+    #[tokio::test]
+    async fn a_pubkey_swap_books_on_both_receive_mirror_axes() {
+        let (backend, bridge, metrics) = make_metered_bridge(&[]);
+        // The node already holds k1 at its canonical pubkeys...
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fixture_key_record("k1", identity_type::NODE),
+            })
+            .await
+            .expect("seed k1");
+        // ...and a peer offers k1 under DIFFERENT pubkeys (the hijack shape).
+        let mut swapped = fixture_key_record("k1", identity_type::NODE);
+        let (other_ed, other_mldsa) = hybrid_pubkeys("attacker-keys");
+        swapped.pubkey_ed25519_base64 = other_ed;
+        swapped.pubkey_ml_dsa_65_base64 = other_mldsa;
+        let bytes =
+            serde_json::to_vec(&SignedKeyRecord { record: swapped }).expect("serialize offer");
+
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Key, &bytes, Some("peer-x"))
+            .await;
+        let ApplyOutcome::Refused(msg) = &outcome else {
+            panic!("a pubkey swap must be Refused, got {outcome:?}");
+        };
+        // WHICH branch classifies is persist's unit (certified upstream; on the
+        // MemoryBackend this shape currently books `store_conflict` — its
+        // plan-free write site — where the planned sqlite/postgres paths name
+        // `pubkey_swap`). EDGE's unit is coherence: the message carries exactly
+        // one stable token from the closed set, and BOTH mirror axes book it.
+        let snap = metrics.snapshot();
+        let booked: Vec<&str> = snap
+            .key_apply_refusals_by_reason
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(booked.len(), 1, "exactly one token booked: {booked:?}");
+        let token = booked[0];
+        assert!(
+            KeyRefusalReason::ALL.iter().any(|r| r.as_str() == token),
+            "the booked token is from the closed contract set: {token}"
+        );
+        assert!(
+            msg.contains(token),
+            "the message names the SAME branch the ledger booked ({token}): {msg}"
+        );
+        assert_eq!(
+            snap.apply_refusals_by_kind.get(&EnvelopeKind::Key).copied(),
+            Some(1),
+            "the kind axis books at the #425 choke"
+        );
+        assert_eq!(
+            snap.key_apply_refusals_by_reason.get(token).copied(),
+            Some(1),
+            "the token axis books the typed branch once"
+        );
+    }
 
     /// apply_envelope_bytes returns false on undeserializable bytes
     /// for every kind. Defence against a peer that ships bytes the

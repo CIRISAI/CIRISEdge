@@ -2130,6 +2130,11 @@ impl PyEdge {
     ///      "detail": "legA-no-role"}, ...   # newest last, ≤ 64 entries
     ///   ],
     ///   "replication_envelopes_served_total": {"attestation": 56, ...},
+    ///   # persist v24.2.0 / CIRISPersist#565 — the receive-plane mirror:
+    ///   # refused applies per kind, and Key-plane policy refusals by
+    ///   # persist's stable token (closed, append-only 9-token contract).
+    ///   "apply_refusals_by_kind": {"key": 3, ...},
+    ///   "key_apply_refusals_by_reason": {"pubkey_swap": 3, ...},
     /// }
     /// ```
     fn metrics_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -2241,6 +2246,21 @@ impl PyEdge {
             served.set_item(kind.as_wire_str(), *v)?;
         }
         root.set_item("replication_envelopes_served_total", served)?;
+
+        // persist v24.2.0 / CIRISPersist#565 — the receive-plane mirror of the
+        // withhold ledger: refused applies per envelope kind, and the typed
+        // Key-plane refusals by persist's stable token (closed, append-only
+        // 9-token contract — key on the token, never on message prose).
+        let refusals_kind = pyo3::types::PyDict::new(py);
+        for (kind, v) in &bundle.apply_refusals_by_kind {
+            refusals_kind.set_item(kind.as_wire_str(), *v)?;
+        }
+        root.set_item("apply_refusals_by_kind", refusals_kind)?;
+        let refusals_reason = pyo3::types::PyDict::new(py);
+        for (token, v) in &bundle.key_apply_refusals_by_reason {
+            refusals_reason.set_item(token.as_str(), *v)?;
+        }
+        root.set_item("key_apply_refusals_by_reason", refusals_reason)?;
 
         Ok(root.unbind().into_any())
     }

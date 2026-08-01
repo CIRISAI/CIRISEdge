@@ -450,6 +450,22 @@ pub struct EdgeMetrics {
     /// this says TO WHOM and ABOUT WHAT, at bounded cardinality and with no need
     /// to turn on debug logging in the field.
     pub recent_withholds: Arc<RwLock<VecDeque<WithholdRecord>>>,
+    /// persist v24.2.0 / CIRISPersist#565 — the RECEIVE-plane mirror of the
+    /// withhold ledger, kind axis: per-[`EnvelopeKind`] count of envelopes this
+    /// node REFUSED to apply (the #425 choke's `ApplyOutcome::Refused`, every
+    /// plane, typed-or-stringy alike). Same inversion, other direction: not
+    /// "did anything fail?" but "did anything move, and if not, what stopped
+    /// it?" — asked of what we were OFFERED rather than what we serve.
+    pub apply_refusals_by_kind: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
+    /// persist v24.2.0 / CIRISPersist#565 — the receive-plane mirror, reason
+    /// axis for the one plane persist types today: Key-plane policy refusals
+    /// counted by persist's STABLE token (`pubkey_swap`, `downgrade`, …; a
+    /// closed, append-only 9-token contract — bounded cardinality by
+    /// construction). Duplicate halves (`Unchanged`,
+    /// `already_anchored_identical`) never count here: the receiver already
+    /// holds what was offered. Extends per-plane as persist types more
+    /// refusals.
+    pub key_apply_refusals_by_reason: Arc<RwLock<HashMap<String, u64>>>,
     /// CIRISEdge#433 — per-[`EnvelopeKind`] count of envelopes the REPLICATION
     /// plane served to a peer. The mirror-image defect of the withhold blindness:
     /// [`Self::envelopes_sent_total`] is bumped only from `src/edge.rs`
@@ -602,6 +618,22 @@ impl EdgeMetrics {
         *guard.entry(kind).or_insert(0) += 1;
     }
 
+    /// persist v24.2.0 / #565 — count one refused apply on `kind` (the
+    /// receive-plane mirror's kind axis, bumped at the #425 choke).
+    pub fn inc_apply_refusal_kind(&self, kind: EnvelopeKind) {
+        let mut guard = self.apply_refusals_by_kind.write();
+        *guard.entry(kind).or_insert(0) += 1;
+    }
+
+    /// persist v24.2.0 / #565 — count one TYPED Key-plane policy refusal by
+    /// persist's stable token. `token` comes from `KeyRefusalReason::as_str()`
+    /// — a closed, append-only set, so this map's cardinality is bounded by
+    /// the persist contract, never by traffic.
+    pub fn inc_key_apply_refusal(&self, token: &str) {
+        let mut guard = self.key_apply_refusals_by_reason.write();
+        *guard.entry(token.to_string()).or_insert(0) += 1;
+    }
+
     /// Update the per-peer reachability ratio gauge. Replaces (does
     /// not accumulate) — the underlying tracker computes the rolling
     /// ratio and the gauge mirrors it.
@@ -636,6 +668,8 @@ impl EdgeMetrics {
                 .replication_envelopes_served_total
                 .read()
                 .clone(),
+            apply_refusals_by_kind: self.apply_refusals_by_kind.read().clone(),
+            key_apply_refusals_by_reason: self.key_apply_refusals_by_reason.read().clone(),
         }
     }
 }
@@ -673,6 +707,12 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#433 — cumulative per-kind count of envelopes the replication
     /// plane actually served (the counter `envelopes_sent_total` never saw).
     pub replication_envelopes_served_total: HashMap<EnvelopeKind, u64>,
+    /// persist v24.2.0 / #565 — refused applies per envelope kind (the
+    /// receive-plane mirror, kind axis).
+    pub apply_refusals_by_kind: HashMap<EnvelopeKind, u64>,
+    /// persist v24.2.0 / #565 — typed Key-plane policy refusals by persist's
+    /// stable token (closed, append-only 9-token contract).
+    pub key_apply_refusals_by_reason: HashMap<String, u64>,
 }
 
 #[cfg(test)]
