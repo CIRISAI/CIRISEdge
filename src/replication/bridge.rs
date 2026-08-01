@@ -278,6 +278,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// read; the [`CONSENT_SEND_SET_MEMO_TTL`] window sits under the anti-entropy
     /// cadence so a between-round withdraw still takes effect next round.
     consent_memo: Mutex<Option<(ResolvedPeerSet, Instant)>>,
+    /// CIRISEdge#433 — the live metrics handle backing the WITHHOLD LEDGER + the
+    /// replication-plane served counter. `None` makes every increment a no-op, so
+    /// the (extensive) test constructions below stay untouched; every PRODUCTION
+    /// construction site threads `Edge`'s handle in via [`Self::with_metrics`].
+    metrics: Option<crate::observability::EdgeMetrics>,
 }
 
 /// CIRISEdge#400 — how long a memoized consent send-set stays fresh. Chosen to
@@ -308,6 +313,7 @@ impl FederationDirectoryReplicationBridge {
             config,
             operational: None,
             consent_memo: Mutex::new(None),
+            metrics: None,
         }
     }
 
@@ -341,6 +347,7 @@ impl FederationDirectoryReplicationBridge {
             config,
             operational: Some(operational),
             consent_memo: Mutex::new(None),
+            metrics: None,
         }
     }
 
@@ -368,6 +375,45 @@ impl FederationDirectoryReplicationBridge {
     pub fn with_local_key_id(mut self, local_key_id: Option<String>) -> Self {
         self.local_key_id = local_key_id;
         self
+    }
+
+    /// CIRISEdge#433 — install the live metrics handle (builder), enabling the
+    /// withhold ledger + the replication-plane served counter.
+    /// [`crate::observability::EdgeMetrics`] is `Clone` and `Arc`-backed, so the
+    /// bridge shares the SAME counters the rest of the edge writes.
+    ///
+    /// Takes an `Option` to match its two sibling builders
+    /// ([`Self::with_self_provider`] / [`Self::with_local_key_id`]), which both
+    /// carry an operator-supplied `Option` straight through from
+    /// `ReplicationRuntimeConfig`. `None` makes every increment a no-op.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// CIRISEdge#433 — record ONE withhold against the ledger. A no-op when no
+    /// metrics handle is installed, so every gate below can call it
+    /// unconditionally and no test construction has to care.
+    ///
+    /// Called at the BRANCH, never at a join point: the ledger's contract is that
+    /// the reason is the branch, not a disjunction over the reasons that might
+    /// have applied.
+    fn withhold(&self, reason: crate::observability::WithholdReason, peer: &str, detail: &str) {
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_withhold(reason, peer, detail);
+        }
+    }
+
+    /// CIRISEdge#433 — the short, low-cardinality `detail` for a hash-addressed
+    /// withhold: the kind plus an 8-byte hash prefix (the same prefix the #379
+    /// withheld-trace log already carries, so a ledger entry and a log line join).
+    fn withhold_detail(kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> String {
+        format!(
+            "{}:{}",
+            kind.as_wire_str(),
+            hex::encode(&envelope_hash[..8])
+        )
     }
 
     /// Decode persist's hex-encoded `persist_row_hash` (64 chars,
@@ -486,13 +532,31 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         envelope_hash: &[u8; 32],
         peer_key_id: Option<&str>,
     ) -> Option<Vec<u8>> {
-        let bytes = self.fetch_envelope_bytes(kind, envelope_hash).await?;
+        // CIRISEdge#433 / #429 — the requester asked for a hash we just claimed to
+        // hold and we cannot resolve it to bytes. This is the bridge-level ORIGIN
+        // of the advertised-then-unfetchable event `session::pack_bounded_deliver`
+        // reports in its `dropped` set (every entry there is this `None`); counting
+        // it HERE keeps it disjoint from the policy gates below — "we could not
+        // find it" never hides inside "we chose not to serve it". The `detail`
+        // string is built INSIDE the branch: this is the per-envelope serve path,
+        // and the happy path must not pay for an attribution nobody reads.
+        let Some(bytes) = self.fetch_envelope_bytes(kind, envelope_hash).await else {
+            self.withhold(
+                crate::observability::WithholdReason::EnvelopeUnfetchable,
+                peer_key_id.unwrap_or("<unattributed>"),
+                &Self::withhold_detail(kind, envelope_hash),
+            );
+            return None;
+        };
         if kind == EnvelopeKind::Attestation {
             if let Some(peer) = peer_key_id {
                 // CIRISEdge#396 item 1 — the same consent-membership bound the
                 // listing applies, so a peer excluded from the advertise cannot
                 // obtain an attestation by fetching a hash it learned
                 // out-of-band. Fail-closed: no `ResolvedRecipient`, no bytes.
+                // (#433: `resolve_attestation_recipient` books its OWN branch's
+                // reason — this call site must not re-count, or a single withhold
+                // would show up twice under two different reasons.)
                 let recipient = self.resolve_attestation_recipient(peer).await?;
                 // #379 `infra:serve` + #396 item 6 `recipient_capability`, over
                 // the WIRE bytes — the direct-fetch twins of the listing gates,
@@ -504,6 +568,10 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     if Self::attestation_requires_serve(inner)
                         && !self.peer_has_serve_capability(recipient.as_str()).await
                     {
+                        // #433: `peer_has_serve_capability` books the specific leg
+                        // (no-role / read-error / not-rooted / walk-error) — its
+                        // `bool` return is exactly the disjunction the ledger must
+                        // not report, so this site logs and does not count.
                         tracing::debug!(
                             peer,
                             envelope_hash = %hex::encode(&envelope_hash[..8]),
@@ -520,10 +588,31 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                         )
                         .await
                     {
+                        // #433 — item 6 was the purest silent withhold on this
+                        // path: a bare `return None` with only a `trace!`. It is
+                        // countable now, booked inside
+                        // `recipient_capability_withholds` at the branch that
+                        // decided (which knows the offending dimension), so this
+                        // site does not re-count.
                         return None;
                     }
                 }
             }
+        }
+        // CIRISEdge#433 — the replication plane's metric-visible moment. This is
+        // where the bridge hands the wire bytes back to `pack_bounded_deliver`;
+        // every gate has cleared and local state resolved the row, so THIS layer's
+        // part of the transaction is definitely complete. Mirrors the CIRISEdge#28
+        // precedent (`edge.rs`: "durable enqueue is the metric-visible moment"):
+        // count where success is definite for the layer doing the counting, not at
+        // a peer acknowledgement this layer never observes. Two known, deliberate
+        // imprecisions, both bounded and both in the honest direction: the caller
+        // may drop the LAST fetched envelope when it would exceed
+        // `MAX_DELIVER_ENVELOPE_BYTES` (at most one per Deliver, re-served next
+        // round), and a Deliver frame lost in flight still counts as served — the
+        // same semantics `envelopes_sent_total` has carried since v0.19.0.
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_replication_served(kind);
         }
         Some(bytes)
     }
@@ -626,7 +715,7 @@ impl FederationDirectoryReplicationBridge {
     /// the exact value persist's `signed_wire_index` keys on), and dedupe by
     /// hash. No caching — [`Self::fetch_envelope_bytes`]'s point-read is the
     /// serve path for every plane but `Revocation`.
-    fn advertise_since<S, IN, TS>(rows: &[S], in_scope: IN, seq_of: TS) -> Vec<EnvelopeRef>
+    fn advertise_since<S, IN, TS>(&self, rows: &[S], in_scope: IN, seq_of: TS) -> Vec<EnvelopeRef>
     where
         S: serde::Serialize,
         IN: Fn(&S) -> bool,
@@ -644,6 +733,15 @@ impl FederationDirectoryReplicationBridge {
                     "advertise_since: a row could not be serialized to its content \
                      hash and is OMITTED from the advertise set — it will not replicate \
                      (CIRISEdge#425)"
+                );
+                // CIRISEdge#433 — and it COUNTS. This is what took `&self`: a plane
+                // going dark for a non-policy reason is the one withhold an
+                // operator has no other way to see, since there is no peer and no
+                // gate to correlate against.
+                self.withhold(
+                    crate::observability::WithholdReason::RowNotSerializable,
+                    "<unattributed>",
+                    "advertise_since: content_hash_of failed",
                 );
                 continue;
             };
@@ -670,7 +768,7 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_key_records_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |row| subjects.contains(&row.record.key_id),
             |row| Self::ms_seq(row.record.valid_from),
@@ -690,7 +788,7 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_identity_occurrences_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |row| subjects.contains(&row.identity_occurrence.occurrence_key_id),
             |row| Self::ms_seq(row.identity_occurrence.asserted_at),
@@ -712,7 +810,7 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_transport_destinations_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |row| subjects.contains(&row.transport_destination.occurrence_key_id),
             |row| {
@@ -742,7 +840,7 @@ impl FederationDirectoryReplicationBridge {
             )
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |row| subjects.contains(&row.identity_occurrence_revocation.occurrence_key_id),
             |row| Self::ms_seq(row.identity_occurrence_revocation.revoked_at),
@@ -780,9 +878,22 @@ impl FederationDirectoryReplicationBridge {
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         for key_id in subjects {
+            // #433 — keep the subject for the withhold attribution below; `fetch`
+            // consumes the owned `String`.
+            let subject = key_id.clone();
             let rows = fetch(key_id).await;
             for row in rows {
                 let Some(envelope_hash) = Self::decode_hash(hash(&row)) else {
+                    // CIRISEdge#433 — the row exists but its `persist_row_hash` is
+                    // not 32 hex bytes, so it is absent from the advertise set and
+                    // will never replicate. Was a bare `continue`; now countable.
+                    // Distinct from `RowNotSerializable`: the row serializes fine,
+                    // its persist-side hash is the wrong shape.
+                    self.withhold(
+                        crate::observability::WithholdReason::RowHashUndecodable,
+                        &subject,
+                        "fan_out_for_member: persist_row_hash not 32 hex bytes",
+                    );
                     continue;
                 };
                 if !seen.insert(envelope_hash) {
@@ -958,7 +1069,16 @@ impl FederationDirectoryReplicationBridge {
         // C — a directory READ ERROR is reported as such, NOT folded into "no role"
         // (a transient failure reported as a confident statement about the peer's
         // blessing is worse than silence: it sends you looking in the wrong place).
-        let withhold = |reason_tag: &str, msg: String| {
+        //
+        // CIRISEdge#433 carries that same split into the LEDGER. This fn returns a
+        // `bool`, which is precisely the disjunction the ledger must not report —
+        // so each leg books its own reason HERE, at the branch, and the callers
+        // (`fetch_envelope_bytes_for_peer`, `list_attestations`) do not re-count.
+        // The counter is unthrottled even though the log is: a floor is right for
+        // log volume, but a metric that under-counts is a metric that lies.
+        use crate::observability::WithholdReason;
+        let withhold = |reason: WithholdReason, reason_tag: &str, msg: String| {
+            self.withhold(reason, peer_key_id, reason_tag);
             if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                 serve_gate_withheld_log().check(&format!("{peer_key_id}:{reason_tag}"))
             {
@@ -974,6 +1094,7 @@ impl FederationDirectoryReplicationBridge {
             Ok(true) => {}
             Ok(false) => {
                 withhold(
+                    WithholdReason::ServeCapabilityMissing,
                     "legA-no-role",
                     "trace attestation WITHHELD (leg A) — recipient has no accord-conferred, \
                      still-verifying `infra:serve`. The fleet must re-genesis with an \
@@ -984,6 +1105,7 @@ impl FederationDirectoryReplicationBridge {
             }
             Err(e) => {
                 withhold(
+                    WithholdReason::ServeCapabilityReadError,
                     "legA-read-error",
                     format!(
                         "trace attestation WITHHELD (leg A) — the `infra:serve` DIRECTORY READ \
@@ -998,6 +1120,7 @@ impl FederationDirectoryReplicationBridge {
         // Leg B — pluggable-trust-root plane.
         let Some(local) = self.local_key_id.as_deref() else {
             withhold(
+                WithholdReason::LocalIdentityMissing,
                 "legB-no-local-key",
                 "trace attestation WITHHELD (leg B) — replication runtime has no `local_key_id`, \
                  so the CIRISEdge#386 trust-root gate cannot be evaluated. This darks the trace \
@@ -1028,6 +1151,7 @@ impl FederationDirectoryReplicationBridge {
                 // The walk needs THREE inputs; `Ok(None)` doesn't say which is
                 // absent, so enumerate them as an actionable checklist (CIRISEdge#425).
                 withhold(
+                    WithholdReason::ServeCapabilityNotRooted,
                     "legB-no-trusted-root",
                     format!(
                         "trace attestation WITHHELD (leg B) — recipient's `infra:serve` roots to \
@@ -1041,6 +1165,7 @@ impl FederationDirectoryReplicationBridge {
             }
             Err(e) => {
                 withhold(
+                    WithholdReason::TrustRootWalkError,
                     "legB-walk-error",
                     format!(
                         "trace attestation WITHHELD (leg B) — the trust-root walk FAILED \
@@ -1145,6 +1270,15 @@ impl FederationDirectoryReplicationBridge {
                     "trace attestation withheld — recipient lacks a producer-required \
                      `recipient_capability` (CIRISEdge#396 item 6)"
                 );
+                // CIRISEdge#433 — booked at the branch, on the ADVERTISE side. The
+                // direct-fetch twin books at its own call site (this fn is shared,
+                // and each path withholds one row per call, so the two never
+                // double-count a single decision).
+                self.withhold(
+                    crate::observability::WithholdReason::RecipientCapabilityRestriction,
+                    peer,
+                    dimension,
+                );
                 return true;
             }
         }
@@ -1161,12 +1295,26 @@ impl FederationDirectoryReplicationBridge {
     /// and the direct-fetch ([`Self::fetch_envelope_bytes_for_peer`]) paths funnel
     /// through here; a peer excluded from the listing cannot obtain an
     /// attestation by Diff/Fetch-ing its hash out-of-band.
+    /// CIRISEdge#433 — each of the three `None` branches books its OWN
+    /// [`crate::observability::WithholdReason`]. They are NOT interchangeable: a
+    /// wiring fault (no local identity), a transient read failure, and a peer the
+    /// operator genuinely did not consent to are three different things to go
+    /// look at. Booked here rather than at the two call sites
+    /// ([`Self::fetch_envelope_bytes_for_peer`] and [`Self::list_attestations`])
+    /// because only here is the branch visible — and so a withhold is counted
+    /// exactly once.
     async fn resolve_attestation_recipient(&self, peer: &str) -> Option<ResolvedRecipient> {
+        use crate::observability::WithholdReason;
         let Some(local) = self.local_key_id.as_deref() else {
             tracing::warn!(
                 peer,
                 "attestation plane withheld — no `local_key_id` to resolve the CIRISEdge#396 \
                  consent send-set; wire ReplicationRuntimeConfig::local_key_id"
+            );
+            self.withhold(
+                WithholdReason::LocalIdentityMissing,
+                peer,
+                "consent-send-set: no local_key_id",
             );
             return None;
         };
@@ -1174,6 +1322,11 @@ impl FederationDirectoryReplicationBridge {
             tracing::debug!(
                 peer,
                 "attestation plane withheld — consent send-set unresolved (fail-closed)"
+            );
+            self.withhold(
+                WithholdReason::SendSetUnresolved,
+                peer,
+                "list_consent_peers read failed",
             );
             return None;
         };
@@ -1183,6 +1336,11 @@ impl FederationDirectoryReplicationBridge {
                 peer,
                 "attestation plane withheld — recipient is not in this node's live \
                  consent:replication send-set (CIRISEdge#396 item 1)"
+            );
+            self.withhold(
+                WithholdReason::RecipientNotInSendSet,
+                peer,
+                "attestation: not consent-included",
             );
         }
         resolved
@@ -1311,10 +1469,26 @@ impl FederationDirectoryReplicationBridge {
         // CIRISEdge#396 item 6 — per-owner parsed consent grants, memoized for
         // this sweep so a same-owner plane costs one grant read.
         let mut grant_cache: HashMap<String, Vec<ConsentTransferPolicy>> = HashMap::new();
+        let peer_label = recipient.unwrap_or("<unattributed>");
         for att in &attestations {
             let Ok(canonical_json) = serde_json::to_value(att) else {
+                // CIRISEdge#433 — an attestation that will not project to a
+                // `Value` is invisible to every gate below AND absent from the
+                // advertise set. Was a bare `continue`.
+                self.withhold(
+                    crate::observability::WithholdReason::RowNotSerializable,
+                    peer_label,
+                    "list_attestations: to_value failed",
+                );
                 continue;
             };
+            // NOTE (#433, deliberate): the projection filter below is NOT a
+            // withhold. `attestation_is_advertised` defines which rows this node
+            // is the publisher OF (a `self`/`family` row is published by its own
+            // subject, never relayed) — a row it excludes was never eligible, so
+            // counting it would flood the ledger with by-design non-events every
+            // sweep and bury the gates that ARE decisions. The audit trail for
+            // projection lives in `namespace::projection_for`, not here.
             if !Self::attestation_is_advertised(&canonical_json, &self_set) {
                 continue;
             }
@@ -1352,6 +1526,13 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
             let Some((hash, _bytes)) = content_hash_of(att) else {
+                // CIRISEdge#433 — cleared every gate, then could not be hashed:
+                // eligible and not served, which is the ledger's exact definition.
+                self.withhold(
+                    crate::observability::WithholdReason::RowNotSerializable,
+                    peer_label,
+                    "list_attestations: content_hash_of failed",
+                );
                 continue;
             };
             if !seen.insert(hash) {
@@ -1419,7 +1600,7 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_families_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |s| s.family.members.iter().any(|m| cohort.contains(&m.key_id)),
             |s| Self::ms_seq(s.family.founded_at),
@@ -1433,7 +1614,7 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_communities_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |s| {
                 s.community
@@ -1456,7 +1637,7 @@ impl FederationDirectoryReplicationBridge {
             )
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |_| true,
             |s| Self::ms_seq(s.family_membership_revocation.removed_at),
@@ -1474,7 +1655,7 @@ impl FederationDirectoryReplicationBridge {
             )
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |_| true,
             |s| Self::ms_seq(s.community_membership_revocation.removed_at),
@@ -1488,7 +1669,7 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_location_proofs_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |s| cohort.contains(&s.location_proof.subject_key_id),
             |s| Self::ms_seq(s.location_proof.asserted_at),
@@ -1531,7 +1712,7 @@ impl FederationDirectoryReplicationBridge {
             .list_organizations_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
+        self.advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
     }
 
     async fn list_org_memberships(&self) -> Vec<EnvelopeRef> {
@@ -1543,7 +1724,7 @@ impl FederationDirectoryReplicationBridge {
             .list_org_memberships_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
+        self.advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
     }
 
     async fn list_partner_records(&self) -> Vec<EnvelopeRef> {
@@ -1559,7 +1740,7 @@ impl FederationDirectoryReplicationBridge {
             .list_signed_partner_records_since(None, self.config.operational_page_limit)
             .await
             .unwrap_or_default();
-        Self::advertise_since(
+        self.advertise_since(
             &rows,
             |_| true,
             |s| Self::ms_seq(s.partner_record.asserted_at),
@@ -2633,7 +2814,8 @@ mod tests {
 
     /// Seed ONE `trace:complete:v1` scores row in the shape persist v18.1.0's
     /// Information-Type validator admits (trace_id + agent_id_hash + trace).
-    #[cfg(feature = "test-anchor")]
+    /// (Un-`cfg`d for CIRISEdge#433: the withhold-ledger tests below seed the same
+    /// gated row on the default feature set, so this is no longer test-anchor-only.)
     async fn seed_trace_attestation(backend: &MemoryBackend, producer: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
@@ -3764,5 +3946,400 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── CIRISEdge#433 — the withhold ledger ─────────────────────────
+    //
+    // Field-provenance discipline ([[feedback_test_field_provenance]]): each test
+    // below drives the REAL gate through the bridge with a directory state that
+    // makes that branch fire, then asserts the LEDGER counted that branch. None
+    // of them call `inc_withhold` directly — a green test on a hand-fed reason
+    // would prove only that the counter increments, not that the gate reaches it.
+    // (The single exception is the ring-buffer bound smoke test in
+    // `observability.rs`, where the bound itself is the unit under test.)
+
+    /// A bridge over a fresh `MemoryBackend` with a LIVE metrics handle attached
+    /// — the production shape (`ReplicationRuntime::start` threads `Edge`'s
+    /// handle in). Returns the handle so a test can read the ledger back.
+    fn make_metered_bridge(
+        cohort: &[String],
+    ) -> (
+        Arc<MemoryBackend>,
+        FederationDirectoryReplicationBridge,
+        crate::observability::EdgeMetrics,
+    ) {
+        let (backend, bridge) = make_bridge(cohort);
+        let metrics = crate::observability::EdgeMetrics::new();
+        (backend, bridge.with_metrics(Some(metrics.clone())), metrics)
+    }
+
+    /// The scaffold BOTH halves of the discriminator share: registered keys for
+    /// every party, and `local`'s bare consent grant naming `peer` so the #396
+    /// item-1 membership bound passes. Identical configuration on both sides
+    /// means the ONLY difference between "idle" and "withholding" is whether a
+    /// gated row exists — which is exactly the distinction #433 exists to make
+    /// visible.
+    async fn seed_serve_scaffold(backend: &MemoryBackend, local: &str, producer: &str, peer: &str) {
+        for key_id in [local, producer, peer] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_consent_membership(backend, local, peer).await;
+    }
+
+    /// CIRISEdge#433, the discriminator property from the issue — **two states,
+    /// now distinguishable**.
+    ///
+    /// Before this cut, a node withholding every `trace:*` row from every peer
+    /// reported exactly what a node with nothing to send reported: zero sent,
+    /// round `completed`, perfect health, zero carriage. Both bridges here are
+    /// configured IDENTICALLY (same keys, same consent grant, same peer lacking
+    /// `infra:serve`); the only difference is that one holds a trace row. That
+    /// used to be invisible. It is now the difference between an empty ledger
+    /// and `serve_capability_missing >= 1`.
+    #[tokio::test]
+    async fn idle_and_withholding_bridges_are_distinguishable() {
+        use crate::observability::WithholdReason;
+        let local = "this-node";
+        let producer = "agent-producer";
+        let peer = "peer-no-capability";
+        let cohort = [local.to_string(), producer.to_string(), peer.to_string()];
+
+        // (a) IDLE — fully wired, consent-included peer, and NOTHING held back:
+        //     every row it advertises, it serves.
+        let (idle_backend, idle_bridge, idle_metrics) = make_metered_bridge(&cohort);
+        let idle_bridge = idle_bridge.with_local_key_id(Some(local.to_string()));
+        seed_serve_scaffold(&idle_backend, local, producer, peer).await;
+        let idle_refs = idle_bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+            .await;
+        for r in &idle_refs {
+            assert!(
+                idle_bridge
+                    .fetch_envelope_bytes_for_peer(
+                        EnvelopeKind::Attestation,
+                        &r.envelope_hash,
+                        Some(peer)
+                    )
+                    .await
+                    .is_some(),
+                "the idle bridge holds nothing back"
+            );
+        }
+        let idle = idle_metrics.snapshot();
+        assert!(
+            idle.withholds_by_reason.is_empty(),
+            "an IDLE node withholds nothing — its ledger is empty, got {:?}",
+            idle.withholds_by_reason
+        );
+        assert_eq!(
+            idle.replication_envelopes_served_total
+                .get(&EnvelopeKind::Attestation)
+                .copied()
+                .unwrap_or(0),
+            idle_refs.len() as u64,
+            "an IDLE node's carriage equals what it advertised"
+        );
+
+        // (b) WITHHOLDING — same wiring, plus one `trace:*` row the peer may not
+        //     have (it holds no accord-conferred `infra:serve`).
+        let (hold_backend, hold_bridge, hold_metrics) = make_metered_bridge(&cohort);
+        let hold_bridge = hold_bridge.with_local_key_id(Some(local.to_string()));
+        seed_serve_scaffold(&hold_backend, local, producer, peer).await;
+        seed_trace_attestation(&hold_backend, producer).await;
+        let trace_hash = locate_trace_hash(&hold_bridge).await;
+
+        // Drive the REAL advertise gate, then the REAL serve gate.
+        let held_refs = hold_bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+            .await;
+        assert!(
+            !held_refs.iter().any(|r| r.envelope_hash == trace_hash),
+            "the trace row is withheld from a peer with no `infra:serve`"
+        );
+        assert!(
+            hold_bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &trace_hash, Some(peer))
+                .await
+                .is_none(),
+            "...on the direct-fetch path too"
+        );
+
+        let held = hold_metrics.snapshot();
+        assert!(
+            held.withholds_by_reason
+                .get(&WithholdReason::ServeCapabilityMissing)
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "the WITHHOLDING node books the branch that decided, got {:?}",
+            held.withholds_by_reason
+        );
+        assert_eq!(
+            held.replication_envelopes_served_total
+                .get(&EnvelopeKind::Attestation)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "and it served NOTHING — the state that used to look identical to idle"
+        );
+
+        // The property, stated directly: the two nodes' reports now differ.
+        assert_ne!(
+            idle.withholds_by_reason, held.withholds_by_reason,
+            "an idle node and a withholding node must not report the same thing"
+        );
+    }
+
+    /// CIRISEdge#433 — a serve that MOVES a row bumps
+    /// `replication_envelopes_served_total`, keyed by the same `EnvelopeKind` the
+    /// wire uses. This is the mirror-image defect: `inc_sent` is called only from
+    /// `src/edge.rs`, so before this counter a node that moved N rows through
+    /// anti-entropy rounds reported `envelopes_sent_total: 0` — reporting broken
+    /// while working.
+    #[tokio::test]
+    async fn a_serve_that_moves_rows_bumps_the_replication_served_counter() {
+        let local = "this-node";
+        let producer = "agent-producer";
+        let peer = "peer-consented";
+        let (backend, bridge, metrics) =
+            make_metered_bridge(&[local.to_string(), producer.to_string(), peer.to_string()]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        seed_serve_scaffold(&backend, local, producer, peer).await;
+        // A NON-trace row: no `trace:` dimension, so the #379/#386 gate is inert
+        // and this exercises the SERVE path, not a withhold.
+        seed_advertised_attestation(&backend, producer).await;
+
+        let refs = bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+            .await;
+        assert!(
+            !refs.is_empty(),
+            "the row is advertised to the consented peer"
+        );
+        for r in &refs {
+            assert!(
+                bridge
+                    .fetch_envelope_bytes_for_peer(
+                        EnvelopeKind::Attestation,
+                        &r.envelope_hash,
+                        Some(peer)
+                    )
+                    .await
+                    .is_some(),
+                "every advertised row serves"
+            );
+        }
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.replication_envelopes_served_total
+                .get(&EnvelopeKind::Attestation)
+                .copied()
+                .unwrap_or(0),
+            refs.len() as u64,
+            "one bump per envelope the bridge handed to the wire path"
+        );
+        assert!(
+            snap.withholds_by_reason.is_empty(),
+            "a clean serve withholds nothing, got {:?}",
+            snap.withholds_by_reason
+        );
+    }
+
+    /// CIRISEdge#433 / #396 item 1 — a peer absent from the live consent send-set
+    /// books `RecipientNotInSendSet`, driven through the REAL advertise path (the
+    /// `consent_membership_fan_out_bound` scenario, now with a ledger on it).
+    #[tokio::test]
+    async fn recipient_not_in_send_set_is_booked_at_the_branch() {
+        use crate::observability::WithholdReason;
+        let local = "this-node";
+        let producer = "agent-producer";
+        let peer_in = "peer-consented";
+        let peer_out = "peer-unconsented";
+        let (backend, bridge, metrics) = make_metered_bridge(&[
+            local.to_string(),
+            producer.to_string(),
+            peer_in.to_string(),
+            peer_out.to_string(),
+        ]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        for key_id in [local, producer, peer_in, peer_out] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_advertised_attestation(&backend, producer).await;
+        seed_consent_membership(&backend, local, peer_in).await;
+
+        // The consent-INCLUDED peer serves cleanly — no withhold.
+        assert!(!bridge.list_attestations(Some(peer_in)).await.is_empty());
+        assert!(
+            metrics.snapshot().withholds_by_reason.is_empty(),
+            "the consented peer's plane is not a withhold"
+        );
+
+        // The consent-EXCLUDED peer loses the WHOLE plane — and it is counted.
+        assert!(bridge.list_attestations(Some(peer_out)).await.is_empty());
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.withholds_by_reason
+                .get(&WithholdReason::RecipientNotInSendSet)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "the item-1 bound books ONE plane-wide withhold, got {:?}",
+            snap.withholds_by_reason
+        );
+        // The reason is the BRANCH: no other reason fired.
+        assert_eq!(
+            snap.withholds_by_reason.len(),
+            1,
+            "exactly one reason, not a disjunction: {:?}",
+            snap.withholds_by_reason
+        );
+        let recent = &snap.recent_withholds;
+        assert_eq!(recent.last().expect("a recent entry").peer_key_id, peer_out);
+    }
+
+    /// CIRISEdge#433 — a bridge with no `local_key_id` cannot resolve the consent
+    /// send-set, so it fail-closes; that is a WIRING fault, and the ledger says so
+    /// (`LocalIdentityMissing`) rather than blaming the peer's consent. Driven
+    /// through the real advertise path (`fan_out_fail_closed_without_local_key_id`).
+    #[tokio::test]
+    async fn missing_local_identity_is_booked_as_a_wiring_fault_not_a_consent_verdict() {
+        use crate::observability::WithholdReason;
+        let local = "this-node";
+        let producer = "agent-producer";
+        let peer = "peer-consented";
+        let (backend, bridge, metrics) =
+            make_metered_bridge(&[local.to_string(), producer.to_string(), peer.to_string()]);
+        // NOTE: deliberately NO `with_local_key_id` — the field condition.
+        seed_serve_scaffold(&backend, local, producer, peer).await;
+        seed_advertised_attestation(&backend, producer).await;
+
+        assert!(
+            bridge.list_attestations(Some(peer)).await.is_empty(),
+            "no local_key_id → the whole plane is withheld (fail-closed)"
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.withholds_by_reason
+                .get(&WithholdReason::LocalIdentityMissing)
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        assert!(
+            !snap
+                .withholds_by_reason
+                .contains_key(&WithholdReason::RecipientNotInSendSet),
+            "a wiring fault must NOT be reported as 'the peer is unconsented' — \
+             that sends the operator looking in the wrong place"
+        );
+    }
+
+    /// CIRISEdge#433 / #396 item 6 — a producer-declared `recipient_capability`
+    /// the recipient lacks books `RecipientCapabilityRestriction`, and the ring
+    /// records the offending DIMENSION. Driven through the real gate with the
+    /// canonical value the advertise sweep feeds it.
+    #[tokio::test]
+    async fn recipient_capability_restriction_is_booked_with_its_dimension() {
+        use crate::observability::WithholdReason;
+        let producer = "agent-producer";
+        let recipient = "peer-no-capability";
+        let (backend, bridge, metrics) =
+            make_metered_bridge(&[producer.to_string(), recipient.to_string()]);
+        for key_id in [producer, recipient] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        let trace_json = trace_row_json(producer);
+
+        // No grant → no restriction → SERVE, and nothing is booked.
+        assert!(
+            !bridge
+                .recipient_capability_withholds(&trace_json, recipient, &mut HashMap::new())
+                .await
+        );
+        assert!(metrics.snapshot().withholds_by_reason.is_empty());
+
+        // A covering grant naming a capability the recipient lacks → WITHHOLD.
+        seed_consent_grant(&backend, producer, recipient, "trace:", "trace:read").await;
+        assert!(
+            bridge
+                .recipient_capability_withholds(&trace_json, recipient, &mut HashMap::new())
+                .await
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.withholds_by_reason
+                .get(&WithholdReason::RecipientCapabilityRestriction)
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        let last = snap.recent_withholds.last().expect("a recent entry");
+        assert_eq!(last.peer_key_id, recipient);
+        assert_eq!(
+            last.detail, "trace:complete:v1",
+            "the ring attributes the offending dimension, not the whole envelope"
+        );
+    }
+
+    /// CIRISEdge#433 / #429 — a hash the requester asks for that local state
+    /// cannot resolve books `EnvelopeUnfetchable`, kept DISJOINT from every
+    /// policy gate. This is the bridge-level origin of the
+    /// advertised-then-unfetchable event `session::pack_bounded_deliver` reports
+    /// in its `dropped` set: "we could not find it" must never hide inside "we
+    /// chose not to serve it".
+    #[tokio::test]
+    async fn an_unfetchable_hash_is_booked_separately_from_every_policy_gate() {
+        use crate::observability::WithholdReason;
+        let local = "this-node";
+        let producer = "agent-producer";
+        let peer = "peer-consented";
+        let (backend, bridge, metrics) =
+            make_metered_bridge(&[local.to_string(), producer.to_string(), peer.to_string()]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        seed_serve_scaffold(&backend, local, producer, peer).await;
+
+        // A hash that was never seeded — the #429 field condition (stale
+        // wire-index / pruned row / hash skew).
+        let missing = [0x5au8; 32];
+        assert!(bridge
+            .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &missing, Some(peer))
+            .await
+            .is_none());
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.withholds_by_reason
+                .get(&WithholdReason::EnvelopeUnfetchable)
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            snap.withholds_by_reason.len(),
+            1,
+            "an unfetchable row is NOT a consent / capability verdict: {:?}",
+            snap.withholds_by_reason
+        );
+        assert_eq!(
+            snap.recent_withholds.last().expect("a recent entry").detail,
+            format!("attestation:{}", hex::encode(&missing[..8])),
+            "the ring carries kind + hash prefix, joinable with the #379 log line"
+        );
     }
 }

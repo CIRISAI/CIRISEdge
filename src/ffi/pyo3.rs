@@ -2119,6 +2119,17 @@ impl PyEdge {
     ///   "transport_bytes_in_total": {"reticulum-rs": 24576, ...},
     ///   "transport_bytes_out_total":{"http": 1024, ...},
     ///   "peer_reachability_ratio":  {"peer-x:reticulum-rs": 0.75, ...},
+    ///   # CIRISEdge#433 — the withhold ledger + the replication-plane
+    ///   # served counter. Together they separate the three states a node
+    ///   # could previously not tell apart: idle (both empty), working
+    ///   # (served non-zero), and WITHHOLDING (withholds non-zero).
+    ///   "withholds_by_reason": {"serve_capability_missing": 12, ...},
+    ///   "recent_withholds": [
+    ///     {"reason": "serve_capability_missing",
+    ///      "peer_key_id": "peer-x",
+    ///      "detail": "legA-no-role"}, ...   # newest last, ≤ 64 entries
+    ///   ],
+    ///   "replication_envelopes_served_total": {"attestation": 56, ...},
     /// }
     /// ```
     fn metrics_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -2197,6 +2208,39 @@ impl PyEdge {
             "replication_inbound_backpressure_drops",
             bundle.replication_inbound_backpressure_drops,
         )?;
+
+        // CIRISEdge#433 — the WITHHOLD LEDGER. A serving-path gate that declines
+        // to serve a row now emits a counted event keyed by the BRANCH that
+        // decided, so an operator can finally distinguish "nothing to send" from
+        // "refusing to send" — the two states that reported identically before.
+        let withholds = pyo3::types::PyDict::new(py);
+        for (reason, v) in &bundle.withholds_by_reason {
+            withholds.set_item(reason.as_str(), *v)?;
+        }
+        root.set_item("withholds_by_reason", withholds)?;
+
+        // CIRISEdge#433 — the bounded attribution window (≤ 64, oldest evicted):
+        // WHO the row was withheld from and WHAT it was, without turning on debug
+        // logging in the field.
+        let recent = pyo3::types::PyList::empty(py);
+        for record in &bundle.recent_withholds {
+            let entry = pyo3::types::PyDict::new(py);
+            entry.set_item("reason", record.reason.as_str())?;
+            entry.set_item("peer_key_id", record.peer_key_id.as_str())?;
+            entry.set_item("detail", record.detail.as_str())?;
+            recent.append(entry)?;
+        }
+        root.set_item("recent_withholds", recent)?;
+
+        // CIRISEdge#433 — the replication plane's own send counter. `envelopes_
+        // sent_total` is bumped only from the application/durable paths, so a node
+        // moving rows through anti-entropy rounds reported zero sends: reporting
+        // broken while working, the mirror image of the withhold blindness.
+        let served = pyo3::types::PyDict::new(py);
+        for (kind, v) in &bundle.replication_envelopes_served_total {
+            served.set_item(kind.as_wire_str(), *v)?;
+        }
+        root.set_item("replication_envelopes_served_total", served)?;
 
         Ok(root.unbind().into_any())
     }

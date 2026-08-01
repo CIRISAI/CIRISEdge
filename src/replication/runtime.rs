@@ -101,6 +101,36 @@ async fn rebuild_signed_wire_index_fail_soft(directory: &Arc<dyn FederationDirec
     }
 }
 
+/// Assemble the production bridge from the runtime config. Extracted from
+/// [`ReplicationRuntime::start`] so the builder chain reads as one thing (and so
+/// `start` stays under the clippy line ceiling).
+///
+/// CIRISEdge#433 — `.with_metrics` is the wiring that makes the withhold ledger +
+/// the replication-plane served counter live: the bridge writes to the SAME
+/// `EdgeMetrics` handle the rest of the edge reports from. This is the ONE
+/// production bridge construction — every coordinator (the initiator set AND the
+/// #312 responder factory) shares this instance, so wiring it here covers both
+/// roles. `config.metrics` is `None` only when the operator started the runtime
+/// without a metrics handle, which also disables the #370 round-outcome counter;
+/// the ledger degrades the same way (every increment becomes a no-op).
+fn build_bridge(
+    directory: &Arc<dyn FederationDirectory>,
+    cohort: CohortProvider,
+    config: &ReplicationRuntimeConfig,
+    self_provider: Option<CohortProvider>,
+) -> Arc<FederationDirectoryReplicationBridge> {
+    Arc::new(
+        FederationDirectoryReplicationBridge::with_config(
+            Arc::clone(directory),
+            cohort,
+            config.bridge,
+        )
+        .with_self_provider(self_provider)
+        .with_local_key_id(config.local_key_id.clone())
+        .with_metrics(config.metrics.clone()),
+    )
+}
+
 fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
     tokio::spawn(async move {
         let peer = coord.peer_key_id().to_string();
@@ -348,15 +378,9 @@ impl ReplicationRuntime {
         // content-hash point-read fetch (once, idempotent, fail-soft).
         rebuild_signed_wire_index_fail_soft(&directory).await;
 
-        let bridge = Arc::new(
-            FederationDirectoryReplicationBridge::with_config(
-                Arc::clone(&directory),
-                cohort,
-                config.bridge,
-            )
-            .with_self_provider(self_provider)
-            .with_local_key_id(config.local_key_id.clone()),
-        );
+        // The ONE production bridge — shared by every coordinator below AND by the
+        // #312 responder factory. See [`build_bridge`] for the #433 metrics wiring.
+        let bridge = build_bridge(&directory, cohort, &config, self_provider);
 
         let registry = Arc::new(ReplicationRegistry::new());
 

@@ -64,12 +64,13 @@
 //! - `peer_reachability_ratio[(peer_key_id, medium)]` — rolling
 //!   reachability window ratio, mirror of `ReachabilityTracker::snapshot_all`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
 use crate::messages::MessageType;
+use crate::replication::protocol::EnvelopeKind;
 use crate::transport::TransportId;
 
 /// Classification of a `VerifyError` for metrics labelling. Mirrors
@@ -204,6 +205,146 @@ impl RoundOutcome {
     }
 }
 
+/// CIRISEdge#433 — the closed taxonomy of *withhold* reasons: every branch on a
+/// serving path where a row WAS eligible to go and did not.
+///
+/// # Why this exists
+///
+/// The metrics surface counted successes (`envelopes_sent_total`), failures
+/// (`send_failures_total`), and drops (back-pressure / low-trust) — but a gate
+/// deciding "I will not serve this row to this peer" emitted nothing countable.
+/// A withholding node therefore reported EXACTLY what an idle node reported:
+/// `envelopes_sent_total: 0`, round `completed`, perfect health, zero carriage.
+/// That is the #423–#429 silent-refusal arc's last uncounted limb, and the
+/// mirror image of the replication-plane send blindness
+/// [`EdgeMetrics::replication_envelopes_served_total`] closes.
+///
+/// # The two properties this type enforces
+///
+/// 1. **A withhold is an event, not a non-event.** Every `return None` /
+///    `continue` on a serving path in [`crate::replication::bridge`] increments
+///    one of these.
+/// 2. **The reason is the BRANCH, not a disjunction.** Each variant maps to ONE
+///    code branch (documented per-variant with the gate it belongs to), so a
+///    `bool`-returning gate that folds five refusal legs into `false` — as
+///    `peer_has_serve_capability` did — reports each leg separately. Collapsing
+///    "the peer has no role" into "the directory read failed" is exactly the
+///    class of confident-but-wrong report #425 Exhibit C called out.
+///
+/// `Copy + Eq + Hash` so it sits in the counter `HashMap` key. The peer and any
+/// per-event detail ride the bounded [`WithholdRecord`] ring, never the label —
+/// unbounded label cardinality explodes downstream metric storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WithholdReason {
+    /// The requested `(kind, envelope_hash)` did not resolve to bytes in local
+    /// state. This is the bridge-level origin of the #429
+    /// *advertised-then-unfetchable* event: every hash the responder's
+    /// `pack_bounded_deliver` reports in its `dropped` set is a `None` from
+    /// [`crate::replication::bridge::FederationDirectoryReplicationBridge`]'s
+    /// recipient-aware fetch, and this is that `None` — stale wire-index, pruned
+    /// row, or hash skew. Deliberately distinct from every policy gate below, so
+    /// "we chose not to" never hides inside "we could not find it".
+    EnvelopeUnfetchable,
+    /// The bridge has no `local_key_id`, so the `I` whose consent / trust would
+    /// be evaluated does not exist. Fail-closed at two sites that share this ONE
+    /// condition and ONE operator remedy (wire
+    /// `ReplicationRuntimeConfig::local_key_id`): the #396 item-1 consent
+    /// send-set resolution and the #386 leg-B trust-root walk. A wiring fault,
+    /// not a policy decision — the `detail` names which site observed it.
+    LocalIdentityMissing,
+    /// The consent send-set (`list_consent_peers(local)`, persist's E7
+    /// projection) could not be read. Fail-closed: a transient directory error
+    /// is NOT a statement that the peer is unconsented (#396 item 1).
+    SendSetUnresolved,
+    /// The send-set resolved and the peer is NOT in it — the #396 item-1
+    /// consent-membership fan-out bound, working as designed. The whole
+    /// Attestation plane is withheld from this peer.
+    RecipientNotInSendSet,
+    /// #379/#386 leg A — the recipient holds no accord-conferred, still-verifying
+    /// `infra:serve`. A `trace:*` row is withheld. This is the reason a fleet
+    /// that has not re-genesised with an `infra:serve`-blessed canonical sees a
+    /// dark trace plane (CIRISPersist#480).
+    ServeCapabilityMissing,
+    /// #386 leg A — the `infra:serve` DIRECTORY READ failed. #425 Exhibit C:
+    /// reported as a read error, never folded into [`Self::ServeCapabilityMissing`],
+    /// because a transient failure reported as a confident statement about the
+    /// peer's blessing sends the operator looking in the wrong place.
+    ServeCapabilityReadError,
+    /// #386 leg B — the recipient's `infra:serve` roots to no root THIS node
+    /// trusts. One of three inputs is absent: the root→peer scoped grant, our own
+    /// trust edge to that root, or a live root charter.
+    ServeCapabilityNotRooted,
+    /// #386 leg B — the trust-root walk itself errored. Same Exhibit C split as
+    /// [`Self::ServeCapabilityReadError`]: transient, not a trust verdict.
+    TrustRootWalkError,
+    /// #396 item 6 — the DATA PRODUCER attached a `recipient_capability`
+    /// restriction to its own `consent:replication:v1` grant covering this row's
+    /// dimension, and the recipient does not hold that capability.
+    RecipientCapabilityRestriction,
+    /// A row present in local state could not be serialized to its content hash
+    /// (`content_hash_of` / `serde_json::to_value` returned nothing), so it is
+    /// OMITTED from the advertise set and will never replicate. Near-impossible
+    /// for these types — which is exactly why it must speak if it ever fires.
+    RowNotSerializable,
+    /// A row's `persist_row_hash` was not decodable as 32 hex-encoded bytes, so
+    /// the row is absent from the advertise set. Distinct from
+    /// [`Self::RowNotSerializable`]: the row serializes fine, its persist-side
+    /// hash is the wrong shape.
+    RowHashUndecodable,
+}
+
+impl WithholdReason {
+    /// Snake-case stable label string. Used as the dict-key on the PyO3
+    /// `metrics_snapshot` surface; stable across releases.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvelopeUnfetchable => "envelope_unfetchable",
+            Self::LocalIdentityMissing => "local_identity_missing",
+            Self::SendSetUnresolved => "send_set_unresolved",
+            Self::RecipientNotInSendSet => "recipient_not_in_send_set",
+            Self::ServeCapabilityMissing => "serve_capability_missing",
+            Self::ServeCapabilityReadError => "serve_capability_read_error",
+            Self::ServeCapabilityNotRooted => "serve_capability_not_rooted",
+            Self::TrustRootWalkError => "trust_root_walk_error",
+            Self::RecipientCapabilityRestriction => "recipient_capability_restriction",
+            Self::RowNotSerializable => "row_not_serializable",
+            Self::RowHashUndecodable => "row_hash_undecodable",
+        }
+    }
+}
+
+impl std::fmt::Display for WithholdReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// CIRISEdge#433 — one entry in the bounded recent-withholds ring: the
+/// attribution a bare counter cannot carry, WITHOUT turning on debug logging.
+///
+/// `detail` is a short, low-cardinality descriptor built at the call site (the
+/// envelope kind plus a hash prefix, or the gate leg) — never a full envelope,
+/// never peer-supplied content. The ring itself is capped at
+/// [`RECENT_WITHHOLDS_CAP`], so the memory this costs is bounded regardless of
+/// how long a node withholds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithholdRecord {
+    /// The branch that withheld.
+    pub reason: WithholdReason,
+    /// The recipient the row was withheld from (`<unattributed>` when the
+    /// withhold is peer-blind, e.g. an unserializable row on the advertise
+    /// sweep).
+    pub peer_key_id: String,
+    /// Short attribution — envelope kind + hash prefix, or the gate leg.
+    pub detail: String,
+}
+
+/// CIRISEdge#433 — how many recent withholds the attribution ring keeps. Fixed
+/// (not tunable) and small: this is a *what just happened* window for an
+/// operator reading a snapshot, not a log. Oldest is evicted first.
+pub const RECENT_WITHHOLDS_CAP: usize = 64;
+
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
 /// # Concurrency
@@ -296,6 +437,28 @@ pub struct EdgeMetrics {
     /// also show `timed_out`). Single `Arc<AtomicU64>`; the offending peer + kind
     /// ride the matching throttled WARN.
     pub replication_inbound_backpressure_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#433 — the WITHHOLD LEDGER: per-[`WithholdReason`] count of rows
+    /// a serving-path gate declined to serve. Shaped exactly like
+    /// [`Self::send_failures_total`] (same `Arc<RwLock<HashMap<_, _>>>` lock
+    /// discipline, same clone-on-snapshot). Before it, a node withholding every
+    /// `trace:*` row from every peer was indistinguishable from a node with
+    /// nothing to send — both reported zero. Now they differ: an idle node's
+    /// ledger is empty, a withholding node's is not.
+    pub withholds_by_reason: Arc<RwLock<HashMap<WithholdReason, u64>>>,
+    /// CIRISEdge#433 — bounded ring ([`RECENT_WITHHOLDS_CAP`] entries, oldest
+    /// evicted) of recent [`WithholdRecord`]s. The counter says HOW MANY and WHY;
+    /// this says TO WHOM and ABOUT WHAT, at bounded cardinality and with no need
+    /// to turn on debug logging in the field.
+    pub recent_withholds: Arc<RwLock<VecDeque<WithholdRecord>>>,
+    /// CIRISEdge#433 — per-[`EnvelopeKind`] count of envelopes the REPLICATION
+    /// plane served to a peer. The mirror-image defect of the withhold blindness:
+    /// [`Self::envelopes_sent_total`] is bumped only from `src/edge.rs`
+    /// application/durable paths, so a node that moved 56 trace rows through
+    /// anti-entropy rounds reported `envelopes_sent_total: 0` — reporting broken
+    /// while working, exactly as the withhold ledger fixes working-while-reporting-
+    /// idle. Keyed on the SAME [`EnvelopeKind`] the replication wire uses (one
+    /// kind list, not two).
+    pub replication_envelopes_served_total: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
 }
 
 impl EdgeMetrics {
@@ -392,6 +555,53 @@ impl EdgeMetrics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CIRISEdge#433 — record ONE withhold: bump the per-reason counter and push
+    /// the attribution onto the bounded ring.
+    ///
+    /// `peer` is the recipient the row was withheld from (`<unattributed>` for a
+    /// peer-blind advertise-sweep withhold); `detail` is a SHORT descriptor — the
+    /// envelope kind plus a hash prefix, or the gate leg. Never a full envelope:
+    /// the ring is an attribution window, not a log sink, and its entries must
+    /// stay bounded in size as well as in count.
+    ///
+    /// The two locks are taken sequentially, never nested — the counter guard is
+    /// a statement temporary, matching [`Self::inc_send_failure`]'s discipline.
+    pub fn inc_withhold(&self, reason: WithholdReason, peer: &str, detail: &str) {
+        *self.withholds_by_reason.write().entry(reason).or_insert(0) += 1;
+        let mut ring = self.recent_withholds.write();
+        while ring.len() >= RECENT_WITHHOLDS_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(WithholdRecord {
+            reason,
+            peer_key_id: peer.to_string(),
+            detail: detail.to_string(),
+        });
+    }
+
+    /// CIRISEdge#433 — read the withhold count for `reason` (tests + consumers
+    /// that want one reason without cloning the whole map).
+    #[must_use]
+    pub fn withholds(&self, reason: WithholdReason) -> u64 {
+        self.withholds_by_reason
+            .read()
+            .get(&reason)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// CIRISEdge#433 — increment the replication-plane served counter for `kind`.
+    ///
+    /// Called at the bridge's serve exit — the moment the bridge hands the wire
+    /// bytes back to the pack path. Mirrors the CIRISEdge#28 precedent at
+    /// `edge.rs` "durable enqueue is the metric-visible moment": the counter marks
+    /// the point where THIS layer's part of the transaction is definitely
+    /// complete, not the point where the peer acknowledged it.
+    pub fn inc_replication_served(&self, kind: EnvelopeKind) {
+        let mut guard = self.replication_envelopes_served_total.write();
+        *guard.entry(kind).or_insert(0) += 1;
+    }
+
     /// Update the per-peer reachability ratio gauge. Replaces (does
     /// not accumulate) — the underlying tracker computes the rolling
     /// ratio and the gauge mirrors it.
@@ -420,6 +630,12 @@ impl EdgeMetrics {
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
+            withholds_by_reason: self.withholds_by_reason.read().clone(),
+            recent_withholds: self.recent_withholds.read().iter().cloned().collect(),
+            replication_envelopes_served_total: self
+                .replication_envelopes_served_total
+                .read()
+                .clone(),
         }
     }
 }
@@ -448,6 +664,15 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#373 — cumulative inbound frames dropped on coordinator
     /// channel back-pressure (previously a silent WARN).
     pub replication_inbound_backpressure_drops: u64,
+    /// CIRISEdge#433 — cumulative per-reason withhold count. Empty on an IDLE
+    /// node; non-empty on a WITHHOLDING one. That difference is the whole point.
+    pub withholds_by_reason: HashMap<WithholdReason, u64>,
+    /// CIRISEdge#433 — the recent-withholds attribution window, oldest first,
+    /// at most [`RECENT_WITHHOLDS_CAP`] entries.
+    pub recent_withholds: Vec<WithholdRecord>,
+    /// CIRISEdge#433 — cumulative per-kind count of envelopes the replication
+    /// plane actually served (the counter `envelopes_sent_total` never saw).
+    pub replication_envelopes_served_total: HashMap<EnvelopeKind, u64>,
 }
 
 #[cfg(test)]
@@ -555,6 +780,66 @@ mod tests {
             3072
         );
         assert_eq!(snap.transport_bytes_out_total[&TransportId::HTTP], 512);
+    }
+
+    /// CIRISEdge#433 — the ring-buffer BOUND is the unit under test here, so this
+    /// is the one test in the cut that calls `inc_withhold` directly (every
+    /// per-reason test drives the real gate through the bridge instead). A ledger
+    /// that grew without limit would be a memory leak on exactly the node that is
+    /// withholding hardest — the failure mode this cap exists to prevent.
+    #[test]
+    fn recent_withholds_ring_is_capped_and_evicts_oldest() {
+        let m = EdgeMetrics::new();
+        for i in 0..(RECENT_WITHHOLDS_CAP + 10) {
+            m.inc_withhold(
+                WithholdReason::ServeCapabilityMissing,
+                &format!("peer-{i}"),
+                "legA-no-role",
+            );
+        }
+        let snap = m.snapshot();
+        // The COUNTER is exact — the cap bounds attribution, never the count.
+        assert_eq!(
+            snap.withholds_by_reason[&WithholdReason::ServeCapabilityMissing],
+            (RECENT_WITHHOLDS_CAP + 10) as u64,
+            "the cap bounds the ring, not the counter — a metric that under-counts lies"
+        );
+        assert_eq!(snap.recent_withholds.len(), RECENT_WITHHOLDS_CAP);
+        // Oldest evicted, newest retained, order preserved (oldest first).
+        assert_eq!(snap.recent_withholds[0].peer_key_id, "peer-10");
+        assert_eq!(
+            snap.recent_withholds[RECENT_WITHHOLDS_CAP - 1].peer_key_id,
+            format!("peer-{}", RECENT_WITHHOLDS_CAP + 9)
+        );
+        assert_eq!(snap.recent_withholds[0].detail, "legA-no-role");
+    }
+
+    /// CIRISEdge#433 — the snake_case labels are the PyO3 dict keys downstream
+    /// consumers alert on; pin the ones the issue named so a rename is a
+    /// deliberate edit, not an accident.
+    #[test]
+    fn withhold_reason_labels_are_stable() {
+        assert_eq!(
+            WithholdReason::ServeCapabilityMissing.as_str(),
+            "serve_capability_missing"
+        );
+        assert_eq!(
+            WithholdReason::RecipientNotInSendSet.as_str(),
+            "recipient_not_in_send_set"
+        );
+        assert_eq!(
+            WithholdReason::SendSetUnresolved.as_str(),
+            "send_set_unresolved"
+        );
+        assert_eq!(
+            WithholdReason::RecipientCapabilityRestriction.as_str(),
+            "recipient_capability_restriction"
+        );
+        // Display agrees with as_str, so `{reason}` in a log joins to the metric.
+        assert_eq!(
+            WithholdReason::EnvelopeUnfetchable.to_string(),
+            "envelope_unfetchable"
+        );
     }
 
     #[test]
