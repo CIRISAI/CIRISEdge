@@ -292,6 +292,37 @@ pub trait RootingDirectory: Send + Sync + 'static {
     async fn hybrid_transport_binding_exists(&self, _key_id: &str, _dest_hash: [u8; 16]) -> bool {
         false
     }
+
+    /// CIRISEdge#432 — point-read the durably stored reticulum binding for
+    /// `key_id`: the read half of the live-map divergence heal.
+    ///
+    /// The live `peers` map and the durable `transport_destinations` store have
+    /// INDEPENDENT writers (the announce path moves both in one motion, but a
+    /// replication-side or server-side rooting writes only the store), so a
+    /// long-lived node can hold a live entry at `Advisory` while the store says
+    /// `rooted` — and the attribution gate reads the one that is wrong. This
+    /// accessor lets the attribution-failure path consult the durable truth and
+    /// heal the live entry in place — a one-peer, mid-session boot prime.
+    /// Default `None` (test doubles / no directory ⇒ no heal, fail-closed —
+    /// a missing store can only leave attribution as it was, never widen it).
+    async fn stored_reticulum_binding(&self, _key_id: &str) -> Option<StoredTransportBinding> {
+        None
+    }
+}
+
+/// CIRISEdge#432 — the durable transport binding as the divergence heal
+/// consumes it: provenance + the full 64-byte `(x25519 ‖ ed25519)` transport
+/// identity (so the heal can require the STORED identity to equal the identity
+/// the link actually proved — the store is authority for trust, never for
+/// identity) + the stored supersession epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredTransportBinding {
+    /// The durably recorded provenance (`rooted` is what the heal acts on).
+    pub provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+    /// The stored transport identity, `[x25519 ‖ ed25519]`.
+    pub transport_pubkey64: [u8; 64],
+    /// The stored monotonic supersession epoch (CIRISEdge#336).
+    pub epoch: u64,
 }
 
 /// CIRISEdge#393 (E3, item 2) — pure predicate under
@@ -398,6 +429,40 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             Ok(routes) => hybrid_reticulum_route_present(&routes, dest_hash),
             Err(_) => false,
         }
+    }
+
+    async fn stored_reticulum_binding(&self, key_id: &str) -> Option<StoredTransportBinding> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // Fail-closed on a read error: no durable truth ⇒ no heal (the live
+        // entry stays as it was; a directory hiccup must never widen anything).
+        let rows = FederationDirectory::list_transport_destinations_for(self, key_id)
+            .await
+            .ok()?;
+        // Best live reticulum row: max epoch, then latest asserted_at — the
+        // same monotonic ordering the (epoch, asserted_at)-guarded put enforces.
+        let row = rows
+            .iter()
+            .filter(|r| r.transport_kind == "reticulum" && r.retired_at.is_none())
+            .max_by_key(|r| (r.epoch, r.asserted_at))?;
+        // Both identity halves must be present + well-formed — a partial row
+        // cannot bind an identity, so it cannot justify a trust upgrade.
+        let x = b64
+            .decode(row.transport_x25519_pubkey_base64.as_deref()?)
+            .ok()?;
+        let e = b64
+            .decode(row.transport_ed25519_pubkey_base64.as_deref()?)
+            .ok()?;
+        let (x32, e32): ([u8; 32], [u8; 32]) =
+            (x.as_slice().try_into().ok()?, e.as_slice().try_into().ok()?);
+        let mut pk = [0u8; 64];
+        pk[..32].copy_from_slice(&x32);
+        pk[32..].copy_from_slice(&e32);
+        Some(StoredTransportBinding {
+            provenance: row.binding_provenance,
+            transport_pubkey64: pk,
+            epoch: row.epoch,
+        })
     }
 
     async fn persist_transport_binding(

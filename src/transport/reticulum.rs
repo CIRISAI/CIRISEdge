@@ -4544,41 +4544,31 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                 }
                 _ => None,
             };
-            if gated.is_none() {
-                // CIRISEdge#404 — the attribution decision now has a voice. INFO
-                // (testing-visible) + throttled by key_id (the 1024-cap map bounds
-                // an attacker-chosen flood). The operands turn "binding is not
-                // Rooted∧owns_key" from three candidates into a verdict: a
-                // `provenance=Advisory ∧ owns_key=true` is a churn DOWNGRADE (owner
-                // reroute overwrote a Rooted binding), NOT an owns_key failure.
-                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
-                    link_attribution_miss_log().check(key_id.as_str())
-                {
-                    if let Some((provenance, owns_key, epoch)) = resolved {
-                        tracing::warn!(
-                            link = ?link_id,
-                            peer = %key_id,
-                            resolved_provenance = ?provenance,
-                            resolved_owns_key = owns_key,
-                            resolved_epoch = epoch,
-                            suppressed_prev,
-                            "inbound frame NOT attributed — resolved binding fails \
-                             Rooted∧owns_key; these are the ACTUAL operands (CIRISEdge#404). \
-                             provenance=Advisory + owns_key=true ⇒ a churn downgrade, not an \
-                             owns_key failure"
-                        );
-                    } else {
-                        tracing::warn!(
-                            link = ?link_id,
-                            peer = %key_id,
-                            suppressed_prev,
-                            "inbound frame DROPPED — item 1 has NO binding in the peers map \
-                             for this link's key_id (candidate resolved, peers-map miss) \
-                             (CIRISEdge#404 link-resolution miss)"
-                        );
-                    }
-                }
-            }
+            let gated = if gated.is_some() {
+                gated
+            } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                // CIRISEdge#404/#432 — the attribution decision has a voice AND a
+                // remedy, both bounded by this per-key_id throttle (the 1024-cap
+                // map bounds an attacker-chosen flood; the throttle's Emit floor
+                // also bounds the heal's directory point-read to a few per window
+                // — and the FIRST failing frame always Emits, so a genuine
+                // divergence heals on frame one, not after a window).
+                link_attribution_miss_log().check(key_id.as_str())
+            {
+                // CIRISEdge#432 — before declaring the miss, consult the DURABLE
+                // store. The live map and the store have independent writers (a
+                // replication-side or server-side rooting updates only the store),
+                // so "resolved Advisory" can be stale while persist holds
+                // `rooted` — the two-day dark-Attestation-plane class. If the
+                // store roots the SAME transport identity this link proved,
+                // upgrade the live entry in place (a one-peer mid-session boot
+                // prime — exactly the motion a process restart performs) and
+                // attribute THIS frame.
+                heal_or_report_attribution_miss(ctx, &key_id, resolved, link_id, suppressed_prev)
+                    .await
+            } else {
+                None
+            };
             gated
         }
         // NO candidate key_id at all — the frame is dropped unattributed. This is
@@ -5219,6 +5209,234 @@ fn route_supersession_decision(
     }
     // Lower epoch, or equal epoch with no upgrade/heal → stale.
     RouteSupersession::IgnoreStale
+}
+
+/// CIRISEdge#432 — the pure heal decision: should the live entry be upgraded
+/// from the durable store?
+///
+/// Inputs are exactly what the field produces: the live entry's operands
+/// (`(Advisory, owns_key=false)` for a first-contact announce admitted at
+/// `UnknownKeyId` — both production reproductions) + its link-proven transport
+/// identity hash, and the store's row. The upgrade requires ALL of:
+/// - the live binding actually fails `Rooted ∧ owns_key` (never touch a
+///   passing binding),
+/// - the store says `Rooted` (the store is authority for TRUST…),
+/// - the stored transport identity equals the identity the link proved
+///   (…but never for IDENTITY — a stored row binding a different transport
+///   identity must not launder trust onto this link).
+fn divergence_heal_decision(
+    live_provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+    live_owns_key: bool,
+    live_identity_hash: [u8; 16],
+    stored: &crate::verify::StoredTransportBinding,
+) -> DivergenceHeal {
+    use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+    if matches!(live_provenance, Rooted) && live_owns_key {
+        return DivergenceHeal::LiveAlreadyPasses;
+    }
+    if !matches!(stored.provenance, Rooted) {
+        return DivergenceHeal::StoreNotRooted;
+    }
+    let x25519: [u8; 32] = stored.transport_pubkey64[..32]
+        .try_into()
+        .unwrap_or([0u8; 32]);
+    let ed25519: [u8; 32] = stored.transport_pubkey64[32..]
+        .try_into()
+        .unwrap_or([0u8; 32]);
+    let stored_hash =
+        Identity::from_public_keys(&x25519, &ed25519).map_or([0u8; 16], |id| *id.hash());
+    if stored_hash != live_identity_hash {
+        return DivergenceHeal::IdentityMismatch;
+    }
+    DivergenceHeal::Upgrade
+}
+
+/// CIRISEdge#432 — the [`divergence_heal_decision`] verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DivergenceHeal {
+    /// Live entry already passes `Rooted ∧ owns_key` — nothing to heal.
+    LiveAlreadyPasses,
+    /// The store does not hold a `Rooted` binding — no divergence to act on.
+    StoreNotRooted,
+    /// The store roots a DIFFERENT transport identity than the link proved —
+    /// divergence detected but NOT healable onto this link (trust must never
+    /// be laundered across identities).
+    IdentityMismatch,
+    /// Upgrade the live entry: `provenance = Rooted`, `owns_key = true`.
+    Upgrade,
+}
+
+/// CIRISEdge#432 — attribution-failure handler: attempt the live-map divergence
+/// heal against the durable store, then report whatever remains, with the
+/// stored provenance alongside the resolved operands (#432 ask 3) and a hint
+/// that matches its own evidence.
+///
+/// Runs ONLY under the caller's throttle `Emit` (first failing frame + the
+/// periodic floor), so the directory point-read is flood-bounded. On a
+/// successful heal the SAME frame is attributed (item 2 permitting) — the dark
+/// plane converges in zero additional frames.
+async fn heal_or_report_attribution_miss(
+    ctx: &EventCtx<'_>,
+    key_id: &str,
+    resolved: Option<(
+        ciris_persist::federation::self_at_login::BindingProvenance,
+        bool,
+        u64,
+    )>,
+    link_id: LinkId,
+    suppressed_prev: u64,
+) -> Option<crate::transport::SourceKeyId> {
+    use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+    let stored = match ctx.rooting {
+        Some(rooting) => rooting.stored_reticulum_binding(key_id).await,
+        None => None,
+    };
+    // The heal arm: a live entry that fails the gate + a store that roots the
+    // same link-proven identity ⇒ upgrade in place, attribute this frame.
+    if let (Some((live_prov, live_ok, _)), Some(s)) = (resolved, stored.as_ref()) {
+        let (decision, dest16) = {
+            let mut peers = ctx.peers.lock().await;
+            match peers.get_mut(key_id) {
+                Some(entry) => {
+                    let d = divergence_heal_decision(
+                        live_prov,
+                        live_ok,
+                        entry.transport_identity_hash,
+                        s,
+                    );
+                    if matches!(d, DivergenceHeal::Upgrade) {
+                        entry.provenance = Rooted;
+                        entry.owns_key = true;
+                        entry.epoch = entry.epoch.max(s.epoch);
+                    }
+                    (Some(d), Some(entry.peer.dest_hash.into_bytes()))
+                }
+                None => (None, None),
+            }
+        };
+        match decision {
+            Some(DivergenceHeal::Upgrade) => {
+                tracing::warn!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    resolved_provenance = ?live_prov,
+                    resolved_owns_key = live_ok,
+                    stored_epoch = s.epoch,
+                    suppressed_prev,
+                    "live peers map DIVERGED from the durable store — HEALED in place \
+                     (resolved failed Rooted∧owns_key, store holds rooted for the SAME \
+                     link-proven transport identity). This peer was admitted at Advisory \
+                     on first contact and rooted through a writer that never updated the \
+                     live map; pre-heal the plane stayed dark until a restart \
+                     (CIRISEdge#432)"
+                );
+                // Item 2 still applies — the heal upgrades item 1 only.
+                if let (Some(d), Some(rooting)) = (dest16, ctx.rooting) {
+                    if rooting.hybrid_transport_binding_exists(key_id, d).await {
+                        return crate::transport::SourceKeyId::from_rooted_binding(
+                            key_id.to_string(),
+                            Rooted,
+                            true,
+                        );
+                    }
+                    tracing::warn!(
+                        link = ?link_id,
+                        peer = %key_id,
+                        dest = %hex::encode(d),
+                        "CIRISEdge#432 heal upgraded item 1, but item 2 still FAILS: no \
+                         hybrid-verified SignedTransportDestination binds this (peer, dest) \
+                         pair — see CIRISEdge#406 (the signed transport-dest producer gap)"
+                    );
+                }
+                return None;
+            }
+            Some(DivergenceHeal::IdentityMismatch) => {
+                tracing::warn!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    resolved_provenance = ?live_prov,
+                    resolved_owns_key = live_ok,
+                    suppressed_prev,
+                    "divergence detected but NOT healed — the durable store roots a \
+                     DIFFERENT transport identity than this link proved (stale rotation, \
+                     or an identity-squat attempt); trust is never laundered across \
+                     identities (CIRISEdge#432)"
+                );
+                return None;
+            }
+            // LiveAlreadyPasses cannot reach here (the gate would have admitted);
+            // StoreNotRooted / no live entry fall through to the miss report.
+            _ => {}
+        }
+    }
+    report_attribution_miss(
+        key_id,
+        resolved,
+        stored.as_ref().map(|s| s.provenance),
+        link_id,
+        suppressed_prev,
+    );
+    None
+}
+
+/// CIRISEdge#404/#432 — the residual miss report: the #404 voice, now carrying
+/// the STORED provenance beside the resolved operands, with a hint that matches
+/// its own evidence (the old unconditional "churn downgrade" hint printed
+/// against `owns_key=false` operands and sent the reader to the wrong cause).
+fn report_attribution_miss(
+    key_id: &str,
+    resolved: Option<(
+        ciris_persist::federation::self_at_login::BindingProvenance,
+        bool,
+        u64,
+    )>,
+    stored_provenance: Option<ciris_persist::federation::self_at_login::BindingProvenance>,
+    link_id: LinkId,
+    suppressed_prev: u64,
+) {
+    use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+    if let Some((provenance, owns_key, epoch)) = resolved {
+        let hint = match (provenance, owns_key) {
+            (Advisory, true) => {
+                "a churn downgrade (owner reroute overwrote a Rooted binding), not an \
+                 owns_key failure"
+            }
+            (Advisory, false) => {
+                "a first-contact Advisory admit whose binding never rooted in this \
+                 process (CIRISEdge#432); stored_provenance names whether the durable \
+                 store diverges"
+            }
+            (Rooted, false) => {
+                "an owns_key failure — the announce could not prove control of the \
+                 federation key"
+            }
+            (Rooted, true) => "unreachable: a passing binding does not miss",
+        };
+        tracing::warn!(
+            link = ?link_id,
+            peer = %key_id,
+            resolved_provenance = ?provenance,
+            resolved_owns_key = owns_key,
+            resolved_epoch = epoch,
+            stored_provenance = ?stored_provenance,
+            suppressed_prev,
+            "inbound frame NOT attributed — resolved binding fails Rooted∧owns_key; \
+             these are the ACTUAL operands (CIRISEdge#404). {hint}"
+        );
+    } else {
+        tracing::warn!(
+            link = ?link_id,
+            peer = %key_id,
+            stored_provenance = ?stored_provenance,
+            suppressed_prev,
+            "inbound frame DROPPED — item 1 has NO binding in the peers map for this \
+             link's key_id (candidate resolved, peers-map miss) (CIRISEdge#404 \
+             link-resolution miss). A stored_provenance=Rooted here means the durable \
+             store knows this peer but the live map lost it (cap eviction / restart \
+             ordering) — divergence detected, not auto-installed (no link-proven \
+             identity in the map to bind against) (CIRISEdge#432)"
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6987,6 +7205,165 @@ mod tests {
             PersistedBindingResolver::new(map).resolve(key_id),
             Some(pubkey)
         );
+    }
+
+    /// CIRISEdge#432 — a minimal valid `federation_keys` fixture row (the FK
+    /// gate `put_transport_destination` enforces). Same shape as the inline
+    /// record in `rooted_transport_write_through_boot_load_round_trip`.
+    fn fixture_key_record_for_transport_tests(
+        key_id: &str,
+    ) -> ciris_persist::federation::KeyRecord {
+        use base64::Engine as _;
+        ciris_persist::federation::KeyRecord {
+            key_id: key_id.to_string(),
+            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: "hybrid".to_string(),
+            identity_type: "agent".to_string(),
+            identity_ref: format!("ref-{key_id}"),
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "key_id": key_id }),
+            original_content_hash: "0".repeat(64),
+            scrub_signature_classical: "x".repeat(88),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_string(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// CIRISEdge#432 — a 64-byte `(x25519 ‖ ed25519)` transport identity whose
+    /// ed25519 half is a VALID curve point (an arbitrary-bytes ed25519 pubkey
+    /// fails decompression, making `from_public_keys` return `Err` and every
+    /// identity hash collapse to the `[0u8; 16]` default — which would let the
+    /// heal's identity-equality test pass vacuously).
+    fn valid_transport_pubkey64(seed: u8) -> [u8; 64] {
+        use ciris_crypto::Ed25519Signer;
+        let ed = Ed25519Signer::from_seed(&[seed; 32])
+            .expect("ed25519 from seed")
+            .verifying_key()
+            .to_bytes();
+        let mut pk = [0u8; 64];
+        pk[..32].copy_from_slice(&[seed.wrapping_add(1); 32]); // x25519: any 32B is valid
+        pk[32..].copy_from_slice(&ed);
+        pk
+    }
+
+    fn identity_hash_of64(pk: &[u8; 64]) -> [u8; 16] {
+        let x: [u8; 32] = pk[..32].try_into().unwrap();
+        let e: [u8; 32] = pk[32..].try_into().unwrap();
+        *Identity::from_public_keys(&x, &e)
+            .expect("valid identity")
+            .hash()
+    }
+
+    /// CIRISEdge#432 — the heal decision, driven with the EXACT operands both
+    /// production reproductions logged: live `(Advisory, owns_key=false)` (the
+    /// first-contact `UnknownKeyId` admit) vs a store holding `rooted` for the
+    /// same link-proven transport identity ⇒ upgrade. The identity-equality
+    /// conjunct is load-bearing: a stored rooted row binding a DIFFERENT
+    /// transport identity must never launder trust onto this link.
+    #[test]
+    fn divergence_heal_upgrades_only_same_identity_rooted_store() {
+        use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+        let pk = valid_transport_pubkey64(7);
+        let live_hash = identity_hash_of64(&pk);
+        let stored_rooted = crate::verify::StoredTransportBinding {
+            provenance: Rooted,
+            transport_pubkey64: pk,
+            epoch: 3,
+        };
+        // The field case: (Advisory, false) + rooted store, same identity → Upgrade.
+        assert_eq!(
+            divergence_heal_decision(Advisory, false, live_hash, &stored_rooted),
+            DivergenceHeal::Upgrade
+        );
+        // (Advisory, true) — the #404 churn shape — also heals when the store roots.
+        assert_eq!(
+            divergence_heal_decision(Advisory, true, live_hash, &stored_rooted),
+            DivergenceHeal::Upgrade
+        );
+        // A store rooting a DIFFERENT identity: divergence, NOT healable.
+        let other = crate::verify::StoredTransportBinding {
+            provenance: Rooted,
+            transport_pubkey64: valid_transport_pubkey64(9),
+            epoch: 3,
+        };
+        assert_eq!(
+            divergence_heal_decision(Advisory, false, live_hash, &other),
+            DivergenceHeal::IdentityMismatch
+        );
+        // A store that is itself Advisory: nothing to act on.
+        let stored_advisory = crate::verify::StoredTransportBinding {
+            provenance: Advisory,
+            transport_pubkey64: pk,
+            epoch: 0,
+        };
+        assert_eq!(
+            divergence_heal_decision(Advisory, false, live_hash, &stored_advisory),
+            DivergenceHeal::StoreNotRooted
+        );
+        // A live binding that already passes is never touched.
+        assert_eq!(
+            divergence_heal_decision(Rooted, true, live_hash, &stored_rooted),
+            DivergenceHeal::LiveAlreadyPasses
+        );
+    }
+
+    /// CIRISEdge#432 — `stored_reticulum_binding` (the heal's read half) against
+    /// the REAL write-through shapes: the first-contact Advisory write, then the
+    /// later rooted write at a higher epoch (the independent-writer sequence the
+    /// production canonical exhibited). The read must return the best live row —
+    /// rooted, max epoch — with both identity halves intact.
+    #[tokio::test]
+    async fn stored_reticulum_binding_returns_the_best_live_row() {
+        use crate::verify::RootingDirectory;
+        use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+        use ciris_persist::store::MemoryBackend;
+
+        let backend = MemoryBackend::new();
+        let key_id = "peer-heal-read";
+        // FK gate: the occurrence's federation_keys row must exist.
+        let mut record = fixture_key_record_for_transport_tests(key_id);
+        record.key_id = key_id.to_string();
+        ciris_persist::federation::FederationDirectory::put_public_key(
+            &backend,
+            ciris_persist::federation::SignedKeyRecord { record },
+        )
+        .await
+        .expect("seed occurrence key");
+
+        let pk = valid_transport_pubkey64(11);
+        // No row yet → None.
+        assert!(
+            RootingDirectory::stored_reticulum_binding(&backend, key_id)
+                .await
+                .is_none(),
+            "no stored binding before any write-through"
+        );
+        // First contact: the Advisory admit's write-through (epoch 0).
+        RootingDirectory::persist_transport_binding(&backend, key_id, [3u8; 16], pk, Advisory, 0)
+            .await;
+        let s = RootingDirectory::stored_reticulum_binding(&backend, key_id)
+            .await
+            .expect("advisory row read back");
+        assert_eq!(s.provenance, Advisory);
+        assert_eq!(s.transport_pubkey64, pk, "identity halves intact");
+        // The independent writer roots it later (higher epoch).
+        RootingDirectory::persist_transport_binding(&backend, key_id, [3u8; 16], pk, Rooted, 1)
+            .await;
+        let s = RootingDirectory::stored_reticulum_binding(&backend, key_id)
+            .await
+            .expect("rooted row read back");
+        assert_eq!(s.provenance, Rooted, "the best live row is the rooted one");
+        assert_eq!(s.epoch, 1);
+        assert_eq!(s.transport_pubkey64, pk);
     }
 
     #[test]
