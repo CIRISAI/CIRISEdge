@@ -4985,26 +4985,71 @@ pub fn init_edge_runtime(
             kind: String,
             destination: String,
         }
+        // CIRISEdge#281 — the #377 retirement filter for the AUTO-seeded
+        // canonical dial: fetch the quorum withdrawal tombstone set ONCE
+        // (`FederationDirectory::list_canonical_withdrawals`, V095) so
+        // neither the engine-served hints below nor the baked-genesis
+        // fallback dial a quorum-retired canonical. persist's
+        // `canonical_bootstrap_hints()` projects the UNFILTERED
+        // `list_canonical_servers` (the tombstone lives on a sibling
+        // table), so the subtraction is the consumer's job — here.
+        // Operator-passed raw `bootstrap_peers` SocketAddrs are never
+        // touched (they are transport config, not canonical
+        // attribution); the recognition-set retirement is handled
+        // separately by `refresh_canonical_retirements` post-build.
+        // Fail-soft: a read error yields an empty retired set + WARN
+        // (never brick init; the recognition-set refresh still prunes
+        // trust).
+        let retired_canonicals: std::collections::HashSet<String> = {
+            let dir = Arc::clone(&federation_directory_for_edge);
+            run_async(
+                &executor,
+                async move { dir.list_canonical_withdrawals().await },
+            )
+            .map_or_else(
+                |e| {
+                    tracing::warn!(
+                        "init_edge_runtime: list_canonical_withdrawals failed — \
+                         retired-canonical dial filter disabled for this init: {e}"
+                    );
+                    std::collections::HashSet::new()
+                },
+                |ws| ws.into_iter().map(|w| w.key_id).collect(),
+            )
+        };
+        let mut seeded = 0usize;
+        let mut seed_dial = |key_id: &str, addr: std::net::SocketAddr, source: &str| {
+            if retired_canonicals.contains(key_id) {
+                tracing::info!(
+                    canonical_key_id = %key_id,
+                    dial = %addr,
+                    source,
+                    "init_edge_runtime: canonical is #377 quorum-retired — NOT dialing \
+                     (CIRISEdge#281)"
+                );
+                return;
+            }
+            if transport_config.bootstrap_peers.contains(&addr) {
+                return; // already present — dedup
+            }
+            transport_config.bootstrap_peers.push(addr);
+            seeded += 1;
+            tracing::info!(
+                canonical_key_id = %key_id,
+                dial = %addr,
+                source,
+                "init_edge_runtime: seeded canonical TCP dial (CIRISEdge#296/#281)"
+            );
+        };
         match engine
             .call_method0("canonical_bootstrap_hints")
             .and_then(|obj| obj.extract::<String>())
         {
             Ok(json) => match serde_json::from_str::<Vec<CanonicalHint>>(&json) {
                 Ok(hints) => {
-                    let mut seeded = 0usize;
                     for h in hints.iter().filter(|h| h.kind == "ip") {
                         match h.destination.parse::<std::net::SocketAddr>() {
-                            Ok(addr) if !transport_config.bootstrap_peers.contains(&addr) => {
-                                transport_config.bootstrap_peers.push(addr);
-                                seeded += 1;
-                                tracing::info!(
-                                    canonical_key_id = %h.key_id,
-                                    dial = %addr,
-                                    "init_edge_runtime: seeded canonical TCP dial from baked \
-                                     canonical_bootstrap_hints (CIRISEdge#296)"
-                                );
-                            }
-                            Ok(_) => {} // already present — dedup
+                            Ok(addr) => seed_dial(&h.key_id, addr, "canonical_bootstrap_hints"),
                             Err(e) => tracing::warn!(
                                 canonical_key_id = %h.key_id,
                                 destination = %h.destination,
@@ -5013,24 +5058,33 @@ pub fn init_edge_runtime(
                             ),
                         }
                     }
-                    if seeded == 0 {
-                        tracing::warn!(
-                            "init_edge_runtime: canonical_bootstrap_hints yielded no NEW ip dial \
-                             (already in bootstrap_peers, or no canonical servers baked). If the \
-                             agent cannot reach the canonical mesh, check list_canonical_servers()."
-                        );
-                    }
                 }
                 Err(e) => tracing::warn!(
-                    "init_edge_runtime: canonical_bootstrap_hints JSON parse failed — canonical \
-                     dial NOT auto-seeded: {e}"
+                    "init_edge_runtime: canonical_bootstrap_hints JSON parse failed — falling \
+                     back to the baked genesis dial set: {e}"
                 ),
             },
             Err(e) => tracing::warn!(
                 "init_edge_runtime: engine.canonical_bootstrap_hints() unavailable (persist < \
-                 v13.6.0 / #402?) — canonical dial NOT auto-seeded; a direct consumer must pass \
-                 the canonical addr in bootstrap_peers: {e}"
+                 v13.6.0 / #402?) — falling back to the baked genesis dial set: {e}"
             ),
+        }
+        // CIRISEdge#281 — the STATIC half of the zero-config dial plane:
+        // the `ip` hints carried inside the baked canonical genesis
+        // bundle's signed envelopes (persist #381/#551). Normally a
+        // dedup no-op (the engine hints above project the same baked
+        // records out of the seeded directory), but it keeps the cold
+        // dial alive when the engine pyfn is unavailable or the
+        // directory is unseeded. Same retirement filter.
+        for (key_id, addr) in crate::edge::baked_canonical_ip_dials() {
+            seed_dial(&key_id, addr, "baked_canonical_genesis");
+        }
+        if seeded == 0 {
+            tracing::warn!(
+                "init_edge_runtime: no NEW canonical ip dial seeded (already in \
+                 bootstrap_peers, no canonical servers baked, or all retired). If the agent \
+                 cannot reach the canonical mesh, check list_canonical_servers()."
+            );
         }
     }
     transport_config.announce_interval = Duration::from_secs(announce_interval_seconds);
@@ -5807,6 +5861,27 @@ pub fn init_edge_runtime(
         .map_err(|e| PyRuntimeError::new_err(format!("Edge::build: {e}")))?;
 
     let edge_arc = Arc::new(edge);
+
+    // CIRISEdge#281 — honor #377 canonical retirements at init: prune
+    // quorum-tombstoned canonicals out of the just-built recognition
+    // set (baked-genesis base ∪ operator peers). `build()` is sync so
+    // the union is provenance-only; this is the async directory read
+    // that subtracts retirement. Fail-soft by construction (the method
+    // retires only on positive tombstone evidence and warns on read
+    // errors — init never bricks here).
+    {
+        let edge_for_refresh = Arc::clone(&edge_arc);
+        let pruned = run_async(&executor, async move {
+            edge_for_refresh.refresh_canonical_retirements().await
+        });
+        if pruned > 0 {
+            tracing::info!(
+                pruned,
+                "init_edge_runtime: dropped #377 quorum-retired canonicals from the \
+                 recognition set (CIRISEdge#281)"
+            );
+        }
+    }
 
     // v0.13.0 (CIRISEdge#36 GO) — install the process-global
     // `Weak<Edge>` so the UniFFI bindings (`crate::ffi::uniffi_impl`)
