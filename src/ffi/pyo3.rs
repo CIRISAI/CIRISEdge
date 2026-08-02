@@ -506,6 +506,23 @@ impl PyEdge {
         VERSION
     }
 
+    /// CIRISEdge#437 — hand over a peer's presented build-attestation
+    /// bundle (the JSON `SignedCegObject` bytes, `kind =
+    /// "build_attestation_bundle"`, CIRISVerify#181) for the durable-save
+    /// bundle gate. Registration is shape-gated fail-closed (size cap /
+    /// JSON / kind); verification against the federation-directory pins
+    /// runs lazily at the next Rooted durable save. This is the server-side
+    /// hand-over seam until the CIRISEdge#436 arrival transport feeds the
+    /// store directly. Raises `ValueError` on a refused registration
+    /// (oversized / not JSON / wrong kind / store full / no Reticulum
+    /// transport on this Edge).
+    #[cfg(feature = "_reticulum-module")]
+    fn register_peer_build_bundle(&self, key_id: &str, bundle_json: &[u8]) -> PyResult<()> {
+        self.inner
+            .register_peer_build_bundle(key_id, bundle_json)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     /// v2.4.0 (CIRISEdge#103) — graceful close. Idempotent; safe to
     /// call from `__del__`, `atexit` hooks, FastAPI shutdown handlers,
     /// `try/finally` blocks, etc.
@@ -4097,6 +4114,7 @@ enum LocalInstanceRole {
     enable_transport = false,
     transport_binding_enforcement = "advisory",
     require_local_signer = false,
+    bundle_save_gate = "off",
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -4237,6 +4255,17 @@ pub fn init_edge_runtime(
     // caller fails loud instead of announcing without attestation. `False`
     // (the default) preserves the warn-and-degrade behaviour exactly.
     require_local_signer: bool,
+    // CIRISEdge#437 — bundle gate on the DURABLE Rooted transport-binding
+    // save. One of `"off"` (default — today's behavior byte-identical) or
+    // `"require_bundle_for_rooted_save"` (a Rooted write-through requires a
+    // verified build-attestation bundle for the peer, else the SAVE — never
+    // in-memory routing — downgrades to Advisory with a loud named warn;
+    // Advisory saves are never gated). The flip is a DATED FLEET-FLOOR
+    // coordination event (see `crate::bundle_gate::BundleSaveGateMode`):
+    // enable only once every Rooted-worthy peer distributes bundles
+    // (CIRISEdge#436 arrival transport, or `Edge.register_peer_build_bundle`),
+    // else those peers degrade to Advisory-only durable bindings.
+    bundle_save_gate: &str,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -4359,6 +4388,21 @@ pub fn init_edge_runtime(
             return Err(PyValueError::new_err(format!(
                 "init_edge_runtime: transport_binding_enforcement must be one of \
                  \"advisory\" | \"warn_only\" | \"require_transport_binding\", got {other:?}"
+            )));
+        }
+    };
+
+    // CIRISEdge#437 — parse the bundle-gate posture on the durable Rooted
+    // save. `"off"` is the default; the flip is a dated fleet-floor event.
+    let bundle_save_gate = match bundle_save_gate {
+        "off" => crate::bundle_gate::BundleSaveGateMode::Off,
+        "require_bundle_for_rooted_save" => {
+            crate::bundle_gate::BundleSaveGateMode::RequireBundleForRootedSave
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "init_edge_runtime: bundle_save_gate must be one of \
+                 \"off\" | \"require_bundle_for_rooted_save\", got {other:?}"
             )));
         }
     };
@@ -5321,6 +5365,9 @@ pub fn init_edge_runtime(
         resolver: persisted_binding_resolver,
         hybrid_policy,
         transport_binding_enforcement,
+        // CIRISEdge#437 — bundle gate on the durable Rooted save (default
+        // Off; the flip is a dated fleet-floor event).
+        bundle_save_gate,
         event_bus: Some(Arc::clone(&event_bus)),
         reachability: Some(Arc::clone(&reachability_tracker)),
         // v0.16.1 (CIRISEdge#33 durable flip / CIRISPersist#120) —
@@ -8937,6 +8984,7 @@ mod pyo3_tier2_tests {
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
+                "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -9049,6 +9097,7 @@ mod pyo3_tier2_tests {
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
+                "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -9200,6 +9249,7 @@ mod pyo3_tier2_tests {
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
+                "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
             )?;
             Ok(())
         });
@@ -9304,6 +9354,7 @@ mod pyo3_tier2_tests {
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
+                "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -9462,6 +9513,7 @@ mod pyo3_tier2_tests {
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
+                "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -9619,6 +9671,7 @@ mod pyo3_tier2_tests {
                 false,      // enable_transport (CIRISEdge#168 — leaf-node default)
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
+                "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
             )?;
             Ok(edge.signer_key_id())
         });

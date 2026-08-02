@@ -293,6 +293,29 @@ pub trait RootingDirectory: Send + Sync + 'static {
         false
     }
 
+    /// CIRISEdge#437 (CIRISVerify#181) — verify a peer's presented
+    /// build-attestation bundle with every trust input pinned from THIS
+    /// federation directory (never caller-supplied, never read from the
+    /// bundle): the presenter member is `presenter_key_id`'s directory row,
+    /// the pipeline member + accord-co-scrubbed record are the directory row
+    /// the carried manifest NAMES (a name only — pubkeys and the
+    /// `infra:attest` blessing come from the row), and the co-scrub anchors
+    /// are the directory's `accord_holder` rows. See
+    /// [`crate::bundle_gate`] for the full chain + what a verdict does and
+    /// does not prove. Default is a typed
+    /// [`BundleGateRefusal::NoDirectory`](crate::bundle_gate::BundleGateRefusal::NoDirectory)
+    /// refusal (test doubles / no directory ⇒ fail-closed — under the gate a
+    /// refusal can only downgrade a durable save, never widen one).
+    async fn verify_peer_build_bundle(
+        &self,
+        _presenter_key_id: &str,
+        _bundle_bytes: &[u8],
+    ) -> crate::bundle_gate::BundleGateVerdict {
+        crate::bundle_gate::BundleGateVerdict::Refused(
+            crate::bundle_gate::BundleGateRefusal::NoDirectory,
+        )
+    }
+
     /// CIRISEdge#432 — point-read the durably stored reticulum binding for
     /// `key_id`: the read half of the live-map divergence heal.
     ///
@@ -429,6 +452,71 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             Ok(routes) => hybrid_reticulum_route_present(&routes, dest_hash),
             Err(_) => false,
         }
+    }
+
+    async fn verify_peer_build_bundle(
+        &self,
+        presenter_key_id: &str,
+        bundle_bytes: &[u8],
+    ) -> crate::bundle_gate::BundleGateVerdict {
+        use crate::bundle_gate::{
+            bundle_pipeline_key_id, verify_bundle_with_directory_rows, BundleGateRefusal as R,
+            BundleGateVerdict as V, MAX_PEER_BUNDLE_BYTES,
+        };
+        // Cheap rejects first (the verify-pipeline cost-asymmetry discipline):
+        // size cap before parse, parse before any directory round-trip.
+        if bundle_bytes.len() > MAX_PEER_BUNDLE_BYTES {
+            return V::Refused(R::OversizedBundle {
+                actual: bundle_bytes.len(),
+                limit: MAX_PEER_BUNDLE_BYTES,
+            });
+        }
+        let Ok(bundle) =
+            serde_json::from_slice::<ciris_verify_core::ceg_outbox::SignedCegObject>(bundle_bytes)
+        else {
+            return V::Refused(R::MalformedBundle("not a JSON SignedCegObject"));
+        };
+        // The ONLY thing read from the object: the pipeline row's NAME. All
+        // pubkeys / roles / quorum inputs come from the directory rows below.
+        let Some(pipeline_key_id) = bundle_pipeline_key_id(&bundle).map(str::to_string) else {
+            return V::Refused(R::MalformedBundle(
+                "carried manifest names no pipeline attesting_key_id",
+            ));
+        };
+        // Pin the presenter — the peer being saved, named by the CALLER
+        // (announce key_id), never by the bundle.
+        let presenter_row =
+            match FederationDirectory::lookup_public_key(self, presenter_key_id).await {
+                Err(e) => return V::Refused(R::DirectoryUnavailable(e.to_string())),
+                Ok(None) => {
+                    return V::Refused(R::PresenterNotInDirectory {
+                        key_id: presenter_key_id.to_string(),
+                    })
+                }
+                Ok(Some(row)) => row,
+            };
+        // Pin the pipeline row the manifest named.
+        let pipeline_row =
+            match FederationDirectory::lookup_public_key(self, &pipeline_key_id).await {
+                Err(e) => return V::Refused(R::DirectoryUnavailable(e.to_string())),
+                Ok(None) => {
+                    return V::Refused(R::PipelineNotInDirectory {
+                        key_id: pipeline_key_id,
+                    })
+                }
+                Ok(Some(row)) => row,
+            };
+        // Pin the accord anchors: the directory's accord_holder rows.
+        let anchor_rows = match FederationDirectory::list_keys_by_identity_type(
+            self,
+            ciris_persist::federation::types::identity_type::ACCORD_HOLDER,
+        )
+        .await
+        {
+            Err(e) => return V::Refused(R::DirectoryUnavailable(e.to_string())),
+            Ok(rows) => rows,
+        };
+        verify_bundle_with_directory_rows(&bundle, &presenter_row, &pipeline_row, &anchor_rows)
     }
 
     async fn stored_reticulum_binding(&self, key_id: &str) -> Option<StoredTransportBinding> {
