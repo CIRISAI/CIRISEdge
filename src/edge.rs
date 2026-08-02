@@ -499,6 +499,29 @@ pub struct EdgeConfig {
     /// 1-hop case) plus 3 levels of sub-delegation, which is the
     /// FSD-002 §2.2.1 default transitive depth + 1 hop of headroom.
     pub delegation_graph_max_depth: usize,
+    /// CIRISEdge#281 — seed [`Edge::is_canonical_peer`]'s recognition
+    /// set from persist's **baked canonical genesis bundle**
+    /// (`ciris_persist::federation::genesis::canonical_genesis_bundle()`,
+    /// persist v23.0.0+ — the CIRISPersist#551 [`GenesisBundle`]
+    /// successor of the v13.1.0 `canonical_genesis_records()` the
+    /// issue was filed against). Default `true`: a fresh node
+    /// recognizes `ciris-canonical-1-…` with ZERO config — the #380
+    /// zero-config promise. Operator-supplied
+    /// [`EdgeBuilder::canonical_bootstrap_peers`] AUGMENT the baked
+    /// base (union), they no longer need to re-declare it.
+    ///
+    /// `false` reproduces the pre-#281 behavior exactly (operator
+    /// config is the only source) — the bare-build fail-safe lever for
+    /// tests and for deployments that deliberately run outside the
+    /// production canonical mesh. This is a RECOGNITION knob, not a
+    /// trust conferral: the directory-side canonical role is only ever
+    /// conferred by persist's 2-of-3 accord admission gate.
+    ///
+    /// Retirement is orthogonal and NOT operator-controlled: a #377
+    /// quorum withdrawal tombstone removes a canonical from the set
+    /// via [`Edge::refresh_canonical_retirements`] regardless of this
+    /// flag or of operator config.
+    pub baked_canonical_genesis_enabled: bool,
 }
 
 impl Default for EdgeConfig {
@@ -588,6 +611,10 @@ impl Default for EdgeConfig {
             // plus 2 hops of headroom for sub-delegation chains a
             // future cut may introduce. Persist clamps at 16.
             delegation_graph_max_depth: 4,
+            // CIRISEdge#281 — zero-config canonical recognition from
+            // persist's baked genesis bundle, ON by default (the #380
+            // promise). `false` = the pre-#281 operator-only posture.
+            baked_canonical_genesis_enabled: true,
         }
     }
 }
@@ -1423,6 +1450,75 @@ pub async fn reseed_canonical_bootstrap_peers(
     Ok(())
 }
 
+/// CIRISEdge#281 — the `key_id`s of persist's **baked canonical genesis
+/// serve-nodes** (`canonical_genesis_bundle().serve_nodes`, persist
+/// v23.0.0+/CIRISPersist#551 — the `GenesisBundle` successor of the
+/// v13.1.0 `canonical_genesis_records()` slice). This is the zero-config
+/// canonical recognition base [`EdgeBuilder::build`] unions into
+/// [`Edge::is_canonical_peer`] when
+/// [`EdgeConfig::baked_canonical_genesis_enabled`] is `true`.
+///
+/// Read-only projection of the baked bundle — edge does NOT reseed these
+/// through [`reseed_canonical_bootstrap_peers`] (which writes
+/// `identity_type = "agent"` rows): the directory rows for baked
+/// canonicals are seeded by persist itself at engine boot
+/// (`seed_canonical_servers`, through the 2-of-3 accord admission gate),
+/// which is strictly stronger provenance. Empty iff the baked bundle
+/// carries no serve-nodes (the pre-v23.1.0 placeholder era) — in which
+/// case everything degrades to the pre-#281 operator-only behavior.
+#[must_use]
+pub fn baked_canonical_genesis_ids() -> Vec<String> {
+    ciris_persist::federation::genesis::canonical_genesis_bundle()
+        .serve_nodes
+        .iter()
+        .map(|sr| sr.record.key_id.clone())
+        .collect()
+}
+
+/// CIRISEdge#281 — the **accord-attested TCP dial set** carried by
+/// persist's baked canonical genesis bundle: every `kind == "ip"`
+/// [`TransportHint`](ciris_persist::federation::types::TransportHint)
+/// embedded in a baked serve-node's signed `registration_envelope`
+/// (CIRISPersist#381 `KeyRecord::transport_hints`), parsed to
+/// `(key_id, SocketAddr)`. This is the static half of the zero-config
+/// dial plane: it needs NO engine handle and NO seeded directory, so a
+/// direct Rust consumer (or the pyo3 init when persist's
+/// `canonical_bootstrap_hints()` pyfn is unavailable) can still dial the
+/// canonical mesh cold. Hints that fail `SocketAddr` parse are skipped
+/// with a warning (a malformed baked hint must not brick init).
+///
+/// Callers composing a dial set MUST subtract #377-retired canonicals
+/// (see [`Edge::refresh_canonical_retirements`] /
+/// `FederationDirectory::list_canonical_withdrawals`) — a quorum-retired
+/// canonical stops being dialed as canonical.
+#[must_use]
+pub fn baked_canonical_ip_dials() -> Vec<(String, std::net::SocketAddr)> {
+    ciris_persist::federation::genesis::canonical_genesis_bundle()
+        .serve_nodes
+        .iter()
+        .flat_map(|sr| {
+            let key_id = sr.record.key_id.clone();
+            sr.record
+                .transport_hints()
+                .into_iter()
+                .filter(|h| h.kind == "ip")
+                .filter_map(
+                    move |h| match h.destination.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => Some((key_id.clone(), addr)),
+                        Err(e) => {
+                            tracing::warn!(
+                                key_id = %key_id,
+                                destination = %h.destination,
+                                "baked canonical ip hint is not a valid SocketAddr, skipping: {e}"
+                            );
+                            None
+                        }
+                    },
+                )
+        })
+        .collect()
+}
+
 impl Edge {
     #[must_use]
     pub fn builder() -> EdgeBuilder {
@@ -1469,6 +1565,92 @@ impl Edge {
             .read()
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// CIRISEdge#281 — honor persist's #377 canonical-role
+    /// WITHDRAW/SUPERSEDE tombstones: prune every quorum-retired
+    /// canonical out of the in-memory recognition set so it stops
+    /// being trusted as canonical (hard-remove guard, `EdgePeerInfo`
+    /// projection, #108 delegation trust roots — all read the same
+    /// set). Returns the number of retired ids removed.
+    ///
+    /// Per id currently in the set, the read is persist's
+    /// **tombstone-aware effective check**
+    /// (`ciris_persist::federation::is_canonical_effective`, the #377
+    /// read — never the bare role-membership form):
+    ///
+    ///   - effective `true` → the directory holds a live
+    ///     accord-conferred canonical row with no tombstone → keep.
+    ///   - effective `false` AND a `lookup_canonical_withdrawal`
+    ///     tombstone exists → quorum-retired → REMOVE. This subtracts
+    ///     regardless of provenance: neither the baked genesis base
+    ///     nor operator config outvotes an accord quorum.
+    ///   - effective `false` with NO tombstone → keep. `false` alone
+    ///     is not retirement: an operator-declared bootstrap peer is
+    ///     reseeded as an `identity_type = "agent"` row (never
+    ///     canonical-typed), and a bare build's directory may not
+    ///     carry the baked rows at all — absence of directory
+    ///     corroboration must not destroy provenance-based
+    ///     recognition (the pre-#281 operator flow keeps working
+    ///     unchanged).
+    ///
+    /// Directory read errors keep the id and warn (retirement only on
+    /// positive tombstone evidence — a transient backend error must
+    /// not evaporate the trust-root set mid-flight). No-op (returns 0)
+    /// when no federation directory is wired.
+    ///
+    /// The cohabitation init path (`init_edge_runtime`) calls this
+    /// once at boot right after `Edge::build`; hosts observing a
+    /// runtime withdrawal (e.g. via anti-entropy) can call it again —
+    /// the set's `RwLock` was designed for exactly this post-build
+    /// mutation.
+    pub async fn refresh_canonical_retirements(&self) -> usize {
+        let Some(directory) = self.federation_directory.as_ref() else {
+            return 0;
+        };
+        let ids: Vec<String> = self
+            .canonical_peers
+            .read()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut retired: Vec<String> = Vec::new();
+        for id in ids {
+            match ciris_persist::federation::is_canonical_effective(directory.as_ref(), &id).await {
+                Ok(true) => {}
+                Ok(false) => match directory.lookup_canonical_withdrawal(&id).await {
+                    Ok(Some(w)) => {
+                        tracing::info!(
+                            key_id = %id,
+                            superseded_by = ?w.superseded_by,
+                            authority_decision_digest = %w.authority_decision_digest,
+                            "canonical retirement honored: #377 tombstone found — dropping \
+                             from the canonical recognition set (CIRISEdge#281)"
+                        );
+                        retired.push(id);
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        key_id = %id,
+                        "refresh_canonical_retirements: lookup_canonical_withdrawal failed — \
+                         keeping id (retire only on positive tombstone evidence): {e}"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    key_id = %id,
+                    "refresh_canonical_retirements: is_canonical_effective failed — \
+                     keeping id (retire only on positive tombstone evidence): {e}"
+                ),
+            }
+        }
+        if retired.is_empty() {
+            return 0;
+        }
+        if let Ok(mut set) = self.canonical_peers.write() {
+            for id in &retired {
+                set.remove(id);
+            }
+        }
+        retired.len()
     }
 
     /// CIRISEdge#48-A → #48-A-completion (v0.19.6) — look up a peer's
@@ -5845,6 +6027,15 @@ impl EdgeBuilder {
     /// / `peer_list` projections fill the `canonical: bool` field and
     /// the `peer_remove` hard-remove guard fires correctly.
     ///
+    /// CIRISEdge#281 — since the baked-genesis adoption, this set
+    /// AUGMENTS the zero-config base [`baked_canonical_genesis_ids`]
+    /// (unioned at `build()` unless
+    /// [`EdgeConfig::baked_canonical_genesis_enabled`] is `false`);
+    /// operators no longer need to re-declare the baked canonical
+    /// mesh, and an empty operator set is a fully working default.
+    /// Neither source outvotes a #377 quorum retirement — see
+    /// [`Edge::refresh_canonical_retirements`].
+    ///
     /// This setter populates the IN-MEMORY set only. The persist
     /// reseed (`add_peer_record` per row) is async and lives in
     /// [`reseed_canonical_bootstrap_peers`] — cohabitation init paths
@@ -6001,18 +6192,33 @@ impl EdgeBuilder {
         let blob_chunk_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // CIRISEdge#46 (v0.18.0) — populate the in-memory canonical
-        // bootstrap-peer set. Empty HashSet when the operator passed no
-        // bootstrap_peers; full set when they did. The persist reseed
-        // is the COHAB INIT path's responsibility (see
+        // bootstrap-peer set. The persist reseed is the COHAB INIT
+        // path's responsibility (see
         // `reseed_canonical_bootstrap_peers`); this builder step only
         // covers the in-memory invariant the `peer_remove` guard +
         // `EdgePeerInfo.canonical` projection depend on.
-        let canonical_peers = Arc::new(std::sync::RwLock::new(
-            self.canonical_bootstrap_peers
-                .iter()
-                .map(|p| p.key_id.clone())
-                .collect::<HashSet<String>>(),
-        ));
+        //
+        // CIRISEdge#281 — union in persist's BAKED canonical genesis
+        // ids (`canonical_genesis_bundle().serve_nodes`) so a fresh
+        // node recognizes the canonical mesh with ZERO config.
+        // Operator-supplied peers AUGMENT the baked base; flipping
+        // `EdgeConfig::baked_canonical_genesis_enabled = false` (or an
+        // empty baked bundle) reproduces the pre-#281 operator-only
+        // set exactly. Baked ids are NOT reseeded into persist here —
+        // persist's own engine boot seeds those rows through the
+        // 2-of-3 accord admission gate. #377 quorum retirements are
+        // subtracted post-build by
+        // `Edge::refresh_canonical_retirements` (build() is sync; the
+        // tombstone read is async directory I/O).
+        let mut canonical_id_set = self
+            .canonical_bootstrap_peers
+            .iter()
+            .map(|p| p.key_id.clone())
+            .collect::<HashSet<String>>();
+        if self.config.baked_canonical_genesis_enabled {
+            canonical_id_set.extend(baked_canonical_genesis_ids());
+        }
+        let canonical_peers = Arc::new(std::sync::RwLock::new(canonical_id_set));
 
         Ok(Edge {
             verify,
@@ -7890,5 +8096,78 @@ mod inbound_ingest_tests {
             std::sync::Arc::ptr_eq(&cell.get().expect("still installed"), &second),
             "same-object re-install is a no-op"
         );
+    }
+}
+
+#[cfg(test)]
+mod baked_genesis_tests {
+    //! CIRISEdge#281 — the pure (sync) half of the baked canonical-genesis
+    //! adoption: the projections over persist's ACTUAL baked
+    //! `canonical_genesis_bundle()` (field-provenance: these read the very
+    //! surface production reads, not synthetic fixtures). The Edge-level
+    //! union / retirement / operator-composition flows are covered by
+    //! `tests/genesis_bootstrap.rs` against a real persist sqlite backend
+    //! seeded through the genuine genesis seed chain.
+    use super::*;
+
+    /// The recognition base derives 1:1 from persist's baked bundle — and
+    /// the production pin (v23.1.0+ trust root) is NON-empty, so the #380
+    /// zero-config promise is live, not vacuous.
+    #[test]
+    fn baked_canonical_genesis_ids_match_persist_bundle() {
+        let ids = baked_canonical_genesis_ids();
+        let expected: Vec<String> = ciris_persist::federation::genesis::canonical_genesis_bundle()
+            .serve_nodes
+            .iter()
+            .map(|sr| sr.record.key_id.clone())
+            .collect();
+        assert_eq!(ids, expected, "ids must project the bundle verbatim");
+        assert!(
+            !ids.is_empty(),
+            "the production canonical genesis bundle must carry at least one \
+             serve-node (v23.1.0 baked the June 2026 ceremony trust root)"
+        );
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "no duplicate baked ids");
+    }
+
+    /// Every baked `ip` transport hint (persist #381: accord-attested,
+    /// carried INSIDE the signed registration envelope) parses to a
+    /// dialable `SocketAddr`, attributed to a baked serve-node — the
+    /// static zero-config dial plane is non-empty on the production pin.
+    #[test]
+    fn baked_canonical_ip_dials_parse_from_signed_envelopes() {
+        let ids: HashSet<String> = baked_canonical_genesis_ids().into_iter().collect();
+        let dials = baked_canonical_ip_dials();
+        assert!(
+            !dials.is_empty(),
+            "the baked production canonical record carries an `ip` hint \
+             (the ceremony envelope's transport_hints) — the cold dial \
+             must not be empty"
+        );
+        for (key_id, _addr) in &dials {
+            assert!(
+                ids.contains(key_id),
+                "every dial must be attributed to a baked serve-node \
+                 (got {key_id})"
+            );
+        }
+        // Cross-check against persist's own typed read: the dial count
+        // equals the bundle's parseable `ip` hint count (nothing invented,
+        // nothing silently dropped).
+        let expected: usize = ciris_persist::federation::genesis::canonical_genesis_bundle()
+            .serve_nodes
+            .iter()
+            .flat_map(|sr| sr.record.transport_hints())
+            .filter(|h| h.kind == "ip" && h.destination.parse::<std::net::SocketAddr>().is_ok())
+            .count();
+        assert_eq!(dials.len(), expected);
+    }
+
+    /// The zero-config default is ON; flipping it off is the documented
+    /// bare-build fail-safe lever (pre-#281 operator-only posture).
+    #[test]
+    fn default_config_enables_baked_genesis() {
+        assert!(EdgeConfig::default().baked_canonical_genesis_enabled);
     }
 }

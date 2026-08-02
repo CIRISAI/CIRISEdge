@@ -296,9 +296,10 @@ pub use directory_cache_driver::{
     DEFAULT_CHANNEL_CAPACITY as DIRECTORY_DRIVER_CHANNEL_CAPACITY,
 };
 pub use edge::{
-    reseed_canonical_bootstrap_peers, run_blackhole_pruner, AgentMode, CanonicalBootstrapPeer,
-    ChunkResult, ContentResult, Edge, EdgeBuilder, EdgeConfig, EdgeError, PublishOutcome,
-    VerifiedEnvelopeSnapshot, DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
+    baked_canonical_genesis_ids, baked_canonical_ip_dials, reseed_canonical_bootstrap_peers,
+    run_blackhole_pruner, AgentMode, CanonicalBootstrapPeer, ChunkResult, ContentResult, Edge,
+    EdgeBuilder, EdgeConfig, EdgeError, PublishOutcome, VerifiedEnvelopeSnapshot,
+    DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
 };
 // v6.1.0 (CIRISEdge#175, FSD §3.1) — Poisson emission surface.
 pub use emission::{
