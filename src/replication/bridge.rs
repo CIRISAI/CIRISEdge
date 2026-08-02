@@ -331,7 +331,18 @@ pub struct FederationDirectoryReplicationBridge {
     /// the (extensive) test constructions below stay untouched; every PRODUCTION
     /// construction site threads `Edge`'s handle in via [`Self::with_metrics`].
     metrics: Option<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#430 — observer called with the revoked `key_id` after an
+    /// ADMITTED Revocation apply. The transit gate's event-driven cache
+    /// invalidation rides this (an in-band un-trust must drop cached hop
+    /// verdicts before any TTL would); the bridge knows nothing about who
+    /// listens. `None` ⇒ no listener (tests, non-A/V deployments).
+    revocation_observer: Option<RevocationObserver>,
 }
+
+/// CIRISEdge#430 — the revoked-key listener installed via
+/// [`FederationDirectoryReplicationBridge::with_revocation_observer`]: called
+/// with the revoked `key_id` after each ADMITTED Revocation apply.
+pub type RevocationObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// CIRISEdge#400 — how long a memoized consent send-set stays fresh. Chosen to
 /// span one anti-entropy round's assembly steps (advertise → Diff → Deliver,
@@ -362,6 +373,7 @@ impl FederationDirectoryReplicationBridge {
             operational: None,
             consent_memo: Mutex::new(None),
             metrics: None,
+            revocation_observer: None,
         }
     }
 
@@ -396,6 +408,7 @@ impl FederationDirectoryReplicationBridge {
             operational: Some(operational),
             consent_memo: Mutex::new(None),
             metrics: None,
+            revocation_observer: None,
         }
     }
 
@@ -437,6 +450,17 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// CIRISEdge#430 — install the revoked-key observer (called with the revoked
+    /// `key_id` after an ADMITTED Revocation apply). The transit gate's
+    /// `TransitGate::invalidate`
+    /// is the intended listener; the TTL remains the backstop when no observer
+    /// is wired.
+    #[must_use]
+    pub fn with_revocation_observer(mut self, observer: Option<RevocationObserver>) -> Self {
+        self.revocation_observer = observer;
         self
     }
 
@@ -705,7 +729,23 @@ impl FederationDirectoryReplicationBridge {
         match kind {
             EnvelopeKind::Key => self.apply_key(envelope_bytes).await,
             EnvelopeKind::Attestation => self.apply_attestation(envelope_bytes).await,
-            EnvelopeKind::Revocation => self.apply_revocation(envelope_bytes).await,
+            EnvelopeKind::Revocation => {
+                let outcome = self.apply_revocation(envelope_bytes).await;
+                // CIRISEdge#430 — an ADMITTED revocation is the event-driven
+                // invalidation signal for cached trust verdicts (the transit
+                // gate's hop cache). Fired only on admit (a refused/duplicate
+                // revocation changed no trust state); the re-deserialize is
+                // once per admitted revocation, a rare event. TTLs remain the
+                // backstop when no observer is installed.
+                if outcome.is_admitted() {
+                    if let Some(observer) = &self.revocation_observer {
+                        if let Ok(r) = serde_json::from_slice::<SignedRevocation>(envelope_bytes) {
+                            observer(&r.revocation.revoked_key_id);
+                        }
+                    }
+                }
+                outcome
+            }
             EnvelopeKind::IdentityOccurrence => {
                 self.apply_identity_occurrence(envelope_bytes).await
             }
@@ -2619,6 +2659,76 @@ mod tests {
             snap.key_apply_refusals_by_reason.get(token).copied(),
             Some(1),
             "the token axis books the typed branch once"
+        );
+    }
+
+    /// CIRISEdge#430 — an ADMITTED revocation fires the revocation observer
+    /// with the REVOKED key_id (the transit gate's event-driven cache
+    /// invalidation signal); a non-admitted apply (garbage) never fires it.
+    #[tokio::test]
+    async fn admitted_revocation_fires_the_observer_with_the_revoked_key() {
+        let (backend, bridge) = make_bridge(&[]);
+        for k in ["revoker-node", "bad-peer"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, identity_type::NODE),
+                })
+                .await
+                .expect("seed key");
+        }
+        let fired: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&fired);
+        let bridge = bridge.with_revocation_observer(Some(Arc::new(move |k: &str| {
+            sink.lock().expect("observer sink").push(k.to_string());
+        })));
+
+        let now = Utc::now();
+        let envelope = serde_json::json!({
+            "revocation_id": "rev-1",
+            "revoked_key_id": "bad-peer",
+            "revoking_key_id": "revoker-node",
+        });
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope("revoker-node", &envelope);
+        let rev = ciris_persist::federation::types::Revocation {
+            revocation_id: "rev-1".to_string(),
+            revoked_key_id: "bad-peer".to_string(),
+            revoking_key_id: "revoker-node".to_string(),
+            reason: None,
+            revoked_at: now,
+            effective_at: now,
+            revocation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: "revoker-node".to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            observed_region: String::new(),
+        };
+        let bytes =
+            serde_json::to_vec(&SignedRevocation { revocation: rev }).expect("serialize rev");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Revocation, &bytes, None)
+            .await;
+        assert!(
+            outcome.is_admitted(),
+            "the fixture revocation must admit (else the observer half is untested): {outcome:?}"
+        );
+        assert_eq!(
+            *fired.lock().expect("read sink"),
+            vec!["bad-peer".to_string()],
+            "the observer fires ONCE with the REVOKED key_id"
+        );
+
+        // A non-admitted apply (garbage) never fires the observer.
+        let _ = bridge
+            .apply_envelope_bytes(EnvelopeKind::Revocation, b"{not a revocation}", None)
+            .await;
+        assert_eq!(
+            fired.lock().expect("read sink").len(),
+            1,
+            "a refused/undeserializable revocation fires nothing"
         );
     }
 

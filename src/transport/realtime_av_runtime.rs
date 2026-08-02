@@ -86,7 +86,9 @@ use super::realtime_av::{
     seal_av_inner, ChunkLayer, ChunkSeq, Epoch, EpochDek, RealtimeAvError, SealedAvChunk, StreamId,
     CODEC_OPAQUE,
 };
-use super::realtime_av_alm::{AlmJoinError, AlmJoinPlanner, JoinPlan, ParentCandidate};
+use super::realtime_av_alm::{
+    AlmJoinError, AlmJoinPlanner, JoinPlan, ParentCandidate, TransitGate,
+};
 use super::realtime_av_dispatcher::{
     AvDispatcher, AvDispatcherConfig, AvDispatcherError, AvInboundLink, AvRole, AvSubscriberLink,
     PeerKeyId, ReconstructedChunk,
@@ -588,6 +590,58 @@ impl AvSubscriber {
             "AV subscriber: ALM parent plan selected"
         );
         Ok(plan)
+    }
+
+    /// CIRISEdge#430 — [`Self::plan_parent`] behind the `infra:transport`
+    /// hop-eligibility gate: filter the pool through
+    /// [`TransitGate::eligible_candidates`] (persist-resolved, cached,
+    /// fail-closed), then plan over the survivors. **This is the live-path
+    /// entry point** — the ungated [`Self::plan_parent`] is for pools a
+    /// caller has already gated (tests, replans over a kept set).
+    ///
+    /// A relay hop is a POSITION of trust (traffic-analysis visibility + an
+    /// availability lever over the subtree — never the DEK, that is
+    /// structural), so an ineligible volunteer must not be selectable no
+    /// matter how good its capacity ad looks. When the gate narrows the pool
+    /// it says so loudly — a plan that fails AFTER filtering names the gate
+    /// as the reason the pool emptied, not a capacity shortfall.
+    ///
+    /// # Errors
+    ///
+    /// [`AlmJoinError`] from the planner over the FILTERED pool (an
+    /// all-ineligible pool surfaces as the planner's empty-pool reason,
+    /// with the filter WARN above it naming why).
+    pub async fn plan_parent_gated(
+        gate: &TransitGate,
+        candidates: Vec<ParentCandidate>,
+        bitrate_mbps: f32,
+        policy: ReceiverLayerPolicy,
+        wall_clock_unix_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<JoinPlan, AlmJoinError> {
+        let offered = candidates.len();
+        let eligible = gate.eligible_candidates(candidates, now).await;
+        if eligible.len() < offered {
+            let filtered = offered - eligible.len();
+            if eligible.is_empty() {
+                tracing::warn!(
+                    offered,
+                    filtered,
+                    "AV subscriber: transit gate refused EVERY offered hop — the pool is \
+                     empty because of eligibility, not capacity (CIRISEdge#430). Peers \
+                     must be directory-present nodes offering infra:transport under a \
+                     shared trust root"
+                );
+            } else {
+                tracing::info!(
+                    offered,
+                    kept = eligible.len(),
+                    filtered,
+                    "AV subscriber: transit gate filtered ineligible hops (CIRISEdge#430)"
+                );
+            }
+        }
+        Self::plan_parent(&eligible, bitrate_mbps, policy, wall_clock_unix_ms)
     }
 
     /// Stand up a subscriber over `inbound` (the dialed link from the
