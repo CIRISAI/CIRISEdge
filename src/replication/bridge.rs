@@ -1972,6 +1972,34 @@ impl FederationDirectoryReplicationBridge {
         )
     }
 
+    // ── CIRISEdge#394 (E4 lockstep verdict) — edge is PASS-THROUGH on the
+    // five authority-signed declaration planes ──────────────────────────
+    //
+    // Family / Community / FamilyMembershipRevocation /
+    // CommunityMembershipRevocation / LocationProof carry an authority
+    // signature persist v21.0.0+ (CIRISPersist#502 E4) verifies FAIL-CLOSED
+    // at admission (hybrid Ed25519 + bound-form ML-DSA-65,
+    // `HybridPolicy::Strict`, over
+    // `ceg_produce_canonicalize(record.signing_envelope())`, against the
+    // authority's REGISTERED pubkeys — `verify_family_admission` et al.).
+    // Edge PRODUCES none of these records: no constructor of the five
+    // `Signed*` wrappers exists anywhere in edge, and the pyo3
+    // `apply_envelope` surface hands over PRE-SIGNED bytes from the rider.
+    // So edge's lockstep duty is byte-transparency, not signing:
+    //
+    //   * RECEIVE (the `apply_*` below): typed deserialize → persist
+    //     `put_*`. The three wrapper fields (`authority_key_id`,
+    //     `scrub_signature_classical`, `scrub_signature_pqc`) flow through
+    //     the typed struct unmodified; persist's gate is the admission
+    //     oracle.
+    //   * SERVE (`list_*` + `fetch_envelope_bytes`): served bytes come from
+    //     persist's `signed_wire_index` — persist's OWN serialization of the
+    //     stored row, never re-signed or re-shaped by edge.
+    //
+    // Pinned by `e4_*_forward_path_preserves_authority_signature` (the five
+    // positive round trips, re-admission on a second node as the oracle) and
+    // `e4_unsigned_declarations_refuse_at_admission` (the fail-closed half)
+    // in the tests module below.
     async fn apply_family(&self, bytes: &[u8]) -> ApplyOutcome {
         apply_signed_plane!(self, "Family", bytes, SignedFamily, put_family)
     }
@@ -2228,8 +2256,9 @@ mod tests {
     use chrono::Utc;
     use ciris_crypto::{ClassicalSigner as _, Ed25519Signer, MlDsa65Signer, PqcSigner as _};
     use ciris_persist::federation::types::{
-        algorithm, identity_type, Attestation, KeyRecord, Revocation, SignedAttestation,
-        SignedKeyRecord,
+        algorithm, identity_type, Attestation, Community, CommunityMember,
+        CommunityMembershipRevocation, Family, FamilyMember, FamilyMembershipRevocation, KeyRecord,
+        LocationProof, Revocation, SignedAttestation, SignedKeyRecord,
     };
     use ciris_persist::store::MemoryBackend;
     use sha2::{Digest as _, Sha256};
@@ -2852,6 +2881,500 @@ mod tests {
             "a refused bare route must not touch persist; found {} row(s)",
             rows.len(),
         );
+    }
+
+    // ── CIRISEdge#394 (E4 lockstep) — the pass-through verdict pins ──
+    //
+    // Edge produces NONE of the five authority-signed declaration planes
+    // (Family / Community / FamilyMembershipRevocation /
+    // CommunityMembershipRevocation / LocationProof) — see the verdict
+    // comment on `apply_family`. These tests pin the property that verdict
+    // rests on: a record signed EXACTLY per persist's E4 contract
+    // (hybrid-sign `record.signing_envelope()` as the registered authority)
+    // survives edge's full forward path — apply (persist ADMITS, the
+    // fail-closed oracle) → advertise → fetch → RE-ADMISSION on a second
+    // node — with the three wrapper fields byte-identical throughout.
+    //
+    // Fixture signing mirrors persist's pub(crate)
+    // `federation::tier_ingest::test_support::sign_*`: the generic hybrid
+    // envelope signer (`sign_attestation_envelope`, despite its name) is the
+    // SAME construction persist verifies — JCS canonical bytes, Ed25519 over
+    // canonical, ML-DSA-65 over `canonical ‖ ed25519_sig`.
+
+    /// Register a deterministic hybrid fixture key for each `(id,
+    /// identity_type)`, so the authority resolves at `verify_*_admission` and
+    /// the FK'd ids exist. The identity_type matters on the Community plane:
+    /// an `agent`-role member must be steward-bound (CC 3.2 / CC 3.4.7.1),
+    /// while a `user`-role member self-anchors — the fixtures register
+    /// community members as `user`.
+    async fn register_fixture_keys(backend: &MemoryBackend, keys: &[(&str, &str)]) {
+        for (k, ty) in keys {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, ty),
+                })
+                .await
+                .expect("register fixture key");
+        }
+    }
+
+    /// Hybrid-sign a [`Family`] for submission as `authority_key_id` —
+    /// persist's `tier_ingest::test_support::sign_family` shape.
+    fn sign_family_fixture(authority_key_id: &str, family: Family) -> SignedFamily {
+        let (_h, classical, pqc) =
+            sign_attestation_envelope(authority_key_id, &family.signing_envelope());
+        SignedFamily {
+            family,
+            authority_key_id: authority_key_id.to_string(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// Hybrid-sign a [`Community`] — mirrors [`sign_family_fixture`].
+    fn sign_community_fixture(authority_key_id: &str, community: Community) -> SignedCommunity {
+        let (_h, classical, pqc) =
+            sign_attestation_envelope(authority_key_id, &community.signing_envelope());
+        SignedCommunity {
+            community,
+            authority_key_id: authority_key_id.to_string(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// Hybrid-sign a [`FamilyMembershipRevocation`] — mirrors
+    /// [`sign_family_fixture`].
+    fn sign_family_membership_revocation_fixture(
+        authority_key_id: &str,
+        revocation: FamilyMembershipRevocation,
+    ) -> SignedFamilyMembershipRevocation {
+        let (_h, classical, pqc) =
+            sign_attestation_envelope(authority_key_id, &revocation.signing_envelope());
+        SignedFamilyMembershipRevocation {
+            family_membership_revocation: revocation,
+            authority_key_id: authority_key_id.to_string(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// Hybrid-sign a [`CommunityMembershipRevocation`] — mirrors
+    /// [`sign_family_fixture`].
+    fn sign_community_membership_revocation_fixture(
+        authority_key_id: &str,
+        revocation: CommunityMembershipRevocation,
+    ) -> SignedCommunityMembershipRevocation {
+        let (_h, classical, pqc) =
+            sign_attestation_envelope(authority_key_id, &revocation.signing_envelope());
+        SignedCommunityMembershipRevocation {
+            community_membership_revocation: revocation,
+            authority_key_id: authority_key_id.to_string(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// Hybrid-sign a [`LocationProof`] — mirrors [`sign_family_fixture`].
+    fn sign_location_proof_fixture(
+        authority_key_id: &str,
+        proof: LocationProof,
+    ) -> SignedLocationProof {
+        let (_h, classical, pqc) =
+            sign_attestation_envelope(authority_key_id, &proof.signing_envelope());
+        SignedLocationProof {
+            location_proof: proof,
+            authority_key_id: authority_key_id.to_string(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// A minimal admissible [`Family`]: `founder_only` is a canonical
+    /// `consensus_protocol` form and every member key_id must be registered
+    /// (persist `validate_family_members`); `family_key_id` itself is
+    /// keyless (persist v24.0.0 dropped that FK).
+    fn fixture_family(family_key_id: &str, member_key_id: &str) -> Family {
+        Family {
+            family_key_id: family_key_id.to_string(),
+            family_name: "E4 Pin Household".to_string(),
+            members: vec![FamilyMember {
+                key_id: member_key_id.to_string(),
+                joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                role: None,
+            }],
+            founded_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+            consensus_protocol: "founder_only".to_string(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// A minimal admissible [`Community`] — structural mirror of
+    /// [`fixture_family`].
+    fn fixture_community(community_key_id: &str, member_key_id: &str) -> Community {
+        Community {
+            community_key_id: community_key_id.to_string(),
+            community_name: "E4 Pin Co-op".to_string(),
+            members: vec![CommunityMember {
+                key_id: member_key_id.to_string(),
+                joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                role: None,
+            }],
+            founded_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+            consensus_protocol: "founder_only".to_string(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// Drive ONE E4 plane through edge's complete forward path and assert
+    /// the pass-through verdict:
+    ///
+    /// 1. node A applies the pre-signed wire bytes → persist ADMITS (the
+    ///    v21.0.0 fail-closed verify is the oracle that the bytes edge
+    ///    forwarded still carry a valid authority signature);
+    /// 2. A advertises exactly one ref and serves bytes that hash back to
+    ///    the advertised hash (byte-integrity of the serve half);
+    /// 3. the three E4 wrapper fields and the signed canonical envelope
+    ///    survive the apply→store→serve round trip unmodified (persist
+    ///    stamps only the server-computed `persist_row_hash`, which is
+    ///    excluded from the signed envelope by construction);
+    /// 4. node B re-admits the bytes A SERVED — the lockstep property
+    ///    itself: what edge passes on remains admissible at the next hop.
+    async fn pin_e4_forward_path<T>(
+        kind: EnvelopeKind,
+        cohort: &[&str],
+        registered_keys: &[(&str, &str)],
+        signed: &T,
+        wrapper_fields_of: impl Fn(&T) -> (String, String, Option<String>),
+        signing_envelope_of: impl Fn(&T) -> serde_json::Value,
+    ) where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let cohort: Vec<String> = cohort.iter().map(|s| (*s).to_string()).collect();
+
+        // Node A — the forwarding edge.
+        let (backend_a, bridge_a) = make_bridge(&cohort);
+        register_fixture_keys(&backend_a, registered_keys).await;
+        let wire = serde_json::to_vec(signed).expect("signed wrapper serializes");
+        let outcome = bridge_a.apply_envelope_bytes(kind, &wire, None).await;
+        assert!(
+            outcome.is_admitted(),
+            "persist must ADMIT the pre-signed {kind:?} edge forwarded \
+             (E4 fail-closed oracle); got {outcome:?}"
+        );
+
+        // Serve half: advertise + fetch, hash-integral.
+        let refs = bridge_a.list_envelope_refs(kind).await;
+        assert_eq!(refs.len(), 1, "exactly one advertised {kind:?} envelope");
+        let served = bridge_a
+            .fetch_envelope_bytes(kind, &refs[0].envelope_hash)
+            .await
+            .expect("advertised envelope must be fetchable");
+        let served_hash: [u8; 32] = Sha256::digest(&served).into();
+        assert_eq!(
+            served_hash, refs[0].envelope_hash,
+            "served bytes must hash back to the advertised hash"
+        );
+
+        // Signature preservation through the round trip.
+        let decoded: T = serde_json::from_slice(&served).expect("served bytes decode");
+        assert_eq!(
+            wrapper_fields_of(&decoded),
+            wrapper_fields_of(signed),
+            "authority_key_id + scrub signatures must survive byte-identical"
+        );
+        assert_eq!(
+            signing_envelope_of(&decoded),
+            signing_envelope_of(signed),
+            "the signed canonical envelope must survive the forward path"
+        );
+
+        // Node B — re-admission of what A served IS the lockstep property.
+        let (backend_b, bridge_b) = make_bridge(&cohort);
+        register_fixture_keys(&backend_b, registered_keys).await;
+        let outcome_b = bridge_b.apply_envelope_bytes(kind, &served, None).await;
+        assert!(
+            outcome_b.is_admitted(),
+            "node B must re-admit the {kind:?} bytes node A served; got {outcome_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn e4_family_forward_path_preserves_authority_signature() {
+        let signed = sign_family_fixture("e4-authority", fixture_family("e4-family", "e4-member"));
+        pin_e4_forward_path(
+            EnvelopeKind::Family,
+            &["e4-member"], // cohort-scoped advertise: a member must be in cohort
+            &[
+                ("e4-authority", identity_type::AGENT),
+                ("e4-member", identity_type::AGENT),
+            ],
+            &signed,
+            |s: &SignedFamily| {
+                (
+                    s.authority_key_id.clone(),
+                    s.scrub_signature_classical.clone(),
+                    s.scrub_signature_pqc.clone(),
+                )
+            },
+            |s| s.family.signing_envelope(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn e4_community_forward_path_preserves_authority_signature() {
+        let signed = sign_community_fixture(
+            "e4-authority",
+            fixture_community("e4-community", "e4-member"),
+        );
+        pin_e4_forward_path(
+            EnvelopeKind::Community,
+            &["e4-member"],
+            // CC 3.2 steward-binding gate: a non-infra community member must
+            // root in an accountable human — a `user`-role member self-anchors.
+            // And unlike the KEYLESS family (persist v24.0.0 dropped that FK),
+            // `community_key_id` must itself exist in federation_keys.
+            &[
+                ("e4-authority", identity_type::AGENT),
+                ("e4-community", identity_type::AGENT),
+                ("e4-member", identity_type::USER),
+            ],
+            &signed,
+            |s: &SignedCommunity| {
+                (
+                    s.authority_key_id.clone(),
+                    s.scrub_signature_classical.clone(),
+                    s.scrub_signature_pqc.clone(),
+                )
+            },
+            |s| s.community.signing_envelope(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn e4_family_membership_revocation_forward_path_preserves_authority_signature() {
+        // FK: family_key_id AND removed_identity_key_id must exist in
+        // federation_keys (persist checks both at put).
+        let signed = sign_family_membership_revocation_fixture(
+            "e4-authority",
+            FamilyMembershipRevocation {
+                family_key_id: "e4-family".to_string(),
+                removed_identity_key_id: "e4-member".to_string(),
+                removed_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        pin_e4_forward_path(
+            EnvelopeKind::FamilyMembershipRevocation,
+            &[], // tombstone plane advertises Global — no cohort needed
+            &[
+                ("e4-authority", identity_type::AGENT),
+                ("e4-family", identity_type::AGENT),
+                ("e4-member", identity_type::AGENT),
+            ],
+            &signed,
+            |s: &SignedFamilyMembershipRevocation| {
+                (
+                    s.authority_key_id.clone(),
+                    s.scrub_signature_classical.clone(),
+                    s.scrub_signature_pqc.clone(),
+                )
+            },
+            |s| s.family_membership_revocation.signing_envelope(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn e4_community_membership_revocation_forward_path_preserves_authority_signature() {
+        // effective_at must NOT be future-dated (SecReview F4: community
+        // removal is immediate for forward secrecy).
+        let signed = sign_community_membership_revocation_fixture(
+            "e4-authority",
+            CommunityMembershipRevocation {
+                community_key_id: "e4-community".to_string(),
+                removed_identity_key_id: "e4-member".to_string(),
+                removed_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                reason: None,
+                witness_set: Vec::new(),
+                persist_row_hash: String::new(),
+            },
+        );
+        pin_e4_forward_path(
+            EnvelopeKind::CommunityMembershipRevocation,
+            &[],
+            &[
+                ("e4-authority", identity_type::AGENT),
+                ("e4-community", identity_type::AGENT),
+                ("e4-member", identity_type::AGENT),
+            ],
+            &signed,
+            |s: &SignedCommunityMembershipRevocation| {
+                (
+                    s.authority_key_id.clone(),
+                    s.scrub_signature_classical.clone(),
+                    s.scrub_signature_pqc.clone(),
+                )
+            },
+            |s| s.community_membership_revocation.signing_envelope(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn e4_location_proof_forward_path_preserves_authority_signature() {
+        // "87283472bffffff" is a canonical resolution-7 H3 cell (verified
+        // against h3o 0.7.1, the version in this build's dependency graph) —
+        // within the §0.8.1 rough-only bound persist enforces at admission.
+        let signed = sign_location_proof_fixture(
+            "e4-authority",
+            LocationProof {
+                subject_key_id: "e4-subject".to_string(),
+                cell_id: "87283472bffffff".to_string(),
+                cell_resolution: 7,
+                asserted_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                valid_until: None,
+                attestation_evidence: None,
+                withdrawn_at: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        pin_e4_forward_path(
+            EnvelopeKind::LocationProof,
+            &["e4-subject"], // cohort-scoped advertise keys on the subject
+            &[
+                ("e4-authority", identity_type::AGENT),
+                ("e4-subject", identity_type::AGENT),
+            ],
+            &signed,
+            |s: &SignedLocationProof| {
+                (
+                    s.authority_key_id.clone(),
+                    s.scrub_signature_classical.clone(),
+                    s.scrub_signature_pqc.clone(),
+                )
+            },
+            |s| s.location_proof.signing_envelope(),
+        )
+        .await;
+    }
+
+    /// CIRISEdge#394 — the fail-closed half of the pass-through verdict. An
+    /// UNSIGNED declaration (empty wrapper fields — the exact legacy shape a
+    /// pre-v21 producer emitted) DECODES fine (the wrapper fields are
+    /// additive `#[serde(default)]`) and is REFUSED at admission: a named
+    /// `Refused`, never `Admitted` and never a wire-shape `Deserialize`
+    /// error. Edge adds no signing of its own, so nothing on the edge side
+    /// can heal — or mask — a stripped authority signature.
+    #[tokio::test]
+    async fn e4_unsigned_declarations_refuse_at_admission() {
+        let (backend, bridge) = make_bridge(&[]);
+        // Every FK'd id exists, so the ONLY failing gate is the E4 verify
+        // (which runs FIRST on every put_* — verify-before-mutation).
+        register_fixture_keys(
+            &backend,
+            &[
+                ("e4-family", identity_type::AGENT),
+                ("e4-community", identity_type::AGENT),
+                ("e4-member", identity_type::USER),
+                ("e4-subject", identity_type::AGENT),
+            ],
+        )
+        .await;
+
+        let unsigned: Vec<(EnvelopeKind, Vec<u8>)> = vec![
+            (
+                EnvelopeKind::Family,
+                serde_json::to_vec(&SignedFamily {
+                    family: fixture_family("e4-family", "e4-member"),
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
+                })
+                .expect("serialize"),
+            ),
+            (
+                EnvelopeKind::Community,
+                serde_json::to_vec(&SignedCommunity {
+                    community: fixture_community("e4-community", "e4-member"),
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
+                })
+                .expect("serialize"),
+            ),
+            (
+                EnvelopeKind::FamilyMembershipRevocation,
+                serde_json::to_vec(&SignedFamilyMembershipRevocation {
+                    family_membership_revocation: FamilyMembershipRevocation {
+                        family_key_id: "e4-family".to_string(),
+                        removed_identity_key_id: "e4-member".to_string(),
+                        removed_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                        effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                        reason: None,
+                        witness_set: Vec::new(),
+                        persist_row_hash: String::new(),
+                    },
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
+                })
+                .expect("serialize"),
+            ),
+            (
+                EnvelopeKind::CommunityMembershipRevocation,
+                serde_json::to_vec(&SignedCommunityMembershipRevocation {
+                    community_membership_revocation: CommunityMembershipRevocation {
+                        community_key_id: "e4-community".to_string(),
+                        removed_identity_key_id: "e4-member".to_string(),
+                        removed_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                        effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                        reason: None,
+                        witness_set: Vec::new(),
+                        persist_row_hash: String::new(),
+                    },
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
+                })
+                .expect("serialize"),
+            ),
+            (
+                EnvelopeKind::LocationProof,
+                serde_json::to_vec(&SignedLocationProof {
+                    location_proof: LocationProof {
+                        subject_key_id: "e4-subject".to_string(),
+                        cell_id: "87283472bffffff".to_string(),
+                        cell_resolution: 7,
+                        asserted_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                        valid_until: None,
+                        attestation_evidence: None,
+                        withdrawn_at: None,
+                        persist_row_hash: String::new(),
+                    },
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
+                })
+                .expect("serialize"),
+            ),
+        ];
+        for (kind, bytes) in unsigned {
+            let outcome = bridge.apply_envelope_bytes(kind, &bytes, None).await;
+            assert!(
+                matches!(outcome, ApplyOutcome::Refused(_)),
+                "an unsigned {kind:?} must be REFUSED at persist's E4 gate \
+                 (not admitted, not a wire-shape error); got {outcome:?}"
+            );
+        }
     }
 
     // ── FSD §7.1 federation-tier-only invariant fence ───────────────
