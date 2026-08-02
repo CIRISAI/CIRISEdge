@@ -1069,6 +1069,15 @@ name = "transport_reticulum_loopback"
 harness = false
 required-features = ["transport-reticulum"]
 
+# CIRISEdge#438 — real-codec half of the fountain survival-floor oracle
+# (decode-success d(m) curve + availability×decode composite + decode/
+# encode wall-clock). Requires the RaptorQ wrap layer; NOT yet in the
+# bench.yml run list nor ci.yml's benches-job feature set (see #438).
+[[bench]]
+name = "fountain_reconstruction"
+harness = false
+required-features = ["codec-fountain"]
+
 [[bench]]
 name = "transport_http_loopback"
 harness = false

@@ -44,10 +44,11 @@ The trend page carries two kinds of series, both consumed by the same
   `realtime_av_rekey`, `realtime_av_mesh_e2e`. Each bench's
   `required-features` (see `Cargo.toml`) is honored.
 - **Fixed-operating-point SIM metrics** (semantic values — ratios / ms /
-  rounds — published **un-normalized**, emitted by the two
-  `#[cfg(test)] mod sim` value dumps
+  rounds — published **un-normalized**, emitted by the three
+  `#[cfg(test)]` value dumps
   `realtime_av_alm::sim::tests::bench_dump_mesh_metrics` +
-  `replication::sim::tests::bench_dump_replication_metrics`):
+  `replication::sim::tests::bench_dump_replication_metrics` +
+  `holonomic::fountain_defaults::tests::bench_dump_fountain_metrics`):
   `mesh/m1_rtt_stretch_p95_x1000` (M1),
   `mesh/m2_reparent_p99_ms` (M2),
   `mesh/m8_continuity_first_delivery_loss5pct_x100000` (M8),
@@ -66,6 +67,7 @@ own and the set forms the curve:
 | `mesh/m3_heal_gap_p95/churn{p}pct_ms` | churn ∈ {0, 5, 10, 15, 20}%/s | ALM sim **M3** — delivery-gap p95 under sustained churn (the task's "reparent_p95/churn" curve; M3 is the only churn-parameterized scenario) |
 | `relay_streams_per_core/N_{n}/S_{s}` | N ∈ {32, 100} × S ∈ {1, 4, 16, 64} | criterion `realtime_av_relay` — the bench's own `BenchmarkId` sweep (no extra code) |
 | `replication/convergence_rounds/N{n}_x1000` | N ∈ {1, 8, 32, 128} | replication sim — mean `rounds_used` vs initiator-corpus size at 2% loss |
+| `fountain/reconstruction/avail{p}pct_x100000` | p ∈ {80, 85, 90, 95} | fountain_defaults dump (#438) — Monte-Carlo survival-floor reconstruction ratio vs per-peer availability at the shipped (N=20, K=6, R=30) tuple; the doc table's measured oracle |
 
 **Scale suffixes** (the `ns/iter` unit on the SIM series is a libtest-format
 artifact, *not* nanoseconds — the integer scale is baked into the name so
@@ -145,6 +147,11 @@ cargo bench --features "transport-http"      --bench transport_http_loopback
 
 # Subscription bus throughput — requires the pyo3 surface.
 cargo bench --features "pyo3" --bench subscription_throughput
+
+# Fountain reconstruction (#438) — real-RaptorQ decode-success curve
+# d(m) + availability×decode composite + decode/encode wall-clock.
+# Requires the codec wrap layer; not yet in the CI bench lanes.
+cargo bench --features "codec-fountain" --bench fountain_reconstruction
 ```
 
 ## CI integration
@@ -180,6 +187,7 @@ cargo bench --features "pyo3" --bench subscription_throughput
 | `subscription_throughput` | ciris-edge | v0.9.0 Tier 2 — broadcast → drainer → GIL-acquire → Python-callback rate. Sweep concurrent-subscriber count 1 / 4 / 16. |
 | `transport_reticulum_loopback` | ciris-edge | Round-trip over Leviculum `LocalInterface`. End-to-end wall clock; sweep envelope size 256 B → 64 KiB (resource layer kicks in past MDU). |
 | `transport_http_loopback` | ciris-edge | Round-trip over the HTTP transport. End-to-end wall clock; same size sweep — comparison anchor for the Reticulum curve. |
+| `fountain_reconstruction` | ciris-edge | CIRISEdge#438 — real-RaptorQ half of the fountain survival-floor oracle. Prints the measured decode-success curve `d(m)` (m ∈ 18..=26 distinct symbols, 1000 subsets each) + the `Σ_m P(X=m)·d(m)` composite next to `fountain_defaults`' availability table; times decode at m ∈ {20, 23, 26} + encode at the recommended tuple. `required-features = ["codec-fountain"]`; not yet wired into bench.yml/ci.yml lanes. |
 
 ## Reading the curves
 
