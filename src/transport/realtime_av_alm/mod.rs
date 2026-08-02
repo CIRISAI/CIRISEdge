@@ -31,6 +31,12 @@
 //!   construction), quantizes to whole servable layers, and coalesces a
 //!   "capacity changed" signal so re-attestation fires only on a bucket
 //!   crossing. Pure core; the leviculum read is one thin gated adapter.
+//! - **ALM-A(delivered)** ([`delivered`]) — CIRISEdge#439: the delivered
+//!   counterpart of the signed claim, keyed EXACTLY to the claim key
+//!   `(advertiser_key_id, stream_id, epoch)`, plus the edge-named CEG
+//!   dimension ([`delivered::CAPACITY_RELAY_DELIVERY_DIMENSION`]) a
+//!   delivered-vs-claimed score is about, and the consent-gated
+//!   (B5/CC#46, fail-closed) scores-plane emission shape LensCore reads.
 //! - **ALM-B** ([`join`]) — parent-finding: given a stream and the set
 //!   of fresh [`capacity::SignedRelayCapacity`] advertisements, select
 //!   a parent for THIS peer that respects fan-out budgets, locality,
@@ -66,6 +72,7 @@
 
 pub mod capacity;
 pub mod capacity_estimator;
+pub mod delivered;
 pub mod heal;
 pub mod join;
 pub mod transit_gate;
@@ -87,6 +94,11 @@ pub use capacity_estimator::{
     DemonstratedCapacity, EstimatorArm, EstimatorConfig, LinkCounters, LinkInterval,
     CEILING_DECAY_SPAN_SECS, CEILING_STALE_SECS, FLOOR_PERCENTILE, FLOOR_WINDOW_SECS,
     SAFETY_MARGIN, UPGRADE_HOLD_WINDOWS,
+};
+pub use delivered::{
+    delivery_envelope, emit_delivered_observation, observe_delivery, DeliveredAccumulator,
+    DeliveredObservation, DeliveryEmitError, DeliveryEmitOutcome, DeliveryWithholdReason,
+    ObservationKey, CAPACITY_RELAY_DELIVERY_DIMENSION,
 };
 pub use heal::{
     DedupRing, HealAction, HealApplyOutcome, MultiParentSubscription, ObserveOutcome,
