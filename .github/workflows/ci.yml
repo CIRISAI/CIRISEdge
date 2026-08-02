@@ -267,10 +267,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-anchor-lane
-      - name: bridge suite under test-anchor (ALLOW + deny + un-trust + leg-B ledger)
-        # The whole bridge module, not just the anchored test: the feature must
-        # not silently break the 35 always-on bridge tests either.
-        run: cargo test --lib --features test-anchor replication::bridge
+      - name: full lib under test-anchor (ALLOW paths + everything the feature touches)
+        # The WHOLE lib, not a module filter: #430's transit-gate ALLOW test
+        # lives in transport::realtime_av_alm, and a filter is how the #435
+        # class starts — an anchored test outside the filtered module silently
+        # never runs. The feature must also not break any always-on test.
+        run: cargo test --lib --features test-anchor
 
   # ─── darwin-aarch64 — Phase 1 macOS dev path ────────────────────────
   # No pyo3 feature here per persist's matrix precedent — the abi3 wheel

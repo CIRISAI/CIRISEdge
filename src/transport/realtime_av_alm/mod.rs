@@ -68,6 +68,7 @@ pub mod capacity;
 pub mod capacity_estimator;
 pub mod heal;
 pub mod join;
+pub mod transit_gate;
 
 // CIRISEdge ALM A/V performance-testing suite (Track A / criteria foundation).
 // Deterministic, clock-stepped, N-node A/V mesh simulator + 10-metric SOTA
@@ -94,3 +95,4 @@ pub use heal::{
 pub use join::{
     AlmJoinError, AlmJoinPlanner, JoinPlan, ParentCandidate, MAX_BACKUPS, MIN_REACHABILITY_RATIO,
 };
+pub use transit_gate::{TransitGate, NEGATIVE_VERDICT_TTL};
