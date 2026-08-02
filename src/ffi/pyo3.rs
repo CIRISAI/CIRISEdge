@@ -2262,6 +2262,21 @@ impl PyEdge {
         }
         root.set_item("key_apply_refusals_by_reason", refusals_reason)?;
 
+        // CIRISEdge#441 — the removal-delivery delta: per removal-class row,
+        // offered/acked counts + peers still lacking a protocol-native ack
+        // (the peer's own Summary). The server's ops ladder consumes this.
+        let removal = pyo3::types::PyList::empty(py);
+        for row in &bundle.removal_delivery {
+            let entry = pyo3::types::PyDict::new(py);
+            entry.set_item("kind", row.kind.as_wire_str())?;
+            entry.set_item("envelope_hash", hex::encode(row.envelope_hash))?;
+            entry.set_item("offered", row.offered)?;
+            entry.set_item("acked", row.acked)?;
+            entry.set_item("unacked_peers", row.unacked_peers.clone())?;
+            removal.append(entry)?;
+        }
+        root.set_item("removal_delivery", removal)?;
+
         Ok(root.unbind().into_any())
     }
 

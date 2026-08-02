@@ -111,6 +111,21 @@ fn apply_deser_reason(plane: &str, bytes: &[u8], err: &serde_json::Error) -> Str
 /// content hash (the value persist's `signed_wire_index` keys on — correlates with
 /// the offered `EnvelopeRef` + a direct `put_*`) + the typed refusal token
 /// ([`ciris_persist::federation::Error::kind`]).
+/// CIRISEdge#441 — the removal-class planes: every kind whose rows REMOVE
+/// standing (revocations + membership revocations). Attestation-plane
+/// `withdraws`/`recants` rows are the named follow-up (they need content
+/// inspection at the ref tier; kind-level covers the four typed planes).
+#[must_use]
+pub fn is_removal_kind(kind: EnvelopeKind) -> bool {
+    matches!(
+        kind,
+        EnvelopeKind::Revocation
+            | EnvelopeKind::IdentityOccurrenceRevocation
+            | EnvelopeKind::FamilyMembershipRevocation
+            | EnvelopeKind::CommunityMembershipRevocation
+    )
+}
+
 fn apply_refusal_reason(
     plane: &str,
     content_hash: &str,
@@ -509,35 +524,18 @@ impl FederationDirectoryReplicationBridge {
 #[async_trait]
 impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        match kind {
-            // CIRISEdge#397 §1+§2 — the five primary signed planes advertise
-            // via persist v21.2.0's bulk since-cursor reads, hashing each row by
-            // its content-hash (`sha256(serde_json::to_vec(row))`) so the wire
-            // hash == the point-read key. Key + IdentityOccurrence +
-            // TransportDestination project SelfOwn (publish-own); Attestation is
-            // per-record (`attestation_is_advertised`); IdentityOccurrenceRevocation
-            // is a tombstone → Global (anti-rollback).
-            EnvelopeKind::Key => self.list_keys().await,
-            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrences().await,
-            EnvelopeKind::TransportDestination => self.list_transport_destinations().await,
-            EnvelopeKind::IdentityOccurrenceRevocation => {
-                self.list_identity_occurrence_revocations().await
+        let refs = self.list_envelope_refs_inner(kind).await;
+        // CIRISEdge#441 — removal-class rows enter the receipt ledger the
+        // moment they are advertisable; the serve exit records offers and
+        // the coordinator's Summary observer records protocol-native acks.
+        if is_removal_kind(kind) {
+            if let Some(m) = self.metrics.as_ref() {
+                for r in &refs {
+                    m.removal_track(kind, r.envelope_hash);
+                }
             }
-            EnvelopeKind::Attestation => self.list_attestations(None).await,
-            EnvelopeKind::Revocation => self.list_revocations().await,
-            EnvelopeKind::Family => self.list_families().await,
-            EnvelopeKind::Community => self.list_communities().await,
-            EnvelopeKind::Organization => self.list_organizations().await,
-            EnvelopeKind::OrgMembership => self.list_org_memberships().await,
-            EnvelopeKind::PartnerRecord => self.list_partner_records().await,
-            EnvelopeKind::FamilyMembershipRevocation => {
-                self.list_family_membership_revocations().await
-            }
-            EnvelopeKind::CommunityMembershipRevocation => {
-                self.list_community_membership_revocations().await
-            }
-            EnvelopeKind::LocationProof => self.list_location_proofs().await,
         }
+        refs
     }
 
     async fn fetch_envelope_bytes(
@@ -685,6 +683,19 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // same semantics `envelopes_sent_total` has carried since v0.19.0.
         if let Some(m) = self.metrics.as_ref() {
             m.inc_replication_served(kind);
+            // CIRISEdge#441 — a removal-class serve is an OFFER in the receipt
+            // ledger: this peer was handed the row; the ack arrives when its
+            // own next Summary advertises the hash.
+            if is_removal_kind(kind) {
+                if let Some(p) = peer_key_id {
+                    m.removal_offer(
+                        kind,
+                        *envelope_hash,
+                        p,
+                        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                    );
+                }
+            }
         }
         Some(bytes)
     }
@@ -722,6 +733,38 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
 }
 
 impl FederationDirectoryReplicationBridge {
+    async fn list_envelope_refs_inner(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        match kind {
+            // CIRISEdge#397 §1+§2 — the five primary signed planes advertise
+            // via persist v21.2.0's bulk since-cursor reads, hashing each row by
+            // its content-hash (`sha256(serde_json::to_vec(row))`) so the wire
+            // hash == the point-read key. Key + IdentityOccurrence +
+            // TransportDestination project SelfOwn (publish-own); Attestation is
+            // per-record (`attestation_is_advertised`); IdentityOccurrenceRevocation
+            // is a tombstone → Global (anti-rollback).
+            EnvelopeKind::Key => self.list_keys().await,
+            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrences().await,
+            EnvelopeKind::TransportDestination => self.list_transport_destinations().await,
+            EnvelopeKind::IdentityOccurrenceRevocation => {
+                self.list_identity_occurrence_revocations().await
+            }
+            EnvelopeKind::Attestation => self.list_attestations(None).await,
+            EnvelopeKind::Revocation => self.list_revocations().await,
+            EnvelopeKind::Family => self.list_families().await,
+            EnvelopeKind::Community => self.list_communities().await,
+            EnvelopeKind::Organization => self.list_organizations().await,
+            EnvelopeKind::OrgMembership => self.list_org_memberships().await,
+            EnvelopeKind::PartnerRecord => self.list_partner_records().await,
+            EnvelopeKind::FamilyMembershipRevocation => {
+                self.list_family_membership_revocations().await
+            }
+            EnvelopeKind::CommunityMembershipRevocation => {
+                self.list_community_membership_revocations().await
+            }
+            EnvelopeKind::LocationProof => self.list_location_proofs().await,
+        }
+    }
+
     /// The per-kind apply dispatch behind the #425 choke —
     /// [`StateApplier::apply_envelope_bytes`] wraps this with the #426
     /// source-peer trace and the #565 refusal counter.

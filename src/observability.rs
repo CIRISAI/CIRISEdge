@@ -320,6 +320,144 @@ impl std::fmt::Display for WithholdReason {
     }
 }
 
+/// CIRISEdge#441 — per-(removal-row, peer) delivery state. The single most-
+/// repeated PKI lesson is that revocation does not arrive (CRL/OCSP soft-
+/// fail); every CIRIS removal primitive rides a pull-only plane, so absence
+/// of delivery was invisible. The three states are deliberately distinct —
+/// collapsing them is how "unverified" gets read as "delivered", the exact
+/// failure receipts exist to expose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalDeliveryState {
+    /// The row exists locally; this peer has never been served it.
+    NeverOffered,
+    /// Served to the peer (packed into a Deliver) at the contained unix-ms
+    /// instant; no evidence the peer holds it yet.
+    Offered(u64),
+    /// The peer's own subsequent Summary advertised the row's hash — the
+    /// protocol-native receipt (a Summary IS a signed-session statement of
+    /// holdings; no new wire). Unix-ms of the observing Summary.
+    Acked(u64),
+}
+
+/// CIRISEdge#441 — the removal-receipt ledger: per removal-class row, the
+/// per-peer delivery state. NOT a delivery guarantee — the instrument that
+/// makes non-delivery visible ("peers that should have this and have not
+/// acked"). Bounded: at most [`REMOVAL_LEDGER_CAP`] rows (oldest evicted);
+/// peers per row bounded by observed cohort.
+#[derive(Debug, Default)]
+pub struct RemovalReceiptLedger {
+    /// (kind, envelope_hash) → per-peer state. `VecDeque` tracks insertion
+    /// order for eviction.
+    rows: HashMap<(EnvelopeKind, [u8; 32]), HashMap<String, RemovalDeliveryState>>,
+    order: VecDeque<(EnvelopeKind, [u8; 32])>,
+}
+
+/// CIRISEdge#441 — how many removal rows the ledger tracks (oldest evicted).
+/// Removal primitives are rare; 1024 covers years of fleet churn.
+pub const REMOVAL_LEDGER_CAP: usize = 1024;
+
+impl RemovalReceiptLedger {
+    /// A removal-class row exists locally (seen at advertise assembly).
+    /// Idempotent; evicts oldest past the cap.
+    pub fn track(&mut self, kind: EnvelopeKind, hash: [u8; 32]) {
+        let key = (kind, hash);
+        if self.rows.contains_key(&key) {
+            return;
+        }
+        while self.rows.len() >= REMOVAL_LEDGER_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.rows.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.rows.insert(key, HashMap::new());
+        self.order.push_back(key);
+    }
+
+    /// The row was SERVED to `peer` (the bridge's recipient-aware serve
+    /// exit). Never downgrades an existing `Acked`.
+    pub fn offer(&mut self, kind: EnvelopeKind, hash: [u8; 32], peer: &str, now_ms: u64) {
+        self.track(kind, hash);
+        if let Some(peers) = self.rows.get_mut(&(kind, hash)) {
+            let e = peers
+                .entry(peer.to_string())
+                .or_insert(RemovalDeliveryState::NeverOffered);
+            if !matches!(e, RemovalDeliveryState::Acked(_)) {
+                *e = RemovalDeliveryState::Offered(now_ms);
+            }
+        }
+    }
+
+    /// `peer`'s Summary for `kind` advertised `hashes` — every tracked row
+    /// among them is now `Acked` for that peer (including rows we never
+    /// offered: the peer got it elsewhere, which is still a receipt).
+    pub fn ack_from_summary(
+        &mut self,
+        peer: &str,
+        kind: EnvelopeKind,
+        hashes: &[[u8; 32]],
+        now_ms: u64,
+    ) {
+        for h in hashes {
+            if let Some(peers) = self.rows.get_mut(&(kind, *h)) {
+                peers.insert(peer.to_string(), RemovalDeliveryState::Acked(now_ms));
+            }
+        }
+    }
+
+    /// The delta read: every tracked row with, per known peer, its state.
+    /// A peer in the serving cohort that appears NOWHERE for a row is
+    /// `NeverOffered` by definition — the caller composes that against its
+    /// cohort list (the ledger only knows peers it has observed).
+    #[must_use]
+    pub fn delta(&self) -> Vec<RemovalRowDelta> {
+        self.order
+            .iter()
+            .filter_map(|key| {
+                let peers = self.rows.get(key)?;
+                let offered = peers
+                    .values()
+                    .filter(|s| matches!(s, RemovalDeliveryState::Offered(_)))
+                    .count();
+                let acked = peers
+                    .values()
+                    .filter(|s| matches!(s, RemovalDeliveryState::Acked(_)))
+                    .count();
+                let mut unacked_peers: Vec<String> = peers
+                    .iter()
+                    .filter(|(_, s)| !matches!(s, RemovalDeliveryState::Acked(_)))
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                unacked_peers.sort();
+                unacked_peers.truncate(16);
+                Some(RemovalRowDelta {
+                    kind: key.0,
+                    envelope_hash: key.1,
+                    offered,
+                    acked,
+                    unacked_peers,
+                })
+            })
+            .collect()
+    }
+}
+
+/// CIRISEdge#441 — one row of the removal-delivery delta read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalRowDelta {
+    /// The removal plane.
+    pub kind: EnvelopeKind,
+    /// The row's envelope hash.
+    pub envelope_hash: [u8; 32],
+    /// Peers offered-but-unacked.
+    pub offered: usize,
+    /// Peers with a Summary-evidenced receipt.
+    pub acked: usize,
+    /// Offered/known peers still lacking an ack (sorted, capped at 16).
+    pub unacked_peers: Vec<String>,
+}
+
 /// CIRISEdge#433 — one entry in the bounded recent-withholds ring: the
 /// attribution a bare counter cannot carry, WITHOUT turning on debug logging.
 ///
@@ -466,6 +604,11 @@ pub struct EdgeMetrics {
     /// holds what was offered. Extends per-plane as persist types more
     /// refusals.
     pub key_apply_refusals_by_reason: Arc<RwLock<HashMap<String, u64>>>,
+    /// CIRISEdge#441 — the removal-receipt ledger (revocation-class rows'
+    /// per-peer delivery states; the pull-plane's missing arrival
+    /// instrument). Fed by the bridge's serve exit (offers) + the
+    /// coordinator's Summary observer (protocol-native acks).
+    pub removal_receipts: Arc<RwLock<RemovalReceiptLedger>>,
     /// CIRISEdge#433 — per-[`EnvelopeKind`] count of envelopes the REPLICATION
     /// plane served to a peer. The mirror-image defect of the withhold blindness:
     /// [`Self::envelopes_sent_total`] is bumped only from `src/edge.rs`
@@ -618,6 +761,32 @@ impl EdgeMetrics {
         *guard.entry(kind).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#441 — record a removal-class row exists (advertise assembly).
+    pub fn removal_track(&self, kind: EnvelopeKind, hash: [u8; 32]) {
+        self.removal_receipts.write().track(kind, hash);
+    }
+
+    /// CIRISEdge#441 — record a removal-class row served to `peer`.
+    pub fn removal_offer(&self, kind: EnvelopeKind, hash: [u8; 32], peer: &str, now_ms: u64) {
+        self.removal_receipts
+            .write()
+            .offer(kind, hash, peer, now_ms);
+    }
+
+    /// CIRISEdge#441 — fold a peer's Summary into the receipt ledger (the
+    /// protocol-native ack: a Summary is the peer's own statement of holdings).
+    pub fn removal_ack_from_summary(
+        &self,
+        peer: &str,
+        kind: EnvelopeKind,
+        hashes: &[[u8; 32]],
+        now_ms: u64,
+    ) {
+        self.removal_receipts
+            .write()
+            .ack_from_summary(peer, kind, hashes, now_ms);
+    }
+
     /// persist v24.2.0 / #565 — count one refused apply on `kind` (the
     /// receive-plane mirror's kind axis, bumped at the #425 choke).
     pub fn inc_apply_refusal_kind(&self, kind: EnvelopeKind) {
@@ -670,6 +839,7 @@ impl EdgeMetrics {
                 .clone(),
             apply_refusals_by_kind: self.apply_refusals_by_kind.read().clone(),
             key_apply_refusals_by_reason: self.key_apply_refusals_by_reason.read().clone(),
+            removal_delivery: self.removal_receipts.read().delta(),
         }
     }
 }
@@ -713,6 +883,9 @@ pub struct EdgeMetricsBundle {
     /// persist v24.2.0 / #565 — typed Key-plane policy refusals by persist's
     /// stable token (closed, append-only 9-token contract).
     pub key_apply_refusals_by_reason: HashMap<String, u64>,
+    /// CIRISEdge#441 — the removal-delivery delta: per tracked removal row,
+    /// offered/acked counts + peers still lacking a receipt.
+    pub removal_delivery: Vec<RemovalRowDelta>,
 }
 
 #[cfg(test)]
@@ -820,6 +993,59 @@ mod tests {
             3072
         );
         assert_eq!(snap.transport_bytes_out_total[&TransportId::HTTP], 512);
+    }
+
+    /// CIRISEdge#441 — the receipt ledger's three-state contract, driven with
+    /// the shapes the seams produce: track at advertise, offer at serve,
+    /// ack from the peer's own Summary. The states are never collapsed —
+    /// that collapse is how "unverified" reads as "delivered".
+    #[test]
+    fn removal_receipts_distinguish_never_offered_offered_and_acked() {
+        let mut l = RemovalReceiptLedger::default();
+        let h = [7u8; 32];
+        let k = EnvelopeKind::Revocation;
+        l.track(k, h);
+        // Tracked, nobody offered: delta row exists, empty peers.
+        let d = l.delta();
+        assert_eq!((d.len(), d[0].offered, d[0].acked), (1, 0, 0));
+        // Offered to peer-a: visible as offered-unacked.
+        l.offer(k, h, "peer-a", 1_000);
+        let d = l.delta();
+        assert_eq!((d[0].offered, d[0].acked), (1, 0));
+        assert_eq!(d[0].unacked_peers, vec!["peer-a".to_string()]);
+        // peer-a's next Summary advertises the hash: the protocol-native ack.
+        l.ack_from_summary("peer-a", k, &[h], 2_000);
+        let d = l.delta();
+        assert_eq!((d[0].offered, d[0].acked), (0, 1));
+        assert!(d[0].unacked_peers.is_empty());
+        // A peer we never offered acks via Summary (got it elsewhere) — still
+        // a receipt; and an ack is never downgraded by a later offer.
+        l.ack_from_summary("peer-b", k, &[h], 3_000);
+        l.offer(k, h, "peer-b", 4_000);
+        let d = l.delta();
+        assert_eq!(d[0].acked, 2, "an ack survives a later offer");
+        // Un-tracked hashes in a Summary are ignored (no unbounded growth).
+        l.ack_from_summary("peer-a", k, &[[9u8; 32]], 5_000);
+        assert_eq!(l.delta().len(), 1);
+    }
+
+    /// CIRISEdge#441 — the ledger cap: oldest rows evict; the ledger can
+    /// never grow past [`REMOVAL_LEDGER_CAP`].
+    #[test]
+    fn removal_receipts_cap_evicts_oldest() {
+        let mut l = RemovalReceiptLedger::default();
+        for i in 0..(REMOVAL_LEDGER_CAP + 5) {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            l.track(EnvelopeKind::Revocation, h);
+        }
+        assert_eq!(l.delta().len(), REMOVAL_LEDGER_CAP);
+        let mut h0 = [0u8; 32];
+        h0[..8].copy_from_slice(&0u64.to_be_bytes());
+        assert!(
+            !l.delta().iter().any(|r| r.envelope_hash == h0),
+            "the oldest row evicted"
+        );
     }
 
     /// CIRISEdge#433 — the ring-buffer BOUND is the unit under test here, so this

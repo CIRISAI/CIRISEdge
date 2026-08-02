@@ -102,6 +102,10 @@ pub enum CoordinatorError {
 /// round, or `drive_round_step(Some(inbound))` (responder) on the
 /// next inbound Summary.
 pub struct ReplicationCoordinator {
+    /// CIRISEdge#441 — optional metrics handle; when present, every inbound
+    /// Summary on a removal-class kind folds into the removal-receipt
+    /// ledger (the peer's Summary IS the protocol-native delivery ack).
+    metrics: Option<crate::observability::EdgeMetrics>,
     transport: Arc<dyn Transport>,
     peer_key_id: String,
     kind: EnvelopeKind,
@@ -143,6 +147,7 @@ impl ReplicationCoordinator {
     ) -> Self {
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(Self::INBOUND_CHANNEL_CAPACITY);
         Self {
+            metrics: None,
             transport,
             peer_key_id: peer_key_id.into(),
             kind,
@@ -214,6 +219,23 @@ impl ReplicationCoordinator {
         let outcome = match msg {
             None => session.start_round(self.provider.as_ref()),
             Some(m) => {
+                // CIRISEdge#441 — a peer's Summary on a removal-class kind is
+                // its own statement of holdings: fold every advertised hash
+                // into the removal-receipt ledger as an ACK before the session
+                // consumes the message. Zero new wire; the pull plane's
+                // missing arrival instrument.
+                if let (Some(metrics), ReplicationMessage::Summary(sm)) = (&self.metrics, &m) {
+                    if crate::replication::bridge::is_removal_kind(sm.kind) {
+                        let hashes: Vec<[u8; 32]> =
+                            sm.refs.iter().map(|r| r.envelope_hash).collect();
+                        metrics.removal_ack_from_summary(
+                            &self.peer_key_id,
+                            sm.kind,
+                            &hashes,
+                            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                        );
+                    }
+                }
                 let mut applier = self.applier.lock().await;
                 // CIRISEdge#426 — this coordinator IS per-peer, so its `peer_key_id`
                 // is the authenticated sender of anything it applies this round.
@@ -239,6 +261,14 @@ impl ReplicationCoordinator {
             session.reset();
         }
         Ok(step)
+    }
+
+    /// CIRISEdge#441 — install the metrics handle (builder; used at the two
+    /// production construction sites). `None` keeps every fold a no-op.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Whether this coordinator's session has completed its current

@@ -393,6 +393,9 @@ impl ReplicationRuntime {
         {
             let factory_transport = Arc::clone(&transport);
             let factory_bridge = Arc::clone(&bridge);
+            // CIRISEdge#441 — the responder coordinators fold peer Summaries
+            // into the removal-receipt ledger; same handle the bridge uses.
+            let factory_metrics = config.metrics.clone();
             registry.set_responder_factory(Arc::new(move |peer_key_id: &str, kind| {
                 let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&factory_bridge) as _;
                 // CIRISEdge#379 — peer-bound provider: the observer-capability
@@ -402,14 +405,17 @@ impl ReplicationRuntime {
                 );
                 let applier: Arc<Mutex<dyn StateApplier>> =
                     Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
-                let coord = Arc::new(ReplicationCoordinator::new(
-                    Arc::clone(&factory_transport),
-                    peer_key_id.to_string(),
-                    kind,
-                    SessionRole::Responder,
-                    provider,
-                    applier,
-                ));
+                let coord = Arc::new(
+                    ReplicationCoordinator::new(
+                        Arc::clone(&factory_transport),
+                        peer_key_id.to_string(),
+                        kind,
+                        SessionRole::Responder,
+                        provider,
+                        applier,
+                    )
+                    .with_metrics(factory_metrics.clone()),
+                );
                 // CIRISEdge#348 — DRIVE the responder. The registry only stores
                 // the coordinator; the scheduler drives INITIATORS only. Without
                 // a driver here the round-open is `deliver_inbound`'d into the
@@ -452,6 +458,7 @@ impl ReplicationRuntime {
                         provider,
                         applier,
                     )
+                    .with_metrics(config.metrics.clone())
                     .with_proactive_publish(proactive_publish),
                 )
             })
