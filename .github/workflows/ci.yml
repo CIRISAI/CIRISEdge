@@ -1362,7 +1362,7 @@ jobs:
         with:
           timeout_minutes: 15
           max_attempts: 3
-          command: cargo bench --no-run --features "transport-http transport-reticulum pyo3 test-anchor"
+          command: cargo bench --no-run --features "transport-http transport-reticulum pyo3 test-anchor codec-fountain"
       - name: sccache stats
         if: always()
         run: sccache --show-stats

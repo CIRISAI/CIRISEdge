@@ -240,6 +240,10 @@ jobs:
           run_bench "transport-reticulum"                realtime_av_relay
           run_bench "transport-http,transport-reticulum" realtime_av_rekey
           run_bench "transport-http,transport-reticulum" realtime_av_mesh_e2e
+          # CIRISEdge#438 — real-RaptorQ reconstruction: measured decode-success
+          # d(m) + the availability×decode composite the fountain_defaults
+          # table's design target is judged against (the bench is the oracle).
+          run_bench "codec-fountain" fountain_reconstruction
           if [ -n "${failed_benches}" ]; then
             echo "::error title=bench job failed::broken benches:${failed_benches}"
             exit 1
