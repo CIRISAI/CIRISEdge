@@ -910,6 +910,87 @@ impl PublishOutcome {
     }
 }
 
+/// CIRISEdge#391 — a LAST-WINS registration cell for components the server
+/// re-registers against a fold-SURVIVING `Edge` on each clean-restart serve.
+///
+/// Replaces the `OnceLock` first-wins pattern for these seams. First-wins is
+/// right for install-once-before-run lifecycles, but in the embedded fold the
+/// `Edge` outlives the server composition: a re-serve re-registers a FRESH
+/// component, and a silently-dropped second call leaves inbound dispatch
+/// pointed at the FIRST serve's torn-down object (the CIRISServer#312
+/// shadowed-topology shape) while every layer reports healthy. Last-wins +
+/// a LOUD replace makes re-registration the correct restart idiom — the same
+/// contract `register_opaque_handler` has always had.
+///
+/// Consumers read per dispatch ([`Self::get`] is one `RwLock` read + `Arc`
+/// clone), so a replacement takes effect on the very next frame.
+struct ReinstallableCell<T> {
+    slot: std::sync::RwLock<Option<Arc<T>>>,
+    /// Which registration this is — names the seam in the replace log.
+    what: &'static str,
+}
+
+impl<T> std::fmt::Debug for ReinstallableCell<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let installed = self
+            .slot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        f.debug_struct("ReinstallableCell")
+            .field("what", &self.what)
+            .field("installed", &installed)
+            .finish()
+    }
+}
+
+impl<T> ReinstallableCell<T> {
+    fn new(what: &'static str) -> Self {
+        Self {
+            slot: std::sync::RwLock::new(None),
+            what,
+        }
+    }
+
+    /// Install `value`, replacing any prior registration (last-wins). A
+    /// replace by a DIFFERENT object logs at `info` — the expected
+    /// fold-restart idiom, visible so a restart's re-wiring is auditable;
+    /// a re-install of the SAME `Arc` (the process-static single-composition
+    /// pattern CIRISServer 0.5.136 guards) logs at `debug` (idempotent).
+    fn install(&self, value: Arc<T>) {
+        let mut slot = self
+            .slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.as_ref() {
+            Some(prev) if Arc::ptr_eq(prev, &value) => {
+                tracing::debug!(
+                    what = self.what,
+                    "re-install of the same object — idempotent (CIRISEdge#391)"
+                );
+            }
+            Some(_) => {
+                tracing::info!(
+                    what = self.what,
+                    "registration REPLACED by re-install — the fold clean-restart idiom \
+                     (CIRISEdge#391): inbound dispatch reads this cell per frame, so the \
+                     new object is live from the next frame"
+                );
+            }
+            None => {}
+        }
+        *slot = Some(value);
+    }
+
+    /// The current registration, if any — one read-lock + `Arc` clone.
+    fn get(&self) -> Option<Arc<T>> {
+        self.slot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// Top-level edge handle. Construct via [`Edge::builder`].
 pub struct Edge {
     verify: Arc<VerifyPipeline>,
@@ -1001,20 +1082,27 @@ pub struct Edge {
     ///
     /// `None` (uninitialized) preserves the v3.5.0 behavior exactly:
     /// no replication routing, every frame goes to `dispatch_inbound`.
-    replication_registry:
-        Arc<std::sync::OnceLock<Arc<crate::replication::registry::ReplicationRegistry>>>,
+    ///
+    /// CIRISEdge#391 — LAST-WINS (was `OnceLock` first-wins): in the
+    /// embedded fold, `Edge` SURVIVES a server clean-restart and the new
+    /// serve re-runs its registrations. First-wins silently kept the
+    /// dispatch pointed at the FIRST serve's torn-down registry — the
+    /// CIRISServer#312 shadowed-topology shape. The dispatch loop reads
+    /// this cell per frame, so a re-install takes effect on the very
+    /// next frame.
+    replication_registry: Arc<ReinstallableCell<crate::replication::registry::ReplicationRegistry>>,
     /// v5.2.0 (CIRISEdge#143) — opt-in fountain swarm orchestration
-    /// runtime. Set-once via `OnceLock`; the [`Edge::install_swarm_runtime`]
-    /// post-build setter holds the runtime for the lifetime of
-    /// `Edge`. When set, the operator's dispatch path may call
+    /// runtime. When set, the operator's dispatch path may call
     /// [`crate::swarm::FountainSwarmRuntime::register_observed_claim`]
     /// on verified inbound holding-claim bodies. When `None`, no
     /// swarm orchestration runs — the substrate primitives stay
     /// reachable for tests but no live publisher / converger fires.
     ///
-    /// `OnceLock<Arc<_>>` because the lifecycle is `install once
-    /// before run`; cheap atomic load from the inbound side.
-    swarm_runtime: Arc<std::sync::OnceLock<Arc<crate::swarm::FountainSwarmRuntime>>>,
+    /// CIRISEdge#391 — LAST-WINS (was `OnceLock` set-once): see
+    /// [`Self::replication_registry`]. The inbound side reads per
+    /// frame; a fold-restart re-install is the correct idiom, not a
+    /// silently-dropped call.
+    swarm_runtime: Arc<ReinstallableCell<crate::swarm::FountainSwarmRuntime>>,
     /// v5.2.0 (CIRISEdge#143) — opt-in consent-decay scheduler
     /// shutdown handle. Same lifecycle as [`Self::swarm_runtime`];
     /// when set, [`Edge::shutdown_swarm_runtime`] also signals the
@@ -1682,10 +1770,13 @@ impl Edge {
         &self,
         runtime: &crate::replication::runtime::ReplicationRuntime,
     ) {
-        // Idempotent — first call wins. A second call returns Err but
-        // we ignore it: the OnceLock semantics + the lifecycle
-        // (install-before-run) make this a no-op race-free guarantee.
-        let _ = self.replication_registry.set(runtime.registry());
+        // CIRISEdge#391 — LAST-WINS (was OnceLock first-wins): a
+        // fold-surviving Edge receives this registration again on every
+        // server re-serve, and the dispatch loop reads the cell per frame,
+        // so the re-install is live from the next frame. A replace by a
+        // different registry logs loudly; same-object re-install is a
+        // debug-level no-op.
+        self.replication_registry.install(runtime.registry());
     }
 
     /// v5.2.0 (CIRISEdge#143) — register a
@@ -1700,16 +1791,21 @@ impl Edge {
     ///   [`crate::swarm::FountainSwarmRuntime::register_observed_claim`]
     ///   (CIRISEdge#184 v6.3.0 — the v5.2.0 deferral closed here).
     ///
-    /// Idempotent: a second call is silently ignored (first wins).
+    /// CIRISEdge#391 — LAST-WINS (was set-once first-wins): a re-install
+    /// replaces the prior runtime and is live from the next inbound frame
+    /// (the dispatch path reads the cell per frame) — the fold clean-restart
+    /// idiom. A replace by a DIFFERENT runtime logs at `info`; re-installing
+    /// the same `Arc` (CIRISServer 0.5.136's process-static composition) is
+    /// a debug-level no-op.
     pub fn install_swarm_runtime(&self, runtime: Arc<crate::swarm::FountainSwarmRuntime>) {
-        let _ = self.swarm_runtime.set(runtime);
+        self.swarm_runtime.install(runtime);
     }
 
     /// v5.2.0 — return the installed
     /// [`crate::swarm::FountainSwarmRuntime`], if any. `None` when
     /// [`Self::install_swarm_runtime`] has not been called yet.
     pub fn swarm_runtime_handle(&self) -> Option<Arc<crate::swarm::FountainSwarmRuntime>> {
-        self.swarm_runtime.get().cloned()
+        self.swarm_runtime.get()
     }
 
     /// v5.2.0 (CIRISEdge#143) — register a consent-decay scheduler
@@ -2999,7 +3095,7 @@ impl Edge {
             self.config.delegation_graph_max_depth,
             self.canonical_peers.clone(),
             self.blob_chunk_source.as_ref(),
-            self.swarm_runtime.get(),
+            self.swarm_runtime.get().as_ref(),
         )
         .await;
     }
@@ -3153,7 +3249,7 @@ impl Edge {
                 // never delivered round-opens to the responder). Only fall through
                 // to envelope dispatch when it's not consumed by replication.
                 if route_replication_frame(
-                    edge_for_dispatch.replication_registry.get(),
+                    edge_for_dispatch.replication_registry.get().as_ref(),
                     &frame,
                     Some(&edge_for_dispatch.metrics()),
                 )
@@ -3642,7 +3738,7 @@ impl Edge {
                     // NEVER diverge again. Routes CRPL replication frames to the
                     // registry; returns true when consumed (→ do not envelope-
                     // dispatch). Every branch logs, throttled.
-                    if route_replication_frame(replication_registry.get(), &frame, Some(&metrics))
+                    if route_replication_frame(replication_registry.get().as_ref(), &frame, Some(&metrics))
                         .await
                     {
                         continue;
@@ -3702,7 +3798,7 @@ impl Edge {
                             delegation_graph_max_depth,
                             delegation_trust_roots_clone,
                             blob_chunk_source_clone.as_ref(),
-                            swarm_runtime_clone.get(),
+                            swarm_runtime_clone.get().as_ref(),
                         ).await;
                     });
                 }
@@ -5935,8 +6031,8 @@ impl EdgeBuilder {
             peer_directory: self.peer_directory,
             steward_directory: self.steward_directory,
             blob_chunk_source: self.blob_chunk_source,
-            replication_registry: Arc::new(std::sync::OnceLock::new()),
-            swarm_runtime: Arc::new(std::sync::OnceLock::new()),
+            replication_registry: Arc::new(ReinstallableCell::new("replication_registry")),
+            swarm_runtime: Arc::new(ReinstallableCell::new("swarm_runtime")),
             #[cfg(feature = "holonomic-consent-decay")]
             consent_decay_shutdown: Arc::new(std::sync::OnceLock::new()),
             subscription_filter: self.subscription_filter,
@@ -7758,6 +7854,41 @@ mod inbound_ingest_tests {
             metrics.inbound_backpressure_drops(),
             1,
             "the back-pressure drop MUST be counted, not silent (CIRISEdge#373)",
+        );
+    }
+
+    /// CIRISEdge#391 — the fold clean-restart contract: registration cells
+    /// are LAST-WINS (a re-serve's fresh component replaces the torn-down
+    /// one), and a same-`Arc` re-install (the process-static composition
+    /// pattern) is an idempotent no-op. Driven on the cell itself — the
+    /// installers are one-line delegates, and the dispatch loop reads the
+    /// cell per frame, so cell semantics ARE the routing semantics.
+    #[test]
+    fn reinstallable_cell_is_last_wins_and_same_object_idempotent() {
+        let cell: super::ReinstallableCell<u32> = super::ReinstallableCell::new("test-cell");
+        assert!(cell.get().is_none(), "empty before any install");
+
+        let first = std::sync::Arc::new(1u32);
+        cell.install(std::sync::Arc::clone(&first));
+        assert!(
+            std::sync::Arc::ptr_eq(&cell.get().expect("installed"), &first),
+            "first install lands"
+        );
+
+        // The fold-restart idiom: a DIFFERENT object replaces the prior one.
+        let second = std::sync::Arc::new(2u32);
+        cell.install(std::sync::Arc::clone(&second));
+        assert!(
+            std::sync::Arc::ptr_eq(&cell.get().expect("replaced"), &second),
+            "LAST wins — the re-serve's fresh component is live, not the \
+             first serve's torn-down one (the pre-#391 OnceLock kept FIRST)"
+        );
+
+        // Same-Arc re-install: idempotent, still the same object.
+        cell.install(std::sync::Arc::clone(&second));
+        assert!(
+            std::sync::Arc::ptr_eq(&cell.get().expect("still installed"), &second),
+            "same-object re-install is a no-op"
         );
     }
 }
