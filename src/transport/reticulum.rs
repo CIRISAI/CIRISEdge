@@ -1570,6 +1570,17 @@ pub struct ReticulumTransport {
     /// CIRISEdge#205 (AV-42 Phase 4) — RNS destination-hash binding
     /// enforcement posture on the announce cold-start path.
     transport_binding_enforcement: TransportBindingEnforcement,
+    /// CIRISEdge#437 — bundle-gate posture on the DURABLE Rooted
+    /// transport-binding save. Default [`BundleSaveGateMode::Off`] (no
+    /// behavior change); the flip is a dated fleet-floor event — see
+    /// [`crate::bundle_gate`].
+    bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
+    /// CIRISEdge#437 — per-peer store of presented build-attestation
+    /// bundles, consumed by the durable-save gate. Fed via
+    /// [`Self::register_peer_build_bundle`] (PyO3:
+    /// `Edge.register_peer_build_bundle`) until the CIRISEdge#436 arrival
+    /// transport wires the link-borne package into it.
+    peer_bundles: Arc<crate::bundle_gate::PeerBundleStore>,
     /// CIRISEdge#34 — shared event bus. Drives the AsyncIterator
     /// surface (`subscribe_announces` / `subscribe_interface_events`)
     /// in `crate::ffi::pyo3`. `None` means a transport built with no
@@ -1738,6 +1749,12 @@ pub struct ReticulumAuth {
     /// [`TransportBindingEnforcement::Advisory`] (no behavior change); the
     /// flip to `RequireTransportBinding` is a dated fleet-floor event.
     pub transport_binding_enforcement: TransportBindingEnforcement,
+    /// CIRISEdge#437 — bundle gate on the DURABLE Rooted transport-binding
+    /// save. [`Default`] is [`BundleSaveGateMode::Off`](crate::bundle_gate::BundleSaveGateMode::Off)
+    /// (today's behavior byte-identical); the flip to
+    /// `RequireBundleForRootedSave` is a dated fleet-floor event — see
+    /// [`crate::bundle_gate`] for the flip-event contract.
+    pub bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
     /// CIRISEdge#34 — optional shared event bus. When supplied, the
     /// transport emits `transport_up` / `transport_down` interface
     /// events at `listen` entry/exit, and `announce_received`
@@ -1804,6 +1821,7 @@ impl Default for ReticulumAuth {
             resolver: None,
             hybrid_policy: HybridPolicy::Strict,
             transport_binding_enforcement: TransportBindingEnforcement::Advisory,
+            bundle_save_gate: crate::bundle_gate::BundleSaveGateMode::Off,
             event_bus: None,
             reachability: None,
             blackhole_rules: None,
@@ -1845,6 +1863,7 @@ impl ReticulumTransport {
             resolver,
             hybrid_policy,
             transport_binding_enforcement,
+            bundle_save_gate,
             event_bus,
             reachability,
             blackhole_rules,
@@ -2164,6 +2183,8 @@ impl ReticulumTransport {
             rooting,
             hybrid_policy,
             transport_binding_enforcement,
+            bundle_save_gate,
+            peer_bundles: Arc::new(crate::bundle_gate::PeerBundleStore::new()),
             event_bus,
             reachability,
             interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
@@ -2181,6 +2202,28 @@ impl ReticulumTransport {
             store_and_forward: None,
             delivery: crate::transport::PendingDelivery::LiveOnly,
         })
+    }
+
+    /// CIRISEdge#437 — register (or replace) a peer's presented
+    /// build-attestation bundle for the durable-save gate. Shape-gated
+    /// fail-closed at registration (size cap / JSON / `kind`); verification
+    /// against the federation-directory pins happens lazily at the next
+    /// Rooted durable save (and the verified outcome is cached against the
+    /// exact bytes — refusals are never cached). This is the store/lookup
+    /// seam the CIRISEdge#436 arrival transport will later feed; until
+    /// then the server hands bundles over via PyO3
+    /// (`Edge.register_peer_build_bundle`).
+    ///
+    /// # Errors
+    ///
+    /// A typed [`crate::bundle_gate::BundleRegisterError`] naming the first
+    /// failing shape check (oversized / not JSON / wrong kind / store full).
+    pub fn register_peer_build_bundle(
+        &self,
+        key_id: &str,
+        bundle_bytes: &[u8],
+    ) -> Result<(), crate::bundle_gate::BundleRegisterError> {
+        self.peer_bundles.register(key_id, bundle_bytes)
     }
 
     /// CIRISEdge#169 (§24 NAT-traversal) — wire a store-and-forward
@@ -4174,6 +4217,8 @@ impl Transport for ReticulumTransport {
                         rooting: self.rooting.as_deref(),
                         hybrid_policy: self.hybrid_policy,
                         transport_binding_enforcement: self.transport_binding_enforcement,
+                        bundle_save_gate: self.bundle_save_gate,
+                        peer_bundles: &self.peer_bundles,
                         event_bus: self.event_bus.as_deref(),
                         reachability: self.reachability.as_ref(),
                         link_established_at: &self.link_established_at,
@@ -4244,6 +4289,12 @@ struct EventCtx<'a> {
     /// CIRISEdge#205 (AV-42 Phase 4) — RNS destination-hash binding
     /// enforcement posture applied in [`resolve_announce_cold_start`].
     transport_binding_enforcement: TransportBindingEnforcement,
+    /// CIRISEdge#437 — bundle-gate posture on the DURABLE Rooted save,
+    /// applied to the write-through in [`resolve_announce_cold_start`].
+    bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
+    /// CIRISEdge#437 — the per-peer presented-bundle store the gate
+    /// consults (see the field of the same name on [`ReticulumTransport`]).
+    peer_bundles: &'a crate::bundle_gate::PeerBundleStore,
     /// CIRISEdge#34 — shared event bus for announce / interface
     /// emissions. `None` → no events emitted (the transport was
     /// constructed without `ReticulumAuth::event_bus`).
@@ -5917,6 +5968,21 @@ async fn resolve_announce_cold_start(
     // FederationDirectory-backed `RootingDirectory`; the write is a no-op
     // for non-directory impls (default trait method).
     if let Some(persisted_key) = newly_rooted_key {
+        // CIRISEdge#437 — the bundle gate on the DURABLE save, and ONLY the
+        // durable save: the live-map entry inserted above keeps its verdict
+        // (routing ≠ trust). Gate Off, or an Advisory save → returns
+        // `persist_provenance` untouched (today's behavior byte-identical).
+        // Gate ON + Rooted → requires a verified build-attestation bundle
+        // for this peer, else the SAVE downgrades to Advisory with a loud
+        // named warn (see `crate::bundle_gate::gated_save_provenance`).
+        let persist_provenance = crate::bundle_gate::gated_save_provenance(
+            ctx.bundle_save_gate,
+            persist_provenance,
+            &persisted_key,
+            ctx.peer_bundles,
+            rooting,
+        )
+        .await;
         // CIRISEdge#317 — persist the TRANSPORT identity (binding_pubkey64), not
         // `announce.public_key()` (the federation identity), so the boot-reloaded
         // binding resolves + seals to the identity the link proves.

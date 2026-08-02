@@ -78,6 +78,7 @@ async fn auth_with_bus(
         hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
         transport_binding_enforcement:
             ciris_edge::transport::attestation::TransportBindingEnforcement::Advisory,
+        bundle_save_gate: ciris_edge::bundle_gate::BundleSaveGateMode::Off,
         event_bus: Some(bus),
         reachability: None,
         blackhole_rules: None,

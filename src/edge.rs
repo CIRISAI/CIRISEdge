@@ -3665,6 +3665,29 @@ impl Edge {
         transport.transport_stats(crate::transport::reticulum::InterfaceHandle(id))
     }
 
+    /// CIRISEdge#437 — register (or replace) a peer's presented
+    /// build-attestation bundle with the Reticulum transport's bundle
+    /// store, for the durable-save gate (see [`crate::bundle_gate`]).
+    /// Typed error when no Reticulum transport is wired (the store lives
+    /// on the transport) or the bundle fails a registration shape check.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::bundle_gate::BundleRegisterError`] — `NoTransport`, or the
+    /// first failing shape check (oversized / not JSON / wrong kind /
+    /// store full).
+    #[cfg(feature = "_reticulum-module")]
+    pub fn register_peer_build_bundle(
+        &self,
+        key_id: &str,
+        bundle_bytes: &[u8],
+    ) -> Result<(), crate::bundle_gate::BundleRegisterError> {
+        let Some(transport) = self.reticulum_transport.as_ref() else {
+            return Err(crate::bundle_gate::BundleRegisterError::NoTransport);
+        };
+        transport.register_peer_build_bundle(key_id, bundle_bytes)
+    }
+
     /// CIRISEdge#32 (v0.14.0) — typed accessor for the Reticulum
     /// transport. Returns `None` if the Edge was built without
     /// [`EdgeBuilder::reticulum_transport`] (e.g. an HTTP-only deployment
