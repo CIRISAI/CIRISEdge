@@ -1060,6 +1060,35 @@ impl FederationDirectoryReplicationBridge {
     /// Unknown/absent dimensions fall to `authority_for`'s `ProducerSteward`
     /// default and unknown scopes to `projection_for`'s `Cohort` negative
     /// default, so every record resolves (no panic, never silently GLOBAL).
+    ///
+    /// ── CIRISEdge#352 (pushdown verdict, persist v24.2.0) ──────────────
+    ///
+    /// This per-record projection deliberately stays EDGE-SIDE. #352 asked to
+    /// push it into persist v17.4.0's `list_scores`, but persist itself moved
+    /// first: v17.5.0 (CIRISPersist#455) split the read surfaces and made the
+    /// split contractual —
+    ///
+    /// - `list_scores` is the CALLER-GATED consumer view (§4.3 visibility
+    ///   gate on `cohort_scope`/`attested_key_id` resolved from the caller,
+    ///   plus `Live`-lifecycle folding and the V106 subject join). Persist's
+    ///   own `list_attestation_log` doc names wiring the sweep through it as
+    ///   the CIRISEdge#336 failure shape ("silently narrows"): a relay must
+    ///   see rows attested *between other parties*, which a caller-relative
+    ///   gate hides.
+    /// - `list_attestation_log` — the read persist DESIGNATES for
+    ///   replication — carries NO projection axes by contract: "gossip policy
+    ///   (what to actually advertise) lives at the consumer tier (edge
+    ///   `projection_for`), never here."
+    /// - `AttestationFilter` cannot express the decision anyway: it has no
+    ///   `cohort_scope` axis (that axis exists only on `FederationKeyFilter`)
+    ///   and composes AND-only, while this predicate is a negated conjunction
+    ///   — advertise UNLESS (scope ∈ {self, family} ∧ ¬tombstone ∧ producer ∉
+    ///   self_set). And the one axis it does offer, `dimension_prefixes`, is
+    ///   a no-op here: `authority_for(dimension)` only picks Global-vs-Cohort,
+    ///   BOTH of which advertise.
+    ///
+    /// The equivalence pin any future pushdown must keep green:
+    /// `advertise_projection_boundary_and_ledger_are_pinned`.
     fn attestation_is_advertised(
         canonical_json: &serde_json::Value,
         self_set: &HashSet<String>,
@@ -3150,6 +3179,33 @@ mod tests {
         attestation_type: &str,
         envelope: serde_json::Value,
     ) {
+        seed_scoped_attestation(
+            backend,
+            id,
+            attester,
+            subject,
+            attestation_type,
+            "federation",
+            envelope,
+        )
+        .await;
+    }
+
+    /// CIRISEdge#352 — [`seed_raw_attestation`] with an explicit
+    /// `cohort_scope`, for tests exercising the advertise projection across
+    /// the audience axis. `self` / `affiliations` / `federation` are the
+    /// membership-free scopes MemoryBackend's write gate admits without
+    /// family/community rows (`family`/`community` require seeded
+    /// membership).
+    async fn seed_scoped_attestation(
+        backend: &MemoryBackend,
+        id: &str,
+        attester: &str,
+        subject: &str,
+        attestation_type: &str,
+        cohort_scope: &str,
+        envelope: serde_json::Value,
+    ) {
         let now = Utc::now();
         let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attester, &envelope);
         let att = Attestation {
@@ -3171,7 +3227,7 @@ mod tests {
             subject_key_ids: vec![subject.to_string()],
             withdraws_admission_rule: None,
             additional_scrubs: Vec::new(),
-            cohort_scope: "federation".to_string(),
+            cohort_scope: cohort_scope.to_string(),
             tier: "federation".to_string(),
             promoted_at: None,
         };
@@ -4677,6 +4733,212 @@ mod tests {
             snap.recent_withholds.last().expect("a recent entry").detail,
             format!("attestation:{}", hex::encode(&missing[..8])),
             "the ring carries kind + hash prefix, joinable with the #379 log line"
+        );
+    }
+
+    /// CIRISEdge#352 — seed the five-row projection matrix for the pin test
+    /// below and return the ids in seeding order:
+    ///
+    /// 1. federation-scoped scores by OTHER → Cohort/Global      → IN
+    /// 2. affiliations-scoped scores by OTHER → Cohort           → IN
+    /// 3. self-scoped scores by NODE (publish-own)               → IN
+    /// 4. self-scoped scores by OTHER (foreign producer — the
+    ///    structural-invisibility case)                          → OUT
+    /// 5. self-scoped withdraws by OTHER tombstoning row 4:
+    ///    anti-rollback overrides the scope → Global             → IN
+    ///
+    /// Dimension is `identity:example:v1` throughout (self-attesting one's
+    /// own identity passes admission; the dimension is deliberately
+    /// projection-irrelevant — `authority_for` only picks Global-vs-Cohort,
+    /// both advertised).
+    async fn seed_projection_matrix(
+        backend: &MemoryBackend,
+        node: &str,
+        other: &str,
+    ) -> [&'static str; 5] {
+        let identity_scores = |id: &str, attester: &str| {
+            serde_json::json!({
+                "id": id,
+                "attesting_key_id": attester,
+                "attested_key_id": attester,
+                "attestation_type": "scores",
+                "dimension": "identity:example:v1",
+            })
+        };
+        let in_fed = "att-352-in-federation";
+        seed_scoped_attestation(
+            backend,
+            in_fed,
+            other,
+            other,
+            "scores",
+            "federation",
+            identity_scores(in_fed, other),
+        )
+        .await;
+        let in_affil = "att-352-in-affiliations";
+        seed_scoped_attestation(
+            backend,
+            in_affil,
+            other,
+            other,
+            "scores",
+            "affiliations",
+            identity_scores(in_affil, other),
+        )
+        .await;
+        let in_self_own = "att-352-in-self-own";
+        seed_scoped_attestation(
+            backend,
+            in_self_own,
+            node,
+            node,
+            "scores",
+            "self",
+            identity_scores(in_self_own, node),
+        )
+        .await;
+        let out_self_foreign = "att-352-out-self-foreign";
+        seed_scoped_attestation(
+            backend,
+            out_self_foreign,
+            other,
+            other,
+            "scores",
+            "self",
+            identity_scores(out_self_foreign, other),
+        )
+        .await;
+        let in_tombstone = "att-352-in-tombstone";
+        seed_scoped_attestation(
+            backend,
+            in_tombstone,
+            other,
+            other,
+            "withdraws",
+            "self",
+            serde_json::json!({
+                "id": in_tombstone,
+                "attesting_key_id": other,
+                "attested_key_id": other,
+                "attestation_type": "withdraws",
+                "references_attestation_id": out_self_foreign,
+                "withdrawal_reason": "test: producer withdraws its own self-scoped edge",
+            }),
+        )
+        .await;
+        [
+            in_fed,
+            in_affil,
+            in_self_own,
+            out_self_foreign,
+            in_tombstone,
+        ]
+    }
+
+    /// CIRISEdge#352 — the advertise-projection pushdown verdict, pinned as
+    /// an equivalence test over a seeded directory.
+    ///
+    /// The projection stays edge-side on the pinned persist (v24.2.0) — see
+    /// the verdict block on
+    /// [`FederationDirectoryReplicationBridge::attestation_is_advertised`] —
+    /// so this test is the byte-identity pin any future pushdown must keep
+    /// green: over a directory holding rows on BOTH sides of the projection,
+    /// the advertised `(hash, seq)` set must equal the exact expected set
+    /// derived from the seeded state. The IN/OUT verdict per row is
+    /// HARD-CODED from the CC replication contract (persist
+    /// `namespace::projection_for`), never computed by re-running the filter
+    /// under test; the hashes come from the rows persist actually holds
+    /// (the store stamps server-side fields — `persist_row_hash`,
+    /// `withdraws_admission_rule` — that the content-hash covers).
+    ///
+    /// The #433 ledger boundary rides the same state: the projection DEFINES
+    /// eligibility, so a row it excludes was never eligible and the sweep
+    /// books NOTHING for it — while the row still appears in the RAW
+    /// holdings view, proving its absence from the advertise set is the
+    /// projection, not admission or serialization.
+    #[tokio::test]
+    async fn advertise_projection_boundary_and_ledger_are_pinned() {
+        let node = "this-node";
+        let other = "other-producer";
+        let cohort = [node.to_string(), other.to_string()];
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+        // The node's OWN publish set — the SelfOwn axis of the projection.
+        let publish_set = vec![node.to_string()];
+        let selector: CohortProvider = Arc::new(move || publish_set.clone());
+        let bridge = bridge.with_self_provider(Some(selector));
+        for key_id in [node, other] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        let [in_fed, in_affil, in_self_own, out_self_foreign, in_tombstone] =
+            seed_projection_matrix(&backend, node, other).await;
+
+        // Derive the EXPECTED set from the state persist actually holds,
+        // keyed by the hard-coded verdicts above.
+        let held = backend
+            .list_attestations_since(None, 100)
+            .await
+            .expect("read back seeded rows");
+        assert_eq!(
+            held.len(),
+            5,
+            "all five rows were ADMITTED — the OUT verdict below is the projection, not admission"
+        );
+        let expected_in = [in_fed, in_affil, in_self_own, in_tombstone];
+        let expected: std::collections::BTreeSet<([u8; 32], u64)> = held
+            .iter()
+            .filter(|row| expected_in.contains(&row.attestation_id.as_str()))
+            .map(|row| {
+                let (hash, _bytes) = content_hash_of(row).expect("held row hashes");
+                (
+                    hash,
+                    FederationDirectoryReplicationBridge::ms_seq(row.asserted_at),
+                )
+            })
+            .collect();
+        assert_eq!(expected.len(), 4);
+        let out_hash = held
+            .iter()
+            .find(|row| row.attestation_id == out_self_foreign)
+            .map(|row| content_hash_of(row).expect("held row hashes").0)
+            .expect("the OUT row is held");
+
+        // Equivalence: the advertise view (the exact entry the round's
+        // `list_envelope_refs` dispatches; `None` recipient = projection-only)
+        // equals the expected (hash, seq) set — nothing more, nothing less.
+        let advertised = bridge.list_envelope_refs(EnvelopeKind::Attestation).await;
+        let advertised_set: std::collections::BTreeSet<([u8; 32], u64)> = advertised
+            .iter()
+            .map(|r| (r.envelope_hash, r.seq))
+            .collect();
+        assert_eq!(advertised.len(), advertised_set.len(), "no duplicate refs");
+        assert_eq!(
+            advertised_set, expected,
+            "the advertised (hash, seq) set is exactly the projection's expected set"
+        );
+
+        // The RAW holdings view (receive axis, #416) still carries the OUT
+        // row: its absence above is the PROJECTION at work.
+        let holdings = bridge.list_holdings(EnvelopeKind::Attestation).await;
+        assert!(
+            holdings.iter().any(|r| r.envelope_hash == out_hash),
+            "the out-of-projection row IS held (receive axis)"
+        );
+        assert_eq!(holdings.len(), 5, "holdings carry every admitted row");
+
+        // #433 boundary: the projection DEFINES eligibility. A row it
+        // excludes was never eligible, so the sweep books NOTHING — not
+        // `RowNotSerializable`, not `RowHashUndecodable`, not anything.
+        let snap = metrics.snapshot();
+        assert!(
+            snap.withholds_by_reason.is_empty(),
+            "a by-design projection non-event books no withhold, got {:?}",
+            snap.withholds_by_reason
         );
     }
 }
