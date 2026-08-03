@@ -199,9 +199,16 @@ pub const DEFERRED_PENDING_PLANE: &[(&str, &str)] = &[
 /// is regenerated from this and kept in sync by `evidence_tsv_matches_emitted`.
 #[must_use]
 pub fn edge_evidence_rows() -> Vec<String> {
-    EDGE_FIELD_CONFORMANCE
-        .iter()
-        .map(|c| {
+    // CIRISEdge#442 — the HEADER ROW is load-bearing: the Constitution's
+    // check_claims.py strips `#` comments and hands the remainder to
+    // csv.DictReader, which consumes the first non-comment line as the
+    // header. Without it the first DATA row became the header and every
+    // other row was silently skipped — the file vendored as zero coverage
+    // and failed nothing ("silence reads as coverage",
+    // CIRISConstitution#54). Column names mirror persist's evidence file
+    // verbatim.
+    std::iter::once("decimal_id\tclaim_id\trepo\tpath#symbol\tcrate@version".to_string())
+        .chain(EDGE_FIELD_CONFORMANCE.iter().map(|c| {
             format!(
                 "{}\t{}\tCIRISEdge\t{}\tciris-edge@v{}",
                 c.cc,
@@ -209,7 +216,7 @@ pub fn edge_evidence_rows() -> Vec<String> {
                 c.evidence,
                 env!("CARGO_PKG_VERSION"),
             )
-        })
+        }))
         .collect()
 }
 
