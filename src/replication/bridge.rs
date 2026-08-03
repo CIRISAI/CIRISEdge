@@ -2806,6 +2806,7 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             observed_region: String::new(),
+            revoked_after: None,
         };
         let bytes =
             serde_json::to_vec(&SignedRevocation { revocation: rev }).expect("serialize rev");
@@ -3880,6 +3881,7 @@ mod tests {
             pqc_completed_at: None,
             observed_region: String::new(),
             persist_row_hash: String::new(),
+            revoked_after: None,
         };
         backend
             .put_revocation(SignedRevocation { revocation })

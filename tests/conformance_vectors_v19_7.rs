@@ -139,6 +139,35 @@ struct AggregationMetaCanonicalVectorV2 {
 }
 
 #[test]
+fn vector_aggregation_meta_canonical_bytes_v3_unbalanced_masses_derive_n_eff_2() {
+    // CIRISEdge#445 / CIRISVerify#236 — verify v11.1.0 re-cut the published
+    // v3 vector because its n_eff was AUTHORED (a hardcoded 3 beside masses
+    // whose inverse-Simpson derives 2.33 → 2). Edge's producer always
+    // DERIVES; this case reproduces the re-cut vector's unbalanced masses
+    // [1_000_000, 500_000, 250_000] and pins the derived value — a
+    // conformance implementation that recomputes from the published masses
+    // must land on 2, never the retracted 3.
+    let source_ids: Vec<String> = ["src-001", "src-002", "src-003"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let meta = assemble_tier_meta_v2(
+        "content-root-fixed",
+        "trace",
+        2,
+        "raptorq-pyramid-v1",
+        &source_ids,
+        &[1.0, 0.5, 0.25],
+        "mean+stddev",
+    );
+    assert_eq!(
+        meta.n_eff, 2,
+        "inverse-Simpson of [1, 0.5, 0.25]-proportioned masses is 2.33 → 2; \
+         the retracted authored value was 3 (CIRISVerify#236)"
+    );
+}
+
+#[test]
 fn vector_aggregation_meta_canonical_bytes_v2_three_source_pyramid() {
     // Same fixed three-source pyramid as the v1 vector, assembled through the
     // #267 producer path: version = 2, n_eff computed from balanced per-member

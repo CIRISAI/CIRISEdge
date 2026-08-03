@@ -20,7 +20,7 @@
 //!   (`capacity:core_identity:v1`) without any closed leaf set. Family
 //!   admission is B1 ([`check_capacity_not_self_attested`] — never
 //!   self-attested, either wire shape) and B5
-//!   (`check_capacity_consent_admission` — a live [`CAPACITY_CONSENT_SCOPE`]
+//!   (`check_capacity_consent_admission` — a live [`ANALYZE_CONSENT_SCOPE`]
 //!   consent from the subject covering the attester, CIRISConstitution#46).
 //! - **Edge owns the ALM vocabulary** (#439: "Edge owns the ALM vocabulary;
 //!   edge should name the leaf"), so edge names the leaf under persist's
@@ -84,7 +84,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 
 use ciris_persist::federation::admission::{
-    check_capacity_not_self_attested, CAPACITY_CONSENT_SCOPE,
+    check_capacity_not_self_attested, ANALYZE_CONSENT_SCOPE,
 };
 use ciris_persist::federation::hard_case::ConsentState;
 use ciris_persist::federation::types::{attestation_tier, attestation_type, cohort_scope};
@@ -108,7 +108,7 @@ use super::capacity::{uplink_mbps_to_u32, PeerKeyId, SignedRelayCapacity};
 /// `put_attestation`, mirrored here pre-emission):
 /// - **B1 / AV-62** — never self-attested
 ///   ([`check_capacity_not_self_attested`]).
-/// - **B5 / CC#46** — a live [`CAPACITY_CONSENT_SCOPE`] (`analyze`) consent
+/// - **B5 / CC#46** — a live [`ANALYZE_CONSENT_SCOPE`] (`analyze`) consent
 ///   from the subject (the relay) covering the attester (this consumer).
 pub const CAPACITY_RELAY_DELIVERY_DIMENSION: &str = "capacity:relay_delivery:v1";
 
@@ -364,7 +364,7 @@ pub enum DeliveryWithholdReason {
     /// restatement), before the consent gate so the refusal names
     /// self-emission rather than being shadowed by "no consent".
     SelfEmission,
-    /// The relay's live [`CAPACITY_CONSENT_SCOPE`] (`analyze`) consent
+    /// The relay's live [`ANALYZE_CONSENT_SCOPE`] (`analyze`) consent
     /// covering this consumer did not resolve `Granted` (B5 / CC#46).
     /// Until the latch-consent wiring mints the grant at latch-accept,
     /// this is the expected live-mesh path.
@@ -474,7 +474,7 @@ pub async fn emit_delivered_observation(
         .resolve_scoped_consent(
             &signer.key_id,
             &observation.key.advertiser_key_id,
-            CAPACITY_CONSENT_SCOPE,
+            ANALYZE_CONSENT_SCOPE,
             None,
             now,
         )
@@ -996,7 +996,7 @@ mod tests {
     ) -> Attestation {
         let envelope = serde_json::json!({
             "dimension": stance_dimension,
-            "scope": [CAPACITY_CONSENT_SCOPE],
+            "scope": [ANALYZE_CONSENT_SCOPE],
         });
         let (och, sc, sp) = sign_attestation_envelope(subject, &envelope);
         Attestation {
