@@ -4952,6 +4952,96 @@ mod tests {
         seed_consent_membership(backend, local, peer).await;
     }
 
+    /// CIRISEdge#455 — the FULL field signature, reproduced and NAMED: on a
+    /// canonical whose `infra:serve` is claimed but not accord-conferred (the
+    /// un-re-genesised fleet state), a `trace:*` row is
+    ///   (1) present in the GLOBAL advertise (the harness's "but it IS among
+    ///       the refs the agent advertises" observation — true and misleading:
+    ///       that read is peer-blind),
+    ///   (2) ABSENT from the PER-PEER offer the wire Summary is actually built
+    ///       from (`DirectoryStateAdapter::local_refs` →
+    ///       `list_envelope_refs_for_peer`), so the receiver never wants it,
+    ///       never fetches it, and reports NOTHING — the "neither admitted nor
+    ///       refused" silence at the canonical,
+    ///   (3) while consent rows still cross the same offer (the "admitted: 5"),
+    ///   (4) and the AGENT's withhold ledger names the branch:
+    ///       `serve_capability_missing` — the reason the ledger's own docs
+    ///       predicted for a dark trace plane (CIRISPersist#480).
+    /// Not a want/Diff/Deliver defect: the row never enters the offer.
+    #[tokio::test]
+    async fn trace_offered_globally_but_withheld_per_peer_is_the_455_signature() {
+        use crate::observability::WithholdReason;
+        let local = "this-node";
+        let producer = "agent-producer";
+        let canonical = "canonical-claimed-not-conferred";
+        let cohort = [
+            local.to_string(),
+            producer.to_string(),
+            canonical.to_string(),
+        ];
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        for (k, it) in [
+            (local, identity_type::NODE),
+            (producer, identity_type::AGENT),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, it),
+                })
+                .await
+                .expect("seed key");
+        }
+        // The canonical CLAIMS infra:serve in its own record — no accord
+        // co-scrub (persist admits the claim; conferral is read-time).
+        let mut rec = fixture_key_record(canonical, identity_type::NODE);
+        rec.capability_roles =
+            vec![FederationDirectoryReplicationBridge::SERVE_CAPABILITY.to_string()];
+        backend
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("seed canonical");
+        seed_consent_membership(&backend, local, canonical).await;
+        seed_trace_attestation(&backend, producer).await;
+        let trace_hash = locate_trace_hash(&bridge).await;
+
+        // (1) The peer-BLIND advertise contains the trace — the harness's
+        // observation, reproduced.
+        assert!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Attestation)
+                .await
+                .iter()
+                .any(|r| r.envelope_hash == trace_hash),
+            "(1) globally advertised"
+        );
+        // (2)+(3) The per-peer offer — what the wire Summary is built from —
+        // omits the trace but still carries the consent row.
+        let offer = bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(canonical))
+            .await;
+        assert!(
+            !offer.iter().any(|r| r.envelope_hash == trace_hash),
+            "(2) absent from the per-peer offer — the receiver never wants it"
+        );
+        assert!(
+            !offer.is_empty(),
+            "(3) consent rows still cross — the round completes and admits"
+        );
+        // (4) The ledger names the branch on the AGENT side.
+        assert!(
+            metrics
+                .snapshot()
+                .withholds_by_reason
+                .get(&WithholdReason::ServeCapabilityMissing)
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "(4) the withhold ledger books serve_capability_missing — the \
+             silence has a name, on the sender"
+        );
+    }
+
     /// CIRISEdge#433, the discriminator property from the issue — **two states,
     /// now distinguishable**.
     ///
