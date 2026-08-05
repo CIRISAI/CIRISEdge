@@ -592,3 +592,67 @@ mod tests {
         }
     }
 }
+
+/// CIRISEdge#453 — the fountain/swarm consumer-floor manifest, emitted from
+/// the SAME constants the planner runs on (never transcribed): persist's
+/// `mesh_config` registry names `repair_planner` as the consumer of the
+/// `redundancy.*` knobs, and its v29-era hand-transcription of these values
+/// produced two defects only edge could detect (`k_repair_target` carrying
+/// `n_source`'s 20, and a `min_viable_floor` ceiling of 3 under our floor of
+/// 5 — an UNSATISFIABLE knob). Persist vendors
+/// `evidence/CIRISEdge.fountain_floors.json` (regenerated from this fn, kept
+/// honest by the `fountain_floors_json_matches_emitted` drift test) and gates
+/// its ceilings against these floors instead of a hand-kept table.
+///
+/// Shape notes: `schema_version` versions the MANIFEST SHAPE only — the
+/// values' provenance is the git tag persist vendors at (no crate-version
+/// stamp, so the vendored copy does not churn on edge releases that leave
+/// the floors untouched). Keys mirror persist v30.0.0's four typed axes
+/// (`Symbols` vs `Holders` — the split that made this expressible) plus
+/// `n_source_symbols` for the axis the original defect confused.
+#[must_use]
+pub fn fountain_floor_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "consumer": "repair_planner",
+        "symbols": {
+            "n_source": DEFAULT_N_SOURCE,
+            "k_repair": DEFAULT_K_REPAIR,
+            "min_viable": DEFAULT_MIN_VIABLE_SYMBOLS,
+        },
+        "holders": {
+            "target": crate::swarm::runtime::DEFAULT_TARGET_HOLDERS,
+            "min_viable": crate::swarm::runtime::DEFAULT_MIN_VIABLE,
+        },
+    })
+}
+
+#[cfg(test)]
+mod floor_manifest_tests {
+    use super::*;
+
+    /// CIRISEdge#453 — the vendored manifest is byte-locked to the emitter
+    /// (which reads the live constants), so a constant change without a
+    /// regenerated artifact is a build failure — transcription is
+    /// structurally impossible in either repo's direction.
+    #[test]
+    fn fountain_floors_json_matches_emitted() {
+        let vendored: serde_json::Value = serde_json::from_str(include_str!(
+            "../../evidence/CIRISEdge.fountain_floors.json"
+        ))
+        .expect("vendored manifest parses");
+        assert_eq!(
+            vendored,
+            fountain_floor_manifest(),
+            "evidence/CIRISEdge.fountain_floors.json drifted from the live \
+             constants — regenerate from fountain_floor_manifest() (CIRISEdge#453)"
+        );
+    }
+
+    /// The knee pin travels WITH the manifest: k_repair in the emitted
+    /// artifact is the property-tested K=6, not an independent number.
+    #[test]
+    fn manifest_k_repair_is_the_pinned_knee() {
+        assert_eq!(fountain_floor_manifest()["symbols"]["k_repair"], 6);
+    }
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "consumer": "repair_planner",
+  "symbols": {
+    "n_source": 20,
+    "k_repair": 6,
+    "min_viable": 5
+  },
+  "holders": {
+    "target": 30,
+    "min_viable": 5
+  }
+}
