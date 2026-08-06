@@ -359,7 +359,9 @@ pub use scope_privacy::{
     derive_record_id, derive_symbol_key, k_record_id, k_symbol, witness_cover_leaf, RecordType,
     HPKE_SUITE_ID, LABEL_RECORD_ID, LABEL_SYMBOL,
 };
-pub use transport::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
+pub use transport::{
+    InboundFrame, NullTransport, Transport, TransportError, TransportId, TransportSendOutcome,
+};
 pub use verify::{
     AccordHolderKey, HybridPolicy, ProvenanceChain, ProvenanceLink, RootingDirectory,
     RootingRejection, RootingVerdict, VerifiedEnvelope, VerifiedTrace, VerifyDirectory,

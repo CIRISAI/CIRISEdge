@@ -29,11 +29,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use ciris_edge::identity::LocalSigner;
-use ciris_edge::transport::{
-    InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
-};
+use ciris_edge::transport::NullTransport;
 use ciris_edge::{
     baked_canonical_genesis_ids, reseed_canonical_bootstrap_peers, CanonicalBootstrapPeer, Edge,
     EdgeConfig, HybridPolicy,
@@ -44,22 +41,6 @@ use ciris_persist::federation::genesis::{
 use ciris_persist::federation::{is_canonical_effective, FederationDirectory};
 use ciris_persist::prelude::FederationDirectorySqlite;
 use ciris_persist::store::sqlite::SqliteBackend;
-use tokio::sync::mpsc;
-
-struct NullTransport;
-
-#[async_trait]
-impl Transport for NullTransport {
-    fn id(&self) -> TransportId {
-        TransportId::HTTP
-    }
-    async fn send(&self, _: &str, _: &[u8]) -> Result<TransportSendOutcome, TransportError> {
-        Ok(TransportSendOutcome::Delivered)
-    }
-    async fn listen(&self, _: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
-        Ok(())
-    }
-}
 
 /// A persist sqlite backend carrying the REAL baked genesis: accord holders
 /// (A1/B1/C1, hardware-custody evidence and all), the accord family, and the

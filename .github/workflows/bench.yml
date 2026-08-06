@@ -179,21 +179,31 @@ jobs:
             | sed -E 's/.*bench:[[:space:]]+([0-9]+) ns\/iter.*/\1/' | head -1)
           CAL_MEM_NS=$(grep -E '^test calibration/dram_random_walk_500k' calibration-output.txt \
             | sed -E 's/.*bench:[[:space:]]+([0-9]+) ns\/iter.*/\1/' | head -1)
+          # CIRISEdge#446 — the AES-GCM throughput anchor for the AEAD-bound
+          # families (seal/relay/loopback). VAES SKU variance moves these ~2.6×
+          # while the CPU/DRAM anchors move ~1.1×, so those families must divide
+          # by THIS, not the integer anchor.
+          CAL_AES_NS=$(grep -E '^test calibration/aes_gcm_seal_4k_20k' calibration-output.txt \
+            | sed -E 's/.*bench:[[:space:]]+([0-9]+) ns\/iter.*/\1/' | head -1)
           if [ -z "$CAL_CPU_NS" ] || [ "$CAL_CPU_NS" = "0" ]; then
             echo "::error::failed to extract CPU calibration ns/iter"; cat calibration-output.txt; exit 1
           fi
           if [ -z "$CAL_MEM_NS" ] || [ "$CAL_MEM_NS" = "0" ]; then
             echo "::error::failed to extract MEM calibration ns/iter"; cat calibration-output.txt; exit 1
           fi
+          if [ -z "$CAL_AES_NS" ] || [ "$CAL_AES_NS" = "0" ]; then
+            echo "::error::failed to extract AES calibration ns/iter"; cat calibration-output.txt; exit 1
+          fi
           echo "CALIBRATION_CPU_NS=$CAL_CPU_NS" >> "$GITHUB_ENV"
           echo "CALIBRATION_MEM_NS=$CAL_MEM_NS" >> "$GITHUB_ENV"
-          echo "Runner calibration: CPU=$CAL_CPU_NS ns/iter (splitmix64_10m), MEM=$CAL_MEM_NS ns/iter (dram_random_walk_500k)"
+          echo "CALIBRATION_AES_NS=$CAL_AES_NS" >> "$GITHUB_ENV"
+          echo "Runner calibration: CPU=$CAL_CPU_NS MEM=$CAL_MEM_NS AES=$CAL_AES_NS ns/iter"
           {
             echo "## Runner calibration"
             echo '```'
-            echo "splitmix64_10m:        $CAL_CPU_NS ns/iter  (CPU anchor — applied to every wall-clock bench)"
-            echo "dram_random_walk_500k: $CAL_MEM_NS ns/iter  (DRAM anchor — published as its own series; reclassify a"
-            echo "                                             throughput-bound family onto it in the normalize step)"
+            echo "splitmix64_10m:        $CAL_CPU_NS ns/iter  (CPU anchor — compute/crypto-verify-bound families)"
+            echo "dram_random_walk_500k: $CAL_MEM_NS ns/iter  (DRAM anchor — own series; memory-bandwidth families)"
+            echo "aes_gcm_seal_4k_20k:   $CAL_AES_NS ns/iter  (AES anchor — the seal/relay/loopback AEAD families, #446)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -268,6 +278,18 @@ jobs:
               val_ns="${BASH_REMATCH[2]}"
               dev_ns="${BASH_REMATCH[3]}"
               case "$bench_name" in
+                # CIRISEdge#446 — AEAD-bound families → AES anchor. These are
+                # dominated by bulk AES-256-GCM (inner/outer seal + re-seal per
+                # subscriber), the VAES-SKU-sensitive axis the integer anchor
+                # cannot track; normalizing them against CPU mis-read a runner
+                # swap as a 2.5× regression. Match the seal, relay-forward,
+                # transport-loopback, mesh/fanout and per-subscriber families.
+                naive_seal_chunk_*|inner_once_outer_*|layered_inner_once_outer_*|\
+                relay_forward_*|relay_sustained_*|relay_streams_*|relay_layered_*|\
+                transport_reticulum_loopback/*|transport_http_loopback/*|\
+                realtime_av_*|mesh_vs_relay_*|mesh_e2e_*|mls_rekey/*)
+                  anchor_ns="$CALIBRATION_AES_NS"
+                  ;;
                 # (reserved) memory-bandwidth-bound families → DRAM anchor. None
                 # today; add a prefix here + a note in benches/calibration.rs when
                 # reclassifying, e.g.  content_fetch_roundtrip/*)  anchor_ns=$CALIBRATION_MEM_NS ;;

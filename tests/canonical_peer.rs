@@ -30,14 +30,11 @@
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_crypto::{ClassicalSigner, Ed25519Signer};
 use ciris_edge::identity::LocalSigner;
-use ciris_edge::transport::{
-    InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
-};
+use ciris_edge::transport::NullTransport;
 use ciris_edge::{
     reseed_canonical_bootstrap_peers, CanonicalBootstrapPeer, Edge, EdgeConfig, EdgePeerHandle,
     HybridPolicy,
@@ -46,7 +43,7 @@ use ciris_persist::federation::{FederationDirectory, TrustClass};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::sqlite::SqliteBackend;
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::sync::Mutex as TokioMutex;
 
 // ─── Test fixtures (mirrors tests/peer_mutation_ffi.rs) ─────────────
 
@@ -116,21 +113,6 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
         attestation_evidence: None,
         consent_role: None,
         additional_scrubs: Vec::new(),
-    }
-}
-
-struct NullTransport;
-
-#[async_trait]
-impl Transport for NullTransport {
-    fn id(&self) -> TransportId {
-        TransportId::HTTP
-    }
-    async fn send(&self, _: &str, _: &[u8]) -> Result<TransportSendOutcome, TransportError> {
-        Ok(TransportSendOutcome::Delivered)
-    }
-    async fn listen(&self, _: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
-        Ok(())
     }
 }
 

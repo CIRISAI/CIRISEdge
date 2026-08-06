@@ -427,3 +427,36 @@ pub trait Transport: Send + Sync + 'static {
         sink: tokio::sync::mpsc::Sender<InboundFrame>,
     ) -> Result<(), TransportError>;
 }
+
+/// CIRISEdge#454 — a no-op [`Transport`] for tests + downstream consumers whose
+/// surface never sends: `EdgeBuilder::build` refuses a transportless `Edge`
+/// (a node with no reach is a misconfiguration in production), so any test that
+/// constructs an `Arc<Edge>` to read an engine-side field still has to stand
+/// one up. Before this, every consumer (CIRISServer's release-gate handler
+/// test, edge's own `canonical_peer`/`genesis_bootstrap`/`blob_swarm_scheduler`
+/// integration tests) hand-rolled the identical twenty lines — a copied fixture
+/// that drifts. `send` reports `Delivered` without moving bytes; `listen`
+/// returns immediately. Exported (not `#[cfg(test)]`) so cross-repo consumers
+/// can depend on it; it is inert in production by behavior, not by gating.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullTransport;
+
+#[async_trait::async_trait]
+impl Transport for NullTransport {
+    fn id(&self) -> TransportId {
+        TransportId::HTTP
+    }
+    async fn send(
+        &self,
+        _destination_key_id: &str,
+        _envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        Ok(TransportSendOutcome::Delivered)
+    }
+    async fn listen(
+        &self,
+        _sink: tokio::sync::mpsc::Sender<InboundFrame>,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+}

@@ -27,14 +27,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_crypto::{ClassicalSigner, Ed25519Signer};
 use ciris_edge::identity::LocalSigner;
-use ciris_edge::transport::{
-    InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
-};
+use ciris_edge::transport::NullTransport;
 use ciris_edge::{
     BlobChunkVerifier, ChunkManifestLite, ChunkResult, ChunkVerifyError, Edge, EdgeConfig,
     HybridPolicy, SwarmConfig, SwarmError, SwarmScheduler,
@@ -44,7 +41,6 @@ use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyReco
 use ciris_persist::store::backend::Backend;
 use ciris_persist::store::sqlite::SqliteBackend;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
 
 // ─── Fixtures (mirror tests/accord_carrier_verify.rs) ───────────────
 
@@ -129,25 +125,6 @@ async fn directory_with(records: Vec<KeyRecord>) -> Arc<SqliteBackend> {
             .expect("put_public_key");
     }
     backend
-}
-
-struct NullTransport;
-
-#[async_trait]
-impl Transport for NullTransport {
-    fn id(&self) -> TransportId {
-        TransportId::HTTP
-    }
-    async fn send(&self, _: &str, _: &[u8]) -> Result<TransportSendOutcome, TransportError> {
-        // The scheduler's `fetch_blob_chunk` rides this on its way to
-        // the per-(blob,chunk) oneshot. We return success and rely on
-        // `complete_pending_chunk_fetch_for_test` to inject the
-        // matching response from the test.
-        Ok(TransportSendOutcome::Delivered)
-    }
-    async fn listen(&self, _: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
-        Ok(())
-    }
 }
 
 async fn build_edge(tmp: &tempfile::TempDir, me: &FedKey, holders: &[&FedKey]) -> Arc<Edge> {

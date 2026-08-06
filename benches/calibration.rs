@@ -19,22 +19,23 @@
 //! …) are wall-clock end-to-end and are the noisiest of the suite, so the
 //! anchor matters more here than in persist.
 //!
-//! ## Two anchors — CPU + DRAM
+//! ## Three anchors — CPU + DRAM + AES (CIRISEdge#446)
 //!
-//! [`bench_calibration_splitmix`] is the CPU-bound anchor;
-//! [`bench_calibration_dram_walk`] is the DRAM/cache-bound companion
-//! (CIRISPersist#122). The workflow classifies each downstream bench by
-//! name prefix and divides its `ns/iter` by the appropriate anchor:
+//! [`bench_calibration_splitmix`] is the CPU/integer anchor;
+//! [`bench_calibration_dram_walk`] the DRAM/cache-bound companion
+//! (CIRISPersist#122); [`bench_calibration_aes_gcm_seal`] the AEAD-throughput
+//! anchor. The workflow classifies each downstream bench by name prefix and
+//! divides its `ns/iter` by the matching anchor:
+//! - AEAD-bound families (seal / relay-forward / transport-loopback / A-V
+//!   mesh — dominated by bulk AES-256-GCM) → AES anchor
 //! - Memory-bandwidth-bound families → DRAM walk anchor
-//! - Default (compute-/crypto-bound: the Ed25519+ML-DSA-65 verify path,
-//!   canonicalization, seal/open) → SplitMix64 CPU anchor
+//! - Default (compute-/verify-bound: the Ed25519+ML-DSA-65 verify path,
+//!   canonicalization) → SplitMix64 CPU anchor
 //!
-//! Edge's default classifier routes everything to the CPU anchor (the
-//! hybrid-verify + AEAD seal hot paths are compute-bound); the DRAM anchor
-//! is computed + published as its own trend series and is available for
-//! reclassification (see the workflow's `case` block) should a
-//! throughput-bound family (e.g. a large-frame `content_fetch_roundtrip`
-//! sweep) show memory-axis false positives.
+//! The AES axis was added because GHA runner CPU generations differ ~2–2.6×
+//! in VAES throughput while integer/DRAM rates move only ~1.1× — so
+//! normalizing an AEAD-bound family against the integer anchor mis-read a
+//! runner-SKU swap as a 2.5× regression (the false alert triaged in #446).
 //!
 //! ## Do not modify the inner loops without bumping the baseline
 //!
@@ -132,9 +133,56 @@ fn bench_calibration_dram_walk(c: &mut Criterion) {
     });
 }
 
+/// AES-GCM-bound calibration anchor for the AEAD-throughput runner-noise axis
+/// (CIRISEdge#446).
+///
+/// The seal/relay/loopback families (`naive_seal_chunk`, `inner_once_outer`,
+/// `layered_inner_once_outer`, `relay_forward`, `transport_*_loopback`, …) are
+/// dominated by bulk AES-256-GCM, and GHA runners span CPU generations whose
+/// VAES throughput differs ~2–2.6× while their integer (SplitMix) and DRAM
+/// rates move only ~1.1×. Normalizing those families against the CPU anchor
+/// therefore mis-reads a runner-SKU swap as a 2.5× regression — the exact
+/// false alert triaged in #446. This anchor exposes the AES axis so the
+/// workflow's `case` classifier can divide the AEAD families by it instead.
+///
+/// Uses `ciris_crypto::aes_gcm::encrypt` — the SAME primitive the realtime-A/V
+/// inner/outer seal runs (`realtime_av.rs`), so the anchor and the benched
+/// families share a code path and move together under a SKU change.
+///
+/// Do-not-modify discipline is identical to the other two anchors: the key,
+/// nonce, buffer size, and iteration count are the trend baseline. Change any
+/// of them only by renaming the bench (a new metric), never in place.
+fn bench_calibration_aes_gcm_seal(c: &mut Criterion) {
+    use ciris_crypto::aes_gcm;
+    // 4 KiB plaintext × 20 000 seals ≈ 80 MB/sample — enough bulk AES for the
+    // VAES path to dominate harness overhead, sized so a sample lands in the
+    // default 5s/group budget on every runner generation.
+    const PLAINTEXT_LEN: usize = 4096;
+    const ITERATIONS: usize = 20_000;
+    let key = [0x5Au8; 32];
+    let nonce = [0x24u8; 12];
+    let plaintext = [0x11u8; PLAINTEXT_LEN];
+
+    c.bench_function("calibration/aes_gcm_seal_4k_20k", |b| {
+        b.iter(|| {
+            // Fixed key + fixed nonce is fine for a THROUGHPUT anchor (this is
+            // never a confidentiality context — no attacker, no reuse concern);
+            // black_box defeats any const-folding of the repeated seal.
+            let mut acc = 0u8;
+            for _ in 0..ITERATIONS {
+                let ct =
+                    aes_gcm::encrypt(&key, &nonce, black_box(&plaintext)).expect("aes-gcm seal");
+                acc = acc.wrapping_add(ct[0]);
+            }
+            black_box(acc)
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_calibration_splitmix,
     bench_calibration_dram_walk,
+    bench_calibration_aes_gcm_seal,
 );
 criterion_main!(benches);

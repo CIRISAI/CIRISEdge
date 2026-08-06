@@ -84,22 +84,29 @@ pub fn resample_nearest(src: &[u8], dst_len: usize) -> Vec<u8> {
 /// would be wrong here: byte vectors are all-positive, so even independent
 /// members score ≈ 0.75.)
 ///
-/// # ⚠️ This pin is wire-affecting AND currently UNGOVERNED
+/// # ⚠️ This pin is wire-affecting; governance is ratification-PENDING
 ///
 /// It determines a **signed** field (`max_source_multiplicity`), and persist
 /// gates admissibility on it — so a divergence here is not a cosmetic mismatch,
 /// it is a **fork in admissibility**: one substrate admits a fold another
 /// rejects, both with valid signatures.
 ///
-/// CC pins **nothing** for this metric or threshold today (CIRISConstitution#35
-/// asks it to). Note it is a *distinct axis* from CC 6.1.2's `(R, ε)`, which is
-/// the **reconstruction** predicate ("can this item be individually recovered")
-/// — NOT similarity between members. The `(R, ε)` fixture
+/// **CIRISConstitution#35's rc3 ratification pins all seven R9 quantities**
+/// (the 1−normalized-L1 metric, the 950-milli threshold, connected-component
+/// clustering, the shared resample basis, `n_min`, the `mass_commitment` leaf
+/// encoding, and the gate) as CEG-normative constants. As of this writing rc3
+/// is **not yet merged** — CC 6.1.2.1.2 is the section that will carry them —
+/// so cross-impl agreement is **conformance-pending, not coincidence-forever**:
+/// this module is verified line-by-line against the ratifying text, and the
+/// only open step is CC's merge (CIRISEdge#443 swaps this note for the live
+/// section pointer at that point). Note it is a *distinct axis* from CC 6.1.2's
+/// `(R, ε)`, the **reconstruction** predicate ("can this item be individually
+/// recovered") — NOT similarity between members; the `(R, ε)` fixture
 /// (`test_540_noise_floor.py`) does not measure this and cannot confirm it.
 ///
-/// So do **not** treat this const as free to tune: until CC pins it, cross-impl
-/// agreement is coincidence rather than conformance. Change it only in lockstep
-/// with CIRISConstitution#35, and add per-`corpus_kind` arms HERE (one place)
+/// So do **not** treat this const as free to tune: it is a governed quantity
+/// awaiting only ratification. Change it only in lockstep with
+/// CIRISConstitution#35, and add per-`corpus_kind` arms HERE (one place)
 /// rather than at call sites.
 #[must_use]
 pub fn multiplicity_similarity_threshold_milli(corpus_kind: &str) -> u64 {
