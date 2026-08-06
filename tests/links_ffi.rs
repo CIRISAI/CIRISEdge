@@ -83,6 +83,7 @@ async fn auth_with_bus(
         reachability: None,
         blackhole_rules: None,
         transport_identity_keystore: None,
+        own_build_bundle: None,
     }
 }
 
