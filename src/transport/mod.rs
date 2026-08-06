@@ -132,6 +132,13 @@ pub mod attestation;
 #[cfg(feature = "_reticulum-module")]
 pub mod reticulum;
 
+/// CIRISEdge#406 — the hybrid-signed `SignedTransportDestination`
+/// producer + bootstrap for edge's OWN reticulum destination (the #393
+/// item-2 gate's missing producer). Wired by the Reticulum transport,
+/// its only consumer.
+#[cfg(feature = "_reticulum-module")]
+pub mod self_route;
+
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (Leviculum exposes no LXMF
 /// propagation surface); pairs with Reticulum Transport-node mode

@@ -316,6 +316,38 @@ pub trait RootingDirectory: Send + Sync + 'static {
         )
     }
 
+    /// CIRISEdge#406 — the CURRENT signed reticulum route stored for
+    /// `key_id`, signature container included (the read half of the
+    /// self-signed-route producer's emit-only-on-change guard). One row per
+    /// `(occurrence_key_id, transport_kind)` is structural in persist's
+    /// route table, so this is at most one row; RETIRED rows are INCLUDED
+    /// (a tombstone must be able to veto an auto-resurrecting re-emit).
+    /// Default `Err` (test doubles / no directory ⇒ the producer defers,
+    /// never emits blind).
+    async fn signed_reticulum_route(
+        &self,
+        _key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::self_at_login::SignedTransportDestination>, String>
+    {
+        Err("no federation directory wired (RootingDirectory default)".to_string())
+    }
+
+    /// CIRISEdge#406 — submit a signed route through persist's authenticated
+    /// admission (`put_signed_transport_destination`: hybrid 1-of-1 over
+    /// `JCS(signed_envelope)` against the attesting key's PINNED federation
+    /// pubkeys + `signer_acts_for` + the `(epoch, asserted_at)` monotonic
+    /// guard). The write half of the self-signed-route producer — the same
+    /// gate the replication bridge's apply path calls, so a self-emitted row
+    /// is admitted under exactly the oracle every peer will re-run. Default
+    /// `Err` (test doubles / no directory ⇒ the producer defers).
+    async fn put_signed_transport_destination(
+        &self,
+        _signed: &ciris_persist::federation::self_at_login::SignedTransportDestination,
+    ) -> Result<ciris_persist::federation::self_at_login::TransportDestinationApplyOutcome, String>
+    {
+        Err("no federation directory wired (RootingDirectory default)".to_string())
+    }
+
     /// CIRISEdge#432 — point-read the durably stored reticulum binding for
     /// `key_id`: the read half of the live-map divergence heal.
     ///
@@ -452,6 +484,31 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             Ok(routes) => hybrid_reticulum_route_present(&routes, dest_hash),
             Err(_) => false,
         }
+    }
+
+    async fn signed_reticulum_route(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::self_at_login::SignedTransportDestination>, String>
+    {
+        let rows = FederationDirectory::list_signed_transport_destinations_for(self, key_id)
+            .await
+            .map_err(|e| format!("list_signed_transport_destinations_for: {e}"))?;
+        // One live row per `(occurrence_key_id, transport_kind)` is structural
+        // (persist #443 route-table PK), so `find` is exhaustive.
+        Ok(rows
+            .into_iter()
+            .find(|r| r.transport_destination.transport_kind == "reticulum"))
+    }
+
+    async fn put_signed_transport_destination(
+        &self,
+        signed: &ciris_persist::federation::self_at_login::SignedTransportDestination,
+    ) -> Result<ciris_persist::federation::self_at_login::TransportDestinationApplyOutcome, String>
+    {
+        FederationDirectory::put_signed_transport_destination(self, signed)
+            .await
+            .map_err(|e| format!("put_signed_transport_destination: {e}"))
     }
 
     async fn verify_peer_build_bundle(

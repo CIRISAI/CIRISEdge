@@ -1514,6 +1514,18 @@ pub struct ReticulumTransport {
     /// announces an empty app-data (peers with rooting enabled will
     /// drop it — fail-honest).
     local_attestation: Option<Vec<u8>>,
+    /// CIRISEdge#406 — the federation `LocalSigner` (mandatory since
+    /// CIRISEdge#333), retained past construction so the signed
+    /// transport-destination producer can re-arm from the announce
+    /// loop. The ciris-keyring `HardwareSigner`/`PqcSigner` handles
+    /// inside are THE signing primitive — no raw keys held (AV-17).
+    local_signer: Arc<LocalSigner>,
+    /// CIRISEdge#406 — idempotent producer state for edge's OWN
+    /// hybrid-signed `SignedTransportDestination` (the #393 item-2
+    /// gate's missing producer). Bootstrapped in `new`; re-armed by
+    /// the periodic announce tick so a boot-time fault (directory not
+    /// yet serving / own key not yet registered) heals in place.
+    self_route: crate::transport::self_route::SelfSignedRouteProducer,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
@@ -1914,7 +1926,7 @@ impl ReticulumTransport {
         // masked the fact that the attested announce was failing to transmit at
         // all. `signer: None` is now a hard configuration error, not a
         // degradation.
-        let Some(signer_ref) = &signer else {
+        let Some(local_signer) = signer else {
             return Err(TransportError::Config(
                 "Reticulum transport requires a federation signer: every announce must be \
                  self-attested (CIRISEdge#333). An unattested announce yields a peer that \
@@ -1924,7 +1936,7 @@ impl ReticulumTransport {
         };
         let local_attestation = Some(
             build_local_attestation(
-                signer_ref,
+                &local_signer,
                 &transport_ed25519,
                 &transport_x25519,
                 &config.local_key_id,
@@ -2066,8 +2078,12 @@ impl ReticulumTransport {
         // construction rather than fall back to a non-byte-equal
         // legacy path (those peers' addressing would diverge, and the
         // cohort's directory cache would never reach them).
-        let federation_ed25519_pubkey: [u8; 32] = if let Some(s) = &signer {
-            let (ed_bytes, _pqc) = s.federation_pubkeys().await.map_err(|e| {
+        // (Signer presence is enforced above, CIRISEdge#333 — the same
+        // requirement covers v7.0.0 explicit-hash addressing: no fallback
+        // to a legacy keystore-derived destination is supported, peers
+        // would diverge on routability.)
+        let federation_ed25519_pubkey: [u8; 32] = {
+            let (ed_bytes, _pqc) = local_signer.federation_pubkeys().await.map_err(|e| {
                 TransportError::Config(format!(
                     "federation pubkey unavailable for explicit-hash addressing: {e}"
                 ))
@@ -2081,13 +2097,6 @@ impl ReticulumTransport {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&ed_bytes);
             arr
-        } else {
-            return Err(TransportError::Config(
-                "Reticulum transport requires a federation signer for v7.0.0 explicit-hash \
-                 addressing — no fallback to the legacy keystore-derived destination is \
-                 supported (peers would diverge on routability)"
-                    .into(),
-            ));
         };
         let explicit_dest_hash = crate::transport::addressing::reticulum_destination_for_pubkey(
             &federation_ed25519_pubkey,
@@ -2165,6 +2174,30 @@ impl ReticulumTransport {
             "Reticulum transport node started",
         );
 
+        // CIRISEdge#406 — bootstrap the hybrid-signed SignedTransportDestination
+        // for edge's OWN (announced) destination: the producer for the #393
+        // item-2 gate. The announce-compose path above holds every operand —
+        // the NAMED dest peers will record, the 64-byte transport identity,
+        // the attestation epoch, and the federation signer. Idempotent
+        // (emit-only-on-change against the durable store) and fail-open: a
+        // boot-time fault (directory not serving / own key not yet
+        // registered / Ed25519-only signer) warns loudly and the periodic
+        // announce tick re-arms it — transport construction never blocks.
+        let self_route = crate::transport::self_route::SelfSignedRouteProducer::new();
+        if let Some(rooting_dir) = rooting.as_deref() {
+            let mut named16 = [0u8; 16];
+            named16.copy_from_slice(local_named_dest_hash.as_bytes());
+            let _outcome = self_route
+                .ensure(
+                    &local_signer,
+                    rooting_dir,
+                    named16,
+                    local_transport_pubkey,
+                    config.local_epoch,
+                )
+                .await;
+        }
+
         Ok(Self {
             config,
             node: Arc::new(node),
@@ -2173,6 +2206,8 @@ impl ReticulumTransport {
             local_transport_pubkey,
             local_identity: identity.clone(),
             local_attestation,
+            local_signer,
+            self_route,
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
@@ -4193,6 +4228,24 @@ impl Transport for ReticulumTransport {
                         .await
                     {
                         tracing::warn!(error = %e, "periodic announce (named destination) failed");
+                    }
+                    // CIRISEdge#406 — re-arm the signed transport-destination
+                    // producer on the announce cadence. Memoized once current
+                    // (no directory read after success); until then this heals
+                    // the boot-order faults (directory unavailable at
+                    // construction, own federation key registered after the
+                    // transport came up) without a restart.
+                    if let Some(rooting) = self.rooting.as_deref() {
+                        let _outcome = self
+                            .self_route
+                            .ensure(
+                                &self.local_signer,
+                                rooting,
+                                self.local_named_dest_hash(),
+                                self.local_transport_pubkey,
+                                self.config.local_epoch,
+                            )
+                            .await;
                     }
                 }
                 event = events.recv() => {
