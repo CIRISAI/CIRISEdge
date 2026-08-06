@@ -618,6 +618,20 @@ pub struct EdgeMetrics {
     /// "did anything fail?" but "did anything move, and if not, what stopped
     /// it?" — asked of what we were OFFERED rather than what we serve.
     pub apply_refusals_by_kind: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
+    /// CIRISEdge#457 — the receive plane's ACCEPTED-apply counters, the last
+    /// uncounted limb of the #433 arc: `apply_refusals_by_kind` booked
+    /// refusals but nothing booked an accepted apply, so "applied all N" and
+    /// "offered nothing" both read `{}`. Two distinct counters, never
+    /// collapsed (the #433 distinct-states rule): `applied` = a NEW row that
+    /// changed local state (`ApplyOutcome::Admitted`), `duplicate` = a row
+    /// already held (`ApplyOutcome::Duplicate`, routine, no state change).
+    /// Together with `apply_refusals_by_kind` the receive plane now answers
+    /// "did anything arrive, and what happened to it" from a scrape.
+    pub replication_applied_total: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
+    /// CIRISEdge#457 — per-kind count of already-held rows an apply saw
+    /// (`ApplyOutcome::Duplicate`). Distinct from `replication_applied_total`
+    /// so "applied new" and "already had it" never collapse.
+    pub replication_duplicate_total: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
     /// persist v24.2.0 / CIRISPersist#565 — the receive-plane mirror, reason
     /// axis for the one plane persist types today: Key-plane policy refusals
     /// counted by persist's STABLE token (`pubkey_swap`, `downgrade`, …; a
@@ -817,6 +831,21 @@ impl EdgeMetrics {
         *guard.entry(kind).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#457 — count one ACCEPTED apply that changed local state
+    /// (`ApplyOutcome::Admitted`) on `kind`, at the same #425 choke as the
+    /// refusal counter.
+    pub fn inc_applied(&self, kind: EnvelopeKind) {
+        let mut guard = self.replication_applied_total.write();
+        *guard.entry(kind).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#457 — count one already-held apply (`ApplyOutcome::Duplicate`)
+    /// on `kind` — distinct from `inc_applied` so the two never collapse.
+    pub fn inc_duplicate(&self, kind: EnvelopeKind) {
+        let mut guard = self.replication_duplicate_total.write();
+        *guard.entry(kind).or_insert(0) += 1;
+    }
+
     /// persist v24.2.0 / #565 — count one TYPED Key-plane policy refusal by
     /// persist's stable token. `token` comes from `KeyRefusalReason::as_str()`
     /// — a closed, append-only set, so this map's cardinality is bounded by
@@ -862,6 +891,8 @@ impl EdgeMetrics {
                 .clone(),
             apply_refusals_by_kind: self.apply_refusals_by_kind.read().clone(),
             key_apply_refusals_by_reason: self.key_apply_refusals_by_reason.read().clone(),
+            replication_applied_total: self.replication_applied_total.read().clone(),
+            replication_duplicate_total: self.replication_duplicate_total.read().clone(),
             removal_delivery: self.removal_receipts.read().delta(),
         }
     }
@@ -906,6 +937,10 @@ pub struct EdgeMetricsBundle {
     /// persist v24.2.0 / #565 — typed Key-plane policy refusals by persist's
     /// stable token (closed, append-only 9-token contract).
     pub key_apply_refusals_by_reason: HashMap<String, u64>,
+    /// CIRISEdge#457 — per-kind accepted applies that changed local state.
+    pub replication_applied_total: HashMap<EnvelopeKind, u64>,
+    /// CIRISEdge#457 — per-kind already-held applies (distinct from applied).
+    pub replication_duplicate_total: HashMap<EnvelopeKind, u64>,
     /// CIRISEdge#441 — the removal-delivery delta: per tracked removal row,
     /// offered/acked counts + peers still lacking a receipt.
     pub removal_delivery: Vec<RemovalRowDelta>,
@@ -1016,6 +1051,33 @@ mod tests {
             3072
         );
         assert_eq!(snap.transport_bytes_out_total[&TransportId::HTTP], 512);
+    }
+
+    /// CIRISEdge#457 — the accepted-apply counters book on their own axes
+    /// (the choke's match arms: Admitted→applied, Duplicate→duplicate). Direct
+    /// smoke; the bridge test drives the Admitted path through the real apply.
+    #[test]
+    fn applied_and_duplicate_counters_are_independent() {
+        let m = EdgeMetrics::new();
+        m.inc_applied(EnvelopeKind::Key);
+        m.inc_applied(EnvelopeKind::Key);
+        m.inc_duplicate(EnvelopeKind::Attestation);
+        let snap = m.snapshot();
+        assert_eq!(
+            snap.replication_applied_total
+                .get(&EnvelopeKind::Key)
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(
+            snap.replication_duplicate_total
+                .get(&EnvelopeKind::Attestation)
+                .copied(),
+            Some(1)
+        );
+        assert!(!snap
+            .replication_applied_total
+            .contains_key(&EnvelopeKind::Attestation));
     }
 
     /// CIRISEdge#441 — the receipt ledger's three-state contract, driven with

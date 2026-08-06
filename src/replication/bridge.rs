@@ -837,9 +837,21 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // choke already logs it; now it is also a metrics-scrape fact). The
         // typed Key-plane token axis books inside `apply_key`.
         let outcome = self.dispatch_apply(kind, envelope_bytes).await;
-        if matches!(outcome, ApplyOutcome::Refused(_)) {
-            if let Some(m) = &self.metrics {
-                m.inc_apply_refusal_kind(kind);
+        // CIRISEdge#457 — the receive plane now books EVERY outcome at this
+        // choke, not just refusals: an accepted apply (Admitted = new state)
+        // and a duplicate (already held) are counted distinctly, so "applied
+        // all N" and "offered nothing" no longer both read `{}` (the #433
+        // distinct-states rule, on the receive side; the mirror of #434).
+        if let Some(m) = &self.metrics {
+            match &outcome {
+                ApplyOutcome::Admitted => m.inc_applied(kind),
+                ApplyOutcome::Duplicate => m.inc_duplicate(kind),
+                ApplyOutcome::Refused(_) => m.inc_apply_refusal_kind(kind),
+                // Deserialize is a malformed-bytes drop, not an apply outcome
+                // on a well-formed row — it stays uncounted here (the choke's
+                // `on_deliver` logs it loud; a metrics kind-count of undecodable
+                // bytes would conflate wire corruption with a policy decision).
+                ApplyOutcome::Deserialize(_) => {}
             }
         }
         outcome
@@ -3076,6 +3088,49 @@ mod tests {
             fired.lock().expect("read sink").len(),
             1,
             "a refused/undeserializable revocation fires nothing"
+        );
+    }
+
+    /// CIRISEdge#457 — the receive plane's distinct-states discriminator:
+    /// an accepted apply books `replication_applied_total`, a duplicate books
+    /// `replication_duplicate_total`, and BOTH are empty on a node that was
+    /// offered nothing — so "applied all N" and "received nothing" no longer
+    /// render identically (the last uncounted limb of the #433 arc, receive
+    /// side; the mirror of #434).
+    #[tokio::test]
+    async fn accepted_apply_and_duplicate_are_counted_distinctly_from_idle() {
+        let (_backend, bridge, metrics) = make_metered_bridge(&[]);
+        // (a) IDLE — nothing offered: both accepted-apply counters empty.
+        let idle = metrics.snapshot();
+        assert!(
+            idle.replication_applied_total.is_empty()
+                && idle.replication_duplicate_total.is_empty(),
+            "an idle node books no accepted applies"
+        );
+        // (b) Apply a FRESH (never-seeded) Key row → Admitted → applied_total.
+        let rec = fixture_key_record("fresh-457", identity_type::NODE);
+        let bytes = serde_json::to_vec(&SignedKeyRecord {
+            record: rec.clone(),
+        })
+        .expect("serialize key");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Key, &bytes, Some("peer-457"))
+            .await;
+        assert!(outcome.is_admitted(), "fresh row admits: {outcome:?}");
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.replication_applied_total
+                .get(&EnvelopeKind::Key)
+                .copied(),
+            Some(1),
+            "an accepted apply is now counted — the state that used to read {{}} \
+             is now distinguishable from idle (CIRISEdge#457)"
+        );
+        // The applied axis is distinct from the duplicate axis — an admit
+        // books ONLY applied, never both (the #433 distinct-states rule).
+        assert!(
+            snap.replication_duplicate_total.is_empty(),
+            "an Admitted apply books applied_total, not duplicate_total"
         );
     }
 

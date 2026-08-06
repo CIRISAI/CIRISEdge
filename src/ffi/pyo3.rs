@@ -2155,6 +2155,12 @@ impl PyEdge {
     ///   "key_apply_refusals_by_reason": {"pubkey_swap": 3, ...},
     /// }
     /// ```
+    // A flat projection of EdgeMetricsBundle into a PyDict — one block per
+    // counter family, growing by a few lines each time the observability
+    // surface gains a counter (#433/#441/#457/…). It is straight-line
+    // key→dict emission with no branching to factor, so the line count is
+    // inherent, not complexity.
+    #[allow(clippy::too_many_lines)]
     fn metrics_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Mirror the live reachability tracker into the gauge before
         // snapshotting — consumers expect the gauge to be current.
@@ -2279,6 +2285,21 @@ impl PyEdge {
             refusals_reason.set_item(token.as_str(), *v)?;
         }
         root.set_item("key_apply_refusals_by_reason", refusals_reason)?;
+
+        // CIRISEdge#457 — the receive plane's accepted-apply counters
+        // (Admitted = new state, Duplicate = already held), the mirror of the
+        // #434 send-side served counter. Together with apply_refusals_by_kind
+        // they let a scrape tell "applied all N" from "offered nothing".
+        let applied = pyo3::types::PyDict::new(py);
+        for (kind, v) in &bundle.replication_applied_total {
+            applied.set_item(kind.as_wire_str(), *v)?;
+        }
+        root.set_item("replication_applied_total", applied)?;
+        let duplicate = pyo3::types::PyDict::new(py);
+        for (kind, v) in &bundle.replication_duplicate_total {
+            duplicate.set_item(kind.as_wire_str(), *v)?;
+        }
+        root.set_item("replication_duplicate_total", duplicate)?;
 
         // CIRISEdge#441 — the removal-delivery delta: per removal-class row,
         // offered/acked counts + peers still lacking a protocol-native ack
