@@ -1063,10 +1063,7 @@ mod tests {
             state: LocalState::new(),
             envelopes: HashMap::new(),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            known: HashMap::new(),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
         let coord = Arc::new(ReplicationCoordinator::new(
             transport,
             "bob",
