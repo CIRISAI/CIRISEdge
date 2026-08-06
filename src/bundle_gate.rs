@@ -41,13 +41,15 @@
 //! or a round-trip with the presenter, and [`TransparencyCheck::Absent`] is
 //! not a failure on this SW-friendly path.
 //!
-//! ## Bundle arrival (CIRISEdge#436) is OUT of scope here
+//! ## Bundle arrival (CIRISEdge#436)
 //!
 //! Bundles enter through [`PeerBundleStore::register`] — a store/lookup seam
-//! the #436 transport half (announce manifest-commitment + link-borne
-//! package) will later feed. Until then the server hands bundles over via the
-//! PyO3 surface (`Edge.register_peer_build_bundle`), or a deployment simply
-//! leaves the gate OFF.
+//! fed by the #436 arrival transport (the announce carries a 32-byte
+//! [`manifest commitment`](manifest_commitment_of_bundle); the package rides
+//! the established link as a `CBND` frame — see
+//! `transport::reticulum::process_peer_bundle_frame` for the one-motion
+//! Advisory→Rooted upgrade it drives) and/or by the server via the PyO3
+//! surface (`Edge.register_peer_build_bundle`).
 //!
 //! [`TransparencyCheck::Absent`]: ciris_verify_core::build_attestation_bundle::TransparencyCheck::Absent
 
@@ -335,6 +337,31 @@ pub enum BundleGateVerdict {
     Refused(BundleGateRefusal),
 }
 
+/// CIRISEdge#436 — the 32-byte **manifest commitment** an announce carries:
+/// `sha256(JCS(manifest_contribution))` over the manifest the bundle carries.
+///
+/// This is deliberately the SAME canonical preimage verify's bundle producer
+/// signs as `manifest_contribution_sha256` (CIRISVerify#181,
+/// `build_attestation_bundle::commitment_hex`) and uses as the transparency
+/// leaf — so the announce commitment, the bundle-internal commitment, and the
+/// log leaf can never drift. Sender and receiver both derive it from their
+/// copy of the bundle bytes with this one function; equality means the
+/// link-borne package IS the package the announce committed to.
+///
+/// `None` for anything that is not a well-shaped `build_attestation_bundle`
+/// carrying a canonicalizable `manifest_contribution` (fail-closed: no
+/// commitment ⇒ nothing to announce / nothing to match).
+#[must_use]
+pub fn manifest_commitment_of_bundle(bundle_bytes: &[u8]) -> Option<[u8; 32]> {
+    let bundle: SignedCegObject = serde_json::from_slice(bundle_bytes).ok()?;
+    if bundle.kind != BUILD_ATTESTATION_BUNDLE_KIND {
+        return None;
+    }
+    let manifest = bundle.body.get("manifest_contribution")?;
+    let canonical = ciris_verify_core::jcs::canonicalize(manifest).ok()?;
+    Some(sha2::Sha256::digest(canonical).into())
+}
+
 /// Pin the pipeline `key_id` NAME out of a bundle's carried manifest — the
 /// only thing ever read from the object itself (all pubkeys, roles, and the
 /// co-scrub quorum come from the directory rows this name selects).
@@ -476,9 +503,15 @@ pub async fn gated_save_provenance(
     }
 }
 
+/// CIRISEdge#436/#437 shared test fixture — the FIELD-provenance artifact
+/// chain: a `MemoryBackend` federation directory seeded through persist's REAL
+/// admission gates, plus a valid bundle minted with verify's own producers.
+/// `pub(crate)` so the #436 arrival-transport tests (`transport::reticulum`)
+/// drive the exact same artifacts the #437 gate tests pinned — one fixture,
+/// never two that drift.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use super::{SignedCegObject, BUILD_ATTESTATION_BUNDLE_KIND};
     use ciris_persist::federation::types::identity_type;
     use ciris_persist::federation::FederationDirectory;
     use ciris_persist::store::MemoryBackend;
@@ -491,34 +524,14 @@ mod tests {
     };
     use ciris_verify_core::self_at_login::HybridSigningIdentity;
 
-    use crate::verify::{ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict};
-
-    const TS: &str = "2026-08-02T00:00:00Z";
-    const PRESENTER: &str = "presenter-437";
-    const PIPELINE: &str = "ci-pipeline-437";
-    const TARGET: &str = "x86_64-unknown-linux-gnu";
-
-    /// A rooting backend with NO directory — every seam call must take the
-    /// default-impl `NoDirectory` refusal. The two required methods are
-    /// unreachable in these tests by construction.
-    struct NoDirectoryRooting;
-
-    #[async_trait::async_trait]
-    impl RootingDirectory for NoDirectoryRooting {
-        async fn root_binding(&self, _key_id: &str, _claimed: &str) -> RootingVerdict {
-            unreachable!("bundle-gate tests never root announces")
-        }
-        async fn provenance_chain(
-            &self,
-            _key_id: &str,
-        ) -> Result<ProvenanceChain, RootingRejection> {
-            unreachable!("bundle-gate tests never walk chains")
-        }
-    }
+    pub(crate) const TS: &str = "2026-08-02T00:00:00Z";
+    pub(crate) const PRESENTER: &str = "presenter-437";
+    pub(crate) const PIPELINE: &str = "ci-pipeline-437";
+    pub(crate) const TARGET: &str = "x86_64-unknown-linux-gnu";
 
     /// A minimal well-shaped (but crypto-empty) bundle blob — enough to pass
     /// the registration shape gate, never enough to verify.
-    fn shaped_bundle_bytes(key_id: &str) -> Vec<u8> {
+    pub(crate) fn shaped_bundle_bytes(key_id: &str) -> Vec<u8> {
         let obj = SignedCegObject::new(
             BUILD_ATTESTATION_BUNDLE_KIND,
             key_id,
@@ -532,7 +545,7 @@ mod tests {
     /// `test_support::fresh_accord_holder_evidence` emits — inlined (the
     /// `replication::bridge` precedent) so these tests do not gate on the
     /// `test-anchor` feature.
-    fn accord_holder_evidence() -> serde_json::Value {
+    pub(crate) fn accord_holder_evidence() -> serde_json::Value {
         serde_json::json!({
             "platform_attestation": {
                 "Android": {
@@ -552,7 +565,7 @@ mod tests {
     /// (both halves), fixture scrub fields (persist's memory backend does
     /// not verify self-scrub signatures at admission; the co-scrub gates
     /// only fire for privileged roles).
-    fn row_for_identity(
+    pub(crate) fn row_for_identity(
         id: &HybridSigningIdentity,
         it: &str,
         evidence: Option<serde_json::Value>,
@@ -593,7 +606,7 @@ mod tests {
     ///
     /// plus a VALID bundle minted with verify's own producers — the exact
     /// artifact chain the field presents.
-    async fn field_fixture() -> (MemoryBackend, Vec<u8>) {
+    pub(crate) async fn field_fixture() -> (MemoryBackend, Vec<u8>) {
         let backend = MemoryBackend::new();
 
         // The roster ids the admission quorum resolves — derived, not
@@ -704,11 +717,90 @@ mod tests {
 
     /// Flip the carried manifest's binary_hash AFTER signing — the
     /// evidence-swap the commitment must catch.
-    fn tampered(bytes: &[u8]) -> Vec<u8> {
+    pub(crate) fn tampered(bytes: &[u8]) -> Vec<u8> {
         let mut bundle: SignedCegObject = serde_json::from_slice(bytes).expect("parse bundle");
         bundle.body["manifest_contribution"]["body"]["signed_envelope"]["build"]["binary_hash"] =
             serde_json::json!("00".repeat(32));
         serde_json::to_vec(&bundle).expect("serialize tampered bundle")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{
+        field_fixture, row_for_identity, shaped_bundle_bytes, tampered, PIPELINE, PRESENTER,
+        TARGET, TS,
+    };
+    use super::*;
+    use ciris_persist::federation::types::identity_type;
+    use ciris_persist::federation::FederationDirectory;
+    use ciris_persist::store::MemoryBackend;
+    use ciris_verify_core::self_at_login::HybridSigningIdentity;
+
+    use crate::verify::{ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict};
+
+    /// A rooting backend with NO directory — every seam call must take the
+    /// default-impl `NoDirectory` refusal. The two required methods are
+    /// unreachable in these tests by construction.
+    struct NoDirectoryRooting;
+
+    #[async_trait::async_trait]
+    impl RootingDirectory for NoDirectoryRooting {
+        async fn root_binding(&self, _key_id: &str, _claimed: &str) -> RootingVerdict {
+            unreachable!("bundle-gate tests never root announces")
+        }
+        async fn provenance_chain(
+            &self,
+            _key_id: &str,
+        ) -> Result<ProvenanceChain, RootingRejection> {
+            unreachable!("bundle-gate tests never walk chains")
+        }
+    }
+
+    /// CIRISEdge#436 — the announce commitment helper derives EXACTLY the
+    /// commitment verify's producer signed into the bundle
+    /// (`manifest_contribution_sha256`, the `sha256(JCS(manifest))` preimage),
+    /// is stable across a serialize/parse round-trip, moves when the carried
+    /// manifest is tampered, and refuses non-bundle blobs.
+    #[tokio::test]
+    async fn manifest_commitment_matches_the_bundles_own_signed_commitment() {
+        let (_backend, bytes) = field_fixture().await;
+        let commitment =
+            manifest_commitment_of_bundle(&bytes).expect("valid bundle has a commitment");
+
+        // Equal to the producer-signed internal commitment — one preimage,
+        // three uses (announce, bundle envelope, transparency leaf).
+        let bundle: SignedCegObject = serde_json::from_slice(&bytes).expect("parse");
+        let signed_hex = bundle.body["signed_envelope"]["manifest_contribution_sha256"]
+            .as_str()
+            .expect("producer signs the commitment");
+        assert_eq!(hex::encode(commitment), signed_hex);
+
+        // Stable across a JSON round-trip (re-serialized bytes, same JCS).
+        let reserialized = serde_json::to_vec(&bundle).expect("serialize");
+        assert_eq!(
+            manifest_commitment_of_bundle(&reserialized),
+            Some(commitment)
+        );
+
+        // A tampered manifest moves the commitment — the announce→package
+        // binding catches the evidence swap.
+        let bad = tampered(&bytes);
+        let moved = manifest_commitment_of_bundle(&bad).expect("still shaped");
+        assert_ne!(moved, commitment);
+
+        // Non-bundles refuse: junk, wrong kind, missing manifest.
+        assert_eq!(manifest_commitment_of_bundle(b"not json"), None);
+        let wrong = SignedCegObject::new("self_login", PRESENTER, TS, serde_json::json!({}));
+        assert_eq!(
+            manifest_commitment_of_bundle(&serde_json::to_vec(&wrong).unwrap()),
+            None
+        );
+        assert_eq!(
+            manifest_commitment_of_bundle(&shaped_bundle_bytes(PRESENTER)),
+            None,
+            "a bundle without a manifest_contribution has no commitment"
+        );
     }
 
     // ── Store: registration shape gate + bounds + verdict cache ────────

@@ -485,6 +485,31 @@ fn oversized_frame_drop_log() -> &'static crate::log_throttle::LogThrottle {
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
 }
 
+static OWN_BUNDLE_PUSH_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#436 — a link-up push of this node's own build-attestation bundle
+/// could not complete (degenerate MDU / channel backpressure). Best-effort by
+/// design (the peer re-receives on the next link-up), but LOUD-throttled, never
+/// silent: a peer that can never receive the bundle can never root us at first
+/// contact, which would otherwise read as an unexplained Advisory plateau.
+fn own_bundle_push_log() -> &'static crate::log_throttle::LogThrottle {
+    OWN_BUNDLE_PUSH_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 8))
+}
+
+static PEER_BUNDLE_ARRIVAL_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#436 — refusals of a link-borne peer bundle (`CBND` frame). Keyed
+/// on the low-cardinality refusal TAG (a fixed set — never attacker-chosen), a
+/// floor per window, never silence: a refused package must never look like a
+/// stored/verified one (the #423 apply-loud discipline).
+fn peer_bundle_arrival_log() -> &'static crate::log_throttle::LogThrottle {
+    PEER_BUNDLE_ARRIVAL_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 32))
+}
+
 static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 
@@ -1015,6 +1040,23 @@ struct RootedPeer {
     /// attribution on: an Advisory or non-owning binding is never attributed, so
     /// it can never be served a peer's `trace:*` corpus.
     owns_key: bool,
+    /// CIRISEdge#436 — the FULL 64-byte transport identity
+    /// (`x25519 ‖ ed25519`) this entry was admitted with (the announce's own
+    /// `public_key`). `transport_identity_hash` above is derived from exactly
+    /// these bytes. Kept so the first-contact bundle upgrade can run its
+    /// durable half (`persist_transport_binding` needs the full identity) in
+    /// the SAME motion as the live-map half — never a second writer with
+    /// different operands (the #432 lesson). `[0u8; 64]` x25519-half for the
+    /// ed25519-only test injector (whose identity hash is already the
+    /// never-matching zero sentinel).
+    transport_pubkey64: [u8; 64],
+    /// CIRISEdge#436 — the 32-byte manifest commitment this peer's announce
+    /// carried (`sha256(JCS(manifest_contribution))` of its build-attestation
+    /// bundle), or `None` for a pre-#436 / unbundled announce. NOT
+    /// trust-bearing on its own: it only selects WHICH link-borne package may
+    /// attempt the Advisory→Rooted upgrade — the package still has to verify
+    /// the full CIRISVerify#181 chain against the directory pins.
+    manifest_commitment: Option<[u8; 32]>,
 }
 
 // ─── Configuration ──────────────────────────────────────────────────
@@ -1588,11 +1630,15 @@ pub struct ReticulumTransport {
     /// [`crate::bundle_gate`].
     bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
     /// CIRISEdge#437 — per-peer store of presented build-attestation
-    /// bundles, consumed by the durable-save gate. Fed via
-    /// [`Self::register_peer_build_bundle`] (PyO3:
-    /// `Edge.register_peer_build_bundle`) until the CIRISEdge#436 arrival
-    /// transport wires the link-borne package into it.
+    /// bundles, consumed by the durable-save gate. Fed by the CIRISEdge#436
+    /// arrival transport (announce commitment + link-borne `CBND` package)
+    /// and/or via [`Self::register_peer_build_bundle`] (PyO3:
+    /// `Edge.register_peer_build_bundle`).
     peer_bundles: Arc<crate::bundle_gate::PeerBundleStore>,
+    /// CIRISEdge#436 — this node's own validated build-attestation bundle
+    /// (announce commitment + link-up `CBND` push). `None` → v1 announces
+    /// byte-identical to pre-#436, nothing served.
+    own_bundle: Option<OwnBuildBundle>,
     /// CIRISEdge#34 — shared event bus. Drives the AsyncIterator
     /// surface (`subscribe_announces` / `subscribe_interface_events`)
     /// in `crate::ffi::pyo3`. `None` means a transport built with no
@@ -1823,6 +1869,28 @@ pub struct ReticulumAuth {
     /// Identity; the keyring trade-off is at-rest only, not RAM.
     /// CIRISEdge#99 documents this explicitly.
     pub transport_identity_keystore: Option<Arc<dyn ciris_keyring::TransportIdentityKeystore>>,
+    /// CIRISEdge#436 — this node's OWN build-attestation bundle (the JSON
+    /// `SignedCegObject` the CI pipeline + presenter signing produced —
+    /// CIRISVerify#181). When `Some`:
+    ///
+    /// - every announce carries the 32-byte **manifest commitment**
+    ///   (`sha256(JCS(manifest_contribution))`) in its attestation (wire v2),
+    /// - the bundle itself is served over every established link as a `CBND`
+    ///   frame, so a fresh peer can validate the package against the
+    ///   commitment and root this node **at first contact**.
+    ///
+    /// Validated at construction (size cap, shape, canonicalizable manifest)
+    /// — a malformed bundle is a hard config error, never a silently
+    /// commitment-less announce. `None` (the default) announces the
+    /// pre-#436 v1 wire byte-identical and serves nothing.
+    ///
+    /// **Mixed-fleet caveat**: a commitment-bearing announce is attestation
+    /// wire v2 — a pre-#436 peer refuses it with its typed unknown-version
+    /// parse error (clean, but it will NOT root this node from the announce).
+    /// Setting this is therefore a peer-visible opt-in, staged like every
+    /// enforcement flip: turn it on once the peers that must root you parse
+    /// v2 (i.e. run #436-aware builds).
+    pub own_build_bundle: Option<Vec<u8>>,
 }
 
 impl Default for ReticulumAuth {
@@ -1838,8 +1906,19 @@ impl Default for ReticulumAuth {
             reachability: None,
             blackhole_rules: None,
             transport_identity_keystore: None,
+            own_build_bundle: None,
         }
     }
+}
+
+/// CIRISEdge#436 — this node's own validated build-attestation bundle, pinned
+/// at construction: the pre-encoded `CBND` frame served on link-up plus the
+/// manifest commitment every announce carries.
+struct OwnBuildBundle {
+    /// The bundle bytes pre-wrapped as a `CBND` v1 frame (encode once).
+    frame: Vec<u8>,
+    /// `sha256(JCS(manifest_contribution))` — the announce commitment.
+    manifest_commitment: [u8; 32],
 }
 
 impl ReticulumTransport {
@@ -1880,6 +1959,7 @@ impl ReticulumTransport {
             reachability,
             blackhole_rules,
             transport_identity_keystore,
+            own_build_bundle,
         } = auth;
 
         // v3.1.0 (CIRISEdge#99) — when the host wired a
@@ -1934,6 +2014,39 @@ impl ReticulumTransport {
                     .to_string(),
             ));
         };
+        // CIRISEdge#436 — validate + pin this node's OWN build-attestation
+        // bundle BEFORE composing the announce attestation, so the announce
+        // can carry the manifest commitment from the very first announce.
+        // Fail-loud at construction: a bundle that cannot yield a commitment
+        // would otherwise silently announce commitment-less and never be
+        // rootable-at-first-contact — a #333-class healthy-looking trap.
+        let own_bundle = match own_build_bundle {
+            None => None,
+            Some(bytes) => {
+                if bytes.len() > crate::bundle_gate::MAX_PEER_BUNDLE_BYTES {
+                    return Err(TransportError::Config(format!(
+                        "own_build_bundle is {} bytes; the peer-bundle cap is {} \
+                         (CIRISEdge#436/#437)",
+                        bytes.len(),
+                        crate::bundle_gate::MAX_PEER_BUNDLE_BYTES,
+                    )));
+                }
+                let Some(manifest_commitment) =
+                    crate::bundle_gate::manifest_commitment_of_bundle(&bytes)
+                else {
+                    return Err(TransportError::Config(
+                        "own_build_bundle is not a build_attestation_bundle SignedCegObject \
+                         with a canonicalizable manifest_contribution — no manifest \
+                         commitment can be announced (CIRISEdge#436)"
+                            .to_string(),
+                    ));
+                };
+                Some(OwnBuildBundle {
+                    frame: crate::transport::peer_bundle_frame::encode(&bytes),
+                    manifest_commitment,
+                })
+            }
+        };
         let local_attestation = Some(
             build_local_attestation(
                 &local_signer,
@@ -1941,6 +2054,7 @@ impl ReticulumTransport {
                 &transport_x25519,
                 &config.local_key_id,
                 config.local_epoch,
+                own_bundle.as_ref().map(|b| b.manifest_commitment),
             )
             .await?,
         );
@@ -2220,6 +2334,7 @@ impl ReticulumTransport {
             transport_binding_enforcement,
             bundle_save_gate,
             peer_bundles: Arc::new(crate::bundle_gate::PeerBundleStore::new()),
+            own_bundle,
             event_bus,
             reachability,
             interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
@@ -2244,10 +2359,9 @@ impl ReticulumTransport {
     /// fail-closed at registration (size cap / JSON / `kind`); verification
     /// against the federation-directory pins happens lazily at the next
     /// Rooted durable save (and the verified outcome is cached against the
-    /// exact bytes — refusals are never cached). This is the store/lookup
-    /// seam the CIRISEdge#436 arrival transport will later feed; until
-    /// then the server hands bundles over via PyO3
-    /// (`Edge.register_peer_build_bundle`).
+    /// exact bytes — refusals are never cached). The CIRISEdge#436 arrival
+    /// transport (announce commitment + link-borne `CBND` package) feeds the
+    /// same store; this PyO3 seam remains for server-side registration.
     ///
     /// # Errors
     ///
@@ -2487,6 +2601,14 @@ impl ReticulumTransport {
                 // #393 — an operator-primed binding asserts key ownership (the
                 // operator baked it, e.g. the canonical), so it is attributable.
                 owns_key: true,
+                // #436 — only the ed25519 half is known here; the zero x25519
+                // half mirrors the zero identity-hash sentinel above.
+                transport_pubkey64: {
+                    let mut pk = [0u8; 64];
+                    pk[32..].copy_from_slice(&signing_key_ed25519);
+                    pk
+                },
+                manifest_commitment: None,
             },
         );
     }
@@ -2525,6 +2647,8 @@ impl ReticulumTransport {
                 // #393 — full-identity test injector simulates an announce-rooted
                 // owning peer (the precondition #340 attribution needs).
                 owns_key: true,
+                transport_pubkey64,
+                manifest_commitment: None,
             },
         );
     }
@@ -2718,6 +2842,11 @@ impl ReticulumTransport {
             .identify_link(&link_id, &self.local_identity)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
+        // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
+        // LINKIDENTIFY so the responder can attribute the frame.
+        if let Some(own) = self.own_bundle.as_ref() {
+            push_own_bundle_frames(&self.node, own, &link_id).await;
+        }
         Ok(link_id.into_bytes())
     }
 
@@ -4140,6 +4269,14 @@ impl Transport for ReticulumTransport {
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
 
+        // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
+        // LINKIDENTIFY (so the responder attributes it) and BEFORE the
+        // resource ship (the fragments ride the link Channel, which never
+        // contends with the resource lane — leviculum#27).
+        if let Some(own) = self.own_bundle.as_ref() {
+            push_own_bundle_frames(&self.node, own, &link_id).await;
+        }
+
         // The outbound-dial path we just established this link; a `Busy`
         // collision here is not the reverse-path retry case, so both variants
         // surface as the send's transport error (the durable dispatcher retries).
@@ -4272,6 +4409,7 @@ impl Transport for ReticulumTransport {
                         transport_binding_enforcement: self.transport_binding_enforcement,
                         bundle_save_gate: self.bundle_save_gate,
                         peer_bundles: &self.peer_bundles,
+                        own_bundle: self.own_bundle.as_ref(),
                         event_bus: self.event_bus.as_deref(),
                         reachability: self.reachability.as_ref(),
                         link_established_at: &self.link_established_at,
@@ -4348,6 +4486,9 @@ struct EventCtx<'a> {
     /// CIRISEdge#437 — the per-peer presented-bundle store the gate
     /// consults (see the field of the same name on [`ReticulumTransport`]).
     peer_bundles: &'a crate::bundle_gate::PeerBundleStore,
+    /// CIRISEdge#436 — this node's own validated build bundle, served as a
+    /// `CBND` frame on responder-side link-up. `None` → nothing served.
+    own_bundle: Option<&'a OwnBuildBundle>,
     /// CIRISEdge#34 — shared event bus for announce / interface
     /// emissions. `None` → no events emitted (the transport was
     /// constructed without `ReticulumAuth::event_bus`).
@@ -4570,6 +4711,19 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             }
         }
     };
+    // CIRISEdge#436 — a link-borne build-attestation-bundle frame (`CBND`) is
+    // a TRANSPORT-level control frame, consumed here exactly like a `CFRG`
+    // fragment — never an envelope, never an `InboundFrame`. Intercepted with
+    // the RAW candidate attribution, BEFORE the E3 `Rooted∧owns_key∧hybrid`
+    // gate below: its whole purpose is to upgrade a peer that is still
+    // Advisory — the very peers the gate (correctly) nulls.
+    if crate::transport::peer_bundle_frame::is_peer_bundle_frame(&data) {
+        handle_peer_bundle_frame(ctx, link_id, candidate_key_id, &data).await;
+        // choke-ok: consumed as a transport control frame, not a drop — every
+        // outcome inside `handle_peer_bundle_frame` speaks (INFO on the
+        // one-motion upgrade; `drop_inbound` / throttled WARN on any refusal).
+        return;
+    }
     // Gate (CIRISEdge#393): admit the attribution only if the candidate's binding
     // is `Rooted ∧ owns_key` (item 1) AND its transport identity is bound by a
     // hybrid-verified `SignedTransportDestination` (item 2, the PQ half). Any
@@ -4767,6 +4921,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     crate::events::EventSeverity::Info,
                     "link established",
                 ));
+            }
+            // CIRISEdge#436 — serve our own build-attestation bundle on
+            // link-up, RESPONDER side only (a link the peer dialed to us: the
+            // peer attributes our frames via its own dialed-dest record, so no
+            // ordering hazard). For links WE dialed the push happens on the
+            // dial paths right after `identify_link`, so the bundle frame can
+            // never outrun the LINKIDENTIFY the receiver attributes it by.
+            if let Some(own) = ctx.own_bundle {
+                let own_dialed = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+                if !own_dialed {
+                    push_own_bundle_frames(ctx.node, own, &link_id).await;
+                }
             }
         }
         NodeEvent::LinkIdentified {
@@ -5543,6 +5709,445 @@ fn report_attribution_miss(
     }
 }
 
+/// CIRISEdge#436 — serve this node's own build-attestation bundle over an
+/// established link, best-effort: `CFRG`-fragment the pre-encoded `CBND` frame
+/// onto the link's packet path (`try_send` — the same non-contending Channel
+/// the reverse-path replies ride, so it interleaves any in-flight resource
+/// transfer) and let the receiver's `attribute_and_deliver` reassemble it. A
+/// lost/backpressured push is recoverable (the next link-up re-serves) but
+/// never silent (throttled WARN).
+async fn push_own_bundle_frames(node: &ReticulumNode, own: &OwnBuildBundle, link_id: &LinkId) {
+    let mdu = node.link_mdu(link_id).unwrap_or(0);
+    let Some(fragments) = crate::transport::frame_fragment::fragment(&own.frame, mdu) else {
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            own_bundle_push_log().check("degenerate-mdu")
+        {
+            tracing::warn!(
+                link = ?link_id,
+                mdu,
+                bytes = own.frame.len(),
+                suppressed_prev,
+                "own build-bundle push skipped — link MDU too small to fragment; the peer \
+                 cannot root us at first contact over this link (CIRISEdge#436)"
+            );
+        }
+        return;
+    };
+    let total = fragments.len();
+    let mut sent = 0usize;
+    for frag in &fragments {
+        if node.link_handle(link_id).try_send(frag).await.is_ok() {
+            sent += 1;
+        } else {
+            break;
+        }
+    }
+    if sent == total {
+        tracing::debug!(
+            link = ?link_id,
+            bytes = own.frame.len(),
+            fragments = total,
+            "own build-attestation bundle served on link-up (CIRISEdge#436)"
+        );
+    } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        own_bundle_push_log().check("channel-backpressure")
+    {
+        tracing::warn!(
+            link = ?link_id,
+            fragments = total,
+            fragments_sent = sent,
+            suppressed_prev,
+            "own build-bundle push incomplete ({sent}/{total} fragments) — link Channel \
+             backpressured; the peer re-receives on the next link-up (CIRISEdge#436)"
+        );
+    }
+}
+
+/// CIRISEdge#436 — why a link-borne peer bundle (`CBND` frame) was refused.
+/// Every variant is a hard, LOUD refusal (throttled WARN on the fixed tag) and
+/// leaves the peer exactly as it was: no store slot, no live-map change, no
+/// durable write. Fail-closed — a refusal can never widen anything.
+#[derive(Debug)]
+enum PeerBundleRefusal {
+    /// The frame is `CBND`-tagged but not a well-formed v1 frame, or the
+    /// carried bundle has no canonicalizable `manifest_contribution`.
+    Malformed(&'static str),
+    /// The carried bundle exceeds [`crate::bundle_gate::MAX_PEER_BUNDLE_BYTES`]
+    /// (checked before any parse/hash — cheap reject first).
+    Oversized { actual: usize, limit: usize },
+    /// The attributed peer has no live peers-map entry (announce not yet
+    /// admitted, or evicted) — there is no announced commitment to bind to.
+    PeerNotInMap,
+    /// The peer's announce carried NO manifest commitment — an unsolicited
+    /// package has nothing binding it to the announce; today's (pre-#436)
+    /// path stays untouched.
+    NoAnnouncedCommitment,
+    /// The package's manifest hashes to a DIFFERENT value than the announced
+    /// commitment — the announce→package binding failed (evidence swap /
+    /// stale bundle).
+    CommitmentMismatch,
+    /// The link's proven identity (or, for a link we dialed, its dialed
+    /// destination) does not match the live entry — trust is never laundered
+    /// across identities (the #432 heal's exact rule).
+    LinkBindingMismatch,
+    /// The shape-gated store registration refused (typed).
+    RegisterRefused(crate::bundle_gate::BundleRegisterError),
+    /// The pins held or failed edge-side; verify's fail-closed chain (or the
+    /// directory pinning that precedes it) refused the bundle.
+    VerifyRefused(crate::bundle_gate::BundleGateRefusal),
+}
+
+impl PeerBundleRefusal {
+    /// Low-cardinality throttle tag (fixed set, never attacker-chosen).
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "malformed",
+            Self::Oversized { .. } => "oversized",
+            Self::PeerNotInMap => "peer-not-in-map",
+            Self::NoAnnouncedCommitment => "no-announced-commitment",
+            Self::CommitmentMismatch => "commitment-mismatch",
+            Self::LinkBindingMismatch => "link-binding-mismatch",
+            Self::RegisterRefused(_) => "register-refused",
+            Self::VerifyRefused(_) => "verify-refused",
+        }
+    }
+}
+
+impl std::fmt::Display for PeerBundleRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(what) => write!(f, "malformed bundle frame: {what}"),
+            Self::Oversized { actual, limit } => {
+                write!(f, "bundle too large: {actual} > {limit} bytes")
+            }
+            Self::PeerNotInMap => write!(f, "peer has no live peers-map entry"),
+            Self::NoAnnouncedCommitment => {
+                write!(f, "peer's announce carried no manifest commitment")
+            }
+            Self::CommitmentMismatch => {
+                write!(f, "package manifest hash != announced commitment")
+            }
+            Self::LinkBindingMismatch => {
+                write!(f, "link identity/destination does not match the live entry")
+            }
+            Self::RegisterRefused(e) => write!(f, "store registration refused: {e}"),
+            Self::VerifyRefused(r) => write!(f, "bundle verification refused: {r}"),
+        }
+    }
+}
+
+/// CIRISEdge#436 — typed outcome of processing a link-borne peer bundle.
+#[derive(Debug)]
+enum PeerBundleOutcome {
+    /// The full chain held; the peer was upgraded Advisory→Rooted in ONE
+    /// motion (live map + durable store). `already_passed` when the live
+    /// entry was already `Rooted ∧ owns_key` (the durable half was still
+    /// re-asserted — idempotent).
+    Upgraded { already_passed: bool },
+    /// No verdict — a typed refusal; nothing changed anywhere.
+    Refused(PeerBundleRefusal),
+}
+
+/// CIRISEdge#436 — the pure link↔entry binding rule, the #432 heal's
+/// identity-equality semantics applied at bundle arrival: the package may only
+/// upgrade the entry whose transport identity THIS link proved.
+///
+/// - The link proved an identity (its `LINKIDENTIFY` / remote identity is
+///   known) → that identity's hash must equal the entry's announce-derived
+///   `transport_identity_hash`. Never laundered across identities.
+/// - No proven identity (a link WE dialed — the initiator side, where the
+///   remote never LINKIDENTIFYs to us) → the link's destination (leviculum's
+///   `link_destination`, or edge's own dialed-dest record) must equal the
+///   entry's announced dest: we dialed the peer's verified dest and RNS
+///   establishment proved the remote controls that destination's identity
+///   keys — the same basis initiator-side frame attribution stands on
+///   (CIRISEdge#353/#424).
+/// - Neither → no binding evidence at all; refuse.
+fn peer_bundle_link_binding_ok(
+    link_identity_hash: Option<[u8; 16]>,
+    link_dest16: Option<[u8; 16]>,
+    entry_identity_hash: [u8; 16],
+    entry_dest16: [u8; 16],
+) -> bool {
+    match link_identity_hash {
+        Some(proven) => proven == entry_identity_hash,
+        None => link_dest16 == Some(entry_dest16),
+    }
+}
+
+/// CIRISEdge#436 — process one link-borne build-attestation-bundle frame: the
+/// arrival transport that feeds the #437 gate, and on a full verdict performs
+/// the **one-motion Advisory→Rooted upgrade** (live map + durable store — the
+/// #432 lesson: never two writers that diverge).
+///
+/// The chain, fail-closed at every step (any refusal leaves EVERYTHING as it
+/// was):
+///
+/// 1. frame shape (`CBND` v1) + size cap (before any parse),
+/// 2. the live entry's ANNOUNCED commitment must exist and equal
+///    `sha256(JCS(manifest_contribution))` of the received package — the
+///    commitment BINDS announce to package,
+/// 3. the link↔entry binding ([`peer_bundle_link_binding_ok`] — the #432
+///    identity-equality rule),
+/// 4. shape-gated registration into the [`PeerBundleStore`]
+///    (the #437 store — a later gated Rooted save reuses the cached verdict),
+/// 5. the full CIRISVerify#181 chain via
+///    [`RootingDirectory::verify_peer_build_bundle`] (presenter = THIS peer's
+///    directory row; pipeline + accord anchors pinned from the directory),
+/// 6. on ELIGIBLE: live entry → `Rooted ∧ owns_key`, and the durable
+///    write-through — routed through [`gated_save_provenance`], the single
+///    #437 choke every Rooted durable save runs (a cache-hit here, since the
+///    verdict was just cached) — with the SAME operands the live entry holds.
+///
+/// What the verdict does NOT prove stays advisory exactly as CIRISVerify#181
+/// frames it: this is the artifact chain to the shared trust root (L1), never
+/// remote-execution proof — the peer's self-report of *running* the validated
+/// binary is Advisory forever (no Rooted bit derives from it anywhere here).
+///
+/// [`PeerBundleStore`]: crate::bundle_gate::PeerBundleStore
+/// [`gated_save_provenance`]: crate::bundle_gate::gated_save_provenance
+// The parameter list IS the test seam: exactly the operands the wrapper reads
+// off the EventCtx, split out so the field-provenance tests can drive the full
+// chain against a real `MemoryBackend` + peers map without a live node
+// (the #424 "the layer the loopback harness cannot reach" lesson).
+#[allow(clippy::too_many_arguments)]
+async fn process_peer_bundle_frame(
+    frame: &[u8],
+    key_id: &str,
+    link_identity_hash: Option<[u8; 16]>,
+    link_dest16: Option<[u8; 16]>,
+    peers: &Mutex<HashMap<String, RootedPeer>>,
+    bundles: &crate::bundle_gate::PeerBundleStore,
+    rooting: &dyn RootingDirectory,
+    gate: crate::bundle_gate::BundleSaveGateMode,
+) -> PeerBundleOutcome {
+    use PeerBundleOutcome::Refused;
+
+    let Some(bundle_bytes) = crate::transport::peer_bundle_frame::decode(frame) else {
+        return Refused(PeerBundleRefusal::Malformed("not a CBND v1 frame"));
+    };
+    if bundle_bytes.len() > crate::bundle_gate::MAX_PEER_BUNDLE_BYTES {
+        return Refused(PeerBundleRefusal::Oversized {
+            actual: bundle_bytes.len(),
+            limit: crate::bundle_gate::MAX_PEER_BUNDLE_BYTES,
+        });
+    }
+    // Snapshot the entry's decision operands; the lock is NOT held across the
+    // hash / registration / directory verification below.
+    let snapshot = {
+        let peers = peers.lock().await;
+        peers.get(key_id).map(|e| {
+            (
+                e.manifest_commitment,
+                e.transport_identity_hash,
+                e.peer.dest_hash.into_bytes(),
+            )
+        })
+    };
+    let Some((announced, entry_identity_hash, entry_dest16)) = snapshot else {
+        return Refused(PeerBundleRefusal::PeerNotInMap);
+    };
+    let Some(announced) = announced else {
+        return Refused(PeerBundleRefusal::NoAnnouncedCommitment);
+    };
+    if !peer_bundle_link_binding_ok(
+        link_identity_hash,
+        link_dest16,
+        entry_identity_hash,
+        entry_dest16,
+    ) {
+        return Refused(PeerBundleRefusal::LinkBindingMismatch);
+    }
+    let Some(computed) = crate::bundle_gate::manifest_commitment_of_bundle(bundle_bytes) else {
+        return Refused(PeerBundleRefusal::Malformed(
+            "no canonicalizable manifest_contribution in the carried bundle",
+        ));
+    };
+    if computed != announced {
+        return Refused(PeerBundleRefusal::CommitmentMismatch);
+    }
+    if let Err(e) = bundles.register(key_id, bundle_bytes) {
+        return Refused(PeerBundleRefusal::RegisterRefused(e));
+    }
+    match rooting.verify_peer_build_bundle(key_id, bundle_bytes).await {
+        crate::bundle_gate::BundleGateVerdict::Refused(refusal) => {
+            // The bundle stays registered (shape-passed); refusals are never
+            // cached, so a directory row replicating in later un-sticks the
+            // #437 gate — but NO upgrade happens now (fail-closed).
+            Refused(PeerBundleRefusal::VerifyRefused(refusal))
+        }
+        crate::bundle_gate::BundleGateVerdict::Verified(verdict) => {
+            bundles.note_verified(key_id, crate::bundle_gate::sha256_of(bundle_bytes));
+            commit_one_motion_upgrade(
+                key_id,
+                link_identity_hash,
+                link_dest16,
+                peers,
+                bundles,
+                rooting,
+                gate,
+                &verdict,
+            )
+            .await
+        }
+    }
+}
+
+/// CIRISEdge#436 — **the one-motion upgrade site**: with the bundle verdict in
+/// hand, flip the peer Advisory→Rooted in the live map AND the durable store as
+/// one write sequence with ONE set of operands (the #432 lesson: never two
+/// writers that diverge).
+///
+/// Live half: re-take the lock, re-check the link↔entry binding against the
+/// CURRENT entry (it may have been superseded during the directory round-trip
+/// — never upgrade an entry the link no longer binds), flip
+/// `Rooted ∧ owns_key`, and snapshot the durable operands FROM THE SAME ENTRY.
+///
+/// Durable half: through [`gated_save_provenance`] — the single #437 choke
+/// every Rooted durable save runs (gate Off → Rooted untouched; gate ON → a
+/// cache-hit on the verdict the caller just cached) — then
+/// `persist_transport_binding` with the live entry's exact operands.
+///
+/// [`gated_save_provenance`]: crate::bundle_gate::gated_save_provenance
+#[allow(clippy::too_many_arguments)] // the one-motion writer takes exactly the upgrade's operands
+async fn commit_one_motion_upgrade(
+    key_id: &str,
+    link_identity_hash: Option<[u8; 16]>,
+    link_dest16: Option<[u8; 16]>,
+    peers: &Mutex<HashMap<String, RootedPeer>>,
+    bundles: &crate::bundle_gate::PeerBundleStore,
+    rooting: &dyn RootingDirectory,
+    gate: crate::bundle_gate::BundleSaveGateMode,
+    verdict: &ciris_verify_core::build_attestation_bundle::BundleVerdict,
+) -> PeerBundleOutcome {
+    use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+    let upgraded = {
+        let mut peers = peers.lock().await;
+        match peers.get_mut(key_id) {
+            Some(entry)
+                if peer_bundle_link_binding_ok(
+                    link_identity_hash,
+                    link_dest16,
+                    entry.transport_identity_hash,
+                    entry.peer.dest_hash.into_bytes(),
+                ) =>
+            {
+                let already_passed = matches!(entry.provenance, Rooted) && entry.owns_key;
+                entry.provenance = Rooted;
+                entry.owns_key = true;
+                Some((
+                    already_passed,
+                    entry.peer.dest_hash.into_bytes(),
+                    entry.transport_pubkey64,
+                    entry.epoch,
+                ))
+            }
+            _ => None,
+        }
+    };
+    let Some((already_passed, dest16, pubkey64, epoch)) = upgraded else {
+        return PeerBundleOutcome::Refused(PeerBundleRefusal::LinkBindingMismatch);
+    };
+    let persist_provenance =
+        crate::bundle_gate::gated_save_provenance(gate, Rooted, key_id, bundles, rooting).await;
+    rooting
+        .persist_transport_binding(key_id, dest16, pubkey64, persist_provenance, epoch)
+        .await;
+    tracing::info!(
+        key_id,
+        target = %verdict.build.target,
+        build_id = %verdict.build.build_id,
+        binary_version = %verdict.build.binary_version,
+        transparency = ?verdict.transparency,
+        already_passed,
+        "first-contact rooting: link-borne build-attestation bundle VERIFIED against \
+         the announced commitment + directory pins — Advisory→Rooted in ONE motion \
+         (live map + durable store) (CIRISEdge#436). Execution self-reports remain \
+         Advisory: this is the artifact chain to the shared trust root (L1), not \
+         remote-execution proof"
+    );
+    PeerBundleOutcome::Upgraded { already_passed }
+}
+
+/// CIRISEdge#436 — the transport-side wrapper: resolve the link's binding
+/// operands from the event context, run [`process_peer_bundle_frame`], and
+/// speak every refusal loudly (throttled on the fixed refusal tag — a refused
+/// package must never look like a stored/verified one).
+async fn handle_peer_bundle_frame(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    candidate_key_id: Option<String>,
+    frame: &[u8],
+) {
+    let Some(key_id) = candidate_key_id else {
+        drop_inbound(
+            Some(link_id),
+            "bundle-unattributed-link",
+            "a CBND bundle frame arrived on a link attributed to no peer key_id — there \
+             is no announced commitment to bind it to; the peer's announce (or our dial \
+             record) must land first (CIRISEdge#436)",
+        );
+        return;
+    };
+    let Some(rooting) = ctx.rooting else {
+        drop_inbound(
+            Some(link_id),
+            "bundle-no-rooting-directory",
+            "a CBND bundle frame arrived but no rooting directory is wired — nothing can \
+             verify, nothing can root (fail-closed) (CIRISEdge#436)",
+        );
+        return;
+    };
+    let link_identity_hash = ctx.node.get_remote_identity(&link_id).map(|id| *id.hash());
+    let link_dest16 = match ctx.node.link_destination(&link_id) {
+        Some(d) => Some(d.into_bytes()),
+        None => ctx
+            .dialed_link_dest
+            .lock()
+            .await
+            .get(&link_id)
+            .map(|d| d.into_bytes()),
+    };
+    match process_peer_bundle_frame(
+        frame,
+        &key_id,
+        link_identity_hash,
+        link_dest16,
+        ctx.peers,
+        ctx.peer_bundles,
+        rooting,
+        ctx.bundle_save_gate,
+    )
+    .await
+    {
+        PeerBundleOutcome::Upgraded { already_passed } => {
+            // The one-motion success already logged (INFO, with the verified
+            // build facts) inside `process_peer_bundle_frame`.
+            tracing::debug!(
+                link = ?link_id,
+                peer = %key_id,
+                already_passed,
+                "peer bundle frame consumed — one-motion upgrade path complete (CIRISEdge#436)"
+            );
+        }
+        PeerBundleOutcome::Refused(refusal) => {
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                peer_bundle_arrival_log().check(refusal.tag())
+            {
+                tracing::warn!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    refusal = %refusal,
+                    suppressed_prev,
+                    "link-borne build-attestation bundle REFUSED — no store slot taken \
+                     beyond shape-registration, no live-map change, no durable write \
+                     (fail-closed; the peer stays exactly as admitted) (CIRISEdge#436)"
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn resolve_announce_cold_start(
     announce: &leviculum_core::ReceivedAnnounce,
@@ -5830,6 +6435,24 @@ async fn resolve_announce_cold_start(
                 None
             }
             RouteSupersession::IgnoreStale => {
+                // CIRISEdge#436 — an OWNER's otherwise-stale re-announce may still
+                // rotate its manifest commitment (a binary upgrade with no epoch
+                // bump / dest change). Metadata-only refresh: not trust-bearing
+                // (the bundle still has to verify the full chain) and gated on
+                // proven ownership, so a spoofer can never repoint a victim's
+                // commitment (its announce fails `owns_key` upstream).
+                if owns_key {
+                    if let Some(existing) = peers.get_mut(&key_id) {
+                        if existing.manifest_commitment != attestation.manifest_commitment {
+                            existing.manifest_commitment = attestation.manifest_commitment;
+                            tracing::debug!(
+                                key_id = %key_id,
+                                "manifest commitment refreshed from an owner's stale \
+                                 re-announce (CIRISEdge#436)"
+                            );
+                        }
+                    }
+                }
                 tracing::trace!(
                     key_id = %key_id,
                     announce_epoch = attestation.epoch,
@@ -5848,6 +6471,11 @@ async fn resolve_announce_cold_start(
                     existing.peer = resolved;
                     existing.epoch = attestation.epoch;
                     existing.transport_identity_hash = transport_identity_hash;
+                    // #436 — the identity + commitment follow the healed route
+                    // (the pubkey64 is what the identity hash above hashes; the
+                    // commitment is the owner's current one).
+                    existing.transport_pubkey64 = binding_pubkey64;
+                    existing.manifest_commitment = attestation.manifest_commitment;
                     // Persist the PRESERVED Rooted provenance, not the incoming
                     // Advisory verdict, so a boot-reload keeps the binding rooted.
                     persist_provenance = existing.provenance;
@@ -6007,6 +6635,12 @@ async fn resolve_announce_cold_start(
                         // the `match verdict` above): Confirmed ⇒ true; Advisory ⇒
                         // true only when the pubkey matched + self-sig verified.
                         owns_key,
+                        // #436 — the announce's own 64-byte transport identity
+                        // (what `transport_identity_hash` hashes) + the manifest
+                        // commitment it carried, consumed by the link-borne
+                        // bundle's one-motion Advisory→Rooted upgrade.
+                        transport_pubkey64: binding_pubkey64,
+                        manifest_commitment: attestation.manifest_commitment,
                     },
                 );
                 Some(persisted_key)
@@ -6189,6 +6823,11 @@ async fn build_local_attestation(
     transport_x25519_pubkey: &[u8; 32],
     federation_key_id: &str,
     epoch: u64,
+    // CIRISEdge#436 — this node's own bundle manifest commitment; `Some`
+    // upgrades the wire to v2 (v1 + trailing 32 B). Not part of the SIGNED
+    // payload (see `AnnounceAttestation::manifest_commitment`), so the
+    // signature domain is unchanged either way.
+    manifest_commitment: Option<[u8; 32]>,
 ) -> Result<Vec<u8>, TransportError> {
     let fed_pubkey = signer
         .classical
@@ -6224,6 +6863,7 @@ async fn build_local_attestation(
         federation_pubkey_ed25519: fed_pubkey32,
         epoch,
         signature: signature64,
+        manifest_commitment,
     };
     attestation
         .to_app_data()
@@ -7483,6 +8123,423 @@ mod tests {
         assert_eq!(s.provenance, Rooted, "the best live row is the rooted one");
         assert_eq!(s.epoch, 1);
         assert_eq!(s.transport_pubkey64, pk);
+    }
+
+    /// CIRISEdge#436 — first-contact rooting: the announce commitment + the
+    /// link-borne package → the ONE-motion Advisory→Rooted upgrade, driven
+    /// with the EXACT field artifacts (a verify-producer-minted bundle over
+    /// persist's real admission — the shared #437 fixture) and the EXACT live
+    /// entry the first-contact Advisory admit inserts (the #432 reproduction
+    /// operands: `Advisory ∧ owns_key=false`).
+    mod first_contact_rooting {
+        use super::*;
+        use crate::bundle_gate::test_support::{field_fixture, tampered, PIPELINE, PRESENTER};
+        use crate::bundle_gate::{
+            manifest_commitment_of_bundle, sha256_of, BundleSaveGateMode, PeerBundleStore,
+            MAX_PEER_BUNDLE_BYTES,
+        };
+        use crate::verify::RootingDirectory;
+        use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+
+        const DEST: [u8; 16] = [3u8; 16];
+
+        /// The live peers map exactly as the field's first-contact announce
+        /// admit leaves it: an `Advisory ∧ owns_key=false` entry carrying the
+        /// announced manifest commitment + the announce's own transport
+        /// identity (both halves) — the #336/#432 test-field-provenance rule.
+        fn live_map_after_first_contact_admit(
+            key_id: &str,
+            pk: [u8; 64],
+            commitment: Option<[u8; 32]>,
+        ) -> Mutex<HashMap<String, RootedPeer>> {
+            let ed25519: [u8; 32] = pk[32..].try_into().unwrap();
+            let mut map = HashMap::new();
+            map.insert(
+                key_id.to_string(),
+                RootedPeer {
+                    peer: ResolvedPeer {
+                        dest_hash: DestinationHash::new(DEST),
+                        signing_key: ed25519,
+                    },
+                    epoch: 0,
+                    chain: None,
+                    provenance: Advisory,
+                    transport_identity_hash: identity_hash_of64(&pk),
+                    owns_key: false,
+                    transport_pubkey64: pk,
+                    manifest_commitment: commitment,
+                },
+            );
+            Mutex::new(map)
+        }
+
+        /// The acceptance path: announce-with-commitment → link → package →
+        /// ELIGIBLE verdict → live map `Rooted ∧ owns_key` AND durable store
+        /// `Rooted` in ONE motion — and attribution item 1 passes on the very
+        /// next frame.
+        #[tokio::test]
+        async fn verified_link_borne_bundle_roots_first_contact_in_one_motion() {
+            let (backend, bundle) = field_fixture().await;
+            let pk = valid_transport_pubkey64(7);
+            let commitment = manifest_commitment_of_bundle(&bundle).expect("commitment");
+            let peers = live_map_after_first_contact_admit(PRESENTER, pk, Some(commitment));
+            // The admit's durable write-through (Advisory, epoch 0) — the row
+            // the one-motion upgrade must flip to Rooted.
+            RootingDirectory::persist_transport_binding(&backend, PRESENTER, DEST, pk, Advisory, 0)
+                .await;
+            let store = PeerBundleStore::new();
+            let frame = crate::transport::peer_bundle_frame::encode(&bundle);
+
+            let out = process_peer_bundle_frame(
+                &frame,
+                PRESENTER,
+                // The link proved exactly the announce's transport identity.
+                Some(identity_hash_of64(&pk)),
+                None,
+                &peers,
+                &store,
+                &backend,
+                BundleSaveGateMode::Off,
+            )
+            .await;
+            assert!(
+                matches!(
+                    out,
+                    PeerBundleOutcome::Upgraded {
+                        already_passed: false
+                    }
+                ),
+                "expected the one-motion upgrade, got {out:?}"
+            );
+
+            // Live half: Rooted ∧ owns_key — attribution item 1 passes NOW.
+            let entry = peers.lock().await.get(PRESENTER).cloned().expect("entry");
+            assert_eq!(entry.provenance, Rooted);
+            assert!(entry.owns_key);
+            assert!(
+                crate::transport::SourceKeyId::from_rooted_binding(
+                    PRESENTER.to_string(),
+                    entry.provenance,
+                    entry.owns_key,
+                )
+                .is_some(),
+                "the E3 item-1 gate admits this binding post-upgrade"
+            );
+
+            // Durable half, SAME motion: the store row is Rooted with the
+            // SAME transport identity the link proved.
+            let stored = RootingDirectory::stored_reticulum_binding(&backend, PRESENTER)
+                .await
+                .expect("durable row");
+            assert_eq!(stored.provenance, Rooted);
+            assert_eq!(stored.transport_pubkey64, pk);
+
+            // And the #437 store now holds the VERIFIED bundle (cached against
+            // the exact bytes) — a later gated Rooted save is a cache-hit.
+            assert!(store.is_verified(PRESENTER, sha256_of(&bundle)));
+        }
+
+        /// Composition with the #437 gate ON: the durable half rides the same
+        /// `gated_save_provenance` choke and stays Rooted (the verdict was
+        /// cached in the same motion) — the gate never sees an unbundled peer
+        /// here by construction.
+        #[tokio::test]
+        async fn one_motion_upgrade_composes_with_the_437_gate_on() {
+            let (backend, bundle) = field_fixture().await;
+            let pk = valid_transport_pubkey64(7);
+            let commitment = manifest_commitment_of_bundle(&bundle).expect("commitment");
+            let peers = live_map_after_first_contact_admit(PRESENTER, pk, Some(commitment));
+            let store = PeerBundleStore::new();
+            let frame = crate::transport::peer_bundle_frame::encode(&bundle);
+            let out = process_peer_bundle_frame(
+                &frame,
+                PRESENTER,
+                Some(identity_hash_of64(&pk)),
+                None,
+                &peers,
+                &store,
+                &backend,
+                BundleSaveGateMode::RequireBundleForRootedSave,
+            )
+            .await;
+            assert!(matches!(out, PeerBundleOutcome::Upgraded { .. }));
+            let stored = RootingDirectory::stored_reticulum_binding(&backend, PRESENTER)
+                .await
+                .expect("durable row");
+            assert_eq!(
+                stored.provenance, Rooted,
+                "gate ON: the just-verified bundle satisfies the #437 choke — \
+                 the durable save stays Rooted, not downgraded"
+            );
+        }
+
+        /// NEGATIVE — the commitment BINDS announce to package: a package
+        /// whose manifest hash differs from the announced commitment refuses
+        /// LOUDLY with NO store slot, NO live-map change, NO durable write.
+        #[tokio::test]
+        async fn commitment_mismatch_refuses_with_no_upgrade_anywhere() {
+            let (backend, bundle) = field_fixture().await;
+            let pk = valid_transport_pubkey64(7);
+            let commitment = manifest_commitment_of_bundle(&bundle).expect("commitment");
+            let peers = live_map_after_first_contact_admit(PRESENTER, pk, Some(commitment));
+            RootingDirectory::persist_transport_binding(&backend, PRESENTER, DEST, pk, Advisory, 0)
+                .await;
+            let store = PeerBundleStore::new();
+            // The evidence swap: a tampered manifest → a different commitment.
+            let frame = crate::transport::peer_bundle_frame::encode(&tampered(&bundle));
+            let out = process_peer_bundle_frame(
+                &frame,
+                PRESENTER,
+                Some(identity_hash_of64(&pk)),
+                None,
+                &peers,
+                &store,
+                &backend,
+                BundleSaveGateMode::Off,
+            )
+            .await;
+            assert!(
+                matches!(
+                    out,
+                    PeerBundleOutcome::Refused(PeerBundleRefusal::CommitmentMismatch)
+                ),
+                "expected CommitmentMismatch, got {out:?}"
+            );
+            assert!(store.is_empty(), "a mismatched package takes no store slot");
+            let entry = peers.lock().await.get(PRESENTER).cloned().unwrap();
+            assert_eq!(entry.provenance, Advisory);
+            assert!(!entry.owns_key);
+            assert_eq!(
+                RootingDirectory::stored_reticulum_binding(&backend, PRESENTER)
+                    .await
+                    .unwrap()
+                    .provenance,
+                Advisory,
+                "the durable row is untouched"
+            );
+        }
+
+        /// NEGATIVE — absent commitment = today's path untouched: a peer whose
+        /// announce carried NO commitment refuses any unsolicited package
+        /// (nothing binds it to the announce) and stays exactly as admitted.
+        #[tokio::test]
+        async fn absent_announced_commitment_keeps_todays_path_untouched() {
+            let (backend, bundle) = field_fixture().await;
+            let pk = valid_transport_pubkey64(7);
+            let peers = live_map_after_first_contact_admit(PRESENTER, pk, None);
+            let store = PeerBundleStore::new();
+            let frame = crate::transport::peer_bundle_frame::encode(&bundle);
+            let out = process_peer_bundle_frame(
+                &frame,
+                PRESENTER,
+                Some(identity_hash_of64(&pk)),
+                None,
+                &peers,
+                &store,
+                &backend,
+                BundleSaveGateMode::Off,
+            )
+            .await;
+            assert!(
+                matches!(
+                    out,
+                    PeerBundleOutcome::Refused(PeerBundleRefusal::NoAnnouncedCommitment)
+                ),
+                "expected NoAnnouncedCommitment, got {out:?}"
+            );
+            assert!(store.is_empty());
+            let entry = peers.lock().await.get(PRESENTER).cloned().unwrap();
+            assert_eq!(entry.provenance, Advisory);
+            assert!(!entry.owns_key);
+        }
+
+        /// NEGATIVE — an oversized package refuses BEFORE any hashing,
+        /// registration, or directory work; malformed / unknown-version frames
+        /// refuse the same way.
+        #[tokio::test]
+        async fn oversized_and_malformed_packages_refuse_before_any_work() {
+            let pk = valid_transport_pubkey64(7);
+            let peers = live_map_after_first_contact_admit(PRESENTER, pk, Some([0xAA; 32]));
+            let store = PeerBundleStore::new();
+            // Oversized: cap + 1 bytes of payload.
+            let big =
+                crate::transport::peer_bundle_frame::encode(&vec![b'x'; MAX_PEER_BUNDLE_BYTES + 1]);
+            let out = process_peer_bundle_frame(
+                &big,
+                PRESENTER,
+                Some(identity_hash_of64(&pk)),
+                None,
+                &peers,
+                &store,
+                &NoDirectoryRootingForBundles,
+                BundleSaveGateMode::Off,
+            )
+            .await;
+            assert!(matches!(
+                out,
+                PeerBundleOutcome::Refused(PeerBundleRefusal::Oversized { .. })
+            ));
+            // Malformed: an unknown frame version.
+            let mut v2 = crate::transport::peer_bundle_frame::encode(b"{}");
+            v2[4] = 0x7F;
+            let out = process_peer_bundle_frame(
+                &v2,
+                PRESENTER,
+                Some(identity_hash_of64(&pk)),
+                None,
+                &peers,
+                &store,
+                &NoDirectoryRootingForBundles,
+                BundleSaveGateMode::Off,
+            )
+            .await;
+            assert!(matches!(
+                out,
+                PeerBundleOutcome::Refused(PeerBundleRefusal::Malformed(_))
+            ));
+            assert!(store.is_empty());
+        }
+
+        /// NEGATIVE — the #432 identity-equality rule at bundle arrival: a
+        /// link that proved a DIFFERENT transport identity than the entry's
+        /// announce can never upgrade it, even with a fully valid package.
+        /// Trust is never laundered across identities.
+        #[tokio::test]
+        async fn link_identity_mismatch_never_launders_trust() {
+            let (backend, bundle) = field_fixture().await;
+            let pk = valid_transport_pubkey64(7);
+            let other_pk = valid_transport_pubkey64(9);
+            let commitment = manifest_commitment_of_bundle(&bundle).expect("commitment");
+            let peers = live_map_after_first_contact_admit(PRESENTER, pk, Some(commitment));
+            let store = PeerBundleStore::new();
+            let frame = crate::transport::peer_bundle_frame::encode(&bundle);
+            let out = process_peer_bundle_frame(
+                &frame,
+                PRESENTER,
+                // The link proved the OTHER identity (a squat / stale rotation).
+                Some(identity_hash_of64(&other_pk)),
+                None,
+                &peers,
+                &store,
+                &backend,
+                BundleSaveGateMode::Off,
+            )
+            .await;
+            assert!(
+                matches!(
+                    out,
+                    PeerBundleOutcome::Refused(PeerBundleRefusal::LinkBindingMismatch)
+                ),
+                "expected LinkBindingMismatch, got {out:?}"
+            );
+            let entry = peers.lock().await.get(PRESENTER).cloned().unwrap();
+            assert_eq!(entry.provenance, Advisory);
+            assert!(!entry.owns_key);
+        }
+
+        /// NEGATIVE — the presenter binding survives this seam: a RELAYED
+        /// valid bundle (another peer's package announced + served under a
+        /// different key_id) passes the commitment check but fails verify's
+        /// `PresenterKeyMismatch` — refused, no upgrade. The bundle stays
+        /// registered (shape-passed; refusals are never cached) exactly as
+        /// the #437 store contract says.
+        #[tokio::test]
+        async fn relayed_bundle_fails_the_presenter_binding_and_never_upgrades() {
+            let (backend, bundle) = field_fixture().await;
+            let pk = valid_transport_pubkey64(11);
+            let commitment = manifest_commitment_of_bundle(&bundle).expect("commitment");
+            // The PIPELINE peer wears the PRESENTER's bundle + commitment.
+            let peers = live_map_after_first_contact_admit(PIPELINE, pk, Some(commitment));
+            let store = PeerBundleStore::new();
+            let frame = crate::transport::peer_bundle_frame::encode(&bundle);
+            let out = process_peer_bundle_frame(
+                &frame,
+                PIPELINE,
+                Some(identity_hash_of64(&pk)),
+                None,
+                &peers,
+                &store,
+                &backend,
+                BundleSaveGateMode::Off,
+            )
+            .await;
+            assert!(
+                matches!(
+                    out,
+                    PeerBundleOutcome::Refused(PeerBundleRefusal::VerifyRefused(_))
+                ),
+                "expected VerifyRefused(PresenterKeyMismatch), got {out:?}"
+            );
+            let entry = peers.lock().await.get(PIPELINE).cloned().unwrap();
+            assert_eq!(
+                entry.provenance, Advisory,
+                "no upgrade for a relayed bundle"
+            );
+            assert!(
+                !store.is_verified(PIPELINE, sha256_of(&bundle)),
+                "a refusal is never cached"
+            );
+        }
+
+        /// The pure link↔entry binding rule (the #432 identity-equality
+        /// semantics), all four evidence corners.
+        #[test]
+        fn link_binding_rule_covers_all_evidence_corners() {
+            let entry_id = [1u8; 16];
+            let entry_dest = [2u8; 16];
+            // Proven identity wins/refuses regardless of dest evidence.
+            assert!(peer_bundle_link_binding_ok(
+                Some(entry_id),
+                None,
+                entry_id,
+                entry_dest
+            ));
+            assert!(!peer_bundle_link_binding_ok(
+                Some([9u8; 16]),
+                Some(entry_dest),
+                entry_id,
+                entry_dest
+            ));
+            // No proven identity: the dialed dest must match the entry's.
+            assert!(peer_bundle_link_binding_ok(
+                None,
+                Some(entry_dest),
+                entry_id,
+                entry_dest
+            ));
+            assert!(!peer_bundle_link_binding_ok(
+                None,
+                Some([9u8; 16]),
+                entry_id,
+                entry_dest
+            ));
+            // No evidence at all: refuse.
+            assert!(!peer_bundle_link_binding_ok(
+                None, None, entry_id, entry_dest
+            ));
+        }
+
+        /// A rooting double whose required methods are unreachable — the
+        /// oversized/malformed arms must refuse BEFORE any directory call.
+        struct NoDirectoryRootingForBundles;
+
+        #[async_trait::async_trait]
+        impl RootingDirectory for NoDirectoryRootingForBundles {
+            async fn root_binding(
+                &self,
+                _key_id: &str,
+                _claimed: &str,
+            ) -> crate::verify::RootingVerdict {
+                unreachable!("shape refusals precede every directory call")
+            }
+            async fn provenance_chain(
+                &self,
+                _key_id: &str,
+            ) -> Result<crate::verify::ProvenanceChain, crate::verify::RootingRejection>
+            {
+                unreachable!("shape refusals precede every directory call")
+            }
+        }
     }
 
     #[test]

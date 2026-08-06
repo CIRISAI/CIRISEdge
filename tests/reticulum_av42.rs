@@ -154,6 +154,7 @@ async fn av42_tampered_attestation_signature_fails_verify() {
         federation_pubkey_ed25519: victim_pubkey,
         epoch: 3,
         signature: genuine_sig,
+        manifest_commitment: None,
     };
     // Sanity: the genuine attestation verifies against the identity it announced with.
     genuine

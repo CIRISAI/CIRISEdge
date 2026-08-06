@@ -126,6 +126,10 @@ pub mod packet_radio;
 #[cfg(feature = "_reticulum-module")]
 pub mod attestation;
 
+/// CIRISEdge#436 — the link-borne build-attestation-bundle frame (`CBND`):
+/// the arrival transport that feeds the #437 bundle gate.
+pub mod peer_bundle_frame;
+
 /// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
 /// (`reticulum-core` + `reticulum-std`). Canonical wire per
 /// `MISSION.md` §2; HTTP is the documented fallback.

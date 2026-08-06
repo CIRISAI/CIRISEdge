@@ -511,8 +511,9 @@ impl PyEdge {
     /// "build_attestation_bundle"`, CIRISVerify#181) for the durable-save
     /// bundle gate. Registration is shape-gated fail-closed (size cap /
     /// JSON / kind); verification against the federation-directory pins
-    /// runs lazily at the next Rooted durable save. This is the server-side
-    /// hand-over seam until the CIRISEdge#436 arrival transport feeds the
+    /// runs lazily at the next Rooted durable save. The server-side
+    /// hand-over seam, alongside the CIRISEdge#436 arrival transport
+    /// (announce commitment + link-borne package) that feeds the same
     /// store directly. Raises `ValueError` on a refused registration
     /// (oversized / not JSON / wrong kind / store full / no Reticulum
     /// transport on this Edge).
@@ -4130,6 +4131,7 @@ enum LocalInstanceRole {
     transport_binding_enforcement = "advisory",
     require_local_signer = false,
     bundle_save_gate = "off",
+    own_build_bundle = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -4281,6 +4283,16 @@ pub fn init_edge_runtime(
     // (CIRISEdge#436 arrival transport, or `Edge.register_peer_build_bundle`),
     // else those peers degrade to Advisory-only durable bindings.
     bundle_save_gate: &str,
+    // CIRISEdge#436 — this node's OWN build-attestation bundle (the JSON
+    // `SignedCegObject` bytes from verify's producer, CIRISVerify#181). When
+    // set: every announce carries the 32-byte manifest commitment (attestation
+    // wire v2) and the bundle is served over every established link (`CBND`
+    // frame), so fresh peers validate the package against the commitment and
+    // root this node at FIRST CONTACT (Advisory→Rooted in one motion on their
+    // side). Validated at transport construction — a malformed bundle is a
+    // hard init error, never a silently commitment-less announce. `None` (the
+    // default) announces the pre-#436 v1 wire byte-identical.
+    own_build_bundle: Option<Vec<u8>>,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -5392,6 +5404,9 @@ pub fn init_edge_runtime(
         blackhole_rules: Some(Arc::clone(&blackhole_rules)),
         // v3.1.0 (CIRISEdge#99) — keyring-tier RNS transport identity.
         transport_identity_keystore,
+        // CIRISEdge#436 — first-contact rooting: announce the bundle's
+        // manifest commitment + serve the bundle on link-up.
+        own_build_bundle,
     };
 
     // ── Step 5: build the transport + Edge under the host runtime.
@@ -9018,6 +9033,7 @@ mod pyo3_tier2_tests {
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
+                None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -9131,6 +9147,7 @@ mod pyo3_tier2_tests {
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
+                None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -9283,6 +9300,7 @@ mod pyo3_tier2_tests {
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
+                None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
             )?;
             Ok(())
         });
@@ -9388,6 +9406,7 @@ mod pyo3_tier2_tests {
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
+                None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -9547,6 +9566,7 @@ mod pyo3_tier2_tests {
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
+                None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -9705,6 +9725,7 @@ mod pyo3_tier2_tests {
                 "advisory", // transport_binding_enforcement (CIRISEdge#205 — default posture)
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
+                None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
             )?;
             Ok(edge.signer_key_id())
         });

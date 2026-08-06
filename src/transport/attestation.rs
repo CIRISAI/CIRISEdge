@@ -257,9 +257,26 @@ pub const ANNOUNCE_APP_DATA_BUDGET: usize = leviculum_core::announce_app_data_bu
 /// so a future shape is distinguishable rather than mis-parsed.
 const ATTESTATION_WIRE_V1: u8 = 0x01;
 
+/// CIRISEdge#436 — the wire tag for a commitment-bearing attestation: the v1
+/// layout with a 32-byte [`manifest commitment`](AnnounceAttestation::manifest_commitment)
+/// appended after the signature. A DISTINCT version byte (the type's own
+/// convention: a new shape must be distinguishable, never mis-parsed): a
+/// pre-#436 parser refuses `0x02` with its typed unknown-version error — the
+/// same clean refusal it gives any non-CIRIS announce — while an
+/// absent-commitment announce still packs as `0x01`, byte-identical to today.
+const ATTESTATION_WIRE_V2: u8 = 0x02;
+
 /// Fixed overhead of the packed attestation, excluding `federation_key_id`:
 /// `version(1) ‖ key_id_len(1) ‖ federation_pubkey(32) ‖ epoch(8) ‖ signature(64)`.
 const ATTESTATION_FIXED_OVERHEAD: usize = 1 + 1 + 32 + 8 + 64;
+
+/// CIRISEdge#436 — byte length of the optional manifest commitment
+/// (`sha256(JCS(manifest_contribution))`, see
+/// [`crate::bundle_gate::manifest_commitment_of_bundle`]).
+pub const MANIFEST_COMMITMENT_LEN: usize = 32;
+
+/// CIRISEdge#436 — fixed overhead of the v2 (commitment-bearing) wire shape.
+const ATTESTATION_V2_FIXED_OVERHEAD: usize = ATTESTATION_FIXED_OVERHEAD + MANIFEST_COMMITMENT_LEN;
 
 /// CIRISEdge#333 — the longest `federation_key_id` that can appear in an
 /// announce. Derived, not chosen: it is whatever [`ANNOUNCE_APP_DATA_BUDGET`]
@@ -268,6 +285,13 @@ const ATTESTATION_FIXED_OVERHEAD: usize = 1 + 1 + 32 + 8 + 64;
 /// compose time instead. Real key_ids are ~20–45 B; this is a wide margin.
 pub const MAX_FEDERATION_KEY_ID_LEN: usize = ANNOUNCE_APP_DATA_BUDGET - ATTESTATION_FIXED_OVERHEAD;
 
+/// CIRISEdge#436 — the longest `federation_key_id` a COMMITMENT-BEARING
+/// announce can carry: the commitment's 32 bytes come out of the same hard
+/// app_data budget, so the bound shrinks by exactly
+/// [`MANIFEST_COMMITMENT_LEN`]. Still a wide margin over real ~20–45 B key_ids.
+pub const MAX_FEDERATION_KEY_ID_LEN_WITH_COMMITMENT: usize =
+    ANNOUNCE_APP_DATA_BUDGET - ATTESTATION_V2_FIXED_OVERHEAD;
+
 // The load-bearing invariant, checked AT COMPILE TIME: the worst admissible
 // attestation fits the announce budget. Add a field to the wire shape without
 // shrinking the key_id bound and THIS fails the build — which is the whole point
@@ -275,6 +299,14 @@ pub const MAX_FEDERATION_KEY_ID_LEN: usize = ANNOUNCE_APP_DATA_BUDGET - ATTESTAT
 const _: () = assert!(
     ATTESTATION_FIXED_OVERHEAD + MAX_FEDERATION_KEY_ID_LEN <= ANNOUNCE_APP_DATA_BUDGET,
     "the worst-case announce attestation must fit ANNOUNCE_APP_DATA_BUDGET"
+);
+
+// CIRISEdge#436 — the same compile-time gate for the commitment-bearing shape:
+// the worst admissible v2 attestation fits the budget too.
+const _: () = assert!(
+    ATTESTATION_V2_FIXED_OVERHEAD + MAX_FEDERATION_KEY_ID_LEN_WITH_COMMITMENT
+        <= ANNOUNCE_APP_DATA_BUDGET,
+    "the worst-case commitment-bearing announce attestation must fit ANNOUNCE_APP_DATA_BUDGET"
 );
 
 /// A federation-key-signed transport-identity binding, carried in the Reticulum
@@ -286,6 +318,21 @@ const _: () = assert!(
 /// u8(version=1) ‖ u8(len key_id) ‖ key_id ‖ federation_pubkey_ed25519(32)
 ///               ‖ u64_be(epoch) ‖ signature(64)
 /// ```
+///
+/// CIRISEdge#436 — when [`Self::manifest_commitment`] is `Some`, the version
+/// byte is `2` and the 32-byte commitment is appended after the signature:
+///
+/// ```text
+/// u8(version=2) ‖ … v1 fields … ‖ manifest_commitment(32)
+/// ```
+///
+/// Absent-commitment announces stay **byte-identical** to the pre-#436 wire
+/// (version `1`), both directions: an old peer parses them unchanged, and this
+/// parser accepts old announces unchanged. A commitment-bearing announce is a
+/// NEW shape by design — an old peer refuses it with its typed
+/// unknown-version parse error (the same clean refusal any non-CIRIS announce
+/// gets), which is why announcing a commitment is strictly opt-in (only a node
+/// with its own build bundle configured emits one).
 ///
 /// Two deliberate choices, both forced by [`ANNOUNCE_APP_DATA_BUDGET`]:
 ///
@@ -320,6 +367,25 @@ pub struct AnnounceAttestation {
     /// [`AttestationPayload::canonical_bytes`] (which covers the transport
     /// identity read from the announce's own `public_key`).
     pub signature: [u8; 64],
+    /// CIRISEdge#436 — OPTIONAL 32-byte **manifest commitment**:
+    /// `sha256(JCS(manifest_contribution))` of the announcer's own
+    /// build-attestation bundle
+    /// ([`crate::bundle_gate::manifest_commitment_of_bundle`] — the same
+    /// canonical preimage the bundle's producer signs internally). The
+    /// commitment BINDS the announce to the link-borne package: a received
+    /// bundle upgrades this peer Advisory→Rooted only if its manifest hashes
+    /// to exactly this value AND the full CIRISVerify#181 chain verifies.
+    ///
+    /// Deliberately NOT covered by the attestation's federation-key
+    /// signature: third-party integrity already rides the RNS announce
+    /// signature (leviculum validates the announce's own signature over its
+    /// `app_data` before surfacing it), the announcer IS the presenter (a
+    /// self-signed field adds nothing against it), and keeping the signed
+    /// payload unchanged means no third signature domain — a v2 announce
+    /// verifies with the exact same canonical bytes as v1. Trust NEVER flows
+    /// from this field alone: a stripped/altered commitment can only make the
+    /// package refuse (fail-closed), never widen anything.
+    pub manifest_commitment: Option<[u8; MANIFEST_COMMITMENT_LEN]>,
 }
 
 /// Errors decoding / verifying an [`AnnounceAttestation`].
@@ -354,21 +420,39 @@ impl AnnounceAttestation {
     /// the node invisible to the mesh.
     pub fn to_app_data(&self) -> Result<Vec<u8>, AttestationError> {
         let key_id = self.federation_key_id.as_bytes();
-        if key_id.len() > MAX_FEDERATION_KEY_ID_LEN {
+        // CIRISEdge#436 — the commitment's 32 bytes come out of the same hard
+        // budget, so a commitment-bearing attestation gets the tighter key_id
+        // bound. Absent commitment ⇒ the pre-#436 bound and wire, byte-identical.
+        let (fixed_overhead, max_key_id) = if self.manifest_commitment.is_some() {
+            (
+                ATTESTATION_V2_FIXED_OVERHEAD,
+                MAX_FEDERATION_KEY_ID_LEN_WITH_COMMITMENT,
+            )
+        } else {
+            (ATTESTATION_FIXED_OVERHEAD, MAX_FEDERATION_KEY_ID_LEN)
+        };
+        if key_id.len() > max_key_id {
             return Err(AttestationError::TooLarge {
-                actual: ATTESTATION_FIXED_OVERHEAD + key_id.len(),
+                actual: fixed_overhead + key_id.len(),
                 budget: ANNOUNCE_APP_DATA_BUDGET,
             });
         }
         let key_id_len = u8::try_from(key_id.len())
             .map_err(|_| AttestationError::Parse("federation_key_id too long".to_string()))?;
-        let mut out = Vec::with_capacity(1 + 1 + key_id.len() + 32 + 8 + 64);
-        out.push(ATTESTATION_WIRE_V1);
+        let mut out = Vec::with_capacity(fixed_overhead + key_id.len());
+        out.push(if self.manifest_commitment.is_some() {
+            ATTESTATION_WIRE_V2
+        } else {
+            ATTESTATION_WIRE_V1
+        });
         out.push(key_id_len);
         out.extend_from_slice(key_id);
         out.extend_from_slice(&self.federation_pubkey_ed25519);
         out.extend_from_slice(&self.epoch.to_be_bytes());
         out.extend_from_slice(&self.signature);
+        if let Some(commitment) = &self.manifest_commitment {
+            out.extend_from_slice(commitment);
+        }
 
         if out.len() > ANNOUNCE_APP_DATA_BUDGET {
             return Err(AttestationError::TooLarge {
@@ -390,14 +474,28 @@ impl AnnounceAttestation {
         if app_data.len() < 2 {
             return Err(bad("attestation too short"));
         }
-        if app_data[0] != ATTESTATION_WIRE_V1 {
-            return Err(AttestationError::Parse(format!(
-                "unknown attestation wire version {:#04x}",
-                app_data[0]
-            )));
-        }
+        // CIRISEdge#436 — v1 (no commitment, the pre-#436 wire, accepted
+        // unchanged) or v2 (v1 + a trailing 32-byte manifest commitment).
+        let commitment_present = match app_data[0] {
+            ATTESTATION_WIRE_V1 => false,
+            ATTESTATION_WIRE_V2 => true,
+            other => {
+                return Err(AttestationError::Parse(format!(
+                    "unknown attestation wire version {other:#04x}"
+                )));
+            }
+        };
         let key_id_len = app_data[1] as usize;
-        let want = 2 + key_id_len + 32 + 8 + 64;
+        let want = 2
+            + key_id_len
+            + 32
+            + 8
+            + 64
+            + if commitment_present {
+                MANIFEST_COMMITMENT_LEN
+            } else {
+                0
+            };
         if app_data.len() != want {
             return Err(AttestationError::Parse(format!(
                 "attestation length {} != expected {want}",
@@ -422,11 +520,22 @@ impl AnnounceAttestation {
         let signature: [u8; 64] = app_data[off..off + 64]
             .try_into()
             .map_err(|_| bad("signature"))?;
+        off += 64;
+        let manifest_commitment = if commitment_present {
+            Some(
+                app_data[off..off + MANIFEST_COMMITMENT_LEN]
+                    .try_into()
+                    .map_err(|_| bad("manifest commitment"))?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             federation_key_id,
             federation_pubkey_ed25519,
             epoch,
             signature,
+            manifest_commitment,
         })
     }
 
@@ -494,9 +603,32 @@ mod tests {
             federation_pubkey_ed25519: [0; 32],
             epoch: u64::MAX,
             signature: [0; 64],
+            manifest_commitment: None,
         };
         let packed = att.to_app_data().expect("worst case must fit");
         assert_eq!(packed.len(), ANNOUNCE_APP_DATA_BUDGET);
+    }
+
+    /// CIRISEdge#436 — the SAME static gate for the commitment-bearing shape:
+    /// the maximum admissible v2 attestation (max key_id + 32 B commitment)
+    /// packs exactly at the announce budget — headroom proven against the real
+    /// packer, not assumed from the v1 case.
+    #[test]
+    fn worst_case_commitment_bearing_attestation_fits_the_announce_budget() {
+        let att = AnnounceAttestation {
+            federation_key_id: "k".repeat(MAX_FEDERATION_KEY_ID_LEN_WITH_COMMITMENT),
+            federation_pubkey_ed25519: [0; 32],
+            epoch: u64::MAX,
+            signature: [0; 64],
+            manifest_commitment: Some([0xC0; 32]),
+        };
+        let packed = att.to_app_data().expect("worst v2 case must fit");
+        assert_eq!(packed.len(), ANNOUNCE_APP_DATA_BUDGET);
+        // The bound is exactly 32 B tighter than v1 — the commitment's cost.
+        assert_eq!(
+            MAX_FEDERATION_KEY_ID_LEN_WITH_COMMITMENT,
+            MAX_FEDERATION_KEY_ID_LEN - MANIFEST_COMMITMENT_LEN
+        );
     }
 
     /// A realistic attestation is far inside budget (the old JSON shape was
@@ -509,6 +641,7 @@ mod tests {
             federation_pubkey_ed25519: [0x11; 32],
             epoch: 7,
             signature: [0x22; 64],
+            manifest_commitment: None,
         };
         let packed = att.to_app_data().expect("must fit");
         assert!(
@@ -518,6 +651,21 @@ mod tests {
         );
         // Real headroom, not a squeaker.
         assert!(packed.len() < 200, "expected ~150 B, got {}", packed.len());
+
+        // CIRISEdge#436 — the same realistic attestation WITH a commitment:
+        // +32 B, still deep inside the 300 B budget (headroom proof).
+        let with_commitment = AnnounceAttestation {
+            manifest_commitment: Some([0xAB; 32]),
+            ..att
+        };
+        let packed_v2 = with_commitment.to_app_data().expect("v2 must fit");
+        assert_eq!(packed_v2.len(), packed.len() + MANIFEST_COMMITMENT_LEN);
+        assert!(
+            packed_v2.len() < 232,
+            "expected ~181 B, got {}",
+            packed_v2.len()
+        );
+        assert!(packed_v2.len() <= ANNOUNCE_APP_DATA_BUDGET);
     }
 
     /// An over-budget attestation is refused at COMPOSE time — loudly — rather
@@ -531,10 +679,93 @@ mod tests {
             federation_pubkey_ed25519: [0; 32],
             epoch: 0,
             signature: [0; 64],
+            manifest_commitment: None,
         };
         assert!(matches!(
             att.to_app_data(),
             Err(AttestationError::TooLarge { .. })
+        ));
+
+        // CIRISEdge#436 — the v2 bound is enforced too: a key_id that fits v1
+        // but is one byte past the COMMITMENT-bearing bound refuses at compose
+        // time the moment a commitment is attached (never a silent
+        // over-budget announce that fails to transmit).
+        let v2_over = AnnounceAttestation {
+            federation_key_id: "k".repeat(MAX_FEDERATION_KEY_ID_LEN_WITH_COMMITMENT + 1),
+            federation_pubkey_ed25519: [0; 32],
+            epoch: 0,
+            signature: [0; 64],
+            manifest_commitment: Some([0; 32]),
+        };
+        assert!(matches!(
+            v2_over.to_app_data(),
+            Err(AttestationError::TooLarge { .. })
+        ));
+        // Sanity: the SAME key_id without the commitment still fits (the
+        // refusal above is the commitment's 32 B, nothing else).
+        let v1_same = AnnounceAttestation {
+            manifest_commitment: None,
+            ..v2_over
+        };
+        assert!(v1_same.to_app_data().is_ok());
+    }
+
+    /// CIRISEdge#436 wire-compat, BOTH directions.
+    ///
+    /// Direction 1 (old parses new): an ABSENT commitment packs byte-identical
+    /// to the pre-#436 v1 wire — asserted against a hand-built v1 layout (the
+    /// old encoder's spec), so a pre-#436 peer parses a new node's default
+    /// announce unchanged.
+    ///
+    /// Direction 2 (new parses old): a hand-built v1 blob (what an old peer
+    /// emits) parses to `manifest_commitment: None` — today's shape untouched.
+    ///
+    /// And the v2 shape round-trips with its commitment intact.
+    #[test]
+    fn wire_compat_absent_commitment_is_byte_identical_and_v2_round_trips() {
+        let key_id = "edge-key-compat";
+        let att = AnnounceAttestation {
+            federation_key_id: key_id.to_string(),
+            federation_pubkey_ed25519: [0x33; 32],
+            epoch: 9,
+            signature: [0x44; 64],
+            manifest_commitment: None,
+        };
+
+        // The pre-#436 v1 layout, built by hand:
+        // version(1)=0x01 ‖ len ‖ key_id ‖ pubkey(32) ‖ epoch(8) ‖ sig(64).
+        let mut expected = vec![0x01u8, u8::try_from(key_id.len()).unwrap()];
+        expected.extend_from_slice(key_id.as_bytes());
+        expected.extend_from_slice(&[0x33; 32]);
+        expected.extend_from_slice(&9u64.to_be_bytes());
+        expected.extend_from_slice(&[0x44; 64]);
+
+        // Direction 1: byte-identical to the old wire.
+        assert_eq!(att.to_app_data().unwrap(), expected);
+
+        // Direction 2: the old wire parses to the None-commitment shape.
+        let parsed = AnnounceAttestation::from_app_data(&expected).unwrap();
+        assert_eq!(parsed, att);
+        assert_eq!(parsed.manifest_commitment, None);
+
+        // v2 round-trip: commitment survives, version byte is 0x02, and the
+        // body is the v1 bytes + the trailing 32.
+        let commitment = [0x5A; 32];
+        let v2 = AnnounceAttestation {
+            manifest_commitment: Some(commitment),
+            ..att.clone()
+        };
+        let packed = v2.to_app_data().unwrap();
+        assert_eq!(packed[0], 0x02);
+        assert_eq!(&packed[1..packed.len() - 32], &expected[1..]);
+        assert_eq!(&packed[packed.len() - 32..], &commitment);
+        assert_eq!(AnnounceAttestation::from_app_data(&packed).unwrap(), v2);
+
+        // A TRUNCATED v2 (commitment declared by the version byte but bytes
+        // missing) refuses with a typed length error — never mis-parses as v1.
+        assert!(matches!(
+            AnnounceAttestation::from_app_data(&packed[..packed.len() - 1]),
+            Err(AttestationError::Parse(_))
         ));
     }
 
@@ -565,6 +796,7 @@ mod tests {
             federation_pubkey_ed25519: fed_pubkey,
             epoch: 7,
             signature: sig,
+            manifest_commitment: None,
         };
 
         // Binary round-trip.
@@ -573,6 +805,20 @@ mod tests {
 
         // Verifies against the identity the packet carried.
         parsed.verify_signature(&fed_pubkey, &announce_pk).unwrap();
+
+        // CIRISEdge#436 — the manifest commitment is NOT in the signed
+        // payload (no third signature domain): the SAME signature verifies
+        // with a commitment attached. Integrity of the commitment rides the
+        // RNS announce signature; trust never flows from the field alone.
+        let with_commitment = AnnounceAttestation {
+            manifest_commitment: Some([0x77; 32]),
+            ..parsed.clone()
+        };
+        let v2_parsed =
+            AnnounceAttestation::from_app_data(&with_commitment.to_app_data().unwrap()).unwrap();
+        v2_parsed
+            .verify_signature(&fed_pubkey, &announce_pk)
+            .unwrap();
 
         // AV-42: a spoofer replays this attestation on ITS OWN destination — the
         // announce's public_key differs, so the bound signature fails.
