@@ -7998,7 +7998,6 @@ mod inbound_ingest_tests {
         use crate::replication::summary::{ApplyOutcome, StateApplier, StateProvider};
         use crate::transport::{Transport, TransportError, TransportSendOutcome};
         use std::sync::Arc;
-        use tokio::sync::Mutex;
 
         struct NoopTransport;
         #[async_trait::async_trait]
@@ -8032,7 +8031,7 @@ mod inbound_ingest_tests {
         struct NoApplier;
         impl StateApplier for NoApplier {
             fn apply_envelope(
-                &mut self,
+                &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
                 _source_peer: Option<&str>,
@@ -8048,7 +8047,7 @@ mod inbound_ingest_tests {
             EnvelopeKind::Key,
             SessionRole::Responder,
             Arc::new(NoProvider) as Arc<dyn StateProvider>,
-            Arc::new(Mutex::new(NoApplier)) as Arc<Mutex<dyn StateApplier>>,
+            Arc::new(NoApplier) as Arc<dyn StateApplier>,
         ));
         // Fill the bounded inbound channel to capacity with NOTHING draining it —
         // exactly a responder parked on a stalled reply (the #353 root of #373).

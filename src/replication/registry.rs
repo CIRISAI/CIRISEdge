@@ -287,7 +287,6 @@ mod tests {
         InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
     };
     use async_trait::async_trait;
-    use tokio::sync::Mutex;
 
     // ── Test transport (no-op) ──────────────────────────────────────
 
@@ -320,8 +319,8 @@ mod tests {
             Arc::clone(&mock) as _;
         let provider: Arc<dyn StateProvider> =
             Arc::new(DirectoryStateAdapter::new(Arc::clone(&dir)));
-        let applier: Arc<Mutex<dyn StateApplier>> =
-            Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(dir)));
+        // CIRISEdge#370 — no mutex: the applier is shared `&self`.
+        let applier: Arc<dyn StateApplier> = Arc::new(MutableDirectoryStateAdapter::new(dir));
         Arc::new(ReplicationCoordinator::new(
             Arc::new(NoopTransport),
             peer,

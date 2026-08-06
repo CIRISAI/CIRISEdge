@@ -542,7 +542,6 @@ mod tests {
     };
     use async_trait::async_trait;
     use std::collections::HashMap;
-    use tokio::sync::Mutex;
 
     fn h(seed: u8) -> [u8; 32] {
         let mut a = [0u8; 32];
@@ -597,13 +596,27 @@ mod tests {
         }
     }
 
+    /// CIRISEdge#370 — `apply_envelope` is `&self`; the recorded set lives
+    /// behind `std::sync::Mutex` interior mutability. Recording semantics
+    /// (admit-once, duplicate detection) are unchanged.
     struct RecordingApplier {
         known: HashMap<Vec<u8>, [u8; 32]>,
-        local_hashes: std::collections::HashSet<[u8; 32]>,
+        local_hashes: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    }
+    impl RecordingApplier {
+        fn with(
+            known: HashMap<Vec<u8>, [u8; 32]>,
+            local_hashes: std::collections::HashSet<[u8; 32]>,
+        ) -> Arc<dyn StateApplier> {
+            Arc::new(Self {
+                known,
+                local_hashes: std::sync::Mutex::new(local_hashes),
+            })
+        }
     }
     impl StateApplier for RecordingApplier {
         fn apply_envelope(
-            &mut self,
+            &self,
             _kind: EnvelopeKind,
             bytes: &[u8],
             _source_peer: Option<&str>,
@@ -611,10 +624,11 @@ mod tests {
             let Some(hash) = self.known.get(bytes).copied() else {
                 return ApplyOutcome::refused("unknown bytes (test)");
             };
-            if self.local_hashes.contains(&hash) {
+            let mut local_hashes = self.local_hashes.lock().unwrap();
+            if local_hashes.contains(&hash) {
                 return ApplyOutcome::Duplicate;
             }
-            self.local_hashes.insert(hash);
+            local_hashes.insert(hash);
             ApplyOutcome::Admitted
         }
     }
@@ -644,10 +658,7 @@ mod tests {
             state: LocalState::new(),
             envelopes: HashMap::new(),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            known: HashMap::new(),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
         let coord = Arc::new(ReplicationCoordinator::new(
             transport,
             "bob",
@@ -701,14 +712,14 @@ mod tests {
             state: b_state,
             envelopes: HashMap::from([(h(3), b"env_3".to_vec()), (h(4), b"env_4".to_vec())]),
         });
-        let alice_applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            known: HashMap::from([(b"env_3".to_vec(), h(3)), (b"env_4".to_vec(), h(4))]),
-            local_hashes: [h(1), h(2)].into_iter().collect(),
-        }));
-        let bob_applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            known: HashMap::from([(b"env_1".to_vec(), h(1)), (b"env_2".to_vec(), h(2))]),
-            local_hashes: [h(3), h(4)].into_iter().collect(),
-        }));
+        let alice_applier = RecordingApplier::with(
+            HashMap::from([(b"env_3".to_vec(), h(3)), (b"env_4".to_vec(), h(4))]),
+            [h(1), h(2)].into_iter().collect(),
+        );
+        let bob_applier = RecordingApplier::with(
+            HashMap::from([(b"env_1".to_vec(), h(1)), (b"env_2".to_vec(), h(2))]),
+            [h(3), h(4)].into_iter().collect(),
+        );
 
         let alice_coord = Arc::new(ReplicationCoordinator::new(
             alice_transport,
@@ -815,10 +826,7 @@ mod tests {
             state: LocalState::new(),
             envelopes: HashMap::new(),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            known: HashMap::new(),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
         let alice_coord = Arc::new(ReplicationCoordinator::new(
             alice_transport,
             "bob",
@@ -904,10 +912,7 @@ mod tests {
             },
             envelopes: HashMap::new(),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            known: HashMap::new(),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
         let coord = Arc::new(ReplicationCoordinator::new(
             transport,
             "ghost-peer",

@@ -164,6 +164,21 @@ impl ApplyOutcome {
 /// committing to local state. The merge layer in persist is the
 /// canonical anti-rollback authority; a duplicate apply hits its R1/Q1
 /// dedupe and returns a `Refused` no-op.
+///
+/// CIRISEdge#370 — `apply_envelope` takes **`&self`** (the third breaking
+/// `StateApplier` change; precedent: #425 `ApplyOutcome`, #426 `source_peer`).
+/// The old `&mut self` was an adapter-shape artifact, not a safety
+/// requirement: the production adapter is a stateless wrapper over
+/// `Arc<dyn ReplicationDirectory>` and the real apply underneath
+/// (`apply_envelope_bytes`) is `&self` with backend-owned concurrency. The
+/// `&mut` forced every coordinator to wrap its applier in an
+/// `Arc<Mutex<dyn StateApplier>>` held across a WHOLE message's applies —
+/// with `block_on` DB I/O inside — so under N concurrent peers, round
+/// servicing serialized (≈ N × batch-apply-time, the sharp collapse past
+/// ~40 peers against the 30 s transport timeout). Coordinators now hold a
+/// shared `Arc<dyn StateApplier>` directly, no mutex; per-peer rounds apply
+/// concurrently down to the store's own serialization. Implementations that
+/// record state (test appliers) use interior mutability.
 pub trait StateApplier: Send + Sync {
     /// Apply one envelope to local state. The receiver MUST verify the signed
     /// envelope's signature + canonical-bytes hash before admitting. Returns an
@@ -179,7 +194,7 @@ pub trait StateApplier: Send + Sync {
     /// non-peer-attributed applies (tests / self-seed). The receiver is transport-
     /// blind otherwise; this is pass-through metadata, not a protocol input.
     fn apply_envelope(
-        &mut self,
+        &self,
         kind: EnvelopeKind,
         envelope_bytes: &[u8],
         source_peer: Option<&str>,

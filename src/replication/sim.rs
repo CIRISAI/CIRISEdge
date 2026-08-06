@@ -163,25 +163,29 @@ impl StateProvider for SimStore {
 }
 /// Applier that records admitted envelopes into a shared store (so the same
 /// bytes-map serves fetch on the next round — the node now HOLDS what it got).
+/// CIRISEdge#370 — `apply_envelope` is `&self`, so the `&mut SimStore` borrow
+/// rides behind `std::sync::Mutex` interior mutability; the recording
+/// semantics (admit-once into the store, duplicate detection) are unchanged.
 struct SimApplier<'a> {
-    store: &'a mut SimStore,
+    store: std::sync::Mutex<&'a mut SimStore>,
     /// Maps applied bytes back to their hash (production verifies + rehashes).
-    applied: Vec<[u8; 32]>,
+    applied: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 impl StateApplier for SimApplier<'_> {
     fn apply_envelope(
-        &mut self,
+        &self,
         kind: EnvelopeKind,
         bytes: &[u8],
         _source_peer: Option<&str>,
     ) -> ApplyOutcome {
         let hash: [u8; 32] = Sha256::digest(bytes).into();
-        if self.store.holds(kind, &hash) {
+        let mut store = self.store.lock().unwrap();
+        if store.holds(kind, &hash) {
             return ApplyOutcome::Duplicate;
         }
-        let seq = self.store.state.by_kind.get(&kind).map_or(0, BTreeMap::len) as u64 + 1;
-        self.store.insert(kind, bytes.to_vec(), seq);
-        self.applied.push(hash);
+        let seq = store.state.by_kind.get(&kind).map_or(0, BTreeMap::len) as u64 + 1;
+        store.insert(kind, bytes.to_vec(), seq);
+        self.applied.lock().unwrap().push(hash);
         ApplyOutcome::Admitted
     }
 }
@@ -464,12 +468,12 @@ impl Scenario {
         };
         let outcome = {
             let node = &mut nodes[to];
-            let mut applier = SimApplier {
-                store: &mut node.store,
-                applied: Vec::new(),
+            let applier = SimApplier {
+                store: std::sync::Mutex::new(&mut node.store),
+                applied: std::sync::Mutex::new(Vec::new()),
             };
             node.session
-                .on_message(msg, &provider_snapshot, &mut applier, None)
+                .on_message(msg, &provider_snapshot, &applier, None)
         };
         self.emit(1 - to, outcome, wire, metrics, &mut nodes[to].retx, rng);
     }
