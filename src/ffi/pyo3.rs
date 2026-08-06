@@ -6289,6 +6289,24 @@ fn federation_session_initiate(
 
 /// Hybrid X25519 + ML-KEM-768 KEX — responder side. Recomputes the same
 /// 32-byte session key the initiator derived.
+///
+/// # ⚠️ Deprecated for NODE / OCCURRENCE identities (CIRISEdge#307)
+///
+/// This takes the private KEX halves (`own_x25519_priv`,
+/// `own_mlkem768_priv`) **raw across the Python boundary** — the exact
+/// export a sealed-host node identity must never make. CIRISVerify shipped
+/// the custody-held respond (`SelfEncKeys::kex_respond`, occurrence-KEX arc
+/// 1/4, live in the pinned verify) precisely so the private halves never
+/// leave custody. A node/occurrence identity opening sealed content
+/// (trace-flow, mesh-visible occurrence enc keys) MUST respond through
+/// **`ciris_verify_self_enc_respond`** (the verify-ffi custody path the agent
+/// already loads) — on a TPM/StrongBox-sealed host the raw privs do not
+/// exist to pass here.
+///
+/// This function is **retained, not removed** — it stays legitimate for
+/// callers that genuinely hold ephemeral or portable raw keys (realtime-A/V
+/// MLS sessions, portable-mint tooling, tests). The deprecation is a routing
+/// rule for WHICH identity class, not a removal.
 #[pyfunction]
 #[pyo3(signature = (own_x25519_priv, own_mlkem768_priv, own_mlkem768_pub, handshake_msg_json))]
 fn federation_session_respond(
