@@ -216,8 +216,10 @@ fn explicit_hash_destination_refuses_to_announce() {
     .expect("with_explicit_hash construction succeeds");
     let mut rng = OsRng;
     let now_ms: u64 = 1_700_000_000_000;
+    // leviculum v0.14 — `announce` gained `emission_secs` (the rate-limit
+    // emission clock); the explicit-hash refusal fires before it is read.
     let err = dest
-        .announce(None, &mut rng, now_ms)
+        .announce(None, &mut rng, now_ms, now_ms / 1000)
         .expect_err("explicit-hash destination must refuse announce");
     assert!(
         matches!(err, AnnounceError::ExplicitHashCannotAnnounce),
