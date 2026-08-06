@@ -135,6 +135,14 @@ pub struct ReplicationScheduler {
     config: SchedulerConfig,
     coordinators: Vec<Arc<ReplicationCoordinator>>,
     command_rx: Option<mpsc::Receiver<SchedulerCommand>>,
+    /// CIRISEdge#440 — the resolved mesh-config read seam. When `Some`, each
+    /// coordinator loop re-checks `antientropy.round_secs` ONCE per round
+    /// (after the round, before the next tick is scheduled): a live relief
+    /// replaces the interval so the NEW cadence governs the next round; the
+    /// relief's expiry restores the configured cadence the same way. `None`
+    /// (every pre-#440 construction) leaves the interval object untouched —
+    /// byte-identical behavior.
+    mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
 }
 
 /// Runtime control command for an actively-running scheduler.
@@ -227,7 +235,19 @@ impl ReplicationScheduler {
             config,
             coordinators: Vec::new(),
             command_rx: None,
+            mesh_config: None,
         }
+    }
+
+    /// CIRISEdge#440 — install the resolved mesh-config reader (builder); see
+    /// the field doc. `None` keeps the exact fixed-cadence behavior.
+    #[must_use]
+    pub fn with_mesh_config(
+        mut self,
+        reader: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
+    ) -> Self {
+        self.mesh_config = reader;
+        self
     }
 
     /// Install the runtime control channel (CIRISEdge#173). Returns
@@ -305,6 +325,7 @@ impl ReplicationScheduler {
         let mut per_coord: HashMap<(String, EnvelopeKind), watch::Sender<bool>> = HashMap::new();
         let mut handles = Vec::with_capacity(self.coordinators.len());
 
+        let mesh_config = self.mesh_config.take();
         for coord in self.coordinators.drain(..) {
             spawn_coord(
                 &mut per_coord,
@@ -313,6 +334,7 @@ impl ReplicationScheduler {
                 self.config.cadence,
                 self.config.round_timeout,
                 event_sink.clone(),
+                mesh_config.clone(),
             );
         }
 
@@ -352,6 +374,7 @@ impl ReplicationScheduler {
                                 self.config.cadence,
                                 self.config.round_timeout,
                                 event_sink.clone(),
+                                mesh_config.clone(),
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
@@ -393,6 +416,7 @@ fn spawn_coord(
     cadence: Duration,
     round_timeout: Duration,
     event_sink: Option<mpsc::Sender<(String, RoundEvent)>>,
+    mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
 ) {
     debug_assert_eq!(
         coord.role(),
@@ -403,8 +427,15 @@ fn spawn_coord(
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     per_coord.insert(key, cancel_tx);
     let h = tokio::spawn(async move {
-        run_one_coordinator_forever(coord, cadence, round_timeout, &mut cancel_rx, event_sink)
-            .await;
+        run_one_coordinator_forever(
+            coord,
+            cadence,
+            round_timeout,
+            &mut cancel_rx,
+            event_sink,
+            mesh_config,
+        )
+        .await;
     });
     handles.push(h);
 }
@@ -415,6 +446,7 @@ async fn run_one_coordinator_forever(
     round_timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
     event_sink: Option<tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
+    mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
 ) {
     let mut interval = tokio::time::interval(cadence);
     // `Burst` is the default; with `MissedTickBehavior::Skip` a
@@ -422,6 +454,11 @@ async fn run_one_coordinator_forever(
     // Skip — a stuck round eating cadence ticks shouldn't compound
     // into a burst of rounds the moment it unblocks.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // CIRISEdge#440 — the cadence currently governing `interval`. Compared
+    // against the resolved relief after every round; only an actual CHANGE
+    // rebuilds the interval, so a reader answering "no relief" forever never
+    // perturbs the pre-#440 tick stream.
+    let mut current_cadence = cadence;
 
     let peer_id = coord.peer_key_id().to_string();
     let kind_str = format!("{:?}", coord.kind());
@@ -472,6 +509,35 @@ async fn run_one_coordinator_forever(
                     // Sink-closed isn't a fault — the metrics consumer
                     // dropped their receiver. Round loops continue.
                     let _ = sink.send((peer_id.clone(), event)).await;
+                }
+                // CIRISEdge#440 — `antientropy.round_secs` relief, applied at
+                // the round boundary: resolve once per round (a cache hit
+                // within the reader's TTL), and rebuild the interval only on a
+                // CHANGE. `interval_at(now + target, target)` schedules the
+                // next round one full NEW cadence out — "a changed value takes
+                // effect next round" — and the same comparison walks the
+                // cadence back to the configured value when the relief's TTL
+                // expires. Relief can only LENGTHEN the cadence
+                // (relieve-never-expand, enforced in persist's fold), so this
+                // can never speed rounds up past what the operator configured.
+                if let Some(reader) = &mesh_config {
+                    let target = reader.relief().await.round_cadence.unwrap_or(cadence);
+                    if target != current_cadence {
+                        tracing::info!(
+                            peer = %peer_id,
+                            kind = %kind_str,
+                            from_secs = current_cadence.as_secs_f64(),
+                            to_secs = target.as_secs_f64(),
+                            "anti-entropy cadence changed by mesh-config relief \
+                             (antientropy.round_secs; CIRISEdge#440)"
+                        );
+                        current_cadence = target;
+                        interval = tokio::time::interval_at(
+                            tokio::time::Instant::now() + target,
+                            target,
+                        );
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
                 }
             }
         }
@@ -972,5 +1038,111 @@ mod tests {
             .await
             .expect("shutdown")
             .expect("join");
+    }
+
+    /// CIRISEdge#440 — build one black-holed Initiator (peer never replies, so
+    /// every round is a fast `TimedOut` event) and run it under `config` with
+    /// an optional mesh-config reader; return how many round events landed in
+    /// `window`.
+    async fn count_rounds_in_window(
+        config: SchedulerConfig,
+        mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
+        window: Duration,
+    ) -> usize {
+        let (alice_to_bob_tx, mut alice_to_bob_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transport = Arc::new(InMemTransport {
+            peer_inbox: HashMap::from([("bob".to_string(), alice_to_bob_tx)]),
+        });
+        tokio::spawn(async move { while alice_to_bob_rx.recv().await.is_some() {} });
+        let provider = Arc::new(StaticProvider {
+            state: LocalState::new(),
+            envelopes: HashMap::new(),
+        });
+        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
+            known: HashMap::new(),
+            local_hashes: std::collections::HashSet::new(),
+        }));
+        let coord = Arc::new(ReplicationCoordinator::new(
+            transport,
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        ));
+        let mut sched = ReplicationScheduler::new(config).with_mesh_config(mesh_config);
+        sched.add_initiator(coord);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let sched_handle =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+        let start = tokio::time::Instant::now();
+        let mut rounds = 0usize;
+        while start.elapsed() < window {
+            if tokio::time::timeout(Duration::from_millis(50), event_rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                rounds += 1;
+            }
+        }
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sched_handle)
+            .await
+            .expect("shutdown")
+            .expect("join");
+        rounds
+    }
+
+    /// CIRISEdge#440 — `antientropy.round_secs` relief takes effect at the NEXT
+    /// round boundary: with a live relief of 3600 s over a 20 ms configured
+    /// cadence, exactly ONE round fires in the observation window (the first
+    /// round runs, then the interval is rebuilt to the relieved cadence); the
+    /// control (a reader answering NO relief — the absence contract) keeps the
+    /// configured cadence and fires many.
+    ///
+    /// The reader here is `fixed_for_test` — the consumer-wiring half. The
+    /// reader→fold→admission half (that a REAL admitted `round_secs` row
+    /// produces exactly this `round_cadence: Some(...)` snapshot) is the
+    /// field-provenance suite in `replication::mesh_config`.
+    #[tokio::test]
+    async fn cadence_relief_takes_effect_next_round_and_absence_keeps_cadence() {
+        use crate::replication::mesh_config::{MeshConfigReader, MeshConfigRelief};
+        use ciris_persist::federation::FederationDirectory;
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::MemoryBackend::new());
+
+        let config = SchedulerConfig {
+            cadence: Duration::from_millis(20),
+            round_timeout: Duration::from_millis(40),
+        };
+        let window = Duration::from_millis(800);
+
+        let relieved_reader = Arc::new(MeshConfigReader::fixed_for_test(
+            Arc::clone(&dir),
+            MeshConfigRelief {
+                round_cadence: Some(Duration::from_secs(3600)),
+                ..MeshConfigRelief::NONE
+            },
+        ));
+        let relieved = count_rounds_in_window(config, Some(relieved_reader), window).await;
+        assert_eq!(
+            relieved, 1,
+            "under a round_secs relief the first round runs and the SECOND is \
+             rescheduled to the relieved cadence — exactly one round in the window"
+        );
+
+        let none_reader = Arc::new(MeshConfigReader::fixed_for_test(
+            Arc::clone(&dir),
+            MeshConfigRelief::NONE,
+        ));
+        let unrelieved = count_rounds_in_window(config, Some(none_reader), window).await;
+        assert!(
+            unrelieved >= 3,
+            "a reader answering NO relief must leave the configured cadence \
+             untouched (absence = today); got {unrelieved} rounds"
+        );
     }
 }

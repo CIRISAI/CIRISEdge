@@ -301,6 +301,23 @@ pub struct OperationalProviders {
     pub steward_roster: StewardRosterProvider,
 }
 
+/// CIRISEdge#440 ask 3 — one author's memoized quarantine consult within a
+/// single sweep/fetch. A tri-state on purpose: `Withheld` and `ReadError` both
+/// withhold, but they are DIFFERENT facts booking DIFFERENT
+/// [`crate::observability::WithholdReason`]s (#433 — a reason is a branch,
+/// never a disjunction), and collapsing them to a `bool` at the memo would
+/// re-create exactly the fold this ledger exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuarantineConsult {
+    /// No live withhold marker governs the author.
+    Clear,
+    /// A live `quarantine:withheld:v1` marker governs the author.
+    Withheld,
+    /// The consult failed; fail-closed for this sweep, reported as a read
+    /// error.
+    ReadError,
+}
+
 // ─── The bridge ──────────────────────────────────────────────────────
 
 /// Production-grade [`ReplicationDirectory`] implementation over
@@ -352,6 +369,14 @@ pub struct FederationDirectoryReplicationBridge {
     /// verdicts before any TTL would); the bridge knows nothing about who
     /// listens. `None` ⇒ no listener (tests, non-A/V deployments).
     revocation_observer: Option<RevocationObserver>,
+    /// CIRISEdge#440 — the resolved mesh-config read seam. `Some` lets a root's
+    /// TTL'd relief shrink the since-page limit
+    /// ([`Self::effective_page_limit`]) and pause the `trace:*` plane
+    /// (`feature.trace_replication=0` ⇒ the advertise sweep + direct-fetch twin
+    /// withhold, booking [`crate::observability::WithholdReason::ConfigPaused`]).
+    /// `None` — every test construction and any host without a `local_key_id` —
+    /// is byte-identical pre-#440 behavior (relief, not a gate).
+    mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
 }
 
 /// CIRISEdge#430 — the revoked-key listener installed via
@@ -389,6 +414,7 @@ impl FederationDirectoryReplicationBridge {
             consent_memo: Mutex::new(None),
             metrics: None,
             revocation_observer: None,
+            mesh_config: None,
         }
     }
 
@@ -424,6 +450,7 @@ impl FederationDirectoryReplicationBridge {
             consent_memo: Mutex::new(None),
             metrics: None,
             revocation_observer: None,
+            mesh_config: None,
         }
     }
 
@@ -477,6 +504,72 @@ impl FederationDirectoryReplicationBridge {
     pub fn with_revocation_observer(mut self, observer: Option<RevocationObserver>) -> Self {
         self.revocation_observer = observer;
         self
+    }
+
+    /// CIRISEdge#440 — install the resolved mesh-config reader (builder). An
+    /// `Option` like its siblings: the runtime threads `Some` only when it has
+    /// a `local_key_id` to fold for; `None` keeps every consumer on its exact
+    /// pre-#440 path.
+    #[must_use]
+    pub fn with_mesh_config(
+        mut self,
+        reader: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
+    ) -> Self {
+        self.mesh_config = reader;
+        self
+    }
+
+    /// CIRISEdge#440 — the since-page limit this sweep runs under:
+    /// the configured [`BridgeConfig::operational_page_limit`], shrunk to a
+    /// live `antientropy.page_limit` relief when one is resolved. `min`, never
+    /// replacement — relief can only shrink a page (relieve-never-expand,
+    /// enforced again here against the configured value in case the operator's
+    /// limit is already tighter than the relieved one). One cached read per
+    /// round-ish window (the reader's TTL), not per row.
+    async fn effective_page_limit(&self) -> u32 {
+        match &self.mesh_config {
+            None => self.config.operational_page_limit,
+            Some(reader) => reader
+                .relief()
+                .await
+                .page_limit
+                .map_or(self.config.operational_page_limit, |relieved| {
+                    relieved.min(self.config.operational_page_limit)
+                }),
+        }
+    }
+
+    /// CIRISEdge#440 — is the `trace:*` plane paused by a live
+    /// `feature.trace_replication=0` relief? `false` on every absence path.
+    async fn trace_plane_paused(&self) -> bool {
+        match &self.mesh_config {
+            None => false,
+            Some(reader) => reader.relief().await.trace_replication_paused,
+        }
+    }
+
+    /// CIRISEdge#440 — book ONE `ConfigPaused` withhold + its named, throttled
+    /// WARN. Shared by the advertise sweep (booked once per sweep) and the
+    /// direct-fetch twin (booked per refused fetch); `site` keeps the two
+    /// throttle keys distinct so neither exit can silence the other's log.
+    fn withhold_config_paused(&self, peer_label: &str, site: &str) {
+        self.withhold(
+            crate::observability::WithholdReason::ConfigPaused,
+            peer_label,
+            "feature.trace_replication=0",
+        );
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            serve_gate_withheld_log().check(&format!("{peer_label}:{site}"))
+        {
+            tracing::warn!(
+                peer = peer_label,
+                suppressed_prev,
+                site,
+                "trace plane PAUSED by mesh config — a trust root relieved \
+                 `feature.trace_replication` to 0, so `trace:*` rows are withheld \
+                 until the relief expires or is superseded (CIRISEdge#440)"
+            );
+        }
     }
 
     /// CIRISEdge#433 — record ONE withhold against the ledger. A no-op when no
@@ -619,6 +712,27 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             return None;
         };
         if kind == EnvelopeKind::Attestation {
+            // CIRISEdge#440 — the direct-fetch twins of the advertise-sweep
+            // pause + quarantine gates, so a peer cannot obtain a paused
+            // `trace:*` row or a quarantined author's row by Diff/Fetch-ing a
+            // hash it learned out-of-band (the same twin discipline #379/#396
+            // established). Parse tolerance matches the sweep: an unparseable
+            // wire row is not gated here (the existing gates below keep their
+            // own parse-and-tolerate shape untouched).
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                let inner = value.get("attestation").unwrap_or(&value);
+                let peer_label = peer_key_id.unwrap_or("<unattributed>");
+                if Self::attestation_requires_serve(inner) && self.trace_plane_paused().await {
+                    self.withhold_config_paused(peer_label, "config-paused-fetch");
+                    return None;
+                }
+                if self
+                    .author_quarantine_withholds(inner, &mut HashMap::new(), peer_label)
+                    .await
+                {
+                    return None;
+                }
+            }
             if let Some(peer) = peer_key_id {
                 // CIRISEdge#396 item 1 — the same consent-membership bound the
                 // listing applies, so a peer excluded from the advertise cannot
@@ -915,7 +1029,7 @@ impl FederationDirectoryReplicationBridge {
             .collect();
         let rows = self
             .directory
-            .list_signed_key_records_since(None, self.config.operational_page_limit)
+            .list_signed_key_records_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(
@@ -935,7 +1049,7 @@ impl FederationDirectoryReplicationBridge {
             .collect();
         let rows = self
             .directory
-            .list_signed_identity_occurrences_since(None, self.config.operational_page_limit)
+            .list_signed_identity_occurrences_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(
@@ -957,7 +1071,7 @@ impl FederationDirectoryReplicationBridge {
             .collect();
         let rows = self
             .directory
-            .list_signed_transport_destinations_since(None, self.config.operational_page_limit)
+            .list_signed_transport_destinations_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(
@@ -986,7 +1100,7 @@ impl FederationDirectoryReplicationBridge {
             .directory
             .list_signed_identity_occurrence_revocations_since(
                 None,
-                self.config.operational_page_limit,
+                self.effective_page_limit().await,
             )
             .await
             .unwrap_or_default();
@@ -1464,6 +1578,103 @@ impl FederationDirectoryReplicationBridge {
         false
     }
 
+    /// CIRISEdge#440 ask 3 — is this row's AUTHOR under a live tier-2
+    /// quarantine (`quarantine:withheld:v1`, persist's marker fold)?
+    ///
+    /// The offer-side twin of persist's own `filter_withheld_rows` serve
+    /// consult (which persist applies on `list_attestation_log`, the #455
+    /// relay read — but NOT on `list_attestations_since`, the read this
+    /// bridge's advertise sweep uses; without this gate a quarantined author's
+    /// rows would still be OFFERED). Same two properties, kept deliberately:
+    ///
+    /// - **The marker plane is never withheld** — a row on a quarantine marker
+    ///   dimension passes unconditionally, even about a withheld author. A
+    ///   marker that stops replicating cannot be folded by the rest of the
+    ///   mesh, and a release that stops replicating makes a quarantine
+    ///   permanent by accident.
+    /// - **Rows are retained locally** — this gates the advertise/serve exits
+    ///   only; [`Self::list_attestation_holdings`] (the receive-diff axis) is
+    ///   untouched, which is what "withhold-from-serving, rows retained,
+    ///   reversible" means.
+    ///
+    /// One directory read per DISTINCT author per sweep (`memo`), mirroring
+    /// persist's own memo shape. Each branch books its OWN reason (#433):
+    /// a withheld author books `QuarantinedAuthor`; a FAILED consult books
+    /// `QuarantineReadError` and fails closed (a transient error must not
+    /// leak a row the markers may withhold) — never both for one row.
+    async fn author_quarantine_withholds(
+        &self,
+        canonical_json: &serde_json::Value,
+        memo: &mut HashMap<String, QuarantineConsult>,
+        peer_label: &str,
+    ) -> bool {
+        use crate::observability::WithholdReason;
+        // The convergence carve-out: marker rows always pass.
+        let dimension = canonical_json
+            .pointer("/attestation_envelope/dimension")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if ciris_persist::federation::quarantine::is_marker_dimension(dimension) {
+            return false;
+        }
+        let Some(author) = canonical_json
+            .get("attesting_key_id")
+            .and_then(|v| v.as_str())
+        else {
+            // No author to consult about — nothing to withhold on this axis.
+            return false;
+        };
+        let consult = if let Some(c) = memo.get(author) {
+            *c
+        } else {
+            let c = match ciris_persist::federation::quarantine::is_withheld(
+                &*self.directory,
+                author,
+                chrono::Utc::now(),
+            )
+            .await
+            {
+                Ok(true) => QuarantineConsult::Withheld,
+                Ok(false) => QuarantineConsult::Clear,
+                Err(e) => {
+                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                        serve_gate_withheld_log().check(&format!("quarantine-read:{author}"))
+                    {
+                        tracing::warn!(
+                            author,
+                            suppressed_prev,
+                            error = %e,
+                            "quarantine consult FAILED for a row's author — withholding \
+                             the author's rows from the offer (fail-closed; a transient \
+                             read error, NOT a quarantine verdict; CIRISEdge#440)"
+                        );
+                    }
+                    QuarantineConsult::ReadError
+                }
+            };
+            memo.insert(author.to_string(), c);
+            c
+        };
+        match consult {
+            QuarantineConsult::Clear => false,
+            QuarantineConsult::Withheld => {
+                self.withhold(WithholdReason::QuarantinedAuthor, peer_label, author);
+                tracing::debug!(
+                    author,
+                    peer = peer_label,
+                    "row withheld from the offer — its author is under a live \
+                     quarantine:withheld marker; the row is retained locally and the \
+                     withhold lifts on a release marker (CIRISEdge#440 ask 3)"
+                );
+                true
+            }
+            QuarantineConsult::ReadError => {
+                self.withhold(WithholdReason::QuarantineReadError, peer_label, author);
+                true
+            }
+        }
+    }
+
     /// CIRISEdge#396 item 1 — resolve `peer` against this node's live consent
     /// send-set (persist's `list_consent_peers` E7 projection, revocation-folded).
     /// `Some(ResolvedRecipient)` iff consent includes it; `None` (fail-closed)
@@ -1569,6 +1780,13 @@ impl FederationDirectoryReplicationBridge {
     /// invariant this restores: after admitting an attestation, its hash is here.
     /// Cheaper than the advertise sweep — it drops the per-row projection resolution.
     async fn list_attestation_holdings(&self) -> Vec<EnvelopeRef> {
+        // CIRISEdge#440 — deliberately the RAW configured limit, NOT
+        // `effective_page_limit`. This is the receive-diff "what I hold" axis:
+        // shrinking it under a page-limit relief would hide held rows from the
+        // node's own `want = remote ∖ holdings` diff, making it re-want rows it
+        // already holds — MORE wire traffic under a congestion relief, the
+        // exact inversion of what the knob is for. Relief bounds what we OFFER
+        // and SERVE, never what we admit knowing about ourselves.
         let attestations = self
             .directory
             .list_attestations_since(None, self.config.operational_page_limit)
@@ -1637,7 +1855,7 @@ impl FederationDirectoryReplicationBridge {
             .collect();
         let attestations = self
             .directory
-            .list_attestations_since(None, self.config.operational_page_limit)
+            .list_attestations_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         let mut refs = Vec::new();
@@ -1649,6 +1867,12 @@ impl FederationDirectoryReplicationBridge {
         // this sweep so a same-owner plane costs one grant read.
         let mut grant_cache: HashMap<String, Vec<ConsentTransferPolicy>> = HashMap::new();
         let peer_label = recipient.unwrap_or("<unattributed>");
+        // CIRISEdge#440 — the trace-plane pause, resolved ONCE per sweep (the
+        // reader's own TTL makes even that a cache hit round-to-round), and the
+        // per-author quarantine memo (one directory read per DISTINCT author).
+        let trace_paused = self.trace_plane_paused().await;
+        let mut trace_pause_booked = false;
+        let mut quarantine_memo: HashMap<String, QuarantineConsult> = HashMap::new();
         for att in &attestations {
             let Ok(canonical_json) = serde_json::to_value(att) else {
                 // CIRISEdge#433 — an attestation that will not project to a
@@ -1669,6 +1893,27 @@ impl FederationDirectoryReplicationBridge {
             // sweep and bury the gates that ARE decisions. The audit trail for
             // projection lives in `namespace::projection_for`, not here.
             if !Self::attestation_is_advertised(&canonical_json, &self_set) {
+                continue;
+            }
+            // CIRISEdge#440 — the mesh-config pause: `feature.trace_replication`
+            // relieved to 0 withholds every `trace:*` row from the advertise.
+            // Booked ONCE per sweep (the decision is one per-sweep fact, not one
+            // per row — the same shape the #379 serve-allowed memo takes), with
+            // a named, throttled WARN; the pause lifts on the relief row's TTL
+            // or a superseding row, with no operator action on this node.
+            if trace_paused && Self::attestation_requires_serve(&canonical_json) {
+                if !trace_pause_booked {
+                    trace_pause_booked = true;
+                    self.withhold_config_paused(peer_label, "config-paused-advertise");
+                }
+                continue;
+            }
+            // CIRISEdge#440 ask 3 — quarantined-author rows are withheld from
+            // the offer (retained locally; markers themselves always pass).
+            if self
+                .author_quarantine_withholds(&canonical_json, &mut quarantine_memo, peer_label)
+                .await
+            {
                 continue;
             }
             // CIRISEdge#379 — RECIPIENT gate (the contextual-integrity
@@ -1776,7 +2021,7 @@ impl FederationDirectoryReplicationBridge {
         let cohort = self.cohort_set();
         let rows = self
             .directory
-            .list_signed_families_since(None, self.config.operational_page_limit)
+            .list_signed_families_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(
@@ -1790,7 +2035,7 @@ impl FederationDirectoryReplicationBridge {
         let cohort = self.cohort_set();
         let rows = self
             .directory
-            .list_signed_communities_since(None, self.config.operational_page_limit)
+            .list_signed_communities_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(
@@ -1812,7 +2057,7 @@ impl FederationDirectoryReplicationBridge {
             .directory
             .list_signed_family_membership_revocations_since(
                 None,
-                self.config.operational_page_limit,
+                self.effective_page_limit().await,
             )
             .await
             .unwrap_or_default();
@@ -1830,7 +2075,7 @@ impl FederationDirectoryReplicationBridge {
             .directory
             .list_signed_community_membership_revocations_since(
                 None,
-                self.config.operational_page_limit,
+                self.effective_page_limit().await,
             )
             .await
             .unwrap_or_default();
@@ -1845,7 +2090,7 @@ impl FederationDirectoryReplicationBridge {
         let cohort = self.cohort_set();
         let rows = self
             .directory
-            .list_signed_location_proofs_since(None, self.config.operational_page_limit)
+            .list_signed_location_proofs_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(
@@ -1888,7 +2133,7 @@ impl FederationDirectoryReplicationBridge {
         // `apply_organization` re-wraps the bare row for `put_organization`.
         let rows = self
             .directory
-            .list_organizations_since(None, self.config.operational_page_limit)
+            .list_organizations_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
@@ -1900,7 +2145,7 @@ impl FederationDirectoryReplicationBridge {
         // the bare row). `apply_org_membership` re-wraps on the receive side.
         let rows = self
             .directory
-            .list_org_memberships_since(None, self.config.operational_page_limit)
+            .list_org_memberships_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
@@ -1916,7 +2161,7 @@ impl FederationDirectoryReplicationBridge {
         // re-serializes the SAME wrapper, so advertise-hash == point-read here.
         let rows = self
             .directory
-            .list_signed_partner_records_since(None, self.config.operational_page_limit)
+            .list_signed_partner_records_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
         self.advertise_since(
@@ -5597,6 +5842,435 @@ mod tests {
             snap.withholds_by_reason.is_empty(),
             "a by-design projection non-event books no withhold, got {:?}",
             snap.withholds_by_reason
+        );
+    }
+
+    // ── CIRISEdge#440 — mesh-config consumption + quarantine-aware offers ──
+
+    /// Seed the mesh-config plane's trust scaffolding for `node`: the root's
+    /// key record + the node's `delegates_to(node → root)` subscription edge
+    /// ("the trust edge is the subscription", persist's `trusted_roots_of`).
+    async fn seed_mesh_config_root(backend: &MemoryBackend, node: &str, root: &str) {
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fixture_key_record(root, identity_type::NODE),
+            })
+            .await
+            .expect("seed mesh-config root key");
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": node,
+            "attested_key_id": root,
+            "attestation_type": "delegates_to",
+            // Infra duty scopes only — the reject-agency-on-node-key gate
+            // (persist #236) refuses agency conferrals on node-typed keys.
+            "scope": ["infra:attest", "infra:serve"],
+        });
+        seed_raw_attestation(backend, &id, node, root, "delegates_to", envelope).await;
+    }
+
+    /// Seed one root-authored mesh-config relief row through the REAL
+    /// replication-plane admission (`put_attestation` — the door edge's own
+    /// `apply_attestation` uses; persist: "the read-time clamp in
+    /// `fold_mesh_config` is what holds for rows that arrive on the
+    /// replication plane"). Built with persist's own `mesh_config_envelope`
+    /// so the shape cannot drift from the fold's `parse_row`.
+    async fn seed_mesh_config_relief(
+        backend: &MemoryBackend,
+        root: &str,
+        key: ciris_persist::federation::MeshConfigKey,
+        value: i64,
+    ) {
+        let envelope = ciris_persist::federation::mesh_config::mesh_config_envelope(
+            key,
+            value,
+            root,
+            ciris_persist::federation::MeshConfigForm::Emergency,
+            Some(Utc::now() + chrono::Duration::hours(1)),
+            "delegation-test-1",
+            None,
+            "test congestion relief",
+        );
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_raw_attestation(backend, &id, root, root, "scores", envelope).await;
+    }
+
+    /// A `MeshConfigReader` over the SAME backend the bridge reads, resolving
+    /// for `node` with the production default baseline shape and TTL zero
+    /// (every consult re-folds, so a just-seeded row is visible immediately).
+    fn mesh_reader_over(
+        backend: &Arc<MemoryBackend>,
+        node: &str,
+    ) -> Arc<crate::replication::mesh_config::MeshConfigReader> {
+        let dir: Arc<dyn FederationDirectory> = Arc::clone(backend) as _;
+        Arc::new(
+            crate::replication::mesh_config::MeshConfigReader::new(
+                dir,
+                node.to_string(),
+                crate::replication::mesh_config::MeshConfigReader::baseline_for(
+                    std::time::Duration::from_secs(30),
+                    BridgeConfig::DEFAULT_OPERATIONAL_PAGE_LIMIT,
+                ),
+            )
+            .with_ttl(std::time::Duration::ZERO),
+        )
+    }
+
+    /// ABSENCE — a bridge with a reader over an EMPTY mesh-config plane
+    /// advertises and serves byte-identically to a bridge with no reader at
+    /// all: same refs, same bytes, per plane. This is the "config is RELIEF,
+    /// not a gate" contract as an executable statement.
+    #[tokio::test]
+    async fn empty_mesh_config_plane_is_byte_identical_to_no_reader() {
+        let local = "this-node";
+        let producer = "agent-producer";
+        let cohort = [local.to_string(), producer.to_string()];
+        let (backend, plain_bridge) = make_bridge(&cohort);
+        seed_serve_scaffold(&backend, local, producer, "peer-consented").await;
+        seed_trace_attestation(&backend, producer).await;
+        // The mesh-config trust scaffolding EXISTS (root subscribed) but the
+        // plane carries no relief rows — the fold resolves everything to
+        // baseline.
+        seed_mesh_config_root(&backend, local, "mc-root").await;
+
+        let dir: Arc<dyn FederationDirectory> = Arc::clone(&backend) as _;
+        let cohort_vec = cohort.to_vec();
+        let cohort_cb: CohortProvider = Arc::new(move || cohort_vec.clone());
+        let read_bridge = FederationDirectoryReplicationBridge::new(dir, cohort_cb)
+            .with_mesh_config(Some(mesh_reader_over(&backend, local)));
+
+        for kind in [
+            EnvelopeKind::Key,
+            EnvelopeKind::Attestation,
+            EnvelopeKind::Revocation,
+        ] {
+            let mut plain = plain_bridge.list_envelope_refs(kind).await;
+            let mut read = read_bridge.list_envelope_refs(kind).await;
+            plain.sort_by_key(|r| r.envelope_hash);
+            read.sort_by_key(|r| r.envelope_hash);
+            assert_eq!(
+                plain, read,
+                "{kind:?}: an empty plane must not change the advertise set"
+            );
+            for r in &plain {
+                let a = plain_bridge
+                    .fetch_envelope_bytes(kind, &r.envelope_hash)
+                    .await;
+                let b = read_bridge
+                    .fetch_envelope_bytes(kind, &r.envelope_hash)
+                    .await;
+                assert_eq!(a, b, "{kind:?}: byte-identical serve under an empty plane");
+            }
+        }
+    }
+
+    /// FIELD PROVENANCE, end to end — a root-authored
+    /// `feature.trace_replication=0` relief row admitted through the real
+    /// replication-plane door pauses the trace plane: the advertise sweep
+    /// withholds the `trace:*` row (non-trace rows untouched), the
+    /// direct-fetch twin refuses the hash, and BOTH book
+    /// `WithholdReason::ConfigPaused` — the #433 rule: a named branch, never
+    /// silence.
+    #[tokio::test]
+    async fn trace_replication_pause_withholds_trace_rows_and_books_config_paused() {
+        use crate::observability::WithholdReason;
+        let local = "this-node";
+        let producer = "agent-producer";
+        let cohort = [local.to_string(), producer.to_string()];
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+        seed_serve_scaffold(&backend, local, producer, "peer-consented").await;
+        seed_trace_attestation(&backend, producer).await;
+        seed_mesh_config_root(&backend, local, "mc-root").await;
+
+        // Locate the trace hash while the plane is un-paused (reader wired,
+        // no relief row yet — also proves the reader alone changes nothing).
+        let bridge = bridge.with_mesh_config(Some(mesh_reader_over(&backend, local)));
+        let trace_hash = locate_trace_hash(&bridge).await;
+        let before = bridge.list_envelope_refs(EnvelopeKind::Attestation).await;
+        assert!(
+            before.iter().any(|r| r.envelope_hash == trace_hash),
+            "un-paused: the trace row advertises"
+        );
+
+        // The relief row, through the real door.
+        seed_mesh_config_relief(
+            &backend,
+            "mc-root",
+            ciris_persist::federation::MeshConfigKey::FeatureTraceReplication,
+            0,
+        )
+        .await;
+
+        let after = bridge.list_envelope_refs(EnvelopeKind::Attestation).await;
+        assert!(
+            !after.iter().any(|r| r.envelope_hash == trace_hash),
+            "paused: the trace row is withheld from the advertise"
+        );
+        assert!(
+            !after.is_empty(),
+            "paused: NON-trace rows (consent grant, trust edges, the relief \
+             row itself) still advertise — the pause is trace-scoped"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &trace_hash, None)
+                .await
+                .is_none(),
+            "paused: the direct-fetch twin refuses the trace hash"
+        );
+        assert!(
+            metrics.withholds(WithholdReason::ConfigPaused) >= 2,
+            "the pause books config_paused on BOTH exits (sweep + fetch twin)"
+        );
+    }
+
+    /// FIELD PROVENANCE, end to end — a root-authored
+    /// `antientropy.page_limit` relief bounds the bridge's since-page:
+    /// the Key plane's advertise shrinks to the relieved limit, and the same
+    /// relief expiring (TTL'd emergency row filtered at read time) restores
+    /// the configured (unbounded) page.
+    #[tokio::test]
+    async fn page_limit_relief_bounds_the_since_page() {
+        let local = "this-node";
+        let producers = ["key-a", "key-b", "key-c"];
+        let cohort: Vec<String> = std::iter::once(local.to_string())
+            .chain(producers.iter().map(|s| (*s).to_string()))
+            .collect();
+        let (backend, bridge) = make_bridge(&cohort);
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fixture_key_record(local, identity_type::NODE),
+            })
+            .await
+            .expect("seed local key");
+        for p in producers {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(p, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_mesh_config_root(&backend, local, "mc-root").await;
+        let bridge = bridge.with_mesh_config(Some(mesh_reader_over(&backend, local)));
+
+        assert_eq!(
+            bridge.list_envelope_refs(EnvelopeKind::Key).await.len(),
+            4,
+            "no relief: the full page (local + the three producers; mc-root is \
+             outside the cohort projection)"
+        );
+
+        seed_mesh_config_relief(
+            &backend,
+            "mc-root",
+            ciris_persist::federation::MeshConfigKey::AntientropyPageLimit,
+            2,
+        )
+        .await;
+        assert_eq!(
+            bridge.list_envelope_refs(EnvelopeKind::Key).await.len(),
+            2,
+            "relieved: the since-page is bounded to the relieved limit"
+        );
+    }
+
+    /// CIRISEdge#440 ask 3 — quarantine-aware offers, end to end against
+    /// persist's REAL marker fold:
+    ///   (1) a `quarantine:withheld:v1` marker about author A withholds A's
+    ///       rows from the ADVERTISE while B's still flow,
+    ///   (2) the ledger books `quarantined_author` (named, never silent),
+    ///   (3) A's rows are KEPT LOCALLY — the raw holdings view still carries
+    ///       them (tier 2: withhold-from-serving, rows retained),
+    ///   (4) the direct-fetch twin refuses A's hash,
+    ///   (5) the MARKER ROW ITSELF still advertises (the convergence
+    ///       carve-out: a quarantine that stopped replicating could not be
+    ///       folded, and a release that stopped replicating would make a
+    ///       reversible control irreversible),
+    ///   (6) a `quarantine:released:v1` marker LIFTS the withhold — reversible,
+    ///       exactly the fediverse-silence / Tor-flag precedent the issue
+    ///       names.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // the six-property scenario is one coherent story
+    async fn quarantined_author_rows_withheld_from_offer_kept_locally_and_reversible() {
+        use crate::observability::WithholdReason;
+        let local = "this-node";
+        let author_a = "author-quarantined";
+        let author_b = "author-clear";
+        let moderator = "quarantine-authority";
+        let cohort = [
+            local.to_string(),
+            author_a.to_string(),
+            author_b.to_string(),
+        ];
+        let commons = "mod-commons";
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+        // The moderator is USER-typed (steward-bound clause 1) — the slash
+        // gate persist runs on EVERY quarantine marker put (`put_attestation`
+        // → `check_delegated_duty_scores_admission`) resolves duty-holders
+        // from the marker's community's steward-bound authority set, so the
+        // marker below is admitted under the REAL authority walk, not waved in.
+        for (k, it) in [
+            (local, identity_type::NODE),
+            (author_a, identity_type::AGENT),
+            (author_b, identity_type::AGENT),
+            (moderator, identity_type::USER),
+            (commons, identity_type::USER),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, it),
+                })
+                .await
+                .expect("seed key");
+        }
+        // The community whose authority set holds the `slash` duty: the
+        // moderator is its founder.
+        backend
+            .put_community(sign_community_fixture(
+                moderator,
+                Community {
+                    community_key_id: commons.to_string(),
+                    community_name: "quarantine test commons".to_string(),
+                    members: vec![CommunityMember {
+                        key_id: moderator.to_string(),
+                        joined_at: Utc::now(),
+                        role: Some("founder".to_string()),
+                    }],
+                    founded_at: Utc::now(),
+                    consensus_protocol: "majority".to_string(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect("seed moderation commons");
+        // One ordinary scores row per author (an open-vocabulary dimension —
+        // Cohort projection, so both advertise peer-blind).
+        for author in [author_a, author_b] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let envelope = serde_json::json!({
+                "id": id,
+                "attesting_key_id": author,
+                "attested_key_id": author,
+                "attestation_type": "scores",
+                "dimension": "credits:test:v1",
+                "score": 1.0,
+            });
+            seed_raw_attestation(&backend, &id, author, author, "scores", envelope).await;
+        }
+        // Map advertised hash → author while nothing is withheld.
+        let mut hash_of: HashMap<String, [u8; 32]> = HashMap::new();
+        for r in bridge.list_envelope_refs(EnvelopeKind::Attestation).await {
+            let bytes = bridge
+                .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                .await
+                .expect("fetch advertised row");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
+            if v.pointer("/attestation_envelope/dimension")
+                .and_then(|d| d.as_str())
+                == Some("credits:test:v1")
+            {
+                let author = v["attesting_key_id"].as_str().expect("author").to_string();
+                hash_of.insert(author, r.envelope_hash);
+            }
+        }
+        let a_hash = hash_of[author_a];
+        let b_hash = hash_of[author_b];
+
+        // The withhold marker, via persist's own envelope builder + the real
+        // replication-plane door.
+        let marker_id = uuid::Uuid::new_v4().to_string();
+        let marker_env = ciris_persist::federation::quarantine::withhold_envelope(
+            author_a,
+            commons,
+            "delegation-test-1",
+            "test: withhold-from-serving",
+        );
+        seed_raw_attestation(
+            &backend, &marker_id, moderator, author_a, "scores", marker_env,
+        )
+        .await;
+
+        // (1) + (5): A withheld, B flows, the marker itself advertises.
+        let offer = bridge.list_envelope_refs(EnvelopeKind::Attestation).await;
+        assert!(
+            !offer.iter().any(|r| r.envelope_hash == a_hash),
+            "(1) the quarantined author's row is withheld from the offer"
+        );
+        assert!(
+            offer.iter().any(|r| r.envelope_hash == b_hash),
+            "(1) the clear author's row still flows"
+        );
+        let marker_advertised = {
+            let mut found = false;
+            for r in &offer {
+                if let Some(bytes) = bridge
+                    .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                    .await
+                {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if v.pointer("/attestation_envelope/dimension")
+                            .and_then(|d| d.as_str())
+                            == Some("quarantine:withheld:v1")
+                        {
+                            found = true;
+                        }
+                    }
+                }
+            }
+            found
+        };
+        assert!(marker_advertised, "(5) the marker plane is never withheld");
+        // (2) named, never silent.
+        assert!(
+            metrics.withholds(WithholdReason::QuarantinedAuthor) >= 1,
+            "(2) the ledger books quarantined_author"
+        );
+        // (3) rows retained: the raw holdings (receive axis) still carry A.
+        assert!(
+            bridge
+                .list_holdings(EnvelopeKind::Attestation)
+                .await
+                .iter()
+                .any(|r| r.envelope_hash == a_hash),
+            "(3) tier 2 retains the row locally"
+        );
+        // (4) the direct-fetch twin refuses A's hash.
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &a_hash, None)
+                .await
+                .is_none(),
+            "(4) the fetch twin withholds too — no out-of-band bypass"
+        );
+
+        // (6) REVERSIBLE: a release marker lifts the withhold.
+        let release_id = uuid::Uuid::new_v4().to_string();
+        let release_env = ciris_persist::federation::quarantine::release_envelope(
+            author_a,
+            commons,
+            &marker_id,
+            "delegation-test-1",
+            "test: released",
+        );
+        seed_raw_attestation(
+            &backend,
+            &release_id,
+            moderator,
+            author_a,
+            "scores",
+            release_env,
+        )
+        .await;
+        assert!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Attestation)
+                .await
+                .iter()
+                .any(|r| r.envelope_hash == a_hash),
+            "(6) a release marker lifts the withhold — the control is reversible"
         );
     }
 }

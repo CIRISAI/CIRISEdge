@@ -55,6 +55,7 @@ use tokio::task::JoinHandle;
 use super::bridge::{BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge};
 use super::coordinator::{DriveStep, ReplicationCoordinator};
 use super::directory::{DirectoryStateAdapter, MutableDirectoryStateAdapter, ReplicationDirectory};
+use super::mesh_config::MeshConfigReader;
 use super::protocol::EnvelopeKind;
 use super::registry::ReplicationRegistry;
 use super::scheduler::{
@@ -118,6 +119,7 @@ fn build_bridge(
     cohort: CohortProvider,
     config: &ReplicationRuntimeConfig,
     self_provider: Option<CohortProvider>,
+    mesh_config: Option<Arc<MeshConfigReader>>,
 ) -> Arc<FederationDirectoryReplicationBridge> {
     Arc::new(
         FederationDirectoryReplicationBridge::with_config(
@@ -127,8 +129,65 @@ fn build_bridge(
         )
         .with_self_provider(self_provider)
         .with_local_key_id(config.local_key_id.clone())
-        .with_metrics(config.metrics.clone()),
+        .with_metrics(config.metrics.clone())
+        .with_mesh_config(mesh_config),
     )
+}
+
+/// CIRISEdge#440 — the ONE resolved mesh-config reader, shared by the bridge
+/// (page limit + trace pause), the scheduler (cadence), and — via
+/// [`ReplicationRuntime::mesh_config_reader`] — any host-wired A/V transit
+/// gate. Built iff there is a `local_key_id`: the fold is about a node's OWN
+/// subscription + consent baseline, and without an identity there is no node
+/// to resolve for (the same structural condition that fail-closes the #386
+/// serve gate). The baseline pins the node's ACTUAL configured cadence + page
+/// limit, so an empty plane resolves to exactly what the node already runs —
+/// relief, never a gate.
+fn build_mesh_config_reader(
+    directory: &Arc<dyn FederationDirectory>,
+    config: &ReplicationRuntimeConfig,
+) -> Option<Arc<MeshConfigReader>> {
+    config.local_key_id.as_ref().map(|local| {
+        Arc::new(MeshConfigReader::new(
+            Arc::clone(directory),
+            local.clone(),
+            MeshConfigReader::baseline_for(
+                config.scheduler.cadence,
+                config.bridge.operational_page_limit,
+            ),
+        ))
+    })
+}
+
+/// CIRISEdge#370 — spawn the scheduler's run loop. With a live metrics handle,
+/// route each round's [`RoundEvent`] through a purpose-built `event_sink` into
+/// a consumer task that folds it into the `EdgeMetrics` round-outcome counter
+/// (the field instrument for the transport concurrency ceiling, leviculum#29);
+/// without one, keep the zero-overhead `run_until_cancelled` path — no
+/// channel, no consumer task. The scheduler tolerates a closed sink, and the
+/// consumer's `recv()` returns `None` when the scheduler task ends and drops
+/// the sender, so the consumer winds down without its own cancel. (Extracted
+/// from [`ReplicationRuntime::start`] verbatim for the clippy line ceiling.)
+fn spawn_scheduler_task(
+    scheduler: ReplicationScheduler,
+    cancel_rx: watch::Receiver<bool>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+) -> JoinHandle<()> {
+    if let Some(metrics) = metrics {
+        let (evt_tx, mut evt_rx) = mpsc::channel::<(String, RoundEvent)>(256);
+        tokio::spawn(async move {
+            while let Some((_peer, event)) = evt_rx.recv().await {
+                metrics.inc_round_outcome(round_outcome_of(&event));
+            }
+        });
+        tokio::spawn(async move {
+            scheduler.run_with_events(cancel_rx, Some(evt_tx)).await;
+        })
+    } else {
+        tokio::spawn(async move {
+            scheduler.run_until_cancelled(cancel_rx).await;
+        })
+    }
 }
 
 fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
@@ -304,6 +363,9 @@ pub struct ReplicationRuntime {
     /// their publish set (set iff `start` got a `self_provider`). Applied to
     /// every Initiator coordinator this runtime builds, including hot-adds.
     proactive_publish: bool,
+    /// CIRISEdge#440 — the shared mesh-config reader (`Some` iff
+    /// `local_key_id` was configured); see [`Self::mesh_config_reader`].
+    mesh_config: Option<Arc<MeshConfigReader>>,
 }
 
 /// Failure modes for the v5.1.0 runtime peer-mutation API
@@ -378,9 +440,17 @@ impl ReplicationRuntime {
         // content-hash point-read fetch (once, idempotent, fail-soft).
         rebuild_signed_wire_index_fail_soft(&directory).await;
 
+        let mesh_config = build_mesh_config_reader(&directory, &config);
+
         // The ONE production bridge — shared by every coordinator below AND by the
         // #312 responder factory. See [`build_bridge`] for the #433 metrics wiring.
-        let bridge = build_bridge(&directory, cohort, &config, self_provider);
+        let bridge = build_bridge(
+            &directory,
+            cohort,
+            &config,
+            self_provider,
+            mesh_config.clone(),
+        );
 
         let registry = Arc::new(ReplicationRegistry::new());
 
@@ -435,7 +505,8 @@ impl ReplicationRuntime {
         // bridge instance; provider + applier are split-shape per
         // session.rs's borrow story (the bridge is the same object
         // backing both).
-        let mut scheduler = ReplicationScheduler::new(config.scheduler);
+        let mut scheduler =
+            ReplicationScheduler::new(config.scheduler).with_mesh_config(mesh_config.clone());
         let scheduler_handle = scheduler.install_control_channel();
         let coords: Vec<Arc<ReplicationCoordinator>> = peers
             .iter()
@@ -478,30 +549,9 @@ impl ReplicationRuntime {
         }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        // CIRISEdge#370 — when a live metrics handle is configured, route
-        // the scheduler's per-round `RoundEvent`s through the purpose-built
-        // `event_sink` into a consumer task that folds each into the
-        // `EdgeMetrics` round-outcome counter (the field instrument for the
-        // transport concurrency ceiling, leviculum#29). Absent a handle we
-        // keep the zero-overhead `run_until_cancelled` path — no channel, no
-        // consumer task. The scheduler tolerates a closed sink, and the
-        // consumer's `recv()` returns `None` when the scheduler task ends and
-        // drops the sender, so the consumer winds down without its own cancel.
-        let scheduler_task = if let Some(metrics) = config.metrics.clone() {
-            let (evt_tx, mut evt_rx) = mpsc::channel::<(String, RoundEvent)>(256);
-            tokio::spawn(async move {
-                while let Some((_peer, event)) = evt_rx.recv().await {
-                    metrics.inc_round_outcome(round_outcome_of(&event));
-                }
-            });
-            tokio::spawn(async move {
-                scheduler.run_with_events(cancel_rx, Some(evt_tx)).await;
-            })
-        } else {
-            tokio::spawn(async move {
-                scheduler.run_until_cancelled(cancel_rx).await;
-            })
-        };
+        // CIRISEdge#370 — see [`spawn_scheduler_task`] for the event-sink /
+        // round-outcome-counter wiring.
+        let scheduler_task = spawn_scheduler_task(scheduler, cancel_rx, config.metrics.clone());
 
         // `directory` is consumed by the bridge above (held inside
         // `bridge`'s Arc<dyn FederationDirectory>). Drop the local
@@ -518,7 +568,18 @@ impl ReplicationRuntime {
             scheduler_handle,
             current_initiators: Arc::new(Mutex::new(initial_initiator_set)),
             proactive_publish,
+            mesh_config,
         }
+    }
+
+    /// CIRISEdge#440 — the shared resolved mesh-config reader, when this
+    /// runtime has one (`local_key_id` was configured). The host hands this to
+    /// [`crate::transport::realtime_av_alm::TransitGate::with_mesh_config`] so
+    /// the `feature.av_streams` toggle gates ALM admission from the SAME
+    /// snapshot the replication plane runs under.
+    #[must_use]
+    pub fn mesh_config_reader(&self) -> Option<Arc<MeshConfigReader>> {
+        self.mesh_config.clone()
     }
 
     /// Hot-add a `(peer_key_id, kind)` peer this node actively replicates

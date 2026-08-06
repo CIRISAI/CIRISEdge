@@ -291,6 +291,26 @@ pub enum WithholdReason {
     /// [`Self::RowNotSerializable`]: the row serializes fine, its persist-side
     /// hash is the wrong shape.
     RowHashUndecodable,
+    /// #440 — the mesh-config plane relieved `feature.trace_replication` to `0`
+    /// (a root's TTL'd congestion relief, persist's per-root most-restrictive
+    /// fold), so `trace:*` rows are withheld from the advertise sweep and the
+    /// direct-fetch twin. A POLICY pause with an expiry, not a fault: it lifts
+    /// on the row's TTL or a superseding row, with no operator action here.
+    ConfigPaused,
+    /// #440 ask 3 — the row's AUTHOR is under a live `quarantine:withheld:v1`
+    /// marker (persist's tier-2 withhold-from-serving fold, CIRISPersist#570
+    /// ask 5): the row is withheld from peers while retained locally
+    /// (reversible — a `quarantine:released:v1` marker lifts it). The marker
+    /// plane itself is never withheld (a quarantine that stops replicating
+    /// could not be folded, and a release that stops replicating would make a
+    /// reversible control irreversible).
+    QuarantinedAuthor,
+    /// #440 ask 3 — the quarantine consult for the row's author FAILED
+    /// (fail-closed: the row is withheld). The #425 Exhibit C split, again:
+    /// a transient read error is NOT a statement that the author is
+    /// quarantined, and folding it into [`Self::QuarantinedAuthor`] would send
+    /// the operator to review a marker that does not exist.
+    QuarantineReadError,
 }
 
 impl WithholdReason {
@@ -310,6 +330,9 @@ impl WithholdReason {
             Self::RecipientCapabilityRestriction => "recipient_capability_restriction",
             Self::RowNotSerializable => "row_not_serializable",
             Self::RowHashUndecodable => "row_hash_undecodable",
+            Self::ConfigPaused => "config_paused",
+            Self::QuarantinedAuthor => "quarantined_author",
+            Self::QuarantineReadError => "quarantine_read_error",
         }
     }
 }

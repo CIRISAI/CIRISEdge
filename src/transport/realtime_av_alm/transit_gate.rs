@@ -146,6 +146,14 @@ pub struct TransitGate {
     /// (fail-closed).
     local_key_id: Option<String>,
     cache: Mutex<VerdictCache>,
+    /// CIRISEdge#440 — the resolved mesh-config read seam (host-wired from
+    /// [`crate::replication::runtime::ReplicationRuntime::mesh_config_reader`]).
+    /// `Some` lets a root's TTL'd `feature.av_streams=0` relief pause ALM
+    /// admission ([`Self::av_streams_paused`], consulted by
+    /// `plan_parent_gated`). `None` — every pre-#440 construction — is
+    /// byte-identical behavior: this toggle is RELIEF, unlike the fail-closed
+    /// trust gate above (absence of config must not refuse anything).
+    mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
 }
 
 impl TransitGate {
@@ -158,6 +166,31 @@ impl TransitGate {
             directory,
             local_key_id,
             cache: Mutex::new(VerdictCache::default()),
+            mesh_config: None,
+        }
+    }
+
+    /// CIRISEdge#440 — install the resolved mesh-config reader (builder); see
+    /// the field doc. `None` keeps admission un-paused unconditionally.
+    #[must_use]
+    pub fn with_mesh_config(
+        mut self,
+        reader: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
+    ) -> Self {
+        self.mesh_config = reader;
+        self
+    }
+
+    /// CIRISEdge#440 — is ALM admission paused by a live `feature.av_streams=0`
+    /// mesh-config relief? `false` on every absence path (no reader, empty
+    /// plane, resolve error): the pause is relief a root actively asked for,
+    /// never a default. Consulted by `plan_parent_gated` BEFORE the per-hop
+    /// eligibility walk, so a paused plane refuses with its own named error
+    /// rather than reading as an empty candidate pool.
+    pub async fn av_streams_paused(&self) -> bool {
+        match &self.mesh_config {
+            None => false,
+            Some(reader) => reader.relief().await.av_streams_paused,
         }
     }
 
