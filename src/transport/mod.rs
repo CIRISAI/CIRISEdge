@@ -144,10 +144,18 @@ pub mod reticulum;
 pub mod self_route;
 
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
-/// edges (CIRISEdge#169). CEG-native (Leviculum exposes no LXMF
-/// propagation surface); pairs with Reticulum Transport-node mode
+/// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
+/// signed CEG envelopes); pairs with Reticulum Transport-node mode
 /// (#168). Pure-Rust, always compiled.
 pub mod store_and_forward;
+
+/// §24 NAT-traversal — LXMF propagated delivery (0x03) store-and-forward
+/// for asleep mobile edges (CIRISEdge#169). The LXMF-wire seam built on
+/// `leviculum-lxmf`: a propagation-node admission core + the mobile's
+/// client pull-on-wake path. Gated on `lxmf` (pulls `leviculum-lxmf`);
+/// with the feature off, edge behaves byte-identically to today.
+#[cfg(feature = "lxmf")]
+pub mod lxmf_propagation;
 
 // Remaining implementations land in subsequent commits; trait shape
 // sealed Phase 1.

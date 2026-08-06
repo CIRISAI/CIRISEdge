@@ -580,6 +580,16 @@ tempfile       = { version = "3", optional = true }
 # The `+ciris.1` is fork build-metadata; the crate semver is 0.10.
 leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.12.0+ciris.1", version = "0.12", optional = true }
 leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.12.0+ciris.1", version = "0.12", optional = true }
+# v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
+# `leviculum-lxmf` workspace member (same pinned tag) ships the whole
+# LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
+# the client `PropagationTransport`, the `MemoryLxmfStorage` bounded
+# store, and the `stamp`/`ticket` proof-of-work anti-spam cost. It is
+# `no_std + alloc` and depends only on `leviculum-core`. Default
+# features keep `pow` on (the stamp/ticket cost we validate at
+# admission). Gated behind the `lxmf` feature — see the `[features]`
+# block. Edge INTEGRATES this crate's protocol; it never reimplements it.
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.12.0+ciris.1", version = "0.12", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
@@ -798,6 +808,34 @@ transport-reticulum             = [
     "transport-reticulum-rnode",
     "transport-reticulum-i2p",
     "dep:leviculum-std",
+    "dep:leviculum-core",
+    # CIRISEdge#169 — LXMF store-and-forward propagation rides on the
+    # Reticulum wire, so the umbrella pulls it in and CI exercises it in
+    # every `transport-reticulum` build. Standalone consumers can also
+    # enable just `lxmf` for the codecs without the full interface set.
+    "lxmf",
+]
+
+# CIRISEdge#169 — LXMF propagated delivery (0x03): store-and-forward for
+# asleep/backgrounded NAT'd mobile edges. A fabric node (CIRISServer)
+# operates a propagation node; the mobile pulls its mailbox on wake.
+# Pulls `leviculum-lxmf` (the whole protocol) + `leviculum-core` (for the
+# public `full_hash` transient-ID primitive). See
+# `src/transport/lxmf_propagation.rs`.
+#
+# NOTE: intentionally does NOT force `_reticulum-module`. The seam is
+# transport-agnostic (leviculum-lxmf's propagation wire is codec +
+# request/response bytes, driven by edge's existing Reticulum
+# request/response primitives) and is not yet referenced from the
+# `_reticulum-module`-gated reticulum.rs, so pulling `_reticulum-module`
+# would only make `cargo check --features lxmf` require a concrete
+# interface sub-feature for no gain. The `transport-reticulum` umbrella
+# (and `pyo3` transitively) co-enable `lxmf` WITH the full reticulum
+# build, so CI exercises the seam under real Reticulum. When the reticulum
+# event loop wires the client/host in, that wiring is gated
+# `all(_reticulum-module, lxmf)`.
+lxmf = [
+    "dep:leviculum-lxmf",
     "dep:leviculum-core",
 ]
 transport-reticulum-auto        = ["dep:leviculum-std", "dep:leviculum-core", "_reticulum-module"]

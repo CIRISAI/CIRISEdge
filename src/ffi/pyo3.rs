@@ -7173,6 +7173,295 @@ impl PyStoreAndForward {
     }
 }
 
+// ─── LXMF propagated delivery (0x03) — CIRISEdge#169 ────────────────
+//
+// The LXMF-wire store-and-forward for asleep/backgrounded mobile edges,
+// built on `leviculum-lxmf`. Two surfaces:
+//   * `LxmfPropagationNode` — the propagation-node admission core a
+//     fabric node (CIRISServer) operates: proof-of-work validation +
+//     the capacity-capped transient-ID mailbox.
+//   * `LxmfPropagationClient` — the mobile's client seam: discover a
+//     node's announce, and on wake run the `/get` list → get →
+//     acknowledge pull (plus the origin-upload path).
+//
+// Gated on `lxmf` (which pulls `leviculum-lxmf`). See
+// `src/transport/lxmf_propagation.rs` for the threat-model disposition
+// and the leviculum#38 host-codec gap that keeps the node's wire
+// (de)serialization out of edge for now.
+#[cfg(feature = "lxmf")]
+fn lxmf_err(e: &crate::transport::lxmf_propagation::LxmfPropagationError) -> PyErr {
+    use crate::transport::lxmf_propagation::LxmfPropagationError as E;
+    match e {
+        E::Codec(_) | E::Peer(_) | E::StampRejected { .. } | E::StoreFull => {
+            PyValueError::new_err(e.to_string())
+        }
+        E::Stamp(_) | E::LockPoisoned => PyRuntimeError::new_err(e.to_string()),
+    }
+}
+
+#[cfg(feature = "lxmf")]
+fn lxmf_transient_ids(ids: Vec<Vec<u8>>) -> PyResult<Vec<[u8; 32]>> {
+    ids.into_iter()
+        .map(|id| fixed_bytes::<32>("transient_id", &id))
+        .collect()
+}
+
+/// LXMF propagation node (CIRISEdge#169). A fabric node stands one up
+/// and operates the mailbox for asleep mobile edges: it validates each
+/// submission's proof-of-work stamp against its advertised cost, stores
+/// the end-to-end-encrypted ciphertext under a capacity cap, and serves
+/// the transient-ID list / fetch / acknowledge exchange. It never
+/// decrypts — it holds ciphertext only.
+#[cfg(feature = "lxmf")]
+#[pyclass(name = "LxmfPropagationNode", module = "ciris_edge")]
+pub struct PyLxmfPropagationNode {
+    inner: crate::transport::lxmf_propagation::LxmfPropagationNode,
+}
+
+#[cfg(feature = "lxmf")]
+#[pymethods]
+impl PyLxmfPropagationNode {
+    /// Stand up a node. `max_bytes` caps the in-memory store (default
+    /// 64 MiB — the DoS bound); `stamp_cost` is the admission
+    /// proof-of-work cost in leading-zero bits (default 8; 0 disables
+    /// the spam bound).
+    #[new]
+    #[pyo3(signature = (max_bytes=None, stamp_cost=None))]
+    fn new(max_bytes: Option<usize>, stamp_cost: Option<u8>) -> Self {
+        use crate::transport::lxmf_propagation::{
+            LxmfPropagationNode, DEFAULT_STAMP_COST, DEFAULT_STORE_MAX_BYTES,
+        };
+        Self {
+            inner: LxmfPropagationNode::new(
+                max_bytes.unwrap_or(DEFAULT_STORE_MAX_BYTES),
+                stamp_cost.unwrap_or(DEFAULT_STAMP_COST),
+            ),
+        }
+    }
+
+    /// The admission proof-of-work cost this node advertises + enforces.
+    fn stamp_cost(&self) -> u8 {
+        self.inner.stamp_cost()
+    }
+
+    /// Validate a submission's `propagation_stamp` (32 bytes) and, if it
+    /// clears the advertised cost and fits the store, park the
+    /// `unstamped_lxmf` ciphertext. Returns the 32-byte transient ID it
+    /// was stored under. Raises `ValueError` if the stamp is below cost
+    /// (spam) or the store is full (DoS).
+    #[pyo3(signature = (propagation_stamp, unstamped_lxmf))]
+    fn validate_and_store<'py>(
+        &self,
+        py: Python<'py>,
+        propagation_stamp: &[u8],
+        unstamped_lxmf: &[u8],
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let stamp = fixed_bytes::<32>("propagation_stamp", propagation_stamp)?;
+        let id = self
+            .inner
+            .validate_and_store(&stamp, unstamped_lxmf)
+            .map_err(|e| lxmf_err(&e))?;
+        Ok(pyo3::types::PyBytes::new(py, &id))
+    }
+
+    /// List the transient IDs currently parked (the `/get` list payload).
+    fn list_transient_ids<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyBytes>>> {
+        let ids = self.inner.list_transient_ids().map_err(|e| lxmf_err(&e))?;
+        Ok(ids
+            .into_iter()
+            .map(|id| pyo3::types::PyBytes::new(py, &id))
+            .collect())
+    }
+
+    /// Fetch the stored ciphertext for each requested transient ID (the
+    /// `/get` download payload). Unknown IDs are skipped.
+    #[pyo3(signature = (wants))]
+    fn fetch<'py>(
+        &self,
+        py: Python<'py>,
+        wants: Vec<Vec<u8>>,
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyBytes>>> {
+        let ids = lxmf_transient_ids(wants)?;
+        let msgs = self.inner.fetch(&ids).map_err(|e| lxmf_err(&e))?;
+        Ok(msgs
+            .into_iter()
+            .map(|m| pyo3::types::PyBytes::new(py, &m))
+            .collect())
+    }
+
+    /// Purge acknowledged transient IDs from the mailbox (the effect of
+    /// a `/get` acknowledge). Unknown IDs are ignored.
+    #[pyo3(signature = (haves))]
+    fn acknowledge(&self, haves: Vec<Vec<u8>>) -> PyResult<()> {
+        let ids = lxmf_transient_ids(haves)?;
+        self.inner.acknowledge(&ids).map_err(|e| lxmf_err(&e))
+    }
+
+    /// Operator health — total parked ciphertext bytes.
+    fn stored_bytes(&self) -> usize {
+        self.inner.stored_bytes()
+    }
+
+    /// Operator health — number of messages currently parked.
+    fn pending_count(&self) -> usize {
+        self.inner.pending_count()
+    }
+}
+
+/// LXMF propagation client (CIRISEdge#169). The mobile edge's seam for
+/// propagated delivery: remember a discovered propagation node, and on
+/// wake produce / parse the `/get` mailbox exchange (list → get →
+/// acknowledge). Sans-I/O — the caller performs the Reticulum
+/// `send_request` and feeds the response bytes back through the parse
+/// methods.
+#[cfg(feature = "lxmf")]
+#[pyclass(name = "LxmfPropagationClient", module = "ciris_edge")]
+pub struct PyLxmfPropagationClient {
+    inner: crate::transport::lxmf_propagation::LxmfPropagationClient,
+}
+
+#[cfg(feature = "lxmf")]
+#[pymethods]
+impl PyLxmfPropagationClient {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: crate::transport::lxmf_propagation::LxmfPropagationClient::new(),
+        }
+    }
+
+    /// Remember a propagation node discovered via an announce on the
+    /// propagation aspect. `dest_hash` is the node's 16-byte Reticulum
+    /// destination hash; `announce_app_data` is the announce payload
+    /// (decoded with leviculum-lxmf's `PropagationNodeAnnounce`).
+    #[pyo3(signature = (dest_hash, announce_app_data))]
+    fn remember_node(&self, dest_hash: &[u8], announce_app_data: &[u8]) -> PyResult<()> {
+        let dh = fixed_bytes::<16>("dest_hash", dest_hash)?;
+        self.inner
+            .remember_node(dh, announce_app_data)
+            .map_err(|e| lxmf_err(&e))
+    }
+
+    /// Number of remembered propagation nodes.
+    fn known_node_count(&self) -> usize {
+        self.inner.known_node_count()
+    }
+
+    /// Wake step 1 — encode the `/get` mailbox-list request.
+    fn plan_list_request<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let bytes = self.inner.plan_list_request().map_err(|e| lxmf_err(&e))?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
+    }
+
+    /// Wake step 2 — parse a `/get` list response into its transient IDs.
+    #[pyo3(signature = (response))]
+    fn parse_list_response<'py>(
+        &self,
+        py: Python<'py>,
+        response: &[u8],
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyBytes>>> {
+        let ids = self
+            .inner
+            .parse_list_response(response)
+            .map_err(|e| lxmf_err(&e))?;
+        Ok(ids
+            .into_iter()
+            .map(|id| pyo3::types::PyBytes::new(py, &id))
+            .collect())
+    }
+
+    /// Wake step 3 — encode a `/get` download request for `wants`,
+    /// declaring `haves` already held locally.
+    #[pyo3(signature = (wants, haves))]
+    fn plan_get_request<'py>(
+        &self,
+        py: Python<'py>,
+        wants: Vec<Vec<u8>>,
+        haves: Vec<Vec<u8>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let wants = lxmf_transient_ids(wants)?;
+        let haves = lxmf_transient_ids(haves)?;
+        let bytes = self
+            .inner
+            .plan_get_request(wants, haves)
+            .map_err(|e| lxmf_err(&e))?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
+    }
+
+    /// Wake step 4 — parse a `/get` download response into the unstamped,
+    /// destination-encrypted LXMF messages (each still ciphertext).
+    #[pyo3(signature = (response))]
+    fn parse_get_response<'py>(
+        &self,
+        py: Python<'py>,
+        response: &[u8],
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyBytes>>> {
+        let msgs = self
+            .inner
+            .parse_get_response(response)
+            .map_err(|e| lxmf_err(&e))?;
+        Ok(msgs
+            .into_iter()
+            .map(|m| pyo3::types::PyBytes::new(py, &m))
+            .collect())
+    }
+
+    /// Wake step 5 — encode a `/get` acknowledge request purging received
+    /// transient IDs from the node's mailbox.
+    #[pyo3(signature = (haves))]
+    fn plan_acknowledge<'py>(
+        &self,
+        py: Python<'py>,
+        haves: Vec<Vec<u8>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let haves = lxmf_transient_ids(haves)?;
+        let bytes = self
+            .inner
+            .plan_acknowledge(haves)
+            .map_err(|e| lxmf_err(&e))?;
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
+    }
+
+    /// Origin-upload — wrap `unstamped_lxmf` + `propagation_stamp`
+    /// (32 bytes) into the encoded upload envelope a propagation node
+    /// accepts.
+    #[pyo3(signature = (timestamp, unstamped_lxmf, propagation_stamp))]
+    fn build_upload<'py>(
+        &self,
+        py: Python<'py>,
+        timestamp: f64,
+        unstamped_lxmf: Vec<u8>,
+        propagation_stamp: &[u8],
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let stamp = fixed_bytes::<32>("propagation_stamp", propagation_stamp)?;
+        let bytes = self.inner.build_upload(timestamp, unstamped_lxmf, stamp);
+        Ok(pyo3::types::PyBytes::new(py, &bytes))
+    }
+
+    /// Compute a proof-of-work propagation stamp for an origin upload at
+    /// `cost` leading-zero bits (the node's advertised `stamp_cost`).
+    /// Blocking — run off the hot path. Returns the 32-byte stamp.
+    #[pyo3(signature = (unstamped_lxmf, cost))]
+    fn generate_propagation_stamp<'py>(
+        &self,
+        py: Python<'py>,
+        unstamped_lxmf: &[u8],
+        cost: u8,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let stamp = self
+            .inner
+            .generate_propagation_stamp(unstamped_lxmf, cost)
+            .map_err(|e| lxmf_err(&e))?;
+        Ok(pyo3::types::PyBytes::new(py, &stamp))
+    }
+}
+
 // ─── CIRISEdge#193 — scope_privacy derivation reach-through ─────────
 //
 // Thin PyO3 wrappers over the §2.2 / §2.4 SCOPE_PRIVACY derivation
@@ -7932,6 +8221,16 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // public fabric node (CIRISServer) operates it for asleep mobile
     // edges.
     m.add_class::<PyStoreAndForward>()?;
+
+    // CIRISEdge#169 — LXMF propagated delivery (0x03). The propagation
+    // node a fabric node operates, and the mobile's pull-on-wake client.
+    // Gated on `lxmf` (pulls leviculum-lxmf); the umbrella / pyo3 build
+    // co-enables it.
+    #[cfg(feature = "lxmf")]
+    {
+        m.add_class::<PyLxmfPropagationNode>()?;
+        m.add_class::<PyLxmfPropagationClient>()?;
+    }
 
     // CIRISEdge#219 (v7.2.0) — runtime hot-plug handle for a phone-
     // attached RNode radio (USB-CDC / BLE-bridged). Returned by
