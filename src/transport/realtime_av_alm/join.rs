@@ -171,6 +171,14 @@ pub enum AlmJoinError {
     /// receiver's layer policy.
     #[error("no candidate's max_layer_supported covers my layer policy")]
     NoCandidateSupportsLayerPolicy,
+    /// CIRISEdge#440 — a trust root relieved `feature.av_streams` to `0` on the
+    /// mesh-config plane, pausing ALM admission until the relief's TTL expires
+    /// or a superseding row lifts it. Its OWN variant, deliberately: a
+    /// config-paused plane refused for POLICY, and reporting it as
+    /// [`Self::NoFeasibleParent`] would send an operator debugging capacity.
+    /// Only `plan_parent_gated` produces it — the pure planner never does.
+    #[error("AV stream admission is paused by mesh config (feature.av_streams=0)")]
+    AvStreamsPaused,
 }
 
 /// Stateless parent-finding planner.

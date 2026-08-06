@@ -619,6 +619,20 @@ impl AvSubscriber {
         wall_clock_unix_ms: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<JoinPlan, AlmJoinError> {
+        // CIRISEdge#440 — the `feature.av_streams` mesh-config toggle, checked
+        // BEFORE the per-hop eligibility walk: a paused plane is a policy fact
+        // about the STREAM PLANE, not about any candidate, and must not be
+        // reported as an empty pool. Named refusal + named log; the pause
+        // lifts on the relief row's TTL or a superseding row.
+        if gate.av_streams_paused().await {
+            tracing::warn!(
+                offered = candidates.len(),
+                "AV subscriber: admission REFUSED — a trust root paused AV stream \
+                 replication via mesh config (feature.av_streams=0, CIRISEdge#440); \
+                 the pause expires on the relief row's TTL or a superseding row"
+            );
+            return Err(AlmJoinError::AvStreamsPaused);
+        }
         let offered = candidates.len();
         let eligible = gate.eligible_candidates(candidates, now).await;
         if eligible.len() < offered {
@@ -956,6 +970,64 @@ mod tests {
         };
         let out = AvSubscriber::subscribe(s, &dek, &"parent".to_string(), inbound);
         assert!(out.is_ok(), "subscriber with a DEK must construct");
+    }
+
+    /// CIRISEdge#440 — `feature.av_streams=0` refuses ALM admission with its
+    /// OWN named error, BEFORE the per-hop eligibility walk; an un-paused gate
+    /// over the same (empty) directory falls through to the ordinary planner
+    /// path — the absence contract.
+    ///
+    /// The reader here is `fixed_for_test` (consumer wiring); that a REAL
+    /// admitted `feature.av_streams=0` row produces exactly this
+    /// `av_streams_paused: true` snapshot is the field-provenance suite in
+    /// `replication::mesh_config`.
+    #[tokio::test]
+    async fn av_streams_pause_refuses_admission_with_named_error() {
+        use crate::replication::mesh_config::{MeshConfigReader, MeshConfigRelief};
+        use ciris_persist::federation::FederationDirectory;
+        use std::sync::Arc;
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::MemoryBackend::new());
+
+        let paused_gate = TransitGate::new(Arc::clone(&dir), Some("us".to_string()))
+            .with_mesh_config(Some(Arc::new(MeshConfigReader::fixed_for_test(
+                Arc::clone(&dir),
+                MeshConfigRelief {
+                    av_streams_paused: true,
+                    ..MeshConfigRelief::NONE
+                },
+            ))));
+        let out = AvSubscriber::plan_parent_gated(
+            &paused_gate,
+            Vec::new(),
+            2.0,
+            ReceiverLayerPolicy::UNCAPPED,
+            0,
+            chrono::Utc::now(),
+        )
+        .await;
+        assert!(
+            matches!(out, Err(AlmJoinError::AvStreamsPaused)),
+            "a paused plane must refuse with its OWN named error, never an \
+             empty-pool NoFeasibleParent: {out:?}"
+        );
+
+        // Absence: no reader wired — the pause can never fire; the call falls
+        // through to the ordinary planner (which reports the empty pool).
+        let plain_gate = TransitGate::new(Arc::clone(&dir), Some("us".to_string()));
+        let out = AvSubscriber::plan_parent_gated(
+            &plain_gate,
+            Vec::new(),
+            2.0,
+            ReceiverLayerPolicy::UNCAPPED,
+            0,
+            chrono::Utc::now(),
+        )
+        .await;
+        assert!(
+            !matches!(out, Err(AlmJoinError::AvStreamsPaused)),
+            "without a reader the pause must be unreachable (absence = today): {out:?}"
+        );
     }
 
     /// Minimal mpsc receiver so the unit test above can build an

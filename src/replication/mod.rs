@@ -119,6 +119,7 @@
 pub mod bridge;
 pub mod coordinator;
 pub mod directory;
+pub mod mesh_config;
 pub mod protocol;
 pub mod registry;
 pub mod resolved_state;
@@ -142,11 +143,13 @@ pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, Round
 #[doc(inline)]
 pub use directory::{DirectoryStateAdapter, MutableDirectoryStateAdapter, ReplicationDirectory};
 #[doc(inline)]
+pub use mesh_config::{MeshConfigReader, MeshConfigRelief, DEFAULT_RELIEF_TTL};
+#[doc(inline)]
 pub use protocol::{
     DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
     SummaryMessage,
 };
-#[doc(inline)]
+
 pub use registry::{RegistryError, ReplicationRegistry, RouteOutcome};
 #[doc(inline)]
 pub use runtime::{ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig};

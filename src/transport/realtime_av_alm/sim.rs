@@ -1660,7 +1660,11 @@ mod tests {
                 Err(
                     AlmJoinError::NoFeasibleParent
                     | AlmJoinError::AllCandidatesStale
-                    | AlmJoinError::NoCandidateSupportsLayerPolicy,
+                    | AlmJoinError::NoCandidateSupportsLayerPolicy
+                    // #440 — produced only by `plan_parent_gated` (mesh-config
+                    // pause), never by the pure planner under storm; listed so
+                    // the "defined Err" partition stays exhaustive.
+                    | AlmJoinError::AvStreamsPaused,
                 ) => {}
             }
         }
