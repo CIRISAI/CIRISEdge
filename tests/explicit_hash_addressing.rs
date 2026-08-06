@@ -209,7 +209,11 @@ fn explicit_hash_destination_refuses_to_announce() {
         Some(identity),
         Direction::In,
         DestinationType::Single,
-        "ciris.edge",
+        // leviculum v0.14 — a dot in app_name/aspect is now rejected
+        // (DotInAppName); it is the RNS name separator. Edge production uses
+        // "ciris"/"edge" (dot-free); this fixture matches. The explicit hash
+        // overrides the name-derived one, so the name is incidental here.
+        "ciris",
         &["edge_v1"],
         explicit,
     )
