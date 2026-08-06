@@ -350,7 +350,10 @@ impl Session {
         &mut self,
         msg: ReplicationMessage,
         provider: &dyn StateProvider,
-        applier: &mut dyn StateApplier,
+        // CIRISEdge#370 — `&dyn` (was `&mut dyn`): appliers are shared,
+        // interior-mutable-or-stateless; no exclusive borrow is required to
+        // apply, so callers need no wrapping mutex.
+        applier: &dyn StateApplier,
         // CIRISEdge#426 — the authenticated sender of this message, forwarded to
         // the apply path so a per-peer RECEIVE decision is expressible. Pure
         // pass-through: only the Deliver arm (the sole write path) consults it.
@@ -512,7 +515,7 @@ impl Session {
     fn on_deliver(
         &mut self,
         deliver: &DeliverMessage,
-        applier: &mut dyn StateApplier,
+        applier: &dyn StateApplier,
         source_peer: Option<&str>,
     ) -> ReplicationOutcome {
         if deliver.kind != self.kind {
@@ -660,16 +663,23 @@ mod tests {
     /// An applier that records what it admitted. Maps inbound bytes
     /// back to a hash by indexing the test's known set; in production
     /// the applier validates signatures + canonical-bytes-hash before
-    /// admitting.
+    /// admitting. CIRISEdge#370 — records behind interior mutability
+    /// (`std::sync::Mutex`) since `apply_envelope` is now `&self`.
     struct TestApplier {
-        admitted: Vec<Vec<u8>>,
-        local_state: LocalState,
+        admitted: std::sync::Mutex<Vec<Vec<u8>>>,
+        local_state: std::sync::Mutex<LocalState>,
         hash_lookup: HashMap<Vec<u8>, [u8; 32]>,
+    }
+
+    impl TestApplier {
+        fn admitted_count(&self) -> usize {
+            self.admitted.lock().unwrap().len()
+        }
     }
 
     impl StateApplier for TestApplier {
         fn apply_envelope(
-            &mut self,
+            &self,
             kind: EnvelopeKind,
             bytes: &[u8],
             _source_peer: Option<&str>,
@@ -677,12 +687,13 @@ mod tests {
             // In production: verify sig + recompute hash. Here we
             // look up the precomputed hash for these bytes.
             if let Some(hash) = self.hash_lookup.get(bytes).copied() {
-                let kind_set = self.local_state.by_kind.entry(kind).or_default();
+                let mut local_state = self.local_state.lock().unwrap();
+                let kind_set = local_state.by_kind.entry(kind).or_default();
                 if kind_set.contains_key(&hash) {
                     return ApplyOutcome::Duplicate;
                 }
                 kind_set.insert(hash, 1);
-                self.admitted.push(bytes.to_vec());
+                self.admitted.lock().unwrap().push(bytes.to_vec());
                 ApplyOutcome::Admitted
             } else {
                 ApplyOutcome::refused("unknown bytes (test fixture)")
@@ -709,8 +720,8 @@ mod tests {
             hash_lookup.insert(b.clone(), *h);
         }
         TestApplier {
-            admitted: Vec::new(),
-            local_state: LocalState::new(),
+            admitted: std::sync::Mutex::new(Vec::new()),
+            local_state: std::sync::Mutex::new(LocalState::new()),
             hash_lookup,
         }
     }
@@ -727,8 +738,8 @@ mod tests {
             (EnvelopeKind::Key, h(3), b"env_3".to_vec(), 12),
             (EnvelopeKind::Key, h(4), b"env_4".to_vec(), 13),
         ]);
-        let mut a_applier = applier_for(&[(h(3), b"env_3".to_vec()), (h(4), b"env_4".to_vec())]);
-        let mut b_applier = applier_for(&[(h(1), b"env_1".to_vec()), (h(2), b"env_2".to_vec())]);
+        let a_applier = applier_for(&[(h(3), b"env_3".to_vec()), (h(4), b"env_4".to_vec())]);
+        let b_applier = applier_for(&[(h(1), b"env_1".to_vec()), (h(2), b"env_2".to_vec())]);
 
         let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
         let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
@@ -744,7 +755,7 @@ mod tests {
         };
 
         // 2. Bob receives Alice's Summary → emits {Summary, Diff}.
-        let bob_step1 = bob.on_message(alice_summary, &b_provider, &mut b_applier, None);
+        let bob_step1 = bob.on_message(alice_summary, &b_provider, &b_applier, None);
         let (bob_summary, bob_diff) = match bob_step1 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 2);
@@ -755,7 +766,7 @@ mod tests {
 
         // 3. Alice receives Bob's Summary → emits Diff. (Then
         //    receives Bob's Diff → emits Deliver.)
-        let alice_step2 = alice.on_message(bob_summary, &a_provider, &mut a_applier, None);
+        let alice_step2 = alice.on_message(bob_summary, &a_provider, &a_applier, None);
         let alice_diff = match alice_step2 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -765,7 +776,7 @@ mod tests {
         };
 
         // 4. Bob receives Alice's Diff → emits Deliver(env_1, env_2).
-        let bob_step2 = bob.on_message(alice_diff, &b_provider, &mut b_applier, None);
+        let bob_step2 = bob.on_message(alice_diff, &b_provider, &b_applier, None);
         let bob_deliver = match bob_step2 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -775,7 +786,7 @@ mod tests {
         };
 
         // 5. Alice receives Bob's Diff → emits Deliver(env_3, env_4).
-        let alice_step3 = alice.on_message(bob_diff, &a_provider, &mut a_applier, None);
+        let alice_step3 = alice.on_message(bob_diff, &a_provider, &a_applier, None);
         let alice_deliver = match alice_step3 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -785,7 +796,7 @@ mod tests {
         };
 
         // 6. Alice applies Bob's Deliver → admitted env_3 + env_4.
-        let alice_final = alice.on_message(bob_deliver, &a_provider, &mut a_applier, None);
+        let alice_final = alice.on_message(bob_deliver, &a_provider, &a_applier, None);
         match alice_final {
             ReplicationOutcome::Applied {
                 admitted,
@@ -801,7 +812,7 @@ mod tests {
         }
 
         // 7. Bob applies Alice's Deliver → admitted env_1 + env_2.
-        let bob_final = bob.on_message(alice_deliver, &b_provider, &mut b_applier, None);
+        let bob_final = bob.on_message(alice_deliver, &b_provider, &b_applier, None);
         match bob_final {
             ReplicationOutcome::Applied {
                 admitted,
@@ -820,8 +831,8 @@ mod tests {
         assert!(alice.is_complete());
         assert!(bob.is_complete());
         // Local state of each applier carries the new envelopes.
-        assert_eq!(a_applier.admitted.len(), 2);
-        assert_eq!(b_applier.admitted.len(), 2);
+        assert_eq!(a_applier.admitted_count(), 2);
+        assert_eq!(b_applier.admitted_count(), 2);
     }
 
     /// Partial overlap — peers share some envelopes; only the missing
@@ -840,8 +851,8 @@ mod tests {
             (EnvelopeKind::Attestation, h(3), b"e3".to_vec(), 3),
             (EnvelopeKind::Attestation, h(4), b"e4".to_vec(), 4),
         ]);
-        let mut a_applier = applier_for(&[(h(4), b"e4".to_vec())]);
-        let mut b_applier = applier_for(&[(h(1), b"e1".to_vec())]);
+        let a_applier = applier_for(&[(h(4), b"e4".to_vec())]);
+        let b_applier = applier_for(&[(h(1), b"e1".to_vec())]);
 
         let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation);
         let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
@@ -852,29 +863,27 @@ mod tests {
             _ => panic!(),
         };
         let (m_bob_summary, m_bob_diff) =
-            match bob.on_message(m_alice_summary, &b_provider, &mut b_applier, None) {
+            match bob.on_message(m_alice_summary, &b_provider, &b_applier, None) {
                 ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
                 _ => panic!(),
             };
-        let m_alice_diff = match alice.on_message(m_bob_summary, &a_provider, &mut a_applier, None)
-        {
+        let m_alice_diff = match alice.on_message(m_bob_summary, &a_provider, &a_applier, None) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let m_bob_deliver = match bob.on_message(m_alice_diff, &b_provider, &mut b_applier, None) {
+        let m_bob_deliver = match bob.on_message(m_alice_diff, &b_provider, &b_applier, None) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let m_alice_deliver = match alice.on_message(m_bob_diff, &a_provider, &mut a_applier, None)
-        {
+        let m_alice_deliver = match alice.on_message(m_bob_diff, &a_provider, &a_applier, None) {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        match alice.on_message(m_bob_deliver, &a_provider, &mut a_applier, None) {
+        match alice.on_message(m_bob_deliver, &a_provider, &a_applier, None) {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
         }
-        match bob.on_message(m_alice_deliver, &b_provider, &mut b_applier, None) {
+        match bob.on_message(m_alice_deliver, &b_provider, &b_applier, None) {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
         }
@@ -915,7 +924,7 @@ mod tests {
             }],
         };
         let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
-        let mut applier = applier_for(&[]);
+        let applier = applier_for(&[]);
 
         let remote_summary = ReplicationMessage::Summary(SummaryMessage {
             kind: EnvelopeKind::Attestation,
@@ -930,7 +939,7 @@ mod tests {
                 },
             ],
         });
-        let out = match responder.on_message(remote_summary, &provider, &mut applier, None) {
+        let out = match responder.on_message(remote_summary, &provider, &applier, None) {
             ReplicationOutcome::Send(m) => m,
             o => panic!("unexpected: {o:?}"),
         };
@@ -966,8 +975,8 @@ mod tests {
             (EnvelopeKind::Key, h(1), b"e1".to_vec(), 1),
             (EnvelopeKind::Key, h(2), b"e2".to_vec(), 2),
         ]);
-        let mut a_applier = applier_for(&[]);
-        let mut b_applier = applier_for(&[]);
+        let a_applier = applier_for(&[]);
+        let b_applier = applier_for(&[]);
 
         let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
         let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
@@ -978,36 +987,35 @@ mod tests {
             _ => panic!(),
         };
         let (bob_summary_resp, bob_diff_msg) =
-            match bob.on_message(alice_summary, &b_provider, &mut b_applier, None) {
+            match bob.on_message(alice_summary, &b_provider, &b_applier, None) {
                 ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
                 _ => panic!(),
             };
-        let alice_diff_msg =
-            match alice.on_message(bob_summary_resp, &a_provider, &mut a_applier, None) {
-                ReplicationOutcome::Send(m) => m[0].clone(),
-                _ => panic!(),
-            };
+        let alice_diff_msg = match alice.on_message(bob_summary_resp, &a_provider, &a_applier, None)
+        {
+            ReplicationOutcome::Send(m) => m[0].clone(),
+            _ => panic!(),
+        };
         // Bob's Deliver from Alice's Diff should be empty (Alice has
         // everything Bob has).
-        let bob_deliver_msg =
-            match bob.on_message(alice_diff_msg, &b_provider, &mut b_applier, None) {
-                ReplicationOutcome::Send(m) => m[0].clone(),
-                _ => panic!(),
-            };
+        let bob_deliver_msg = match bob.on_message(alice_diff_msg, &b_provider, &b_applier, None) {
+            ReplicationOutcome::Send(m) => m[0].clone(),
+            _ => panic!(),
+        };
         if let ReplicationMessage::Deliver(d) = &bob_deliver_msg {
             assert!(d.envelopes.is_empty(), "bob should deliver nothing");
         }
         // Same for Alice's Deliver from Bob's Diff.
-        let alice_deliver_msg =
-            match alice.on_message(bob_diff_msg, &a_provider, &mut a_applier, None) {
-                ReplicationOutcome::Send(m) => m[0].clone(),
-                _ => panic!(),
-            };
+        let alice_deliver_msg = match alice.on_message(bob_diff_msg, &a_provider, &a_applier, None)
+        {
+            ReplicationOutcome::Send(m) => m[0].clone(),
+            _ => panic!(),
+        };
         if let ReplicationMessage::Deliver(d) = &alice_deliver_msg {
             assert!(d.envelopes.is_empty(), "alice should deliver nothing");
         }
         // Applied with 0 admitted, InSync staleness.
-        match alice.on_message(bob_deliver_msg, &a_provider, &mut a_applier, None) {
+        match alice.on_message(bob_deliver_msg, &a_provider, &a_applier, None) {
             ReplicationOutcome::Applied {
                 admitted,
                 staleness,
@@ -1025,7 +1033,7 @@ mod tests {
     #[test]
     fn mismatched_kind_refused() {
         let provider = provider_with(&[]);
-        let mut applier = applier_for(&[]);
+        let applier = applier_for(&[]);
         let mut s = Session::new(SessionRole::Responder, EnvelopeKind::Key);
         let r = s.on_message(
             ReplicationMessage::Diff(DiffMessage {
@@ -1033,7 +1041,7 @@ mod tests {
                 want: vec![],
             }),
             &provider,
-            &mut applier,
+            &applier,
             None,
         );
         assert_eq!(r, ReplicationOutcome::UnexpectedMessage);
@@ -1050,7 +1058,7 @@ mod tests {
     #[test]
     fn responder_applies_unsolicited_bare_deliver() {
         let provider = provider_with(&[]);
-        let mut applier = applier_for(&[(h(1), b"pushed-key".to_vec())]);
+        let applier = applier_for(&[(h(1), b"pushed-key".to_vec())]);
         let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
         // No Summary, no Diff — the initiator just pushes its key envelope.
         let r = bob.on_message(
@@ -1059,7 +1067,7 @@ mod tests {
                 envelopes: vec![b"pushed-key".to_vec()],
             }),
             &provider,
-            &mut applier,
+            &applier,
             None,
         );
         match r {
@@ -1116,7 +1124,7 @@ mod tests {
             (EnvelopeKind::Attestation, h(1), b"env-a".to_vec(), 1),
             (EnvelopeKind::Attestation, h(2), b"env-b".to_vec(), 2),
         ]);
-        let mut applier = applier_for(&[]);
+        let applier = applier_for(&[]);
         let mut s = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation)
             .with_proactive_publish(true);
         // The responder's reverse-path Summary arrives first: it holds h(1).
@@ -1129,7 +1137,7 @@ mod tests {
                 }],
             }),
             &provider,
-            &mut applier,
+            &applier,
             None,
         );
         match s.start_round(&provider) {
@@ -1220,7 +1228,7 @@ mod tests {
     #[test]
     fn initiator_final_completes_only_on_confirmed_sync() {
         let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"env-a".to_vec(), 1)]);
-        let mut applier = applier_for(&[]);
+        let applier = applier_for(&[]);
         let mut s =
             Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
         // Round 1: never heard the peer → pushes, must NOT complete.
@@ -1238,7 +1246,7 @@ mod tests {
                 }],
             }),
             &provider,
-            &mut applier,
+            &applier,
             None,
         );
         // Round 2: confirmed sync → SendAndComplete.
@@ -1266,7 +1274,7 @@ mod tests {
     #[test]
     fn initiator_final_blocked_when_we_want_their_rows() {
         let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"env-a".to_vec(), 1)]);
-        let mut applier = applier_for(&[]);
+        let applier = applier_for(&[]);
         let mut s =
             Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
         let _ = s.on_message(
@@ -1284,7 +1292,7 @@ mod tests {
                 ],
             }),
             &provider,
-            &mut applier,
+            &applier,
             None,
         );
         assert!(
@@ -1302,7 +1310,7 @@ mod tests {
             (EnvelopeKind::Attestation, h(1), b"e1".to_vec(), 1),
             (EnvelopeKind::Attestation, h(2), b"e2".to_vec(), 2),
         ]);
-        let mut applier = applier_for(&[]);
+        let applier = applier_for(&[]);
         let mut s = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
         let r = s.on_message(
             ReplicationMessage::Fetch(FetchMessage {
@@ -1310,7 +1318,7 @@ mod tests {
                 want: vec![h(1), h(99)], // h(99) doesn't exist
             }),
             &provider,
-            &mut applier,
+            &applier,
             None,
         );
         match r {
@@ -1336,7 +1344,7 @@ mod tests {
         // only accepts 1 of them (the other 2 have unknown bytes →
         // refused).
         let a_provider = provider_with(&[]);
-        let mut a_applier = applier_for(&[(h(1), b"e1".to_vec())]);
+        let a_applier = applier_for(&[(h(1), b"e1".to_vec())]);
         let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
         // Skip the wire dance — drive on_message directly.
         let bob_summary = ReplicationMessage::Summary(SummaryMessage {
@@ -1357,7 +1365,7 @@ mod tests {
             ],
         });
         alice.start_round(&a_provider);
-        let _ = alice.on_message(bob_summary, &a_provider, &mut a_applier, None);
+        let _ = alice.on_message(bob_summary, &a_provider, &a_applier, None);
         let bob_deliver = ReplicationMessage::Deliver(DeliverMessage {
             kind: EnvelopeKind::Key,
             envelopes: vec![
@@ -1366,7 +1374,7 @@ mod tests {
                 b"unknown_e3".to_vec(),
             ],
         });
-        match alice.on_message(bob_deliver, &a_provider, &mut a_applier, None) {
+        match alice.on_message(bob_deliver, &a_provider, &a_applier, None) {
             ReplicationOutcome::Applied {
                 admitted,
                 refused,
@@ -1392,7 +1400,7 @@ mod tests {
         struct RefusingApplier;
         impl StateApplier for RefusingApplier {
             fn apply_envelope(
-                &mut self,
+                &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
                 _source_peer: Option<&str>,
@@ -1405,7 +1413,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
         };
-        match responder.on_deliver(&deliver, &mut RefusingApplier, Some("peer-x")) {
+        match responder.on_deliver(&deliver, &RefusingApplier, Some("peer-x")) {
             ReplicationOutcome::Applied {
                 admitted, refused, ..
             } => {
@@ -1424,28 +1432,34 @@ mod tests {
     #[test]
     fn on_deliver_threads_source_peer_to_the_applier() {
         struct PeerRecordingApplier {
-            seen: Vec<Option<String>>,
+            // CIRISEdge#370 — interior mutability: `apply_envelope` is `&self`.
+            seen: std::sync::Mutex<Vec<Option<String>>>,
         }
         impl StateApplier for PeerRecordingApplier {
             fn apply_envelope(
-                &mut self,
+                &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
                 source_peer: Option<&str>,
             ) -> ApplyOutcome {
-                self.seen.push(source_peer.map(str::to_owned));
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(source_peer.map(str::to_owned));
                 ApplyOutcome::Admitted
             }
         }
-        let mut applier = PeerRecordingApplier { seen: Vec::new() };
+        let applier = PeerRecordingApplier {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
         let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
         let deliver = DeliverMessage {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"x".to_vec(), b"y".to_vec()],
         };
-        responder.on_deliver(&deliver, &mut applier, Some("canonical-1"));
+        responder.on_deliver(&deliver, &applier, Some("canonical-1"));
         assert_eq!(
-            applier.seen,
+            *applier.seen.lock().unwrap(),
             vec![
                 Some("canonical-1".to_string()),
                 Some("canonical-1".to_string())

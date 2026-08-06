@@ -111,7 +111,15 @@ pub struct ReplicationCoordinator {
     kind: EnvelopeKind,
     role: SessionRole,
     provider: Arc<dyn StateProvider>,
-    applier: Arc<Mutex<dyn StateApplier>>,
+    /// CIRISEdge#370 — the applier is a SHARED `Arc<dyn StateApplier>` with
+    /// NO wrapping mutex: `apply_envelope` is `&self` (stateless production
+    /// adapter; interior-mutable test appliers), so per-peer coordinators
+    /// apply concurrently down to the store's own serialization. The old
+    /// `Arc<Mutex<_>>` was held across a whole message's applies — with
+    /// `block_on` DB I/O inside — serializing round servicing across peers
+    /// (≈ N × batch-apply-time; the ~40-peer collapse past the 30 s
+    /// transport timeout) while protecting nothing.
+    applier: Arc<dyn StateApplier>,
     /// The long-lived state machine for this peer-pair anti-entropy
     /// relationship. Wrapped in `Mutex` so `drive_round_step` can
     /// take `&self` (matching the existing API + letting the
@@ -143,7 +151,7 @@ impl ReplicationCoordinator {
         kind: EnvelopeKind,
         role: SessionRole,
         provider: Arc<dyn StateProvider>,
-        applier: Arc<Mutex<dyn StateApplier>>,
+        applier: Arc<dyn StateApplier>,
     ) -> Self {
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(Self::INBOUND_CHANNEL_CAPACITY);
         Self {
@@ -236,14 +244,15 @@ impl ReplicationCoordinator {
                         );
                     }
                 }
-                let mut applier = self.applier.lock().await;
                 // CIRISEdge#426 — this coordinator IS per-peer, so its `peer_key_id`
                 // is the authenticated sender of anything it applies this round.
                 // Forward it so the apply path can make a per-peer receive decision.
+                // CIRISEdge#370 — no applier lock: `apply_envelope` is `&self`;
+                // another peer's round can apply concurrently with this one.
                 session.on_message(
                     m,
                     self.provider.as_ref(),
-                    &mut *applier,
+                    self.applier.as_ref(),
                     Some(self.peer_key_id.as_str()),
                 )
             }
@@ -516,25 +525,41 @@ mod tests {
     }
 
     /// Applier that records every admitted envelope into a Vec the
-    /// test can inspect.
+    /// test can inspect. CIRISEdge#370 — the recorded state lives behind
+    /// `std::sync::Mutex` interior mutability since `apply_envelope` is
+    /// `&self`; the recording semantics (what was admitted, duplicate
+    /// detection) are unchanged.
     struct RecordingApplier {
-        admitted_bytes: Vec<Vec<u8>>,
+        admitted_bytes: std::sync::Mutex<Vec<Vec<u8>>>,
         known: HashMap<Vec<u8>, [u8; 32]>,
-        local_hashes: std::collections::HashSet<[u8; 32]>,
+        local_hashes: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    }
+    impl RecordingApplier {
+        fn with(
+            known: HashMap<Vec<u8>, [u8; 32]>,
+            local_hashes: std::collections::HashSet<[u8; 32]>,
+        ) -> Arc<dyn StateApplier> {
+            Arc::new(Self {
+                admitted_bytes: std::sync::Mutex::new(Vec::new()),
+                known,
+                local_hashes: std::sync::Mutex::new(local_hashes),
+            })
+        }
     }
     impl StateApplier for RecordingApplier {
         fn apply_envelope(
-            &mut self,
+            &self,
             _kind: EnvelopeKind,
             bytes: &[u8],
             _source_peer: Option<&str>,
         ) -> ApplyOutcome {
             if let Some(hash) = self.known.get(bytes).copied() {
-                if self.local_hashes.contains(&hash) {
+                let mut local_hashes = self.local_hashes.lock().unwrap();
+                if local_hashes.contains(&hash) {
                     return ApplyOutcome::Duplicate;
                 }
-                self.local_hashes.insert(hash);
-                self.admitted_bytes.push(bytes.to_vec());
+                local_hashes.insert(hash);
+                self.admitted_bytes.lock().unwrap().push(bytes.to_vec());
                 ApplyOutcome::Admitted
             } else {
                 ApplyOutcome::refused("unknown bytes (test)")
@@ -579,16 +604,14 @@ mod tests {
             envelopes: HashMap::from([(h(3), b"env_3".to_vec()), (h(4), b"env_4".to_vec())]),
         });
 
-        let a_applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::from([(b"env_3".to_vec(), h(3)), (b"env_4".to_vec(), h(4))]),
-            local_hashes: [h(1), h(2)].into_iter().collect(),
-        }));
-        let b_applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::from([(b"env_1".to_vec(), h(1)), (b"env_2".to_vec(), h(2))]),
-            local_hashes: [h(3), h(4)].into_iter().collect(),
-        }));
+        let a_applier = RecordingApplier::with(
+            HashMap::from([(b"env_3".to_vec(), h(3)), (b"env_4".to_vec(), h(4))]),
+            [h(1), h(2)].into_iter().collect(),
+        );
+        let b_applier = RecordingApplier::with(
+            HashMap::from([(b"env_1".to_vec(), h(1)), (b"env_2".to_vec(), h(2))]),
+            [h(3), h(4)].into_iter().collect(),
+        );
 
         let alice_coord = ReplicationCoordinator::new(
             alice_t.clone(),
@@ -841,11 +864,7 @@ mod tests {
             state: LocalState::new(),
             envelopes: HashMap::new(),
         });
-        let a_applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::new(),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let a_applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
         let coord = ReplicationCoordinator::new(
             alice_t,
             "nobody_home",
@@ -876,11 +895,7 @@ mod tests {
             state: alice_state,
             envelopes: HashMap::from([(h(1), b"e1".to_vec())]),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::new(),
-            local_hashes: [h(1)].into_iter().collect(),
-        }));
+        let applier = RecordingApplier::with(HashMap::new(), [h(1)].into_iter().collect());
         let coord = ReplicationCoordinator::new(
             Arc::new(alice_t),
             "bob",
@@ -914,11 +929,7 @@ mod tests {
             state: LocalState::new(),
             envelopes: HashMap::new(),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::new(),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
         let coord = ReplicationCoordinator::new(
             Arc::new(alice_t),
             "bob",
@@ -962,11 +973,10 @@ mod tests {
             state: LocalState::new(),
             envelopes: HashMap::new(),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::from([(b"e1".to_vec(), h(1))]),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let applier = RecordingApplier::with(
+            HashMap::from([(b"e1".to_vec(), h(1))]),
+            std::collections::HashSet::new(),
+        );
         let coord = ReplicationCoordinator::new(
             Arc::new(alice_t),
             "bob",
@@ -1012,11 +1022,10 @@ mod tests {
             state: alice_state,
             envelopes: HashMap::from([(h(1), b"env_1".to_vec())]),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::from([(b"env_3".to_vec(), h(3)), (b"env_4".to_vec(), h(4))]),
-            local_hashes: [h(1)].into_iter().collect(),
-        }));
+        let applier = RecordingApplier::with(
+            HashMap::from([(b"env_3".to_vec(), h(3)), (b"env_4".to_vec(), h(4))]),
+            [h(1)].into_iter().collect(),
+        );
         let coord = ReplicationCoordinator::new(
             Arc::new(alice_t),
             "bob",
@@ -1092,11 +1101,10 @@ mod tests {
             state: LocalState::new(),
             envelopes: HashMap::new(),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::from([(b"e1".to_vec(), h(1))]),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let applier = RecordingApplier::with(
+            HashMap::from([(b"e1".to_vec(), h(1))]),
+            std::collections::HashSet::new(),
+        );
         let coord = ReplicationCoordinator::new(
             Arc::new(alice_t),
             "bob",
@@ -1129,11 +1137,7 @@ mod tests {
             state: LocalState::new(),
             envelopes: HashMap::new(),
         });
-        let applier: Arc<Mutex<dyn StateApplier>> = Arc::new(Mutex::new(RecordingApplier {
-            admitted_bytes: Vec::new(),
-            known: HashMap::new(),
-            local_hashes: std::collections::HashSet::new(),
-        }));
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
         let coord = ReplicationCoordinator::new(
             Arc::new(alice_t),
             "bob",
@@ -1148,5 +1152,134 @@ mod tests {
         });
         let step = coord.drive_round_step(Some(wrong_kind)).await.unwrap();
         assert!(matches!(step, DriveStep::Refused));
+    }
+
+    /// CIRISEdge#370 — THE fix's proof: two coordinators (two different peers)
+    /// sharing ONE `Arc<dyn StateApplier>` apply CONCURRENTLY — no wrapping
+    /// mutex serializes them. Field-provenance: the shared applier is the REAL
+    /// production adapter ([`MutableDirectoryStateAdapter`], the exact
+    /// `block_in_place → block_on` bridge the runtime wires), over a
+    /// [`ReplicationDirectory`] whose `apply_envelope_bytes` parks each apply
+    /// on a 2-party `tokio::sync::Barrier`. The barrier releases ONLY if the
+    /// second peer's apply enters while the first is still inside — under the
+    /// old `Arc<Mutex<dyn StateApplier>>` (held across the whole message's
+    /// applies) the second apply could never start until the first finished,
+    /// so this test would hang at the barrier and trip the timeout. The
+    /// max-in-flight gauge then pins the same fact positively (== 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_applier_serves_two_coordinators_concurrently() {
+        use crate::replication::directory::{MutableDirectoryStateAdapter, ReplicationDirectory};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Directory whose apply is a 2-party rendezvous + in-flight gauge.
+        struct BarrierDirectory {
+            barrier: tokio::sync::Barrier,
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+        }
+        #[async_trait]
+        impl ReplicationDirectory for BarrierDirectory {
+            async fn list_envelope_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                vec![]
+            }
+            async fn fetch_envelope_bytes(
+                &self,
+                _kind: EnvelopeKind,
+                _envelope_hash: &[u8; 32],
+            ) -> Option<Vec<u8>> {
+                None
+            }
+            async fn apply_envelope_bytes(
+                &self,
+                _kind: EnvelopeKind,
+                _envelope_bytes: &[u8],
+                _source_peer: Option<&str>,
+            ) -> ApplyOutcome {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                // Rendezvous: completes only when BOTH peers' applies are
+                // inside apply_envelope_bytes at the same time.
+                self.barrier.wait().await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                ApplyOutcome::Admitted
+            }
+        }
+
+        let dir = Arc::new(BarrierDirectory {
+            barrier: tokio::sync::Barrier::new(2),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        });
+        // ONE shared applier — the production adapter, the production shape
+        // (the runtime hands this same Arc to every coordinator).
+        let applier: Arc<dyn StateApplier> = Arc::new(MutableDirectoryStateAdapter::new(
+            Arc::clone(&dir) as Arc<dyn ReplicationDirectory>,
+        ));
+
+        let make_coord = |peer: &str| {
+            Arc::new(ReplicationCoordinator::new(
+                Arc::new(InMemTransport {
+                    id: TransportId::HTTP,
+                    peer_inbox: HashMap::new(),
+                    my_inbox: Arc::new(Mutex::new(tokio::sync::mpsc::unbounded_channel().1)),
+                }),
+                peer,
+                EnvelopeKind::Key,
+                SessionRole::Responder,
+                Arc::new(StaticProvider {
+                    state: LocalState::new(),
+                    envelopes: HashMap::new(),
+                }) as Arc<dyn StateProvider>,
+                Arc::clone(&applier),
+            ))
+        };
+        let coord_a = make_coord("peer-a");
+        let coord_b = make_coord("peer-b");
+
+        let deliver = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![b"env_x".to_vec()],
+        });
+        let task_a = tokio::spawn({
+            let coord = Arc::clone(&coord_a);
+            let msg = deliver.clone();
+            async move { coord.drive_round_step(Some(msg)).await }
+        });
+        let task_b = tokio::spawn({
+            let coord = Arc::clone(&coord_b);
+            let msg = deliver;
+            async move { coord.drive_round_step(Some(msg)).await }
+        });
+
+        // A generous bound: if applies serialize (the #370 regression), the
+        // barrier never gets its second party and both tasks hang here.
+        let (step_a, step_b) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+                (task_a.await, task_b.await)
+            })
+            .await
+            .expect(
+                "applies serialized — a lock above the store is back between \
+             drive_round_step and apply_envelope (CIRISEdge#370 regression)",
+            );
+
+        for step in [
+            step_a.expect("join a").expect("drive a"),
+            step_b.expect("join b").expect("drive b"),
+        ] {
+            match step {
+                DriveStep::Complete(report) => {
+                    assert_eq!(report.admitted, 1, "each peer's Deliver admitted");
+                    assert_eq!(report.refused, 0);
+                }
+                o => panic!("expected Complete, got {o:?}"),
+            }
+        }
+        assert_eq!(
+            dir.max_in_flight.load(Ordering::SeqCst),
+            2,
+            "both peers' applies were inside the store simultaneously — \
+             the shared applier imposes no serialization of its own (#370)"
+        );
     }
 }

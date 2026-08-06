@@ -144,8 +144,8 @@ pub trait ReplicationDirectory: Send + Sync {
 }
 
 /// Adapter that lifts an `Arc<dyn ReplicationDirectory>` into the
-/// sync [`StateProvider`] + async [`StateApplier`] surfaces the
-/// session machinery expects.
+/// sync [`StateProvider`] surface the session machinery expects (the
+/// apply half lives on [`MutableDirectoryStateAdapter`]).
 ///
 /// The session machinery uses synchronous traits (the state machine
 /// is itself synchronous — it just produces messages); this adapter
@@ -232,36 +232,18 @@ impl StateProvider for DirectoryStateAdapter {
     }
 }
 
-impl StateApplier for DirectoryStateAdapter {
-    fn apply_envelope(
-        &mut self,
-        _kind: EnvelopeKind,
-        _envelope_bytes: &[u8],
-        _source_peer: Option<&str>,
-    ) -> ApplyOutcome {
-        // NOTE: This impl is the *read* half of the adapter — the
-        // `Session` machinery currently borrows the applier `&mut`,
-        // which conflicts with the borrow-checker on a shared
-        // `Arc<DirectoryStateAdapter>`. The production wiring uses a
-        // separate `Arc<Mutex<dyn StateApplier>>` shape (the
-        // coordinator's `apply_envelope` is gated by the mutex).
-        //
-        // For the `&mut self` apply surface, see
-        // `MutableDirectoryStateAdapter` below — the same adapter
-        // body, exposed through `&mut self` so the coordinator's
-        // `Mutex<dyn StateApplier>` shape composes.
-        unreachable!(
-            "DirectoryStateAdapter::apply_envelope on shared self — \
-             use MutableDirectoryStateAdapter (held inside Mutex) for the apply path"
-        )
-    }
-}
-
-/// Mutable-self variant of [`DirectoryStateAdapter`] for the
-/// `Arc<Mutex<dyn StateApplier>>` shape the coordinator owns.
-/// The implementations are identical to the shared-self read path;
-/// keeping them as distinct types makes the borrow story crystal
-/// clear at the type level.
+/// The apply half of [`DirectoryStateAdapter`], kept as a distinct type so
+/// the provider (peer-BOUND: #379 observer gate) and applier (peer-BLIND:
+/// `source_peer` arrives per-call) surfaces stay separate at the type level.
+///
+/// CIRISEdge#370 — `apply_envelope` is `&self` and this adapter is a
+/// STATELESS wrapper over `Arc<dyn ReplicationDirectory>`, so ONE shared
+/// `Arc<dyn StateApplier>` serves every per-peer coordinator with NO
+/// wrapping mutex. (The historical name survives from the `&mut self` era,
+/// when the coordinator had to hold it inside `Arc<Mutex<dyn StateApplier>>`
+/// — the lock protected nothing and serialized every peer's applies through
+/// one hold-across-the-whole-message critical section with `block_on` DB
+/// I/O inside; the store owns the real concurrency control.)
 pub struct MutableDirectoryStateAdapter {
     inner: Arc<dyn ReplicationDirectory>,
 }
@@ -274,7 +256,7 @@ impl MutableDirectoryStateAdapter {
 
 impl StateApplier for MutableDirectoryStateAdapter {
     fn apply_envelope(
-        &mut self,
+        &self,
         kind: EnvelopeKind,
         envelope_bytes: &[u8],
         source_peer: Option<&str>,
@@ -517,12 +499,12 @@ mod tests {
     }
 
     /// MutableDirectoryStateAdapter (write path) bridges the async
-    /// trait to the &mut self StateApplier.
+    /// trait to the `&self` StateApplier (#370).
     #[tokio::test(flavor = "multi_thread")]
     async fn mutable_directory_state_adapter_writes_through() {
         let mock = Arc::new(MockReplicationDirectory::new());
         let dir: Arc<dyn ReplicationDirectory> = Arc::clone(&mock) as Arc<dyn ReplicationDirectory>;
-        let mut adapter = MutableDirectoryStateAdapter::new(dir);
+        let adapter = MutableDirectoryStateAdapter::new(dir);
         let admitted = adapter.apply_envelope(EnvelopeKind::Revocation, b"rev_bytes", None);
         assert!(admitted.is_admitted());
         assert_eq!(mock.count(EnvelopeKind::Revocation).await, 1);
@@ -537,7 +519,7 @@ mod tests {
             .await;
         let dir: Arc<dyn ReplicationDirectory> = Arc::clone(&mock) as Arc<dyn ReplicationDirectory>;
         let provider = DirectoryStateAdapter::new(Arc::clone(&dir));
-        let mut applier = MutableDirectoryStateAdapter::new(dir);
+        let applier = MutableDirectoryStateAdapter::new(dir);
         // Initial list shows the seed.
         assert_eq!(provider.local_refs(EnvelopeKind::Attestation).len(), 1);
         // Apply a new envelope.

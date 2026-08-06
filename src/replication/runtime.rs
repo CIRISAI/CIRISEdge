@@ -288,6 +288,15 @@ pub struct ReplicationRuntime {
     transport: Arc<dyn Transport>,
     registry: Arc<ReplicationRegistry>,
     bridge: Arc<FederationDirectoryReplicationBridge>,
+    /// CIRISEdge#370 — THE applier: one shared `Arc<dyn StateApplier>`
+    /// (stateless adapter over the bridge) handed to every coordinator this
+    /// runtime builds — initial initiators, the #312 responder factory, and
+    /// hot-adds — with NO wrapping mutex. `apply_envelope` is `&self`, so
+    /// per-peer rounds apply concurrently down to the store's own
+    /// serialization; the old per-coordinator `Arc<Mutex<_>>` hold-across-
+    /// the-whole-message critical section (with `block_on` DB I/O inside)
+    /// is gone.
+    applier: Arc<dyn StateApplier>,
     cancel_tx: watch::Sender<bool>,
     scheduler_task: Option<JoinHandle<()>>,
     config: ReplicationRuntimeConfig,
@@ -384,6 +393,15 @@ impl ReplicationRuntime {
 
         let registry = Arc::new(ReplicationRegistry::new());
 
+        // CIRISEdge#370 — ONE shared applier for every coordinator (initial
+        // initiators, the #312 responder factory, hot-adds). The adapter is a
+        // stateless `&self` wrapper over the bridge, so nothing needs a mutex;
+        // applies from different peers' rounds run concurrently and serialize
+        // only in the store.
+        let shared_applier: Arc<dyn StateApplier> = Arc::new(MutableDirectoryStateAdapter::new(
+            Arc::clone(&bridge) as Arc<dyn ReplicationDirectory>,
+        ));
+
         // CIRISEdge#312 — install the responder factory so an inbound round
         // from an admitted-but-uncoordinated peer (a #301 advisory source we
         // don't consent-pull from, hence never built an Initiator for)
@@ -393,6 +411,9 @@ impl ReplicationRuntime {
         {
             let factory_transport = Arc::clone(&transport);
             let factory_bridge = Arc::clone(&bridge);
+            // CIRISEdge#370 — the factory hands every responder the ONE shared
+            // no-mutex applier.
+            let factory_applier = Arc::clone(&shared_applier);
             // CIRISEdge#441 — the responder coordinators fold peer Summaries
             // into the removal-receipt ledger; same handle the bridge uses.
             let factory_metrics = config.metrics.clone();
@@ -400,11 +421,9 @@ impl ReplicationRuntime {
                 let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&factory_bridge) as _;
                 // CIRISEdge#379 — peer-bound provider: the observer-capability
                 // gate on the trace attestation plane applies per recipient.
-                let provider: Arc<dyn StateProvider> = Arc::new(
-                    DirectoryStateAdapter::new(Arc::clone(&bridge_dir)).with_peer(peer_key_id),
-                );
-                let applier: Arc<Mutex<dyn StateApplier>> =
-                    Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
+                let provider: Arc<dyn StateProvider> =
+                    Arc::new(DirectoryStateAdapter::new(bridge_dir).with_peer(peer_key_id));
+                let applier = Arc::clone(&factory_applier);
                 let coord = Arc::new(
                     ReplicationCoordinator::new(
                         Arc::clone(&factory_transport),
@@ -432,9 +451,9 @@ impl ReplicationRuntime {
         }
 
         // Build coordinators + scheduler. Coordinators share one
-        // bridge instance; provider + applier are split-shape per
-        // session.rs's borrow story (the bridge is the same object
-        // backing both).
+        // bridge instance; the provider is per-peer (#379 observer gate),
+        // the applier is the ONE shared no-mutex `Arc<dyn StateApplier>`
+        // (#370 — apply is `&self`; the store owns serialization).
         let mut scheduler = ReplicationScheduler::new(config.scheduler);
         let scheduler_handle = scheduler.install_control_channel();
         let coords: Vec<Arc<ReplicationCoordinator>> = peers
@@ -442,13 +461,9 @@ impl ReplicationRuntime {
             .map(|peer| {
                 let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&bridge) as _;
                 // CIRISEdge#379 — peer-bound provider (observer gate, see above).
-                let provider: Arc<dyn StateProvider> = Arc::new(
-                    DirectoryStateAdapter::new(Arc::clone(&bridge_dir))
-                        .with_peer(&peer.peer_key_id),
-                );
-                let applier: Arc<tokio::sync::Mutex<dyn StateApplier>> = Arc::new(
-                    tokio::sync::Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)),
-                );
+                let provider: Arc<dyn StateProvider> =
+                    Arc::new(DirectoryStateAdapter::new(bridge_dir).with_peer(&peer.peer_key_id));
+                let applier = Arc::clone(&shared_applier);
                 Arc::new(
                     ReplicationCoordinator::new(
                         Arc::clone(&transport),
@@ -512,6 +527,7 @@ impl ReplicationRuntime {
             transport,
             registry,
             bridge,
+            applier: shared_applier,
             cancel_tx,
             scheduler_task: Some(scheduler_task),
             config,
@@ -665,9 +681,9 @@ impl ReplicationRuntime {
         let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&self.bridge) as _;
         // CIRISEdge#379 — peer-bound provider (observer gate).
         let provider: Arc<dyn StateProvider> =
-            Arc::new(DirectoryStateAdapter::new(Arc::clone(&bridge_dir)).with_peer(peer_key_id));
-        let applier: Arc<Mutex<dyn StateApplier>> =
-            Arc::new(Mutex::new(MutableDirectoryStateAdapter::new(bridge_dir)));
+            Arc::new(DirectoryStateAdapter::new(bridge_dir).with_peer(peer_key_id));
+        // CIRISEdge#370 — hot-adds share the runtime's ONE no-mutex applier.
+        let applier = Arc::clone(&self.applier);
         // CIRISEdge#927 — hot-added Initiators inherit the runtime's proactive-
         // publish posture. Harmless for Responders (they never `start_round`).
         Arc::new(
