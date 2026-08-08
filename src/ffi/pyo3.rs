@@ -4938,10 +4938,25 @@ pub fn init_edge_runtime(
             // `Arc<dyn HardwareSigner>` via persist's adapter — the
             // adapter's `public_key()` returns the 32-byte raw Ed25519
             // (`SigningKey::verifying_key().to_bytes()`). We thread it
-            // into edge's `LocalSigner` `classical` slot. PQC stays
-            // `None` here — the Reticulum attestation only signs the
-            // Ed25519 transport-identity payload; PQC envelope signing
-            // is the hot-path keyring signer's responsibility.
+            // into edge's `LocalSigner` `classical` slot; the PQC half
+            // forwarded below completes the hybrid pair.
+            //
+            // CIRISEdge#458 — forward persist's transport-identity ML-DSA-65
+            // (PQC) half. persist v30.4.0's `local_signer_capsule` carries the
+            // node's OWN hybrid identity — the keystore
+            // `<identity_dir>/ml_dsa_65.seed` (CIRISPersist#616) or the
+            // `from_shared_with_local` PQC pair — and `pqc_signer()` yields it.
+            // This transport-identity signer becomes `ReticulumAuth.signer`,
+            // which the transport retains as `local_signer` and the
+            // `SelfSignedRouteProducer` signs the #393 item-2
+            // `SignedTransportDestination` with. So it MUST be hybrid or the
+            // node routes but can never root (peers drop its frames UNATTRIBUTED
+            // at the E3 gate). This slot historically hard-coded `None` because
+            // the Reticulum attestation only signed the Ed25519 transport
+            // identity — but #406/#393 made this same signer responsible for the
+            // hybrid item-2 mint, so dropping the PQC here WAS the #458 fault.
+            // Extract it BEFORE the adapter consumes `local_signer_arc`.
+            let identity_pqc = local_signer_arc.pqc_signer();
             let adapter: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
                 ciris_persist::signing::LocalSignerHardwareAdapter::new(local_signer_arc),
             );
@@ -4959,7 +4974,7 @@ pub fn init_edge_runtime(
             Arc::new(LocalSigner::new(
                 derived_signer_key_id.clone(),
                 adapter,
-                None,
+                identity_pqc,
             ))
         }
         Err(LocalSignerCapsuleError::Unavailable) => {
@@ -5471,6 +5486,39 @@ pub fn init_edge_runtime(
         let _ = (transport_config, auth);
         None
     } else {
+        // CIRISEdge#458 — STOP SERVING if the resolved transport identity signer
+        // has no ML-DSA-65 (PQC) half. This signer is `ReticulumAuth.signer`,
+        // which the transport retains as `local_signer` and the
+        // `SelfSignedRouteProducer` signs the #393 item-2
+        // `SignedTransportDestination` with. Without the hybrid half it cannot
+        // mint that binding, so every peer drops this node's frames UNATTRIBUTED
+        // at the E3 gate — it would route and never root, the identical "looks
+        // healthy and is not" trap the `signer: None` (#333) arm in
+        // `ReticulumTransport::new` refuses. The PQC half loads SYNCHRONOUSLY
+        // from the keystore/seed (ms — never attached asynchronously), so its
+        // absence is a provisioning fault, not a boot race: persist resolves it
+        // from the keystore `<identity_dir>/ml_dsa_65.seed` (Engine(...,
+        // identity_dir=, keystore_alias=), CIRISPersist#616 v30.4.0) or the
+        // `from_shared_with_local` PQC pair, and hands it to edge via
+        // `local_signer_capsule().pqc_signer()` (forwarded in Step 3.5 above) —
+        // so a `None` here means the keyring has no ML-DSA-65 seed to load. We
+        // refuse rather than bind a transport that serves into a black hole and
+        // merely warns. HTTPS-only nodes (`disable_reticulum=True`) never reach
+        // this branch, so they are exempt by construction.
+        if reticulum_identity_signer.pqc.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "Reticulum transport requires a HYBRID federation signer, but the resolved \
+                 transport identity has NO ML-DSA-65 (PQC) half. This node cannot mint the \
+                 hybrid-signed SignedTransportDestination CIRISEdge#393 item 2 requires, so \
+                 every peer would drop its frames UNATTRIBUTED at the E3 gate — it would route \
+                 and never root. The PQC half loads synchronously from the keystore's ml_dsa_65 \
+                 seed (persist resolves it via local_signer_capsule().pqc_signer()), so this is \
+                 a provisioning fault, not a boot race: ensure the node's keystore has its \
+                 ML-DSA-65 seed — under persist v30.4.0 that is `<identity_dir>/ml_dsa_65.seed` \
+                 for the Engine(..., identity_dir=, keystore_alias=) path, or the \
+                 local_pqc_key_path pair for from_shared_with_local. (CIRISEdge#458)",
+            ));
+        }
         // #320: was `runtime.block_on(...)` on persist's raw Handle
         // (release deadlock). ReticulumTransport::new performs identity
         // + attestation crypto (persist signer) with no reactor-bound
@@ -9291,6 +9339,7 @@ mod pyo3_tier2_tests {
     /// composition on that persist-owned runtime via
     /// `ciris_persist::current_runtime_handle()`.
     #[test]
+    #[allow(clippy::too_many_lines)] // verbose 30-arg init call + #458 PQC provisioning
     fn py_init_edge_runtime_via_capsule_succeeds() {
         init_python();
         let _engine_guard = engine_lock();
@@ -9322,6 +9371,17 @@ mod pyo3_tier2_tests {
             kwargs.set_item("signing_key_id", signer_key_id.as_str())?;
             kwargs.set_item("local_key_id", "edge-cohabit-local")?;
             kwargs.set_item("local_key_path", local_seed_path.to_string_lossy().as_ref())?;
+            // CIRISEdge#458 — a Reticulum-transport-building node now REQUIRES the
+            // ML-DSA-65 (PQC) half (the SelfSignedRouteProducer mints the #393
+            // item-2 binding with it), so init hard-refuses without it. Provision a
+            // real 32-byte seed; persist loads it via MlDsa65SoftwareSigner::from_seed_file.
+            let pqc_seed_path = local_seed_path.with_file_name("ml_dsa_65.seed");
+            std::fs::write(&pqc_seed_path, [0x77_u8; 32]).expect("write ml_dsa_65 seed");
+            kwargs.set_item("local_pqc_key_id", "edge-cohabit-local-pqc")?;
+            kwargs.set_item(
+                "local_pqc_key_path",
+                pqc_seed_path.to_string_lossy().as_ref(),
+            )?;
             kwargs.set_item("pqc_sweep_on_init", false)?;
             let engine = engine_cls.call((), Some(&kwargs))?;
             let edge = init_edge_runtime(
@@ -9816,6 +9876,7 @@ mod pyo3_tier2_tests {
     /// and does NOT contain "local_signer_capsule" (capsule extraction
     /// failure).
     #[test]
+    #[allow(clippy::too_many_lines)] // verbose 30-arg init call + #458 PQC provisioning
     fn py_init_edge_runtime_local_signer_capsule_supplies_reticulum_identity() {
         init_python();
         let _engine_guard = engine_lock();
@@ -9846,6 +9907,17 @@ mod pyo3_tier2_tests {
             kwargs.set_item("signing_key_id", signer_key_id.as_str())?;
             kwargs.set_item("local_key_id", "edge-cohabit-local-id")?;
             kwargs.set_item("local_key_path", local_seed_path.to_string_lossy().as_ref())?;
+            // CIRISEdge#458 — a Reticulum-transport-building node now REQUIRES the
+            // ML-DSA-65 (PQC) half (the SelfSignedRouteProducer mints the #393
+            // item-2 binding with it), so init hard-refuses without it. Provision a
+            // real 32-byte seed; persist loads it via MlDsa65SoftwareSigner::from_seed_file.
+            let pqc_seed_path = local_seed_path.with_file_name("ml_dsa_65.seed");
+            std::fs::write(&pqc_seed_path, [0x77_u8; 32]).expect("write ml_dsa_65 seed");
+            kwargs.set_item("local_pqc_key_id", "edge-cohabit-local-id-pqc")?;
+            kwargs.set_item(
+                "local_pqc_key_path",
+                pqc_seed_path.to_string_lossy().as_ref(),
+            )?;
             kwargs.set_item("pqc_sweep_on_init", false)?;
             let engine = engine_cls.call((), Some(&kwargs))?;
             // Sanity: the engine MUST expose local_signer_capsule under
@@ -9947,6 +10019,127 @@ mod pyo3_tier2_tests {
                 );
             }
         }
+    }
+
+    /// CIRISEdge#458 — a Reticulum-transport-building node whose resolved
+    /// transport identity has NO ML-DSA-65 (PQC) half must STOP SERVING.
+    /// `init_edge_runtime` refuses at construction rather than bind a transport
+    /// that would route but never root: the `SelfSignedRouteProducer` cannot
+    /// mint the #393 item-2 `SignedTransportDestination` without the hybrid
+    /// half, so every peer drops this node's frames UNATTRIBUTED at the E3 gate.
+    ///
+    /// The engine is built with `local_key_id` + `local_key_path` (so
+    /// `local_signer_capsule` resolves the transport identity) but WITHOUT a PQC
+    /// seed, so `local_signer_capsule().pqc_signer()` yields `None` — the exact
+    /// provisioning fault the gate names. Reticulum is ENABLED
+    /// (`disable_reticulum=false`) so construction reaches the transport-build
+    /// branch where the gate lives. This is the field-provenance twin of
+    /// `py_init_edge_runtime_local_signer_capsule_supplies_reticulum_identity`
+    /// (which provisions the seed and succeeds): same path, PQC present vs absent.
+    // Runs STANDALONE only. persist hosts exactly one engine per process, and a
+    // sibling init test's success installs a process-global edge that pins its
+    // (hybrid) engine — so in a shared test process this either collides at
+    // construction (EngineConfigMismatch) or attaches to a hybrid engine that
+    // never reaches the gate. In its own process it constructs the pqc-less
+    // engine cleanly and asserts the #458 refusal. Enforced by the dedicated
+    // `--exact` CI step in ci.yml (the #458 gate line); the sibling positive
+    // test `py_init_edge_runtime_local_signer_capsule_supplies_reticulum_identity`
+    // covers the forward (with-PQC → transport builds) in-suite.
+    #[test]
+    #[ignore = "one-engine-per-process: run with --exact in its own process (see ci.yml #458 gate step)"]
+    fn py_init_edge_runtime_refuses_pqc_less_reticulum_transport() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let identity_path = tmp.path().join("transport.id");
+        let local_seed_path = tmp.path().join("local.seed");
+        std::fs::write(&local_seed_path, [0x51_u8; 32]).expect("write local seed");
+
+        let signer_key_id = format!(
+            "edge-458-nopqc-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        // persist hosts exactly one engine per process (keyed on DSN +
+        // signing_key_id). Bracket this test with `reset_engine()` so a sibling
+        // engine test's lingering singleton can't collide with our construction,
+        // and so our own engine doesn't linger for the next one. We capture the
+        // init RESULT rather than `?`-propagating it — the Err IS the assertion.
+        let init_err: Option<String> = Python::attach(|py| -> PyResult<Option<String>> {
+            install_ciris_persist_module(py)?;
+            let ciris_persist_mod = py.import("ciris_persist")?;
+            // A sibling engine test's engine may linger in persist's
+            // ENGINE_SINGLETON (one engine per process); GC-collect any
+            // finalizable engine object, THEN reset so our construction below
+            // doesn't hit EngineConfigMismatch.
+            if let Ok(gc) = py.import("gc") {
+                let _ = gc.call_method0("collect");
+            }
+            let _ = ciris_persist_mod.call_method1("reset_engine", (5.0_f64,));
+            let engine_cls = ciris_persist_mod.getattr("Engine")?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("dsn", "sqlite::memory:")?;
+            kwargs.set_item("signing_key_id", signer_key_id.as_str())?;
+            kwargs.set_item("local_key_id", "edge-458-nopqc-local")?;
+            kwargs.set_item("local_key_path", local_seed_path.to_string_lossy().as_ref())?;
+            // Deliberately NO local_pqc_key_id / local_pqc_key_path — this is the
+            // PQC-absent provisioning fault #458 refuses to serve into.
+            kwargs.set_item("pqc_sweep_on_init", false)?;
+            let engine = engine_cls.call((), Some(&kwargs))?;
+            let init_result = init_edge_runtime(
+                py,
+                engine,
+                identity_path.to_str().expect("identity path utf8"),
+                "127.0.0.1:0",
+                vec![],
+                300,
+                0,
+                "strict",
+                60,
+                "proxy",
+                None,
+                None,       // https_listen_addr
+                None,       // https_tls_cert_path
+                None,       // https_tls_key_path
+                false,      // https_mtls_required
+                None,       // https_bearer_secret
+                false,      // https_dev_self_signed
+                false,      // disable_reticulum — MUST build the transport to reach the gate
+                None,       // disk_budget_bytes
+                None,       // trust_recursion_depth
+                None,       // local_instance_name
+                "auto",     // local_instance_role
+                None,       // agent_occurrence_key_id
+                None,       // transport_identity_keyring_dir
+                false,      // enable_transport
+                "advisory", // transport_binding_enforcement
+                false,      // require_local_signer
+                "off",      // bundle_save_gate
+                None,       // own_build_bundle
+            );
+            // Cleanup: drop OUR engine from the singleton so the next real-engine
+            // sibling test constructs cleanly (one persist engine per process).
+            let _ = ciris_persist_mod.call_method1("reset_engine", (5.0_f64,));
+            Ok(init_result.err().map(|e| e.to_string()))
+        })
+        .expect("test harness (python / engine construction) must not itself error");
+
+        let msg = init_err.expect(
+            "a PQC-less Reticulum-transport node MUST be refused at init (CIRISEdge#458) — \
+             it would route but never root",
+        );
+        assert!(
+            msg.contains("CIRISEdge#458"),
+            "the refusal must be the #458 hybrid-signer gate, not some other failure. Got: {msg}"
+        );
+        assert!(
+            msg.contains("ML-DSA-65") && msg.contains("item 2"),
+            "the #458 error must name the missing ML-DSA-65 half + the #393 item-2 reason. \
+             Got: {msg}"
+        );
     }
 
     /// v0.16.1 cherry-pick — fallback path. Engine constructed

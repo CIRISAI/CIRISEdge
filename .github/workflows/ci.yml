@@ -168,6 +168,18 @@ jobs:
             else
               cargo test --features "${{ matrix.combo.features }}" --lib
             fi
+      # CIRISEdge#458 gate — a PQC-less Reticulum transport is REFUSED at init
+      # ("stop serving"; the SelfSignedRouteProducer can't mint the #393 item-2
+      # binding without the hybrid half). This test is #[ignore]d in the shared
+      # run above because persist hosts exactly ONE engine per process and a
+      # sibling init test's success pins a hybrid engine — so it must run ALONE
+      # to construct its own pqc-less engine and reach the gate. Anti-rot: a gate
+      # no lane runs rots silently (CIRISEdge#435).
+      - name: "CIRISEdge#458 gate — pqc-less transport refused (own process)"
+        if: matrix.combo.name == 'pyo3-full'
+        run: |
+          cargo test --features "${{ matrix.combo.features }}" --lib \
+            py_init_edge_runtime_refuses_pqc_less_reticulum_transport -- --ignored
       # CIRISEdge#229 — RESTORE only on this lane. The canonical
       # linux-x86_64 save lives on the `pyo3-wheel` `linux-x86_64`
       # matrix entry (release-profile `target/`, ~1 GB), matching every
