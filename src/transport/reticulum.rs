@@ -5084,13 +5084,20 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // `established_links` (leviculum hasn't yet seen LinkClosed
             // arrive); leave the set alone — `LinkClosed` is the
             // authoritative removal point — but surface the staleness
-            // on the event stream so the UI can render a warning.
+            // on the event stream so the UI can render it.
+            //
+            // CIRISEdge#460 — `Info`, NOT `Warning`. A link going stale is the
+            // routine idle-reap precursor (idle → reaped at 60/90s → closed),
+            // not a fault. Emitting it at Warning made routine link turnover 70%
+            // of the server's WARN stream, training readers to skip the level
+            // and burying real refusals (#459) in the noise. Fault teardowns are
+            // classified by `LinkCloseReason` at the `LinkClosed` arm below.
             if let Some(bus) = ctx.event_bus {
                 bus.emit_link(link_event(
                     crate::events::EventKind::LinkDropped,
                     &link_id,
                     None,
-                    crate::events::EventSeverity::Warning,
+                    crate::events::EventSeverity::Info,
                     "link became stale",
                 ));
             }
@@ -5266,18 +5273,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.
+            //
+            // CIRISEdge#460 — `Stale` (idle-timeout reap) is ROUTINE, like
+            // `Normal`: it is the authoritative close of a link idled out at
+            // 60/90s, not a fault. Only reasons that indicate a real problem
+            // (Timeout / InvalidProof / ChannelExhausted / Blackholed, and
+            // PeerClosed as the peer's unilateral teardown) stay `Warning`.
             if let Some(bus) = ctx.event_bus {
-                let severity = match reason {
-                    leviculum_core::link::LinkCloseReason::Normal => {
-                        crate::events::EventSeverity::Info
-                    }
-                    _ => crate::events::EventSeverity::Warning,
-                };
                 bus.emit_link(link_event(
                     crate::events::EventKind::LinkDropped,
                     &link_id,
                     None,
-                    severity,
+                    link_close_severity(reason),
                     format!("link closed: {reason:?}"),
                 ));
             }
@@ -5300,6 +5307,26 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         other => {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
+    }
+}
+
+/// CIRISEdge#460 — severity for a `LinkClosed` event, decided PURELY from the
+/// [`LinkCloseReason`](leviculum_core::link::LinkCloseReason) (no I/O, unit-
+/// tested over every variant). `Normal` and `Stale` (idle-timeout reap) are
+/// ROUTINE link turnover → `Info`; every reason that signals a real problem
+/// stays `Warning`, so a node under investigation still sees fault teardowns at
+/// the level it scans. A routine reap must never train readers to skip WARN.
+fn link_close_severity(
+    reason: leviculum_core::link::LinkCloseReason,
+) -> crate::events::EventSeverity {
+    use crate::events::EventSeverity;
+    use leviculum_core::link::LinkCloseReason;
+    match reason {
+        LinkCloseReason::Normal | LinkCloseReason::Stale => EventSeverity::Info,
+        // Timeout / InvalidProof / PeerClosed / ChannelExhausted / Blackholed —
+        // a real problem or the peer's unilateral teardown; keep it loud. The
+        // non-exhaustive `_` also fails safe (louder) on any future variant.
+        _ => EventSeverity::Warning,
     }
 }
 
@@ -7235,6 +7262,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CIRISEdge#460 — the `LinkClosed` severity mapping. Routine turnover
+    /// (`Normal`, `Stale`) is `Info`; every fault reason is `Warning`. Pins that
+    /// a routine idle reap never re-enters the WARN stream (70% of the server's
+    /// log was this) and that fault teardowns stay loud. `LinkCloseReason` is
+    /// `#[non_exhaustive]`, so production and this table both fail SAFE (a
+    /// future/unknown reason → `Warning`, verified via a synthetic default arm).
+    #[test]
+    fn link_close_severity_is_info_only_for_routine_turnover() {
+        use crate::events::EventSeverity::{Info, Warning};
+        use leviculum_core::link::LinkCloseReason;
+        let table = [
+            (LinkCloseReason::Normal, Info),
+            (LinkCloseReason::Stale, Info),
+            (LinkCloseReason::Timeout, Warning),
+            (LinkCloseReason::InvalidProof, Warning),
+            (LinkCloseReason::PeerClosed, Warning),
+            (LinkCloseReason::ChannelExhausted, Warning),
+            (LinkCloseReason::Blackholed, Warning),
+        ];
+        for (reason, expected) in table {
+            assert_eq!(
+                link_close_severity(reason),
+                expected,
+                "LinkCloseReason::{reason:?} severity regressed (CIRISEdge#460)"
+            );
+        }
+    }
 
     // ── CIRISEdge#424 initiator-side link attribution — the pure decision ──
     //
