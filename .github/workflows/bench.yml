@@ -336,10 +336,19 @@ jobs:
           fi
           echo "Sim metric lines captured: $(wc -l < sim-metrics.txt)"
 
-      # Final publish input: calibration (raw) + normalized criterion + raw sim.
+      # Publish input for the ALERT + trend: NORMALIZED wall-clock criterion +
+      # deterministic SIM metrics. The raw calibration anchor is DELIBERATELY
+      # EXCLUDED here — it is the normalization REFERENCE, not an alert subject.
+      # On a shared GitHub runner it drifts every run (e.g. splitmix64 +13% on a
+      # slow-CPU runner), and github-action-benchmark alerts against the
+      # previous-best, so a raw anchor line self-trips the threshold on runner
+      # drift alone — a guaranteed-noisy, circular alarm. Its drift stays visible
+      # for triage in the step summary above ("Runner calibration: CPU/MEM/AES")
+      # and in the 90-day artifact (calibration-output.txt), which is exactly
+      # what answers "was that alert a real regression or a slow runner?".
       - name: Assemble bench-output.txt
         run: |
-          cat calibration-output.txt bench-output-normalized.txt sim-metrics.txt > bench-output.txt
+          cat bench-output-normalized.txt sim-metrics.txt > bench-output.txt
           {
             echo "## Bench top-line (published series)"
             echo '```'
@@ -361,10 +370,25 @@ jobs:
           output-file-path: bench-output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: true
-          # 110% = a bench got 10% slower than its previous-best on this branch.
-          # Below 110% is the shared-runner noise floor (post-normalization);
-          # above is worth a look.
-          alert-threshold: '110%'
+          # 130% = the shared-runner WALL-TIME noise floor AFTER anchor
+          # normalization. A 10% gate false-alarms on runner drift alone: the
+          # CI research is unambiguous that GitHub-hosted runners need a wide gate
+          # (a ~7% gate already gives ~1% false positives on a well-behaved
+          # runner, and edge's are noisier). Observed on b26cf5d: the CPU anchor
+          # drifted 1.13× uniformly, with per-family residual to 1.21× where a
+          # runner's CPU and AES-NI axes moved unevenly and a family's true
+          # bottleneck did not match its assigned anchor (single-anchor
+          # normalization cannot fully cancel a heterogeneous runner). 130% sits
+          # above that residual while still flagging a GROSS wall-time regression.
+          #
+          # This wall-time alert is a coarse tracking alarm — NOT the precise
+          # regression gate. The precise, runner-INDEPENDENT signal is the
+          # deterministic SIM/curve metrics (counts: depths, rounds, delivery
+          # ratios) plus the guard/unit tests, which do not vary with the runner.
+          # The durable cross-runner-variance fix is same-runner A/B (bench base +
+          # head on ONE runner so drift cancels exactly) or instruction-count
+          # (cachegrind) benching — tracked in CIRISEdge#461.
+          alert-threshold: '130%'
           # Comment-only — do NOT fail the build on regression. Flip to
           # fail-on-alert: true once the trend shows the runner's noise floor.
           fail-on-alert: false
