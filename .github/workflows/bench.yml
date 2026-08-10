@@ -481,42 +481,54 @@ jobs:
       # under the repo's 10 GB cache budget (crowded out by ~850 MB rust-caches),
       # so the comparison silently reverted to "no baseline" (N/A). The metric is
       # DETERMINISTIC (Callgrind simulates the CPU), so we don't need cross-run
-      # persistence OR a same runner to cancel drift — we just bench BOTH commits
-      # in THIS job and diff them exactly:
-      #   1. checkout HEAD~1, `--save-baseline base` (record the parent's counts)
-      #   2. checkout HEAD,   `--baseline base`      (compare; soft_limits Ir +5%
-      #      in benches/icount.rs FAILS the job on a real regression)
-      # No cache, no artifact round-trip, no cross-run state to evict. If HEAD~1
-      # predates benches/icount.rs (the first commits after it landed), the base
-      # bench is skipped and this run only establishes head's counts.
+      # persistence OR a same runner to cancel drift — we bench BOTH commits in
+      # THIS job (plain `cargo bench`, no fragile iai baseline args) and diff the
+      # parsed instruction counts ourselves. If HEAD~1 predates benches/icount.rs
+      # (the first commits after it landed), the base bench is skipped and this
+      # run only establishes head's counts.
       - name: cargo bench --bench icount (same-runner A/B, fails on a REAL >5% regression)
+        # We do the comparison OURSELVES (.github/scripts/icount_gate.py) rather
+        # than lean on iai's `--baseline` plumbing: that attempt benched NOTHING
+        # (the space-separated value was misparsed as a bench-name filter → 0
+        # benches, empty target/iai, a VACUOUS green). This depends only on the two
+        # things proven to work — plain `cargo bench --bench icount` (prints exact
+        # `Instructions: N` per bench, deterministic under Callgrind) and a parse
+        # + compare we fully control. The script exits 3 (fails the job) if a run
+        # yields ZERO counts, so a vacuous green cannot recur.
         run: |
           set -euo pipefail
           HEAD_SHA=$(git rev-parse HEAD)
           BASE_SHA=$(git rev-parse HEAD~1)
           echo "base=$BASE_SHA  head=$HEAD_SHA"
-          BASE_HAS_BENCH=0
+
           if git cat-file -e "$BASE_SHA:benches/icount.rs" 2>/dev/null; then
-            BASE_HAS_BENCH=1
-          fi
-          if [ "$BASE_HAS_BENCH" = "1" ]; then
-            echo "::group::bench BASE ($BASE_SHA) → --save-baseline base"
+            echo "::group::bench BASE ($BASE_SHA)"
             git checkout --quiet --detach "$BASE_SHA"
-            cargo bench --bench icount -- --save-baseline base
+            cargo bench --bench icount 2>&1 | tee base_raw.txt
             git checkout --quiet "$HEAD_SHA"
             echo "::endgroup::"
-            echo "::group::bench HEAD ($HEAD_SHA) → --baseline base (GATE)"
-            cargo bench --bench icount -- --baseline base
-            echo "::endgroup::"
           else
-            echo "HEAD~1 predates benches/icount.rs — establishing head counts only (no gate this run)"
-            cargo bench --bench icount
+            echo "HEAD~1 predates benches/icount.rs — no gate this run (establish head only)"
+            : > base_raw.txt
           fi
+
+          echo "::group::bench HEAD ($HEAD_SHA)"
+          cargo bench --bench icount 2>&1 | tee head_raw.txt
+          echo "::endgroup::"
+
+          echo "=== instruction-count gate (head vs base, +5% fails) ==="
+          python3 .github/scripts/icount_gate.py head_raw.txt base_raw.txt
 
       - name: Upload instruction-count results
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: icount-${{ github.run_id }}
-          path: target/iai/**
+          # Raw base/head console output (the gate's inputs) + target/iai for
+          # post-hoc; if a run were ever vacuous, the empty raw file shows it.
+          path: |
+            base_raw.txt
+            head_raw.txt
+            target/iai/**
           retention-days: 90
+          if-no-files-found: ignore
