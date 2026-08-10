@@ -1065,6 +1065,15 @@ required-features = ["ffi-uniffi"]
 name = "calibration"
 harness = false
 
+# CIRISEdge#461 — DETERMINISTIC instruction-count lane (iai-callgrind / Valgrind
+# Callgrind). Zero runner variance → the precise, actionable regression gate that
+# wall-clock benches on shared runners cannot be. Requires valgrind + a
+# version-matched `iai-callgrind-runner` at RUN time (CI installs both); it
+# COMPILES without them, so the -D-warnings bench-compile gate covers it.
+[[bench]]
+name = "icount"
+harness = false
+
 [[bench]]
 name = "envelope_canonicalize"
 harness = false
@@ -1189,6 +1198,11 @@ sha2               = "0.10"
 # the text summary lands as `bench-results-txt`. Same cadence as
 # CIRISVerify's bench.yml (push-to-main + workflow_dispatch).
 criterion          = { version = "0.5", features = ["html_reports", "async_tokio"] }
+# CIRISEdge#461 — deterministic instruction-count harness for `benches/icount.rs`
+# (Valgrind Callgrind under the hood). Pinned to the last stable iai-callgrind
+# line (0.16.x); the crate COMPILES standalone — only `cargo bench --bench icount`
+# needs valgrind + a version-matched `iai-callgrind-runner` (CI installs both).
+iai-callgrind      = "0.16"
 async-trait        = "0.1"
 # v0.6.0 — `tests/federation_announcement.rs` (CIRISEdge#18) drives
 # persist's `put_delivery_attestation` / `list_delivery_attestations`

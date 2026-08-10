@@ -413,3 +413,77 @@ jobs:
             sim-metrics.txt
             sim-dump-raw.txt
           retention-days: 90
+
+  # ── Deterministic instruction-count GATE (CIRISEdge#461) ────────────────────
+  # The precise, actionable regression gate the wall-clock lane above cannot be.
+  # Valgrind Callgrind SIMULATES the CPU and counts the exact instructions a run
+  # executes, so the number is identical on every runner regardless of load or
+  # SKU — a change is a REAL code change, never runner noise. `benches/icount.rs`
+  # fails (soft_limits) if instruction reads regress >5% vs the rolling baseline.
+  # Fast: single-shot (no timing samples); the edge release compile dominates.
+  icount:
+    name: instruction-count gate (deterministic, #461)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free runner disk (reclaim unused preinstalled toolchains)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+
+      - name: install libsqlite3-dev + valgrind
+        # libsqlite3-dev: persist's sqlite backend links it. valgrind: the
+        # Callgrind engine iai-callgrind drives (the whole point of this lane).
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev valgrind
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: '1.97.0'
+
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+
+      # The iai-callgrind-runner version MUST match the `iai-callgrind` crate
+      # (0.16.1, pinned in Cargo.toml). Cache the built binary so we don't
+      # recompile the runner every run.
+      - name: Cache iai-callgrind-runner
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/iai-callgrind-runner
+          key: iai-callgrind-runner-0.16.1-${{ runner.os }}
+      - name: Install iai-callgrind-runner (version-matched)
+        run: |
+          if ! command -v iai-callgrind-runner >/dev/null 2>&1; then
+            cargo install --version 0.16.1 iai-callgrind-runner --locked
+          fi
+          iai-callgrind-runner --version
+
+      # Rolling baseline: restore the previous run's target/iai (the newest
+      # `icount-baseline-*` via restore-keys), compare against it, and save a
+      # fresh one keyed on this sha. Because the metric is deterministic, any
+      # delta vs the baseline is a real code change — the regression check in
+      # benches/icount.rs (soft_limits Ir +5%) is what fails the job.
+      - name: Restore instruction-count baseline
+        uses: actions/cache@v5
+        with:
+          path: target/iai
+          key: icount-baseline-${{ github.sha }}
+          restore-keys: |
+            icount-baseline-
+
+      - name: cargo bench --bench icount (fails on a REAL >5% instruction regression)
+        run: cargo bench --bench icount
+
+      - name: Upload instruction-count results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: icount-${{ github.run_id }}
+          path: target/iai/**
+          retention-days: 90
