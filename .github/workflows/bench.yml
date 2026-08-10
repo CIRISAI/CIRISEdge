@@ -424,9 +424,14 @@ jobs:
   icount:
     name: instruction-count gate (deterministic, #461)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Two edge compiles (base + head) — see the same-runner A/B step below.
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v6
+        with:
+          # SAME-RUNNER A/B needs HEAD~1 checkoutable. fetch-depth:2 is the
+          # minimum that exposes the immediate parent commit.
+          fetch-depth: 2
 
       - name: Free runner disk (reclaim unused preinstalled toolchains)
         run: |
@@ -471,21 +476,42 @@ jobs:
           fi
           command -v iai-callgrind-runner
 
-      # Rolling baseline: restore the previous run's target/iai (the newest
-      # `icount-baseline-*` via restore-keys), compare against it, and save a
-      # fresh one keyed on this sha. Because the metric is deterministic, any
-      # delta vs the baseline is a real code change — the regression check in
-      # benches/icount.rs (soft_limits Ir +5%) is what fails the job.
-      - name: Restore instruction-count baseline
-        uses: actions/cache@v5
-        with:
-          path: target/iai
-          key: icount-baseline-${{ github.sha }}
-          restore-keys: |
-            icount-baseline-
-
-      - name: cargo bench --bench icount (fails on a REAL >5% instruction regression)
-        run: cargo bench --bench icount
+      # SAME-RUNNER A/B — the eviction-proof way to compare. A first attempt
+      # persisted the baseline in actions/cache; a 13 KB baseline got LRU-evicted
+      # under the repo's 10 GB cache budget (crowded out by ~850 MB rust-caches),
+      # so the comparison silently reverted to "no baseline" (N/A). The metric is
+      # DETERMINISTIC (Callgrind simulates the CPU), so we don't need cross-run
+      # persistence OR a same runner to cancel drift — we just bench BOTH commits
+      # in THIS job and diff them exactly:
+      #   1. checkout HEAD~1, `--save-baseline base` (record the parent's counts)
+      #   2. checkout HEAD,   `--baseline base`      (compare; soft_limits Ir +5%
+      #      in benches/icount.rs FAILS the job on a real regression)
+      # No cache, no artifact round-trip, no cross-run state to evict. If HEAD~1
+      # predates benches/icount.rs (the first commits after it landed), the base
+      # bench is skipped and this run only establishes head's counts.
+      - name: cargo bench --bench icount (same-runner A/B, fails on a REAL >5% regression)
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          BASE_SHA=$(git rev-parse HEAD~1)
+          echo "base=$BASE_SHA  head=$HEAD_SHA"
+          BASE_HAS_BENCH=0
+          if git cat-file -e "$BASE_SHA:benches/icount.rs" 2>/dev/null; then
+            BASE_HAS_BENCH=1
+          fi
+          if [ "$BASE_HAS_BENCH" = "1" ]; then
+            echo "::group::bench BASE ($BASE_SHA) → --save-baseline base"
+            git checkout --quiet --detach "$BASE_SHA"
+            cargo bench --bench icount -- --save-baseline base
+            git checkout --quiet "$HEAD_SHA"
+            echo "::endgroup::"
+            echo "::group::bench HEAD ($HEAD_SHA) → --baseline base (GATE)"
+            cargo bench --bench icount -- --baseline base
+            echo "::endgroup::"
+          else
+            echo "HEAD~1 predates benches/icount.rs — establishing head counts only (no gate this run)"
+            cargo bench --bench icount
+          fi
 
       - name: Upload instruction-count results
         uses: actions/upload-artifact@v4
