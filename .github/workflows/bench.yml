@@ -458,11 +458,18 @@ jobs:
           path: ~/.cargo/bin/iai-callgrind-runner
           key: iai-callgrind-runner-0.16.1-${{ runner.os }}
       - name: Install iai-callgrind-runner (version-matched)
+        # Version MUST equal the `iai-callgrind` crate (0.16.1). No `--locked`:
+        # the runner's pinned Cargo.lock carries a yanked `slab`, and the runner
+        # is a leaf build tool, so a fresh resolve is fine. Do NOT run
+        # `iai-callgrind-runner --version` to verify — the runner is a cargo-bench
+        # helper that needs the bench's env to report a version and errors
+        # standalone ("No version information found"); `command -v` is the right
+        # check. `cargo bench --bench icount` below invokes it with the right env.
         run: |
           if ! command -v iai-callgrind-runner >/dev/null 2>&1; then
-            cargo install --version 0.16.1 iai-callgrind-runner --locked
+            cargo install --version 0.16.1 iai-callgrind-runner
           fi
-          iai-callgrind-runner --version
+          command -v iai-callgrind-runner
 
       # Rolling baseline: restore the previous run's target/iai (the newest
       # `icount-baseline-*` via restore-keys), compare against it, and save a
