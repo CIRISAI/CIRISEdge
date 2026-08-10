@@ -3023,17 +3023,102 @@ mod tests {
     /// CIRISEdge#430 — an ADMITTED revocation fires the revocation observer
     /// with the REVOKED key_id (the transit gate's event-driven cache
     /// invalidation signal); a non-admitted apply (garbage) never fires it.
+    ///
+    ///
+    /// `test-anchor`-gated: persist v30.8.0 (CIRISPersist#628 / CIRISConstitution#87)
+    /// requires a THIRD-PARTY revocation's revoker to hold `slash` conferred by a
+    /// root THIS NODE trusts, and standing up a valid trust root needs the accord
+    /// roster helpers persist exports only behind `test-anchor` (the same fence
+    /// #386's ALLOW-path twin uses; its CI lane runs the whole lib, so this is
+    /// real coverage). The test MUST stay third-party (revoked ≠ revoking) — its
+    /// whole value is proving the observer fires with the REVOKED key, not the
+    /// revoker's, so a self-revocation or empty-revoker shortcut would hide a
+    /// fire-with-the-wrong-field bug. We model the FULL production-shaped
+    /// authorized graph on purpose: the `slash`-wielding revoker is a `user`
+    /// (CC 4.4.3.4.3 — infrastructure has no agency), a trusted external root
+    /// confers `slash` on it, and only then does edge's apply path admit the
+    /// revocation and fire the observer. That is exactly what a real node will
+    /// see, so a green here is confidence the prod path behaves as intended.
+    #[cfg(feature = "test-anchor")]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // roster + trust graph + authorized revocation: one scenario
     async fn admitted_revocation_fires_the_observer_with_the_revoked_key() {
+        use ciris_persist::federation::accord_test_support::{register_accord_holder, Identity};
+        use ciris_persist::federation::genesis::effective_accord_holder_records;
+
         let (backend, bridge) = make_bridge(&[]);
-        for k in ["revoker-node", "bad-peer"] {
+        let local = "self-node";
+        let root = "trust-root";
+        let lifecycle_attester = "accord-holder-live";
+        // The revoker is a USER: only agency-bearing identities may hold `slash`.
+        let revoker = "revoker-user";
+        let target = "bad-peer";
+
+        // The live accord family, registered at their pinned pubkeys so the
+        // root's accord:lifecycle row verifies against the real roster.
+        let holders: Vec<Identity> = effective_accord_holder_records()
+            .iter()
+            .map(|r| Identity::new(&r.record.key_id))
+            .collect();
+        for h in &holders {
+            register_accord_holder(&*backend, h)
+                .await
+                .expect("register accord holder");
+        }
+
+        // Register the identities. The revoker is a USER (agency); local/root are
+        // infrastructure; the lifecycle attester is an ACCORD_HOLDER and must
+        // carry attestation_evidence (CIRISPersist v22 #543/#513).
+        for (k, it) in [
+            (local, identity_type::NODE),
+            (root, identity_type::NODE),
+            (revoker, identity_type::USER),
+            (target, identity_type::NODE),
+            (lifecycle_attester, identity_type::ACCORD_HOLDER),
+        ] {
+            let mut record = fixture_key_record(k, it);
+            if it == identity_type::ACCORD_HOLDER {
+                record.attestation_evidence = Some(serde_json::json!({
+                    "platform_attestation": {
+                        "Android": {
+                            "key_attestation_chain": [
+                                [0x30, 0x82, 0x01, 0x00],
+                                [0x30, 0x82, 0x02, 0x00],
+                            ],
+                            "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                            "strongbox_backed": true,
+                        }
+                    },
+                    "nonce_captured_at": Utc::now().to_rfc3339(),
+                }));
+            }
             backend
-                .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(k, identity_type::NODE),
-                })
+                .put_public_key(SignedKeyRecord { record })
                 .await
                 .expect("seed key");
         }
+
+        // The authorized trust graph, exactly the production shape
+        // `check_revocation_authority` walks: root self-declares (charter), THIS
+        // NODE trusts it, it is live, and it confers `slash` on the revoker.
+        backend.set_node_key_id(local);
+        seed_root_charter(&backend, root, &[format!("{root}-successor")]).await;
+        seed_delegates_to(
+            &backend,
+            local,
+            root,
+            &serde_json::json!(["infra:attest", "infra:serve"]),
+        )
+        .await;
+        seed_accord_lifecycle(&backend, lifecycle_attester, root).await;
+        seed_delegates_to(
+            &backend,
+            root,
+            revoker,
+            &serde_json::json!([ciris_persist::federation::admission::DELEGATION_SCOPE_SLASH]),
+        )
+        .await;
+
         let fired: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&fired);
         let bridge = bridge.with_revocation_observer(Some(Arc::new(move |k: &str| {
@@ -3043,14 +3128,14 @@ mod tests {
         let now = Utc::now();
         let envelope = serde_json::json!({
             "revocation_id": "rev-1",
-            "revoked_key_id": "bad-peer",
-            "revoking_key_id": "revoker-node",
+            "revoked_key_id": target,
+            "revoking_key_id": revoker,
         });
-        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope("revoker-node", &envelope);
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(revoker, &envelope);
         let rev = ciris_persist::federation::types::Revocation {
             revocation_id: "rev-1".to_string(),
-            revoked_key_id: "bad-peer".to_string(),
-            revoking_key_id: "revoker-node".to_string(),
+            revoked_key_id: target.to_string(),
+            revoking_key_id: revoker.to_string(),
             reason: None,
             revoked_at: now,
             effective_at: now,
@@ -3058,7 +3143,7 @@ mod tests {
             original_content_hash: hash,
             scrub_signature_classical: ed_sig,
             scrub_signature_pqc: pqc_sig,
-            scrub_key_id: "revoker-node".to_string(),
+            scrub_key_id: revoker.to_string(),
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
@@ -4208,7 +4293,15 @@ mod tests {
                 .await
                 .expect("seed key");
         }
-        seed_revocation(&backend, revoking, revoked).await;
+        // persist v30.8.0 (CIRISPersist#628) — a third-party revocation now needs
+        // the revoker authorized with `slash` from a trusted root. This test is
+        // about the cache-free FETCH round trip (#396 item 3), where the
+        // revocation's authority is irrelevant — so seed a SELF-revocation
+        // (`revoking == revoked`, the path v30.8.0 leaves untouched) rather than
+        // drag a conferral fixture into a fetch-mechanics test. `revoking` still
+        // seeds a distinct key above (harmless); the fetched row's revoked_key_id
+        // is what this asserts.
+        seed_revocation(&backend, revoked, revoked).await;
 
         let refs = bridge.list_revocations().await;
         assert!(!refs.is_empty(), "the seeded revocation is advertised");
