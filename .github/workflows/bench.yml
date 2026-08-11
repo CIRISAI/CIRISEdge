@@ -381,19 +381,27 @@ jobs:
           # normalization cannot fully cancel a heterogeneous runner). 130% sits
           # above that residual while still flagging a GROSS wall-time regression.
           #
-          # This wall-time alert is a coarse tracking alarm — NOT the precise
-          # regression gate. The precise, runner-INDEPENDENT signal is the
-          # deterministic SIM/curve metrics (counts: depths, rounds, delivery
-          # ratios) plus the guard/unit tests, which do not vary with the runner.
-          # The durable cross-runner-variance fix is same-runner A/B (bench base +
-          # head on ONE runner so drift cancels exactly) or instruction-count
-          # (cachegrind) benching — tracked in CIRISEdge#461.
-          alert-threshold: '130%'
-          # Comment-only — do NOT fail the build on regression. Flip to
-          # fail-on-alert: true once the trend shows the runner's noise floor.
+          # TREND-ONLY — this lane no longer COMMENTS/alerts. Shared-runner
+          # wall-time cannot be a regression signal for the throughput/transport
+          # families, and NO threshold fixes it. Proof (v15.21.8, 8195601 vs
+          # fc02960): a source-compat re-pin — zero edge/bench code changed, and
+          # the deterministic instruction-count gate (CIRISEdge#461) measured the
+          # canonicalize path at -0.04% — yet this lane flagged relay/seal/loopback
+          # at 1.35×-3.59×. The calibration anchors were FLAT that run (CPU
+          # 40.43M→40.44M, AES 19.55M→18.97M), so it was neither runner drift NOR
+          # code: it was TIME-VARYING contention during the bench window that a
+          # single calibration SNAPSHOT can't cancel, compounded by inherent
+          # per-bench variance (transport_reticulum_loopback carries ±38%). A ratio
+          # between two runs each at ±40% noise is meaningless.
+          #
+          # So: keep the gh-pages TREND chart (auto-push) for eyeballing drift, but
+          # the ALERT is the deterministic `icount` job (benches/icount.rs, exact
+          # Callgrind instruction counts, same-runner A/B) — it reds the run on a
+          # REAL >5% regression and never false-alarms. Extending that gate to the
+          # seal/relay compute paths is the open follow-up on CIRISEdge#461.
+          alert-threshold: '200%'
           fail-on-alert: false
-          comment-on-alert: true
-          alert-comment-cc-users: '@CIRISAI/cirisedge-maintainers'
+          comment-on-alert: false
 
       - name: Save raw criterion + sim dump as artifact
         # 90-day retention. The raw target/criterion/ tree + the raw/normalized/
