@@ -2541,8 +2541,9 @@ impl PyReplicationHandle {
     /// revocations and the attestations about-or-by it — the `SelfOwn` plane
     /// anti-entropy never advertises.
     ///
-    /// Fire-and-forget: returns once the Pulls are dispatched. Raises
-    /// `RuntimeError` if the runtime has been stopped.
+    /// Returns once the Pulls are dispatched. Raises `RuntimeError` if the
+    /// runtime has been stopped OR if any Pull send failed (the caller must retry
+    /// — anti-entropy will NOT recover the `SelfOwn` plane on its own).
     fn pull_subject_testimony(
         &self,
         py: Python<'_>,

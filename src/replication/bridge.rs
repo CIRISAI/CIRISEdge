@@ -1022,12 +1022,15 @@ impl FederationDirectoryReplicationBridge {
                     }
                     let seq = Self::ms_seq(att.asserted_at);
                     if let Some((hash, _)) = content_hash_of(&att) {
-                        push(hash, seq);
+                        if self.pull_ref_is_serveable(&att, subject_key_id).await {
+                            push(hash, seq);
+                        }
                     }
                 }
                 // SENDER axis — records BY the subject (authorship recovery). No
-                // carve: an attestation I authored is mine to recover, even a
-                // `capacity:*` score I asserted about someone else.
+                // G2 carve (an attestation I authored is mine to recover, even a
+                // `capacity:*` score I asserted about someone else) — but the SAME
+                // serve gate, so a ref and its bytes always agree.
                 for att in self
                     .directory
                     .list_attestations_by(subject_key_id)
@@ -1036,7 +1039,9 @@ impl FederationDirectoryReplicationBridge {
                 {
                     let seq = Self::ms_seq(att.asserted_at);
                     if let Some((hash, _)) = content_hash_of(&att) {
-                        push(hash, seq);
+                        if self.pull_ref_is_serveable(&att, subject_key_id).await {
+                            push(hash, seq);
+                        }
                     }
                 }
             }
@@ -1046,6 +1051,43 @@ impl FederationDirectoryReplicationBridge {
             _ => {}
         }
         refs
+    }
+
+    /// CIRISEdge#462 — may this Attestation ref be disclosed to the requester
+    /// (== the subject)? A Pull answers with refs, and a ref discloses the row's
+    /// existence (hash + seq), so a row the requester could not be SERVED must not
+    /// be LISTED — else the Summary is an info-leak and an advertised-then-
+    /// unfetchable #429.
+    ///
+    /// The gate is deliberately NARROWER than the advertise/`fetch_envelope_bytes_for_peer`
+    /// path: it applies the E3 CONFIDENTIALITY gates (the `trace:*` plane pause,
+    /// author quarantine, and the `trace:* → infra:serve` capability check) but
+    /// NOT the #396 producer-advertise-consent bound (`resolve_attestation_recipient`).
+    /// A peer receiving another producer's advertised attestation is #396-gated;
+    /// a SUBJECT pulling its OWN testimony is not — its first-party right to obtain
+    /// the rows it must act on (a conferred duty, a revocation target) overrides a
+    /// producer's choice of advertise-recipients. So `delegates_to`/`trust:confers`
+    /// about the subject serve unconditionally, while a `trace:*` row still
+    /// requires the subject to hold `infra:serve`. `peer == subject` here (enforced
+    /// by [`Self::subject_holdings`]).
+    async fn pull_ref_is_serveable(&self, att: &Attestation, requester: &str) -> bool {
+        let Ok(value) = serde_json::to_value(att) else {
+            return false; // an unserializable row is not disclosed
+        };
+        if Self::attestation_requires_serve(&value) {
+            // `trace:*` — E3 confidentiality. Withheld while the plane is paused,
+            // and served only to a subject that itself holds `infra:serve`.
+            if self.trace_plane_paused().await {
+                return false;
+            }
+            if !self.peer_has_serve_capability(requester).await {
+                return false;
+            }
+        }
+        // A quarantined author's row is withheld on every path.
+        !self
+            .author_quarantine_withholds(&value, &mut HashMap::new(), requester)
+            .await
     }
 
     /// CIRISEdge#462 — the G2 self-revocation-hole carve, resolved by CONSUMING
@@ -4662,6 +4704,58 @@ mod tests {
                 .await
                 .is_empty(),
             "T must not pull S's testimony (impersonation blocked)"
+        );
+    }
+
+    /// CIRISEdge#462 (Codex #463 Finding 2) — a Pull ref must not DISCLOSE a row
+    /// the requester could not be served. A `trace:*` row is E3-confidential
+    /// (`infra:serve` only); a subject WITHOUT that capability must not even learn
+    /// the row exists (its hash + seq) — so it is gated OUT of the Summary, not
+    /// merely withheld at Deliver. A non-trace attestation about the subject (its
+    /// first-party testimony) is served regardless — the pull gate is E3
+    /// confidentiality, NOT the #396 producer-advertise-consent bound.
+    #[tokio::test]
+    async fn subject_pull_gates_trace_refs_it_cannot_serve() {
+        let subject = "subject-s";
+        let (backend, bridge) = make_bridge(&[subject.to_string()]);
+        for kid in [subject, "peer-p"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, "user"),
+                })
+                .await
+                .expect("register key");
+        }
+        // Non-trace testimony ABOUT the subject — served (first-party right; not
+        // #396-gated).
+        seed_delegates_to(
+            &backend,
+            "peer-p",
+            subject,
+            &serde_json::json!(["infra:serve"]),
+        )
+        .await;
+        let before = bridge
+            .subject_holdings(EnvelopeKind::Attestation, subject, Some(subject))
+            .await
+            .len();
+        assert_eq!(
+            before, 1,
+            "the subject's non-trace testimony is served (not gated by the producer's #396 consent)"
+        );
+
+        // A trace:* row about the subject (self-emitted). The subject holds no
+        // infra:serve capability, so the row must NOT appear in the pull refs —
+        // no hash/seq disclosure of a row that Deliver would withhold.
+        seed_trace_attestation(&backend, subject).await;
+        let after = bridge
+            .subject_holdings(EnvelopeKind::Attestation, subject, Some(subject))
+            .await
+            .len();
+        assert_eq!(
+            after, before,
+            "a trace:* row the requester cannot be served is gated OUT of the Pull refs \
+             (E3 confidentiality — no ref info-leak)"
         );
     }
 

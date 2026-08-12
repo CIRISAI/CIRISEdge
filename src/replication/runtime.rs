@@ -386,6 +386,13 @@ pub enum ReplicationRuntimeError {
     /// calls will keep failing.
     #[error("replication runtime has shut down; peer mutation is no longer accepted")]
     SchedulerStopped,
+    /// CIRISEdge#462 — one or more subject-`Pull` sends failed to reach the peer.
+    /// The scheduled Initiator was still installed (ordinary anti-entropy runs),
+    /// but anti-entropy CANNOT carry the `SelfOwn` plane a Pull recovers, so the
+    /// caller MUST treat the pull as not-dispatched for the named kinds and retry
+    /// — never a silent `Ok`. Carries `"<Kind>: <error>; …"`.
+    #[error("subject Pull dispatch failed: {0}")]
+    PullDispatch(String),
 }
 
 impl From<SchedulerCommandError> for ReplicationRuntimeError {
@@ -679,15 +686,22 @@ impl ReplicationRuntime {
     /// advertise projection never offers the `SelfOwn` plane, and the graph
     /// already holds the answer, just on another node.
     ///
-    /// FIRE-AND-FORGET, matching the anti-entropy model: `register_initiator_peer`
-    /// failing (scheduler stopped) is the only hard error; a transient Pull-send
-    /// failure for one kind is logged, not propagated, because the peer is now a
-    /// scheduled initiator whose next round re-attempts convergence.
+    /// A failed `Pull` send is NOT swallowed. The scheduled Initiator installed
+    /// here runs ordinary anti-entropy, but anti-entropy is advertise-based and
+    /// CANNOT carry the `SelfOwn` plane a Pull recovers — so a dropped Pull would
+    /// silently lose that kind's subject recovery while the caller believed it was
+    /// dispatched. We attempt every kind (so partial progress lands and register
+    /// stays idempotent for a clean retry), then return [`PullDispatch`] naming
+    /// the kinds whose send failed. `register_initiator_peer` failing (scheduler
+    /// stopped) is a hard error that aborts immediately.
+    ///
+    /// [`PullDispatch`]: ReplicationRuntimeError::PullDispatch
     pub async fn pull_subject_testimony(
         &self,
         peer_key_id: &str,
         subject_key_id: &str,
     ) -> Result<(), ReplicationRuntimeError> {
+        let mut failures: Vec<String> = Vec::new();
         for kind in EnvelopeKind::subject_pullable() {
             // Idempotent — installs (or reuses) the scheduled drive loop that
             // consumes the Pull's Summary reply.
@@ -699,13 +713,17 @@ impl ReplicationRuntime {
                         subject = %subject_key_id,
                         kind = ?kind,
                         error = %e,
-                        "subject Pull send failed for this kind — the scheduled round will \
-                         retry convergence (#462 fire-and-forget)"
+                        "subject Pull send failed — surfacing to the caller for retry (#462)"
                     );
+                    failures.push(format!("{kind:?}: {e}"));
                 }
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ReplicationRuntimeError::PullDispatch(failures.join("; ")))
+        }
     }
 
     /// Hot-remove a `(peer_key_id, kind)` peer — CIRISEdge#173,
