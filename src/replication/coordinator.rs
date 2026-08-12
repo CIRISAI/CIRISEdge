@@ -44,7 +44,7 @@ use tokio::sync::Mutex;
 
 use crate::transport::{Transport, TransportError};
 
-use super::protocol::{EnvelopeKind, ProtocolError, ReplicationMessage};
+use super::protocol::{EnvelopeKind, ProtocolError, PullMessage, ReplicationMessage};
 use super::session::{ReplicationOutcome, Session, SessionRole};
 use super::summary::{StalenessSignal, StateApplier, StateProvider};
 
@@ -370,6 +370,25 @@ impl ReplicationCoordinator {
             .map_err(CoordinatorError::from)
     }
 
+    /// CIRISEdge#462 — INITIATE a subject-scoped RECEIVE-axis pull: send this
+    /// coordinator's peer a `Pull{kind, subject_key_id}`. The peer answers with a
+    /// [`super::protocol::SummaryMessage`] of the subject's refs, which arrives on
+    /// this coordinator's inbound channel and is processed by the NORMAL round
+    /// drive loop (`on_summary` → Diff → Deliver → apply) — so this coordinator
+    /// MUST be an [`SessionRole::Initiator`](super::session::SessionRole::Initiator)
+    /// with a live drive loop (the scheduler's periodic round, installed by
+    /// [`super::runtime::ReplicationRuntime::register_initiator_peer`]). Fire-and-
+    /// forget: the testimony converges over the peer's next round, matching the
+    /// anti-entropy model — sending the Pull carries no session state (only the
+    /// reply does), so there is nothing to await here.
+    pub async fn start_pull(&self, subject_key_id: &str) -> Result<(), CoordinatorError> {
+        let pull = ReplicationMessage::Pull(PullMessage {
+            kind: self.kind,
+            subject_key_id: subject_key_id.to_string(),
+        });
+        self.send_message(&pull).await
+    }
+
     /// Try to parse on-wire bytes as a [`ReplicationMessage`].
     /// Returns:
     ///
@@ -521,6 +540,12 @@ mod tests {
         }
         fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
             self.envelopes.get(h).cloned()
+        }
+        // CIRISEdge#462 — the mock treats its whole state as the pulled subject's
+        // testimony (a real bridge scopes + gates per subject; here we exercise
+        // the coordinator wiring, not the serve gate).
+        fn subject_refs(&self, kind: EnvelopeKind, _subject_key_id: &str) -> Vec<EnvelopeRef> {
+            self.state.refs_for(kind)
         }
     }
 
@@ -772,6 +797,125 @@ mod tests {
         // ready to begin again on the next scheduler tick).
         assert!(!alice_coord.is_round_complete().await);
         assert!(!bob_coord.is_round_complete().await);
+    }
+
+    /// CIRISEdge#462 — the INITIATION drives the full RECEIVE cycle end-to-end: a
+    /// fresh node's `start_pull` → the responder's subject-scoped Summary → the
+    /// requester's Diff → the responder's Deliver → the requester applies the
+    /// subject's testimony. Proves the Pull reuses the ordinary receive path
+    /// (`on_summary`/`on_diff`/`on_deliver`) with an Initiator requester.
+    #[tokio::test]
+    async fn start_pull_drives_the_full_receive_cycle() {
+        let (alice_t, bob_t) = alice_bob_transports();
+        let alice_t = Arc::new(alice_t);
+        let bob_t = Arc::new(bob_t);
+
+        // Alice is a FRESH node: holds nothing, but knows how to admit the two
+        // rows the subject's testimony consists of.
+        let a_provider = Arc::new(StaticProvider {
+            state: LocalState::new(),
+            envelopes: HashMap::new(),
+        });
+        let a_applier = RecordingApplier::with(
+            HashMap::from([(b"env_3".to_vec(), h(3)), (b"env_4".to_vec(), h(4))]),
+            std::collections::HashSet::new(),
+        );
+
+        // Bob HOLDS the subject's testimony (env_3, env_4); its `subject_refs`
+        // returns them (the mock stands in for the bridge's subject_holdings).
+        let mut b_state = LocalState::new();
+        b_state.insert(EnvelopeKind::Key, h(3), 3);
+        b_state.insert(EnvelopeKind::Key, h(4), 4);
+        let b_provider = Arc::new(StaticProvider {
+            state: b_state,
+            envelopes: HashMap::from([(h(3), b"env_3".to_vec()), (h(4), b"env_4".to_vec())]),
+        });
+        let b_applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+
+        let alice_coord = ReplicationCoordinator::new(
+            alice_t.clone(),
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            a_provider,
+            a_applier,
+        );
+        let bob_coord = ReplicationCoordinator::new(
+            bob_t.clone(),
+            "alice",
+            EnvelopeKind::Key,
+            SessionRole::Responder,
+            b_provider,
+            b_applier,
+        );
+
+        // 1. Alice INITIATES the pull — sends bob a subject-scoped Pull.
+        alice_coord.start_pull("subject-xyz").await.unwrap();
+
+        // 2. Bob receives the Pull → answers with a Summary of the subject's refs.
+        let bob_pull = {
+            let mut inbox = bob_t.my_inbox.lock().await;
+            inbox.recv().await.expect("bob recv pull")
+        };
+        let bob_pull = ReplicationCoordinator::parse_inbound_bytes(&bob_pull).unwrap();
+        assert!(
+            matches!(bob_pull, ReplicationMessage::Pull(ref p) if p.subject_key_id == "subject-xyz"),
+            "bob received a subject-scoped Pull"
+        );
+        let bob_summary = match bob_coord.drive_round_step(Some(bob_pull)).await.unwrap() {
+            DriveStep::SendThenWait(ref msgs) => msgs[0].clone(),
+            o => panic!("expected Summary, got {o:?}"),
+        };
+        bob_coord.send_message(&bob_summary).await.unwrap();
+
+        // 3. Alice receives the Summary → wants both (holds nothing) → Diff.
+        let alice_summary = {
+            let mut inbox = alice_t.my_inbox.lock().await;
+            inbox.recv().await.expect("alice recv summary")
+        };
+        let alice_summary = ReplicationCoordinator::parse_inbound_bytes(&alice_summary).unwrap();
+        let alice_diff = match alice_coord
+            .drive_round_step(Some(alice_summary))
+            .await
+            .unwrap()
+        {
+            DriveStep::SendThenWait(ref msgs) => msgs[0].clone(),
+            o => panic!("expected Diff, got {o:?}"),
+        };
+        alice_coord.send_message(&alice_diff).await.unwrap();
+
+        // 4. Bob receives the Diff → Delivers the subject's bytes.
+        let bob_diff = {
+            let mut inbox = bob_t.my_inbox.lock().await;
+            inbox.recv().await.expect("bob recv diff")
+        };
+        let bob_diff = ReplicationCoordinator::parse_inbound_bytes(&bob_diff).unwrap();
+        let bob_deliver = match bob_coord.drive_round_step(Some(bob_diff)).await.unwrap() {
+            DriveStep::SendThenWait(ref msgs) => msgs[0].clone(),
+            o => panic!("expected Deliver, got {o:?}"),
+        };
+        bob_coord.send_message(&bob_deliver).await.unwrap();
+
+        // 5. Alice receives the Deliver → APPLIES the subject's testimony.
+        let alice_deliver = {
+            let mut inbox = alice_t.my_inbox.lock().await;
+            inbox.recv().await.expect("alice recv deliver")
+        };
+        let alice_deliver = ReplicationCoordinator::parse_inbound_bytes(&alice_deliver).unwrap();
+        match alice_coord
+            .drive_round_step(Some(alice_deliver))
+            .await
+            .unwrap()
+        {
+            DriveStep::Complete(report) => {
+                assert_eq!(
+                    report.admitted, 2,
+                    "the fresh node admitted the subject's 2 rows"
+                );
+                assert_eq!(report.refused, 0);
+            }
+            o => panic!("expected Complete(admitted=2), got {o:?}"),
+        }
     }
 
     /// `try_parse_inbound_bytes` returns `Ok(None)` for non-replication

@@ -108,6 +108,31 @@ pub trait StateProvider: Send + Sync {
     /// hash, or `None` if the envelope isn't in local state. Called
     /// during the Deliver-message construction step.
     fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> Option<Vec<u8>>;
+
+    /// CIRISEdge#462 — the RECEIVE-axis SERVE reader: the refs this node holds
+    /// for `kind` where `subject_key_id` is the data-subject (`list_signed_records`)
+    /// or, for the Attestation plane, the sender (`list_attestations_by` — the
+    /// subject's own authored testimony, for recovery). Answers an inbound
+    /// [`crate::replication::protocol::PullMessage`]: unlike [`Self::local_refs`]
+    /// (the whole advertised set) this is SUBJECT-scoped, so it reaches the
+    /// `SelfOwn` plane the advertise projection never offers.
+    ///
+    /// The impl MUST apply the SAME per-record projection gate its advertise path
+    /// applies (a Pull can only surface a row the responder would already serve),
+    /// and MUST withhold the consent-gated peer-authored scores about the subject
+    /// that persist's `consent_gated_claim` classifies (the `capacity:*` family —
+    /// the G2 self-revocation-hole carve: a subject pulling a score *about* itself
+    /// onto the node where it is the sole writer conflates read-copy with
+    /// write-authority). Refs only — the existing
+    /// Diff/Deliver flow carries the bytes, re-gated by [`Self::fetch_envelope`].
+    ///
+    /// Defaults to empty: only the production `DirectoryStateAdapter` (which holds
+    /// the persist `FederationDirectory`) can answer a subject pull. Test/in-memory
+    /// providers that don't override it simply return no refs — a Pull to them is
+    /// a well-formed no-op, never a panic.
+    fn subject_refs(&self, _kind: EnvelopeKind, _subject_key_id: &str) -> Vec<EnvelopeRef> {
+        Vec::new()
+    }
 }
 
 /// CIRISEdge#425 — the typed result of applying ONE delivered envelope.

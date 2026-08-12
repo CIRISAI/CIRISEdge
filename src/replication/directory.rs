@@ -103,6 +103,30 @@ pub trait ReplicationDirectory: Send + Sync {
         self.list_envelope_refs(kind).await
     }
 
+    /// CIRISEdge#462 — the RECEIVE-axis SERVE reader: the refs held for `kind`
+    /// where `subject_key_id` is the data-subject (records ABOUT it) or, on the
+    /// Attestation plane, the sender (records BY it — authorship recovery).
+    /// Answers an inbound subject-scoped Pull, reaching the `SelfOwn` plane the
+    /// advertise projection never offers (a fedID pulling its own testimony onto
+    /// a node no peer would ever *advertise* it to).
+    ///
+    /// `peer_key_id` is the AUTHENTICATED requester. The implementation MUST
+    /// serve only a requester entitled to the subject's rows (this cut:
+    /// requester == subject, fail-closed) and MUST withhold peer-authored
+    /// `capacity:*` scores about the subject (the G2 self-revocation-hole carve).
+    /// The refs it returns hash the SAME struct the wire index keys on, so the
+    /// unchanged Diff/Deliver flow — re-gated per record by
+    /// [`Self::fetch_envelope_bytes_for_peer`] — carries the bytes. Defaults to
+    /// empty: only the production bridge answers a subject pull.
+    async fn subject_holdings(
+        &self,
+        _kind: EnvelopeKind,
+        _subject_key_id: &str,
+        _peer_key_id: Option<&str>,
+    ) -> Vec<EnvelopeRef> {
+        Vec::new()
+    }
+
     /// Return the byte-exact signed envelope for `(kind,
     /// envelope_hash)`, or `None` if the envelope isn't in local state.
     /// Called during the `Deliver`-message construction step.
@@ -226,6 +250,23 @@ impl StateProvider for DirectoryStateAdapter {
             tokio::runtime::Handle::current().block_on(async move {
                 inner
                     .fetch_envelope_bytes_for_peer(kind, &hash, peer.as_deref())
+                    .await
+            })
+        })
+    }
+
+    /// CIRISEdge#462 — answer a subject-scoped Pull. Routes to
+    /// [`ReplicationDirectory::subject_holdings`] with the bound `peer_key_id`
+    /// (the authenticated requester) so the impl's entitlement gate (requester ==
+    /// subject) and the G2 capacity carve both apply.
+    fn subject_refs(&self, kind: EnvelopeKind, subject_key_id: &str) -> Vec<EnvelopeRef> {
+        let inner = Arc::clone(&self.inner);
+        let subject = subject_key_id.to_owned();
+        let peer = self.peer_key_id.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                inner
+                    .subject_holdings(kind, &subject, peer.as_deref())
                     .await
             })
         })

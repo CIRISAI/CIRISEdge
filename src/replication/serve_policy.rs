@@ -47,7 +47,37 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
             ("bulk_since", "public")
         }
     };
-    serde_json::json!({ "kind": kind.as_wire_str(), "advertise": advertise, "serve": serve })
+    // CIRISEdge#462 — `receive`: whether this kind answers a subject-scoped Pull
+    // (the RECEIVE axis), and under what rule. The FIVE replicated kinds are
+    // subject-pullable, entitlement FAIL-CLOSED to the subject itself; the
+    // Attestation plane sweeps BOTH testimonial axes with the G2 score carve;
+    // every other kind is NOT subject-pullable (`none`). This column is the
+    // coordinated-cut witness CIRISServer pins alongside `serve`.
+    let receive = match kind {
+        EnvelopeKind::Key
+        | EnvelopeKind::IdentityOccurrence
+        | EnvelopeKind::TransportDestination
+        | EnvelopeKind::IdentityOccurrenceRevocation => "subject_pull:data_subject; subject-only",
+        EnvelopeKind::Attestation => {
+            "subject_pull:data_subject+sender; subject-only; \
+             consent-gated scores carved on data_subject axis (G2: persist consent_gated_claim)"
+        }
+        EnvelopeKind::Revocation
+        | EnvelopeKind::Family
+        | EnvelopeKind::Community
+        | EnvelopeKind::LocationProof
+        | EnvelopeKind::FamilyMembershipRevocation
+        | EnvelopeKind::CommunityMembershipRevocation
+        | EnvelopeKind::Organization
+        | EnvelopeKind::OrgMembership
+        | EnvelopeKind::PartnerRecord => "none",
+    };
+    serde_json::json!({
+        "kind": kind.as_wire_str(),
+        "advertise": advertise,
+        "serve": serve,
+        "receive": receive,
+    })
 }
 
 /// The canonical serve/advertise policy manifest (mirrors persist's
@@ -56,8 +86,9 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
 #[must_use]
 pub fn serve_advertise_manifest() -> serde_json::Value {
     serde_json::json!({
+        // CIRISEdge#462 — v2 adds the per-kind `receive` (subject-Pull) axis.
         "contract": "replication_serve_advertise_policy",
-        "version": 1,
+        "version": 2,
         "policies": EnvelopeKind::ALL
             .iter()
             .map(|k| policy_for(*k))
@@ -79,7 +110,7 @@ pub fn serve_advertise_policy_sha256() -> String {
 /// deliberate, reviewed re-pin, visible to CIRISServer which pins it alongside
 /// persist's `REPLICATION_POLICY_HASH`. See CIRISEdge#393 §4.2/§4.3.
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "79f5c63a4e4945995f9beba6f3746c380e0bee3fe805866ebfaff34ac6d7c9ff";
+    "049e71ef208d24266fe366b8eaed365a467cadd3aadd8856c8ed917c90bced33";
 
 #[cfg(test)]
 mod tests {
@@ -94,6 +125,39 @@ mod tests {
              trace:* serve gate), then re-pin deliberately (CIRISEdge#393 §4.2). \
              CIRISServer pins this alongside persist's REPLICATION_POLICY_HASH.",
         );
+    }
+
+    /// CIRISEdge#462 — the RECEIVE axis witness: EXACTLY the five replicated
+    /// kinds answer a subject Pull (`subject_pull:*`), every other kind is `none`,
+    /// and the Attestation plane is the one that names both axes + the G2 carve.
+    #[test]
+    fn only_the_five_replicated_kinds_answer_a_subject_pull() {
+        let manifest = serve_advertise_manifest();
+        let policies = manifest["policies"].as_array().unwrap();
+        let pullable: Vec<&str> = policies
+            .iter()
+            .filter(|p| p["receive"].as_str().unwrap().starts_with("subject_pull"))
+            .map(|p| p["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            pullable,
+            vec![
+                "key",
+                "attestation",
+                "identity_occurrence",
+                "identity_occurrence_revocation",
+                "transport_destination",
+            ],
+            "exactly the five replicated kinds are subject-pullable (RECEIVE axis)"
+        );
+        // The Attestation plane is the one that sweeps both axes + carves scores.
+        let att = policies
+            .iter()
+            .find(|p| p["kind"] == "attestation")
+            .unwrap();
+        let recv = att["receive"].as_str().unwrap();
+        assert!(recv.contains("data_subject+sender"), "both axes: {recv}");
+        assert!(recv.contains("G2"), "the score carve is witnessed: {recv}");
     }
 
     /// The load-bearing E3 fact must hold in the manifest: exactly ONE kind is

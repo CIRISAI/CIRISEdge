@@ -386,6 +386,13 @@ pub enum ReplicationRuntimeError {
     /// calls will keep failing.
     #[error("replication runtime has shut down; peer mutation is no longer accepted")]
     SchedulerStopped,
+    /// CIRISEdge#462 — one or more subject-`Pull` sends failed to reach the peer.
+    /// The scheduled Initiator was still installed (ordinary anti-entropy runs),
+    /// but anti-entropy CANNOT carry the `SelfOwn` plane a Pull recovers, so the
+    /// caller MUST treat the pull as not-dispatched for the named kinds and retry
+    /// — never a silent `Ok`. Carries `"<Kind>: <error>; …"`.
+    #[error("subject Pull dispatch failed: {0}")]
+    PullDispatch(String),
 }
 
 impl From<SchedulerCommandError> for ReplicationRuntimeError {
@@ -662,6 +669,61 @@ impl ReplicationRuntime {
             .await;
         self.scheduler_handle.add_initiator(coord).await?;
         Ok(())
+    }
+
+    /// CIRISEdge#462 — INITIATE a subject-scoped RECEIVE-axis pull: recover
+    /// `subject_key_id`'s own testimony (and testimony ABOUT it) from
+    /// `peer_key_id`. For each subject-pullable kind (the five replicated planes)
+    /// this ensures a scheduled Initiator coordinator exists — so the reply's
+    /// drive loop is live — then sends a `Pull`. The peer answers with the
+    /// subject's refs (projection-gated + G2-carved by its `subject_holdings`),
+    /// and the node pulls the gap through the ordinary Diff/Deliver flow.
+    ///
+    /// This is the mechanism the observation in #462 needs: a fedID that claimed
+    /// a fresh node cannot otherwise obtain its own keys / occurrences / routes /
+    /// occurrence-revocations, nor the attestations about-or-by it (so a
+    /// moderation duty conferred on it becomes exercisable) — anti-entropy's
+    /// advertise projection never offers the `SelfOwn` plane, and the graph
+    /// already holds the answer, just on another node.
+    ///
+    /// A failed `Pull` send is NOT swallowed. The scheduled Initiator installed
+    /// here runs ordinary anti-entropy, but anti-entropy is advertise-based and
+    /// CANNOT carry the `SelfOwn` plane a Pull recovers — so a dropped Pull would
+    /// silently lose that kind's subject recovery while the caller believed it was
+    /// dispatched. We attempt every kind (so partial progress lands and register
+    /// stays idempotent for a clean retry), then return [`PullDispatch`] naming
+    /// the kinds whose send failed. `register_initiator_peer` failing (scheduler
+    /// stopped) is a hard error that aborts immediately.
+    ///
+    /// [`PullDispatch`]: ReplicationRuntimeError::PullDispatch
+    pub async fn pull_subject_testimony(
+        &self,
+        peer_key_id: &str,
+        subject_key_id: &str,
+    ) -> Result<(), ReplicationRuntimeError> {
+        let mut failures: Vec<String> = Vec::new();
+        for kind in EnvelopeKind::subject_pullable() {
+            // Idempotent — installs (or reuses) the scheduled drive loop that
+            // consumes the Pull's Summary reply.
+            self.register_initiator_peer(peer_key_id, kind).await?;
+            if let Some(coord) = self.registry.get(peer_key_id, kind).await {
+                if let Err(e) = coord.start_pull(subject_key_id).await {
+                    tracing::warn!(
+                        peer = %peer_key_id,
+                        subject = %subject_key_id,
+                        kind = ?kind,
+                        error = %e,
+                        "subject Pull send failed — surfacing to the caller for retry (#462)"
+                    );
+                    failures.push(format!("{kind:?}: {e}"));
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ReplicationRuntimeError::PullDispatch(failures.join("; ")))
+        }
     }
 
     /// Hot-remove a `(peer_key_id, kind)` peer — CIRISEdge#173,

@@ -105,6 +105,15 @@ ignore = [
     "RUSTSEC-2025-0098",  # unic-* unmaintained
     "RUSTSEC-2025-0100",  # unic-* unmaintained
 
+    # bincode 1.3.3 unmaintained — NOT a vulnerability. The bincode team
+    # permanently ceased development after a doxxing/harassment incident and
+    # consider 1.3.3 a COMPLETE version needing no updates ("No safe upgrade is
+    # available" because none is needed). Transitive DEV-ONLY via
+    # `iai-callgrind v0.16.1` (the CIRISEdge#461 deterministic instruction-count
+    # bench harness); it never ships in any wheel or transport binary. Clears if
+    # the icount harness migrates to gungraun (the post-rename iai successor).
+    "RUSTSEC-2025-0141",  # bincode 1.3.3 unmaintained (dev-only, via iai-callgrind)
+
     # 2026-07-17 — six same-day libcrux advisories, ALL from the ONE dep
     # `openmls_libcrux_crypto v0.3.1` (RFC 9420 MLS backend, CIRISEdge#66) via
     # hpke-rs-libcrux / libcrux-{aead,kem,ml-kem,sha3}. NONE reach the
