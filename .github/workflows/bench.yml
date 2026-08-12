@@ -76,9 +76,27 @@ env:
   CARGO_HTTP_MULTIPLEXING: 'false'      # HTTP/1.1 — sidesteps the HTTP/2 framing flake
   CARGO_NET_GIT_FETCH_WITH_CLI: 'true'  # git CLI for the CIRIS git-dep pins
 
+# Cancel a SUPERSEDED Bench run when a newer commit lands on the same PR/branch.
+# ci.yml already does this; bench.yml did NOT — so a PR's rapid pushes stacked
+# whole 99-min wall-time runs (observed: FOUR concurrent Bench runs on one PR's
+# four pushes, ~6.5 runner-hours, none cancelled). Mirrors ci.yml's group: on a
+# PR every push shares the ref group (older run cancels); on main/tags the group
+# is the SHA so each release keeps its own run (never cancel a release's bench).
+concurrency:
+  group: bench-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   bench:
     name: Transport / A-V-mesh / replication bench suite
+    # TREND-ONLY, so NOT on pull_request: on a PR this job publishes nothing (the
+    # gh-pages trend push below is gated to push-to-main) and alerts nothing
+    # (comment-on-alert:false) — it was ~99 min of pure runner burn per PR push,
+    # triggered on every PR touching src/{transport,replication}/**. The
+    # deterministic `icount` job below IS the PR regression gate (~6 min,
+    # runner-independent). The wall-time trend still refreshes on push-to-main +
+    # the weekly schedule + workflow_dispatch. See CIRISEdge#461.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # HEAVY: nine criterion micro-benches across four feature-set compilations
     # (default, +reticulum, +http, +both) — the realtime_av_* benches carry
