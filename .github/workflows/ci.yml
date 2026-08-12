@@ -296,6 +296,7 @@ jobs:
   # build for darwin runs via the pyo3-wheel matrix entry below.
   darwin-aarch64-test:
     name: darwin-aarch64 (no pyo3)
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: off PR (cut runners)
     runs-on: macos-14
     # CIRISEdge#229 — restore only; canonical macos-aarch64 save lives
     # on `pyo3-wheel` `darwin-aarch64` (release-profile target/).
@@ -414,13 +415,13 @@ jobs:
       # 12m+ per ABI job). 3 jobs → 6, each doing ONE build; the ABI
       # legs drop from ~14-16m to ~7-8m wall. The include entries match
       # on `abi` and enrich every {abi, variant} combination.
-      matrix:
-        variant: [plain, pyo3]
-        abi: [arm64-v8a, x86_64, armeabi-v7a]
-        include:
-          - { abi: arm64-v8a,    target: aarch64-linux-android,   clang_prefix: aarch64-linux-android24,     pointer_width: 64 }
-          - { abi: x86_64,       target: x86_64-linux-android,    clang_prefix: x86_64-linux-android24,      pointer_width: 64 }
-          - { abi: armeabi-v7a,  target: armv7-linux-androideabi, clang_prefix: armv7a-linux-androideabi24,  pointer_width: 32 }
+      # CIRISEdge (cut runners): PR + main build ONE pyo3 subset-canary (arm64-v8a
+      # pyo3 — the #618-class cfg-subset guard, the load-bearing mobile check); the
+      # full 3-ABI × {plain,pyo3} matrix builds only on tags where the android
+      # release wheels are cut (6 android jobs → 1 per PR/merge). Whole-`matrix:`
+      # fromJSON — the documented dynamic-matrix form (job-level `if:` can't see
+      # `matrix`, CIRISPersist#638).
+      matrix: ${{ fromJSON( startsWith(github.ref, 'refs/tags/v') && '{"include":[{"abi":"arm64-v8a","variant":"plain","target":"aarch64-linux-android","clang_prefix":"aarch64-linux-android24","pointer_width":64},{"abi":"arm64-v8a","variant":"pyo3","target":"aarch64-linux-android","clang_prefix":"aarch64-linux-android24","pointer_width":64},{"abi":"x86_64","variant":"plain","target":"x86_64-linux-android","clang_prefix":"x86_64-linux-android24","pointer_width":64},{"abi":"x86_64","variant":"pyo3","target":"x86_64-linux-android","clang_prefix":"x86_64-linux-android24","pointer_width":64},{"abi":"armeabi-v7a","variant":"plain","target":"armv7-linux-androideabi","clang_prefix":"armv7a-linux-androideabi24","pointer_width":32},{"abi":"armeabi-v7a","variant":"pyo3","target":"armv7-linux-androideabi","clang_prefix":"armv7a-linux-androideabi24","pointer_width":32}]}' || '{"include":[{"abi":"arm64-v8a","variant":"pyo3","target":"aarch64-linux-android","clang_prefix":"aarch64-linux-android24","pointer_width":64}]}' ) }}
     env:
       # CIRISEdge#216 — sccache over the GHA cache backend (the
       # CIRISServer bench.yml pattern). Compilation-unit caching that
@@ -619,6 +620,7 @@ jobs:
   #      abi3 wheels (one per ABI), tagged `cp310-abi3-android_24_{abi}`.
   android-package:
     name: package android artifacts
+    if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
     runs-on: ubuntu-latest
     needs: [android-ndk]
     steps:
@@ -754,6 +756,7 @@ jobs:
   # stable.
   build-ios:
     name: ios ${{ matrix.target }}
+    if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
     runs-on: macos-latest
     # CIRISEdge#229 — restore only; the canonical ios save happens on
     # the ios-pyo3 lane (PyO3 + extension-module on top is the densest
@@ -846,6 +849,7 @@ jobs:
   # `CIRISEdge.xcframework` that Swift consumers drag into Xcode.
   xcframework:
     name: Create XCFramework
+    if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
     needs: build-ios
     runs-on: macos-latest
     steps:
@@ -971,10 +975,11 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { target: aarch64-apple-ios,     dir: ios-device,    sysconfig: _sysconfigdata__ios_arm64-iphoneos.py,       xcfw_dir: ios-arm64,                       plat: ios-aarch64     }
-          - { target: aarch64-apple-ios-sim, dir: ios-simulator, sysconfig: _sysconfigdata__ios_arm64-iphonesimulator.py, xcfw_dir: ios-arm64_x86_64-simulator,      plat: ios-aarch64-sim }
+      # CIRISEdge (cut runners): PR + main build ONE pyo3-sim canary (the ios
+      # cfg-subset/cross-link guard); both targets build only on tags where the
+      # xcframework/wheels are cut. Whole-`matrix:` fromJSON — the documented
+      # dynamic-matrix form (job-level `if:` can't see `matrix`, CIRISPersist#638).
+      matrix: ${{ fromJSON( startsWith(github.ref, 'refs/tags/v') && '{"include":[{"target":"aarch64-apple-ios","dir":"ios-device","sysconfig":"_sysconfigdata__ios_arm64-iphoneos.py","xcfw_dir":"ios-arm64","plat":"ios-aarch64"},{"target":"aarch64-apple-ios-sim","dir":"ios-simulator","sysconfig":"_sysconfigdata__ios_arm64-iphonesimulator.py","xcfw_dir":"ios-arm64_x86_64-simulator","plat":"ios-aarch64-sim"}]}' || '{"include":[{"target":"aarch64-apple-ios-sim","dir":"ios-simulator","sysconfig":"_sysconfigdata__ios_arm64-iphonesimulator.py","xcfw_dir":"ios-arm64_x86_64-simulator","plat":"ios-aarch64-sim"}]}' ) }}
     env:
       # Persist's pin verbatim — see job docblock above for rationale.
       PYTHON_IOS_VER: "3.10"
@@ -1147,6 +1152,7 @@ jobs:
   # tarball delivers exactly that.
   ios-pyo3-package:
     name: package ios PyO3 artifacts
+    if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
     runs-on: ubuntu-latest
     needs: [ios-pyo3]
     steps:
@@ -1417,6 +1423,12 @@ jobs:
 
   pyo3-wheel:
     name: maturin abi3-py310 wheel (${{ matrix.label }})
+    # CIRISEdge (cut runners): the desktop maturin wheels (linux-x86_64,
+    # linux-aarch64, macos-aarch64, windows-x64 — windows alone ~27m) are release
+    # artifacts + cross-repo cache warmers; nothing on a PR consumes them (the
+    # pyo3 compile is already covered by linux-x86_64 (pyo3-full) + the android/ios
+    # pyo3 canaries). Off PR; still on main (cache + wheel-break catch) and tags.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: [cargo-pyproject-skew-check]
     # CIRISEdge#229 — save the cross-repo cache on main-branch wheel
     # builds (one per canonical PLAT: linux-x86_64, linux-aarch64,
@@ -2176,7 +2188,14 @@ jobs:
           crypto  = find_tag('ciris-crypto')
           assert keyring == crypto, f'ciris-keyring ({keyring}) and ciris-crypto ({crypto}) must share a tag — both come from CIRISVerify'
           pins = {
-              'ciris-persist': f'ciris-persist=={persist}',
+              # CIRISEdge: persist stopped PyPI-publishing at v30.4.0, so a version
+              # pin (ciris-persist==X) resolves against PyPI and fails with "No
+              # matching distribution" — cohab was permanently benign-red. Build it
+              # from its git tag instead (the reusable workflow's documented
+              # git-source override): the same tag edge pins in Cargo.toml, off the
+              # assets we build, not PyPI. (verify is still a version pin — flip it
+              # to git-source the same way if a tag-run shows it also left PyPI.)
+              'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@v{persist}',
               'ciris-verify':  f'ciris-verify=={keyring}',
           }
           print(f'json={json.dumps(pins)}')
@@ -2186,6 +2205,7 @@ jobs:
 
   cohabitation-conformance:
     name: cohabitation (${{ matrix.platform }} × ${{ matrix.backend }})
+    if: startsWith(github.ref, 'refs/tags/v')  # CIRISEdge: release-only, off PR+merge (cut runners)
     needs: [pyo3-wheel, extract-substrate-pins]
     strategy:
       fail-fast: false
