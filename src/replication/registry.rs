@@ -239,6 +239,9 @@ impl ReplicationRegistry {
             super::protocol::ReplicationMessage::Diff(m) => m.kind,
             super::protocol::ReplicationMessage::Fetch(m) => m.kind,
             super::protocol::ReplicationMessage::Deliver(m) => m.kind,
+            // CIRISEdge#462 — a subject-scoped Pull routes on its kind like every
+            // other verb; the auto-registered Responder below answers it.
+            super::protocol::ReplicationMessage::Pull(m) => m.kind,
         };
         // CIRISEdge#312 — if no coordinator exists for this (peer, kind), this
         // node doesn't consent-pull from the peer (so no Initiator was built),

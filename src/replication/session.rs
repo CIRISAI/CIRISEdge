@@ -36,8 +36,8 @@
 //! Delivers have been applied.
 
 use super::protocol::{
-    DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
-    SummaryMessage,
+    DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, PullMessage,
+    ReplicationMessage, SummaryMessage,
 };
 use super::summary::{diff_refs, ApplyOutcome, StalenessSignal, StateApplier, StateProvider};
 
@@ -366,7 +366,39 @@ impl Session {
             ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider, source_peer),
             ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier, source_peer),
             ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider, source_peer),
+            ReplicationMessage::Pull(pull) => self.on_pull(&pull, provider),
         }
+    }
+
+    /// CIRISEdge#462 — serve a subject-scoped RECEIVE-axis pull. The requester
+    /// asked "which `kind` records do you hold where `subject_key_id` is the
+    /// data-subject or sender?" We answer with an ordinary [`SummaryMessage`] of
+    /// the refs we hold for that subject — sourced from
+    /// [`StateProvider::subject_refs`], which is projection-gated and withholds
+    /// the `capacity:*` scores about the subject (the G2 carve). From here the
+    /// EXISTING flow takes over unchanged: the requester's `on_summary` computes
+    /// `want = subject_refs ∖ its own holdings`, sends a Diff, and our `on_diff`
+    /// serves the bytes through `fetch_envelope` — which RE-APPLIES the full
+    /// per-record serve gate, so the Pull widens nothing.
+    ///
+    /// Reusing Summary here is deliberate: the want-generator the receive axis
+    /// needs (`remote ∖ holdings`) is *exactly* what `on_summary` already is; the
+    /// Pull's only job is to seed that machinery with a SUBJECT-scoped ref set
+    /// instead of the advertise set the `SelfOwn` plane never produces.
+    fn on_pull(&mut self, pull: &PullMessage, provider: &dyn StateProvider) -> ReplicationOutcome {
+        if pull.kind != self.kind {
+            return ReplicationOutcome::UnexpectedMessage;
+        }
+        let refs = provider.subject_refs(self.kind, &pull.subject_key_id);
+        let summary = SummaryMessage {
+            kind: self.kind,
+            refs,
+        };
+        // Record what we offered so a subsequent Diff for these refs is served
+        // (the responder path reads `last_summary_sent` conceptually via
+        // `fetch_envelope`; recording it keeps staleness telemetry honest).
+        self.last_summary_sent = Some(summary.clone());
+        ReplicationOutcome::Send(vec![ReplicationMessage::Summary(summary)])
     }
 
     fn on_summary(

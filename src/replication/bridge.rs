@@ -685,6 +685,37 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
+    /// CIRISEdge#462 — serve a subject-scoped RECEIVE-axis Pull. Entitlement is
+    /// FAIL-CLOSED: a Pull for subject `S` is answered only to a requester
+    /// authenticated AS `S` (`peer_key_id == Some(S)`). A requester `P ≠ S` — or
+    /// an unattributed one — gets nothing, and it says so. (Owner-delegation, a
+    /// node key pulling for its owner fedID, needs `owner_of` and is a deliberate
+    /// follow-up, not silently permitted here.) The refs themselves come from
+    /// [`Self::subject_holdings_inner`], which hashes the SAME struct the wire
+    /// index keys on and applies the G2 capacity carve.
+    async fn subject_holdings(
+        &self,
+        kind: EnvelopeKind,
+        subject_key_id: &str,
+        peer_key_id: Option<&str>,
+    ) -> Vec<EnvelopeRef> {
+        match peer_key_id {
+            Some(p) if p == subject_key_id => {
+                self.subject_holdings_inner(kind, subject_key_id).await
+            }
+            other => {
+                tracing::warn!(
+                    subject = %subject_key_id,
+                    requester = ?other,
+                    kind = ?kind,
+                    "subject Pull refused: requester is not the subject — serving nothing \
+                     (#462 fail-closed; owner-delegation via owner_of is a follow-up)"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// CIRISEdge#379 — recipient-aware fetch: the serve-side twin of the
     /// listing gate, so a peer excluded from the listing cannot obtain a
     /// `trace:*` envelope anyway by Diff/Fetch-ing a hash it learned
@@ -889,6 +920,155 @@ impl FederationDirectoryReplicationBridge {
             }
             EnvelopeKind::LocationProof => self.list_location_proofs().await,
         }
+    }
+
+    /// CIRISEdge#462 — the subject-scoped RECEIVE-axis ref builder (entitlement
+    /// already checked by [`Self::subject_holdings`]). For each replicated kind
+    /// it calls the SAME per-subject persist read `list_signed_records` composes,
+    /// but hashes the returned STRUCT with [`content_hash_of`] — the wire index
+    /// keys on `sha256(to_vec(row))`, whereas `list_signed_records`' `to_value`
+    /// canonical JSON re-orders keys (no serde_json `preserve_order`) and would
+    /// not resolve through the content-hash fetch path. So the refs here are the
+    /// index's own hashes by construction, and the unchanged Diff/Deliver flow
+    /// (re-gated per record by `fetch_envelope_bytes_for_peer`) serves them.
+    /// (CIRISPersist#634 asks for a subject-scoped wire-index read that would
+    /// return these index hashes directly and retire this compose-and-rehash.)
+    ///
+    /// The Attestation plane sweeps BOTH testimonial axes: `list_attestations_for`
+    /// (records ABOUT the subject — the revocation-reachability set, with the G2
+    /// [`Self::is_self_nonretainable_score`] carve) and `list_attestations_by`
+    /// (records BY the subject — authorship recovery, no carve: mine to recover).
+    /// Non-replicated / cohort kinds are not subject-pullable and return empty.
+    async fn subject_holdings_inner(
+        &self,
+        kind: EnvelopeKind,
+        subject_key_id: &str,
+    ) -> Vec<EnvelopeRef> {
+        let mut refs: Vec<EnvelopeRef> = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut push = |hash: [u8; 32], seq: u64| {
+            if seen.insert(hash) {
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq,
+                });
+            }
+        };
+        match kind {
+            EnvelopeKind::Key => {
+                if let Ok(Some(record)) = self.directory.lookup_public_key(subject_key_id).await {
+                    let seq = Self::ms_seq(record.valid_from);
+                    if let Some((hash, _)) = content_hash_of(&SignedKeyRecord { record }) {
+                        push(hash, seq);
+                    }
+                }
+            }
+            EnvelopeKind::IdentityOccurrence => {
+                for row in self
+                    .directory
+                    .list_signed_identity_occurrences_for(subject_key_id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let seq = Self::ms_seq(row.identity_occurrence.asserted_at);
+                    if let Some((hash, _)) = content_hash_of(&row) {
+                        push(hash, seq);
+                    }
+                }
+            }
+            EnvelopeKind::TransportDestination => {
+                for row in self
+                    .directory
+                    .list_signed_transport_destinations_for(subject_key_id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let td = &row.transport_destination;
+                    let seq = if td.epoch > 0 {
+                        td.epoch
+                    } else {
+                        Self::ms_seq(td.asserted_at)
+                    };
+                    if let Some((hash, _)) = content_hash_of(&row) {
+                        push(hash, seq);
+                    }
+                }
+            }
+            EnvelopeKind::IdentityOccurrenceRevocation => {
+                for row in self
+                    .directory
+                    .list_signed_identity_occurrence_revocations_for(subject_key_id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let seq = Self::ms_seq(row.identity_occurrence_revocation.revoked_at);
+                    if let Some((hash, _)) = content_hash_of(&row) {
+                        push(hash, seq);
+                    }
+                }
+            }
+            EnvelopeKind::Attestation => {
+                // DATA-SUBJECT axis — records ABOUT the subject (the 84-family
+                // revocation-reachability set), MINUS the G2 self-non-retainable
+                // scores.
+                for att in self
+                    .directory
+                    .list_attestations_for(subject_key_id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if Self::is_self_nonretainable_score(&att) {
+                        continue;
+                    }
+                    let seq = Self::ms_seq(att.asserted_at);
+                    if let Some((hash, _)) = content_hash_of(&att) {
+                        push(hash, seq);
+                    }
+                }
+                // SENDER axis — records BY the subject (authorship recovery). No
+                // carve: an attestation I authored is mine to recover, even a
+                // `capacity:*` score I asserted about someone else.
+                for att in self
+                    .directory
+                    .list_attestations_by(subject_key_id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let seq = Self::ms_seq(att.asserted_at);
+                    if let Some((hash, _)) = content_hash_of(&att) {
+                        push(hash, seq);
+                    }
+                }
+            }
+            // Revocation (key-level), the cohort planes (Family/Community/
+            // LocationProof), the membership-revocation planes, and the
+            // operational trio are not subject-scoped-pullable via this axis.
+            _ => {}
+        }
+        refs
+    }
+
+    /// CIRISEdge#462 — the G2 self-revocation-hole carve. A peer-authored SCORE
+    /// about the subject (`capacity:*` / `capacity_assurance:*` / `moderation:*`
+    /// dimension, CC 2.1 — the dimension lives inside `attestation_envelope`) is
+    /// NEVER served on the data-subject Pull axis: landing a score ABOUT me onto
+    /// the node where I am the sole writer conflates read-copy with
+    /// write-authority — the shape that produced the G2 hole. The subject's OWN
+    /// authored scores (the sender axis) are unaffected.
+    ///
+    /// The prefix set is edge-local pending persist's `is_subject_retainable`
+    /// predicate (CIRISPersist#635) that would own this on the authoritative
+    /// namespace taxonomy; it is fail-closed in spirit — an unclassifiable score
+    /// dimension should be *added* here, never pulled onto self by default.
+    fn is_self_nonretainable_score(att: &Attestation) -> bool {
+        att.attestation_envelope
+            .pointer("/dimension")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| {
+                d.starts_with("capacity:")
+                    || d.starts_with("capacity_assurance:")
+                    || d.starts_with("moderation:")
+            })
     }
 
     /// The per-kind apply dispatch behind the #425 choke —
@@ -4187,6 +4367,140 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .expect("seed trust-graph attestation");
+    }
+
+    /// CIRISEdge#462 — build a minimal `Attestation` carrying `dimension` inside
+    /// its envelope (CC 2.1), for the pure G2-carve predicate test. All other
+    /// fields are placeholders — only `attestation_envelope/dimension` is read.
+    fn att_with_dimension(dimension: Option<&str>) -> Attestation {
+        let now = Utc::now();
+        Attestation {
+            attestation_id: "t".into(),
+            attesting_key_id: "a".into(),
+            attested_key_id: "s".into(),
+            attestation_type: "scores".into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: match dimension {
+                Some(d) => serde_json::json!({ "dimension": d }),
+                None => serde_json::json!({}),
+            },
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "a".into(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: vec!["s".into()],
+            withdraws_admission_rule: None,
+            additional_scrubs: Vec::new(),
+            cohort_scope: "federation".into(),
+            tier: "federation".into(),
+            promoted_at: None,
+        }
+    }
+
+    /// CIRISEdge#462 — the G2 self-revocation-hole carve is EXACTLY the
+    /// peer-authored score families (`capacity:*` / `capacity_assurance:*` /
+    /// `moderation:*`); relationship/charter testimony (and trace:*, which is
+    /// E3-gated at fetch, not carved from the refs) is kept.
+    #[test]
+    fn g2_carve_excludes_peer_scores_keeps_testimony() {
+        use FederationDirectoryReplicationBridge as B;
+        for score in [
+            "capacity:core_identity:v1",
+            "capacity_assurance:composite:v1",
+            "moderation:removal:v1",
+        ] {
+            assert!(
+                B::is_self_nonretainable_score(&att_with_dimension(Some(score))),
+                "{score} is a peer-authored score about the subject — carved (G2)"
+            );
+        }
+        assert!(
+            !B::is_self_nonretainable_score(&att_with_dimension(Some("trace:coherence:v1"))),
+            "trace:* is served (E3-gated at fetch), not carved from the pull refs"
+        );
+        assert!(
+            !B::is_self_nonretainable_score(&att_with_dimension(None)),
+            "a charter/relationship attestation (no dimension) is testimony — kept"
+        );
+    }
+
+    /// CIRISEdge#462 — the subject-scoped serve reader answers the SUBJECT with
+    /// its testimony across BOTH axes (ABOUT-me via the data-subject axis +
+    /// authored-BY-me via the sender axis), never leaks another subject's rows,
+    /// and serves NOTHING to a requester that is not the subject (fail-closed).
+    #[tokio::test]
+    async fn subject_pull_serves_both_axes_and_fails_closed() {
+        let subject = "eric-moore-v2-portable";
+        let other = "some-other-subject";
+        let (backend, bridge) = make_bridge(&[subject.to_string()]);
+
+        // Every attester AND attested key must exist in federation_keys to seed
+        // a delegates_to attestation.
+        for kid in [subject, other, "peer-attester"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, "user"),
+                })
+                .await
+                .expect("register attester key");
+        }
+
+        // ABOUT the subject — the data-subject axis.
+        seed_delegates_to(
+            &backend,
+            "peer-attester",
+            subject,
+            &serde_json::json!(["infra:serve"]),
+        )
+        .await;
+        // BY the subject about someone else — the sender axis (authorship recovery).
+        seed_delegates_to(
+            &backend,
+            subject,
+            other,
+            &serde_json::json!(["infra:serve"]),
+        )
+        .await;
+        // About a DIFFERENT subject, by a peer — neither of S's axes; must not leak.
+        seed_delegates_to(
+            &backend,
+            "peer-attester",
+            other,
+            &serde_json::json!(["infra:serve"]),
+        )
+        .await;
+
+        let refs = bridge
+            .subject_holdings(EnvelopeKind::Attestation, subject, Some(subject))
+            .await;
+        assert_eq!(
+            refs.len(),
+            2,
+            "subject pull = {{about-me (data-subject), by-me (sender)}}; the other \
+             subject's peer-authored row never leaks"
+        );
+
+        // Fail-closed entitlement: a requester ≠ subject, or an unattributed one,
+        // gets nothing.
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, subject, Some("intruder"))
+                .await
+                .is_empty(),
+            "a Pull for S by a requester ≠ S serves nothing (#462 fail-closed)"
+        );
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, subject, None)
+                .await
+                .is_empty(),
+            "an unattributed Pull serves nothing"
+        );
     }
 
     /// Seed a producer's `consent:replication:v1` grant carrying a single

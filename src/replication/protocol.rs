@@ -337,6 +337,37 @@ pub struct FetchMessage {
     pub want: Vec<[u8; 32]>,
 }
 
+/// CIRISEdge#462 — the RECEIVE axis's discovery request: a subject-scoped
+/// pull. This is the "third channel" [`FetchMessage`] documents but the wire
+/// never had — a node asks a peer "which `kind` records do you hold where I am
+/// the data-subject or the sender?"
+///
+/// It is NOT anti-entropy. The want-set it seeds is scoped to a SUBJECT (my own
+/// testimony / testimony about me), not to a kind's advertised convergence set —
+/// so it reaches the `SelfOwn` plane that `namespace::projection_for` never
+/// advertises. A fedID that just claimed a fresh node can pull its own testimony
+/// (and a moderation duty conferred on it) that no peer would ever *advertise*.
+///
+/// The responder answers with an ordinary [`SummaryMessage`] of the refs it
+/// holds for the subject — projection-gated exactly as its advertise path would
+/// be, with peer-authored `capacity:*` scores about the subject WITHHELD (the G2
+/// self-revocation-hole carve). The existing Summary → Diff → Deliver flow then
+/// carries the bytes unchanged; the responder's per-record serve gate
+/// (`fetch_envelope`) still backs every byte, so a Pull can only surface rows
+/// the requester was already entitled to receive — it widens nothing.
+///
+/// The requester MUST be admitted as `subject_key_id` (or its owner). Like every
+/// other message, a Pull is scoped to ONE `kind` (one Session/round per kind); a
+/// subject sweep issues one Pull per replicated kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullMessage {
+    /// The kind this pull is scoped to.
+    pub kind: EnvelopeKind,
+    /// The fedID whose testimony is requested — `ci_axes.data_subject` (records
+    /// about it) and `ci_axes.sender` (records by it) both resolve to this id.
+    pub subject_key_id: String,
+}
+
 /// "Here are the bytes." Wraps the requested envelopes' raw signed-
 /// bytes form (the same shape `put_*` admits expect on the receiver's
 /// persist side). Order is unspecified; the receiver MUST validate
@@ -360,6 +391,11 @@ pub enum ReplicationMessage {
     Diff(DiffMessage),
     Fetch(FetchMessage),
     Deliver(DeliverMessage),
+    /// CIRISEdge#462 — subject-scoped RECEIVE-axis discovery. A post-v1 verb: v1
+    /// peers serde-refuse the unknown `type` tag (they do NOT silently ignore
+    /// it), so it is a genuine wire-compat event, coordinated by the
+    /// [`crate::replication::serve_policy::SERVE_ADVERTISE_POLICY_HASH`] re-pin.
+    Pull(PullMessage),
 }
 
 impl ReplicationMessage {
@@ -376,6 +412,7 @@ impl ReplicationMessage {
             Self::Diff(m) => m.kind,
             Self::Fetch(m) => m.kind,
             Self::Deliver(m) => m.kind,
+            Self::Pull(m) => m.kind,
         }
     }
 
@@ -471,6 +508,28 @@ mod tests {
         let bytes = m.to_bytes();
         let parsed = ReplicationMessage::from_bytes(&bytes).expect("parse");
         assert_eq!(parsed, m);
+    }
+
+    /// CIRISEdge#462 — the subject-scoped Pull verb round-trips, and its wire
+    /// tag is the snake_case `pull`.
+    #[test]
+    fn pull_round_trips() {
+        let m = ReplicationMessage::Pull(PullMessage {
+            kind: EnvelopeKind::Attestation,
+            subject_key_id: "eric-moore-v2-portable-f34de31d8c21".to_string(),
+        });
+        let bytes = m.to_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains(r#""type":"pull""#), "pull wire tag: {s}");
+        assert!(
+            s.contains("eric-moore-v2-portable-f34de31d8c21"),
+            "subject: {s}"
+        );
+        let parsed = ReplicationMessage::from_bytes(&bytes).expect("parse");
+        assert_eq!(parsed, m);
+        // The verb carries its kind so wire-framing picks the version like any
+        // other message.
+        assert_eq!(parsed.kind(), EnvelopeKind::Attestation);
     }
 
     /// Unknown tag refused — wire-stability guarantee.
