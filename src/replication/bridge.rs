@@ -936,7 +936,7 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// The Attestation plane sweeps BOTH testimonial axes: `list_attestations_for`
     /// (records ABOUT the subject — the revocation-reachability set, with the G2
-    /// [`Self::is_consent_gated_score`] carve) and `list_attestations_by`
+    /// [`Self::is_non_retainable_score`] carve) and `list_attestations_by`
     /// (records BY the subject — authorship recovery, no carve: mine to recover).
     /// Non-replicated / cohort kinds are not subject-pullable and return empty.
     async fn subject_holdings_inner(
@@ -1017,7 +1017,7 @@ impl FederationDirectoryReplicationBridge {
                     .await
                     .unwrap_or_default()
                 {
-                    if Self::is_consent_gated_score(&att) {
+                    if Self::is_non_retainable_score(&att) {
                         continue;
                     }
                     let seq = Self::ms_seq(att.asserted_at);
@@ -1091,27 +1091,33 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#462 — the G2 self-revocation-hole carve, resolved by CONSUMING
-    /// persist's authoritative CEG taxonomy rather than an edge prefix list: an
-    /// attestation whose dimension is a consent-gated peer-authored SCORE (persist
-    /// [`consent_gated_claim`](ciris_persist::federation::admission::consent_gated_claim)
-    /// — the `capacity:*` reputation family, CC 3.4.5 / AV-79) is NEVER served on
-    /// the data-subject Pull axis. Landing a score ABOUT me onto the node where I
-    /// am the sole writer conflates read-copy with write-authority — the shape
-    /// that produced the G2 hole. The subject's OWN authored scores (the sender
-    /// axis) are unaffected: `consent_gated_claim` classifies by dimension and
-    /// edge consults it ONLY on the data-subject axis.
+    /// persist's authoritative retainability ALLOWLIST (CIRISPersist#635,
+    /// [`is_subject_retainable`](ciris_persist::federation::namespace::is_subject_retainable)):
+    /// a data-subject-axis attestation whose DIMENSION is a score is withheld
+    /// UNLESS persist affirms the subject is necessarily its author (`emit_authority`
+    /// — trace:*, transport:{kind}, the substrate self-reports, …). Landing a score
+    /// ABOUT me onto the node where I am the sole writer is safe only when I am its
+    /// author; otherwise it conflates read-copy with write-authority (the G2 hole).
     ///
-    /// Deliberately persist's decision, not an edge prefix list — the gated set is
-    /// CEG state resolution persist owns (the closed `ConsentGatedFamily` enum
-    /// grows there), so edge tracks new consent-gated score families for free and
-    /// cannot drift. This matches the issue's exact scope (`capacity:*`);
-    /// `moderation:*` / `slashing:*` are role-gated, NOT consent-gated, and are
-    /// community-cohort — they follow the duty, not the individual identity, so
-    /// they do not ride the data-subject axis. CIRISPersist#635 tracks the open
-    /// question of whether the pull carve should ALSO cover the role-gated
-    /// abuse-response families.
-    fn is_consent_gated_score(att: &Attestation) -> bool {
-        ciris_persist::federation::admission::consent_gated_claim(att).is_some()
+    /// This REPLACES the earlier `consent_gated_claim` (capacity-only) carve, which
+    /// UNDER-carved: it withheld only the consent-gated family and let every other
+    /// peer-authored score through. `is_subject_retainable` is an allowlist, so it
+    /// is FAIL-CLOSED — an unknown / new / renamed scored family reads
+    /// non-retainable and is carved, not silently pulled. (Consequence per #635: a
+    /// family edge legitimately needs to pull that is missing from the allowlist
+    /// shrinks the pull SILENTLY; that is a persist ask — tell them to add it, do
+    /// not assume persist knows.)
+    ///
+    /// DIMENSIONLESS attestations carry no score and are NOT carved: a `delegates_to`
+    /// conferral (the moderation-duty shape #462 exists to recover) is signed by the
+    /// conferring authority — the subject cannot forge it, so a retained copy grants
+    /// no write authority. The subject's OWN authored scores (the sender axis) are
+    /// likewise untouched — a score I authored is mine to recover.
+    fn is_non_retainable_score(att: &Attestation) -> bool {
+        att.attestation_envelope
+            .pointer("/dimension")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|dim| !ciris_persist::federation::namespace::is_subject_retainable(dim))
     }
 
     /// The per-kind apply dispatch behind the #425 choke —
@@ -4445,37 +4451,39 @@ mod tests {
         }
     }
 
-    /// CIRISEdge#462 — the G2 carve is persist's authoritative consent-gated-score
-    /// classification (`consent_gated_claim`), NOT an edge prefix list. That is
-    /// EXACTLY the `capacity:*` reputation family (CC 3.4.5): the peer-authored
-    /// score whose landing on the subject's own node is the self-revocation hole.
-    /// `moderation:*` / `slashing:*` are role-gated (not consent-gated) and
-    /// community-cohort — persist deliberately does not gate them, and they follow
-    /// the duty not the identity, so they are NOT carved here; relationship/charter
-    /// testimony and trace:* (E3-gated at fetch) are kept.
+    /// CIRISEdge#462 — the G2 carve is persist's authoritative retainability
+    /// ALLOWLIST (`is_subject_retainable`, CIRISPersist#635), keyed on authorship.
+    /// A scored dimension is carved UNLESS persist affirms the subject is its
+    /// author. This is FAIL-CLOSED: unlike the earlier capacity-only carve, ANY
+    /// peer-authored score — capacity, capacity_assurance, moderation, or an
+    /// unknown/new family — is withheld. Self-authored scores (trace:*) and
+    /// dimensionless conferrals (delegates_to) are kept.
     #[test]
-    fn g2_carve_is_persist_consent_gated_score_taxonomy() {
+    fn g2_carve_is_persist_retainability_allowlist() {
         use FederationDirectoryReplicationBridge as B;
-        assert!(
-            B::is_consent_gated_score(&att_with_dimension(Some("capacity:core_identity:v1"))),
-            "capacity:* is the consent-gated reputation family — carved (G2)"
-        );
-        // Consuming persist's taxonomy: these are NOT consent-gated scores, so the
-        // pull does not carve them (persist owns this call — edge cannot drift).
-        for kept in [
-            "capacity_assurance:composite:v1", // not the `capacity:` prefix
-            "moderation:removal:v1",           // role-gated, community-cohort
-            "trace:coherence:v1",              // E3-gated at fetch, not here
+        // Peer-authored scores about the subject — ALL carved (fail-closed
+        // allowlist), including families the old capacity-only carve missed.
+        for carved in [
+            "capacity:core_identity:v1",       // the canonical G2 reputation score
+            "capacity_assurance:composite:v1", // the old carve LET THIS THROUGH
+            "moderation:removal:v1",           // ditto — now correctly carved
+            "some_future:score:v9",            // unknown family → fail-closed → carved
         ] {
             assert!(
-                !B::is_consent_gated_score(&att_with_dimension(Some(kept))),
-                "{kept} is not a consent-gated score — persist does not gate it, so the pull \
-                 does not carve it (role-gated/other families are handled elsewhere)"
+                B::is_non_retainable_score(&att_with_dimension(Some(carved))),
+                "{carved} is not in persist's retainable allowlist — carved (G2, fail-closed)"
             );
         }
+        // Self-authored (allowlisted) scores are kept here (trace:* is separately
+        // E3-gated at fetch); a dimensionless conferral (delegates_to — the
+        // moderation-duty shape) is never a score, so it is kept.
         assert!(
-            !B::is_consent_gated_score(&att_with_dimension(None)),
-            "a charter/relationship attestation (no dimension) is testimony — kept"
+            !B::is_non_retainable_score(&att_with_dimension(Some("trace:coherence:v1"))),
+            "trace:* is self-emission-mandatory (retainable); kept here, E3-gated at fetch"
+        );
+        assert!(
+            !B::is_non_retainable_score(&att_with_dimension(None)),
+            "a dimensionless conferral (delegates_to) carries no score — kept (unforgeable)"
         );
     }
 
