@@ -79,6 +79,14 @@ env:
 jobs:
   bench:
     name: Transport / A-V-mesh / replication bench suite
+    # TREND-ONLY, so NOT on pull_request: on a PR this job publishes nothing (the
+    # gh-pages trend push below is gated to push-to-main) and alerts nothing
+    # (comment-on-alert:false) — it was ~99 min of pure runner burn per PR push,
+    # triggered on every PR touching src/{transport,replication}/**. The
+    # deterministic `icount` job below IS the PR regression gate (~6 min,
+    # runner-independent). The wall-time trend still refreshes on push-to-main +
+    # the weekly schedule + workflow_dispatch. See CIRISEdge#461.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # HEAVY: nine criterion micro-benches across four feature-set compilations
     # (default, +reticulum, +http, +both) — the realtime_av_* benches carry
