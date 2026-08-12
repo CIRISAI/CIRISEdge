@@ -4503,6 +4503,55 @@ mod tests {
         );
     }
 
+    /// CIRISEdge#462 — the load-bearing hash-match invariant: every ref
+    /// `subject_holdings` emits resolves through the SAME content-hash fetch path
+    /// a `Deliver` uses (`fetch_envelope_bytes` → persist's `signed_wire_index`).
+    /// If the pull's struct-hashing (`content_hash_of` on the `_for`-read struct)
+    /// ever diverged from what the index keys on, this would surface as
+    /// advertised-then-unfetchable and a Pull would deliver nothing. Proven across
+    /// the Key plane (lookup + `SignedKeyRecord` wrap) and the Attestation plane.
+    #[tokio::test]
+    async fn subject_pull_refs_resolve_through_fetch() {
+        let subject = "eric-moore-v2-portable";
+        let (backend, bridge) = make_bridge(&[subject.to_string()]);
+        // Register the subject's key (also the Key-plane row) + a peer attester,
+        // then seed an attestation ABOUT the subject.
+        for kid in [subject, "peer-attester"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, "user"),
+                })
+                .await
+                .expect("register key");
+        }
+        seed_delegates_to(
+            &backend,
+            "peer-attester",
+            subject,
+            &serde_json::json!(["infra:serve"]),
+        )
+        .await;
+
+        for kind in [EnvelopeKind::Key, EnvelopeKind::Attestation] {
+            let refs = bridge.subject_holdings(kind, subject, Some(subject)).await;
+            assert!(
+                !refs.is_empty(),
+                "{kind:?}: a subject Pull must surface at least one ref"
+            );
+            for r in &refs {
+                assert!(
+                    bridge
+                        .fetch_envelope_bytes(kind, &r.envelope_hash)
+                        .await
+                        .is_some(),
+                    "{kind:?}: pull ref {} must resolve through the content-hash fetch path \
+                     (hash-match with the wire index; else advertised-then-unfetchable)",
+                    hex::encode(r.envelope_hash),
+                );
+            }
+        }
+    }
+
     /// Seed a producer's `consent:replication:v1` grant carrying a single
     /// `recipient_capability` restriction over `prefix`, naming `recipient` as
     /// the consented peer — so persist's E7 projection sources a live row from
