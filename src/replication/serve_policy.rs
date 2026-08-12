@@ -60,7 +60,7 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         | EnvelopeKind::IdentityOccurrenceRevocation => "subject_pull:data_subject; subject-only",
         EnvelopeKind::Attestation => {
             "subject_pull:data_subject+sender; subject-only; \
-             scores carved (G2: capacity:*/capacity_assurance:*/moderation:*)"
+             consent-gated scores carved on data_subject axis (G2: persist consent_gated_claim)"
         }
         EnvelopeKind::Revocation
         | EnvelopeKind::Family
@@ -110,7 +110,7 @@ pub fn serve_advertise_policy_sha256() -> String {
 /// deliberate, reviewed re-pin, visible to CIRISServer which pins it alongside
 /// persist's `REPLICATION_POLICY_HASH`. See CIRISEdge#393 §4.2/§4.3.
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "0bf4ce1400014288bc298dd2bf598f333e54d08bba8ce6a8d5a485ca38823ff1";
+    "049e71ef208d24266fe366b8eaed365a467cadd3aadd8856c8ed917c90bced33";
 
 #[cfg(test)]
 mod tests {

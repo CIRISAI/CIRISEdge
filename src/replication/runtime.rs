@@ -664,6 +664,50 @@ impl ReplicationRuntime {
         Ok(())
     }
 
+    /// CIRISEdge#462 — INITIATE a subject-scoped RECEIVE-axis pull: recover
+    /// `subject_key_id`'s own testimony (and testimony ABOUT it) from
+    /// `peer_key_id`. For each subject-pullable kind (the five replicated planes)
+    /// this ensures a scheduled Initiator coordinator exists — so the reply's
+    /// drive loop is live — then sends a `Pull`. The peer answers with the
+    /// subject's refs (projection-gated + G2-carved by its `subject_holdings`),
+    /// and the node pulls the gap through the ordinary Diff/Deliver flow.
+    ///
+    /// This is the mechanism the observation in #462 needs: a fedID that claimed
+    /// a fresh node cannot otherwise obtain its own keys / occurrences / routes /
+    /// occurrence-revocations, nor the attestations about-or-by it (so a
+    /// moderation duty conferred on it becomes exercisable) — anti-entropy's
+    /// advertise projection never offers the `SelfOwn` plane, and the graph
+    /// already holds the answer, just on another node.
+    ///
+    /// FIRE-AND-FORGET, matching the anti-entropy model: `register_initiator_peer`
+    /// failing (scheduler stopped) is the only hard error; a transient Pull-send
+    /// failure for one kind is logged, not propagated, because the peer is now a
+    /// scheduled initiator whose next round re-attempts convergence.
+    pub async fn pull_subject_testimony(
+        &self,
+        peer_key_id: &str,
+        subject_key_id: &str,
+    ) -> Result<(), ReplicationRuntimeError> {
+        for kind in EnvelopeKind::subject_pullable() {
+            // Idempotent — installs (or reuses) the scheduled drive loop that
+            // consumes the Pull's Summary reply.
+            self.register_initiator_peer(peer_key_id, kind).await?;
+            if let Some(coord) = self.registry.get(peer_key_id, kind).await {
+                if let Err(e) = coord.start_pull(subject_key_id).await {
+                    tracing::warn!(
+                        peer = %peer_key_id,
+                        subject = %subject_key_id,
+                        kind = ?kind,
+                        error = %e,
+                        "subject Pull send failed for this kind — the scheduled round will \
+                         retry convergence (#462 fire-and-forget)"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Hot-remove a `(peer_key_id, kind)` peer — CIRISEdge#173,
     /// v5.1.0.
     ///

@@ -2531,6 +2531,44 @@ impl PyReplicationHandle {
         })
     }
 
+    /// CIRISEdge#462 — pull a subject's own testimony from a peer (the RECEIVE
+    /// axis). For each subject-pullable kind, ensures a scheduled Initiator
+    /// coordinator for `peer_key_id` and sends a subject-scoped `Pull`; the peer
+    /// answers with the refs it holds where `subject_key_id` is the data-subject
+    /// or sender (projection-gated + G2-carved), and the ordinary Diff/Deliver
+    /// flow converges the gap over the next rounds. This is how a fedID that
+    /// claimed a fresh node recovers its keys / occurrences / routes /
+    /// revocations and the attestations about-or-by it — the `SelfOwn` plane
+    /// anti-entropy never advertises.
+    ///
+    /// Fire-and-forget: returns once the Pulls are dispatched. Raises
+    /// `RuntimeError` if the runtime has been stopped.
+    fn pull_subject_testimony(
+        &self,
+        py: Python<'_>,
+        peer_key_id: &str,
+        subject_key_id: &str,
+    ) -> PyResult<()> {
+        let peer = peer_key_id.to_string();
+        let subject = subject_key_id.to_string();
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                let guard = inner.lock().await;
+                match guard.as_ref() {
+                    Some(rt) => rt
+                        .pull_subject_testimony(&peer, &subject)
+                        .await
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+                    None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "replication runtime is stopped",
+                    )),
+                }
+            })
+        })
+    }
+
     /// CIRISEdge#173 / v5.1.0 — hot-add an Initiator peer at runtime.
     /// The scheduler spawns a task that fires anti-entropy rounds at
     /// the configured cadence immediately. Idempotent.

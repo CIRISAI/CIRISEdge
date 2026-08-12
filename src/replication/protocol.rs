@@ -1,6 +1,6 @@
 //! Wire-stable message types for the anti-entropy protocol.
 //!
-//! Four messages, exchanged pairwise between region peers:
+//! Five messages, exchanged pairwise between region peers:
 //!
 //! ```text
 //!  A → B   Summary  { kind, refs: [(envelope_hash, seq)] }
@@ -17,6 +17,15 @@
 //! reference). The [`SummaryMessage`] / [`DiffMessage`] flow is the
 //! steady-state anti-entropy path; [`FetchMessage`] is the on-demand
 //! path.
+//!
+//! A [`PullMessage`] (CIRISEdge#462) is the RECEIVE axis's discovery verb —
+//! "which `kind` records do you hold where I am the data-subject or the sender?"
+//! It is the SUBJECT-scoped "third channel" `FetchMessage` documents: the
+//! responder answers with a [`SummaryMessage`] of the subject's refs and the
+//! ordinary Diff/Deliver flow carries the bytes. Unlike anti-entropy (which can
+//! only ever converge what a peer *advertises*), a Pull reaches the `SelfOwn`
+//! plane no peer advertises — a fedID pulling its own testimony onto a fresh
+//! node. See [`PullMessage`] for the entitlement + G2 carve.
 //!
 //! ## Wire codec
 //!
@@ -205,6 +214,35 @@ impl EnvelopeKind {
             self,
             Self::Key | Self::IdentityOccurrence | Self::TransportDestination
         )
+    }
+
+    /// CIRISEdge#462 — is this kind answerable by a subject-scoped `Pull` (the
+    /// RECEIVE axis)? EXACTLY the five replicated kinds — the persist
+    /// `ReplicatedKind` set the bridge's `subject_holdings` sweeps. This is the
+    /// single source of truth the initiation loop iterates; it MUST agree with
+    /// the `receive` column of
+    /// [`crate::replication::serve_policy::serve_advertise_manifest`] (asserted in
+    /// that module's `only_the_five_replicated_kinds_answer_a_subject_pull`).
+    #[must_use]
+    pub fn is_subject_pullable(self) -> bool {
+        matches!(
+            self,
+            Self::Key
+                | Self::IdentityOccurrence
+                | Self::TransportDestination
+                | Self::IdentityOccurrenceRevocation
+                | Self::Attestation
+        )
+    }
+
+    /// The kinds a subject sweep issues a `Pull` for — the
+    /// [`Self::is_subject_pullable`] set, in `ALL` order.
+    #[must_use]
+    pub fn subject_pullable() -> Vec<EnvelopeKind> {
+        Self::ALL
+            .into_iter()
+            .filter(|k| k.is_subject_pullable())
+            .collect()
     }
 
     /// Stable snake_case wire name for this kind — the manifest/witness key
@@ -530,6 +568,33 @@ mod tests {
         // The verb carries its kind so wire-framing picks the version like any
         // other message.
         assert_eq!(parsed.kind(), EnvelopeKind::Attestation);
+    }
+
+    /// CIRISEdge#462 — `is_subject_pullable` is EXACTLY the five replicated kinds
+    /// (the persist `ReplicatedKind` set), checked over ALL 14 so a new pullable
+    /// kind must be a deliberate edit here. MUST agree with the serve-policy
+    /// `receive` witness.
+    #[test]
+    fn is_subject_pullable_is_exactly_the_five_replicated_kinds() {
+        for kind in EnvelopeKind::ALL {
+            let expected = matches!(
+                kind,
+                EnvelopeKind::Key
+                    | EnvelopeKind::IdentityOccurrence
+                    | EnvelopeKind::TransportDestination
+                    | EnvelopeKind::IdentityOccurrenceRevocation
+                    | EnvelopeKind::Attestation
+            );
+            assert_eq!(
+                kind.is_subject_pullable(),
+                expected,
+                "{kind:?}: pullable iff it is one of the five replicated kinds"
+            );
+        }
+        assert_eq!(EnvelopeKind::subject_pullable().len(), 5);
+        // The key-level Revocation plane is NOT subject-pullable (not a
+        // ReplicatedKind — it rides the persist_row_hash wire, no subject index).
+        assert!(!EnvelopeKind::Revocation.is_subject_pullable());
     }
 
     /// Unknown tag refused — wire-stability guarantee.

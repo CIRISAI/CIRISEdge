@@ -119,10 +119,11 @@ pub trait StateProvider: Send + Sync {
     ///
     /// The impl MUST apply the SAME per-record projection gate its advertise path
     /// applies (a Pull can only surface a row the responder would already serve),
-    /// and MUST withhold peer-authored `capacity:*` / `capacity_assurance:*` /
-    /// `moderation:*` scores about the subject (the G2 self-revocation-hole carve:
-    /// a subject pulling a score *about* itself onto the node where it is the sole
-    /// writer conflates read-copy with write-authority). Refs only — the existing
+    /// and MUST withhold the consent-gated peer-authored scores about the subject
+    /// that persist's `consent_gated_claim` classifies (the `capacity:*` family —
+    /// the G2 self-revocation-hole carve: a subject pulling a score *about* itself
+    /// onto the node where it is the sole writer conflates read-copy with
+    /// write-authority). Refs only — the existing
     /// Diff/Deliver flow carries the bytes, re-gated by [`Self::fetch_envelope`].
     ///
     /// Defaults to empty: only the production `DirectoryStateAdapter` (which holds

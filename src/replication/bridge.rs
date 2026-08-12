@@ -936,7 +936,7 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// The Attestation plane sweeps BOTH testimonial axes: `list_attestations_for`
     /// (records ABOUT the subject — the revocation-reachability set, with the G2
-    /// [`Self::is_self_nonretainable_score`] carve) and `list_attestations_by`
+    /// [`Self::is_consent_gated_score`] carve) and `list_attestations_by`
     /// (records BY the subject — authorship recovery, no carve: mine to recover).
     /// Non-replicated / cohort kinds are not subject-pullable and return empty.
     async fn subject_holdings_inner(
@@ -1017,7 +1017,7 @@ impl FederationDirectoryReplicationBridge {
                     .await
                     .unwrap_or_default()
                 {
-                    if Self::is_self_nonretainable_score(&att) {
+                    if Self::is_consent_gated_score(&att) {
                         continue;
                     }
                     let seq = Self::ms_seq(att.asserted_at);
@@ -1048,27 +1048,28 @@ impl FederationDirectoryReplicationBridge {
         refs
     }
 
-    /// CIRISEdge#462 — the G2 self-revocation-hole carve. A peer-authored SCORE
-    /// about the subject (`capacity:*` / `capacity_assurance:*` / `moderation:*`
-    /// dimension, CC 2.1 — the dimension lives inside `attestation_envelope`) is
-    /// NEVER served on the data-subject Pull axis: landing a score ABOUT me onto
-    /// the node where I am the sole writer conflates read-copy with
-    /// write-authority — the shape that produced the G2 hole. The subject's OWN
-    /// authored scores (the sender axis) are unaffected.
+    /// CIRISEdge#462 — the G2 self-revocation-hole carve, resolved by CONSUMING
+    /// persist's authoritative CEG taxonomy rather than an edge prefix list: an
+    /// attestation whose dimension is a consent-gated peer-authored SCORE (persist
+    /// [`consent_gated_claim`](ciris_persist::federation::admission::consent_gated_claim)
+    /// — the `capacity:*` reputation family, CC 3.4.5 / AV-79) is NEVER served on
+    /// the data-subject Pull axis. Landing a score ABOUT me onto the node where I
+    /// am the sole writer conflates read-copy with write-authority — the shape
+    /// that produced the G2 hole. The subject's OWN authored scores (the sender
+    /// axis) are unaffected: `consent_gated_claim` classifies by dimension and
+    /// edge consults it ONLY on the data-subject axis.
     ///
-    /// The prefix set is edge-local pending persist's `is_subject_retainable`
-    /// predicate (CIRISPersist#635) that would own this on the authoritative
-    /// namespace taxonomy; it is fail-closed in spirit — an unclassifiable score
-    /// dimension should be *added* here, never pulled onto self by default.
-    fn is_self_nonretainable_score(att: &Attestation) -> bool {
-        att.attestation_envelope
-            .pointer("/dimension")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|d| {
-                d.starts_with("capacity:")
-                    || d.starts_with("capacity_assurance:")
-                    || d.starts_with("moderation:")
-            })
+    /// Deliberately persist's decision, not an edge prefix list — the gated set is
+    /// CEG state resolution persist owns (the closed `ConsentGatedFamily` enum
+    /// grows there), so edge tracks new consent-gated score families for free and
+    /// cannot drift. This matches the issue's exact scope (`capacity:*`);
+    /// `moderation:*` / `slashing:*` are role-gated, NOT consent-gated, and are
+    /// community-cohort — they follow the duty, not the individual identity, so
+    /// they do not ride the data-subject axis. CIRISPersist#635 tracks the open
+    /// question of whether the pull carve should ALSO cover the role-gated
+    /// abuse-response families.
+    fn is_consent_gated_score(att: &Attestation) -> bool {
+        ciris_persist::federation::admission::consent_gated_claim(att).is_some()
     }
 
     /// The per-kind apply dispatch behind the #425 choke —
@@ -4402,29 +4403,36 @@ mod tests {
         }
     }
 
-    /// CIRISEdge#462 — the G2 self-revocation-hole carve is EXACTLY the
-    /// peer-authored score families (`capacity:*` / `capacity_assurance:*` /
-    /// `moderation:*`); relationship/charter testimony (and trace:*, which is
-    /// E3-gated at fetch, not carved from the refs) is kept.
+    /// CIRISEdge#462 — the G2 carve is persist's authoritative consent-gated-score
+    /// classification (`consent_gated_claim`), NOT an edge prefix list. That is
+    /// EXACTLY the `capacity:*` reputation family (CC 3.4.5): the peer-authored
+    /// score whose landing on the subject's own node is the self-revocation hole.
+    /// `moderation:*` / `slashing:*` are role-gated (not consent-gated) and
+    /// community-cohort — persist deliberately does not gate them, and they follow
+    /// the duty not the identity, so they are NOT carved here; relationship/charter
+    /// testimony and trace:* (E3-gated at fetch) are kept.
     #[test]
-    fn g2_carve_excludes_peer_scores_keeps_testimony() {
+    fn g2_carve_is_persist_consent_gated_score_taxonomy() {
         use FederationDirectoryReplicationBridge as B;
-        for score in [
-            "capacity:core_identity:v1",
-            "capacity_assurance:composite:v1",
-            "moderation:removal:v1",
+        assert!(
+            B::is_consent_gated_score(&att_with_dimension(Some("capacity:core_identity:v1"))),
+            "capacity:* is the consent-gated reputation family — carved (G2)"
+        );
+        // Consuming persist's taxonomy: these are NOT consent-gated scores, so the
+        // pull does not carve them (persist owns this call — edge cannot drift).
+        for kept in [
+            "capacity_assurance:composite:v1", // not the `capacity:` prefix
+            "moderation:removal:v1",           // role-gated, community-cohort
+            "trace:coherence:v1",              // E3-gated at fetch, not here
         ] {
             assert!(
-                B::is_self_nonretainable_score(&att_with_dimension(Some(score))),
-                "{score} is a peer-authored score about the subject — carved (G2)"
+                !B::is_consent_gated_score(&att_with_dimension(Some(kept))),
+                "{kept} is not a consent-gated score — persist does not gate it, so the pull \
+                 does not carve it (role-gated/other families are handled elsewhere)"
             );
         }
         assert!(
-            !B::is_self_nonretainable_score(&att_with_dimension(Some("trace:coherence:v1"))),
-            "trace:* is served (E3-gated at fetch), not carved from the pull refs"
-        );
-        assert!(
-            !B::is_self_nonretainable_score(&att_with_dimension(None)),
+            !B::is_consent_gated_score(&att_with_dimension(None)),
             "a charter/relationship attestation (no dimension) is testimony — kept"
         );
     }
@@ -4500,6 +4508,160 @@ mod tests {
                 .await
                 .is_empty(),
             "an unattributed Pull serves nothing"
+        );
+    }
+
+    /// CIRISEdge#462 — seed `subject`'s `consent:state:granted` for `covers` on
+    /// the `analyze` scope, so a peer-authored `capacity:*` row about `subject`
+    /// clears persist's `check_capacity_consent_admission` gate
+    /// (`resolve_scoped_consent(attester, subject, "analyze") == Granted`). Lets
+    /// the G2 test admit REAL capacity data rather than assert on a synthetic
+    /// struct.
+    async fn seed_analyze_consent(backend: &MemoryBackend, subject: &str, covers: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            backend,
+            &id,
+            subject,
+            covers,
+            "scores",
+            "federation",
+            serde_json::json!({ "dimension": "consent:state:granted:v1", "scope": ["analyze"] }),
+        )
+        .await;
+    }
+
+    /// CIRISEdge#462 — the G2 carve holds on REAL admitted capacity data and is
+    /// AXIS-SPECIFIC. Modeled as store mutations so the security assumption is
+    /// proven on the real serve path, not just the predicate:
+    ///   MUTATION 1 — a peer-authored `capacity:*` score ABOUT me is carved from
+    ///     the pull (it must NEVER land on the node where I am the sole writer:
+    ///     the G2 self-revocation-hole shape).
+    ///   MUTATION 2 — a `capacity:*` score I AUTHORED about someone else IS
+    ///     recoverable (the carve must not be over-broad and eat my own
+    ///     authorship).
+    #[tokio::test]
+    async fn g2_carve_holds_on_real_capacity_data_and_is_axis_specific() {
+        let subject = "subject-s";
+        let peer = "peer-p";
+        let other = "other-t";
+        let (backend, bridge) = make_bridge(&[subject.to_string()]);
+        for kid in [subject, peer, other] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, "user"),
+                })
+                .await
+                .expect("register key");
+        }
+        // Consents that let the capacity rows admit: S grants P (so P may score
+        // S); T grants S (so S may score T). Both are `scores` attestations that
+        // also ride S's pull axes — so we snapshot the BASELINE after seeding them
+        // and assert only the DELTAS the two capacity mutations produce.
+        seed_analyze_consent(&backend, subject, peer).await;
+        seed_analyze_consent(&backend, other, subject).await;
+        // A benign attestation ABOUT S (data-subject axis).
+        seed_delegates_to(&backend, peer, subject, &serde_json::json!(["infra:serve"])).await;
+
+        let baseline = bridge
+            .subject_holdings(EnvelopeKind::Attestation, subject, Some(subject))
+            .await
+            .len();
+
+        // MUTATION 1 — a peer-authored capacity score ABOUT S. It admits (S
+        // granted P), but the pull must be UNCHANGED: the score is carved.
+        seed_scoped_attestation(
+            &backend,
+            "cap-p-about-s",
+            peer,
+            subject,
+            "scores",
+            "federation",
+            serde_json::json!({ "dimension": "capacity:core_identity:v1" }),
+        )
+        .await;
+        assert_eq!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, subject, Some(subject))
+                .await
+                .len(),
+            baseline,
+            "G2: a peer-authored capacity score ABOUT me is carved — it must not be pullable \
+             onto my own node (the self-revocation-hole shape)"
+        );
+
+        // MUTATION 2 — a capacity score S AUTHORED about T (sender axis). It
+        // admits (T granted S), and the pull MUST gain it: authorship recovery,
+        // the carve is not over-broad.
+        seed_scoped_attestation(
+            &backend,
+            "cap-s-about-t",
+            subject,
+            other,
+            "scores",
+            "federation",
+            serde_json::json!({ "dimension": "capacity:integrity:v1" }),
+        )
+        .await;
+        assert_eq!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, subject, Some(subject))
+                .await
+                .len(),
+            baseline + 1,
+            "axis-specific: a capacity score I AUTHORED (sender axis) is recoverable — the carve \
+             must not eat my own authorship"
+        );
+    }
+
+    /// CIRISEdge#462 — entitlement DISCRIMINATES, it is not deny-all. Two legit
+    /// registered subjects each hold testimony: each pulls its OWN and gets it;
+    /// neither can pull the OTHER's (the impersonation mutation). This is the
+    /// fail-closed gate proving it still serves the rightful subject.
+    #[tokio::test]
+    async fn subject_pull_entitlement_discriminates() {
+        let s = "subject-s";
+        let t = "subject-t";
+        let (backend, bridge) = make_bridge(&[s.to_string(), t.to_string()]);
+        for kid in [s, t, "peer-p"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, "user"),
+                })
+                .await
+                .expect("register key");
+        }
+        // Each subject has one attestation ABOUT it.
+        seed_delegates_to(&backend, "peer-p", s, &serde_json::json!(["infra:serve"])).await;
+        seed_delegates_to(&backend, "peer-p", t, &serde_json::json!(["infra:serve"])).await;
+
+        let s_pulls_s = bridge
+            .subject_holdings(EnvelopeKind::Attestation, s, Some(s))
+            .await;
+        let t_pulls_t = bridge
+            .subject_holdings(EnvelopeKind::Attestation, t, Some(t))
+            .await;
+        assert!(!s_pulls_s.is_empty(), "S pulling S gets S's testimony");
+        assert!(
+            !t_pulls_t.is_empty(),
+            "T pulling T gets T's testimony (not deny-all)"
+        );
+
+        // The impersonation mutation: S authenticated, pulling T's subject — and
+        // vice versa — gets NOTHING. The gate discriminates on the subject.
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, t, Some(s))
+                .await
+                .is_empty(),
+            "S must not pull T's testimony (impersonation blocked)"
+        );
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, s, Some(t))
+                .await
+                .is_empty(),
+            "T must not pull S's testimony (impersonation blocked)"
         );
     }
 

@@ -327,6 +327,48 @@ the CRPL wire-frame prefix (#72) plus the long-lived Session (#73)
 plus the scheduler (#75) constitute the v1 anti-entropy protocol.
 CEG defers to edge per #58.
 
+#### 3.4.1 The RECEIVE axis — subject-scoped `Pull` (CIRISEdge#462)
+
+Anti-entropy converges what a peer **advertises**. It structurally
+cannot carry the `SelfOwn` plane (`namespace::projection_for` →
+`SelfOwn` is never advertised), so a fedID that claimed a fresh node
+cannot obtain its own testimony — keys, occurrences, routes,
+occurrence-revocations, and the attestations about-or-by it — even
+though the graph already holds them on another node. `Pull` is the
+fifth verb (a fifth `ReplicationMessage` variant) that closes this:
+
+```text
+  A → B   Pull    { kind, subject_key_id }     // A: "what do you hold for this subject?"
+  A ← B   Summary { kind, refs }               // B answers with the subject's refs
+  ...then the ordinary Diff/Deliver flow carries the bytes
+```
+
+- **Not anti-entropy.** The want-set is SUBJECT-scoped, not the kind's
+  advertised convergence set. The responder answers with an ordinary
+  `Summary`, so the entire existing receive path (`on_summary` →
+  Diff → Deliver → apply) is reused unchanged; only the requester
+  (Initiator) sending `Pull` and the responder's `on_pull` are new.
+- **Scope.** EXACTLY the five replicated kinds (`EnvelopeKind::is_subject_pullable`
+  = the persist `ReplicatedKind` set). The Attestation plane sweeps
+  BOTH testimonial axes: `list_attestations_for` (about-the-subject)
+  and `list_attestations_by` (authored-by-the-subject, recovery).
+- **Entitlement — fail-closed.** The responder serves a subject's rows
+  ONLY to a requester authenticated AS that subject (owner-delegation
+  via `owner_of` is a follow-up). Every byte is re-gated by the
+  responder's per-record serve gate (`fetch_envelope_bytes_for_peer`),
+  so a `Pull` widens nothing.
+- **G2 carve.** Consent-gated peer-authored scores about the subject
+  (persist `admission::consent_gated_claim` — the `capacity:*`
+  reputation family) are withheld on the data-subject axis: landing a
+  score about me onto the node where I am the sole writer is the
+  self-revocation-hole shape. Persist owns this taxonomy; edge consumes
+  it. The subject's OWN authored scores (sender axis) are unaffected.
+- **Wire-compat.** `Pull` is a post-v1 verb; v1 peers serde-refuse the
+  unknown `type` tag (they do NOT silently ignore). Adding it flips the
+  responder-policy witness `SERVE_ADVERTISE_POLICY_HASH` (a `receive`
+  column, manifest v2), which CIRISServer pins — so the cut is
+  coordinated by construction.
+
 ### 3.5 WIRE_PROTOCOL_VERSION
 
 Replication protocol version is carried in the wire-frame:
