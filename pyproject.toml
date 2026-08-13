@@ -55,6 +55,15 @@ classifiers = [
 # alignment). The bundled cdylib links persist 19; a `<19` ceiling here would
 # republish the exact v2.0.2 failure above (Requires-Dist asking for a version
 # the cdylib does not expect → ResolutionImpossible for co-resident consumers).
+# CIRISEdge#471 / git-tag-only: edge is NOT consumed standalone off PyPI —
+# `pip install ciris-edge` is not a supported path (the PyPI publish job is gone,
+# and edge's own wheel exceeds the PyPI project-size quota). Rust consumers pin the
+# Cargo git tag; Python consumers ride the ciris-server one-wheel, which resolves
+# ONE process-wide ciris-persist by construction. persist itself stopped
+# PyPI-publishing at v30.4.0, so this `>=31,<32` never resolves from PyPI: it is a
+# source-build major-tracker + the co-resident version-agreement declaration, NOT
+# an install-time index requirement (so the "unresolvable from PyPI" shape is by
+# design, not a regression).
 dependencies = [
     "ciris-persist>=31,<32",
 ]

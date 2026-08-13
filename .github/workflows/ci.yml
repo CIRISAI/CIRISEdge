@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
-    # Fire on v-prefixed release tags so the publish-pypi job (gated on
-    # `refs/tags/v*`) actually runs. Mirrors persist's v0.1.12 closure.
+    # Fire on v-prefixed release tags so the tag-gated release jobs (gated on
+    # `refs/tags/v*`) run — mobile-release, cohab, build-ios, xcframework, etc.
     tags: ['v*']
   pull_request:
 
@@ -1791,7 +1791,7 @@ jobs:
   # OQ-12 closure: every released CIRISEdge artifact publishes
   # `EdgeExtras` JSON signed via `ciris-build-sign` (Ed25519 +
   # ML-DSA-65 hybrid) and registers with CIRISRegistry. Round-trip
-  # verified before publish-pypi runs.
+  # verified as part of the tag-gated release.
   #
   # Trust posture: this manifest is the cryptographic root of trust.
   # PyPI is just a fast distribution channel — peers verifying
@@ -1804,8 +1804,8 @@ jobs:
   # otherwise both POST `version=X` to the registry — and because
   # maturin wheels aren't byte-reproducible, the two runs register
   # different hashes and the loser's round-trip GET fails on a hash
-  # mismatch. Matching `publish-pypi`'s gate keeps registration to
-  # the tag run only (CIRISEdge#11; v0.2.3 main-run hit the race).
+  # mismatch. The tag-gate keeps registration to the tag run only
+  # (CIRISEdge#11; v0.2.3 main-run hit the race).
   build-manifest:
     name: Generate + sign build manifest (hybrid Ed25519 + ML-DSA-65)
     runs-on: ubuntu-latest
@@ -1908,21 +1908,64 @@ jobs:
           MLDSA_KEY_PATH=$(mktemp)
           printf '%s' "${CIRIS_BUILD_ED25519_SECRET}" | base64 -d > "$ED_KEY_PATH"
           printf '%s' "${CIRIS_BUILD_MLDSA_SECRET}" | base64 -d > "$MLDSA_KEY_PATH"
-          BINARY="$(ls dist/wheel/*.whl | head -1)"
-          ciris-build-sign sign \
-            --primitive edge \
-            --build-id "${{ steps.version.outputs.version }}" \
-            --target x86_64-unknown-linux-gnu \
-            --binary "$BINARY" \
-            --binary-version "${{ steps.version.outputs.version }}" \
-            --extras "dist/edge-extras-${{ steps.version.outputs.version }}.json" \
-            --ed25519-seed "$ED_KEY_PATH" \
-            --mldsa-secret "$MLDSA_KEY_PATH" \
-            --key-id ciris-edge-build-v1 \
-            --output "dist/ciris-edge-${{ steps.version.outputs.version }}.manifest.json"
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist/manifests
+          # CIRISEdge#471 — EVERY desktop platform gets its own hybrid-signed
+          # manifest, not just linux-x86_64. Each wheel sits under
+          # dist/wheels/ciris_edge-wheel-<label>/ (the multi-arch download above).
+          # `--target` is metadata and ciris-build-sign HASHES the wheel file (never
+          # runs it), so signing the windows/darwin/aarch64 wheels on this linux
+          # runner is correct.
+          sign_platform() {
+            local label="$1" target="$2" wheel
+            wheel="$(ls "dist/wheels/ciris_edge-wheel-${label}"/*.whl 2>/dev/null | head -1)"
+            if [ -z "$wheel" ]; then
+              echo "::error::no wheel found for ${label} (dist/wheels/ciris_edge-wheel-${label}/)"
+              exit 1
+            fi
+            # EdgeExtras is a linux-x86_64 SOURCE/build-input snapshot — its dep-tree
+            # hash is `cargo tree --target x86_64-unknown-linux-gnu` and
+            # enabled_transports reflects the emit binary — so it is accurate ONLY for
+            # the canonical manifest. The other platforms sign binary hash + target +
+            # signature WITHOUT it, rather than stamp a linux source snapshot onto a
+            # non-linux wheel (Codex on #471). `--extras` is optional to ciris-build-sign.
+            local extras_args=()
+            if [ "$label" = "linux-x86_64" ]; then
+              extras_args=(--extras "dist/edge-extras-${VERSION}.json")
+            fi
+            ciris-build-sign sign \
+              --primitive edge \
+              --build-id "$VERSION" \
+              --target "$target" \
+              --binary "$wheel" \
+              --binary-version "$VERSION" \
+              "${extras_args[@]}" \
+              --ed25519-seed "$ED_KEY_PATH" \
+              --mldsa-secret "$MLDSA_KEY_PATH" \
+              --key-id ciris-edge-build-v1 \
+              --output "dist/manifests/ciris-edge-${VERSION}-${label}.manifest.json"
+            echo "✓ signed ${label} (${target})"
+          }
+          sign_platform linux-x86_64   x86_64-unknown-linux-gnu
+          sign_platform linux-aarch64  aarch64-unknown-linux-gnu
+          sign_platform darwin-aarch64 aarch64-apple-darwin
+          sign_platform windows-x86_64 x86_64-pc-windows-msvc
           shred -uz "$ED_KEY_PATH" "$MLDSA_KEY_PATH" 2>/dev/null || rm -f "$ED_KEY_PATH" "$MLDSA_KEY_PATH"
-          echo "Signed manifest:"
-          cat "dist/ciris-edge-${{ steps.version.outputs.version }}.manifest.json"
+          # The linux-x86_64 manifest is the CANONICAL one registered with
+          # CIRISRegistry (its round-trip below); the other three ride the GitHub
+          # Release attached beside their wheels.
+          cp "dist/manifests/ciris-edge-${VERSION}-linux-x86_64.manifest.json" \
+             "dist/ciris-edge-${VERSION}.manifest.json"
+          echo "=== per-platform signed manifests ==="
+          ls -la dist/manifests/
+          echo "=== canonical (linux-x86_64) manifest ==="
+          cat "dist/ciris-edge-${VERSION}.manifest.json"
+      - name: upload per-platform signed manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: ciris-edge-manifests
+          path: dist/manifests/*.manifest.json
+          if-no-files-found: error
       - name: pre-flight registry steward-key check
         # Surfaces the registry's active steward key_id to the step
         # summary. Persist + lens log this for human-visible
@@ -2012,7 +2055,7 @@ jobs:
               'version': '${{ steps.version.outputs.version }}',
               'binaries': binaries,
               'generated_at': '${GENERATED_AT}',
-              'notes': 'CIRIS federation transport substrate; manifest signed via ciris-build-sign --primitive edge (CIRISVerify v1.9.0). Multi-arch publish: linux x86_64 + aarch64, darwin arm64.',
+              'notes': 'CIRIS federation transport substrate; manifest signed via ciris-build-sign --primitive edge (CIRISVerify v1.9.0). Per-platform hybrid-signed manifests for linux x86_64 + aarch64, darwin arm64, windows x64 (this registry holds the linux-x86_64 canonical; all four are attached to the GitHub Release beside their wheels). Git-tag-only; not published to PyPI.',
           }))
           " "${BINARIES_JSON}")
           echo "POST ${REGISTRY_URL}/v1/verify/binary-manifest"
@@ -2122,8 +2165,8 @@ jobs:
   # problem only surfaces when persist and edge are TWO wheels. This
   # job loads exactly that deployment shape — pinned siblings from
   # CIRISConformance's matrix + the just-built under-test wheel — and
-  # runs the conformance suite. A regression here BLOCKS publish-pypi
-  # (added to its `needs:` graph below).
+  # runs the conformance suite. Tag-only release-quality signal; it does not
+  # gate any publisher (edge is git-tag-only).
   #
   # Matrix: 3 platforms × 2 backends = 6 cells. Each platform exercises
   # its own native wheel; each backend (sqlite, postgres) exercises
@@ -2184,19 +2227,30 @@ jobs:
                   raise SystemExit(f'no tag found for {crate} in Cargo.toml')
               return m.group(1)
           persist = find_tag('ciris-persist')
+          # ciris-verify-core / ciris-keyring / ciris-crypto all ship from the
+          # CIRISVerify monorepo under ONE tag. Assert that parity before pinning
+          # the Python `ciris-verify` package to it (Codex #471) — else cohab could
+          # test a `ciris-verify` wheel from a different repo revision than the
+          # keyring/crypto crates actually linked into edge, and pass on a shape that
+          # was never built.
+          verify  = find_tag('ciris-verify-core')
           keyring = find_tag('ciris-keyring')
           crypto  = find_tag('ciris-crypto')
-          assert keyring == crypto, f'ciris-keyring ({keyring}) and ciris-crypto ({crypto}) must share a tag — both come from CIRISVerify'
+          assert verify == keyring == crypto, (
+              f'CIRISVerify crates disagree on tag (verify-core {verify}, keyring '
+              f'{keyring}, crypto {crypto}) — they share one monorepo tag by design'
+          )
           pins = {
-              # CIRISEdge: persist stopped PyPI-publishing at v30.4.0, so a version
-              # pin (ciris-persist==X) resolves against PyPI and fails with "No
-              # matching distribution" — cohab was permanently benign-red. Build it
-              # from its git tag instead (the reusable workflow's documented
-              # git-source override): the same tag edge pins in Cargo.toml, off the
-              # assets we build, not PyPI. (verify is still a version pin — flip it
-              # to git-source the same way if a tag-run shows it also left PyPI.)
+              # CIRISEdge is git-tag-only, and so are its substrate siblings: NEITHER
+              # persist (stopped at v30.4.0) NOR verify publishes to PyPI, and NO ONE
+              # consumes them off PyPI — every consumer pins the Cargo git tag (Rust)
+              # or rides the ciris-server one-wheel (Python). A version pin
+              # (ciris-persist==X / ciris-verify==X) would resolve against PyPI and
+              # fail "No matching distribution", so build BOTH from the git tags edge
+              # pins in Cargo.toml (the reusable workflow's documented git-source
+              # override) — off the assets we build, not PyPI.
               'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@v{persist}',
-              'ciris-verify':  f'ciris-verify=={keyring}',
+              'ciris-verify':  f'git+https://github.com/CIRISAI/CIRISVerify.git@v{verify}',
           }
           print(f'json={json.dumps(pins)}')
           PYEOF
@@ -2225,117 +2279,6 @@ jobs:
       under-test-package: ciris-edge
       pin-overrides: ${{ needs.extract-substrate-pins.outputs.pin-overrides }}
 
-  # ─── publish-pypi: tag-gated wheel upload via OIDC ──────────────────
-  #
-  # Trust posture: the BuildManifest round-trip (build-manifest job
-  # above) is the cryptographic root of trust. PyPI is the fast
-  # distribution channel — peers verifying authenticity check the
-  # registry-side hybrid Ed25519 + ML-DSA-65 signature on the
-  # manifest, not the PyPI artifact itself. PEP 740 attestations
-  # compound the two.
-  #
-  # Auth: OIDC trusted publishing. NO API token in CI secrets — PyPI
-  # validates the workflow's GitHub identity directly. One-time setup
-  # on PyPI side is required (project owner reserves the name +
-  # configures the trusted publisher); see docs/PYPI_PUBLISH.md.
-  publish-pypi:
-    name: Publish wheels to PyPI (tag-gated)
-    runs-on: ubuntu-latest
-    # Gate publish on every quality job — presence-of-wheel alone is
-    # not a quality gate. Same v0.3.3 closure persist applied after
-    # v0.3.2 shipped wheels through a fmt-failure tag run.
-    #
-    # v0.7.0 (CIRISEdge#17) — added the four mobile lanes to the gate.
-    # publish-pypi still only ships the three desktop abi3 wheels
-    # (linux x86_64 + linux aarch64 + darwin aarch64) — Chaquopy wheels
-    # and iOS PyO3 tarballs go to GitHub Release via `mobile-release`,
-    # not PyPI. Mirrors persist's discipline exactly (persist's
-    # publish-pypi also gates on ios-build + android-package without
-    # consuming their artifacts). Rationale: a tag that builds a green
-    # desktop wheel but breaks the iOS/Android cohabitation paths
-    # should not ship to PyPI either — the cohabiting agent expects
-    # version-aligned substrate across all platforms.
-    needs:
-      - pyo3-wheel
-      - build-manifest
-      - lint
-      - license-audit
-      - linux-x86_64-test
-      - darwin-aarch64-test
-      - android-package
-      - ios-pyo3-package
-      - xcframework
-      # v3.0.1 — `cohabitation-conformance` dropped from publish-pypi
-      # gating. During family-wide major-version transitions (v3.0.0
-      # pyo3 0.28→0.29 + persist 5→6 + verify 5.1→5.2 was the trigger)
-      # the harness can't pass: it installs the latest PyPI siblings
-      # alongside the under-test wheel, but those siblings haven't
-      # co-bumped yet — pip resolution hits `ResolutionImpossible` and
-      # the gate becomes a structural blocker for the lockstep itself
-      # (no member of the family can publish until all members have
-      # already published, classic chicken-and-egg).
-      #
-      # Cohabitation still runs as an INFORMATIONAL job — operators see
-      # the failures in PR reviews and can choose to wait for downstream
-      # consumers to co-bump before merging. It just no longer blocks
-      # the OIDC publish.
-      #
-      # When `ciris-lens-core` (and any other siblings) ship their
-      # co-bump to the new persist/edge/verify floor, re-enable this by
-      # adding `- cohabitation-conformance` back to the `needs` list.
-      # Tracked in CIRISLensCore#53 for the immediate lens-core
-      # co-bump.
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment:
-      name: pypi
-      url: https://pypi.org/project/ciris-edge/
-    permissions:
-      # OIDC token-issuance permission. Required for PyPI's trusted
-      # publishing. Scope is the workflow's GitHub-issued JWT only;
-      # no long-lived secret.
-      id-token: write
-    steps:
-      - name: download all multi-arch wheels
-        # `merge-multiple: true` flattens the per-artifact subdirs;
-        # the .whl filenames already encode the target tag (e.g.
-        # `-manylinux_2_34_aarch64`) so there's no collision.
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ciris_edge-wheel-*
-          merge-multiple: true
-          path: dist
-      - name: sanity-check wheel shapes before publish
-        run: |
-          ls -la dist/
-          COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
-          if [ "${COUNT}" -lt 3 ]; then
-            echo "::error::Expected 3 wheels (linux x86_64 + aarch64, darwin arm64); got ${COUNT}"
-            ls dist/*.whl 2>/dev/null || echo "  (no .whl files at all)"
-            exit 1
-          fi
-          for wheel in dist/*.whl; do
-            # v0.7.0 (CIRISEdge#17) — abi3-py310 floor (Chaquopy compat).
-            if ! [[ "${wheel}" =~ -cp310-abi3- ]]; then
-              echo "::error::Non-abi3 wheel detected: ${wheel}"
-              exit 1
-            fi
-            echo "✓ ${wheel}"
-          done
-          echo "✓ All ${COUNT} wheels conform to cp310-abi3."
-      - name: publish to PyPI via OIDC trusted publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          # No `password:` — OIDC trusted publishing handles auth.
-          packages-dir: dist
-          # skip-existing makes tag re-runs idempotent. PyPI rejects
-          # same-version re-uploads anyway; failing softly here keeps
-          # re-runs from blowing up.
-          skip-existing: true
-          # PEP 740 — sigstore-attested upload. Consumers verifying
-          # the manifest can also verify the PyPI artifact ties to
-          # this exact GH workflow identity.
-          attestations: true
-
   # ─── mobile-release: GitHub Release tarball publish (CIRISEdge#17) ──
   #
   # Pattern lifted verbatim from CIRISPersist v2.0.7+ `mobile-release`
@@ -2355,17 +2298,18 @@ jobs:
   #   - `SHA256SUMS`                                — release-attestable
   #     hashes over all of the above
   #
-  # `publish-pypi` ships the THREE desktop wheels to PyPI separately
-  # (linux-x86_64, linux-aarch64, darwin-aarch64). The two channels
-  # are complementary — PyPI for `pip install ciris-edge` on desktop,
-  # GitHub Release for `gh release download` on mobile/native.
+  # v16.0.1 (CIRISEdge#471) — the GitHub Release is the SOLE desktop-wheel
+  # channel too: mobile-release attaches the four desktop wheels
+  # (linux-x86_64, linux-aarch64, darwin-aarch64, windows-x86_64) + their
+  # per-platform hybrid-signed manifests here. There is no PyPI publish; edge is
+  # git-tag-only.
   #
   # Persist's job: CIRISPersist ci.yml lines 1293-1426. Mirrored shape:
   #   - Tag-gate: `if: startsWith(github.ref, 'refs/tags/v')`
   #   - `gh run download` with 5-attempt retry (absorbs ListArtifacts
   #     transient 403s — persist hit this on v1.5.24 tag run).
   #   - `gh release create --verify-tag` if release doesn't exist yet
-  #     (publish-pypi may have created it).
+  #     (mobile-release is the sole creator now — CIRISEdge#471).
   #   - `gh release upload --clobber` for idempotent tag re-runs.
   #
   # Edge-specific additions: XCFramework asset (verify ships one too;
@@ -2380,6 +2324,15 @@ jobs:
       - xcframework
       - lint
       - license-audit
+      # CIRISEdge#471 — mobile-release is now the SOLE publisher of the desktop
+      # wheels + their per-platform signed manifests, so it inherits publish-pypi's
+      # desktop quality gates: never ship a wheel whose platform tests failed, or
+      # before the full wheel matrix + signed manifests exist (no partial-download
+      # race). `pyo3-wheel` gates on ALL four desktop cells (incl. windows).
+      - pyo3-wheel
+      - build-manifest
+      - linux-x86_64-test
+      - darwin-aarch64-test
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -2471,6 +2424,73 @@ jobs:
             echo "::warning::XCFramework download attempt $attempt failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
+      - name: download desktop abi3 wheels for durable Release attach (with retry)
+        # CIRISEdge#471 — publish-pypi was the desktop wheels' ONLY durable home;
+        # with it removed, attach them to the GitHub Release so build-manifest's
+        # registered (hybrid-signed) hashes stay obtainable. NOT PyPI — no one
+        # consumes these off PyPI; the Release is the durable, hash-matching source.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern 'ciris_edge-wheel-*' \
+                --dir dist/wheels; then
+              echo "✓ desktop wheels download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::desktop wheels download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::desktop wheels download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          # gh run download nests each artifact in its own dir; flatten beside the
+          # tarballs so SHA256SUMS + the upload pick them up.
+          find dist/wheels -name '*.whl' -exec mv {} dist/ \;
+          echo "=== desktop wheels ==="
+          ls -la dist/*.whl
+          COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
+          if [ "$COUNT" -ne 4 ]; then
+            echo "::error::expected 4 desktop wheels (linux x86_64+aarch64, darwin arm64, windows x64), got $COUNT"
+            exit 1
+          fi
+      - name: download per-platform signed manifests (with retry)
+        # CIRISEdge#471 — the hybrid-signed manifest for EACH desktop wheel
+        # (build-manifest signs all four). Attached to the Release beside its wheel
+        # so EVERY platform's binary is verifiable against a signed manifest.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name ciris-edge-manifests \
+                --dir dist/manifests; then
+              echo "✓ signed manifests download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::signed manifests download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::signed manifests download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "=== per-platform signed manifests ==="
+          ls -la dist/manifests/*.manifest.json
+          MCOUNT=$(ls dist/manifests/*.manifest.json 2>/dev/null | wc -l)
+          if [ "$MCOUNT" -ne 4 ]; then
+            echo "::error::expected 4 per-platform signed manifests, got $MCOUNT"
+            exit 1
+          fi
+          # Flatten beside the wheels/tarballs — gh release upload/download use a
+          # FLAT asset namespace, so SHA256SUMS must reference basenames or
+          # `sha256sum -c` fails for a consumer who downloads them side-by-side
+          # (CIRISEdge#471, Codex).
+          mv dist/manifests/*.manifest.json dist/
       # v0.13.0 (CIRISEdge#36 GO) — bundle the UniFFI-generated Kotlin
       # and Swift bindings as release tarballs. Mobile / native
       # consumers (CIRISAgent KMP UI, future iOS shell) consume them
@@ -2509,7 +2529,11 @@ jobs:
       - name: generate SHA256SUMS
         run: |
           cd dist
-          sha256sum ciris-edge-v*.tar.gz > SHA256SUMS
+          # Include the desktop wheels + their per-platform signed manifests so all
+          # integrity metadata travels with the Release (CIRISEdge#471). All by
+          # BASENAME — release assets are a flat namespace, so `sha256sum -c` works
+          # when a consumer downloads them beside SHA256SUMS.
+          sha256sum ciris-edge-v*.tar.gz *.whl *.manifest.json > SHA256SUMS
           cat SHA256SUMS
       - name: create GitHub Release + upload assets
         env:
@@ -2518,10 +2542,11 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           VERSION="${{ steps.version.outputs.version }}"
 
-          # publish-pypi creates the GitHub Release in some flows; create
-          # here if it doesn't exist yet, otherwise just upload. --verify-tag
-          # ensures we don't accidentally create a release for a tag that
-          # doesn't exist (e.g. workflow_dispatch on main).
+          # mobile-release is the SOLE creator of the GitHub Release (edge is
+          # git-tag-only; there is no PyPI publish job). Create here if it does
+          # not exist yet, otherwise just upload. --verify-tag ensures we don't
+          # accidentally create a release for a tag that doesn't exist (e.g.
+          # workflow_dispatch on main).
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
@@ -2545,6 +2570,8 @@ jobs:
             "dist/ciris-edge-v${VERSION}-xcframework.tar.gz" \
             "dist/ciris-edge-v${VERSION}-kotlin-bindings.tar.gz" \
             "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz" \
+            dist/*.whl \
+            dist/*.manifest.json \
             "dist/SHA256SUMS"
 
           # Promote draft → published. Idempotent on already-published
