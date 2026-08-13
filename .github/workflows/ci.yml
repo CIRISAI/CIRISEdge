@@ -1923,13 +1923,23 @@ jobs:
               echo "::error::no wheel found for ${label} (dist/wheels/ciris_edge-wheel-${label}/)"
               exit 1
             fi
+            # EdgeExtras is a linux-x86_64 SOURCE/build-input snapshot — its dep-tree
+            # hash is `cargo tree --target x86_64-unknown-linux-gnu` and
+            # enabled_transports reflects the emit binary — so it is accurate ONLY for
+            # the canonical manifest. The other platforms sign binary hash + target +
+            # signature WITHOUT it, rather than stamp a linux source snapshot onto a
+            # non-linux wheel (Codex on #471). `--extras` is optional to ciris-build-sign.
+            local extras_args=()
+            if [ "$label" = "linux-x86_64" ]; then
+              extras_args=(--extras "dist/edge-extras-${VERSION}.json")
+            fi
             ciris-build-sign sign \
               --primitive edge \
               --build-id "$VERSION" \
               --target "$target" \
               --binary "$wheel" \
               --binary-version "$VERSION" \
-              --extras "dist/edge-extras-${VERSION}.json" \
+              "${extras_args[@]}" \
               --ed25519-seed "$ED_KEY_PATH" \
               --mldsa-secret "$MLDSA_KEY_PATH" \
               --key-id ciris-edge-build-v1 \
