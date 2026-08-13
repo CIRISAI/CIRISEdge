@@ -60,7 +60,8 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         | EnvelopeKind::IdentityOccurrenceRevocation => "subject_pull:data_subject; subject-only",
         EnvelopeKind::Attestation => {
             "subject_pull:data_subject+sender; subject-only; \
-             consent-gated scores carved on data_subject axis (G2: persist consent_gated_claim)"
+             non-retainable scores-plane rows carved on data_subject axis \
+             (G2: attestation_type==scores AND !persist::is_subject_retainable(dimension))"
         }
         EnvelopeKind::Revocation
         | EnvelopeKind::Family
@@ -109,8 +110,12 @@ pub fn serve_advertise_policy_sha256() -> String {
 /// (advertise scope or serve gate for ANY of the 14 kinds) flips this — a
 /// deliberate, reviewed re-pin, visible to CIRISServer which pins it alongside
 /// persist's `REPLICATION_POLICY_HASH`. See CIRISEdge#393 §4.2/§4.3.
+// v16.0.0 — re-pinned: the Attestation `receive` carve text now describes the
+// retainability-allowlist rule (scores-plane, `!is_subject_retainable(dimension)`),
+// replacing the stale `consent_gated_claim` prose the #635 carve had left behind
+// (Codex on #470). CIRISServer re-pins from 049e71ef… to this value.
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "049e71ef208d24266fe366b8eaed365a467cadd3aadd8856c8ed917c90bced33";
+    "6f683311627689221d886f4245ac7b9fa6715e6f1e135855f52fa7800fb7cda5";
 
 #[cfg(test)]
 mod tests {

@@ -1108,26 +1108,42 @@ impl FederationDirectoryReplicationBridge {
     /// shrinks the pull SILENTLY; that is a persist ask — tell them to add it, do
     /// not assume persist knows.)
     ///
-    /// DIMENSIONLESS attestations carry no score and are NOT carved: a `delegates_to`
-    /// conferral (the moderation-duty shape #462 exists to recover) is signed by the
-    /// conferring authority — the subject cannot forge it, so a retained copy grants
-    /// no write authority. The subject's OWN authored scores (the sender axis) are
-    /// likewise untouched — a score I authored is mine to recover.
+    /// CONFERRALS ARE RETAINED BY TYPE, not by dimension: a `delegates_to` (the
+    /// moderation-duty shape #462 exists to recover) is signed by the conferring
+    /// authority — the subject cannot forge it, so a retained copy grants no write
+    /// authority. This holds EVEN when the conferral is dimension-bearing: the
+    /// `self_at_login` shape carries `dimension:
+    /// "self:delegates_to:agent_occurrence:v1"` (src/edge.rs), which is NOT in
+    /// persist's retainable allowlist. The subject's OWN authored scores (the sender
+    /// axis) are likewise untouched — a score I authored is mine to recover.
     ///
-    /// INVARIANT this carve depends on (shared with persist's taxonomy, not a
-    /// per-family lookup): **scores are dimension-bearing, conferrals are
-    /// dimensionless.** The G2 hazard is "sole-writer of a row about me"; CC binds
-    /// authority to the SIGNATURE, never to custody, so an authority-signed
-    /// conferral is safe to retain regardless of dimension. The `has-dimension`
-    /// gate therefore lands the authorship hazard exactly — *given* that invariant.
-    /// If persist ever made a peer-authored score dimensionless, or a conferral
-    /// dimension-bearing, the gate would misfire; that is the one thing to keep
-    /// true across both repos.
+    /// INVARIANT (corrected — Codex on #470): key the carve on the SCORES PLANE, not
+    /// on has-a-dimension. The earlier "scores are dimension-bearing, conferrals are
+    /// dimensionless" reading was FALSE — `self_at_login` is a dimension-bearing
+    /// conferral — and the has-dimension gate would carve that delegation out of the
+    /// very pull the receive axis exists to serve. The reliable discriminator is
+    /// `attestation_type`: every peer-authored claim (reputation / capacity /
+    /// moderation) rides `attestation_type == "scores"` with a distinguishing
+    /// dimension; conferrals ride `delegates_to` / `trust:confers`. So the carve is
+    /// `type == scores AND !is_subject_retainable(dimension)`. The one thing to keep
+    /// true across both repos: persist keeps peer-authored claims on the scores
+    /// plane and conferrals off it.
     fn is_non_retainable_score(att: &Attestation) -> bool {
-        att.attestation_envelope
-            .pointer("/dimension")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|dim| !ciris_persist::federation::namespace::is_subject_retainable(dim))
+        // Only the SCORES plane is carveable. A conferral (delegates_to /
+        // trust:confers) is authority-signed — unforgeable by the subject — so it is
+        // retained by TYPE regardless of dimension, INCLUDING the dimension-bearing
+        // self_at_login shape (`self:delegates_to:agent_occurrence:v1`, src/edge.rs),
+        // which is NOT in persist's retainable allowlist. Gating on the dimension
+        // alone would carve that delegation OUT of the pull the receive axis exists
+        // to recover (Codex on #470).
+        att.attestation_type == ciris_persist::federation::types::attestation_type::SCORES
+            && att
+                .attestation_envelope
+                .pointer("/dimension")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|dim| {
+                    !ciris_persist::federation::namespace::is_subject_retainable(dim)
+                })
     }
 
     /// The per-kind apply dispatch behind the #425 choke —
@@ -4582,6 +4598,29 @@ mod tests {
         assert!(
             !B::is_non_retainable_score(&att_with_dimension(None)),
             "a dimensionless conferral (delegates_to) carries no score — kept (unforgeable)"
+        );
+    }
+
+    /// Codex on #470 — the carve keys on the SCORES PLANE, not on has-a-dimension.
+    /// `self_at_login` proves conferrals CAN be dimension-bearing
+    /// (`self:delegates_to:agent_occurrence:v1`, src/edge.rs), and that dimension is
+    /// NOT in persist's retainable allowlist — so a has-dimension gate would carve
+    /// the delegation OUT of the very pull the receive axis exists to recover. The
+    /// control proves the discriminator is `attestation_type`, not the dimension.
+    #[test]
+    fn g2_carve_keeps_dimension_bearing_conferrals() {
+        use FederationDirectoryReplicationBridge as B;
+        let dim = "self:delegates_to:agent_occurrence:v1";
+        let mut conferral = att_with_dimension(Some(dim));
+        conferral.attestation_type = "delegates_to".into();
+        assert!(
+            !B::is_non_retainable_score(&conferral),
+            "a dimension-bearing delegates_to conferral is retained by TYPE, never carved"
+        );
+        // Control: the SAME non-retainable dimension on a SCORES-type row IS carved.
+        assert!(
+            B::is_non_retainable_score(&att_with_dimension(Some(dim))),
+            "the same non-retainable dimension on a scores-type row is still carved (fail-closed)"
         );
     }
 

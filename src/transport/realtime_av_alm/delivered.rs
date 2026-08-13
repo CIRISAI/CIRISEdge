@@ -423,6 +423,8 @@ pub enum DeliveryEmitError {
     /// The directory refused or failed the submission.
     #[error("delivery emission submit failed: {0}")]
     Submit(String),
+    #[error("delivery row v31 envelope binding failed: {0}")]
+    Bind(String),
 }
 
 /// Emit one [`DeliveredObservation`] as a scores-plane row about the relay
@@ -540,10 +542,65 @@ async fn build_delivery_row(
         .pqc
         .as_ref()
         .ok_or(DeliveryEmitError::SignerLacksPqc)?;
-    let envelope = delivery_envelope(observation);
-    let canonical = ceg_produce_canonicalize(&envelope)
+    // #598: the fold orders on the `asserted_at` COLUMN, so it must be SIGNED and
+    // microsecond-truncated (postgres TIMESTAMPTZ can't hold sub-µs). Truncate
+    // through persist's own helper so the resolution can never drift.
+    let now = ciris_persist::federation::admission::truncate_to_substrate_resolution(now);
+
+    // Content-address the row id off the STABLE (pre-binding) envelope so identical
+    // window contents still dedupe to one row — the id must be derived BEFORE the
+    // asserted_at/row bindings (#643 requires the id INSIDE the signed bytes, so the
+    // hash of the bound envelope cannot in turn define the id).
+    let mut envelope = delivery_envelope(observation);
+    let stable_hash = hex::encode(Sha256::digest(
+        &ceg_produce_canonicalize(&envelope)
+            .map_err(|e| DeliveryEmitError::Canonicalize(e.to_string()))?,
+    ));
+    let attestation_id = format!("capacity-delivery-{}", &stable_hash[..16]);
+
+    // #598: bind the signed `asserted_at` into the envelope before it is signed.
+    if let Some(obj) = envelope.as_object_mut() {
+        obj.insert(
+            "asserted_at".to_owned(),
+            serde_json::json!(now.to_rfc3339()),
+        );
+    }
+
+    // Assemble the row, then #643: stamp the typed-column `row` mirror into the
+    // envelope via persist's canonical binder (keyed on `attestation_id`), so the
+    // scrub signature below covers it — else v31's admit gate refuses the score and
+    // delivery measurements silently stop persisting (Codex on #470).
+    let mut attestation = Attestation {
+        attestation_id,
+        attesting_key_id: signer.key_id.clone(),
+        attested_key_id: observation.key.advertiser_key_id.clone(),
+        attestation_type: attestation_type::SCORES.to_owned(),
+        weight: None,
+        asserted_at: now,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: String::new(),
+        scrub_signature_classical: String::new(),
+        scrub_signature_pqc: None,
+        scrub_key_id: signer.key_id.clone(),
+        scrub_timestamp: now,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: Vec::new(),
+        withdraws_admission_rule: None,
+        cohort_scope: cohort_scope::FEDERATION.to_owned(),
+        tier: attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    };
+    ciris_persist::federation::envelope::RowMirror::stamp_row(&mut attestation)
+        .map_err(|e| DeliveryEmitError::Bind(e.to_string()))?;
+
+    // Sign the NOW-BOUND envelope (asserted_at + row present) — AV-33 bound-PQC
+    // (ML-DSA-65 over `canonical ‖ ed25519_sig`).
+    let canonical = ceg_produce_canonicalize(&attestation.attestation_envelope)
         .map_err(|e| DeliveryEmitError::Canonicalize(e.to_string()))?;
-    let original_content_hash = hex::encode(Sha256::digest(&canonical));
+    attestation.original_content_hash = hex::encode(Sha256::digest(&canonical));
     let ed_sig = signer
         .classical
         .sign(&canonical)
@@ -555,31 +612,9 @@ async fn build_delivery_row(
         .sign(&bound)
         .await
         .map_err(|e| DeliveryEmitError::Sign(format!("ml_dsa_65 sign: {e}")))?;
-
-    let attestation_id = format!("capacity-delivery-{}", &original_content_hash[..16]);
-    Ok(Attestation {
-        attestation_id,
-        attesting_key_id: signer.key_id.clone(),
-        attested_key_id: observation.key.advertiser_key_id.clone(),
-        attestation_type: attestation_type::SCORES.to_owned(),
-        weight: None,
-        asserted_at: now,
-        expires_at: None,
-        attestation_envelope: envelope,
-        original_content_hash,
-        scrub_signature_classical: B64.encode(&ed_sig),
-        scrub_signature_pqc: Some(B64.encode(&pqc_sig)),
-        scrub_key_id: signer.key_id.clone(),
-        scrub_timestamp: now,
-        pqc_completed_at: None,
-        persist_row_hash: String::new(),
-        subject_key_ids: Vec::new(),
-        withdraws_admission_rule: None,
-        cohort_scope: cohort_scope::FEDERATION.to_owned(),
-        tier: attestation_tier::FEDERATION.to_owned(),
-        promoted_at: None,
-        additional_scrubs: Vec::new(),
-    })
+    attestation.scrub_signature_classical = B64.encode(&ed_sig);
+    attestation.scrub_signature_pqc = Some(B64.encode(&pqc_sig));
+    Ok(attestation)
 }
 
 #[cfg(test)]
@@ -994,12 +1029,15 @@ mod tests {
         stance_dimension: &str,
         asserted_at: DateTime<Utc>,
     ) -> Attestation {
+        // #598 µs floor — the fold orders on the signed `asserted_at` column.
+        let asserted_at =
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(asserted_at);
         let envelope = serde_json::json!({
             "dimension": stance_dimension,
             "scope": [ANALYZE_CONSENT_SCOPE],
+            "asserted_at": asserted_at.to_rfc3339(),
         });
-        let (och, sc, sp) = sign_attestation_envelope(subject, &envelope);
-        Attestation {
+        let mut attestation = Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: subject.to_owned(),
             attested_key_id: covers.to_owned(),
@@ -1008,9 +1046,9 @@ mod tests {
             asserted_at,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: sc,
-            scrub_signature_pqc: sp,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: subject.to_owned(),
             scrub_timestamp: asserted_at,
             pqc_completed_at: None,
@@ -1021,7 +1059,15 @@ mod tests {
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        // #643: stamp the typed-column row mirror in, then sign the bound envelope.
+        ciris_persist::federation::envelope::RowMirror::stamp_row(&mut attestation)
+            .expect("stamp v31 row mirror");
+        let (och, sc, sp) = sign_attestation_envelope(subject, &attestation.attestation_envelope);
+        attestation.original_content_hash = och;
+        attestation.scrub_signature_classical = sc;
+        attestation.scrub_signature_pqc = sp;
+        attestation
     }
 
     /// A [`LocalSigner`] whose hybrid keys derive from the SAME
