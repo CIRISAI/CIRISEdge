@@ -2476,6 +2476,11 @@ jobs:
             echo "::error::expected 4 per-platform signed manifests, got $MCOUNT"
             exit 1
           fi
+          # Flatten beside the wheels/tarballs — gh release upload/download use a
+          # FLAT asset namespace, so SHA256SUMS must reference basenames or
+          # `sha256sum -c` fails for a consumer who downloads them side-by-side
+          # (CIRISEdge#471, Codex).
+          mv dist/manifests/*.manifest.json dist/
       # v0.13.0 (CIRISEdge#36 GO) — bundle the UniFFI-generated Kotlin
       # and Swift bindings as release tarballs. Mobile / native
       # consumers (CIRISAgent KMP UI, future iOS shell) consume them
@@ -2515,8 +2520,10 @@ jobs:
         run: |
           cd dist
           # Include the desktop wheels + their per-platform signed manifests so all
-          # integrity metadata travels with the Release (CIRISEdge#471).
-          sha256sum ciris-edge-v*.tar.gz *.whl manifests/*.manifest.json > SHA256SUMS
+          # integrity metadata travels with the Release (CIRISEdge#471). All by
+          # BASENAME — release assets are a flat namespace, so `sha256sum -c` works
+          # when a consumer downloads them beside SHA256SUMS.
+          sha256sum ciris-edge-v*.tar.gz *.whl *.manifest.json > SHA256SUMS
           cat SHA256SUMS
       - name: create GitHub Release + upload assets
         env:
@@ -2554,7 +2561,7 @@ jobs:
             "dist/ciris-edge-v${VERSION}-kotlin-bindings.tar.gz" \
             "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz" \
             dist/*.whl \
-            dist/manifests/*.manifest.json \
+            dist/*.manifest.json \
             "dist/SHA256SUMS"
 
           # Promote draft → published. Idempotent on already-published
