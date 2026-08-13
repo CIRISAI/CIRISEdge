@@ -2184,19 +2184,16 @@ jobs:
                   raise SystemExit(f'no tag found for {crate} in Cargo.toml')
               return m.group(1)
           persist = find_tag('ciris-persist')
-          keyring = find_tag('ciris-keyring')
-          crypto  = find_tag('ciris-crypto')
-          assert keyring == crypto, f'ciris-keyring ({keyring}) and ciris-crypto ({crypto}) must share a tag — both come from CIRISVerify'
+          verify  = find_tag('ciris-verify-core')
           pins = {
-              # CIRISEdge: persist stopped PyPI-publishing at v30.4.0, so a version
-              # pin (ciris-persist==X) resolves against PyPI and fails with "No
-              # matching distribution" — cohab was permanently benign-red. Build it
-              # from its git tag instead (the reusable workflow's documented
-              # git-source override): the same tag edge pins in Cargo.toml, off the
-              # assets we build, not PyPI. (verify is still a version pin — flip it
-              # to git-source the same way if a tag-run shows it also left PyPI.)
+              # CIRISEdge: neither persist (stopped at v30.4.0) nor verify publishes
+              # to PyPI — everyone consumes them via git tag now. A version pin
+              # (ciris-persist==X / ciris-verify==X) resolves against PyPI and fails
+              # "No matching distribution". Build BOTH from the git tags edge pins in
+              # Cargo.toml (the reusable workflow's documented git-source override) —
+              # off the assets we build, not PyPI.
               'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@v{persist}',
-              'ciris-verify':  f'ciris-verify=={keyring}',
+              'ciris-verify':  f'git+https://github.com/CIRISAI/CIRISVerify.git@v{verify}',
           }
           print(f'json={json.dumps(pins)}')
           PYEOF
@@ -2224,117 +2221,6 @@ jobs:
       under-test-wheel-artifact: ciris_edge-wheel-${{ matrix.platform }}
       under-test-package: ciris-edge
       pin-overrides: ${{ needs.extract-substrate-pins.outputs.pin-overrides }}
-
-  # ─── publish-pypi: tag-gated wheel upload via OIDC ──────────────────
-  #
-  # Trust posture: the BuildManifest round-trip (build-manifest job
-  # above) is the cryptographic root of trust. PyPI is the fast
-  # distribution channel — peers verifying authenticity check the
-  # registry-side hybrid Ed25519 + ML-DSA-65 signature on the
-  # manifest, not the PyPI artifact itself. PEP 740 attestations
-  # compound the two.
-  #
-  # Auth: OIDC trusted publishing. NO API token in CI secrets — PyPI
-  # validates the workflow's GitHub identity directly. One-time setup
-  # on PyPI side is required (project owner reserves the name +
-  # configures the trusted publisher); see docs/PYPI_PUBLISH.md.
-  publish-pypi:
-    name: Publish wheels to PyPI (tag-gated)
-    runs-on: ubuntu-latest
-    # Gate publish on every quality job — presence-of-wheel alone is
-    # not a quality gate. Same v0.3.3 closure persist applied after
-    # v0.3.2 shipped wheels through a fmt-failure tag run.
-    #
-    # v0.7.0 (CIRISEdge#17) — added the four mobile lanes to the gate.
-    # publish-pypi still only ships the three desktop abi3 wheels
-    # (linux x86_64 + linux aarch64 + darwin aarch64) — Chaquopy wheels
-    # and iOS PyO3 tarballs go to GitHub Release via `mobile-release`,
-    # not PyPI. Mirrors persist's discipline exactly (persist's
-    # publish-pypi also gates on ios-build + android-package without
-    # consuming their artifacts). Rationale: a tag that builds a green
-    # desktop wheel but breaks the iOS/Android cohabitation paths
-    # should not ship to PyPI either — the cohabiting agent expects
-    # version-aligned substrate across all platforms.
-    needs:
-      - pyo3-wheel
-      - build-manifest
-      - lint
-      - license-audit
-      - linux-x86_64-test
-      - darwin-aarch64-test
-      - android-package
-      - ios-pyo3-package
-      - xcframework
-      # v3.0.1 — `cohabitation-conformance` dropped from publish-pypi
-      # gating. During family-wide major-version transitions (v3.0.0
-      # pyo3 0.28→0.29 + persist 5→6 + verify 5.1→5.2 was the trigger)
-      # the harness can't pass: it installs the latest PyPI siblings
-      # alongside the under-test wheel, but those siblings haven't
-      # co-bumped yet — pip resolution hits `ResolutionImpossible` and
-      # the gate becomes a structural blocker for the lockstep itself
-      # (no member of the family can publish until all members have
-      # already published, classic chicken-and-egg).
-      #
-      # Cohabitation still runs as an INFORMATIONAL job — operators see
-      # the failures in PR reviews and can choose to wait for downstream
-      # consumers to co-bump before merging. It just no longer blocks
-      # the OIDC publish.
-      #
-      # When `ciris-lens-core` (and any other siblings) ship their
-      # co-bump to the new persist/edge/verify floor, re-enable this by
-      # adding `- cohabitation-conformance` back to the `needs` list.
-      # Tracked in CIRISLensCore#53 for the immediate lens-core
-      # co-bump.
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment:
-      name: pypi
-      url: https://pypi.org/project/ciris-edge/
-    permissions:
-      # OIDC token-issuance permission. Required for PyPI's trusted
-      # publishing. Scope is the workflow's GitHub-issued JWT only;
-      # no long-lived secret.
-      id-token: write
-    steps:
-      - name: download all multi-arch wheels
-        # `merge-multiple: true` flattens the per-artifact subdirs;
-        # the .whl filenames already encode the target tag (e.g.
-        # `-manylinux_2_34_aarch64`) so there's no collision.
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ciris_edge-wheel-*
-          merge-multiple: true
-          path: dist
-      - name: sanity-check wheel shapes before publish
-        run: |
-          ls -la dist/
-          COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
-          if [ "${COUNT}" -lt 3 ]; then
-            echo "::error::Expected 3 wheels (linux x86_64 + aarch64, darwin arm64); got ${COUNT}"
-            ls dist/*.whl 2>/dev/null || echo "  (no .whl files at all)"
-            exit 1
-          fi
-          for wheel in dist/*.whl; do
-            # v0.7.0 (CIRISEdge#17) — abi3-py310 floor (Chaquopy compat).
-            if ! [[ "${wheel}" =~ -cp310-abi3- ]]; then
-              echo "::error::Non-abi3 wheel detected: ${wheel}"
-              exit 1
-            fi
-            echo "✓ ${wheel}"
-          done
-          echo "✓ All ${COUNT} wheels conform to cp310-abi3."
-      - name: publish to PyPI via OIDC trusted publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          # No `password:` — OIDC trusted publishing handles auth.
-          packages-dir: dist
-          # skip-existing makes tag re-runs idempotent. PyPI rejects
-          # same-version re-uploads anyway; failing softly here keeps
-          # re-runs from blowing up.
-          skip-existing: true
-          # PEP 740 — sigstore-attested upload. Consumers verifying
-          # the manifest can also verify the PyPI artifact ties to
-          # this exact GH workflow identity.
-          attestations: true
 
   # ─── mobile-release: GitHub Release tarball publish (CIRISEdge#17) ──
   #
@@ -2518,10 +2404,11 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           VERSION="${{ steps.version.outputs.version }}"
 
-          # publish-pypi creates the GitHub Release in some flows; create
-          # here if it doesn't exist yet, otherwise just upload. --verify-tag
-          # ensures we don't accidentally create a release for a tag that
-          # doesn't exist (e.g. workflow_dispatch on main).
+          # mobile-release is the SOLE creator of the GitHub Release (edge is
+          # git-tag-only; there is no PyPI publish job). Create here if it does
+          # not exist yet, otherwise just upload. --verify-tag ensures we don't
+          # accidentally create a release for a tag that doesn't exist (e.g.
+          # workflow_dispatch on main).
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
