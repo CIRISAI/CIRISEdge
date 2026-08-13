@@ -2227,30 +2227,21 @@ jobs:
                   raise SystemExit(f'no tag found for {crate} in Cargo.toml')
               return m.group(1)
           persist = find_tag('ciris-persist')
-          # ciris-verify-core / ciris-keyring / ciris-crypto all ship from the
-          # CIRISVerify monorepo under ONE tag. Assert that parity before pinning
-          # the Python `ciris-verify` package to it (Codex #471) — else cohab could
-          # test a `ciris-verify` wheel from a different repo revision than the
-          # keyring/crypto crates actually linked into edge, and pass on a shape that
-          # was never built.
-          verify  = find_tag('ciris-verify-core')
-          keyring = find_tag('ciris-keyring')
-          crypto  = find_tag('ciris-crypto')
-          assert verify == keyring == crypto, (
-              f'CIRISVerify crates disagree on tag (verify-core {verify}, keyring '
-              f'{keyring}, crypto {crypto}) — they share one monorepo tag by design'
-          )
           pins = {
-              # CIRISEdge is git-tag-only, and so are its substrate siblings: NEITHER
-              # persist (stopped at v30.4.0) NOR verify publishes to PyPI, and NO ONE
-              # consumes them off PyPI — every consumer pins the Cargo git tag (Rust)
-              # or rides the ciris-server one-wheel (Python). A version pin
-              # (ciris-persist==X / ciris-verify==X) would resolve against PyPI and
-              # fail "No matching distribution", so build BOTH from the git tags edge
-              # pins in Cargo.toml (the reusable workflow's documented git-source
-              # override) — off the assets we build, not PyPI.
+              # CIRISEdge is git-tag-only and persist stopped PyPI-publishing at
+              # v30.4.0, so build persist from the git tag edge pins in Cargo.toml.
+              #
+              # VERIFY is intentionally NOT pinned here — edge consumes verify THROUGH
+              # persist. persist's own pyproject says it: `pip install ciris-persist`
+              # pulls the whole verify+persist stack (its Requires-Dist includes the
+              # matching `ciris-verify` PyPI package), so a separate override is both
+              # unnecessary AND wrong: the CIRISVerify Python project lives at
+              # `bindings/python`, not the repo root, so a `git+…/CIRISVerify` override
+              # fails "does not appear to be a Python project" (v16.0.1 tag run). The
+              # Rust crate tag (v13.x) is also NOT the Python package version — persist
+              # pins the right `ciris-verify` transitively. ciris-server (a PyPI
+              # package) rounds out the cohabiting set via the harness's base pin.
               'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@v{persist}',
-              'ciris-verify':  f'git+https://github.com/CIRISAI/CIRISVerify.git@v{verify}',
           }
           print(f'json={json.dumps(pins)}')
           PYEOF
