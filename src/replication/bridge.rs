@@ -1136,14 +1136,18 @@ impl FederationDirectoryReplicationBridge {
         // which is NOT in persist's retainable allowlist. Gating on the dimension
         // alone would carve that delegation OUT of the pull the receive axis exists
         // to recover (Codex on #470).
+        //
+        // FAIL-CLOSED on the scores axis: a scores row is carved UNLESS it carries a
+        // dimension that is EXPLICITLY retainable. A scores row with an absent or
+        // non-string `/dimension` (legacy / malformed) is therefore carved, not
+        // served — the earlier `!is_subject_retainable(dim)` form fell OPEN on a
+        // missing dimension, reopening G2 for that input (Codex on #470, round 2).
         att.attestation_type == ciris_persist::federation::types::attestation_type::SCORES
-            && att
+            && !att
                 .attestation_envelope
                 .pointer("/dimension")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|dim| {
-                    !ciris_persist::federation::namespace::is_subject_retainable(dim)
-                })
+                .is_some_and(ciris_persist::federation::namespace::is_subject_retainable)
     }
 
     /// The per-kind apply dispatch behind the #425 choke —
@@ -4589,15 +4593,17 @@ mod tests {
             );
         }
         // Self-authored (allowlisted) scores are kept here (trace:* is separately
-        // E3-gated at fetch); a dimensionless conferral (delegates_to — the
-        // moderation-duty shape) is never a score, so it is kept.
+        // E3-gated at fetch).
         assert!(
             !B::is_non_retainable_score(&att_with_dimension(Some("trace:coherence:v1"))),
             "trace:* is self-emission-mandatory (retainable); kept here, E3-gated at fetch"
         );
+        // FAIL-CLOSED: a SCORES row with NO dimension is carved, not served — a
+        // missing/malformed dimension must never fall open on the data-subject axis
+        // (Codex on #470 round 2). `att_with_dimension` builds attestation_type=scores.
         assert!(
-            !B::is_non_retainable_score(&att_with_dimension(None)),
-            "a dimensionless conferral (delegates_to) carries no score — kept (unforgeable)"
+            B::is_non_retainable_score(&att_with_dimension(None)),
+            "a scores row with no dimension is carved (fail-closed); it is NOT a conferral"
         );
     }
 
@@ -4621,6 +4627,14 @@ mod tests {
         assert!(
             B::is_non_retainable_score(&att_with_dimension(Some(dim))),
             "the same non-retainable dimension on a scores-type row is still carved (fail-closed)"
+        );
+        // A DIMENSIONLESS conferral is kept by TYPE — NOT because it lacks a
+        // dimension (a dimensionless SCORES row is carved, fail-closed).
+        let mut dimensionless_conferral = att_with_dimension(None);
+        dimensionless_conferral.attestation_type = "delegates_to".into();
+        assert!(
+            !B::is_non_retainable_score(&dimensionless_conferral),
+            "a dimensionless conferral is kept by TYPE (the moderation-duty shape)"
         );
     }
 

@@ -311,7 +311,15 @@ async fn build_and_sign_self_route(
         occurrence_key_id: signer.key_id.clone(),
         transport_kind: RETICULUM_TRANSPORT_KIND.to_string(),
         destination,
-        asserted_at: Utc::now(),
+        // #598/v31: this `asserted_at` is BOTH signed into the envelope AND the
+        // supersession-ordering key (persist's self_at_login fold reads it). It must
+        // be microsecond-truncated before signing — postgres TIMESTAMPTZ cannot hold
+        // sub-µs, so a raw ns `Utc::now()` would sign a byte the stored column can't
+        // reproduce, diverging the row after storage (Codex on #470). Memory/sqlite
+        // tolerate ns, so only a postgres node exposes this — hence untested locally.
+        asserted_at: ciris_persist::federation::admission::truncate_to_substrate_resolution(
+            Utc::now(),
+        ),
         last_seen_at: None,
         // `[x25519 ‖ ed25519]` — same split as the #299 write-through.
         transport_ed25519_pubkey_base64: Some(B64.encode(&transport_pubkey[32..64])),
