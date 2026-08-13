@@ -7475,16 +7475,25 @@ mod delegation_gate_tests {
     /// v6.5.0 `self_at_login` shape: scope as JSON array.
     #[allow(clippy::similar_names)] // granter/grantee mirrors persist's column names
     fn delegates_to_row(granter: &str, grantee: &str, scope: &[&str]) -> Attestation {
-        let now = Utc::now();
-        let envelope = serde_json::json!({
+        // v31.0.0 (CIRISPersist#598): µs-truncate the instant so the signed
+        // `asserted_at` and its typed column agree at postgres resolution.
+        let now =
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(Utc::now());
+        let mut envelope = serde_json::json!({
             "kind": "delegates_to",
             "dimension": "self:delegates_to:agent_occurrence:v1",
             "agent_occurrence_key_id": grantee,
             "bilateral_pair_id": format!("pair-{granter}-{grantee}"),
             "scope": scope,
         });
-        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(granter, &envelope);
-        Attestation {
+        // #598: bind the signed `asserted_at` into the envelope BEFORE signing.
+        if let Some(obj) = envelope.as_object_mut() {
+            obj.insert(
+                "asserted_at".to_owned(),
+                serde_json::json!(now.to_rfc3339()),
+            );
+        }
+        let mut att = Attestation {
             attestation_id: format!("att-{granter}-{grantee}"),
             attesting_key_id: granter.into(),
             attested_key_id: grantee.into(),
@@ -7493,9 +7502,9 @@ mod delegation_gate_tests {
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: hash,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: granter.into(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -7506,18 +7515,36 @@ mod delegation_gate_tests {
             cohort_scope: "federation".into(),
             tier: "federation".into(),
             promoted_at: None,
-        }
+        };
+        // #643: stamp the `row` mirror of the typed columns into the envelope
+        // AFTER the struct fields are set, BEFORE we canonicalize/sign.
+        ciris_persist::federation::envelope::RowMirror::stamp_row(&mut att)
+            .expect("stamp v31 row mirror");
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(granter, &att.attestation_envelope);
+        att.original_content_hash = hash;
+        att.scrub_signature_classical = ed_sig;
+        att.scrub_signature_pqc = pqc_sig;
+        att
     }
 
     fn withdraws_row(granter: &str, target: &str) -> Attestation {
-        let now = Utc::now();
-        let envelope = serde_json::json!({
+        // v31.0.0 (CIRISPersist#598): µs-truncate so the signed `asserted_at`
+        // and its typed column agree at postgres resolution.
+        let now =
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(Utc::now());
+        let mut envelope = serde_json::json!({
             "kind": "withdraws",
             "dimension": "withdraws:self:delegates_to:agent_occurrence:v1",
             "target_attestation_id": format!("att-{granter}-{target}"),
         });
-        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(granter, &envelope);
-        Attestation {
+        // #598: bind the signed `asserted_at` into the envelope BEFORE signing.
+        if let Some(obj) = envelope.as_object_mut() {
+            obj.insert(
+                "asserted_at".to_owned(),
+                serde_json::json!(now.to_rfc3339()),
+            );
+        }
+        let mut att = Attestation {
             attestation_id: format!("withdraws-{granter}-{target}"),
             attesting_key_id: granter.into(),
             attested_key_id: target.into(),
@@ -7526,9 +7553,9 @@ mod delegation_gate_tests {
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: hash,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: granter.into(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -7539,7 +7566,16 @@ mod delegation_gate_tests {
             cohort_scope: "federation".into(),
             tier: "federation".into(),
             promoted_at: None,
-        }
+        };
+        // #643: stamp the `row` mirror of the typed columns into the envelope
+        // AFTER the struct fields are set, BEFORE we canonicalize/sign.
+        ciris_persist::federation::envelope::RowMirror::stamp_row(&mut att)
+            .expect("stamp v31 row mirror");
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(granter, &att.attestation_envelope);
+        att.original_content_hash = hash;
+        att.scrub_signature_classical = ed_sig;
+        att.scrub_signature_pqc = pqc_sig;
+        att
     }
 
     async fn seed_keys(backend: &Arc<MemoryBackend>, keys: &[(&str, &str)]) {

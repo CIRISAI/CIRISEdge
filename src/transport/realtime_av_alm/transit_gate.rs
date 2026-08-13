@@ -449,14 +449,24 @@ mod tests {
         // (envelope + Attestation field layout copied from operational.rs
         // test_support; the signature is persist's own sign_envelope).
         let id = "gate-restore-user-edge";
-        let envelope = serde_json::json!({
+        // v31.0.0 (CIRISPersist#598): µs-truncate so the signed `asserted_at`
+        // and its typed column agree at postgres resolution. `now` stays in
+        // function scope — the gate/planner assertions below reuse it.
+        let now =
+            ciris_persist::federation::admission::truncate_to_substrate_resolution(Utc::now());
+        let mut envelope = serde_json::json!({
             "references_attestation_id": id,
             "dimension": TRUST_ACCEPTS_DIMENSION,
             "scope": [INFRA_SERVE_SCOPE],
         });
-        let (och, sc, sp) = sign_envelope_like_persist("gate-user", &envelope);
-        let now = Utc::now();
-        let edge = ciris_persist::federation::Attestation {
+        // #598: bind the signed `asserted_at` into the envelope BEFORE signing.
+        if let Some(obj) = envelope.as_object_mut() {
+            obj.insert(
+                "asserted_at".to_owned(),
+                serde_json::json!(now.to_rfc3339()),
+            );
+        }
+        let mut edge = ciris_persist::federation::Attestation {
             attestation_id: id.to_owned(),
             attesting_key_id: "gate-user".to_owned(),
             attested_key_id: "gate-root".to_owned(),
@@ -466,9 +476,9 @@ mod tests {
             asserted_at: now,
             expires_at: None,
             attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: sc,
-            scrub_signature_pqc: sp,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: "gate-user".to_owned(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -480,6 +490,14 @@ mod tests {
             promoted_at: None,
             additional_scrubs: Vec::new(),
         };
+        // #643: stamp the `row` mirror of the typed columns into the envelope
+        // AFTER the struct fields are set, BEFORE we canonicalize/sign.
+        ciris_persist::federation::envelope::RowMirror::stamp_row(&mut edge)
+            .expect("stamp v31 row mirror");
+        let (och, sc, sp) = sign_envelope_like_persist("gate-user", &edge.attestation_envelope);
+        edge.original_content_hash = och;
+        edge.scrub_signature_classical = sc;
+        edge.scrub_signature_pqc = sp;
         FederationDirectory::put_attestation(
             &*backend,
             ciris_persist::federation::SignedAttestation { attestation: edge },

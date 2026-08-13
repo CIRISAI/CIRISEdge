@@ -936,7 +936,7 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// The Attestation plane sweeps BOTH testimonial axes: `list_attestations_for`
     /// (records ABOUT the subject — the revocation-reachability set, with the G2
-    /// [`Self::is_consent_gated_score`] carve) and `list_attestations_by`
+    /// [`Self::is_non_retainable_score`] carve) and `list_attestations_by`
     /// (records BY the subject — authorship recovery, no carve: mine to recover).
     /// Non-replicated / cohort kinds are not subject-pullable and return empty.
     async fn subject_holdings_inner(
@@ -1017,7 +1017,7 @@ impl FederationDirectoryReplicationBridge {
                     .await
                     .unwrap_or_default()
                 {
-                    if Self::is_consent_gated_score(&att) {
+                    if Self::is_non_retainable_score(&att) {
                         continue;
                     }
                     let seq = Self::ms_seq(att.asserted_at);
@@ -1091,27 +1091,63 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#462 — the G2 self-revocation-hole carve, resolved by CONSUMING
-    /// persist's authoritative CEG taxonomy rather than an edge prefix list: an
-    /// attestation whose dimension is a consent-gated peer-authored SCORE (persist
-    /// [`consent_gated_claim`](ciris_persist::federation::admission::consent_gated_claim)
-    /// — the `capacity:*` reputation family, CC 3.4.5 / AV-79) is NEVER served on
-    /// the data-subject Pull axis. Landing a score ABOUT me onto the node where I
-    /// am the sole writer conflates read-copy with write-authority — the shape
-    /// that produced the G2 hole. The subject's OWN authored scores (the sender
-    /// axis) are unaffected: `consent_gated_claim` classifies by dimension and
-    /// edge consults it ONLY on the data-subject axis.
+    /// persist's authoritative retainability ALLOWLIST (CIRISPersist#635,
+    /// [`is_subject_retainable`](ciris_persist::federation::namespace::is_subject_retainable)):
+    /// a data-subject-axis attestation whose DIMENSION is a score is withheld
+    /// UNLESS persist affirms the subject is necessarily its author (`emit_authority`
+    /// — trace:*, transport:{kind}, the substrate self-reports, …). Landing a score
+    /// ABOUT me onto the node where I am the sole writer is safe only when I am its
+    /// author; otherwise it conflates read-copy with write-authority (the G2 hole).
     ///
-    /// Deliberately persist's decision, not an edge prefix list — the gated set is
-    /// CEG state resolution persist owns (the closed `ConsentGatedFamily` enum
-    /// grows there), so edge tracks new consent-gated score families for free and
-    /// cannot drift. This matches the issue's exact scope (`capacity:*`);
-    /// `moderation:*` / `slashing:*` are role-gated, NOT consent-gated, and are
-    /// community-cohort — they follow the duty, not the individual identity, so
-    /// they do not ride the data-subject axis. CIRISPersist#635 tracks the open
-    /// question of whether the pull carve should ALSO cover the role-gated
-    /// abuse-response families.
-    fn is_consent_gated_score(att: &Attestation) -> bool {
-        ciris_persist::federation::admission::consent_gated_claim(att).is_some()
+    /// This REPLACES the earlier `consent_gated_claim` (capacity-only) carve, which
+    /// UNDER-carved: it withheld only the consent-gated family and let every other
+    /// peer-authored score through. `is_subject_retainable` is an allowlist, so it
+    /// is FAIL-CLOSED — an unknown / new / renamed scored family reads
+    /// non-retainable and is carved, not silently pulled. (Consequence per #635: a
+    /// family edge legitimately needs to pull that is missing from the allowlist
+    /// shrinks the pull SILENTLY; that is a persist ask — tell them to add it, do
+    /// not assume persist knows.)
+    ///
+    /// CONFERRALS ARE RETAINED BY TYPE, not by dimension: a `delegates_to` (the
+    /// moderation-duty shape #462 exists to recover) is signed by the conferring
+    /// authority — the subject cannot forge it, so a retained copy grants no write
+    /// authority. This holds EVEN when the conferral is dimension-bearing: the
+    /// `self_at_login` shape carries `dimension:
+    /// "self:delegates_to:agent_occurrence:v1"` (src/edge.rs), which is NOT in
+    /// persist's retainable allowlist. The subject's OWN authored scores (the sender
+    /// axis) are likewise untouched — a score I authored is mine to recover.
+    ///
+    /// INVARIANT (corrected — Codex on #470): key the carve on the SCORES PLANE, not
+    /// on has-a-dimension. The earlier "scores are dimension-bearing, conferrals are
+    /// dimensionless" reading was FALSE — `self_at_login` is a dimension-bearing
+    /// conferral — and the has-dimension gate would carve that delegation out of the
+    /// very pull the receive axis exists to serve. The reliable discriminator is
+    /// `attestation_type`: every peer-authored claim (reputation / capacity /
+    /// moderation) rides `attestation_type == "scores"` with a distinguishing
+    /// dimension; conferrals ride `delegates_to` / `trust:confers`. So the carve is
+    /// `type == scores AND !is_subject_retainable(dimension)`. The one thing to keep
+    /// true across both repos: persist keeps peer-authored claims on the scores
+    /// plane and conferrals off it.
+    fn is_non_retainable_score(att: &Attestation) -> bool {
+        // Only the SCORES plane is carveable. A conferral (delegates_to /
+        // trust:confers) is authority-signed — unforgeable by the subject — so it is
+        // retained by TYPE regardless of dimension, INCLUDING the dimension-bearing
+        // self_at_login shape (`self:delegates_to:agent_occurrence:v1`, src/edge.rs),
+        // which is NOT in persist's retainable allowlist. Gating on the dimension
+        // alone would carve that delegation OUT of the pull the receive axis exists
+        // to recover (Codex on #470).
+        //
+        // FAIL-CLOSED on the scores axis: a scores row is carved UNLESS it carries a
+        // dimension that is EXPLICITLY retainable. A scores row with an absent or
+        // non-string `/dimension` (legacy / malformed) is therefore carved, not
+        // served — the earlier `!is_subject_retainable(dim)` form fell OPEN on a
+        // missing dimension, reopening G2 for that input (Codex on #470, round 2).
+        att.attestation_type == ciris_persist::federation::types::attestation_type::SCORES
+            && !att
+                .attestation_envelope
+                .pointer("/dimension")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(ciris_persist::federation::namespace::is_subject_retainable)
     }
 
     /// The per-kind apply dispatch behind the #425 choke —
@@ -2776,6 +2812,7 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
+    use chrono::SubsecRound as _;
     use chrono::Utc;
     use ciris_crypto::{ClassicalSigner as _, Ed25519Signer, MlDsa65Signer, PqcSigner as _};
     use ciris_persist::federation::types::{
@@ -3046,17 +3083,28 @@ mod tests {
         // AV-62 anti-Goodhart gate forbids a SELF-attested `capacity:*` row (you
         // can't rate your own reputation), which the old `capacity:example:v1`
         // fixture tripped — but self-attesting one's own identity is legitimate.
-        let now = Utc::now();
-        let envelope = serde_json::json!({
+        let now = Utc::now().trunc_subsecs(6);
+        let attestation_id = uuid::Uuid::new_v4().to_string();
+        let mut envelope = serde_json::json!({
             "attesting_key_id": other_producer,
             "attested_key_id": other_producer,
             "attestation_type": "scores",
             "dimension": "identity:example:v1",
             "cohort_scope": "self",
         });
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            &attestation_id,
+            other_producer,
+            "scores",
+            other_producer,
+            &[other_producer],
+            "self",
+        );
         let (hash_hex, ed_sig, pqc_sig) = sign_attestation_envelope(other_producer, &envelope);
         let att = Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attestation_id,
             attesting_key_id: other_producer.to_string(),
             attested_key_id: other_producer.to_string(),
             attestation_type: "scores".to_string(),
@@ -3348,31 +3396,31 @@ mod tests {
             sink.lock().expect("observer sink").push(k.to_string());
         })));
 
-        let now = Utc::now();
-        let envelope = serde_json::json!({
-            "revocation_id": "rev-1",
-            "revoked_key_id": target,
-            "revoking_key_id": revoker,
-        });
-        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(revoker, &envelope);
-        let rev = ciris_persist::federation::types::Revocation {
+        let now = Utc::now().trunc_subsecs(6);
+        let mut rev = ciris_persist::federation::types::Revocation {
             revocation_id: "rev-1".to_string(),
             revoked_key_id: target.to_string(),
             revoking_key_id: revoker.to_string(),
             reason: None,
             revoked_at: now,
             effective_at: now,
-            revocation_envelope: envelope,
-            original_content_hash: hash,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            revocation_envelope: serde_json::json!({}),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: revoker.to_string(),
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            observed_region: String::new(),
+            observed_region: "us".to_string(),
             revoked_after: None,
         };
+        ciris_persist::federation::admission::bind_revocation_into_envelope(&mut rev)
+            .expect("bind revocation envelope");
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(revoker, &rev.revocation_envelope);
+        rev.original_content_hash = hash;
+        rev.scrub_signature_classical = ed_sig;
+        rev.scrub_signature_pqc = pqc_sig;
         let bytes =
             serde_json::to_vec(&SignedRevocation { revocation: rev }).expect("serialize rev");
         let outcome = bridge
@@ -4092,15 +4140,26 @@ mod tests {
         // Build a federation-tier attestation with real hybrid sigs
         // (v6.3.2 / CIRISEdge#166 — passes persist v9.0.0's
         // verify_federation_tier_ingest).
-        let now = Utc::now();
-        let envelope = serde_json::json!({
+        let now = Utc::now().trunc_subsecs(6);
+        let attestation_id = uuid::Uuid::new_v4().to_string();
+        let mut envelope = serde_json::json!({
             "attesting_key_id": attesting_id,
             "attested_key_id": attested_id,
             "attestation_type": "delegates_to",
         });
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            &attestation_id,
+            attesting_id,
+            "delegates_to",
+            attested_id,
+            &[],
+            "federation",
+        );
         let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attesting_id, &envelope);
         let att = Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attestation_id,
             attesting_key_id: attesting_id.to_string(),
             attested_key_id: attested_id.to_string(),
             attestation_type: "delegates_to".to_string(),
@@ -4164,17 +4223,28 @@ mod tests {
 
         // A federation-tier (tier="federation") Attestation via put_attestation
         // (indexes under "Attestation"; cohort_scope="federation" → advertised).
-        let now = Utc::now();
-        let envelope = serde_json::json!({
+        let now = Utc::now().trunc_subsecs(6);
+        let attestation_id = uuid::Uuid::new_v4().to_string();
+        let mut envelope = serde_json::json!({
             "attesting_key_id": attester,
             "attested_key_id": key_id,
             "attestation_type": "delegates_to",
         });
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            &attestation_id,
+            attester,
+            "delegates_to",
+            key_id,
+            &[],
+            "federation",
+        );
         let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attester, &envelope);
         backend
             .put_attestation(SignedAttestation {
                 attestation: Attestation {
-                    attestation_id: uuid::Uuid::new_v4().to_string(),
+                    attestation_id,
                     attesting_key_id: attester.to_string(),
                     attested_key_id: key_id.to_string(),
                     attestation_type: "delegates_to".to_string(),
@@ -4372,6 +4442,42 @@ mod tests {
     /// membership-free scopes MemoryBackend's write gate admits without
     /// family/community rows (`family`/`community` require seeded
     /// membership).
+    /// CIRISPersist#598 + #643 (v31.0.0) — stamp the SIGNED bindings an attestation
+    /// envelope must now carry before signing, so the scrub signature covers them:
+    /// the `asserted_at` instant (the fold orders on it) and the `row` mirror of the
+    /// typed columns (else a relay rewrites attestation_id/attester/type/subject/
+    /// cohort while the signature still verifies — the subject-blindness class).
+    /// `subject_key_ids` omitted ⇔ the column is empty; `weight` omitted ⇔ NULL.
+    /// The single sink every attestation fixture routes through.
+    #[allow(clippy::too_many_arguments)] // mirrors the attestation's typed-column set
+    fn bind_attestation_envelope(
+        envelope: &mut serde_json::Value,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        attestation_id: &str,
+        attesting_key_id: &str,
+        attestation_type: &str,
+        attested_key_id: &str,
+        subject_key_ids: &[&str],
+        cohort_scope: &str,
+    ) {
+        let Some(obj) = envelope.as_object_mut() else {
+            return;
+        };
+        obj.entry("asserted_at")
+            .or_insert_with(|| serde_json::json!(asserted_at.to_rfc3339()));
+        let mut row = serde_json::json!({
+            "attestation_id": attestation_id,
+            "attesting_key_id": attesting_key_id,
+            "attestation_type": attestation_type,
+            "attested_key_id": attested_key_id,
+            "cohort_scope": cohort_scope,
+        });
+        if !subject_key_ids.is_empty() {
+            row["subject_key_ids"] = serde_json::json!(subject_key_ids);
+        }
+        obj.entry("row").or_insert(row);
+    }
+
     async fn seed_scoped_attestation(
         backend: &MemoryBackend,
         id: &str,
@@ -4379,9 +4485,27 @@ mod tests {
         subject: &str,
         attestation_type: &str,
         cohort_scope: &str,
-        envelope: serde_json::Value,
+        mut envelope: serde_json::Value,
     ) {
-        let now = Utc::now();
+        // CIRISPersist#598 (v31.0.0): truncate to MICROSECONDS — postgres TIMESTAMPTZ
+        // can't store sub-µs, so a producer that mints ns precision makes an op
+        // sequence a strict order on sqlite/memory but a TIE on postgres. The fold
+        // refuses ns rows outright.
+        let now = Utc::now().trunc_subsecs(6);
+        // #598: the fold orders on the `asserted_at` COLUMN, so that instant must be
+        // SIGNED — stamp it into the envelope (matching the column) before signing,
+        // or the row is REFUSED as an unbound replay. RFC3339, the shape persist's
+        // own fixtures bind.
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            id,
+            attester,
+            attestation_type,
+            subject,
+            &[subject],
+            cohort_scope,
+        );
         let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attester, &envelope);
         let att = Attestation {
             attestation_id: id.to_string(),
@@ -4445,37 +4569,72 @@ mod tests {
         }
     }
 
-    /// CIRISEdge#462 — the G2 carve is persist's authoritative consent-gated-score
-    /// classification (`consent_gated_claim`), NOT an edge prefix list. That is
-    /// EXACTLY the `capacity:*` reputation family (CC 3.4.5): the peer-authored
-    /// score whose landing on the subject's own node is the self-revocation hole.
-    /// `moderation:*` / `slashing:*` are role-gated (not consent-gated) and
-    /// community-cohort — persist deliberately does not gate them, and they follow
-    /// the duty not the identity, so they are NOT carved here; relationship/charter
-    /// testimony and trace:* (E3-gated at fetch) are kept.
+    /// CIRISEdge#462 — the G2 carve is persist's authoritative retainability
+    /// ALLOWLIST (`is_subject_retainable`, CIRISPersist#635), keyed on authorship.
+    /// A scored dimension is carved UNLESS persist affirms the subject is its
+    /// author. This is FAIL-CLOSED: unlike the earlier capacity-only carve, ANY
+    /// peer-authored score — capacity, capacity_assurance, moderation, or an
+    /// unknown/new family — is withheld. Self-authored scores (trace:*) and
+    /// dimensionless conferrals (delegates_to) are kept.
     #[test]
-    fn g2_carve_is_persist_consent_gated_score_taxonomy() {
+    fn g2_carve_is_persist_retainability_allowlist() {
         use FederationDirectoryReplicationBridge as B;
-        assert!(
-            B::is_consent_gated_score(&att_with_dimension(Some("capacity:core_identity:v1"))),
-            "capacity:* is the consent-gated reputation family — carved (G2)"
-        );
-        // Consuming persist's taxonomy: these are NOT consent-gated scores, so the
-        // pull does not carve them (persist owns this call — edge cannot drift).
-        for kept in [
-            "capacity_assurance:composite:v1", // not the `capacity:` prefix
-            "moderation:removal:v1",           // role-gated, community-cohort
-            "trace:coherence:v1",              // E3-gated at fetch, not here
+        // Peer-authored scores about the subject — ALL carved (fail-closed
+        // allowlist), including families the old capacity-only carve missed.
+        for carved in [
+            "capacity:core_identity:v1",       // the canonical G2 reputation score
+            "capacity_assurance:composite:v1", // the old carve LET THIS THROUGH
+            "moderation:removal:v1",           // ditto — now correctly carved
+            "some_future:score:v9",            // unknown family → fail-closed → carved
         ] {
             assert!(
-                !B::is_consent_gated_score(&att_with_dimension(Some(kept))),
-                "{kept} is not a consent-gated score — persist does not gate it, so the pull \
-                 does not carve it (role-gated/other families are handled elsewhere)"
+                B::is_non_retainable_score(&att_with_dimension(Some(carved))),
+                "{carved} is not in persist's retainable allowlist — carved (G2, fail-closed)"
             );
         }
+        // Self-authored (allowlisted) scores are kept here (trace:* is separately
+        // E3-gated at fetch).
         assert!(
-            !B::is_consent_gated_score(&att_with_dimension(None)),
-            "a charter/relationship attestation (no dimension) is testimony — kept"
+            !B::is_non_retainable_score(&att_with_dimension(Some("trace:coherence:v1"))),
+            "trace:* is self-emission-mandatory (retainable); kept here, E3-gated at fetch"
+        );
+        // FAIL-CLOSED: a SCORES row with NO dimension is carved, not served — a
+        // missing/malformed dimension must never fall open on the data-subject axis
+        // (Codex on #470 round 2). `att_with_dimension` builds attestation_type=scores.
+        assert!(
+            B::is_non_retainable_score(&att_with_dimension(None)),
+            "a scores row with no dimension is carved (fail-closed); it is NOT a conferral"
+        );
+    }
+
+    /// Codex on #470 — the carve keys on the SCORES PLANE, not on has-a-dimension.
+    /// `self_at_login` proves conferrals CAN be dimension-bearing
+    /// (`self:delegates_to:agent_occurrence:v1`, src/edge.rs), and that dimension is
+    /// NOT in persist's retainable allowlist — so a has-dimension gate would carve
+    /// the delegation OUT of the very pull the receive axis exists to recover. The
+    /// control proves the discriminator is `attestation_type`, not the dimension.
+    #[test]
+    fn g2_carve_keeps_dimension_bearing_conferrals() {
+        use FederationDirectoryReplicationBridge as B;
+        let dim = "self:delegates_to:agent_occurrence:v1";
+        let mut conferral = att_with_dimension(Some(dim));
+        conferral.attestation_type = "delegates_to".into();
+        assert!(
+            !B::is_non_retainable_score(&conferral),
+            "a dimension-bearing delegates_to conferral is retained by TYPE, never carved"
+        );
+        // Control: the SAME non-retainable dimension on a SCORES-type row IS carved.
+        assert!(
+            B::is_non_retainable_score(&att_with_dimension(Some(dim))),
+            "the same non-retainable dimension on a scores-type row is still carved (fail-closed)"
+        );
+        // A DIMENSIONLESS conferral is kept by TYPE — NOT because it lacks a
+        // dimension (a dimensionless SCORES row is carved, fail-closed).
+        let mut dimensionless_conferral = att_with_dimension(None);
+        dimensionless_conferral.attestation_type = "delegates_to".into();
+        assert!(
+            !B::is_non_retainable_score(&dimensionless_conferral),
+            "a dimensionless conferral is kept by TYPE (the moderation-duty shape)"
         );
     }
 
@@ -4759,6 +4918,182 @@ mod tests {
         );
     }
 
+    /// CIRISPersist#659 (v31.0.0) — SPOOFING PROOF (the Revocation plane).
+    ///
+    /// A signed revocation now binds `revoked_key_id` (and its sibling typed
+    /// columns) INTO the signed envelope. Pre-v31 that column was UNSIGNED, so a
+    /// single genuine revocation could be re-pointed at ANY key: a relay repaints
+    /// the column, the scrub signature still verifies over the (now-mismatched)
+    /// envelope, and the row de-admits whatever the column names — one signature,
+    /// unbounded reach (the subject-blindness class: possession of a signed blob
+    /// conferred authority over a key the signer never named). This exercises the
+    /// binding gate directly — `check_revocation_envelope_binding`, which EVERY
+    /// store's admit path (memory / sqlite / postgres / tier_ingest) runs — proving
+    /// the honestly bound row passes while the paste is refused, and isolating the
+    /// subject-binding fix from the ORTHOGONAL slash-authority gate (a third-party
+    /// `put_revocation` also requires the revoker hold `slash` from a trusted root:
+    /// defense in depth, but not what #659 closes). Authority is bound to the
+    /// SIGNATURE, never to custody of the row.
+    #[test]
+    fn v31_revocation_paste_cannot_deadmit_an_unintended_key() {
+        // Build a well-formed, signed revocation of `revoked`, tagged `id`.
+        let build = |id: &str, revoked: &str| {
+            let now = Utc::now().trunc_subsecs(6);
+            let mut rev = Revocation {
+                revocation_id: id.to_string(),
+                revoked_key_id: revoked.to_string(),
+                revoking_key_id: "revoker".to_string(),
+                reason: None,
+                revoked_at: now,
+                effective_at: now,
+                revocation_envelope: serde_json::json!({}),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: "revoker".to_string(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                observed_region: "us".to_string(),
+                persist_row_hash: String::new(),
+                revoked_after: None,
+            };
+            // persist's OWN binder stamps the typed columns into the envelope, so
+            // the member set can never drift from the verifier.
+            ciris_persist::federation::admission::bind_revocation_into_envelope(&mut rev)
+                .expect("bind revocation envelope");
+            let (hash, ed_sig, pqc_sig) =
+                sign_attestation_envelope("revoker", &rev.revocation_envelope);
+            rev.original_content_hash = hash;
+            rev.scrub_signature_classical = ed_sig;
+            rev.scrub_signature_pqc = pqc_sig;
+            rev
+        };
+
+        // CONTROL: the honestly-bound revocation PASSES the binding gate. Every
+        // store's admit path (memory / sqlite / postgres / tier_ingest) runs
+        // exactly this check, so it is the real gate, not a stand-in.
+        let honest = build("rev-honest", "victim-A");
+        ciris_persist::federation::admission::check_revocation_envelope_binding(&honest)
+            .expect("an honestly-bound revocation satisfies the column-to-envelope binding");
+
+        // ATTACK: sign a revocation of victim-A, then repaint the target column to
+        // victim-B. The signed envelope still pins victim-A.
+        let mut pasted = build("rev-spoof", "victim-A");
+        pasted.revoked_key_id = "victim-B".to_string();
+
+        let err = ciris_persist::federation::admission::check_revocation_envelope_binding(&pasted)
+            .expect_err(
+                "a revocation signed to de-admit victim-A must NOT de-admit victim-B once its \
+                 column is repainted — pre-v31 the unsigned column pasted onto ANY key (#659)",
+            );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("RevocationEnvelopeUnbound") || msg.contains("revoked_key_id"),
+            "refused for the RIGHT reason (revoked_key_id column ≠ signed envelope), got: {msg}"
+        );
+    }
+
+    /// CIRISPersist#643 (v31.0.0) — SPOOFING PROOF (the Attestation/conferral plane).
+    ///
+    /// A `delegates_to` conferral now binds `attested_key_id` + `subject_key_ids`
+    /// into the signed `row` mirror. Pre-v31 those columns were UNSIGNED, so a
+    /// single genuine conferral (say `infra:serve` granted to grantee-A) could be
+    /// lifted onto ANY key — repaint the target column and the authority the signer
+    /// never granted rides the same signature. persist's own doc flags
+    /// `subject_key_ids` as the column that "grants revocation authority", so
+    /// lifting it is the highest-value forgery; this proves v31 refuses the lift
+    /// while the honest conferral admits.
+    #[tokio::test]
+    async fn v31_conferral_paste_cannot_lift_authority_onto_another_key() {
+        let (backend, _bridge) = make_bridge(&[]);
+        for kid in ["root", "grantee-A", "grantee-B"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, "user"),
+                })
+                .await
+                .expect("register key");
+        }
+
+        // Build a signed delegates_to(root → attested, scope infra:serve).
+        let build = |id: &str, attested: &str| {
+            let now = Utc::now().trunc_subsecs(6);
+            let mut envelope = serde_json::json!({
+                "id": id,
+                "attesting_key_id": "root",
+                "attested_key_id": attested,
+                "attestation_type": "delegates_to",
+                "scope": ["infra:serve"],
+            });
+            bind_attestation_envelope(
+                &mut envelope,
+                now,
+                id,
+                "root",
+                "delegates_to",
+                attested,
+                &[attested],
+                "federation",
+            );
+            let (hash, ed_sig, pqc_sig) = sign_attestation_envelope("root", &envelope);
+            Attestation {
+                attestation_id: id.to_string(),
+                attesting_key_id: "root".to_string(),
+                attested_key_id: attested.to_string(),
+                attestation_type: "delegates_to".to_string(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: hash,
+                scrub_signature_classical: ed_sig,
+                scrub_signature_pqc: pqc_sig,
+                scrub_key_id: "root".to_string(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: vec![attested.to_string()],
+                withdraws_admission_rule: None,
+                additional_scrubs: Vec::new(),
+                cohort_scope: "federation".to_string(),
+                tier: "federation".to_string(),
+                promoted_at: None,
+            }
+        };
+
+        // CONTROL: the honest conferral onto grantee-A ADMITS.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: build("att-honest", "grantee-A"),
+            })
+            .await
+            .expect("an honestly-bound conferral admits");
+
+        // ATTACK: sign a conferral onto grantee-A, then repaint BOTH target columns
+        // to grantee-B. The signed `row` mirror still pins grantee-A.
+        let mut pasted = build("att-spoof", "grantee-A");
+        pasted.attested_key_id = "grantee-B".to_string();
+        pasted.subject_key_ids = vec!["grantee-B".to_string()];
+
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: pasted,
+            })
+            .await
+            .expect_err(
+                "a delegates_to signed to grant grantee-A must NOT grant grantee-B once its \
+                 target columns are repainted — pre-v31 the unsigned columns lifted authority \
+                 onto ANY key (#643)",
+            );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("subject_key_ids")
+                || msg.contains("attested_key_id")
+                || msg.contains("InvalidArgument"),
+            "refused for the RIGHT reason (signed row mirror ≠ typed columns), got: {msg}"
+        );
+    }
+
     /// CIRISEdge#462 — the load-bearing hash-match invariant: every ref
     /// `subject_holdings` emits resolves through the SAME content-hash fetch path
     /// a `Deliver` uses (`fetch_envelope_bytes` → persist's `signed_wire_index`).
@@ -4861,32 +5196,37 @@ mod tests {
     /// be registered keys). persist computes `persist_row_hash` on put — the
     /// value the Revocation plane advertises + the cache-free fetch scan matches.
     async fn seed_revocation(backend: &MemoryBackend, revoking: &str, revoked: &str) {
-        let now = Utc::now();
+        let now = Utc::now().trunc_subsecs(6); // #598 microsecond floor
         let id = uuid::Uuid::new_v4().to_string();
-        let envelope = serde_json::json!({
-            "revocation_id": id,
-            "revoked_key_id": revoked,
-            "revoking_key_id": revoking,
-        });
-        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(revoking, &envelope);
-        let revocation = Revocation {
+        let mut revocation = Revocation {
             revocation_id: id,
             revoked_key_id: revoked.to_string(),
             revoking_key_id: revoking.to_string(),
             reason: None,
             revoked_at: now,
             effective_at: now,
-            revocation_envelope: envelope,
-            original_content_hash: hash,
-            scrub_signature_classical: ed_sig,
-            scrub_signature_pqc: pqc_sig,
+            revocation_envelope: serde_json::json!({}),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
             scrub_key_id: revoking.to_string(),
             scrub_timestamp: now,
             pqc_completed_at: None,
-            observed_region: String::new(),
+            observed_region: "us".to_string(), // #598-era: must be {us,eu,apac}, not empty
             persist_row_hash: String::new(),
             revoked_after: None,
         };
+        // CIRISPersist#659 (v31.0.0): bind the typed columns (revoked_key_id, reason,
+        // revoked_at, …) into the signed envelope — else a relay could paste one
+        // signed revocation onto ANY key. Use persist's OWN binder so the member set
+        // never drifts, then sign the now-bound envelope.
+        ciris_persist::federation::admission::bind_revocation_into_envelope(&mut revocation)
+            .expect("bind revocation envelope");
+        let (hash, ed_sig, pqc_sig) =
+            sign_attestation_envelope(revoking, &revocation.revocation_envelope);
+        revocation.original_content_hash = hash;
+        revocation.scrub_signature_classical = ed_sig;
+        revocation.scrub_signature_pqc = pqc_sig;
         backend
             .put_revocation(SignedRevocation { revocation })
             .await
@@ -5344,7 +5684,7 @@ mod tests {
 
         // A trace scores-attestation (self-subject, federation tier =
         // promoted) + a NON-trace attestation for the control.
-        let now = Utc::now();
+        let now = Utc::now().trunc_subsecs(6);
         for (attestation_type, dimension) in [
             ("scores", Some("trace:complete:v1")),
             ("delegates_to", None),
@@ -5363,9 +5703,20 @@ mod tests {
                 envelope["agent_id_hash"] = serde_json::json!("ah-fixture-1");
                 envelope["trace"] = serde_json::json!({ "steps": [] });
             }
+            let attestation_id = uuid::Uuid::new_v4().to_string();
+            bind_attestation_envelope(
+                &mut envelope,
+                now,
+                &attestation_id,
+                producer,
+                attestation_type,
+                producer,
+                &[producer],
+                "federation",
+            );
             let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(producer, &envelope);
             let att = Attestation {
-                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attestation_id,
                 attesting_key_id: producer.to_string(),
                 attested_key_id: producer.to_string(),
                 attestation_type: attestation_type.to_string(),
@@ -5457,6 +5808,11 @@ mod tests {
         use ciris_persist::federation::accord_test_support::{
             register_accord_holder, signed_canonical_record_with_roles, Identity,
         };
+        // CIRISPersist v31.0.0 (#467): the helper now stamps the SUBJECT BINDING
+        // (pubkeys) into the envelope before signing, so a signature can no longer
+        // be lifted onto a different key_id. This fixture doesn't spoof, so the
+        // placeholder subject + no-PQC is the byte-preserving update.
+        use ciris_persist::federation::operational::test_support::PLACEHOLDER_SUBJECT_ED25519_BASE64;
         // The roster key_ids `has_accord_conferred_role` resolves against. Persist's
         // own `accord_holder_roster_key_ids` is private, but it is derived from
         // this public genesis accessor — so we mint identities under exactly
@@ -5532,6 +5888,8 @@ mod tests {
             let rec = signed_canonical_record_with_roles(
                 peer,
                 identity_type::NODE,
+                PLACEHOLDER_SUBJECT_ED25519_BASE64,
+                None,
                 vec![FederationDirectoryReplicationBridge::SERVE_CAPABILITY.to_string()],
                 serde_json::json!({ "key_id": peer }),
                 &scrubbers,
