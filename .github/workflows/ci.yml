@@ -2184,14 +2184,28 @@ jobs:
                   raise SystemExit(f'no tag found for {crate} in Cargo.toml')
               return m.group(1)
           persist = find_tag('ciris-persist')
+          # ciris-verify-core / ciris-keyring / ciris-crypto all ship from the
+          # CIRISVerify monorepo under ONE tag. Assert that parity before pinning
+          # the Python `ciris-verify` package to it (Codex #471) — else cohab could
+          # test a `ciris-verify` wheel from a different repo revision than the
+          # keyring/crypto crates actually linked into edge, and pass on a shape that
+          # was never built.
           verify  = find_tag('ciris-verify-core')
+          keyring = find_tag('ciris-keyring')
+          crypto  = find_tag('ciris-crypto')
+          assert verify == keyring == crypto, (
+              f'CIRISVerify crates disagree on tag (verify-core {verify}, keyring '
+              f'{keyring}, crypto {crypto}) — they share one monorepo tag by design'
+          )
           pins = {
-              # CIRISEdge: neither persist (stopped at v30.4.0) nor verify publishes
-              # to PyPI — everyone consumes them via git tag now. A version pin
-              # (ciris-persist==X / ciris-verify==X) resolves against PyPI and fails
-              # "No matching distribution". Build BOTH from the git tags edge pins in
-              # Cargo.toml (the reusable workflow's documented git-source override) —
-              # off the assets we build, not PyPI.
+              # CIRISEdge is git-tag-only, and so are its substrate siblings: NEITHER
+              # persist (stopped at v30.4.0) NOR verify publishes to PyPI, and NO ONE
+              # consumes them off PyPI — every consumer pins the Cargo git tag (Rust)
+              # or rides the ciris-server one-wheel (Python). A version pin
+              # (ciris-persist==X / ciris-verify==X) would resolve against PyPI and
+              # fail "No matching distribution", so build BOTH from the git tags edge
+              # pins in Cargo.toml (the reusable workflow's documented git-source
+              # override) — off the assets we build, not PyPI.
               'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@v{persist}',
               'ciris-verify':  f'git+https://github.com/CIRISAI/CIRISVerify.git@v{verify}',
           }
@@ -2357,6 +2371,39 @@ jobs:
             echo "::warning::XCFramework download attempt $attempt failed; retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
+      - name: download desktop abi3 wheels for durable Release attach (with retry)
+        # CIRISEdge#471 — publish-pypi was the desktop wheels' ONLY durable home;
+        # with it removed, attach them to the GitHub Release so build-manifest's
+        # registered (hybrid-signed) hashes stay obtainable. NOT PyPI — no one
+        # consumes these off PyPI; the Release is the durable, hash-matching source.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern 'ciris_edge-wheel-*' \
+                --dir dist/wheels; then
+              echo "✓ desktop wheels download succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" = "5" ]; then
+              echo "::error::desktop wheels download failed 5 times"
+              exit 1
+            fi
+            echo "::warning::desktop wheels download attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          # gh run download nests each artifact in its own dir; flatten beside the
+          # tarballs so SHA256SUMS + the upload pick them up.
+          find dist/wheels -name '*.whl' -exec mv {} dist/ \;
+          echo "=== desktop wheels ==="
+          ls -la dist/*.whl
+          COUNT=$(ls dist/*.whl 2>/dev/null | wc -l)
+          if [ "$COUNT" -lt 3 ]; then
+            echo "::error::expected >=3 desktop abi3 wheels (linux x86_64 + aarch64, darwin arm64), got $COUNT"
+            exit 1
+          fi
       # v0.13.0 (CIRISEdge#36 GO) — bundle the UniFFI-generated Kotlin
       # and Swift bindings as release tarballs. Mobile / native
       # consumers (CIRISAgent KMP UI, future iOS shell) consume them
@@ -2395,7 +2442,9 @@ jobs:
       - name: generate SHA256SUMS
         run: |
           cd dist
-          sha256sum ciris-edge-v*.tar.gz > SHA256SUMS
+          # Include the desktop abi3 wheels so their hashes travel with the Release
+          # (they match build-manifest's registered hashes — CIRISEdge#471).
+          sha256sum ciris-edge-v*.tar.gz *.whl > SHA256SUMS
           cat SHA256SUMS
       - name: create GitHub Release + upload assets
         env:
@@ -2432,6 +2481,7 @@ jobs:
             "dist/ciris-edge-v${VERSION}-xcframework.tar.gz" \
             "dist/ciris-edge-v${VERSION}-kotlin-bindings.tar.gz" \
             "dist/ciris-edge-v${VERSION}-swift-bindings.tar.gz" \
+            dist/*.whl \
             "dist/SHA256SUMS"
 
           # Promote draft → published. Idempotent on already-published
