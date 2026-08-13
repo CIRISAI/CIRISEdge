@@ -343,16 +343,64 @@ mod tests {
             .expect("seed key record");
     }
 
+    /// #598 (v31.0.0) + #643: bind the `asserted_at` instant the fold orders on
+    /// (RFC3339, MICROSECOND precision — ns is REFUSED) and the `row` mirror of
+    /// the typed columns INTO the envelope BEFORE signing, else the row is
+    /// refused as an unbound replay. Duplicated verbatim from `bridge.rs`'s test
+    /// module (cfg(test) items cannot cross module boundaries).
+    #[allow(clippy::too_many_arguments)] // mirrors the attestation's typed-column set
+    fn bind_attestation_envelope(
+        envelope: &mut serde_json::Value,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+        attestation_id: &str,
+        attesting_key_id: &str,
+        attestation_type: &str,
+        attested_key_id: &str,
+        subject_key_ids: &[&str],
+        cohort_scope: &str,
+    ) {
+        let Some(obj) = envelope.as_object_mut() else {
+            return;
+        };
+        obj.entry("asserted_at")
+            .or_insert_with(|| serde_json::json!(asserted_at.to_rfc3339()));
+        let mut row = serde_json::json!({
+            "attestation_id": attestation_id,
+            "attesting_key_id": attesting_key_id,
+            "attestation_type": attestation_type,
+            "attested_key_id": attested_key_id,
+            "cohort_scope": cohort_scope,
+        });
+        if !subject_key_ids.is_empty() {
+            row["subject_key_ids"] = serde_json::json!(subject_key_ids);
+        }
+        obj.entry("row").or_insert(row);
+    }
+
     fn attestation(
         attester: &str,
         subject: &str,
         attestation_type: &str,
-        envelope: serde_json::Value,
+        mut envelope: serde_json::Value,
     ) -> Attestation {
-        let now = Utc::now();
+        use chrono::SubsecRound as _;
+        // #598: the fold orders on the `asserted_at` COLUMN, so bind that instant
+        // (µs-truncated) + the #643 `row` mirror into the envelope before signing.
+        let now = Utc::now().trunc_subsecs(6);
+        let attestation_id = uuid::Uuid::new_v4().to_string();
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            &attestation_id,
+            attester,
+            attestation_type,
+            subject,
+            &[subject],
+            "federation",
+        );
         let (hash, ed_sig, pqc_sig) = sign_envelope(attester, &envelope);
         Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attestation_id,
             attesting_key_id: attester.to_string(),
             attested_key_id: subject.to_string(),
             attestation_type: attestation_type.to_string(),

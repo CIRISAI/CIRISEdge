@@ -25,7 +25,9 @@ use sha2::{Digest, Sha256};
 
 use ciris_crypto::{ClassicalSigner, Ed25519Signer, HybridSigner, MlDsa65Signer, PqcSigner};
 use ciris_edge::verify::{RootingDirectory, RootingVerdict};
-use ciris_persist::federation::genesis::test_anchor_genesis_records;
+use ciris_persist::federation::genesis::{
+    test_anchor_genesis_records, test_anchor_registration_envelope,
+};
 use ciris_persist::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
 use ciris_persist::prelude::FederationDirectorySqlite;
 use ciris_persist::verify::canonical::ceg_produce_canonicalize;
@@ -52,7 +54,17 @@ async fn test_anchor_peer_roots_through_edge_root_binding() {
 
     // ── 2. The root's VERIFIABLE self-scrub over test-accord-holder-0's own
     //       CANONICAL envelope (CIRISPersist#451 CIRIS_TEST_TRUST_ROOT_SCRUB*). ─
-    let holder_env = serde_json::json!({ "key_id": "test-accord-holder-0", "test_anchor": true });
+    // v31.0.0 (CIRISVerify 13.1.0): the test-anchor preimage moved — the holder's
+    // signed registration envelope now binds `identity_type` (accord_holder) and
+    // both pubkeys for the provenance-link subject binding. Build it via persist's
+    // exported pinned helper (not a hand-rolled literal) so the scrub covers the
+    // EXACT bytes genesis stores as the holder's registration_envelope; the holder
+    // IS the SW root, so its pubkeys are the root's.
+    let holder_env = test_anchor_registration_envelope(
+        "test-accord-holder-0",
+        &B64.encode(&root_ed_pub),
+        Some(&B64.encode(&root_pqc_pub)),
+    );
     let holder_canonical = canonical_bytes(&holder_env);
     let holder_scrub = root_signer
         .sign(&holder_canonical)
@@ -90,7 +102,18 @@ async fn test_anchor_peer_roots_through_edge_root_binding() {
     let peer_pqc = MlDsa65Signer::from_seed(&[0x0b; 32]).expect("peer ml-dsa");
     let peer_ed_pub = peer_ed.public_key().expect("peer ed pub");
     let peer_pqc_pub = PqcSigner::public_key(&peer_pqc).expect("peer pqc pub");
-    let peer_env = serde_json::json!({ "key_id": "edge-key-peer" });
+    // v31.0.0: the provenance link's subject binding now REFUSES a registration
+    // whose SIGNED bytes omit any of `identity_type`/`pubkey_ed25519_base64`/
+    // `pubkey_ml_dsa_65_base64` (an absent binding is skippable-by-omission: a
+    // relay could rewrite the identity/keys while the scrub still verifies).
+    // Bind the full subject set into the envelope the scrub covers so it matches
+    // the columns below.
+    let peer_env = serde_json::json!({
+        "key_id": "edge-key-peer",
+        "identity_type": "agent",
+        "pubkey_ed25519_base64": B64.encode(&peer_ed_pub),
+        "pubkey_ml_dsa_65_base64": B64.encode(&peer_pqc_pub),
+    });
     let peer_canonical = canonical_bytes(&peer_env);
     let peer_scrub = root_signer
         .sign(&peer_canonical)
