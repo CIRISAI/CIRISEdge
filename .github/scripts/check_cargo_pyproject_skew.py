@@ -43,11 +43,15 @@ def cargo_pinned_tag(crate: str, text: str) -> str:
     line. Edge pins persist twice (main deps + dev-deps) but on the same
     tag — taking the first is fine.
     """
-    pattern = rf'^\s*{re.escape(crate)}\s*=\s*\{{[^}}]*tag\s*=\s*"v(\d+\.\d+\.\d+)"'
+    # Accept a release tag `vX.Y.Z` AND a pre-release/build tag `vX.Y.Z-rc.N`
+    # (RC staging adopts, e.g. `v31.2.0-rc.1`) — the suffix is captured so the
+    # PEP 440 comparison below sees the real pre-release version.
+    pattern = rf'^\s*{re.escape(crate)}\s*=\s*\{{[^}}]*tag\s*=\s*"v(\d+\.\d+\.\d+(?:[-.+][0-9A-Za-z.+-]*)?)"'
     match = re.search(pattern, text, re.M)
     if not match:
         raise SystemExit(
-            f"check_cargo_pyproject_skew: no `tag = \"vX.Y.Z\"` entry for {crate} in Cargo.toml"
+            f"check_cargo_pyproject_skew: no `tag = \"vX.Y.Z\"` (or `vX.Y.Z-rc.N`) "
+            f"entry for {crate} in Cargo.toml"
         )
     return match.group(1)
 
@@ -79,7 +83,11 @@ def main() -> int:
         constraint = pyproject_constraint(package, pyproject_text)
         spec = SpecifierSet(constraint)
         v = Version(cargo_version)
-        if v in spec:
+        # prereleases=True: this guard checks MAJOR/range consistency (would a pip
+        # resolve skew like the v2.0.1 cascade), and an RC pin like 31.2.0rc1 is
+        # consistent with `>=31,<32`. packaging excludes pre-releases from a
+        # release-only spec by default, so ask explicitly.
+        if spec.contains(v, prereleases=True):
             successes.append(
                 f"  OK   {crate}: Cargo v{cargo_version} satisfies pyproject {constraint!r}"
             )
