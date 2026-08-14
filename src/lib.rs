@@ -144,8 +144,13 @@ mod wire_vocabulary_hash_tests {
 /// re-pin is a deliberate, reviewed act across the triple (the same posture as
 /// [`WIRE_VOCABULARY_HASH`], now for the admission surface rather than the wire
 /// vocabulary).
+// v31.1.0 re-pin: persist's replication policy moved with the ceremony trust-root
+// bake (#665, "install the plane it confers") + the exclusion-plane rebuild
+// (#655/#662). Edge's serve/advertise half is UNCHANGED — its own
+// SERVE_ADVERTISE_POLICY_HASH test + all 815 behavioral tests still pass — so this
+// is a clean witness re-pin of the persist-internal apply policy (CIRISEdge#393).
 pub const PERSIST_REPLICATION_POLICY_HASH: &str =
-    "351912ead0aab4847f40d2b54a7a326546c37d43507deb38ea24d6094d29d63b";
+    "3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef";
 
 #[cfg(test)]
 mod replication_policy_hash_tests {
@@ -174,8 +179,11 @@ mod replication_policy_hash_tests {
 /// `recipient_capability` enforcement (#396 item 6), the op vocabulary is drawn
 /// from a manifest whose drift is a BUILD failure first, a behavior change
 /// second — the same posture as [`PERSIST_REPLICATION_POLICY_HASH`].
+// v31.1.0 re-pin: the closed consent grammar moved with the baked plane the
+// ceremony trust root confers (#665). Edge's consent handling is UNCHANGED (no
+// consent test regressed), so this is a clean witness re-pin (CIRISEdge#397 §5).
 pub const PERSIST_CONSENT_GRAMMAR_HASH: &str =
-    "2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05";
+    "b66870da9639c8560538a26c566168fea9759139eaa67ad4116ff8a5f290d69f";
 
 #[cfg(test)]
 mod consent_grammar_hash_tests {
