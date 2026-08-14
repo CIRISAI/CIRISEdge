@@ -88,6 +88,17 @@ pub const MIN_FRAGMENTABLE_MDU: usize = FRAGMENT_HEADER_LEN + 16;
 /// reject ceiling — so every admissible frame fragments.
 const MAX_FRAGMENTS: usize = u16::MAX as usize;
 
+/// SECURITY (v16 review, pre-attribution reassembly OOM): the receive side bounded
+/// only the COUNT of in-flight partials (`max_in_flight`), never their bytes — so
+/// a peer declaring `total = u16::MAX` and streaming fragments (withholding one so
+/// the frame never completes) could pin ~27 MB in a SINGLE partial, and
+/// `max_in_flight` of them ~7 GB, all before the link is even attributed. These
+/// cap a single frame's accumulated payload (matching the transport `MAX_BODY_BYTES`
+/// admissibility ceiling), and the TOTAL resident reassembly memory across all
+/// partials — the hard bound regardless of partial count.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024; // == transport MAX_BODY_BYTES
+const MAX_IN_FLIGHT_BYTES: usize = 4 * MAX_FRAME_BYTES; // 32 MiB global budget
+
 /// CIRISEdge#422 — fragment-ARQ NAK magic. A third, distinct 4-byte tag so a
 /// receiver tells a NAK (`CNAK`) from a whole frame (`CRPL`) or a data fragment
 /// (`CFRG`) at a glance — a NAK is a TRANSPORT-level control packet, never a
@@ -249,6 +260,9 @@ pub fn parse_nak(bytes: &[u8]) -> Option<([u8; 8], Vec<u16>)> {
 struct Partial {
     total: u16,
     chunks: HashMap<u16, Vec<u8>>,
+    /// Accumulated payload bytes across `chunks` (maintained by delta so a resent
+    /// index never double-counts) — the per-frame ceiling is enforced against this.
+    bytes: usize,
 }
 
 /// Reassembles fragments (of possibly-interleaved frames) back into whole frames.
@@ -259,6 +273,9 @@ pub struct Reassembler {
     partials: HashMap<[u8; 8], Partial>,
     order: VecDeque<[u8; 8]>,
     max_in_flight: usize,
+    /// Sum of every partial's `bytes` — the global reassembly budget is enforced
+    /// against this so total resident memory is bounded regardless of partial count.
+    in_flight_bytes: usize,
 }
 
 impl Reassembler {
@@ -276,6 +293,7 @@ impl Reassembler {
             partials: HashMap::new(),
             order: VecDeque::new(),
             max_in_flight: max_in_flight.max(1),
+            in_flight_bytes: 0,
         }
     }
 
@@ -295,24 +313,58 @@ impl Reassembler {
             return None; // malformed
         }
         let chunk = packet[FRAGMENT_HEADER_LEN..].to_vec();
+        let chunk_len = chunk.len();
 
-        let entry = self.partials.entry(msg_id).or_insert_with(|| {
-            self.order.push_back(msg_id);
-            Partial {
-                total,
-                chunks: HashMap::new(),
+        // Ensure the partial exists. A total mismatch across fragments of the "same"
+        // id (collision / attack) drops this frame's partial rather than reassemble
+        // corrupt bytes. (Copy the existing `total` out so no borrow is held across
+        // the removal below.)
+        match self.partials.get(&msg_id).map(|p| p.total) {
+            Some(t) if t != total => {
+                let dropped = self.partials.remove(&msg_id).map_or(0, |p| p.bytes);
+                self.in_flight_bytes = self.in_flight_bytes.saturating_sub(dropped);
+                self.order.retain(|id| *id != msg_id);
+                return None;
             }
-        });
-        // A total mismatch across fragments of the "same" id (collision / attack)
-        // — drop this frame's partial rather than reassemble corrupt bytes.
-        if entry.total != total {
+            None => {
+                self.order.push_back(msg_id);
+                self.partials.insert(
+                    msg_id,
+                    Partial {
+                        total,
+                        chunks: HashMap::new(),
+                        bytes: 0,
+                    },
+                );
+            }
+            Some(_) => {}
+        }
+
+        // Insert the chunk, maintaining byte accounting by DELTA (a resent index
+        // replaces its previous bytes, never double-counts). Copy out what the
+        // post-checks need, then the &mut is released before any removal.
+        let entry = self
+            .partials
+            .get_mut(&msg_id)
+            .expect("ensured present above");
+        let prev_len = entry.chunks.insert(index, chunk).map_or(0, |v| v.len());
+        entry.bytes = entry.bytes + chunk_len - prev_len;
+        let entry_bytes = entry.bytes;
+        let complete = entry.chunks.len() == entry.total as usize;
+        self.in_flight_bytes = self.in_flight_bytes + chunk_len - prev_len;
+
+        // SECURITY (v16 review): a single frame cannot exceed MAX_FRAME_BYTES — drop
+        // the partial if a peer streams past it (e.g. total=u16::MAX, never completes).
+        if entry_bytes > MAX_FRAME_BYTES {
             self.partials.remove(&msg_id);
+            self.in_flight_bytes = self.in_flight_bytes.saturating_sub(entry_bytes);
             self.order.retain(|id| *id != msg_id);
             return None;
         }
-        entry.chunks.insert(index, chunk);
-        if entry.chunks.len() == entry.total as usize {
+
+        if complete {
             let mut partial = self.partials.remove(&msg_id).expect("just inserted");
+            self.in_flight_bytes = self.in_flight_bytes.saturating_sub(partial.bytes);
             self.order.retain(|id| *id != msg_id);
             let mut frame = Vec::new();
             for i in 0..partial.total {
@@ -327,9 +379,16 @@ impl Reassembler {
     }
 
     fn evict_if_over_cap(&mut self) {
-        while self.order.len() > self.max_in_flight {
-            if let Some(oldest) = self.order.pop_front() {
-                self.partials.remove(&oldest);
+        // Evict oldest partials until BOTH the count cap AND the global byte budget
+        // hold — MAX_IN_FLIGHT_BYTES is the hard bound on total resident reassembly
+        // memory regardless of how bytes are distributed across partials.
+        while self.order.len() > self.max_in_flight || self.in_flight_bytes > MAX_IN_FLIGHT_BYTES {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    let freed = self.partials.remove(&oldest).map_or(0, |p| p.bytes);
+                    self.in_flight_bytes = self.in_flight_bytes.saturating_sub(freed);
+                }
+                None => break,
             }
         }
     }
@@ -591,6 +650,42 @@ mod tests {
         assert!(
             r.in_flight() <= 4,
             "LRU cap bounds memory under lost fragments"
+        );
+    }
+
+    #[test]
+    fn accept_bounds_a_single_frame_at_max_frame_bytes() {
+        // SECURITY (v16 review): a peer declares total=u16::MAX and streams
+        // full-payload fragments while WITHHOLDING index 0, so the frame never
+        // completes. The receive side must cap accumulated bytes at MAX_FRAME_BYTES
+        // (dropping the partial) instead of pinning ~27 MB — the old path had NO
+        // receive-side byte ceiling.
+        fn frag(msg_id: [u8; 8], total: u16, index: u16, payload: &[u8]) -> Vec<u8> {
+            let mut p = Vec::with_capacity(FRAGMENT_HEADER_LEN + payload.len());
+            p.extend_from_slice(&FRAGMENT_MAGIC);
+            p.extend_from_slice(&msg_id);
+            p.extend_from_slice(&total.to_be_bytes());
+            p.extend_from_slice(&index.to_be_bytes());
+            p.extend_from_slice(payload);
+            p
+        }
+        let mut r = Reassembler::new();
+        let msg_id = [7u8; 8];
+        let payload = vec![0xABu8; 4096];
+        let mut peak = 0usize;
+        // ~16 MiB streamed into ONE never-completing frame (index 0 withheld).
+        for index in 1u16..=4096 {
+            let out = r.accept(&frag(msg_id, u16::MAX, index, &payload));
+            assert!(out.is_none(), "the frame never completes");
+            peak = peak.max(r.in_flight_bytes);
+        }
+        assert!(
+            peak <= MAX_FRAME_BYTES + payload.len(),
+            "a single frame's reassembly is bounded at MAX_FRAME_BYTES (peak {peak})"
+        );
+        assert!(
+            r.in_flight_bytes <= MAX_IN_FLIGHT_BYTES,
+            "the global reassembly budget holds"
         );
     }
 

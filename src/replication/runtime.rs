@@ -717,6 +717,23 @@ impl ReplicationRuntime {
                     );
                     failures.push(format!("{kind:?}: {e}"));
                 }
+            } else {
+                // SECURITY/correctness (v16 review): register_initiator_peer just
+                // installed this coordinator, so a None means a concurrent
+                // deregister/reconcile raced it away before we could send. That is a
+                // NOT-SENT Pull for this kind — record it, never a silent Ok (the
+                // PullDispatch contract; anti-entropy cannot carry SelfOwn, so a
+                // swallowed Pull is silent subject-recovery loss).
+                tracing::warn!(
+                    peer = %peer_key_id,
+                    subject = %subject_key_id,
+                    kind = ?kind,
+                    "subject Pull coordinator absent immediately after register \
+                     (raced by a concurrent deregister) — surfacing, not swallowing"
+                );
+                failures.push(format!(
+                    "{kind:?}: coordinator absent after register (raced)"
+                ));
             }
         }
         if failures.is_empty() {

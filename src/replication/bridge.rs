@@ -765,23 +765,43 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 }
             }
             if let Some(peer) = peer_key_id {
-                // CIRISEdge#396 item 1 — the same consent-membership bound the
-                // listing applies, so a peer excluded from the advertise cannot
-                // obtain an attestation by fetching a hash it learned
-                // out-of-band. Fail-closed: no `ResolvedRecipient`, no bytes.
-                // (#433: `resolve_attestation_recipient` books its OWN branch's
-                // reason — this call site must not re-count, or a single withhold
-                // would show up twice under two different reasons.)
-                let recipient = self.resolve_attestation_recipient(peer).await?;
-                // #379 `infra:serve` + #396 item 6 `recipient_capability`, over
-                // the WIRE bytes — the direct-fetch twins of the listing gates,
-                // so the fetch path narrows exactly as the advertise path did.
-                // The wire is the BARE `Attestation` (§3); tolerate the legacy
-                // `{"attestation": …}` wrap for a peer still on the old wire.
+                // v16 review: FIRST-PARTY right overrides #396 producer-advertise-
+                // consent. If `peer` is this attestation's AUTHOR or DATA-SUBJECT it is
+                // fetching its OWN testimony — the same first-party carve the subject-
+                // Pull LIST gate (`pull_ref_is_serveable`) applies — so list and fetch
+                // AGREE (no advertised-then-unfetchable, no ref disclosed-then-withheld).
+                // For a first-party fetch the recipient IS the peer; #396 item-1
+                // consent-membership and item-6 recipient_capability do not apply. The
+                // E3 trace serve-cap gate below STILL does (a subject pulling its own
+                // `trace:*` row needs `infra:serve`, exactly as the list requires).
+                let first_party = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .is_some_and(|v| {
+                        Self::attestation_is_first_party_to(
+                            v.get("attestation").unwrap_or(&v),
+                            peer,
+                        )
+                    });
+                // #396 item 1 — the same consent-membership bound the listing applies,
+                // so a THIRD-party peer excluded from the advertise cannot obtain an
+                // attestation by fetching a hash it learned out-of-band. Fail-closed:
+                // no `ResolvedRecipient`, no bytes. (#433: `resolve_attestation_recipient`
+                // books its OWN branch's reason — no re-count here.)
+                let recipient: String = if first_party {
+                    peer.to_owned()
+                } else {
+                    self.resolve_attestation_recipient(peer)
+                        .await?
+                        .as_str()
+                        .to_owned()
+                };
+                // #379 `infra:serve` + #396 item 6 `recipient_capability`, over the WIRE
+                // bytes — the direct-fetch twins of the listing gates. The wire is the
+                // BARE `Attestation` (§3); tolerate the legacy `{"attestation": …}` wrap.
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     let inner = value.get("attestation").unwrap_or(&value);
                     if Self::attestation_requires_serve(inner)
-                        && !self.peer_has_serve_capability(recipient.as_str()).await
+                        && !self.peer_has_serve_capability(&recipient).await
                     {
                         // #433: `peer_has_serve_capability` books the specific leg
                         // (no-role / read-error / not-rooted / walk-error) — its
@@ -795,20 +815,17 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                         );
                         return None;
                     }
-                    if self
-                        .recipient_capability_withholds(
-                            inner,
-                            recipient.as_str(),
-                            &mut HashMap::new(),
-                        )
-                        .await
+                    // #396 item 6 — recipient_capability gates a THIRD-party recipient
+                    // (an author-chosen audience). A first-party subject/author is not
+                    // such a recipient, so it does not apply (matches the list gate).
+                    if !first_party
+                        && self
+                            .recipient_capability_withholds(inner, &recipient, &mut HashMap::new())
+                            .await
                     {
-                        // #433 — item 6 was the purest silent withhold on this
-                        // path: a bare `return None` with only a `trace!`. It is
-                        // countable now, booked inside
-                        // `recipient_capability_withholds` at the branch that
-                        // decided (which knows the offending dimension), so this
-                        // site does not re-count.
+                        // #433 — item 6 was the purest silent withhold on this path.
+                        // Countable now, booked inside `recipient_capability_withholds`
+                        // at the deciding branch, so this site does not re-count.
                         return None;
                     }
                 }
@@ -1964,6 +1981,27 @@ impl FederationDirectoryReplicationBridge {
     /// ([`Self::fetch_envelope_bytes_for_peer`] and [`Self::list_attestations`])
     /// because only here is the branch visible — and so a withhold is counted
     /// exactly once.
+    /// Whether the authenticated `peer` is FIRST-PARTY to this attestation `inner`
+    /// (the BARE wire value): its author (`attesting_key_id`), its primary subject
+    /// (`attested_key_id`), or in its data-subject set (`subject_key_ids`). All three
+    /// are bound into the SIGNED envelope (#643), and the link authenticates `peer`,
+    /// so a match means the peer genuinely authored-or-is-the-subject-of the row.
+    ///
+    /// v16 review: first-party right overrides #396 producer-advertise-consent. The
+    /// subject-Pull LIST gate (`pull_ref_is_serveable`) already drops #396 (a subject
+    /// pulls its own testimony from a node no peer would ever advertise it to); the
+    /// FETCH must AGREE, else the ref is listed-then-withheld (advertised-then-
+    /// unfetchable + a disclosed ref the subject can't obtain).
+    fn attestation_is_first_party_to(inner: &serde_json::Value, peer: &str) -> bool {
+        let is = |field: &str| inner.get(field).and_then(serde_json::Value::as_str) == Some(peer);
+        is("attesting_key_id")
+            || is("attested_key_id")
+            || inner
+                .get("subject_key_ids")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|arr| arr.iter().any(|s| s.as_str() == Some(peer)))
+    }
+
     async fn resolve_attestation_recipient(&self, peer: &str) -> Option<ResolvedRecipient> {
         use crate::observability::WithholdReason;
         let Some(local) = self.local_key_id.as_deref() else {
@@ -4638,6 +4676,89 @@ mod tests {
         );
     }
 
+    /// v16 review (#3): the FETCH first-party classifier. Author (sender axis),
+    /// primary subject, and any co-subject are first-party; an unrelated peer is not.
+    #[test]
+    fn attestation_is_first_party_to_matches_author_and_subject() {
+        use FederationDirectoryReplicationBridge as B;
+        let att = serde_json::json!({
+            "attesting_key_id": "author-A",
+            "attested_key_id": "subject-S",
+            "subject_key_ids": ["subject-S", "co-subject-C"],
+            "dimension": "x",
+        });
+        assert!(B::attestation_is_first_party_to(&att, "author-A")); // sender axis
+        assert!(B::attestation_is_first_party_to(&att, "subject-S")); // primary subject
+        assert!(B::attestation_is_first_party_to(&att, "co-subject-C")); // data-subject set
+        assert!(!B::attestation_is_first_party_to(&att, "stranger-X")); // still #396-gated
+                                                                        // Missing fields must not false-positive into a first-party bypass.
+        assert!(!B::attestation_is_first_party_to(
+            &serde_json::json!({}),
+            "anyone"
+        ));
+    }
+
+    /// v16 review (#3): the FETCH honors first-party right, matching the Pull LIST
+    /// gate. A subject fetching a `delegates_to` ABOUT itself gets the bytes even
+    /// though the node granted it NO #396 consent-membership — while a third party
+    /// with no consent is still withheld. Closes the list-wider-than-fetch gap (a
+    /// ref listed then unfetchable).
+    #[tokio::test]
+    async fn first_party_fetch_overrides_producer_advertise_consent() {
+        let local = "this-node";
+        let producer = "author-A";
+        let subject = "subject-S";
+        let stranger = "stranger-X";
+        let (backend, bridge) = make_bridge(&[
+            local.to_string(),
+            producer.to_string(),
+            subject.to_string(),
+            stranger.to_string(),
+        ]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        for kid in [local, producer, subject, stranger] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        // A delegates_to ABOUT the subject, authored by the producer, with NO consent
+        // grant/membership for anyone → #396 withholds every THIRD party.
+        seed_delegates_to(
+            &backend,
+            producer,
+            subject,
+            &serde_json::json!(["infra:serve"]),
+        )
+        .await;
+
+        // The subject's own Pull LISTS the ref (entitlement fail-closed to the subject).
+        let refs = bridge
+            .subject_holdings(EnvelopeKind::Attestation, subject, Some(subject))
+            .await;
+        assert!(!refs.is_empty(), "the subject lists its own delegates_to");
+        let hash = refs[0].envelope_hash;
+
+        // FIRST-PARTY: the subject fetches its own testimony despite no #396 consent.
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some(subject))
+                .await
+                .is_some(),
+            "the data-subject fetches its own row — first-party overrides #396"
+        );
+        // THIRD-PARTY: a stranger with no consent-membership is still withheld.
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some(stranger))
+                .await
+                .is_none(),
+            "a third party without #396 consent still cannot fetch it (the gate holds)"
+        );
+    }
+
     /// CIRISEdge#462 — the subject-scoped serve reader answers the SUBJECT with
     /// its testimony across BOTH axes (ABOUT-me via the data-subject axis +
     /// authored-BY-me via the sender axis), never leaks another subject's rows,
@@ -5086,11 +5207,16 @@ mod tests {
                  onto ANY key (#643)",
             );
         let msg = format!("{err:?}");
+        // v16 review: assert the #643 row-column binding gate refused it SPECIFICALLY
+        // — check_row_column_binding names the divergent member. A bare
+        // "InvalidArgument" is NOT enough: many other put_attestation gates
+        // (cohort-scope, #510 consent-grammar, canonicalize) Debug-format the same,
+        // so accepting it would let this test stay green even if the paste were
+        // refused by an unrelated gate (false confidence).
         assert!(
-            msg.contains("subject_key_ids")
-                || msg.contains("attested_key_id")
-                || msg.contains("InvalidArgument"),
-            "refused for the RIGHT reason (signed row mirror ≠ typed columns), got: {msg}"
+            msg.contains("subject_key_ids") || msg.contains("attested_key_id"),
+            "must be refused by the #643 row-column binding (naming the divergent \
+             attested_key_id/subject_key_ids), not an incidental InvalidArgument, got: {msg}"
         );
     }
 
