@@ -5426,13 +5426,42 @@ enum RouteSupersession {
     HijackRefused,
 }
 
+/// Whether an Advisory announce's `rejection` proves the announcer OWNS the
+/// federation key — i.e. its claimed pubkey MATCHED the directory row. Only
+/// rejections raised AFTER the pubkey comparison qualify, so this is an
+/// **allowlist** of post-match variants; everything else (including any
+/// future-added variant) is fail-CLOSED.
+///
+/// SECURITY (v16 review, `owns_key` route-hijack): a former denylist
+/// `!matches!(UnknownKeyId | PubkeyMismatch)` FAILED OPEN on `DirectoryError`.
+/// persist's `root_binding` returns `DirectoryError` when a `lookup_public_key`
+/// call errors — and the FIRST such lookup happens BEFORE any pubkey comparison,
+/// so a first-lookup error proves NO match. It is also indistinguishable from a
+/// mid-walk error by variant alone, so ALL `DirectoryError` must be fail-closed.
+/// The old denylist mapped it to `owns_key=true`, letting a transient directory
+/// error during a hostile announce defeat the CRITICAL-1 verified-only
+/// supersession gate and hijack a Rooted peer's route.
+fn owns_key_from_rooting_rejection(rejection: &RootingRejection) -> bool {
+    matches!(
+        rejection,
+        RootingRejection::BrokenProvenanceLink { .. }
+            | RootingRejection::UnsignedProvenanceLink { .. }
+            | RootingRejection::NotRootedAtSteward { .. }
+            | RootingRejection::TerminusNotInAnchor { .. }
+            | RootingRejection::CycleDetected { .. }
+            | RootingRejection::OverDepth { .. }
+    )
+}
+
 /// Decide whether an incoming announce supersedes the cached route for its
 /// key_id. `existing` is `(provenance, epoch, dest16)` of the cached entry (if
 /// any). `incoming_owns_key` is whether the announcer PROVED control of the key
 /// the directory binds to this `key_id` (Confirmed, or an Advisory whose
-/// rejection was neither `UnknownKeyId` nor `PubkeyMismatch` — i.e. the pubkey
-/// matched and the announce self-verified). This is the load-bearing signal
-/// that separates the OWNER rerouting its own dest from a SPOOF.
+/// rejection is a POST-pubkey-match variant per
+/// [`owns_key_from_rooting_rejection`] — i.e. the pubkey matched and the announce
+/// self-verified; a pre-match rejection or a lookup `DirectoryError` is
+/// fail-closed to `false`). This is the load-bearing signal that separates the
+/// OWNER rerouting its own dest from a SPOOF.
 ///
 /// Order is load-bearing: the hijack gate is checked FIRST, before any epoch
 /// comparison, so a `u64::MAX`-epoch spoof cannot poison a rooted route.
@@ -6361,10 +6390,10 @@ async fn resolve_announce_cold_start(
             // the owner from healing its OWN routing dest — which is exactly the
             // boot-prime (#238 Rooted, epoch 0, explicit dest) → genuine-announce
             // (Advisory, named dest) heal that #336 depends on.
-            let owns_key = !matches!(
-                rejection,
-                RootingRejection::UnknownKeyId { .. } | RootingRejection::PubkeyMismatch { .. }
-            );
+            // SECURITY (v16 review): owns_key is an ALLOWLIST of post-pubkey-match
+            // rejections — a lookup `DirectoryError` (or any pre-match rejection)
+            // does NOT prove the announcer owns the key, so it is fail-closed here.
+            let owns_key = owns_key_from_rooting_rejection(&rejection);
             // CIRISEdge#337 §4 — advisory admits are attacker-floodable (mint
             // unlimited self-signed keypairs). DEBUG, not INFO: the always-on
             // admit signal is the THROTTLED `peer_admitted_log` point-1 line
@@ -7738,6 +7767,61 @@ mod tests {
                 route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Advisory, false, 0, NAMED),
                 RouteSupersession::HijackRefused,
             );
+        }
+
+        /// SECURITY (v16 review): `owns_key` is fail-CLOSED on every rejection that
+        /// does NOT prove a pubkey match. The route-hijack bug was `DirectoryError`
+        /// (a first-lookup error, raised BEFORE any pubkey comparison) reading as
+        /// owns_key=true under the old denylist. Exhaustive over all 9 variants.
+        #[test]
+        fn owns_key_is_a_post_pubkey_match_allowlist() {
+            use super::RootingRejection as R;
+            let s = String::new;
+            // Fail-CLOSED — these prove NO pubkey match (pre-match or the mismatch itself):
+            for r in [
+                R::UnknownKeyId { key_id: s() },
+                R::PubkeyMismatch {
+                    key_id: s(),
+                    claimed_pubkey_ed25519_base64: s(),
+                    directory_pubkey_ed25519_base64: s(),
+                },
+                // THE FIX: a lookup DirectoryError is indistinguishable from a
+                // first-lookup (no-match) error, so it can never imply ownership.
+                R::DirectoryError { detail: s() },
+            ] {
+                assert!(
+                    !owns_key_from_rooting_rejection(&r),
+                    "must be fail-closed (no proven pubkey match): {r:?}"
+                );
+            }
+            // ALLOWED — the pubkey matched; only the trust chain fell short. This is
+            // the OWNER healing its own route (the #336 boot-prime→genuine-announce).
+            for r in [
+                R::BrokenProvenanceLink {
+                    key_id: s(),
+                    missing_parent_key_id: s(),
+                },
+                R::UnsignedProvenanceLink {
+                    key_id: s(),
+                    signed_by_key_id: s(),
+                    detail: s(),
+                },
+                R::NotRootedAtSteward {
+                    key_id: s(),
+                    identity_type: s(),
+                },
+                R::TerminusNotInAnchor {
+                    key_id: s(),
+                    terminus_pubkey_ed25519_base64: s(),
+                },
+                R::CycleDetected { key_id: s() },
+                R::OverDepth { max_depth: 8 },
+            ] {
+                assert!(
+                    owns_key_from_rooting_rejection(&r),
+                    "a post-pubkey-match rejection is the owner healing its route: {r:?}"
+                );
+            }
         }
 
         /// A Confirmed (Rooted, owns_key) reroute at equal epoch also heals — the

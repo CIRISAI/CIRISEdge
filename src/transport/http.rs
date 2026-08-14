@@ -1141,6 +1141,8 @@ pub enum HttpsInitError {
     /// `None`). Cert + key always travel together.
     #[error("https_tls_cert_path and https_tls_key_path must both be set (got only one)")]
     CertKeyPair,
+    #[error("https_listen_addr is set in non-dev mode but https_tls_cert_path and https_tls_key_path are both unset — a production HTTPS listener needs a cert+key pair (or enable https_dev_self_signed)")]
+    MissingCertKey,
 
     /// `https_listen_addr` did not parse as a SocketAddr.
     #[error("https_listen_addr parse: {0}")]
@@ -1225,6 +1227,13 @@ impl HttpsInitParams {
         // Cert + key always travel together.
         match (tls_cert_path, tls_key_path) {
             (Some(_), None) | (None, Some(_)) => return Err(HttpsInitError::CertKeyPair),
+            // SECURITY/correctness (v16 review): a non-dev HTTPS transport REQUIRES a
+            // cert+key pair. Reject the both-absent case with a typed error here —
+            // otherwise init_edge_runtime's `.expect("validated by
+            // HttpsInitParams::parse")` on `tls_cert_path` panics ACROSS the FFI on a
+            // plausible operator misconfig (listen addr set, forgot the cert paths,
+            // didn't enable dev mode).
+            (None, None) if !dev_self_signed => return Err(HttpsInitError::MissingCertKey),
             _ => {}
         }
 
@@ -1427,6 +1436,17 @@ mod v0_19_3_init_tests {
             false,
         );
         assert!(matches!(r, Err(HttpsInitError::CertKeyPair)));
+    }
+
+    #[test]
+    fn parse_both_paths_absent_in_non_dev_is_missing_cert_key() {
+        // SECURITY/correctness (v16 review): listen addr set, non-dev mode, NO
+        // cert/key must be a TYPED error — not a downstream `.expect(...)` FFI panic.
+        let r = HttpsInitParams::parse(Some("0.0.0.0:4242"), None, None, false, None, false);
+        assert!(matches!(r, Err(HttpsInitError::MissingCertKey)));
+        // Control: the SAME both-absent inputs in DEV mode are fine (mints a pair).
+        let ok = HttpsInitParams::parse(Some("0.0.0.0:4242"), None, None, false, None, true);
+        assert!(matches!(ok, Ok(Some(_))));
     }
 
     #[test]
