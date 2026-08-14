@@ -9,12 +9,17 @@ on:
   pull_request:
 
 concurrency:
-  # CIRISEdge#293 / CIRISPersist#397 — one full matrix per released commit.
-  # Push events key on the SHA so a merge (refs/heads/main) and its release
-  # tag (refs/tags/v*) — the SAME commit — share a group; cancel-in-progress
-  # lets the tag run (the superset that also publishes) cancel the redundant
-  # main run. PRs key on the ref so a new push cancels the stale PR run.
-  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  # CIRISEdge#293 — dedup redundant runs, but NEVER cancel a release tag's run.
+  # A merge (refs/heads/main) and its release tag (refs/tags/v*) are the SAME
+  # commit. The old SHA-shared group + cancel-in-progress was a RACE — whichever
+  # push REGISTERED LAST won — and on v16.0.2 the main-push run cancelled the TAG
+  # run, losing the full release matrix + mobile-release (no Release, no signed
+  # manifests). Fix: give TAGS their own ref-based group so a same-SHA main-push
+  # can never cancel the release run. PRs key on the ref (a new push cancels the
+  # stale PR run); branch pushes key on the SHA (main-push self-dedup preserved).
+  # Trade: a released commit's non-tag matrix runs on both the main AND tag runs —
+  # a bounded, infrequent cost, in exchange for a release that always publishes.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || (startsWith(github.ref, 'refs/tags/v') && github.ref || github.sha) }}
   cancel-in-progress: true
 
 env:
