@@ -70,9 +70,10 @@ use ciris_persist::federation::register::{KeyRefusalReason, ReplicatedKeyOutcome
 use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
 use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
-    Attestation, SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation,
-    SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence,
-    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
+    Attestation, KeyRecord, SignedAttestation, SignedCommunity,
+    SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
+    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+    SignedLocationProof, SignedRevocation,
 };
 use ciris_persist::federation::FederationDirectory;
 use ciris_verify_core::threshold::ThresholdMember;
@@ -1353,22 +1354,45 @@ impl FederationDirectoryReplicationBridge {
         refs
     }
 
-    /// Key plane — `SelfOwn` (publish-own): the node's OWN establishment
-    /// records. Scope filter is the `SelfOwn` publish set; seq is `valid_from`.
+    /// Key plane — `SelfOwn` (publish-own): the node's OWN establishment records.
+    /// Scope filter is the `SelfOwn` publish set.
+    ///
+    /// persist v32 (CIRISPersist#682) wraps each served key in
+    /// `ServedKeyRecord { record, admitted_at }` — `admitted_at` is the node-local
+    /// admission instant (monotonic, out of the content hash) that fixes the
+    /// late-replication cursor bug (a record signed in January, admitted here in
+    /// February, must not sort under January and become permanently invisible).
+    /// Two consequences edge MUST honor, both invisible to the compiler:
+    ///   1. the wire content hash is over the SIGNED record ONLY — the v31
+    ///      `SignedKeyRecord{record}` shape — so `admitted_at` must stay OUT of it.
+    ///      [`KeyAdvertiseRow`]'s `#[serde(skip)]` reproduces that exact byte shape
+    ///      (pinned by `key_advertise_row_hashes_identically_to_signed_key_record`),
+    ///      so the advertised hash still resolves through the content-hash fetch —
+    ///      hashing the bare `ServedKeyRecord` would fold `admitted_at` in and make
+    ///      every ref listed-then-unfetchable (the LIST-vs-FETCH class);
+    ///   2. the resume `seq` moves from the producer's `valid_from` to the
+    ///      node-local `admitted_at` — the #682 fix, so a late-admitted key sorts
+    ///      by when THIS node saw it, not by a stale producer clock.
     async fn list_keys(&self) -> Vec<EnvelopeRef> {
         let subjects: HashSet<String> = self
             .subjects_for_projection(Projection::SelfOwn)
             .into_iter()
             .collect();
-        let rows = self
+        let rows: Vec<KeyAdvertiseRow> = self
             .directory
             .list_signed_key_records_since(None, self.effective_page_limit().await)
             .await
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(|served| KeyAdvertiseRow {
+                record: served.record,
+                admitted_at: served.admitted_at,
+            })
+            .collect();
         self.advertise_since(
             &rows,
             |row| subjects.contains(&row.record.key_id),
-            |row| Self::ms_seq(row.record.valid_from),
+            |row| Self::ms_seq(row.admitted_at),
         )
     }
 
@@ -2932,6 +2956,24 @@ fn content_hash_of<T: serde::Serialize>(value: &T) -> Option<([u8; 32], Vec<u8>)
     Some((hash, bytes))
 }
 
+/// CIRISEdge#474-adjacent (persist v32/#682) — the Key plane's advertise row.
+///
+/// persist v32's `list_signed_key_records_since` returns
+/// `ServedKeyRecord { record, admitted_at }`; edge advertises the content hash of
+/// the SIGNED record only (the v31 `SignedKeyRecord { record }` shape). This
+/// carries `admitted_at` for the resume seq but `#[serde(skip)]`s it, so
+/// [`content_hash_of`] of this row is byte-identical to
+/// `content_hash_of(&SignedKeyRecord { record })` — the exact hash persist's
+/// `signed_wire_index` keys on. The identity is pinned by a test
+/// (`key_advertise_row_hashes_identically_to_signed_key_record`); if serde field
+/// order or naming ever drifted, that test reds before the wire does.
+#[derive(serde::Serialize)]
+struct KeyAdvertiseRow {
+    record: KeyRecord,
+    #[serde(skip)]
+    admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3054,6 +3096,43 @@ mod tests {
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
+    }
+
+    /// persist v32/#682 belt: the Key-plane advertise row must hash byte-identically
+    /// to the v31 `SignedKeyRecord { record }` shape (persist's `signed_wire_index`
+    /// basis), and the node-local `admitted_at` must NOT enter that hash. If serde
+    /// field order/naming ever drifted, this reds BEFORE the wire does — the silent
+    /// LIST-vs-FETCH break `cargo check` cannot see.
+    #[test]
+    fn key_advertise_row_hashes_identically_to_signed_key_record() {
+        let record = fixture_key_record("agent-alice", identity_type::AGENT);
+        // The exact wire hash edge must reproduce.
+        let (want, _) = content_hash_of(&SignedKeyRecord {
+            record: record.clone(),
+        })
+        .expect("signed key hashes");
+        // Two DIFFERENT admission instants → the advertise hash is unchanged.
+        let t1 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t2 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_800_000_123, 456).unwrap();
+        let (h1, _) = content_hash_of(&KeyAdvertiseRow {
+            record: record.clone(),
+            admitted_at: t1,
+        })
+        .expect("advertise row hashes");
+        let (h2, _) = content_hash_of(&KeyAdvertiseRow {
+            record,
+            admitted_at: t2,
+        })
+        .expect("advertise row hashes");
+        assert_eq!(
+            h1, want,
+            "KeyAdvertiseRow must hash as SignedKeyRecord{{record}} — the content-hash \
+             fetch keys on it; folding admitted_at in makes every ref unfetchable"
+        );
+        assert_eq!(
+            h1, h2,
+            "the wire hash is INVARIANT to admitted_at (node-local, never serialized)"
+        );
     }
 
     // ── Construction smoke ───────────────────────────────────────────
