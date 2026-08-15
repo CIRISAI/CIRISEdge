@@ -7379,9 +7379,15 @@ impl PyLxmfPropagationNode {
         unstamped_lxmf: &[u8],
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
         let stamp = fixed_bytes::<32>("propagation_stamp", propagation_stamp)?;
-        let id = self
-            .inner
-            .validate_and_store(&stamp, unstamped_lxmf)
+        // CIRISEdge#482 item 7 — the proof-of-work VALIDATION (workblock
+        // expansion rounds) is CPU-heavy and previously ran holding the GIL,
+        // freezing every other Python thread for its whole duration. Copy the
+        // Python-borrowed ciphertext to an owned buffer, then RELEASE the GIL
+        // (`py.detach`) for the stamp check so Python threads keep running.
+        let unstamped = unstamped_lxmf.to_vec();
+        let node = &self.inner;
+        let id = py
+            .detach(|| node.validate_and_store(&stamp, &unstamped))
             .map_err(|e| lxmf_err(&e))?;
         Ok(pyo3::types::PyBytes::new(py, &id))
     }
@@ -7576,9 +7582,14 @@ impl PyLxmfPropagationClient {
         unstamped_lxmf: &[u8],
         cost: u8,
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let stamp = self
-            .inner
-            .generate_propagation_stamp(unstamped_lxmf, cost)
+        // CIRISEdge#482 item 7 — PoW GENERATION is the heaviest CPU path here
+        // (searching for a stamp at `cost` leading-zero bits over the workblock
+        // rounds). Copy the borrowed input, then release the GIL so Python
+        // threads run during the search instead of freezing behind it.
+        let unstamped = unstamped_lxmf.to_vec();
+        let node = &self.inner;
+        let stamp = py
+            .detach(|| node.generate_propagation_stamp(&unstamped, cost))
             .map_err(|e| lxmf_err(&e))?;
         Ok(pyo3::types::PyBytes::new(py, &stamp))
     }
