@@ -362,6 +362,27 @@ fn reverse_path_wait_step(
 /// announce storm can't be driven by rapid link churn.
 const EVENT_ANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// CIRISEdge#482 item 5 — window a `check_blackhole` deny-list snapshot stays
+/// valid before the next dial re-reads `blackhole_list()` from persist. Short
+/// enough that operator add/remove takes effect near-immediately; long enough
+/// that a dial FLOOD (the hot path this optimizes) collapses to one DB read.
+/// See the `blackhole_cache` field docblock for the staleness argument.
+const BLACKHOLE_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// CIRISEdge#482 item 2 — window a `hybrid_transport_binding_exists` verdict
+/// stays valid before the next inbound frame re-queries the rooting directory.
+/// The inbound attribution path checked this per frame (an uncached directory
+/// lookup); caching collapses a burst from one peer to a single query. Kept
+/// tight because caching a stale `true` past a binding *revocation* is the
+/// security-relevant direction — see the `binding_cache` field docblock.
+const BINDING_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// CIRISEdge#482 item 2 — the memo backing [`binding_exists_cached`]. Keyed by
+/// the COMPLETE input to `hybrid_transport_binding_exists` — `(key_id, dest)` —
+/// mapping to `(verdict, fetched_at)`. A plain `std::sync::Mutex` (guard never
+/// held across an `.await`, keeping the inbound path #217-safe).
+type BindingCache = std::sync::Mutex<HashMap<(String, [u8; 16]), (bool, std::time::Instant)>>;
+
 /// CIRISEdge#318 — cap on the in-memory `peers` (rooted + advisory bindings)
 /// map. Bounds advisory-admit pollution: at cap, an Advisory binding is evicted
 /// before a new key is inserted (Rooted bindings are never evicted for advisory
@@ -1725,6 +1746,32 @@ pub struct ReticulumTransport {
     /// `routing_blackhole_*` returns `TransportError::Config` in that
     /// case, and the send-path enforcement check is a no-op.
     blackhole: Option<Arc<dyn ciris_persist::federation::BlackholeRules>>,
+    /// CIRISEdge#482 item 5 — short-TTL snapshot of the deny-list so a
+    /// dial FLOOD collapses to one `blackhole_list()` DB round-trip per
+    /// [`BLACKHOLE_CACHE_TTL`] window instead of one read per dial (the
+    /// hot send-path was an uncached full-table read). Holds
+    /// `(fetched_at, rows)`; a lookup within the window scans the cached
+    /// `Arc<Vec<_>>` with zero DB traffic. The lock is a plain
+    /// `std::sync::Mutex` held only across the snapshot swap — never
+    /// across the `.await` refresh — so this stays #217-safe (no tokio
+    /// timing primitive on a path that can run on persist's runtime
+    /// thread). **Staleness bound**: a newly-`add`ed rule takes effect,
+    /// and a `remove`d rule stops blocking, within one TTL window; the
+    /// deny-list is operator-intent (see the #120 docblock — low-dozens,
+    /// human-curated), so a ≤TTL enforcement lag on a peer that was
+    /// reachable a moment ago is immaterial, and both directions
+    /// fail-safe (over-block briefly on removal, under-block briefly on
+    /// add). `None`-backend transports never populate this.
+    blackhole_cache: std::sync::Mutex<
+        Option<(
+            std::time::Instant,
+            Arc<Vec<ciris_persist::federation::BlackholeRecord>>,
+        )>,
+    >,
+    /// CIRISEdge#482 item 2 — per-`(peer, dest)` hybrid-binding memo consulted
+    /// on the inbound attribution path (once-per-frame directory lookup → one
+    /// query per TTL window). See [`binding_exists_cached`].
+    binding_cache: BindingCache,
     /// CIRISEdge#33 (v0.15.0) — process-wall-clock instant the
     /// transport was constructed. Backs `routing_transport_uptime`.
     /// Monotonic via `std::time::Instant`; transport replacement
@@ -2330,6 +2377,8 @@ impl ReticulumTransport {
             )),
             dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
             blackhole: blackhole_rules,
+            blackhole_cache: std::sync::Mutex::new(None),
+            binding_cache: std::sync::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             store_and_forward: None,
             delivery: crate::transport::PendingDelivery::LiveOnly,
@@ -3245,7 +3294,9 @@ impl ReticulumTransport {
         store
             .blackhole_upsert(identity_hash, until_parsed, reason)
             .await
-            .map_err(|e| TransportError::Io(format!("blackhole_upsert: {e}")))
+            .map_err(|e| TransportError::Io(format!("blackhole_upsert: {e}")))?;
+        self.invalidate_blackhole_cache();
+        Ok(())
     }
 
     /// Remove a blackhole rule. Idempotent: returns `Ok(())` whether
@@ -3268,7 +3319,22 @@ impl ReticulumTransport {
         store
             .blackhole_remove(identity_hash)
             .await
-            .map_err(|e| TransportError::Io(format!("blackhole_remove: {e}")))
+            .map_err(|e| TransportError::Io(format!("blackhole_remove: {e}")))?;
+        self.invalidate_blackhole_cache();
+        Ok(())
+    }
+
+    /// #482 item 5 — drop the cached deny-list snapshot so a LOCAL rule
+    /// mutation (`add`/`remove`) is visible to the very next dial instead
+    /// of waiting out [`BLACKHOLE_CACHE_TTL`]. The TTL then only bounds
+    /// staleness against rules written by OTHER processes sharing the
+    /// persist-backed `cirislens.blackhole_rules` table (which this
+    /// process cannot observe without a read).
+    fn invalidate_blackhole_cache(&self) {
+        *self
+            .blackhole_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// v0.18.0 (CIRISEdge#33 background-pruner wiring) — expose the
@@ -3435,18 +3501,48 @@ impl ReticulumTransport {
         let Some(store) = self.blackhole.as_ref() else {
             return Ok(());
         };
-        // Pull the full row set; v0.16.1 cohabitation deployments have
-        // operator-curated deny-lists in the low-dozens range. A
-        // future cut can pivot to a single-row lookup primitive if
-        // persist exposes one (the trait surface today is
-        // `blackhole_list` only — see #120 docblock for the rationale
-        // of batched-flush over per-row lookup).
-        let rows = store
-            .blackhole_list()
-            .await
-            .map_err(|e| TransportError::Io(format!("blackhole_list (check): {e}")))?;
+        // #482 item 5 — serve the full deny-list from a short-TTL snapshot
+        // so a dial FLOOD collapses to one `blackhole_list()` round-trip per
+        // window instead of one per dial. v0.16.1 cohabitation deployments
+        // have operator-curated deny-lists in the low-dozens range, so the
+        // snapshot is cheap to hold. The `std::sync::Mutex` guard is dropped
+        // before the `.await` refresh (never held across it) — keeping this
+        // #217-safe on a send-path that can run on persist's runtime thread.
+        // A future cut can pivot to a single-row lookup primitive if persist
+        // exposes one (the trait surface today is `blackhole_list` only —
+        // see #120 docblock for the rationale of batched-flush).
+        let cached = {
+            let guard = self
+                .blackhole_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_ref() {
+                Some((fetched_at, rows)) if fetched_at.elapsed() < BLACKHOLE_CACHE_TTL => {
+                    Some(Arc::clone(rows))
+                }
+                _ => None,
+            }
+        };
+        let rows = match cached {
+            Some(rows) => rows,
+            None => {
+                let fetched = store
+                    .blackhole_list()
+                    .await
+                    .map_err(|e| TransportError::Io(format!("blackhole_list (check): {e}")))?;
+                let rows = Arc::new(fetched);
+                // Benign race: two concurrent stale-misses may both refresh;
+                // last-writer-wins with no correctness impact (identical data).
+                *self
+                    .blackhole_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((std::time::Instant::now(), Arc::clone(&rows)));
+                rows
+            }
+        };
         let now = chrono::Utc::now();
-        for rec in rows {
+        for rec in rows.iter() {
             if rec.identity_hash != identity_hash {
                 continue;
             }
@@ -3477,8 +3573,8 @@ impl ReticulumTransport {
                 }
             });
             return Err(TransportError::PeerBlackholed {
-                identity_hash: rec.identity_hash,
-                reason: rec.reason,
+                identity_hash: rec.identity_hash.clone(),
+                reason: rec.reason.clone(),
                 until: rec.until.map(|t| t.to_rfc3339()),
             });
         }
@@ -4369,6 +4465,7 @@ impl Transport for ReticulumTransport {
                         sent_resource_progress: &self.sent_resource_progress,
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
+                        binding_cache: &self.binding_cache,
                         hybrid_policy: self.hybrid_policy,
                         transport_binding_enforcement: self.transport_binding_enforcement,
                         bundle_save_gate: self.bundle_save_gate,
@@ -4436,6 +4533,9 @@ struct EventCtx<'a> {
     /// Persist directory adapter for the authenticated cold-start
     /// path; `None` → announces are dropped (no rooting possible).
     rooting: Option<&'a dyn RootingDirectory>,
+    /// CIRISEdge#482 item 2 — per-`(peer, dest)` hybrid-binding memo, borrowed
+    /// from the owning transport; see [`binding_exists_cached`].
+    binding_cache: &'a BindingCache,
     /// Consumer hybrid PQC policy applied to a rooted chain.
     hybrid_policy: HybridPolicy,
     /// CIRISEdge#205 (AV-42 Phase 4) — RNS destination-hash binding
@@ -4546,6 +4646,56 @@ fn resolve_link_attribution(
 /// the `LinkIdentified`-fed table first (a peer dialed us), then the link's
 /// DESTINATION (a link WE dialed — the reverse path), then `None`
 /// (SkippedNoSourceKeyId downstream, never a silent drop).
+/// CIRISEdge#482 item 2 — consult a per-`(peer, dest)` TTL memo before querying
+/// the rooting directory for a hybrid transport binding. The inbound attribution
+/// path calls `hybrid_transport_binding_exists` once PER FRAME; a peer that is
+/// actively sending re-proves the SAME `(key_id, dest)` binding on every frame,
+/// so a short-TTL memo collapses that to one directory query per
+/// [`BINDING_CACHE_TTL`] window (the hot receive path this optimizes).
+///
+/// `(key_id, dest)` is the COMPLETE input to `hybrid_transport_binding_exists`,
+/// so the cache key is exact: a re-key (new `key_id`) or re-home (new `dest`)
+/// changes the key and misses, re-querying live. **Staleness bound**: a binding
+/// *revocation* (persist supports subject-revoked bindings) propagates to this
+/// gate within one TTL window — bounded, and additive to the rooting
+/// directory's own federation-propagation latency, not the sole delay. The
+/// window is deliberately tight (seconds) because a stale `true` is the
+/// security-relevant direction on this load-bearing E3 attribution gate; a
+/// stale `false` is fail-closed (a just-rooted peer is briefly not attributed,
+/// then self-heals on the next window).
+async fn binding_exists_cached(
+    cache: &BindingCache,
+    rooting: &dyn RootingDirectory,
+    key_id: &str,
+    dest: [u8; 16],
+) -> bool {
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((verdict, at)) = guard.get(&(key_id.to_string(), dest)) {
+            if at.elapsed() < BINDING_CACHE_TTL {
+                return *verdict;
+            }
+        }
+    }
+    let verdict = rooting.hybrid_transport_binding_exists(key_id, dest).await;
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bound memory: prune expired entries before inserting. The live set is
+        // naturally bounded by the rooted-peer population (item 1 gates entry to
+        // this check), but departed peers must not accumulate.
+        guard.retain(|_, (_, at)| at.elapsed() < BINDING_CACHE_TTL);
+        guard.insert(
+            (key_id.to_string(), dest),
+            (verdict, std::time::Instant::now()),
+        );
+    }
+    verdict
+}
+
 async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8>) {
     // CIRISEdge#353 — stamp last-inbound for the reverse-path link selector
     // (RNS `last_inbound`). This frame proves the peer is ALIVE on THIS link
@@ -4716,7 +4866,7 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             // directory (can't prove the hybrid route ⇒ not attributable).
             let gated = match (item1, dest, ctx.rooting) {
                 (Some(sid), Some(d), Some(rooting)) => {
-                    if rooting.hybrid_transport_binding_exists(&key_id, d).await {
+                    if binding_exists_cached(ctx.binding_cache, rooting, &key_id, d).await {
                         Some(sid)
                     } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                         link_attribution_miss_log().check(key_id.as_str())
@@ -5603,7 +5753,7 @@ async fn heal_or_report_attribution_miss(
                 );
                 // Item 2 still applies — the heal upgrades item 1 only.
                 if let (Some(d), Some(rooting)) = (dest16, ctx.rooting) {
-                    if rooting.hybrid_transport_binding_exists(key_id, d).await {
+                    if binding_exists_cached(ctx.binding_cache, rooting, key_id, d).await {
                         return crate::transport::SourceKeyId::from_rooted_binding(
                             key_id.to_string(),
                             Rooted,
