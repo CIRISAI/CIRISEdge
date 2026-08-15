@@ -1128,6 +1128,16 @@ name = "transport_reticulum_loopback"
 harness = false
 required-features = ["transport-reticulum"]
 
+# CIRISEdge#369 — makes the leviculum#29 node-lock contention story visible at
+# edge's seam: outbound resource latency under a concurrent inbound flood
+# (quiescent vs N-flooder). TREND-ONLY (wall-time concurrency, not icount-able;
+# #461). Acceptance = the flood/quiescent ratio separates leviculum v0.14.0 from
+# v0.15.0 (the local A/B). NOT yet in the bench.yml run list.
+[[bench]]
+name = "transport_reticulum_inbound_contention"
+harness = false
+required-features = ["transport-reticulum"]
+
 # CIRISEdge#438 — real-codec half of the fountain survival-floor oracle
 # (decode-success d(m) curve + availability×decode composite + decode/
 # encode wall-clock). Requires the RaptorQ wrap layer; NOT yet in the

@@ -40,6 +40,13 @@ The trend page carries two kinds of series, both consumed by the same
   repos share a runner-noise model): `envelope_verify`,
   `envelope_canonicalize`, `dispatch_inbound`,
   `transport_reticulum_loopback`, `transport_http_loopback`,
+  `transport_reticulum_inbound_contention` (CIRISEdge#369 — the node-lock
+  concurrency trend: V's inbound drain rate quiescent vs while-sending, over
+  a real N-flooder fixture; runs **tolerantly** — a flaked transport-timing
+  run is a warning, not a red job — and is **version-blind for the µs-scale
+  leviculum#29 class** by construction, so it trends COARSE end-to-end
+  concurrency changes, not per-packet lock-holds; see the bench's own docs
+  for the A/B that established this),
   `realtime_av_fanout` (seal cost), `realtime_av_relay`,
   `realtime_av_rekey`, `realtime_av_mesh_e2e`. Each bench's
   `required-features` (see `Cargo.toml`) is honored.
