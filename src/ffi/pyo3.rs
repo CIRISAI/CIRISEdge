@@ -6368,10 +6368,12 @@ fn seal_av_outer(
 
 /// Hybrid X25519 + ML-KEM-768 KEX — initiator side (CIRISEdge#54).
 ///
-/// `algorithm` is one of `"hybrid"`, `"hybrid-required"`, or `"classical"`.
-/// HNDL-strict callers (realtime A/V, key_grant DEK distribution) should
-/// pass `"hybrid-required"`: classical fallback is REJECTED rather than
-/// silently negotiated down.
+/// `algorithm` is one of `"hybrid"` or `"hybrid-required"`. Post-CIRISEdge#481
+/// the two are identical on the initiate side (both require the peer's
+/// ML-KEM-768 half and reject a classical-only peer); `"hybrid-required"`
+/// remains as an explicit HNDL-strict marker for realtime A/V + key_grant DEK
+/// distribution. `"classical"` is REJECTED with `PyValueError` — the classical
+/// X25519-only KEX is retired (there is no negotiable quantum-vulnerable path).
 ///
 /// Returns `(handshake_msg_json_bytes, session_key, negotiated_algorithm_wire_id)`.
 /// The handshake JSON round-trips through
@@ -6395,10 +6397,18 @@ fn federation_session_initiate(
     let requested = match algorithm {
         "hybrid" => KexAlgorithm::Hybrid,
         "hybrid-required" => KexAlgorithm::HybridRequired,
-        "classical" => KexAlgorithm::Classical,
+        // CIRISEdge#481 — the classical KEX is retired. Refuse the request
+        // explicitly (rather than routing it to `initiate`, which would also
+        // reject it) so the caller gets a clear, actionable error.
+        "classical" => {
+            return Err(PyValueError::new_err(
+                "algorithm 'classical': the classical X25519-only KEX is retired \
+                 (CIRISEdge#481, HNDL discipline) — use 'hybrid' or 'hybrid-required'",
+            ));
+        }
         other => {
             return Err(PyValueError::new_err(format!(
-                "algorithm: expected 'hybrid' | 'hybrid-required' | 'classical', got {other:?}"
+                "algorithm: expected 'hybrid' | 'hybrid-required', got {other:?}"
             )));
         }
     };

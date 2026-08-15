@@ -34,17 +34,30 @@
 //!
 //! ## Negotiation rules
 //!
-//! - Hybrid is the default.
-//! - Classical fallback is admitted iff the peer's advertised KEX pubkeys
-//!   lack the ML-KEM-768 half.
-//! - **ML-KEM-only is rejected at v1** — both peers MUST support X25519
-//!   for fallback safety. A peer advertising ML-KEM-768 without X25519 is
-//!   out-of-spec; honoring it would create a degraded ciphersuite an
-//!   attacker could force by stripping the X25519 advertisement.
+//! - Hybrid X25519+ML-KEM-768 is MANDATORY. Both peers MUST advertise the
+//!   ML-KEM-768 half; a peer that lacks it is REJECTED, not degraded.
+//! - **The classical X25519-only KEX is RETIRED (CIRISEdge#481).** There is
+//!   no negotiable classical path: [`FederationSession::initiate`] refuses a
+//!   classical request (or a classical-only peer) and
+//!   [`FederationSession::respond`] refuses a classical handshake, both with
+//!   [`SessionError::ClassicalKexRetired`]. Fed TM §3.3 Gap C is only closed
+//!   if an active attacker cannot force EITHER side down to a
+//!   quantum-vulnerable session by stripping the ML-KEM advertisement —
+//!   which requires the classical path to be gone, not merely deprioritized.
+//!   `Hybrid` and `HybridRequired` are consequently identical on the
+//!   initiate side; the `Classical` enum/wire variants are retained ONLY so
+//!   a downgrade attempt parses to a typed, logged refusal.
+//! - **ML-KEM-only is rejected** — both peers MUST support X25519 as the
+//!   classical half of the hybrid construction. A peer advertising ML-KEM-768
+//!   without X25519 is out-of-spec; honoring it would create a degraded
+//!   ciphersuite an attacker could force by stripping the X25519 half.
 //!
-//! These rules are encoded structurally in [`PeerKexPubkeys`]
-//! (`x25519_pub` is required; `mlkem768_pub` is `Option`) and enforced
-//! in [`FederationSession::initiate`].
+//! `PeerKexPubkeys.mlkem768_pub` remains `Option` (rather than being made
+//! non-optional) because directory-sourced advertisements are represented
+//! with `None` and rejected at their CONSTRUCTION boundary — the FFI Member
+//! conversion and the A/V-MLS bridge both HNDL-pre-check `mlkem768_pub` is
+//! present. The retirement above enforces the same invariant at the two KEX
+//! verbs, so a classical-only peer is refused wherever it enters.
 
 use ciris_crypto::hybrid_kex::{
     self, ClassicalHandshakeMsg, HybridHandshakeMsg, KEX_ALGORITHM_CLASSICAL_V1,
@@ -62,20 +75,24 @@ pub const ALGORITHM_CLASSICAL_V1: &str = KEX_ALGORITHM_CLASSICAL_V1;
 /// representable — see module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KexAlgorithm {
-    /// Hybrid X25519 + ML-KEM-768. Default whenever the peer advertises
-    /// both halves; falls back to [`Self::Classical`] silently when the
-    /// peer is classical-only.
+    /// Hybrid X25519 + ML-KEM-768. The peer MUST advertise both halves; a
+    /// classical-only peer is REJECTED with
+    /// [`SessionError::HybridRequiredButPeerLacksMlkem`]. Since CIRISEdge#481
+    /// retired the classical fallback, this is now IDENTICAL to
+    /// [`Self::HybridRequired`] on the initiate side (there is no longer a
+    /// weaker mode to fall back to).
     Hybrid,
-    /// Hybrid X25519 + ML-KEM-768 with NO classical fallback. Caller
-    /// asserts the channel content is HNDL-sensitive (CEG §10.5.5;
-    /// realtime A/V; key_grant DEK distribution) — a peer that hasn't
-    /// advertised ML-KEM-768 is REJECTED with
-    /// [`SessionError::HybridRequiredButPeerLacksMlkem`] rather than
-    /// silently degraded.
+    /// Hybrid X25519 + ML-KEM-768, HNDL-strict. Retained as a distinct name
+    /// for callers that assert the channel content is HNDL-sensitive
+    /// (CEG §10.5.5; realtime A/V; key_grant DEK distribution). Post-#481 its
+    /// negotiation is the same as [`Self::Hybrid`] — a classical-only peer is
+    /// REJECTED with [`SessionError::HybridRequiredButPeerLacksMlkem`].
     HybridRequired,
-    /// Classical X25519 only. Admitted when the peer hasn't published
-    /// an ML-KEM-768 pubkey AND the caller opted in to fallback via
-    /// [`Self::Hybrid`] (NOT [`Self::HybridRequired`]).
+    /// Classical X25519 only — **RETIRED (CIRISEdge#481)**. No longer a
+    /// negotiable outcome: requesting it makes [`FederationSession::initiate`]
+    /// return [`SessionError::ClassicalKexRetired`]. The variant is retained
+    /// so a classical wire message parses to a typed, logged refusal (see
+    /// [`SessionHandshakeMsg::Classical`]) rather than a blind parse failure.
     Classical,
 }
 
@@ -224,6 +241,18 @@ pub enum SessionError {
     /// post-quantum era, and a classical-only outcome would violate that.
     #[error("HybridRequired mode rejects classical-fallback peer (HNDL discipline)")]
     HybridRequiredButPeerLacksMlkem,
+    /// CIRISEdge#481 — the classical X25519-only KEX is RETIRED. Fed TM
+    /// §3.3 Gap C (harvest-now-decrypt-later) is only closed if there is
+    /// NO negotiable classical path at all: an active attacker who strips a
+    /// peer's ML-KEM-768 advertisement must not be able to force either side
+    /// down to a quantum-vulnerable session key. This error fires when
+    /// `initiate` is asked for classical (explicitly, or via a peer that
+    /// lacks ML-KEM-768) OR when `respond` receives a classical handshake.
+    /// The `Classical` wire/enum variants are RETAINED so the refusal is a
+    /// typed, observable rejection (a downgrade attempt is logged as itself)
+    /// rather than a parse failure an attacker could probe blindly.
+    #[error("classical KEX is retired (CIRISEdge#481, HNDL discipline) — hybrid X25519+ML-KEM-768 is mandatory")]
+    ClassicalKexRetired,
 }
 
 impl From<hybrid_kex::KexError> for SessionError {
@@ -263,18 +292,23 @@ impl FederationSession {
         if peer.x25519_pub == [0u8; 32] && peer.mlkem768_pub.is_some() {
             return Err(SessionError::MlKemOnlyRejected);
         }
-        // Negotiation:
-        // - HybridRequired + peer has ML-KEM → hybrid
-        // - HybridRequired + peer lacks ML-KEM → REJECT (HNDL discipline)
-        // - Hybrid + peer has ML-KEM → hybrid
-        // - Hybrid + peer lacks ML-KEM → classical fallback
-        // - Classical (requested) → classical
+        // CIRISEdge#481 — negotiation AFTER classical retirement. `Hybrid` and
+        // `HybridRequired` are now IDENTICAL on the initiate side: both REQUIRE
+        // the peer to advertise ML-KEM-768, and there is NO classical fallback.
+        // - Hybrid | HybridRequired + peer has ML-KEM → hybrid
+        // - Hybrid | HybridRequired + peer lacks ML-KEM → REJECT (no downgrade)
+        // - Classical (explicitly requested) → REJECT (retired)
+        //
+        // The silent `Hybrid + peer-lacks-ML-KEM → classical` fallback that used
+        // to live here was PRECISELY the downgrade an active attacker forces by
+        // stripping a peer's ML-KEM advertisement; Fed TM §3.3 Gap C is only
+        // closed once that path is gone.
         let actual = match (requested, peer.mlkem768_pub.is_some()) {
-            (KexAlgorithm::HybridRequired, false) => {
+            (KexAlgorithm::HybridRequired | KexAlgorithm::Hybrid, true) => KexAlgorithm::Hybrid,
+            (KexAlgorithm::HybridRequired | KexAlgorithm::Hybrid, false) => {
                 return Err(SessionError::HybridRequiredButPeerLacksMlkem);
             }
-            (KexAlgorithm::HybridRequired | KexAlgorithm::Hybrid, true) => KexAlgorithm::Hybrid,
-            (KexAlgorithm::Hybrid, false) | (KexAlgorithm::Classical, _) => KexAlgorithm::Classical,
+            (KexAlgorithm::Classical, _) => return Err(SessionError::ClassicalKexRetired),
         };
         match actual {
             KexAlgorithm::Hybrid => {
@@ -282,16 +316,14 @@ impl FederationSession {
                 let (msg, k) = hybrid_kex::initiate_hybrid(&peer.x25519_pub, mlkem_pub)?;
                 Ok((SessionHandshakeMsg::Hybrid(msg), SessionKey(k)))
             }
-            KexAlgorithm::Classical => {
-                let (msg, k) = hybrid_kex::initiate_classical(&peer.x25519_pub)?;
-                Ok((SessionHandshakeMsg::Classical(msg), SessionKey(k)))
-            }
-            // `actual` is the post-negotiation outcome — the negotiation
-            // arm above either returns Err for `HybridRequired` against
-            // a classical peer or collapses to `Hybrid` against a
-            // hybrid one, so `HybridRequired` never reaches here.
-            KexAlgorithm::HybridRequired => unreachable!(
-                "post-negotiation actual is Hybrid or Classical; HybridRequired never escapes"
+            // #481 — `actual` is `Hybrid` by construction: the explicit
+            // `Classical` request and the classical-peer case both returned
+            // `Err` above, and `HybridRequired` collapsed to `Hybrid`. The
+            // classical initiate path (`hybrid_kex::initiate_classical`) is
+            // retired and no longer reachable from this verb.
+            KexAlgorithm::Classical | KexAlgorithm::HybridRequired => unreachable!(
+                "post-#481 negotiation yields only Hybrid; classical is retired \
+                 and HybridRequired collapses to Hybrid"
             ),
         }
     }
@@ -322,10 +354,14 @@ impl FederationSession {
                 let k = hybrid_kex::respond_hybrid_with_public(&own.x25519_priv, priv_, pub_, m)?;
                 Ok(SessionKey(k))
             }
-            SessionHandshakeMsg::Classical(m) => {
-                let k = hybrid_kex::respond_classical(&own.x25519_priv, m)?;
-                Ok(SessionKey(k))
-            }
+            // CIRISEdge#481 — a responder MUST NOT derive a key from a classical
+            // handshake. This is the ACTIVE-attacker close: an attacker who
+            // strips the initiator's ML-KEM advertisement (or hand-crafts a
+            // classical handshake) must not establish a quantum-vulnerable
+            // session with us. The `Classical` variant is still PARSED so the
+            // refusal is typed and observable (a downgrade attempt is logged as
+            // itself), but no key is ever computed from it.
+            SessionHandshakeMsg::Classical(_m) => Err(SessionError::ClassicalKexRetired),
         }
     }
 }
@@ -381,34 +417,54 @@ mod tests {
         assert_eq!(initiator_key.as_bytes().len(), 32);
     }
 
-    /// Same as above, classical mode (X25519 only).
+    /// CIRISEdge#481 — an explicit `Classical` request is RETIRED. `initiate`
+    /// refuses it with [`SessionError::ClassicalKexRetired`] rather than
+    /// producing a classical session key (was: `classical_round_trip`).
     #[test]
-    fn classical_round_trip_yields_matching_session_keys() {
+    fn classical_initiate_is_retired() {
         let responder = fresh_recipient();
         let peer_view = advertise(&responder);
-        let (msg, initiator_key) =
-            FederationSession::initiate(&peer_view, KexAlgorithm::Classical).expect("initiate");
-        assert_eq!(msg.algorithm(), ALGORITHM_CLASSICAL_V1);
-        let responder_key = FederationSession::respond(&responder, &msg).expect("respond");
-        assert_eq!(initiator_key.as_bytes(), responder_key.as_bytes());
+        let r = FederationSession::initiate(&peer_view, KexAlgorithm::Classical);
+        assert!(
+            matches!(r, Err(SessionError::ClassicalKexRetired)),
+            "classical initiate must be retired, got {r:?}"
+        );
     }
 
-    /// Acceptance criterion 3 — classical fallback when peer hasn't
-    /// advertised ML-KEM-768. Requesting hybrid against such a peer
-    /// negotiates DOWN to classical, NOT failing.
+    /// CIRISEdge#481 — requesting `Hybrid` against a classical-only peer no
+    /// longer falls back to classical; it is REJECTED. This is the exact
+    /// active-downgrade an attacker forces by stripping the ML-KEM
+    /// advertisement (was: `..._falls_back`, which asserted the now-retired
+    /// fallback).
     #[test]
-    fn hybrid_requested_against_classical_only_peer_falls_back() {
+    fn hybrid_requested_against_classical_only_peer_is_rejected() {
         let responder = fresh_recipient();
         let peer_view = advertise_classical_only(&responder);
-        let (msg, initiator_key) =
-            FederationSession::initiate(&peer_view, KexAlgorithm::Hybrid).expect("initiate");
-        assert_eq!(
-            msg.algorithm(),
-            ALGORITHM_CLASSICAL_V1,
-            "fallback should pick classical"
+        let r = FederationSession::initiate(&peer_view, KexAlgorithm::Hybrid);
+        assert!(
+            matches!(r, Err(SessionError::HybridRequiredButPeerLacksMlkem)),
+            "hybrid vs classical-only peer must reject (no fallback), got {r:?}"
         );
-        let responder_key = FederationSession::respond(&responder, &msg).expect("respond");
-        assert_eq!(initiator_key.as_bytes(), responder_key.as_bytes());
+    }
+
+    /// CIRISEdge#481 — the ACTIVE-attacker close: even a WELL-FORMED classical
+    /// handshake (what an attacker who stripped the initiator's ML-KEM
+    /// advertisement would present) is REFUSED by the responder, never
+    /// completed into a session key.
+    #[test]
+    fn respond_rejects_classical_handshake() {
+        let responder = fresh_recipient();
+        let peer_view = advertise(&responder);
+        // Produce a genuine classical handshake via the crypto layer directly
+        // — `initiate` itself will no longer emit one.
+        let (classical_msg, _initiator_key) = hybrid_kex::initiate_classical(&peer_view.x25519_pub)
+            .expect("classical initiate (crypto layer)");
+        let wire = SessionHandshakeMsg::Classical(classical_msg);
+        let r = FederationSession::respond(&responder, &wire);
+        assert!(
+            matches!(r, Err(SessionError::ClassicalKexRetired)),
+            "responder must refuse a classical handshake, got {r:?}"
+        );
     }
 
     /// Acceptance criterion 4 — ML-KEM-only mode rejected. A peer view
