@@ -362,6 +362,15 @@ fn reverse_path_wait_step(
 /// announce storm can't be driven by rapid link churn.
 const EVENT_ANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// CIRISEdge#482 item 3 — bound on the announce cold-start hand-off queue. The
+/// EventReceiver task `try_send`s each inbound announce here and a dedicated
+/// worker drains it, so a slow/contended rooting directory can no longer
+/// head-of-line every other node event behind an announce's DB round-trips.
+/// At the cap, the oldest-losing policy is a LOUD drop (RNS announces are
+/// periodic + idempotent, so a dropped one self-heals on the next re-announce),
+/// never a silent one (CIRISEdge#425).
+const ANNOUNCE_QUEUE_DEPTH: usize = 256;
+
 /// CIRISEdge#482 item 5 — window a `check_blackhole` deny-list snapshot stays
 /// valid before the next dial re-reads `blackhole_list()` from persist. Short
 /// enough that operator add/remove takes effect near-immediately; long enough
@@ -4503,6 +4512,33 @@ impl Transport for ReticulumTransport {
         // announce immediately.
         let mut last_event_announce: Option<std::time::Instant> = None;
 
+        // CIRISEdge#482 item 3 — offload announce cold-start onto a dedicated
+        // worker so a slow / contended rooting directory can no longer
+        // head-of-line every other node event behind an announce's DB
+        // round-trips. The EventReceiver select arm below `try_send`s each
+        // inbound announce here; this single worker drains them FIFO (the same
+        // serial processing order as the old inline path, just decoupled from
+        // the hot event task — so it introduces no new concurrency). The worker
+        // exits when `announce_tx` drops on listener shutdown.
+        let announce_ctx = AnnounceCtx {
+            peers: Arc::clone(&self.peers),
+            rooting: self.rooting.clone(),
+            event_bus: self.event_bus.clone(),
+            reachability: self.reachability.clone(),
+            peer_bundles: Arc::clone(&self.peer_bundles),
+            hybrid_policy: self.hybrid_policy,
+            transport_binding_enforcement: self.transport_binding_enforcement,
+            bundle_save_gate: self.bundle_save_gate,
+        };
+        let (announce_tx, mut announce_rx) =
+            mpsc::channel::<leviculum_core::ReceivedAnnounce>(ANNOUNCE_QUEUE_DEPTH);
+        tokio::spawn(async move {
+            while let Some(announce) = announce_rx.recv().await {
+                resolve_announce_cold_start(announce, &announce_ctx).await;
+            }
+            tracing::debug!("announce cold-start worker exiting (channel closed)");
+        });
+
         loop {
             tokio::select! {
                 _ = announce_tick.tick() => {
@@ -4552,13 +4588,11 @@ impl Transport for ReticulumTransport {
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
                         binding_cache: &self.binding_cache,
-                        hybrid_policy: self.hybrid_policy,
-                        transport_binding_enforcement: self.transport_binding_enforcement,
+                        announce_tx: &announce_tx,
                         bundle_save_gate: self.bundle_save_gate,
                         peer_bundles: &self.peer_bundles,
                         own_bundle: self.own_bundle.as_ref(),
                         event_bus: self.event_bus.as_deref(),
-                        reachability: self.reachability.as_ref(),
                         link_established_at: &self.link_established_at,
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                         link_last_inbound_at: &self.link_last_inbound_at,
@@ -4607,6 +4641,25 @@ impl Transport for ReticulumTransport {
     }
 }
 
+/// CIRISEdge#482 item 3 — the OWNED subset of transport state that
+/// [`resolve_announce_cold_start`] needs, so it can run on a dedicated worker
+/// task (fed from [`EventCtx::announce_tx`]) instead of inline on the single
+/// EventReceiver task. Every field is `Arc`/`Copy` so the whole struct clones
+/// cheaply; it mirrors exactly the 8 `EventCtx` fields the cold-start path
+/// touches (verified: it delegates `ctx` to no other helper). Built once in
+/// [`ReticulumTransport::listen`] and moved into the worker.
+#[derive(Clone)]
+struct AnnounceCtx {
+    peers: Arc<Mutex<HashMap<String, RootedPeer>>>,
+    rooting: Option<Arc<dyn RootingDirectory>>,
+    event_bus: Option<Arc<crate::events::EventBus>>,
+    reachability: Option<Arc<ReachabilityTracker>>,
+    peer_bundles: Arc<crate::bundle_gate::PeerBundleStore>,
+    hybrid_policy: HybridPolicy,
+    transport_binding_enforcement: TransportBindingEnforcement,
+    bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
+}
+
 /// Shared handles the event loop hands to [`handle_event`].
 struct EventCtx<'a> {
     node: &'a ReticulumNode,
@@ -4622,11 +4675,10 @@ struct EventCtx<'a> {
     /// CIRISEdge#482 item 2 — per-`(peer, dest)` hybrid-binding memo, borrowed
     /// from the owning transport; see [`binding_exists_cached`].
     binding_cache: &'a BindingCache,
-    /// Consumer hybrid PQC policy applied to a rooted chain.
-    hybrid_policy: HybridPolicy,
-    /// CIRISEdge#205 (AV-42 Phase 4) — RNS destination-hash binding
-    /// enforcement posture applied in [`resolve_announce_cold_start`].
-    transport_binding_enforcement: TransportBindingEnforcement,
+    /// CIRISEdge#482 item 3 — hand-off channel to the announce cold-start
+    /// worker. The `AnnounceReceived` arm `try_send`s here instead of running
+    /// [`resolve_announce_cold_start`] inline on the EventReceiver task.
+    announce_tx: &'a mpsc::Sender<leviculum_core::ReceivedAnnounce>,
     /// CIRISEdge#437 — bundle-gate posture on the DURABLE Rooted save,
     /// applied to the write-through in [`resolve_announce_cold_start`].
     bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
@@ -4640,11 +4692,6 @@ struct EventCtx<'a> {
     /// emissions. `None` → no events emitted (the transport was
     /// constructed without `ReticulumAuth::event_bus`).
     event_bus: Option<&'a crate::events::EventBus>,
-    /// CIRISEdge#29 — per-medium reachability tracker. `Some` →
-    /// every successfully-rooted announce records an
-    /// `AttemptOutcome::AnnounceReceived` against `(peer_key_id,
-    /// TransportId::RETICULUM_RS)`.
-    reachability: Option<&'a Arc<ReachabilityTracker>>,
     /// CIRISEdge#32 (v0.14.0) — link establishment timestamps,
     /// populated on `LinkEstablished` / cleared on `LinkClosed` /
     /// `LinkStale`.
@@ -5072,13 +5119,23 @@ fn select_reply_link(
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
     match event {
         NodeEvent::AnnounceReceived { announce, .. } => {
-            // The announce app-data carries the peer's signed
-            // attestation. Run the authenticated cold-start path —
-            // root the federation key, verify the attestation
-            // signature, apply the hybrid policy — before the peer
-            // is recorded as resolvable. This replaces v0.3.1's
-            // trust-on-first-use (CIRISEdge#15, AV-42).
-            resolve_announce_cold_start(&announce, ctx).await;
+            // The announce app-data carries the peer's signed attestation; the
+            // authenticated cold-start path roots the federation key, verifies
+            // the attestation signature, and applies the hybrid policy before
+            // the peer is recorded as resolvable (replaces v0.3.1 TOFU —
+            // CIRISEdge#15, AV-42). CIRISEdge#482 item 3 — that work is now
+            // handed to a dedicated worker (non-blocking `try_send`) so its DB
+            // round-trips don't head-of-line every other node event. A full
+            // queue drops the announce LOUDLY (never silently — CIRISEdge#425);
+            // RNS announces are periodic + idempotent, so the peer's next
+            // re-announce retries.
+            if let Err(e) = ctx.announce_tx.try_send(announce) {
+                tracing::warn!(
+                    error = %e,
+                    "announce DROPPED — cold-start worker queue full or closed \
+                     (CIRISEdge#482 item 3; RNS re-announce will retry)"
+                );
+            }
         }
         // v7.2.0: Leviculum v0.8.x upstream auto-accepts inbound link
         // requests internally — the v0.7.x `NodeEvent::LinkRequest` +
@@ -6387,14 +6444,14 @@ async fn handle_peer_bundle_frame(
 
 #[allow(clippy::too_many_lines)]
 async fn resolve_announce_cold_start(
-    announce: &leviculum_core::ReceivedAnnounce,
-    ctx: &EventCtx<'_>,
+    announce: leviculum_core::ReceivedAnnounce,
+    ctx: &AnnounceCtx,
 ) {
     use ciris_persist::federation::self_at_login::BindingProvenance;
     // Step 0 — the cold-start path needs the persist directory. With
     // no rooting backend the announce cannot be authenticated; drop
     // it (fail-honest — never fall back to TOFU).
-    let Some(rooting) = ctx.rooting else {
+    let Some(rooting) = ctx.rooting.as_deref() else {
         // CIRISEdge#425 — no rooting directory means EVERY announce is dropped, so
         // no peer can ever root: the mesh silently never forms. A floored WARN
         // (fixed discriminant — one config condition) so a misconfigured node says
@@ -6437,7 +6494,7 @@ async fn resolve_announce_cold_start(
             // CIRISEdge#34 — still surface on the announce stream for operators
             // who subscribe, but at INFO severity: ambient non-CIRIS traffic is
             // informational, not a warning (CIRISEdge#357).
-            if let Some(bus) = ctx.event_bus {
+            if let Some(bus) = ctx.event_bus.as_deref() {
                 bus.emit_announce(crate::events::NetworkEvent::announce(
                     None,
                     announce.destination_hash().as_bytes().to_vec(),
@@ -6473,7 +6530,7 @@ async fn resolve_announce_cold_start(
                      the announce identity pubkeys (RNS §5.6.8.8.1.1 mismatch — \
                      spoofed transport-identity binding)",
                 );
-                if let Some(bus) = ctx.event_bus {
+                if let Some(bus) = ctx.event_bus.as_deref() {
                     bus.emit_announce(crate::events::NetworkEvent::announce(
                         Some(key_id.clone()),
                         announce.destination_hash().as_bytes().to_vec(),
@@ -6773,7 +6830,7 @@ async fn resolve_announce_cold_start(
                 // tracker / event / peer-map writes are logically
                 // independent (the tracker is observability, the peer
                 // map is routing).
-                if let Some(tracker) = ctx.reachability {
+                if let Some(tracker) = ctx.reachability.as_ref() {
                     tracker.record_attempt(
                         &key_id,
                         TransportId::RETICULUM_RS,
@@ -6784,7 +6841,7 @@ async fn resolve_announce_cold_start(
                 // event with info severity. The peer key_id is now known
                 // to be authentic; surface it on the announce stream so
                 // the UI can render "peer X joined".
-                if let Some(bus) = ctx.event_bus {
+                if let Some(bus) = ctx.event_bus.as_deref() {
                     bus.emit_announce(crate::events::NetworkEvent::announce(
                         Some(key_id.clone()),
                         announce.destination_hash().as_bytes().to_vec(),
@@ -6903,7 +6960,7 @@ async fn resolve_announce_cold_start(
             ctx.bundle_save_gate,
             persist_provenance,
             &persisted_key,
-            ctx.peer_bundles,
+            &ctx.peer_bundles,
             rooting,
         )
         .await;
