@@ -10,8 +10,9 @@ name: Bench
 #
 #   Lane A — single-value trends (one scalar per release):
 #     · criterion micro-benches (envelope_verify/_canonicalize, dispatch_inbound,
-#       transport_{reticulum,http}_loopback, realtime_av_{fanout,relay,rekey,
-#       mesh_e2e}) — wall-clock, NORMALIZED against the calibration anchor.
+#       transport_{reticulum,http}_loopback, transport_reticulum_inbound_contention
+#       (#369 node-lock concurrency trend, tolerant), realtime_av_{fanout,relay,
+#       rekey,mesh_e2e}) — wall-clock, NORMALIZED against the calibration anchor.
 #     · fixed-operating-point SIM metrics (ALM M1/M2/M8 + replication
 #       anti-entropy rounds / reassembly-delivery-ratio) — semantic values
 #       (ratios/ms/rounds), published UN-normalized. Below-bar grades publish
@@ -256,6 +257,20 @@ jobs:
               failed_benches="${failed_benches} ${bench}"
             fi
           }
+          # CIRISEdge#369 — TOLERANT run for the real-multi-node concurrency bench:
+          # its transport timing (N+2-node discovery, inter-node flood) can flake on
+          # a loaded runner, and it is trend-only + alert-suppressed + version-blind,
+          # so a flaked run is a WARNING (a missed trend point) — NOT a red job. It
+          # must still BUILD (a compile break is caught by every other feature combo),
+          # so this tolerates only the run, never a silent no-op of the whole lane.
+          run_bench_tolerant() {
+            local features="$1" bench="$2"
+            echo "::group::bench ${bench} (TOLERANT; features: ${features:-default})"
+            cargo bench --features "$features" --bench "$bench" -- --output-format bencher \
+              | tee -a bench-output-raw.txt \
+              || echo "::warning title=tolerant bench flaked::${bench} produced no trend point this run (real-transport timing) — not a failure"
+            echo "::endgroup::"
+          }
           # RNS/transport + envelope plane (default features)
           run_bench "" envelope_verify
           run_bench "" envelope_canonicalize
@@ -263,6 +278,9 @@ jobs:
           # transport loopbacks
           run_bench "transport-reticulum" transport_reticulum_loopback
           run_bench "transport-http"      transport_http_loopback
+          # CIRISEdge#369 — the node-lock CONCURRENCY trend (inbound drain rate,
+          # quiescent vs while-sending). Tolerant: real multi-node, timing-flaky.
+          run_bench_tolerant "transport-reticulum" transport_reticulum_inbound_contention
           # realtime A/V mesh plane
           run_bench "transport-http,transport-reticulum" realtime_av_fanout
           run_bench "transport-reticulum"                realtime_av_relay
@@ -305,6 +323,7 @@ jobs:
                 naive_seal_chunk_*|inner_once_outer_*|layered_inner_once_outer_*|\
                 relay_forward_*|relay_sustained_*|relay_streams_*|relay_layered_*|\
                 transport_reticulum_loopback/*|transport_http_loopback/*|\
+                transport_reticulum_inbound_contention/*|\
                 realtime_av_*|mesh_vs_relay_*|mesh_e2e_*|mls_rekey/*)
                   anchor_ns="$CALIBRATION_AES_NS"
                   ;;
