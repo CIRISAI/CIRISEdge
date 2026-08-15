@@ -2458,6 +2458,10 @@ fn parse_envelope_kind(s: &str) -> PyResult<crate::replication::EnvelopeKind> {
         "family_membership_revocation" => Ok(EnvelopeKind::FamilyMembershipRevocation),
         "community_membership_revocation" => Ok(EnvelopeKind::CommunityMembershipRevocation),
         "location_proof" => Ok(EnvelopeKind::LocationProof),
+        // CIRISEdge#474 — activation surface for the accord-quorum-evidence cursor
+        // plane: without this an operator cannot register a
+        // `(peer, accord_quorum_evidence)` Initiator, so the plane never opens.
+        "accord_quorum_evidence" => Ok(EnvelopeKind::AccordQuorumEvidence),
         other => Err(PyValueError::new_err(format!(
             "unknown EnvelopeKind: {other:?} (valid: key, attestation, revocation, \
              identity_occurrence, family, community, \
