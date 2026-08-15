@@ -577,9 +577,21 @@ tempfile       = { version = "3", optional = true }
 # pre-hashes inbound packets: the reply-side node-wide inbound stall drops from
 # ~32% to ~1% (bench-measured), directly relieving the CIRISEdge#370 reply-stall
 # component — the round-outcome instrument (v13.5.0) observes it in the field.
-# The `+ciris.1` is fork build-metadata; the crate semver is 0.10.
-leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.14.0+ciris.1", version = "0.14", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.14.0+ciris.1", version = "0.14", optional = true }
+# v0.15.0+ciris.1 (CIRISEdge#369) — catch-up to upstream 0.8.1+ (LXMF file
+# storage, per-transfer limits, driver-tick CoreProcessor, path-parity fixes) +
+# leviculum#29 stages 2-3: every expensive crypto class now runs OUTSIDE the node
+# mutex — measured lock-holds single-dest datagram 35µs -> 1.2µs (~20x), announce
+# 44µs -> ~21µs. This structurally removes the inbound-crypto-blocks-outbound-sends
+# exclusion CIRISEdge#370 traced (the #29 stage-1 relief above becomes complete).
+# Also carries the envelope-ceiling fix (leviculum#39: Channel::mdu capped at
+# u16::MAX, oversized send -> TooLarge not a lock-holding-thread panic) — the
+# leviculum-side twin of edge's own v16.2.0 frame_fragment cap. SOURCE-COMPAT: the
+# upstream catch-up moved nothing in the API edge consumes (try_send / link_mdu /
+# connect unchanged); the reticulum + reticulum,lxmf feature builds compile with no
+# match-arm or call-site churn. The crate semver is now 0.15; `+ciris.1` is fork
+# build-metadata.
+leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.15.0+ciris.1", version = "0.15", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.15.0+ciris.1", version = "0.15", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -589,7 +601,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.14.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.14.0+ciris.1", version = "0.14", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.15.0+ciris.1", version = "0.15", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
