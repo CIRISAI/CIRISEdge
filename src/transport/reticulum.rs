@@ -383,6 +383,18 @@ const BINDING_CACHE_TTL: Duration = Duration::from_secs(3);
 /// held across an `.await`, keeping the inbound path #217-safe).
 type BindingCache = std::sync::Mutex<HashMap<(String, [u8; 16]), (bool, std::time::Instant)>>;
 
+/// CIRISEdge#482 item 5 — the deny-list snapshot cache: `(generation,
+/// Option<(fetched_at, rows)>)`. The generation is bumped on local
+/// invalidation so a concurrent refresh can't clobber it. See the
+/// `blackhole_cache` field docblock.
+type BlackholeCache = std::sync::Mutex<(
+    u64,
+    Option<(
+        std::time::Instant,
+        Arc<Vec<ciris_persist::federation::BlackholeRecord>>,
+    )>,
+)>;
+
 /// CIRISEdge#318 — cap on the in-memory `peers` (rooted + advisory bindings)
 /// map. Bounds advisory-admit pollution: at cap, an Advisory binding is evicted
 /// before a new key is inserted (Rooted bindings are never evicted for advisory
@@ -1768,12 +1780,16 @@ pub struct ReticulumTransport {
     /// reachable a moment ago is immaterial, and both directions
     /// fail-safe (over-block briefly on removal, under-block briefly on
     /// add). `None`-backend transports never populate this.
-    blackhole_cache: std::sync::Mutex<
-        Option<(
-            std::time::Instant,
-            Arc<Vec<ciris_persist::federation::BlackholeRecord>>,
-        )>,
-    >,
+    ///
+    /// The leading `u64` is a GENERATION counter bumped by
+    /// [`Self::invalidate_blackhole_cache`] under this same lock:
+    /// `check_blackhole` snapshots it before its DB read and only commits
+    /// the fetched snapshot if the generation is UNCHANGED, so a local
+    /// `add`/`remove` that lands DURING an in-flight dial's read is never
+    /// clobbered by that dial's stale pre-mutation snapshot re-armed with a
+    /// fresh timestamp (CIRISEdge#482 review finding) — the "visible to the
+    /// very next dial" invalidation guarantee holds against that race.
+    blackhole_cache: BlackholeCache,
     /// CIRISEdge#482 item 2 — per-`(peer, dest)` hybrid-binding memo consulted
     /// on the inbound attribution path (once-per-frame directory lookup → one
     /// query per TTL window). See [`binding_exists_cached`].
@@ -2410,7 +2426,7 @@ impl ReticulumTransport {
             )),
             dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
             blackhole: blackhole_rules,
-            blackhole_cache: std::sync::Mutex::new(None),
+            blackhole_cache: std::sync::Mutex::new((0, None)),
             binding_cache: std::sync::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             store_and_forward: None,
@@ -3385,10 +3401,15 @@ impl ReticulumTransport {
     /// persist-backed `cirislens.blackhole_rules` table (which this
     /// process cannot observe without a read).
     fn invalidate_blackhole_cache(&self) {
-        *self
+        let mut guard = self
             .blackhole_cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bump the generation so any dial with an in-flight `blackhole_list()`
+        // read (snapshotted the OLD generation before its `.await`) declines to
+        // commit its now-stale snapshot, and drop the current snapshot.
+        guard.0 = guard.0.wrapping_add(1);
+        guard.1 = None;
     }
 
     /// v0.18.0 (CIRISEdge#33 background-pruner wiring) — expose the
@@ -3565,35 +3586,46 @@ impl ReticulumTransport {
         // A future cut can pivot to a single-row lookup primitive if persist
         // exposes one (the trait surface today is `blackhole_list` only —
         // see #120 docblock for the rationale of batched-flush).
-        let cached = {
+        let (cached, gen_at_miss) = {
             let guard = self
                 .blackhole_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match guard.as_ref() {
+            let cached = match guard.1.as_ref() {
                 Some((fetched_at, rows)) if fetched_at.elapsed() < BLACKHOLE_CACHE_TTL => {
                     Some(Arc::clone(rows))
                 }
                 _ => None,
-            }
+            };
+            // Snapshot the generation WITH the miss check so a concurrent
+            // invalidation during the `.await` below is detected at commit.
+            (cached, guard.0)
         };
-        let rows = match cached {
-            Some(rows) => rows,
-            None => {
-                let fetched = store
-                    .blackhole_list()
-                    .await
-                    .map_err(|e| TransportError::Io(format!("blackhole_list (check): {e}")))?;
-                let rows = Arc::new(fetched);
-                // Benign race: two concurrent stale-misses may both refresh;
-                // last-writer-wins with no correctness impact (identical data).
-                *self
+        let rows = if let Some(rows) = cached {
+            rows
+        } else {
+            let fetched = store
+                .blackhole_list()
+                .await
+                .map_err(|e| TransportError::Io(format!("blackhole_list (check): {e}")))?;
+            let rows = Arc::new(fetched);
+            // Commit the fresh snapshot ONLY if no invalidation raced our read
+            // (generation unchanged since the miss). If a LOCAL add/remove bumped
+            // the generation during our `.await`, drop this now-stale snapshot and
+            // let the next dial re-read — so the explicit invalidation is never
+            // clobbered by a pre-mutation snapshot re-armed with a fresh timestamp
+            // (CIRISEdge#482 review finding). Two concurrent stale-misses WITHOUT
+            // an interleaved mutation still race benignly (identical data).
+            {
+                let mut guard = self
                     .blackhole_cache
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some((std::time::Instant::now(), Arc::clone(&rows)));
-                rows
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.0 == gen_at_miss {
+                    guard.1 = Some((std::time::Instant::now(), Arc::clone(&rows)));
+                }
             }
+            rows
         };
         let now = chrono::Utc::now();
         for rec in rows.iter() {
@@ -4681,25 +4713,6 @@ fn resolve_link_attribution(
     }
 }
 
-/// Handle one [`NodeEvent`]. Announce events populate the peer map;
-/// link requests are accepted with auto-resource-accept; established
-/// links + completed sender-side resources unblock [`Transport::send`];
-/// completed receiver-side resources become [`InboundFrame`]s.
-// v0.14.0 (CIRISEdge#32 + #34 link-half) — grew past clippy's 100-line
-// cap once the LinkIdentified / LinkStale / ResponseReceived /
-// RequestTimedOut arms + the link-event emissions on existing arms
-// landed. Each new arm is a small typed routing of one NodeEvent
-// variant onto a side-effect (record / emit); extracting would
-// fragment the event-loop verdict across multiple helpers.
-#[allow(clippy::too_many_lines)]
-/// CIRISEdge#353/#365 — attribute an inbound link frame to its source peer and
-/// hand it to the inbound sink. Shared by BOTH the resource path
-/// (`ResourceCompleted`) and the packet path (`LinkDataReceived`, the #353 ask #2
-/// non-contending reverse-path reply) so the two can NEVER diverge in how they
-/// attribute or route a frame (the #348 two-loops lesson). Attribution order:
-/// the `LinkIdentified`-fed table first (a peer dialed us), then the link's
-/// DESTINATION (a link WE dialed — the reverse path), then `None`
-/// (SkippedNoSourceKeyId downstream, never a silent drop).
 /// CIRISEdge#482 item 2 — consult a per-`(peer, dest)` TTL memo before querying
 /// the rooting directory for a hybrid transport binding. The inbound attribution
 /// path calls `hybrid_transport_binding_exists` once PER FRAME; a peer that is
@@ -4750,6 +4763,25 @@ async fn binding_exists_cached(
     verdict
 }
 
+/// Handle one [`NodeEvent`]. Announce events populate the peer map;
+/// link requests are accepted with auto-resource-accept; established
+/// links + completed sender-side resources unblock [`Transport::send`];
+/// completed receiver-side resources become [`InboundFrame`]s.
+// v0.14.0 (CIRISEdge#32 + #34 link-half) — grew past clippy's 100-line
+// cap once the LinkIdentified / LinkStale / ResponseReceived /
+// RequestTimedOut arms + the link-event emissions on existing arms
+// landed. Each new arm is a small typed routing of one NodeEvent
+// variant onto a side-effect (record / emit); extracting would
+// fragment the event-loop verdict across multiple helpers.
+#[allow(clippy::too_many_lines)]
+/// CIRISEdge#353/#365 — attribute an inbound link frame to its source peer and
+/// hand it to the inbound sink. Shared by BOTH the resource path
+/// (`ResourceCompleted`) and the packet path (`LinkDataReceived`, the #353 ask #2
+/// non-contending reverse-path reply) so the two can NEVER diverge in how they
+/// attribute or route a frame (the #348 two-loops lesson). Attribution order:
+/// the `LinkIdentified`-fed table first (a peer dialed us), then the link's
+/// DESTINATION (a link WE dialed — the reverse path), then `None`
+/// (SkippedNoSourceKeyId downstream, never a silent drop).
 async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8>) {
     // CIRISEdge#353 — stamp last-inbound for the reverse-path link selector
     // (RNS `last_inbound`). This frame proves the peer is ALIVE on THIS link
