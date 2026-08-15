@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "17.0.0"
+version = "17.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -590,8 +590,20 @@ tempfile       = { version = "3", optional = true }
 # connect unchanged); the reticulum + reticulum,lxmf feature builds compile with no
 # match-arm or call-site churn. The crate semver is now 0.15; `+ciris.1` is fork
 # build-metadata.
-leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.15.0+ciris.1", version = "0.15", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.15.0+ciris.1", version = "0.15", optional = true }
+# v0.16.0+ciris.1 (CIRISEdge#484, leviculum#42/#44) — the ANTI-POLL API cut, built
+# largely FOR edge: additive completion-futures/await variants (`send_resource_awaited`,
+# `connect_awaited`/`await_link_established`, `send_request_awaited`, `subscribe_events`
+# → bounded `EventTap`) that let edge DELETE all six of its poll loops (reticulum.rs
+# 100ms/50ms/20ms polls). NO wire changes, NO breaking signatures vs v0.15 →
+# SOURCE-COMPAT on the bump (the poll-loop code still compiles; the awaited adoption is
+# a follow-up). FREE on this bump (no code): #44 the periodic storage flush no longer
+# holds the node lock across read+merge+write (the hourly deaf window on SD-card-class
+# HW is gone), + #42 registry hardening (stale-terminal-event race closed pre-tag). The
+# crate semver is now 0.16. CHANGELOG-gotcha lesson from their release: grep for
+# conflict markers before tagging (prose doesn't compile). Adoption sequenced in #484:
+# awaited variants next, then #482 item-1 buffer_unordered dispatcher.
+leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.16.0+ciris.1", version = "0.16", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.16.0+ciris.1", version = "0.16", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -601,7 +613,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.15.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.15.0+ciris.1", version = "0.15", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.16.0+ciris.1", version = "0.16", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
