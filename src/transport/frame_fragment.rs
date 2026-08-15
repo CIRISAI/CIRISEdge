@@ -88,6 +88,25 @@ pub const MIN_FRAGMENTABLE_MDU: usize = FRAGMENT_HEADER_LEN + 16;
 /// reject ceiling — so every admissible frame fragments.
 const MAX_FRAGMENTS: usize = u16::MAX as usize;
 
+/// SECURITY / robustness (leviculum#39): the HARD per-piece byte ceiling on the
+/// link Channel send path. Each fragment (and the whole-frame fast path) rides a
+/// single `LinkHandle::try_send`, whose payload becomes the leviculum Channel
+/// `Envelope`'s `data` — and that envelope's wire length field is a `u16`, so
+/// `data.len()` can never exceed `u16::MAX`, **regardless of how large an MTU the
+/// link negotiated**. `node.link_mdu()` reports the RAW negotiated MDU, which MTU
+/// discovery can push far above this (a live node saw ~200 KB). Without this cap
+/// the `frame.len() <= mdu` fast path handed a 113 KiB frame to a single
+/// `try_send`, and leviculum's `Envelope` length assert panicked the delivery
+/// thread ("envelope data length 115764 exceeds maximum 65535") — a `Result`-shaped
+/// condition surfacing as a crash in a lock-holding thread, deafening the node.
+/// [`fragment`] caps its effective MDU at this value so an oversized frame
+/// FRAGMENTS (each piece `<= u16::MAX`) instead of going whole. This mirrors
+/// leviculum#39's own `Channel::mdu(..).min(u16::MAX)` on the send guard, and
+/// hardens edge against BOTH the pre-#39 panic and any future stricter refusal.
+/// The 6-byte `CHANNEL_ENVELOPE_HEADER_SIZE` leviculum prepends is separate framing
+/// not counted in the `u16` `data` length, so this ceiling is exact.
+const WIRE_ENVELOPE_MAX_BYTES: usize = u16::MAX as usize;
+
 /// SECURITY (v16 review, pre-attribution reassembly OOM): the receive side bounded
 /// only the COUNT of in-flight partials (`max_in_flight`), never their bytes — so
 /// a peer declaring `total = u16::MAX` and streaming fragments (withholding one so
@@ -167,8 +186,16 @@ fn msg_id_of(frame: &[u8]) -> [u8; 8] {
 /// for a degenerate `mdu < MIN_FRAGMENTABLE_MDU` or a frame that would need more
 /// than [`MAX_FRAGMENTS`] pieces (the caller then keeps its existing
 /// oversized-drop path, now loud + counted).
+///
+/// The effective MDU is capped at [`WIRE_ENVELOPE_MAX_BYTES`] (leviculum#39): no
+/// single link Channel send can carry more than `u16::MAX` bytes of payload no
+/// matter how large the link MDU, so a frame above that ceiling FRAGMENTS rather
+/// than riding the whole-frame fast path into a length-assert panic.
 #[must_use]
 pub fn fragment(frame: &[u8], mdu: usize) -> Option<Vec<Vec<u8>>> {
+    // leviculum#39: never let the whole-frame fast path (or a fragment) exceed the
+    // Channel Envelope's u16 wire ceiling, even on a large-MTU link.
+    let mdu = mdu.min(WIRE_ENVELOPE_MAX_BYTES);
     if frame.len() <= mdu {
         return Some(vec![frame.to_vec()]);
     }
@@ -582,6 +609,54 @@ mod tests {
             got = r.accept(f).or(got);
         }
         assert_eq!(got, Some(frame));
+    }
+
+    #[test]
+    fn large_mtu_link_fragments_below_the_u16_envelope_ceiling() {
+        // leviculum#39 field regression: on a link whose negotiated MDU exceeds the
+        // Channel Envelope's u16 wire ceiling, an oversized frame MUST fragment —
+        // never ride the whole-frame fast path into a single `try_send` that panics
+        // leviculum's `Envelope` length assert. Reproduces the live failure exactly:
+        // a 115_764-byte frame on a ~200 KB-MDU link ("envelope data length 115764
+        // exceeds maximum 65535").
+        let link_mdu = 200_000usize; // MTU discovery can negotiate this
+        let frame: Vec<u8> = (0..115_764u32).map(|i| (i % 239) as u8).collect();
+        let frags = fragment(&frame, link_mdu).unwrap();
+        assert!(
+            frags.len() > 1,
+            "the frame must fragment, not go whole — {} piece(s)",
+            frags.len()
+        );
+        for f in &frags {
+            assert!(
+                f.len() <= WIRE_ENVELOPE_MAX_BYTES,
+                "every piece fits the u16 Channel Envelope ceiling ({} <= {})",
+                f.len(),
+                WIRE_ENVELOPE_MAX_BYTES
+            );
+            assert!(is_fragment(f));
+        }
+        // And it still reassembles byte-exact through the CFRG path.
+        let mut r = Reassembler::new();
+        let mut got = None;
+        for f in &frags {
+            got = r.accept(f).or(got);
+        }
+        assert_eq!(got.as_ref(), Some(&frame), "reassembles byte-exact");
+        assert_eq!(r.in_flight(), 0, "completed frame is freed");
+    }
+
+    #[test]
+    fn frame_at_the_u16_ceiling_rides_whole_even_on_a_huge_link() {
+        // A frame exactly at the envelope ceiling is still one deliverable unit; the
+        // cap only bites ABOVE u16::MAX. (u16::MAX itself is an admissible data len.)
+        let frame: Vec<u8> = (0..WIRE_ENVELOPE_MAX_BYTES as u32)
+            .map(|i| (i % 233) as u8)
+            .collect();
+        let frags = fragment(&frame, 1_000_000).unwrap();
+        assert_eq!(frags.len(), 1, "a ==ceiling frame is one whole piece");
+        assert!(!is_fragment(&frags[0]));
+        assert_eq!(frags[0].len(), WIRE_ENVELOPE_MAX_BYTES);
     }
 
     #[test]
