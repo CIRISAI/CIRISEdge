@@ -25,6 +25,7 @@ use ciris_persist::outbound::Error as PersistOutboundError;
 use ciris_persist::prelude::{
     OutboundFailureOutcome, OutboundFilter, OutboundQueue, OutboundRow, QueueId,
 };
+use futures::stream::StreamExt as _;
 
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
 use crate::transport::{Transport, TransportError, TransportSendOutcome};
@@ -462,11 +463,30 @@ pub async fn run_dispatcher(
             continue;
         }
 
-        for row in claimed {
-            dispatch_one(&*queue, &transports, &row, &config, reachability.as_ref()).await;
-        }
+        // CIRISEdge#482 item-1 — dispatch the claimed batch CONCURRENTLY (was a
+        // strictly serial `for` loop through `transports[0]`). Serially, ONE
+        // unreachable peer cost a 30 s establish + up to 120 s transfer and
+        // head-of-lined all the other rows in the batch — including rows for
+        // healthy peers. `for_each_concurrent` lets a slow/dead peer's row time out
+        // in its own slot while the rest proceed; the bound caps concurrent link
+        // establishment so a large batch can't thundering-herd the transport.
+        let queue_ref = &*queue;
+        let transports_ref = &transports;
+        let config_ref = &config;
+        let reach_ref = reachability.as_ref();
+        futures::stream::iter(claimed)
+            .for_each_concurrent(DISPATCH_CONCURRENCY, |row| async move {
+                dispatch_one(queue_ref, transports_ref, &row, config_ref, reach_ref).await;
+            })
+            .await;
     }
 }
+
+/// CIRISEdge#482 — how many claimed outbound rows dispatch concurrently. Bounds
+/// concurrent link establishment (a slow/dead peer occupies at most ONE slot, so
+/// it never head-of-lines the batch) without letting a large claimed batch open an
+/// unbounded number of dials at once.
+const DISPATCH_CONCURRENCY: usize = 16;
 
 #[allow(clippy::too_many_lines)] // CIRISEdge#29 hook insertion crosses the 100-line bound; refactor as
                                  // part of the dispatcher-tier overhaul (FSD §3.4 follow-up)
