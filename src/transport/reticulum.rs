@@ -87,7 +87,7 @@ use tokio::sync::{mpsc, Mutex};
 use leviculum_core::link::LinkId;
 use leviculum_core::resource::ResourceStrategy;
 use leviculum_core::{Destination, DestinationHash, DestinationType, Direction, Identity};
-use leviculum_std::driver::{EventReceiver, ReticulumNode, ReticulumNodeBuilder};
+use leviculum_std::driver::{CompletionError, EventReceiver, ReticulumNode, ReticulumNodeBuilder};
 use leviculum_std::NodeEvent;
 
 use super::attestation::{
@@ -1590,11 +1590,6 @@ pub struct ReticulumTransport {
     /// The event loop owns the only `NodeEvent` receiver, so this set
     /// is `send`'s sole window onto link state.
     established_links: Arc<Mutex<HashSet<LinkId>>>,
-    /// Resource hashes the event loop has seen complete on the
-    /// sender side (`ResourceCompleted { is_sender: true }`). `send`
-    /// waits on this set so it returns `Delivered` only once the
-    /// transfer has actually drained, not merely enqueued.
-    sent_resources: Arc<Mutex<HashSet<[u8; 32]>>>,
     /// CIRISEdge#353b/v13.6.1 — sender-side transfer progress for in-flight
     /// resources, keyed by `resource_hash`. Populated by the
     /// `Resource{Advertised,TransferStarted,Progress}` (`is_sender: true`) event
@@ -1713,16 +1708,6 @@ pub struct ReticulumTransport {
     /// of "I dialed link L to dest D", consulted when `link_destination` is `None`.
     /// Removed on `LinkClosed`.
     dialed_link_dest: Arc<Mutex<HashMap<LinkId, DestinationHash>>>,
-    /// CIRISEdge#32 (v0.14.0) — request/response slot. The listen-loop
-    /// populates this on `NodeEvent::ResponseReceived` keyed by
-    /// `request_id`; [`Self::link_request`] polls + removes.
-    request_responses: Arc<Mutex<HashMap<[u8; 16], Vec<u8>>>>,
-    /// CIRISEdge#32 (v0.14.0) — typed timeout sentinel. The listen-loop
-    /// populates this on `NodeEvent::RequestTimedOut`;
-    /// [`Self::link_request`] surfaces the `Timeout` error when a
-    /// `request_id` lands here. A `HashSet<[u8; 16]>` so multiple
-    /// in-flight requests across links never collide.
-    timed_out_requests: Arc<Mutex<HashSet<[u8; 16]>>>,
     /// CIRISEdge#33 — operator-configured deny-list. Keyed by the
     /// 16-byte Reticulum identity hash of the blocked peer. `send`
     /// consults this BEFORE the leviculum connect call; a hit
@@ -2325,7 +2310,6 @@ impl ReticulumTransport {
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
-            sent_resources: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             resolver,
@@ -2345,8 +2329,6 @@ impl ReticulumTransport {
                 crate::transport::frame_fragment::Reassembler::new(),
             )),
             dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
-            request_responses: Arc::new(Mutex::new(HashMap::new())),
-            timed_out_requests: Arc::new(Mutex::new(HashSet::new())),
             blackhole: blackhole_rules,
             started_at: std::time::Instant::now(),
             store_and_forward: None,
@@ -2811,9 +2793,15 @@ impl ReticulumTransport {
         // peer's federation pubkey) and the legacy announce-bound
         // route (when the peer is still on v6.x). The 16 bytes are
         // opaque to leviculum; the receiver's index dispatches.
-        let link = self
+        // CIRISEdge#484 — leviculum v0.16 `connect_awaited` registers the
+        // establishment waiter BEFORE dispatch (the `LinkEstablished` proof can never
+        // precede registration), keyed on the ORIGINAL dial id — which is exactly the
+        // #342/#66 alias the old 50 ms `link_is_established` poll resolved (a re-key on
+        // a lossy path). The future takes NO node lock and resolves `Err(LinkClosed)`
+        // if the link dies first, so it never hangs; the caller owns the timeout.
+        let (link, established) = self
             .node
-            .connect(&dest_hash, &signing_key)
+            .connect_awaited(&dest_hash, &signing_key)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
@@ -2824,14 +2812,10 @@ impl ReticulumTransport {
             .await
             .insert(link_id, dest_hash);
 
-        // CIRISEdge#342 — alias-resolving establishment poll (see `send`): a
-        // #66 re-key on a lossy path re-keys the link under a fresh id, so a raw
-        // `established_links.contains(&original_id)` misses.
-        let established = wait_until_async(timeout, Duration::from_millis(50), || async {
-            self.node.link_is_established(&link_id)
-        })
-        .await;
-        if !established {
+        // Runtime-agnostic bound (CIRISEdge#217): `established` resolves `Ok(())` on
+        // establishment / `Err(LinkClosed)` on link death; anything else — or the
+        // timeout — is a failed dial.
+        if !matches!(with_timeout(timeout, established).await, Some(Ok(()))) {
             return Err(TransportError::Timeout(timeout));
         }
         // CIRISEdge#340 — identify the link so the responder can attribute what
@@ -2872,15 +2856,10 @@ impl ReticulumTransport {
             return Ok(());
         }
 
-        // Best-effort drain — wait briefly for any pending sender-side
-        // resource to drop out of `sent_resources`. The drain is
-        // bounded so a wedged peer can't block teardown indefinitely.
-        let _drained = wait_until_async(
-            Duration::from_millis(500),
-            Duration::from_millis(50),
-            || async { self.sent_resources.lock().await.is_empty() },
-        )
-        .await;
+        // CIRISEdge#484 — the sender-side resource drain is now redundant: every
+        // resource send (`ship_resource_on_link`) AWAITS its own completion future
+        // before returning (leviculum v0.16), so no send is in flight by the time a
+        // caller reaches teardown. The `sent_resources` mirror is deleted with it.
 
         // close_link emits a LinkClosed event on the loop; the loop's
         // handle_event removes the link from `established_links`.
@@ -2916,33 +2895,30 @@ impl ReticulumTransport {
         let link_id = LinkId::new(link_id_array);
 
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-        let request_id = self
+        // CIRISEdge#484 — leviculum v0.16 completion future replaces the 20 ms
+        // `request_responses`/`timed_out_requests` poll loop (both mirror maps + their
+        // `handle_event` populate arms are now deleted). The waiter is registered
+        // BEFORE dispatch (the response can never precede registration), takes NO node
+        // lock, and resolves `Err(RequestTimedOut)` on the in-protocol timeout or
+        // `Err(LinkClosed)` if the link dies first — it never hangs on a dead link.
+        let (_request_id, response) = self
             .node
-            .send_request(&link_id, path, Some(data), Some(timeout_ms))
+            .send_request_awaited(&link_id, path, Some(data), Some(timeout_ms))
             .await
             .map_err(|e| TransportError::Io(format!("reticulum send_request: {e}")))?;
-
-        // Poll the per-request response slot. The listen-loop populates
-        // `request_responses` on `ResponseReceived` and removes the
-        // request_id from `pending_requests` on `RequestTimedOut`.
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            {
-                let mut responses = self.request_responses.lock().await;
-                if let Some(bytes) = responses.remove(&request_id) {
-                    return Ok(bytes);
-                }
-            }
-            {
-                let mut timed = self.timed_out_requests.lock().await;
-                if timed.remove(&request_id) {
-                    return Err(TransportError::Timeout(timeout));
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(TransportError::Timeout(timeout));
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // The future self-bounds via the in-protocol `timeout_ms` (resolves
+        // `RequestTimedOut`) and via `LinkClosed` on link death, so it ALWAYS
+        // resolves — no outer timer is added (CIRISEdge#217: these send/request paths
+        // can be awaited on a thread whose tokio-locals belong to persist's runtime,
+        // where `tokio::time::*` panics "no reactor running"; the completion future is
+        // Timer-free).
+        match response.await {
+            Ok(info) => Ok(info.response_data),
+            Err(CompletionError::RequestTimedOut) => Err(TransportError::Timeout(timeout)),
+            Err(CompletionError::LinkClosed { reason }) => Err(TransportError::Io(format!(
+                "reticulum request: link closed before response ({reason:?})"
+            ))),
+            Err(e) => Err(TransportError::Io(format!("reticulum request: {e}"))),
         }
     }
 
@@ -3920,9 +3896,9 @@ impl ReticulumTransport {
         let _ = self
             .node
             .set_resource_strategy(link_id, ResourceStrategy::AcceptAll);
-        let resource_hash = self
+        let (resource_hash, sent) = self
             .node
-            .send_resource(link_id, envelope_bytes, None, true)
+            .send_resource_awaited(link_id, envelope_bytes, None, true)
             .await
             .map_err(|e| match e {
                 leviculum_std::error::Error::Resource(
@@ -3933,90 +3909,90 @@ impl ReticulumTransport {
                 ))),
             })?;
 
-        // CIRISEdge#353b/v13.6.1 — PROGRESS-AWARE wait for the sender-side
-        // `ResourceCompleted` (delivered + proven). A resource completes only
-        // after advertise → accept → parts → proof, so a large reply over a
-        // high-RTT link legitimately takes many seconds even when live. Rather
-        // than a flat cutoff (which severed live transfers), extend WHILE parts
-        // flow (`ResourceProgress` bumps `last_update`) up to `max_transfer`, but
-        // fast-fail once `no_progress_window` passes with no progress (dead link),
-        // and bail distinctly if the link dies mid-transfer. `reverse_path_wait_step`
-        // holds the (unit-tested) decision.
+        // CIRISEdge#484 + #353b/v13.6.1 — leviculum v0.16 completion future replaces
+        // the 100 ms `sent_resources` completion-poll (and its `link_is_established`
+        // liveness re-check): `sent` resolves `Ok` on the proven `ResourceCompleted`
+        // and `Err(LinkClosed)` if the link dies mid-transfer, taking NO node lock.
+        // The future carries NO progress signal, so the PROGRESS-AWARE #353b fast-fail
+        // (extend WHILE parts flow, but bail once `no_progress_window` passes with the
+        // link still alive) is preserved by a lean watchdog tick that reuses the
+        // (unit-tested) `reverse_path_wait_step` for exactly its {Stalled, MaxDeadline}
+        // arms; {Done, LinkStale} now come from the future. `sent_resource_progress`
+        // stays (the watchdog reads it); `sent_resources` is deleted with Site 4.
         let start = std::time::Instant::now();
+        tokio::pin!(sent);
         let mut poll = tokio::time::interval(Duration::from_millis(100));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            poll.tick().await;
-            let completed = self.sent_resources.lock().await.remove(&resource_hash);
-            let link_live = self.node.link_is_established(link_id);
-            let (since_last_progress, stage) = {
-                let guard = self.sent_resource_progress.lock().await;
-                guard.get(&resource_hash).map_or_else(
-                    || (start.elapsed(), None),
-                    |p| (p.last_update.elapsed(), Some(p.stage)),
-                )
-            };
-            match reverse_path_wait_step(
-                completed,
-                link_live,
-                since_last_progress,
-                start.elapsed(),
-                no_progress_window,
-                max_transfer,
-            ) {
-                ReverseWaitStep::Continue => {}
-                ReverseWaitStep::Done => {
-                    self.sent_resource_progress
-                        .lock()
-                        .await
-                        .remove(&resource_hash);
-                    return Ok(());
+            tokio::select! {
+                result = &mut sent => {
+                    self.sent_resource_progress.lock().await.remove(&resource_hash);
+                    return match result {
+                        Ok(_info) => Ok(()),
+                        Err(CompletionError::LinkClosed { .. }) => {
+                            tracing::warn!(
+                                resource = %hex::encode(&resource_hash[..8]),
+                                elapsed_secs = start.elapsed().as_secs(),
+                                "reverse-path link CLOSED mid-transfer — the peer churned this link \
+                                 before the resource completed (CIRISEdge#353b caveat; burst-and-leave \
+                                 is the separate initiator-push end-state)"
+                            );
+                            Err(ShipError::Other(TransportError::Timeout(max_transfer)))
+                        }
+                        Err(e) => Err(ShipError::Other(TransportError::Io(format!(
+                            "reticulum resource send: {e}"
+                        )))),
+                    };
                 }
-                ReverseWaitStep::StalledNoProgress => {
-                    self.sent_resource_progress
-                        .lock()
-                        .await
-                        .remove(&resource_hash);
-                    tracing::debug!(
-                        resource = %hex::encode(&resource_hash[..8]),
-                        stalled_at = stage
-                            .map_or("no transfer started (peer never accepted, or advertise lost)",
-                                    ResourceSendStage::as_str),
-                        elapsed_secs = start.elapsed().as_secs(),
-                        "reverse-path resource made no progress; failing fast (CIRISEdge#353b) — the \
-                         stage names WHERE it stalled, so Outcome B (slow) vs A (stuck) is \
-                         field-answerable at DEBUG"
-                    );
-                    return Err(ShipError::Other(TransportError::Timeout(
+                _ = poll.tick() => {
+                    let (since_last_progress, stage) = {
+                        let guard = self.sent_resource_progress.lock().await;
+                        guard.get(&resource_hash).map_or_else(
+                            || (start.elapsed(), None),
+                            |p| (p.last_update.elapsed(), Some(p.stage)),
+                        )
+                    };
+                    // `completed=false` / `link_live=true`: a proven completion or a
+                    // dead link fires the `sent` arm above, never here — so this only
+                    // ever yields Continue / StalledNoProgress / MaxDeadline.
+                    match reverse_path_wait_step(
+                        false,
+                        true,
+                        since_last_progress,
+                        start.elapsed(),
                         no_progress_window,
-                    )));
-                }
-                ReverseWaitStep::LinkStale => {
-                    self.sent_resource_progress
-                        .lock()
-                        .await
-                        .remove(&resource_hash);
-                    tracing::warn!(
-                        resource = %hex::encode(&resource_hash[..8]),
-                        elapsed_secs = start.elapsed().as_secs(),
-                        stalled_at = stage.map_or("pre-transfer", ResourceSendStage::as_str),
-                        "reverse-path link went STALE mid-transfer — the peer churned this link \
-                         before the resource completed (CIRISEdge#353b caveat; burst-and-leave is \
-                         the separate initiator-push end-state)"
-                    );
-                    return Err(ShipError::Other(TransportError::Timeout(max_transfer)));
-                }
-                ReverseWaitStep::MaxDeadline => {
-                    self.sent_resource_progress
-                        .lock()
-                        .await
-                        .remove(&resource_hash);
-                    tracing::warn!(
-                        resource = %hex::encode(&resource_hash[..8]),
-                        max_secs = max_transfer.as_secs(),
-                        "reverse-path resource still transferring at the hard cap; abandoning so the \
-                         responder drain is not parked forever (CIRISEdge#353b/#373)"
-                    );
-                    return Err(ShipError::Other(TransportError::Timeout(max_transfer)));
+                        max_transfer,
+                    ) {
+                        ReverseWaitStep::Continue => {}
+                        ReverseWaitStep::StalledNoProgress => {
+                            self.sent_resource_progress.lock().await.remove(&resource_hash);
+                            tracing::debug!(
+                                resource = %hex::encode(&resource_hash[..8]),
+                                stalled_at = stage.map_or(
+                                    "no transfer started (peer never accepted, or advertise lost)",
+                                    ResourceSendStage::as_str),
+                                elapsed_secs = start.elapsed().as_secs(),
+                                "reverse-path resource made no progress; failing fast (CIRISEdge#353b) — \
+                                 the stage names WHERE it stalled, so Outcome B (slow) vs A (stuck) is \
+                                 field-answerable at DEBUG"
+                            );
+                            return Err(ShipError::Other(TransportError::Timeout(no_progress_window)));
+                        }
+                        ReverseWaitStep::MaxDeadline => {
+                            self.sent_resource_progress.lock().await.remove(&resource_hash);
+                            tracing::warn!(
+                                resource = %hex::encode(&resource_hash[..8]),
+                                max_secs = max_transfer.as_secs(),
+                                "reverse-path resource still transferring at the hard cap; abandoning \
+                                 so the responder drain is not parked forever (CIRISEdge#353b/#373)"
+                            );
+                            return Err(ShipError::Other(TransportError::Timeout(max_transfer)));
+                        }
+                        ReverseWaitStep::Done | ReverseWaitStep::LinkStale => {
+                            unreachable!("Done/LinkStale are owned by the completion future, \
+                                          not the progress watchdog (completed=false, link_live=true)");
+                        }
+                    }
                 }
             }
         }
@@ -4181,15 +4157,15 @@ impl Transport for ReticulumTransport {
             NO_PATH_ESTABLISH_TIMEOUT
         };
 
-        // Establish a link to the peer's destination. `connect`
-        // returns immediately; the link is usable once
-        // `LinkEstablished` arrives on the event channel. The event
-        // loop is owned by `listen`, so we cannot observe that event
-        // here — instead we poll `active_link_count` / link presence
-        // via a short bounded wait, then send the resource.
-        let link = self
+        // CIRISEdge#484 — leviculum v0.16 `connect_awaited` returns the handle
+        // immediately AND a completion future for `LinkEstablished`, registered
+        // BEFORE dispatch (edge no longer needs to observe the event loop `listen`
+        // owns). The future keys on the ORIGINAL dial id — the #342/#66 alias the old
+        // `link_is_established` poll resolved — takes NO node lock, and resolves
+        // `Err(LinkClosed)` on link death. Caller owns the wall-clock bound.
+        let (link, established) = self
             .node
-            .connect(&peer.dest_hash, &peer.signing_key)
+            .connect_awaited(&peer.dest_hash, &peer.signing_key)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
@@ -4202,26 +4178,15 @@ impl Transport for ReticulumTransport {
             .await
             .insert(link_id, peer.dest_hash);
 
-        // Wait for the link to reach `LinkEstablished` on BOTH ends —
-        // the peer must have accepted the LINK_REQUEST or a resource
-        // transfer cannot start. The event loop records established
-        // link IDs in `established_links`; poll it.
-        // CIRISEdge#342 — poll leviculum's ALIAS-RESOLVING establishment query,
-        // not edge's own `established_links` set. On a lossy path the #66
-        // establishment retry re-keys the link under a fresh wire id; the
-        // `LinkEstablished` event (hence `established_links`) then carries the
-        // RE-KEYED id, while we hold connect's ORIGINAL id. A raw
-        // `established_links.contains(&original)` never matches → we time out →
-        // never reach `send_resource` → 0 Data frames → the link idles to a
-        // keepalive death (the field symptom on the remote/canonical path).
-        // `link_is_established` resolves the origin id through leviculum's #66
-        // alias table and gates on `LinkState::Active`.
-        let established =
-            wait_until_async(establish_timeout, Duration::from_millis(50), || async {
-                self.node.link_is_established(&link_id)
-            })
-            .await;
-        if !established {
+        // Await `LinkEstablished` on BOTH ends — the peer must have accepted the
+        // LINK_REQUEST or a resource transfer cannot start. `established` resolves
+        // `Ok(())` on establishment, `Err(LinkClosed)` if the peer refused / the link
+        // died first; a timeout means no route or a stalled dial.
+        let established_ok = matches!(
+            with_timeout(establish_timeout, established).await,
+            Some(Ok(()))
+        );
+        if !established_ok {
             // CIRISEdge#336 — a no-path target that never established is
             // un-routable, not slow: fail fast with the self-diagnosing error
             // (naming target dest, key_id, and the paths we DO hold — the
@@ -4401,7 +4366,6 @@ impl Transport for ReticulumTransport {
                         node: &self.node,
                         peers: &self.peers,
                         established_links: &self.established_links,
-                        sent_resources: &self.sent_resources,
                         sent_resource_progress: &self.sent_resource_progress,
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
@@ -4413,8 +4377,6 @@ impl Transport for ReticulumTransport {
                         event_bus: self.event_bus.as_deref(),
                         reachability: self.reachability.as_ref(),
                         link_established_at: &self.link_established_at,
-                        request_responses: &self.request_responses,
-                        timed_out_requests: &self.timed_out_requests,
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                         link_last_inbound_at: &self.link_last_inbound_at,
                         inbound_reasm: &self.inbound_reasm,
@@ -4467,7 +4429,6 @@ struct EventCtx<'a> {
     node: &'a ReticulumNode,
     peers: &'a Mutex<HashMap<String, RootedPeer>>,
     established_links: &'a Mutex<HashSet<LinkId>>,
-    sent_resources: &'a Mutex<HashSet<[u8; 32]>>,
     /// CIRISEdge#353b/v13.6.1 — sender-side resource transfer progress (see the
     /// field of the same name on [`ReticulumTransport`]).
     sent_resource_progress: &'a Mutex<HashMap<[u8; 32], ResourceSendProgress>>,
@@ -4502,12 +4463,6 @@ struct EventCtx<'a> {
     /// populated on `LinkEstablished` / cleared on `LinkClosed` /
     /// `LinkStale`.
     link_established_at: &'a Mutex<HashMap<LinkId, u64>>,
-    /// CIRISEdge#32 (v0.14.0) — per-request response slot, populated
-    /// on `NodeEvent::ResponseReceived`.
-    request_responses: &'a Mutex<HashMap<[u8; 16], Vec<u8>>>,
-    /// CIRISEdge#32 (v0.14.0) — per-request timeout sentinel,
-    /// populated on `NodeEvent::RequestTimedOut`.
-    timed_out_requests: &'a Mutex<HashSet<[u8; 16]>>,
     /// v3.5.1 (CIRISEdge#119 + #120) — per-link rooted-peer
     /// attribution. Populated on `NodeEvent::LinkIdentified` after
     /// matching the link's remote identity to a rooted peer; consumed
@@ -5183,10 +5138,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 .await
                 .remove(&resource_hash);
             if is_sender {
-                // choke-ok: sender-side completion, NOT an inbound drop — our own
-                // outbound envelope finished transferring; unblock the `send`
-                // waiting on this resource hash (CIRISEdge#425).
-                ctx.sent_resources.lock().await.insert(resource_hash);
+                // choke-ok: sender-side completion is NOT an inbound drop — our own
+                // outbound envelope finished transferring. CIRISEdge#484 — it is now
+                // delivered to the `ship_resource_on_link` waiter by the leviculum v0.16
+                // completion future (no `sent_resources` mirror); here we only need to
+                // NOT process our own outbound completion as a receiver-side frame.
                 return;
             }
             // Receiver side: the first segment carries the full envelope (edge
@@ -5289,21 +5245,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 ));
             }
         }
-        NodeEvent::ResponseReceived {
-            request_id,
-            response_data,
-            ..
-        } => {
-            // CIRISEdge#32 (v0.14.0) — feed the per-request response
-            // slot the link_request poller reads.
-            ctx.request_responses
-                .lock()
-                .await
-                .insert(request_id, response_data);
-        }
-        NodeEvent::RequestTimedOut { request_id, .. } => {
-            ctx.timed_out_requests.lock().await.insert(request_id);
-        }
+        // CIRISEdge#484 — `ResponseReceived` / `RequestTimedOut` are now resolved by
+        // the leviculum v0.16 completion registry (fed at the dispatch layer), so
+        // `link_request` no longer mirrors them here — the events fall through to the
+        // trace arm and the `request_responses` / `timed_out_requests` maps are gone.
         other => {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
@@ -7256,35 +7201,25 @@ fn apply_interface_config(
     }
 }
 
-// ─── Bounded polling helper ─────────────────────────────────────────
+// ─── Runtime-agnostic timeout helper ────────────────────────────────
 
-/// Poll an async `cond` every `interval` until it resolves to `true`
-/// or `timeout` elapses. Returns whether the condition was met. Used
-/// by `send` to wait on link establishment + resource completion
-/// without owning the `NodeEvent` loop (which `listen` owns).
+/// Bound `fut` by `dur`, returning `None` on timeout. Runtime-agnostic:
+/// `futures_timer::Delay` carries its OWN timer thread, so this needs NO tokio
+/// Timer driver — unlike `tokio::time::timeout`.
 ///
-/// v7.0.12 (CIRISEdge#217) — uses `futures_timer::Delay` +
-/// `std::time::Instant` instead of `tokio::time::*` so the poll is
-/// runtime-agnostic. The cross-cdylib tokio aliasing class makes
-/// `tokio::time::sleep` panic with "no reactor running" when this
-/// helper is awaited on a thread whose tokio thread-locals belong to
-/// persist's runtime — the bootstrapping-node failure mode in #217.
-/// `cond()`'s own awaits (typically `tokio::sync::Mutex::lock`) don't
-/// need a Timer driver, just state-machine polling.
-async fn wait_until_async<F, Fut>(timeout: Duration, interval: Duration, mut cond: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let start = std::time::Instant::now();
-    loop {
-        if cond().await {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        futures_timer::Delay::new(interval).await;
+/// CIRISEdge#217/#484 — the leviculum v0.16 completion futures (`connect_awaited`
+/// etc.) that retired edge's six poll loops are Timer-free themselves, but the dial
+/// paths still need a CALLER bound (leviculum's own establishment timeout, scaled
+/// for LoRa + retries, is longer than edge's budget). Those dial paths can be
+/// awaited on a thread whose tokio thread-locals belong to persist's runtime — the
+/// #217 bootstrapping-node case — where `tokio::time::*` panics "no reactor
+/// running", so the bound is `futures_timer`-based, the same rationale the retired
+/// `wait_until_async` poll helper carried.
+async fn with_timeout<F: std::future::Future>(dur: Duration, fut: F) -> Option<F::Output> {
+    tokio::pin!(fut);
+    tokio::select! {
+        out = &mut fut => Some(out),
+        () = futures_timer::Delay::new(dur) => None,
     }
 }
 
