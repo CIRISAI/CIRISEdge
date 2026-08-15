@@ -1546,6 +1546,12 @@ pub struct ReticulumTransport {
     /// listening on ... (dest <explicit_hash>) (named-dest
     /// <named_hash>)` on the `transport_up` interface event.
     local_named_dest_hash: DestinationHash,
+    /// CIRISEdge#489 — the announce-suppression policy installed on `node`
+    /// via `set_announce_control`. Retained here (Arc-backed inner shares
+    /// state with the node's boxed clone) so a future scoped destination can
+    /// be registered via `register_destination_scope` and the node's
+    /// auto-announce loops immediately honour its cohort scope.
+    announce_policy: crate::announce_suppression::ScopePrivacyAnnouncePolicy,
     /// v2.1.0 (CIRISPersist `LocalIdentityAggregate` RET-transport
     /// role) — the 64-byte Reticulum dual-key public material edge
     /// minted at startup: `x25519_pub (32) ‖ ed25519_pub (32)`. The
@@ -2305,6 +2311,32 @@ impl ReticulumTransport {
         // `register_destination` (native) registers it at `local_named_dest_hash`.
         node.register_destination(named_dest);
 
+        // CIRISEdge#489 — INSTALL the announce-suppression policy onto the node.
+        // Until this call `ScopePrivacyAnnouncePolicy` was dead code:
+        // `set_announce_control` was never invoked anywhere in `src/`, so
+        // leviculum's own local-destination auto-announce loops (the periodic
+        // management re-announce + the local re-gossip pass) gossiped every
+        // local destination unconditionally — a group-scoped destination could
+        // be announced in breach of CC 5.4 (§5.4: group-scoped destinations
+        // MUST NOT announce). The policy default-SUPPRESSES every UNregistered
+        // destination, so the ONE destination that must keep auto-announcing —
+        // this node's NAMED discovery address, the Commons-scoped public mesh
+        // address peers resolve us by — is registered `Public` here so its
+        // auto-re-announce survives. The explicit-hash dest needs no
+        // registration: leviculum skips explicit-hash announces structurally,
+        // and default-suppress is the belt. Edge's own explicit interval
+        // announce of the named dest (`announce_destination`, below) is a
+        // SEPARATE path that does not consult the policy, so mesh discovery is
+        // preserved on both the explicit and the auto paths; the policy only
+        // adds suppression for scoped destinations (register future ones via
+        // the retained `announce_policy` handle).
+        let announce_policy = crate::announce_suppression::ScopePrivacyAnnouncePolicy::new();
+        announce_policy.register_destination_scope(
+            local_named_dest_hash.into_bytes(),
+            crate::cohort_scope::CohortScope::Public,
+        );
+        node.set_announce_control(Some(Box::new(announce_policy.clone())));
+
         // Take the single event receiver before starting, then start
         // the event loop. `listen` claims the stashed receiver.
         let events = node
@@ -2349,6 +2381,7 @@ impl ReticulumTransport {
             node: Arc::new(node),
             local_dest_hash,
             local_named_dest_hash,
+            announce_policy,
             local_transport_pubkey,
             local_identity: identity.clone(),
             local_attestation,
@@ -2499,6 +2532,27 @@ impl ReticulumTransport {
         let mut out = [0u8; 16];
         out.copy_from_slice(bytes);
         out
+    }
+
+    /// CIRISEdge#489 — register (or update) the cohort scope of a destination
+    /// with the installed announce-suppression policy. The node's own
+    /// auto-announce loops (management re-announce + local re-gossip) consult
+    /// this on their very next pass: a group-scoped destination
+    /// (`SelfOnly` / `Family` / `Cohort`) is thereafter SUPPRESSED (CC 5.4 —
+    /// group-scoped destinations must not announce), a `Public` (Commons)
+    /// destination stays announceable. Idempotent; re-registration overwrites
+    /// the prior scope. This is the "register as edge admits each scoped
+    /// destination" half of the policy contract — the node's own named
+    /// discovery address is registered `Public` at construction; any scoped
+    /// destination edge later registers with the node MUST also be scoped here
+    /// (a missing registration default-suppresses, which is safer-than-leak).
+    pub fn register_announce_scope(
+        &self,
+        dest_hash: [u8; 16],
+        scope: crate::cohort_scope::CohortScope,
+    ) {
+        self.announce_policy
+            .register_destination_scope(dest_hash, scope);
     }
 
     /// spec. Returns a `Vec<TransportSpec>` of `(handle, kind)` pairs.
