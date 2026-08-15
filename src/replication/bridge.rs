@@ -685,6 +685,42 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
+    /// CIRISEdge#474 — serve an accord-quorum-evidence cursor pull. The plane has
+    /// no content-hash `signed_wire_index`, so this is its ONLY serve path: read
+    /// persist's `list_signed_accord_quorum_evidence_since` (ordered `(evidence_at,
+    /// proposal_digest)`, bounded by the page limit) and JSON-serialize each bundle
+    /// exactly as the apply side (`apply_accord_quorum_evidence`) deserializes it —
+    /// the byte-for-byte round trip persist's re-tally admit expects. A read error
+    /// is a loud empty (the round re-pulls next pass), never a panic. Non-cursor
+    /// kinds return empty: they converge over Summary/Diff/Fetch, not here.
+    async fn accord_evidence_since(
+        &self,
+        kind: EnvelopeKind,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Vec<Vec<u8>> {
+        if kind != EnvelopeKind::AccordQuorumEvidence {
+            return Vec::new();
+        }
+        let limit = self.effective_page_limit().await;
+        match self
+            .directory
+            .list_signed_accord_quorum_evidence_since(since, limit)
+            .await
+        {
+            Ok(bundles) => bundles
+                .iter()
+                .filter_map(|b| serde_json::to_vec(b).ok())
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "accord-quorum-evidence cursor serve read failed (CIRISEdge#474)"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// CIRISEdge#462 — serve a subject-scoped RECEIVE-axis Pull. Entitlement is
     /// FAIL-CLOSED: a Pull for subject `S` is answered only to a requester
     /// authenticated AS `S` (`peer_key_id == Some(S)`). A requester `P ≠ S` — or
@@ -936,6 +972,12 @@ impl FederationDirectoryReplicationBridge {
                 self.list_community_membership_revocations().await
             }
             EnvelopeKind::LocationProof => self.list_location_proofs().await,
+            // CIRISEdge#474 — the accord-quorum-evidence plane is NEVER advertised
+            // by content-hash: it has no `signed_wire_index` entry
+            // (`persist_index_kind` → None), so a ref here would be listed-then-
+            // unfetchable (the LIST-vs-FETCH divergence class). It converges over
+            // the dedicated cursor path (`CursorPull` → `Deliver`) instead.
+            EnvelopeKind::AccordQuorumEvidence => Vec::new(),
         }
     }
 
@@ -1214,6 +1256,9 @@ impl FederationDirectoryReplicationBridge {
             EnvelopeKind::LocationProof => self.apply_location_proof(envelope_bytes).await,
             EnvelopeKind::TransportDestination => {
                 self.apply_transport_destination(envelope_bytes).await
+            }
+            EnvelopeKind::AccordQuorumEvidence => {
+                self.apply_accord_quorum_evidence(envelope_bytes).await
             }
         }
     }
@@ -2643,6 +2688,50 @@ impl FederationDirectoryReplicationBridge {
             SignedLocationProof,
             put_location_proof
         )
+    }
+
+    /// CIRISEdge#474 — RECEIVE half of the accord-quorum-evidence cursor plane.
+    /// This does NOT go through [`apply_signed_plane!`]: there is no `Signed*`
+    /// wrapper and no `put_*`. The delivered bytes are a persist
+    /// [`AccordQuorumEvidence`](ciris_persist::federation::accord_carriage::AccordQuorumEvidence)
+    /// bundle; `apply_replicated_accord_evidence` **re-tallies** it against THIS
+    /// node's own accord roster (never the sender's verdict), fail-closed with
+    /// [`Error::AccordEvidenceUnverified`](ciris_persist::federation::Error), and
+    /// is idempotent on replay. Progress (`Admitted`) iff a new participation
+    /// landed OR a withdrawal tombstone was re-derived locally; a byte-identical
+    /// replay (`participations_admitted == 0`, no new tombstone) is `Duplicate`,
+    /// exactly as the anti-entropy loop counts one — never a silent no-op.
+    async fn apply_accord_quorum_evidence(&self, bytes: &[u8]) -> ApplyOutcome {
+        use ciris_persist::federation::accord_carriage::AccordQuorumEvidence;
+        let evidence: AccordQuorumEvidence = match serde_json::from_slice(bytes) {
+            Ok(e) => e,
+            Err(e) => {
+                return ApplyOutcome::Deserialize(apply_deser_reason(
+                    "AccordQuorumEvidence",
+                    bytes,
+                    &e,
+                ))
+            }
+        };
+        match self
+            .directory
+            .apply_replicated_accord_evidence(&evidence)
+            .await
+        {
+            Ok(admission) => {
+                if admission.participations_admitted > 0
+                    || !admission.withdrawals_projected.is_empty()
+                {
+                    ApplyOutcome::Admitted
+                } else {
+                    ApplyOutcome::Duplicate
+                }
+            }
+            Err(e) => ApplyOutcome::Refused(format!(
+                "AccordQuorumEvidence: admission refused (refusal={}): {e}",
+                e.kind(),
+            )),
+        }
     }
 
     /// CIRISEdge#338 / CIRISPersist#443 (v17.0.0) — admit a replicated route.

@@ -133,6 +133,27 @@ pub trait StateProvider: Send + Sync {
     fn subject_refs(&self, _kind: EnvelopeKind, _subject_key_id: &str) -> Vec<EnvelopeRef> {
         Vec::new()
     }
+
+    /// CIRISEdge#474 — the accord-quorum-evidence CURSOR serve reader. Answers an
+    /// inbound [`crate::replication::protocol::CursorPullMessage`]: the byte-exact
+    /// [`AccordQuorumEvidence`](ciris_persist::federation::accord_carriage::AccordQuorumEvidence)
+    /// bundles this node holds with `evidence_at > since`, JSON-serialized ready to
+    /// wrap in a [`crate::replication::protocol::DeliverMessage`]. UNLIKE
+    /// [`Self::local_refs`] / [`Self::subject_refs`] this returns BYTES, not refs —
+    /// the plane has no content-hash index, so there is no Diff/Fetch round-trip;
+    /// the responder delivers directly. Bounded by the impl's page limit; the
+    /// requester re-pulls from its new high-water next round to drain a backlog.
+    ///
+    /// Defaults to empty: only the production `DirectoryStateAdapter` (holding the
+    /// persist `FederationDirectory`) and the DST store answer it. A cursor pull to
+    /// a provider that doesn't override it is a well-formed no-op, never a panic.
+    fn accord_evidence_since(
+        &self,
+        _kind: EnvelopeKind,
+        _since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
 }
 
 /// CIRISEdge#425 — the typed result of applying ONE delivered envelope.

@@ -127,6 +127,21 @@ pub trait ReplicationDirectory: Send + Sync {
         Vec::new()
     }
 
+    /// CIRISEdge#474 — the accord-quorum-evidence CURSOR serve reader: the
+    /// byte-exact bundles held with `evidence_at > since`, JSON-serialized ready to
+    /// wrap in a `Deliver`. Answers an inbound `CursorPull` for a plane that has NO
+    /// content-hash index (so no Diff/Fetch round-trip — the responder delivers
+    /// directly). Bounded by the impl's page limit; the requester re-pulls from its
+    /// new high-water to drain a backlog. Defaults to empty: only the production
+    /// bridge (holding the persist `FederationDirectory`) answers it.
+    async fn accord_evidence_since(
+        &self,
+        _kind: EnvelopeKind,
+        _since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
     /// Return the byte-exact signed envelope for `(kind,
     /// envelope_hash)`, or `None` if the envelope isn't in local state.
     /// Called during the `Deliver`-message construction step.
@@ -269,6 +284,21 @@ impl StateProvider for DirectoryStateAdapter {
                     .subject_holdings(kind, &subject, peer.as_deref())
                     .await
             })
+        })
+    }
+
+    /// CIRISEdge#474 — serve an accord-quorum-evidence cursor pull, bridging the
+    /// async persist read into the sync provider surface (same `block_on` pattern
+    /// as [`Self::subject_refs`]). Returns the serialized bundles past `since`.
+    fn accord_evidence_since(
+        &self,
+        kind: EnvelopeKind,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Vec<Vec<u8>> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async move { inner.accord_evidence_since(kind, since).await })
         })
     }
 }

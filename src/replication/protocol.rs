@@ -163,14 +163,29 @@ pub enum EnvelopeKind {
     /// REQUIRES `WIRE_PROTOCOL_VERSION_V2` (v1-only peers refuse the unknown
     /// tag at serde-decode — the additive-and-safe transition per FSD §3.7).
     TransportDestination,
+    /// CIRISEdge#474 / CIRISPersist v31.1.0 (#662) — the accord-quorum-evidence
+    /// plane: a `put_accord_proposal` bundle (`proposal` + `participations` +
+    /// `evidence_at`) that carries a steward-quorum decision projecting
+    /// `RoleWithdrawals` across the federation (`WireTier::FederationOnly`).
+    /// UNLIKE every other kind it is **cursor-served, NOT content-hash-indexed**:
+    /// a bundle is an aggregate whose hash moves as each participation lands, so
+    /// persist deliberately keeps it out of the `signed_wire_index`
+    /// ([`Self::persist_index_kind`] returns `None`). It therefore rides the
+    /// dedicated cursor path (`CursorPull` → `Deliver`, resume on `evidence_at`),
+    /// never Summary/Diff/Fetch, and its RECEIVE gate **re-tallies** against the
+    /// receiver's own roster (`apply_replicated_accord_evidence`) rather than
+    /// trusting the sender's verdict. A NEW post-v1 tag: v1-only peers serde-reject
+    /// it (`min_wire_version` → V2). `list_signed_accord_quorum_evidence_since`.
+    AccordQuorumEvidence,
 }
 
 impl EnvelopeKind {
-    /// All 14 replicated wire kinds, in declaration order. Mirrors persist's
-    /// `replication_policy::EnvelopeKind::ALL` (same 14 names/order, pinned by
+    /// All 15 replicated wire kinds, in declaration order. Mirrors persist's
+    /// `replication_policy::EnvelopeKind::ALL` (same 15 names/order, pinned by
     /// `REPLICATION_POLICY_HASH`). Basis for the serve/advertise manifest
-    /// (CIRISEdge#393 item 3).
-    pub const ALL: [EnvelopeKind; 14] = [
+    /// (CIRISEdge#393 item 3). `AccordQuorumEvidence` (CIRISEdge#474) is appended
+    /// last — order is hashed, so it MUST stay at the end.
+    pub const ALL: [EnvelopeKind; 15] = [
         Self::Key,
         Self::Attestation,
         Self::Revocation,
@@ -185,6 +200,7 @@ impl EnvelopeKind {
         Self::OrgMembership,
         Self::PartnerRecord,
         Self::TransportDestination,
+        Self::AccordQuorumEvidence,
     ];
 
     /// CIRISEdge#402/#406 — the finite, self-authenticating **bootstrap** kinds a
@@ -235,6 +251,19 @@ impl EnvelopeKind {
         )
     }
 
+    /// CIRISEdge#474 — is this kind served over the dedicated CURSOR path
+    /// (`CursorPull` → `Deliver`, resume on `evidence_at`) rather than the
+    /// content-hash Summary/Diff/Fetch flow? EXACTLY the kinds with no
+    /// `signed_wire_index` entry ([`Self::persist_index_kind`] → None AND not
+    /// [`Self::Revocation`], which is index-less but rides `persist_row_hash`).
+    /// Currently only [`Self::AccordQuorumEvidence`]; checked over `ALL` in a test
+    /// so a future cursor kind is a deliberate widening, never an accident. An
+    /// Initiator round for such a kind opens with a `CursorPull`, not a Summary.
+    #[must_use]
+    pub fn is_cursor_served(self) -> bool {
+        matches!(self, Self::AccordQuorumEvidence)
+    }
+
     /// The kinds a subject sweep issues a `Pull` for — the
     /// [`Self::is_subject_pullable`] set, in `ALL` order.
     #[must_use]
@@ -265,6 +294,7 @@ impl EnvelopeKind {
             Self::OrgMembership => "org_membership",
             Self::PartnerRecord => "partner_record",
             Self::TransportDestination => "transport_destination",
+            Self::AccordQuorumEvidence => "accord_quorum_evidence",
         }
     }
 
@@ -273,14 +303,20 @@ impl EnvelopeKind {
     /// ([`ciris_persist::federation::FederationDirectory::lookup_signed_record_by_content_hash`]).
     /// This is persist's `replication_policy::EnvelopeKind::as_str` PascalCase
     /// token (`"Key"`, `"Attestation"`, …) — NOT [`Self::as_wire_str`]'s
-    /// snake_case. `None` for [`Self::Revocation`], the ONE kind persist
-    /// deliberately does not index (its fetch stays on the local cache).
+    /// snake_case. `None` for the two kinds persist deliberately does not index:
+    /// [`Self::Revocation`] (its fetch stays on the local cache) and
+    /// [`Self::AccordQuorumEvidence`] (a vote-aggregating bundle whose hash moves
+    /// as participations land — served by cursor, never by content-hash point-read;
+    /// CIRISEdge#474).
     #[must_use]
     pub fn persist_index_kind(self) -> Option<&'static str> {
         Some(match self {
             Self::Key => "Key",
             Self::Attestation => "Attestation",
-            Self::Revocation => return None,
+            // Both are absent from persist's content-hash `signed_wire_index`:
+            // Revocation rides `persist_row_hash`; AccordQuorumEvidence rides the
+            // cursor path (#474). Neither has a content-hash point-read.
+            Self::Revocation | Self::AccordQuorumEvidence => return None,
             Self::IdentityOccurrence => "IdentityOccurrence",
             Self::Family => "Family",
             Self::Community => "Community",
@@ -324,7 +360,10 @@ impl EnvelopeKind {
             | Self::PartnerRecord
             // #311 — a new post-v1 tag; v1-only peers don't know it and
             // would serde-reject the body, so it rides at V2 framing.
-            | Self::TransportDestination => {
+            | Self::TransportDestination
+            // #474 — the accord-quorum-evidence plane is likewise a new post-v1
+            // tag; v1-only peers serde-reject it, so it rides at V2 framing.
+            | Self::AccordQuorumEvidence => {
                 crate::replication::wire_frame::WIRE_PROTOCOL_VERSION_V2
             }
         }
@@ -406,6 +445,32 @@ pub struct PullMessage {
     pub subject_key_id: String,
 }
 
+/// CIRISEdge#474 — the accord-quorum-evidence CURSOR request. The plane has no
+/// content-hash `signed_wire_index` (its bundle hash moves as participations
+/// land), so it CANNOT ride the Summary/Diff/Fetch convergence flow like every
+/// other kind, nor the #462 subject `Pull` (which resolves to a content-hash
+/// `Summary`). Instead the requester names a resume watermark and the responder
+/// answers DIRECTLY with a [`DeliverMessage`] of the bundles past it — ordered
+/// `(evidence_at, proposal_digest)`, served by
+/// [`ciris_persist::federation::FederationDirectory::list_signed_accord_quorum_evidence_since`].
+///
+/// `since` is the requester's high-water `evidence_at`: the responder returns
+/// bundles with `evidence_at > since` (`None` = from the beginning). The receiver
+/// RE-TALLIES each bundle against its own roster on apply, so pulling from `None`
+/// every round is always safe (idempotent) — the cursor is an optimization, not a
+/// trust input. A post-v1 verb, exactly like `Pull`: v1 peers serde-refuse the
+/// unknown `type` tag, coordinated by the `SERVE_ADVERTISE_POLICY_HASH` re-pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorPullMessage {
+    /// The kind this cursor pull is scoped to — currently only
+    /// [`EnvelopeKind::AccordQuorumEvidence`].
+    pub kind: EnvelopeKind,
+    /// Resume watermark: the responder returns records with `evidence_at`
+    /// strictly greater than this. `None` pulls from the beginning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// "Here are the bytes." Wraps the requested envelopes' raw signed-
 /// bytes form (the same shape `put_*` admits expect on the receiver's
 /// persist side). Order is unspecified; the receiver MUST validate
@@ -434,6 +499,10 @@ pub enum ReplicationMessage {
     /// it), so it is a genuine wire-compat event, coordinated by the
     /// [`crate::replication::serve_policy::SERVE_ADVERTISE_POLICY_HASH`] re-pin.
     Pull(PullMessage),
+    /// CIRISEdge#474 — the accord-quorum-evidence CURSOR request (resume on
+    /// `evidence_at`). Like `Pull`, a post-v1 verb v1 peers serde-refuse; the
+    /// responder answers with a `Deliver` of the bundles past the watermark.
+    CursorPull(CursorPullMessage),
 }
 
 impl ReplicationMessage {
@@ -451,6 +520,7 @@ impl ReplicationMessage {
             Self::Fetch(m) => m.kind,
             Self::Deliver(m) => m.kind,
             Self::Pull(m) => m.kind,
+            Self::CursorPull(m) => m.kind,
         }
     }
 
@@ -568,6 +638,63 @@ mod tests {
         // The verb carries its kind so wire-framing picks the version like any
         // other message.
         assert_eq!(parsed.kind(), EnvelopeKind::Attestation);
+    }
+
+    /// CIRISEdge#474 — the `CursorPull` verb round-trips on the wire (snake_case
+    /// `cursor_pull` tag), carries its kind for framing, and omits `since` when
+    /// `None` (the stateless pull-all case) so the wire stays compact.
+    #[test]
+    fn cursor_pull_round_trips() {
+        let m = ReplicationMessage::CursorPull(CursorPullMessage {
+            kind: EnvelopeKind::AccordQuorumEvidence,
+            since: None,
+        });
+        let bytes = m.to_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            s.contains(r#""type":"cursor_pull""#),
+            "cursor_pull wire tag: {s}"
+        );
+        assert!(
+            !s.contains("since"),
+            "None `since` is skipped on the wire: {s}"
+        );
+        let parsed = ReplicationMessage::from_bytes(&bytes).expect("parse");
+        assert_eq!(parsed, m);
+        assert_eq!(parsed.kind(), EnvelopeKind::AccordQuorumEvidence);
+        // A v2-framed kind — v1-only peers serde-refuse the tag.
+        assert_eq!(
+            parsed.kind().min_wire_version(),
+            crate::replication::wire_frame::WIRE_PROTOCOL_VERSION_V2
+        );
+    }
+
+    /// CIRISEdge#474 — `is_cursor_served` is EXACTLY `AccordQuorumEvidence`,
+    /// checked over ALL so a future cursor kind is a deliberate widening. It agrees
+    /// with `persist_index_kind() == None` (no content-hash index) — but NOT with
+    /// `Revocation`, which is also index-less yet rides `persist_row_hash`, not the
+    /// cursor path.
+    #[test]
+    fn is_cursor_served_is_exactly_accord_quorum_evidence() {
+        for kind in EnvelopeKind::ALL {
+            assert_eq!(
+                kind.is_cursor_served(),
+                matches!(kind, EnvelopeKind::AccordQuorumEvidence),
+                "{kind:?}: cursor-served iff it is AccordQuorumEvidence"
+            );
+        }
+        // The one cursor kind is unindexed, v2-framed, and NOT subject-pullable.
+        assert!(EnvelopeKind::AccordQuorumEvidence
+            .persist_index_kind()
+            .is_none());
+        assert!(!EnvelopeKind::AccordQuorumEvidence.is_subject_pullable());
+        assert_eq!(
+            EnvelopeKind::AccordQuorumEvidence.as_wire_str(),
+            "accord_quorum_evidence"
+        );
+        // Revocation is index-less but is NOT cursor-served (different wire).
+        assert!(EnvelopeKind::Revocation.persist_index_kind().is_none());
+        assert!(!EnvelopeKind::Revocation.is_cursor_served());
     }
 
     /// CIRISEdge#462 — `is_subject_pullable` is EXACTLY the five replicated kinds

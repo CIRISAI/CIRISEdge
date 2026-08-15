@@ -36,8 +36,8 @@
 //! Delivers have been applied.
 
 use super::protocol::{
-    DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, PullMessage,
-    ReplicationMessage, SummaryMessage,
+    CursorPullMessage, DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage,
+    PullMessage, ReplicationMessage, SummaryMessage,
 };
 use super::summary::{diff_refs, ApplyOutcome, StalenessSignal, StateApplier, StateProvider};
 
@@ -170,6 +170,12 @@ pub struct Session {
     /// CIRISEdge#380 — monotonic count of initiator rounds this session has
     /// started. Basis for the `proactive_sent` refresh window.
     round_counter: u64,
+    /// CIRISEdge#474 — set when this Initiator opened a CURSOR round (emitted a
+    /// `CursorPull` instead of a Summary). The answering `Deliver` is then a
+    /// SOLICITED reply, not an unsolicited push — so [`Self::on_deliver`] applies
+    /// it without the per-round unsolicited-WARN, and an empty cursor result still
+    /// completes the round cleanly. Per-round state, cleared by [`Self::reset`].
+    awaiting_cursor_deliver: bool,
 }
 
 /// CIRISEdge#380 — per-round byte budget for the proactive Deliver. The
@@ -198,6 +204,7 @@ impl Session {
             proactive_publish: false,
             proactive_sent: std::collections::BTreeMap::new(),
             round_counter: 0,
+            awaiting_cursor_deliver: false,
         }
     }
 
@@ -224,6 +231,7 @@ impl Session {
         self.last_summary_sent = None;
         self.diff_want_count = None;
         self.completed = false;
+        self.awaiting_cursor_deliver = false;
     }
 
     pub fn role(&self) -> SessionRole {
@@ -241,6 +249,22 @@ impl Session {
             matches!(self.role, SessionRole::Initiator),
             "start_round() is initiator-only"
         );
+        // CIRISEdge#474 — the accord-quorum-evidence plane has no content-hash
+        // index, so its round opens with a CURSOR pull, not a Summary. `since:
+        // None` pulls all (bounded by the responder's page limit); the receiver's
+        // re-tally admit is idempotent on replay, so a stateless-from-None puller
+        // is correct — edge's uniform per-round read model. The answering Deliver
+        // is marked solicited (`awaiting_cursor_deliver`) so `on_deliver` applies
+        // it as a reply, and an evidence-free peer completes the round cleanly.
+        if self.kind.is_cursor_served() {
+            self.awaiting_cursor_deliver = true;
+            return ReplicationOutcome::Send(vec![ReplicationMessage::CursorPull(
+                CursorPullMessage {
+                    kind: self.kind,
+                    since: None,
+                },
+            )]);
+        }
         let refs = provider.local_refs(self.kind);
         let summary = SummaryMessage {
             kind: self.kind,
@@ -367,7 +391,35 @@ impl Session {
             ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier, source_peer),
             ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider, source_peer),
             ReplicationMessage::Pull(pull) => self.on_pull(&pull, provider),
+            ReplicationMessage::CursorPull(cp) => self.on_cursor_pull(&cp, provider),
         }
+    }
+
+    /// CIRISEdge#474 — serve an accord-quorum-evidence CURSOR pull. Unlike
+    /// [`Self::on_pull`] (which seeds the content-hash Summary→Diff→Deliver
+    /// machinery), this plane has NO content-hash index, so we answer DIRECTLY
+    /// with a [`DeliverMessage`] of the serialized bundles past the requester's
+    /// `since` watermark — sourced from [`StateProvider::accord_evidence_since`],
+    /// which reads persist's cursor-ordered `list_signed_accord_quorum_evidence_since`
+    /// and applies the same page limit as every other plane. The requester
+    /// re-tallies each bundle on apply (`apply_accord_quorum_evidence`), so serving
+    /// from `since` (or the beginning) can only converge — a byte-identical replay
+    /// is a `Duplicate`, never a double-count. An empty result is a well-formed
+    /// empty `Deliver`: the round still completes (the reply is solicited via the
+    /// requester's `awaiting_cursor_deliver`), no timeout, no unsolicited WARN.
+    fn on_cursor_pull(
+        &mut self,
+        pull: &CursorPullMessage,
+        provider: &dyn StateProvider,
+    ) -> ReplicationOutcome {
+        if pull.kind != self.kind {
+            return ReplicationOutcome::UnexpectedMessage;
+        }
+        let envelopes = provider.accord_evidence_since(self.kind, pull.since);
+        ReplicationOutcome::Send(vec![ReplicationMessage::Deliver(DeliverMessage {
+            kind: self.kind,
+            envelopes,
+        })])
     }
 
     /// CIRISEdge#462 — serve a subject-scoped RECEIVE-axis pull. The requester
@@ -563,7 +615,11 @@ impl Session {
         // quota. Instead we make the phase + peer VISIBLE (a bare unsolicited push on
         // a non-bootstrap plane from a peer is the row to watch), and the threaded
         // `source_peer` lets the applier/persist make the per-peer call.
-        let solicited = self.diff_want_count.is_some();
+        // CIRISEdge#474 — a cursor round's Deliver answers the `CursorPull` this
+        // Initiator sent (no `Diff` phase exists for the index-less accord plane),
+        // so `awaiting_cursor_deliver` marks it solicited exactly as `diff_want_count`
+        // does for the content-hash planes.
+        let solicited = self.diff_want_count.is_some() || self.awaiting_cursor_deliver;
         if !solicited && !deliver.envelopes.is_empty() {
             let bootstrap_plane = matches!(
                 self.kind,
@@ -756,6 +812,141 @@ mod tests {
             local_state: std::sync::Mutex::new(LocalState::new()),
             hash_lookup,
         }
+    }
+
+    /// CIRISEdge#474 — a provider that answers an accord cursor pull with canned
+    /// serialized bundles (the bytes the apply path would `from_slice`). Every
+    /// content-hash method is empty: the cursor plane never advertises refs.
+    struct CursorProvider {
+        bundles: Vec<Vec<u8>>,
+    }
+    impl StateProvider for CursorProvider {
+        fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            Vec::new()
+        }
+        fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+        fn accord_evidence_since(
+            &self,
+            _kind: EnvelopeKind,
+            _since: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Vec<Vec<u8>> {
+            self.bundles.clone()
+        }
+    }
+
+    /// CIRISEdge#474 — an Initiator round for the cursor plane opens with a
+    /// `CursorPull` (`since: None`), NEVER a Summary: the plane has no content-hash
+    /// index, so the Summary/Diff/Fetch flow does not apply to it.
+    #[test]
+    fn cursor_round_initiator_opens_with_cursor_pull_not_summary() {
+        let provider = CursorProvider { bundles: vec![] };
+        let mut init = Session::new(SessionRole::Initiator, EnvelopeKind::AccordQuorumEvidence);
+        match init.start_round(&provider) {
+            ReplicationOutcome::Send(msgs) => {
+                assert_eq!(msgs.len(), 1, "one CursorPull, no Summary");
+                match &msgs[0] {
+                    ReplicationMessage::CursorPull(cp) => {
+                        assert_eq!(cp.kind, EnvelopeKind::AccordQuorumEvidence);
+                        assert!(cp.since.is_none(), "stateless pull-all (#474)");
+                    }
+                    other => panic!("expected CursorPull, got {other:?}"),
+                }
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    /// CIRISEdge#474 — a Responder answers a `CursorPull` DIRECTLY with a `Deliver`
+    /// of the provider's bundles (no Summary/Diff round-trip for an index-less plane).
+    #[test]
+    fn cursor_round_responder_serves_bundles_as_a_deliver() {
+        let b1 = b"{\"proposal\":1}".to_vec();
+        let b2 = b"{\"proposal\":2}".to_vec();
+        let provider = CursorProvider {
+            bundles: vec![b1.clone(), b2.clone()],
+        };
+        let applier = applier_for(&[]);
+        let mut resp = Session::new(SessionRole::Responder, EnvelopeKind::AccordQuorumEvidence);
+        let pull = ReplicationMessage::CursorPull(CursorPullMessage {
+            kind: EnvelopeKind::AccordQuorumEvidence,
+            since: None,
+        });
+        match resp.on_message(pull, &provider, &applier, Some("peer")) {
+            ReplicationOutcome::Send(msgs) => {
+                assert_eq!(msgs.len(), 1);
+                match &msgs[0] {
+                    ReplicationMessage::Deliver(d) => {
+                        assert_eq!(d.kind, EnvelopeKind::AccordQuorumEvidence);
+                        assert_eq!(
+                            d.envelopes,
+                            vec![b1, b2],
+                            "serves the cursor bytes verbatim"
+                        );
+                    }
+                    other => panic!("expected Deliver, got {other:?}"),
+                }
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    /// CIRISEdge#474 — the full 2-message exchange: Initiator CursorPull → Deliver
+    /// → the Initiator applies the delivered bundles (solicited via
+    /// `awaiting_cursor_deliver`) and completes.
+    #[test]
+    fn cursor_round_initiator_applies_delivered_bundles_and_completes() {
+        let b1 = b"{\"proposal\":\"a\"}".to_vec();
+        let h1 = h(7);
+        let provider = CursorProvider {
+            bundles: vec![b1.clone()],
+        };
+        let applier = applier_for(&[(h1, b1.clone())]);
+        let mut init = Session::new(SessionRole::Initiator, EnvelopeKind::AccordQuorumEvidence);
+        let ReplicationOutcome::Send(open) = init.start_round(&provider) else {
+            panic!("expected Send")
+        };
+        assert!(matches!(open[0], ReplicationMessage::CursorPull(_)));
+        let deliver = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::AccordQuorumEvidence,
+            envelopes: vec![b1],
+        });
+        match init.on_message(deliver, &provider, &applier, Some("peer")) {
+            ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert_eq!(applier.admitted_count(), 1);
+        assert!(
+            init.is_complete(),
+            "the cursor round completes after the Deliver"
+        );
+    }
+
+    /// CIRISEdge#474 — an evidence-free peer answers with an EMPTY Deliver; the
+    /// Initiator's round still completes cleanly (no timeout, no unsolicited WARN —
+    /// the reply is solicited via `awaiting_cursor_deliver`).
+    #[test]
+    fn empty_cursor_pull_completes_the_round() {
+        let provider = CursorProvider { bundles: vec![] };
+        let applier = applier_for(&[]);
+        let mut init = Session::new(SessionRole::Initiator, EnvelopeKind::AccordQuorumEvidence);
+        let _ = init.start_round(&provider);
+        assert!(!init.is_complete());
+        let empty = ReplicationMessage::Deliver(DeliverMessage {
+            kind: EnvelopeKind::AccordQuorumEvidence,
+            envelopes: vec![],
+        });
+        match init.on_message(empty, &provider, &applier, Some("peer")) {
+            ReplicationOutcome::Applied {
+                admitted, refused, ..
+            } => {
+                assert_eq!(admitted, 0);
+                assert_eq!(refused, 0);
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert!(init.is_complete(), "an empty cursor round still completes");
     }
 
     /// Two peers with disjoint state converge in one round.

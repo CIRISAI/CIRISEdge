@@ -242,6 +242,9 @@ impl ReplicationRegistry {
             // CIRISEdge#462 — a subject-scoped Pull routes on its kind like every
             // other verb; the auto-registered Responder below answers it.
             super::protocol::ReplicationMessage::Pull(m) => m.kind,
+            // CIRISEdge#474 — a cursor pull routes on its kind too; the
+            // auto-registered Responder serves it via `on_cursor_pull`.
+            super::protocol::ReplicationMessage::CursorPull(m) => m.kind,
         };
         // CIRISEdge#312 — if no coordinator exists for this (peer, kind), this
         // node doesn't consent-pull from the peer (so no Initiator was built),

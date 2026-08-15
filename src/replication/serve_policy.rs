@@ -1,7 +1,7 @@
 //! CIRISEdge#393 (E3, item 3) — the SERVE/ADVERTISE policy manifest: edge's
 //! responder half of the Registry-of-Record contract.
 //!
-//! persist owns the APPLY policy for all 14 replicated kinds and exports it as
+//! persist owns the APPLY policy for all 15 replicated kinds and exports it as
 //! `ciris_persist::federation::replication_policy::REPLICATION_POLICY_HASH`
 //! (pinned by edge in `lib.rs`). Edge owns the **serve/advertise** half — for
 //! each kind, WHICH peers it advertises to (the projection scope) and WHETHER
@@ -46,6 +46,11 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         EnvelopeKind::Organization | EnvelopeKind::OrgMembership | EnvelopeKind::PartnerRecord => {
             ("bulk_since", "public")
         }
+        // CIRISEdge#474 — the accord-quorum-evidence plane rides the dedicated
+        // CURSOR path (`CursorPull` → `Deliver`, resume on `evidence_at`), NOT the
+        // content-hash Summary/Diff/Fetch flow (`persist_index_kind` → None). The
+        // bundle is a public `FederationOnly`-tier record — no capability gate.
+        EnvelopeKind::AccordQuorumEvidence => ("cursor:evidence_at", "public"),
     };
     // CIRISEdge#462 — `receive`: whether this kind answers a subject-scoped Pull
     // (the RECEIVE axis), and under what rule. The FIVE replicated kinds are
@@ -72,6 +77,13 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         | EnvelopeKind::Organization
         | EnvelopeKind::OrgMembership
         | EnvelopeKind::PartnerRecord => "none",
+        // CIRISEdge#474 — NOT a subject-scoped Pull. It is received over the
+        // dedicated cursor path and its RECEIVE gate re-tallies against the
+        // receiver's own roster rather than trusting the sender's verdict; the
+        // value stays out of the `subject_pull:*` namespace by construction.
+        EnvelopeKind::AccordQuorumEvidence => {
+            "cursor_pull:evidence_at; re-tally admit (apply_replicated_accord_evidence)"
+        }
     };
     serde_json::json!({
         "kind": kind.as_wire_str(),
@@ -107,15 +119,19 @@ pub fn serve_advertise_policy_sha256() -> String {
 }
 
 /// The pinned serve/advertise policy hash. A change to edge's responder policy
-/// (advertise scope or serve gate for ANY of the 14 kinds) flips this — a
+/// (advertise scope or serve gate for ANY of the 15 kinds) flips this — a
 /// deliberate, reviewed re-pin, visible to CIRISServer which pins it alongside
 /// persist's `REPLICATION_POLICY_HASH`. See CIRISEdge#393 §4.2/§4.3.
 // v16.0.0 — re-pinned: the Attestation `receive` carve text now describes the
 // retainability-allowlist rule (scores-plane, `!is_subject_retainable(dimension)`),
 // replacing the stale `consent_gated_claim` prose the #635 carve had left behind
 // (Codex on #470). CIRISServer re-pins from 049e71ef… to this value.
+// v16.3.0 (CIRISEdge#474) — re-pinned: the 15th kind `accord_quorum_evidence` is
+// appended (advertise `cursor:evidence_at`, serve `public`, receive
+// `cursor_pull:evidence_at` — the cursor plane, NOT a subject Pull). CIRISServer
+// re-pins from 6f683311… to this value alongside persist's v31 REPLICATION_POLICY_HASH.
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "6f683311627689221d886f4245ac7b9fa6715e6f1e135855f52fa7800fb7cda5";
+    "328d73b0a6a5c7e2d1272b81e245ecceeca1d837dd08b0415105e1661ff4a699";
 
 #[cfg(test)]
 mod tests {
@@ -163,6 +179,35 @@ mod tests {
         let recv = att["receive"].as_str().unwrap();
         assert!(recv.contains("data_subject+sender"), "both axes: {recv}");
         assert!(recv.contains("G2"), "the score carve is witnessed: {recv}");
+    }
+
+    /// CIRISEdge#474 — the accord-quorum-evidence plane appears in the manifest as
+    /// a CURSOR plane: advertise `cursor:evidence_at`, serve `public`, receive
+    /// `cursor_pull:*` (NOT `subject_pull:*`, so it stays out of the five
+    /// subject-pullable kinds), and never capability-gated.
+    #[test]
+    fn accord_quorum_evidence_is_a_public_cursor_plane() {
+        let manifest = serve_advertise_manifest();
+        let policies = manifest["policies"].as_array().unwrap();
+        let aqe = policies
+            .iter()
+            .find(|p| p["kind"] == "accord_quorum_evidence")
+            .expect("accord_quorum_evidence is in the 15-kind manifest");
+        assert_eq!(aqe["advertise"], "cursor:evidence_at");
+        assert_eq!(aqe["serve"], "public");
+        let recv = aqe["receive"].as_str().unwrap();
+        assert!(
+            recv.starts_with("cursor_pull:"),
+            "cursor receive axis: {recv}"
+        );
+        assert!(
+            !recv.starts_with("subject_pull"),
+            "NOT a subject pull — stays out of the five: {recv}"
+        );
+        assert!(
+            !aqe["serve"].as_str().unwrap().contains("capability:"),
+            "the accord plane is public, never capability-gated"
+        );
     }
 
     /// The load-bearing E3 fact must hold in the manifest: exactly ONE kind is
