@@ -366,9 +366,10 @@ const EVENT_ANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 /// EventReceiver task `try_send`s each inbound announce here and a dedicated
 /// worker drains it, so a slow/contended rooting directory can no longer
 /// head-of-line every other node event behind an announce's DB round-trips.
-/// At the cap, the oldest-losing policy is a LOUD drop (RNS announces are
-/// periodic + idempotent, so a dropped one self-heals on the next re-announce),
-/// never a silent one (CIRISEdge#425).
+/// At the cap, `try_send` TAIL-drops — it rejects the NEWEST announce and keeps
+/// the 256 already queued — with a LOUD warn, never a silent drop
+/// (CIRISEdge#425). RNS announces are periodic + idempotent, so a dropped one
+/// self-heals on the peer's next re-announce.
 const ANNOUNCE_QUEUE_DEPTH: usize = 256;
 
 /// CIRISEdge#482 item 5 — window a `check_blackhole` deny-list snapshot stays
@@ -5125,16 +5126,28 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // the peer is recorded as resolvable (replaces v0.3.1 TOFU —
             // CIRISEdge#15, AV-42). CIRISEdge#482 item 3 — that work is now
             // handed to a dedicated worker (non-blocking `try_send`) so its DB
-            // round-trips don't head-of-line every other node event. A full
-            // queue drops the announce LOUDLY (never silently — CIRISEdge#425);
-            // RNS announces are periodic + idempotent, so the peer's next
-            // re-announce retries.
-            if let Err(e) = ctx.announce_tx.try_send(announce) {
-                tracing::warn!(
-                    error = %e,
-                    "announce DROPPED — cold-start worker queue full or closed \
-                     (CIRISEdge#482 item 3; RNS re-announce will retry)"
-                );
+            // round-trips don't head-of-line every other node event. Both drop
+            // paths are LOUD (never silent — CIRISEdge#425), but split so a DEAD
+            // worker (channel Closed) is diagnosable rather than masked as
+            // ordinary backpressure (queue Full).
+            match ctx.announce_tx.try_send(announce) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        "announce DROPPED — cold-start worker queue FULL \
+                         (backpressure); RNS re-announce will retry (CIRISEdge#482 item 3)"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // The worker task is gone (exited or panicked). This is NOT
+                    // routine backpressure — every subsequent announce will be
+                    // dropped until the transport is rebuilt, so it is an ERROR.
+                    tracing::error!(
+                        "announce DROPPED — cold-start worker is GONE (channel \
+                         closed: the worker task exited); announces are no longer \
+                         being processed (CIRISEdge#482 item 3)"
+                    );
+                }
             }
         }
         // v7.2.0: Leviculum v0.8.x upstream auto-accepts inbound link
