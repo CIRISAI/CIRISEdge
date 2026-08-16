@@ -1334,6 +1334,80 @@ impl PyEdge {
         }
     }
 
+    /// CIRISEdge#492 — IFAC membership-key rotation, phase 1 (install-next).
+    /// The node accepts BOTH the current and the next access code
+    /// (make-before-break); no member is excluded yet. Distribute `passphrase`
+    /// to hybrid-verified members (the persist `key_grant` handoff,
+    /// CIRISPersist#704) BEFORE calling `ifac_activate_next`. `ifac_size` is in
+    /// BYTES (pass bits ÷ 8). Returns the number of interfaces updated.
+    #[pyo3(signature = (passphrase, ifac_size, netname=None))]
+    fn ifac_install_next(
+        &self,
+        passphrase: &str,
+        ifac_size: usize,
+        netname: Option<&str>,
+    ) -> PyResult<usize> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "ifac_install_next: edge has no Reticulum transport \
+                     (disable_reticulum=True, or wheel built without _reticulum-module)",
+                )
+            })?;
+            transport
+                .ifac_install_next(netname, passphrase, ifac_size)
+                .map_err(|e| PyRuntimeError::new_err(format!("ifac_install_next: {e}")))
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            let _ = (passphrase, ifac_size, netname);
+            Err(PyRuntimeError::new_err(
+                "ifac_install_next: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
+    /// CIRISEdge#492 — IFAC rotation phase 2 (activate-next): swap the next code
+    /// to PRIMARY. Outbound frames under the new code; a straggler still on the
+    /// old code continues to land (both accepted). Call after the passphrase has
+    /// reached members. Returns the number of interfaces affected.
+    fn ifac_activate_next(&self) -> PyResult<usize> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err("ifac_activate_next: edge has no Reticulum transport")
+            })?;
+            Ok(transport.ifac_activate_next())
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            Err(PyRuntimeError::new_err(
+                "ifac_activate_next: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
+    /// CIRISEdge#492 — IFAC rotation phase 3 (seal): drop the OLD code. A member
+    /// that never re-keyed is now excluded (readmission = fresh grant + re-key).
+    /// Call after the convergence window. Returns the number of interfaces
+    /// affected.
+    fn ifac_seal_rotation(&self) -> PyResult<usize> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err("ifac_seal_rotation: edge has no Reticulum transport")
+            })?;
+            Ok(transport.ifac_seal_rotation())
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            Err(PyRuntimeError::new_err(
+                "ifac_seal_rotation: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
     /// v2.4.0 (CIRISEdge#95) — fetch a remote peer's hybrid KEM
     /// pubkeys (x25519 + ML-KEM-768) from persist's federation
     /// directory for `FederationSession::initiate` consumers
@@ -4196,6 +4270,10 @@ enum LocalInstanceRole {
     require_local_signer = false,
     bundle_save_gate = "off",
     own_build_bundle = None,
+    transit = None,
+    ifac_netname = None,
+    ifac_passphrase = None,
+    ifac_size = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -4357,6 +4435,15 @@ pub fn init_edge_runtime(
     // hard init error, never a silently commitment-less announce. `None` (the
     // default) announces the pre-#436 v1 wire byte-identical.
     own_build_bundle: Option<Vec<u8>>,
+    // CIRISEdge#492 — node-wide scoped-transit posture for the LEGACY interface
+    // path (the `listen_addr` server + `bootstrap_peers` clients). `transit=False`
+    // = public LEAF port (never rebroadcasts announces); the IFAC trio
+    // (`ifac_netname`/`ifac_passphrase`/`ifac_size`, all three together) gates the
+    // ports to CIRIS members. `ifac_size` is in BYTES (pass bits ÷ 8).
+    transit: Option<bool>,
+    ifac_netname: Option<String>,
+    ifac_passphrase: Option<String>,
+    ifac_size: Option<usize>,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -5241,6 +5328,52 @@ pub fn init_edge_runtime(
     transport_config.local_epoch = local_epoch;
     // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
     transport_config.enable_transport = enable_transport;
+    // CIRISEdge#492 — node-wide scoped-transit posture for the legacy interface
+    // path (listen_addr server + bootstrap clients). IFAC needs the passphrase +
+    // size together; netname is optional. A relay is typically
+    // `enable_transport=True` + IFAC (member-only); a public leaf sets
+    // `transit=False`.
+    {
+        // Fail CLOSED on partial IFAC config (CIRISEdge#492 review): naming a
+        // network does not scope it, so ifac_netname-without-passphrase must be
+        // an error, not a silently-open port. Same for the passphrase-XOR-size
+        // case.
+        let ifac_cfg = match (ifac_passphrase, ifac_size) {
+            (Some(passphrase), Some(size)) => Some(crate::transport::reticulum::IfacConfig {
+                networkname: ifac_netname,
+                passphrase,
+                ifac_size: size,
+            }),
+            (None, None) if ifac_netname.is_none() => None,
+            (None, None) => {
+                return Err(PyValueError::new_err(
+                    "init_edge_runtime: ifac_netname is set without ifac_passphrase/ifac_size — \
+                     naming a network does not scope it. Supply the passphrase + size to gate the \
+                     port to members, or drop ifac_netname.",
+                ));
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "init_edge_runtime: ifac_passphrase and ifac_size must be provided together \
+                     (IFAC needs both; ifac_netname is optional)",
+                ));
+            }
+        };
+        // The node-wide posture applies ONLY to the legacy interface path (empty
+        // `interfaces`). Shared-instance mode (`local_instance_name`) pushes a
+        // Local interface, so that path is skipped and node-wide IFAC/transit
+        // would be SILENTLY dropped — reject it loudly (CIRISEdge#492 review). In
+        // shared-instance mode the shared rnsd owns the real interfaces.
+        if (transit.is_some() || ifac_cfg.is_some()) && local_instance_name.is_some() {
+            return Err(PyValueError::new_err(
+                "init_edge_runtime: node-wide transit/IFAC (scoped transit) cannot be combined \
+                 with local_instance_name (shared-instance mode) — the shared rnsd owns the \
+                 interfaces, so the posture would be silently ignored. Configure IFAC on the \
+                 shared instance instead.",
+            ));
+        }
+        transport_config = transport_config.with_scoped_transit(transit, ifac_cfg);
+    }
 
     // v2.3.0 (CIRISEdge#100) — shared-instance leader election +
     // LocalInterfaceConfig push. Only runs when the operator supplied
@@ -9478,6 +9611,10 @@ mod pyo3_tier2_tests {
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
                 None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
+                None,  // transit (CIRISEdge#492 — default relay posture)
+                None,  // ifac_netname
+                None,  // ifac_passphrase
+                None,  // ifac_size
             )?;
             Ok(edge.signer_key_id())
         });
@@ -9592,6 +9729,10 @@ mod pyo3_tier2_tests {
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
                 None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
+                None,  // transit (CIRISEdge#492 — default relay posture)
+                None,  // ifac_netname
+                None,  // ifac_passphrase
+                None,  // ifac_size
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -9745,6 +9886,10 @@ mod pyo3_tier2_tests {
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
                 None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
+                None,  // transit (CIRISEdge#492 — default relay posture)
+                None,  // ifac_netname
+                None,  // ifac_passphrase
+                None,  // ifac_size
             )?;
             Ok(())
         });
@@ -9851,6 +9996,10 @@ mod pyo3_tier2_tests {
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
                 None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
+                None,  // transit (CIRISEdge#492 — default relay posture)
+                None,  // ifac_netname
+                None,  // ifac_passphrase
+                None,  // ifac_size
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -10023,6 +10172,10 @@ mod pyo3_tier2_tests {
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
                 None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
+                None,  // transit (CIRISEdge#492 — default relay posture)
+                None,  // ifac_netname
+                None,  // ifac_passphrase
+                None,  // ifac_size
             )?;
             Ok(edge.signer_key_id())
         });
@@ -10183,6 +10336,10 @@ mod pyo3_tier2_tests {
                 false,      // require_local_signer
                 "off",      // bundle_save_gate
                 None,       // own_build_bundle
+                None,       // transit (CIRISEdge#492)
+                None,       // ifac_netname
+                None,       // ifac_passphrase
+                None,       // ifac_size
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -10303,6 +10460,10 @@ mod pyo3_tier2_tests {
                 false,      // require_local_signer (CIRISEdge#289 — default warn-and-degrade)
                 "off", // bundle_save_gate (CIRISEdge#437 — default Off; flip = fleet-floor event)
                 None,  // own_build_bundle (CIRISEdge#436 — default: no first-contact bundle)
+                None,  // transit (CIRISEdge#492 — default relay posture)
+                None,  // ifac_netname
+                None,  // ifac_passphrase
+                None,  // ifac_size
             )?;
             Ok(edge.signer_key_id())
         });
