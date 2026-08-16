@@ -362,6 +362,49 @@ fn reverse_path_wait_step(
 /// announce storm can't be driven by rapid link churn.
 const EVENT_ANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// CIRISEdge#482 item 3 — bound on the announce cold-start hand-off queue. The
+/// EventReceiver task `try_send`s each inbound announce here and a dedicated
+/// worker drains it, so a slow/contended rooting directory can no longer
+/// head-of-line every other node event behind an announce's DB round-trips.
+/// At the cap, `try_send` TAIL-drops — it rejects the NEWEST announce and keeps
+/// the 256 already queued — with a LOUD warn, never a silent drop
+/// (CIRISEdge#425). RNS announces are periodic + idempotent, so a dropped one
+/// self-heals on the peer's next re-announce.
+const ANNOUNCE_QUEUE_DEPTH: usize = 256;
+
+/// CIRISEdge#482 item 5 — window a `check_blackhole` deny-list snapshot stays
+/// valid before the next dial re-reads `blackhole_list()` from persist. Short
+/// enough that operator add/remove takes effect near-immediately; long enough
+/// that a dial FLOOD (the hot path this optimizes) collapses to one DB read.
+/// See the `blackhole_cache` field docblock for the staleness argument.
+const BLACKHOLE_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// CIRISEdge#482 item 2 — window a `hybrid_transport_binding_exists` verdict
+/// stays valid before the next inbound frame re-queries the rooting directory.
+/// The inbound attribution path checked this per frame (an uncached directory
+/// lookup); caching collapses a burst from one peer to a single query. Kept
+/// tight because caching a stale `true` past a binding *revocation* is the
+/// security-relevant direction — see the `binding_cache` field docblock.
+const BINDING_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// CIRISEdge#482 item 2 — the memo backing [`binding_exists_cached`]. Keyed by
+/// the COMPLETE input to `hybrid_transport_binding_exists` — `(key_id, dest)` —
+/// mapping to `(verdict, fetched_at)`. A plain `std::sync::Mutex` (guard never
+/// held across an `.await`, keeping the inbound path #217-safe).
+type BindingCache = std::sync::Mutex<HashMap<(String, [u8; 16]), (bool, std::time::Instant)>>;
+
+/// CIRISEdge#482 item 5 — the deny-list snapshot cache: `(generation,
+/// Option<(fetched_at, rows)>)`. The generation is bumped on local
+/// invalidation so a concurrent refresh can't clobber it. See the
+/// `blackhole_cache` field docblock.
+type BlackholeCache = std::sync::Mutex<(
+    u64,
+    Option<(
+        std::time::Instant,
+        Arc<Vec<ciris_persist::federation::BlackholeRecord>>,
+    )>,
+)>;
+
 /// CIRISEdge#318 — cap on the in-memory `peers` (rooted + advisory bindings)
 /// map. Bounds advisory-admit pollution: at cap, an Advisory binding is evicted
 /// before a new key is inserted (Rooted bindings are never evicted for advisory
@@ -1525,6 +1568,12 @@ pub struct ReticulumTransport {
     /// listening on ... (dest <explicit_hash>) (named-dest
     /// <named_hash>)` on the `transport_up` interface event.
     local_named_dest_hash: DestinationHash,
+    /// CIRISEdge#489 — the announce-suppression policy installed on `node`
+    /// via `set_announce_control`. Retained here (Arc-backed inner shares
+    /// state with the node's boxed clone) so a future scoped destination can
+    /// be registered via `register_destination_scope` and the node's
+    /// auto-announce loops immediately honour its cohort scope.
+    announce_policy: crate::announce_suppression::ScopePrivacyAnnouncePolicy,
     /// v2.1.0 (CIRISPersist `LocalIdentityAggregate` RET-transport
     /// role) — the 64-byte Reticulum dual-key public material edge
     /// minted at startup: `x25519_pub (32) ‖ ed25519_pub (32)`. The
@@ -1725,6 +1774,36 @@ pub struct ReticulumTransport {
     /// `routing_blackhole_*` returns `TransportError::Config` in that
     /// case, and the send-path enforcement check is a no-op.
     blackhole: Option<Arc<dyn ciris_persist::federation::BlackholeRules>>,
+    /// CIRISEdge#482 item 5 — short-TTL snapshot of the deny-list so a
+    /// dial FLOOD collapses to one `blackhole_list()` DB round-trip per
+    /// [`BLACKHOLE_CACHE_TTL`] window instead of one read per dial (the
+    /// hot send-path was an uncached full-table read). Holds
+    /// `(fetched_at, rows)`; a lookup within the window scans the cached
+    /// `Arc<Vec<_>>` with zero DB traffic. The lock is a plain
+    /// `std::sync::Mutex` held only across the snapshot swap — never
+    /// across the `.await` refresh — so this stays #217-safe (no tokio
+    /// timing primitive on a path that can run on persist's runtime
+    /// thread). **Staleness bound**: a newly-`add`ed rule takes effect,
+    /// and a `remove`d rule stops blocking, within one TTL window; the
+    /// deny-list is operator-intent (see the #120 docblock — low-dozens,
+    /// human-curated), so a ≤TTL enforcement lag on a peer that was
+    /// reachable a moment ago is immaterial, and both directions
+    /// fail-safe (over-block briefly on removal, under-block briefly on
+    /// add). `None`-backend transports never populate this.
+    ///
+    /// The leading `u64` is a GENERATION counter bumped by
+    /// [`Self::invalidate_blackhole_cache`] under this same lock:
+    /// `check_blackhole` snapshots it before its DB read and only commits
+    /// the fetched snapshot if the generation is UNCHANGED, so a local
+    /// `add`/`remove` that lands DURING an in-flight dial's read is never
+    /// clobbered by that dial's stale pre-mutation snapshot re-armed with a
+    /// fresh timestamp (CIRISEdge#482 review finding) — the "visible to the
+    /// very next dial" invalidation guarantee holds against that race.
+    blackhole_cache: BlackholeCache,
+    /// CIRISEdge#482 item 2 — per-`(peer, dest)` hybrid-binding memo consulted
+    /// on the inbound attribution path (once-per-frame directory lookup → one
+    /// query per TTL window). See [`binding_exists_cached`].
+    binding_cache: BindingCache,
     /// CIRISEdge#33 (v0.15.0) — process-wall-clock instant the
     /// transport was constructed. Backs `routing_transport_uptime`.
     /// Monotonic via `std::time::Instant`; transport replacement
@@ -2258,6 +2337,32 @@ impl ReticulumTransport {
         // `register_destination` (native) registers it at `local_named_dest_hash`.
         node.register_destination(named_dest);
 
+        // CIRISEdge#489 — INSTALL the announce-suppression policy onto the node.
+        // Until this call `ScopePrivacyAnnouncePolicy` was dead code:
+        // `set_announce_control` was never invoked anywhere in `src/`, so
+        // leviculum's own local-destination auto-announce loops (the periodic
+        // management re-announce + the local re-gossip pass) gossiped every
+        // local destination unconditionally — a group-scoped destination could
+        // be announced in breach of CC 5.4 (§5.4: group-scoped destinations
+        // MUST NOT announce). The policy default-SUPPRESSES every UNregistered
+        // destination, so the ONE destination that must keep auto-announcing —
+        // this node's NAMED discovery address, the Commons-scoped public mesh
+        // address peers resolve us by — is registered `Public` here so its
+        // auto-re-announce survives. The explicit-hash dest needs no
+        // registration: leviculum skips explicit-hash announces structurally,
+        // and default-suppress is the belt. Edge's own explicit interval
+        // announce of the named dest (`announce_destination`, below) is a
+        // SEPARATE path that does not consult the policy, so mesh discovery is
+        // preserved on both the explicit and the auto paths; the policy only
+        // adds suppression for scoped destinations (register future ones via
+        // the retained `announce_policy` handle).
+        let announce_policy = crate::announce_suppression::ScopePrivacyAnnouncePolicy::new();
+        announce_policy.register_destination_scope(
+            local_named_dest_hash.into_bytes(),
+            crate::cohort_scope::CohortScope::Public,
+        );
+        node.set_announce_control(Some(Box::new(announce_policy.clone())));
+
         // Take the single event receiver before starting, then start
         // the event loop. `listen` claims the stashed receiver.
         let events = node
@@ -2302,6 +2407,7 @@ impl ReticulumTransport {
             node: Arc::new(node),
             local_dest_hash,
             local_named_dest_hash,
+            announce_policy,
             local_transport_pubkey,
             local_identity: identity.clone(),
             local_attestation,
@@ -2330,6 +2436,8 @@ impl ReticulumTransport {
             )),
             dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
             blackhole: blackhole_rules,
+            blackhole_cache: std::sync::Mutex::new((0, None)),
+            binding_cache: std::sync::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             store_and_forward: None,
             delivery: crate::transport::PendingDelivery::LiveOnly,
@@ -2450,6 +2558,27 @@ impl ReticulumTransport {
         let mut out = [0u8; 16];
         out.copy_from_slice(bytes);
         out
+    }
+
+    /// CIRISEdge#489 — register (or update) the cohort scope of a destination
+    /// with the installed announce-suppression policy. The node's own
+    /// auto-announce loops (management re-announce + local re-gossip) consult
+    /// this on their very next pass: a group-scoped destination
+    /// (`SelfOnly` / `Family` / `Cohort`) is thereafter SUPPRESSED (CC 5.4 —
+    /// group-scoped destinations must not announce), a `Public` (Commons)
+    /// destination stays announceable. Idempotent; re-registration overwrites
+    /// the prior scope. This is the "register as edge admits each scoped
+    /// destination" half of the policy contract — the node's own named
+    /// discovery address is registered `Public` at construction; any scoped
+    /// destination edge later registers with the node MUST also be scoped here
+    /// (a missing registration default-suppresses, which is safer-than-leak).
+    pub fn register_announce_scope(
+        &self,
+        dest_hash: [u8; 16],
+        scope: crate::cohort_scope::CohortScope,
+    ) {
+        self.announce_policy
+            .register_destination_scope(dest_hash, scope);
     }
 
     /// spec. Returns a `Vec<TransportSpec>` of `(handle, kind)` pairs.
@@ -3245,7 +3374,9 @@ impl ReticulumTransport {
         store
             .blackhole_upsert(identity_hash, until_parsed, reason)
             .await
-            .map_err(|e| TransportError::Io(format!("blackhole_upsert: {e}")))
+            .map_err(|e| TransportError::Io(format!("blackhole_upsert: {e}")))?;
+        self.invalidate_blackhole_cache();
+        Ok(())
     }
 
     /// Remove a blackhole rule. Idempotent: returns `Ok(())` whether
@@ -3268,7 +3399,27 @@ impl ReticulumTransport {
         store
             .blackhole_remove(identity_hash)
             .await
-            .map_err(|e| TransportError::Io(format!("blackhole_remove: {e}")))
+            .map_err(|e| TransportError::Io(format!("blackhole_remove: {e}")))?;
+        self.invalidate_blackhole_cache();
+        Ok(())
+    }
+
+    /// #482 item 5 — drop the cached deny-list snapshot so a LOCAL rule
+    /// mutation (`add`/`remove`) is visible to the very next dial instead
+    /// of waiting out [`BLACKHOLE_CACHE_TTL`]. The TTL then only bounds
+    /// staleness against rules written by OTHER processes sharing the
+    /// persist-backed `cirislens.blackhole_rules` table (which this
+    /// process cannot observe without a read).
+    fn invalidate_blackhole_cache(&self) {
+        let mut guard = self
+            .blackhole_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bump the generation so any dial with an in-flight `blackhole_list()`
+        // read (snapshotted the OLD generation before its `.await`) declines to
+        // commit its now-stale snapshot, and drop the current snapshot.
+        guard.0 = guard.0.wrapping_add(1);
+        guard.1 = None;
     }
 
     /// v0.18.0 (CIRISEdge#33 background-pruner wiring) — expose the
@@ -3435,18 +3586,59 @@ impl ReticulumTransport {
         let Some(store) = self.blackhole.as_ref() else {
             return Ok(());
         };
-        // Pull the full row set; v0.16.1 cohabitation deployments have
-        // operator-curated deny-lists in the low-dozens range. A
-        // future cut can pivot to a single-row lookup primitive if
-        // persist exposes one (the trait surface today is
-        // `blackhole_list` only — see #120 docblock for the rationale
-        // of batched-flush over per-row lookup).
-        let rows = store
-            .blackhole_list()
-            .await
-            .map_err(|e| TransportError::Io(format!("blackhole_list (check): {e}")))?;
+        // #482 item 5 — serve the full deny-list from a short-TTL snapshot
+        // so a dial FLOOD collapses to one `blackhole_list()` round-trip per
+        // window instead of one per dial. v0.16.1 cohabitation deployments
+        // have operator-curated deny-lists in the low-dozens range, so the
+        // snapshot is cheap to hold. The `std::sync::Mutex` guard is dropped
+        // before the `.await` refresh (never held across it) — keeping this
+        // #217-safe on a send-path that can run on persist's runtime thread.
+        // A future cut can pivot to a single-row lookup primitive if persist
+        // exposes one (the trait surface today is `blackhole_list` only —
+        // see #120 docblock for the rationale of batched-flush).
+        let (cached, gen_at_miss) = {
+            let guard = self
+                .blackhole_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cached = match guard.1.as_ref() {
+                Some((fetched_at, rows)) if fetched_at.elapsed() < BLACKHOLE_CACHE_TTL => {
+                    Some(Arc::clone(rows))
+                }
+                _ => None,
+            };
+            // Snapshot the generation WITH the miss check so a concurrent
+            // invalidation during the `.await` below is detected at commit.
+            (cached, guard.0)
+        };
+        let rows = if let Some(rows) = cached {
+            rows
+        } else {
+            let fetched = store
+                .blackhole_list()
+                .await
+                .map_err(|e| TransportError::Io(format!("blackhole_list (check): {e}")))?;
+            let rows = Arc::new(fetched);
+            // Commit the fresh snapshot ONLY if no invalidation raced our read
+            // (generation unchanged since the miss). If a LOCAL add/remove bumped
+            // the generation during our `.await`, drop this now-stale snapshot and
+            // let the next dial re-read — so the explicit invalidation is never
+            // clobbered by a pre-mutation snapshot re-armed with a fresh timestamp
+            // (CIRISEdge#482 review finding). Two concurrent stale-misses WITHOUT
+            // an interleaved mutation still race benignly (identical data).
+            {
+                let mut guard = self
+                    .blackhole_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.0 == gen_at_miss {
+                    guard.1 = Some((std::time::Instant::now(), Arc::clone(&rows)));
+                }
+            }
+            rows
+        };
         let now = chrono::Utc::now();
-        for rec in rows {
+        for rec in rows.iter() {
             if rec.identity_hash != identity_hash {
                 continue;
             }
@@ -3477,8 +3669,8 @@ impl ReticulumTransport {
                 }
             });
             return Err(TransportError::PeerBlackholed {
-                identity_hash: rec.identity_hash,
-                reason: rec.reason,
+                identity_hash: rec.identity_hash.clone(),
+                reason: rec.reason.clone(),
                 until: rec.until.map(|t| t.to_rfc3339()),
             });
         }
@@ -4321,6 +4513,33 @@ impl Transport for ReticulumTransport {
         // announce immediately.
         let mut last_event_announce: Option<std::time::Instant> = None;
 
+        // CIRISEdge#482 item 3 — offload announce cold-start onto a dedicated
+        // worker so a slow / contended rooting directory can no longer
+        // head-of-line every other node event behind an announce's DB
+        // round-trips. The EventReceiver select arm below `try_send`s each
+        // inbound announce here; this single worker drains them FIFO (the same
+        // serial processing order as the old inline path, just decoupled from
+        // the hot event task — so it introduces no new concurrency). The worker
+        // exits when `announce_tx` drops on listener shutdown.
+        let announce_ctx = AnnounceCtx {
+            peers: Arc::clone(&self.peers),
+            rooting: self.rooting.clone(),
+            event_bus: self.event_bus.clone(),
+            reachability: self.reachability.clone(),
+            peer_bundles: Arc::clone(&self.peer_bundles),
+            hybrid_policy: self.hybrid_policy,
+            transport_binding_enforcement: self.transport_binding_enforcement,
+            bundle_save_gate: self.bundle_save_gate,
+        };
+        let (announce_tx, mut announce_rx) =
+            mpsc::channel::<leviculum_core::ReceivedAnnounce>(ANNOUNCE_QUEUE_DEPTH);
+        tokio::spawn(async move {
+            while let Some(announce) = announce_rx.recv().await {
+                resolve_announce_cold_start(announce, &announce_ctx).await;
+            }
+            tracing::debug!("announce cold-start worker exiting (channel closed)");
+        });
+
         loop {
             tokio::select! {
                 _ = announce_tick.tick() => {
@@ -4369,13 +4588,12 @@ impl Transport for ReticulumTransport {
                         sent_resource_progress: &self.sent_resource_progress,
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
-                        hybrid_policy: self.hybrid_policy,
-                        transport_binding_enforcement: self.transport_binding_enforcement,
+                        binding_cache: &self.binding_cache,
+                        announce_tx: &announce_tx,
                         bundle_save_gate: self.bundle_save_gate,
                         peer_bundles: &self.peer_bundles,
                         own_bundle: self.own_bundle.as_ref(),
                         event_bus: self.event_bus.as_deref(),
-                        reachability: self.reachability.as_ref(),
                         link_established_at: &self.link_established_at,
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                         link_last_inbound_at: &self.link_last_inbound_at,
@@ -4424,6 +4642,25 @@ impl Transport for ReticulumTransport {
     }
 }
 
+/// CIRISEdge#482 item 3 — the OWNED subset of transport state that
+/// [`resolve_announce_cold_start`] needs, so it can run on a dedicated worker
+/// task (fed from [`EventCtx::announce_tx`]) instead of inline on the single
+/// EventReceiver task. Every field is `Arc`/`Copy` so the whole struct clones
+/// cheaply; it mirrors exactly the 8 `EventCtx` fields the cold-start path
+/// touches (verified: it delegates `ctx` to no other helper). Built once in
+/// [`ReticulumTransport::listen`] and moved into the worker.
+#[derive(Clone)]
+struct AnnounceCtx {
+    peers: Arc<Mutex<HashMap<String, RootedPeer>>>,
+    rooting: Option<Arc<dyn RootingDirectory>>,
+    event_bus: Option<Arc<crate::events::EventBus>>,
+    reachability: Option<Arc<ReachabilityTracker>>,
+    peer_bundles: Arc<crate::bundle_gate::PeerBundleStore>,
+    hybrid_policy: HybridPolicy,
+    transport_binding_enforcement: TransportBindingEnforcement,
+    bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
+}
+
 /// Shared handles the event loop hands to [`handle_event`].
 struct EventCtx<'a> {
     node: &'a ReticulumNode,
@@ -4436,11 +4673,13 @@ struct EventCtx<'a> {
     /// Persist directory adapter for the authenticated cold-start
     /// path; `None` → announces are dropped (no rooting possible).
     rooting: Option<&'a dyn RootingDirectory>,
-    /// Consumer hybrid PQC policy applied to a rooted chain.
-    hybrid_policy: HybridPolicy,
-    /// CIRISEdge#205 (AV-42 Phase 4) — RNS destination-hash binding
-    /// enforcement posture applied in [`resolve_announce_cold_start`].
-    transport_binding_enforcement: TransportBindingEnforcement,
+    /// CIRISEdge#482 item 2 — per-`(peer, dest)` hybrid-binding memo, borrowed
+    /// from the owning transport; see [`binding_exists_cached`].
+    binding_cache: &'a BindingCache,
+    /// CIRISEdge#482 item 3 — hand-off channel to the announce cold-start
+    /// worker. The `AnnounceReceived` arm `try_send`s here instead of running
+    /// [`resolve_announce_cold_start`] inline on the EventReceiver task.
+    announce_tx: &'a mpsc::Sender<leviculum_core::ReceivedAnnounce>,
     /// CIRISEdge#437 — bundle-gate posture on the DURABLE Rooted save,
     /// applied to the write-through in [`resolve_announce_cold_start`].
     bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
@@ -4454,11 +4693,6 @@ struct EventCtx<'a> {
     /// emissions. `None` → no events emitted (the transport was
     /// constructed without `ReticulumAuth::event_bus`).
     event_bus: Option<&'a crate::events::EventBus>,
-    /// CIRISEdge#29 — per-medium reachability tracker. `Some` →
-    /// every successfully-rooted announce records an
-    /// `AttemptOutcome::AnnounceReceived` against `(peer_key_id,
-    /// TransportId::RETICULUM_RS)`.
-    reachability: Option<&'a Arc<ReachabilityTracker>>,
     /// CIRISEdge#32 (v0.14.0) — link establishment timestamps,
     /// populated on `LinkEstablished` / cleared on `LinkClosed` /
     /// `LinkStale`.
@@ -4525,6 +4759,56 @@ fn resolve_link_attribution(
             None => LinkAttribution::DestUnmatched(d),
         },
     }
+}
+
+/// CIRISEdge#482 item 2 — consult a per-`(peer, dest)` TTL memo before querying
+/// the rooting directory for a hybrid transport binding. The inbound attribution
+/// path calls `hybrid_transport_binding_exists` once PER FRAME; a peer that is
+/// actively sending re-proves the SAME `(key_id, dest)` binding on every frame,
+/// so a short-TTL memo collapses that to one directory query per
+/// [`BINDING_CACHE_TTL`] window (the hot receive path this optimizes).
+///
+/// `(key_id, dest)` is the COMPLETE input to `hybrid_transport_binding_exists`,
+/// so the cache key is exact: a re-key (new `key_id`) or re-home (new `dest`)
+/// changes the key and misses, re-querying live. **Staleness bound**: a binding
+/// *revocation* (persist supports subject-revoked bindings) propagates to this
+/// gate within one TTL window — bounded, and additive to the rooting
+/// directory's own federation-propagation latency, not the sole delay. The
+/// window is deliberately tight (seconds) because a stale `true` is the
+/// security-relevant direction on this load-bearing E3 attribution gate; a
+/// stale `false` is fail-closed (a just-rooted peer is briefly not attributed,
+/// then self-heals on the next window).
+async fn binding_exists_cached(
+    cache: &BindingCache,
+    rooting: &dyn RootingDirectory,
+    key_id: &str,
+    dest: [u8; 16],
+) -> bool {
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((verdict, at)) = guard.get(&(key_id.to_string(), dest)) {
+            if at.elapsed() < BINDING_CACHE_TTL {
+                return *verdict;
+            }
+        }
+    }
+    let verdict = rooting.hybrid_transport_binding_exists(key_id, dest).await;
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bound memory: prune expired entries before inserting. The live set is
+        // naturally bounded by the rooted-peer population (item 1 gates entry to
+        // this check), but departed peers must not accumulate.
+        guard.retain(|_, (_, at)| at.elapsed() < BINDING_CACHE_TTL);
+        guard.insert(
+            (key_id.to_string(), dest),
+            (verdict, std::time::Instant::now()),
+        );
+    }
+    verdict
 }
 
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
@@ -4716,7 +5000,7 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             // directory (can't prove the hybrid route ⇒ not attributable).
             let gated = match (item1, dest, ctx.rooting) {
                 (Some(sid), Some(d), Some(rooting)) => {
-                    if rooting.hybrid_transport_binding_exists(&key_id, d).await {
+                    if binding_exists_cached(ctx.binding_cache, rooting, &key_id, d).await {
                         Some(sid)
                     } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                         link_attribution_miss_log().check(key_id.as_str())
@@ -4836,13 +5120,35 @@ fn select_reply_link(
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
     match event {
         NodeEvent::AnnounceReceived { announce, .. } => {
-            // The announce app-data carries the peer's signed
-            // attestation. Run the authenticated cold-start path —
-            // root the federation key, verify the attestation
-            // signature, apply the hybrid policy — before the peer
-            // is recorded as resolvable. This replaces v0.3.1's
-            // trust-on-first-use (CIRISEdge#15, AV-42).
-            resolve_announce_cold_start(&announce, ctx).await;
+            // The announce app-data carries the peer's signed attestation; the
+            // authenticated cold-start path roots the federation key, verifies
+            // the attestation signature, and applies the hybrid policy before
+            // the peer is recorded as resolvable (replaces v0.3.1 TOFU —
+            // CIRISEdge#15, AV-42). CIRISEdge#482 item 3 — that work is now
+            // handed to a dedicated worker (non-blocking `try_send`) so its DB
+            // round-trips don't head-of-line every other node event. Both drop
+            // paths are LOUD (never silent — CIRISEdge#425), but split so a DEAD
+            // worker (channel Closed) is diagnosable rather than masked as
+            // ordinary backpressure (queue Full).
+            match ctx.announce_tx.try_send(announce) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        "announce DROPPED — cold-start worker queue FULL \
+                         (backpressure); RNS re-announce will retry (CIRISEdge#482 item 3)"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // The worker task is gone (exited or panicked). This is NOT
+                    // routine backpressure — every subsequent announce will be
+                    // dropped until the transport is rebuilt, so it is an ERROR.
+                    tracing::error!(
+                        "announce DROPPED — cold-start worker is GONE (channel \
+                         closed: the worker task exited); announces are no longer \
+                         being processed (CIRISEdge#482 item 3)"
+                    );
+                }
+            }
         }
         // v7.2.0: Leviculum v0.8.x upstream auto-accepts inbound link
         // requests internally — the v0.7.x `NodeEvent::LinkRequest` +
@@ -5603,7 +5909,7 @@ async fn heal_or_report_attribution_miss(
                 );
                 // Item 2 still applies — the heal upgrades item 1 only.
                 if let (Some(d), Some(rooting)) = (dest16, ctx.rooting) {
-                    if rooting.hybrid_transport_binding_exists(key_id, d).await {
+                    if binding_exists_cached(ctx.binding_cache, rooting, key_id, d).await {
                         return crate::transport::SourceKeyId::from_rooted_binding(
                             key_id.to_string(),
                             Rooted,
@@ -6151,14 +6457,14 @@ async fn handle_peer_bundle_frame(
 
 #[allow(clippy::too_many_lines)]
 async fn resolve_announce_cold_start(
-    announce: &leviculum_core::ReceivedAnnounce,
-    ctx: &EventCtx<'_>,
+    announce: leviculum_core::ReceivedAnnounce,
+    ctx: &AnnounceCtx,
 ) {
     use ciris_persist::federation::self_at_login::BindingProvenance;
     // Step 0 — the cold-start path needs the persist directory. With
     // no rooting backend the announce cannot be authenticated; drop
     // it (fail-honest — never fall back to TOFU).
-    let Some(rooting) = ctx.rooting else {
+    let Some(rooting) = ctx.rooting.as_deref() else {
         // CIRISEdge#425 — no rooting directory means EVERY announce is dropped, so
         // no peer can ever root: the mesh silently never forms. A floored WARN
         // (fixed discriminant — one config condition) so a misconfigured node says
@@ -6201,7 +6507,7 @@ async fn resolve_announce_cold_start(
             // CIRISEdge#34 — still surface on the announce stream for operators
             // who subscribe, but at INFO severity: ambient non-CIRIS traffic is
             // informational, not a warning (CIRISEdge#357).
-            if let Some(bus) = ctx.event_bus {
+            if let Some(bus) = ctx.event_bus.as_deref() {
                 bus.emit_announce(crate::events::NetworkEvent::announce(
                     None,
                     announce.destination_hash().as_bytes().to_vec(),
@@ -6237,7 +6543,7 @@ async fn resolve_announce_cold_start(
                      the announce identity pubkeys (RNS §5.6.8.8.1.1 mismatch — \
                      spoofed transport-identity binding)",
                 );
-                if let Some(bus) = ctx.event_bus {
+                if let Some(bus) = ctx.event_bus.as_deref() {
                     bus.emit_announce(crate::events::NetworkEvent::announce(
                         Some(key_id.clone()),
                         announce.destination_hash().as_bytes().to_vec(),
@@ -6537,7 +6843,7 @@ async fn resolve_announce_cold_start(
                 // tracker / event / peer-map writes are logically
                 // independent (the tracker is observability, the peer
                 // map is routing).
-                if let Some(tracker) = ctx.reachability {
+                if let Some(tracker) = ctx.reachability.as_ref() {
                     tracker.record_attempt(
                         &key_id,
                         TransportId::RETICULUM_RS,
@@ -6548,7 +6854,7 @@ async fn resolve_announce_cold_start(
                 // event with info severity. The peer key_id is now known
                 // to be authentic; surface it on the announce stream so
                 // the UI can render "peer X joined".
-                if let Some(bus) = ctx.event_bus {
+                if let Some(bus) = ctx.event_bus.as_deref() {
                     bus.emit_announce(crate::events::NetworkEvent::announce(
                         Some(key_id.clone()),
                         announce.destination_hash().as_bytes().to_vec(),
@@ -6667,7 +6973,7 @@ async fn resolve_announce_cold_start(
             ctx.bundle_save_gate,
             persist_provenance,
             &persisted_key,
-            ctx.peer_bundles,
+            &ctx.peer_bundles,
             rooting,
         )
         .await;

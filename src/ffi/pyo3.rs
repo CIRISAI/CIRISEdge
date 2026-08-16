@@ -6368,10 +6368,12 @@ fn seal_av_outer(
 
 /// Hybrid X25519 + ML-KEM-768 KEX — initiator side (CIRISEdge#54).
 ///
-/// `algorithm` is one of `"hybrid"`, `"hybrid-required"`, or `"classical"`.
-/// HNDL-strict callers (realtime A/V, key_grant DEK distribution) should
-/// pass `"hybrid-required"`: classical fallback is REJECTED rather than
-/// silently negotiated down.
+/// `algorithm` is one of `"hybrid"` or `"hybrid-required"`. Post-CIRISEdge#481
+/// the two are identical on the initiate side (both require the peer's
+/// ML-KEM-768 half and reject a classical-only peer); `"hybrid-required"`
+/// remains as an explicit HNDL-strict marker for realtime A/V + key_grant DEK
+/// distribution. `"classical"` is REJECTED with `PyValueError` — the classical
+/// X25519-only KEX is retired (there is no negotiable quantum-vulnerable path).
 ///
 /// Returns `(handshake_msg_json_bytes, session_key, negotiated_algorithm_wire_id)`.
 /// The handshake JSON round-trips through
@@ -6395,10 +6397,18 @@ fn federation_session_initiate(
     let requested = match algorithm {
         "hybrid" => KexAlgorithm::Hybrid,
         "hybrid-required" => KexAlgorithm::HybridRequired,
-        "classical" => KexAlgorithm::Classical,
+        // CIRISEdge#481 — the classical KEX is retired. Refuse the request
+        // explicitly (rather than routing it to `initiate`, which would also
+        // reject it) so the caller gets a clear, actionable error.
+        "classical" => {
+            return Err(PyValueError::new_err(
+                "algorithm 'classical': the classical X25519-only KEX is retired \
+                 (CIRISEdge#481, HNDL discipline) — use 'hybrid' or 'hybrid-required'",
+            ));
+        }
         other => {
             return Err(PyValueError::new_err(format!(
-                "algorithm: expected 'hybrid' | 'hybrid-required' | 'classical', got {other:?}"
+                "algorithm: expected 'hybrid' | 'hybrid-required', got {other:?}"
             )));
         }
     };
@@ -7369,9 +7379,15 @@ impl PyLxmfPropagationNode {
         unstamped_lxmf: &[u8],
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
         let stamp = fixed_bytes::<32>("propagation_stamp", propagation_stamp)?;
-        let id = self
-            .inner
-            .validate_and_store(&stamp, unstamped_lxmf)
+        // CIRISEdge#482 item 7 — the proof-of-work VALIDATION (workblock
+        // expansion rounds) is CPU-heavy and previously ran holding the GIL,
+        // freezing every other Python thread for its whole duration. Copy the
+        // Python-borrowed ciphertext to an owned buffer, then RELEASE the GIL
+        // (`py.detach`) for the stamp check so Python threads keep running.
+        let unstamped = unstamped_lxmf.to_vec();
+        let node = &self.inner;
+        let id = py
+            .detach(|| node.validate_and_store(&stamp, &unstamped))
             .map_err(|e| lxmf_err(&e))?;
         Ok(pyo3::types::PyBytes::new(py, &id))
     }
@@ -7566,9 +7582,14 @@ impl PyLxmfPropagationClient {
         unstamped_lxmf: &[u8],
         cost: u8,
     ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        let stamp = self
-            .inner
-            .generate_propagation_stamp(unstamped_lxmf, cost)
+        // CIRISEdge#482 item 7 — PoW GENERATION is the heaviest CPU path here
+        // (searching for a stamp at `cost` leading-zero bits over the workblock
+        // rounds). Copy the borrowed input, then release the GIL so Python
+        // threads run during the search instead of freezing behind it.
+        let unstamped = unstamped_lxmf.to_vec();
+        let node = &self.inner;
+        let stamp = py
+            .detach(|| node.generate_propagation_stamp(&unstamped, cost))
             .map_err(|e| lxmf_err(&e))?;
         Ok(pyo3::types::PyBytes::new(py, &stamp))
     }
