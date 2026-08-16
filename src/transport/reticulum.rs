@@ -1176,6 +1176,16 @@ pub struct ReticulumTransportConfig {
     /// leviculum's valid band by [`effective_link_keepalive_secs`] before it
     /// reaches the builder — an operator override cannot escape the DoS bound.
     pub link_keepalive: Option<Duration>,
+    /// CIRISEdge#492 — node-wide relay (transit) posture applied to the LEGACY
+    /// interface path (the `listen_addr` server + `bootstrap_peers` clients, used
+    /// when `interfaces` is empty). `None` = leviculum default (relay-by-default);
+    /// `Some(false)` = leaf-only. Typed `interfaces` carry their OWN per-interface
+    /// posture and ignore this. See [`IfacConfig`].
+    pub transit: Option<bool>,
+    /// CIRISEdge#492 — node-wide IFAC applied to the LEGACY interface path: `Some`
+    /// makes the `listen_addr` server + every bootstrap client a member-only port;
+    /// `None` = open. Typed `interfaces` carry their own IFAC.
+    pub ifac: Option<IfacConfig>,
 }
 
 impl ReticulumTransportConfig {
@@ -1196,7 +1206,21 @@ impl ReticulumTransportConfig {
             // CIRISEdge#363 — default the bootstrap keepalive ON so advisory
             // links survive the two-plane anti-entropy out of the box.
             link_keepalive: Some(BOOTSTRAP_LINK_KEEPALIVE),
+            transit: None,
+            ifac: None,
         }
+    }
+
+    /// CIRISEdge#492 — set the node-wide scoped-transit posture for the legacy
+    /// interface path: `transit` (`Some(false)` = leaf-only, never rebroadcasts
+    /// announces) + an optional IFAC (member-only access code). Builder-style;
+    /// applies to the `listen_addr` server + every `bootstrap_peers` client.
+    /// Typed `interfaces` carry their own posture and are unaffected.
+    #[must_use]
+    pub fn with_scoped_transit(mut self, transit: Option<bool>, ifac: Option<IfacConfig>) -> Self {
+        self.transit = transit;
+        self.ifac = ifac;
+        self
     }
 
     /// **CIRISEdge#168** — opt this node into Reticulum Transport-node
@@ -1321,12 +1345,43 @@ pub struct AutoInterfaceConfig {
     pub multicast_loopback: Option<bool>,
 }
 
+/// CIRISEdge#492 — per-interface IFAC (Interface Framing Access Code): the
+/// shared-secret "network access code" that scopes an interface to CIRIS
+/// members. Packets without the code drop AT the interface, so everything past
+/// it is member traffic by construction — structural invisibility, no per-packet
+/// identity inspection. Maps onto leviculum's `add_tcp_server_ifac` /
+/// `add_tcp_client_ifac` / `InterfaceConfig { networkname, passphrase, ifac_size }`.
+#[cfg(feature = "_reticulum-module")]
+#[derive(Debug, Clone)]
+pub struct IfacConfig {
+    /// IFAC virtual-network name (`None` = leviculum's unnamed default network).
+    pub networkname: Option<String>,
+    /// The shared member passphrase. Distributed to hybrid-verified members as a
+    /// rotating PQC `key_grant` (CIRISPersist#704) for flag-day-free rotation via
+    /// the three rotation verbs; operator-supplied until that lands.
+    pub passphrase: String,
+    /// IFAC hash-truncation size in BYTES (Python callers pass bits ÷ 8). The
+    /// leviculum convention is 16 for a NETWORK interface (TCP/UDP — edge's
+    /// relay ports) and 8 for a serial link (RNode/pipe/KISS/AX.25). Both peers
+    /// on an interface MUST agree.
+    pub ifac_size: usize,
+}
+
 /// `TcpServerInterface` configuration — bind a TCP socket.
 #[cfg(feature = "transport-reticulum-tcp-server")]
 #[derive(Debug, Clone)]
 pub struct TcpServerInterfaceConfig {
     /// Address the TCP server binds to.
     pub listen_addr: SocketAddr,
+    /// CIRISEdge#492 — relay (transit) posture. `None` = leviculum default
+    /// (relay-by-default, leviculum#48/#51); `Some(false)` = a public LEAF port
+    /// that never rebroadcasts announces and drops any relay crossing it. Declare
+    /// non-transit on a public leaf so no peer builds a path expecting a transit
+    /// this CIRIS node won't provide (the Tor-exit-policy lesson — a silent-drop
+    /// router is worse than absence).
+    pub transit: Option<bool>,
+    /// CIRISEdge#492 — IFAC scoping. `Some` = member-only port; `None` = open.
+    pub ifac: Option<IfacConfig>,
 }
 
 /// `TcpClientInterface` configuration — dial a remote TCP server.
@@ -1335,6 +1390,13 @@ pub struct TcpServerInterfaceConfig {
 pub struct TcpClientInterfaceConfig {
     /// Target TCP server address to dial.
     pub target_addr: SocketAddr,
+    /// CIRISEdge#492 — relay (transit) posture for this dialed link. `None` =
+    /// leviculum default (relay); `Some(false)` = leaf-only. See
+    /// [`TcpServerInterfaceConfig::transit`].
+    pub transit: Option<bool>,
+    /// CIRISEdge#492 — IFAC scoping. `Some` = the dialed peer is a member port
+    /// (member access code applied); `None` = open dial.
+    pub ifac: Option<IfacConfig>,
 }
 
 /// `UdpInterface` configuration — listen + forward addrs.
@@ -2176,8 +2238,15 @@ impl ReticulumTransport {
         if config.interfaces.is_empty() {
             // Legacy v0.11.x defaults — TCP server + bootstrap TCP
             // clients. Registry records each one so the typed surface
-            // is uniform.
-            builder = builder.add_tcp_server(config.listen_addr);
+            // is uniform. CIRISEdge#492 — the node-wide `transit`/`ifac`
+            // posture (if set) applies to these legacy interfaces via the
+            // same shared mapper the typed path uses.
+            builder = apply_tcp_server_transit(
+                builder,
+                config.listen_addr,
+                config.transit,
+                config.ifac.as_ref(),
+            );
             interface_specs.push(RegisteredInterface {
                 handle: InterfaceHandle(interface_specs.len()),
                 kind: "TCPServerInterface".to_string(),
@@ -2190,7 +2259,8 @@ impl ReticulumTransport {
                 ),
             });
             for peer in &config.bootstrap_peers {
-                builder = builder.add_tcp_client(*peer);
+                builder =
+                    apply_tcp_client_transit(builder, *peer, config.transit, config.ifac.as_ref());
                 interface_specs.push(RegisteredInterface {
                     handle: InterfaceHandle(interface_specs.len()),
                     kind: "TCPClientInterface".to_string(),
@@ -2516,6 +2586,41 @@ impl ReticulumTransport {
     #[must_use]
     pub(crate) fn node(&self) -> &Arc<ReticulumNode> {
         &self.node
+    }
+
+    /// CIRISEdge#492 — three-phase IFAC membership-key rotation, flag-day-free.
+    /// Edge owns the orchestration CADENCE; leviculum owns the MECHANISM, and
+    /// the passphrase distribution BETWEEN phases is the persist `key_grant`
+    /// handoff (CIRISPersist#704). Phase 1 — `install_next`: the node accepts
+    /// BOTH the current code and the next (make-before-break); no member is
+    /// excluded yet. Returns the number of interfaces updated.
+    pub fn ifac_install_next(
+        &self,
+        netname: Option<&str>,
+        passphrase: &str,
+        ifac_size: usize,
+    ) -> Result<usize, TransportError> {
+        self.node
+            .ifac_install_next(netname, passphrase, ifac_size)
+            .map_err(|e| TransportError::Io(format!("ifac_install_next: {e}")))
+    }
+
+    /// CIRISEdge#492 — phase 2: swap the next IFAC code to PRIMARY. Outbound now
+    /// frames under the new code; a straggler still holding only the old code
+    /// continues to LAND (both are accepted). Call after the new passphrase has
+    /// been distributed to members. Returns the number of interfaces affected.
+    #[must_use]
+    pub fn ifac_activate_next(&self) -> usize {
+        self.node.ifac_activate_next()
+    }
+
+    /// CIRISEdge#492 — phase 3: SEAL the rotation — drop the old IFAC code. Any
+    /// member that never re-keyed is now excluded (readmission requires a fresh
+    /// grant + re-key). Call after the convergence window. Returns the number of
+    /// interfaces affected.
+    #[must_use]
+    pub fn ifac_seal_rotation(&self) -> usize {
+        self.node.ifac_seal_rotation()
     }
 
     /// v2.2.2 (CIRISEdge#97) — return edge's announced RNS destination
@@ -7368,6 +7473,75 @@ fn set_owner_only(_path: &std::path::Path) -> Result<(), TransportError> {
 /// `Option<String>` parameters since leviculum's share-instance is
 /// configured via separate builder methods rather than the interface
 /// vec.
+/// CIRISEdge#492 — apply a TCP SERVER interface's scoped-transit posture to the
+/// leviculum builder. THE single source of truth for the `(transit, ifac)` →
+/// builder-method mapping, shared by [`apply_interface_config`] (typed path) and
+/// the node-wide legacy path so the two can never diverge on a security-relevant
+/// predicate. IFAC-only → `add_tcp_server_ifac`; no-transit-only →
+/// `add_tcp_server_no_transit`; the IFAC+no-transit combo (a member-only LEAF
+/// port — no convenience method covers it) → the general `add_interface_config`.
+fn apply_tcp_server_transit(
+    builder: ReticulumNodeBuilder,
+    addr: SocketAddr,
+    transit: Option<bool>,
+    ifac: Option<&IfacConfig>,
+) -> ReticulumNodeBuilder {
+    match (ifac, transit == Some(false)) {
+        (Some(ifac), true) => {
+            builder.add_interface_config(leviculum_std::config::InterfaceConfig {
+                interface_type: "TCPServerInterface".to_string(),
+                name: "TCP Server".to_string(),
+                listen_ip: Some(addr.ip().to_string()),
+                listen_port: Some(addr.port()),
+                transit: Some(false),
+                networkname: ifac.networkname.clone(),
+                passphrase: Some(ifac.passphrase.clone()),
+                ifac_size: Some(ifac.ifac_size),
+                ..Default::default()
+            })
+        }
+        (Some(ifac), false) => builder.add_tcp_server_ifac(
+            addr,
+            ifac.networkname.as_deref(),
+            &ifac.passphrase,
+            ifac.ifac_size,
+        ),
+        (None, true) => builder.add_tcp_server_no_transit(addr),
+        (None, false) => builder.add_tcp_server(addr),
+    }
+}
+
+/// CIRISEdge#492 — apply a TCP CLIENT interface's scoped-transit posture.
+/// leviculum has `add_tcp_client_ifac` but NO `add_tcp_client_no_transit`, so any
+/// no-transit client (with or without IFAC) rides `add_interface_config`.
+fn apply_tcp_client_transit(
+    builder: ReticulumNodeBuilder,
+    addr: SocketAddr,
+    transit: Option<bool>,
+    ifac: Option<&IfacConfig>,
+) -> ReticulumNodeBuilder {
+    match (ifac, transit == Some(false)) {
+        (ifac_opt, true) => builder.add_interface_config(leviculum_std::config::InterfaceConfig {
+            interface_type: "TCPClientInterface".to_string(),
+            name: "TCP Client".to_string(),
+            target_host: Some(addr.ip().to_string()),
+            target_port: Some(addr.port()),
+            transit: Some(false),
+            networkname: ifac_opt.as_ref().and_then(|i| i.networkname.clone()),
+            passphrase: ifac_opt.as_ref().map(|i| i.passphrase.clone()),
+            ifac_size: ifac_opt.as_ref().map(|i| i.ifac_size),
+            ..Default::default()
+        }),
+        (Some(ifac), false) => builder.add_tcp_client_ifac(
+            addr,
+            ifac.networkname.as_deref(),
+            &ifac.passphrase,
+            ifac.ifac_size,
+        ),
+        (None, false) => builder.add_tcp_client(addr),
+    }
+}
+
 #[allow(unused_variables, unused_mut)]
 // every variant arm is feature-gated
 // v0.12.0 (CIRISEdge#24) — the match arms cover seven feature-gated
@@ -7410,13 +7584,17 @@ fn apply_interface_config(
         #[cfg(feature = "transport-reticulum-tcp-server")]
         ReticulumInterfaceConfig::TcpServer(cfg) => {
             let name = format!("tcp-server-{}", cfg.listen_addr);
-            builder = builder.add_tcp_server(cfg.listen_addr);
+            // CIRISEdge#492 — scoped-transit posture via the shared mapper.
+            builder =
+                apply_tcp_server_transit(builder, cfg.listen_addr, cfg.transit, cfg.ifac.as_ref());
             Ok((builder, "TCPServerInterface", name))
         }
         #[cfg(feature = "transport-reticulum-tcp-client")]
         ReticulumInterfaceConfig::TcpClient(cfg) => {
             let name = format!("tcp-client-{}", cfg.target_addr);
-            builder = builder.add_tcp_client(cfg.target_addr);
+            // CIRISEdge#492 — scoped-transit posture via the shared mapper.
+            builder =
+                apply_tcp_client_transit(builder, cfg.target_addr, cfg.transit, cfg.ifac.as_ref());
             Ok((builder, "TCPClientInterface", name))
         }
         #[cfg(feature = "transport-reticulum-udp")]

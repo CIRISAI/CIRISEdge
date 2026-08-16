@@ -40,7 +40,7 @@ use std::sync::Arc;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::transport::reticulum::UdpInterfaceConfig;
 use ciris_edge::transport::reticulum::{
-    AutoInterfaceConfig, LocalInterfaceConfig, ReticulumAuth, ReticulumInterfaceConfig,
+    AutoInterfaceConfig, IfacConfig, LocalInterfaceConfig, ReticulumAuth, ReticulumInterfaceConfig,
     ReticulumTransportConfig, TcpClientInterfaceConfig, TcpServerInterfaceConfig, TransportSpec,
     TransportStats,
 };
@@ -97,11 +97,15 @@ fn every_interface_kind_config_struct_round_trips_into_transport_config() {
         .add_interface(ReticulumInterfaceConfig::TcpServer(
             TcpServerInterfaceConfig {
                 listen_addr: loopback_addr(45_000),
+                transit: None,
+                ifac: None,
             },
         ))
         .add_interface(ReticulumInterfaceConfig::TcpClient(
             TcpClientInterfaceConfig {
                 target_addr: loopback_addr(45_001),
+                transit: None,
+                ifac: None,
             },
         ))
         .add_interface(ReticulumInterfaceConfig::Udp(UdpInterfaceConfig {
@@ -238,6 +242,8 @@ async fn tcp_server_and_tcp_client_typed_round_trip() {
         .add_interface(ReticulumInterfaceConfig::TcpServer(
             TcpServerInterfaceConfig {
                 listen_addr: server_addr,
+                transit: None,
+                ifac: None,
             },
         ));
     let server = ReticulumTransport::new(server_cfg, test_auth("interface-diversity-server"))
@@ -256,6 +262,8 @@ async fn tcp_server_and_tcp_client_typed_round_trip() {
         .add_interface(ReticulumInterfaceConfig::TcpClient(
             TcpClientInterfaceConfig {
                 target_addr: loopback_addr(1),
+                transit: None,
+                ifac: None,
             },
         ));
     let client = ReticulumTransport::new(client_cfg, test_auth("interface-diversity-client"))
@@ -278,6 +286,121 @@ async fn tcp_server_and_tcp_client_typed_round_trip() {
     assert_eq!(c_stats.kind, "TCPClientInterface");
 }
 
+/// CIRISEdge#492 — every scoped-transit posture round-trips through the shared
+/// `apply_interface_config` mapper into a transport that BUILDS: an IFAC'd
+/// member relay (IFAC-only), a public leaf (`transit=false`, no IFAC), a
+/// member-leaf (IFAC + `transit=false` combo → the general escape hatch), and an
+/// IFAC client. This pins that each posture reaches the correct leviculum
+/// builder call without error; leviculum's own `scoped_transit.rs` conformance
+/// harness pins the resulting on-wire behavior.
+#[tokio::test]
+async fn scoped_transit_postures_build() {
+    use ciris_edge::transport::reticulum::ReticulumTransport;
+    let tmp = TempDir::new().expect("tempdir");
+    let ifac = || IfacConfig {
+        networkname: Some("ciris-mesh".to_string()),
+        passphrase: "member-secret".to_string(),
+        ifac_size: 16,
+    };
+    let cfg = ReticulumTransportConfig::new(tmp_identity_path(&tmp, "relay"), "key-relay")
+        .with_transport_node(true)
+        .add_interface(ReticulumInterfaceConfig::TcpServer(
+            TcpServerInterfaceConfig {
+                listen_addr: loopback_addr(0),
+                transit: None,      // relay (leviculum default)
+                ifac: Some(ifac()), // member-only
+            },
+        ))
+        .add_interface(ReticulumInterfaceConfig::TcpServer(
+            TcpServerInterfaceConfig {
+                listen_addr: loopback_addr(0),
+                transit: Some(false), // public leaf
+                ifac: None,
+            },
+        ))
+        .add_interface(ReticulumInterfaceConfig::TcpServer(
+            TcpServerInterfaceConfig {
+                listen_addr: loopback_addr(0),
+                transit: Some(false), // member leaf — the IFAC+no-transit combo
+                ifac: Some(ifac()),
+            },
+        ))
+        .add_interface(ReticulumInterfaceConfig::TcpClient(
+            TcpClientInterfaceConfig {
+                target_addr: loopback_addr(1),
+                transit: None,
+                ifac: Some(ifac()), // dial a member port → add_tcp_client_ifac
+            },
+        ))
+        .add_interface(ReticulumInterfaceConfig::TcpClient(
+            TcpClientInterfaceConfig {
+                target_addr: loopback_addr(2),
+                transit: Some(false), // member-leaf client: IFAC + no-transit combo
+                ifac: Some(ifac()),   // → the escape-hatch arm (target_host/target_port)
+            },
+        ))
+        .add_interface(ReticulumInterfaceConfig::TcpClient(
+            TcpClientInterfaceConfig {
+                target_addr: loopback_addr(3),
+                transit: Some(false), // no-transit client, no IFAC → also escape-hatch
+                ifac: None,
+            },
+        ));
+    let relay = ReticulumTransport::new(cfg, test_auth("scoped-transit-relay"))
+        .await
+        .expect("scoped-transit transport builds across every posture");
+    let specs = relay.interface_specs();
+    assert_eq!(
+        specs.len(),
+        6,
+        "all six scoped-transit interfaces registered"
+    );
+    assert_eq!(
+        specs
+            .iter()
+            .filter(|s| s.kind == "TCPServerInterface")
+            .count(),
+        3
+    );
+    // All THREE client arms build: IFAC-only, IFAC+no-transit combo, and
+    // no-transit-plain — the last two exercise the hand-rolled
+    // target_host/target_port escape-hatch (no add_tcp_client_no_transit exists).
+    assert_eq!(
+        specs
+            .iter()
+            .filter(|s| s.kind == "TCPClientInterface")
+            .count(),
+        3
+    );
+}
+
+/// CIRISEdge#492 — the NODE-WIDE posture (`with_scoped_transit`) reaches the same
+/// mapper on the LEGACY interface path: a config with no typed interfaces but a
+/// node-wide IFAC + `transit=false` builds the legacy `listen_addr` server
+/// IFAC'd + leaf. This is the shape a Python operator gets from
+/// `init_edge_runtime(ifac_passphrase=…, transit=False)`.
+#[tokio::test]
+async fn node_wide_scoped_transit_legacy_path_builds() {
+    use ciris_edge::transport::reticulum::ReticulumTransport;
+    let tmp = TempDir::new().expect("tempdir");
+    let mut cfg = ReticulumTransportConfig::new(tmp_identity_path(&tmp, "nodewide"), "key-nw")
+        .with_scoped_transit(
+            Some(false),
+            Some(IfacConfig {
+                networkname: None,
+                passphrase: "member-secret".to_string(),
+                ifac_size: 16,
+            }),
+        );
+    cfg.listen_addr = loopback_addr(0); // OS-assigned test port (not 0.0.0.0:4242)
+    let t = ReticulumTransport::new(cfg, test_auth("node-wide-scoped"))
+        .await
+        .expect("node-wide scoped-transit legacy path builds");
+    let specs = t.interface_specs();
+    assert_eq!(specs.len(), 1, "legacy server registered");
+    assert_eq!(specs[0].kind, "TCPServerInterface");
+}
+
 /// **Gateway-peer pattern**: one transport configured with TWO
 /// different interface kinds (TCP server + AutoInterface). Both end
 /// up in the spec registry — the gateway-peer routing pattern at the
@@ -298,6 +421,8 @@ async fn gateway_peer_registers_multiple_interface_kinds() {
         .add_interface(ReticulumInterfaceConfig::TcpServer(
             TcpServerInterfaceConfig {
                 listen_addr: loopback_addr(0),
+                transit: None,
+                ifac: None,
             },
         ))
         .add_interface(ReticulumInterfaceConfig::Auto(AutoInterfaceConfig {
@@ -385,6 +510,8 @@ async fn transport_spec_handle_round_trips_through_transport_stats() {
         .add_interface(ReticulumInterfaceConfig::TcpServer(
             TcpServerInterfaceConfig {
                 listen_addr: loopback_addr(0),
+                transit: None,
+                ifac: None,
             },
         ));
     let transport = ReticulumTransport::new(cfg, test_auth("interface-diversity-test"))
