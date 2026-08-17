@@ -264,34 +264,78 @@ fn check_delivery_mode() -> Result<(), String> {
 
 fn check_cohort_scope_projection() -> Result<(), String> {
     use ciris_persist::federation::namespace::Projection;
-    use ciris_persist::federation::namespace::{projection_for, registry::authority_for};
+    use ciris_persist::federation::namespace::{
+        projection_for, registry::authority_for, tombstone_ceiling, ObjectClass,
+    };
     use ciris_persist::federation::types::cohort_scope;
-    // projection_for must be TOTAL over the 7 closed cohort scopes — edge's
-    // offer/projection filter is a function of this value, so an unhandled scope
-    // would be a routing hole. `authority_for` on a benign dimension gives a
-    // concrete AuthorityClass; the projection must resolve for every scope.
+    // CIRISPersist#713 / v35.0.0 — the projection is per-PLANE. It must be TOTAL
+    // over (plane × the 7 closed cohort scopes) — edge's offer/projection filter
+    // is a function of this value, so an unhandled cell would be a routing hole.
+    // `authority_for` on a benign dimension gives a concrete AuthorityClass.
     let authority = authority_for("trust:example:v1").class;
-    for scope in [
-        cohort_scope::SELF,
-        cohort_scope::FAMILY,
-        cohort_scope::COMMUNITY,
-        cohort_scope::AFFILIATIONS,
-        cohort_scope::SPECIES,
-        cohort_scope::BIOSPHERE,
-        cohort_scope::FEDERATION,
+    for plane in [
+        ObjectClass::Attestation,
+        ObjectClass::KeyRecord,
+        ObjectClass::TransportDestination,
+        ObjectClass::FountainContent,
+        ObjectClass::HardCaseEvent,
     ] {
-        // Both tombstone polarities — a total function over the value domain.
-        let _ = projection_for(scope, authority, false);
-        let _ = projection_for(scope, authority, true);
+        for scope in [
+            cohort_scope::SELF,
+            cohort_scope::FAMILY,
+            cohort_scope::COMMUNITY,
+            cohort_scope::AFFILIATIONS,
+            cohort_scope::SPECIES,
+            cohort_scope::BIOSPHERE,
+            cohort_scope::FEDERATION,
+        ] {
+            // Both tombstone polarities — total over the value domain.
+            let _ = projection_for(plane, scope, authority, false);
+            let _ = projection_for(plane, scope, authority, true);
+        }
     }
-    // The value-semantics witness: self/family are NOT globally advertised
-    // (structural invisibility), federation-tier trust IS — the projection keys
-    // on the VALUE, not on presence.
-    if projection_for(cohort_scope::SELF, authority, false) != Projection::SelfOwn {
+    // Value-semantics witnesses. Structural invisibility holds on every plane:
+    if projection_for(ObjectClass::KeyRecord, cohort_scope::SELF, authority, false)
+        != Projection::SelfOwn
+    {
         return Err("cohort_scope=self must project SelfOwn (structural invisibility)".into());
     }
-    if projection_for(cohort_scope::SELF, authority, true) != Projection::Global {
-        return Err("a tombstone must project Global regardless of scope (anti-rollback)".into());
+    // #713 — the per-plane CEILING replaces unconditional tombstone-Global.
+    // Key-plane tombstones stay Global (verify-relevance is unbounded)…
+    if projection_for(ObjectClass::KeyRecord, cohort_scope::SELF, authority, true)
+        != Projection::Global
+    {
+        return Err("a KeyRecord tombstone must project Global (anti-rollback)".into());
+    }
+    // …while a non-root reachability tombstone projects at the plane ceiling
+    // (Cohort), NOT Global — widening a tombstone would disclose more than the
+    // original fact ("this route was withdrawn" reveals the route existed).
+    // This is the limb-(b) close: reachability no longer inherits the key
+    // plane's audience (CIRISEdge#311 / CIRISPersist#713).
+    if !authority.is_trust_root()
+        && projection_for(
+            ObjectClass::TransportDestination,
+            cohort_scope::SELF,
+            authority,
+            true,
+        ) != Projection::Cohort
+    {
+        return Err(
+            "a non-root reachability tombstone must project at the plane ceiling \
+             (Cohort), not Global (contextual integrity, CIRISPersist#713)"
+                .into(),
+        );
+    }
+    // The ceiling identity the resolver documents: tombstone projection equals
+    // tombstone_ceiling(plane, authority) by construction.
+    if projection_for(
+        ObjectClass::TransportDestination,
+        cohort_scope::FEDERATION,
+        authority,
+        true,
+    ) != tombstone_ceiling(ObjectClass::TransportDestination, authority)
+    {
+        return Err("tombstone projection must equal tombstone_ceiling(plane, authority)".into());
     }
     Ok(())
 }
@@ -303,9 +347,20 @@ fn check_dimension_projection() -> Result<(), String> {
     // dimension resolves DETERMINISTICALLY to the same per-record projection (edge
     // routes each record by its actual dimension, not by presence). A
     // non-deterministic or panicking resolution would be a routing hole.
+    use ciris_persist::federation::namespace::ObjectClass;
     let dimension = "trust:example:v1";
-    let a = projection_for("federation", authority_for(dimension).class, false);
-    let b = projection_for("federation", authority_for(dimension).class, false);
+    let a = projection_for(
+        ObjectClass::Attestation,
+        "federation",
+        authority_for(dimension).class,
+        false,
+    );
+    let b = projection_for(
+        ObjectClass::Attestation,
+        "federation",
+        authority_for(dimension).class,
+        false,
+    );
     if a != b {
         return Err(format!(
             "per-record projection for {dimension:?} is non-deterministic ({a:?} vs {b:?})"

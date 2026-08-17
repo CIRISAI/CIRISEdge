@@ -1623,7 +1623,18 @@ impl FederationDirectoryReplicationBridge {
             .unwrap_or("");
         let authority = namespace::registry::authority_for(dimension).class;
         let is_tombstone = namespace::is_withdraw_or_revocation(attestation_type);
-        match namespace::projection_for(cohort_scope, authority, is_tombstone) {
+        // CIRISPersist#713 / v35.0.0 — the projection is per-PLANE. This dispatch
+        // decides attestation advertisement, so the plane is `Attestation` (whose
+        // row holds documented pre-#713 behavior — the decomposition is the part
+        // #713 stays open for). The per-plane divergence (reachability ceiling)
+        // lands on the TransportDestination/KeyRecord planes wherever THEY are
+        // projected; this call site's behavior is unchanged by construction.
+        match namespace::projection_for(
+            namespace::ObjectClass::Attestation,
+            cohort_scope,
+            authority,
+            is_tombstone,
+        ) {
             Projection::Global | Projection::Cohort => true,
             Projection::SelfOwn => canonical_json
                 .get("attesting_key_id")
@@ -6442,6 +6453,48 @@ mod tests {
 
     fn set_of(keys: &[&str]) -> HashSet<String> {
         keys.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// CIRISPersist#713 macro-acceptance instrument — times the FULL advertise
+    /// decision (JSON field extraction + authority resolution + the per-plane
+    /// `projection_for`) that runs per envelope-ref on the publish loop.
+    /// `#[ignore]` by default: run on demand for the before/after A-B a persist
+    /// re-pin commits edge to reporting:
+    /// `cargo test --release -p ciris-edge --lib advertise_decision_micro_timing --features transport-http -- --ignored --nocapture`
+    #[test]
+    #[ignore = "on-demand hot-path measurement (CIRISPersist#713 acceptance), not a correctness test"]
+    #[allow(clippy::cast_precision_loss)] // ns/call diagnostic print; f64 precision is ample
+    fn advertise_decision_micro_timing() {
+        const N: u32 = 1_000_000;
+        let fixtures = [
+            att_json("trust:reliability:v1", "self", "scores", "node-own"),
+            att_json("trust:reliability:v1", "community", "scores", "peer-a"),
+            att_json(
+                "provenance:build_manifest:linux-x86_64",
+                "federation",
+                "scores",
+                "some-builder",
+            ),
+            att_json("trust:reliability:v1", "family", "withdraw", "node-own"),
+        ];
+        let self_set = set_of(&["node-own"]);
+        // Warm-up pass so allocator/caches settle before the timed window.
+        let mut acc = 0u32;
+        for f in &fixtures {
+            acc += u32::from(Bridge::attestation_is_advertised(f, &self_set));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            for f in &fixtures {
+                acc += u32::from(Bridge::attestation_is_advertised(f, &self_set));
+            }
+        }
+        let elapsed = start.elapsed();
+        let calls = u64::from(N) * fixtures.len() as u64;
+        println!(
+            "advertise_decision_micro_timing: {calls} calls in {elapsed:?} => {:.1} ns/call (acc={acc})",
+            elapsed.as_nanos() as f64 / calls as f64
+        );
     }
 
     /// A trust-root (`provenance:build_manifest:*` → `AccordCoScrub`) attestation
