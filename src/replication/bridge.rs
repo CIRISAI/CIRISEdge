@@ -1668,6 +1668,24 @@ impl FederationDirectoryReplicationBridge {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         let _ = (dimension, cohort_scope, attestation_type);
+        // DECLINE a present-but-empty scope rather than projecting it. An empty
+        // string is malformed data (the column is a closed set), and asking the
+        // registry about it would silently pick a policy — the exact
+        // "one signal covering two worlds" shape this arc has been removing.
+        // Fail-closed AND loud: not advertised, and it says so.
+        if Self::attestation_cohort_scope(canonical_json).is_empty() {
+            tracing::warn!(
+                dimension = %canonical_json
+                    .pointer("/attestation_envelope/dimension")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                "attestation DECLINED from the advertise set — `cohort_scope` is \
+                 present but EMPTY (malformed: the column is a closed set). A \
+                 missing key means `federation` by persist's serde contract; an \
+                 empty one means the row is bad (CIRISEdge v17.7.0 / CIRISPersist#713)"
+            );
+            return false;
+        }
         // v36 (CIRISPersist#713) — one resolver for the whole family decision:
         // `Plane::Attestation { dimension }` is value-keyed, so `trace:*` resolves
         // Capability and `scores:*` resolves Subject from the TABLE rather than
@@ -1732,6 +1750,26 @@ impl FederationDirectoryReplicationBridge {
             .is_some_and(|d| d.starts_with("trace:"))
     }
 
+    /// v17.7.0 — the ONE reader of an attestation's `cohort_scope`.
+    ///
+    /// persist's `Attestation::cohort_scope` carries `default = "federation"` +
+    /// `skip_serializing_if = (s == "federation")` — exact inverses, so a MISSING
+    /// key means `federation`, NOT "unknown". Edge's old `unwrap_or("")`
+    /// manufactured a scope the wire never carried: invisible pre-v36 (every
+    /// family mapped unknown → `Cohort`) and a silent `trace:*` replication halt
+    /// in v36 (the Trace family maps unknown → `SelfOwn`). Measured with persist
+    /// on #713 — the backends round-trip the column; the defect was this read.
+    ///
+    /// A key that is PRESENT but empty is malformed data, not a policy state, and
+    /// is declined by [`Self::attestation_is_advertised`] rather than projected —
+    /// "absent" and "empty" must never collapse to one value again.
+    fn attestation_cohort_scope(canonical_json: &serde_json::Value) -> &str {
+        canonical_json.get("cohort_scope").map_or(
+            ciris_persist::federation::types::cohort_scope::FEDERATION,
+            |v| v.as_str().unwrap_or_default(),
+        )
+    }
+
     /// v17.7.0 (CIRISPersist#713 decomposition) — resolve an attestation's
     /// PROJECTION from the registry: `Plane::Attestation { dimension }` +
     /// cohort_scope + authority + tombstone. This replaced edge's two bespoke
@@ -1747,10 +1785,16 @@ impl FederationDirectoryReplicationBridge {
             .pointer("/attestation_envelope/dimension")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let cohort_scope = canonical_json
-            .get("cohort_scope")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+        // v17.7.0 — READ THE SERDE CONTRACT, don't invent a value. persist's
+        // `Attestation::cohort_scope` carries
+        // `default = "federation"` + `skip_serializing_if = (s == "federation")`
+        // — exact inverses, so a MISSING key means `federation`, not "unknown".
+        // Edge's old `unwrap_or("")` manufactured a scope the wire never carried;
+        // pre-v36 that was invisible (every family mapped unknown → Cohort), and
+        // in v36 it silently halted `trace:*` replication (the Trace family maps
+        // unknown → SelfOwn). Measured and confirmed with persist on #713: the
+        // backends round-trip the column faithfully; the defect was this read.
+        let cohort_scope = Self::attestation_cohort_scope(canonical_json);
         let attestation_type = canonical_json
             .get("attestation_type")
             .and_then(serde_json::Value::as_str)
@@ -6819,8 +6863,20 @@ mod tests {
             "species",
             "biosphere",
             "federation",
-            "", // absent/unknown scope → Cohort negative default
+            // v17.7.0 — "" is NOT "absent". persist's serde contract makes an
+            // ABSENT key mean `federation` (default + skip_serializing_if are
+            // inverses); a PRESENT-but-empty value is malformed and is DECLINED
+            // by the advertise gate. Asserted separately below.
         ];
+        // The empty-scope decline, pinned once rather than per family: malformed
+        // input is refused, never silently projected.
+        assert!(
+            !Bridge::attestation_is_advertised(
+                &att_json("trust:reliability:v1", "", "scores", "peer"),
+                &HashSet::new()
+            ),
+            "a present-but-EMPTY cohort_scope must be declined, not projected"
+        );
         let families = namespace::registry::entries();
         assert_eq!(
             families.len(),
@@ -6833,9 +6889,14 @@ mod tests {
                 let scored = att_json(&entry.prefix, scope, "scores", "peer");
                 let tombstone = att_json(&entry.prefix, scope, "withdraws", "peer");
                 let _ = Bridge::attestation_is_advertised(&scored, &HashSet::new());
+                // v17.7.0 (#713) — a tombstone no longer gossips unconditionally
+                // Global; it projects at `tombstone_ceiling(plane, authority)`.
+                // Every family's ceiling is an ADVERTISED projection (Global /
+                // Cohort / Capability / Subject — never SelfOwn), so the
+                // advertise invariant holds while the audience is per-plane.
                 assert!(
                     Bridge::attestation_is_advertised(&tombstone, &HashSet::new()),
-                    "every family's withdraws tombstone gossips Global ({})",
+                    "every family's withdraws tombstone advertises at its ceiling ({})",
                     entry.prefix
                 );
             }
@@ -7485,7 +7546,7 @@ mod tests {
             .iter()
             .filter(|row| expected_in.contains(&row.attestation.attestation_id.as_str()))
             .map(|row| {
-                let (hash, _bytes) = content_hash_of(row).expect("held row hashes");
+                let (hash, _bytes) = content_hash_of(&row.attestation).expect("held row hashes");
                 (
                     hash,
                     FederationDirectoryReplicationBridge::ms_seq(row.admitted_at),
@@ -7496,7 +7557,11 @@ mod tests {
         let out_hash = held
             .iter()
             .find(|row| row.attestation.attestation_id == out_self_foreign)
-            .map(|row| content_hash_of(row).expect("held row hashes").0)
+            .map(|row| {
+                content_hash_of(&row.attestation)
+                    .expect("held row hashes")
+                    .0
+            })
             .expect("the OUT row is held");
 
         // Equivalence: the advertise view (the exact entry the round's
