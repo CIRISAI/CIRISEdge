@@ -65,7 +65,7 @@ classifiers = [
 # an install-time index requirement (so the "unresolvable from PyPI" shape is by
 # design, not a regression).
 dependencies = [
-    "ciris-persist>=32,<33",
+    "ciris-persist>=34,<35",
 ]
 dynamic = ["version"]
 
