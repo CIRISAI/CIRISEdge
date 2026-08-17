@@ -1653,21 +1653,12 @@ impl FederationDirectoryReplicationBridge {
         canonical_json: &serde_json::Value,
         self_set: &HashSet<String>,
     ) -> bool {
-        // CC 2.1: the `dimension` lives inside the attestation envelope; the
-        // audience + relation fields are the top-level persist columns.
-        let dimension = canonical_json
-            .pointer("/attestation_envelope/dimension")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let cohort_scope = canonical_json
-            .get("cohort_scope")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let attestation_type = canonical_json
-            .get("attestation_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let _ = (dimension, cohort_scope, attestation_type);
+        // v17.7.0 — the field reads live in `attestation_projection` /
+        // `attestation_cohort_scope` (ONE reader each). A vestigial
+        // `.get("cohort_scope").unwrap_or("")` block sat here after the v36
+        // refactor with its value discarded: harmless, but it is the exact
+        // CIRISPersist#727 shape, and dead code is where a live bug gets
+        // recruited from. Removed rather than left to be reused.
         // DECLINE a present-but-empty scope rather than projecting it. An empty
         // string is malformed data (the column is a closed set), and asking the
         // registry about it would silently pick a policy — the exact
@@ -1723,31 +1714,34 @@ impl FederationDirectoryReplicationBridge {
     /// [`Self::SERVE_CAPABILITY`]? True iff its `dimension` (CC 2.1 — inside
     /// `attestation_envelope`) is in the `trace:*` namespace.
     ///
-    /// ## v17.7.0 — why this is NOT folded onto `Projection::Capability` (yet)
+    /// ## v17.7.0 — folded onto the registry's FAMILY classifier (v36.1.0)
     ///
-    /// CIRISPersist#713's adopt note says this overlay "folds onto
-    /// `Capability(token)`". Edge verified that BEFORE swapping and it is
-    /// **unsafe as written**: `Capability(InfraServe)` is the `trace:*` cell only
-    /// at the COMMONS tiers (species/biosphere/federation). At `community` /
-    /// `affiliations` / `self` / `family` the same family resolves `SelfOwn`, so
-    /// `matches!(projection, Capability(_))` returns FALSE there — and this gate
-    /// would stop firing for community-scoped trace rows, serving trace content
-    /// to peers holding no `infra:serve`. The gate is a FAMILY question
-    /// (is this trace content?), which is scope-independent; the projection is a
-    /// family-AND-scope answer.
+    /// This was edge's `dimension.starts_with("trace:")` prefix rule — a policy
+    /// duplicated from persist's table, i.e. two owners for one fact. It is now
+    /// persist's own `attestation_family` classifier, exported in v36.1.0 for
+    /// exactly this fold (CIRISPersist#713).
     ///
-    /// The 1:1 surface is persist's own `attestation_family(dimension)`
-    /// classifier, but it and `AttestationFamily` are **private** in v36.0.0.
-    /// Filed on CIRISPersist#713; when exported, this body becomes
-    /// `matches!(family(dimension), AttestationFamily::Trace)` and edge's prefix
-    /// rule is deleted for real. Until then the duplicated rule stays, ANNOTATED,
-    /// because a silently-disabled capability gate is the worse failure.
-    /// `capability_and_subject_folds_match_the_replaced_overlays` pins both facts.
+    /// **It is NOT folded onto `Projection::Capability(_)`**, which the v36.0.0
+    /// adopt note recommended and which edge verified is unsafe: `Capability` is
+    /// the `trace:*` cell only at the COMMONS tiers; at `self` / `family` /
+    /// `community` / `affiliations` the same family resolves `SelfOwn`, so a
+    /// projection-keyed gate stops firing there — on the direct-fetch path,
+    /// where E3 requires `infra:serve` even for a subject pulling its OWN row.
+    /// The gate is a FAMILY question (is this trace content?), scope-free; the
+    /// projection is a family-AND-scope answer. `AttestationFamily` is
+    /// `#[non_exhaustive]`, so a future decided family is additive policy rather
+    /// than a build break.
+    /// Pinned both directions by
+    /// `capability_and_subject_folds_match_the_replaced_overlays`.
     fn attestation_requires_serve(canonical_json: &serde_json::Value) -> bool {
-        canonical_json
+        let dimension = canonical_json
             .pointer("/attestation_envelope/dimension")
-            .and_then(|v| v.as_str())
-            .is_some_and(|d| d.starts_with("trace:"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        matches!(
+            namespace::attestation_family(dimension),
+            namespace::AttestationFamily::Trace
+        )
     }
 
     /// v17.7.0 — the ONE reader of an attestation's `cohort_scope`.
@@ -6667,6 +6661,71 @@ mod tests {
         );
     }
 
+    /// **CIRISPersist#727 structural gate** — a `skip_serializing_if` field must
+    /// never be read by JSON KEY with an empty/default fallback.
+    ///
+    /// This is the class that produced the v36 trace-replication halt: persist's
+    /// `Attestation::cohort_scope` carries `default = "federation"` +
+    /// `skip_serializing_if = (s == "federation")`, so the key is ABSENT exactly
+    /// when the value is the default. Edge read the key with `unwrap_or("")` and
+    /// turned "omitted because default" into "unknown" — invisible for as long as
+    /// every family mapped unknown to the same projection, then a silent
+    /// replication halt the moment one family didn't.
+    ///
+    /// A fix is not the close; a GATE is. This scans edge's own source for the
+    /// shape and fails on a NEW one, the same way the #425 inbound-exit pin does.
+    /// The allowlist is the audited set: each entry either resolves the persist
+    /// DEFAULT on absence, or is a field whose skipped value is genuinely empty
+    /// (`Option`/`Vec`), where `unwrap_or_default()` is already correct.
+    ///
+    /// To add a read: resolve the persist default explicitly (see
+    /// [`Bridge::attestation_cohort_scope`]) and record it here with why.
+    #[test]
+    fn skip_serializing_if_fields_are_never_read_by_json_key_with_an_empty_default() {
+        // persist fields whose SKIPPED value is a non-empty default — reading the
+        // key and falling back to ""/default silently substitutes a different
+        // value. (`dimension`/`subject_key_ids` are Option/Vec: absent genuinely
+        // means none/empty, so `unwrap_or_default` is correct for them.)
+        const NON_EMPTY_DEFAULTED: [&str; 1] = ["cohort_scope"];
+        // Audited sites that resolve the persist default explicitly.
+        const ALLOWED: [&str; 1] = [
+            // `attestation_cohort_scope` — map_or(cohort_scope::FEDERATION, …)
+            "ciris_persist::federation::types::cohort_scope::FEDERATION",
+        ];
+        let src = include_str!("bridge.rs");
+        let mut violations = Vec::new();
+        for (idx, line) in src.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            for field in NON_EMPTY_DEFAULTED {
+                if !line.contains(&format!("\"{field}\"")) {
+                    continue;
+                }
+                if !(line.contains(".get(") || line.contains(".pointer(")) {
+                    continue;
+                }
+                // The read must resolve persist's default within the next 4 lines.
+                let window: String = src.lines().skip(idx).take(5).collect::<Vec<_>>().join("\n");
+                if ALLOWED.iter().any(|a| window.contains(a)) {
+                    continue;
+                }
+                violations.push(format!("bridge.rs:{}: {}", idx + 1, trimmed));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "CIRISPersist#727 — a `skip_serializing_if` field is read by JSON key \
+             without resolving persist's default. The key is ABSENT exactly when the \
+             value IS the default, so a `unwrap_or(\"\")`/`unwrap_or_default()` here \
+             substitutes a DIFFERENT value and the failure presents as silence \
+             (v36: a silent trace-replication halt). Resolve the persist default \
+             explicitly and add the site to ALLOWED:\n{}",
+            violations.join("\n")
+        );
+    }
+
     /// v17.7.0 (CIRISPersist#713) — VALUE pin, not a boolean pin. The advertise
     /// gate maps `Global | Cohort | Capability | Subject => true`, so a narrowing
     /// of the trust-root provenance audience is INVISIBLE to
@@ -6674,15 +6733,17 @@ mod tests {
     /// stays green while the audience halves. This test asserts the projection
     /// ITSELF so the change is loud on edge.
     ///
-    /// **Currently pinned to v36.0.0's conservative default (`Cohort`).** Edge's
-    /// decision on #713 is that `provenance:build_manifest:*` must be restored to
-    /// `Global` by a decided registry row (a build manifest is the cross-cohort
-    /// binary-verification surface — capped at Cohort, the #436/#437 bundle gate
-    /// silently degrades to Advisory at first contact between cohorts). Persist is
-    /// baking that row into a minor.
+    /// **This pin has already done its job once.** v36.0.0 capped
+    /// `provenance:*` at `Cohort` via the conservative default; edge argued on
+    /// #713 that `provenance:build_manifest:*` is the cross-cohort
+    /// binary-verification surface (capped at Cohort, the #436/#437 bundle gate
+    /// degrades to Advisory at first contact BETWEEN cohorts) and persist shipped
+    /// the decided row in v36.1.0 — `provenance:build_manifest:` at the
+    /// trust-root arm across all three commons tiers. The pin failed on the
+    /// v36.1.0 re-pin, which is exactly how edge learned the row had landed.
     ///
-    /// **When this test fails with `Global`, that row has landed** — update the
-    /// expectation and re-verify cross-cohort bundle-gate admission.
+    /// If this fails again, the audience of build manifests moved: re-verify
+    /// cross-cohort bundle-gate admission before changing the expectation.
     #[test]
     fn trust_root_provenance_projection_value_is_pinned() {
         let a = att_json(
@@ -6693,10 +6754,23 @@ mod tests {
         );
         let got = Bridge::attestation_projection(&a);
         assert!(
-            matches!(got, Projection::Cohort),
-            "trust-root provenance projects {got:?}; expected Cohort (v36 default). \
-             If this is now Global, persist's decided row landed — update this pin \
-             and re-verify cross-cohort bundle-gate admission (CIRISPersist#713)."
+            matches!(got, Projection::Global),
+            "trust-root provenance projects {got:?}; expected Global (the v36.1.0 \
+             decided row). A narrowing here silently degrades cross-cohort \
+             bundle-gate admission to Advisory (CIRISPersist#713)."
+        );
+        // The stem is `provenance:build_manifest:`, NOT `provenance:` — a
+        // sibling provenance family is deliberately NOT widened by that row.
+        let sibling = att_json(
+            "provenance:other:v1",
+            "federation",
+            "scores",
+            "some-builder",
+        );
+        assert!(
+            !matches!(Bridge::attestation_projection(&sibling), Projection::Global),
+            "only the build_manifest stem is widened; `provenance:*` at large stays \
+             at the conservative default"
         );
     }
 
