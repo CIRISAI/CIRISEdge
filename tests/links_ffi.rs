@@ -248,11 +248,25 @@ async fn link_open_returns_handle() {
         .expect("link_open should succeed for a rooted peer");
     assert_eq!(link_id_bytes.len(), 16, "LinkId is 16 bytes");
 
-    let list = transport_b.link_list().await;
+    // v17.7.0 — `link_open` returns once the link handle exists, but `link_list`
+    // reads the registry the EVENT LOOP populates on `LinkEstablished`. Those are
+    // separate tasks, so asserting synchronously was a coin flip: this test failed
+    // ~50% of runs locally on v17.6.0 and on this branch alike (measured), and its
+    // CI reds were read as adoption regressions more than once. Poll the registry
+    // instead of racing it — the file's own `wait_for` helper, same as the other
+    // link tests use.
+    let appeared = wait_for(Duration::from_secs(10), || async {
+        transport_b
+            .link_list()
+            .await
+            .iter()
+            .any(|info| info.link_id == link_id_bytes)
+    })
+    .await;
     assert!(
-        list.iter().any(|info| info.link_id == link_id_bytes),
-        "the opened link must appear in link_list (got {} entries)",
-        list.len()
+        appeared,
+        "the opened link must appear in link_list within 10s (got {} entries)",
+        transport_b.link_list().await.len()
     );
     let count = transport_b.link_count().await;
     assert!(count >= 1, "link_count must be at least 1 after link_open");

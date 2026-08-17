@@ -265,7 +265,7 @@ fn check_delivery_mode() -> Result<(), String> {
 fn check_cohort_scope_projection() -> Result<(), String> {
     use ciris_persist::federation::namespace::Projection;
     use ciris_persist::federation::namespace::{
-        projection_for, registry::authority_for, tombstone_ceiling, ObjectClass,
+        projection_for, registry::authority_for, tombstone_ceiling, Plane,
     };
     use ciris_persist::federation::types::cohort_scope;
     // CIRISPersist#713 / v35.0.0 — the projection is per-PLANE. It must be TOTAL
@@ -274,11 +274,13 @@ fn check_cohort_scope_projection() -> Result<(), String> {
     // `authority_for` on a benign dimension gives a concrete AuthorityClass.
     let authority = authority_for("trust:example:v1").class;
     for plane in [
-        ObjectClass::Attestation,
-        ObjectClass::KeyRecord,
-        ObjectClass::TransportDestination,
-        ObjectClass::FountainContent,
-        ObjectClass::HardCaseEvent,
+        Plane::Attestation {
+            dimension: "trust:example:v1",
+        },
+        Plane::KeyRecord,
+        Plane::TransportDestination,
+        Plane::FountainContent,
+        Plane::HardCaseEvent,
     ] {
         for scope in [
             cohort_scope::SELF,
@@ -295,16 +297,13 @@ fn check_cohort_scope_projection() -> Result<(), String> {
         }
     }
     // Value-semantics witnesses. Structural invisibility holds on every plane:
-    if projection_for(ObjectClass::KeyRecord, cohort_scope::SELF, authority, false)
-        != Projection::SelfOwn
+    if projection_for(Plane::KeyRecord, cohort_scope::SELF, authority, false) != Projection::SelfOwn
     {
         return Err("cohort_scope=self must project SelfOwn (structural invisibility)".into());
     }
     // #713 — the per-plane CEILING replaces unconditional tombstone-Global.
     // Key-plane tombstones stay Global (verify-relevance is unbounded)…
-    if projection_for(ObjectClass::KeyRecord, cohort_scope::SELF, authority, true)
-        != Projection::Global
-    {
+    if projection_for(Plane::KeyRecord, cohort_scope::SELF, authority, true) != Projection::Global {
         return Err("a KeyRecord tombstone must project Global (anti-rollback)".into());
     }
     // …while a non-root reachability tombstone projects at the plane ceiling
@@ -314,7 +313,7 @@ fn check_cohort_scope_projection() -> Result<(), String> {
     // plane's audience (CIRISEdge#311 / CIRISPersist#713).
     if !authority.is_trust_root()
         && projection_for(
-            ObjectClass::TransportDestination,
+            Plane::TransportDestination,
             cohort_scope::SELF,
             authority,
             true,
@@ -329,11 +328,11 @@ fn check_cohort_scope_projection() -> Result<(), String> {
     // The ceiling identity the resolver documents: tombstone projection equals
     // tombstone_ceiling(plane, authority) by construction.
     if projection_for(
-        ObjectClass::TransportDestination,
+        Plane::TransportDestination,
         cohort_scope::FEDERATION,
         authority,
         true,
-    ) != tombstone_ceiling(ObjectClass::TransportDestination, authority)
+    ) != tombstone_ceiling(Plane::TransportDestination, authority)
     {
         return Err("tombstone projection must equal tombstone_ceiling(plane, authority)".into());
     }
@@ -347,16 +346,16 @@ fn check_dimension_projection() -> Result<(), String> {
     // dimension resolves DETERMINISTICALLY to the same per-record projection (edge
     // routes each record by its actual dimension, not by presence). A
     // non-deterministic or panicking resolution would be a routing hole.
-    use ciris_persist::federation::namespace::ObjectClass;
+    use ciris_persist::federation::namespace::Plane;
     let dimension = "trust:example:v1";
     let a = projection_for(
-        ObjectClass::Attestation,
+        Plane::Attestation { dimension },
         "federation",
         authority_for(dimension).class,
         false,
     );
     let b = projection_for(
-        ObjectClass::Attestation,
+        Plane::Attestation { dimension },
         "federation",
         authority_for(dimension).class,
         false,

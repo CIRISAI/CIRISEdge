@@ -705,7 +705,18 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         let limit = self.effective_page_limit().await;
         match self
             .directory
-            .list_signed_accord_quorum_evidence_since(since, limit)
+            .list_signed_accord_quorum_evidence_since(
+                // v36 (CIRISPersist#668) — cursors resume from the
+                // `(admitted_at, id)` PAIR. Edge's CursorPull wire carries only
+                // the timestamp, so pair it with the EMPTY id: that sorts before
+                // every real id, so a tie at `since` is RE-delivered rather than
+                // skipped. Persist documents duplicates-on-resume with
+                // "callers must be idempotent by id", and edge's apply re-tallies
+                // each bundle (`apply_accord_quorum_evidence`), so at-least-once
+                // is correct here and a skip would be silent evidence loss.
+                since.map(|ts| (ts, String::new())),
+                limit,
+            )
             .await
         {
             Ok(bundles) => bundles
@@ -1297,7 +1308,14 @@ impl FederationDirectoryReplicationBridge {
                 let set = self.self_provider.as_ref().unwrap_or(&self.cohort);
                 set()
             }
-            Projection::Cohort => (self.cohort)(),
+            // v36 (CIRISPersist#713 decomposition) — role-keyed (`Capability`)
+            // and subject-keyed (`Subject`) audiences are NOT enumerable from a
+            // roster: the narrowing happens PER RECIPIENT at send/fetch time
+            // (the capability-token holder check and the data-subject's grant).
+            // They therefore enumerate the same CANDIDATE set as `Cohort` and the
+            // per-recipient gates cut it down — never wider than today, and those
+            // gates are fail-closed.
+            Projection::Cohort | Projection::Capability(_) | Projection::Subject => (self.cohort)(),
             Projection::Global => {
                 let mut subjects: Vec<String> =
                     self.self_provider.as_ref().map(|p| p()).unwrap_or_default();
@@ -1313,16 +1331,33 @@ impl FederationDirectoryReplicationBridge {
     /// the exact value persist's `signed_wire_index` keys on), and dedupe by
     /// hash. No caching — [`Self::fetch_envelope_bytes`]'s point-read is the
     /// serve path for every plane but `Revocation`.
-    fn advertise_since<S, IN, TS>(&self, rows: &[S], in_scope: IN, seq_of: TS) -> Vec<EnvelopeRef>
+    /// v17.7.0 (persist v36 `Served*` reshape) — `content_of` names WHAT IS
+    /// HASHED, separately from the row that carries the resume cursor.
+    ///
+    /// v36 wraps every plane as `Served<X> { <inner>, admitted_at }`. Hashing the
+    /// WRAPPER folds node-local `admitted_at` into the content hash, so the
+    /// advertise hash stops matching the point-read (which keys on persist's
+    /// `signed_wire_index` over the SIGNED container) — an advertised-then-
+    /// unfetchable split, silent on the wire and compiler-green. This is the
+    /// v31 `ServedKeyRecord` lesson (`KeyAdvertiseRow`) generalized to the other
+    /// 12 planes instead of re-solved 12 times: callers pass `|r| &r.<inner>`.
+    fn advertise_since<S, T, IN, TS, C>(
+        &self,
+        rows: &[S],
+        in_scope: IN,
+        seq_of: TS,
+        content_of: C,
+    ) -> Vec<EnvelopeRef>
     where
-        S: serde::Serialize,
+        T: serde::Serialize,
         IN: Fn(&S) -> bool,
         TS: Fn(&S) -> u64,
+        C: Fn(&S) -> &T,
     {
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         for row in rows.iter().filter(|r| in_scope(r)) {
-            let Some((hash, _bytes)) = content_hash_of(row) else {
+            let Some((hash, _bytes)) = content_hash_of(content_of(row)) else {
                 // CIRISEdge#425 — a row that will not serialize is silently absent
                 // from the advertise set (peers never learn it exists, so it never
                 // replicates). Near-impossible for these types, but a real
@@ -1393,6 +1428,8 @@ impl FederationDirectoryReplicationBridge {
             &rows,
             |row| subjects.contains(&row.record.key_id),
             |row| Self::ms_seq(row.admitted_at),
+            // Already hash-correct: `KeyAdvertiseRow` #[serde(skip)]s admitted_at.
+            |row| row,
         )
     }
 
@@ -1411,8 +1448,9 @@ impl FederationDirectoryReplicationBridge {
             .unwrap_or_default();
         self.advertise_since(
             &rows,
-            |row| subjects.contains(&row.identity_occurrence.occurrence_key_id),
-            |row| Self::ms_seq(row.identity_occurrence.asserted_at),
+            |row| subjects.contains(&row.occurrence.identity_occurrence.occurrence_key_id),
+            |row| Self::ms_seq(row.occurrence.identity_occurrence.asserted_at),
+            |row| &row.occurrence,
         )
     }
 
@@ -1433,14 +1471,15 @@ impl FederationDirectoryReplicationBridge {
             .unwrap_or_default();
         self.advertise_since(
             &rows,
-            |row| subjects.contains(&row.transport_destination.occurrence_key_id),
+            |row| subjects.contains(&row.destination.transport_destination.occurrence_key_id),
             |row| {
-                if row.transport_destination.epoch > 0 {
-                    row.transport_destination.epoch
+                if row.destination.transport_destination.epoch > 0 {
+                    row.destination.transport_destination.epoch
                 } else {
-                    Self::ms_seq(row.transport_destination.asserted_at)
+                    Self::ms_seq(row.destination.transport_destination.asserted_at)
                 }
             },
+            |row| &row.destination,
         )
     }
 
@@ -1463,8 +1502,15 @@ impl FederationDirectoryReplicationBridge {
             .unwrap_or_default();
         self.advertise_since(
             &rows,
-            |row| subjects.contains(&row.identity_occurrence_revocation.occurrence_key_id),
-            |row| Self::ms_seq(row.identity_occurrence_revocation.revoked_at),
+            |row| {
+                subjects.contains(
+                    &row.revocation
+                        .identity_occurrence_revocation
+                        .occurrence_key_id,
+                )
+            },
+            |row| Self::ms_seq(row.revocation.identity_occurrence_revocation.revoked_at),
+            |row| &row.revocation,
         )
     }
 
@@ -1607,35 +1653,42 @@ impl FederationDirectoryReplicationBridge {
         canonical_json: &serde_json::Value,
         self_set: &HashSet<String>,
     ) -> bool {
-        // CC 2.1: the `dimension` lives inside the attestation envelope; the
-        // audience + relation fields are the top-level persist columns.
-        let dimension = canonical_json
-            .pointer("/attestation_envelope/dimension")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let cohort_scope = canonical_json
-            .get("cohort_scope")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let attestation_type = canonical_json
-            .get("attestation_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let authority = namespace::registry::authority_for(dimension).class;
-        let is_tombstone = namespace::is_withdraw_or_revocation(attestation_type);
-        // CIRISPersist#713 / v35.0.0 — the projection is per-PLANE. This dispatch
-        // decides attestation advertisement, so the plane is `Attestation` (whose
-        // row holds documented pre-#713 behavior — the decomposition is the part
-        // #713 stays open for). The per-plane divergence (reachability ceiling)
-        // lands on the TransportDestination/KeyRecord planes wherever THEY are
-        // projected; this call site's behavior is unchanged by construction.
-        match namespace::projection_for(
-            namespace::ObjectClass::Attestation,
-            cohort_scope,
-            authority,
-            is_tombstone,
-        ) {
-            Projection::Global | Projection::Cohort => true,
+        // v17.7.0 — the field reads live in `attestation_projection` /
+        // `attestation_cohort_scope` (ONE reader each). A vestigial
+        // `.get("cohort_scope").unwrap_or("")` block sat here after the v36
+        // refactor with its value discarded: harmless, but it is the exact
+        // CIRISPersist#727 shape, and dead code is where a live bug gets
+        // recruited from. Removed rather than left to be reused.
+        // DECLINE a present-but-empty scope rather than projecting it. An empty
+        // string is malformed data (the column is a closed set), and asking the
+        // registry about it would silently pick a policy — the exact
+        // "one signal covering two worlds" shape this arc has been removing.
+        // Fail-closed AND loud: not advertised, and it says so.
+        if Self::attestation_cohort_scope(canonical_json).is_empty() {
+            tracing::warn!(
+                dimension = %canonical_json
+                    .pointer("/attestation_envelope/dimension")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                "attestation DECLINED from the advertise set — `cohort_scope` is \
+                 present but EMPTY (malformed: the column is a closed set). A \
+                 missing key means `federation` by persist's serde contract; an \
+                 empty one means the row is bad (CIRISEdge v17.7.0 / CIRISPersist#713)"
+            );
+            return false;
+        }
+        // v36 (CIRISPersist#713) — one resolver for the whole family decision:
+        // `Plane::Attestation { dimension }` is value-keyed, so `trace:*` resolves
+        // Capability and `scores:*` resolves Subject from the TABLE rather than
+        // from edge-side prose.
+        match Self::attestation_projection(canonical_json) {
+            // Capability/Subject rows ARE advertisable at the list level; the
+            // audience narrowing is per-recipient at send/fetch (the token-holder
+            // check and the subject grant), exactly as the pre-v36 overlays did.
+            Projection::Global
+            | Projection::Cohort
+            | Projection::Capability(_)
+            | Projection::Subject => true,
             Projection::SelfOwn => canonical_json
                 .get("attesting_key_id")
                 .and_then(serde_json::Value::as_str)
@@ -1660,11 +1713,92 @@ impl FederationDirectoryReplicationBridge {
     /// CIRISEdge#379 — does this attestation row require the recipient to hold
     /// [`Self::SERVE_CAPABILITY`]? True iff its `dimension` (CC 2.1 — inside
     /// `attestation_envelope`) is in the `trace:*` namespace.
+    ///
+    /// ## v17.7.0 — folded onto the registry's FAMILY classifier (v36.1.0)
+    ///
+    /// This was edge's `dimension.starts_with("trace:")` prefix rule — a policy
+    /// duplicated from persist's table, i.e. two owners for one fact. It is now
+    /// persist's own `attestation_family` classifier, exported in v36.1.0 for
+    /// exactly this fold (CIRISPersist#713).
+    ///
+    /// **It is NOT folded onto `Projection::Capability(_)`**, which the v36.0.0
+    /// adopt note recommended and which edge verified is unsafe: `Capability` is
+    /// the `trace:*` cell only at the COMMONS tiers; at `self` / `family` /
+    /// `community` / `affiliations` the same family resolves `SelfOwn`, so a
+    /// projection-keyed gate stops firing there — on the direct-fetch path,
+    /// where E3 requires `infra:serve` even for a subject pulling its OWN row.
+    /// The gate is a FAMILY question (is this trace content?), scope-free; the
+    /// projection is a family-AND-scope answer. `AttestationFamily` is
+    /// `#[non_exhaustive]`, so a future decided family is additive policy rather
+    /// than a build break.
+    /// Pinned both directions by
+    /// `capability_and_subject_folds_match_the_replaced_overlays`.
     fn attestation_requires_serve(canonical_json: &serde_json::Value) -> bool {
-        canonical_json
+        let dimension = canonical_json
             .pointer("/attestation_envelope/dimension")
-            .and_then(|v| v.as_str())
-            .is_some_and(|d| d.starts_with("trace:"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        matches!(
+            namespace::attestation_family(dimension),
+            namespace::AttestationFamily::Trace
+        )
+    }
+
+    /// v17.7.0 — the ONE reader of an attestation's `cohort_scope`.
+    ///
+    /// persist's `Attestation::cohort_scope` carries `default = "federation"` +
+    /// `skip_serializing_if = (s == "federation")` — exact inverses, so a MISSING
+    /// key means `federation`, NOT "unknown". Edge's old `unwrap_or("")`
+    /// manufactured a scope the wire never carried: invisible pre-v36 (every
+    /// family mapped unknown → `Cohort`) and a silent `trace:*` replication halt
+    /// in v36 (the Trace family maps unknown → `SelfOwn`). Measured with persist
+    /// on #713 — the backends round-trip the column; the defect was this read.
+    ///
+    /// A key that is PRESENT but empty is malformed data, not a policy state, and
+    /// is declined by [`Self::attestation_is_advertised`] rather than projected —
+    /// "absent" and "empty" must never collapse to one value again.
+    fn attestation_cohort_scope(canonical_json: &serde_json::Value) -> &str {
+        canonical_json.get("cohort_scope").map_or(
+            ciris_persist::federation::types::cohort_scope::FEDERATION,
+            |v| v.as_str().unwrap_or_default(),
+        )
+    }
+
+    /// v17.7.0 (CIRISPersist#713 decomposition) — resolve an attestation's
+    /// PROJECTION from the registry: `Plane::Attestation { dimension }` +
+    /// cohort_scope + authority + tombstone. This replaced edge's two bespoke
+    /// overlays — the `dimension.starts_with("trace:")` prefix heuristic and the
+    /// hand-classified recipient-capability rule — with the one tested table.
+    /// The heuristic was the "one signal covering two worlds" shape: edge
+    /// asserted an audience the registry didn't know about, so the claim and the
+    /// enforcement could drift. Now the registry decides WHICH audience kind
+    /// applies; edge still owns the per-recipient MECHANISM (does this peer hold
+    /// the token / the subject's grant), which persist does not model.
+    fn attestation_projection(canonical_json: &serde_json::Value) -> Projection {
+        let dimension = canonical_json
+            .pointer("/attestation_envelope/dimension")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        // v17.7.0 — READ THE SERDE CONTRACT, don't invent a value. persist's
+        // `Attestation::cohort_scope` carries
+        // `default = "federation"` + `skip_serializing_if = (s == "federation")`
+        // — exact inverses, so a MISSING key means `federation`, not "unknown".
+        // Edge's old `unwrap_or("")` manufactured a scope the wire never carried;
+        // pre-v36 that was invisible (every family mapped unknown → Cohort), and
+        // in v36 it silently halted `trace:*` replication (the Trace family maps
+        // unknown → SelfOwn). Measured and confirmed with persist on #713: the
+        // backends round-trip the column faithfully; the defect was this read.
+        let cohort_scope = Self::attestation_cohort_scope(canonical_json);
+        let attestation_type = canonical_json
+            .get("attestation_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        namespace::projection_for(
+            namespace::Plane::Attestation { dimension },
+            cohort_scope,
+            namespace::registry::authority_for(dimension).class,
+            namespace::is_withdraw_or_revocation(attestation_type),
+        )
     }
 
     /// CIRISEdge#379 — `[`Self::attestation_requires_serve`]` over WIRE bytes
@@ -2185,7 +2319,7 @@ impl FederationDirectoryReplicationBridge {
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         for att in &attestations {
             // Skip only an unparseable/unhashable row (never a projection filter).
-            let Some((hash, _bytes)) = content_hash_of(att) else {
+            let Some((hash, _bytes)) = content_hash_of(&att.attestation) else {
                 continue;
             };
             if !seen.insert(hash) {
@@ -2193,7 +2327,7 @@ impl FederationDirectoryReplicationBridge {
             }
             refs.push(EnvelopeRef {
                 envelope_hash: hash,
-                seq: Self::ms_seq(att.asserted_at),
+                seq: Self::ms_seq(att.admitted_at),
             });
         }
         refs
@@ -2263,7 +2397,7 @@ impl FederationDirectoryReplicationBridge {
         let mut trace_pause_booked = false;
         let mut quarantine_memo: HashMap<String, QuarantineConsult> = HashMap::new();
         for att in &attestations {
-            let Ok(canonical_json) = serde_json::to_value(att) else {
+            let Ok(canonical_json) = serde_json::to_value(&att.attestation) else {
                 // CIRISEdge#433 — an attestation that will not project to a
                 // `Value` is invisible to every gate below AND absent from the
                 // advertise set. Was a bare `continue`.
@@ -2338,7 +2472,7 @@ impl FederationDirectoryReplicationBridge {
                     continue;
                 }
             }
-            let Some((hash, _bytes)) = content_hash_of(att) else {
+            let Some((hash, _bytes)) = content_hash_of(&att.attestation) else {
                 // CIRISEdge#433 — cleared every gate, then could not be hashed:
                 // eligible and not served, which is the ledger's exact definition.
                 self.withhold(
@@ -2353,7 +2487,7 @@ impl FederationDirectoryReplicationBridge {
             }
             refs.push(EnvelopeRef {
                 envelope_hash: hash,
-                seq: Self::ms_seq(att.asserted_at),
+                seq: Self::ms_seq(att.admitted_at),
             });
         }
         refs
@@ -2415,8 +2549,15 @@ impl FederationDirectoryReplicationBridge {
             .unwrap_or_default();
         self.advertise_since(
             &rows,
-            |s| s.family.members.iter().any(|m| cohort.contains(&m.key_id)),
-            |s| Self::ms_seq(s.family.founded_at),
+            |s| {
+                s.family
+                    .family
+                    .members
+                    .iter()
+                    .any(|m| cohort.contains(&m.key_id))
+            },
+            |s| Self::ms_seq(s.family.family.founded_at),
+            |s| &s.family,
         )
     }
 
@@ -2431,11 +2572,13 @@ impl FederationDirectoryReplicationBridge {
             &rows,
             |s| {
                 s.community
+                    .community
                     .members
                     .iter()
                     .any(|m| cohort.contains(&m.key_id))
             },
-            |s| Self::ms_seq(s.community.founded_at),
+            |s| Self::ms_seq(s.community.community.founded_at),
+            |s| &s.community,
         )
     }
 
@@ -2453,7 +2596,8 @@ impl FederationDirectoryReplicationBridge {
         self.advertise_since(
             &rows,
             |_| true,
-            |s| Self::ms_seq(s.family_membership_revocation.removed_at),
+            |s| Self::ms_seq(s.revocation.family_membership_revocation.removed_at),
+            |s| &s.revocation,
         )
     }
 
@@ -2471,7 +2615,8 @@ impl FederationDirectoryReplicationBridge {
         self.advertise_since(
             &rows,
             |_| true,
-            |s| Self::ms_seq(s.community_membership_revocation.removed_at),
+            |s| Self::ms_seq(s.revocation.community_membership_revocation.removed_at),
+            |s| &s.revocation,
         )
     }
 
@@ -2484,8 +2629,9 @@ impl FederationDirectoryReplicationBridge {
             .unwrap_or_default();
         self.advertise_since(
             &rows,
-            |s| cohort.contains(&s.location_proof.subject_key_id),
-            |s| Self::ms_seq(s.location_proof.asserted_at),
+            |s| cohort.contains(&s.proof.location_proof.subject_key_id),
+            |s| Self::ms_seq(s.proof.location_proof.asserted_at),
+            |s| &s.proof,
         )
     }
 
@@ -2525,7 +2671,12 @@ impl FederationDirectoryReplicationBridge {
             .list_organizations_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
-        self.advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
+        self.advertise_since(
+            &rows,
+            |_| true,
+            |row| Self::ms_seq(row.admitted_at),
+            |row| &row.organization,
+        )
     }
 
     async fn list_org_memberships(&self) -> Vec<EnvelopeRef> {
@@ -2537,7 +2688,12 @@ impl FederationDirectoryReplicationBridge {
             .list_org_memberships_since(None, self.effective_page_limit().await)
             .await
             .unwrap_or_default();
-        self.advertise_since(&rows, |_| true, |row| Self::ms_seq(row.asserted_at))
+        self.advertise_since(
+            &rows,
+            |_| true,
+            |row| Self::ms_seq(row.admitted_at),
+            |row| &row.org_membership,
+        )
     }
 
     async fn list_partner_records(&self) -> Vec<EnvelopeRef> {
@@ -2556,7 +2712,8 @@ impl FederationDirectoryReplicationBridge {
         self.advertise_since(
             &rows,
             |_| true,
-            |s| Self::ms_seq(s.partner_record.asserted_at),
+            |s| Self::ms_seq(s.record.partner_record.asserted_at),
+            |s| &s.record,
         )
     }
 }
@@ -2737,7 +2894,9 @@ impl FederationDirectoryReplicationBridge {
     /// replay (`participations_admitted == 0`, no new tombstone) is `Duplicate`,
     /// exactly as the anti-entropy loop counts one — never a silent no-op.
     async fn apply_accord_quorum_evidence(&self, bytes: &[u8]) -> ApplyOutcome {
-        use ciris_persist::federation::accord_carriage::AccordQuorumEvidence;
+        use ciris_persist::federation::accord_carriage::{
+            AccordAdmissionEffect, AccordQuorumEvidence,
+        };
         let evidence: AccordQuorumEvidence = match serde_json::from_slice(bytes) {
             Ok(e) => e,
             Err(e) => {
@@ -2754,9 +2913,14 @@ impl FederationDirectoryReplicationBridge {
             .await
         {
             Ok(admission) => {
-                if admission.participations_admitted > 0
-                    || !admission.withdrawals_projected.is_empty()
-                {
+                // v36 — the count became a typed effect. Exhaustive match (not
+                // `matches!`) so a NEW variant breaks the build instead of
+                // silently falling through to "duplicate".
+                let novel = match admission.effect {
+                    AccordAdmissionEffect::Supplied { .. } => true,
+                    AccordAdmissionEffect::Duplicate => false,
+                };
+                if novel || !admission.withdrawals_projected.is_empty() {
                     ApplyOutcome::Admitted
                 } else {
                     ApplyOutcome::Duplicate
@@ -6497,6 +6661,176 @@ mod tests {
         );
     }
 
+    /// **CIRISPersist#727 structural gate** — a `skip_serializing_if` field must
+    /// never be read by JSON KEY with an empty/default fallback.
+    ///
+    /// This is the class that produced the v36 trace-replication halt: persist's
+    /// `Attestation::cohort_scope` carries `default = "federation"` +
+    /// `skip_serializing_if = (s == "federation")`, so the key is ABSENT exactly
+    /// when the value is the default. Edge read the key with `unwrap_or("")` and
+    /// turned "omitted because default" into "unknown" — invisible for as long as
+    /// every family mapped unknown to the same projection, then a silent
+    /// replication halt the moment one family didn't.
+    ///
+    /// A fix is not the close; a GATE is. This scans edge's own source for the
+    /// shape and fails on a NEW one, the same way the #425 inbound-exit pin does.
+    /// The allowlist is the audited set: each entry either resolves the persist
+    /// DEFAULT on absence, or is a field whose skipped value is genuinely empty
+    /// (`Option`/`Vec`), where `unwrap_or_default()` is already correct.
+    ///
+    /// To add a read: resolve the persist default explicitly (see
+    /// [`Bridge::attestation_cohort_scope`]) and record it here with why.
+    #[test]
+    fn skip_serializing_if_fields_are_never_read_by_json_key_with_an_empty_default() {
+        // persist fields whose SKIPPED value is a non-empty default — reading the
+        // key and falling back to ""/default silently substitutes a different
+        // value. (`dimension`/`subject_key_ids` are Option/Vec: absent genuinely
+        // means none/empty, so `unwrap_or_default` is correct for them.)
+        const NON_EMPTY_DEFAULTED: [&str; 1] = ["cohort_scope"];
+        // Audited sites that resolve the persist default explicitly.
+        const ALLOWED: [&str; 1] = [
+            // `attestation_cohort_scope` — map_or(cohort_scope::FEDERATION, …)
+            "ciris_persist::federation::types::cohort_scope::FEDERATION",
+        ];
+        let src = include_str!("bridge.rs");
+        let mut violations = Vec::new();
+        for (idx, line) in src.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            for field in NON_EMPTY_DEFAULTED {
+                if !line.contains(&format!("\"{field}\"")) {
+                    continue;
+                }
+                if !(line.contains(".get(") || line.contains(".pointer(")) {
+                    continue;
+                }
+                // The read must resolve persist's default within the next 4 lines.
+                let window: String = src.lines().skip(idx).take(5).collect::<Vec<_>>().join("\n");
+                if ALLOWED.iter().any(|a| window.contains(a)) {
+                    continue;
+                }
+                violations.push(format!("bridge.rs:{}: {}", idx + 1, trimmed));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "CIRISPersist#727 — a `skip_serializing_if` field is read by JSON key \
+             without resolving persist's default. The key is ABSENT exactly when the \
+             value IS the default, so a `unwrap_or(\"\")`/`unwrap_or_default()` here \
+             substitutes a DIFFERENT value and the failure presents as silence \
+             (v36: a silent trace-replication halt). Resolve the persist default \
+             explicitly and add the site to ALLOWED:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// v17.7.0 (CIRISPersist#713) — VALUE pin, not a boolean pin. The advertise
+    /// gate maps `Global | Cohort | Capability | Subject => true`, so a narrowing
+    /// of the trust-root provenance audience is INVISIBLE to
+    /// `attestation_trust_root_commons_is_global_advertised` below: that test
+    /// stays green while the audience halves. This test asserts the projection
+    /// ITSELF so the change is loud on edge.
+    ///
+    /// **This pin has already done its job once.** v36.0.0 capped
+    /// `provenance:*` at `Cohort` via the conservative default; edge argued on
+    /// #713 that `provenance:build_manifest:*` is the cross-cohort
+    /// binary-verification surface (capped at Cohort, the #436/#437 bundle gate
+    /// degrades to Advisory at first contact BETWEEN cohorts) and persist shipped
+    /// the decided row in v36.1.0 — `provenance:build_manifest:` at the
+    /// trust-root arm across all three commons tiers. The pin failed on the
+    /// v36.1.0 re-pin, which is exactly how edge learned the row had landed.
+    ///
+    /// If this fails again, the audience of build manifests moved: re-verify
+    /// cross-cohort bundle-gate admission before changing the expectation.
+    #[test]
+    fn trust_root_provenance_projection_value_is_pinned() {
+        let a = att_json(
+            "provenance:build_manifest:linux-x86_64",
+            "federation",
+            "scores",
+            "some-builder",
+        );
+        let got = Bridge::attestation_projection(&a);
+        assert!(
+            matches!(got, Projection::Global),
+            "trust-root provenance projects {got:?}; expected Global (the v36.1.0 \
+             decided row). A narrowing here silently degrades cross-cohort \
+             bundle-gate admission to Advisory (CIRISPersist#713)."
+        );
+        // The stem is `provenance:build_manifest:`, NOT `provenance:` — a
+        // sibling provenance family is deliberately NOT widened by that row.
+        let sibling = att_json(
+            "provenance:other:v1",
+            "federation",
+            "scores",
+            "some-builder",
+        );
+        assert!(
+            !matches!(Bridge::attestation_projection(&sibling), Projection::Global),
+            "only the build_manifest stem is widened; `provenance:*` at large stays \
+             at the conservative default"
+        );
+    }
+
+    /// v17.7.0 — the #713 overlay fold is 1:1 with the heuristic it replaced.
+    /// Edge deleted `dimension.starts_with("trace:")` in favour of the registry
+    /// resolving `Capability`; this pins that the swap did not move the gate.
+    #[test]
+    fn capability_and_subject_folds_match_the_replaced_overlays() {
+        // The serve gate is scope-INDEPENDENT: trace content requires
+        // `infra:serve` at EVERY scope. This is the invariant that made the
+        // naive fold onto `Capability(_)` unsafe.
+        for scope in ["self", "family", "community", "affiliations", "federation"] {
+            let trace = att_json("trace:complete:v1", scope, "scores", "peer-a");
+            assert!(
+                Bridge::attestation_requires_serve(&trace),
+                "the infra:serve gate must fire for trace:* at scope {scope:?}"
+            );
+        }
+        // …while the PROJECTION is family-AND-scope: Capability only at the
+        // commons tiers, SelfOwn below. Pinning the trap so a future fold onto
+        // `Capability(_)` cannot be made without seeing it.
+        assert!(
+            matches!(
+                Bridge::attestation_projection(&att_json(
+                    "trace:complete:v1",
+                    "federation",
+                    "scores",
+                    "peer-a"
+                )),
+                Projection::Capability(_)
+            ),
+            "trace:* at a commons tier resolves Capability"
+        );
+        assert!(
+            matches!(
+                Bridge::attestation_projection(&att_json(
+                    "trace:complete:v1",
+                    "community",
+                    "scores",
+                    "peer-a"
+                )),
+                Projection::SelfOwn
+            ),
+            "trace:* at community resolves SelfOwn — NOT Capability. A serve gate \
+             folded onto `Capability(_)` would silently stop firing here."
+        );
+        // scores:* → Subject → the item-6 recipient gate's family.
+        let scores = att_json("scores:reliability:v1", "community", "scores", "peer-a");
+        assert!(
+            matches!(Bridge::attestation_projection(&scores), Projection::Subject),
+            "scores:* must resolve Subject (folds recipient_capability_withholds)"
+        );
+        // A non-gated family must NOT acquire the serve gate.
+        let other = att_json("trust:reliability:v1", "community", "scores", "peer-a");
+        assert!(
+            !Bridge::attestation_requires_serve(&other),
+            "the serve gate must not widen to families the heuristic never gated"
+        );
+    }
+
     /// A trust-root (`provenance:build_manifest:*` → `AccordCoScrub`) attestation
     /// at a commons scope reaches the WHOLE federation — advertised even though
     /// this node didn't produce it. This is the v10 fix: infra / canonical /
@@ -6603,8 +6937,20 @@ mod tests {
             "species",
             "biosphere",
             "federation",
-            "", // absent/unknown scope → Cohort negative default
+            // v17.7.0 — "" is NOT "absent". persist's serde contract makes an
+            // ABSENT key mean `federation` (default + skip_serializing_if are
+            // inverses); a PRESENT-but-empty value is malformed and is DECLINED
+            // by the advertise gate. Asserted separately below.
         ];
+        // The empty-scope decline, pinned once rather than per family: malformed
+        // input is refused, never silently projected.
+        assert!(
+            !Bridge::attestation_is_advertised(
+                &att_json("trust:reliability:v1", "", "scores", "peer"),
+                &HashSet::new()
+            ),
+            "a present-but-EMPTY cohort_scope must be declined, not projected"
+        );
         let families = namespace::registry::entries();
         assert_eq!(
             families.len(),
@@ -6617,9 +6963,14 @@ mod tests {
                 let scored = att_json(&entry.prefix, scope, "scores", "peer");
                 let tombstone = att_json(&entry.prefix, scope, "withdraws", "peer");
                 let _ = Bridge::attestation_is_advertised(&scored, &HashSet::new());
+                // v17.7.0 (#713) — a tombstone no longer gossips unconditionally
+                // Global; it projects at `tombstone_ceiling(plane, authority)`.
+                // Every family's ceiling is an ADVERTISED projection (Global /
+                // Cohort / Capability / Subject — never SelfOwn), so the
+                // advertise invariant holds while the audience is per-plane.
                 assert!(
                     Bridge::attestation_is_advertised(&tombstone, &HashSet::new()),
-                    "every family's withdraws tombstone gossips Global ({})",
+                    "every family's withdraws tombstone advertises at its ceiling ({})",
                     entry.prefix
                 );
             }
@@ -7267,20 +7618,24 @@ mod tests {
         let expected_in = [in_fed, in_affil, in_self_own, in_tombstone];
         let expected: std::collections::BTreeSet<([u8; 32], u64)> = held
             .iter()
-            .filter(|row| expected_in.contains(&row.attestation_id.as_str()))
+            .filter(|row| expected_in.contains(&row.attestation.attestation_id.as_str()))
             .map(|row| {
-                let (hash, _bytes) = content_hash_of(row).expect("held row hashes");
+                let (hash, _bytes) = content_hash_of(&row.attestation).expect("held row hashes");
                 (
                     hash,
-                    FederationDirectoryReplicationBridge::ms_seq(row.asserted_at),
+                    FederationDirectoryReplicationBridge::ms_seq(row.admitted_at),
                 )
             })
             .collect();
         assert_eq!(expected.len(), 4);
         let out_hash = held
             .iter()
-            .find(|row| row.attestation_id == out_self_foreign)
-            .map(|row| content_hash_of(row).expect("held row hashes").0)
+            .find(|row| row.attestation.attestation_id == out_self_foreign)
+            .map(|row| {
+                content_hash_of(&row.attestation)
+                    .expect("held row hashes")
+                    .0
+            })
             .expect("the OUT row is held");
 
         // Equivalence: the advertise view (the exact entry the round's
