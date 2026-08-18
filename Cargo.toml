@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "17.7.0"
+version = "17.8.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -602,8 +602,8 @@ tempfile       = { version = "3", optional = true }
 # crate semver is now 0.16. CHANGELOG-gotcha lesson from their release: grep for
 # conflict markers before tagging (prose doesn't compile). Adoption sequenced in #484:
 # awaited variants next, then #482 item-1 buffer_unordered dispatcher.
-leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.18.0+ciris.1", version = "0.18", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.18.0+ciris.1", version = "0.18", optional = true }
+leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.19.0+ciris.1", version = "0.19", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.19.0+ciris.1", version = "0.19", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -613,7 +613,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.18.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.18.0+ciris.1", version = "0.18", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.19.0+ciris.1", version = "0.19", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
