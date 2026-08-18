@@ -18,7 +18,7 @@
 //! over-delivers, and **this predicate is what narrows carriage back to exactly
 //! that set.**
 //!
-//! ## WHICH accord? The OBJECT says — never the host (CIRISPersist#731)
+//! ## WHICH accord? The OBJECT says — and PERSIST reads it (CIRISPersist#733)
 //!
 //! Until v17.10.0 this gate judged every `accord:*` row against ONE root the
 //! host named at construction (`ReplicationRuntimeConfig::accord_relay_root`).
@@ -31,24 +31,61 @@
 //! > belongs to a **different** accord. The predicate cannot detect this,
 //! > because it was never given the object.
 //!
-//! So the nominated root is **gone**. Both arguments to persist's predicate are
-//! now read out of the object's own **signature-covered** bytes — see
-//! [`AccordRelaySubject`] — and the cache is keyed by the PAIR, because the
-//! same signer under two different roots has two different correct verdicts and
-//! a signer-keyed cache would reintroduce exactly the confusion the verb fix
-//! removed.
+//! Edge's first answer to that (v17.10.0) was to read the root out of the row
+//! ITSELF — a hand-rolled [`RowMirror`](ciris_persist::federation::envelope::RowMirror)
+//! walk plus an `accord:lifecycle:v1` special case, which meant edge held a rule
+//! about **which field of an `accord:*` row names its accord**. That rule was
+//! never edge's, and persist v37.0.0 (CIRISPersist#733) took it:
+//! [`accord_root_claim`] reads the claim off a row, a signed
+//! [`accord_root`](ciris_persist::federation::envelope::paths::ACCORD_ROOT)
+//! envelope key carries it on every dimension, and
+//! [`may_relay_accord_attestation`] is the **taking verb** — hand it the row and
+//! it answers, nominating nothing.
+//!
+//! **So the hand-parsing is gone.** What edge keeps is a CACHE KEY, which is a
+//! local concern — and even that is derived through [`accord_root_claim`] rather
+//! than by re-reading the row, so there is exactly one reading of *"which
+//! root?"* in the process. The key is the PAIR `(root, signer)`: the same signer
+//! under two different roots has two different correct verdicts, and a
+//! signer-keyed cache would rebuild #731 *behind* the fixed verb, where it is
+//! harder to see.
 //!
 //! ## Zero trust logic here
 //!
 //! The whole verdict is persist's — [`may_relay_accord_participation`] for an
-//! [`AccordParticipation`], [`may_relay_accord_object`] for an `accord:*`
-//! attestation whose signed bytes named its root. Seated signer AND a live
-//! `delegates_to(self → root)`. This module resolves, caches, and enforces; it
-//! decides nothing. It does not re-derive seating, roster membership, or edge
-//! existence, and the family classification of a dimension is persist's
-//! [`attestation_family`](ciris_persist::federation::namespace::attestation_family)
+//! [`AccordParticipation`], [`may_relay_accord_attestation`] for an `accord:*`
+//! attestation. Seated signer AND a live `delegates_to(self → root)`. This
+//! module resolves, caches, and enforces; it decides nothing. It does not
+//! re-derive seating, roster membership, edge existence, **or which accord a row
+//! belongs to**, and the family classification of a dimension is persist's
+//! [`attestation_family`]
 //! (the same fold `attestation_requires_serve` took in v17.7.0), never an
 //! edge-side `"accord:"` prefix match.
+//!
+//! ## The two persist predicates edge calls for ATTRIBUTION, and why
+//!
+//! [`may_relay_accord_attestation`] returns a three-bool [`RelayVerdict`], and
+//! it collapses FOUR distinct *"I cannot judge"* causes into
+//! `roster_resolvable: false` — an absent/divergent row mirror, a not-`accord:*`
+//! row, [`AccordRootClaim::Unnamed`] and [`AccordRootClaim::Disagrees`]. Persist
+//! keeps those apart in its own table; edge must too, because each is a
+//! different thing for an operator to go fix, and the #425 withhold-ledger
+//! discipline is that a refusal names ONE branch.
+//!
+//! There is no way to recover them from the verdict, so edge asks persist's own
+//! two pure functions —
+//! [`check_row_column_binding`]
+//! and [`accord_root_claim`], **the very two the verb runs internally**, in the
+//! same order — and maps each to its own [`RelayRefusal`]. This is not a second
+//! definition of anything: both callers call one body, which is the property
+//! #733 was written to establish.
+//!
+//! It also protects the CACHE. The key's root half can come from an unsigned
+//! column on the drill-dimension fallback, so keying before the binding gate has
+//! run would let a forged row park an *unjudgeable* verdict on a LEGITIMATE
+//! `(root, signer)` pair for a whole TTL — a fail-closed denial of the kill
+//! switch plane, cheap to repeat. Running the binding gate FIRST, and refusing
+//! without caching, means every key half is signature-covered by construction.
 //!
 //! ## The three-way verdict is kept three-way
 //!
@@ -78,8 +115,9 @@
 //! ## Fail CLOSED, in every direction
 //!
 //! A cache miss, an expired entry, an invalidated entry, a resolver error, an
-//! absent directory, an absent local identity, an unreadable object, an object
-//! that names no root, and `roster_resolvable == false` all refuse.
+//! absent directory, an absent local identity, a row that will not deserialize,
+//! a row whose signed mirror is absent or diverges, a row that names no root, a
+//! row that names two, and `roster_resolvable == false` all refuse.
 //! [`RelayRefusal::Unresolved`] is deliberately distinct from every decided
 //! refusal, so a refusal *because we never ran the predicate* can never be read
 //! as a refusal *because we decided* — the distinction a fail-safe default
@@ -105,23 +143,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ciris_persist::federation::admission::envelope_dimension;
-use ciris_persist::federation::envelope::{paths, RowMirror};
+use ciris_persist::federation::admission::check_row_column_binding;
 use ciris_persist::federation::namespace::{attestation_family, AttestationFamily};
 use ciris_persist::federation::trust_root::{
-    may_relay_accord_object, may_relay_accord_participation, RelayVerdict,
-    ACCORD_HEARTBEAT_DIMENSION,
+    accord_root_claim, may_relay_accord_attestation, may_relay_accord_participation,
+    AccordRootClaim, RelayVerdict,
 };
-use ciris_persist::federation::FederationDirectory;
+use ciris_persist::federation::{Attestation, FederationDirectory};
 use ciris_verify_core::accord_live_quorum::AccordParticipation;
-
-/// The row column holding the SIGNED envelope. persist publishes the member
-/// names INSIDE the envelope ([`paths`] / [`ciris_persist::federation::envelope::row_paths`])
-/// but the column that holds it is a schema name on
-/// [`Attestation`](ciris_persist::federation::Attestation), so it is spelled
-/// here — the one string this module owns, and the same one
-/// `attestation_requires_serve` and the quarantine consult already read.
-const ATTESTATION_ENVELOPE: &str = "attestation_envelope";
 
 /// How long one resolved [`RelayVerdict`] stays usable before the gate
 /// re-resolves it.
@@ -175,18 +204,53 @@ pub enum RelayRefusal {
     /// `delegates_to(self → root)` could exist. A WIRING fault
     /// (`ReplicationRuntimeConfig::local_key_id`), not a policy decision.
     NoLocalIdentity,
-    /// CIRISPersist#731 — the object's SIGNED bytes could not be read: no
-    /// `attestation_envelope`, no `row` mirror, or a mirror that is not
-    /// persist's [`RowMirror`]. Neither the signer nor the root is knowable, so
-    /// there is no question to ask. Fail-closed and LOUD (CIRISEdge#425) — a
-    /// malformed row, never a silent `continue`.
+    /// The wire value is not an [`Attestation`] at all — it does not
+    /// deserialize into persist's row type, so there is no row to hand the verb
+    /// and nothing to ask. Fail-closed and LOUD (CIRISEdge#425) — a malformed
+    /// row, never a silent `continue`. Reachable only from the direct-fetch
+    /// path, whose bytes come off the wire; the advertise and subject-Pull sites
+    /// hold a typed row and serialize it themselves.
     ObjectUnreadable,
-    /// CIRISPersist#731 — the object parsed, but **nothing in its signed bytes
-    /// names the accord it acts under**. Answering "which root?" from
-    /// construction state is the exact permissive failure #731 reports, so this
-    /// refuses instead. See [`AccordRelaySubject::of_attestation`]: an UPSTREAM
-    /// gap, not a local misconfiguration.
+    /// CIRISPersist#733, persist's first *"cannot judge"* row — the row's signed
+    /// [`RowMirror`](ciris_persist::federation::envelope::RowMirror) is ABSENT
+    /// (a pre-#643 unstamped row) or DIVERGES from the typed columns, so the
+    /// columns assert nothing and the row never passed a persist door. Distinct
+    /// from [`Self::ObjectUnreadable`]: that row is not an attestation, this one
+    /// is an attestation whose unsigned half has been edited. A divergence is a
+    /// SECURITY event (a relay rewriting a signed row's identity, verb, signer
+    /// or subject); a missing mirror is a producer-vintage problem. Different
+    /// findings, different remedies, so never folded.
+    MirrorUnbound,
+    /// [`AccordRootClaim::NotAccord`] — persist says this row is not on the
+    /// `accord:*` family at all, so it "is not this predicate's to judge" and
+    /// the verb refuses it. Unreachable through
+    /// `FederationDirectoryReplicationBridge::accord_relay_withholds`, whose
+    /// `attestation_is_accord` early-out already used persist's own
+    /// [`attestation_family`] classifier — and kept anyway so a DIRECT caller of
+    /// the public entry point below fails CLOSED with a name, rather than
+    /// falling through to an allow.
+    ObjectNotAccord,
+    /// [`AccordRootClaim::Unnamed`] — the row IS on the `accord:*` family and
+    /// **nothing in it names the accord it acts under**: no signed
+    /// [`accord_root`](ciris_persist::federation::envelope::paths::ACCORD_ROOT)
+    /// key, and not the one dimension whose fallback rule persist defines. A
+    /// pre-#733 row or an unadopted producer's. Answering "which root?" from
+    /// construction state is the permissive failure #731 reports, so this
+    /// refuses instead — the durable narrowing #733 accepted, not a local
+    /// misconfiguration.
     ObjectRootUnnamed,
+    /// [`AccordRootClaim::Disagrees`] — **ONE ARTIFACT ASSERTING TWO ACCORDS**:
+    /// a drill row carrying both signals, whose signed `accord_root` key and
+    /// drill-dimension rule name different roots. Neither signal is preferred
+    /// (preferring the key lets an emitter relabel a heartbeat's accord;
+    /// preferring the column makes the new field decorative), so it refuses.
+    ///
+    /// **This is NOT dead code behind persist's write door.** That door protects
+    /// rows this node ADMITS; relaying is exactly when a node handles rows it
+    /// never admitted, which is the entire premise of this plane. Its own
+    /// variant, never folded into [`Self::ObjectRootUnnamed`] — "names no
+    /// accord" and "names two" send an operator to different places.
+    ObjectRootDisagrees,
 }
 
 impl RelayRefusal {
@@ -201,7 +265,10 @@ impl RelayRefusal {
             Self::Unresolved => "unresolved",
             Self::NoLocalIdentity => "no_local_identity",
             Self::ObjectUnreadable => "object_unreadable",
+            Self::MirrorUnbound => "mirror_unbound",
+            Self::ObjectNotAccord => "object_not_accord",
             Self::ObjectRootUnnamed => "object_root_unnamed",
+            Self::ObjectRootDisagrees => "object_root_disagrees",
         }
     }
 }
@@ -212,35 +279,42 @@ impl std::fmt::Display for RelayRefusal {
     }
 }
 
-/// CIRISPersist#731 — **the two facts a relay decision needs, both read out of
-/// the object's own signature-covered bytes**: which accord it acts under, and
+/// **The CACHE KEY, and nothing else**: which accord an object acts under, and
 /// who signed it.
 ///
-/// # Why this type exists at all
+/// # What this is NOT, post-#733
 ///
-/// It is the thing the pre-#731 gate did not have. `may_relay_accord_object`
-/// takes `(signer, root)` as parameters, and edge was passing a root the HOST
-/// named — so an object belonging to accord B, signed by a key seated on accord
-/// A, was judged against A and carried. Making the pair a value derived
-/// *from the object* is what removes the caller's ability to nominate.
+/// It is not edge's reading of the object. v17.10.0's version of this type
+/// walked the [`RowMirror`](ciris_persist::federation::envelope::RowMirror) by
+/// hand and carried an `accord:lifecycle:v1` special case, which made edge a
+/// second owner of *"which field names the accord"*. Persist v37.0.0 took that
+/// rule ([`accord_root_claim`]), so both constructors below now **consume**
+/// persist's answer rather than compute one.
 ///
-/// # Signed bytes only
+/// The pair still has to exist on edge's side because the verdict is CACHED and
+/// a cache needs a key. Both of persist's legs are root-relative
+/// (`active_roster_of(root)`, `delegates_to(self → root)`), so ONE signer has as
+/// many correct verdicts as there are roots: keying on the signer alone would
+/// serve accord A's answer for an accord B object — the cross-accord confusion
+/// #731 is about, rebuilt *behind* the fixed verb where it is harder to see,
+/// because the resolver would be reading the object correctly and the cache
+/// would be answering for a different one.
 ///
-/// Persist's scrub signature covers `JCS(attestation_envelope)` **and nothing
-/// else** — the top-level `attesting_key_id` / `attested_key_id` columns are
-/// unsigned copies, bound to the envelope only by `check_row_column_binding` at
-/// `put_attestation`. That binding is a receive-path admission gate; this is a
-/// SERVE-path carriage gate, so it reads the signed mirror
-/// ([`paths::ROW`] → [`RowMirror`], the seven members CIRISPersist#643 stamped
-/// inside the signature precisely so a relay could not rewrite them) rather
-/// than trusting a column a relay could have edited. Reading the unsigned copy
-/// would hand an attacker the choice of root, which is #731 rebuilt one field
-/// over.
+/// # Every half is signature-covered
+///
+/// [`Self::of_row`] runs
+/// [`check_row_column_binding`]
+/// BEFORE it reads anything, so the typed columns are proven equal to the signed
+/// mirror first. After that, `attesting_key_id` (which is the signer persist's
+/// own verb reads) and the drill-dimension fallback's `attested_key_id` are
+/// reading signed bytes. Keying without that proof would let a forged row park a
+/// verdict on a legitimate pair — see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccordRelaySubject {
-    /// The accord trust root the object acts under, from the object.
+    /// The accord trust root the object acts under, as [`accord_root_claim`]
+    /// read it off the object (or, for a participation, `family_key_id`).
     pub root_ref: String,
-    /// The key that signed the object, from the object.
+    /// The key that signed the object.
     pub signer_key_id: String,
 }
 
@@ -263,61 +337,69 @@ impl AccordRelaySubject {
         }
     }
 
-    /// The subject of an `accord:*` ATTESTATION row, from its signed envelope.
+    /// The subject of an `accord:*` attestation ROW — persist's two pure gates,
+    /// in persist's own order, and no edge parsing at all.
     ///
-    /// # Which field names the root, and why only one dimension qualifies
+    /// 1. [`check_row_column_binding`]
+    ///    — the same call [`may_relay_accord_attestation`] makes first, for the
+    ///    same reason: `attesting_key_id` and `attested_key_id` are UNSIGNED
+    ///    columns, and relaying is exactly when a node handles a row it never
+    ///    admitted, so nothing may be read off them until they are proven equal
+    ///    to the signed mirror.
+    /// 2. [`accord_root_claim`] — persist's ONE reading of *"which accord does
+    ///    this row claim?"*, shared with its write door.
     ///
-    /// The signer is unambiguous: [`RowMirror::attesting_key_id`], signed.
-    ///
-    /// The ROOT is not, and this is the honest part. `accord:*` is a whole
-    /// dimension FAMILY whose only registry rule is `accord_holder-only`
-    /// (CC 3.4.1 — it constrains the EMITTER's `identity_type`, and says nothing
-    /// about which accord a row belongs to). Persist's own fixtures show
-    /// `attested_key_id` carrying different things across the family: for
-    /// `accord:human_dignity:v1` it is the AGENT being scored, and for
-    /// `accord:invoke:notify:*` it is the self-attesting holder — neither is a
-    /// root.
-    ///
-    /// **Exactly one dimension has an upstream answer.** For
-    /// [`ACCORD_HEARTBEAT_DIMENSION`] persist's own trust-root fold resolves
-    /// drills as `list_attestations_for(root_ref)` filtered to that dimension —
-    /// i.e. persist *defines* an `accord:lifecycle:v1` row about X as a drill
-    /// about accord X. Reading `attested_key_id` as the root there consumes
-    /// persist's rule; asserting it for any other `accord:*` dimension would be
-    /// edge inventing one.
-    ///
-    /// So every other dimension yields [`RelayRefusal::ObjectRootUnnamed`] and
-    /// is REFUSED. That is a real narrowing of what this node will carry, and it
-    /// is the correct direction: the alternative is answering "which root?" from
-    /// construction state, which is the permissive failure #731 exists to close.
-    /// The gap belongs to persist — a taking verb for `accord:*` attestations,
-    /// the way [`may_relay_accord_participation`] is the one for participations.
+    /// Each non-[`AccordRootClaim::Named`] outcome maps to its own
+    /// [`RelayRefusal`], because the verb collapses all of them into
+    /// `roster_resolvable: false` and an operator needs to know WHICH.
     ///
     /// # Errors
     ///
-    /// [`RelayRefusal::ObjectUnreadable`] if the signed envelope or its
-    /// [`RowMirror`] cannot be read; [`RelayRefusal::ObjectRootUnnamed`] if it
-    /// can, but names no root.
-    pub fn of_attestation(canonical_json: &serde_json::Value) -> Result<Self, RelayRefusal> {
-        let envelope = canonical_json
-            .get(ATTESTATION_ENVELOPE)
-            .ok_or(RelayRefusal::ObjectUnreadable)?;
-        // The SIGNED mirror, through persist's own typed view of it. `RowMirror`
-        // is `deny_unknown_fields`, so this is the exact seven-member object the
-        // scrub signature covers — not a hand-spelled pointer walk that could
-        // drift from the vocabulary.
-        let mirror: RowMirror = envelope
-            .get(paths::ROW)
-            .and_then(|row| serde_json::from_value(row.clone()).ok())
-            .ok_or(RelayRefusal::ObjectUnreadable)?;
-        if envelope_dimension(envelope) != Some(ACCORD_HEARTBEAT_DIMENSION) {
-            return Err(RelayRefusal::ObjectRootUnnamed);
+    /// [`RelayRefusal::MirrorUnbound`], [`RelayRefusal::ObjectNotAccord`],
+    /// [`RelayRefusal::ObjectRootUnnamed`] or
+    /// [`RelayRefusal::ObjectRootDisagrees`] — one per row of persist's own
+    /// *"why this is 'I cannot judge'"* table.
+    pub fn of_row(row: &Attestation) -> Result<Self, RelayRefusal> {
+        if check_row_column_binding(row).is_err() {
+            return Err(RelayRefusal::MirrorUnbound);
         }
-        Ok(Self {
-            root_ref: mirror.attested_key_id,
-            signer_key_id: mirror.attesting_key_id,
-        })
+        match accord_root_claim(row) {
+            AccordRootClaim::Named { root_ref, .. } => Ok(Self {
+                root_ref,
+                // The signer persist's own verb passes to
+                // `may_relay_accord_object` — read from the same column, now
+                // proven equal to the signed mirror by step 1.
+                signer_key_id: row.attesting_key_id.clone(),
+            }),
+            AccordRootClaim::NotAccord => Err(RelayRefusal::ObjectNotAccord),
+            AccordRootClaim::Unnamed { .. } => Err(RelayRefusal::ObjectRootUnnamed),
+            AccordRootClaim::Disagrees { .. } => Err(RelayRefusal::ObjectRootDisagrees),
+        }
     }
+
+    /// [`Self::of_row`] for a wire value — the shape the serve paths carry.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayRefusal::ObjectUnreadable`] if the value is not an
+    /// [`Attestation`]; otherwise [`Self::of_row`]'s.
+    pub fn of_attestation(canonical_json: &serde_json::Value) -> Result<Self, RelayRefusal> {
+        Self::of_row(&deserialize_row(canonical_json)?)
+    }
+}
+
+/// The ONE place a wire value becomes persist's row type.
+///
+/// Borrows rather than cloning: `serde_json` implements `Deserializer` for
+/// `&Value`, so this costs one walk and no copy of the envelope.
+///
+/// A failure is [`RelayRefusal::ObjectUnreadable`] — LOUD and withheld, never a
+/// silent pass (CIRISEdge#425). It is only genuinely reachable from the
+/// direct-fetch path, whose bytes come off the wire; the advertise and
+/// subject-Pull sites serialize a typed row they already hold, so their
+/// round-trip cannot fail.
+fn deserialize_row(canonical_json: &serde_json::Value) -> Result<Attestation, RelayRefusal> {
+    serde::Deserialize::deserialize(canonical_json).map_err(|_| RelayRefusal::ObjectUnreadable)
 }
 
 /// The gate's answer for one `accord:*` object. `#[must_use]` for the same
@@ -566,40 +648,53 @@ impl AccordRelayGate {
         }
     }
 
-    /// Resolve one already-derived subject through persist and cache it, unless
-    /// a fresh verdict is already held (cache-first — a hit costs one lock and
-    /// no directory read).
+    /// **The ONE async step**: hand the ROW to persist's taking verb
+    /// ([`may_relay_accord_attestation`]) and cache what it says, unless a fresh
+    /// verdict is already held (cache-first — a hit costs one lock and no
+    /// directory read). Returns the subject the verdict was filed under, so the
+    /// caller can [`Self::decide`] on it.
+    ///
+    /// Nothing here nominates a root or a signer: the verb is given the object.
+    /// [`AccordRelaySubject::of_row`] runs persist's own two pure gates purely to
+    /// name a refusal and to key the cache, and it is the same pair of calls the
+    /// verb makes internally — so a row this returns `Ok` for is exactly a row
+    /// the verb will judge on its merits.
     ///
     /// The cache lock is taken twice, briefly, and **never held across the
     /// `.await`** (CIRISEdge#217). A resolver error does NOT cache: a transient
     /// directory fault must not pin a subject refused past the fault — the next
     /// call re-resolves, and [`Self::decide`] refuses meanwhile as
     /// [`RelayRefusal::Unresolved`], which says exactly what happened.
-    pub async fn prime(&self, subject: &AccordRelaySubject, now: Instant) {
+    ///
+    /// # Errors
+    ///
+    /// [`AccordRelaySubject::of_row`]'s — a row persist cannot judge is refused
+    /// here, before any directory read and without caching anything.
+    pub async fn prime(
+        &self,
+        row: &Attestation,
+        now: Instant,
+    ) -> Result<AccordRelaySubject, RelayRefusal> {
+        let subject = AccordRelaySubject::of_row(row)?;
+        // No "I" ⇒ no `delegates_to(self → root)` to resolve. `decide` reports
+        // that as `NoLocalIdentity`; resolving would be meaningless.
         let Some(us) = self.self_key_id.as_deref() else {
-            return;
+            return Ok(subject);
         };
         let gen_at_miss = {
             let guard = self
                 .cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.get_fresh(subject, now).is_some() {
-                return;
+            if guard.get_fresh(&subject, now).is_some() {
+                return Ok(subject);
             }
             // Snapshot the generation WITH the miss check, so an invalidation
             // during the `.await` below is detected at commit.
             guard.generation
         };
 
-        let verdict = match may_relay_accord_object(
-            &*self.directory,
-            us,
-            &subject.signer_key_id,
-            &subject.root_ref,
-        )
-        .await
-        {
+        let verdict = match may_relay_accord_attestation(&*self.directory, us, row).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -609,31 +704,39 @@ impl AccordRelayGate {
                     "accord relay verdict resolve FAILED — carriage refused as `unresolved` \
                      until the next resolve (fail-closed, workstream F)"
                 );
-                return;
+                return Ok(subject);
             }
         };
         self.cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .commit(subject, verdict, gen_at_miss, now);
+            .commit(&subject, verdict, gen_at_miss, now);
+        Ok(subject)
     }
 
-    /// **The serve-path entry point for an `accord:*` attestation row**: derive
-    /// the subject from the row's SIGNED bytes, resolve, and decide.
+    /// [`Self::prime`] then [`Self::decide`], for a caller holding persist's row
+    /// type. The async resolve / pure-sync predicate split is preserved: this is
+    /// only the two in sequence.
+    pub async fn may_relay_row(&self, row: &Attestation, now: Instant) -> RelayDecision {
+        match self.prime(row, now).await {
+            Ok(subject) => self.decide(&subject, now),
+            Err(refusal) => RelayDecision::Refused(refusal),
+        }
+    }
+
+    /// **The serve-path entry point for an `accord:*` attestation row**, from
+    /// the wire value the three call sites carry.
     ///
-    /// The row is never trusted to tell the gate which root to use via anything
-    /// but its signed mirror, and a row that cannot name one is REFUSED with a
-    /// named leg rather than judged against a fallback (CIRISPersist#731).
+    /// Deserializes ONCE into persist's row type and delegates to
+    /// [`Self::may_relay_row`]; a value that is not an [`Attestation`] is
+    /// REFUSED as [`RelayRefusal::ObjectUnreadable`], never carried.
     pub async fn may_relay_attestation(
         &self,
         canonical_json: &serde_json::Value,
         now: Instant,
     ) -> RelayDecision {
-        match AccordRelaySubject::of_attestation(canonical_json) {
-            Ok(subject) => {
-                self.prime(&subject, now).await;
-                self.decide(&subject, now)
-            }
+        match deserialize_row(canonical_json) {
+            Ok(row) => self.may_relay_row(&row, now).await,
             Err(refusal) => RelayDecision::Refused(refusal),
         }
     }
@@ -733,6 +836,7 @@ impl AccordRelayGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ciris_persist::federation::trust_root::{AccordRootSource, ACCORD_HEARTBEAT_DIMENSION};
     use ciris_persist::store::MemoryBackend;
 
     /// The three-bool verdict, spelled out at every call so a test's INPUT is
@@ -761,29 +865,74 @@ mod tests {
         }
     }
 
-    /// An `accord:*` attestation row in the SIGNED shape persist v31.0.0
-    /// (#643) stamps: the `row` mirror lives inside `attestation_envelope`,
-    /// which is what the scrub signature covers. The top-level columns are
-    /// written too — deliberately SKEWED in one test below, to prove the gate
-    /// reads the signed half.
-    fn accord_row(dimension: &str, attesting: &str, attested: &str) -> serde_json::Value {
+    /// A COMPLETE `accord:*` attestation row as a wire VALUE, in the shape
+    /// persist v31.0.0 (#643) stamps: the `row` mirror lives inside
+    /// `attestation_envelope` (what the scrub signature covers) and MIRRORS the
+    /// typed columns, so `check_row_column_binding` passes. `accord_root` is the
+    /// v37.0.0 (#733) signed key naming the row's own accord — `None` omits it,
+    /// which is how a pre-#733 row looks.
+    ///
+    /// Every field persist's `Attestation` requires is present: these tests
+    /// exercise the REAL deserialize the serve path performs, not a
+    /// hand-selected subset (CIRISEdge's "test the field's own input" scar —
+    /// a fixture the row type would reject proves nothing about a row type
+    /// that must accept it).
+    fn accord_row_value(
+        dimension: &str,
+        attesting: &str,
+        attested: &str,
+        accord_root: Option<&str>,
+    ) -> serde_json::Value {
+        let mut envelope = serde_json::json!({
+            "dimension": dimension,
+            "asserted_at": "2026-01-01T00:00:00Z",
+            "row": {
+                "attestation_id": "att-1",
+                "attesting_key_id": attesting,
+                "attestation_type": "scores",
+                "attested_key_id": attested,
+                "cohort_scope": "federation",
+            },
+        });
+        if let Some(root) = accord_root {
+            envelope["accord_root"] = serde_json::json!(root);
+        }
         serde_json::json!({
             "attestation_id": "att-1",
             "attesting_key_id": attesting,
             "attested_key_id": attested,
             "attestation_type": "scores",
-            "attestation_envelope": {
-                "dimension": dimension,
-                "asserted_at": "2026-01-01T00:00:00Z",
-                "row": {
-                    "attestation_id": "att-1",
-                    "attesting_key_id": attesting,
-                    "attestation_type": "scores",
-                    "attested_key_id": attested,
-                    "cohort_scope": "federation",
-                },
-            },
+            "asserted_at": "2026-01-01T00:00:00Z",
+            "attestation_envelope": envelope,
+            "original_content_hash": "0".repeat(64),
+            "scrub_signature_classical": "x".repeat(88),
+            "scrub_key_id": attesting,
+            "scrub_timestamp": "2026-01-01T00:00:00Z",
+            "persist_row_hash": "",
         })
+    }
+
+    /// [`accord_row_value`] as persist's row type — the argument the taking verb
+    /// takes.
+    fn accord_row(
+        dimension: &str,
+        attesting: &str,
+        attested: &str,
+        accord_root: Option<&str>,
+    ) -> Attestation {
+        serde_json::from_value(accord_row_value(
+            dimension,
+            attesting,
+            attested,
+            accord_root,
+        ))
+        .expect("the fixture is a well-formed persist Attestation")
+    }
+
+    /// A drill row: the one dimension whose fallback rule persist defines, so
+    /// `attested_key_id` IS the accord and no signed key is needed.
+    fn drill_row(attesting: &str, root: &str) -> Attestation {
+        accord_row(ACCORD_HEARTBEAT_DIMENSION, attesting, root, None)
     }
 
     // ── decision_of: the verdict → decision mapping ──────────────────────
@@ -839,89 +988,228 @@ mod tests {
         assert!(!decision_of(verdict(false, false, false)).may_relay());
     }
 
-    // ── AccordRelaySubject: the object names its own root (#731) ──────────
+    // ── AccordRelaySubject: persist reads the claim, edge keys on it ──────
 
-    /// The heartbeat/drill dimension is the ONE `accord:*` shape with an
-    /// upstream root rule (persist's trust-root fold resolves drills as
-    /// `list_attestations_for(root)` filtered to this dimension), so the signed
-    /// `attested_key_id` IS the accord.
+    /// REWRITTEN for CIRISPersist#733. This used to assert that EDGE's mirror
+    /// walk plus its `accord:lifecycle:v1` special case produced the pair. It
+    /// now asserts the delegation: persist's [`accord_root_claim`] carries the
+    /// drill-dimension fallback, edge consumes its answer, and the two agree by
+    /// CONSTRUCTION rather than by edge re-deriving the rule.
+    ///
+    /// Asserted against persist's claim directly, so a change to persist's rule
+    /// moves both sides of this test together — which is the point of having one
+    /// owner.
     #[test]
-    fn a_heartbeat_row_names_its_root_and_its_signer() {
-        let row = accord_row(ACCORD_HEARTBEAT_DIMENSION, "holder-a", "accord-x");
+    fn the_subject_is_exactly_what_persists_claim_says() {
+        let row = drill_row("holder-a", "accord-x");
         assert_eq!(
-            AccordRelaySubject::of_attestation(&row),
+            accord_root_claim(&row),
+            AccordRootClaim::Named {
+                root_ref: "accord-x".to_owned(),
+                source: AccordRootSource::HeartbeatDimensionRule,
+            },
+            "the drill fallback is PERSIST's rule and it is the one that answers"
+        );
+        assert_eq!(
+            AccordRelaySubject::of_row(&row),
             Ok(subject("accord-x", "holder-a")),
-            "both halves come from the SIGNED row mirror"
+            "edge's key is persist's root plus the signer persist's own verb reads"
         );
     }
 
-    /// **The signed half wins.** The unsigned top-level columns are bound to
-    /// the envelope by persist's `check_row_column_binding` at
-    /// `put_attestation` — a RECEIVE-path gate. This is a SERVE-path carriage
-    /// gate, so it must not depend on that binding having run: skew the columns
-    /// and the subject must be unmoved. Reading the unsigned copy would hand an
-    /// attacker the choice of root — CIRISPersist#731 rebuilt one field over.
+    /// REWRITTEN, and the property INVERTED — deliberately, because #733 moved
+    /// it.
+    ///
+    /// The old test skewed the unsigned columns and asserted the subject was
+    /// UNMOVED, because edge read the signed mirror and ignored the columns.
+    /// That was edge working around a receive-path gate it did not run. Persist
+    /// v37.0.0's verb runs
+    /// [`check_row_column_binding`]
+    /// ITSELF and treats its refusal as *"I cannot judge"*, so the correct
+    /// serve-path answer to a skewed row is not "re-read it from the mirror" —
+    /// it is **REFUSE**. Strictly stronger: the old behaviour would have carried
+    /// a row whose signed and unsigned halves disagree, on the strength of the
+    /// signed half alone.
     #[test]
-    fn the_unsigned_columns_cannot_move_the_subject() {
-        let mut row = accord_row(ACCORD_HEARTBEAT_DIMENSION, "holder-a", "accord-x");
-        row["attesting_key_id"] = serde_json::json!("attacker");
-        row["attested_key_id"] = serde_json::json!("accord-the-attacker-prefers");
+    fn a_row_whose_columns_diverge_from_its_signed_mirror_is_refused() {
+        let mut value = accord_row_value(ACCORD_HEARTBEAT_DIMENSION, "holder-a", "accord-x", None);
+        value["attesting_key_id"] = serde_json::json!("attacker");
+        value["attested_key_id"] = serde_json::json!("accord-the-attacker-prefers");
         assert_eq!(
-            AccordRelaySubject::of_attestation(&row),
+            AccordRelaySubject::of_attestation(&value),
+            Err(RelayRefusal::MirrorUnbound),
+            "columns that diverge from the signed mirror make the row UNJUDGEABLE — persist's \
+             own first `cannot judge` row, not a subject to be recovered from the mirror"
+        );
+        // …and the same row with its columns intact IS judgeable, so the
+        // refusal above is about the divergence and not about the fixture.
+        assert_eq!(
+            AccordRelaySubject::of_attestation(&accord_row_value(
+                ACCORD_HEARTBEAT_DIMENSION,
+                "holder-a",
+                "accord-x",
+                None
+            )),
             Ok(subject("accord-x", "holder-a")),
-            "the scrub signature covers JCS(attestation_envelope) and NOTHING else — the \
-             top-level columns are unsigned and are not read here"
         );
     }
 
-    /// Every other `accord:*` dimension names no root, so it is refused with
-    /// its OWN leg rather than judged against a fallback. `accord_holder-only`
-    /// (CC 3.4.1) constrains the emitter's identity type and says nothing about
-    /// which accord a row belongs to; persist's own fixtures put a scored AGENT
-    /// in `attested_key_id` for `accord:human_dignity:v1` and the self-attesting
-    /// HOLDER for `accord:invoke:notify:*`.
+    /// REWRITTEN — this is the #733 WIDENING, and the old test asserted its
+    /// opposite.
+    ///
+    /// Edge used to refuse every non-drill `accord:*` dimension outright
+    /// (`ObjectRootUnnamed`), because nothing in such a row named its accord and
+    /// edge would not invent a rule. v37.0.0 added the signed `accord_root`
+    /// envelope key, so those rows CAN now name their accord — and the refusal
+    /// survives only for the ones that still do not.
     #[test]
-    fn a_non_heartbeat_accord_row_names_no_root_and_is_refused_distinctly() {
+    fn a_non_drill_row_names_its_accord_with_the_signed_key_or_is_refused() {
         for dim in [
             "accord:human_dignity:v1",
             "accord:invoke:notify:halt",
             "accord:halt:v1",
         ] {
             assert_eq!(
-                AccordRelaySubject::of_attestation(&accord_row(dim, "holder-a", "someone")),
+                AccordRelaySubject::of_row(&accord_row(dim, "holder-a", "some-agent", None)),
                 Err(RelayRefusal::ObjectRootUnnamed),
-                "{dim}: no signed field names the accord — refuse, do NOT fall back to a \
-                 host-nominated root (CIRISPersist#731)"
+                "{dim} with no `accord_root`: a pre-#733 row names no accord — refuse, never \
+                 fall back to a host-nominated root"
+            );
+            assert_eq!(
+                AccordRelaySubject::of_row(&accord_row(
+                    dim,
+                    "holder-a",
+                    "some-agent",
+                    Some("accord-x")
+                )),
+                Ok(subject("accord-x", "holder-a")),
+                "{dim} WITH the signed key: #733's general answer, on a dimension where \
+                 `attested_key_id` is the scored agent and never the root"
             );
         }
     }
 
-    /// An unreadable object is its own leg, distinct from "names no root":
-    /// one is a malformed row, the other a well-formed row with an upstream
-    /// vocabulary gap, and they send an operator to different places.
+    /// **THE DUAL-SIGNAL DISAGREEMENT, and it is NOT dead code.** A drill row
+    /// carrying BOTH signals that name different accords is refused — with its
+    /// own leg, never folded into "names no root".
+    ///
+    /// Persist's write door refuses this shape too, which is exactly why the
+    /// arm matters HERE: a write door protects rows this node ADMITS, and
+    /// relaying is the case where a node handles a row it never admitted. That
+    /// is the entire premise of the plane, and persist says so in
+    /// `may_relay_accord_attestation`'s own doc.
+    ///
+    /// Neither signal is preferred: preferring the key lets an emitter relabel a
+    /// heartbeat's accord, preferring the column makes the new field decorative.
+    /// One artifact asserting two accords is malformed, whichever you believe.
     #[test]
-    fn an_unreadable_row_is_its_own_refusal_leg() {
-        // No envelope at all.
+    fn a_row_naming_two_accords_is_refused_as_disagrees_never_as_unnamed() {
+        let row = accord_row(
+            ACCORD_HEARTBEAT_DIMENSION,
+            "holder-a",
+            "accord-from-the-column",
+            Some("accord-from-the-signed-key"),
+        );
+        assert_eq!(
+            accord_root_claim(&row),
+            AccordRootClaim::Disagrees {
+                envelope_root: "accord-from-the-signed-key".to_owned(),
+                attested_key_id: "accord-from-the-column".to_owned(),
+            },
+        );
+        let got = AccordRelaySubject::of_row(&row);
+        assert_eq!(
+            got,
+            Err(RelayRefusal::ObjectRootDisagrees),
+            "one artifact asserting TWO accords is its own finding"
+        );
+        assert_ne!(
+            got,
+            Err(RelayRefusal::ObjectRootUnnamed),
+            "`names two` is not `names none` — folding them sends an operator to add a key \
+             the row already has"
+        );
+        // Agreement is NOT a disagreement: the same two signals naming the same
+        // accord resolve, and the signed key is reported as the source.
+        assert_eq!(
+            AccordRelaySubject::of_row(&accord_row(
+                ACCORD_HEARTBEAT_DIMENSION,
+                "holder-a",
+                "accord-x",
+                Some("accord-x")
+            )),
+            Ok(subject("accord-x", "holder-a")),
+            "both signals agreeing turns the drill rule into a CHECK, not a refusal"
+        );
+    }
+
+    /// The two "we could not even get a row" legs, kept apart.
+    ///
+    /// REWRITTEN: all three inputs below used to land on `ObjectUnreadable`,
+    /// because edge parsed the envelope by hand and every shape it could not
+    /// walk looked the same. Now a value that is not an [`Attestation`] and a
+    /// well-formed [`Attestation`] whose signed mirror is missing are DIFFERENT
+    /// findings — fix the producer's serializer vs. re-mint a pre-#643 row — so
+    /// they get different legs.
+    #[test]
+    fn an_unreadable_value_and_an_unbound_mirror_are_different_legs() {
+        // Not an `Attestation` at all: no `attestation_id`, no signatures, no
+        // `asserted_at`. persist's row type refuses it, and so do we.
         assert_eq!(
             AccordRelaySubject::of_attestation(&serde_json::json!({ "attesting_key_id": "a" })),
             Err(RelayRefusal::ObjectUnreadable),
         );
-        // Envelope, but no signed `row` mirror (a pre-#643 unstamped row).
+        // A row that is missing only the SIGNATURE fields is still not a row.
         assert_eq!(
             AccordRelaySubject::of_attestation(&serde_json::json!({
+                "attestation_id": "att-1",
+                "attesting_key_id": "a",
+                "attested_key_id": "b",
+                "attestation_type": "scores",
+                "asserted_at": "2026-01-01T00:00:00Z",
                 "attestation_envelope": { "dimension": ACCORD_HEARTBEAT_DIMENSION },
             })),
             Err(RelayRefusal::ObjectUnreadable),
         );
-        // A `row` that is not persist's closed-member `RowMirror`.
+        // A COMPLETE row whose envelope carries no signed `row` mirror — a
+        // pre-#643 unstamped row. Deserializes fine; persist's binding gate
+        // refuses it.
+        let mut value = accord_row_value(ACCORD_HEARTBEAT_DIMENSION, "holder-a", "accord-x", None);
+        value["attestation_envelope"]
+            .as_object_mut()
+            .expect("envelope object")
+            .remove("row");
         assert_eq!(
-            AccordRelaySubject::of_attestation(&serde_json::json!({
-                "attestation_envelope": {
-                    "dimension": ACCORD_HEARTBEAT_DIMENSION,
-                    "row": { "attesting_key_id": "a", "not_a_mirror_member": 1 },
-                },
-            })),
-            Err(RelayRefusal::ObjectUnreadable),
+            AccordRelaySubject::of_attestation(&value),
+            Err(RelayRefusal::MirrorUnbound),
+            "an unstamped row is UNBOUND, not unreadable — the two send an operator to \
+             different places"
+        );
+        // …and a `row` that is not persist's closed-member mirror lands there
+        // too: the binding gate owns that judgement now, not an edge walk.
+        let mut value = accord_row_value(ACCORD_HEARTBEAT_DIMENSION, "holder-a", "accord-x", None);
+        value["attestation_envelope"]["row"] =
+            serde_json::json!({ "attesting_key_id": "a", "not_a_mirror_member": 1 });
+        assert_eq!(
+            AccordRelaySubject::of_attestation(&value),
+            Err(RelayRefusal::MirrorUnbound),
+        );
+    }
+
+    /// [`AccordRootClaim::NotAccord`] fails CLOSED at the gate's public entry
+    /// point. It is unreachable through the bridge (whose `attestation_is_accord`
+    /// early-out is persist's own [`attestation_family`] classifier, and `under`
+    /// implies `starts_with`), but the arm must not be an allow: a direct caller
+    /// of a `pub` predicate is a caller.
+    #[test]
+    fn a_row_that_is_not_accord_at_all_fails_closed_with_its_own_leg() {
+        let row = accord_row("scores:reputation:v1", "holder-a", "someone", None);
+        assert_eq!(accord_root_claim(&row), AccordRootClaim::NotAccord);
+        assert_eq!(
+            AccordRelaySubject::of_row(&row),
+            Err(RelayRefusal::ObjectNotAccord),
+            "persist refuses a non-accord row as unjudgeable; edge must not turn that into \
+             a carriage grant"
         );
     }
 
@@ -1148,9 +1436,16 @@ mod tests {
     async fn priming_an_unheld_root_caches_a_cannot_judge_verdict() {
         let dir: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
         let gate = AccordRelayGate::new(dir, Some("this-node".into()));
-        let s = subject("unheld-accord-root", "holder-a");
         let t0 = now();
-        gate.prime(&s, t0).await;
+        let s = gate
+            .prime(&drill_row("holder-a", "unheld-accord-root"), t0)
+            .await
+            .expect("a well-formed drill row is judgeable");
+        assert_eq!(
+            s,
+            subject("unheld-accord-root", "holder-a"),
+            "the verdict is filed under the pair persist read off the row"
+        );
         assert_eq!(
             gate.decide(&s, t0),
             RelayDecision::Refused(RelayRefusal::RosterUnresolvable),
@@ -1264,8 +1559,11 @@ mod tests {
         // (B) seated signer, but this node has NOT granted the root. The leg a
         // bare `Global` projection runs straight over.
         assert_eq!(
-            gate.may_relay_attestation(&accord_row(ACCORD_HEARTBEAT_DIMENSION, seated, root), t0)
-                .await,
+            gate.may_relay_attestation(
+                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, seated, root, None),
+                t0
+            )
+            .await,
             RelayDecision::Refused(RelayRefusal::NoTrustEdge),
             "seated but un-granted: CC 4.2.1 — simply not reached"
         );
@@ -1273,8 +1571,11 @@ mod tests {
         // (C) signer NOT on the roster. The roster IS resolvable here, so this
         // must read as `signer_not_seated` and never as `cannot judge`.
         assert_eq!(
-            gate.may_relay_attestation(&accord_row(ACCORD_HEARTBEAT_DIMENSION, stranger, root), t0)
-                .await,
+            gate.may_relay_attestation(
+                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, stranger, root, None),
+                t0
+            )
+            .await,
             RelayDecision::Refused(RelayRefusal::SignerNotSeated),
         );
 
@@ -1283,7 +1584,12 @@ mod tests {
         // root THE OBJECT NAMES changed, and the REASON changes with it.
         assert_eq!(
             gate.may_relay_attestation(
-                &accord_row(ACCORD_HEARTBEAT_DIMENSION, seated, "some-other-accord"),
+                &accord_row_value(
+                    ACCORD_HEARTBEAT_DIMENSION,
+                    seated,
+                    "some-other-accord",
+                    None
+                ),
                 t0
             )
             .await,
@@ -1334,7 +1640,7 @@ mod tests {
         // The object says `accord-b`. The signer is seated on `accord-a`.
         let decision = gate
             .may_relay_attestation(
-                &accord_row(ACCORD_HEARTBEAT_DIMENSION, signer, "accord-b"),
+                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, "accord-b", None),
                 t0,
             )
             .await;
@@ -1351,7 +1657,7 @@ mod tests {
         // leg after seating passes.)
         assert_eq!(
             gate.may_relay_attestation(
-                &accord_row(ACCORD_HEARTBEAT_DIMENSION, signer, "accord-a"),
+                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, "accord-a", None),
                 t0,
             )
             .await,
@@ -1366,60 +1672,115 @@ mod tests {
         );
     }
 
-    /// **The serve-path entry point carries the object refusals through.**
+    /// **ALL FIVE object refusals, carried through the serve-path ENTRY POINT.**
     ///
-    /// [`AccordRelaySubject::of_attestation`] is unit-tested above, but that
-    /// proves only that the DERIVATION refuses; it says nothing about what
+    /// [`AccordRelaySubject::of_row`] is unit-tested above, but that proves only
+    /// that the DERIVATION refuses; it says nothing about what
     /// [`AccordRelayGate::may_relay_attestation`] does with an `Err`. Turning
-    /// that arm into an allow is a one-token edit, and without this test the
-    /// whole gate module stays green while every unreadable and rootless
-    /// `accord:*` row is carried. MUTATION-VERIFIED (see the module report):
-    /// `Err(_) => RelayDecision::Relay` reds exactly this test.
+    /// either `Err` arm into an allow is a one-token edit.
+    ///
+    /// # Every leg is asserted HERE, and that is the point
+    ///
+    /// This test originally covered two of the five, and a mutation run found
+    /// the hole the user's rule predicts: flipping the `Disagrees` arm to
+    /// `Named` left the entire suite green except the DERIVATION test, because
+    /// nothing asserted what the GATE would then do with the row — and what it
+    /// would do is resolve it against the envelope-named root and CARRY it if
+    /// the signer happened to be seated there. So the roster below seats the
+    /// signer on every root these rows name, which turns each refusal into a
+    /// claim that survives the seating leg: a mutation that stops refusing gets
+    /// `no_trust_edge` (or a relay), never the expected leg.
     ///
     /// The seated-signer half is asserted too, so this cannot pass by refusing
     /// everything.
     #[tokio::test]
-    async fn the_serve_entry_point_refuses_rows_it_cannot_judge() {
+    async fn the_serve_entry_point_refuses_every_row_it_cannot_judge() {
         let us = "e-node";
         let signer = "e-holder";
         let root = "e-accord";
+        let other = "e-other-accord";
         let backend = Arc::new(MemoryBackend::new());
-        for who in [us, signer, root] {
+        for who in [us, signer, root, other] {
             backend.put_public_key(key(who)).await.expect("register");
         }
+        // The signer is SEATED on both roots any row below names. So if a leg
+        // stopped refusing, the gate would reach persist's seating leg and pass
+        // it — the answer would change to `no_trust_edge`, and every assertion
+        // here would red. A roster that seated nobody would let a broken arm
+        // land on `signer_not_seated` and hide behind a fail-safe default.
         seed_family(&backend, root, &[signer]).await;
+        seed_family(&backend, other, &[signer]).await;
         let dir: Arc<dyn FederationDirectory> = backend;
         let gate = AccordRelayGate::new(dir, Some(us.to_owned()));
         let t0 = now();
 
-        // A row whose signed bytes name no accord.
+        // (1) Not an `Attestation` at all.
+        assert_eq!(
+            gate.may_relay_attestation(&serde_json::json!({ "attesting_key_id": signer }), t0)
+                .await,
+            RelayDecision::Refused(RelayRefusal::ObjectUnreadable),
+            "an unreadable value is withheld, not carried"
+        );
+
+        // (2) A row whose columns diverge from its signed mirror.
+        let mut skewed = accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, root, None);
+        skewed["attested_key_id"] = serde_json::json!(other);
+        assert_eq!(
+            gate.may_relay_attestation(&skewed, t0).await,
+            RelayDecision::Refused(RelayRefusal::MirrorUnbound),
+            "an unbound row is withheld — and the signer is seated on BOTH roots here, so \
+             a gate that stopped refusing would have CARRIED it"
+        );
+
+        // (3) Not on the `accord:*` family at all.
         assert_eq!(
             gate.may_relay_attestation(
-                &accord_row("accord:human_dignity:v1", signer, "some-agent"),
+                &accord_row_value("scores:reputation:v1", signer, root, None),
+                t0
+            )
+            .await,
+            RelayDecision::Refused(RelayRefusal::ObjectNotAccord),
+        );
+
+        // (4) On the family, naming no accord.
+        assert_eq!(
+            gate.may_relay_attestation(
+                &accord_row_value("accord:human_dignity:v1", signer, "some-agent", None),
                 t0
             )
             .await,
             RelayDecision::Refused(RelayRefusal::ObjectRootUnnamed),
             "no root in the signed bytes ⇒ nothing to judge against ⇒ REFUSE, never carry"
         );
-        // A row that does not parse at all.
+
+        // (5) On the family, naming TWO. Both named roots seat this signer, so
+        // resolving either one instead of refusing reaches the trust-edge leg.
         assert_eq!(
-            gate.may_relay_attestation(&serde_json::json!({ "attesting_key_id": signer }), t0)
-                .await,
-            RelayDecision::Refused(RelayRefusal::ObjectUnreadable),
-            "an unreadable row is withheld, not carried"
+            gate.may_relay_attestation(
+                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, root, Some(other)),
+                t0
+            )
+            .await,
+            RelayDecision::Refused(RelayRefusal::ObjectRootDisagrees),
+            "one artifact asserting two accords is withheld at the GATE, not merely \
+             classified as a disagreement by the derivation"
         );
+
         assert_eq!(
             gate.cached_len(),
             0,
-            "a row we could not read never reached the resolver, so it cached nothing"
+            "not one of the five reached the resolver, so nothing was cached — a row we \
+             cannot judge must not park a verdict on any (root, signer) pair"
         );
 
         // …and the gate is ALIVE: a well-formed drill by the seated signer gets
         // a real, resolved verdict (leg 2 — no trust edge is seeded here).
         assert_eq!(
-            gate.may_relay_attestation(&accord_row(ACCORD_HEARTBEAT_DIMENSION, signer, root), t0)
-                .await,
+            gate.may_relay_attestation(
+                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, root, None),
+                t0
+            )
+            .await,
             RelayDecision::Refused(RelayRefusal::NoTrustEdge),
             "a judgeable row IS judged — the refusals above are about the object, not a \
              gate that refuses everything"
@@ -1465,9 +1826,10 @@ mod tests {
         let gate = AccordRelayGate::new(dir, Some("us".into()));
         let t0 = now();
         let s = subject("accord-root", "holder-a");
+        let row = drill_row("holder-a", "accord-root");
         // Prime a verdict (an empty directory yields cannot-judge; what is
         // under test is the CACHE lifecycle, not the verdict's value).
-        gate.prime(&s, t0).await;
+        gate.prime(&row, t0).await.expect("judgeable");
         assert_eq!(gate.cached_len(), 1);
         assert_eq!(
             gate.decide(&s, t0),
@@ -1484,15 +1846,96 @@ mod tests {
         );
 
         // A root-naming invalidation drops every signer under THAT root.
-        gate.prime(&s, t0).await;
-        gate.prime(&subject("accord-root", "holder-b"), t0).await;
-        gate.prime(&subject("other-root", "holder-a"), t0).await;
+        for r in [
+            &row,
+            &drill_row("holder-b", "accord-root"),
+            &drill_row("holder-a", "other-root"),
+        ] {
+            gate.prime(r, t0).await.expect("judgeable");
+        }
         assert_eq!(gate.cached_len(), 3);
         gate.invalidate("accord-root");
         assert_eq!(
             gate.cached_len(),
             1,
             "a change naming the ROOT falsifies every verdict under it — and only under it"
+        );
+    }
+
+    /// **THE REQUIRED #733 PAIR, at the gate.** A row whose SIGNED `accord_root`
+    /// key names accord B, signed by a holder seated only on accord A, on a node
+    /// that holds a real family for BOTH — so `cannot judge` is doing none of
+    /// the work here and the roster resolves either way.
+    ///
+    /// This is the shape #733 made possible and #731 made necessary: pre-#733
+    /// the row could only be judged if its DIMENSION happened to be the drill
+    /// one, and pre-#731 it was judged against whichever root the host had
+    /// nominated — which, for a signer seated on A, was an ALLOW.
+    ///
+    /// Both halves are asserted. The refusal half alone would be satisfied by a
+    /// gate that refuses everything; the twin — the same signer, the same
+    /// dimension, the same node, with only the row's named root changed to the
+    /// one it IS seated on — passes the seating leg and moves the refusal to the
+    /// trust-edge leg, which is the next one along. (The full allow, with a live
+    /// `delegates_to(self → root)` and a genuinely SERVED row, is
+    /// `bridge::tests::a_signed_accord_root_decides_which_roster_judges_the_row`
+    /// — a trust edge needs the bridge module's hybrid-signing fixtures.)
+    #[tokio::test]
+    async fn a_signed_accord_root_naming_another_accord_is_judged_against_that_one() {
+        let us = "sk-node";
+        let signer = "sk-holder-on-a";
+        let backend = Arc::new(MemoryBackend::new());
+        for who in [us, signer, "sk-other-holder", "accord-a", "accord-b"] {
+            backend.put_public_key(key(who)).await.expect("register");
+        }
+        seed_family(&backend, "accord-a", &[signer]).await;
+        seed_family(&backend, "accord-b", &["sk-other-holder"]).await;
+
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let gate = AccordRelayGate::new(dir, Some(us.to_owned()));
+        let t0 = now();
+
+        // A NON-drill dimension, so the ONLY thing naming the accord is the
+        // signed `accord_root` key — the drill fallback cannot answer here, and
+        // `attested_key_id` is the scored agent.
+        assert_eq!(
+            gate.may_relay_attestation(
+                &accord_row_value(
+                    "accord:human_dignity:v1",
+                    signer,
+                    "some-scored-agent",
+                    Some("accord-b")
+                ),
+                t0
+            )
+            .await,
+            RelayDecision::Refused(RelayRefusal::SignerNotSeated),
+            "the row NAMES accord-b, so accord-b's roster judges it — and this signer holds \
+             no seat there. Judging it on accord-a's roster (where it IS seated) is the \
+             confidently-wrong allow #731 reports"
+        );
+
+        // THE POSITIVE TWIN — only the named root changed.
+        assert_eq!(
+            gate.may_relay_attestation(
+                &accord_row_value(
+                    "accord:human_dignity:v1",
+                    signer,
+                    "some-scored-agent",
+                    Some("accord-a")
+                ),
+                t0
+            )
+            .await,
+            RelayDecision::Refused(RelayRefusal::NoTrustEdge),
+            "on the accord it NAMES and IS seated on, seating passes and the refusal moves \
+             to the trust-edge leg — so the refusal above is about the ROOT, not a gate \
+             that refuses every row it is shown"
+        );
+        assert_eq!(
+            gate.cached_len(),
+            2,
+            "two named roots, two cached verdicts for one signer"
         );
     }
 }

@@ -336,23 +336,55 @@ pub enum WithholdReason {
     /// says *"we never ran the check"*, which is a wiring/timing fact, not a
     /// statement about the signer or the root.
     AccordRelayUnresolved,
-    /// CIRISPersist#731 — an `accord:*` row whose SIGNED bytes could not be read
-    /// at all: no `attestation_envelope`, no `row` mirror, or a mirror that does
-    /// not deserialize as persist's
-    /// [`RowMirror`](ciris_persist::federation::envelope::RowMirror). The gate
-    /// cannot learn WHO signed it or WHICH accord it acts under, so it is
-    /// withheld — LOUD and named, never a silent `continue` (CIRISEdge#425/#433).
-    /// A malformed or pre-v31 unstamped row, not a trust statement.
+    /// CIRISPersist#731 — the wire value is not an
+    /// [`Attestation`](ciris_persist::federation::Attestation) at all: it does
+    /// not deserialize into persist's row type, so there is no row to hand the
+    /// relay verb and nothing to ask. Withheld — LOUD and named, never a silent
+    /// `continue` (CIRISEdge#425/#433). A producer/serialization fault, not a
+    /// trust statement.
     AccordRelayObjectUnreadable,
-    /// CIRISPersist#731 — the row's signed bytes parsed, but **nothing in them
-    /// names the accord this object acts under**, so "which root?" has no
-    /// object-derived answer and the carriage question cannot be asked. The
-    /// permissive failure #731 is about is precisely what happens if this is
-    /// answered from construction state instead, so it refuses. See
-    /// [`AccordRelaySubject`](crate::replication::accord_relay_gate::AccordRelaySubject)
-    /// — an UPSTREAM gap (persist owns which field of an `accord:*` row names its
-    /// root), not a local misconfiguration.
+    /// CIRISPersist#733 — the row deserialized, but its signed
+    /// [`RowMirror`](ciris_persist::federation::envelope::RowMirror) is ABSENT
+    /// (a pre-#643 unstamped row) or DIVERGES from the typed columns, so the
+    /// columns assert nothing: persist's
+    /// [`check_row_column_binding`](ciris_persist::federation::admission::check_row_column_binding)
+    /// refuses it and its own relay verb treats that as *"I cannot judge"*.
+    ///
+    /// Never folded into [`Self::AccordRelayObjectUnreadable`]: a DIVERGENCE is a
+    /// security event (a relay rewriting a signed row's identity, verb, signer or
+    /// subject while the signature still verifies — CIRISPersist#643's whole
+    /// class), while a missing mirror is a producer-vintage problem. Different
+    /// findings, different remedies.
+    AccordRelayMirrorUnbound,
+    /// CIRISPersist#733 — persist's own classifier says the row is not on the
+    /// `accord:*` family at all
+    /// ([`AccordRootClaim::NotAccord`](ciris_persist::federation::trust_root::AccordRootClaim)),
+    /// so it "is not this predicate's to judge" and the verb refuses it.
+    /// Structurally unreachable through the serve path (the `accord:*` early-out
+    /// runs persist's own `attestation_family` first) and booked anyway, so a
+    /// classifier disagreement surfaces as a NAMED withhold rather than as an
+    /// allow.
+    AccordRelayObjectNotAccord,
+    /// CIRISPersist#733 — the row is on the `accord:*` family and **nothing in
+    /// it names the accord this object acts under**: no signed `accord_root`
+    /// key, and not the one dimension whose fallback rule persist defines. A
+    /// pre-#733 row or an unadopted producer's. "Which root?" has no
+    /// object-derived answer, and answering it from construction state instead
+    /// is precisely the permissive failure #731 reports — so it refuses. The
+    /// durable narrowing #733 accepted, not a local misconfiguration.
     AccordRelayObjectRootUnnamed,
+    /// CIRISPersist#733 — **ONE ARTIFACT ASSERTING TWO ACCORDS**: the row's
+    /// signed `accord_root` key and the drill-dimension rule name DIFFERENT
+    /// roots. Neither is preferred (preferring the key lets an emitter relabel a
+    /// heartbeat's accord; preferring the column makes the new field
+    /// decorative), so the row is refused rather than resolved.
+    ///
+    /// Reachable at RELAY even though persist's write door refuses the same
+    /// shape: that door protects rows this node ADMITS, and relaying is exactly
+    /// when a node handles rows it never admitted. Its own variant, never folded
+    /// into [`Self::AccordRelayObjectRootUnnamed`] — "names none" sends an
+    /// operator to add a key, "names two" sends them to remove one.
+    AccordRelayObjectRootDisagrees,
 }
 
 impl WithholdReason {
@@ -380,7 +412,10 @@ impl WithholdReason {
             Self::AccordRelayNoTrustEdge => "accord_relay_no_trust_edge",
             Self::AccordRelayUnresolved => "accord_relay_unresolved",
             Self::AccordRelayObjectUnreadable => "accord_relay_object_unreadable",
+            Self::AccordRelayMirrorUnbound => "accord_relay_mirror_unbound",
+            Self::AccordRelayObjectNotAccord => "accord_relay_object_not_accord",
             Self::AccordRelayObjectRootUnnamed => "accord_relay_object_root_unnamed",
+            Self::AccordRelayObjectRootDisagrees => "accord_relay_object_root_disagrees",
         }
     }
 }
