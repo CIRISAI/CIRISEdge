@@ -6387,18 +6387,28 @@ impl EdgeBuilder {
     /// swarm holdings gate all read their arming from that one handle, so
     /// "which addresses I answer on" and "which I send to" cannot drift.
     ///
-    /// # The trade you are making
+    /// # What one hop actually costs, which depends on the other flag
     ///
-    /// Scoped destinations are **one hop**. CC 5.4.6 binds the *emission*
-    /// (ruled: CIRISConstitution#91), so a scope-derived destination never
-    /// announces and no transport node ever learns a path to it. Scoped
-    /// content therefore reaches directly-attached peers only. In exchange,
-    /// this node presents an unlinkable address per context instead of one
-    /// `sha256(fed_pubkey)[..16]` everywhere.
+    /// Scoped destinations are **one hop**: CC 5.4.6 binds the *emission*
+    /// (ruled at CIRISConstitution#91), so a scope-derived destination never
+    /// announces and no transport node learns a path to it.
     ///
-    /// That is a genuine operational trade, which is why it is opt-in rather
-    /// than a default: a deployment that needs multi-hop reach for
-    /// cohort-scoped content should not inherit one-hop behaviour silently.
+    /// Whether that is a cost at all depends on
+    /// [`ReticulumTransportConfig::federation_visible`] — the wizard's
+    /// *"allow me to be visible to the federation so I can use the mesh"*
+    /// question, which is the opt-in that actually decides this node's reach:
+    ///
+    /// - **Not federation-visible.** The node is point-to-point anyway. Scoped
+    ///   addressing costs it **nothing it had**, and gives it an unlinkable
+    ///   address per context instead of one `sha256(fed_pubkey)[..16]`
+    ///   everywhere. There is no trade here, only a gain.
+    /// - **Federation-visible.** The node has mesh reach on the federation
+    ///   plane, and arming this moves *scoped* flows off that plane onto
+    ///   one-hop delivery. That is the real trade, and it is why this stays a
+    ///   separate decision rather than riding the visibility flag.
+    ///
+    /// So this is opt-in because the second case exists, not because
+    /// unlinkable addressing is exotic.
     ///
     /// `convergence` is how long a superseded epoch stays reachable after a
     /// rotation — see [`DEFAULT_CONVERGENCE_WINDOW`]. Seal earlier and a peer

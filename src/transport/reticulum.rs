@@ -1123,6 +1123,29 @@ pub struct ReticulumTransportConfig {
     /// TCP address the node listens on for inbound Reticulum links.
     /// Legacy v0.11.x field — consulted only when [`Self::interfaces`]
     /// is empty.
+    /// **"Allow me to be visible to the federation so I can use the mesh."**
+    ///
+    /// The wizard question, and the ONE opt-in that decides this node's
+    /// reachability posture. When `true` the node's named discovery
+    /// destination announces, transport nodes learn a path to it, and it
+    /// participates in the mesh. When `false` it announces nothing and is
+    /// reachable **point-to-point only** — a peer must already hold its
+    /// address to reach it.
+    ///
+    /// Getting the direction right matters, because it is easy to read
+    /// scope-native addressing (CIRISEdge#499) as a privacy feature you trade
+    /// reach for. It is not. A node that has not opted into federation
+    /// visibility is point-to-point **anyway**; scoped destinations being
+    /// one-hop (CC 5.4.6, ruled at CIRISConstitution#91) costs such a node
+    /// nothing it had. The trade only exists for a node that IS
+    /// federation-visible and is choosing to move some flows off that plane.
+    ///
+    /// Defaults to `true` — NOT because visibility is the right default, but
+    /// because flipping a deployed node to invisible on upgrade would silently
+    /// remove it from the mesh, and a silent reachability change is the one
+    /// failure mode worse than an over-visible default. A wizard MUST ask
+    /// rather than inherit this.
+    pub federation_visible: bool,
     pub listen_addr: SocketAddr,
     /// Bootstrap peer TCP addresses dialled as Reticulum TCP clients
     /// on startup. Empty is valid (listen-only / announce-discovered).
@@ -1198,6 +1221,7 @@ impl ReticulumTransportConfig {
     pub fn new(identity_path: PathBuf, local_key_id: impl Into<String>) -> Self {
         Self {
             listen_addr: "0.0.0.0:4242".parse().expect("static addr parses"),
+            federation_visible: true,
             bootstrap_peers: Vec::new(),
             identity_path,
             announce_interval: Duration::from_secs(300),
@@ -2440,10 +2464,31 @@ impl ReticulumTransport {
         // adds suppression for scoped destinations (register future ones via
         // the retained `announce_policy` handle).
         let announce_policy = crate::announce_suppression::ScopePrivacyAnnouncePolicy::new();
-        announce_policy.register_destination_scope(
-            local_named_dest_hash.into_bytes(),
-            crate::cohort_scope::CohortScope::Public,
-        );
+        // The federation-visibility opt-in, and the only thing that decides
+        // whether this node is on the mesh at all.
+        //
+        // `Public` is the one scope the policy lets announce, so registering
+        // the named discovery destination as `Public` is what puts this node
+        // in the mesh. Leaving it UNregistered is not an oversight — the
+        // policy default-SUPPRESSES anything it does not know, so an invisible
+        // node falls out of the same rule that keeps scoped destinations
+        // silent, rather than needing a second mechanism to be quiet.
+        //
+        // A point-to-point node is still fully reachable by anyone who already
+        // holds its address; what it does not do is advertise so strangers can
+        // learn one.
+        if config.federation_visible {
+            announce_policy.register_destination_scope(
+                local_named_dest_hash.into_bytes(),
+                crate::cohort_scope::CohortScope::Public,
+            );
+        } else {
+            tracing::info!(
+                "federation visibility OFF — this node announces nothing and is reachable \
+                 point-to-point only. Scoped destinations were already one-hop (CC 5.4.6), \
+                 so scope-native addressing costs this posture nothing."
+            );
+        }
         node.set_announce_control(Some(Box::new(announce_policy.clone())));
 
         // Take the single event receiver before starting, then start
@@ -2919,6 +2964,25 @@ impl ReticulumTransport {
     /// What the ruling DID keep is that in-group MLS distribution of addressing
     /// material was never prohibited — the cached-directory discipline — so a
     /// roster learning its own members' addresses over MLS stays open.
+    ///
+    /// # Why one hop is not fatal to a mesh call
+    ///
+    /// CC 1.0-rc4's Position paragraph at 5.4.6 names the reason, and it holds
+    /// in this implementation: **derivation replaces discovery, and determinism
+    /// replaces coordination.** Every member can derive every other member's
+    /// address from the group secret without asking anyone, so the candidate
+    /// set is complete without a discovery round — which is what recovers the
+    /// ⌈log_k N⌉ ALM fan-out (CC 6.1.6) that a one-hop-only reading looks like
+    /// it should destroy.
+    ///
+    /// Concretely: [`AlmJoinPlanner::plan`] takes a caller-supplied candidate
+    /// set under staleness and reachability filters. It plans over advertised
+    /// candidates and established links, never over an assumption that every
+    /// member is dialable. So the one-hop property constrains FIRST CONTACT —
+    /// which happens on the federation plane, where announces are permitted —
+    /// and not the shape of the tree built afterwards.
+    ///
+    /// [`AlmJoinPlanner::plan`]: crate::transport::realtime_av_alm::AlmJoinPlanner::plan
     ///
     /// # Errors
     /// [`TransportError::BodyTooLarge`] above the AV-13 ceiling;
@@ -9572,9 +9636,9 @@ mod scope_native_addressing_tests {
     use crate::scope_addressing::StubDeriver;
     use leviculum_core::AnnounceControl as _;
 
-    async fn bare_transport(dir: &std::path::Path, key_id: &str) -> ReticulumTransport {
-        // A hybrid signer, because CIRISEdge#333 refuses to build a transport
-        // that cannot self-attest its announces.
+    /// A hybrid signer — CIRISEdge#333 refuses a transport that cannot
+    /// self-attest its announces.
+    fn test_signer(key_id: &str) -> Arc<LocalSigner> {
         let mut ed_seed = [0u8; 32];
         let mut pqc_seed = [0u8; 32];
         let salt = u8::try_from(key_id.len() % 251).expect("in range");
@@ -9593,7 +9657,24 @@ mod scope_native_addressing_tests {
             )
             .expect("ml_dsa_65"),
         );
-        let signer = Arc::new(LocalSigner::new(key_id, classical, Some(pqc)));
+        Arc::new(LocalSigner::new(key_id, classical, Some(pqc)))
+    }
+
+    async fn transport_with(config: ReticulumTransportConfig, key_id: &str) -> ReticulumTransport {
+        let signer = test_signer(key_id);
+        ReticulumTransport::new(
+            config,
+            ReticulumAuth {
+                signer: Some(signer),
+                ..ReticulumAuth::default()
+            },
+        )
+        .await
+        .expect("transport")
+    }
+
+    async fn bare_transport(dir: &std::path::Path, key_id: &str) -> ReticulumTransport {
+        let signer = test_signer(key_id);
 
         // No typed interfaces, and the default `0.0.0.0:4242` server replaced
         // with an ephemeral port so these four tests can run concurrently. The
@@ -9622,6 +9703,48 @@ mod scope_native_addressing_tests {
             .install_group(scope, group_id, 1, &[9u8; 32], members)
             .expect("install group");
         table
+    }
+
+    #[tokio::test]
+    async fn federation_visibility_off_makes_the_node_announce_nothing() {
+        // The wizard's "allow me to be visible to the federation so I can use
+        // the mesh" opt-in. OFF means point-to-point only: the node announces
+        // nothing, so no stranger can learn an address for it.
+        //
+        // Asserted on the POLICY rather than on the flag, because the flag
+        // being read is not the property — the property is that the named
+        // discovery destination stops being announceable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = ReticulumTransportConfig::new(dir.path().join("t.id"), "edge-invisible");
+        config.listen_addr = "127.0.0.1:0".parse().expect("addr");
+        config.federation_visible = false;
+
+        let transport = transport_with(config, "edge-invisible").await;
+        assert!(
+            transport
+                .announce_policy
+                .should_suppress_announce(&DestinationHash::new(transport.local_named_dest_hash())),
+            "an invisible node must not announce its discovery destination",
+        );
+        assert_eq!(
+            transport.announce_policy.len(),
+            0,
+            "invisibility is the policy's DEFAULT-suppress, not a second \
+             mechanism — nothing should be registered at all",
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_visibility_on_keeps_the_node_discoverable() {
+        // The other half, so the pair cannot pass by suppressing everything.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "edge-visible").await;
+        assert!(
+            !transport
+                .announce_policy
+                .should_suppress_announce(&DestinationHash::new(transport.local_named_dest_hash())),
+            "a federation-visible node must still announce discovery",
+        );
     }
 
     #[tokio::test]
