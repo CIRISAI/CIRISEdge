@@ -166,6 +166,20 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         | WithholdReason::BlobArrivalScopeInsufficient
         | WithholdReason::BlobArrivalGroupMismatch => CiParameter::Recipient,
 
+        // CIRISEdge#499 (holdings plane) — "I hold this" is itself a
+        // flow, and before this cut a family-scoped holding's content id
+        // AND symbol ids were announced on a timer to every peer the
+        // cohort callback returned. All four defend the same commitment
+        // — a claim reaches only the context it was made in — and are
+        // four variants rather than one because each sends the operator
+        // somewhere different: fix the wiring, fix the declaration, fix
+        // the roster, or await a persist widening. Different remedies,
+        // same promise.
+        WithholdReason::HoldingScopeUndeterminable
+        | WithholdReason::HoldingScopePublicGroup
+        | WithholdReason::HoldingScopePeerNotInRoster
+        | WithholdReason::HoldingScopeProjectionUnsupported => CiParameter::Recipient,
+
         // ── Transmission principle ──────────────────────────────────
         // The serve capability and the per-record restriction are the
         // grant's own terms: not "who may see" but "under what rule
@@ -354,7 +368,7 @@ mod tests {
     /// exhaustive match is what actually guarantees totality, so a
     /// reason missing from THIS list weakens the tests, never the
     /// invariant.
-    const ALL_REASONS: [WithholdReason; 26] = [
+    const ALL_REASONS: [WithholdReason; 30] = [
         WithholdReason::EnvelopeUnfetchable,
         WithholdReason::LocalIdentityMissing,
         WithholdReason::SendSetUnresolved,
@@ -381,5 +395,9 @@ mod tests {
         WithholdReason::BlobScopeUndeterminable,
         WithholdReason::BlobArrivalScopeInsufficient,
         WithholdReason::BlobArrivalGroupMismatch,
+        WithholdReason::HoldingScopeUndeterminable,
+        WithholdReason::HoldingScopePublicGroup,
+        WithholdReason::HoldingScopePeerNotInRoster,
+        WithholdReason::HoldingScopeProjectionUnsupported,
     ];
 }

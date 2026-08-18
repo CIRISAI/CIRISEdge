@@ -67,6 +67,7 @@ use super::diversity::{diversity_contribution, NullRttObserver, PeerRttObserver}
 use super::persist_fountain_evict::{
     FountainEvictError, FountainHoldingsSource, HeldFountainContent,
 };
+use super::scope::{HoldingAnnounce, HoldingsPublishGate};
 use crate::holonomic::fountain_defaults::{recommended_policy, FountainPolicy};
 use crate::holonomic::swarm_rarity::{
     compute_rarity_score, should_eject_with_diversity, ConsentState, EjectionVerdict,
@@ -215,6 +216,15 @@ pub type SwarmRuntimeEventSink = Arc<dyn Fn(SwarmEvent) + Send + Sync>;
 /// - `rtt_observer`: latency source for the diversity-aware ejection
 ///   policy. `None` defaults to [`NullRttObserver`] — diversity
 ///   gating then degrades to rarity-only (the substrate verdict).
+/// - `scope_table` (CIRISEdge#499): the node's scope-address table. Its
+///   presence is the ARMING condition for the holdings scope gate — see
+///   [`super::scope`]. `None` (every deployment until the MLS exporter
+///   label is specified upstream) means the publisher broadcasts exactly
+///   as it did pre-#499.
+/// - `metrics` (CIRISEdge#433): the withhold-ledger handle. `None` means
+///   withholds are logged but not counted; production threads `Edge`'s
+///   handle, mirroring
+///   `FederationDirectoryReplicationBridge::with_metrics`.
 ///
 /// All optionals MAY be `None`; the runtime stays operational on every
 /// combination of present/absent fields. New optionals land here
@@ -227,6 +237,13 @@ pub struct SwarmRuntimeOptions {
     /// Per-peer RTT source for the diversity-aware ejection policy.
     /// `None` defaults to [`NullRttObserver`] (rarity-only fallback).
     pub rtt_observer: Option<Arc<dyn PeerRttObserver>>,
+    /// CIRISEdge#499 — the scope-address table. `Some` ARMS the holdings
+    /// scope gate: a held content's declared scope then decides which
+    /// peers are told the holding exists. `None` is pre-#499 behaviour.
+    pub scope_table: Option<Arc<crate::scope_addressing::ScopeAddressTable>>,
+    /// CIRISEdge#433 — withhold-ledger handle. Every holding withheld from
+    /// a peer is booked here with its named reason.
+    pub metrics: Option<crate::observability::EdgeMetrics>,
 }
 
 impl std::fmt::Debug for SwarmRuntimeOptions {
@@ -234,6 +251,8 @@ impl std::fmt::Debug for SwarmRuntimeOptions {
         f.debug_struct("SwarmRuntimeOptions")
             .field("signer_present", &self.signer.is_some())
             .field("rtt_observer_present", &self.rtt_observer.is_some())
+            .field("scope_native", &self.scope_table.is_some())
+            .field("metrics_present", &self.metrics.is_some())
             .finish()
     }
 }
@@ -401,6 +420,14 @@ impl FountainSwarmRuntime {
             .clone()
             .unwrap_or_else(|| Arc::new(NullRttObserver));
 
+        // CIRISEdge#499 — the publish-side scope gate. Built ONCE at start
+        // (it holds only an `Option<Arc<ScopeAddressTable>>` + the metrics
+        // handle, both cheap clones), but every DECISION it makes is
+        // resolved per record on the tick — the table is read live, never
+        // snapshotted, so a rotation seal takes effect on the next tick.
+        let publish_gate =
+            HoldingsPublishGate::new(options.scope_table.clone(), options.metrics.clone());
+
         let publisher_task = {
             let holdings = Arc::clone(&holdings);
             let transport = Arc::clone(&transport);
@@ -412,7 +439,15 @@ impl FountainSwarmRuntime {
             let signer = options.signer.clone();
             tokio::spawn(async move {
                 run_publisher(
-                    holdings, transport, cohort, local_peer, cadence, cancel_rx, sink, signer,
+                    holdings,
+                    transport,
+                    cohort,
+                    local_peer,
+                    cadence,
+                    cancel_rx,
+                    sink,
+                    signer,
+                    publish_gate,
                 )
                 .await;
             })
@@ -489,6 +524,7 @@ async fn run_publisher(
     mut cancel_rx: watch::Receiver<bool>,
     sink: Option<SwarmRuntimeEventSink>,
     signer: Option<Arc<LocalSigner>>,
+    publish_gate: HoldingsPublishGate,
 ) {
     let mut ticker = tokio::time::interval(cadence);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -508,6 +544,7 @@ async fn run_publisher(
                     &local_peer_id,
                     sink.as_ref(),
                     signer.as_ref(),
+                    &publish_gate,
                 )
                 .await
                 {
@@ -518,6 +555,7 @@ async fn run_publisher(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_tick(
     holdings: &Arc<dyn FountainHoldingsSource>,
     transport: &Arc<dyn Transport>,
@@ -525,6 +563,7 @@ async fn publish_tick(
     local_peer_id: &str,
     sink: Option<&SwarmRuntimeEventSink>,
     signer: Option<&Arc<LocalSigner>>,
+    publish_gate: &HoldingsPublishGate,
 ) -> Result<usize, FountainEvictError> {
     let held = holdings.list_held_fountain_content().await?;
     let peers = cohort();
@@ -537,11 +576,29 @@ async fn publish_tick(
             content.symbol_ids.clone(),
             observed_at_unix_ms,
         );
+        // CIRISEdge#499 — the record's REAL scope, read per record on this
+        // tick from the host's declaration. Never cached across ticks and
+        // never inferred: a `None` here is *unknown*, and on a scope-native
+        // node unknown is withheld, not published (see `super::scope`).
+        // Synchronous, so no guard can outlive it into the `.await`s below
+        // (CIRISEdge#217).
+        let content_scope = holdings.content_scope(&content.content_id);
         for peer in &peers {
             // Skip self — the cohort callback typically already
             // excludes the local peer, but defense in depth.
             if peer == local_peer_id {
                 continue;
+            }
+            // CIRISEdge#499 — the entitlement filter this path never had.
+            // A holdings claim discloses `content_id` AND `symbol_ids`;
+            // announcing a family- or community-scoped holding to a peer
+            // outside its roster is a contextual-integrity violation even
+            // though no content bytes move. `admit_and_book` BOOKS the
+            // withhold (#433 ledger) and logs it before returning, so this
+            // is never a bare `continue`.
+            match publish_gate.admit_and_book(&content.content_id, content_scope.as_ref(), peer) {
+                HoldingAnnounce::Announce => {}
+                HoldingAnnounce::Withhold(_) => continue,
             }
             // v6.3.0 (CIRISEdge#184): when a signer is wired, ship a
             // signed `MessageType::FountainHoldingClaim` EdgeEnvelope.
@@ -1225,5 +1282,257 @@ mod tests {
         let all = claims.all_claims_for("c");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].symbol_ids, vec![1, 2]);
+    }
+
+    // ─── CIRISEdge#499 — the publisher's entitlement filter ───────────
+    //
+    // These drive the REAL publisher loop (not the pure gate — that is
+    // pinned in `super::super::scope::tests`), because the defect was in
+    // the loop: it broadcast every held content_id AND its symbol_ids to
+    // every peer the cohort callback returned. A green gate with an
+    // unwired loop would be exactly the "test the convenient input, not
+    // the field's input" failure this repo has hit twice.
+
+    use crate::blob_swarm::ContentScope;
+    use crate::cohort_scope::CohortScope;
+    use crate::observability::{EdgeMetrics, WithholdReason};
+    use crate::scope_addressing::{ScopeAddressTable, StubDeriver};
+
+    const INSIDER: &str = "ed25519:bob";
+    const OUTSIDER: &str = "ed25519:mallory";
+
+    /// Holdings whose scope is declared by the HOST — the production
+    /// shape. Contents not named in `scopes` report `None`
+    /// (undeterminable), which is how an unwired consumer behaves.
+    struct ScopedHoldings {
+        held: Vec<HeldFountainContent>,
+        scopes: BTreeMap<String, ContentScope>,
+    }
+    #[async_trait]
+    impl FountainHoldingsSource for ScopedHoldings {
+        async fn list_held_fountain_content(
+            &self,
+        ) -> Result<Vec<HeldFountainContent>, FountainEvictError> {
+            Ok(self.held.clone())
+        }
+        fn content_scope(&self, content_id: &str) -> Option<ContentScope> {
+            self.scopes.get(content_id).cloned()
+        }
+    }
+
+    fn held(content_id: &str, symbol_ids: Vec<u32>) -> HeldFountainContent {
+        HeldFountainContent {
+            content_id: content_id.into(),
+            corpus_kind: "fountain-corpus".into(),
+            symbol_ids,
+        }
+    }
+
+    /// A table with ONE family group `fam-1` whose only member is
+    /// `INSIDER`. `OUTSIDER` is reachable on the federation address and
+    /// belongs to no scope group — the peer the leak used to reach.
+    fn family_table() -> Arc<ScopeAddressTable> {
+        let t = ScopeAddressTable::new(Arc::new(StubDeriver));
+        t.install_group(&CohortScope::Family, "fam-1", 1, &[0xA1; 32], &[INSIDER])
+            .expect("family install");
+        Arc::new(t)
+    }
+
+    /// Did `peer` receive an announcement naming `content_id`? The
+    /// holding claim's signing preimage carries the content_id verbatim
+    /// (`u64-lp(content_id)`), so a byte-window search over what the
+    /// transport actually shipped is the field's own evidence — no
+    /// re-derivation of what we THINK was sent.
+    fn announced(sends: &[(String, Vec<u8>)], peer: &str, content_id: &str) -> bool {
+        let needle = content_id.as_bytes();
+        sends
+            .iter()
+            .any(|(dest, bytes)| dest == peer && bytes.windows(needle.len()).any(|w| w == needle))
+    }
+
+    /// Run the publisher for a few ticks and return what the transport
+    /// was actually asked to send.
+    async fn drive_publisher(
+        holdings: Arc<dyn FountainHoldingsSource>,
+        peers: Vec<String>,
+        options: SwarmRuntimeOptions,
+    ) -> Vec<(String, Vec<u8>)> {
+        let recording_tx = Arc::new(RecordingTransport::default());
+        let tx: Arc<dyn Transport> = recording_tx.clone();
+        let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || peers.clone());
+        let mut rt = FountainSwarmRuntime::start_with_options(
+            fast_config(),
+            holdings,
+            test_directory(),
+            tx,
+            cohort,
+            "alice".to_string(),
+            None,
+            options,
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        rt.shutdown().await;
+        let sends = recording_tx.sends.lock().unwrap().clone();
+        sends
+    }
+
+    /// **THE test.** A family-scoped holding is NOT announced to a peer
+    /// outside the family, and a federation-scoped holding IS announced
+    /// to that SAME peer on the SAME tick — so this cannot pass by
+    /// broadcasting nothing. The family member still gets both, so it
+    /// cannot pass by breaking the family plane either.
+    #[tokio::test]
+    async fn family_holding_is_not_announced_outside_the_cohort_but_federation_still_is() {
+        let holdings: Arc<dyn FountainHoldingsSource> = Arc::new(ScopedHoldings {
+            held: vec![held("c-family", vec![1, 2]), held("c-federation", vec![9])],
+            scopes: BTreeMap::from([
+                (
+                    "c-family".to_string(),
+                    ContentScope::Group {
+                        scope: CohortScope::Family,
+                        group_id: "fam-1".to_string(),
+                    },
+                ),
+                ("c-federation".to_string(), ContentScope::Federation),
+            ]),
+        });
+        let metrics = EdgeMetrics::default();
+        let sends = drive_publisher(
+            holdings,
+            vec![INSIDER.to_string(), OUTSIDER.to_string()],
+            SwarmRuntimeOptions {
+                scope_table: Some(family_table()),
+                metrics: Some(metrics.clone()),
+                ..SwarmRuntimeOptions::default()
+            },
+        )
+        .await;
+
+        assert!(
+            !announced(&sends, OUTSIDER, "c-family"),
+            "a family-scoped holding leaked to a peer outside the family",
+        );
+        assert!(
+            announced(&sends, OUTSIDER, "c-federation"),
+            "the federation-scoped holding must STILL reach that peer — a suite \
+             that passes by broadcasting nothing proves nothing",
+        );
+        assert!(
+            announced(&sends, INSIDER, "c-family"),
+            "the family MEMBER must still be told; withholding from everyone is \
+             not the fix",
+        );
+        assert!(announced(&sends, INSIDER, "c-federation"));
+        assert!(
+            metrics.withholds(WithholdReason::HoldingScopePeerNotInRoster) > 0,
+            "the withhold must be BOOKED, not a bare continue",
+        );
+    }
+
+    /// Unknown scope on a scope-native node is not announced to anyone,
+    /// and the refusal carries its own named reason — never folded into
+    /// the roster branch, and never read as "public".
+    #[tokio::test]
+    async fn unknown_scope_is_not_announced_and_books_its_own_reason() {
+        // No entry in `scopes` ⇒ `content_scope` returns None.
+        let holdings: Arc<dyn FountainHoldingsSource> = Arc::new(ScopedHoldings {
+            held: vec![held("c-unclassified", vec![4])],
+            scopes: BTreeMap::new(),
+        });
+        let metrics = EdgeMetrics::default();
+        let sends = drive_publisher(
+            holdings,
+            vec![INSIDER.to_string(), OUTSIDER.to_string()],
+            SwarmRuntimeOptions {
+                scope_table: Some(family_table()),
+                metrics: Some(metrics.clone()),
+                ..SwarmRuntimeOptions::default()
+            },
+        )
+        .await;
+
+        assert!(
+            sends.is_empty(),
+            "an undeterminable scope must not be announced to anyone, got {} sends",
+            sends.len(),
+        );
+        assert!(
+            metrics.withholds(WithholdReason::HoldingScopeUndeterminable) > 0,
+            "the undeterminable branch must book ITS OWN reason",
+        );
+        assert_eq!(
+            metrics.withholds(WithholdReason::HoldingScopePeerNotInRoster),
+            0,
+            "'I cannot tell what this is' must never be reported as \
+             'you are not on its roster' (CIRISEdge#433)",
+        );
+        let snap = metrics.snapshot();
+        assert!(snap
+            .recent_withholds
+            .iter()
+            .any(|w| w.detail.starts_with("fountain:c-unclassified")));
+    }
+
+    /// **The no-regression case.** A deployment with NO scope information
+    /// — no address table, no `content_scope` override — announces every
+    /// held content to every peer, exactly as it did pre-#499. This is
+    /// what makes the cut safe to ship inert.
+    #[tokio::test]
+    async fn a_deployment_with_no_scope_information_broadcasts_exactly_as_before() {
+        // `VecHoldings` does NOT override `content_scope`, so every
+        // content reports `None` — the pre-#499 consumer, verbatim.
+        let holdings: Arc<dyn FountainHoldingsSource> = Arc::new(VecHoldings(vec![
+            held("c-x", vec![1, 2, 3]),
+            held("c-y", vec![10, 20]),
+        ]));
+        let metrics = EdgeMetrics::default();
+        let sends = drive_publisher(
+            holdings,
+            vec![INSIDER.to_string(), OUTSIDER.to_string()],
+            SwarmRuntimeOptions {
+                // No table ⇒ the gate is not armed.
+                scope_table: None,
+                metrics: Some(metrics.clone()),
+                ..SwarmRuntimeOptions::default()
+            },
+        )
+        .await;
+
+        for peer in [INSIDER, OUTSIDER] {
+            for cid in ["c-x", "c-y"] {
+                assert!(
+                    announced(&sends, peer, cid),
+                    "unarmed deployment must announce {cid} to {peer} exactly as before",
+                );
+            }
+        }
+        assert!(
+            metrics.snapshot().withholds_by_reason.is_empty(),
+            "an unarmed deployment withholds nothing and books nothing",
+        );
+    }
+
+    /// The armed-but-unwired ordering fact, stated as a test so nobody
+    /// discovers it in production: installing an address table WITHOUT
+    /// overriding `content_scope` fails the holdings plane closed. That
+    /// is the correct order of operations (declare scopes, then derive
+    /// addresses), and it is loud — every refusal is booked.
+    #[tokio::test]
+    async fn arming_without_declaring_scopes_fails_closed_and_loud() {
+        let holdings: Arc<dyn FountainHoldingsSource> =
+            Arc::new(VecHoldings(vec![held("c-x", vec![1])]));
+        let metrics = EdgeMetrics::default();
+        let sends = drive_publisher(
+            holdings,
+            vec![OUTSIDER.to_string()],
+            SwarmRuntimeOptions {
+                scope_table: Some(family_table()),
+                metrics: Some(metrics.clone()),
+                ..SwarmRuntimeOptions::default()
+            },
+        )
+        .await;
+        assert!(sends.is_empty());
+        assert!(metrics.withholds(WithholdReason::HoldingScopeUndeterminable) > 0);
     }
 }

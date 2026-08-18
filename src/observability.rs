@@ -407,6 +407,36 @@ pub enum WithholdReason {
     /// folding this into [`Self::BlobArrivalScopeInsufficient`] would report a
     /// cross-group access attempt as an ordinary scope mismatch.
     BlobArrivalGroupMismatch,
+    /// CIRISEdge#499 (swarm holdings plane) — the publisher could not determine
+    /// a held content's SCOPE on a scope-native node, so it cannot know which
+    /// peers are entitled to learn the holding exists. Fail-closed, and its own
+    /// branch: "I do not know what this content is" is a wiring fact
+    /// ([`FountainHoldingsSource::content_scope`](crate::swarm::FountainHoldingsSource::content_scope)
+    /// unwired or returning `None`) with an operator remedy, not a statement
+    /// about any peer.
+    HoldingScopeUndeterminable,
+    /// CIRISEdge#499 (swarm holdings plane) — the host declared a scope GROUP at
+    /// `Public` cohort scope. A private roster paired with a public audience is a
+    /// contradiction, not a configuration, and is refused before any roster
+    /// lookup — never folded into [`Self::HoldingScopePeerNotInRoster`], which
+    /// would send an operator to edit a membership list instead of the
+    /// declaration.
+    HoldingScopePublicGroup,
+    /// CIRISEdge#499 (swarm holdings plane) — persist's
+    /// `projection_for(Plane::FountainContent, …)` bound this holding's audience
+    /// to the record's OWN roster (`Cohort` over a named group, or the
+    /// structurally-invisible `SelfOwn`) and the peer holds no derived address in
+    /// that group at any live epoch. **The leak this cut closes**: before it, a
+    /// family- or community-scoped holding — content id AND symbol ids — was
+    /// announced on a timer to every peer the cohort callback returned.
+    HoldingScopePeerNotInRoster,
+    /// CIRISEdge#499 (swarm holdings plane) — the projection named an audience
+    /// KIND the publisher has no peer-set mechanism for on this plane
+    /// (`Capability` / `Subject`, which `Plane::FountainContent` has no cell for
+    /// today). Structurally unreachable against persist v37's table and booked
+    /// fail-closed anyway, so a future persist widening surfaces as a NAMED
+    /// withhold rather than as an allow.
+    HoldingScopeProjectionUnsupported,
 }
 
 impl WithholdReason {
@@ -441,6 +471,10 @@ impl WithholdReason {
             Self::BlobScopeUndeterminable => "blob_scope_undeterminable",
             Self::BlobArrivalScopeInsufficient => "blob_arrival_scope_insufficient",
             Self::BlobArrivalGroupMismatch => "blob_arrival_group_mismatch",
+            Self::HoldingScopeUndeterminable => "holding_scope_undeterminable",
+            Self::HoldingScopePublicGroup => "holding_scope_public_group",
+            Self::HoldingScopePeerNotInRoster => "holding_scope_peer_not_in_roster",
+            Self::HoldingScopeProjectionUnsupported => "holding_scope_projection_unsupported",
         }
     }
 }
