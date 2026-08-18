@@ -144,7 +144,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ciris_persist::federation::admission::check_row_column_binding;
-use ciris_persist::federation::namespace::{attestation_family, AttestationFamily};
 use ciris_persist::federation::trust_root::{
     accord_root_claim, may_relay_accord_attestation, may_relay_accord_participation,
     AccordRootClaim, RelayVerdict,
@@ -616,9 +615,17 @@ impl AccordRelayGate {
     /// decided family is additive policy rather than a build break — and
     /// `objection:*`, the reserved-prefix sibling, is deliberately NOT in this
     /// family (CIRISPersist#713).
+    ///
+    /// **Reads [`crate::family_gates::gates_for`], not a local `matches!`.**
+    /// That is the whole point of the fold: an inline
+    /// `matches!(.., Accord)` returns `false` for a family this build
+    /// predates, which SKIPS the relay gate and CARRIES the row — permissive
+    /// on exactly the case `#[non_exhaustive]` exists to warn about.
+    /// `gates_for`'s wildcard is maximally gated instead, so an unknown
+    /// family is withheld and says so.
     #[must_use]
     pub fn dimension_is_gated(dimension: &str) -> bool {
-        matches!(attestation_family(dimension), AttestationFamily::Accord)
+        crate::family_gates::gates_for(dimension).accord_relay_gated
     }
 
     /// **The PURE SYNC predicate** — the gate itself. No I/O, no `.await`, no

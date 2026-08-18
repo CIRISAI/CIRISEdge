@@ -57,6 +57,41 @@
 //! unrecoverable one: rows that should not have been carried already
 //! were. Given the two, edge takes the loud one.
 //!
+//! # What this changes today: NOTHING. The protection is latent.
+//!
+//! Stated plainly because the first version of this module claimed
+//! otherwise. Every `AttestationFamily` variant that exists at this pin
+//! is named in [`gates_for`] — including `Unknown`, which persist
+//! returns for any dimension with no family and which is emphatically
+//! NOT the unknown-family case. So no constructible input reaches the
+//! wildcard, and `gates_for` is **behaviourally identical** to the two
+//! inline `matches!` expressions it replaced.
+//!
+//! The value is entirely in the future: when persist decides family
+//! number ten, an inline `matches!` silently returns `false` and routes
+//! it ungated, while this fold routes it through the wildcard and
+//! withholds it loudly. Wiring it now is what puts the protection in
+//! the path *before* it is needed, not a behaviour change.
+//!
+//! **The wildcard arm therefore has no test, and cannot have one.** No
+//! constructible input reaches it, and asserting on
+//! `FamilyGates::MAXIMAL_UNKNOWN` directly is a compile-time constant
+//! that proves nothing at run time — clippy says so, and it is right.
+//! A test asserting a constant would manufacture the appearance of
+//! coverage over the one arm that has none, which is worse than the
+//! honest gap. The arm is held by review and by this paragraph.
+//!
+//! Two corrections are baked into that paragraph, both found by wiring
+//! this module rather than by testing it:
+//!
+//! - It sat with **zero callers** while its own docs and commit message
+//!   said it had replaced the inline checks. Mutation-verified tests on
+//!   a unit nothing calls is a green board over a dead protection.
+//! - It conflated `Unknown` with unknown-family, which maximally gated
+//!   `trust:*` and every other unclassified dimension. That reddened 13
+//!   unrelated tests the moment it was wired — and would have withheld
+//!   most of the corpus had it shipped inert-but-wired.
+//!
 //! This module holds **no projection rules**. Which cohort tiers a
 //! family reaches is persist's (`projection_for`, CIRISPersist#713),
 //! and edge reads it per-row with the row's real dimension, so routing
@@ -117,6 +152,13 @@ impl FamilyGates {
 /// any other, and anything this build does not know reaches the
 /// wildcard and is maximally gated.
 #[must_use]
+// The arms are grouped by MEANING, not by value. `Unknown` shares
+// `FamilyGates::NONE` with the plain families, but the two say different
+// things — "persist maps this to no family" versus "a decided family with no
+// edge-side gate" — and the comments on each are the record of a bug that
+// came from conflating exactly those. Merging them to satisfy the lint would
+// delete that distinction, which is the one this module got wrong once.
+#[allow(clippy::match_same_arms)]
 pub fn gates_for(dimension: &str) -> FamilyGates {
     match attestation_family(dimension) {
         // The E3 capability gate. `trace:*` is the one family whose
@@ -140,10 +182,32 @@ pub fn gates_for(dimension: &str) -> FamilyGates {
         | AttestationFamily::Scores
         | AttestationFamily::Capacity
         | AttestationFamily::ContentClass
-        | AttestationFamily::SubstrateHealth => FamilyGates::NONE,
-        // FORCED by `#[non_exhaustive]`, and deliberately the
-        // restrictive arm. See the module docs: over-gating is visible
-        // and reversible, under-gating is neither.
+        | AttestationFamily::SubstrateHealth
+        | AttestationFamily::Moderation
+        | AttestationFamily::ProvenanceBuildManifest => FamilyGates::NONE,
+
+        // `Unknown` is NOT the unknown-family case, and conflating the two
+        // was a real bug in this module — invisible for as long as it had no
+        // callers, and it maximally-gated 13 test paths the moment it was
+        // wired.
+        //
+        // Persist returns `Unknown` for any dimension its registry maps to no
+        // family at all: `trust:*`, `objection:*`, and every ordinary
+        // dimension outside the nine decided families. Those are not
+        // mysteries — they are simply not family-gated, and gating them would
+        // withhold most of the corpus.
+        //
+        // The case this module exists for is a variant added by a persist
+        // NEWER than this build, which `#[non_exhaustive]` makes reachable
+        // and which no name here can match. That is the wildcard below, and
+        // separating it from `Unknown` is what makes the wildcard mean what
+        // its doc says.
+        AttestationFamily::Unknown => FamilyGates::NONE,
+        // FORCED by `#[non_exhaustive]`, and now genuinely reserved for a
+        // family decided by a persist newer than this build — every family
+        // this build knows about, INCLUDING `Unknown`, is named above.
+        // Deliberately the restrictive arm: over-gating is visible and
+        // reversible, under-gating is neither.
         _ => FamilyGates::MAXIMAL_UNKNOWN,
     }
 }
@@ -216,40 +280,91 @@ mod tests {
         }
     }
 
+    /// The test that would have caught this module being DEAD CODE.
+    ///
+    /// Every other test here calls `gates_for` directly, so all four stayed
+    /// green — and mutation-verified — while the serve path still used its own
+    /// inline `matches!` and nothing called this module at all. A
+    /// mutation-verified unit with no callers is a green board over a dead
+    /// protection, and it is the exact trap this repo keeps hitting.
+    ///
+    /// So this asserts through the CALL SITES instead: the two public
+    /// predicates the serve path actually consults must agree with
+    /// `gates_for`, including on the unknown case. Re-inlining a `matches!`
+    /// at either site reds this.
     #[test]
-    fn an_unclassifiable_dimension_is_maximally_gated_not_ungated() {
-        // THE property. A family this build predates, or a malformed
-        // dimension, must end up withheld rather than served. The old
-        // shape — two independent `matches!` at two call sites — gave
-        // the opposite: an unknown family matched NEITHER, so every
-        // family-conditioned gate was skipped and the row went out
-        // ungated.
+    fn the_serve_paths_predicates_read_this_module_and_not_a_local_matches() {
+        use crate::replication::accord_relay_gate::AccordRelayGate;
+
         for dimension in [
+            "accord:human_dignity:v1",
+            "trace:reasoning:v1",
+            "consent:share:v1",
+            "trust:example:v1",
+            "objection:halt:v1",
+        ] {
+            let expected = gates_for(dimension);
+            assert_eq!(
+                AccordRelayGate::dimension_is_gated(dimension),
+                expected.accord_relay_gated,
+                "the relay gate's pre-filter must read gates_for for {dimension:?} \
+                 — an inline matches! returns false on an unknown family and CARRIES it",
+            );
+        }
+
+        // HONEST LIMIT: with `Unknown` correctly mapped to NONE, `gates_for`
+        // and the inline `matches!` it replaced are behaviourally IDENTICAL
+        // at this pin — every existing variant is named, so they cannot
+        // disagree on any constructible input. This test therefore guards the
+        // WIRING (that the serve path reads one shared fold) and cannot, by
+        // construction, detect a re-inline by behaviour alone. The protection
+        // is latent: it bites when persist adds a family, not today.
+    }
+
+    #[test]
+    fn a_dimension_with_no_family_is_not_family_gated() {
+        // REGRESSION TEST for a real bug in this module, which was invisible
+        // for as long as it had no callers.
+        //
+        // Persist returns `AttestationFamily::Unknown` for any dimension its
+        // registry maps to no family — `trust:*`, `objection:*`, and most of
+        // the corpus. The first version of `gates_for` let `Unknown` fall to
+        // the wildcard and be MAXIMALLY gated, conflating "no family" with
+        // "a family I have never heard of". Wiring the module turned 13
+        // unrelated tests red, which is what surfaced it.
+        //
+        // Those dimensions are not mysteries. They are simply not
+        // family-gated, and gating them would withhold most of what this node
+        // carries.
+        for dimension in [
+            "trust:example:v1",
+            "objection:halt:v1",
             "",
             "not-a-namespace",
-            "someday:persist:decides:this:v1",
-            "accordion:not:accord:v1",
         ] {
             let gates = gates_for(dimension);
+            assert!(
+                !gates.unknown_family,
+                "{dimension:?} classifies as Unknown, which is a KNOWN answer",
+            );
             assert_eq!(
                 gates,
-                FamilyGates::MAXIMAL_UNKNOWN,
-                "{dimension:?} must be maximally gated, not silently ungated",
+                FamilyGates::NONE,
+                "{dimension:?} has no family, so no family-conditioned gate applies",
             );
-            assert!(gates.unknown_family, "and must SAY it could not classify");
         }
     }
 
     #[test]
     fn a_near_miss_prefix_does_not_inherit_a_families_gates() {
         // `accordion:` starts with `accord` as a string but is not the
-        // `accord:` family. Edge must not hand-roll prefix matching —
-        // this pins that `gates_for` goes through persist's classifier,
-        // where the stem boundary is defined.
-        assert!(gates_for("accordion:not:accord:v1").unknown_family);
+        // `accord:` family. Pins that `gates_for` goes through persist's
+        // classifier, where the stem boundary is defined, rather than
+        // hand-rolling a prefix match.
         assert_ne!(
             gates_for("accordion:not:accord:v1"),
             gates_for("accord:human_dignity:v1"),
         );
+        assert!(!gates_for("accordion:not:accord:v1").accord_relay_gated);
     }
 }

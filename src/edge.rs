@@ -3290,7 +3290,11 @@ impl Edge {
         };
         #[cfg(not(feature = "_reticulum-module"))]
         let sent = {
-            let _ = &envelope_bytes;
+            // `address` is only dialled on the Reticulum arm; bind it here so
+            // the reticulum-free build does not warn on it. Deliberately NOT
+            // renamed to `_address` at the binding: the name documents what
+            // the resolved value IS on the arm that uses it.
+            let _ = (&envelope_bytes, address);
             Err::<(), EdgeError>(EdgeError::Config(format!(
                 "scope-native blob fetch: holder '{}' resolved to a scope-derived \
                  address but this build has no Reticulum module — refusing rather \

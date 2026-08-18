@@ -1977,10 +1977,12 @@ impl FederationDirectoryReplicationBridge {
             .pointer("/attestation_envelope/dimension")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        matches!(
-            namespace::attestation_family(dimension),
-            namespace::AttestationFamily::Trace
-        )
+        // Reads `family_gates::gates_for`, not a local `matches!`. An inline
+        // `matches!(.., Trace)` returns `false` for a family this build
+        // predates, which SKIPS the E3 `infra:serve` gate and SERVES the row.
+        // `gates_for`'s wildcard is maximally gated, so an unknown family is
+        // withheld rather than served.
+        crate::family_gates::gates_for(dimension).requires_serve_capability
     }
 
     /// v17.7.0 — the ONE reader of an attestation's `cohort_scope`.
