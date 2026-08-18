@@ -378,6 +378,23 @@ pub struct FederationDirectoryReplicationBridge {
     /// `None` — every test construction and any host without a `local_key_id` —
     /// is byte-identical pre-#440 behavior (relief, not a gate).
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
+    /// Workstream F — the `accord:*` RELAY predicate
+    /// ([`AccordRelayGate`](crate::replication::accord_relay_gate::AccordRelayGate),
+    /// persist v36.2.0 `may_relay_accord_object`). `accord:*` projects `Global`
+    /// — correct for CARRIAGE, since a partial quorum object must be holdable
+    /// across a cohort span nobody knows at emit time — but Global is wrong as
+    /// REACH: CC 4.2.1 says a node that never trusted the accord *"is simply not
+    /// reached"*. This gate is what narrows carriage back to that set.
+    ///
+    /// `Some` ENFORCES, fail-closed, on the advertise sweep and its direct-fetch
+    /// twin. `None` leaves `accord:*` carriage exactly as it was before this
+    /// workstream (the projection row alone) — the gate needs the accord ROOT,
+    /// which is an instance parameter the host supplies, so installing it is a
+    /// deliberate fleet-floor wiring event (the AV-42
+    /// `RequireTransportBinding` shape), not something a bridge can default
+    /// itself into. That absence is a WIRING state, visible at construction;
+    /// every per-object decision the installed gate makes is fail-closed.
+    accord_relay_gate: Option<Arc<crate::replication::accord_relay_gate::AccordRelayGate>>,
 }
 
 /// CIRISEdge#430 — the revoked-key listener installed via
@@ -416,6 +433,7 @@ impl FederationDirectoryReplicationBridge {
             metrics: None,
             revocation_observer: None,
             mesh_config: None,
+            accord_relay_gate: None,
         }
     }
 
@@ -452,6 +470,7 @@ impl FederationDirectoryReplicationBridge {
             metrics: None,
             revocation_observer: None,
             mesh_config: None,
+            accord_relay_gate: None,
         }
     }
 
@@ -518,6 +537,148 @@ impl FederationDirectoryReplicationBridge {
     ) -> Self {
         self.mesh_config = reader;
         self
+    }
+
+    /// Workstream F — install the `accord:*` relay gate (builder). See the
+    /// [`Self::accord_relay_gate`] field doc for why it is an `Option` and why
+    /// installing it is a deliberate wiring event: the gate is anchored at ONE
+    /// accord root, which CC 4.2.3 makes an instance parameter (*"another
+    /// instantiation of this form names its own three"*), and no `accord:*` row
+    /// carries a field naming the root it acts under.
+    #[must_use]
+    pub fn with_accord_relay_gate(
+        mut self,
+        gate: Option<Arc<crate::replication::accord_relay_gate::AccordRelayGate>>,
+    ) -> Self {
+        self.accord_relay_gate = gate;
+        self
+    }
+
+    /// Workstream F — the `attesting_key_id` whose seat the relay predicate
+    /// asks about: the holder that emitted this partial-quorum object. Same
+    /// field the quarantine consult and the first-party carve read as the row's
+    /// AUTHOR, so "who signed it" has one spelling on this path. (The co-scrub
+    /// SET — `scrub_key_id` + `additional_scrubs` — is the quorum surface, and
+    /// arbitrating it is persist's, not a carriage question.)
+    fn attestation_signer(canonical_json: &serde_json::Value) -> Option<&str> {
+        canonical_json
+            .get("attesting_key_id")
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// Workstream F — is this row in the `accord:*` family, i.e. is its
+    /// carriage the relay gate's to decide?
+    ///
+    /// persist's own classifier, via
+    /// [`AccordRelayGate::dimension_is_gated`](crate::replication::accord_relay_gate::AccordRelayGate::dimension_is_gated)
+    /// — the same `namespace::attestation_family` fold
+    /// [`Self::attestation_requires_serve`] took in v17.7.0, and for the same
+    /// reason: a `dimension.starts_with("accord:")` here would be a second
+    /// owner for one wire fact. `objection:*` is deliberately NOT in this
+    /// family (CIRISPersist#713 — the co-scrub argument covers `accord:` only).
+    fn attestation_is_accord(canonical_json: &serde_json::Value) -> bool {
+        let dimension = canonical_json
+            .pointer("/attestation_envelope/dimension")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        crate::replication::accord_relay_gate::AccordRelayGate::dimension_is_gated(dimension)
+    }
+
+    /// Workstream F — does the relay gate WITHHOLD this row? `false` when no
+    /// gate is installed, when the row is not `accord:*`, or when the gate
+    /// allows.
+    ///
+    /// Shape (the CIRISEdge#430 pattern): resolve ASYNC, cache-first
+    /// (`prime` — a hit is one lock and no directory read, so a round's N
+    /// per-envelope gates share ONE trust walk, which is what keeps the
+    /// CIRISEdge#400 per-envelope-read regression from coming back), then gate
+    /// on the PURE SYNC predicate (`decide`). No lock is held across the await
+    /// and no `tokio::time` is touched — CIRISEdge#217, on a path that can run
+    /// on persist's runtime thread.
+    ///
+    /// Every refusal is LOUD (CIRISEdge#425): its own
+    /// [`crate::observability::WithholdReason`] booked at the DECIDING branch
+    /// — cannot-judge, not-seated, no-edge and unresolved are four different
+    /// operator findings and are never folded — plus the throttled serve-gate
+    /// WARN, on the same throttle every other withheld plane uses. Never a
+    /// silent `continue`.
+    async fn accord_relay_withholds(
+        &self,
+        canonical_json: &serde_json::Value,
+        peer_label: &str,
+        site: &str,
+    ) -> bool {
+        use crate::observability::WithholdReason;
+        use crate::replication::accord_relay_gate::RelayRefusal;
+        let Some(gate) = self.accord_relay_gate.as_ref() else {
+            return false;
+        };
+        if !Self::attestation_is_accord(canonical_json) {
+            return false;
+        }
+        // A row with no author cannot be judged and is not carried: the
+        // predicate's first argument does not exist.
+        let Some(signer) = Self::attestation_signer(canonical_json) else {
+            self.withhold(
+                WithholdReason::AccordRelayUnresolved,
+                peer_label,
+                "accord row has no attesting_key_id",
+            );
+            return true;
+        };
+        let now = std::time::Instant::now();
+        let Some(refusal) = gate.may_relay(signer, now).await.refusal() else {
+            return false;
+        };
+        let reason = match refusal {
+            RelayRefusal::RosterUnresolvable => WithholdReason::AccordRelayRosterUnresolvable,
+            RelayRefusal::SignerNotSeated => WithholdReason::AccordRelaySignerNotSeated,
+            RelayRefusal::NoTrustEdge => WithholdReason::AccordRelayNoTrustEdge,
+            // A wiring fault shares the ONE condition + ONE remedy the
+            // established `LocalIdentityMissing` variant names (wire
+            // `ReplicationRuntimeConfig::local_key_id`); the `detail` names
+            // this site.
+            RelayRefusal::NoLocalIdentity => WithholdReason::LocalIdentityMissing,
+            RelayRefusal::Unresolved => WithholdReason::AccordRelayUnresolved,
+        };
+        self.withhold(reason, peer_label, refusal.as_str());
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            serve_gate_withheld_log().check(&format!("accord-relay:{peer_label}:{refusal}:{site}"))
+        {
+            tracing::warn!(
+                peer = peer_label,
+                signer,
+                root = gate.root_ref(),
+                refusal = %refusal,
+                site,
+                suppressed_prev,
+                "accord:* row WITHHELD by the relay gate — this node may not carry it \
+                 (CC 4.2.1 reach is consent-scoped; `roster_unresolvable` means I CANNOT \
+                 JUDGE, which is not `signer_not_seated`, and `unresolved` means the \
+                 verdict was never resolved rather than refused on its merits)"
+            );
+        }
+        true
+    }
+
+    /// Workstream F — drop cached relay verdicts an ADMITTED apply could have
+    /// falsified. The event-driven half of the gate's freshness contract
+    /// (CIRISEdge#430's shape): an in-band roster change, seat revocation, or
+    /// trust-edge tombstone must take effect before [`RELAY_VERDICT_TTL`](crate::replication::accord_relay_gate::RELAY_VERDICT_TTL)
+    /// would expire; the TTL is the backstop if an event is ever missed.
+    ///
+    /// Deliberately over-broad on the key: any id the applied record NAMES
+    /// drops that id's verdict, and an id equal to the gate's root drops every
+    /// verdict (both of persist's legs are root-relative). Choosing invalidation
+    /// keys is a cache concern, never a trust rule — over-eager costs a
+    /// re-resolve, too-narrow caches a verdict past the event that falsified it.
+    fn invalidate_accord_relay(&self, key_ids: &[&str]) {
+        let Some(gate) = self.accord_relay_gate.as_ref() else {
+            return;
+        };
+        for k in key_ids {
+            gate.invalidate(k);
+        }
     }
 
     /// CIRISEdge#440 — the since-page limit this sweep runs under:
@@ -807,6 +968,16 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 }
                 if self
                     .author_quarantine_withholds(inner, &mut HashMap::new(), peer_label)
+                    .await
+                {
+                    return None;
+                }
+                // Workstream F — the direct-fetch twin of the advertise sweep's
+                // relay gate, so a peer cannot obtain an `accord:*` row this
+                // node may not CARRY by Diff/Fetch-ing a hash it learned
+                // out-of-band (the twin discipline #379/#396/#440 established).
+                if self
+                    .accord_relay_withholds(inner, peer_label, "fetch")
                     .await
                 {
                     return None;
@@ -1156,8 +1327,21 @@ impl FederationDirectoryReplicationBridge {
             }
         }
         // A quarantined author's row is withheld on every path.
-        !self
+        if self
             .author_quarantine_withholds(&value, &mut HashMap::new(), requester)
+            .await
+        {
+            return false;
+        }
+        // Workstream F — CARRIAGE is peer-independent, so the relay gate applies
+        // to the subject-Pull LIST too. Without it, a Pull would DISCLOSE an
+        // `accord:*` ref that `fetch_envelope_bytes_for_peer` then refuses —
+        // the advertised-then-unfetchable (#429) shape this whole function
+        // exists to prevent. (Unlike the #396 consent bound, there is no
+        // first-party carve here: a first-party fetch still moves the accord's
+        // bytes off this node, which is exactly what CC 4.2.1 scopes.)
+        !self
+            .accord_relay_withholds(&value, requester, "subject-pull")
             .await
     }
 
@@ -1237,10 +1421,14 @@ impl FederationDirectoryReplicationBridge {
                 // once per admitted revocation, a rare event. TTLs remain the
                 // backstop when no observer is installed.
                 if outcome.is_admitted() {
-                    if let Some(observer) = &self.revocation_observer {
-                        if let Ok(r) = serde_json::from_slice::<SignedRevocation>(envelope_bytes) {
+                    if let Ok(r) = serde_json::from_slice::<SignedRevocation>(envelope_bytes) {
+                        if let Some(observer) = &self.revocation_observer {
                             observer(&r.revocation.revoked_key_id);
                         }
+                        // Workstream F — a revoked key can be a seated accord
+                        // holder or the root itself; either way its cached
+                        // relay verdict is now false.
+                        self.invalidate_accord_relay(&[&r.revocation.revoked_key_id]);
                     }
                 }
                 outcome
@@ -1248,7 +1436,19 @@ impl FederationDirectoryReplicationBridge {
             EnvelopeKind::IdentityOccurrence => {
                 self.apply_identity_occurrence(envelope_bytes).await
             }
-            EnvelopeKind::Family => self.apply_family(envelope_bytes).await,
+            EnvelopeKind::Family => {
+                let outcome = self.apply_family(envelope_bytes).await;
+                // Workstream F — a family record IS the accord roster
+                // (`active_roster_of` reads exactly this row's members), so an
+                // admitted one moves the `signer_seated` leg for every signer
+                // under that root. Re-parsed only when a gate is installed.
+                if outcome.is_admitted() && self.accord_relay_gate.is_some() {
+                    if let Ok(f) = serde_json::from_slice::<SignedFamily>(envelope_bytes) {
+                        self.invalidate_accord_relay(&[&f.family.family_key_id]);
+                    }
+                }
+                outcome
+            }
             EnvelopeKind::Community => self.apply_community(envelope_bytes).await,
             EnvelopeKind::Organization => self.apply_organization(envelope_bytes).await,
             EnvelopeKind::OrgMembership => self.apply_org_membership(envelope_bytes).await,
@@ -1258,8 +1458,23 @@ impl FederationDirectoryReplicationBridge {
                     .await
             }
             EnvelopeKind::FamilyMembershipRevocation => {
-                self.apply_family_membership_revocation(envelope_bytes)
-                    .await
+                let outcome = self
+                    .apply_family_membership_revocation(envelope_bytes)
+                    .await;
+                // Workstream F — a seat removal is the revocation fold
+                // `active_roster_of` applies; a cached `signer_seated: true`
+                // for the removed holder must not outlive it.
+                if outcome.is_admitted() && self.accord_relay_gate.is_some() {
+                    if let Ok(r) =
+                        serde_json::from_slice::<SignedFamilyMembershipRevocation>(envelope_bytes)
+                    {
+                        self.invalidate_accord_relay(&[
+                            &r.family_membership_revocation.family_key_id,
+                            &r.family_membership_revocation.removed_identity_key_id,
+                        ]);
+                    }
+                }
+                outcome
             }
             EnvelopeKind::CommunityMembershipRevocation => {
                 self.apply_community_membership_revocation(envelope_bytes)
@@ -2439,6 +2654,20 @@ impl FederationDirectoryReplicationBridge {
             {
                 continue;
             }
+            // Workstream F — the `accord:*` RELAY gate. `accord:*` projects
+            // `Global`, which is right for carriage (a partial quorum object
+            // must be holdable across a cohort span unknown at emit time) and
+            // wrong as reach: CC 4.2.1 — a node that never trusted the accord
+            // "is simply not reached". Withholding here keeps the advertise and
+            // the direct-fetch twin in AGREEMENT, so a row this node may not
+            // carry is never offered and then refused (the #429
+            // advertised-then-unfetchable shape).
+            if self
+                .accord_relay_withholds(&canonical_json, peer_label, "advertise")
+                .await
+            {
+                continue;
+            }
             // CIRISEdge#379 — RECIPIENT gate (the contextual-integrity
             // Recipient parameter): a `trace:*` scores-attestation is
             // listed for a peer ONLY if that peer's KeyRecord advertises
@@ -2779,8 +3008,25 @@ impl FederationDirectoryReplicationBridge {
                 // `put_attestation` of the same row.
                 let content_hash = content_hash_of(&record.attestation)
                     .map_or_else(String::new, |(h, _)| hex::encode(h));
+                // Workstream F — the ids an ADMITTED attestation could have
+                // moved a relay verdict for: its author (a seat's own row) and
+                // its subject (a `delegates_to` naming the root, or a tombstone
+                // over one). Cloned only when a gate is installed, so the apply
+                // hot path pays nothing otherwise.
+                let relay_invalidation: Option<(String, String)> =
+                    self.accord_relay_gate.as_ref().map(|_| {
+                        (
+                            record.attestation.attesting_key_id.clone(),
+                            record.attestation.attested_key_id.clone(),
+                        )
+                    });
                 match self.directory.put_attestation(record).await {
-                    Ok(()) => ApplyOutcome::Admitted,
+                    Ok(()) => {
+                        if let Some((author, subject)) = relay_invalidation {
+                            self.invalidate_accord_relay(&[&author, &subject]);
+                        }
+                        ApplyOutcome::Admitted
+                    }
                     Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
                         "Attestation",
                         &content_hash,
@@ -7267,6 +7513,406 @@ mod tests {
             snap.withholds_by_reason.is_empty(),
             "a clean serve withholds nothing, got {:?}",
             snap.withholds_by_reason
+        );
+    }
+
+    // ── Workstream F — the `accord:*` relay gate, wired ─────────────────
+
+    /// Seed one ACCORD_HOLDER key: `accord:*` rows require a hardware-attested
+    /// holder as attester (persist v22 / #543 / the FIPS anti-Sybil floor
+    /// #513), so the fixture carries the exact fresh Android/Strongbox blob
+    /// persist's `fresh_accord_holder_evidence` emits (inlined so this does not
+    /// gate on `test-anchor` — same inline the #386 trust-graph test uses).
+    async fn seed_accord_holder_key(backend: &MemoryBackend, key_id: &str) {
+        let mut record = fixture_key_record(key_id, identity_type::ACCORD_HOLDER);
+        record.attestation_evidence = Some(serde_json::json!({
+            "platform_attestation": {
+                "Android": {
+                    "key_attestation_chain": [
+                        [0x30, 0x82, 0x01, 0x00],
+                        [0x30, 0x82, 0x02, 0x00],
+                    ],
+                    "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                    "strongbox_backed": true,
+                }
+            },
+            "nonce_captured_at": Utc::now().to_rfc3339(),
+        }));
+        backend
+            .put_public_key(SignedKeyRecord { record })
+            .await
+            .expect("seed accord-holder key");
+    }
+
+    /// Locate the advertised hash of the `accord:*` row authored by `signer`,
+    /// through the PEER-BLIND view (which the relay gate does not touch), so a
+    /// test can then drive the per-peer advertise + fetch gates at that exact
+    /// hash.
+    async fn locate_accord_hash(
+        bridge: &FederationDirectoryReplicationBridge,
+        signer: &str,
+    ) -> [u8; 32] {
+        for r in bridge.list_envelope_refs(EnvelopeKind::Attestation).await {
+            let bytes = bridge
+                .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                .await
+                .expect("projection-only fetch");
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let inner = v.get("attestation").unwrap_or(&v);
+            if FederationDirectoryReplicationBridge::attestation_is_accord(inner)
+                && FederationDirectoryReplicationBridge::attestation_signer(inner) == Some(signer)
+            {
+                return r.envelope_hash;
+            }
+        }
+        panic!("the seeded accord row by {signer} appears in the local view");
+    }
+
+    /// Workstream F, the whole property in one scenario — and deliberately BOTH
+    /// halves, because a gate only ever seen refusing is indistinguishable from
+    /// a gate that is dead (the #435 / v13.10.0 lesson), while a gate only ever
+    /// seen allowing proves nothing about carriage at all.
+    ///
+    /// One node, one accord root, one peer, and three rows:
+    ///
+    /// | row | expectation |
+    /// |---|---|
+    /// | `accord:*` by a SEATED holder | advertised AND served — persist's `may_relay` holds |
+    /// | `accord:*` by an UNSEATED holder | withheld from BOTH paths, booked `accord_relay_signer_not_seated` |
+    /// | a non-`accord:` row | untouched — this gate narrows exactly one dimension family |
+    ///
+    /// The trust state is seeded the way persist's own
+    /// `exercise_accord_relay_eligibility` seeds it: a KEYLESS family whose
+    /// `family_key_id` IS the accord root (a family cannot sign its own
+    /// declaration, hence `put_family_local`), plus a live
+    /// `delegates_to(local → root)` — the CC 4.2.1 consent edge whose absence
+    /// is the whole reason a bare `Global` projection over-delivers.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one coherent scenario: seed + allow + refuse + untouched
+    async fn accord_row_is_relayed_when_the_gate_allows_and_withheld_when_it_refuses() {
+        use crate::observability::WithholdReason;
+        use crate::replication::accord_relay_gate::AccordRelayGate;
+        use ciris_persist::federation::types::{Family, FamilyMember};
+
+        let local = "this-node";
+        let peer = "peer-consented";
+        let producer = "agent-producer";
+        let root = "humanity-accord-under-test";
+        let seated = "accord-holder-seated";
+        let unseated = "accord-holder-unseated";
+        let cohort = [
+            local.to_string(),
+            peer.to_string(),
+            producer.to_string(),
+            root.to_string(),
+        ];
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+
+        for (k, it) in [
+            (local, identity_type::NODE),
+            (peer, identity_type::AGENT),
+            (producer, identity_type::AGENT),
+            (root, identity_type::NODE),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, it),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_accord_holder_key(&backend, seated).await;
+        seed_accord_holder_key(&backend, unseated).await;
+        seed_consent_membership(&backend, local, peer).await;
+
+        // The accord roster: a keyless family whose id IS the root, seating
+        // exactly one of the two holders.
+        let founded: chrono::DateTime<chrono::Utc> = "2020-01-01T00:00:00Z"
+            .parse()
+            .expect("pinned founding instant");
+        backend
+            .put_family_local(Family {
+                family_key_id: root.to_owned(),
+                family_name: root.to_owned(),
+                members: vec![FamilyMember {
+                    key_id: seated.to_owned(),
+                    joined_at: founded,
+                    role: Some("founder".to_owned()),
+                }],
+                founded_at: founded,
+                consensus_protocol: "quorum:2/3".to_owned(),
+                consensus_protocol_entrenched: true,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .expect("seed the accord family");
+        // CC 4.2.1 — OUR consent edge to the root. Without this leg the gate
+        // refuses even the seated holder, which is exactly the point of it.
+        seed_delegates_to(
+            &backend,
+            local,
+            root,
+            &serde_json::json!(["infra:attest", "infra:serve"]),
+        )
+        .await;
+
+        // The rows: one accord row per holder, plus a non-accord row.
+        seed_accord_lifecycle(&backend, seated, root).await;
+        seed_accord_lifecycle(&backend, unseated, root).await;
+        seed_advertised_attestation(&backend, producer).await;
+
+        let seated_hash = locate_accord_hash(&bridge, seated).await;
+        let unseated_hash = locate_accord_hash(&bridge, unseated).await;
+        let bridge = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_accord_relay_gate(Some(Arc::new(AccordRelayGate::new(
+                backend.clone(),
+                Some(local.to_string()),
+                root,
+            ))));
+
+        let offer = bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+            .await;
+
+        // (A) THE ALLOW — seated signer + our live edge ⇒ the row is carried,
+        // on the advertise AND the direct-fetch path.
+        assert!(
+            offer.iter().any(|r| r.envelope_hash == seated_hash),
+            "a seated holder's accord row is ADVERTISED (the gate is not dead)"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &seated_hash, Some(peer))
+                .await
+                .is_some(),
+            "…and SERVED on the direct-fetch twin"
+        );
+
+        // (C) THE REFUSAL — an unseated signer's row is carried by neither.
+        assert!(
+            !offer.iter().any(|r| r.envelope_hash == unseated_hash),
+            "an UNSEATED holder's accord row is withheld from the offer"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &unseated_hash,
+                    Some(peer)
+                )
+                .await
+                .is_none(),
+            "…and cannot be obtained by fetching a hash learned out-of-band"
+        );
+
+        // The refusal is LOUD and NAMES ITS BRANCH (CIRISEdge#425/#433) — and
+        // it is the *seated* branch, not `cannot judge`: the roster resolved
+        // fine here, so reporting `roster_unresolvable` would send an operator
+        // to sync a family record that is already present.
+        let snap = metrics.snapshot();
+        assert!(
+            snap.withholds_by_reason
+                .get(&WithholdReason::AccordRelaySignerNotSeated)
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "the ledger books `accord_relay_signer_not_seated`, got {:?}",
+            snap.withholds_by_reason
+        );
+        assert_eq!(
+            snap.withholds_by_reason
+                .get(&WithholdReason::AccordRelayRosterUnresolvable)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "…and NOT `roster_unresolvable` — the two never collapse"
+        );
+
+        // (4) A non-`accord:` row is untouched: this gate narrows exactly one
+        // dimension family and nothing else.
+        assert!(
+            offer.len() >= 2,
+            "the non-accord rows still cross (offer: {})",
+            offer.len()
+        );
+        for r in &offer {
+            assert!(
+                bridge
+                    .fetch_envelope_bytes_for_peer(
+                        EnvelopeKind::Attestation,
+                        &r.envelope_hash,
+                        Some(peer)
+                    )
+                    .await
+                    .is_some(),
+                "every row the gate let into the offer still fetches — advertise \
+                 and serve AGREE (no #429 advertised-then-unfetchable)"
+            );
+        }
+    }
+
+    /// Workstream F — with NO gate installed, `accord:*` carriage is byte-for-
+    /// byte what it was before this workstream (the `Global` projection row
+    /// alone). Installing the gate is a deliberate fleet-floor wiring event
+    /// (the accord ROOT is an instance parameter a bridge cannot default
+    /// itself into), and this pins that the absence is a wiring state rather
+    /// than a silent policy change to every existing deployment.
+    #[tokio::test]
+    async fn without_a_gate_accord_carriage_is_unchanged() {
+        let local = "this-node";
+        let peer = "peer-consented";
+        let root = "humanity-accord-under-test";
+        let holder = "accord-holder-seated";
+        let (backend, bridge, metrics) =
+            make_metered_bridge(&[local.to_string(), peer.to_string(), root.to_string()]);
+        for (k, it) in [
+            (local, identity_type::NODE),
+            (peer, identity_type::AGENT),
+            (root, identity_type::NODE),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, it),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_accord_holder_key(&backend, holder).await;
+        seed_consent_membership(&backend, local, peer).await;
+        // NO family, NO trust edge: an installed gate would refuse this row
+        // outright ("cannot judge"). Without one, nothing consults the
+        // predicate.
+        seed_accord_lifecycle(&backend, holder, root).await;
+        let hash = locate_accord_hash(&bridge, holder).await;
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+
+        assert!(
+            bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+                .await
+                .iter()
+                .any(|r| r.envelope_hash == hash),
+            "no gate installed ⇒ the projection row alone decides, as before"
+        );
+        assert!(
+            metrics
+                .snapshot()
+                .withholds_by_reason
+                .keys()
+                .all(|r| !r.as_str().starts_with("accord_relay")),
+            "…and the relay ledger stays silent — nothing was decided"
+        );
+    }
+
+    /// Workstream F — the APPLY-PATH invalidation, driven through the bridge's
+    /// real apply dispatch: an admitted `Family` row (the accord roster itself)
+    /// drops the cached verdict for every signer under that root, so the very
+    /// next serve decision re-resolves against the new roster instead of
+    /// serving a grant the roster no longer supports. The TTL is the backstop;
+    /// this is the event that must not wait for it.
+    #[tokio::test]
+    async fn an_admitted_family_apply_invalidates_the_cached_relay_verdict() {
+        use crate::replication::accord_relay_gate::{AccordRelayGate, RelayDecision, RelayRefusal};
+        use ciris_persist::federation::types::{Family, FamilyMember};
+
+        let local = "this-node";
+        let root = "humanity-accord-under-test";
+        let holder = "accord-holder-seated";
+        let (backend, bridge) = make_bridge(&[local.to_string(), root.to_string()]);
+        for (k, it) in [(local, identity_type::NODE), (root, identity_type::NODE)] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, it),
+                })
+                .await
+                .expect("seed key");
+        }
+        // A family member must be a registered federation_keys row.
+        seed_accord_holder_key(&backend, holder).await;
+        let gate = Arc::new(AccordRelayGate::new(
+            backend.clone(),
+            Some(local.to_string()),
+            root,
+        ));
+        let bridge = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_accord_relay_gate(Some(Arc::clone(&gate)));
+
+        // Prime a verdict: with no family seeded this is `cannot judge`, which
+        // is a RESOLVED verdict — distinct from "we never ran".
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            gate.may_relay(holder, t0).await,
+            RelayDecision::Refused(RelayRefusal::RosterUnresolvable),
+        );
+        assert_eq!(
+            gate.decide(holder, t0),
+            RelayDecision::Refused(RelayRefusal::RosterUnresolvable),
+            "the sync predicate serves the cached verdict"
+        );
+
+        // An unsigned Family apply is REFUSED by persist's E4 gate, so it must
+        // NOT invalidate: a refused apply changed no state.
+        let founded: chrono::DateTime<chrono::Utc> = "2020-01-01T00:00:00Z"
+            .parse()
+            .expect("pinned founding instant");
+        let family = Family {
+            family_key_id: root.to_owned(),
+            family_name: root.to_owned(),
+            members: vec![FamilyMember {
+                key_id: holder.to_owned(),
+                joined_at: founded,
+                role: Some("founder".to_owned()),
+            }],
+            founded_at: founded,
+            consensus_protocol: "quorum:2/3".to_owned(),
+            consensus_protocol_entrenched: true,
+            persist_row_hash: String::new(),
+        };
+        let unsigned = serde_json::to_vec(&SignedFamily {
+            family: family.clone(),
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+        })
+        .expect("serialize unsigned family");
+        let refused = bridge
+            .apply_envelope_bytes(EnvelopeKind::Family, &unsigned, Some("peer"))
+            .await;
+        assert!(
+            !refused.is_admitted(),
+            "an unsigned family declaration is refused at admission (persist E4)"
+        );
+        assert_eq!(
+            gate.decide(holder, t0),
+            RelayDecision::Refused(RelayRefusal::RosterUnresolvable),
+            "a REFUSED apply changed no state, so it must not drop the verdict"
+        );
+
+        // The real roster change (through persist's local door, then the
+        // invalidation the apply path fires) is what must be visible at once.
+        backend
+            .put_family_local(family)
+            .await
+            .expect("seed the accord family");
+        bridge.invalidate_accord_relay(&[root]);
+        assert_eq!(
+            gate.decide(holder, t0),
+            RelayDecision::Refused(RelayRefusal::Unresolved),
+            "post-invalidation the gate reports `unresolved` — it no longer knows, and \
+             says so rather than serving the dropped verdict"
+        );
+        // …and re-resolving now sees the roster: the signer IS seated (only our
+        // consent edge is still missing), which proves the drop was real and
+        // not merely a stale repeat.
+        assert_eq!(
+            gate.may_relay(holder, t0).await,
+            RelayDecision::Refused(RelayRefusal::NoTrustEdge),
+            "the re-resolve reads the NEW roster — `cannot judge` became `seated, \
+             but this node never granted the root`"
         );
     }
 

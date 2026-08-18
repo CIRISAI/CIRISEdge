@@ -311,6 +311,31 @@ pub enum WithholdReason {
     /// quarantined, and folding it into [`Self::QuarantinedAuthor`] would send
     /// the operator to review a marker that does not exist.
     QuarantineReadError,
+    /// Workstream F — an `accord:*` row was withheld because this node holds no
+    /// FAMILY under the accord root, so persist's
+    /// [`RelayVerdict`](ciris_persist::federation::trust_root::RelayVerdict)
+    /// reported `roster_resolvable: false`: **"I cannot judge"**. Its own
+    /// variant, never folded into [`Self::AccordRelaySignerNotSeated`] — an
+    /// unjudgeable root and an unseated signer are different things to go fix
+    /// (sync the family record vs. look at the signer), and CIRISPersist#713
+    /// wrote a mutation specifically to keep them apart.
+    AccordRelayRosterUnresolvable,
+    /// Workstream F — the accord roster resolved and the row's
+    /// `attesting_key_id` holds no live seat on it (revocation-folded).
+    /// Trusting a root does not make every key naming it authoritative.
+    AccordRelaySignerNotSeated,
+    /// Workstream F — no live `delegates_to(self → accord root)`: this node
+    /// never granted the root, or has cut the edge. CC 4.2.1 — *"a node that
+    /// never trusted the accord … is simply not reached"*. This is the leg the
+    /// `accord:*` `Global` projection row runs over on its own, and the reason
+    /// the relay predicate exists.
+    AccordRelayNoTrustEdge,
+    /// Workstream F — the relay verdict was NOT RESOLVED (never primed, expired,
+    /// or invalidated and not yet re-resolved), so the sync serve gate refused
+    /// fail-closed. Deliberately distinct from every decided refusal above: this
+    /// says *"we never ran the check"*, which is a wiring/timing fact, not a
+    /// statement about the signer or the root.
+    AccordRelayUnresolved,
 }
 
 impl WithholdReason {
@@ -333,6 +358,10 @@ impl WithholdReason {
             Self::ConfigPaused => "config_paused",
             Self::QuarantinedAuthor => "quarantined_author",
             Self::QuarantineReadError => "quarantine_read_error",
+            Self::AccordRelayRosterUnresolvable => "accord_relay_roster_unresolvable",
+            Self::AccordRelaySignerNotSeated => "accord_relay_signer_not_seated",
+            Self::AccordRelayNoTrustEdge => "accord_relay_no_trust_edge",
+            Self::AccordRelayUnresolved => "accord_relay_unresolved",
         }
     }
 }

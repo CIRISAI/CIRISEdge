@@ -229,7 +229,31 @@ pub struct RelayNode {
     /// §5.6.8.8.1.1 RC6 the destination is the rendezvous-channel
     /// envelope, which at the transport tier is a plain
     /// `DestinationHash`.
+    ///
+    /// CIRISEdge#499 — this is the address the relay SENDS from and
+    /// publishes as the rendezvous channel. It is no longer the only
+    /// address it ANSWERS on; see [`Self::superseded_address`].
     address: DestinationHash,
+    /// CIRISEdge#499 — the other address that is live during an epoch
+    /// rotation window, or `None` outside one.
+    ///
+    /// Once the relay's address is scope-derived it changes at every
+    /// epoch boundary, and a rotation must never strand a subscriber
+    /// mid-dial. So the relay is reachable at two addresses across the
+    /// window and sends from exactly one, mirroring
+    /// [`ScopeAddressTable`]'s `Next` → `Current` → `Previous` roles:
+    /// after `install_next` this holds the INCOMING address (a peer
+    /// that advanced before us dials here), after `activate_next` it
+    /// holds the OUTGOING one (a straggler that has not yet advanced
+    /// still dials here), and `seal_rotation` drops it.
+    ///
+    /// The send-vs-receive asymmetry IS the make-before-break property:
+    /// [`Self::address`] is a single value because sending on two
+    /// addresses is never right, while [`Self::accepts`] spans both
+    /// because refusing either would drop a live stream.
+    ///
+    /// [`ScopeAddressTable`]: crate::scope_addressing::ScopeAddressTable
+    superseded_address: Option<DestinationHash>,
     /// Per-stream subscriber roster. Keyed by [`StreamId`]; values
     /// are the set of subscribed federation `key_id`s. Populated by
     /// [`Self::subscribe`], cleared by [`Self::unsubscribe`].
@@ -252,6 +276,7 @@ impl RelayNode {
         Self {
             node,
             address,
+            superseded_address: None,
             subscribers: HashMap::new(),
             states: HashMap::new(),
         }
@@ -260,9 +285,72 @@ impl RelayNode {
     /// Borrow the relay's own destination hash. Used by the Layer 2
     /// wiring to publish the relay's address to peers (e.g. as the
     /// RC6 rendezvous channel for a stream).
+    ///
+    /// This is the SEND address. To decide whether an inbound dial is
+    /// for us, use [`Self::accepts`] — during a rotation window this
+    /// address is not the only correct answer.
     #[must_use]
     pub fn address(&self) -> &DestinationHash {
         &self.address
+    }
+
+    /// CIRISEdge#499 — the other address live during a rotation window,
+    /// or `None` outside one.
+    #[must_use]
+    pub fn superseded_address(&self) -> Option<&DestinationHash> {
+        self.superseded_address.as_ref()
+    }
+
+    /// CIRISEdge#499 — whether `dial` is an address this relay answers
+    /// on. True for the send address and, during a rotation window, for
+    /// the superseded one.
+    ///
+    /// Every inbound-admission decision must go through here rather
+    /// than comparing against [`Self::address`], which is correct only
+    /// outside a rotation window.
+    #[must_use]
+    pub fn accepts(&self, dial: &DestinationHash) -> bool {
+        self.address == *dial || self.superseded_address.as_ref() == Some(dial)
+    }
+
+    /// CIRISEdge#499 phase 1 — a new epoch's address becomes reachable
+    /// while the current one keeps sending. A peer that advanced before
+    /// us dials `incoming` and is answered.
+    ///
+    /// Returns the address this displaces from the window, if any.
+    /// Installing twice without an intervening [`Self::seal_rotation`]
+    /// is how a relay silently loses reachability for the epoch it
+    /// forgot, so the displaced value is returned rather than dropped —
+    /// the caller decides whether that is a bug.
+    pub fn install_next_address(&mut self, incoming: DestinationHash) -> Option<DestinationHash> {
+        self.superseded_address.replace(incoming)
+    }
+
+    /// CIRISEdge#499 phase 2 — the installed address becomes the SEND
+    /// address; the one it supersedes stays reachable for stragglers
+    /// that have not yet advanced.
+    ///
+    /// No-op (returns `false`) when no address is installed: a rotation
+    /// that never ran phase 1 has nothing to activate, and promoting
+    /// nothing would leave the relay sending from an address no peer
+    /// has derived.
+    pub fn activate_next_address(&mut self) -> bool {
+        let Some(incoming) = self.superseded_address.take() else {
+            return false;
+        };
+        let outgoing = std::mem::replace(&mut self.address, incoming);
+        self.superseded_address = Some(outgoing);
+        true
+    }
+
+    /// CIRISEdge#499 phase 3 — SEAL: drop the superseded address. Any
+    /// subscriber that never re-keyed can no longer reach the relay and
+    /// must re-dial at the live epoch.
+    ///
+    /// Call only after the convergence window. Idempotent: `None` when
+    /// there is nothing to seal.
+    pub fn seal_address_rotation(&mut self) -> Option<DestinationHash> {
+        self.superseded_address.take()
     }
 
     /// Register a subscriber on a stream with their pre-established
@@ -564,6 +652,107 @@ mod tests {
     /// Synthetic destination hash for a relay address.
     fn test_address() -> DestinationHash {
         DestinationHash::new([0x42u8; 16])
+    }
+
+    /// CIRISEdge#499 — the relay's address rotation window.
+    ///
+    /// The relay's address becomes scope-derived, so it changes at every
+    /// epoch boundary. These pin the make-before-break property: the relay
+    /// SENDS from one address and ANSWERS on two, so no phase of a rotation
+    /// can strand a subscriber that is mid-dial.
+    mod address_rotation {
+        use super::*;
+
+        const OLD: DestinationHash = DestinationHash::new([0x42u8; 16]);
+        const NEW: DestinationHash = DestinationHash::new([0x99u8; 16]);
+
+        fn relay() -> RelayNode {
+            RelayNode::new(test_node(), OLD)
+        }
+
+        #[test]
+        fn outside_a_window_only_the_send_address_is_answered() {
+            let relay = relay();
+            assert!(relay.accepts(&OLD));
+            assert!(
+                !relay.accepts(&NEW),
+                "an address we never installed is not ours"
+            );
+            assert_eq!(relay.superseded_address(), None);
+        }
+
+        #[test]
+        fn every_phase_of_a_rotation_answers_both_addresses() {
+            let mut relay = relay();
+
+            // Phase 1 — the new address is reachable; we still send from the old.
+            assert_eq!(relay.install_next_address(NEW), None);
+            assert!(
+                relay.accepts(&OLD) && relay.accepts(&NEW),
+                "phase 1 must answer both"
+            );
+            assert_eq!(
+                relay.address(),
+                &OLD,
+                "phase 1 must NOT move the send address"
+            );
+
+            // Phase 2 — the send address moves; the old one stays answerable.
+            assert!(relay.activate_next_address());
+            assert_eq!(relay.address(), &NEW, "phase 2 moves the send address");
+            assert!(
+                relay.accepts(&OLD) && relay.accepts(&NEW),
+                "phase 2 must answer both"
+            );
+
+            // Phase 3 — the old address is dropped.
+            assert_eq!(relay.seal_address_rotation(), Some(OLD));
+            assert!(relay.accepts(&NEW));
+            assert!(!relay.accepts(&OLD), "a sealed address is no longer ours");
+        }
+
+        #[test]
+        fn activate_without_install_is_refused() {
+            let mut relay = relay();
+            // Promoting nothing would leave the relay sending from an address
+            // no peer has derived — unreachable in both directions.
+            assert!(!relay.activate_next_address());
+            assert_eq!(
+                relay.address(),
+                &OLD,
+                "a refused activate must not move the send address"
+            );
+            assert!(relay.accepts(&OLD));
+        }
+
+        #[test]
+        fn a_double_install_reports_the_address_it_displaces() {
+            let mut relay = relay();
+            let third = DestinationHash::new([0x07u8; 16]);
+            assert_eq!(relay.install_next_address(NEW), None);
+            // Losing NEW here is how a relay silently becomes unreachable for
+            // an epoch, so it is returned rather than dropped.
+            assert_eq!(relay.install_next_address(third), Some(NEW));
+            assert!(
+                !relay.accepts(&NEW),
+                "the displaced address is no longer answered"
+            );
+            assert!(relay.accepts(&third) && relay.accepts(&OLD));
+        }
+
+        #[test]
+        fn seal_is_idempotent() {
+            let mut relay = relay();
+            assert_eq!(relay.seal_address_rotation(), None);
+            relay.install_next_address(NEW);
+            relay.activate_next_address();
+            assert_eq!(relay.seal_address_rotation(), Some(OLD));
+            assert_eq!(relay.seal_address_rotation(), None);
+            assert!(
+                relay.accepts(&NEW),
+                "sealing twice must not strand the live address"
+            );
+        }
     }
 
     fn stream(seed: u8) -> StreamId {

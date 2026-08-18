@@ -96,6 +96,12 @@ pub mod reachability;
 pub mod replication;
 pub mod sas;
 mod sas_wordlist;
+// CIRISEdge#499 (workstream B) — scope-native derived-address table.
+// `(scope, group_id, epoch, member)` -> 16-byte Reticulum destination
+// hash, derived on membership/epoch change and read (never derived) on
+// the packet path, with the three-phase epoch rotation that keeps the
+// receive accept-set a superset of the send-set (CIRISEdge#492 shape).
+pub mod scope_addressing;
 // v6.0.0 (CIRISEdge#175) — CC 1.13.3.4 substrate.
 pub mod scope_privacy;
 pub mod swarm;
