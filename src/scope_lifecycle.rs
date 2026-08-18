@@ -45,21 +45,35 @@
 //! event that means "every peer has advanced" — the convergence window
 //! is a deliberate operator parameter, not something to infer.
 //!
-//! # Known gap: retirement is not yet enforceable at the RNS layer
+//! # Retirement, and what it does and does not cut
 //!
-//! `leviculum-std`'s driver forwards `register_destination` but not its
-//! inverse (**leviculum#54**; `NodeCore::unregister_destination` exists
-//! and is simply not exposed on the `&self` driver an `Arc<ReticulumNode>`
-//! holder can reach). Until that lands, sealing removes an address from
-//! edge's table — so it stops being attributed — but the node keeps
-//! routing on it, meaning an observer who learned the old address can
-//! still confirm this node is there.
+//! Sealing removes the superseded epoch from the table AND retires its
+//! destination from the node, so a peer that still holds a path and
+//! dials the old address finds nobody home. Both halves are needed: the
+//! table half stops attribution, the transport half stops the probe.
 //!
-//! That is a real residual disclosure and it is handled LOUDLY, never
-//! silently: [`ScopedDestinationSink::retire`] returns an error, the
-//! lifecycle counts and WARNs on it, and [`SealOutcome::unretired`]
-//! reports it to the caller. When the driver verb lands this becomes a
-//! one-line change in the sink, and the counter goes to zero.
+//! This was the one thing the lifecycle could not do at first —
+//! `leviculum-std`'s driver forwarded `register_destination` but not its
+//! inverse, so a sealed address stayed routable and an observer who
+//! learned it could keep re-confirming this node. Closed by
+//! **leviculum#54** in v0.20.0+ciris.1, whose contract edge relies on
+//! rather than infers: retirement is **idempotent** (so a timing-driven
+//! seal may fire twice) and **leaves established links running** (a link
+//! is keyed by `LinkId`, not by the destination it was dialled through).
+//!
+//! Edge deliberately does not follow retirement with a `close_link`
+//! sweep. A peer holding an established link dialled it while
+//! legitimately in the group; cutting it would drop a live stream, which
+//! is precisely what the make-before-break window exists to prevent. The
+//! unlinkability concern is about *new* probes, and retirement is what
+//! stops those. Cutting live links remains available and is a separate,
+//! deliberate act.
+//!
+//! [`SealOutcome::unretired`] therefore reports zero in a healthy
+//! deployment. It is kept — rather than removed now that the verb
+//! exists — because a non-zero value is the alarm for a transport that
+//! cannot retire, and silence is a worse way to learn that than a
+//! counter.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -94,10 +108,11 @@ pub trait ScopedDestinationSink: Send + Sync {
     ///
     /// # Errors
     /// Returns `Err` when the underlying transport cannot retire a
-    /// destination at all — the leviculum#54 gap. The lifecycle treats
-    /// that as loud-but-non-fatal, because there is no alternative
-    /// action available and pretending it succeeded would hide a
-    /// reachability disclosure.
+    /// destination. The lifecycle treats that as loud-but-non-fatal:
+    /// there is no alternative action available, and pretending it
+    /// succeeded would hide a reachability disclosure. The Reticulum
+    /// transport has been able to retire since leviculum#54, so this
+    /// arm is an alarm rather than an expected path.
     fn retire(&self, address: &MemberAddress, scope: &CohortScope) -> Result<(), String>;
 }
 
@@ -119,8 +134,10 @@ pub struct SealOutcome {
     /// Groups whose superseded epoch was dropped from the table.
     pub sealed: usize,
     /// Sealed epochs whose destination could NOT be retired from the
-    /// transport — the leviculum#54 residual. Non-zero means those
-    /// addresses remain routable despite being sealed.
+    /// transport. **Zero in a healthy deployment** since leviculum#54
+    /// (v0.20.0+ciris.1). Non-zero means those addresses remain routable
+    /// despite being sealed — a live reachability disclosure, and the
+    /// value to alert on.
     pub unretired: usize,
 }
 

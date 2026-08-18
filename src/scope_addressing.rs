@@ -373,6 +373,20 @@ pub enum ScopeAddressError {
     /// Catching it here turns a key-reuse bug into a loud install-time
     /// error instead of a leviculum `register_destination` displacement
     /// warning and a half-deaf group.
+    ///
+    /// The two checks compose deliberately, and the ordering gives the
+    /// leviculum-side warning a sharper meaning than it would have alone.
+    /// Because the table refuses a colliding address BEFORE
+    /// [`ReticulumTransport::register_scoped_destination`] is ever
+    /// reached, leviculum's same-hash displacement warning (v0.19.0+)
+    /// should be **unreachable** for scope-derived destinations. If it
+    /// ever fires for one, it does not mean "a collision happened" — it
+    /// means a destination was registered by a path that bypassed this
+    /// table, which is a structurally more serious thing to learn. Worth
+    /// treating as a canary rather than as noise.
+    ///
+    /// [`ReticulumTransport::register_scoped_destination`]:
+    ///     crate::transport::reticulum::ReticulumTransport::register_scoped_destination
     #[error("scope_addressing: address collision on member '{member_key_id}' (epoch {epoch}) — reused exporter_secret?")]
     AddressCollision {
         /// The member whose derived address collided.

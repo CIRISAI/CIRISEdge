@@ -2799,40 +2799,54 @@ impl ReticulumTransport {
 
     /// CIRISEdge#499 — retire a scope-derived destination.
     ///
-    /// The inverse of [`Self::register_scoped_destination`], and the one
-    /// half of the lifecycle edge cannot currently honour:
-    /// `leviculum-std`'s driver forwards `register_destination` but not
-    /// `unregister_destination` (**leviculum#54**). `NodeCore` has the
-    /// verb and it does the right thing — it drops the routing entry and
-    /// the destination — it is simply not exposed on the `&self` driver
-    /// an `Arc<ReticulumNode>` holder can reach, and there is no
-    /// `destination_mut` or node escape hatch to route around it.
+    /// The inverse of [`Self::register_scoped_destination`], and the
+    /// second half of the rotation: after this returns the hash is no
+    /// longer one of ours, so a peer that still holds a path and dials
+    /// it finds nobody home. Without it a superseded address keeps
+    /// answering forever, which re-confirms this node to anyone still
+    /// probing it — the reachability disclosure CIRISEdge#311 exists to
+    /// prevent, and the reason a rotation that cannot retire only ever
+    /// *adds* addresses.
     ///
-    /// So this returns `Err` rather than silently succeeding. A sealed
-    /// address that stays registered is a real residual disclosure: an
-    /// observer who learned it can keep probing and keep confirming this
-    /// node is reachable, which is the reachability publication
-    /// CIRISEdge#311 exists to prevent. Reporting that honestly is worth
-    /// more than a no-op that reads as success.
+    /// Landed in leviculum v0.20.0+ciris.1 (leviculum#54). Two contract
+    /// points edge relies on, both pinned by leviculum's own
+    /// `destination_lifecycle.rs` rather than inferred here:
     ///
-    /// When the driver verb lands, the body becomes
-    /// `self.node.unregister_destination(&DestinationHash::new(hash))`
-    /// plus the announce-policy `forget`, and
-    /// [`crate::scope_lifecycle::SealOutcome::unretired`] goes to zero.
+    /// - **Idempotent** — retiring an already-gone or never-registered
+    ///   hash is a no-op. That is what lets the seal be timing-driven
+    ///   ([`crate::scope_lifecycle::ScopeLifecycle::seal_due`] may fire
+    ///   twice for one rotation).
+    /// - **Established links keep running** — a link is keyed by its
+    ///   `LinkId`, not by the destination it was dialled through, so
+    ///   only NEW link requests are refused.
+    ///
+    /// That second point is the behaviour edge wants, and edge
+    /// deliberately does NOT follow it with a `close_link` sweep.
+    /// A peer holding an established link dialled it while legitimately
+    /// in the group; tearing it down would drop a live stream, which is
+    /// exactly what the make-before-break rotation window exists to
+    /// prevent (a `DestinationHash` is used to dial and listen, never
+    /// per chunk). The unlinkability concern is about *new* probes, and
+    /// those are what retirement stops. Cutting live links is available
+    /// (`close_link` by `LinkId`) and is a separate, deliberate act.
     ///
     /// # Errors
-    /// Always, until leviculum#54 lands.
+    /// [`TransportError::Config`] never, currently — retained in the
+    /// signature because the sink contract
+    /// ([`crate::scope_lifecycle::ScopedDestinationSink::retire`]) is
+    /// fallible and a future transport may not be able to retire.
     pub fn retire_scoped_destination(
         &self,
         address: &MemberAddress,
         _scope: &crate::cohort_scope::CohortScope,
     ) -> Result<(), TransportError> {
-        let _ = address;
-        Err(TransportError::Config(
-            "leviculum-std exposes no unregister_destination on the node driver \
-             (leviculum#54); the sealed scope address stays routable"
-                .to_owned(),
-        ))
+        let hash = *address.as_bytes();
+        self.node
+            .unregister_destination(&DestinationHash::new(hash));
+        // Drop the scope record too, so the policy map does not grow one
+        // entry per epoch per group for addresses that are no longer ours.
+        self.announce_policy.forget(&hash);
+        Ok(())
     }
 
     /// CIRISEdge#499 — resolve an inbound destination hash to the scope
@@ -9525,6 +9539,61 @@ mod scope_native_addressing_tests {
                     &DestinationHash::new(transport.local_named_dest_hash()),
                 ),
             "the named Commons discovery destination still announces",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_destination_round_trips_register_then_retire() {
+        // leviculum#54 (v0.20.0+ciris.1) — the seal half of the rotation.
+        // Without retirement a superseded address keeps answering forever
+        // and an observer who learned it can re-confirm this node, which
+        // is the reachability disclosure the whole feature removes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "edge-retire").await;
+
+        let scope = CohortScope::Family;
+        let table = table_with_group(&scope, "grp-r", &["member-r"]);
+        let address = table
+            .send_address(&scope, "grp-r", "member-r")
+            .expect("derived address");
+        let hash = *address.as_bytes();
+
+        let before = transport.announce_policy.len();
+        transport
+            .register_scoped_destination(&address, &scope)
+            .expect("register");
+        assert_eq!(transport.announce_policy.len(), before + 1);
+
+        transport
+            .retire_scoped_destination(&address, &scope)
+            .expect("retire");
+        // The scope record goes too, or the policy map grows one entry per
+        // epoch per group for addresses that are no longer ours.
+        assert_eq!(
+            transport.announce_policy.len(),
+            before,
+            "retiring must drop the scope record, not just the destination",
+        );
+
+        // Idempotent — leviculum pins this, and the seal is timing-driven
+        // so it may genuinely fire twice for one rotation.
+        transport
+            .retire_scoped_destination(&address, &scope)
+            .expect("retiring twice is a no-op");
+        assert_eq!(transport.announce_policy.len(), before);
+
+        // And re-registering the same address afterwards still works: a
+        // member re-admitted at a later epoch must not be poisoned by the
+        // earlier retirement.
+        transport
+            .register_scoped_destination(&address, &scope)
+            .expect("re-register after retire");
+        assert_eq!(transport.announce_policy.len(), before + 1);
+        assert!(
+            transport
+                .announce_policy
+                .should_suppress_announce(&DestinationHash::new(hash)),
+            "a re-registered scoped destination is still never announced",
         );
     }
 
