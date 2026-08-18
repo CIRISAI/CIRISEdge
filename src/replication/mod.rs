@@ -116,6 +116,7 @@
 //! hard NATs should use Reticulum, which is what MISSION §1.4
 //! designates canonical anyway.
 
+pub mod accord_relay_gate;
 pub mod bridge;
 pub mod coordinator;
 pub mod directory;
@@ -133,6 +134,10 @@ pub mod storage_contention;
 pub mod summary;
 pub mod wire_frame;
 
+#[doc(inline)]
+pub use accord_relay_gate::{
+    AccordRelayGate, RelayDecision, RelayRefusal, RELAY_VERDICT_TTL as ACCORD_RELAY_VERDICT_TTL,
+};
 #[doc(inline)]
 pub use bridge::{
     BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge, KeyDirectoryProvider,

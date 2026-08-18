@@ -130,7 +130,20 @@ fn build_bridge(
         .with_self_provider(self_provider)
         .with_local_key_id(config.local_key_id.clone())
         .with_metrics(config.metrics.clone())
-        .with_mesh_config(mesh_config),
+        .with_mesh_config(mesh_config)
+        // Workstream F — installed iff the operator named an accord root. See
+        // `ReplicationRuntimeConfig::accord_relay_root`: the root is an
+        // instance parameter edge must be TOLD, so `None` keeps `accord:*`
+        // carriage on the projection row alone (pre-workstream behavior) and
+        // `Some` enforces the fail-closed relay predicate on both the advertise
+        // sweep and its direct-fetch twin.
+        .with_accord_relay_gate(config.accord_relay_root.as_ref().map(|root| {
+            Arc::new(crate::replication::accord_relay_gate::AccordRelayGate::new(
+                Arc::clone(directory),
+                config.local_key_id.clone(),
+                root.clone(),
+            ))
+        })),
     )
 }
 
@@ -337,6 +350,29 @@ pub struct ReplicationRuntimeConfig {
     /// cannot evaluate its own trust. The server supplies the same
     /// `node_key_id` it already threads into consent-peer resolution.
     pub local_key_id: Option<String>,
+    /// Workstream F — the ACCORD ROOT this node relays `accord:*` objects
+    /// under. `Some` installs the
+    /// [`AccordRelayGate`](crate::replication::accord_relay_gate::AccordRelayGate)
+    /// on the bridge (fail-closed carriage: persist v36.2.0's
+    /// `may_relay_accord_object` — seated signer AND a live
+    /// `delegates_to(self → root)`); `None` (the default) leaves `accord:*`
+    /// carriage exactly as the `Global` projection row alone decides it, i.e.
+    /// byte-identical pre-workstream behavior.
+    ///
+    /// It is an operator-supplied value on purpose. CC 4.2.3 makes the roster
+    /// an INSTANCE parameter (*"another instantiation of this form names its
+    /// own three"*), no `accord:*` row carries a field naming the root it acts
+    /// under, and persist exposes no `accord_root_of(row)` resolver — so edge
+    /// deriving it would be edge holding a rule that belongs upstream. A
+    /// single-instance fleet passes its genesis accord family id; turning this
+    /// on is a dated fleet-floor event (the AV-42 `RequireTransportBinding`
+    /// shape), never a silent default, because a fleet whose family records
+    /// have not converged would go dark on the accord plane the moment it
+    /// flipped — and "cannot judge" is a REFUSAL by design.
+    ///
+    /// Requires [`Self::local_key_id`]: with no "I" there is no
+    /// `delegates_to(self → root)` to evaluate, and the gate holds fully closed.
+    pub accord_relay_root: Option<String>,
 }
 
 /// Live replication runtime — bridge + registry + scheduler task +
