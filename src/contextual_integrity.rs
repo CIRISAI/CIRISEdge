@@ -53,6 +53,28 @@
 //! the enum is edge's, so the compiler can hold the invariant directly:
 //! **a new way to withhold cannot enter this codebase anonymously.**
 //!
+//! # Boundary: this attributes the SERVE side only
+//!
+//! Edge has two refusal mechanisms and they are not the same thing:
+//!
+//! - **Serve / emit** refusals go through [`WithholdReason`] and
+//!   `EdgeMetrics::inc_withhold` — a counted, attributed ledger. That is
+//!   what this module maps.
+//! - **Inbound / transport** refusals go through
+//!   `ReticulumTransport::drop_inbound` — a throttled WARN with a string
+//!   reason tag (CIRISEdge#425). It is log-only, carries no
+//!   [`WithholdReason`], and is therefore **not attributed here**.
+//!
+//! That asymmetry is real and is not an oversight to paper over: an
+//! inbound drop is edge declining to *accept* a frame it cannot
+//! attribute, which is a question about the Sender parameter, while
+//! everything below is edge declining to *make* a flow. The compile-time
+//! guard covers the second and says nothing about the first.
+//!
+//! Stated so the coverage is not overread. Typing the inbound reasons
+//! would extend the guard across both, and is the obvious next
+//! improvement rather than a defect being hidden.
+//!
 //! # What this module is NOT
 //!
 //! It makes **no decisions**. Every verdict is still the gate's; this

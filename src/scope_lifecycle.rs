@@ -45,6 +45,29 @@
 //! event that means "every peer has advanced" — the convergence window
 //! is a deliberate operator parameter, not something to infer.
 //!
+//! # The rotation TRIGGER is contingent on emitting nothing
+//!
+//! [`Self::advance`] fires on the MLS epoch, which advances on every
+//! Add/Remove — i.e. it is **group-event-driven**. That is correct
+//! today, and the reason is narrow enough to be worth writing down:
+//! **because a rotation emits nothing.** No announce, no probe, no
+//! packet an outsider can time. The trigger is unobservable, so binding
+//! it to membership costs nothing.
+//!
+//! CC 1.0-rc4's Position paragraph at 5.4.6 states that any future
+//! multi-hop relaxation carries a rotation rule — **clocks global,
+//! never group-event-driven** — because once a rotation *does* emit,
+//! an epoch-bound trigger turns every Add/Remove into a synchronized
+//! wave whose cardinality, timing and churn are themselves the leak.
+//!
+//! So the epoch binding here is not "right"; it is *right while nothing
+//! is emitted*. An implementer wiring a future amendment would land on
+//! this function, see a working rotation, and keep precisely the trigger
+//! the relaxation forbids. If emission is ever added, this trigger moves
+//! to a global clock in the same change — not afterwards.
+//! (CIRISVerify recorded the same contingency at `derive_destination`;
+//! CIRISVerify#264.)
+//!
 //! # Retirement, and what it does and does not cut
 //!
 //! Sealing removes the superseded epoch from the table AND retires its
