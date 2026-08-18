@@ -77,6 +77,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -96,6 +97,7 @@ use super::attestation::{
 use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 use crate::identity::LocalSigner;
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
+use crate::scope_addressing::{InboundAddress, MemberAddress, ScopeAddressTable};
 use crate::verify::{
     HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
 };
@@ -1660,6 +1662,17 @@ pub struct ReticulumTransport {
     /// PRIVATE key (unlike `local_transport_pubkey`), so it can sign the
     /// LINKIDENTIFY packet.
     local_identity: Identity,
+    /// CIRISEdge#499 — the scope-native address table, installed ONCE
+    /// (`install_scope_address_table`) after the cohort/session MLS layer
+    /// derives its first group secret. `OnceLock` because the lifecycle is
+    /// genuinely write-once-then-read-many: the transport starts long before
+    /// any group is joined, and every later mutation (install/rotate/remove)
+    /// happens *inside* the table's own lock, not by swapping the handle. A
+    /// read is therefore one atomic load on the receive path — no transport
+    /// lock, so nothing here can be held across an `.await` (CIRISEdge#217).
+    /// `None` until installed: every scope-native lookup then declines and
+    /// the federation-scope paths are unaffected.
+    scope_addresses: OnceLock<Arc<ScopeAddressTable>>,
     /// Edge's own announce attestation app-data — built once in
     /// `new` (sign with the federation `LocalSigner`) and emitted
     /// verbatim on every announce. `None` when no signer was
@@ -2480,6 +2493,7 @@ impl ReticulumTransport {
             announce_policy,
             local_transport_pubkey,
             local_identity: identity.clone(),
+            scope_addresses: OnceLock::new(),
             local_attestation,
             local_signer,
             self_route,
@@ -2684,6 +2698,121 @@ impl ReticulumTransport {
     ) {
         self.announce_policy
             .register_destination_scope(dest_hash, scope);
+    }
+
+    /// CIRISEdge#499 — install the scope-native address table. Called ONCE,
+    /// by whichever layer owns the MLS group secrets, as soon as the first
+    /// group is joined. Returns `Err` if a table is already installed rather
+    /// than silently displacing it: two tables would mean two disagreeing
+    /// answers to "is this inbound hash mine", and the loser's registered
+    /// destinations would still be live on the node.
+    ///
+    /// # Errors
+    /// [`TransportError::Config`] if a table was already installed.
+    pub fn install_scope_address_table(
+        &self,
+        table: Arc<ScopeAddressTable>,
+    ) -> Result<(), TransportError> {
+        self.scope_addresses
+            .set(table)
+            .map_err(|_| TransportError::Config("scope address table already installed".to_owned()))
+    }
+
+    /// CIRISEdge#499 — the installed scope-address table, if any.
+    ///
+    /// This is the accessor the **replication layer** uses to resolve a
+    /// scoped address *above* the transport. Per the #499 design fork,
+    /// `Transport::send` deliberately grows no scope parameter and the
+    /// transport deliberately does not parse scope on the send path: the
+    /// caller already computed `projection_for` for the record, so it
+    /// already holds the scope, and it hands `send` an address that cannot
+    /// be wrong (the [`ResolvedRecipient`] pattern from CIRISEdge#402).
+    ///
+    /// [`ResolvedRecipient`]: crate::replication::resolved_state::ResolvedRecipient
+    #[must_use]
+    pub fn scope_address_table(&self) -> Option<&Arc<ScopeAddressTable>> {
+        self.scope_addresses.get()
+    }
+
+    /// CIRISEdge#499 — listen on a scope-derived destination.
+    ///
+    /// The address is a [`MemberAddress`], which has no public byte
+    /// constructor: the only way to hold one is to have obtained it from a
+    /// [`ScopeAddressTable`], which derives it from an MLS `exporter_secret`.
+    /// So "this hash was derived from a group secret I possess" is a property
+    /// of the *type*, not something this function has to re-check.
+    ///
+    /// Registration is COLD — once per (group, epoch, member), never per
+    /// packet. It does two things that must not drift apart: registers the
+    /// explicit-hash destination with the node, and registers its scope with
+    /// the announce-suppression policy so the node's auto-announce loops
+    /// suppress it (CC 5.4 — group-scoped destinations MUST NOT announce).
+    ///
+    /// `Public` is refused. A derived per-member address is not a discovery
+    /// address; announcing one would publish the very reachability fact the
+    /// derivation exists to withhold (CIRISEdge#311 limb (b)), and it would
+    /// not even work — leviculum v0.19 answers path requests for
+    /// explicit-hash destinations with silence, because a path response *is*
+    /// an announce and an announce for a caller-supplied hash is
+    /// unverifiable by reference RNS. First contact happens at federation
+    /// scope; scoped addresses are derived thereafter.
+    ///
+    /// # Errors
+    /// [`TransportError::Config`] if `scope` is `Public`, or if the
+    /// destination cannot be built.
+    pub fn register_scoped_destination(
+        &self,
+        address: &MemberAddress,
+        scope: &crate::cohort_scope::CohortScope,
+    ) -> Result<(), TransportError> {
+        if matches!(scope, crate::cohort_scope::CohortScope::Public) {
+            return Err(TransportError::Config(
+                "refusing to register a scope-derived destination as Public: \
+                 a derived per-member address is not a discovery address"
+                    .to_owned(),
+            ));
+        }
+        let hash = *address.as_bytes();
+        let mut dest = Destination::with_explicit_hash(
+            Some(self.local_identity.clone()),
+            Direction::In,
+            DestinationType::Single,
+            EDGE_APP_NAME,
+            &[EDGE_APP_ASPECT],
+            hash,
+        )
+        .map_err(|e| TransportError::Config(format!("scoped destination build: {e}")))?;
+        dest.set_accepts_links(true);
+        debug_assert_eq!(
+            dest.hash().as_bytes(),
+            &hash,
+            "explicit-hash destination must index by the derived address",
+        );
+        // Scope FIRST, then register. The policy default-SUPPRESSES an
+        // unregistered destination, so this order has no window in which the
+        // node holds an announceable destination it has no scope for; the
+        // reverse order does.
+        self.register_announce_scope(hash, scope.clone());
+        self.node.register_destination(dest);
+        Ok(())
+    }
+
+    /// CIRISEdge#499 — resolve an inbound destination hash to the scope
+    /// group, member and epoch it was derived for, or `None` if it is not one
+    /// of ours.
+    ///
+    /// A `Some` here is a **cryptographic admission fact**, not a hint:
+    /// the hash is derived from an MLS `exporter_secret`, which binds
+    /// `(group_id, epoch)` per RFC 9420 §8.5, so arrival on it proves the
+    /// sender possessed that group secret. This is why scope-native
+    /// addressing makes the hottest path (`attribute_and_deliver`) *cheaper*
+    /// rather than dearer — admission moves ahead of the parse.
+    ///
+    /// Returns `None` when no table is installed, which is the production
+    /// state until the derivation lands (CIRISVerify#259).
+    #[must_use]
+    pub fn inbound_scope(&self, dest_hash: &[u8; 16]) -> Option<InboundAddress> {
+        self.scope_addresses.get()?.accepts_inbound(dest_hash)
     }
 
     /// spec. Returns a `Vec<TransportSpec>` of `(handle, kind)` pairs.
@@ -9173,5 +9302,235 @@ mod tests {
         let mut leaf = ReticulumTransportConfig::new(PathBuf::from("/tmp/x.id"), "leaf-key");
         leaf.enable_transport = false;
         assert!(!leaf.enable_transport, "mobile leaf edge does not forward");
+    }
+}
+
+/// CIRISEdge#499 — the transport half of scope-native addressing.
+///
+/// These live in-crate rather than in `tests/` on purpose: `StubDeriver` is
+/// `#[cfg(test)]`, so an integration test cannot build a [`ScopeAddressTable`]
+/// at all. That is the point — outside this crate's own tests there is no way
+/// to obtain a [`MemberAddress`] except from a real derivation.
+#[cfg(test)]
+mod scope_native_addressing_tests {
+    use super::*;
+    use crate::cohort_scope::CohortScope;
+    use crate::scope_addressing::StubDeriver;
+    use leviculum_core::AnnounceControl as _;
+
+    async fn bare_transport(dir: &std::path::Path, key_id: &str) -> ReticulumTransport {
+        // A hybrid signer, because CIRISEdge#333 refuses to build a transport
+        // that cannot self-attest its announces.
+        let mut ed_seed = [0u8; 32];
+        let mut pqc_seed = [0u8; 32];
+        let salt = u8::try_from(key_id.len() % 251).expect("in range");
+        for (i, b) in ed_seed.iter_mut().enumerate() {
+            *b = u8::try_from(i % 251).expect("in range") ^ salt;
+        }
+        pqc_seed.copy_from_slice(&ed_seed);
+        pqc_seed[0] ^= 0x55;
+        let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            ciris_keyring::Ed25519SoftwareSigner::from_bytes(&ed_seed, key_id).expect("ed25519"),
+        );
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &pqc_seed,
+                format!("{key_id}-pqc"),
+            )
+            .expect("ml_dsa_65"),
+        );
+        let signer = Arc::new(LocalSigner::new(key_id, classical, Some(pqc)));
+
+        // No typed interfaces, and the default `0.0.0.0:4242` server replaced
+        // with an ephemeral port so these four tests can run concurrently. The
+        // node comes up with a routing table and a local identity; nothing here
+        // sends a byte.
+        let mut config = ReticulumTransportConfig::new(dir.join("transport.id"), key_id);
+        config.listen_addr = "127.0.0.1:0".parse().expect("ephemeral addr parses");
+        ReticulumTransport::new(
+            config,
+            ReticulumAuth {
+                signer: Some(signer),
+                ..ReticulumAuth::default()
+            },
+        )
+        .await
+        .expect("bare transport")
+    }
+
+    fn table_with_group(
+        scope: &CohortScope,
+        group_id: &str,
+        members: &[&str],
+    ) -> Arc<ScopeAddressTable> {
+        let table = Arc::new(ScopeAddressTable::new(Arc::new(StubDeriver)));
+        table
+            .install_group(scope, group_id, 1, &[9u8; 32], members)
+            .expect("install group");
+        table
+    }
+
+    #[tokio::test]
+    async fn scope_address_table_installs_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "edge-once").await;
+
+        assert!(
+            transport.scope_address_table().is_none(),
+            "a fresh transport has no table — production state until CIRISVerify#259",
+        );
+
+        let first = Arc::new(ScopeAddressTable::new(Arc::new(StubDeriver)));
+        transport
+            .install_scope_address_table(Arc::clone(&first))
+            .expect("first install succeeds");
+
+        // A second install must be REFUSED, not silently accepted: the loser's
+        // destinations would still be registered on the node, so two tables
+        // would disagree about which inbound hashes are ours.
+        let second = Arc::new(ScopeAddressTable::new(Arc::new(StubDeriver)));
+        let err = transport
+            .install_scope_address_table(second)
+            .expect_err("second install must be refused");
+        assert!(
+            format!("{err}").contains("already installed"),
+            "displacement must be named, got: {err}",
+        );
+        assert!(
+            transport
+                .scope_address_table()
+                .is_some_and(|t| Arc::ptr_eq(t, &first)),
+            "the FIRST table stays installed after a refused displacement",
+        );
+    }
+
+    #[tokio::test]
+    async fn public_scope_is_refused_for_a_derived_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "edge-public").await;
+
+        let scope = CohortScope::Family;
+        let table = table_with_group(&scope, "grp-a", &["member-a"]);
+        let address = table
+            .send_address(&scope, "grp-a", "member-a")
+            .expect("derived address");
+
+        // Registering a derived address as Public would hand it to the node's
+        // auto-announce loops, publishing the reachability fact the derivation
+        // exists to withhold (CIRISEdge#311 limb (b)).
+        let err = transport
+            .register_scoped_destination(&address, &CohortScope::Public)
+            .expect_err("Public must be refused");
+        assert!(
+            format!("{err}").contains("not a discovery address"),
+            "the refusal must say why, got: {err}",
+        );
+
+        // ...and the group scopes it exists for are all accepted.
+        for accepted in [
+            CohortScope::SelfOnly,
+            CohortScope::Family,
+            CohortScope::Cohort {
+                cohort_id: "c-1".to_owned(),
+            },
+        ] {
+            transport
+                .register_scoped_destination(&address, &accepted)
+                .unwrap_or_else(|e| panic!("{accepted:?} must register: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn registering_a_scoped_destination_suppresses_its_announce() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "edge-suppress").await;
+
+        let scope = CohortScope::Cohort {
+            cohort_id: "neighbourhood".to_owned(),
+        };
+        let table = table_with_group(&scope, "grp-b", &["member-b"]);
+        let address = table
+            .send_address(&scope, "grp-b", "member-b")
+            .expect("derived address");
+        let hash = *address.as_bytes();
+
+        let registered_before = transport.announce_policy.len();
+        transport
+            .register_scoped_destination(&address, &scope)
+            .expect("register");
+
+        // The scope must actually be RECORDED, not merely fail-safe. Dropping
+        // the `register_announce_scope` call leaves the destination suppressed
+        // anyway (the policy default-suppresses anything unregistered), so a
+        // suppression assertion alone is blind to that mutation — verified by
+        // deleting the call and watching this test stay green. The entry count
+        // is what distinguishes "suppressed because we said so" from
+        // "suppressed because we forgot".
+        assert_eq!(
+            transport.announce_policy.len(),
+            registered_before + 1,
+            "the derived destination's scope must be recorded in the policy map",
+        );
+
+        // CC 5.4 — a group-scoped destination MUST NOT announce. The named
+        // discovery destination registered at construction still must.
+        assert!(
+            transport
+                .announce_policy
+                .should_suppress_announce(&DestinationHash::new(hash)),
+            "a scope-derived destination must never be announced",
+        );
+        assert!(
+            !transport
+                .announce_policy
+                .should_suppress_announce(
+                    &DestinationHash::new(transport.local_named_dest_hash()),
+                ),
+            "the named Commons discovery destination still announces",
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_scope_declines_without_a_table_and_resolves_with_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "edge-inbound").await;
+
+        let scope = CohortScope::Family;
+        let table = table_with_group(&scope, "grp-c", &["member-c", "member-d"]);
+        let address = table
+            .send_address(&scope, "grp-c", "member-c")
+            .expect("derived address");
+        let hash = *address.as_bytes();
+
+        // Production state today: no table installed → every scope-native
+        // lookup declines and the federation-scope paths are untouched.
+        assert!(
+            transport.inbound_scope(&hash).is_none(),
+            "no table installed → decline",
+        );
+
+        transport
+            .install_scope_address_table(Arc::clone(&table))
+            .expect("install");
+
+        let resolved = transport
+            .inbound_scope(&hash)
+            .expect("installed table resolves its own derived address");
+        assert_eq!(resolved.group().scope(), &scope);
+        assert_eq!(resolved.group().group_id(), "grp-c");
+        assert_eq!(
+            resolved.member_key_id(),
+            "member-c",
+            "the address resolves to the member it was derived FOR — not merely \
+             to the group; a per-member hash is what keeps the RNS routing entry \
+             unambiguous",
+        );
+        assert_eq!(resolved.epoch(), 1);
+
+        // A hash that is not ours stays not-ours.
+        assert!(
+            transport.inbound_scope(&[0u8; 16]).is_none(),
+            "an unrelated hash must not resolve",
+        );
     }
 }
