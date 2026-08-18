@@ -1211,7 +1211,7 @@ required-features = ["transport-reticulum"]
 # fidelity property holds (~5.2 µs per added sub-stream); planner
 # picks 4 distinct primaries across the 4 sub-stream paths.
 [[bench]]
-name = "realtime_av_mesh_e2e"
+name = "realtime_av_mdc_substrate"
 harness = false
 required-features = ["transport-http", "transport-reticulum"]
 
@@ -1322,3 +1322,20 @@ inherits = "release"
 debug = "full"
 strip = "none"
 incremental = false
+
+# Multi-container mesh harness (bench-mesh/). ONE edge occurrence per
+# process: its own federation seed, its own leviculum transport identity,
+# its own on-disk sealed KV, its own persist directory handle. Roles are
+# env-driven (`EDGE_ROLE=publisher|relay|subscriber|nonmember`) and the
+# topology comes up under `bench-mesh/compose.yaml`.
+#
+# This is the counterpart to — NOT a replacement for — the criterion
+# benches: those measure per-operation substrate cost in-process and feed
+# the deterministic instruction-count gate (CIRISEdge#461); this measures
+# whether real occurrences deliver real media across a real network while
+# the roster changes. `required-features` because it needs a live
+# Reticulum transport to be a real node at all.
+[[bin]]
+name = "edge_node"
+path = "src/bin/edge_node.rs"
+required-features = ["transport-reticulum"]

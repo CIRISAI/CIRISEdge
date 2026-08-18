@@ -1,3 +1,27 @@
+//! `realtime_av_mdc_substrate` — MDC decomposition + reassembly bench
+//! (renamed from `realtime_av_mesh_e2e`, CIRISEdge#499).
+//!
+//! # It was never end-to-end, and now it does not claim to be
+//!
+//! This measures the MDC/ALM **substrate**: dyadic decomposition,
+//! multi-parent dedup, proportional-fidelity degradation,
+//! `AlmJoinPlanner` parent-distinctness, and per-step cost. All of that
+//! is real and none of it is replaced by anything else.
+//!
+//! What it never did — and its own docs said so — is validate a real
+//! codec or a real network: the payloads are synthetic buffers and every
+//! participant is in one process. The `_e2e` name promised the opposite,
+//! and a reader comparing "the e2e bench is green" against a field
+//! failure would be comparing against the wrong instrument.
+//!
+//! The end-to-end question now has its own instrument: `bench-mesh/`
+//! runs separate containers, each a distinct edge occurrence with its
+//! own identity and sealed KV, pushing ffmpeg-encoded H.264 and real
+//! blobs across a real network while the roster changes. Go there for
+//! "does it work"; stay here for "what does the substrate cost".
+//!
+//! Original header follows.
+//!
 //! `realtime_av_mesh_e2e` — full holographic-mesh round-trip bench
 //! (v3.8.0 CIRISEdge#128 MDC substrate validation).
 //!

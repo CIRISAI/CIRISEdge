@@ -1,0 +1,235 @@
+# The mesh topology: 1 publisher, K relays, M subscribers, 1 non-member,
+# each a distinct edge occurrence on a real docker network.
+#
+# ── Why this shape ──────────────────────────────────────────────────
+#
+#   publisher ──► relay-1 ──► sub-1, sub-2, nonmember
+#                    └──────► relay-2 ──► sub-3, sub-4
+#
+# Connectivity over TCP interfaces is exactly "who dialled whom", so a
+# subscriber that only dials a relay CANNOT reach the publisher directly.
+# Publisher↔subscriber traffic therefore genuinely transits a relay, and
+# sub-3/sub-4 genuinely transit two hops. That is what makes `relay` a
+# meaningful role rather than a third leaf: relays run with
+# `with_transport_node(true)` and carry other nodes' frames.
+#
+# ── Distinct occurrences, enforced by the infrastructure ────────────
+#
+# Every container gets its OWN named volume at `/state`. Its federation
+# seed, its leviculum transport identity, and its XChaCha-sealed KV live
+# there and are unreachable from any other container. The only shared
+# writable volume is `/mesh`, which carries PUBLIC bootstrap data — the
+# roster of `(key_id, public key, host:port)` and the steward-signed
+# `federation_keys` rows. That is the data production learns through
+# directory-cache anti-entropy (CIRISEdge#175); no private key is ever
+# written there.
+#
+# ── Parameterisation ────────────────────────────────────────────────
+#
+# `./run.sh` computes RELAYS / SUBSCRIBERS and sets the profiles plus the
+# MESH_EXPECT / MESH_COHORT lists. Run it rather than `docker compose up`
+# directly, or the roster barrier will wait for nodes that never start.
+#
+#   ./run.sh                    # K=1, M=2   (the default point)
+#   ./run.sh --relays 2 --subs 4
+#   ./run.sh --sweep            # M ∈ {1,2,4} for the fan-out curve
+
+name: ciris-edge-bench-mesh
+
+x-node: &node
+  image: ciris-edge-bench-mesh:local
+  build:
+    context: ..
+    dockerfile: bench-mesh/Dockerfile
+  networks: [mesh]
+  environment: &node-env
+    EDGE_LISTEN: "0.0.0.0:4242"
+    EDGE_COMMUNITY: "${MESH_COMMUNITY:-bench-mesh}"
+    EDGE_SCOPE: "${MESH_SCOPE:-cohort:bench}"
+    EDGE_EXPECT: "${MESH_EXPECT:?run ./run.sh — MESH_EXPECT must list every node}"
+    EDGE_COHORT_MEMBERS: "${MESH_COHORT:?run ./run.sh — MESH_COHORT must list the cohort roster}"
+    EDGE_OBSERVERS: "${MESH_OBSERVERS:-}"
+    EDGE_FRAMES: "${MESH_FRAMES:-120}"
+    EDGE_ROTATE_AT: "${MESH_ROTATE_AT:-60}"
+    # NO `:-default` here. `${VAR:-x}` substitutes x when VAR is set but
+    # EMPTY, which would override run.sh deliberately choosing "no late
+    # joiner" for a single-subscriber topology. run.sh is the single
+    # source of truth for this value.
+    EDGE_LATE_JOINER: "${MESH_LATE_JOINER:-}"
+    EDGE_LATE_JOIN_DELAY_SECS: "${MESH_LATE_JOIN_DELAY_SECS:-10}"
+    EDGE_CONVERGENCE_SECS: "${MESH_CONVERGENCE_SECS:-20}"
+    EDGE_ROOT_TIMEOUT_SECS: "${MESH_ROOT_TIMEOUT_SECS:-180}"
+    EDGE_BARRIER_TIMEOUT_SECS: "${MESH_BARRIER_TIMEOUT_SECS:-300}"
+    RUST_BACKTRACE: "1"
+  volumes:
+    - mesh:/mesh
+    - results:/results
+  # A node that cannot come up must fail the run, not restart into a
+  # half-measured second attempt.
+  restart: "no"
+  stop_grace_period: 5s
+
+services:
+
+  # ─── The publisher: cohort creator, stream + blob source, steward ──
+  publisher:
+    <<: *node
+    container_name: bm-publisher
+    hostname: publisher
+    environment:
+      <<: *node-env
+      EDGE_ROLE: publisher
+      EDGE_NODE_ID: publisher
+      EDGE_ADVERTISE: "publisher:4242"
+      # No bootstrap: everyone else dials in.
+    volumes:
+      - state-publisher:/state
+      - mesh:/mesh
+      - results:/results
+
+  # ─── Relays: real transit nodes, no cohort secret ─────────────────
+  relay-1:
+    <<: *node
+    container_name: bm-relay-1
+    hostname: relay-1
+    depends_on: [publisher]
+    environment:
+      <<: *node-env
+      EDGE_ROLE: relay
+      EDGE_NODE_ID: relay-1
+      EDGE_ADVERTISE: "relay-1:4242"
+      EDGE_BOOTSTRAP: "publisher:4242"
+    volumes:
+      - state-relay-1:/state
+      - mesh:/mesh
+      - results:/results
+
+  relay-2:
+    <<: *node
+    container_name: bm-relay-2
+    hostname: relay-2
+    profiles: ["relays2"]
+    depends_on: [relay-1]
+    environment:
+      <<: *node-env
+      EDGE_ROLE: relay
+      EDGE_NODE_ID: relay-2
+      EDGE_ADVERTISE: "relay-2:4242"
+      EDGE_BOOTSTRAP: "relay-1:4242"
+    volumes:
+      - state-relay-2:/state
+      - mesh:/mesh
+      - results:/results
+
+  # ─── Subscribers: cohort members ──────────────────────────────────
+  #
+  # sub-1 is the default late joiner: it delays before presenting its
+  # KeyPackage so its admission lands MID-STREAM and drives the epoch
+  # advance the rotation conformance leg turns on.
+  sub-1:
+    <<: *node
+    container_name: bm-sub-1
+    hostname: sub-1
+    depends_on: [relay-1]
+    environment:
+      <<: *node-env
+      EDGE_ROLE: subscriber
+      EDGE_NODE_ID: sub-1
+      EDGE_ADVERTISE: "sub-1:4242"
+      EDGE_BOOTSTRAP: "relay-1:4242"
+    volumes:
+      - state-sub-1:/state
+      - mesh:/mesh
+      - results:/results
+
+  sub-2:
+    <<: *node
+    container_name: bm-sub-2
+    hostname: sub-2
+    profiles: ["subs2", "subs4"]
+    depends_on: [relay-1]
+    environment:
+      <<: *node-env
+      EDGE_ROLE: subscriber
+      EDGE_NODE_ID: sub-2
+      EDGE_ADVERTISE: "sub-2:4242"
+      EDGE_BOOTSTRAP: "relay-1:4242"
+    volumes:
+      - state-sub-2:/state
+      - mesh:/mesh
+      - results:/results
+
+  sub-3:
+    <<: *node
+    container_name: bm-sub-3
+    hostname: sub-3
+    profiles: ["subs4"]
+    depends_on: [relay-1]
+    environment:
+      <<: *node-env
+      EDGE_ROLE: subscriber
+      EDGE_NODE_ID: sub-3
+      EDGE_ADVERTISE: "sub-3:4242"
+      # Two hops from the publisher when relay-2 is up.
+      EDGE_BOOTSTRAP: "${MESH_DEEP_BOOTSTRAP:-relay-1:4242}"
+    volumes:
+      - state-sub-3:/state
+      - mesh:/mesh
+      - results:/results
+
+  sub-4:
+    <<: *node
+    container_name: bm-sub-4
+    hostname: sub-4
+    profiles: ["subs4"]
+    depends_on: [relay-1]
+    environment:
+      <<: *node-env
+      EDGE_ROLE: subscriber
+      EDGE_NODE_ID: sub-4
+      EDGE_ADVERTISE: "sub-4:4242"
+      EDGE_BOOTSTRAP: "${MESH_DEEP_BOOTSTRAP:-relay-1:4242}"
+    volumes:
+      - state-sub-4:/state
+      - mesh:/mesh
+      - results:/results
+
+  # ─── The non-member: on the mesh, not in the cohort ───────────────
+  #
+  # Rooted, reachable, and handed the same ciphertext — and it must still
+  # be unable to derive a cohort-scoped address or open a frame. Without
+  # it the refusal assertion could pass by refusing everything.
+  nonmember:
+    <<: *node
+    container_name: bm-nonmember
+    hostname: nonmember
+    depends_on: [relay-1]
+    environment:
+      <<: *node-env
+      EDGE_ROLE: nonmember
+      EDGE_NODE_ID: nonmember
+      EDGE_ADVERTISE: "nonmember:4242"
+      EDGE_BOOTSTRAP: "relay-1:4242"
+    volumes:
+      - state-nonmember:/state
+      - mesh:/mesh
+      - results:/results
+
+networks:
+  mesh:
+    driver: bridge
+
+volumes:
+  # PUBLIC bootstrap data only.
+  mesh:
+  # JSONL results, one line per leg per node.
+  results:
+  # PRIVATE per-occurrence state. One volume per container, never shared.
+  state-publisher:
+  state-relay-1:
+  state-relay-2:
+  state-sub-1:
+  state-sub-2:
+  state-sub-3:
+  state-sub-4:
+  state-nonmember:
