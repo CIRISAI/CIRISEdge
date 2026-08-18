@@ -1199,6 +1199,12 @@ pub struct Edge {
     /// `EdgeBindingsError::Unsupported`.
     #[cfg(feature = "_reticulum-module")]
     reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
+    /// CIRISEdge#499 — the scope-address lifecycle, present only when the
+    /// operator opted in via [`EdgeBuilder::scope_native_addressing`] AND a
+    /// Reticulum transport is wired. `None` is the default and is
+    /// byte-identical to pre-#499 behaviour.
+    #[cfg(feature = "_reticulum-module")]
+    scope_lifecycle: Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
     /// CIRISEdge#26 mutation surface (v0.15.1) — optional
     /// concrete-typed `Arc<dyn FederationDirectory>` retained so the
     /// UniFFI peer-mutation surface (`peer_add` / `peer_remove` /
@@ -1297,6 +1303,11 @@ pub struct EdgeBuilder {
     /// pushed into `transports` so listen+send fan-out is unchanged.
     #[cfg(feature = "_reticulum-module")]
     reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
+    /// CIRISEdge#499 — the convergence window, when the operator has opted
+    /// into scope-native addressing. `None` (the default) leaves the address
+    /// table uninstalled and every scope-native path declining.
+    #[cfg(feature = "_reticulum-module")]
+    scope_native_convergence: Option<std::time::Duration>,
     /// CIRISEdge#34 (v0.14.0 wiring) — optionally pre-built
     /// reachability tracker so a Reticulum transport constructed BEFORE
     /// Edge (the pyo3 cohabitation init order) can share the same
@@ -1536,6 +1547,8 @@ impl Edge {
             events: None,
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: None,
+            #[cfg(feature = "_reticulum-module")]
+            scope_native_convergence: None,
             reachability: None,
             derived_schema: None,
             canonical_bootstrap_peers: Vec::new(),
@@ -3431,8 +3444,31 @@ impl Edge {
     ///
     /// Returns a router with no table — i.e. the pre-#499 federation-only
     /// behaviour — on HTTP-only deployments, on builds without the Reticulum
-    /// module, and on every deployment that has not installed a table (which is
-    /// all of them until CIRISVerify#259's MLS exporter label is specified).
+    /// module, and on any deployment that has not armed scope-native addressing
+    /// via [`EdgeBuilder::scope_native_addressing`] (the default).
+    /// CIRISEdge#499 — the scope-address lifecycle, when the operator armed it
+    /// with [`EdgeBuilder::scope_native_addressing`].
+    ///
+    /// This is how a host drives the plane: snapshot a group, install it,
+    /// advance it on every epoch change, and seal on a cadence.
+    ///
+    /// ```ignore
+    /// let life = edge.scope_lifecycle().expect("armed");
+    /// let snap = cohort_addressing::snapshot(&community).await?;  // or av_addressing::snapshot(&call)?
+    /// life.install(&scope, &snap)?;
+    /// // …on every epoch change:
+    /// life.advance(&scope, &snapshot(&community).await?, Instant::now())?;
+    /// // …and on a timer:
+    /// life.seal_due(Instant::now());
+    /// ```
+    ///
+    /// `None` when not armed, which is the default.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn scope_lifecycle(&self) -> Option<&Arc<crate::scope_lifecycle::ScopeLifecycle>> {
+        self.scope_lifecycle.as_ref()
+    }
+
     #[must_use]
     pub fn blob_scope_router(&self) -> crate::blob_swarm::BlobScopeRouter {
         #[cfg(feature = "_reticulum-module")]
@@ -3862,7 +3898,6 @@ impl Edge {
     /// [`EdgeBuilder::transport`] path). The Links UniFFI surface
     /// consults this; `None` → `EdgeBindingsError::Unsupported`.
     #[cfg(feature = "_reticulum-module")]
-    #[must_use]
     pub fn reticulum_transport(
         &self,
     ) -> Option<Arc<crate::transport::reticulum::ReticulumTransport>> {
@@ -6159,6 +6194,66 @@ async fn dispatch_inbound(
 // ─── Builder ────────────────────────────────────────────────────────
 
 impl EdgeBuilder {
+    /// CIRISEdge#499 — arm scope-native addressing, if the operator asked.
+    ///
+    /// Extracted from [`Self::build`] so the arming reads as one decision
+    /// rather than as a block inside a 130-line constructor.
+    ///
+    /// OPT-IN, and deliberately so. Scoped addressing is ONE HOP by
+    /// constitutional ruling (CIRISConstitution#91: CC 5.4.6 binds the
+    /// emission, so a scope-derived destination can never announce and no
+    /// transport node ever learns a path to it). Enabling it is a real
+    /// operator trade — unlinkable per-context addressing in exchange for
+    /// direct-link-only reach on scoped content — and a trade like that is
+    /// chosen, never inherited from a default.
+    ///
+    /// Installing the table ARMS every scope-native path at once: the
+    /// transport's `inbound_scope`, the blob router and serve gate, and the
+    /// swarm holdings gate all read their arming from this one handle, so
+    /// "which addresses I answer on" and "which I send to" cannot drift.
+    #[cfg(feature = "_reticulum-module")]
+    fn arm_scope_native(
+        convergence: Option<std::time::Duration>,
+        transport: Option<&Arc<crate::transport::reticulum::ReticulumTransport>>,
+        own_key_id: &str,
+    ) -> Result<Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>, EdgeError> {
+        match (convergence, transport) {
+            (Some(convergence), Some(transport)) => {
+                let table = Arc::new(crate::scope_addressing::ScopeAddressTable::new(Arc::new(
+                    crate::scope_addressing::ScopePrivacyDeriver,
+                )));
+                // The transport owns the table (one source of truth) and is
+                // also the lifecycle's sink, so a registration and its table
+                // entry are made by the same object.
+                transport
+                    .install_scope_address_table(Arc::clone(&table))
+                    .map_err(|e| EdgeError::Config(format!("scope address table: {e}")))?;
+                tracing::info!(
+                    convergence_secs = convergence.as_secs(),
+                    "CIRISEdge#499 — scope-native addressing ARMED. Scoped destinations \
+                     are one-hop by CC 5.4.6 (CIRISConstitution#91): they never announce, \
+                     so scoped content reaches directly-attached peers only."
+                );
+                Ok(Some(Arc::new(crate::scope_lifecycle::ScopeLifecycle::new(
+                    table,
+                    Arc::clone(transport) as Arc<dyn crate::scope_lifecycle::ScopedDestinationSink>,
+                    own_key_id.to_owned(),
+                    convergence,
+                ))))
+            }
+            // Asked for, but no Reticulum transport to register on. Refused
+            // rather than silently ignored: a host that opted in and got the
+            // pre-#499 behaviour anyway would believe it had unlinkable
+            // addressing that it does not have.
+            (Some(_), None) => Err(EdgeError::Config(
+                "scope_native_addressing requires a Reticulum transport — the address \
+                 table has nowhere to register scoped destinations without one"
+                    .into(),
+            )),
+            (None, _) => Ok(None),
+        }
+    }
+
     /// Sovereign-mode convenience: load steward identity from
     /// filesystem seeds via `ciris-keyring`, open persist's
     /// SQLite-backed federation directory + edge outbound queue at
@@ -6281,6 +6376,45 @@ impl EdgeBuilder {
     /// additive variant. The typed handle is OPTIONAL — `link_open`
     /// returns `EdgeBindingsError::Unsupported` when no Reticulum
     /// transport is registered.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    /// CIRISEdge#499 — **arm scope-native addressing** with `convergence` as
+    /// the rotation window.
+    ///
+    /// Off by default. Calling this installs a [`ScopeAddressTable`] on the
+    /// Reticulum transport, which arms every scope-native path at once: the
+    /// transport's inbound admission, the blob router and serve gate, and the
+    /// swarm holdings gate all read their arming from that one handle, so
+    /// "which addresses I answer on" and "which I send to" cannot drift.
+    ///
+    /// # The trade you are making
+    ///
+    /// Scoped destinations are **one hop**. CC 5.4.6 binds the *emission*
+    /// (ruled: CIRISConstitution#91), so a scope-derived destination never
+    /// announces and no transport node ever learns a path to it. Scoped
+    /// content therefore reaches directly-attached peers only. In exchange,
+    /// this node presents an unlinkable address per context instead of one
+    /// `sha256(fed_pubkey)[..16]` everywhere.
+    ///
+    /// That is a genuine operational trade, which is why it is opt-in rather
+    /// than a default: a deployment that needs multi-hop reach for
+    /// cohort-scoped content should not inherit one-hop behaviour silently.
+    ///
+    /// `convergence` is how long a superseded epoch stays reachable after a
+    /// rotation — see [`DEFAULT_CONVERGENCE_WINDOW`]. Seal earlier and a peer
+    /// that has not re-keyed is cut off; later and a rotated-away address stays
+    /// live longer.
+    ///
+    /// After building, drive it through [`Edge::scope_lifecycle`].
+    ///
+    /// [`ScopeAddressTable`]: crate::scope_addressing::ScopeAddressTable
+    /// [`DEFAULT_CONVERGENCE_WINDOW`]: crate::scope_lifecycle::DEFAULT_CONVERGENCE_WINDOW
+    #[cfg(feature = "_reticulum-module")]
+    pub fn scope_native_addressing(mut self, convergence: std::time::Duration) -> Self {
+        self.scope_native_convergence = Some(convergence);
+        self
+    }
+
     #[cfg(feature = "_reticulum-module")]
     #[must_use]
     pub fn reticulum_transport(
@@ -6441,6 +6575,12 @@ impl EdgeBuilder {
         self
     }
 
+    // `build` wires ~30 subsystems into one value; the 100-line threshold is
+    // arbitrary for a constructor of that shape, and splitting it would spread
+    // one wiring decision across several functions. The allow sits DIRECTLY on
+    // the fn so nothing can be inserted between it and its target — a
+    // displacement this file has already produced twice today.
+    #[allow(clippy::too_many_lines)]
     pub fn build(self) -> Result<Edge, EdgeError> {
         let directory = self
             .directory
@@ -6521,6 +6661,13 @@ impl EdgeBuilder {
         // gracefully under the same back-pressure regime.
         let (verified_envelope_tx, _) =
             broadcast::channel(self.config.event_channel_capacity.max(1));
+        #[cfg(feature = "_reticulum-module")]
+        let scope_lifecycle = Self::arm_scope_native(
+            self.scope_native_convergence,
+            self.reticulum_transport.as_ref(),
+            &signer.key_id,
+        )?;
+
         let content_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // CIRISEdge#55 — sibling pending-map for chunk fetches.
         let blob_chunk_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -6581,6 +6728,8 @@ impl EdgeBuilder {
             reachability,
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: self.reticulum_transport,
+            #[cfg(feature = "_reticulum-module")]
+            scope_lifecycle,
             federation_directory: self.federation_directory,
             detector,
             canonical_peers,
@@ -8542,5 +8691,81 @@ mod baked_genesis_tests {
     #[test]
     fn default_config_enables_baked_genesis() {
         assert!(EdgeConfig::default().baked_canonical_genesis_enabled);
+    }
+}
+
+/// CIRISEdge#499 — the install path: arming, refusing, and staying off.
+///
+/// These build a real `Edge` rather than asserting on the builder, because
+/// the property that matters is that arming ACTUALLY INSTALLS the table —
+/// the single handle every scope-native path reads its arming from. A test
+/// that only checked the flag would pass with the install deleted.
+#[cfg(all(test, feature = "_reticulum-module"))]
+mod scope_native_install_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn builder(dir: &std::path::Path, key_id: &str) -> EdgeBuilder {
+        // `from_keyring_seed_dir` READS a seed; it does not mint one.
+        let seeds = dir.join("seeds");
+        std::fs::create_dir_all(&seeds).expect("seed dir");
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = u8::try_from(i).expect("in range") ^ 0x5a;
+        }
+        std::fs::write(seeds.join("ed25519.seed"), seed).expect("write seed");
+
+        EdgeBuilder::from_keyring_seed_dir(key_id, seeds, dir.join("edge.sqlite"))
+            .await
+            .expect("builder")
+    }
+
+    #[tokio::test]
+    async fn off_by_default_leaves_every_scope_native_path_declining() {
+        // The pre-#499 posture, and the one an existing deployment inherits
+        // by upgrading. Arming is an operator decision because scoped
+        // addressing is ONE HOP by CC 5.4.6 (CIRISConstitution#91) — a
+        // deployment must not acquire direct-link-only reach silently.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let edge = builder(tmp.path(), "edge-default")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .build()
+            .expect("build");
+
+        assert!(
+            edge.scope_lifecycle().is_none(),
+            "scope-native addressing must be OFF unless asked for",
+        );
+        assert!(
+            !edge.blob_scope_router().is_scope_native(),
+            "the blob router must stay federation-only when unarmed",
+        );
+    }
+
+    #[tokio::test]
+    async fn arming_without_a_transport_is_refused_not_silently_ignored() {
+        // THE safety property of this seam. A host that asked for unlinkable
+        // addressing and got the federation-only path anyway would believe it
+        // had a guarantee it does not have — the worst failure available here,
+        // because it is invisible and it is a privacy claim.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A transport IS configured — just not a Reticulum one. This is the
+        // dangerous shape: a host with working delivery that believes it also
+        // has unlinkable addressing.
+        let Err(err) = builder(tmp.path(), "edge-no-transport")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .scope_native_addressing(Duration::from_secs(300))
+            .build()
+        else {
+            panic!("arming without a Reticulum transport must be refused");
+        };
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scope_native_addressing") && msg.contains("Reticulum transport"),
+            "the refusal must name what is missing and why, got: {msg}",
+        );
     }
 }
