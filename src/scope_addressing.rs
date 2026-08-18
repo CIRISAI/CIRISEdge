@@ -57,18 +57,47 @@
 //! §2.2/§2.4-shaped, alongside the `k_record_id` / `k_symbol` /
 //! `derive_record_id` family this crate already re-exports from
 //! `crate::scope_privacy`). Verify is the first conformant impl per FSD
-//! §9; edge reproduces its bytes, it does not invent them.
+//! §9; edge reproduces its bytes, it does not invent them. It shipped in
+//! **v13.4.0**, and [`ScopePrivacyDeriver`] is the thin adapter onto it —
+//! `k_destination` then `derive_destination`, with no edge-side
+//! transformation of either input or output.
 //!
 //! **A destination hash is a cross-impl wire fact.** Two members of one
 //! group find each other only if both compute the same 16 bytes.
 //! Shipping edge-local "good enough" bytes would give that wire fact two
 //! owners, and the divergence is invisible until a real group silently
-//! fails to converge in the field. So the only [`DestinationDeriver`]
-//! impl in this crate is [`StubDeriver`], and it is `#[cfg(test)]` —
-//! not feature-gated, `#[cfg(test)]`. There is no build flag that puts
-//! it in a wheel; a release build that wanted it would not compile.
-//! [`ScopeAddressTable::new`] takes the deriver as a parameter for
-//! exactly that reason: production must supply verify's.
+//! fails to converge in the field. So the only other
+//! [`DestinationDeriver`] impl in this crate is [`StubDeriver`], and it
+//! is `#[cfg(test)]` — not feature-gated, `#[cfg(test)]`. There is no
+//! build flag that puts it in a wheel; a release build that wanted it
+//! would not compile. [`ScopeAddressTable::new`] takes the deriver as a
+//! parameter for exactly that reason: production must supply verify's.
+//!
+//! Verify's published vectors are reproduced in this file's
+//! `verify_259_golden_vectors` tests. Persist deliberately ships no
+//! witness for them (`ciris-crypto` gates `scope-privacy` behind a
+//! feature persist does not enable, since persist never calls these
+//! functions), so that module is the **only** place in the stack where a
+//! destination-derivation drift is caught.
+//!
+//! # Open: which MLS exporter label feeds `exporter_secret`
+//!
+//! `k_destination` takes "the group's `exporter_secret`", but RFC 9420
+//! §8.5's exporter is a *labelled* KDF — `export_secret(label, context,
+//! len)` — so that input is only well-defined once the label is fixed,
+//! and two members agree only if they export under the same one. That
+//! label is therefore as wire-affecting as the derivation itself and is
+//! **not** edge's to choose (raised on CIRISVerify#259 after v13.4.0
+//! closed it).
+//!
+//! One thing is already settled in the negative: edge's existing
+//! `ROOT_SECRET_LABEL` (`"ciris-realtime-av-epoch-dek-seed-v1"`,
+//! `transport::realtime_av_mls`) must NOT be that input. It is a DEK
+//! seed; feeding it here would derive a routing identifier that appears
+//! in the clear on the wire from the same material that seeds the
+//! content key, collapsing two secrets the exporter exists to keep
+//! independent. Until the label is specified, the table is simply never
+//! installed in production.
 //!
 //! # Locking
 //!
@@ -825,6 +854,32 @@ fn set_role(reverse: &mut HashMap<[u8; 16], InboundAddress>, slot: &EpochSlot, r
     }
 }
 
+// ─── Production deriver ─────────────────────────────────────────────
+
+/// The real derivation, from CIRISVerify v13.4.0's `scope_privacy`
+/// (CIRISVerify#259 — shipped, closed).
+///
+/// `derive` is `k_destination` then `derive_destination`, in that order,
+/// with no edge-side transformation of either input or output. That is
+/// the whole point: a destination hash is a cross-impl wire fact, so
+/// edge reproduces verify's bytes rather than computing its own — the
+/// same relationship [`crate::scope_privacy`] already has with
+/// `k_record_id` / `k_symbol` per FSD §9.
+///
+/// `k_destination` is recomputed per `derive` call rather than cached
+/// alongside the group. Derivation is COLD — once per
+/// `(group, epoch, member)` at an epoch boundary, never per packet — so
+/// caching would trade a real hazard (a `k_destination` living longer
+/// than the epoch whose secret produced it) for no measurable gain.
+pub struct ScopePrivacyDeriver;
+
+impl DestinationDeriver for ScopePrivacyDeriver {
+    fn derive(&self, exporter_secret: &[u8; 32], member_key_id: &str) -> [u8; 16] {
+        let k = crate::scope_privacy::k_destination(exporter_secret);
+        crate::scope_privacy::derive_destination(&k, member_key_id)
+    }
+}
+
 // ─── Test-only deriver ──────────────────────────────────────────────
 
 /// **TEST ONLY.** A non-cryptographic stand-in for CIRISVerify#259's
@@ -1438,5 +1493,106 @@ mod tests {
             StubDeriver.derive(&s, "ed25519:alice"),
             StubDeriver.derive(&secret(0x22), "ed25519:alice")
         );
+    }
+}
+
+/// CIRISVerify#259 golden vectors, reproduced byte-for-byte.
+///
+/// Per FSD §9 verify is the first conformant impl and edge reproduces its
+/// vectors in edge's own CI — the same obligation [`crate::scope_privacy`]
+/// already discharges for §2.2/§2.4. Persist deliberately ships no witness
+/// for these (`ciris-crypto` gates `scope-privacy` behind a feature persist
+/// does not enable, because persist never calls these functions), so this is
+/// the ONLY place in the stack where the destination vectors are asserted.
+/// If it is deleted, nothing else catches a derivation drift — and a drifted
+/// destination fails silently: an RNS hash nobody registered is simply never
+/// delivered to, with no error anywhere.
+#[cfg(test)]
+mod verify_259_golden_vectors {
+    use super::*;
+
+    /// Published in CIRISVerify v13.4.0.
+    const EXPORTER: [u8; 32] = [0x42u8; 32];
+    const K_DESTINATION_HEX: &str =
+        "3d854734e268842395e65c84d13a5ce74ddac1e5c51e70f2e0a5455e7293c2fb";
+    const DESTINATION_HEX: &str = "944a30ea6ea5c07fbfd0ece7a0779a29";
+    const MEMBER: &str = "ciris-node-1";
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            write!(s, "{b:02x}").expect("write to String is infallible");
+        }
+        s
+    }
+
+    #[test]
+    fn k_destination_matches_the_published_vector() {
+        assert_eq!(
+            hex(&crate::scope_privacy::k_destination(&EXPORTER)),
+            K_DESTINATION_HEX,
+            "K_destination drifted from CIRISVerify v13.4.0",
+        );
+    }
+
+    #[test]
+    fn derive_destination_matches_the_published_vector() {
+        let k = crate::scope_privacy::k_destination(&EXPORTER);
+        assert_eq!(
+            hex(&crate::scope_privacy::derive_destination(&k, MEMBER)),
+            DESTINATION_HEX,
+            "destination hash drifted from CIRISVerify v13.4.0",
+        );
+    }
+
+    /// The vector must survive the trait, not just the free functions —
+    /// this is what the table actually calls.
+    #[test]
+    fn the_production_deriver_reproduces_the_vector() {
+        assert_eq!(
+            hex(&ScopePrivacyDeriver.derive(&EXPORTER, MEMBER)),
+            DESTINATION_HEX,
+            "ScopePrivacyDeriver must be k_destination then derive_destination, \
+             with no edge-side transformation of either input or output",
+        );
+    }
+
+    /// Per-member, never a shared group hash (decision 1 of the issue): the
+    /// same group secret must give different members different addresses, or
+    /// N nodes land under one RNS routing entry and unicast is ambiguous.
+    #[test]
+    fn members_of_one_group_get_unrelated_addresses() {
+        let a = ScopePrivacyDeriver.derive(&EXPORTER, "ciris-node-1");
+        let b = ScopePrivacyDeriver.derive(&EXPORTER, "ciris-node-2");
+        assert_ne!(a, b, "a shared group hash is unicast-ambiguous in RNS");
+    }
+
+    /// The epoch secret is what separates epochs: the same member under a
+    /// different exporter must land somewhere unrelated, which is what makes
+    /// the three-phase rotation necessary in the first place.
+    #[test]
+    fn a_new_epoch_secret_moves_the_address() {
+        let old = ScopePrivacyDeriver.derive(&EXPORTER, MEMBER);
+        let new = ScopePrivacyDeriver.derive(&[0x43u8; 32], MEMBER);
+        assert_ne!(
+            old, new,
+            "if an epoch bump did not move the address, rotation would be a no-op",
+        );
+    }
+
+    /// The table must hand out exactly what the deriver computes — no
+    /// truncation, re-hashing, or byte-order surprise between them.
+    #[test]
+    fn the_table_hands_out_the_derived_bytes_unchanged() {
+        let scope = crate::cohort_scope::CohortScope::Family;
+        let table = ScopeAddressTable::new(Arc::new(ScopePrivacyDeriver));
+        table
+            .install_group(&scope, "grp", 1, &EXPORTER, &[MEMBER])
+            .expect("install");
+        let addr = table
+            .send_address(&scope, "grp", MEMBER)
+            .expect("send address");
+        assert_eq!(hex(addr.as_bytes()), DESTINATION_HEX);
     }
 }

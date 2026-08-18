@@ -41,8 +41,8 @@
 // ─── §2.2 / §2.4 / §3.4 re-exports (verify v6.3.0 authority) ────────
 
 pub use ciris_crypto::scope_privacy::{
-    derive_record_id, derive_symbol_key, k_record_id, k_symbol, witness_cover_leaf, RecordType,
-    LABEL_RECORD_ID, LABEL_SYMBOL,
+    derive_destination, derive_record_id, derive_symbol_key, k_destination, k_record_id, k_symbol,
+    witness_cover_leaf, RecordType, LABEL_DESTINATION, LABEL_RECORD_ID, LABEL_SYMBOL,
 };
 
 // ─── §3.3 HPKE_SUITE_ID re-export (verify v6.3.0 pinned bytes) ──────
