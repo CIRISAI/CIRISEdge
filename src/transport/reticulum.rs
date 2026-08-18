@@ -2883,11 +2883,42 @@ impl ReticulumTransport {
     /// BROADCAST-ONLY: it reaches a directly-attached neighbour and no further,
     /// exactly like a v7 explicit-hash peer before `prime_peer`.
     ///
-    /// How a scoped address becomes relay-routable without re-publishing the
-    /// reachability fact is **not edge's rule to choose** and is raised rather
-    /// than guessed. Until it is specified, a multi-hop scoped fetch fails at
-    /// the establish timeout with [`TransportError::NoRouteToPeer`] — loudly,
-    /// and without ever having put the scoped bytes on the federation address.
+    /// **This is a RULED posture, not a gap to fix.** CIRISConstitution#91
+    /// asked whether CC 5.4.6's announce prohibition binds the *packet* or the
+    /// *leak*, and CC 1.0-rc4 ruled: **the packet, stated as the emission**. A
+    /// directed announce iterated over the roster inherits the prohibition
+    /// rather than escaping it — the clause binds the emission, not the
+    /// addressing mode. Three legs, now in-clause at 5.4.6:
+    ///
+    /// - No directed announce on RNS transport can satisfy the purposive
+    ///   gloss, because multi-hop path learning IS outsider observation, and
+    ///   the path state intermediates retain is exactly the class the subpoena
+    ///   framing promises does not exist.
+    /// - The flat `MUST NOT` was never broadcast-era shorthand: the same
+    ///   section bans the targeted, non-broadcast per-destination query in the
+    ///   same breath, so the emission class was always the object.
+    /// - A directed announce would trade *no emission exists* — structural and
+    ///   honestly claimable — for *emissions exist but resist analysis*, which
+    ///   is traffic-analysis privacy, precisely the claim CEG/RET declines to
+    ///   make outside the Anonymous Tier (CC 1.13.3.1). **A reading must not
+    ///   spend a claimable guarantee to purchase an unclaimable one.**
+    ///
+    /// The ruling also names a bind edge's own filing missed: the derivation
+    /// is EPOCH-BOUND, so an announcing scheme must either re-announce
+    /// roster-wide on every Add/Remove — a synchronized wave whose cardinality,
+    /// timing and churn are themselves the leak — or never rotate, which leaves
+    /// a removed member holding every peer's addressing forever.
+    ///
+    /// So a multi-hop scoped fetch fails at the establish timeout with
+    /// [`TransportError::NoRouteToPeer`] — loudly, and without ever having put
+    /// the scoped bytes on the federation address. **Do not "fix" this by
+    /// announcing.** Multi-hop scoped reach remains open on the amendment
+    /// plane with its bar stated: no outsider-observable emission, no
+    /// outsider-retained path state, no epoch-correlated wave.
+    ///
+    /// What the ruling DID keep is that in-group MLS distribution of addressing
+    /// material was never prohibited — the cached-directory discipline — so a
+    /// roster learning its own members' addresses over MLS stays open.
     ///
     /// # Errors
     /// [`TransportError::BodyTooLarge`] above the AV-13 ceiling;
