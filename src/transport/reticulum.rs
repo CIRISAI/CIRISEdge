@@ -2797,6 +2797,44 @@ impl ReticulumTransport {
         Ok(())
     }
 
+    /// CIRISEdge#499 — retire a scope-derived destination.
+    ///
+    /// The inverse of [`Self::register_scoped_destination`], and the one
+    /// half of the lifecycle edge cannot currently honour:
+    /// `leviculum-std`'s driver forwards `register_destination` but not
+    /// `unregister_destination` (**leviculum#54**). `NodeCore` has the
+    /// verb and it does the right thing — it drops the routing entry and
+    /// the destination — it is simply not exposed on the `&self` driver
+    /// an `Arc<ReticulumNode>` holder can reach, and there is no
+    /// `destination_mut` or node escape hatch to route around it.
+    ///
+    /// So this returns `Err` rather than silently succeeding. A sealed
+    /// address that stays registered is a real residual disclosure: an
+    /// observer who learned it can keep probing and keep confirming this
+    /// node is reachable, which is the reachability publication
+    /// CIRISEdge#311 exists to prevent. Reporting that honestly is worth
+    /// more than a no-op that reads as success.
+    ///
+    /// When the driver verb lands, the body becomes
+    /// `self.node.unregister_destination(&DestinationHash::new(hash))`
+    /// plus the announce-policy `forget`, and
+    /// [`crate::scope_lifecycle::SealOutcome::unretired`] goes to zero.
+    ///
+    /// # Errors
+    /// Always, until leviculum#54 lands.
+    pub fn retire_scoped_destination(
+        &self,
+        address: &MemberAddress,
+        _scope: &crate::cohort_scope::CohortScope,
+    ) -> Result<(), TransportError> {
+        let _ = address;
+        Err(TransportError::Config(
+            "leviculum-std exposes no unregister_destination on the node driver \
+             (leviculum#54); the sealed scope address stays routable"
+                .to_owned(),
+        ))
+    }
+
     /// CIRISEdge#499 — resolve an inbound destination hash to the scope
     /// group, member and epoch it was derived for, or `None` if it is not one
     /// of ours.
@@ -9532,5 +9570,30 @@ mod scope_native_addressing_tests {
             transport.inbound_scope(&[0u8; 16]).is_none(),
             "an unrelated hash must not resolve",
         );
+    }
+}
+
+/// CIRISEdge#499 — the transport as the lifecycle's destination sink.
+///
+/// Keeps the two halves that must not drift — edge's address table and
+/// the leviculum node's routing table — behind one object, so a
+/// transition cannot update one and forget the other.
+impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
+    fn register(
+        &self,
+        address: &MemberAddress,
+        scope: &crate::cohort_scope::CohortScope,
+    ) -> Result<(), String> {
+        self.register_scoped_destination(address, scope)
+            .map_err(|e| e.to_string())
+    }
+
+    fn retire(
+        &self,
+        address: &MemberAddress,
+        scope: &crate::cohort_scope::CohortScope,
+    ) -> Result<(), String> {
+        self.retire_scoped_destination(address, scope)
+            .map_err(|e| e.to_string())
     }
 }

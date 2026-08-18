@@ -103,6 +103,7 @@ mod sas_wordlist;
 // receive accept-set a superset of the send-set (CIRISEdge#492 shape).
 pub mod cohort_addressing;
 pub mod scope_addressing;
+pub mod scope_lifecycle;
 // v6.0.0 (CIRISEdge#175) — CC 1.13.3.4 substrate.
 pub mod scope_privacy;
 pub mod swarm;
