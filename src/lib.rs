@@ -103,6 +103,7 @@ mod sas_wordlist;
 // receive accept-set a superset of the send-set (CIRISEdge#492 shape).
 pub mod av_addressing;
 pub mod cohort_addressing;
+pub mod contextual_integrity;
 pub mod family_gates;
 pub mod scope_addressing;
 pub mod scope_lifecycle;
