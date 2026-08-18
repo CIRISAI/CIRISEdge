@@ -336,6 +336,28 @@ pub enum WithholdReason {
     /// says *"we never ran the check"*, which is a wiring/timing fact, not a
     /// statement about the signer or the root.
     AccordRelayUnresolved,
+    /// CIRISEdge#499 (blob plane) — an inbound `BlobChunkFetch` was refused
+    /// because the responder could not determine the blob's SCOPE, so it could
+    /// not evaluate whether this requester is entitled to it. Fail-closed, and
+    /// its own branch: "I do not know what this content is" is a wiring fact
+    /// (`BlobChunkSource::chunk_scope` unwired or returning `None`) with an
+    /// operator remedy, not a statement about the requester.
+    BlobScopeUndeterminable,
+    /// CIRISEdge#499 (blob plane) — the blob's scope does not admit the scope
+    /// the request ARRIVED on, per the #48-A
+    /// [`allows_recipient_scope`](crate::cohort_scope::CohortScope::allows_recipient_scope)
+    /// predicate. The canonical case: family-scoped content requested over the
+    /// federation address, where reaching a public discovery endpoint proves
+    /// nothing about family membership. This is the gate working as designed.
+    BlobArrivalScopeInsufficient,
+    /// CIRISEdge#499 (blob plane) — the arrival SCOPE matched but the request
+    /// arrived on an address derived from a DIFFERENT group's MLS
+    /// `exporter_secret`. Its own branch because the scope predicate
+    /// structurally cannot see it (`Family` vs `Family` is a match), and yet
+    /// possession of one family's group secret proves nothing about another's —
+    /// folding this into [`Self::BlobArrivalScopeInsufficient`] would report a
+    /// cross-group access attempt as an ordinary scope mismatch.
+    BlobArrivalGroupMismatch,
 }
 
 impl WithholdReason {
@@ -362,6 +384,9 @@ impl WithholdReason {
             Self::AccordRelaySignerNotSeated => "accord_relay_signer_not_seated",
             Self::AccordRelayNoTrustEdge => "accord_relay_no_trust_edge",
             Self::AccordRelayUnresolved => "accord_relay_unresolved",
+            Self::BlobScopeUndeterminable => "blob_scope_undeterminable",
+            Self::BlobArrivalScopeInsufficient => "blob_arrival_scope_insufficient",
+            Self::BlobArrivalGroupMismatch => "blob_arrival_group_mismatch",
         }
     }
 }

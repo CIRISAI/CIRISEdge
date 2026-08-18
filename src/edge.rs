@@ -3169,6 +3169,141 @@ impl Edge {
         }
     }
 
+    /// CIRISEdge#499 — fetch a chunk from a holder at the address its
+    /// content's SCOPE requires.
+    ///
+    /// The scope-native sibling of [`Self::fetch_blob_chunk`]. It takes a
+    /// [`BlobRecipient`], which is constructible only by
+    /// [`BlobScopeRouter::route`](crate::blob_swarm::BlobScopeRouter::route):
+    /// holding one is proof that the content's scope was determined and an
+    /// address resolved for it. There is no overload that takes a bare peer id
+    /// and a scope — that would let a caller name a scope the address does not
+    /// match, which is exactly the mistake the newtype exists to make
+    /// unrepresentable.
+    ///
+    /// The correlation half (the pending-map keyed by
+    /// `(blob_sha256, chunk_sha256)`, the timeout, the cleanup on every exit)
+    /// is IDENTICAL to [`Self::fetch_blob_chunk`] and shared with it. Only the
+    /// send differs:
+    ///
+    /// - [`BlobRoute::Federation`] — delegates to the unscoped path verbatim,
+    ///   so public content is byte-identical to pre-#499.
+    /// - `Scoped` — signs the same `BlobChunkFetch` and ships it to the
+    ///   derived destination via
+    ///   [`ReticulumTransport::send_to_scoped_destination`].
+    ///
+    /// # Fail-closed
+    ///
+    /// A scoped route on a node with no Reticulum transport (HTTP-only, or a
+    /// build without the module) is an ERROR, never a downgrade: HTTP has no
+    /// scope-derived destination plane, so serving the request there would put
+    /// the scoped blob back on the federation endpoint and re-collapse the
+    /// context. The caller sees a typed refusal and can pick another holder.
+    ///
+    /// [`BlobRecipient`]: crate::blob_swarm::BlobRecipient
+    /// [`BlobRoute::Federation`]: crate::blob_swarm::scope::BlobRoute::Federation
+    /// [`ReticulumTransport::send_to_scoped_destination`]: crate::transport::reticulum::ReticulumTransport::send_to_scoped_destination
+    ///
+    /// # Errors
+    /// Every error [`Self::fetch_blob_chunk`] returns, plus
+    /// [`EdgeError::Config`] when a scoped route cannot be shipped on this
+    /// node's transports.
+    pub async fn fetch_blob_chunk_scoped(
+        &self,
+        recipient: &crate::blob_swarm::BlobRecipient,
+        blob_sha256: [u8; 32],
+        chunk_sha256: [u8; 32],
+        timeout: std::time::Duration,
+    ) -> Result<ChunkResult, EdgeError> {
+        let Some(address) = recipient.scoped_address() else {
+            // Federation route — the unscoped path, verbatim.
+            return self
+                .fetch_blob_chunk(recipient.peer_key_id(), blob_sha256, chunk_sha256, timeout)
+                .await;
+        };
+
+        let key = (blob_sha256, chunk_sha256);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self
+                .blob_chunk_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.insert(key, tx);
+        }
+
+        let forget = |edge: &Self| {
+            let mut pending = edge
+                .blob_chunk_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.remove(&key);
+        };
+
+        let fetch = crate::messages::BlobChunkFetch {
+            blob_sha256,
+            chunk_sha256,
+            response_hint: None,
+        };
+
+        // Build + sign exactly as the unscoped path does — the ENVELOPE is
+        // unchanged by scope-native addressing, only the address it rides.
+        let envelope_bytes = match self
+            .build_signed_envelope_with_cohort_scope(recipient.peer_key_id(), &fetch, None, None)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                forget(self);
+                return Err(e);
+            }
+        };
+
+        #[cfg(feature = "_reticulum-module")]
+        let sent = match self.reticulum_transport.as_ref() {
+            Some(transport) => transport
+                .send_to_scoped_destination(recipient.peer_key_id(), address, &envelope_bytes)
+                .await
+                .map(|_| ())
+                .map_err(|e| EdgeError::Config(format!("scope-native blob fetch send: {e}"))),
+            None => Err(EdgeError::Config(format!(
+                "scope-native blob fetch: holder '{}' resolved to a scope-derived \
+                 address but this node has no Reticulum transport. HTTP and packet \
+                 radio have no scope-derived destination plane, and shipping this \
+                 request on the federation endpoint would re-collapse the context the \
+                 address exists to separate — refusing (CIRISEdge#499)",
+                recipient.peer_key_id()
+            ))),
+        };
+        #[cfg(not(feature = "_reticulum-module"))]
+        let sent = {
+            let _ = &envelope_bytes;
+            Err::<(), EdgeError>(EdgeError::Config(format!(
+                "scope-native blob fetch: holder '{}' resolved to a scope-derived \
+                 address but this build has no Reticulum module — refusing rather \
+                 than falling back to the federation address (CIRISEdge#499)",
+                recipient.peer_key_id()
+            )))
+        };
+        if let Err(e) = sent {
+            forget(self);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(EdgeError::Config(
+                "fetch_blob_chunk_scoped channel closed before response".into(),
+            )),
+            Err(_) => {
+                forget(self);
+                Err(EdgeError::Config(format!(
+                    "fetch_blob_chunk_scoped timeout after {timeout:?}"
+                )))
+            }
+        }
+    }
+
     /// CIRISEdge#55 — test-only sibling of
     /// [`Self::complete_pending_fetch_for_test`]: inject a fake
     /// `BlobChunkBody` / `BlobChunkMiss` outcome into the pending-chunk
@@ -3278,8 +3413,40 @@ impl Edge {
             self.canonical_peers.clone(),
             self.blob_chunk_source.as_ref(),
             self.swarm_runtime.get().as_ref(),
+            &self.blob_scope_router(),
         )
         .await;
+    }
+
+    /// CIRISEdge#499 — the blob plane's scope-address resolver.
+    ///
+    /// Derived from the Reticulum transport's installed
+    /// [`ScopeAddressTable`](crate::scope_addressing::ScopeAddressTable) rather
+    /// than held as a second copy on `Edge`. That is deliberate: the table is
+    /// also what registers the node's scoped destinations and what resolves
+    /// inbound arrivals, so a second install path would let "which addresses do
+    /// I answer on" and "which addresses do I send to" drift apart — and the
+    /// failure would be silent (an RNS hash nobody registered is simply never
+    /// delivered to). One `OnceLock`, one truth.
+    ///
+    /// Returns a router with no table — i.e. the pre-#499 federation-only
+    /// behaviour — on HTTP-only deployments, on builds without the Reticulum
+    /// module, and on every deployment that has not installed a table (which is
+    /// all of them until CIRISVerify#259's MLS exporter label is specified).
+    #[must_use]
+    pub fn blob_scope_router(&self) -> crate::blob_swarm::BlobScopeRouter {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            crate::blob_swarm::BlobScopeRouter::new(
+                self.reticulum_transport
+                    .as_ref()
+                    .and_then(|t| t.scope_address_table().cloned()),
+            )
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            crate::blob_swarm::BlobScopeRouter::default()
+        }
     }
 
     /// CIRISEdge#208 — install a runtime override for the
@@ -3919,6 +4086,15 @@ impl Edge {
         // Clone of the `Arc<OnceLock<Arc<FountainSwarmRuntime>>>`; the
         // OnceLock load inside the dispatch is a cheap atomic.
         let swarm_runtime = self.swarm_runtime.clone();
+        // CIRISEdge#499 — the handle the blob scope gate reads its address table
+        // from. Captured as the TRANSPORT, not as a pre-built router, because
+        // `install_scope_address_table` may fire after `run` starts (the MLS
+        // layer installs as soon as the first group is joined): resolving per
+        // frame means a table installed mid-run arms the gate on the next frame,
+        // where a router built once here would stay disarmed until restart.
+        // Cost is an `Arc` clone plus a `OnceLock` load per frame.
+        #[cfg(feature = "_reticulum-module")]
+        let blob_scope_transport = self.reticulum_transport.clone();
         // CIRISEdge#119 v3.5.1 — opt-in replication routing. When the
         // OnceLock has been populated by
         // `Edge::install_replication_routing`, the inbound loop
@@ -3970,6 +4146,14 @@ impl Edge {
                     let delegation_trust_roots_clone = delegation_trust_roots.clone();
                     let blob_chunk_source_clone = blob_chunk_source.clone();
                     let swarm_runtime_clone = swarm_runtime.clone();
+                    #[cfg(feature = "_reticulum-module")]
+                    let blob_scope_router = crate::blob_swarm::BlobScopeRouter::new(
+                        blob_scope_transport
+                            .as_ref()
+                            .and_then(|t| t.scope_address_table().cloned()),
+                    );
+                    #[cfg(not(feature = "_reticulum-module"))]
+                    let blob_scope_router = crate::blob_swarm::BlobScopeRouter::default();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -4004,6 +4188,7 @@ impl Edge {
                             delegation_trust_roots_clone,
                             blob_chunk_source_clone.as_ref(),
                             swarm_runtime_clone.get().as_ref(),
+                            &blob_scope_router,
                         ).await;
                     });
                 }
@@ -4218,6 +4403,20 @@ static INBOUND_VERIFY_REJECT_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 fn inbound_unroutable_crpl_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_UNROUTABLE_CRPL_LOG.get_or_init(|| {
         crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+    })
+}
+
+/// CIRISEdge#499 — a `BlobChunkFetch` withheld on scope admission. Keyed on the
+/// refusal's `reason_tag` (a three-value closed set, never attacker-chosen), so
+/// a flood from one gate collapses to a suppressed-count while each DISTINCT
+/// gate still gets a voice. The withhold COUNTER is deliberately unthrottled —
+/// a metric that under-counts is a metric that lies (CIRISEdge#433).
+static BLOB_SCOPE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+fn blob_scope_withheld_log() -> &'static crate::log_throttle::LogThrottle {
+    BLOB_SCOPE_WITHHELD_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(300), 16)
     })
 }
 
@@ -4505,6 +4704,7 @@ fn first_bytes_hex(bytes: &[u8]) -> String {
         delegation_trust_roots,
         blob_chunk_source,
         swarm_runtime,
+        blob_scope_router,
     ),
     fields(
         transport_id = %frame.transport.0,
@@ -4589,9 +4789,19 @@ async fn dispatch_inbound(
     // (verify still runs) but no runtime hook fires — same posture as
     // `blob_chunk_source` for the chunked-blob swarm.
     swarm_runtime: Option<&Arc<crate::swarm::FountainSwarmRuntime>>,
+    // CIRISEdge#499 — the blob plane's scope-address resolver, read from the
+    // transport's installed table so there is exactly ONE source of truth for
+    // "is this node scope-native". Default (no table) leaves the blob serve gate
+    // DISARMED, i.e. byte-identical to pre-#499.
+    blob_scope_router: &crate::blob_swarm::BlobScopeRouter,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
+    // CIRISEdge#499 — the receive-side ADMISSION FACT, resolved by the transport
+    // ahead of any parse (see `InboundFrame::arrival_scope`). Captured here, at
+    // the top, so every serve gate below reads the same value and none of them
+    // can accidentally re-derive it from something the requester said.
+    let arrival_scope = frame.arrival_scope.clone();
     // CIRISEdge#28 (v0.19.0) — count the bytes consumed by the
     // listener side regardless of verify outcome (the wire spent the
     // bytes; observability covers them).
@@ -5005,22 +5215,172 @@ async fn dispatch_inbound(
                 use crate::messages::{
                     BlobChunkBody, BlobChunkMiss as BlobChunkMissBody, MissReason,
                 };
-                let (response_kind, response_envelope_bytes) = match source
-                    .read_chunk(req.blob_sha256, req.chunk_sha256)
-                {
-                    Ok(Some(bytes)) => {
-                        // AV-13 size gate on outbound: refuse to
-                        // emit a chunk that exceeds the ceiling
-                        // (the peer would drop it anyway, but the
-                        // wire surface should never propose an
-                        // oversize body).
-                        if bytes.len() > max_content_body_bytes {
+
+                // CIRISEdge#499 — SCOPE ADMISSION, ahead of the read.
+                //
+                // The requester's entitlement is judged on the address the frame
+                // physically ARRIVED on, never on anything it claimed: an
+                // `arrival_scope` exists only because the destination hash
+                // matched the scope table's reverse index, and those hashes are
+                // derived from the group's MLS `exporter_secret` (RFC 9420 §8.5
+                // binds `(group_id, epoch)`), so holding one IS proof of
+                // group-secret possession. `None` means the federation address,
+                // which proves reachability and nothing more.
+                //
+                // The content's scope comes from the persist-backed consumer
+                // (`chunk_scope`); edge never infers it, and a `None` is
+                // refused rather than read as Public.
+                //
+                // Ordered BEFORE `read_chunk` so an unentitled request never
+                // touches the store — a refusal that still performed the read
+                // would leak timing and burn IO on a peer we will not answer.
+                //
+                // `chunk_scope` is consulted ONLY on a scope-native node. On a
+                // node with no address table the gate admits unconditionally, so
+                // calling it would be a consumer round-trip whose answer cannot
+                // change the outcome — and "byte-identical to pre-#499" has to
+                // mean the responder makes the same calls, not just reaches the
+                // same verdict.
+                let scope_native = blob_scope_router.is_scope_native();
+                let content_scope = if scope_native {
+                    source.chunk_scope(req.blob_sha256)
+                } else {
+                    None
+                };
+                let admission = crate::blob_swarm::admit_blob_serve(
+                    scope_native,
+                    arrival_scope.as_ref(),
+                    content_scope.as_ref(),
+                );
+                let scope_refusal = match admission {
+                    crate::blob_swarm::ServeAdmission::Admit => None,
+                    // Never a bare `continue` (CIRISEdge#425): the refusal is
+                    // BOOKED unthrottled (a metric that under-counts is a metric
+                    // that lies) and SPOKEN under the shared serve throttle, then
+                    // answered with a typed miss so the fetcher fails over to
+                    // another holder instead of hanging.
+                    crate::blob_swarm::ServeAdmission::Refuse(reason) => {
+                        metrics.inc_withhold(
+                            reason.withhold_reason(),
+                            &envelope.signing_key_id,
+                            reason.reason_tag(),
+                        );
+                        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                            blob_scope_withheld_log().check(reason.reason_tag())
+                        {
                             tracing::warn!(
-                                transport = ?transport,
-                                chunk_size = bytes.len(),
-                                max = max_content_body_bytes,
-                                "BlobChunkFetch responder: chunk exceeds AV-13 ceiling, replying NotHeld",
+                                event = "edge.blob_chunk_fetch.scope_withheld",
+                                peer_key_id = %envelope.signing_key_id,
+                                blob_sha256 = %hex::encode(&req.blob_sha256[..8]),
+                                reason = reason.reason_tag(),
+                                arrival_scope = arrival_scope
+                                    .as_ref()
+                                    .map_or("federation", |a| a.group().scope().kind_token()),
+                                suppressed_prev,
+                                "BlobChunkFetch WITHHELD on scope admission — {reason} \
+                                 (CIRISEdge#499)",
                             );
+                        }
+                        Some(reason)
+                    }
+                };
+
+                let (response_kind, response_envelope_bytes) = if scope_refusal.is_some() {
+                    // A scope refusal is a POLICY denial on the wire: the bytes
+                    // are not gone federation-wide, this node simply will not
+                    // serve them to this requester, so the scheduler's
+                    // `PolicyDenied` reaction (demote this responder, retry
+                    // elsewhere) is exactly right. The precise branch stays
+                    // LOCAL, in the withhold ledger — the wire reason must not
+                    // tell an unentitled peer which gate it failed.
+                    let miss = BlobChunkMissBody {
+                        blob_sha256: req.blob_sha256,
+                        chunk_sha256: req.chunk_sha256,
+                        reason: MissReason::PolicyDenied,
+                    };
+                    match build_chunk_response_envelope(
+                        MessageType::BlobChunkMiss,
+                        &envelope.signing_key_id,
+                        signer,
+                        &miss,
+                        body_sha256,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "BlobChunkFetch responder: failed to build scope-refusal envelope",
+                            );
+                            (MessageType::BlobChunkMiss, None)
+                        }
+                    }
+                } else {
+                    match source.read_chunk(req.blob_sha256, req.chunk_sha256) {
+                        Ok(Some(bytes)) => {
+                            // AV-13 size gate on outbound: refuse to
+                            // emit a chunk that exceeds the ceiling
+                            // (the peer would drop it anyway, but the
+                            // wire surface should never propose an
+                            // oversize body).
+                            if bytes.len() > max_content_body_bytes {
+                                tracing::warn!(
+                                    transport = ?transport,
+                                    chunk_size = bytes.len(),
+                                    max = max_content_body_bytes,
+                                    "BlobChunkFetch responder: chunk exceeds AV-13 ceiling, replying NotHeld",
+                                );
+                                let miss = BlobChunkMissBody {
+                                    blob_sha256: req.blob_sha256,
+                                    chunk_sha256: req.chunk_sha256,
+                                    reason: MissReason::NotHeld,
+                                };
+                                match build_chunk_response_envelope(
+                                    MessageType::BlobChunkMiss,
+                                    &envelope.signing_key_id,
+                                    signer,
+                                    &miss,
+                                    body_sha256,
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "BlobChunkFetch responder: failed to build miss envelope",
+                                        );
+                                        (MessageType::BlobChunkMiss, None)
+                                    }
+                                }
+                            } else {
+                                let body = BlobChunkBody {
+                                    blob_sha256: req.blob_sha256,
+                                    chunk_sha256: req.chunk_sha256,
+                                    bytes,
+                                };
+                                match build_chunk_response_envelope(
+                                    MessageType::BlobChunkBody,
+                                    &envelope.signing_key_id,
+                                    signer,
+                                    &body,
+                                    body_sha256,
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => (MessageType::BlobChunkBody, Some(bytes)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "BlobChunkFetch responder: failed to build body envelope",
+                                        );
+                                        (MessageType::BlobChunkBody, None)
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
                             let miss = BlobChunkMissBody {
                                 blob_sha256: req.blob_sha256,
                                 chunk_sha256: req.chunk_sha256,
@@ -5044,79 +5404,30 @@ async fn dispatch_inbound(
                                     (MessageType::BlobChunkMiss, None)
                                 }
                             }
-                        } else {
-                            let body = BlobChunkBody {
+                        }
+                        Err(refusal) => {
+                            let miss = BlobChunkMissBody {
                                 blob_sha256: req.blob_sha256,
                                 chunk_sha256: req.chunk_sha256,
-                                bytes,
+                                reason: refusal.to_miss_reason(),
                             };
                             match build_chunk_response_envelope(
-                                MessageType::BlobChunkBody,
+                                MessageType::BlobChunkMiss,
                                 &envelope.signing_key_id,
                                 signer,
-                                &body,
+                                &miss,
                                 body_sha256,
                             )
                             .await
                             {
-                                Ok(bytes) => (MessageType::BlobChunkBody, Some(bytes)),
+                                Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
                                 Err(e) => {
                                     tracing::warn!(
                                         error = %e,
-                                        "BlobChunkFetch responder: failed to build body envelope",
+                                        "BlobChunkFetch responder: failed to build refusal envelope",
                                     );
-                                    (MessageType::BlobChunkBody, None)
+                                    (MessageType::BlobChunkMiss, None)
                                 }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        let miss = BlobChunkMissBody {
-                            blob_sha256: req.blob_sha256,
-                            chunk_sha256: req.chunk_sha256,
-                            reason: MissReason::NotHeld,
-                        };
-                        match build_chunk_response_envelope(
-                            MessageType::BlobChunkMiss,
-                            &envelope.signing_key_id,
-                            signer,
-                            &miss,
-                            body_sha256,
-                        )
-                        .await
-                        {
-                            Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "BlobChunkFetch responder: failed to build miss envelope",
-                                );
-                                (MessageType::BlobChunkMiss, None)
-                            }
-                        }
-                    }
-                    Err(refusal) => {
-                        let miss = BlobChunkMissBody {
-                            blob_sha256: req.blob_sha256,
-                            chunk_sha256: req.chunk_sha256,
-                            reason: refusal.to_miss_reason(),
-                        };
-                        match build_chunk_response_envelope(
-                            MessageType::BlobChunkMiss,
-                            &envelope.signing_key_id,
-                            signer,
-                            &miss,
-                            body_sha256,
-                        )
-                        .await
-                        {
-                            Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "BlobChunkFetch responder: failed to build refusal envelope",
-                                );
-                                (MessageType::BlobChunkMiss, None)
                             }
                         }
                     }
@@ -7866,6 +8177,7 @@ mod inbound_ingest_tests {
             received_at: chrono::Utc::now(),
             source_key_id: source.map(crate::transport::SourceKeyId::transport_authenticated),
             link_key_id: None,
+            arrival_scope: None,
         }
     }
 
@@ -7934,6 +8246,7 @@ mod inbound_ingest_tests {
             received_at: chrono::Utc::now(),
             source_key_id: None,
             link_key_id: link.map(str::to_string),
+            arrival_scope: None,
         };
 
         // (a) Key + link → admitted on the link's transport identity.
@@ -7982,6 +8295,7 @@ mod inbound_ingest_tests {
             received_at: chrono::Utc::now(),
             source_key_id: None,
             link_key_id: Some("fresh-peer".into()),
+            arrival_scope: None,
         };
         assert!(
             bootstrap_carve_out_source(&junk).is_none(),
@@ -8012,6 +8326,7 @@ mod inbound_ingest_tests {
                 received_at: chrono::Utc::now(),
                 source_key_id: None,
                 link_key_id: link.clone(),
+                arrival_scope: None,
             };
             // Some(link) exactly when kind is a bootstrap kind AND a link exists.
             let expected = link.filter(|_| kind.is_bootstrap());

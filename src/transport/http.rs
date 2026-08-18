@@ -621,6 +621,9 @@ async fn inbound_handler(
         // CIRISEdge#402 — HTTP attributes via mTLS/bearer (`source_key_id`); it
         // carries no advisory-link identity, so no bootstrap carve-out here.
         link_key_id: None,
+        // CIRISEdge#499 — HTTP has no scope-derived destination plane; every
+        // request arrives at the federation endpoint.
+        arrival_scope: None,
     };
     match state.sink.send(frame).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
