@@ -23,14 +23,22 @@
 //! │  ├── welcome_wrap      — §3.3 HPKE-Base + ML-DSA-65 Welcome │
 //! │  ├── scope_state       — substrate-tier StorageProvider     │
 //! │  │                      (openmls 0.8) over EncryptedKVStore │
+//! │  ├── cohort_group      — persistent per-cohort MLS group    │
+//! │  │                      (CIRISEdge#499): real exporter_     │
+//! │  │                      secret for community/affiliations,  │
+//! │  │                      snapshot-persisted into scope_state │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
 pub mod archive_mode;
+pub mod cohort_group;
 pub mod scope_state;
 pub mod welcome_wrap;
 
 pub use archive_mode::{ArchiveMode, ArchiveModeError, DEFAULT_ROTATE_FORWARD_WINDOW_DAYS};
+pub use cohort_group::{
+    CohortCommit, CohortGroup, CohortGroupError, CohortGroups, CohortSecret, COHORT_SECRET_LABEL,
+};
 pub use scope_state::{ScopeStateProvider, ScopeStateProviderError};
 pub use welcome_wrap::{
     unwrap_welcome, wrap_welcome, FederationDirectoryEntry, WelcomeWrapError, WrappedWelcome,
