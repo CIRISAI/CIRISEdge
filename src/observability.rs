@@ -336,6 +336,23 @@ pub enum WithholdReason {
     /// says *"we never ran the check"*, which is a wiring/timing fact, not a
     /// statement about the signer or the root.
     AccordRelayUnresolved,
+    /// CIRISPersist#731 — an `accord:*` row whose SIGNED bytes could not be read
+    /// at all: no `attestation_envelope`, no `row` mirror, or a mirror that does
+    /// not deserialize as persist's
+    /// [`RowMirror`](ciris_persist::federation::envelope::RowMirror). The gate
+    /// cannot learn WHO signed it or WHICH accord it acts under, so it is
+    /// withheld — LOUD and named, never a silent `continue` (CIRISEdge#425/#433).
+    /// A malformed or pre-v31 unstamped row, not a trust statement.
+    AccordRelayObjectUnreadable,
+    /// CIRISPersist#731 — the row's signed bytes parsed, but **nothing in them
+    /// names the accord this object acts under**, so "which root?" has no
+    /// object-derived answer and the carriage question cannot be asked. The
+    /// permissive failure #731 is about is precisely what happens if this is
+    /// answered from construction state instead, so it refuses. See
+    /// [`AccordRelaySubject`](crate::replication::accord_relay_gate::AccordRelaySubject)
+    /// — an UPSTREAM gap (persist owns which field of an `accord:*` row names its
+    /// root), not a local misconfiguration.
+    AccordRelayObjectRootUnnamed,
 }
 
 impl WithholdReason {
@@ -362,6 +379,8 @@ impl WithholdReason {
             Self::AccordRelaySignerNotSeated => "accord_relay_signer_not_seated",
             Self::AccordRelayNoTrustEdge => "accord_relay_no_trust_edge",
             Self::AccordRelayUnresolved => "accord_relay_unresolved",
+            Self::AccordRelayObjectUnreadable => "accord_relay_object_unreadable",
+            Self::AccordRelayObjectRootUnnamed => "accord_relay_object_root_unnamed",
         }
     }
 }
