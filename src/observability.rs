@@ -437,6 +437,33 @@ pub enum WithholdReason {
     /// fail-closed anyway, so a future persist widening surfaces as a NAMED
     /// withhold rather than as an allow.
     HoldingScopeProjectionUnsupported,
+    /// CIRISPersist#744 (swarm holdings plane) — the gate is ARMED (a scope
+    /// address table is installed) but no `FederationDirectory` is wired, so
+    /// neither `holdings_authority` nor `resolve_projection_recipients` can be
+    /// asked. A WIRING fault, not a policy decision. Refused rather than
+    /// falling back to the pre-#744 hard-coded `ProducerSteward`, which would
+    /// resurrect the under-advertisement defect invisibly.
+    HoldingScopeDirectoryMissing,
+    /// CIRISPersist#744 (swarm holdings plane) — persist's `holdings_authority`
+    /// errored: the accord-co-scrub trust-root walk over the PUBLISHER's key
+    /// could not be completed. Never folded into a `ProducerSteward` default —
+    /// a read that failed is not a statement that the publisher is a plain
+    /// producer (the #425 Exhibit C split, on the authority axis).
+    HoldingScopeAuthorityUnresolved,
+    /// CIRISPersist#744 (swarm holdings plane) — persist's
+    /// `resolve_projection_recipients` returned `set_resolvable: false`:
+    /// **"I cannot judge"** this record's recipient set. Its own variant,
+    /// never folded into [`Self::HoldingScopePeerNotInRoster`] — persist keeps
+    /// the two bools separate precisely so an admission of ignorance is not
+    /// reported as an accusation about the peer, and the remedies differ (fix
+    /// a roster table or a group registration vs. fix a membership list).
+    HoldingScopeRecipientSetUnresolved,
+    /// CIRISPersist#744 (swarm holdings plane) — persist's
+    /// `resolve_projection_recipients` returned `Err`. Distinct from
+    /// [`Self::HoldingScopeRecipientSetUnresolved`], which is a VERDICT persist
+    /// reached deliberately; this is an infrastructure fault. Persist retains
+    /// the `Result` for exactly this split.
+    HoldingScopeRecipientReadError,
 }
 
 impl WithholdReason {
@@ -474,6 +501,10 @@ impl WithholdReason {
             Self::HoldingScopeUndeterminable => "holding_scope_undeterminable",
             Self::HoldingScopePublicGroup => "holding_scope_public_group",
             Self::HoldingScopePeerNotInRoster => "holding_scope_peer_not_in_roster",
+            Self::HoldingScopeDirectoryMissing => "holding_scope_directory_missing",
+            Self::HoldingScopeAuthorityUnresolved => "holding_scope_authority_unresolved",
+            Self::HoldingScopeRecipientSetUnresolved => "holding_scope_recipient_set_unresolved",
+            Self::HoldingScopeRecipientReadError => "holding_scope_recipient_read_error",
             Self::HoldingScopeProjectionUnsupported => "holding_scope_projection_unsupported",
         }
     }

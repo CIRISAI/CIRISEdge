@@ -80,6 +80,7 @@ pub use runtime::{
     FountainSwarmRuntime, ObservedClaim, SwarmEvent, SwarmRuntimeConfig, SwarmRuntimeEventSink,
     SwarmRuntimeOptions,
 };
-pub use scope::{
-    HoldingAnnounce, HoldingRefusal, HoldingsPublishGate, HoldingsScopeGate, HOLDING_AUTHORITY,
-};
+// `HOLDING_AUTHORITY` is GONE as of v37.1.0 (CIRISPersist#744): the
+// hard-coded `ProducerSteward` was the under-advertisement defect, and the
+// authority is now resolved per publisher by persist's `holdings_authority`.
+pub use scope::{HoldingAnnounce, HoldingRefusal, HoldingsPublishGate, HoldingsScopeGate};

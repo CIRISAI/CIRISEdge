@@ -425,8 +425,17 @@ impl FountainSwarmRuntime {
         // handle, both cheap clones), but every DECISION it makes is
         // resolved per record on the tick — the table is read live, never
         // snapshotted, so a rotation seal takes effect on the next tick.
-        let publish_gate =
-            HoldingsPublishGate::new(options.scope_table.clone(), options.metrics.clone());
+        // CIRISPersist#744 — the gate asks its two persist verbs of the
+        // runtime's OWN directory, the one already required by this
+        // constructor. Deliberately NOT a new `SwarmRuntimeOptions`
+        // field: an armed node must never be one forgotten option away
+        // from a hard-coded authority class, and the directory it should
+        // ask is the same one the rest of the swarm reads.
+        let publish_gate = HoldingsPublishGate::new(
+            options.scope_table.clone(),
+            Some(Arc::clone(&directory)),
+            options.metrics.clone(),
+        );
 
         let publisher_task = {
             let holdings = Arc::clone(&holdings);
@@ -596,7 +605,22 @@ async fn publish_tick(
             // though no content bytes move. `admit_and_book` BOOKS the
             // withhold (#433 ledger) and logs it before returning, so this
             // is never a bare `continue`.
-            match publish_gate.admit_and_book(&content.content_id, content_scope.as_ref(), peer) {
+            // CIRISPersist#744 — `async` now: the gate resolves the
+            // PUBLISHER's authority class and the recipient set through
+            // persist. `local_peer_id` is the publisher — this node signs
+            // the holding claim — and it is passed rather than held on
+            // the gate so the authority is never cached across one.
+            // No guard is live across this await (CIRISEdge#217):
+            // `content_scope` above is a plain `Option<ContentScope>`.
+            match publish_gate
+                .admit_and_book(
+                    local_peer_id,
+                    &content.content_id,
+                    content_scope.as_ref(),
+                    peer,
+                )
+                .await
+            {
                 HoldingAnnounce::Announce => {}
                 HoldingAnnounce::Withhold(_) => continue,
             }
@@ -1357,16 +1381,30 @@ mod tests {
         peers: Vec<String>,
         options: SwarmRuntimeOptions,
     ) -> Vec<(String, Vec<u8>)> {
+        drive_publisher_as(holdings, peers, options, "alice", test_directory()).await
+    }
+
+    /// CIRISPersist#744 — drive the loop under a NAMED publisher against a
+    /// NAMED directory, because the publisher's authority class is now an
+    /// input to the gate. `drive_publisher` keeps the plain-producer
+    /// default; the federation-reach assertions need a real trust root.
+    async fn drive_publisher_as(
+        holdings: Arc<dyn FountainHoldingsSource>,
+        peers: Vec<String>,
+        options: SwarmRuntimeOptions,
+        publisher: &str,
+        directory: Arc<dyn FederationDirectory>,
+    ) -> Vec<(String, Vec<u8>)> {
         let recording_tx = Arc::new(RecordingTransport::default());
         let tx: Arc<dyn Transport> = recording_tx.clone();
         let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || peers.clone());
         let mut rt = FountainSwarmRuntime::start_with_options(
             fast_config(),
             holdings,
-            test_directory(),
+            directory,
             tx,
             cohort,
-            "alice".to_string(),
+            publisher.to_string(),
             None,
             options,
         );
@@ -1397,7 +1435,17 @@ mod tests {
             ]),
         });
         let metrics = EdgeMetrics::default();
-        let sends = drive_publisher(
+        // CIRISPersist#744 — the publisher is a REAL trust root
+        // (accord-co-scrubbed `infra:attest`, admitted through persist's
+        // own gate). That is what makes the federation-scoped holding
+        // reach an outsider at all: `holdings_authority` resolves
+        // `AccordCoScrub`, `projection_for` gives `Global`, and persist's
+        // recipient verb answers `Unbounded`. Under a plain producer the
+        // same content projects `Cohort` at a commons tier, which has no
+        // roster table, and persist withholds — see
+        // `a_plain_producers_federation_holding_is_withheld_by_the_verb`.
+        let (backend, _bundle) = crate::bundle_gate::test_support::field_fixture().await;
+        let sends = drive_publisher_as(
             holdings,
             vec![INSIDER.to_string(), OUTSIDER.to_string()],
             SwarmRuntimeOptions {
@@ -1405,6 +1453,8 @@ mod tests {
                 metrics: Some(metrics.clone()),
                 ..SwarmRuntimeOptions::default()
             },
+            crate::bundle_gate::test_support::PIPELINE,
+            Arc::new(backend),
         )
         .await;
 
@@ -1426,6 +1476,65 @@ mod tests {
         assert!(
             metrics.withholds(WithholdReason::HoldingScopePeerNotInRoster) > 0,
             "the withhold must be BOOKED, not a bare continue",
+        );
+    }
+
+    /// CIRISPersist#744, at the LOOP — the twin of
+    /// `family_holding_is_not_announced_outside_the_cohort_but_federation_still_is`.
+    ///
+    /// The same federation-scoped holding, the same armed table, the same
+    /// peers — only the PUBLISHER changes, from a trust root to a plain
+    /// producer. Persist projects `Cohort` at a commons tier, holds no
+    /// roster table for one, and answers "I cannot judge", so the holding
+    /// is withheld and BOOKED under its own reason.
+    ///
+    /// This is the half-landing guard driven through the real publisher
+    /// rather than the pure gate: revert the authority seam and the two
+    /// tests collapse onto one answer, which is precisely the collapse
+    /// that hid the defect.
+    #[tokio::test]
+    async fn a_plain_producers_federation_holding_is_withheld_by_the_verb() {
+        let holdings: Arc<dyn FountainHoldingsSource> = Arc::new(ScopedHoldings {
+            held: vec![held("c-federation", vec![9])],
+            scopes: BTreeMap::from([("c-federation".to_string(), ContentScope::Federation)]),
+        });
+        let metrics = EdgeMetrics::default();
+        let (backend, _bundle) = crate::bundle_gate::test_support::field_fixture().await;
+        let sends = drive_publisher_as(
+            holdings,
+            vec![INSIDER.to_string(), OUTSIDER.to_string()],
+            SwarmRuntimeOptions {
+                scope_table: Some(family_table()),
+                metrics: Some(metrics.clone()),
+                ..SwarmRuntimeOptions::default()
+            },
+            // A plain node row — NOT accord-co-scrubbed.
+            crate::bundle_gate::test_support::PRESENTER,
+            Arc::new(backend),
+        )
+        .await;
+
+        assert!(
+            !announced(&sends, OUTSIDER, "c-federation"),
+            "a PLAIN producer's federation holding must not be broadcast: \
+             persist projects Cohort at a commons tier, has no roster table \
+             for one, and says so",
+        );
+        assert!(
+            !announced(&sends, INSIDER, "c-federation"),
+            "'cannot judge' is about the SET, not about one peer — it \
+             withholds from everyone, including a family member",
+        );
+        assert!(
+            metrics.withholds(WithholdReason::HoldingScopeRecipientSetUnresolved) > 0,
+            "the withhold must be BOOKED under the 'cannot judge' reason, \
+             never as peer-not-in-roster",
+        );
+        assert_eq!(
+            metrics.withholds(WithholdReason::HoldingScopePeerNotInRoster),
+            0,
+            "an admission of ignorance must never be booked as an accusation \
+             about the peer",
         );
     }
 

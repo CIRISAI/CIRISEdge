@@ -191,16 +191,28 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         // CIRISEdge#499 (holdings plane) — "I hold this" is itself a
         // flow, and before this cut a family-scoped holding's content id
         // AND symbol ids were announced on a timer to every peer the
-        // cohort callback returned. All four defend the same commitment
-        // — a claim reaches only the context it was made in — and are
-        // four variants rather than one because each sends the operator
-        // somewhere different: fix the wiring, fix the declaration, fix
-        // the roster, or await a persist widening. Different remedies,
-        // same promise.
+        // cohort callback returned. All of these defend the same
+        // commitment — a claim reaches only the context it was made in —
+        // and are separate variants rather than one because each sends
+        // the operator somewhere different: fix the declaration, fix the
+        // roster, or await a persist widening. Different remedies, same
+        // promise.
+        //
+        // CIRISPersist#744 adds the two verdict-side arms. Both are the
+        // RECIPIENT axis because they are persist answering "who may be
+        // told", not a claim about the publisher: `RecipientSetUnresolved`
+        // is persist declining to name the audience ("I cannot judge"),
+        // and `RecipientReadError` is that same question left unanswered
+        // by a fault. Neither is a statement about the peer — which is
+        // exactly why they are not folded into `PeerNotInRoster` — but
+        // both are edge refusing to move a claim it cannot bound to a
+        // context, which is the recipient commitment.
         WithholdReason::HoldingScopeUndeterminable
         | WithholdReason::HoldingScopePublicGroup
         | WithholdReason::HoldingScopePeerNotInRoster
-        | WithholdReason::HoldingScopeProjectionUnsupported => CiParameter::Recipient,
+        | WithholdReason::HoldingScopeProjectionUnsupported
+        | WithholdReason::HoldingScopeRecipientSetUnresolved
+        | WithholdReason::HoldingScopeRecipientReadError => CiParameter::Recipient,
 
         // ── Transmission principle ──────────────────────────────────
         // The serve capability and the per-record restriction are the
@@ -222,6 +234,28 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         | WithholdReason::TrustRootWalkError
         | WithholdReason::QuarantinedAuthor
         | WithholdReason::QuarantineReadError => CiParameter::Sender,
+
+        // CIRISPersist#744 (holdings plane) — the two PUBLISHER-side
+        // arms, and they are Sender for the reason the group above
+        // states rather than Recipient by default.
+        //
+        // `HoldingScopeAuthorityUnresolved` IS a trust-root walk failure:
+        // `holdings_authority` is `is_canonical_effective ||
+        // is_infra_attest_effective` over the publisher's key. It is the
+        // same question as `TrustRootWalkError` asked on the holdings
+        // plane — "I cannot establish who this is from" — so it takes the
+        // same attribution. Filing it under Recipient would say edge
+        // declined to reach a peer, when what actually happened is that
+        // edge could not establish its own publisher's standing.
+        //
+        // `HoldingScopeDirectoryMissing` is the wiring twin, and it sits
+        // here for the reason `LocalIdentityMissing` does: with no
+        // directory there is no verified state in which the publisher's
+        // authority class exists to be resolved. That call is also
+        // strictly first — the recipient verb TAKES the authority as an
+        // input — so the parameter that fails first is the sender's.
+        WithholdReason::HoldingScopeAuthorityUnresolved
+        | WithholdReason::HoldingScopeDirectoryMissing => CiParameter::Sender,
 
         // The row is not the type it claims, or its signed mirror does
         // not bind its columns — so the named source is not established
