@@ -290,6 +290,51 @@ pub enum CohortGroupError {
         "cohort group reached the reserved head-pointer epoch {HEAD_SLOT}; refusing to persist"
     )]
     EpochExhausted,
+    /// The bytes handed to [`CohortGroup::join`] decoded as MLS but
+    /// were not a Welcome.
+    #[error("expected a Welcome message, got a different MLS content type")]
+    NotAWelcome,
+    /// [`StagedWelcome::new_from_welcome`] refused the Welcome — most
+    /// often because none of this node's `KeyPackage`s match it (the
+    /// Welcome was minted for someone else, or for a KeyPackage this
+    /// node has already consumed).
+    ///
+    /// [`StagedWelcome::new_from_welcome`]: openmls::prelude::StagedWelcome::new_from_welcome
+    #[error("MLS cohort Welcome could not be staged: {0}")]
+    WelcomeRejected(String),
+    /// The Welcome is cryptographically valid but admits this node to
+    /// a group whose id is not the one [`cohort_group_id`] derives for
+    /// the community being joined.
+    ///
+    /// Refused BEFORE the group is constructed or persisted. Accepting
+    /// it would file another community's group under this
+    /// `community_id`'s namespace — and since the exporter context is
+    /// the `community_id`, every secret derived afterwards would be
+    /// derived under a community this group is not actually for.
+    #[error(
+        "cohort Welcome is for MLS group {got:?}, not the group id derived for community \
+         {community_id:?} ({expected:?})"
+    )]
+    WelcomeForDifferentGroup {
+        /// The community this join was attempted for.
+        community_id: String,
+        /// The group id `cohort_group_id(community_id)` derives.
+        expected: Vec<u8>,
+        /// The group id the Welcome actually admits to.
+        got: Vec<u8>,
+    },
+    /// [`CohortGroup::join`] was called for a community this node
+    /// already holds persisted group state for.
+    ///
+    /// Refused rather than overwritten: a join writes a genesis head
+    /// pointer, so proceeding would displace an existing group's head
+    /// and strand every snapshot it names. A node that really is being
+    /// re-admitted after removal must drop the old state explicitly.
+    #[error(
+        "cohort group state already exists for community {0:?} at epoch {1}; \
+         refusing to displace it with a join"
+    )]
+    AlreadyJoined(String, u64),
 }
 
 // ─── The cohort epoch secret ────────────────────────────────────────
@@ -891,6 +936,155 @@ impl CohortGroup {
         })
     }
 
+    /// Join an existing cohort from a `Welcome` (CIRISEdge#500).
+    ///
+    /// The counterpart to [`Self::create`]. Until this existed the
+    /// cohort bootstrap was one-directional: a founder could `create`
+    /// a group and [`Self::add_member`] you — producing a Welcome —
+    /// and you had no supported way to turn that Welcome into a
+    /// [`CohortGroup`]. A node that cannot join a cohort cannot derive
+    /// its scoped address in it (CIRISEdge#499), and that failure is
+    /// silent, because an RNS destination hash nobody registered is
+    /// simply never delivered to.
+    ///
+    /// `own_key_id` is NOT a parameter: it is
+    /// [`CohortKeyMaterial::key_id`], the id already stamped into the
+    /// credential whose private half decrypts this Welcome. Taking it
+    /// separately would let the two disagree.
+    ///
+    /// # What is checked, and in what order
+    ///
+    /// 1. The ciphersuite gate, before anything is decrypted.
+    /// 2. The bytes decode as MLS and carry a Welcome body.
+    /// 3. **No group state already exists for `community_id`** — a
+    ///    join writes a genesis head pointer, so proceeding would
+    ///    displace an existing group's head and strand every snapshot
+    ///    it names.
+    /// 4. The Welcome stages against this node's key material.
+    /// 5. **The group id is the one [`cohort_group_id`] derives for
+    ///    `community_id`** — checked on the [`StagedWelcome`]'s group
+    ///    context, so a mismatched Welcome never becomes a group at
+    ///    all. Accepting one would file another community's group
+    ///    under this namespace, and since the exporter context is the
+    ///    `community_id`, every secret derived afterwards would be
+    ///    derived under a community the group is not for.
+    /// 6. Only then is the group constructed and persisted.
+    ///
+    /// # What is NOT checked
+    ///
+    /// **Welcome authenticity is not membership authorization.**
+    /// openmls proves the Welcome is well-formed and that this node's
+    /// key package matches it. It does not prove the sender was
+    /// entitled to add this node to this community — that is a
+    /// federation-tier question about the sender's standing, and the
+    /// answer is not in the Welcome. Callers that need it must gate
+    /// before calling; this function deliberately does not invent a
+    /// rule for it.
+    ///
+    /// # Durable before usable
+    ///
+    /// The returned handle already has its snapshot and head pointer
+    /// written, the same discipline that makes a [`CohortCommit`]
+    /// durable before it is emittable. A crash immediately after
+    /// joining reloads into the group rather than losing membership
+    /// that peers have already committed to.
+    ///
+    /// # Errors
+    /// See [`CohortGroupError::NotAWelcome`],
+    /// [`CohortGroupError::WelcomeRejected`],
+    /// [`CohortGroupError::WelcomeForDifferentGroup`],
+    /// [`CohortGroupError::AlreadyJoined`].
+    pub async fn join(
+        store: ScopeStateProvider,
+        community_id: &str,
+        key_material: CohortKeyMaterial,
+        welcome: &[u8],
+        retained_epochs: u64,
+    ) -> Result<Self, CohortGroupError> {
+        use openmls::prelude::{MlsGroupJoinConfig, MlsMessageBodyIn, StagedWelcome};
+
+        if CIPHERSUITE_ID != 0x004D {
+            return Err(CohortGroupError::CiphersuiteNotAvailable);
+        }
+
+        let msg_in = MlsMessageIn::tls_deserialize(&mut &welcome[..])
+            .map_err(|e| CohortGroupError::WireDecodeFailed(format!("{e:?}")))?;
+        let MlsMessageBodyIn::Welcome(welcome_body) = msg_in.extract() else {
+            return Err(CohortGroupError::NotAWelcome);
+        };
+
+        // Before consuming the key material: refuse if this node already
+        // holds state for the community. `new_from_welcome` consumes the
+        // matching KeyPackage's private half even when it fails, so the
+        // cheap fail-closed check goes first.
+        if let Some(head_raw) = store.group_state_get(community_id, HEAD_SLOT).await? {
+            let epoch = decode_head(&head_raw)?;
+            return Err(CohortGroupError::AlreadyJoined(
+                community_id.to_string(),
+                epoch,
+            ));
+        }
+
+        let join_config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+        let staged = StagedWelcome::new_from_welcome(
+            key_material.provider.as_ref(),
+            &join_config,
+            welcome_body,
+            None,
+        )
+        .map_err(|e| CohortGroupError::WelcomeRejected(format!("{e:?}")))?;
+
+        // Check the group id on the STAGED welcome, so a Welcome for a
+        // different community never becomes an MlsGroup at all.
+        let expected = cohort_group_id(community_id);
+        let got = staged.group_context().group_id();
+        if got != &expected {
+            return Err(CohortGroupError::WelcomeForDifferentGroup {
+                community_id: community_id.to_string(),
+                expected: expected.as_slice().to_vec(),
+                got: got.as_slice().to_vec(),
+            });
+        }
+
+        let group = staged
+            .into_group(key_material.provider.as_ref())
+            .map_err(|e| CohortGroupError::WelcomeRejected(format!("into_group: {e:?}")))?;
+
+        let inner = CohortGroupInner {
+            community_id: community_id.to_string(),
+            provider: key_material.provider,
+            signer: key_material.signer,
+            group,
+            store,
+            retained_epochs: retained_epochs.max(1),
+        };
+
+        // Persist the joined epoch before handing out a handle — same
+        // ordering as `create`, and for the same reason: a group that
+        // exists only in RAM is membership the node loses on restart
+        // while its peers still count it in the roster.
+        let epoch = inner.epoch();
+        if epoch == HEAD_SLOT {
+            return Err(CohortGroupError::EpochExhausted);
+        }
+        let blob = inner.snapshot()?;
+        inner
+            .store
+            .group_state_put(&inner.community_id, epoch, &blob)
+            .await?;
+        inner
+            .store
+            .group_state_put(&inner.community_id, HEAD_SLOT, &encode_head(epoch))
+            .await?;
+
+        Ok(Self {
+            community_id: Arc::from(community_id),
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
     /// Reload a cohort group from the sealed KV, or `Ok(None)` if
     /// this node has never created/joined one for `community_id`.
     ///
@@ -1243,6 +1437,50 @@ impl CohortGroups {
         Ok(handle)
     }
 
+    /// Join `community_id` from a `Welcome` and register the handle
+    /// (CIRISEdge#500) — the registry-level counterpart to
+    /// [`CohortGroup::join`].
+    ///
+    /// Use this rather than calling [`CohortGroup::join`] directly
+    /// whenever a [`CohortGroups`] exists, because the whole
+    /// load-or-join runs under the SAME `live` lock that [`Self::open`]
+    /// holds. Without that, an `open` racing a `join` for one community
+    /// would find no state, take its `create` branch, and mint a
+    /// *second* group under the same `community_id` — two groups, two
+    /// epoch lines, and the single-writer property gone. Holding the
+    /// lock across the join makes the two calls serialize.
+    ///
+    /// If a handle is already live for `community_id`, that handle is
+    /// returned and the Welcome is left unconsumed: rejoining a
+    /// community this node is already in is a caller error, not
+    /// something to resolve by displacing live state.
+    ///
+    /// # Errors
+    /// Whatever [`CohortGroup::join`] returns — including
+    /// [`CohortGroupError::AlreadyJoined`] when persisted state exists
+    /// for a community with no live handle.
+    pub async fn join(
+        &self,
+        community_id: &str,
+        key_material: CohortKeyMaterial,
+        welcome: &[u8],
+    ) -> Result<CohortGroup, CohortGroupError> {
+        let mut live = self.live.lock().await;
+        if let Some(existing) = live.get(community_id) {
+            return Ok(existing.clone());
+        }
+        let handle = CohortGroup::join(
+            self.store.clone(),
+            community_id,
+            key_material,
+            welcome,
+            self.retained_epochs,
+        )
+        .await?;
+        live.insert(community_id.to_string(), handle.clone());
+        Ok(handle)
+    }
+
     /// Drop the in-memory handle for `community_id` without touching
     /// its persisted state — the next [`Self::open`] reloads from the
     /// KV. Used by tests to simulate a process restart; also useful
@@ -1264,6 +1502,215 @@ mod tests {
     fn open_store() -> ScopeStateProvider {
         let kv = XChaChaKvStore::open_in_memory(b"cohort-group-test-passphrase").unwrap();
         ScopeStateProvider::new(Arc::new(kv))
+    }
+
+    // ── Join (CIRISEdge#500) ────────────────────────────────────────
+
+    /// Founder creates, adds `joiner`, and returns (founder, joiner's
+    /// key material, the Welcome bytes). Two independent stores —
+    /// the real deployment shape; sharing one would have both nodes
+    /// clobbering the same head pointer.
+    async fn founder_and_welcome(
+        community: &str,
+        joiner: &str,
+    ) -> (CohortGroup, CohortKeyMaterial, Vec<u8>) {
+        let a = CohortGroup::create(open_store(), community, "node-a", 16)
+            .await
+            .unwrap();
+        let (material, kp) = mint_cohort_key_material(joiner).unwrap();
+        let add = a.add_member(joiner, kp).await.unwrap();
+        let welcome = add.welcome().expect("an Add produces a Welcome").to_vec();
+        (a, material, welcome)
+    }
+
+    #[tokio::test]
+    async fn a_joiner_lands_in_the_founders_group_at_the_same_epoch_and_secret() {
+        let (a, material, welcome) = founder_and_welcome("c-join", "node-b").await;
+        let b = CohortGroup::join(open_store(), "c-join", material, &welcome, 16)
+            .await
+            .expect("join");
+
+        assert_eq!(b.community_id(), "c-join");
+        assert_eq!(
+            b.epoch().await,
+            a.epoch().await,
+            "joiner lands at the add epoch"
+        );
+        // The exporter is the whole point — a joiner that agreed on
+        // everything except the secret would derive a different scoped
+        // address and be silently unreachable (CIRISEdge#499).
+        assert_eq!(
+            b.current_exporter().await.unwrap().as_bytes(),
+            a.current_exporter().await.unwrap().as_bytes(),
+            "joiner must derive the SAME cohort secret as the founder",
+        );
+        let mut roster = b.member_key_ids().await;
+        roster.sort();
+        assert_eq!(roster, vec!["node-a".to_string(), "node-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_join_is_durable_before_the_handle_is_usable() {
+        // The invariant. Process death is simulated by dropping the
+        // handle, which discards the whole in-memory provider —
+        // everything but the sealed KV.
+        let (a, material, welcome) = founder_and_welcome("c-join-durable", "node-b").await;
+        let store_b = open_store();
+
+        let (epoch_at_join, secret_at_join) = {
+            let b = CohortGroup::join(store_b.clone(), "c-join-durable", material, &welcome, 16)
+                .await
+                .unwrap();
+            // At the instant the caller holds the handle, the KV must
+            // ALREADY name this epoch — not after some later commit.
+            let head = store_b
+                .group_state_get("c-join-durable", HEAD_SLOT)
+                .await
+                .unwrap()
+                .expect("head pointer written before join returned");
+            let epoch = b.epoch().await;
+            assert_eq!(decode_head(&head).unwrap(), epoch);
+            assert!(
+                store_b
+                    .group_state_get("c-join-durable", epoch)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the snapshot the head names must exist before join returns",
+            );
+            (epoch, *b.current_exporter().await.unwrap().as_bytes())
+        };
+
+        // Crash, then reload. Membership peers already committed to
+        // must survive.
+        let reloaded = CohortGroup::load(store_b, "c-join-durable", 16)
+            .await
+            .unwrap()
+            .expect("a joined group reloads");
+        assert_eq!(reloaded.epoch().await, epoch_at_join);
+        assert_eq!(
+            *reloaded.current_exporter().await.unwrap().as_bytes(),
+            secret_at_join,
+        );
+        // And it can still take part: applying the founder's next
+        // commit is what proves the signer survived the round trip.
+        let rotate = a.rotate().await.unwrap();
+        let new_epoch = reloaded.apply_remote_commit(rotate.commit()).await.unwrap();
+        assert_eq!(new_epoch, a.epoch().await);
+        assert_eq!(
+            reloaded.current_exporter().await.unwrap().as_bytes(),
+            a.current_exporter().await.unwrap().as_bytes(),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_welcome_for_another_community_is_refused_and_persists_nothing() {
+        let (_a, material, welcome) = founder_and_welcome("c-real", "node-b").await;
+        let store_b = open_store();
+
+        // Same cryptographically-valid Welcome, filed under the wrong
+        // community. Accepting it would derive every later secret
+        // under a community the group is not for (the exporter context
+        // is the community_id).
+        let err = CohortGroup::join(store_b.clone(), "c-imposter", material, &welcome, 16)
+            .await
+            .expect_err("a Welcome for another group must be refused");
+        match err {
+            CohortGroupError::WelcomeForDifferentGroup {
+                ref community_id, ..
+            } => assert_eq!(community_id, "c-imposter"),
+            other => panic!("expected WelcomeForDifferentGroup, got {other:?}"),
+        }
+        assert!(
+            store_b
+                .group_state_get("c-imposter", HEAD_SLOT)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused join must leave NOTHING persisted",
+        );
+    }
+
+    #[tokio::test]
+    async fn join_refuses_to_displace_existing_group_state() {
+        let (_a, material, welcome) = founder_and_welcome("c-existing", "node-b").await;
+        // This node already has its own group for the community.
+        let store_b = open_store();
+        let own = CohortGroup::create(store_b.clone(), "c-existing", "node-b", 16)
+            .await
+            .unwrap();
+        let own_epoch = own.epoch().await;
+        let own_secret = *own.current_exporter().await.unwrap().as_bytes();
+
+        let err = CohortGroup::join(store_b.clone(), "c-existing", material, &welcome, 16)
+            .await
+            .expect_err("join must not displace existing state");
+        assert!(
+            matches!(err, CohortGroupError::AlreadyJoined(ref c, e) if c == "c-existing" && e == own_epoch)
+        );
+
+        // The pre-existing group is untouched — head still names its
+        // epoch, and it still derives its own secret.
+        let reloaded = CohortGroup::load(store_b, "c-existing", 16)
+            .await
+            .unwrap()
+            .expect("pre-existing group survives a refused join");
+        assert_eq!(reloaded.epoch().await, own_epoch);
+        assert_eq!(
+            *reloaded.current_exporter().await.unwrap().as_bytes(),
+            own_secret
+        );
+    }
+
+    #[tokio::test]
+    async fn non_welcome_bytes_are_refused_by_content_type_not_by_crash() {
+        let (a, material, _welcome) = founder_and_welcome("c-notwelcome", "node-b").await;
+        // A Commit is a valid MLS message and NOT a Welcome.
+        let rotate = a.rotate().await.unwrap();
+        let err = CohortGroup::join(open_store(), "c-notwelcome", material, rotate.commit(), 16)
+            .await
+            .expect_err("a Commit is not a Welcome");
+        assert!(matches!(err, CohortGroupError::NotAWelcome), "got {err:?}");
+
+        let (material2, _kp) = mint_cohort_key_material("node-c").unwrap();
+        let err = CohortGroup::join(
+            open_store(),
+            "c-notwelcome",
+            material2,
+            b"not mls at all",
+            16,
+        )
+        .await
+        .expect_err("garbage is not MLS");
+        assert!(
+            matches!(err, CohortGroupError::WireDecodeFailed(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_join_registers_one_handle_and_open_reuses_it() {
+        let (_a, material, welcome) = founder_and_welcome("c-registry", "node-b").await;
+        let groups = CohortGroups::with_retention(open_store(), "node-b", 16);
+
+        let joined = groups.join("c-registry", material, &welcome).await.unwrap();
+        // `open` must find the JOINED group, not take its create branch
+        // and mint a second group under the same community.
+        let opened = groups.open("c-registry").await.unwrap();
+        assert!(
+            Arc::ptr_eq(&joined.inner, &opened.inner),
+            "open must return the joined handle, not create a rival group",
+        );
+        assert_eq!(opened.epoch().await, joined.epoch().await);
+
+        // After eviction it reloads from the KV rather than re-creating.
+        assert!(groups.evict("c-registry").await);
+        let reopened = groups.open("c-registry").await.unwrap();
+        assert!(!Arc::ptr_eq(&joined.inner, &reopened.inner));
+        assert_eq!(reopened.epoch().await, joined.epoch().await);
+        let mut roster = reopened.member_key_ids().await;
+        roster.sort();
+        assert_eq!(roster, vec!["node-a".to_string(), "node-b".to_string()]);
     }
 
     // ── Snapshot codec ──────────────────────────────────────────────
@@ -1763,9 +2210,14 @@ mod tests {
     async fn apply_remote_commit_persists_before_reporting_the_epoch() {
         // Second member joins via Welcome so it holds a real remote
         // group, then the first member's rotate Commit is applied by
-        // the second. Uses `openmls`'s Welcome path directly (the
-        // cohort surface does not expose join in this cut).
-        use openmls::prelude::{MlsGroupJoinConfig, MlsMessageBodyIn, StagedWelcome};
+        // the second.
+        //
+        // This drives the PUBLIC `join` verb (CIRISEdge#500). It used
+        // to hand-assemble node-b's handle out of openmls's
+        // `StagedWelcome` and a directly-constructed
+        // `CohortGroupInner`, because no join verb existed — which
+        // meant the test asserted the apply path over a handle no
+        // production code path could ever produce.
 
         // Two nodes, ONE community, two independent local sealed
         // stores — the real deployment shape. (Sharing a store would
@@ -1779,38 +2231,15 @@ mod tests {
         let (material, kp) = mint_cohort_key_material("node-b").unwrap();
         let add = a.add_member("node-b", kp).await.unwrap();
 
-        // Build node-b's group from the Welcome.
-        let msg_in = MlsMessageIn::tls_deserialize(&mut add.welcome().unwrap()).unwrap();
-        let MlsMessageBodyIn::Welcome(welcome) = msg_in.extract() else {
-            panic!("expected a Welcome body");
-        };
-        let join_config = MlsGroupJoinConfig::builder()
-            .use_ratchet_tree_extension(true)
-            .build();
-        let staged = StagedWelcome::new_from_welcome(
-            material.provider.as_ref(),
-            &join_config,
-            welcome,
-            None,
+        let b = CohortGroup::join(
+            store_b.clone(),
+            "c-apply",
+            material,
+            add.welcome().expect("an Add produces a Welcome"),
+            16,
         )
-        .unwrap();
-        let b_group = staged.into_group(material.provider.as_ref()).unwrap();
-
-        // Wrap node-b's joined group in a cohort handle over its own
-        // local store so the apply path persists. (This module does
-        // not expose a join verb in this cut — that is the Welcome
-        // path's workstream — so the handle is assembled directly.)
-        let b = CohortGroup {
-            community_id: Arc::from("c-apply"),
-            inner: Arc::new(Mutex::new(CohortGroupInner {
-                community_id: "c-apply".to_string(),
-                provider: material.provider.clone(),
-                signer: material.signer,
-                group: b_group,
-                store: store_b.clone(),
-                retained_epochs: 16,
-            })),
-        };
+        .await
+        .expect("join");
         assert_eq!(b.epoch().await, add.epoch());
 
         let rotate = a.rotate().await.unwrap();
