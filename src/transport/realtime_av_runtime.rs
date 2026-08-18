@@ -83,8 +83,8 @@
 use tokio::sync::mpsc;
 
 use super::realtime_av::{
-    seal_av_inner, ChunkLayer, ChunkSeq, Epoch, EpochDek, RealtimeAvError, SealedAvChunk, StreamId,
-    CODEC_OPAQUE,
+    seal_av_inner, ChunkLayer, ChunkSeq, Epoch, EpochDek, InnerSealed, RealtimeAvError,
+    SealedAvChunk, StreamId, CODEC_OPAQUE,
 };
 use super::realtime_av_alm::{
     AlmJoinError, AlmJoinPlanner, JoinPlan, ParentCandidate, TransitGate,
@@ -234,6 +234,19 @@ impl AvPublisher {
         self.epoch
     }
 
+    /// Borrow the MLS session backing this publisher.
+    ///
+    /// CIRISEdge#499 — the session is the addressing plane's input:
+    /// [`crate::av_addressing::snapshot`] reduces it to the one shape
+    /// [`crate::scope_lifecycle::ScopeLifecycle`] takes. Read-only by
+    /// design; every mutation of the session still runs through
+    /// [`Self::admit_joiner`] / [`Self::advance_epoch`], so an epoch can
+    /// never move without this struct's DEK moving with it.
+    #[must_use]
+    pub fn session(&self) -> &AvSession {
+        &self.session
+    }
+
     /// Downstream subscriber count.
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
@@ -260,6 +273,36 @@ impl AvPublisher {
         codec_id: u8,
         layer: ChunkLayer,
     ) -> Result<ChunkSeq, AvRuntimeError> {
+        let (seq, inner) = self.seal_next(plaintext, codec_id, layer)?;
+        self.dispatch_inner(inner).await?;
+        Ok(seq)
+    }
+
+    /// Inner-seal one chunk under the current epoch DEK and stamp it
+    /// with the next [`ChunkSeq`], WITHOUT dispatching it.
+    ///
+    /// The split exists for the CIRISEdge#122 fan-out shape: a node that
+    /// both publishes and relays a stream must inner-seal **once** and
+    /// hand the same [`super::realtime_av::InnerSealed`] to every
+    /// fan-out point (its own dispatcher links AND its
+    /// [`super::realtime_av_relay::RelayNode`] roster). Sealing twice
+    /// would re-derive the same `(stream, epoch, chunk_seq)` inner nonce
+    /// for a second ciphertext — wasteful at best, and a nonce-reuse
+    /// hazard the moment the two plaintexts differ.
+    ///
+    /// The sequence counter advances HERE rather than after a successful
+    /// dispatch: once a nonce has been used to seal bytes, re-issuing it
+    /// is unsafe whether or not those bytes reached the wire.
+    ///
+    /// # Errors
+    ///
+    /// [`AvRuntimeError::Seal`] on inner-seal failure.
+    pub fn seal_next(
+        &mut self,
+        plaintext: &[u8],
+        codec_id: u8,
+        layer: ChunkLayer,
+    ) -> Result<(ChunkSeq, InnerSealed), AvRuntimeError> {
         let seq = ChunkSeq(self.next_chunk_seq);
         let inner = seal_av_inner(
             plaintext,
@@ -270,17 +313,30 @@ impl AvPublisher {
             codec_id,
             layer,
         )?;
+        self.next_chunk_seq = self.next_chunk_seq.wrapping_add(1);
         tracing::info!(
             stream = %stream_tag(self.stream_id),
             epoch = self.epoch.0,
             chunk_seq = seq.0,
             bytes = plaintext.len(),
             subscribers = self.dispatcher.subscriber_count(),
-            "AV publish: inner-sealed, fanning out"
+            "AV publish: inner-sealed"
         );
+        Ok((seq, inner))
+    }
+
+    /// Outer-seal an already-inner-sealed chunk per downstream
+    /// subscriber and enqueue it onto each subscriber's link. Returns
+    /// the number of links fanned to.
+    ///
+    /// # Errors
+    ///
+    /// [`AvRuntimeError::Dispatcher`] on outer-seal / transport-send
+    /// failure (fan-out stops at the first failing subscriber).
+    pub async fn dispatch_inner(&mut self, inner: InnerSealed) -> Result<usize, AvRuntimeError> {
+        let reached = self.dispatcher.subscriber_count();
         self.dispatcher.publish_inner(inner).await?;
-        self.next_chunk_seq = self.next_chunk_seq.wrapping_add(1);
-        Ok(seq)
+        Ok(reached)
     }
 
     /// Publish an opaque chunk with the substrate default codec + layer.

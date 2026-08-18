@@ -85,6 +85,18 @@ pub mod realtime_av_dispatcher;
 /// behind `_reticulum-module` (their only leviculum dependency).
 pub mod realtime_av_runtime;
 
+/// The A/V spine (CIRISEdge#499) — the integrating runtime that drives
+/// ONE call from join to media to heal. Owns the publisher, the relay
+/// and the scope-address lifecycle *together*, so an MLS epoch can never
+/// move without the scoped addresses that epoch derives: the gap that
+/// silently stranded peers (an RNS destination nobody registered is
+/// never delivered to, with no error anywhere). Also the only thing that
+/// drives [`crate::scope_lifecycle::ScopeLifecycle::seal_due`] on a
+/// cadence. Gated alongside the rest of the Reticulum surface because it
+/// owns a [`realtime_av_relay::RelayNode`].
+#[cfg(feature = "_reticulum-module")]
+pub mod av_spine;
+
 /// Application-Layer Multicast (ALM) — mesh-tree video built on the
 /// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
 /// CIRISEdge#128 MDC). Pure-Rust, signed [`realtime_av_alm::RelayCapacity`]

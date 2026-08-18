@@ -264,6 +264,80 @@ impl ScopeLifecycle {
         &self.own_key_id
     }
 
+    /// The address table this lifecycle drives.
+    ///
+    /// Read-only in practice: the table's own transition verbs are what
+    /// the lifecycle sequences, and calling them behind its back is the
+    /// drift this module exists to prevent. Exposed for the lookups
+    /// (`address_at`, `send_address`, `accepts_inbound`) a caller needs
+    /// to dial a peer it has just installed.
+    #[must_use]
+    pub fn table(&self) -> &std::sync::Arc<ScopeAddressTable> {
+        &self.table
+    }
+
+    /// How long a superseded epoch stays reachable after being
+    /// superseded.
+    ///
+    /// Exposed so a caller that holds a SECOND make-before-break window
+    /// over the same rotation — the A/V relay's answerable address pair,
+    /// [`RelayNode`] — closes it on the same deadline rather than
+    /// inventing a parallel one. Two convergence windows over one
+    /// rotation is exactly the drift this module exists to prevent.
+    ///
+    /// [`RelayNode`]: crate::transport::realtime_av_relay::RelayNode
+    #[must_use]
+    pub fn convergence(&self) -> Duration {
+        self.convergence
+    }
+
+    /// When THIS group's pending rotation may be sealed, or `None` when
+    /// it has none.
+    ///
+    /// The deadline a cadence driver waits on. Returns
+    /// [`std::time::Instant`] deliberately: every timing decision on a
+    /// transport path is made against the monotonic clock, never a
+    /// runtime timer's notion of now (CIRISEdge#217).
+    #[must_use]
+    pub fn seal_deadline(&self, scope: &CohortScope, group_id: &str) -> Option<Instant> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(scope.clone(), group_id.to_owned()))
+            .map(|p| p.due)
+    }
+
+    /// Seal exactly ONE group's rotation, if its convergence window has
+    /// elapsed. `None` when nothing was due for that group.
+    ///
+    /// [`Self::seal_due`] is the fleet-wide sweep; this is the targeted
+    /// verb, for a caller that must take a second action *iff* this
+    /// particular group sealed — the A/V spine drops the relay's
+    /// superseded address on exactly this signal, so the relay's
+    /// answerable set and the table's accept-set close together instead
+    /// of on two timers that can disagree.
+    ///
+    /// Idempotent, and cheap when nothing is due.
+    pub fn seal_group_due(
+        &self,
+        scope: &CohortScope,
+        group_id: &str,
+        now: Instant,
+    ) -> Option<SealOutcome> {
+        let key = (scope.clone(), group_id.to_owned());
+        let seal = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match pending.get(&key) {
+                Some(p) if now >= p.due => pending.remove(&key)?,
+                _ => return None,
+            }
+        };
+        Some(self.seal_one(scope, group_id, &seal))
+    }
+
     /// **The install verb.** A group became ours: derive every member's
     /// address for its current epoch and start listening on our own.
     ///
@@ -382,7 +456,8 @@ impl ScopeLifecycle {
         }
 
         if let Some(retiring) = outgoing {
-            self.pending
+            let displaced = self
+                .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(
@@ -392,6 +467,40 @@ impl ScopeLifecycle {
                         retiring,
                     },
                 );
+            // A SECOND rotation inside one convergence window — three
+            // people joining a call in five minutes produces it. There
+            // is one `previous` slot, so `activate_next` above already
+            // evicted the older epoch from the accept window: edge will
+            // not attribute an arrival on that address any more.
+            //
+            // Its destination is still REGISTERED, though, and the
+            // pending-seal entry that owed it a retirement has just been
+            // overwritten — so without this it would stay routable for
+            // the life of the process, accepting links nothing can
+            // attribute. Retire it now rather than schedule it: the
+            // convergence window it was serving ended the moment the
+            // table stopped accepting it.
+            if let Some(stale) = displaced {
+                match self.sink.retire(&stale.retiring, scope) {
+                    Ok(()) => tracing::info!(
+                        group = %group_id,
+                        epoch,
+                        "a second rotation inside one convergence window evicted an \
+                         older epoch early — its destination was retired immediately \
+                         rather than left registered with nothing behind it \
+                         (CIRISEdge#499)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        group = %group_id,
+                        epoch,
+                        error = %e,
+                        "an early-evicted epoch's destination could NOT be retired — it \
+                         stays routable while the table no longer attributes it, so an \
+                         observer that learned it can still confirm this node \
+                         (leviculum#54)"
+                    ),
+                }
+            }
         }
 
         Ok(TransitionOutcome {
@@ -422,28 +531,40 @@ impl ScopeLifecycle {
 
         let mut out = SealOutcome::default();
         for ((scope, group_id), seal) in ready {
-            match self.table.seal_rotation(&scope, &group_id) {
-                Ok(Some(_) | None) => out.sealed += 1,
-                Err(e) => {
-                    tracing::warn!(
-                        group = %group_id,
-                        error = %e,
-                        "scope address seal FAILED — the superseded epoch stays live \
-                         (CIRISEdge#499)"
-                    );
-                    continue;
-                }
-            }
-            if let Err(e) = self.sink.retire(&seal.retiring, &scope) {
-                out.unretired += 1;
+            let one = self.seal_one(&scope, &group_id, &seal);
+            out.sealed += one.sealed;
+            out.unretired += one.unretired;
+        }
+        out
+    }
+
+    /// Seal one already-due rotation: drop the superseded epoch from the
+    /// table, then retire its destination from the transport. Shared by
+    /// the sweep ([`Self::seal_due`]) and the targeted verb
+    /// ([`Self::seal_group_due`]) so the two can never diverge.
+    fn seal_one(&self, scope: &CohortScope, group_id: &str, seal: &PendingSeal) -> SealOutcome {
+        let mut out = SealOutcome::default();
+        match self.table.seal_rotation(scope, group_id) {
+            Ok(Some(_) | None) => out.sealed += 1,
+            Err(e) => {
                 tracing::warn!(
                     group = %group_id,
                     error = %e,
-                    "scope address SEALED but NOT retired from the transport — the node \
-                     keeps routing on a rotated-away address, so an observer that learned \
-                     it can still confirm this node is reachable (leviculum#54)"
+                    "scope address seal FAILED — the superseded epoch stays live \
+                     (CIRISEdge#499)"
                 );
+                return out;
             }
+        }
+        if let Err(e) = self.sink.retire(&seal.retiring, scope) {
+            out.unretired += 1;
+            tracing::warn!(
+                group = %group_id,
+                error = %e,
+                "scope address SEALED but NOT retired from the transport — the node \
+                 keeps routing on a rotated-away address, so an observer that learned \
+                 it can still confirm this node is reachable (leviculum#54)"
+            );
         }
         out
     }
@@ -732,6 +853,81 @@ mod tests {
         assert!(table
             .accepts_inbound(first.own_address.as_bytes())
             .is_none());
+    }
+
+    #[test]
+    fn a_second_rotation_inside_one_window_retires_the_epoch_it_evicts_early() {
+        // Three people joining a call in five minutes: two rotations, one
+        // convergence window. There is ONE `previous` slot, so
+        // `activate_next` evicts the oldest epoch from the accept window
+        // — and there is ONE pending-seal entry per group, so the
+        // retirement that epoch was owed gets overwritten.
+        //
+        // Without the immediate retire, that destination stays registered
+        // with the transport for the life of the process while the table
+        // no longer attributes it: it accepts links it cannot place, and
+        // an observer that learned it can keep confirming this node. The
+        // regression is silent in every other way, which is why it is
+        // pinned here.
+        let (life, table, sink) = fixture();
+        let first = life
+            .joined(&scope(), "g", 1, &[7u8; 32], &["node-self"])
+            .unwrap();
+        let t0 = Instant::now();
+        let second = life
+            .epoch_advanced(&scope(), "g", 2, &[9u8; 32], &["node-self"], t0)
+            .unwrap();
+        assert!(sink.retired.lock().unwrap().is_empty());
+
+        let third = life
+            .epoch_advanced(
+                &scope(),
+                "g",
+                3,
+                &[11u8; 32],
+                &["node-self"],
+                t0 + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(
+            *sink.retired.lock().unwrap(),
+            vec![*first.own_address.as_bytes()],
+            "the early-evicted epoch's destination is retired IMMEDIATELY — its \
+             convergence window ended the moment the table stopped accepting it",
+        );
+        assert!(
+            table
+                .accepts_inbound(first.own_address.as_bytes())
+                .is_none(),
+            "and the table agrees: the evicted epoch is no longer ours",
+        );
+        // The two epochs still inside the window are untouched.
+        assert!(table
+            .accepts_inbound(second.own_address.as_bytes())
+            .is_some());
+        assert!(table
+            .accepts_inbound(third.own_address.as_bytes())
+            .is_some());
+        assert_eq!(
+            life.pending_seals(),
+            1,
+            "one pending seal per group — for the epoch that is actually superseded",
+        );
+
+        // The surviving pending seal retires the SUPERSEDED epoch, not
+        // the live one.
+        life.seal_due(t0 + Duration::from_secs(1) + DEFAULT_CONVERGENCE_WINDOW);
+        assert_eq!(
+            *sink.retired.lock().unwrap(),
+            vec![
+                *first.own_address.as_bytes(),
+                *second.own_address.as_bytes()
+            ],
+        );
+        assert!(table
+            .accepts_inbound(third.own_address.as_bytes())
+            .is_some());
     }
 
     #[test]

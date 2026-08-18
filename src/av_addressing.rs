@@ -40,7 +40,11 @@
 //! moves both together, so the relay's answerable set and the table's
 //! accept-set cannot disagree.
 
-use crate::scope_lifecycle::{ScopeGroupSnapshot, TransitionOutcome};
+use crate::scope_lifecycle::ScopeGroupSnapshot;
+// Only the relay half consumes a `TransitionOutcome`, and the relay is
+// gated with the Reticulum surface.
+#[cfg(feature = "_reticulum-module")]
+use crate::scope_lifecycle::TransitionOutcome;
 use crate::transport::realtime_av_session::{AvSession, AvSessionError};
 
 /// Why a session's addresses could not be installed.
@@ -105,16 +109,36 @@ pub fn snapshot(session: &AvSession) -> Result<ScopeGroupSnapshot, AvAddressErro
 /// The relay answers on current+next for the same reason the table
 /// does: a `DestinationHash` is used to dial and listen, never per
 /// chunk, so a rotation must not strand a subscriber mid-dial.
+///
+/// # Two rotations inside one convergence window
+///
+/// The relay's window holds exactly one superseded address, so a second
+/// rotation before the first has sealed pushes the oldest one out early.
+/// That is **not** a bug — three people joining a call inside five
+/// minutes produces it — and it is exactly what
+/// [`ScopeAddressTable::activate_next`] does to an unsealed older epoch,
+/// which reports it as `EpochTransition::evicted` rather than asserting
+/// on it. So this returns the address that left the window early instead
+/// of claiming it cannot happen; the caller logs it, and a peer still
+/// dialling that address re-dials at the live epoch.
+///
+/// [`ScopeAddressTable::activate_next`]: crate::scope_addressing::ScopeAddressTable::activate_next
+///
+/// Gated with [`RelayNode`] itself: the relay is part of the Reticulum
+/// surface, and an HTTP-only build has no relay to advance. Without the
+/// gate this module fails to compile in any reticulum-free feature
+/// subset — which `--all-features` cannot show, since a union build
+/// always has the dependency present.
+///
+/// [`RelayNode`]: crate::transport::realtime_av_relay::RelayNode
+#[cfg(feature = "_reticulum-module")]
 pub fn advance_relay_window(
     relay: &mut crate::transport::realtime_av_relay::RelayNode,
     activated: &TransitionOutcome,
-) {
+) -> Option<leviculum_core::DestinationHash> {
     let displaced = relay.install_next_address(leviculum_core::DestinationHash::new(
         *activated.own_address.as_bytes(),
     ));
-    debug_assert!(
-        displaced.is_none(),
-        "a relay rotation was installed without an intervening seal",
-    );
     relay.activate_next_address();
+    displaced
 }
