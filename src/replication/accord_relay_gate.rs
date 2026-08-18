@@ -146,7 +146,7 @@ use std::time::{Duration, Instant};
 use ciris_persist::federation::admission::check_row_column_binding;
 use ciris_persist::federation::trust_root::{
     accord_root_claim, may_relay_accord_attestation, may_relay_accord_participation,
-    AccordRootClaim, RelayVerdict,
+    AccordRootClaim, RelayRefusal as PersistRelayRefusal, RelayVerdict,
 };
 use ciris_persist::federation::{Attestation, FederationDirectory};
 use ciris_verify_core::accord_live_quorum::AccordParticipation;
@@ -442,16 +442,47 @@ impl RelayDecision {
 /// roster also leaves `signer_seated == false`, and reporting that as
 /// "not seated" is the collapse CIRISPersist#713 wrote a mutation to forbid.
 fn decision_of(verdict: RelayVerdict) -> RelayDecision {
-    if verdict.may_relay() {
-        return RelayDecision::Relay;
+    // v37.1.0 (CIRISPersist#743) — persist owns the ORDER now, via
+    // `RelayVerdict::refusal_reason`. Edge maps its three-variant answer onto
+    // its own richer refusal set and adds nothing.
+    //
+    // The order is load-bearing and was edge's to get wrong: `roster_resolvable`
+    // must be read BEFORE `signer_seated`, or *"I cannot judge"* collapses into
+    // *"the signer is not seated"* — an accusation substituted for an admission
+    // of ignorance, on a relay gate. Persist's own mutation for this is the
+    // cleanest demonstration in the substrate of why an equivalence test is not
+    // coverage: reversing the two checks left their
+    // `refusal_reason_is_none_exactly_when_may_relay_is_true` test GREEN,
+    // because reordering changes WHY it refuses, not WHETHER. Only an ordering
+    // test caught it.
+    //
+    // Edge held that ordering itself until now, which meant a second consumer
+    // reading the three bools in the obvious order would have got a
+    // confidently wrong attribution with nothing to catch it. It travels with
+    // the type from here.
+    match verdict.refusal_reason() {
+        None => RelayDecision::Relay,
+        Some(PersistRelayRefusal::RosterUnresolvable) => {
+            RelayDecision::Refused(RelayRefusal::RosterUnresolvable)
+        }
+        Some(PersistRelayRefusal::SignerNotSeated) => {
+            RelayDecision::Refused(RelayRefusal::SignerNotSeated)
+        }
+        Some(PersistRelayRefusal::NoEdgeToRoot) => {
+            RelayDecision::Refused(RelayRefusal::NoTrustEdge)
+        }
+        // FORCED: persist's `RelayRefusal` is `#[non_exhaustive]`, so a
+        // downstream match can never be exhaustive (the same constraint that
+        // denies edge a compile-error guard on `AttestationFamily` — see
+        // `crate::family_gates`).
+        //
+        // A refusal reason this build cannot name maps to `Unresolved` —
+        // edge's own *"I cannot judge"* — and NOT to a seated/not-seated
+        // answer. That is the whole point of the ordering this delegation
+        // exists to inherit: when edge does not know why persist refused, the
+        // honest report is ignorance, never an accusation about the signer.
+        Some(_) => RelayDecision::Refused(RelayRefusal::Unresolved),
     }
-    if !verdict.roster_resolvable {
-        return RelayDecision::Refused(RelayRefusal::RosterUnresolvable);
-    }
-    if !verdict.signer_seated {
-        return RelayDecision::Refused(RelayRefusal::SignerNotSeated);
-    }
-    RelayDecision::Refused(RelayRefusal::NoTrustEdge)
 }
 
 /// One cached verdict for one `(root, signer)` pair.
@@ -1793,6 +1824,42 @@ mod tests {
              gate that refuses everything"
         );
         assert_eq!(gate.cached_len(), 1, "…and that one DID reach the resolver");
+    }
+
+    /// The ORDERING, not the equivalence.
+    ///
+    /// Persist showed why the distinction matters: reversing the two checks
+    /// left their `refusal_reason_is_none_exactly_when_may_relay_is_true` test
+    /// GREEN, because reordering changes WHY it refuses, not WHETHER. Shipping
+    /// on equivalence alone yields a verdict saying "the signer is not seated"
+    /// when the truth is "I cannot judge" — an accusation substituted for an
+    /// admission of ignorance, on a relay gate.
+    ///
+    /// So this asserts the attribution where BOTH legs are false. No
+    /// equivalence test can distinguish the two orderings on that input.
+    #[test]
+    fn cannot_judge_outranks_not_seated_when_both_legs_are_false() {
+        let both_false = RelayVerdict {
+            roster_resolvable: false,
+            signer_seated: false,
+            edge_exists: true,
+        };
+        assert_eq!(
+            decision_of(both_false),
+            RelayDecision::Refused(RelayRefusal::RosterUnresolvable),
+            "an unresolvable roster is 'I cannot judge' and must NOT be \
+             reported as 'the signer is not seated'",
+        );
+        // ...and the seated leg still reports itself when the roster DID
+        // resolve, so this cannot pass by always answering RosterUnresolvable.
+        assert_eq!(
+            decision_of(RelayVerdict {
+                roster_resolvable: true,
+                signer_seated: false,
+                edge_exists: true,
+            }),
+            RelayDecision::Refused(RelayRefusal::SignerNotSeated),
+        );
     }
 
     /// persist's participation verb reads `family_key_id` / `member_id` out of

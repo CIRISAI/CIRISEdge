@@ -568,12 +568,33 @@ impl FederationDirectoryReplicationBridge {
     /// reason: a `dimension.starts_with("accord:")` here would be a second
     /// owner for one wire fact. `objection:*` is deliberately NOT in this
     /// family (CIRISPersist#713 — the co-scrub argument covers `accord:` only).
+    /// CIRISEdge#505 / CIRISPersist#743 — is this row on the `accord:*`
+    /// family, in EITHER namespace?
+    ///
+    /// This read only the `dimension` until v37.1.0, and that was a live
+    /// under-gating hole: persist's own admission comment is explicit that the
+    /// family rides both namespaces — *"`accord:invoke:*` as a TYPE,
+    /// `accord:human_dignity:v1` as a `scores` DIMENSION"* — so every
+    /// `accord:invoke:*` row carried in the `attestation_type` namespace
+    /// skipped the CC 4.2.1 relay gate entirely. A false NEGATIVE: the gate
+    /// never carried something it should have refused once it looked, it
+    /// failed to look.
+    ///
+    /// Persist now owns the question (`is_accord_family`), so edge stops
+    /// spelling it. Edge widening the pre-filter itself would have put a
+    /// second reading of *"is this the accord family"* in this repo — the
+    /// exact drift CIRISPersist#731 and #733 spent two releases removing, and
+    /// it would re-break the moment a third namespace arm appears.
     fn attestation_is_accord(canonical_json: &serde_json::Value) -> bool {
-        let dimension = canonical_json
-            .pointer("/attestation_envelope/dimension")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        crate::replication::accord_relay_gate::AccordRelayGate::dimension_is_gated(dimension)
+        ciris_persist::federation::trust_root::is_accord_family(
+            canonical_json
+                .pointer("/attestation_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            canonical_json
+                .pointer("/attestation_envelope/dimension")
+                .and_then(serde_json::Value::as_str),
+        )
     }
 
     /// Workstream F — does the relay gate WITHHOLD this row? `false` when no
@@ -7862,6 +7883,42 @@ mod tests {
                  and serve AGREE (no #429 advertised-then-unfetchable)"
             );
         }
+    }
+
+    /// CIRISEdge#505 — the pre-filter must see BOTH namespaces.
+    ///
+    /// Until v37.1.0 this read only the dimension, so an `accord:invoke:*` row
+    /// carried in the `attestation_type` namespace never reached the relay
+    /// gate at all — advertised, fetched and subject-pulled with no CC 4.2.1
+    /// carriage check. A false NEGATIVE: the gate failed to look.
+    #[test]
+    fn the_accord_pre_filter_sees_the_type_namespace_not_only_the_dimension() {
+        let by_dimension = serde_json::json!({
+            "attestation_type": "scores",
+            "attestation_envelope": { "dimension": "accord:human_dignity:v1" },
+        });
+        let by_type = serde_json::json!({
+            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_envelope": { "dimension": "trust:example:v1" },
+        });
+        let neither = serde_json::json!({
+            "attestation_type": "scores",
+            "attestation_envelope": { "dimension": "trust:example:v1" },
+        });
+
+        assert!(FederationDirectoryReplicationBridge::attestation_is_accord(
+            &by_dimension
+        ));
+        assert!(
+            FederationDirectoryReplicationBridge::attestation_is_accord(&by_type),
+            "an accord:* row in the TYPE namespace must reach the relay gate — \
+             skipping it is the CIRISEdge#505 under-gating hole",
+        );
+        assert!(
+            !FederationDirectoryReplicationBridge::attestation_is_accord(&neither),
+            "and a non-accord row must still bypass the gate, so this cannot \
+             pass by gating everything",
+        );
     }
 
     /// **THE CIRISPersist#731 REGRESSION TEST.** One signer, two accords, a node
