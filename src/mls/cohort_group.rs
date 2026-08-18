@@ -77,12 +77,20 @@
 //! # Relationship to `transport::realtime_av_mls`
 //!
 //! Same ciphersuite (`0x004D` X-Wing), same provider, same commit
-//! patterns — but a **different** exporter label
-//! ([`COHORT_SECRET_LABEL`] vs the A/V module's
-//! `ciris-realtime-av-epoch-dek-seed-v1`), so a cohort secret and an
-//! A/V DEK seed can never collide even if some future deployment
-//! points both at one group. RFC 9420 makes exporter derivations
-//! label-domain-separated; this module relies on that.
+//! patterns — but **different** exporter labels. This module exports
+//! under CIRISVerify's scope-privacy labels
+//! ([`crate::scope_privacy::DESTINATION_EXPORTER_LABEL`] and
+//! [`crate::scope_privacy::RECORD_EXPORTER_LABEL`], v13.5.0); the A/V
+//! module exports under `ciris-realtime-av-epoch-dek-seed-v1`. So a
+//! cohort secret and an A/V DEK seed can never collide even if some
+//! future deployment points both at one group. RFC 9420 makes exporter
+//! derivations label-domain-separated; this module relies on that.
+//!
+//! Verify refused the DEK-seed label for scope-privacy inputs
+//! explicitly and on the record: it protects payload confidentiality,
+//! and deriving a routing identifier that appears in the clear on the
+//! wire from that material would collapse two secrets §8.5 exists to
+//! keep independent.
 //!
 //! Per the workstream file boundary this module does **not** import
 //! from `crate::transport::*`. The few helpers it needs from there —
@@ -131,16 +139,12 @@ pub const CIPHERSUITE_ID: u16 = 0x004D;
 /// The openmls enum value [`CIPHERSUITE_ID`] maps to.
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 
-/// Exporter label for the cohort epoch secret.
-///
-/// **Domain-separated** from the A/V path's
-/// `ciris-realtime-av-epoch-dek-seed-v1`. RFC 9420 §8.5 derives
-/// exporters as a function of the label, so two consumers of the same
-/// group's exporter that use different labels get unrelated secrets.
-/// The cohort secret feeds `scope_privacy`'s `k_record_id` /
-/// `k_symbol` (CEWP `SCOPE_PRIVACY.md` §2.2); the A/V one feeds a
-/// media DEK. They must never be the same bytes.
-pub const COHORT_SECRET_LABEL: &str = "ciris-cohort-mls-epoch-exporter-v1";
+// The exporter labels for cohort secrets are NOT defined here. They are
+// CIRISVerify's (`RECORD_EXPORTER_LABEL` / `DESTINATION_EXPORTER_LABEL`,
+// v13.5.0), re-exported through `crate::scope_privacy` and used
+// verbatim — a label is a cross-impl wire fact, and an edge-local one
+// would put two owners on it. This module previously defined its own
+// `COHORT_SECRET_LABEL`; it was retired when verify settled the family.
 
 /// Length of a [`CohortSecret`], in bytes.
 pub const COHORT_SECRET_LEN: usize = 32;
@@ -340,7 +344,9 @@ pub enum CohortGroupError {
 // ─── The cohort epoch secret ────────────────────────────────────────
 
 /// The current epoch's MLS exporter secret for a cohort, derived
-/// under [`COHORT_SECRET_LABEL`].
+/// under one of CIRISVerify's scope-privacy exporter labels — see
+/// [`CohortGroup::destination_secret`] and
+/// [`CohortGroup::record_secret`].
 ///
 /// This is the `exporter_secret` the `community` / `affiliations`
 /// scopes were missing: 32 bytes bound to *this* group at *this*
@@ -783,19 +789,37 @@ impl CohortGroupInner {
         }
     }
 
-    /// Derive this epoch's cohort exporter secret.
-    fn exporter(&self) -> Result<CohortSecret, CohortGroupError> {
+    /// Derive this epoch's cohort secret under one of CIRISVerify's
+    /// scope-privacy exporter labels (CIRISVerify#259, v13.5.0).
+    ///
+    /// `label` is [`crate::scope_privacy::RECORD_EXPORTER_LABEL`] or
+    /// [`crate::scope_privacy::DESTINATION_EXPORTER_LABEL`] — never an
+    /// edge-local string. Both the label and the context are
+    /// cross-impl wire facts: two members of one cohort derive the
+    /// same bytes only if they export under the same `(label,
+    /// context, length)`, so verify owns all three and edge reproduces
+    /// them.
+    fn scope_secret(&self, label: &str) -> Result<CohortSecret, CohortGroupError> {
         let bytes = self
             .group
             .export_secret(
                 self.provider.crypto(),
-                COHORT_SECRET_LABEL,
-                // Context = the community id. The group id already
-                // commits to it (see `cohort_group_id`), so this is
-                // belt-and-braces: it means a snapshot restored under
-                // the WRONG community namespace produces a different
-                // secret rather than a silently-shared one.
-                self.community_id.as_bytes(),
+                label,
+                // EXPORTER_CONTEXT is EMPTY, per verify: the exporter
+                // already binds (group_id, epoch) via RFC 9420 §8.5, so
+                // a context adds nothing and is "one less thing to
+                // diverge on". This deliberately replaces edge's
+                // earlier `community_id`-as-context: that was
+                // belt-and-braces against a snapshot restored under the
+                // wrong namespace, but a non-empty context edge chose
+                // for itself would make edge derive different bytes
+                // from every other implementation — trading a local
+                // safety margin for a silent cross-impl split. The
+                // namespace check now lives where it can be enforced
+                // without touching the wire: `join` refuses a Welcome
+                // whose group id is not the one derived for the
+                // community (CIRISEdge#500).
+                crate::scope_privacy::EXPORTER_CONTEXT,
                 COHORT_SECRET_LEN,
             )
             .map_err(|e| CohortGroupError::ExportFailed(format!("{e:?}")))?;
@@ -1179,11 +1203,42 @@ impl CohortGroup {
     /// `exporter_secret` the `community` / `affiliations` scopes need
     /// (CIRISEdge#499).
     ///
-    /// Derived under [`COHORT_SECRET_LABEL`], domain-separated from
-    /// the A/V media-key label, with the `community_id` as exporter
-    /// context.
-    pub async fn current_exporter(&self) -> Result<CohortSecret, CohortGroupError> {
-        self.inner.lock().await.exporter()
+    /// The **destination** plane secret — the input to
+    /// `k_destination` / `derive_destination`, and therefore to every
+    /// scoped Reticulum address this node presents in the cohort.
+    ///
+    /// Derived under [`crate::scope_privacy::DESTINATION_EXPORTER_LABEL`],
+    /// which is deliberately distinct from the record plane's label:
+    /// the two secrets go to different subsystems, and sharing one PRK
+    /// would mean a compromise yielding the record secret
+    /// *retroactively deanonymizes all routing* — an adversary
+    /// recomputes and links every address the node ever presented,
+    /// collapsing exactly the unlinkability scope-native addressing
+    /// exists to buy.
+    ///
+    /// # Errors
+    /// [`CohortGroupError::ExportFailed`] on a corrupted group state.
+    pub async fn destination_secret(&self) -> Result<CohortSecret, CohortGroupError> {
+        self.inner
+            .lock()
+            .await
+            .scope_secret(crate::scope_privacy::DESTINATION_EXPORTER_LABEL)
+    }
+
+    /// The **record** plane secret — the input to `k_record_id` /
+    /// `k_symbol`, derived under
+    /// [`crate::scope_privacy::RECORD_EXPORTER_LABEL`].
+    ///
+    /// Independent of [`Self::destination_secret`] by construction; see
+    /// there for why the separation is load-bearing rather than tidy.
+    ///
+    /// # Errors
+    /// [`CohortGroupError::ExportFailed`] on a corrupted group state.
+    pub async fn record_secret(&self) -> Result<CohortSecret, CohortGroupError> {
+        self.inner
+            .lock()
+            .await
+            .scope_secret(crate::scope_privacy::RECORD_EXPORTER_LABEL)
     }
 
     /// Add a member from a KeyPackage that member published, advance
@@ -1540,8 +1595,8 @@ mod tests {
         // everything except the secret would derive a different scoped
         // address and be silently unreachable (CIRISEdge#499).
         assert_eq!(
-            b.current_exporter().await.unwrap().as_bytes(),
-            a.current_exporter().await.unwrap().as_bytes(),
+            b.destination_secret().await.unwrap().as_bytes(),
+            a.destination_secret().await.unwrap().as_bytes(),
             "joiner must derive the SAME cohort secret as the founder",
         );
         let mut roster = b.member_key_ids().await;
@@ -1578,7 +1633,7 @@ mod tests {
                     .is_some(),
                 "the snapshot the head names must exist before join returns",
             );
-            (epoch, *b.current_exporter().await.unwrap().as_bytes())
+            (epoch, *b.destination_secret().await.unwrap().as_bytes())
         };
 
         // Crash, then reload. Membership peers already committed to
@@ -1589,7 +1644,7 @@ mod tests {
             .expect("a joined group reloads");
         assert_eq!(reloaded.epoch().await, epoch_at_join);
         assert_eq!(
-            *reloaded.current_exporter().await.unwrap().as_bytes(),
+            *reloaded.destination_secret().await.unwrap().as_bytes(),
             secret_at_join,
         );
         // And it can still take part: applying the founder's next
@@ -1598,8 +1653,8 @@ mod tests {
         let new_epoch = reloaded.apply_remote_commit(rotate.commit()).await.unwrap();
         assert_eq!(new_epoch, a.epoch().await);
         assert_eq!(
-            reloaded.current_exporter().await.unwrap().as_bytes(),
-            a.current_exporter().await.unwrap().as_bytes(),
+            reloaded.destination_secret().await.unwrap().as_bytes(),
+            a.destination_secret().await.unwrap().as_bytes(),
         );
     }
 
@@ -1640,7 +1695,7 @@ mod tests {
             .await
             .unwrap();
         let own_epoch = own.epoch().await;
-        let own_secret = *own.current_exporter().await.unwrap().as_bytes();
+        let own_secret = *own.destination_secret().await.unwrap().as_bytes();
 
         let err = CohortGroup::join(store_b.clone(), "c-existing", material, &welcome, 16)
             .await
@@ -1657,7 +1712,7 @@ mod tests {
             .expect("pre-existing group survives a refused join");
         assert_eq!(reloaded.epoch().await, own_epoch);
         assert_eq!(
-            *reloaded.current_exporter().await.unwrap().as_bytes(),
+            *reloaded.destination_secret().await.unwrap().as_bytes(),
             own_secret
         );
     }
@@ -1879,30 +1934,98 @@ mod tests {
         let g = CohortGroup::create(store, "c-exp", "node-a", 4)
             .await
             .unwrap();
-        let s0 = g.current_exporter().await.unwrap();
-        let s0b = g.current_exporter().await.unwrap();
+        let s0 = g.destination_secret().await.unwrap();
+        let s0b = g.destination_secret().await.unwrap();
         assert_eq!(s0.as_bytes(), s0b.as_bytes());
 
         let _ = g.rotate().await.unwrap();
-        let s1 = g.current_exporter().await.unwrap();
+        let s1 = g.destination_secret().await.unwrap();
         assert_ne!(s0.as_bytes(), s1.as_bytes());
     }
 
     #[tokio::test]
+    async fn the_two_scope_planes_derive_independent_secrets() {
+        // CIRISVerify v13.5.0 gives the record plane and the
+        // destination plane their OWN exporter labels, and that
+        // separation is load-bearing rather than tidy: sharing one PRK
+        // would mean a compromise yielding the record secret
+        // retroactively deanonymizes all routing — an adversary
+        // recomputes and links every address the node ever presented.
+        // If these two ever came back equal, that property is gone and
+        // nothing else in the stack would notice.
+        let g = CohortGroup::create(open_store(), "c-planes", "node-a", 4)
+            .await
+            .unwrap();
+        let dest = *g.destination_secret().await.unwrap().as_bytes();
+        let record = *g.record_secret().await.unwrap().as_bytes();
+        assert_ne!(
+            dest, record,
+            "record and destination planes must not share a PRK",
+        );
+
+        // Each is deterministic within an epoch...
+        assert_eq!(*g.destination_secret().await.unwrap().as_bytes(), dest);
+        assert_eq!(*g.record_secret().await.unwrap().as_bytes(), record);
+
+        // ...and both move when the epoch does, or rotation would not
+        // re-address the group.
+        let _rotated = g.rotate().await.unwrap();
+        assert_ne!(*g.destination_secret().await.unwrap().as_bytes(), dest);
+        assert_ne!(*g.record_secret().await.unwrap().as_bytes(), record);
+    }
+
+    #[tokio::test]
+    async fn the_exporter_context_is_verifys_empty_value_not_the_community_id() {
+        // The context is a cross-impl wire fact: two members agree only
+        // under the same (label, context, length). Edge previously used
+        // `community_id` as the context — a local safety margin that
+        // would have made edge derive different bytes from every other
+        // implementation. Verify specifies EMPTY, so that is what this
+        // pins, by deriving the same secret a bare export_secret call
+        // under verify's constants produces.
+        let g = CohortGroup::create(open_store(), "c-context", "node-a", 4)
+            .await
+            .unwrap();
+        let via_accessor = *g.destination_secret().await.unwrap().as_bytes();
+
+        let inner = g.inner.lock().await;
+        let direct = inner
+            .group
+            .export_secret(
+                inner.provider.crypto(),
+                crate::scope_privacy::DESTINATION_EXPORTER_LABEL,
+                crate::scope_privacy::EXPORTER_CONTEXT,
+                COHORT_SECRET_LEN,
+            )
+            .unwrap();
+        assert_eq!(
+            via_accessor.as_slice(),
+            direct.as_slice(),
+            "the accessor must export under verify's exact (label, context, length)",
+        );
+        assert!(
+            crate::scope_privacy::EXPORTER_CONTEXT.is_empty(),
+            "verify specifies an EMPTY exporter context",
+        );
+    }
+
+    #[tokio::test]
     async fn exporter_is_domain_separated_from_the_av_label() {
-        // The cohort label must NOT be the A/V one. Asserted on the
-        // constant (the A/V string is duplicated here rather than
+        // Neither scope-privacy label may be the A/V DEK-seed label —
+        // verify refused that input explicitly. Asserted on the
+        // constants (the A/V string is duplicated here rather than
         // imported — `crate::transport::*` is off-limits for this
         // workstream) and behaviourally: exporting the same group
         // under the A/V label yields different bytes.
         const AV_LABEL: &str = "ciris-realtime-av-epoch-dek-seed-v1";
-        assert_ne!(COHORT_SECRET_LABEL, AV_LABEL);
+        assert_ne!(crate::scope_privacy::DESTINATION_EXPORTER_LABEL, AV_LABEL);
+        assert_ne!(crate::scope_privacy::RECORD_EXPORTER_LABEL, AV_LABEL);
 
         let store = open_store();
         let g = CohortGroup::create(store, "c-label", "node-a", 4)
             .await
             .unwrap();
-        let cohort = g.current_exporter().await.unwrap();
+        let cohort = g.destination_secret().await.unwrap();
 
         let inner = g.inner.lock().await;
         let av = inner
@@ -2058,14 +2181,14 @@ mod tests {
             let g = CohortGroup::create(store.clone(), "c-exp-rt", "node-a", 8)
                 .await
                 .unwrap();
-            *g.current_exporter().await.unwrap().as_bytes()
+            *g.destination_secret().await.unwrap().as_bytes()
         };
         let reloaded = CohortGroup::load(store, "c-exp-rt", 8)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            *reloaded.current_exporter().await.unwrap().as_bytes(),
+            *reloaded.destination_secret().await.unwrap().as_bytes(),
             before
         );
     }
@@ -2256,8 +2379,8 @@ mod tests {
 
         // Both sides derive the same exporter for the same epoch —
         // the property that makes a cohort secret a *shared* secret.
-        let shared = *a.current_exporter().await.unwrap().as_bytes();
-        assert_eq!(*b.current_exporter().await.unwrap().as_bytes(), shared);
+        let shared = *a.destination_secret().await.unwrap().as_bytes();
+        assert_eq!(*b.destination_secret().await.unwrap().as_bytes(), shared);
 
         // …and node-b's applied epoch survives a restart, exporter
         // included. A Welcome-joined group persists exactly like a
@@ -2270,7 +2393,7 @@ mod tests {
             .expect("joined group must reload");
         assert_eq!(b_reloaded.epoch().await, new_epoch);
         assert_eq!(
-            *b_reloaded.current_exporter().await.unwrap().as_bytes(),
+            *b_reloaded.destination_secret().await.unwrap().as_bytes(),
             shared
         );
     }
@@ -2371,13 +2494,13 @@ mod tests {
         let g = groups.open("c-evict").await.unwrap();
         let _ = g.rotate().await.unwrap();
         let epoch = g.epoch().await;
-        let secret = *g.current_exporter().await.unwrap().as_bytes();
+        let secret = *g.destination_secret().await.unwrap().as_bytes();
         drop(g);
 
         assert!(groups.evict("c-evict").await);
         let back = groups.open("c-evict").await.unwrap();
         assert_eq!(back.epoch().await, epoch);
-        assert_eq!(*back.current_exporter().await.unwrap().as_bytes(), secret);
+        assert_eq!(*back.destination_secret().await.unwrap().as_bytes(), secret);
     }
 
     #[tokio::test]
@@ -2390,8 +2513,8 @@ mod tests {
         assert_eq!(a.epoch().await, 1);
         assert_eq!(b.epoch().await, 0);
         assert_ne!(
-            a.current_exporter().await.unwrap().as_bytes(),
-            b.current_exporter().await.unwrap().as_bytes()
+            a.destination_secret().await.unwrap().as_bytes(),
+            b.destination_secret().await.unwrap().as_bytes()
         );
     }
 }
