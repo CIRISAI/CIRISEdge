@@ -61,9 +61,16 @@
 //! - Stream-based chunk delivery (FSD §10.5.1 live-stream surface).
 //!   v3.4.0-pre1 ships sealed-blob fetch only.
 
+pub mod scope;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+pub use scope::{
+    admit_blob_serve, BlobRecipient, BlobScopeRouter, ContentScope, ScopeRouteRefusal,
+    ServeAdmission, ServeRefusal,
+};
 
 /// Operator knobs for the swarm scheduler. Defaults match the
 /// CIRISEdge#55 TL;DR (in-flight cap 4 per peer, EWMA alpha 0.3,
@@ -219,6 +226,23 @@ pub enum SwarmError {
     /// from "the swarm broke."
     #[error("invalid manifest for blob {0}: {1}")]
     InvalidManifest(String, String),
+    /// CIRISEdge#499 — the blob's scope could not be resolved to an address
+    /// for ANY holder, so the fetch never started. A separate variant from
+    /// [`Self::NoHolders`] on purpose: holders exist, we simply must not ask
+    /// them at the federation address, and folding the two would report a
+    /// privacy gate as a federation-wide miss.
+    ///
+    /// Never a fallback. There is deliberately no arm of the scheduler that
+    /// degrades an unroutable scoped fetch onto the federation address — that
+    /// degradation IS the defect #499 removes.
+    #[error("scope routing failed for every holder of blob {blob_sha}: {reason}")]
+    ScopeUnroutable {
+        /// Hex-encoded overall blob SHA-256.
+        blob_sha: String,
+        /// The first refusal observed, rendered. Every holder's refusal is
+        /// logged; this carries the leading one for the error surface.
+        reason: String,
+    },
 }
 
 /// Distinct outcomes from a [`BlobChunkVerifier::verify_and_store`]
@@ -303,6 +327,30 @@ pub trait BlobChunkSource: Send + Sync + 'static {
         blob_sha256: [u8; 32],
         chunk_sha256: [u8; 32],
     ) -> Result<Option<Vec<u8>>, ChunkSourceRefusal>;
+
+    /// CIRISEdge#499 — the SCOPE this blob's content lives in, so the
+    /// responder can decide whether the address a request arrived on
+    /// entitles the requester to it.
+    ///
+    /// **Edge never infers a blob's scope.** Content classification is
+    /// the persist-backed consumer's, exactly as SHA verification is
+    /// (CIRISPersist#145 §10.1.1) — this method is the seam, not a
+    /// decision edge makes. `None` means *undeterminable*, and is NEVER
+    /// read as `Public`: on a scope-native node it refuses the serve
+    /// ([`ServeRefusal::ScopeUndeterminable`]).
+    ///
+    /// The default returns `None`, which keeps every existing
+    /// implementation compiling AND keeps its behaviour byte-identical:
+    /// the scope gate is armed only where a
+    /// [`ScopeAddressTable`](crate::scope_addressing::ScopeAddressTable)
+    /// is installed, and a deployment with no table admits every serve
+    /// regardless of what this returns. A consumer that installs an
+    /// address table MUST override this or its blob plane fails closed —
+    /// which is the correct order of operations: derive addresses only
+    /// once you can say what they are for.
+    fn chunk_scope(&self, _blob_sha256: [u8; 32]) -> Option<ContentScope> {
+        None
+    }
 }
 
 /// Refusal reasons surfaced by a [`BlobChunkSource::read_chunk`]
@@ -453,13 +501,57 @@ impl SwarmScheduler {
     /// - **Holder list.** The caller queries persist's
     ///   `BlobStorage::list_holders(blob_sha256)` and passes the
     ///   result. The scheduler does not call persist directly.
-    #[allow(clippy::too_many_lines)] // the driver loop is the load-bearing composition site
-    #[allow(clippy::cast_possible_truncation)] // assembled blob size is bounded by AV-13 family caps
     pub async fn fetch_blob(
         &self,
         blob_sha256: [u8; 32],
         manifest: ChunkManifestLite,
         holders: Vec<String>,
+    ) -> Result<Vec<u8>, SwarmError> {
+        // CIRISEdge#499 — a caller that cannot say what scope the blob is gets
+        // `None`, and the router's `None` semantics are exactly right for it:
+        //
+        //  - on a node with no address table (every deployment today) it routes
+        //    to the federation address, so this call is byte-identical to
+        //    pre-#499;
+        //  - on a scope-native node it is REFUSED, because a caller that cannot
+        //    name the scope cannot be given an address that respects it, and
+        //    guessing "public" is the one default this stack must never adopt.
+        //
+        // Scope-aware callers use [`Self::fetch_blob_scoped`].
+        self.fetch_blob_scoped(blob_sha256, manifest, holders, None)
+            .await
+    }
+
+    /// CIRISEdge#499 — drive a swarm fetch of a blob whose content scope is
+    /// KNOWN, requesting every chunk at the address that scope requires.
+    ///
+    /// `content_scope` is the blob's declared scope (from the persist-backed
+    /// consumer that owns content classification — edge never infers it), or
+    /// `None` when it could not be determined.
+    ///
+    /// Routing happens ONCE, up front, for every holder, and BEFORE a single
+    /// byte moves. That ordering is the point: a per-dispatch resolution could
+    /// leave the scheduler half-way through a fetch when it discovers a holder
+    /// is unaddressable, having already put scoped request bytes on the
+    /// federation address for the holders it got to first. Resolving the whole
+    /// holder set first makes the fetch all-or-nothing with respect to context.
+    ///
+    /// A holder that cannot be routed is DROPPED from the candidate set with a
+    /// logged reason, exactly like a demoted peer — never silently retried at
+    /// the federation address. If no holder survives, the fetch fails with
+    /// [`SwarmError::ScopeUnroutable`].
+    ///
+    /// # Errors
+    /// Every error [`Self::fetch_blob`] returns, plus
+    /// [`SwarmError::ScopeUnroutable`].
+    #[allow(clippy::too_many_lines)] // the driver loop is the load-bearing composition site
+    #[allow(clippy::cast_possible_truncation)] // assembled blob size is bounded by AV-13 family caps
+    pub async fn fetch_blob_scoped(
+        &self,
+        blob_sha256: [u8; 32],
+        manifest: ChunkManifestLite,
+        holders: Vec<String>,
+        content_scope: Option<ContentScope>,
     ) -> Result<Vec<u8>, SwarmError> {
         let blob_hex = hex::encode(blob_sha256);
 
@@ -471,9 +563,22 @@ impl SwarmScheduler {
             return Err(SwarmError::NoHolders(blob_hex));
         }
 
-        // Per-peer state, fetch-scoped.
-        let mut peers: HashMap<String, PeerState> = holders
-            .iter()
+        // CIRISEdge#499 — resolve every holder to an address BEFORE dispatch.
+        // The router reads its table from the transport, so "is this node
+        // scope-native" has one source of truth (see `Edge::blob_scope_router`).
+        let scope_router = self.edge.blob_scope_router();
+        let routes =
+            resolve_holder_routes(&scope_router, content_scope.as_ref(), &holders, &blob_hex)
+                .map_err(|reason| SwarmError::ScopeUnroutable {
+                    blob_sha: blob_hex.clone(),
+                    reason,
+                })?;
+
+        // Per-peer state, fetch-scoped. Keyed on the routable holders only —
+        // an unroutable holder is not a candidate, so `pick_peer` can never
+        // select one and no dispatch can reach it.
+        let mut peers: HashMap<String, PeerState> = routes
+            .keys()
             .map(|k| (k.clone(), PeerState::default()))
             .collect();
 
@@ -507,7 +612,7 @@ impl SwarmScheduler {
                 let Some(chunk_sha) = pending.pop_front() else {
                     break;
                 };
-                self.dispatch_chunk_fetch(&peer, blob_sha256, chunk_sha, &tx);
+                self.dispatch_chunk_fetch(&routes, &peer, blob_sha256, chunk_sha, &tx);
                 if let Some(state) = peers.get_mut(&peer) {
                     state.in_flight = state.in_flight.saturating_add(1);
                 }
@@ -531,6 +636,7 @@ impl SwarmScheduler {
             let remaining = pending.len() + total_in_flight;
             if remaining > 0 && remaining <= self.config.endgame_threshold {
                 self.maybe_endgame_dispatch(
+                    &routes,
                     blob_sha256,
                     &chunk_bytes,
                     &manifest,
@@ -683,6 +789,7 @@ impl SwarmScheduler {
     /// `chunk_sha`, forwarding the result over `tx`.
     fn dispatch_chunk_fetch(
         &self,
+        routes: &HashMap<String, BlobRecipient>,
         peer_key_id: &str,
         blob_sha256: [u8; 32],
         chunk_sha: [u8; 32],
@@ -690,12 +797,27 @@ impl SwarmScheduler {
     ) {
         let edge = self.edge.clone();
         let peer = peer_key_id.to_string();
+        // CIRISEdge#499 — the pre-resolved address for this holder. Absent only
+        // if a caller reached here with a peer that was never routed, which
+        // `peers` being built FROM `routes` makes unreachable; the `else` is
+        // defensive and loud rather than a silent federation-address dispatch.
+        let Some(recipient) = routes.get(peer_key_id).cloned() else {
+            tracing::error!(
+                holder = %peer,
+                "swarm dispatch reached an UNROUTED holder — refusing to fall back to \
+                 the federation address (CIRISEdge#499)",
+            );
+            return;
+        };
         let timeout = self.config.per_request_timeout;
         let tx = tx.clone();
         let started_at = Instant::now();
         tokio::spawn(async move {
+            // `fetch_blob_chunk_scoped` delegates verbatim to the unscoped
+            // `fetch_blob_chunk` for a federation route, so the public-content
+            // path is byte-identical to pre-#499.
             let result = match edge
-                .fetch_blob_chunk(&peer, blob_sha256, chunk_sha, timeout)
+                .fetch_blob_chunk_scoped(&recipient, blob_sha256, chunk_sha, timeout)
                 .await
             {
                 Ok(crate::ChunkResult::Bytes(bytes)) => FetchResultBody::Bytes(bytes),
@@ -719,8 +841,17 @@ impl SwarmScheduler {
     /// `chunk_bytes`), if a holder with capacity exists, dispatch a
     /// duplicate request. First response wins via the
     /// `chunk_bytes.contains_key` check on the verifier path.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "CIRISEdge#499 added the pre-resolved `routes` map; every other \
+                  argument is pre-existing scheduler state this endgame pass must \
+                  read or mutate. Bundling them into a struct would put the \
+                  scheduler's mutable loop state behind an indirection for one \
+                  call site and hide which fields this pass actually touches."
+    )]
     fn maybe_endgame_dispatch(
         &self,
+        routes: &HashMap<String, BlobRecipient>,
         blob_sha256: [u8; 32],
         chunk_bytes: &HashMap<[u8; 32], Vec<u8>>,
         manifest: &ChunkManifestLite,
@@ -741,7 +872,7 @@ impl SwarmScheduler {
                 .map(|(k, _)| k.clone())
                 .next();
             if let Some(peer) = candidate {
-                self.dispatch_chunk_fetch(&peer, blob_sha256, *chunk_sha, tx);
+                self.dispatch_chunk_fetch(routes, &peer, blob_sha256, *chunk_sha, tx);
                 if let Some(state) = peers.get_mut(&peer) {
                     state.in_flight = state.in_flight.saturating_add(1);
                 }
@@ -756,6 +887,56 @@ impl SwarmScheduler {
             }
         }
     }
+}
+
+/// CIRISEdge#499 — resolve every holder to the address this content's SCOPE
+/// requires, dropping (loudly) the ones that cannot be addressed for it.
+///
+/// Pure and free-standing so the scope decision is testable without standing up
+/// a live edge handle: this is where the privacy-relevant choice lives, so it is
+/// the part that must be cheap to assert on and cheap to mutation-test.
+///
+/// Returns `Err(reason)` — the FIRST refusal, rendered — when no holder survives.
+/// There is deliberately no arm that returns a federation route for content that
+/// asked for a scoped one: a partial degradation would put scoped request bytes
+/// on the public address for whichever holders resolved first, which is the exact
+/// context collapse the routing exists to prevent.
+fn resolve_holder_routes(
+    scope_router: &BlobScopeRouter,
+    content_scope: Option<&ContentScope>,
+    holders: &[String],
+    blob_hex: &str,
+) -> Result<HashMap<String, BlobRecipient>, String> {
+    let mut routes: HashMap<String, BlobRecipient> = HashMap::with_capacity(holders.len());
+    let mut first_refusal: Option<String> = None;
+    for holder in holders {
+        match scope_router.route(content_scope, holder) {
+            Ok(recipient) => {
+                routes.insert(holder.clone(), recipient);
+            }
+            Err(refusal) => {
+                // Loud, never a bare `continue` (CIRISEdge#425). One line per
+                // unroutable holder; the holder set is caller-supplied and small
+                // (persist's `list_holders`), so this is bounded.
+                tracing::warn!(
+                    blob_sha = %blob_hex,
+                    holder = %holder,
+                    reason = refusal.reason_tag(),
+                    "blob holder DROPPED from the swarm candidate set — no address for \
+                     this content's scope. NOT retried at the federation address: {refusal}",
+                );
+                if first_refusal.is_none() {
+                    first_refusal = Some(refusal.to_string());
+                }
+            }
+        }
+    }
+    if routes.is_empty() {
+        return Err(
+            first_refusal.unwrap_or_else(|| "no holder could be routed for this scope".to_owned())
+        );
+    }
+    Ok(routes)
 }
 
 /// Pick the peer with lowest EWMA-RTT that has capacity. Untimed
@@ -932,6 +1113,207 @@ mod tests {
         peers.insert("a".into(), a);
         peers.insert("b".into(), b);
         assert!(pick_peer(&peers, 4).is_none());
+    }
+
+    // ── CIRISEdge#499: holder routing ────────────────────────────────
+
+    mod scope_native_holder_routing {
+        use super::*;
+        use crate::cohort_scope::CohortScope;
+        use crate::scope_addressing::{MemberAddress, ScopeAddressTable, StubDeriver};
+
+        const ALICE: &str = "ed25519:alice";
+        const BOB: &str = "ed25519:bob";
+
+        fn neighbourhood() -> CohortScope {
+            CohortScope::Cohort {
+                cohort_id: "neighbourhood".to_owned(),
+            }
+        }
+
+        /// alice + bob are members of community group `com-1`; mallory is not.
+        fn table() -> Arc<ScopeAddressTable> {
+            let t = ScopeAddressTable::new(Arc::new(StubDeriver));
+            t.install_group(&neighbourhood(), "com-1", 3, &[0xB2; 32], &[ALICE, BOB])
+                .expect("install com-1");
+            Arc::new(t)
+        }
+
+        fn community_blob() -> ContentScope {
+            ContentScope::Group {
+                scope: neighbourhood(),
+                group_id: "com-1".to_owned(),
+            }
+        }
+
+        fn holders(names: &[&str]) -> Vec<String> {
+            names.iter().map(|s| (*s).to_owned()).collect()
+        }
+
+        #[test]
+        fn a_cohort_scoped_blob_routes_every_member_to_its_own_derived_address() {
+            let t = table();
+            let scope_router = BlobScopeRouter::new(Some(Arc::clone(&t)));
+
+            let routes = resolve_holder_routes(
+                &scope_router,
+                Some(&community_blob()),
+                &holders(&[ALICE, BOB]),
+                "deadbeef",
+            )
+            .expect("both holders are members");
+
+            assert_eq!(routes.len(), 2);
+            for member in [ALICE, BOB] {
+                let got = routes[member]
+                    .scoped_address()
+                    .expect("a community blob must not ride the federation address")
+                    .as_bytes();
+                let want = t
+                    .send_address(&neighbourhood(), "com-1", member)
+                    .expect("table has the member");
+                assert_eq!(
+                    got,
+                    want.as_bytes(),
+                    "the routed address must be BYTE-EXACT with the table's derivation \
+                     — edge reproduces CIRISVerify#259's bytes, it does not transform them",
+                );
+            }
+            assert_ne!(
+                routes[ALICE].scoped_address().map(MemberAddress::as_bytes),
+                routes[BOB].scoped_address().map(MemberAddress::as_bytes),
+                "per-member, never a shared group hash (unicast-ambiguous in RNS)",
+            );
+        }
+
+        #[test]
+        fn a_public_blob_routes_every_holder_to_the_federation_address() {
+            // The no-regression case on a SCOPE-NATIVE node: installing a table
+            // must not move public content off the federation address.
+            let scope_router = BlobScopeRouter::new(Some(table()));
+            let routes = resolve_holder_routes(
+                &scope_router,
+                Some(&ContentScope::Federation),
+                &holders(&[ALICE, BOB, "ed25519:mallory"]),
+                "deadbeef",
+            )
+            .expect("public content always routes");
+
+            assert_eq!(
+                routes.len(),
+                3,
+                "including the non-member — public is public"
+            );
+            for r in routes.values() {
+                assert!(!r.is_scoped());
+                assert!(r.scoped_address().is_none());
+            }
+        }
+
+        #[test]
+        fn a_legacy_node_routes_everything_to_the_federation_address() {
+            // The no-regression case on a node with NO table — i.e. every
+            // production deployment today. `None` scope is what the pre-#499
+            // `fetch_blob` entry point supplies.
+            let scope_router = BlobScopeRouter::default();
+            let routes =
+                resolve_holder_routes(&scope_router, None, &holders(&[ALICE, BOB]), "deadbeef")
+                    .expect("legacy nodes route unconditionally");
+            assert_eq!(routes.len(), 2);
+            for r in routes.values() {
+                assert!(!r.is_scoped(), "byte-identical to pre-#499");
+            }
+        }
+
+        #[test]
+        fn an_unroutable_holder_is_dropped_and_the_routable_ones_survive() {
+            let scope_router = BlobScopeRouter::new(Some(table()));
+            let routes = resolve_holder_routes(
+                &scope_router,
+                Some(&community_blob()),
+                &holders(&[ALICE, "ed25519:mallory", BOB]),
+                "deadbeef",
+            )
+            .expect("two of three holders are members");
+
+            assert_eq!(routes.len(), 2);
+            assert!(routes.contains_key(ALICE) && routes.contains_key(BOB));
+            assert!(
+                !routes.contains_key("ed25519:mallory"),
+                "a non-member holder must be DROPPED, never federation-routed — a \
+                 partial degradation would put scoped request bytes on the public \
+                 address",
+            );
+        }
+
+        #[test]
+        fn a_blob_no_holder_can_be_addressed_for_fails_with_a_named_reason() {
+            let scope_router = BlobScopeRouter::new(Some(table()));
+            let err = resolve_holder_routes(
+                &scope_router,
+                Some(&community_blob()),
+                &holders(&["ed25519:mallory", "ed25519:trudy"]),
+                "deadbeef",
+            )
+            .expect_err("no holder is a member");
+            assert!(
+                err.contains("HOLDER") || err.contains("holder"),
+                "the refusal must NAME why, not just fail: {err}",
+            );
+
+            // The trap: a refusal test that passes by refusing everything.
+            assert!(
+                resolve_holder_routes(
+                    &scope_router,
+                    Some(&community_blob()),
+                    &holders(&[ALICE]),
+                    "deadbeef",
+                )
+                .is_ok(),
+                "a legitimate member must still route under the identical call",
+            );
+        }
+
+        #[test]
+        fn an_undeterminable_scope_is_refused_on_a_scope_native_node_only() {
+            let native = BlobScopeRouter::new(Some(table()));
+            let err = resolve_holder_routes(&native, None, &holders(&[ALICE, BOB]), "deadbeef")
+                .expect_err("unknown scope on a scope-native node");
+            assert!(
+                err.contains("UNDETERMINABLE"),
+                "the refusal must name the undeterminable scope: {err}",
+            );
+
+            // ...and the same node still routes a blob whose scope IS known,
+            // both scoped and public.
+            assert!(resolve_holder_routes(
+                &native,
+                Some(&community_blob()),
+                &holders(&[ALICE]),
+                "deadbeef"
+            )
+            .is_ok());
+            assert!(resolve_holder_routes(
+                &native,
+                Some(&ContentScope::Federation),
+                &holders(&[ALICE]),
+                "deadbeef"
+            )
+            .is_ok());
+
+            // On a legacy node the SAME input is not a refusal at all.
+            assert!(
+                resolve_holder_routes(
+                    &BlobScopeRouter::default(),
+                    None,
+                    &holders(&[ALICE]),
+                    "deadbeef"
+                )
+                .is_ok(),
+                "arming the gate on a node that cannot derive addresses would break \
+                 every existing deployment without moving a single byte",
+            );
+        }
     }
 
     #[test]

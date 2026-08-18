@@ -2849,6 +2849,146 @@ impl ReticulumTransport {
         Ok(())
     }
 
+    /// CIRISEdge#499 — send a byte-exact signed envelope to a peer at its
+    /// SCOPE-DERIVED address rather than its federation address.
+    ///
+    /// This is the send half of scope-native addressing, and its whole design
+    /// is in the signature. `Transport::send` deliberately grows no scope
+    /// parameter — it has 10 implementors, including HTTP and packet radio,
+    /// neither of which has a scope-derived destination plane — and this method
+    /// deliberately parses no scope. It takes a [`MemberAddress`], which has no
+    /// public byte constructor: the ONLY way a caller holds one is to have
+    /// obtained it from a [`ScopeAddressTable`] lookup keyed by a
+    /// `member_key_id`. So "this address is the right one for this content's
+    /// scope" is a property the caller already proved, above the transport,
+    /// and hands down as a value that cannot be wrong — the `ResolvedRecipient`
+    /// pattern (CIRISEdge#396/#402), applied to addressing.
+    ///
+    /// `destination_key_id` is still required, and is NOT the routing input: it
+    /// is the peer's federation key id, used only to resolve the transport-tier
+    /// Ed25519 the link proof is verified against. The dial target is the
+    /// derived address, exclusively — there is no arm of this method that falls
+    /// back to a federation candidate, because a silent fallback is precisely
+    /// the context collapse the derivation exists to remove.
+    ///
+    /// # Routability (the open upstream question)
+    ///
+    /// A scope-derived destination is registered with
+    /// [`Self::register_scoped_destination`], which builds an EXPLICIT-HASH
+    /// destination and suppresses its announce (CC 5.4 — group-scoped
+    /// destinations MUST NOT announce; announcing one would publish the very
+    /// reachability fact the derivation withholds). Reference RNS therefore
+    /// holds no learned path to it, and leviculum v0.19 answers path requests
+    /// for explicit-hash destinations with silence. So this dial is
+    /// BROADCAST-ONLY: it reaches a directly-attached neighbour and no further,
+    /// exactly like a v7 explicit-hash peer before `prime_peer`.
+    ///
+    /// How a scoped address becomes relay-routable without re-publishing the
+    /// reachability fact is **not edge's rule to choose** and is raised rather
+    /// than guessed. Until it is specified, a multi-hop scoped fetch fails at
+    /// the establish timeout with [`TransportError::NoRouteToPeer`] — loudly,
+    /// and without ever having put the scoped bytes on the federation address.
+    ///
+    /// # Errors
+    /// [`TransportError::BodyTooLarge`] above the AV-13 ceiling;
+    /// [`TransportError::Unreachable`] when the peer's transport identity
+    /// cannot be resolved (no signing key ⇒ no link proof);
+    /// [`TransportError::NoRouteToPeer`] / [`TransportError::Timeout`] when the
+    /// derived destination does not establish; [`TransportError::Io`] on a
+    /// leviculum fault.
+    pub async fn send_to_scoped_destination(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
+        }
+
+        let dest_hash = DestinationHash::new(*address.as_bytes());
+        // Operator deny-list first, on the DERIVED hash — a ban must not be
+        // bypassable by addressing the peer in one of its scopes.
+        self.check_blackhole(&dest_hash.into_bytes()).await?;
+
+        // The peer's transport-tier Ed25519, for the link proof. Any candidate
+        // carries it (they differ in ROUTING hash, not in signing key), so take
+        // the first. The candidate's own dest_hash is deliberately discarded:
+        // routing here is the derived address, never a federation one.
+        let Some(signing_key) = self
+            .resolve_dial_candidates(destination_key_id)
+            .await
+            .first()
+            .map(|c| c.signing_key)
+        else {
+            return Err(TransportError::Unreachable(format!(
+                "scope-native send: no transport identity resolved for \
+                 destination_key_id={destination_key_id} — cannot prove a link to its \
+                 derived address (CIRISEdge#499)"
+            )));
+        };
+
+        let (link, established) = self
+            .node
+            .connect_awaited(&dest_hash, &signing_key)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum connect (scoped): {e}")))?;
+        let link_id = *link.link_id();
+        // CIRISEdge#424 — record the dest we dialed so a reply arriving on this
+        // link attributes to this peer (leviculum's `link_destination` is `None`
+        // for our own dialed links).
+        self.dialed_link_dest
+            .lock()
+            .await
+            .insert(link_id, dest_hash);
+
+        // Explicit-hash destinations are never pathed (see the routability note
+        // above), so this is always the bootstrap-broadcast budget.
+        if !matches!(
+            with_timeout(NO_PATH_ESTABLISH_TIMEOUT, established).await,
+            Some(Ok(()))
+        ) {
+            tracing::error!(
+                key_id = %destination_key_id,
+                target_dest = %hex::encode(dest_hash.into_bytes()),
+                "scope-native send: derived destination did not establish. A derived \
+                 address is announce-suppressed by design (CC 5.4), so it is \
+                 broadcast-only — only a directly-attached neighbour answers. Making a \
+                 scoped address relay-routable without re-publishing the reachability \
+                 fact is unspecified upstream (CIRISEdge#499). NOT retried on the \
+                 federation address: that would collapse the very context this \
+                 address exists to separate."
+            );
+            return Err(TransportError::NoRouteToPeer {
+                key_id: destination_key_id.to_string(),
+                target_dest: hex::encode(dest_hash.into_bytes()),
+                has_path: false,
+                paths: self.path_table_snapshot(),
+            });
+        }
+
+        // CIRISEdge#340 — IDENTIFY before shipping, so the responder can
+        // attribute the frame. Same ordering as the federation send path.
+        self.node
+            .identify_link(&link_id, &self.local_identity)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum identify_link (scoped): {e}")))?;
+
+        self.ship_resource_on_link(
+            &link_id,
+            envelope_bytes,
+            DIAL_NO_PROGRESS_WINDOW,
+            RESOURCE_TRANSFER_TIMEOUT,
+        )
+        .await
+        .map_err(ShipError::into_transport)?;
+
+        Ok(TransportSendOutcome::Delivered)
+    }
+
     /// CIRISEdge#499 — resolve an inbound destination hash to the scope
     /// group, member and epoch it was derived for, or `None` if it is not one
     /// of ours.
@@ -4885,6 +5025,7 @@ impl Transport for ReticulumTransport {
                         link_last_inbound_at: &self.link_last_inbound_at,
                         inbound_reasm: &self.inbound_reasm,
                         dialed_link_dest: &self.dialed_link_dest,
+                        scope_addresses: &self.scope_addresses,
                     };
                     handle_event(event, &ctx).await;
 
@@ -5003,6 +5144,14 @@ struct EventCtx<'a> {
     /// same name on [`ReticulumTransport`]). Consulted in `attribute_and_deliver`
     /// when leviculum's `link_destination` is `None` for an own-dialed link.
     dialed_link_dest: &'a Mutex<HashMap<LinkId, DestinationHash>>,
+    /// CIRISEdge#499 — the scope-native address table (see the field of the same
+    /// name on [`ReticulumTransport`]). `attribute_and_deliver` probes its
+    /// reverse index once per frame to stamp `InboundFrame::arrival_scope`,
+    /// which is the receive-side admission fact the blob serve gate consumes.
+    /// Empty `OnceLock` (the production state until CIRISVerify#259's exporter
+    /// label is specified) ⇒ every frame is stamped `None`, i.e. federation
+    /// arrival, i.e. exactly pre-#499 behaviour.
+    scope_addresses: &'a OnceLock<Arc<ScopeAddressTable>>,
 }
 
 /// CIRISEdge#424 — the classified result of attributing an inbound frame's link to
@@ -5362,12 +5511,34 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         // exact condition already stated upstream).
         None => None,
     };
+    // CIRISEdge#499 — resolve the SCOPE-DERIVED address this frame arrived on,
+    // here, once, BEFORE the envelope is parsed. `dest` is the link's
+    // destination, already in hand for the attribution above; the resolution is
+    // a single hash-map probe against the reverse index (the table exists
+    // precisely so the packet path never derives — see
+    // `scope_addressing::lookup_never_calls_the_deriver`).
+    //
+    // `None` — no table installed, or a hash that is not one of ours — means the
+    // frame arrived on the FEDERATION address, which downstream reads as
+    // `CohortScope::Public`. That is not a downgrade: it is the literal truth
+    // about what reaching a public discovery address demonstrates.
+    //
+    // This is a receive-side ADMISSION FACT, orthogonal to `source_key_id`: it
+    // says which group secret the sender possessed, not who the sender is. A
+    // frame can carry one without the other, and the blob serve gate needs
+    // exactly this one.
+    let arrival_scope = dest.and_then(|d| {
+        ctx.scope_addresses
+            .get()
+            .and_then(|t| t.accepts_inbound(&d.into_bytes()))
+    });
     let frame = InboundFrame {
         envelope_bytes: data,
         transport: TransportId::RETICULUM_RS,
         received_at: Utc::now(),
         source_key_id,
         link_key_id,
+        arrival_scope,
     };
     if let Err(e) = ctx.sink.send(frame).await {
         tracing::error!(error = %e, "inbound channel send failed");

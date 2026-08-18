@@ -456,6 +456,8 @@ async fn accord_carrier_2_of_3_valid_propagates() {
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
@@ -514,6 +516,8 @@ async fn accord_carrier_1_of_3_refuses_and_emits_refusal() {
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
@@ -579,6 +583,8 @@ async fn accord_carrier_3_of_3_propagates() {
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
@@ -642,6 +648,8 @@ async fn accord_carrier_2_valid_1_invalid_propagates() {
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
@@ -699,6 +707,8 @@ async fn accord_carrier_0_accord_holders_in_directory_refuses_with_no_accord_hol
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
@@ -768,6 +778,8 @@ async fn accord_carrier_duplicate_signatures_from_same_holder_count_once() {
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
@@ -826,6 +838,8 @@ async fn accord_carrier_non_accord_class_announcements_skip_threshold_check() {
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
@@ -899,6 +913,8 @@ async fn accord_carrier_classical_only_signatures_refused_require_hybrid() {
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
@@ -966,6 +982,8 @@ async fn accord_carrier_spare_holder_not_seated_does_not_count() {
         received_at: Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 

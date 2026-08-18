@@ -285,6 +285,8 @@ async fn dispatch_inbound_emits_structured_span_with_fields() {
         received_at: chrono::Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -368,6 +370,8 @@ async fn verify_failure_emits_structured_error_event() {
         received_at: chrono::Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 

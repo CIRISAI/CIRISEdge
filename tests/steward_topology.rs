@@ -497,6 +497,8 @@ async fn federation_delivery_emits_attestation_per_recipient() {
         transport: TransportId::HTTP,
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     };
     receiver_edge.dispatch_inbound_for_test(frame).await;
 

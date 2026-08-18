@@ -431,6 +431,8 @@ async fn tier3_dispatch_inbound_signals_fetch_content() {
         received_at: chrono::Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     })
     .await;
 
