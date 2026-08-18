@@ -166,6 +166,60 @@ pub enum ScopeLifecycleError {
     Register(String),
 }
 
+/// One group-epoch, ready to be addressed — the single shape every kind
+/// of MLS group edge holds is reduced to before it reaches the
+/// lifecycle.
+///
+/// This exists so downstream learns **one** verb pair. A community
+/// ([`CohortGroup`]) and a call ([`AvSession`]) are different types with
+/// different concurrency (the first is behind an async mutex, the second
+/// is not), so a common trait would have to be async and would not be
+/// `dyn`-safe. A common *value* costs one struct and gives every group
+/// kind the same call:
+///
+/// ```ignore
+/// let snap = cohort_addressing::snapshot(&community).await?;  // or av_addressing::snapshot(&call)?
+/// lifecycle.install(&scope, &snap)?;
+/// ```
+///
+/// The secret is borrowed for the lifetime of the snapshot and zeroized
+/// on drop; what outlives it is only the 16-byte public addresses
+/// derived from it.
+///
+/// [`CohortGroup`]: crate::mls::CohortGroup
+/// [`AvSession`]: crate::transport::realtime_av_session::AvSession
+pub struct ScopeGroupSnapshot {
+    /// The table's group id. Namespaced per kind by its producer, so a
+    /// community and a call inside it cannot collide.
+    pub group_id: String,
+    /// The MLS epoch these addresses belong to.
+    pub epoch: u64,
+    /// Every member's federation key id — we derive all of them (to
+    /// dial) and listen on exactly one (our own).
+    pub members: Vec<String>,
+    /// The DESTINATION-plane exporter secret for this epoch. Never the
+    /// record plane's, and never an A/V DEK seed.
+    pub destination_secret: [u8; 32],
+}
+
+impl std::fmt::Debug for ScopeGroupSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeGroupSnapshot")
+            .field("group_id", &self.group_id)
+            .field("epoch", &self.epoch)
+            .field("members", &self.members.len())
+            .field("destination_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for ScopeGroupSnapshot {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.destination_secret.zeroize();
+    }
+}
+
 /// Drives scope-address transitions and keeps the table and the
 /// transport in step.
 pub struct ScopeLifecycle {
@@ -210,6 +264,52 @@ impl ScopeLifecycle {
         &self.own_key_id
     }
 
+    /// **The install verb.** A group became ours: derive every member's
+    /// address for its current epoch and start listening on our own.
+    ///
+    /// Takes the same [`ScopeGroupSnapshot`] for every kind of group, so
+    /// a community and a call are installed by the same call.
+    ///
+    /// # Errors
+    /// See [`ScopeLifecycleError`].
+    pub fn install(
+        &self,
+        scope: &CohortScope,
+        snapshot: &ScopeGroupSnapshot,
+    ) -> Result<TransitionOutcome, ScopeLifecycleError> {
+        self.joined(
+            scope,
+            &snapshot.group_id,
+            snapshot.epoch,
+            &snapshot.destination_secret,
+            &snapshot.members,
+        )
+    }
+
+    /// **The advance verb.** The group reached a new epoch: re-address
+    /// it make-before-break, and schedule the superseded epoch's seal.
+    ///
+    /// # Errors
+    /// See [`ScopeLifecycleError`].
+    pub fn advance(
+        &self,
+        scope: &CohortScope,
+        snapshot: &ScopeGroupSnapshot,
+        now: Instant,
+    ) -> Result<TransitionOutcome, ScopeLifecycleError> {
+        self.epoch_advanced(
+            scope,
+            &snapshot.group_id,
+            snapshot.epoch,
+            &snapshot.destination_secret,
+            &snapshot.members,
+            now,
+        )
+    }
+
+    /// The raw install, for callers that already hold the parts. Prefer
+    /// [`Self::install`], which is what the group-kind adapters use.
+    ///
     /// A group became ours: derive every member's address for its
     /// current epoch and start listening on our own.
     ///
@@ -239,6 +339,9 @@ impl ScopeLifecycle {
         })
     }
 
+    /// The raw advance, for callers that already hold the parts. Prefer
+    /// [`Self::advance`].
+    ///
     /// The group advanced to a new epoch: derive the new addresses,
     /// make them the ones we send on, and start listening on our new
     /// own address — while the superseded epoch stays live for receive

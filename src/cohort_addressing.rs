@@ -42,9 +42,8 @@
 //! guessing it here would either strand slow peers or hold a superseded
 //! address open indefinitely.
 
-use crate::cohort_scope::CohortScope;
 use crate::mls::{CohortGroup, CohortGroupError};
-use crate::scope_addressing::{ScopeAddressError, ScopeAddressTable};
+use crate::scope_lifecycle::ScopeGroupSnapshot;
 
 /// Why a cohort's addresses could not be installed.
 #[derive(Debug, thiserror::Error)]
@@ -53,102 +52,74 @@ pub enum CohortAddressError {
     /// group state.
     #[error("cohort exporter: {0}")]
     Exporter(#[from] CohortGroupError),
-    /// The address table refused the install.
-    #[error("scope address table: {0}")]
-    Table(#[from] ScopeAddressError),
 }
 
-/// Install a cohort's scoped addresses at its CURRENT epoch.
+/// **The adapter.** Reduce a community to the one shape the lifecycle
+/// takes.
 ///
-/// Call once, after joining or creating the group. The group id in the
-/// table is the `community_id`, and the members are the group's own
-/// roster — so the table's view cannot drift from MLS's without the
-/// roster itself changing.
+/// Identical in form to [`crate::av_addressing::snapshot`] — that is the
+/// point. Downstream writes the same two lines whether it is standing up
+/// a community or a call inside one:
+///
+/// ```ignore
+/// let snap = cohort_addressing::snapshot(&community).await?;
+/// lifecycle.install(&scope, &snap)?;
+/// ```
+///
+/// `async` only because a `CohortGroup`'s state lives behind the async
+/// mutex that gives it its single-writer property; the A/V twin is sync
+/// for the same reason inverted. That difference is exactly why the
+/// lifecycle takes a value rather than a trait — a common trait would
+/// have to be async and would not be `dyn`-safe.
+///
+/// The group id is namespaced (`cohort:{community_id}`) so a community
+/// and a call running inside it cannot collide in the table.
 ///
 /// # Errors
-/// [`CohortAddressError::Exporter`] on corrupted group state;
-/// [`CohortAddressError::Table`] if the community is already installed
-/// (use [`advance_cohort_addresses`] for a later epoch).
-pub async fn install_cohort_addresses(
-    table: &ScopeAddressTable,
-    scope: &CohortScope,
-    group: &CohortGroup,
-) -> Result<usize, CohortAddressError> {
-    let (epoch, members, secret) = read_epoch(group).await?;
-    Ok(table.install_group(
-        scope,
-        group.community_id(),
-        epoch,
-        secret.as_bytes(),
-        &members,
-    )?)
-}
-
-/// Move a cohort's addresses onto a NEW epoch, make-before-break.
-///
-/// Runs phases 1 and 2 together: the new epoch's addresses become
-/// reachable, then become the ones we send on, while the superseded
-/// epoch stays accepted for receive. A peer that advanced before us is
-/// answered the whole time, and a straggler that has not yet advanced
-/// keeps being addressed on the old epoch until the caller seals.
-///
-/// Both phases run against the SAME secret read, so the addresses
-/// installed and the addresses activated cannot come from two different
-/// epochs — which is the failure a naive `install_next(); activate();`
-/// pair would have if the group advanced between them.
-///
-/// # Errors
-/// [`CohortAddressError::Exporter`] on corrupted group state;
-/// [`CohortAddressError::Table`] if the community is not installed, or
-/// the epoch is already live.
-pub async fn advance_cohort_addresses(
-    table: &ScopeAddressTable,
-    scope: &CohortScope,
-    group: &CohortGroup,
-) -> Result<usize, CohortAddressError> {
-    let (epoch, members, secret) = read_epoch(group).await?;
-    let installed = table.install_next(
-        scope,
-        group.community_id(),
-        epoch,
-        secret.as_bytes(),
-        &members,
-    )?;
-    table.activate_next(scope, group.community_id())?;
-    Ok(installed)
-}
-
-/// Read `(epoch, roster, destination secret)` for the group's current
-/// epoch.
-///
-/// The three are read through separate locks rather than one, so a
-/// concurrent commit could in principle land between them. That is
-/// harmless *here* and worth stating: a torn read yields a
-/// `(secret, roster)` pair that is merely stale, and the table refuses
-/// a stale epoch on install (`AddressCollision` / the epoch checks)
-/// rather than silently mixing epochs. It is not a substitute for the
-/// group's own single-writer lock, which is what actually serializes
-/// commits.
-async fn read_epoch(
-    group: &CohortGroup,
-) -> Result<(u64, Vec<String>, crate::mls::CohortSecret), CohortGroupError> {
+/// [`CohortAddressError::Exporter`] on corrupted group state.
+pub async fn snapshot(group: &CohortGroup) -> Result<ScopeGroupSnapshot, CohortAddressError> {
+    // Three separate reads rather than one lock: a concurrent commit
+    // could in principle land between them, which is harmless HERE —
+    // a torn read yields a merely-stale (epoch, roster, secret), and the
+    // table refuses a stale epoch on install rather than mixing epochs.
+    // It is not a substitute for the group's own single-writer lock,
+    // which is what actually serializes commits.
     let epoch = group.epoch().await;
     let members = group.member_key_ids().await;
-    // The DESTINATION plane secret specifically — never the record
-    // plane's, and never the A/V DEK seed. See
-    // `CohortGroup::destination_secret`.
+    // The DESTINATION plane specifically — never the record plane's,
+    // and never the A/V DEK seed.
     let secret = group.destination_secret().await?;
-    Ok((epoch, members, secret))
+    Ok(ScopeGroupSnapshot {
+        group_id: format!("cohort:{}", group.community_id()),
+        epoch,
+        members,
+        destination_secret: *secret.as_bytes(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cohort_scope::CohortScope;
     use crate::mls::cohort_group::mint_cohort_key_material;
     use crate::mls::{CohortGroup, ScopeStateProvider};
-    use crate::scope_addressing::ScopePrivacyDeriver;
+    use crate::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
+    use crate::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
     use ciris_persist::encrypted_kv::XChaChaKvStore;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Sink(Mutex<Vec<[u8; 16]>>);
+    impl ScopedDestinationSink for Sink {
+        fn register(&self, a: &MemberAddress, _s: &CohortScope) -> Result<(), String> {
+            self.0.lock().unwrap().push(*a.as_bytes());
+            Ok(())
+        }
+        fn retire(&self, _a: &MemberAddress, _s: &CohortScope) -> Result<(), String> {
+            Ok(())
+        }
+    }
 
     fn store() -> ScopeStateProvider {
         ScopeStateProvider::new(Arc::new(
@@ -156,8 +127,15 @@ mod tests {
         ))
     }
 
-    fn table() -> ScopeAddressTable {
-        ScopeAddressTable::new(Arc::new(ScopePrivacyDeriver))
+    fn node(own: &str) -> (ScopeLifecycle, Arc<ScopeAddressTable>) {
+        let table = Arc::new(ScopeAddressTable::new(Arc::new(ScopePrivacyDeriver)));
+        let life = ScopeLifecycle::new(
+            Arc::clone(&table),
+            Arc::new(Sink::default()),
+            own,
+            Duration::from_secs(300),
+        );
+        (life, table)
     }
 
     fn scope() -> CohortScope {
@@ -167,12 +145,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_members_of_one_cohort_derive_each_others_addresses() {
-        // THE property the whole feature rests on. Both nodes hold the
-        // same MLS group, so both must compute the same 16 bytes for a
-        // given member — otherwise each addresses a hash the other
-        // never registered, and nothing errors anywhere: an RNS
-        // destination nobody registered is simply never delivered to.
+    async fn two_members_of_one_community_derive_each_others_addresses() {
+        // THE property the feature rests on, driven through exactly the
+        // two lines downstream writes. If the two nodes disagree,
+        // nothing errors anywhere: an RNS destination nobody registered
+        // is simply never delivered to.
         let a = CohortGroup::create(store(), "c-addr", "node-a", 16)
             .await
             .unwrap();
@@ -182,27 +159,38 @@ mod tests {
             .await
             .unwrap();
 
-        let (ta, tb) = (table(), table());
-        install_cohort_addresses(&ta, &scope(), &a).await.unwrap();
-        install_cohort_addresses(&tb, &scope(), &b).await.unwrap();
+        let (life_a, table_a) = node("node-a");
+        let (life_b, table_b) = node("node-b");
+        life_a
+            .install(&scope(), &snapshot(&a).await.unwrap())
+            .unwrap();
+        life_b
+            .install(&scope(), &snapshot(&b).await.unwrap())
+            .unwrap();
 
+        let gid = format!("cohort:{}", a.community_id());
         for member in ["node-a", "node-b"] {
-            let from_a = ta.send_address(&scope(), "c-addr", member).unwrap();
-            let from_b = tb.send_address(&scope(), "c-addr", member).unwrap();
             assert_eq!(
-                from_a.as_bytes(),
-                from_b.as_bytes(),
+                table_a
+                    .send_address(&scope(), &gid, member)
+                    .unwrap()
+                    .as_bytes(),
+                table_b
+                    .send_address(&scope(), &gid, member)
+                    .unwrap()
+                    .as_bytes(),
                 "both members must derive the SAME address for {member}",
             );
         }
-
-        // Per-member, not per-group: a shared hash would put both nodes
-        // under one RNS routing entry.
+        // Per-member, never a shared group hash: a shared one puts both
+        // nodes under a single RNS routing entry.
         assert_ne!(
-            ta.send_address(&scope(), "c-addr", "node-a")
+            table_a
+                .send_address(&scope(), &gid, "node-a")
                 .unwrap()
                 .as_bytes(),
-            ta.send_address(&scope(), "c-addr", "node-b")
+            table_a
+                .send_address(&scope(), &gid, "node-b")
                 .unwrap()
                 .as_bytes(),
         );
@@ -210,45 +198,40 @@ mod tests {
 
     #[tokio::test]
     async fn an_epoch_advance_re_addresses_without_deafening_the_old_epoch() {
-        let a = CohortGroup::create(store(), "c-rot", "node-a", 16)
+        let g = CohortGroup::create(store(), "c-rot", "node-a", 16)
             .await
             .unwrap();
-        let t = table();
-        install_cohort_addresses(&t, &scope(), &a).await.unwrap();
-        let before = *t
-            .send_address(&scope(), "c-rot", "node-a")
-            .unwrap()
-            .as_bytes();
+        let (life, table) = node("node-a");
+        let first = life
+            .install(&scope(), &snapshot(&g).await.unwrap())
+            .unwrap();
 
-        let _rotated = a.rotate().await.unwrap();
-        advance_cohort_addresses(&t, &scope(), &a).await.unwrap();
+        let _commit = g.rotate().await.unwrap();
+        let t0 = std::time::Instant::now();
+        let second = life
+            .advance(&scope(), &snapshot(&g).await.unwrap(), t0)
+            .unwrap();
 
-        let after = *t
-            .send_address(&scope(), "c-rot", "node-a")
-            .unwrap()
-            .as_bytes();
-        assert_ne!(before, after, "an epoch bump must move the address");
-
-        // Make-before-break: the OLD address is still accepted for
-        // receive, so a peer that has not yet advanced still reaches us.
-        assert!(
-            t.accepts_inbound(&before).is_some(),
-            "the superseded epoch must stay accepted until seal",
-        );
-        assert!(t.accepts_inbound(&after).is_some());
-
-        // ...and only stops after the caller seals.
-        t.seal_rotation(&scope(), "c-rot").unwrap();
-        assert!(
-            t.accepts_inbound(&before).is_none(),
-            "a sealed epoch is no longer ours",
-        );
-        assert!(t.accepts_inbound(&after).is_some());
+        assert_ne!(first.own_address.as_bytes(), second.own_address.as_bytes());
+        // Make-before-break: the old address still answers until sealed.
+        assert!(table
+            .accepts_inbound(first.own_address.as_bytes())
+            .is_some());
+        assert!(table
+            .accepts_inbound(second.own_address.as_bytes())
+            .is_some());
+        life.seal_due(t0 + Duration::from_secs(300));
+        assert!(table
+            .accepts_inbound(first.own_address.as_bytes())
+            .is_none());
+        assert!(table
+            .accepts_inbound(second.own_address.as_bytes())
+            .is_some());
     }
 
     #[tokio::test]
-    async fn a_different_cohort_yields_unrelated_addresses() {
-        // Unlinkability: the same node in two cohorts presents two
+    async fn a_different_community_yields_unrelated_addresses() {
+        // Unlinkability: one node in two communities presents two
         // addresses nothing correlates without the group secrets.
         let one = CohortGroup::create(store(), "c-one", "node-a", 16)
             .await
@@ -256,55 +239,55 @@ mod tests {
         let two = CohortGroup::create(store(), "c-two", "node-a", 16)
             .await
             .unwrap();
-        let t = table();
-        install_cohort_addresses(&t, &scope(), &one).await.unwrap();
-        install_cohort_addresses(&t, &scope(), &two).await.unwrap();
-
+        let (life, table) = node("node-a");
+        life.install(&scope(), &snapshot(&one).await.unwrap())
+            .unwrap();
+        life.install(&scope(), &snapshot(&two).await.unwrap())
+            .unwrap();
         assert_ne!(
-            t.send_address(&scope(), "c-one", "node-a")
+            table
+                .send_address(&scope(), "cohort:c-one", "node-a")
                 .unwrap()
                 .as_bytes(),
-            t.send_address(&scope(), "c-two", "node-a")
+            table
+                .send_address(&scope(), "cohort:c-two", "node-a")
                 .unwrap()
                 .as_bytes(),
-            "one node in two cohorts must present unrelated addresses",
         );
     }
 
     #[tokio::test]
-    async fn the_record_plane_secret_would_produce_different_addresses() {
-        // Guards the plane split from the inside: if this module ever
-        // reached for `record_secret` instead, every address would
-        // change and every peer would silently stop resolving us. The
-        // assertion is that the two planes are NOT interchangeable.
+    async fn the_snapshot_carries_the_destination_plane_not_the_record_plane() {
+        // Guards the plane split from the inside. Note the two-member
+        // agreement test CANNOT catch this: both members would use the
+        // same wrong secret and still agree with each other.
         let g = CohortGroup::create(store(), "c-plane", "node-a", 16)
             .await
             .unwrap();
-        let t = table();
-        install_cohort_addresses(&t, &scope(), &g).await.unwrap();
-        let via_destination = *t
-            .send_address(&scope(), "c-plane", "node-a")
-            .unwrap()
-            .as_bytes();
-
-        let record = g.record_secret().await.unwrap();
-        let other = table();
-        other
-            .install_group(
-                &scope(),
-                "c-plane",
-                g.epoch().await,
-                record.as_bytes(),
-                &["node-a"],
-            )
-            .unwrap();
+        let snap = snapshot(&g).await.unwrap();
+        assert_eq!(
+            snap.destination_secret,
+            *g.destination_secret().await.unwrap().as_bytes(),
+        );
         assert_ne!(
-            via_destination,
-            *other
-                .send_address(&scope(), "c-plane", "node-a")
-                .unwrap()
-                .as_bytes(),
+            snap.destination_secret,
+            *g.record_secret().await.unwrap().as_bytes(),
             "record and destination planes must not be interchangeable",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_group_id_namespaces_a_community_apart_from_a_call() {
+        // A community and an A/V call inside it are separate groups with
+        // separate secrets; their table ids must not collide either.
+        let g = CohortGroup::create(store(), "c-ns", "node-a", 16)
+            .await
+            .unwrap();
+        let snap = snapshot(&g).await.unwrap();
+        assert_eq!(snap.group_id, "cohort:c-ns");
+        assert!(
+            !snap.group_id.starts_with("av-stream:"),
+            "the two namespaces must be disjoint",
         );
     }
 }

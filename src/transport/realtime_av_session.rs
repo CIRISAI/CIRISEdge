@@ -359,6 +359,28 @@ impl AvSession {
     }
 
     /// Current epoch counter — tracks the underlying MLS group epoch.
+    /// CIRISEdge#499 — this epoch's DESTINATION secret, the input to
+    /// `k_destination` and therefore to every scoped address this node
+    /// presents in the session.
+    ///
+    /// Distinct from the epoch DEK's seed by construction: verify gives
+    /// the record and destination planes separate exporter labels
+    /// precisely so a compromise of one cannot recompute the other. See
+    /// `realtime_av_mls::export_destination_secret`.
+    ///
+    /// # Errors
+    /// [`AvSessionError`] on corrupted group state.
+    pub fn destination_secret(&self) -> Result<[u8; 32], AvSessionError> {
+        self.mls().destination_secret().map_err(map_mls_err)
+    }
+
+    /// CIRISEdge#499 — the session roster, for deriving every member's
+    /// scoped address at the current epoch.
+    #[must_use]
+    pub fn member_key_ids(&self) -> Vec<String> {
+        self.mls().member_key_ids()
+    }
+
     pub fn epoch(&self) -> Epoch {
         self.epoch
     }
