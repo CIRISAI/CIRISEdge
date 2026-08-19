@@ -208,10 +208,13 @@ pub struct EpochRekeyArtifacts {
 /// Errors a rekey or join can surface.
 #[derive(Debug, thiserror::Error)]
 pub enum AvSessionError {
-    /// A member's advertised KEX pubkeys lack the ML-KEM-768 half. The
-    /// 0x004D ciphersuite requires it; the rekey fails-closed before
-    /// any MLS code runs. Preserves the HNDL discipline T2 had.
-    #[error("peer {0} lacks ML-KEM-768 — required by ciphersuite 0x004D (HNDL discipline)")]
+    /// An identity's KEX key material lacks the ML-KEM-768 half. The
+    /// 0x004D ciphersuite requires it; fails-closed before any MLS
+    /// code runs. Post-CIRISEdge#481 item 4 a PEER advertisement
+    /// without ML-KEM-768 is unrepresentable (refused at
+    /// `PeerKexPubkeys` construction), so this reaches callers only
+    /// from the OWN-key side (`OwnKexKeys` on the joiner paths).
+    #[error("{0} lacks ML-KEM-768 — required by ciphersuite 0x004D (HNDL discipline)")]
     PeerLacksMlkem(PeerKeyId),
     /// Welcome bytes are empty or don't parse as an MLS Welcome message.
     #[error("welcome bytes malformed: {0}")]
@@ -502,8 +505,9 @@ impl AvSession {
     /// [`AvSession::process_welcome`] before accepting membership.
     ///
     /// - `invitee_kex` — the joiner's advertised static X-Wing public
-    ///   key (the HPKE recipient key). A classical-only advertisement is
-    ///   [`AvSessionError::PeerLacksMlkem`].
+    ///   key (the HPKE recipient key). Complete by construction:
+    ///   CIRISEdge#481 item 4 made a classical-only advertisement
+    ///   unrepresentable.
     /// - `inviter_signer` — the local node's long-term ML-DSA-65
     ///   federation signer (whatever the joiner's directory holds for
     ///   `inviter_pk_id`).
@@ -713,7 +717,7 @@ mod tests {
         (
             PeerKexPubkeys {
                 x25519_pub: x_pk,
-                mlkem768_pub: Some(mlkem_pk.clone()),
+                mlkem768_pub: mlkem_pk.clone(),
             },
             OwnKexKeys {
                 x25519_priv: x_sk,
@@ -743,25 +747,15 @@ mod tests {
         }
     }
 
-    /// Build a hybrid-ready `Member` with synthetic KEX pubkeys. The
-    /// bytes are not consumed by openmls; only the HNDL pre-check
-    /// looks at `mlkem768_pub.is_some()`.
+    /// Build a hybrid-ready `Member` with synthetic KEX pubkeys (the
+    /// only representable kind post-#481 item 4). The bytes are not
+    /// consumed by openmls.
     fn hybrid_member(key_id: &str) -> Member {
         Member {
             key_id: key_id.to_string(),
             kex_pubkeys: PeerKexPubkeys {
                 x25519_pub: [1u8; 32],
-                mlkem768_pub: Some(vec![0xAB; 1184]), // ML-KEM-768 pubkey size
-            },
-        }
-    }
-
-    fn classical_only_member(key_id: &str) -> Member {
-        Member {
-            key_id: key_id.to_string(),
-            kex_pubkeys: PeerKexPubkeys {
-                x25519_pub: [1u8; 32],
-                mlkem768_pub: None,
+                mlkem768_pub: vec![0xAB; 1184], // ML-KEM-768 pubkey size
             },
         }
     }
@@ -1083,8 +1077,12 @@ mod tests {
     /// Atomic HNDL gate: a batch with one classical-only Add MUST
     /// reject before any proposal is queued. The MlsSession's
     /// group epoch must NOT advance (proof of atomicity).
+    /// (Was the HNDL-breach atomicity test — the classical-only Add it
+    /// used as the failing op is unrepresentable post-#481 item 4, so
+    /// the failing op is now a Remove of an unknown member; the
+    /// atomicity contract under test is unchanged.)
     #[test]
-    fn batch_atomic_fails_closed_on_hndl_breach() {
+    fn batch_atomic_fails_closed_on_invalid_op() {
         let (mut session, dek0) = AvSession::create(
             dummy_stream(),
             "alice",
@@ -1095,15 +1093,18 @@ mod tests {
         let pre_roster_size = session.roster_size();
 
         let ops = vec![
-            RosterOp::Add(hybrid_member("ed")),              // ok
-            RosterOp::Remove("bob".to_string()),             // ok
-            RosterOp::Add(classical_only_member("badpeer")), // FAIL
-            RosterOp::Add(hybrid_member("frank")),           // would-be-ok
+            RosterOp::Add(hybrid_member("ed")),           // ok
+            RosterOp::Remove("bob".to_string()),          // ok
+            RosterOp::Remove("not-a-member".to_string()), // FAIL
+            RosterOp::Add(hybrid_member("frank")),        // would-be-ok
         ];
         let r = session.advance_epoch(RosterDelta::Batch(ops));
         assert!(
-            matches!(r, Err(AvSessionError::PeerLacksMlkem(ref k)) if k == "badpeer"),
-            "expected PeerLacksMlkem(badpeer), got {r:?}"
+            matches!(
+                r,
+                Err(AvSessionError::Mls(MlsError::MemberNotFound(ref k))) if k == "not-a-member"
+            ),
+            "expected Mls(MemberNotFound(not-a-member)), got {r:?}"
         );
 
         // Atomicity proof: the session state is exactly as it was
@@ -1195,34 +1196,10 @@ mod tests {
         assert_eq!(session.roster_size(), 52, "alice + bob + 50 joiners");
     }
 
-    /// HNDL discipline: a member lacking ML-KEM-768 is refused at
-    /// create-time. Same gate the T2 baseline had, now via the
-    /// MLS-layer pre-check.
-    #[test]
-    fn hndl_member_lacking_mlkem_refused_at_create() {
-        let r = AvSession::create(
-            dummy_stream(),
-            "creator",
-            vec![hybrid_member("alice"), classical_only_member("bob")],
-        );
-        assert!(
-            matches!(r, Err(AvSessionError::PeerLacksMlkem(ref k)) if k == "bob"),
-            "expected PeerLacksMlkem(bob), got {r:?}"
-        );
-    }
-
-    /// HNDL discipline: same gate at `advance_epoch(Join)`.
-    #[test]
-    fn hndl_member_lacking_mlkem_refused_at_advance_join() {
-        let (mut session, _dek) =
-            AvSession::create(dummy_stream(), "alice", vec![hybrid_member("bob")]).expect("create");
-
-        let r = session.advance_epoch(RosterDelta::Join(classical_only_member("carol")));
-        assert!(
-            matches!(r, Err(AvSessionError::PeerLacksMlkem(ref k)) if k == "carol"),
-            "expected PeerLacksMlkem(carol), got {r:?}"
-        );
-    }
+    // (was: `hndl_member_lacking_mlkem_refused_at_create` /
+    // `hndl_member_lacking_mlkem_refused_at_advance_join` — the
+    // classical-only Member is unrepresentable post-#481 item 4; the
+    // HNDL gate is structural at `PeerKexPubkeys` construction.)
 
     // ─── Joiner path (CIRISEdge#155 Gap 2) ──────────────────────────
 

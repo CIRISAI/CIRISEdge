@@ -87,9 +87,26 @@ pub struct DirectoryRecord {
     /// ML-DSA-65 public key bytes (the
     /// `EncodedVerifyingKey<MlDsa65>` form).
     pub ml_dsa_pk: Vec<u8>,
-    /// X-Wing public key (X25519 + ML-KEM-768 halves). Optional
-    /// because some directory entries — e.g. read-only governance
-    /// keys — may carry only ML-DSA-65.
+    /// X-Wing public key (X25519 + ML-KEM-768 halves).
+    ///
+    /// `Option` is DELIBERATE (CIRISEdge#481 item 7, investigated):
+    /// a legitimate absent state exists. Signature-only directory
+    /// entries — governance/steward keys resolved SOLELY as the
+    /// CIRISEdge#331 (E8) inviter-signature trust input via
+    /// [`DirectoryCache::welcome_wrap_lookup`] — carry only
+    /// ML-DSA-65 and are never KEX recipients. Precisely who may
+    /// lack it: entries whose identity never acts as an HPKE/KEX
+    /// recipient (they verify, they don't decrypt).
+    ///
+    /// This field is NOT a KEX input and MUST never become one: peer
+    /// KEX pubkeys are resolved through persist's
+    /// `resolve_encryption_keys` (both halves required) in
+    /// `Edge::resolve_peer_kex_pubkeys`, and
+    /// `PeerKexPubkeys.mlkem768_pub` is a required `Vec<u8>` (#481
+    /// item 4) whose only Option-accepting constructor
+    /// (`PeerKexPubkeys::from_advertisement`) refuses absence with a
+    /// typed error — so an absent key here structurally cannot reach
+    /// KEX construction.
     pub x_wing_pk: Option<XWingPublic>,
     /// Caller-tagged identity type.
     pub identity_type: IdentityType,

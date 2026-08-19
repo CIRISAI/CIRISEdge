@@ -147,7 +147,12 @@ pub struct FederationDirectoryEntry {
     pub ml_dsa_pk: Vec<u8>,
     /// Inviter's X-Wing public key (for outgoing wraps — unused
     /// during inbound verification but included for parity with the
-    /// substrate-tier directory).
+    /// substrate-tier directory). `Option` is deliberate (CIRISEdge#481
+    /// item 7): signature-only entries (governance/steward keys that
+    /// verify but never decrypt) legitimately lack it, and it is not a
+    /// KEX input — the wrap path takes its recipient key
+    /// (`invitee_pk`) as a required argument, and `PeerKexPubkeys`
+    /// (#481 item 4) cannot be constructed from an absent key.
     pub x_wing_pk: Option<XWingRecipientPublic>,
 }
 

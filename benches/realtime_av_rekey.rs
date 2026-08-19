@@ -147,7 +147,7 @@ fn fresh_synthetic_peer(idx: usize) -> SyntheticPeer {
         key_id: format!("peer-{idx:06}"),
         advertised: PeerKexPubkeys {
             x25519_pub: x_pub,
-            mlkem768_pub: Some(mlkem_pub),
+            mlkem768_pub: mlkem_pub,
         },
     }
 }
