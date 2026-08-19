@@ -103,6 +103,7 @@
 //! [`FountainHoldingClaim`]: crate::holonomic::swarm_rarity::FountainHoldingClaim
 //! [`BlobScopeRouter::is_scope_native`]: crate::blob_swarm::BlobScopeRouter::is_scope_native
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ciris_persist::federation::namespace::{
@@ -471,10 +472,21 @@ impl HoldingsScopeGate {
     /// # Arming
     ///
     /// `is_scope_native() == false` ⇒ [`HoldingAnnounce::Announce`]
-    /// unconditionally, with no table probe, **no directory call** and no
-    /// log. See the module docs: additive, not disruptive. The early
-    /// return is byte-identical to pre-#499 and pre-#744 alike — an
-    /// unarmed node performs no `.await` on this path at all.
+    /// unconditionally, with no table probe and **no directory call**. See
+    /// the module docs: additive, not disruptive. The early return is
+    /// byte-identical to pre-#499 and pre-#744 alike — an unarmed node
+    /// performs no `.await` on this path at all.
+    ///
+    /// v18 — the UNARMED state is no longer silent: the FIRST consultation
+    /// of an unarmed gate emits one process-lifetime WARN naming the
+    /// staged state and what arming requires — installing the MLS
+    /// [`ScopeAddressTable`], an OPERATOR OPT-IN via
+    /// `EdgeBuilder::scope_native_addressing` (the deriver itself shipped
+    /// with CIRISVerify#259's `ScopePrivacyDeriver`; nothing upstream is
+    /// pending). One atomic flag, no throttle table, no behavior change —
+    /// production deliberately rides unarmed until the operator opts in,
+    /// and an operator reading logs must be able to tell "staged open"
+    /// from "armed and passing".
     ///
     /// # The two halves of CIRISPersist#744, and why they are one change
     ///
@@ -531,6 +543,7 @@ impl HoldingsScopeGate {
     ) -> HoldingAnnounce {
         // ARMING — the byte-identical early return. No probe, no await.
         let Some(table) = self.table.as_ref() else {
+            warn_holdings_scope_gate_unarmed();
             return HoldingAnnounce::Announce;
         };
 
@@ -632,8 +645,34 @@ impl HoldingsScopeGate {
                     // hash-map probe and no derivation. See the
                     // "seam edge cannot yet supply" note above for why
                     // persist's verb is NOT asked here.
+                    //
+                    // v18 audit note — `SelfOwn` announced-to-roster is a
+                    // DELIBERATE reading, not the attestation plane's
+                    // "structurally invisible" collapsed by accident. A
+                    // holdings claim is publish-own BY CONSTRUCTION (the
+                    // announcing node is the claim's producer), so the
+                    // SelfOwn publisher restriction is trivially satisfied;
+                    // what remains is the AUDIENCE, and persist bounds it
+                    // to the record's OWN roster — the family's MLS group
+                    // for family scope (the same set the blob serve gate
+                    // admits on the family address), and the owner's own
+                    // device set for `self` scope (the single-owner
+                    // boundary, CIRISConstitution#23). The residual trust
+                    // assumption is the TABLE INSTALLER's: a `self`-scope
+                    // group's roster must be only the owner's nodes — this
+                    // gate cannot verify that. Pinned by
+                    // `family_holding_withheld_from_outsider_while_federation_still_flows`.
                     Projection::Cohort | Projection::SelfOwn => {
                         if table.send_address(scope, group_id, peer_key_id).is_some() {
+                            if projection == Projection::SelfOwn {
+                                tracing::debug!(
+                                    peer = %peer_key_id,
+                                    content_kind = scope.kind_token(),
+                                    "SelfOwn-projected holding announced to its OWN \
+                                     group roster (deliberate — see the v18 audit \
+                                     note at this site)"
+                                );
+                            }
                             HoldingAnnounce::Announce
                         } else {
                             HoldingAnnounce::Withhold(HoldingRefusal::PeerNotInRoster {
@@ -798,6 +837,27 @@ fn withhold_detail(content_id: &str) -> String {
     format!("fountain:{prefix}")
 }
 
+/// v18 — has the unarmed-gate staging WARN fired this process?
+static HOLDINGS_SCOPE_GATE_UNARMED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// v18 — say ONCE (per process) that the holdings scope gate is riding the
+/// staged default-open state. The default itself is INTENTIONAL and must not
+/// flip (production rides it; `unarmed_gate_announces_everything` pins it) —
+/// this only makes the state legible, so "staged open" can never again be
+/// mistaken for "armed and passing".
+fn warn_holdings_scope_gate_unarmed() {
+    if !HOLDINGS_SCOPE_GATE_UNARMED_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "fountain holdings scope gate UNARMED — scope-native addressing is not \
+             installed, so this node rides the pre-#499 staged state: every held \
+             content is announced to every cohort peer, with no scope filter. This \
+             is the deliberate default; arming is an OPERATOR OPT-IN — install the \
+             MLS ScopeAddressTable via EdgeBuilder::scope_native_addressing (the \
+             CIRISVerify#259 ScopePrivacyDeriver is shipped). Warned once per process."
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,6 +1015,15 @@ mod tests {
     /// A node with NO address table announces everything, including
     /// content whose scope is unknown AND content that is family-scoped.
     /// This is the pre-#499 deployment and it must not change.
+    ///
+    /// v18 PIN — "no table ⇒ default-open" is INTENTIONAL, not an
+    /// oversight: production rides this staged state, and arming is an
+    /// operator OPT-IN (`EdgeBuilder::scope_native_addressing` installs the
+    /// MLS table; the CIRISVerify#259 deriver is shipped). A future "fix"
+    /// that flips this default fail-closed would dark every holding on
+    /// every existing deployment. If you are here to flip it: that is the
+    /// arming event, done by installing the table — not by editing the
+    /// gate.
     #[tokio::test]
     async fn unarmed_gate_announces_everything() {
         let g = HoldingsScopeGate::new(None, None);

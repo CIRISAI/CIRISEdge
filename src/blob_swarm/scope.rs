@@ -65,10 +65,34 @@
 //! [`SwarmScheduler::fetch_blob`]: super::SwarmScheduler::fetch_blob
 //! [`ApplyOutcome`]: crate::replication::summary::ApplyOutcome
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::cohort_scope::CohortScope;
 use crate::scope_addressing::{InboundAddress, MemberAddress, ScopeAddressTable};
+
+/// v18 — has the unarmed-gate staging WARN fired this process?
+static BLOB_SCOPE_GATE_UNARMED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// v18 — say ONCE (per process) that the blob serve gate is riding the staged
+/// default-open state, so "staged open" is never mistaken for "armed and
+/// passing". The default itself is INTENTIONAL and must not flip — production
+/// rides it; arming is an OPERATOR OPT-IN (install the MLS
+/// [`ScopeAddressTable`] via `EdgeBuilder::scope_native_addressing`; the
+/// CIRISVerify#259 `ScopePrivacyDeriver` is shipped, nothing upstream pends).
+fn warn_blob_scope_gate_unarmed() {
+    if !BLOB_SCOPE_GATE_UNARMED_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "blob serve scope gate UNARMED — scope-native addressing is not \
+             installed, so this node rides the pre-#499 staged state: every \
+             arrival is treated as the federation address and every blob request \
+             is admitted without a scope check. This is the deliberate default; \
+             arming is an OPERATOR OPT-IN — install the MLS ScopeAddressTable via \
+             EdgeBuilder::scope_native_addressing (the CIRISVerify#259 \
+             ScopePrivacyDeriver is shipped). Warned once per process."
+        );
+    }
+}
 
 // ─── What "this blob's scope" means to the addressing layer ─────────
 
@@ -542,12 +566,19 @@ impl ServeAdmission {
 /// address for anyone to arrive on, so every request would arrive as
 /// `None` and a gate would refuse all non-public content on every
 /// existing deployment. Additive, not disruptive.
+///
+/// v18 — the UNARMED state is no longer silent: the first consultation
+/// emits one process-lifetime WARN naming the staged state (see
+/// [`warn_blob_scope_gate_unarmed`]). The default itself is INTENTIONAL
+/// and unchanged — production rides it, and
+/// `the_gate_is_disarmed_when_no_table_is_installed` pins it.
 pub fn admit_blob_serve(
     scope_native: bool,
     arrival: Option<&InboundAddress>,
     content: Option<&ContentScope>,
 ) -> ServeAdmission {
     if !scope_native {
+        warn_blob_scope_gate_unarmed();
         return ServeAdmission::Admit;
     }
 
@@ -961,6 +992,13 @@ mod tests {
         assert!(admit_blob_serve(true, Some(&own), Some(&community_content())).is_admitted());
     }
 
+    /// v18 PIN — "no table ⇒ default-open" is INTENTIONAL, not an oversight.
+    /// Production rides this staged state: arming is an operator OPT-IN
+    /// (install the table via `EdgeBuilder::scope_native_addressing`), and a
+    /// future "fix" that flips this default fail-closed would refuse every
+    /// non-public blob on every existing deployment (a legacy node cannot
+    /// produce a non-`None` arrival). If you are here to flip it: that is the
+    /// arming EVENT, done by installing the table — not by editing this gate.
     #[test]
     fn the_gate_is_disarmed_when_no_table_is_installed() {
         // The no-regression case at the gate. A legacy node cannot produce
@@ -974,7 +1012,9 @@ mod tests {
             assert_eq!(
                 admit_blob_serve(false, None, content),
                 ServeAdmission::Admit,
-                "a deployment with no address table must serve exactly as pre-#499",
+                "a deployment with no address table must serve exactly as pre-#499 \
+                 — the INTENTIONAL staged default; do not flip it here (arming = \
+                 installing the ScopeAddressTable, an operator opt-in)",
             );
         }
     }
