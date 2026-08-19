@@ -255,12 +255,17 @@ mod yubico_attestation_root_hash_tests {
 pub const PERSIST_NAMESPACE_MANIFEST_VERSION: &str = "0.3.0";
 
 /// Pinned SHA-256 of persist's closed **transform algebra** (CIRISPersist#519,
-/// `transform::TRANSFORM_ALGEBRA_HASH`). Edge applies the per-family declared
-/// transforms (`strip_field` + shape ops) at the serve/projection path from the
-/// manifest, never a hand-rolled op list (CIRISEdge#411 §3). Pinning the algebra
-/// hash makes a persist change to the op vocabulary — a new strip, a changed
-/// shape op — a BUILD failure at edge first, forcing a deliberate re-review of
-/// edge's serve-time transform application before the wire behavior can drift.
+/// `transform::TRANSFORM_ALGEBRA_HASH`). Edge does NOT apply `strip_field` at
+/// the serve path — serve-time stripping is unsound on edge's content-addressed
+/// signed wire (the recipient fetches by content-hash and re-verifies the hybrid
+/// signature, so a strip breaks both; #397). The strip is a persist
+/// PROMOTION-side transform (`promote_attestation_with_transforms`); at edge's
+/// serve layer `StripField` deliberately resolves to a no-op
+/// (`bridge.rs` `recipient_capability` collection) and the deferral is accounted
+/// for in `field_conformance::DEFERRED_PENDING_PLANE`. Pinning the algebra hash
+/// makes a persist change to the op vocabulary — a new strip, a changed shape
+/// op — a BUILD failure at edge first, forcing a deliberate re-review of that
+/// no-op boundary before the wire behavior can drift.
 pub const PERSIST_TRANSFORM_ALGEBRA_HASH: &str =
     "b7bd779468f4ad1ab551a5fd2dc0392df01e6f2e0ed393f924a806ed49686b4b";
 
