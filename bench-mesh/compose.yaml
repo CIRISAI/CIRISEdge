@@ -60,6 +60,13 @@ x-node: &node
     EDGE_CONVERGENCE_SECS: "${MESH_CONVERGENCE_SECS:-20}"
     EDGE_ROOT_TIMEOUT_SECS: "${MESH_ROOT_TIMEOUT_SECS:-180}"
     EDGE_BARRIER_TIMEOUT_SECS: "${MESH_BARRIER_TIMEOUT_SECS:-300}"
+    # A fan-out mesh is exactly the "servers override larger" case the
+    # control-channel default (256) anticipates: under M=4 churn,
+    # control-plane event drops plausibly feed the wedge cascade
+    # (CIRISEdge#508). Config wins over this env; clamp is [16, 65536].
+    # The transport's own INFO wiring-decision log is the authority; the
+    # mesh.standup leg detail records the intent.
+    CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY: "2048"
     RUST_BACKTRACE: "1"
   volumes:
     - mesh:/mesh

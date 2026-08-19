@@ -22,8 +22,8 @@
 //! - **A real `ReticulumTransport`** over real TCP interfaces on a real
 //!   docker network, and **real announce-based rooting** — a node learns
 //!   its peers by verifying their signed announce attestations against
-//!   the federation directory. No `inject_rooted_peer_for_test` on the
-//!   federation plane.
+//!   the federation directory. No `inject_rooted_peer_for_test`
+//!   anywhere in this binary.
 //! - **A real MLS `CohortGroup`** (openmls 0.8.1, X-Wing ciphersuite
 //!   0x004D), joined **across process boundaries**: the joiner mints a
 //!   real KeyPackage, ships it over the real RNS wire, and the creator's
@@ -43,11 +43,10 @@
 //!
 //! # What is a SEAM (stubbed, and named)
 //!
-//! Three things the harness cannot reach today, each behind a narrow
+//! Two things the harness cannot reach today, each behind a narrow
 //! trait so the real API drops in as a second impl without touching the
-//! measurement or the reporting. Two are APIs being built concurrently
-//! (`av_spine`, scope-native blob fetch); the third is a verb that does
-//! not exist at all yet:
+//! measurement or the reporting. Both are APIs being built concurrently
+//! (`av_spine`, scope-native blob fetch):
 //!
 //! - [`MediaLink`] — how a sealed chunk crosses the wire. Today's impl
 //!   ([`TransportMediaLink`]) uses `Transport::send`, the real RNS
@@ -62,30 +61,39 @@
 //!   holding a `ReticulumTransport` **cannot** reach the node, so it
 //!   cannot construct the real-RNS A/V sender. See the report.
 //!
-//! - [`ScopedDialer`] — how a *scope-derived* address is dialled.
-//!   `ScopeAddressTable::send_address` hands you the peer's 16 bytes and
-//!   there is no transport verb that takes them; `link_open` resolves
-//!   its signing key from the rooted-peer map, which is keyed on
-//!   federation destinations. The harness installs the missing binding
-//!   itself ([`HarnessScopedDialer`]) and says so in its output
-//!   (`dial_binding: "harness_installed"`), so no reader mistakes the
-//!   seal-retirement leg for proof that a production dial path exists.
-//!
-//!   Running it produced a second, larger finding: **a scope-derived
-//!   destination is not reachable off-link at all.** It is registered
-//!   with `Destination::with_explicit_hash`, and an explicit-hash
-//!   destination cannot announce, so no multi-hop RNS path to one can
-//!   exist. The federation destination escapes this only because a node
-//!   registers an *announceable* named destination beside it; a scoped
-//!   address has no such twin by design, since announcing one would
-//!   publish the reachability fact the derivation exists to withhold.
-//!   So the peer-dials-it half of "a sealed address finds nobody home"
-//!   is not measurable from a relayed peer today, and the leg reports
-//!   `ran: false` carrying that diagnosis. The owner-side half IS
-//!   measured, by the member's own `scope.seal` leg.
-//!
 //! Blob fetch is scope-*gated* here but not yet scope-*native*:
 //! `src/blob_swarm/` is being extended concurrently. See [`BlobPlane`].
+//!
+//! # How seal retirement is measured (CIRISEdge#499)
+//!
+//! An earlier shape of the `conformance.seal_retires` leg tried to
+//! RNS-dial the member's scope-derived address directly, through the
+//! relay. Running it proved that structurally impossible, and BY
+//! DESIGN: a scope-derived destination is registered with
+//! `Destination::with_explicit_hash`, and an explicit-hash destination
+//! cannot announce (`AnnounceError::ExplicitHashCannotAnnounce`;
+//! leviculum answers a path request for one with silence, because a
+//! path response IS an announce and an announce for a caller-supplied
+//! hash is unverifiable). No multi-hop RNS path to one can exist. The
+//! federation destination escapes this only because a node registers an
+//! *announceable* named destination beside it; a scoped address has no
+//! such twin, since announcing one would publish the very reachability
+//! fact the derivation exists to withhold. **A scoped address is an
+//! arrival discriminator, not a routable endpoint.**
+//!
+//! So the leg measures retirement at the ADMISSION SEAM instead. The
+//! publisher CAN reach the member over its announced node destination —
+//! `mesh.rooting` proves those paths exist through the relay — so it
+//! sends an application-level [`Control::AddressProbe`] naming the
+//! 16 derived bytes, and the member answers from the SAME lookup the
+//! production transport consults when it stamps
+//! `InboundFrame::arrival_scope` on every arriving frame
+//! (`ReticulumTransport::inbound_scope` →
+//! `ScopeAddressTable::accepts_inbound`, the reverse index). After the
+//! seal the superseded address must be refused (`held: false`) WHILE
+//! the live address still answers `held: true` — the live answer is the
+//! aliveness control that makes "refused" distinguishable from "node
+//! down". That is the honest network observable under #499.
 //!
 //! # Honesty
 //!
@@ -123,7 +131,7 @@ use ciris_crypto::{kdf, ClassicalSigner, Ed25519Signer};
 use ciris_edge::cohort_scope::CohortScope;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::mls::cohort_group::mint_cohort_key_material;
-use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
+use ciris_edge::mls::{CohortGroup, CommitApplyOutcome, ScopeStateProvider};
 use ciris_edge::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink, TransitionOutcome};
 use ciris_edge::transport::realtime_av::{
@@ -512,16 +520,6 @@ fn publish_transport_entry(mesh: &Path, entry: &TransportEntry) -> std::io::Resu
     std::fs::rename(&tmp, &final_path)
 }
 
-/// Read a peer's transport ed25519 half, or `None` if it has not
-/// published one yet.
-fn peer_transport_ed25519(mesh: &Path, key_id: &str) -> Option<[u8; 32]> {
-    let path = roster_dir(mesh).join(format!("{key_id}.transport.json"));
-    let bytes = std::fs::read(path).ok()?;
-    let entry: TransportEntry = serde_json::from_slice(&bytes).ok()?;
-    let raw = B64.decode(entry.transport_ed25519_b64).ok()?;
-    raw.try_into().ok()
-}
-
 fn read_roster(mesh: &Path) -> BTreeMap<String, RosterEntry> {
     let mut out = BTreeMap::new();
     let Ok(rd) = std::fs::read_dir(roster_dir(mesh)) else {
@@ -788,16 +786,34 @@ enum Control {
         bytes: usize,
         chunks: usize,
     },
-    /// Member → creator: "dial my live and superseded addresses BEFORE
+    /// Member → creator: "probe my live and superseded addresses BEFORE
     /// I seal". Carries no addresses: the creator derives them from its
     /// OWN table, which is additionally the cross-node agreement check —
-    /// a dial that lands proves both nodes derived the same 16 bytes.
-    /// Sent only by a member that crossed an epoch advance and therefore
-    /// has a superseded epoch to retire.
+    /// a probe answered `held: true` proves both nodes derived the same
+    /// 16 bytes. Sent only by a member that crossed an epoch advance and
+    /// therefore has a superseded epoch to retire.
     SealProbe {
         key_id: String,
         superseded_epoch: u64,
     },
+    /// Creator → member: "does your transport's arrival-admission table
+    /// currently hold this scope-derived address?" Sent over the
+    /// member's announced, rooted node destination — a scoped address
+    /// itself cannot be dialled across a relay (explicit-hash
+    /// destinations never announce), so this application-level probe is
+    /// how a peer observes admission (see the module doc). The address
+    /// travels as the raw 16 derived bytes (hex) because the answering
+    /// lookup — `ReticulumTransport::inbound_scope`, the same
+    /// `ScopeAddressTable::accepts_inbound` reverse index that stamps
+    /// `InboundFrame::arrival_scope` on every arriving frame — is keyed
+    /// on exactly those bytes.
+    AddressProbe { address_hex: String, nonce: u64 },
+    /// Member → creator: the admission answer. `held` is the production
+    /// lookup's verdict, not a parallel bookkeeping read. The ack
+    /// ARRIVING is itself the aliveness proof that distinguishes
+    /// "refused" (`held: false`) from "node down" (silence); silence is
+    /// transport loss, never an admission answer.
+    AddressProbeAck { nonce: u64, held: bool },
     /// Creator → member: "I have taken the before-reading; seal now".
     SealGo { key_id: String },
     /// Member → creator: the seal ran; here is what it did.
@@ -964,63 +980,139 @@ impl MediaLink for TransportMediaLink {
     }
 }
 
-/// **SEAM 2 — how a *scope-derived* address is dialled.**
+// ═══════════════════════════════════════════════════════════════════
+// The admission-seam address probe (`conformance.seal_retires`)
+// ═══════════════════════════════════════════════════════════════════
+//
+// See "How seal retirement is measured" in the module doc. A scoped
+// address is an arrival discriminator, not a routable endpoint, so the
+// probe rides the member's rooted node destination and the ANSWER — not
+// a link establishing — is the observable.
+
+/// Publisher side: send one [`Control::AddressProbe`] for `address` to
+/// `member` and await the matching ack.
 ///
-/// `ScopeAddressTable::send_address(scope, group, member)` hands back a
-/// peer's 16-byte derived address and there is no transport verb that
-/// accepts one: `register_scoped_destination` / `retire_scoped_
-/// destination` / `inbound_scope` cover the LISTEN half, and
-/// `link_open` resolves its peer signing key from the rooted-peer map,
-/// which is keyed on federation destinations. `send_address` has zero
-/// non-test callers in the tree.
+/// Returns `Some(held)` when the ack arrives — the member's production
+/// admission verdict for those 16 bytes — and `None` on silence, which
+/// is transport loss and never an admission answer.
 ///
-/// The harness supplies the binding itself so the seal-retirement leg
-/// can make a real *network* assertion, and stamps
-/// `dial_binding: "harness_installed"` on the result so nobody reads
-/// that leg as evidence a production dial path exists.
-#[async_trait::async_trait]
-trait ScopedDialer: Send + Sync {
-    fn binding_source(&self) -> &'static str;
-    /// Try to establish a link to a scope-derived address. `Ok(true)`
-    /// means somebody answered.
-    async fn dial(
-        &self,
-        address: &MemberAddress,
-        peer_transport_ed25519: [u8; 32],
-        timeout: Duration,
-    ) -> bool;
+/// The tail of the publisher run is ONE state machine on purpose (two
+/// loops each discarding the other's messages is the shape that
+/// silently loses one), so a `Report` arriving while this waits is
+/// folded into `member_reports` rather than dropped. Stale acks from an
+/// earlier probe are skipped by nonce.
+/// The publisher-loop state a probe bracket must feed instead of eat:
+/// member Reports land in the report map, and OTHER members' seal traffic
+/// (SealProbe/Sealed) is stashed for the outer loop rather than dropped.
+struct ProbeSideChannel<'a> {
+    member_reports: &'a mut serde_json::Map<String, serde_json::Value>,
+    stash: &'a mut std::collections::VecDeque<Control>,
 }
 
-struct HarnessScopedDialer {
-    transport: Arc<ReticulumTransport>,
-}
-
-#[async_trait::async_trait]
-impl ScopedDialer for HarnessScopedDialer {
-    fn binding_source(&self) -> &'static str {
-        // Named, not hidden: the production verb does not exist yet.
-        "harness_installed"
+async fn probe_scope_address(
+    transport: &ReticulumTransport,
+    mailbox: &Mailbox,
+    member: &str,
+    address: &MemberAddress,
+    nonce: u64,
+    timeout: Duration,
+    side: &mut ProbeSideChannel<'_>,
+) -> Option<bool> {
+    let probe = Control::AddressProbe {
+        address_hex: hex::encode(address.as_bytes()),
+        nonce,
+    };
+    if send_control(transport, member, &probe).await.is_err() {
+        return None;
     }
-    async fn dial(
-        &self,
-        address: &MemberAddress,
-        peer_transport_ed25519: [u8; 32],
-        timeout: Duration,
-    ) -> bool {
-        let hash = *address.as_bytes();
-        // Install exactly the (derived hash → peer transport key) binding
-        // the missing `dial_scoped` verb would resolve internally. A
-        // pseudo key id keyed on the hash keeps it out of the federation
-        // peer namespace.
-        let pseudo = format!("scoped:{}", hex::encode(hash));
-        self.transport
-            .inject_rooted_peer_for_test(&pseudo, hash, peer_transport_ed25519)
-            .await;
-        self.transport.link_open(&hash, timeout).await.is_ok()
+    let until = Instant::now() + timeout;
+    while Instant::now() < until {
+        let Ok((_s, msg)) = mailbox.next_control(Duration::from_secs(2)).await else {
+            continue;
+        };
+        match msg {
+            Control::AddressProbeAck { nonce: n, held } if n == nonce => return Some(held),
+            Control::Report { key_id, body } => {
+                side.member_reports.insert(key_id, body);
+            }
+            // Another member's seal traffic arriving DURING this bracket's
+            // ack-wait must not be eaten — at M≥3 several members cross the
+            // epoch and probe near-simultaneously, and a discarded SealProbe
+            // strands that member for its full 90 s SealGo wait (the M=4
+            // "no SealGo from the publisher" class). Stash for the outer
+            // loop; everything else (stale acks) still drops.
+            m @ (Control::SealProbe { .. } | Control::Sealed { .. }) => side.stash.push_back(m),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Member side: answer one [`Control::AddressProbe`].
+///
+/// The answer is routed through `ReticulumTransport::inbound_scope` —
+/// the SAME `ScopeAddressTable::accepts_inbound` reverse-index lookup
+/// the transport's arrival path performs to stamp
+/// `InboundFrame::arrival_scope` on every real inbound frame — so the
+/// leg measures the production admission decision, not a parallel
+/// bookkeeping read. Bytes that do not decode to a 16-byte hash are
+/// answered `held: false`: they name nothing this table could admit.
+async fn answer_address_probe(
+    transport: &ReticulumTransport,
+    to: &str,
+    address_hex: &str,
+    nonce: u64,
+) {
+    let held = hex::decode(address_hex)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        .is_some_and(|h| transport.inbound_scope(&h).is_some());
+    let _ = send_control(transport, to, &Control::AddressProbeAck { nonce, held }).await;
+}
+
+/// The `conformance.seal_retires` after-reading, as a pure verdict.
+///
+/// Inputs are exactly what [`probe_scope_address`] produces post-seal:
+/// `Some(held)` from an ack's payload, `None` on silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealAfterVerdict {
+    /// Both post-seal probes were acked and the pair is the retirement
+    /// shape: the superseded address refused (`held: false`) WHILE the
+    /// live control still answered `held: true` — the aliveness control
+    /// that makes "refused" distinguishable from "node down".
+    Retired,
+    /// Both probes were acked but the pair is not the retirement shape.
+    /// The reading is evaluable and it is a FAILURE: `old_held` means
+    /// the seal did not retire at the admission seam; `!live_held`
+    /// (from a node demonstrably alive — it acked) means the seal took
+    /// the live address down with it.
+    NotRetired { live_held: bool, old_held: bool },
+    /// A probe went silent. Silence is transport loss, not an admission
+    /// answer — a refusal is an ack carrying `held: false` — so the
+    /// reading is NOT evaluable and the leg must say `not_run` rather
+    /// than guess. `!live_answered` is the indistinguishable-from-
+    /// node-down case.
+    Unanswerable {
+        live_answered: bool,
+        old_answered: bool,
+    },
+}
+
+fn seal_after_verdict(after_live: Option<bool>, after_old: Option<bool>) -> SealAfterVerdict {
+    match (after_live, after_old) {
+        (Some(true), Some(false)) => SealAfterVerdict::Retired,
+        (Some(live_held), Some(old_held)) => SealAfterVerdict::NotRetired {
+            live_held,
+            old_held,
+        },
+        (live, old) => SealAfterVerdict::Unanswerable {
+            live_answered: live.is_some(),
+            old_answered: old.is_some(),
+        },
     }
 }
 
-/// **SEAM 3 — scope-native blob fetch.**
+/// **SEAM 2 — scope-native blob fetch.**
 ///
 /// `src/blob_swarm/` is being extended concurrently with a scope-native
 /// fetch path. Today the harness pushes the blob over the same real
@@ -1473,7 +1565,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         if admitted.contains(&key_id) {
             continue;
         }
-        let (welcome, _commit, _epoch) = admit(&group, &key_id, &kp_b64).await?;
+        let (welcome, commit, epoch) = admit(&group, &key_id, &kp_b64).await?;
         send_control(
             &occ.transport,
             &key_id,
@@ -1484,7 +1576,30 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         )
         .await
         .map_err(|e| format!("send Welcome to {key_id}: {e}"))?;
+        // Every already-admitted member must advance in step — a
+        // member left behind holds keys for a dead epoch and dies on
+        // the NEXT commit it sees. Distribution is awaited member by
+        // member before the next admission is taken, so at most one
+        // commit is ever outstanding toward any member; the receive
+        // side still absorbs reordering (`CommitApplyOutcome`), this
+        // just keeps the hold buffer off the happy path.
+        let commit_b64 = B64.encode(&commit);
+        for m in &admitted {
+            let _ = send_control(
+                &occ.transport,
+                m,
+                &Control::Commit {
+                    epoch,
+                    commit_b64: commit_b64.clone(),
+                },
+            )
+            .await;
+        }
         admitted.push(key_id);
+        // A short pause between successive admissions lets the fanned
+        // commit clear the transport before its successor is minted —
+        // pacing, not an ack protocol.
+        tokio_sleep(Duration::from_millis(150)).await;
     }
     rep.ran(
         "cohort.join",
@@ -1840,12 +1955,20 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     // Reports and the seal handshake interleave, so a single state
     // machine handles both. Two loops each discarding the other's
     // messages is the shape that silently loses one.
-    let dialer = HarnessScopedDialer {
-        transport: Arc::clone(&occ.transport),
-    };
-    let dial_timeout = Duration::from_secs(10);
+    let probe_timeout = Duration::from_secs(15);
+    let mut probe_nonce: u64 = 0;
     let mut member_reports = serde_json::Map::new();
-    let mut seal_probe: Option<(String, MemberAddress, MemberAddress, bool, bool)> = None;
+    // `(owner, live_addr, superseded_addr, before_live, before_old)` —
+    // the before-readings are `Option<bool>`: `Some(held)` from an ack,
+    // `None` on silence.
+    #[allow(clippy::type_complexity)]
+    let mut seal_probe: Option<(
+        String,
+        MemberAddress,
+        MemberAddress,
+        Option<bool>,
+        Option<bool>,
+    )> = None;
     // No rotation means no superseded address, so the leg says that up
     // front rather than by timing out on a probe that can never come.
     let mut seal_done = if rotated {
@@ -1866,6 +1989,10 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     // then say so — waiting out the whole barrier would turn a reportable
     // fact into a hang.
     let mut probe_grace: Option<Instant> = None;
+    // Seal traffic that arrived while a probe bracket was awaiting its ack
+    // (stashed by `probe_scope_address` instead of eaten) — drained before
+    // the mailbox so no member's handshake is lost to another's bracket.
+    let mut stash: std::collections::VecDeque<Control> = std::collections::VecDeque::new();
     while Instant::now() < deadline {
         if member_reports.len() >= live.len() {
             if seal_done {
@@ -1877,17 +2004,39 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 break;
             }
         }
-        let Ok((_s, msg)) = occ.mailbox.next_control(Duration::from_secs(5)).await else {
-            continue;
+        let msg = if let Some(m) = stash.pop_front() {
+            m
+        } else {
+            let Ok((_s, msg)) = occ.mailbox.next_control(Duration::from_secs(5)).await else {
+                continue;
+            };
+            msg
         };
         match msg {
             Control::Report { key_id, body } => {
                 member_reports.insert(key_id, body);
             }
+            // EVERY member that crossed the advance probes and then waits on
+            // SealGo — at M≥3 that is several members, near-simultaneously.
+            // The network-observed bracket (`conformance.seal_retires`) is
+            // measured ONCE, on the first prober; every LATER prober gets an
+            // immediate SealGo so its own owner-side `scope.seal` leg can
+            // run — withholding it strands that member for its full 90 s
+            // wait and reds a leg this loop was starving, not measuring.
+            Control::SealProbe { key_id, .. } if seal_probe.is_some() || seal_done => {
+                let _ = send_control(
+                    &occ.transport,
+                    &key_id,
+                    &Control::SealGo {
+                        key_id: key_id.clone(),
+                    },
+                )
+                .await;
+            }
             Control::SealProbe {
                 key_id,
                 superseded_epoch,
-            } if seal_probe.is_none() => {
+            } => {
                 let gid = occ.group_id();
                 let (Some(live_a), Some(old_a)) = (
                     occ.table.send_address(&cfg.scope, &gid, &key_id),
@@ -1901,20 +2050,62 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                         ),
                     );
                     seal_done = true;
+                    // The bracket cannot run, but the member's own
+                    // `scope.seal` leg still can — don't strand it.
+                    let _ = send_control(
+                        &occ.transport,
+                        &key_id,
+                        &Control::SealGo {
+                            key_id: key_id.clone(),
+                        },
+                    )
+                    .await;
                     continue;
                 };
-                let Some(peer_key) = peer_transport_ed25519(&cfg.mesh_dir, &key_id) else {
-                    rep.not_run(
-                        "conformance.seal_retires",
-                        format!("{key_id} published no transport key, so it cannot be dialled"),
-                    );
-                    seal_done = true;
-                    continue;
-                };
-                // BEFORE. Both must answer, or the after-reading proves
-                // nothing.
-                let before_live = dialer.dial(&live_a, peer_key, dial_timeout).await;
-                let before_old = dialer.dial(&old_a, peer_key, dial_timeout).await;
+                // BEFORE-reading, at the ADMISSION SEAM (module doc:
+                // "How seal retirement is measured"). A scoped address
+                // is an explicit-hash destination — an arrival
+                // discriminator, not a routable endpoint — so it is not
+                // dialled: the probe rides the member's announced,
+                // rooted node destination through the relay (the path
+                // `mesh.rooting` proved), and the member answers from
+                // the production arrival-admission lookup. Both
+                // addresses must come back `held: true` here, or the
+                // after-reading proves nothing. Superseded first, then
+                // live — the trailing live answer re-proves the node
+                // was still answering after the superseded probe.
+                probe_nonce += 1;
+                let before_old = probe_scope_address(
+                    &occ.transport,
+                    &occ.mailbox,
+                    &key_id,
+                    &old_a,
+                    probe_nonce,
+                    probe_timeout,
+                    &mut ProbeSideChannel {
+                        member_reports: &mut member_reports,
+                        stash: &mut stash,
+                    },
+                )
+                .await;
+                probe_nonce += 1;
+                let before_live = probe_scope_address(
+                    &occ.transport,
+                    &occ.mailbox,
+                    &key_id,
+                    &live_a,
+                    probe_nonce,
+                    probe_timeout,
+                    &mut ProbeSideChannel {
+                        member_reports: &mut member_reports,
+                        stash: &mut stash,
+                    },
+                )
+                .await;
+                // SealGo goes out even when the before-reading failed:
+                // the member's own `scope.seal` leg must still run, and
+                // the verdict arm below reports the failed precondition
+                // honestly.
                 seal_probe = Some((key_id.clone(), live_a, old_a, before_live, before_old));
                 let _ = send_control(
                     &occ.transport,
@@ -1937,72 +2128,110 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 if probe_id != key_id {
                     continue;
                 }
-                let Some(peer_key) = peer_transport_ed25519(&cfg.mesh_dir, &key_id) else {
-                    continue;
-                };
-                // AFTER.
-                let after_live = dialer.dial(&live_a, peer_key, dial_timeout).await;
-                let after_old = dialer.dial(&old_a, peer_key, dial_timeout).await;
+                // AFTER-reading: superseded first, then the live
+                // control. The seal must refuse the superseded address
+                // WHILE the live one still answers — the live answer is
+                // what distinguishes "refused" from "node down".
+                probe_nonce += 1;
+                let after_old = probe_scope_address(
+                    &occ.transport,
+                    &occ.mailbox,
+                    &key_id,
+                    &old_a,
+                    probe_nonce,
+                    probe_timeout,
+                    &mut ProbeSideChannel {
+                        member_reports: &mut member_reports,
+                        stash: &mut stash,
+                    },
+                )
+                .await;
+                probe_nonce += 1;
+                let after_live = probe_scope_address(
+                    &occ.transport,
+                    &occ.mailbox,
+                    &key_id,
+                    &live_a,
+                    probe_nonce,
+                    probe_timeout,
+                    &mut ProbeSideChannel {
+                        member_reports: &mut member_reports,
+                        stash: &mut stash,
+                    },
+                )
+                .await;
                 seal_done = true;
-                if before_live && before_old {
-                    rep.ran(
-                        "conformance.seal_retires",
-                        sealed > 0
-                            && unretired == 0
-                            && after_live
-                            && !after_old,
-                        serde_json::json!({
-                            "owner": key_id,
-                            "sealed": sealed,
-                            "unretired": unretired,
-                            "dial_live_before": before_live,
-                            "dial_superseded_before": before_old,
-                            "dial_live_after": after_live,
-                            "dial_superseded_after": after_old,
-                            "live_address": hex::encode(live_a.as_bytes()),
-                            "superseded_address": hex::encode(old_a.as_bytes()),
-                            "addresses_derived_by": "the DIALLER's own table, so a landed                                                      dial also proves cross-node derivation                                                      agreement",
-                            "convergence_secs": cfg.convergence.as_secs(),
-                            "dial_binding": dialer.binding_source(),
-                            "measured_by": "a DIFFERENT node than the one that sealed",
-                            "note": "the dial-side binding is installed by the harness: no \
-                                     transport verb dials a ScopeAddressTable::send_address \
-                                     result",
-                        }),
-                    );
-                } else {
-                    // DIAGNOSED, not shrugged at. A scope-derived
-                    // destination is registered with
-                    // `Destination::with_explicit_hash`, and an
-                    // explicit-hash destination CANNOT announce
-                    // (`AnnounceError::ExplicitHashCannotAnnounce`;
-                    // leviculum answers path requests for one with
-                    // silence, because a path response IS an announce and
-                    // an announce for a caller-supplied hash is
-                    // unverifiable). It therefore has no multi-hop RNS
-                    // path, and this topology puts a relay between the
-                    // dialler and the owner.
-                    //
-                    // So the peer-dials-it form of "the superseded address
-                    // finds nobody home" is not measurable today — not
-                    // because the seal failed, but because there is no
-                    // route to dial in the first place. The owner-side
-                    // half IS measured, by the member's own `scope.seal`
-                    // leg: table closed, transport retired
-                    // (`unretired == 0`), live address still answering.
+                if before_live != Some(true) || before_old != Some(true) {
+                    // The before-reading is the leg's precondition: with
+                    // no evidence both addresses were admitted PRE-seal,
+                    // a post-seal refusal proves nothing about the seal.
+                    // (`null` = the probe went unanswered; `false` = the
+                    // member answered but did not hold the address.)
                     rep.not_run(
                         "conformance.seal_retires",
                         format!(
-                            "pre-seal dials did not establish (live={before_live}, \
-                             superseded={before_old}), so an after-reading would be \
-                             indistinguishable from a broken dial. DIAGNOSIS: a \
-                             scope-derived destination is an explicit-hash destination, \
-                             which cannot announce, so no multi-hop RNS path to it can \
-                             exist and this topology relays between dialler and owner. \
-                             The owner-side half of the claim is measured by that \
-                             member's `scope.seal` leg instead."
+                            "the before-reading did not establish both addresses held \
+                             (live={before_live:?}, superseded={before_old:?}); a post-seal \
+                             refusal could not be attributed to the seal",
                         ),
                     );
+                    continue;
+                }
+                let verdict = seal_after_verdict(after_live, after_old);
+                match verdict {
+                    SealAfterVerdict::Retired | SealAfterVerdict::NotRetired { .. } => {
+                        rep.ran(
+                            "conformance.seal_retires",
+                            sealed > 0 && unretired == 0 && verdict == SealAfterVerdict::Retired,
+                            serde_json::json!({
+                                "owner": key_id,
+                                "sealed": sealed,
+                                "unretired": unretired,
+                                "probe_live_before_held": before_live,
+                                "probe_superseded_before_held": before_old,
+                                "probe_live_after_held": after_live,
+                                "probe_superseded_after_held": after_old,
+                                "live_address": hex::encode(live_a.as_bytes()),
+                                "superseded_address": hex::encode(old_a.as_bytes()),
+                                "addresses_derived_by": "the PROBER's own table, so a \
+                                                         held=true answer also proves \
+                                                         cross-node derivation agreement",
+                                "admission_lookup": "ReticulumTransport::inbound_scope -> \
+                                                     ScopeAddressTable::accepts_inbound (the \
+                                                     arrival_scope reverse index)",
+                                "probe_plane": "application-level AddressProbe over the \
+                                                member's announced node destination, \
+                                                through the relay",
+                                "convergence_secs": cfg.convergence.as_secs(),
+                                "measured_by": "a DIFFERENT node than the one that sealed",
+                                "note": "a scoped address is an arrival discriminator, not \
+                                         a routable endpoint (explicit-hash destinations \
+                                         never announce), so admission — not link \
+                                         establishment — is the network observable",
+                            }),
+                        );
+                    }
+                    SealAfterVerdict::Unanswerable {
+                        live_answered,
+                        old_answered,
+                    } => {
+                        rep.not_run(
+                            "conformance.seal_retires",
+                            if live_answered {
+                                format!(
+                                    "the post-seal superseded-address probe went \
+                                     unanswered (old_answered={old_answered}); silence is \
+                                     transport loss, not a refusal (a refusal is an ack \
+                                     carrying held=false), so the reading is not evaluable",
+                                )
+                            } else {
+                                "the post-seal live-control probe went unanswered, so \
+                                 'superseded refused' would be indistinguishable from \
+                                 'node down'"
+                                    .to_owned()
+                            },
+                        );
+                    }
                 }
             }
             _ => {}
@@ -2074,6 +2303,82 @@ async fn admit(
     let (_e, commit_bytes, welcome) = commit.into_parts();
     let welcome = welcome.ok_or_else(|| "add_member produced no Welcome".to_owned())?;
     Ok((welcome, commit_bytes, epoch))
+}
+
+/// What one inbound Commit control frame produced.
+///
+/// Mirrors [`CommitApplyOutcome`] plus the harness-side follow-through
+/// (address advance, key-ring extension). `Failed` is the only
+/// verdict-bearing arm — and it fails the LEG, never the node: a
+/// member that stops applying commits still owes the publisher its
+/// barrier traffic and its delivery report.
+enum CommitDisposition {
+    /// Applied (possibly draining held successors); addresses advanced
+    /// and the key ring now covers the new epoch.
+    Applied(u64),
+    /// Framed in a future epoch; held inside the cohort group until
+    /// its predecessor lands. Nothing to do here.
+    Held,
+    /// Duplicate/replay; already applied. Nothing to do.
+    Duplicate,
+    /// A genuine fault — bad wire bytes, a commit that failed
+    /// validation in its own epoch, or the post-apply follow-through
+    /// failing.
+    Failed(String),
+}
+
+/// Feed one base64 Commit through the cohort group and, when it
+/// applies, advance addresses and extend the key ring. Ordering
+/// weather (out-of-order arrival, duplicates) is absorbed by
+/// `apply_remote_commit`'s hold buffer; every problem comes back as a
+/// [`CommitDisposition`], never as an `Err` that would kill the node.
+///
+/// The key ring gains only the epoch the apply LANDED on. A chained
+/// drain skips intermediate epochs' keys by design: their exporters
+/// are gone once the group ratchets past them (forward secrecy), and
+/// no media is sealed under them — the publisher only seals while its
+/// epoch is stable, at the stream-start and post-rotation plateaus.
+async fn handle_commit_control(
+    occ: &Occurrence,
+    group: &CohortGroup,
+    stream_id: &StreamId,
+    key_ring: &mut BTreeMap<u64, ([u8; 32], [u8; 32])>,
+    commit_b64: &str,
+) -> CommitDisposition {
+    let bytes = match B64.decode(commit_b64) {
+        Ok(b) => b,
+        Err(e) => return CommitDisposition::Failed(format!("decode commit: {e}")),
+    };
+    match group.apply_remote_commit(&bytes).await {
+        Ok(CommitApplyOutcome::Applied(now_epoch)) => {
+            if let Err(e) = occ.advance_addresses(group).await {
+                return CommitDisposition::Failed(format!("advance_addresses: {e}"));
+            }
+            let secret = match group.record_secret().await {
+                Ok(s) => *s.as_bytes(),
+                Err(e) => return CommitDisposition::Failed(format!("record_secret: {e}")),
+            };
+            match epoch_keys(&secret, stream_id, now_epoch) {
+                Ok(keys) => {
+                    key_ring.insert(now_epoch, keys);
+                    CommitDisposition::Applied(now_epoch)
+                }
+                Err(e) => CommitDisposition::Failed(format!("epoch_keys: {e}")),
+            }
+        }
+        Ok(CommitApplyOutcome::Deferred { held_for_epoch }) => {
+            tracing::info!(
+                held_for_epoch,
+                "commit arrived ahead of its predecessor; held"
+            );
+            CommitDisposition::Held
+        }
+        Ok(CommitApplyOutcome::AlreadyApplied(epoch)) => {
+            tracing::info!(epoch, "duplicate commit; already applied");
+            CommitDisposition::Duplicate
+        }
+        Err(e) => CommitDisposition::Failed(format!("apply_remote_commit: {e}")),
+    }
 }
 
 /// What happened to one inbound media frame.
@@ -2176,22 +2481,31 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     .map_err(|e| format!("send KeyPackage: {e}"))?;
 
     let join_start = Instant::now();
+    // Commits can outrun this node's own Welcome on an unordered
+    // transport. One consumed here is one the receive loop can never
+    // see — a permanent hole in the epoch chain — so they are stashed
+    // and fed through the normal commit path once the group exists.
+    let mut pre_welcome_commits: std::collections::VecDeque<(u64, String)> =
+        std::collections::VecDeque::new();
     let welcome = loop {
         let (_s, msg) = occ
             .mailbox
             .next_control(cfg.barrier_timeout)
             .await
             .map_err(|e| format!("waiting for Welcome: {e}"))?;
-        if let Control::Welcome {
-            key_id,
-            welcome_b64,
-        } = msg
-        {
-            if key_id == cfg.node_id {
+        match msg {
+            Control::Welcome {
+                key_id,
+                welcome_b64,
+            } if key_id == cfg.node_id => {
                 break B64
                     .decode(&welcome_b64)
                     .map_err(|e| format!("decode Welcome: {e}"))?;
             }
+            Control::Commit { epoch, commit_b64 } => {
+                pre_welcome_commits.push_back((epoch, commit_b64));
+            }
+            _ => {}
         }
     };
     let kv = Arc::new(open_sealed_kv(
@@ -2268,6 +2582,18 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     let mut deferred: Vec<(u64, u64, Vec<u8>)> = Vec::new();
     let mut deferred_dropped = 0usize;
 
+    // Commit-arrival weather, reported rather than fatal: out-of-order
+    // and duplicate arrivals are absorbed (`CommitApplyOutcome`), and
+    // even a genuinely failed apply fails a LEG, never the node — a
+    // dead member starves the publisher's barriers and cascades.
+    let mut commits_applied = 0usize;
+    let mut commits_held = 0usize;
+    let mut commits_duplicate = 0usize;
+    let mut commit_apply_fatal: Option<String> = None;
+    // Commits stashed while this node was still waiting for its own
+    // Welcome, replayed through the same arm as live arrivals.
+    let mut pending_commits = pre_welcome_commits;
+
     let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut opened = 0usize;
     let mut open_failed = 0usize;
@@ -2295,48 +2621,73 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     while Instant::now() < deadline {
         // Control first — a commit changes the keys the media path uses.
         {
-            let mut rx = occ.mailbox.control.lock().await;
-            let got = rx.try_recv().ok();
-            drop(rx);
+            // Stashed pre-Welcome commits replay through the SAME arm
+            // as live arrivals, so they get identical ordering
+            // tolerance and identical follow-through.
+            let got = if let Some((epoch, commit_b64)) = pending_commits.pop_front() {
+                Some((None, Control::Commit { epoch, commit_b64 }))
+            } else {
+                let mut rx = occ.mailbox.control.lock().await;
+                let got = rx.try_recv().ok();
+                drop(rx);
+                got
+            };
             if let Some((_s, msg)) = got {
                 match msg {
                     Control::Commit {
                         epoch: e,
                         commit_b64,
                     } => {
-                        let bytes = B64
-                            .decode(&commit_b64)
-                            .map_err(|er| format!("decode commit: {er}"))?;
-                        group
-                            .apply_remote_commit(&bytes)
-                            .await
-                            .map_err(|er| format!("apply_remote_commit: {er}"))?;
-                        let _ = occ.advance_addresses(&group).await?;
-                        let secret = *group
-                            .record_secret()
-                            .await
-                            .map_err(|er| format!("record_secret: {er}"))?
-                            .as_bytes();
-                        let now_epoch = group.epoch().await;
-                        key_ring.insert(now_epoch, epoch_keys(&secret, &stream_id, now_epoch)?);
-                        tracing::info!(epoch = e, "applied a remote commit and advanced addresses");
-                        // Drain what arrived ahead of the commit.
-                        let held = std::mem::take(&mut deferred);
-                        for (seq, ep, payload) in held {
-                            match open_media(
-                                &key_ring,
-                                ep,
-                                seq,
-                                &payload,
-                                cfg.node_id.as_bytes(),
-                                &mut recv_lat,
-                            ) {
-                                MediaOutcome::Opened => {
-                                    opened += 1;
-                                    seen.insert(seq);
+                        // Whatever this arm produces, the member LIVES:
+                        // ordering weather is absorbed, and a genuine
+                        // fault is reported as a failed leg at the end
+                        // of the run instead of `?`-ing the node away
+                        // mid-stream.
+                        match handle_commit_control(
+                            &occ,
+                            &group,
+                            &stream_id,
+                            &mut key_ring,
+                            &commit_b64,
+                        )
+                        .await
+                        {
+                            CommitDisposition::Applied(now_epoch) => {
+                                commits_applied += 1;
+                                tracing::info!(
+                                    announced_epoch = e,
+                                    applied_epoch = now_epoch,
+                                    "applied a remote commit and advanced addresses"
+                                );
+                                // Drain what arrived ahead of the commit.
+                                let held = std::mem::take(&mut deferred);
+                                for (seq, ep, payload) in held {
+                                    match open_media(
+                                        &key_ring,
+                                        ep,
+                                        seq,
+                                        &payload,
+                                        cfg.node_id.as_bytes(),
+                                        &mut recv_lat,
+                                    ) {
+                                        MediaOutcome::Opened => {
+                                            opened += 1;
+                                            seen.insert(seq);
+                                        }
+                                        MediaOutcome::Failed => open_failed += 1,
+                                        MediaOutcome::NoKeyYet => deferred.push((seq, ep, payload)),
+                                    }
                                 }
-                                MediaOutcome::Failed => open_failed += 1,
-                                MediaOutcome::NoKeyYet => deferred.push((seq, ep, payload)),
+                            }
+                            CommitDisposition::Held => commits_held += 1,
+                            CommitDisposition::Duplicate => commits_duplicate += 1,
+                            CommitDisposition::Failed(why) => {
+                                tracing::warn!(
+                                    announced_epoch = e,
+                                    error = %why,
+                                    "commit apply failed; member stays up, leg will report it"
+                                );
+                                commit_apply_fatal.get_or_insert(why);
                             }
                         }
                     }
@@ -2502,6 +2853,9 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                     "open_failures": open_failed,
                     "still_deferred_awaiting_commit": deferred.len(),
                     "deferred_dropped_over_budget": deferred_dropped,
+                    "commits_applied": commits_applied,
+                    "commits_held_for_order": commits_held,
+                    "commits_duplicate": commits_duplicate,
                     "epochs_observed": epochs_seen.iter().copied().collect::<Vec<u64>>(),
                     "time_to_first_frame_ms": first_frame_at.map(|d| d.as_millis()),
                     "open_latency": latency_json(&mut recv_lat.clone()),
@@ -2559,6 +2913,23 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
         rep.ran("perf.receive", delivery_ok, delivery_detail);
     }
 
+    // A commit-apply fault surfaces HERE, as a failed leg — the member
+    // stayed up for the barriers and its delivery report above, which
+    // is what keeps one bad commit from cascading into starved
+    // publishers and null blob completions.
+    if let Some(why) = commit_apply_fatal.as_ref() {
+        rep.ran(
+            "cohort.commit_apply",
+            false,
+            serde_json::json!({
+                "error": why,
+                "commits_applied": commits_applied,
+                "commits_held_for_order": commits_held,
+                "commits_duplicate": commits_duplicate,
+            }),
+        );
+    }
+
     match blob_result.clone() {
         Some(b) => rep.ran(
             "conformance.member_can_fetch",
@@ -2575,9 +2946,15 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     //
     // Only the OWNER of an address can retire it, so this node seals and
     // the PUBLISHER takes the before/after network reading. The order is
-    // strict: probe → publisher dials → SealGo → seal → Sealed →
-    // publisher dials again. Anything else and the two readings would not
-    // bracket the seal.
+    // strict: probe → publisher's before-probes → SealGo → seal → Sealed
+    // → publisher's after-probes. Anything else and the two readings
+    // would not bracket the seal.
+    //
+    // The publisher's readings are application-level `AddressProbe`s
+    // over THIS node's announced destination (a scoped address is an
+    // arrival discriminator, not a routable endpoint — module doc), and
+    // this node answers each one from the production arrival-admission
+    // lookup, so the answers ARE the admission seam, not bookkeeping.
     let gid = occ.group_id();
     match occ
         .table
@@ -2601,18 +2978,22 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                 )
                 .await
                 .map_err(|e| format!("send SealProbe: {e}"))?;
-                // Wait for the publisher's before-reading to be taken.
+                // Wait for the publisher's before-reading to be taken,
+                // answering its address probes while doing so — the
+                // before-reading IS those probes, so a loop that only
+                // listened for SealGo would deadlock the handshake.
                 let until = Instant::now() + Duration::from_secs(90);
                 loop {
                     if Instant::now() >= until {
                         return Err("no SealGo from the publisher".to_owned());
                     }
-                    if let Ok((_s, Control::SealGo { key_id })) =
-                        occ.mailbox.next_control(Duration::from_secs(5)).await
-                    {
-                        if key_id == cfg.node_id {
-                            break;
+                    match occ.mailbox.next_control(Duration::from_secs(5)).await {
+                        Ok((_s, Control::SealGo { key_id })) if key_id == cfg.node_id => break,
+                        Ok((_s, Control::AddressProbe { address_hex, nonce })) => {
+                            answer_address_probe(&occ.transport, &publisher, &address_hex, nonce)
+                                .await;
                         }
+                        _ => {}
                     }
                 }
                 // The convergence window is what makes a seal legitimate;
@@ -2630,6 +3011,22 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                 )
                 .await
                 .map_err(|e| format!("send Sealed: {e}"))?;
+                // The publisher's after-reading is two more probes
+                // (superseded, then the live control). Service them
+                // before moving on to the Report — the seal already ran,
+                // so each answer is the POST-seal admission verdict. The
+                // count bounds the wait when both arrive; the deadline
+                // bounds it when a probe is lost in transit.
+                let mut answered = 0u8;
+                let until = Instant::now() + Duration::from_secs(60);
+                while answered < 2 && Instant::now() < until {
+                    if let Ok((_s, Control::AddressProbe { address_hex, nonce })) =
+                        occ.mailbox.next_control(Duration::from_secs(5)).await
+                    {
+                        answer_address_probe(&occ.transport, &publisher, &address_hex, nonce).await;
+                        answered += 1;
+                    }
+                }
                 Ok::<_, String>((outcome, previous))
             }
             .await;
@@ -2880,6 +3277,11 @@ fn main() -> std::process::ExitCode {
                 "peers_in_roster": occ.roster.len(),
                 "transport_dest_hash": hex::encode(occ.transport.local_dest_hash()),
                 "interfaces": occ.transport.interface_specs().len(),
+                // Intent only: the transport's own INFO wiring-decision
+                // log is the authority on the effective (config-wins,
+                // clamped) value. `null` when the env var is unset.
+                "control_channel_capacity_env":
+                    std::env::var("CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY").ok(),
             }),
         );
 
@@ -2902,4 +3304,105 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{seal_after_verdict, SealAfterVerdict};
+
+    // Field provenance (the #336 lesson): every input below is exactly a
+    // value `probe_scope_address` produces — `Some(held)` is an
+    // `AddressProbeAck`'s payload, `None` is silence — not a convenient
+    // stand-in. The four evaluable combinations first.
+
+    #[test]
+    fn after_reading_retired_cleanly() {
+        // Superseded refused WHILE the live control still answers: the
+        // one shape that passes.
+        assert_eq!(
+            seal_after_verdict(Some(true), Some(false)),
+            SealAfterVerdict::Retired
+        );
+    }
+
+    #[test]
+    fn after_reading_superseded_still_admitted_fails() {
+        // The node acked both probes and still holds the superseded
+        // address: the seal did not retire at the admission seam.
+        assert_eq!(
+            seal_after_verdict(Some(true), Some(true)),
+            SealAfterVerdict::NotRetired {
+                live_held: true,
+                old_held: true
+            }
+        );
+    }
+
+    #[test]
+    fn after_reading_live_also_retired_fails() {
+        // Both acked, both refused: the node is demonstrably alive (it
+        // answered), so this is over-retirement — the seal took the
+        // live address down with it — and must FAIL, not not_run.
+        assert_eq!(
+            seal_after_verdict(Some(false), Some(false)),
+            SealAfterVerdict::NotRetired {
+                live_held: false,
+                old_held: false
+            }
+        );
+    }
+
+    #[test]
+    fn after_reading_inverted_pair_fails() {
+        // Live gone, superseded kept — evaluable and wrong.
+        assert_eq!(
+            seal_after_verdict(Some(false), Some(true)),
+            SealAfterVerdict::NotRetired {
+                live_held: false,
+                old_held: true
+            }
+        );
+    }
+
+    // The un-evaluable readings: silence is transport loss, never an
+    // admission answer, so no `held` payload may be invented for it.
+
+    #[test]
+    fn after_reading_live_control_silent_is_indistinguishable() {
+        // The live control went unanswered: "superseded refused" would
+        // be indistinguishable from "node down", whatever the
+        // superseded probe said.
+        assert_eq!(
+            seal_after_verdict(None, Some(false)),
+            SealAfterVerdict::Unanswerable {
+                live_answered: false,
+                old_answered: true
+            }
+        );
+    }
+
+    #[test]
+    fn after_reading_superseded_probe_silent_is_unanswerable() {
+        // The live control answered but the superseded probe was lost:
+        // a refusal is an ack carrying held=false, so silence cannot be
+        // scored as retirement.
+        assert_eq!(
+            seal_after_verdict(Some(true), None),
+            SealAfterVerdict::Unanswerable {
+                live_answered: true,
+                old_answered: false
+            }
+        );
+    }
+
+    #[test]
+    fn after_reading_both_silent_is_unanswerable() {
+        assert_eq!(
+            seal_after_verdict(None, None),
+            SealAfterVerdict::Unanswerable {
+                live_answered: false,
+                old_answered: false
+            }
+        );
+    }
 }
