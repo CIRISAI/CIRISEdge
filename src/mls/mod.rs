@@ -36,7 +36,9 @@ pub mod scope_state;
 pub mod welcome_wrap;
 
 pub use archive_mode::{ArchiveMode, ArchiveModeError, DEFAULT_ROTATE_FORWARD_WINDOW_DAYS};
-pub use cohort_group::{CohortCommit, CohortGroup, CohortGroupError, CohortGroups, CohortSecret};
+pub use cohort_group::{
+    CohortCommit, CohortGroup, CohortGroupError, CohortGroups, CohortSecret, CommitApplyOutcome,
+};
 pub use scope_state::{ScopeStateProvider, ScopeStateProviderError};
 pub use welcome_wrap::{
     unwrap_welcome, wrap_welcome, FederationDirectoryEntry, WelcomeWrapError, WrappedWelcome,
