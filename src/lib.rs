@@ -184,7 +184,7 @@ mod replication_policy_hash_tests {
 /// CIRISEdge#397 / persist v21.2.0 (CIRISPersist#510 P1) — the closed consent
 /// grammar's cross-repo drift witness. persist validates every
 /// `consent:replication:v1` grant against an exhaustive, fail-closed grammar
-/// (the 14 kinds, `strip_field` signed-post-transform) and exports it as
+/// (the 15 kinds, `strip_field` signed-post-transform) and exports it as
 /// [`ciris_persist::federation::consent_grammar::CONSENT_GRAMMAR_HASH`]. Edge
 /// pins it now so that when edge later implements serve-side
 /// `recipient_capability` enforcement (#396 item 6), the op vocabulary is drawn

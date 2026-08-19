@@ -864,7 +864,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // content-hash-index; it rides the `persist_row_hash` wire. Resolve it
         // with NO cache: this retires the last in-memory fetch cache, so every
         // plane's fetch is now a direct persist read.
-        if kind == EnvelopeKind::Revocation {
+        if kind.is_row_hash_served() {
             return self.fetch_revocation_bytes(envelope_hash).await;
         }
         None
