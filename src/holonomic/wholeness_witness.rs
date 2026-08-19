@@ -125,7 +125,13 @@ pub const WW2_ANONYMOUS_NAMESPACE_PREFIX: &str = "anonymous";
 
 /// §19.1 WW-2 — cohort scope whose leaves are filtered out before
 /// Merkle construction (self-private content).
-pub const WW2_SELF_COHORT_SCOPE: &str = "self";
+///
+/// Routed through the single `"self"`-token authority
+/// [`crate::cohort_scope::SELF_SCOPE_TOKEN`] (which itself routes
+/// through persist's lattice const) — the WW2 filter compares this
+/// against the wire scope token, and a re-typed literal drifting here
+/// would silently PUBLISH self-scoped leaves into the Merkle witness.
+pub const WW2_SELF_COHORT_SCOPE: &str = crate::cohort_scope::SELF_SCOPE_TOKEN;
 
 /// Failure to canonicalize a witness. The error is rare in practice
 /// (serde_json over a fixed-shape struct), but propagating it lets

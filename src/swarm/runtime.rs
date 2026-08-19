@@ -78,8 +78,19 @@ use crate::messages::MessageType;
 use crate::transport::Transport;
 
 /// `target_holders` default — the recommended `H` from §R-policy
-/// (CEG 1.0 §R / [`crate::holonomic::fountain_defaults::DEFAULT_TARGET_HOLDERS`]).
-pub const DEFAULT_TARGET_HOLDERS: u32 = 30;
+/// (CEG 1.0 §R).
+///
+/// RE-EXPORTED from the fountain-policy authority
+/// [`crate::holonomic::fountain_defaults::DEFAULT_TARGET_HOLDERS`]
+/// (previously a duplicated `= 30` literal). The two planes share the
+/// number BY DESIGN: the fountain plane derives the survival-floor
+/// target (`C₁ = N + K` × churn margin, with the §R reconstruction-
+/// probability table computed AT this holder count), and this swarm
+/// converger EXISTS to drive the observed holder count toward exactly
+/// that target. Two literals agreeing by luck would let the converger
+/// steady-state at a count the survival math was not computed for, so
+/// it is one `const` with one owner.
+pub use crate::holonomic::fountain_defaults::DEFAULT_TARGET_HOLDERS;
 
 /// `min_viable` default — the survival floor below which the
 /// converger emits `RepairNeeded`. Matches §R-policy's

@@ -151,6 +151,11 @@ pub const DEFAULT_MIN_VIABLE_SYMBOLS: u32 = 5;
 /// floor. At R = 30 the exact survival floor is
 /// [`recommended_reconstruction_probability`] — see the module-level
 /// table.
+///
+/// SINGLE AUTHORITY: `crate::swarm::runtime::DEFAULT_TARGET_HOLDERS`
+/// re-exports this const (the converger drives holder count toward
+/// THIS target; the survival table above is computed at it, so the
+/// two planes must move together).
 pub const DEFAULT_TARGET_HOLDERS: u32 = 30;
 
 /// The recommended fountain replication policy bundled as one

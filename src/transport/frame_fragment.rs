@@ -107,15 +107,28 @@ const MAX_FRAGMENTS: usize = u16::MAX as usize;
 /// not counted in the `u16` `data` length, so this ceiling is exact.
 const WIRE_ENVELOPE_MAX_BYTES: usize = u16::MAX as usize;
 
+/// THE transport-level envelope-body budget: the single 8 MiB authority
+/// (AV-13 `MAX_BODY_BYTES`) every transport enforces on an outbound /
+/// inbound envelope body. `transport::http` (extractor layer + both send
+/// paths) and `transport::reticulum` (send path) IMPORT this constant
+/// rather than re-typing the literal, and the receive-side reassembly
+/// ceiling below DERIVES from it — so raising the budget raises the
+/// admissibility checks and the reassembly bound in lockstep. Before this
+/// was the authority, three independent `8 * 1024 * 1024` literals agreed
+/// only by comment; raising the send-side one alone would have produced
+/// frames the receive side structurally refuses to reassemble.
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// SECURITY (v16 review, pre-attribution reassembly OOM): the receive side bounded
 /// only the COUNT of in-flight partials (`max_in_flight`), never their bytes — so
 /// a peer declaring `total = u16::MAX` and streaming fragments (withholding one so
 /// the frame never completes) could pin ~27 MB in a SINGLE partial, and
 /// `max_in_flight` of them ~7 GB, all before the link is even attributed. These
-/// cap a single frame's accumulated payload (matching the transport `MAX_BODY_BYTES`
-/// admissibility ceiling), and the TOTAL resident reassembly memory across all
+/// cap a single frame's accumulated payload (derived from the transport
+/// [`MAX_BODY_BYTES`] admissibility ceiling — equal BY CONSTRUCTION, not by
+/// comment), and the TOTAL resident reassembly memory across all
 /// partials — the hard bound regardless of partial count.
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024; // == transport MAX_BODY_BYTES
+const MAX_FRAME_BYTES: usize = MAX_BODY_BYTES;
 const MAX_IN_FLIGHT_BYTES: usize = 4 * MAX_FRAME_BYTES; // 32 MiB global budget
 
 /// CIRISEdge#422 — fragment-ARQ NAK magic. A third, distinct 4-byte tag so a

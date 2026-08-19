@@ -22,6 +22,15 @@
 //!   stream) is deferred to v6.1.0 — v6.0.0 ships the cache with a
 //!   public [`DirectoryCache::insert`] / [`DirectoryCache::remove`]
 //!   API for the v6.1.0 wiring agent to drive against.
+//!
+//! # Revocation coherency
+//!
+//! The cache is no longer fill-only: [`DirectoryCache::invalidate`] /
+//! [`DirectoryCache::invalidate_all`] are the eviction surface for
+//! revocation events. Intended producer: the replication bridge's
+//! `with_revocation_observer` hook (revocation → `revoked_key_id` →
+//! `cache.invalidate(key_id)`), registered by the runtime coordinator
+//! at bridge build.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -175,6 +184,42 @@ impl DirectoryCache {
         g.remove(federation_id)
     }
 
+    /// Invalidate (drop) the cached record for a revoked key. Returns
+    /// the dropped record, or `None` if the key was not cached.
+    ///
+    /// The cache was originally fill-only: a key revoked after admission
+    /// kept being served (to Welcome wrap, the emission layer, scope
+    /// echo) until process restart. This is the revocation-coherency
+    /// surface closing that gap.
+    ///
+    /// INTENDED WIRING — the replication bridge's revocation observer:
+    /// `FederationDirectoryReplicationBridge::with_revocation_observer`
+    /// fires with the signed revocation's `revoked_key_id`; the
+    /// coordinator registers, at bridge build,
+    /// `Some(Arc::new(move |k: &str| { cache.invalidate(k); }))`.
+    /// (Not wired here: the bridge is owned by a sibling workstream and
+    /// no non-bridge path in this module's callers receives revocation
+    /// events.)
+    ///
+    /// Semantically identical to [`Self::remove`]; named separately so
+    /// call sites read as cache-coherency on revocation, not roster
+    /// mutation.
+    pub fn invalidate(&self, federation_id: &str) -> Option<DirectoryRecord> {
+        self.remove(federation_id)
+    }
+
+    /// Drop EVERY cached record, returning how many were dropped. For
+    /// events with no per-key enumeration of the blast radius (e.g. a
+    /// trust-root change / re-genesis): the safe posture is an empty
+    /// cache that anti-entropy refills, never a cache serving keys the
+    /// new root no longer stands behind.
+    pub fn invalidate_all(&self) -> usize {
+        let mut g = self.inner.write();
+        let n = g.len();
+        g.clear();
+        n
+    }
+
     /// Lookup a directory record by `federation_id`.
     #[must_use]
     pub fn get(&self, federation_id: &str) -> Option<DirectoryRecord> {
@@ -251,6 +296,32 @@ mod tests {
         let cache = DirectoryCache::new();
         cache.insert(rec("alice", 0xaa));
         assert!(cache.get("bob").is_none());
+    }
+
+    /// Audit item — the revocation-coherency surface: `invalidate`
+    /// drops exactly the revoked key's record (the shape the
+    /// bridge-side revocation observer drives with `revoked_key_id`).
+    #[test]
+    fn invalidate_drops_revoked_key_only() {
+        let cache = DirectoryCache::new();
+        cache.insert(rec("alice", 0xaa));
+        cache.insert(rec("bob", 0xbb));
+        let dropped = cache.invalidate("alice").expect("alice was cached");
+        assert_eq!(dropped.federation_id, "alice");
+        assert!(cache.get("alice").is_none(), "revoked key no longer served");
+        assert!(cache.get("bob").is_some(), "unrevoked key untouched");
+        // Idempotent — a second revocation observation is a no-op.
+        assert!(cache.invalidate("alice").is_none());
+    }
+
+    #[test]
+    fn invalidate_all_empties_cache_and_counts() {
+        let cache = DirectoryCache::new();
+        cache.insert(rec("alice", 0xaa));
+        cache.insert(rec("bob", 0xbb));
+        assert_eq!(cache.invalidate_all(), 2);
+        assert!(cache.is_empty());
+        assert_eq!(cache.invalidate_all(), 0);
     }
 
     #[test]
