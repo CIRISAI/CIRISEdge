@@ -359,9 +359,10 @@ restoring cross-wheel installability for the persist v3.5.4+ chain.
   - Leviculum-fork accessor exposure (#44; gap-stubs functional).
 - **v1.1.x**:
   - ~~L2+ trust recursion depths.~~ *(Retro-note, 2026-08: the depth knob
-    shipped as `EdgeConfig::delegation_graph_max_depth` — default 4,
-    `src/edge.rs` — threaded per CIRISEdge#51; L2+ CEWP *tier* semantics
-    remain deferred.)*
+    shipped as `EdgeConfig::trust_recursion_depth` — default 0/0/1 for
+    Client/Proxy/Server, `src/edge.rs` — threaded per CIRISEdge#51; L2+
+    CEWP *tier* semantics remain deferred, and no persist `TrustScoring`
+    impl yet honors any depth — CIRISPersist#748.)*
   - L1-as-CDN-edge full HTTP fetch (the prefetch stub at v0.20.1 is
     wire-shape + dispatch-path locked; full implementation deferred).
 - **Production deployments** per

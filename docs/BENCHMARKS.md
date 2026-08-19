@@ -27,6 +27,41 @@ state of the art.
 > gh-pages root has no index.html by design — the bare Pages URL 404s; the
 > charts live under `/dev/bench/`.)
 
+## The mesh acceptance sweep (the third lane: does it actually work?)
+
+Micro-benches measure what an operation costs. The **acceptance sweep**
+measures whether the whole system does what we say it does, on a real
+network: separate containers, each its own identity and keystore, real
+encoded video and a real file pushed through a relay while members join and
+keys rotate.
+
+**Current result — 100%** (2026-08-19, edge v18.1.0; baselines in
+[`bench-mesh/results/`](../bench-mesh/results/)):
+
+| Group size | Nodes | Checks run | Failures |
+|---|---|---|---|
+| 1 subscriber | 4 | 23 | 0 |
+| 2 subscribers | 5 | 31 | 0 |
+| 4 subscribers (one joining mid-stream) | 7 | 47 | 0 |
+
+What "0 failures" covers, in plain terms: the video and the file arrived
+intact at every member; the relay carried them without being able to read
+them or learn the group exists; a member who joined mid-stream received
+correctly from that point; the key rotation lost nobody a single frame; a
+retired address verifiably stopped answering while its replacement kept
+working; and an outsider who asked was refused. The scoring is honest by
+construction — a check that doesn't run counts as a failure, so silence can
+never look like success.
+
+Known honest numbers from the sweep: the test publisher sends to each member
+one at a time (~4.5 chunks/s through the relay) — a pipelined sender is the
+obvious next improvement, for the test and for production alike. File
+distribution currently measures direct push; the swarm-fetch mechanism is
+the next measurement to add.
+
+Run it yourself: `cd bench-mesh && ./run.sh --sweep` (docker required; see
+[`bench-mesh/README.md`](../bench-mesh/README.md)).
+
 ## The two publishing lanes
 
 The trend page carries two kinds of series, both consumed by the same

@@ -103,10 +103,19 @@ while the roster changes. Its census is honest by construction — a leg that
 did not run fails the run — and it runs in CI (`bench-mesh.yml`, weekly +
 dispatch).
 
-First CI datapoint (2026-08-19, K=1 relay, M=2 subscribers, run 32268885154):
-**28 of 28 executed legs passed** — delivery, rooting, cohort join, scope
-install/rotation, non-member refusal, relay address-blindness — with the three
-skipped legs being exactly the two known in-flight seams (§5).
+**The full acceptance sweep is at 100%** (2026-08-19, edge v18.1.0, baselines
+committed at `bench-mesh/results/`): M=1 — 23 legs, M=2 — 31 legs, M=4 — 47
+legs across 7 nodes with a deliberate mid-stream late joiner — **zero
+contract violations at every point** under the per-role census. Every leg
+that a node's role obligates it to run, ran and passed: real encoded video
+and a real blob delivered through a relay that holds no group address;
+members admitted mid-stream; keys rotated with zero frame loss for every
+member present across the advance; a retired address verifiably refusing at
+the admission seam while its live successor still answers (the probe also
+proves both nodes derived the same address independently); non-members
+refused; the relay address-blind. (The first CI datapoint, run 32268885154
+on the pre-fix code, recorded 28/28 executed with the then-known seams —
+kept here as the before-picture the fixes closed.)
 
 ---
 
@@ -132,7 +141,7 @@ rotation, retirement, moderation — was the casualty either way.
 | Non-member cannot fetch | Scope-gated serve; arrival-scope admission | **Measured** (`conformance.nonmember_cannot_fetch`) |
 | Relay holds no group address | Relay serves transit on the identity plane only | **Measured** (`conformance.relay_holds_no_cohort_address`) |
 | Membership + rotation | MLS cohorts (TreeKEM, X-Wing 0x004D), `welcome-wrap` (CC 5.4.4) | Shipped; rotation **Measured** (`conformance.rotation_frame_loss`: zero loss across an epoch advance) |
-| Address retirement | Seal: a superseded epoch's address stops being admitted | Owner half **Measured** (`scope.seal`); network-observed half in flight (§5) |
+| Address retirement | Seal: a superseded epoch's address stops being admitted | **Measured**, both halves (`scope.seal` owner-side; `conformance.seal_retires` network-observed at the admission seam, every fan-out) |
 | Moderation with accountability | Accord-conferred duty-holders, quorum trust root, revocation planes | Shipped (persist substrate; edge replicates + refuses) |
 
 ---
@@ -143,13 +152,17 @@ rotation, retirement, moderation — was the casualty either way.
 member-relays at log depth, keys rotating mid-stream, no SFU, no coordinator.
 
 **Labels.** Shipped (the A/V spine: join → subscribe → publish → heal → seal;
-MLS-keyed streams; MDC/SVC codec planes) and **Measured** at K=1/M∈{1,2}:
+MLS-keyed streams; MDC/SVC codec planes) and **Measured at every sweep
+point** (K=1, M ∈ {1, 2, 4}; 7 nodes at M=4 with a mid-stream late joiner):
 real video frames + a 120 KB blob delivered through a relay container with
-byte-intact verification, blob completion ~20–23 ms/peer, zero frame loss
-across a mid-stream epoch advance. **In flight**: M=4 fan-out currently
-wedges on MLS commit ordering under concurrent admissions (§5), and blob
-distribution still uses direct push — the scope-native swarm fetch is the
-designed mechanism (`scope_native_fetch: false` in the leg detail marks it).
+byte-intact verification, zero frame loss across the mid-stream epoch
+advance for every member present across it, and the late joiner receiving
+correctly from its admission point. **Honest numbers**: the harness
+publisher serial-awaits each delivery (~4.5 chunks/s measured through the
+relay) — a pipelined publisher is the known improvement, and log-depth
+topology is separately benched (depth 2/4/5 at N=10/100/1000). **Still
+open**: blob distribution measures direct push; the scope-native swarm
+fetch is the next harness mechanism.
 
 ---
 
@@ -188,26 +201,38 @@ rule: rotation clocks global, never group-event-driven.
 
 ---
 
-## 6. In-flight seams (the gap between Measured and 100%)
+## 6. Seams — closed, and what remains
 
-Tracked as the bench-mesh 100% program; each seam has an owner-track:
+The bench-mesh 100% program CLOSED (2026-08-19, the sweep above). What each
+seam became:
 
-1. **MLS commit ordering at M≥4** — commits fan out unordered; a laggard hits
-   `WrongEpoch` fatally. Fix: bounded hold-buffer in the production cohort
-   layer + non-fatal harness handling + admission pacing. *(Track A.)*
-2. **`seal_retires` measured the impossible thing** — it tried to RNS-dial a
-   derived address through a relay, which CC 5.4.6 now normatively forbids
-   the preconditions of (no announce, so no multi-hop path — by design, not
-   defect). Redesign: probe over the identity-plane rooted link, answered by
-   the production arrival-admission lookup; the live-address probe is the
-   aliveness control that makes "refused" distinguishable from "down."
-   *(Track C.)*
-3. **Census role-contracts** — the deliberate late joiner can never satisfy
-   across-the-advance legs; the census gains per-role expected-leg sets with
-   the honesty rule intact. *(Track D.)*
-4. **Swarm fetch as the blob mechanism** — replace/augment direct push with
-   the scope-native holdings fetch. *(Second wave, after Track A.)*
-5. **Voting legs** — §5's planned proof. *(Track V, after integration.)*
+1. **MLS commit ordering at M≥4** — CLOSED: bounded hold-buffer in the
+   production cohort layer (`CommitApplyOutcome`; `WrongEpoch` structurally
+   untrippable via frame-header pre-classification), plus the real root
+   cause — the harness was *discarding* admission commits — fixed, plus
+   non-fatal commit handling and admission pacing.
+2. **`seal_retires`** — CLOSED by redesign: it measured the impossible thing
+   (RNS-dialling a derived address through a relay — normatively forbidden
+   preconditions per CC 5.4.6, by design not defect). Now an admission-seam
+   probe over the identity-plane rooted path, answered by the production
+   arrival-admission lookup; the live-address probe disambiguates "refused"
+   from "down"; runs and passes at every fan-out.
+3. **Census role-contracts** — CLOSED: per-role expected-leg sets; a skipped
+   *expected* leg still fails the run; the deliberate late joiner's
+   across-the-advance exclusions are contract, not excuses.
+4. **Publisher seal service** — found AND closed at M=4: the harness
+   publisher served only one seal handshake and dropped concurrent probes;
+   now every prober is served (one measured bracket, nobody starved).
+
+Still open, honestly:
+
+- **Swarm fetch as the blob mechanism** — the blob leg still measures direct
+  push (`scope_native_fetch: false` in its detail); the scope-native
+  holdings-fetch measurement is the next harness feature.
+- **Fan-out pipelining** — the harness publisher serial-awaits per-recipient
+  deliveries (~4.5 chunks/s measured); pipelining would raise the measured
+  number and is the recommended shape for any production publisher.
+- **Voting legs** — §5's planned proof (Track V).
 
 ---
 
