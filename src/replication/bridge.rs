@@ -558,27 +558,30 @@ impl FederationDirectoryReplicationBridge {
         self
     }
 
-    /// Workstream F — is this row in the `accord:*` family, i.e. is its
-    /// carriage the relay gate's to decide?
+    /// Workstream F / CIRISEdge#505 / CIRISPersist#743 — is this row on the
+    /// `accord:*` family, in EITHER namespace, i.e. is its carriage the relay
+    /// gate's to decide?
     ///
-    /// persist's own classifier, via
-    /// [`AccordRelayGate::dimension_is_gated`](crate::replication::accord_relay_gate::AccordRelayGate::dimension_is_gated)
-    /// — the same `namespace::attestation_family` fold
-    /// [`Self::attestation_requires_serve`] took in v17.7.0, and for the same
-    /// reason: a `dimension.starts_with("accord:")` here would be a second
-    /// owner for one wire fact. `objection:*` is deliberately NOT in this
-    /// family (CIRISPersist#713 — the co-scrub argument covers `accord:` only).
-    /// CIRISEdge#505 / CIRISPersist#743 — is this row on the `accord:*`
-    /// family, in EITHER namespace?
+    /// **The two-namespace rule.** The family rides BOTH namespaces a row can
+    /// carry it on, and persist's admission comment
+    /// (`check_reserved_prefix_admission`, the CIRISPersist#733 placement note)
+    /// is explicit: *"The `accord:*` family rides BOTH namespaces —
+    /// `accord:invoke:*` as a TYPE, `accord:human_dignity:v1` as a `scores`
+    /// DIMENSION"*. So this pre-filter reads the exact two fields persist's own
+    /// admission reads — the `attestation_type` column
+    /// (`/attestation_type`, persist's `row.attestation_type`) and the signed
+    /// envelope dimension (`/attestation_envelope/dimension`, persist's
+    /// `admission::envelope_dimension`) — and hands both to persist's own
+    /// classifier, [`ciris_persist::federation::trust_root::is_accord_family`].
+    /// `objection:*` is deliberately NOT in this family (CIRISPersist#713 —
+    /// the co-scrub argument covers `accord:` only).
     ///
     /// This read only the `dimension` until v37.1.0, and that was a live
-    /// under-gating hole: persist's own admission comment is explicit that the
-    /// family rides both namespaces — *"`accord:invoke:*` as a TYPE,
-    /// `accord:human_dignity:v1` as a `scores` DIMENSION"* — so every
-    /// `accord:invoke:*` row carried in the `attestation_type` namespace
-    /// skipped the CC 4.2.1 relay gate entirely. A false NEGATIVE: the gate
-    /// never carried something it should have refused once it looked, it
-    /// failed to look.
+    /// under-gating hole: every `accord:invoke:*` row carried in the
+    /// `attestation_type` namespace skipped the CC 4.2.1 relay gate entirely —
+    /// advertised, fetched and subject-pulled with no carriage check. A false
+    /// NEGATIVE: the gate never carried something it should have refused once
+    /// it looked, it failed to look.
     ///
     /// Persist now owns the question (`is_accord_family`), so edge stops
     /// spelling it. Edge widening the pre-filter itself would have put a
@@ -5109,6 +5112,39 @@ mod tests {
         seed_raw_attestation(backend, &id, attester, scored, "scores", envelope).await;
     }
 
+    /// CIRISEdge#505 / CIRISPersist#743 — an `accord:*` row in the **TYPE
+    /// namespace**: `attestation_type = "accord:invoke:…"`, NO `dimension` key
+    /// at all, naming its accord with the signed `accord_root` envelope key.
+    ///
+    /// This is the OTHER half of persist's two-namespace admission rule
+    /// (*"`accord:invoke:*` as a TYPE, `accord:human_dignity:v1` as a `scores`
+    /// DIMENSION"*), and the wire shape the pre-#505 pre-filter never showed
+    /// the relay gate. The invoke shape is self-attesting
+    /// (`attested_key_id` = the holder — persist #733: "the SELF-ATTESTING
+    /// HOLDER"), and admission requires the attesting key's `identity_type` to
+    /// be `accord_holder` (CC 3.4.1) plus the signed root
+    /// (`check_accord_root_binding`) — the fixture goes through the REAL write
+    /// door, so it carries what the field must carry.
+    async fn seed_accord_invoke(backend: &MemoryBackend, holder: &str, accord_root: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": holder,
+            "attested_key_id": holder,
+            "attestation_type": "accord:invoke:notify:halt",
+            "accord_root": accord_root,
+        });
+        seed_raw_attestation(
+            backend,
+            &id,
+            holder,
+            holder,
+            "accord:invoke:notify:halt",
+            envelope,
+        )
+        .await;
+    }
+
     /// Seed a `withdraws` composer tombstoning `target_id` — the CEG un-trust
     /// primitive. Shape mirrors persist's own `fix_withdraws` witness: the
     /// composer references its target through `references_attestation_id`
@@ -7677,10 +7713,15 @@ mod tests {
     /// the gate itself derives, so a test always aims at the row the gate will
     /// actually judge. (It previously matched the UNSIGNED top-level
     /// `attesting_key_id` column, which is not what the gate reads.)
+    /// `ty` discriminates the NAMESPACE the row rides (CIRISEdge#505): one
+    /// holder can hold both a dimension-namespace row (`ty = "scores"`) and a
+    /// type-namespace row (`ty = "accord:invoke:…"`) under the same root, and
+    /// `(root, signer)` alone no longer picks one.
     async fn locate_accord_hash(
         bridge: &FederationDirectoryReplicationBridge,
         root: &str,
         signer: &str,
+        ty: &str,
     ) -> [u8; 32] {
         use crate::replication::accord_relay_gate::AccordRelaySubject;
         for r in bridge.list_envelope_refs(EnvelopeKind::Attestation).await {
@@ -7693,13 +7734,14 @@ mod tests {
             };
             let inner = v.get("attestation").unwrap_or(&v);
             if FederationDirectoryReplicationBridge::attestation_is_accord(inner)
+                && inner.get("attestation_type").and_then(|t| t.as_str()) == Some(ty)
                 && AccordRelaySubject::of_attestation(inner)
                     .is_ok_and(|s| s.root_ref == root && s.signer_key_id == signer)
             {
                 return r.envelope_hash;
             }
         }
-        panic!("the seeded accord row by {signer} under {root} appears in the local view");
+        panic!("the seeded {ty} accord row by {signer} under {root} appears in the local view");
     }
 
     /// Workstream F, the whole property in one scenario — and deliberately BOTH
@@ -7707,13 +7749,18 @@ mod tests {
     /// a gate that is dead (the #435 / v13.10.0 lesson), while a gate only ever
     /// seen allowing proves nothing about carriage at all.
     ///
-    /// One node, one accord root, one peer, and three rows:
+    /// One node, one accord root, one peer, and five rows — the family's BOTH
+    /// namespaces (CIRISEdge#505: `accord:invoke:*` as a TYPE,
+    /// `accord:human_dignity:v1`-style rows as a `scores` DIMENSION), each with
+    /// an allow and a refuse so neither namespace can pass by being skipped:
     ///
     /// | row | expectation |
     /// |---|---|
-    /// | `accord:*` by a SEATED holder | advertised AND served — persist's `may_relay` holds |
-    /// | `accord:*` by an UNSEATED holder | withheld from BOTH paths, booked `accord_relay_signer_not_seated` |
-    /// | a non-`accord:` row | untouched — this gate narrows exactly one dimension family |
+    /// | dimension-namespace `accord:*` by a SEATED holder | advertised AND served — persist's `may_relay` holds |
+    /// | dimension-namespace `accord:*` by an UNSEATED holder | withheld from BOTH paths, booked `accord_relay_signer_not_seated` |
+    /// | TYPE-namespace `accord:invoke:*` by a SEATED holder | advertised AND served — the pre-filter admits it AND the gate allows it |
+    /// | TYPE-namespace `accord:invoke:*` by an UNSEATED holder | withheld from BOTH paths — pre-#505 this row skipped the gate and was CARRIED |
+    /// | a non-`accord:` row | untouched — this gate narrows exactly one family |
     ///
     /// The trust state is seeded the way persist's own
     /// `exercise_accord_relay_eligibility` seeds it: a KEYLESS family whose
@@ -7790,13 +7837,20 @@ mod tests {
         )
         .await;
 
-        // The rows: one accord row per holder, plus a non-accord row.
+        // The rows: per holder, one accord row in EACH namespace (dimension +
+        // type — CIRISEdge#505), plus a non-accord row.
         seed_accord_lifecycle(&backend, seated, root).await;
         seed_accord_lifecycle(&backend, unseated, root).await;
+        seed_accord_invoke(&backend, seated, root).await;
+        seed_accord_invoke(&backend, unseated, root).await;
         seed_advertised_attestation(&backend, producer).await;
 
-        let seated_hash = locate_accord_hash(&bridge, root, seated).await;
-        let unseated_hash = locate_accord_hash(&bridge, root, unseated).await;
+        let seated_hash = locate_accord_hash(&bridge, root, seated, "scores").await;
+        let unseated_hash = locate_accord_hash(&bridge, root, unseated, "scores").await;
+        let seated_invoke_hash =
+            locate_accord_hash(&bridge, root, seated, "accord:invoke:notify:halt").await;
+        let unseated_invoke_hash =
+            locate_accord_hash(&bridge, root, unseated, "accord:invoke:notify:halt").await;
         let bridge = bridge
             .with_local_key_id(Some(local.to_string()))
             .with_accord_relay_gate(Some(Arc::new(AccordRelayGate::new(
@@ -7837,6 +7891,46 @@ mod tests {
                 .await
                 .is_none(),
             "…and cannot be obtained by fetching a hash learned out-of-band"
+        );
+
+        // (B/D) THE TYPE NAMESPACE (CIRISEdge#505) — the same allow/refuse
+        // pair for `accord:invoke:*` rows, whose family membership rides the
+        // `attestation_type` and NOT the dimension. Before the pre-filter fix
+        // these rows never reached the gate at all, so the UNSEATED holder's
+        // row below was advertised and served — the under-gating hole.
+        assert!(
+            offer.iter().any(|r| r.envelope_hash == seated_invoke_hash),
+            "a seated holder's TYPE-namespace accord row is ADVERTISED — the \
+             pre-filter admits it to the gate and the gate allows it"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &seated_invoke_hash,
+                    Some(peer)
+                )
+                .await
+                .is_some(),
+            "…and SERVED on the direct-fetch twin"
+        );
+        assert!(
+            !offer
+                .iter()
+                .any(|r| r.envelope_hash == unseated_invoke_hash),
+            "an UNSEATED holder's TYPE-namespace accord row is withheld from the \
+             offer — pre-#505 the pre-filter skipped the gate and CARRIED it"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &unseated_invoke_hash,
+                    Some(peer)
+                )
+                .await
+                .is_none(),
+            "…and cannot be obtained by fetching its hash out-of-band either"
         );
 
         // The refusal is LOUD and NAMES ITS BRANCH (CIRISEdge#425/#433) — and
@@ -7901,9 +7995,31 @@ mod tests {
             "attestation_type": "accord:invoke:notify:halt",
             "attestation_envelope": { "dimension": "trust:example:v1" },
         });
+        // The shape a TYPE-namespace row actually produces on the wire: the
+        // namespace travels as the type and there is NO `dimension` key at all
+        // (persist's `is_accord_family` takes `Option<&str>` for exactly this
+        // row — `None` is not a dimension-arm match, never an error).
+        let by_type_no_dimension = serde_json::json!({
+            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_envelope": { "accord_root": "humanity-accord" },
+        });
+        // BOTH fields accord-shaped — one row, one family membership, and the
+        // caller consults ONE gate for it (the gate resolves ONE subject; see
+        // accord_relay_gate's
+        // `the_type_namespace_row_is_judged_not_skipped_and_both_namespaces_gate_once`).
+        let by_both = serde_json::json!({
+            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_envelope": { "dimension": "accord:human_dignity:v1" },
+        });
         let neither = serde_json::json!({
             "attestation_type": "scores",
             "attestation_envelope": { "dimension": "trust:example:v1" },
+        });
+        // Non-accord in the TYPE namespace with no dimension — the
+        // `delegates_to` / `withdraws` wire shape must keep bypassing the gate.
+        let neither_no_dimension = serde_json::json!({
+            "attestation_type": "delegates_to",
+            "attestation_envelope": { "scope": ["infra:attest"] },
         });
 
         assert!(FederationDirectoryReplicationBridge::attestation_is_accord(
@@ -7915,9 +8031,71 @@ mod tests {
              skipping it is the CIRISEdge#505 under-gating hole",
         );
         assert!(
+            FederationDirectoryReplicationBridge::attestation_is_accord(&by_type_no_dimension),
+            "…including with NO dimension key at all, which is the exact wire \
+             shape an `accord:invoke:*` row carries",
+        );
+        assert!(
+            FederationDirectoryReplicationBridge::attestation_is_accord(&by_both),
+            "a row accord-shaped on BOTH namespaces is on the family",
+        );
+        assert!(
             !FederationDirectoryReplicationBridge::attestation_is_accord(&neither),
             "and a non-accord row must still bypass the gate, so this cannot \
              pass by gating everything",
+        );
+        assert!(
+            !FederationDirectoryReplicationBridge::attestation_is_accord(&neither_no_dimension),
+            "a non-accord TYPE with no dimension bypasses too — widening to \
+             `None`-dimension rows must not have gated the structural verbs",
+        );
+    }
+
+    /// **THE CIRISEdge#505 RE-OPEN FENCE** — a source assertion, in the style
+    /// of `skip_serializing_if_fields_are_never_read_by_json_key_with_an_empty_default`.
+    ///
+    /// The behavioural test above proves the pre-filter's ANSWERS; this pins
+    /// its READS, because on every constructible fixture today the answers
+    /// cannot distinguish persist's `is_accord_family` from a re-inlined
+    /// prefix check or from the dimension-half helper the pre-filter consulted
+    /// before v37.1.0 (`AccordRelayGate::dimension_half_is_gated`, the fenced
+    /// remnant) — the three diverge exactly when a third namespace arm or a
+    /// registry change lands, which is when the second spelling bites.
+    #[test]
+    fn the_carriage_pre_filter_reads_is_accord_family_not_the_dimension_half() {
+        let src = include_str!("bridge.rs");
+        let start = src
+            .find("fn attestation_is_accord")
+            .expect("the pre-filter exists");
+        let end = src[start..].find("\n    }").expect("the fn body closes");
+        let body = &src[start..start + end];
+        assert!(
+            body.contains("is_accord_family"),
+            "attestation_is_accord must delegate to persist's `is_accord_family` — \
+             the ONE owner of the two-namespace accord family test (CIRISPersist#743)"
+        );
+        for (path, mirror_of) in [
+            ("\"/attestation_type\"", "`row.attestation_type`"),
+            (
+                "\"/attestation_envelope/dimension\"",
+                "`admission::envelope_dimension`",
+            ),
+        ] {
+            assert!(
+                body.contains(path),
+                "attestation_is_accord must read {path} — the exact field persist's \
+                 admission reads via {mirror_of}; dropping either re-opens CIRISEdge#505"
+            );
+        }
+        assert!(
+            !body.contains("dimension_half_is_gated") && !body.contains("dimension_is_gated"),
+            "the dimension-half helper is NOT a carriage classifier — routing the \
+             pre-filter through it is the CIRISEdge#505 under-gating hole verbatim"
+        );
+        assert!(
+            !body.contains("starts_with"),
+            "no edge-side prefix spelling — persist owns the family test \
+             (the CIRISPersist#731/#733 two-owners drift)"
         );
     }
 
@@ -8023,8 +8201,8 @@ mod tests {
         seed_accord_lifecycle(&backend, holder, accord_a).await;
         seed_accord_lifecycle(&backend, holder, accord_b).await;
 
-        let own_accord_hash = locate_accord_hash(&bridge, accord_a, holder).await;
-        let other_accord_hash = locate_accord_hash(&bridge, accord_b, holder).await;
+        let own_accord_hash = locate_accord_hash(&bridge, accord_a, holder, "scores").await;
+        let other_accord_hash = locate_accord_hash(&bridge, accord_b, holder, "scores").await;
         assert_ne!(
             own_accord_hash, other_accord_hash,
             "two distinct rows, differing only in the accord they name"
@@ -8215,8 +8393,8 @@ mod tests {
         seed_accord_scored(&backend, holder, scored, accord_a).await;
         seed_accord_scored(&backend, holder, scored, accord_b).await;
 
-        let on_a = locate_accord_hash(&bridge, accord_a, holder).await;
-        let on_b = locate_accord_hash(&bridge, accord_b, holder).await;
+        let on_a = locate_accord_hash(&bridge, accord_a, holder, "scores").await;
+        let on_b = locate_accord_hash(&bridge, accord_b, holder, "scores").await;
         assert_ne!(
             on_a, on_b,
             "the two rows are distinct on the wire — the `accord_root` key is inside the \
@@ -8342,7 +8520,7 @@ mod tests {
         // outright ("cannot judge"). Without one, nothing consults the
         // predicate.
         seed_accord_lifecycle(&backend, holder, root).await;
-        let hash = locate_accord_hash(&bridge, root, holder).await;
+        let hash = locate_accord_hash(&bridge, root, holder, "scores").await;
         let bridge = bridge.with_local_key_id(Some(local.to_string()));
 
         assert!(
