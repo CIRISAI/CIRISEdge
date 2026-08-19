@@ -209,6 +209,67 @@ fn effective_link_keepalive_secs(configured: Option<Duration>) -> Option<u64> {
     })
 }
 
+/// CIRISEdge#508 item (d) — operator env override for the lossless
+/// control-plane event-channel capacity. leviculum documents its 256 default
+/// as sized for "small std platforms … servers override larger via config or
+/// builder" (leviculum-std `config.rs`), but until this knob existed edge
+/// exposed no way to take that advice — the canonical wedged with the default.
+const CONTROL_CHANNEL_CAPACITY_ENV: &str = "CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY";
+
+/// Lower clamp for [`effective_control_channel_capacity`]. Below leviculum's
+/// own 256 default is already a foot-gun; 16 exists only so a deliberate
+/// test rig can force saturation, and 0 would panic tokio's `mpsc::channel`.
+const CONTROL_CHANNEL_CAPACITY_MIN: usize = 16;
+
+/// Upper clamp for [`effective_control_channel_capacity`]. Each slot is one
+/// queued `NodeEvent`; 65 536 bounds worst-case queue memory while being 256×
+/// the default — far past any observed saturation (CIRISEdge#508 measured a
+/// 256-deep channel overflowing behind a lock stall, not a real 64k burst).
+const CONTROL_CHANNEL_CAPACITY_MAX: usize = 65_536;
+
+/// Where the effective control-channel capacity came from — logged at node
+/// build so the operator can see which knob (if any) took effect.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ControlChannelCapacitySource {
+    /// `ReticulumTransportConfig::control_channel_capacity` was `Some`.
+    Config,
+    /// The `CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY` env var parsed.
+    Env,
+    /// The env var was set but did not parse as a `usize`; ignored (loudly).
+    EnvInvalid,
+    /// Nothing configured — leviculum's default applies.
+    Default,
+}
+
+/// Resolve the control-channel capacity for `ReticulumNodeBuilder`
+/// (CIRISEdge#508 item (d)). Precedence: explicit config field, then env var,
+/// then leviculum's default (`None`). The result is clamped into
+/// [`CONTROL_CHANNEL_CAPACITY_MIN`]..=[`CONTROL_CHANNEL_CAPACITY_MAX`] so an
+/// operator typo can neither panic the channel (0) nor commit unbounded
+/// queue memory. Pure — `env_raw` is passed in, not read here — so tests
+/// exercise the EXACT env-string shapes the field produces.
+fn effective_control_channel_capacity(
+    configured: Option<usize>,
+    env_raw: Option<&str>,
+) -> (Option<usize>, ControlChannelCapacitySource) {
+    if let Some(cap) = configured {
+        return (
+            Some(cap.clamp(CONTROL_CHANNEL_CAPACITY_MIN, CONTROL_CHANNEL_CAPACITY_MAX)),
+            ControlChannelCapacitySource::Config,
+        );
+    }
+    match env_raw {
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(cap) => (
+                Some(cap.clamp(CONTROL_CHANNEL_CAPACITY_MIN, CONTROL_CHANNEL_CAPACITY_MAX)),
+                ControlChannelCapacitySource::Env,
+            ),
+            Err(_) => (None, ControlChannelCapacitySource::EnvInvalid),
+        },
+        None => (None, ControlChannelCapacitySource::Default),
+    }
+}
+
 /// How long [`Transport::send`] waits for a resource transfer to
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -445,6 +506,23 @@ fn peer_admitted_log() -> &'static crate::log_throttle::LogThrottle {
 fn link_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
     LINK_ATTRIBUTION_MISS_LOG
         .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1024))
+}
+
+static CONTROL_PLANE_OVERFLOW_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#508 — leviculum's `ControlPlaneOverflow` marker consumed instead
+/// of falling through the `other =>` trace-level catch-all. The marker is
+/// leviculum's designed loss surface (it carries the aggregate dropped_count
+/// and is itself never dropped), so DISCARDING it at TRACE meant the one
+/// aggregate line an operator needed was invisible while the per-drop
+/// EVENT_CHANNEL_FULL flood buried everything 30:1. Keyed on a single fixed
+/// key (cardinality 1); throttled because sustained saturation re-arms a
+/// marker every drain window, which an announce/link flood can influence —
+/// first 6 per minute log loudly, the rest collapse to a suppressed count.
+fn control_plane_overflow_log() -> &'static crate::log_throttle::LogThrottle {
+    CONTROL_PLANE_OVERFLOW_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(6, Duration::from_secs(60), 1))
 }
 
 static INITIATOR_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -1203,6 +1281,18 @@ pub struct ReticulumTransportConfig {
     /// leviculum's valid band by [`effective_link_keepalive_secs`] before it
     /// reaches the builder — an operator override cannot escape the DoS bound.
     pub link_keepalive: Option<Duration>,
+    /// CIRISEdge#508 item (d) — capacity of leviculum's LOSSLESS control-plane
+    /// event channel (`ReticulumNodeBuilder::control_channel_capacity`).
+    /// `None` → leviculum's 256 default, which its own docs size for "small
+    /// std platforms" with servers expected to override — advice no edge
+    /// embedder could take before this field. Operators without a config path
+    /// set the `CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY` env var
+    /// instead; an explicit field value wins over the env var, and either is
+    /// clamped by [`effective_control_channel_capacity`]. Capacity only buys
+    /// headroom in front of a consumer stall (it is deliberately item (d),
+    /// LAST, in CIRISEdge#508's priority order) — the stall itself is
+    /// leviculum#56–#59.
+    pub control_channel_capacity: Option<usize>,
     /// CIRISEdge#492 — node-wide relay (transit) posture applied to the LEGACY
     /// interface path (the `listen_addr` server + `bootstrap_peers` clients, used
     /// when `interfaces` is empty). `None` = leviculum default (relay-by-default);
@@ -1234,6 +1324,7 @@ impl ReticulumTransportConfig {
             // CIRISEdge#363 — default the bootstrap keepalive ON so advisory
             // links survive the two-plane anti-entropy out of the box.
             link_keepalive: Some(BOOTSTRAP_LINK_KEEPALIVE),
+            control_channel_capacity: None,
             transit: None,
             ifac: None,
         }
@@ -2274,6 +2365,44 @@ impl ReticulumTransport {
                 tracing::info!(
                     "reticulum link keepalive left at leviculum's RTT-derived default \
                      (CIRISEdge#363: bootstrap links may reap at ~16 s)"
+                );
+            }
+        }
+        // CIRISEdge#508 item (d) — control-plane channel capacity. Same
+        // wiring-decision discipline as the keepalive above: one INFO line per
+        // node build, so "which capacity is this node actually running" is
+        // answerable from logs instead of forensic archaeology. leviculum's
+        // 256 default overflowed on the live canonical; the overflow was a
+        // SYMPTOM of a consumer stall (leviculum#56–#58), so capacity is
+        // headroom, not the fix — but the headroom must at least be settable.
+        let env_capacity = std::env::var(CONTROL_CHANNEL_CAPACITY_ENV).ok();
+        match effective_control_channel_capacity(
+            config.control_channel_capacity,
+            env_capacity.as_deref(),
+        ) {
+            (Some(capacity), source) => {
+                builder = builder.control_channel_capacity(capacity);
+                tracing::info!(
+                    capacity,
+                    ?source,
+                    "reticulum control-plane event channel capacity overridden \
+                     (CIRISEdge#508 item d)"
+                );
+            }
+            (None, source @ ControlChannelCapacitySource::EnvInvalid) => {
+                tracing::warn!(
+                    env_var = CONTROL_CHANNEL_CAPACITY_ENV,
+                    raw = env_capacity.as_deref().unwrap_or(""),
+                    ?source,
+                    "control-channel capacity env var did not parse as usize — \
+                     IGNORED, leviculum default (256) applies (CIRISEdge#508 item d)"
+                );
+            }
+            (None, _) => {
+                tracing::info!(
+                    "reticulum control-plane event channel at leviculum's 256 default \
+                     (CIRISEdge#508 item d: a canonical-scale server should override \
+                     via config or CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY)"
                 );
             }
         }
@@ -6246,6 +6375,37 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         // the leviculum v0.16 completion registry (fed at the dispatch layer), so
         // `link_request` no longer mirrors them here — the events fall through to the
         // trace arm and the `request_responses` / `timed_out_requests` maps are gone.
+        // CIRISEdge#508 — the control-plane loss marker, consumed. leviculum
+        // drops lossless-plane events with try_send when the channel is full,
+        // then delivers ONE ControlPlaneOverflow carrying the aggregate count
+        // once the channel has room — the marker is the designed observable
+        // and is itself never dropped. Before this arm it fell into the
+        // `other =>` TRACE catch-all: the single line an operator needed was
+        // invisible while ~1000 per-drop EVENT_CHANNEL_FULL warns (buried
+        // 30:1 on the canonical) said nothing actionable. WARN with the
+        // consequence stated; throttled (see `control_plane_overflow_log`)
+        // because saturation frequency is attacker-influenceable. Dropped
+        // control events mean edge may have MISSED LinkEstablished /
+        // LinkClosed / AnnounceReceived — so link bookkeeping here may be
+        // stale until the next event for the affected link arrives.
+        NodeEvent::ControlPlaneOverflow { dropped_count } => {
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                control_plane_overflow_log().check("overflow")
+            {
+                tracing::warn!(
+                    dropped_count,
+                    suppressed_prev,
+                    "leviculum control-plane channel overflowed: {dropped_count} lossless \
+                     event(s) were DROPPED before this marker — edge may have missed link \
+                     lifecycle or announce events and its link bookkeeping may be stale \
+                     until the affected links next produce an event. Sustained overflow \
+                     means the event consumer is stalling (leviculum#58) or the channel \
+                     is undersized for this deployment — raise it via \
+                     ReticulumTransportConfig::control_channel_capacity or \
+                     CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY (CIRISEdge#508)"
+                );
+            }
+        }
         other => {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
@@ -8974,6 +9134,83 @@ mod tests {
             assert_eq!(
                 effective_link_keepalive_secs(Some(Duration::from_secs(45))),
                 Some(45),
+            );
+        }
+    }
+
+    /// CIRISEdge#508 item (d) — the control-channel capacity resolver.
+    /// Exercised with the EXACT input shapes the field produces: an explicit
+    /// config value, raw env strings (valid / padded / garbage / empty), and
+    /// nothing at all.
+    mod control_channel_capacity {
+        use super::*;
+
+        /// Config wins over env, and passes through when in band.
+        #[test]
+        fn config_wins_over_env_and_passes_through() {
+            assert_eq!(
+                effective_control_channel_capacity(Some(4096), Some("1024")),
+                (Some(4096), ControlChannelCapacitySource::Config),
+            );
+            // `ReticulumTransportConfig::new` ships it OFF (leviculum default).
+            let cfg = ReticulumTransportConfig::new(std::path::PathBuf::from("/x"), "k");
+            assert_eq!(cfg.control_channel_capacity, None);
+        }
+
+        /// A valid env var applies when no config field is set — including the
+        /// whitespace-padded form a compose file or systemd unit produces.
+        #[test]
+        fn env_applies_when_config_absent() {
+            assert_eq!(
+                effective_control_channel_capacity(None, Some("1024")),
+                (Some(1024), ControlChannelCapacitySource::Env),
+            );
+            assert_eq!(
+                effective_control_channel_capacity(None, Some(" 2048\n")),
+                (Some(2048), ControlChannelCapacitySource::Env),
+            );
+        }
+
+        /// Both sources clamp into the safe band: 0 would panic tokio's
+        /// `mpsc::channel`, and an absurd value would commit unbounded queue
+        /// memory (each slot is a queued NodeEvent).
+        #[test]
+        fn both_sources_clamp_into_band() {
+            assert_eq!(
+                effective_control_channel_capacity(Some(0), None),
+                (
+                    Some(CONTROL_CHANNEL_CAPACITY_MIN),
+                    ControlChannelCapacitySource::Config
+                ),
+            );
+            assert_eq!(
+                effective_control_channel_capacity(None, Some("999999999")),
+                (
+                    Some(CONTROL_CHANNEL_CAPACITY_MAX),
+                    ControlChannelCapacitySource::Env
+                ),
+            );
+        }
+
+        /// Garbage / empty env is IGNORED (loudly at the call site), never a
+        /// panic and never a silent zero — leviculum's default stays in force.
+        #[test]
+        fn invalid_env_is_ignored_not_applied() {
+            for raw in ["lots", "-1", "", "0x400", "1024 events"] {
+                assert_eq!(
+                    effective_control_channel_capacity(None, Some(raw)),
+                    (None, ControlChannelCapacitySource::EnvInvalid),
+                    "raw env {raw:?} must be ignored",
+                );
+            }
+        }
+
+        /// Nothing configured → leviculum's default, and the decision says so.
+        #[test]
+        fn absent_everywhere_is_leviculum_default() {
+            assert_eq!(
+                effective_control_channel_capacity(None, None),
+                (None, ControlChannelCapacitySource::Default),
             );
         }
     }
