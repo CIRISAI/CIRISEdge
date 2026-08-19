@@ -214,6 +214,52 @@ impl Default for LxmfServeLimits {
 /// policy is persist's or the constitution's to state. Edge offers the
 /// mechanism and fails closed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// # Why this is NOT `resolve_transit_eligibility` (CIRISPersist#561 / CIRISEdge#430)
+///
+/// The obvious move is to reuse the RNS transit rule — *directory-present,
+/// `identity_type` contains `node`, self-offers `infra:transport`, shares a
+/// trust root I trust* — since both planes carry only ciphertext. **That rule
+/// is too wide here**, and persist's own rationale for why it is wide is what
+/// rules it out:
+///
+/// > A relay carries only ciphertext — no `EpochDek` is reachable from a hop
+/// > … and it is what keeps relaying DECENTRALIZED: any trust-anchored node
+/// > offering transport can serve as a hop.
+///
+/// Three legs hold that up, and LXMF propagation satisfies only the first:
+///
+/// | | RNS transit | LXMF propagation |
+/// |---|---|---|
+/// | ciphertext-only | yes | **yes** |
+/// | transient | the frame passes, the node forgets | **retains for days** |
+/// | breadth is the point | yes, every hop matters | no, a mailbox needs no strangers |
+///
+/// The decisive difference is what the node **learns and holds over time**. A
+/// transit hop sees `(prev, next, size, time)` and forgets. A propagation node
+/// holds a mailbox **keyed by recipient**, and durably learns which
+/// destinations have mail waiting, how much and from whom, and *when the
+/// recipient came online to collect it* — a presence oracle. It can also
+/// withhold or delete, which is an availability lever aimed at one named
+/// person.
+///
+/// So the confidentiality property is identical and the metadata and
+/// availability properties are categorically different. `infra:transport`'s
+/// bar is proportionate to *"carries ciphertext and forgets"*. It is not
+/// proportionate to *"holds your mailbox and knows when you check it"*.
+///
+/// # The rule that does apply
+///
+/// **Self, family, and the communities this node is a member of** — the
+/// cohort-scope vocabulary CC already defines, resolved through machinery
+/// CIRISEdge#499 already built (`CohortGroup`'s roster, `ScopeAddressTable`'s
+/// membership). Edge POPULATES this roster from cohort membership; it does not
+/// author a predicate, which is what kept this from being edge writing policy.
+///
+/// Both legs read the same set, and they are different questions:
+/// - **upload** — someone hands this node mail *for* `R`: `R` must be served.
+/// - **download** — a requester wants `R`'s mail: the requester must *be* `R`
+///   (already structural, since the mailbox indexes by destination) *and* `R`
+///   must be served.
 pub enum PropagationAudience {
     /// This node does not carry third-party mail. The default posture.
     #[default]
@@ -223,6 +269,50 @@ pub enum PropagationAudience {
 }
 
 impl PropagationAudience {
+    /// Build the roster from **cohort membership** — self, family, and the
+    /// communities this node belongs to.
+    ///
+    /// This is the rule that applies to propagation (see the type docs for
+    /// why it is not `resolve_transit_eligibility`), expressed as code so the
+    /// next implementer inherits it rather than re-deriving it.
+    ///
+    /// `groups` is the set of `(scope, group_id)` pairs this node is a member
+    /// of — exactly what a host already holds after driving
+    /// [`ScopeLifecycle::install`] for each. For each, every member's derived
+    /// address is added, because a propagation node holds mail *for the
+    /// cohort*, not only for itself.
+    ///
+    /// Edge is POPULATING a set here, not authoring a predicate: membership is
+    /// answered by [`ScopeAddressTable`], and the scope vocabulary is CC's.
+    ///
+    /// Returns [`Self::Disabled`] when the table admits nothing — an empty
+    /// roster and "carry no third-party mail" are the same posture, and
+    /// collapsing them means there is no way to be armed-but-empty and believe
+    /// otherwise.
+    ///
+    /// [`ScopeLifecycle::install`]: crate::scope_lifecycle::ScopeLifecycle::install
+    /// [`ScopeAddressTable`]: crate::scope_addressing::ScopeAddressTable
+    #[must_use]
+    pub fn from_cohort_membership(
+        table: &crate::scope_addressing::ScopeAddressTable,
+        groups: &[(crate::cohort_scope::CohortScope, String)],
+        members_of: &dyn Fn(&crate::cohort_scope::CohortScope, &str) -> Vec<String>,
+    ) -> Self {
+        let mut roster = BTreeSet::new();
+        for (scope, group_id) in groups {
+            for member in members_of(scope, group_id) {
+                if let Some(addr) = table.send_address(scope, group_id, &member) {
+                    roster.insert(*addr.as_bytes());
+                }
+            }
+        }
+        if roster.is_empty() {
+            Self::Disabled
+        } else {
+            Self::Roster(roster)
+        }
+    }
+
     /// Whether `destination` is one this node carries for.
     #[must_use]
     pub fn serves(&self, destination: &DestinationHash16) -> bool {

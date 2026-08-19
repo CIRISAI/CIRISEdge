@@ -890,3 +890,61 @@ fn every_refusal_emits_a_matching_notice() {
         );
     }
 }
+
+// ── The roster rule: cohort membership, not RNS transit eligibility ──
+
+/// The propagation roster is COHORT MEMBERSHIP — self, family, and the
+/// communities this node is in — and deliberately NOT the RNS transit rule.
+///
+/// Reusing `resolve_transit_eligibility` here would admit any trust-anchored
+/// node self-offering `infra:transport`. That bar is proportionate to "carries
+/// ciphertext and forgets"; it is not proportionate to "holds your mailbox and
+/// knows when you check it". See `PropagationAudience`'s docs for the full
+/// reasoning.
+#[test]
+fn the_roster_is_cohort_membership_and_admits_only_members() {
+    use crate::cohort_scope::CohortScope;
+    use crate::scope_addressing::{ScopeAddressTable, StubDeriver};
+    use std::sync::Arc;
+
+    let family = CohortScope::Family;
+    let table = ScopeAddressTable::new(Arc::new(StubDeriver));
+    table
+        .install_group(&family, "kin", 1, &[7u8; 32], &["me", "sibling"])
+        .expect("install");
+
+    let audience = PropagationAudience::from_cohort_membership(
+        &table,
+        &[(family.clone(), "kin".to_owned())],
+        &|_, _| vec!["me".to_owned(), "sibling".to_owned()],
+    );
+
+    for member in ["me", "sibling"] {
+        let addr = table.send_address(&family, "kin", member).expect("addr");
+        assert!(
+            audience.serves(addr.as_bytes()),
+            "{member} is in the cohort, so this node holds mail for them",
+        );
+    }
+
+    // The half the transit rule would get wrong: a stranger sharing a trust
+    // root passes `infra:transport` and must still fail here.
+    assert!(
+        !audience.serves(&[0x5a; DESTINATION_LENGTH]),
+        "a non-member destination must not be served",
+    );
+}
+
+/// An empty membership collapses to `Disabled` rather than an armed-but-empty
+/// roster: there must be no state in which a node believes it is carrying mail
+/// and is not.
+#[test]
+fn an_empty_membership_collapses_to_disabled() {
+    use crate::scope_addressing::{ScopeAddressTable, StubDeriver};
+    use std::sync::Arc;
+
+    let table = ScopeAddressTable::new(Arc::new(StubDeriver));
+    let audience = PropagationAudience::from_cohort_membership(&table, &[], &|_, _| Vec::new());
+    assert_eq!(audience, PropagationAudience::Disabled);
+    assert!(!audience.serves(&[0u8; DESTINATION_LENGTH]));
+}
