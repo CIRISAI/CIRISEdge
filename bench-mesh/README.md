@@ -110,13 +110,12 @@ everything.
 
 ## What is stubbed, and where
 
-Three seams. Each is a named trait in `src/bin/edge_node.rs` so the real
+Two seams. Each is a named trait in `src/bin/edge_node.rs` so the real
 API drops in as a second impl without touching measurement or reporting.
 
 | Seam | Trait | Today | Blocked on |
 |---|---|---|---|
 | A/V chunk transport | `MediaLink` | `Transport::send` — the real RNS resource path | `src/transport/av_spine.rs` (join→subscribe→relay→heal), in flight |
-| Dialling a scope-derived address | `ScopedDialer` | the harness installs the peer binding itself, then `link_open` | no transport verb accepts a `ScopeAddressTable::send_address` result |
 | Scope-native blob fetch | `BlobPlane` | push over the transport, gated on cohort membership | `src/blob_swarm/` scope-native fetch, in flight |
 
 The A/V seam exists for a structural reason worth knowing: `AvPublisher`
@@ -126,9 +125,11 @@ and `#[cfg(feature = "pyo3")]`. A downstream consumer holding a
 `ReticulumTransport` cannot reach the node, so it cannot construct the
 real-RNS A/V sender at all.
 
-The `ScopedDialer` leg stamps `dial_binding: "harness_installed"` on its
-own output, so nobody can read the seal-retirement result as evidence
-that a production dial path exists.
+(An earlier third seam, `ScopedDialer`, installed a peer binding by hand
+and tried to `link_open` a scope-derived address. It is gone: a scoped
+address is an explicit-hash destination and cannot be routed to at all,
+so the seal-retirement leg now measures the admission seam instead —
+see the `conformance.seal_retires` row below.)
 
 **The media DEK and the per-link transit key are a labelled harness
 derivation** (`epoch_keys`, HKDF over the cohort's record-plane exporter
@@ -185,7 +186,7 @@ throughput curve. A single point cannot show where fan-out stops scaling.
 | `conformance.nonmember_cannot_fetch` | the non-member derived **no** scoped address and opened **zero** frames, *and* `ciphertext_frames_offered > 0`. If no ciphertext ever reached it the leg reports `ran: false` — a leg that refuses nothing proves nothing. Only the first few frames are addressed to it (`observer_frames_each`): the refusal is an AEAD key it does not hold, which fails identically on every frame, and addressing it the whole stream would make the publisher pay a transport timeout per frame the moment the observer stops reading — quietly turning `fanout_chunks_per_s` into a measure of how fast a dead peer fails. Observer sends are excluded from the throughput numbers (`observer_sends_excluded_from_throughput`). |
 | `conformance.member_can_fetch` | a member reassembled the blob and the SHA-256 matched. The paired half of the above: the two together are what stop the test passing by refusing everything. |
 | `scope.seal` | the **owner-side** half of retirement, measured by the member that owns the address: after the convergence window, `sealed > 0`, `unretired: 0`, the superseded address is gone from the table, and the live one still answers. |
-| `conformance.seal_retires` | the **peer-side** half: a *different* node dials the owner's live and superseded addresses, before and after the seal, and the superseded one must stop answering while the live one keeps answering. The dialler derives both addresses from its **own** table, so a dial that lands is also cross-node derivation agreement. Both are dialled **before** the seal; if they did not both answer then, the leg reports `ran: false` rather than scoring a pass off a dead dial. **This leg currently reports `ran: false` on this branch — see below.** |
+| `conformance.seal_retires` | the **peer-side** half, measured at the **admission seam**: a *different* node (the publisher) sends application-level `AddressProbe`s over the owner's announced, rooted node destination — through the relay — naming the owner's live and superseded scope addresses, before and after the seal. The owner answers each probe from the **production** arrival-admission lookup (`ReticulumTransport::inbound_scope` → `ScopeAddressTable::accepts_inbound`, the same reverse index that stamps `arrival_scope` on every arriving frame), so the answer is the admission decision, not bookkeeping. After the seal the superseded address must answer `held: false` **while** the live one still answers `held: true` — the live answer is the aliveness control that makes "refused" distinguishable from "node down". The prober derives both addresses from its **own** table, so a `held: true` answer is also cross-node derivation agreement. If the before-reading did not establish both addresses held, or a post-seal probe goes silent (silence is transport loss, not a refusal — a refusal is an ack carrying `held: false`), the leg reports `ran: false` with the reason rather than guessing. See below for why it probes instead of dialling. |
 | `conformance.relay_holds_no_cohort_address` | a relay, which is not in the cohort roster, derived no address — no exporter secret reaches it. |
 
 ### Two shapes of epoch advance
@@ -207,10 +208,11 @@ The node admitted at the rotation reports
 preceded its admission are not losses, and scoring them against it would
 score the wrong node.
 
-### A known `ran: false`: `conformance.seal_retires`
+### Why `conformance.seal_retires` probes instead of dialling
 
-On this branch the peer-side dial does not establish, and the leg says so
-with the diagnosis rather than a shrug. The cause is not a failed seal:
+An earlier shape of this leg tried to RNS-dial the owner's scope-derived
+address directly through the relay, and reported `ran: false` on every
+run. That was structural, and **by design** (CIRISEdge#499):
 
 A scope-derived destination is registered with
 `Destination::with_explicit_hash`, and an explicit-hash destination
@@ -219,20 +221,22 @@ leviculum answers a path request for one with silence, because a path
 response *is* an announce and an announce for a caller-supplied hash is
 unverifiable by reference RNS). So no multi-hop RNS path to a scoped
 address can exist — and this topology deliberately puts a relay between
-the dialler and the owner.
+the prober and the owner.
 
 The federation-scope destination does not have this problem because a
 node also registers an *announceable* named destination alongside it. A
 scope-derived address has no such twin, by design: announcing one would
-publish the very reachability fact the derivation exists to withhold.
+publish the very reachability fact the derivation exists to withhold. A
+scoped address is an **arrival discriminator, not a routable endpoint**.
 
-What that means for the claim: the **owner-side** half is measured and
-passes (`scope.seal` — table closed, transport retired, `unretired: 0`,
-live address still answering). The **peer-dials-it** half is not
-measurable from a relayed peer today. Do not read the `ran: false` as a
-seal failure, and do not "fix" it by putting the dialler on the same
-link as the owner — that would make the leg pass while measuring
-something narrower than it claims.
+So the leg now measures retirement where it actually lives: at the
+**admission seam**. The publisher *can* reach the owner over its
+announced node destination (`mesh.rooting` proves those paths exist
+through the relay), so it probes over that path and the owner answers
+from the same lookup the transport's arrival path consults for every
+real frame. The two halves together: `scope.seal` is the owner's own
+table-and-transport view, `conformance.seal_retires` is a different
+node observing the production admission decision flip across the seal.
 
 ### A measured limit: M=4 through a single relay
 
