@@ -169,6 +169,17 @@ pub mod store_and_forward;
 #[cfg(feature = "lxmf")]
 pub mod lxmf_propagation;
 
+/// CIRISEdge#169 — the LXMF propagation **host serve path**: this node
+/// acting as a propagation node for others, with a rostered audience, a
+/// recipient-scoped mailbox and a bounded retention window.
+///
+/// Gated on `all(_reticulum-module, lxmf)` because it exists to be driven
+/// from edge's one Reticulum event loop; a build with `lxmf` alone gets the
+/// transport-agnostic codecs in [`lxmf_propagation`] and no serve path.
+/// With either feature off, edge behaves byte-identically to today.
+#[cfg(all(feature = "_reticulum-module", feature = "lxmf"))]
+pub mod lxmf_serve;
+
 // Remaining implementations land in subsequent commits; trait shape
 // sealed Phase 1.
 //

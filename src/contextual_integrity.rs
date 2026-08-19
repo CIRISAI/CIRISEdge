@@ -214,6 +214,18 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         | WithholdReason::HoldingScopeRecipientSetUnresolved
         | WithholdReason::HoldingScopeRecipientReadError => CiParameter::Recipient,
 
+        // CIRISEdge#169 (LXMF propagation host) — serving as a propagation
+        // node means moving someone ELSE's claim on their behalf, so the
+        // recipient axis is where its two identity gates land. The mailbox
+        // is indexed BY destination, which makes "you may read only your
+        // own mail" structural rather than a filter; these two are what
+        // that structure says out loud when it refuses. Off-roster is a
+        // context this node does not carry into at all; a scope mismatch
+        // is a requester reaching for a context that is not theirs.
+        WithholdReason::LxmfDestinationNotServed | WithholdReason::LxmfMailboxScopeMismatch => {
+            CiParameter::Recipient
+        }
+
         // ── Transmission principle ──────────────────────────────────
         // The serve capability and the per-record restriction are the
         // grant's own terms: not "who may see" but "under what rule
@@ -224,6 +236,30 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         | WithholdReason::ServeCapabilityReadError
         | WithholdReason::ServeCapabilityNotRooted
         | WithholdReason::RecipientCapabilityRestriction => CiParameter::TransmissionPrinciple,
+
+        // CIRISEdge#169 — a propagation node's TERMS OF CARRIAGE. Each of
+        // these is the node's published rule about how a flow may pass
+        // through it, refusing a flow that does not meet it:
+        //   * `LxmfPropagationDisabled` — this node does not carry
+        //     third-party mail at all (the default posture).
+        //   * `LxmfStampBelowCost` — the proof-of-work cost the node
+        //     ANNOUNCES is the price of carriage; an unpaid upload has not
+        //     met the offered rule.
+        //   * `LxmfFrameOversized` / `LxmfMailboxFull` — the size and
+        //     capacity ceilings the node commits to, refusing rather than
+        //     silently growing to accommodate a stranger.
+        //   * `LxmfRetentionExpired` — the bounded-retention promise
+        //     itself: "held, but only this long". This is the parameter
+        //     Nissenbaum describes as retain-with-limits, and it is the
+        //     whole reason edge will not quietly become a mailbox.
+        // None of these is a claim about WHO may receive — an on-roster
+        // recipient whose mail expires was refused by the clock, not by
+        // the audience.
+        WithholdReason::LxmfPropagationDisabled
+        | WithholdReason::LxmfStampBelowCost
+        | WithholdReason::LxmfFrameOversized
+        | WithholdReason::LxmfMailboxFull
+        | WithholdReason::LxmfRetentionExpired => CiParameter::TransmissionPrinciple,
 
         // ── Sender ──────────────────────────────────────────────────
         // Every flow must have a named, rooted, non-quarantined source.
@@ -264,11 +300,32 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
             CiParameter::Sender
         }
 
+        // CIRISEdge#169 — a `/get` on a link whose remote identity edge
+        // could not resolve. Deliberately NOT `Recipient`, though it is a
+        // request to receive: what actually failed is attribution, and
+        // this is the same commitment the E3 unattributed-frame drop
+        // keeps — a frame edge cannot attribute gets no service. Reading
+        // it as a recipient gate would misfile the remedy (identify the
+        // link, not amend the roster).
+        WithholdReason::LxmfRequesterUnidentified => CiParameter::Sender,
+
         // ── Information type ────────────────────────────────────────
         // Persist's classifier says this row is not on the family the
         // gate exists for — a claim about WHAT this is, not who may
         // have it.
         WithholdReason::AccordRelayObjectNotAccord => CiParameter::InformationType,
+
+        // CIRISEdge#169 — "these bytes are not what this endpoint
+        // admits". `LxmfWireUnparseable` is malformed input;
+        // `LxmfPeerSyncUnsupported` is the crate's own distinction —
+        // a well-formed MULTI-message upload is the node-to-node
+        // `/offer` sync form, i.e. a message for an endpoint edge does
+        // not serve (leviculum#209), not a broken one. Two variants
+        // because the operator goes somewhere different for each, one
+        // parameter because both answer WHAT rather than WHO.
+        WithholdReason::LxmfWireUnparseable | WithholdReason::LxmfPeerSyncUnsupported => {
+            CiParameter::InformationType
+        }
 
         // ── Data subject ────────────────────────────────────────────
         // A record edge cannot fetch, serialize or hash cannot have its
@@ -424,7 +481,20 @@ mod tests {
     /// exhaustive match is what actually guarantees totality, so a
     /// reason missing from THIS list weakens the tests, never the
     /// invariant.
-    const ALL_REASONS: [WithholdReason; 30] = [
+    ///
+    /// **It has already drifted once, and the mechanism is worth knowing.**
+    /// Two agents added variants concurrently; the merge auto-resolved
+    /// `contextual_integrity.rs` by taking one side's array, which had been
+    /// written against a base predating the other side's four reasons. The
+    /// enum had 44, this had 40, and it compiled — because a shorter literal
+    /// with a matching length annotation is perfectly valid. `parameter_of`
+    /// stayed exhaustive, so nothing was misattributed; the tests simply
+    /// stopped covering four reasons, silently.
+    ///
+    /// So: when adding a reason, add it here too, and on a merge that touches
+    /// this file check the count against the enum rather than trusting a
+    /// green suite.
+    const ALL_REASONS: [WithholdReason; 44] = [
         WithholdReason::EnvelopeUnfetchable,
         WithholdReason::LocalIdentityMissing,
         WithholdReason::SendSetUnresolved,
@@ -455,5 +525,19 @@ mod tests {
         WithholdReason::HoldingScopePublicGroup,
         WithholdReason::HoldingScopePeerNotInRoster,
         WithholdReason::HoldingScopeProjectionUnsupported,
+        WithholdReason::LxmfPropagationDisabled,
+        WithholdReason::LxmfDestinationNotServed,
+        WithholdReason::LxmfRequesterUnidentified,
+        WithholdReason::LxmfMailboxScopeMismatch,
+        WithholdReason::LxmfStampBelowCost,
+        WithholdReason::LxmfWireUnparseable,
+        WithholdReason::LxmfPeerSyncUnsupported,
+        WithholdReason::LxmfFrameOversized,
+        WithholdReason::LxmfMailboxFull,
+        WithholdReason::LxmfRetentionExpired,
+        WithholdReason::HoldingScopeAuthorityUnresolved,
+        WithholdReason::HoldingScopeDirectoryMissing,
+        WithholdReason::HoldingScopeRecipientSetUnresolved,
+        WithholdReason::HoldingScopeRecipientReadError,
     ];
 }
