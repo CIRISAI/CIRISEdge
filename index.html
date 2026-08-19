@@ -1,7 +1,66 @@
-<!DOCTYPE html>
+<!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>CIRISEdge — benchmarks</title>
-<meta http-equiv="refresh" content="0; url=dev/bench/">
-<link rel="canonical" href="dev/bench/">
-<p>Redirecting to the
-<a href="dev/bench/">CIRISEdge benchmark trend dashboard</a>…</p>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Public faces, invisible rooms — CIRIS Edge</title>
+<meta name="description" content="A network with two planes, one derivation apart: a public directory of accountable identities, and private groups that structurally do not exist to outsiders. Measured, not promised.">
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; font-family: Georgia, 'Times New Roman', serif; line-height: 1.65;
+         background: #faf9f6; color: #1c1b18; }
+  @media (prefers-color-scheme: dark) { body { background: #14130f; color: #e8e6df; } }
+  main { max-width: 42rem; margin: 0 auto; padding: 3.5rem 1.25rem 5rem; }
+  h1 { font-size: 2.1rem; line-height: 1.2; margin: 0 0 .4rem; }
+  .stamp { font-style: italic; opacity: .75; margin: 0 0 2.4rem; }
+  h2 { font-size: 1.3rem; margin: 2.6rem 0 .7rem; }
+  p { margin: 0 0 1.05rem; }
+  em { font-style: italic; }
+  .kicker { letter-spacing: .08em; text-transform: uppercase; font-size: .78rem;
+            font-family: system-ui, sans-serif; opacity: .6; margin-bottom: .6rem; }
+  footer { margin-top: 3.5rem; padding-top: 1.2rem; border-top: 1px solid rgba(128,128,128,.35);
+           font-family: system-ui, sans-serif; font-size: .9rem; }
+  footer a { margin-right: 1.4rem; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+<p class="kicker">CIRIS Edge — the transport of the constitutional mesh</p>
+<h1>Public faces, invisible rooms</h1>
+<p class="stamp">Everything under “What it solves” is running and measured. “What comes next” is not.</p>
+
+<h2>What this is</h2>
+<p>A network with two planes, one derivation apart.</p>
+<p>The <strong>lightnet</strong> is a public directory of accountable identities: named humans, cryptographic keys — hardware-attested where authority demands it — and a quorum trust root. It hides nothing, by design. Every byte that arrives is attributed to a rooted identity before any code acts on it.</p>
+<p>The <strong>darknet</strong> is every private group on the mesh — and it is not a second network. A group’s address, its relay tree, and its delivery plan are pure functions of directory state its members already hold. Nothing is ever announced. There is no address to look up, no descriptor to store, no bootstrap message to intercept, because none of those things is ever said aloud — each member simply computes them.</p>
+<p>No announcement means no emission. No emission means that to an outsider, a relay, or a subpoena, the group does not exist. Encryption hides what a group says. Mixnets hide who it talks to. This hides that it is.</p>
+
+<h2>What it solves</h2>
+<p>Private groups have always forced a three-way trade. You could have <strong>invisibility</strong> — but you paid with out-of-band address exchange and no way to manage the group. You could have <strong>management</strong> — admission, removal, key rotation, accountable moderation — but that required a coordinator or server that had to know the group exists. You could have <strong>efficiency</strong> — logarithmic delivery instead of everyone-sends-to-everyone — but the coordinator came back. Every prior system picked one corner and declared the others out of scope.</p>
+<p>This design holds all three at once, because the shared directory does the work a coordinator used to do. Derivation replaces discovery. Determinism replaces coordination. Members are admitted and removed, keys rotate mid-stream, superseded addresses stop being honored, moderation duties sit with attested humans — and no third party ever learns the group is there.</p>
+<p>It also solves the mesh’s own problem. A coordination network built on accountable identity is, to an adversary, a membership map. This is what makes an accountable network joinable: you are named in public and unfindable in company. Accountable in identity, invisible in association.</p>
+
+<h2>Why nobody built it sooner</h2>
+<p>Because the prerequisite was ideologically off-limits. The whole trick — deriving group reachability instead of announcing it — only works if members already share a trustworthy, accountable directory. Anonymity research spent four decades treating accountable identity as the threat, so it never built the directory the derivation needs. Identity infrastructure built the directories and treated privacy as someone else’s layer. Group messaging standardized the cryptography and formally declared the metadata problem out of scope — RFC 9750 delegates it to exactly the layer that didn’t exist.</p>
+<p>Three fields, each optimizing its own corner, each pricing the composite out. The insight is small and was available to all of them: everything a coordinator would have to say out loud is computable from state the members already hold — <em>if</em> the members hold accountable shared state. Nobody wanted both halves. We did, because the mesh’s safety argument requires accountability and the mesh’s joinability requires invisible association. The tension forced the design.</p>
+<p>The parts are also young. MLS was standardized in 2023. Post-quantum hybrids became cheap to ship even more recently. The window in which this could be built is only a few years old. We built it in that window, and it runs — measured on a real network, by an acceptance harness that fails loudly when a claim doesn’t.</p>
+<p>Concretely: live encrypted video and files delivered across separate machines through a relay that can neither read them nor name the room; members admitted mid-stream; keys rotated without a dropped frame; a retired address verifiably going dark while its successor still answers. Every group size tested, every check green — and a check that doesn’t run counts as a failure, so silence can never look like success.</p>
+
+<h2>What comes next — planned, not shipped</h2>
+<p>The next layer is <strong>confidential credentials</strong>, following the anonymous-credential work emerging around the EU Digital Identity Wallet. Today, proving something about yourself on the light plane means showing who you are. Selective-disclosure credentials let a group’s admission rule check a <em>predicate</em> — over 18, licensed physician, one person one key, resident of a jurisdiction — without learning anything else about the holder, and without the check being linkable across groups.</p>
+<p>That completes the triad. Accountable in identity. Invisible in association. Selective in attributes.</p>
+<p>Two honest notes. The standard is emergent: the EU’s zero-knowledge attestation work is real and moving fast, but the credential profiles are still being piloted, so we integrate against a moving target and label it accordingly — this is a planned capability, staged behind the standard it depends on, and nothing on this page’s shipped list relies on it. And a government wallet is a centralized issuer, which is exactly the kind of chokepoint this mesh exists to route around — so credentials will only ever be an <em>optional</em> admission predicate a group can choose, never a mesh-wide requirement. The mesh must remain joinable by people whose governments issue them nothing.</p>
+
+<h2>What this does not do</h2>
+<p>The identity plane is public on purpose: this is not anonymity for individuals. A link-level observer can still see that one member moved bytes toward another; we claim no multi-hop traffic anonymity, and we name the nearest design that does. Members of a group see the group. What is protected is structural: the group’s existence, its address, its membership, its elections. A classical secret ballot hides the vote. Structural invisibility hides the election.</p>
+
+<footer>
+  <a href="https://github.com/CIRISAI/CIRISEdge">The code (AGPL)</a>
+  <a href="https://github.com/CIRISAI/CIRISEdge/blob/main/docs/LIGHTNET_DARKNET.md">Every claim, with its proof</a>
+  <a href="dev/bench/">Benchmark trends</a>
+  <a href="https://ciris.ai">ciris.ai</a>
+</footer>
+</main>
+</body>
+</html>
