@@ -102,14 +102,13 @@ pub enum ReplicationOutcome {
         refused: usize,
         staleness: StalenessSignal,
     },
-    /// The round is complete for this kind from this side's
-    /// perspective. The other direction's round may still be in
-    /// flight; the caller tracks that independently.
-    RoundComplete { kind: EnvelopeKind },
-    /// The peer sent an unexpected message for the current state
-    /// (e.g. a Deliver before any Diff was exchanged). NOT a fatal
-    /// error — the session resets to idle and the caller can decide
-    /// whether to retry or drop the peer.
+    /// The peer sent a message this session refuses — in practice a message
+    /// whose `kind` mismatches this `(peer, kind)` session (the only refusal
+    /// the `on_*` arms produce), or a `start_round` on a Responder. NOT a
+    /// fatal error, and NOT a state transition: the refusal is
+    /// message-typed — the session's round state is left untouched, and only
+    /// the coordinator resets the session (its auto-reset on round
+    /// Complete). The caller can decide whether to retry or drop the peer.
     UnexpectedMessage,
 }
 
@@ -244,11 +243,23 @@ impl Session {
 
     /// Start a round. Only valid for [`SessionRole::Initiator`] —
     /// responders wait for an inbound Summary via [`Self::on_message`].
+    /// A Responder `start_round` is refused with
+    /// [`ReplicationOutcome::UnexpectedMessage`] (state untouched).
     pub fn start_round(&mut self, provider: &dyn StateProvider) -> ReplicationOutcome {
-        debug_assert!(
-            matches!(self.role, SessionRole::Initiator),
-            "start_round() is initiator-only"
-        );
+        if !matches!(self.role, SessionRole::Initiator) {
+            // Release-safe guard (was a `debug_assert!` that compiled OUT of
+            // release builds, so a mis-scheduled production Responder would
+            // have emitted a bogus Summary-as-initiator instead of refusing).
+            // `UnexpectedMessage` is the existing message-typed refusal the
+            // coordinator already maps to `DriveStep::Refused` and the
+            // scheduler to `RoundEvent::Refused` — the non-fatal shape a
+            // scheduler bug deserves; panicking a production node would not be.
+            tracing::error!(
+                kind = ?self.kind,
+                "start_round() called on a Responder session — refused (initiator-only)"
+            );
+            return ReplicationOutcome::UnexpectedMessage;
+        }
         // CIRISEdge#474 — the accord-quorum-evidence plane has no content-hash
         // index, so its round opens with a CURSOR pull, not a Summary. `since:
         // None` pulls all (bounded by the responder's page limit); the receiver's
@@ -621,10 +632,14 @@ impl Session {
         // does for the content-hash planes.
         let solicited = self.diff_want_count.is_some() || self.awaiting_cursor_deliver;
         if !solicited && !deliver.envelopes.is_empty() {
-            let bootstrap_plane = matches!(
-                self.kind,
-                EnvelopeKind::Key | EnvelopeKind::IdentityOccurrence
-            );
+            // CIRISEdge#402/#406 — the bootstrap classification is the SINGLE
+            // predicate `EnvelopeKind::is_bootstrap` (ALL-pinned in protocol.rs),
+            // never an inline kind list: the local list this replaces had already
+            // drifted (it omitted TransportDestination, so a #927 proactive push
+            // of the peer's own transport binding was mislabeled a WARN-class
+            // unsolicited write). Source-asserted through this call site in
+            // `the_unsolicited_deliver_classification_reads_is_bootstrap`.
+            let bootstrap_plane = self.kind.is_bootstrap();
             if bootstrap_plane {
                 tracing::debug!(
                     kind = ?self.kind,
@@ -1837,5 +1852,66 @@ mod tests {
         let (envelopes, dropped) = responder.pack_bounded_deliver(&[a, b], &provider);
         assert!(dropped.is_empty(), "no unfetchable want → no drop");
         assert_eq!(envelopes.len(), 2, "both fetchable wants pack");
+    }
+
+    /// `start_round` on a Responder is REFUSED release-safe (the old guard was
+    /// a `debug_assert!` that compiled out of release builds): it returns the
+    /// message-typed `UnexpectedMessage`, sends nothing, and leaves the
+    /// session's round state untouched — a mis-scheduled `start_round` must
+    /// not emit a bogus Summary-as-initiator nor complete anything.
+    #[test]
+    fn responder_start_round_is_refused_release_safe() {
+        let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"e1".to_vec(), 1)]);
+        let mut s = Session::new(SessionRole::Responder, EnvelopeKind::Key);
+        assert_eq!(
+            s.start_round(&provider),
+            ReplicationOutcome::UnexpectedMessage,
+            "a Responder never opens a round"
+        );
+        assert!(!s.is_complete(), "the refusal is not a state transition");
+        // The session still services its real job afterwards: an inbound
+        // Summary produces the ordinary {Summary, Diff} responder step.
+        let applier = applier_for(&[]);
+        let out = s.on_message(
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            }),
+            &provider,
+            &applier,
+            None,
+        );
+        assert!(
+            matches!(out, ReplicationOutcome::Send(ref m) if m.len() == 2),
+            "state untouched — the responder round proceeds normally, got {out:?}"
+        );
+    }
+
+    /// The unsolicited-Deliver bootstrap classification reads
+    /// `EnvelopeKind::is_bootstrap` THROUGH THE CALL SITE, never a local
+    /// `matches!` (the family_gates.rs model: a source assertion through the
+    /// call site so re-inlining the predicate reds the build). The inline list
+    /// this locks out had ALREADY drifted once — it omitted
+    /// TransportDestination, mislabeling #927 proactive pushes of the peer's
+    /// own transport binding at WARN. The membership itself is ALL-pinned in
+    /// protocol.rs (`is_bootstrap_is_exactly_the_three_bootstrap_kinds`); this
+    /// pins the WIRING, which log-level-only behavior cannot observe.
+    #[test]
+    fn the_unsolicited_deliver_classification_reads_is_bootstrap() {
+        let src = include_str!("session.rs");
+        let start = src.find("fn on_deliver").expect("on_deliver exists");
+        let end = src[start..]
+            .find("pub fn is_complete")
+            .expect("is_complete follows on_deliver");
+        let body = &src[start..start + end];
+        assert!(
+            body.contains("let bootstrap_plane = self.kind.is_bootstrap();"),
+            "on_deliver must classify via EnvelopeKind::is_bootstrap"
+        );
+        assert!(
+            !body.contains("matches!"),
+            "on_deliver must not re-inline a kind list — the inline matches! \
+             drifted from is_bootstrap once already (TransportDestination)"
+        );
     }
 }
