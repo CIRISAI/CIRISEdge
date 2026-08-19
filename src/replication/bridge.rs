@@ -4191,6 +4191,7 @@ mod tests {
     ///   matching the subject-Pull LIST gate);
     /// - an advertised (federation-scope) row → unaffected for the same peer.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // e2e security scenario: full fixture + both peers + both verdicts
     async fn foreign_self_scope_attestation_is_not_served_by_direct_fetch() {
         let local = "this-node";
         let producer = "other-producer";
