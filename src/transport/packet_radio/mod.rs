@@ -249,6 +249,9 @@ impl Transport for PacketRadioTransport {
                         received_at: Utc::now(),
                         source_key_id: None,
                         link_key_id: None, // CIRISEdge#402 — no advisory-link identity
+                        // CIRISEdge#499 — packet radio has no scope-derived destination
+                        // plane; every frame arrives at the federation address.
+                        arrival_scope: None,
                     };
                     if sink.send(frame).await.is_err() {
                         // Sink closed — listener should exit cleanly.

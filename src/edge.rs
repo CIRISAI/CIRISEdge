@@ -1199,6 +1199,12 @@ pub struct Edge {
     /// `EdgeBindingsError::Unsupported`.
     #[cfg(feature = "_reticulum-module")]
     reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
+    /// CIRISEdge#499 — the scope-address lifecycle, present only when the
+    /// operator opted in via [`EdgeBuilder::scope_native_addressing`] AND a
+    /// Reticulum transport is wired. `None` is the default and is
+    /// byte-identical to pre-#499 behaviour.
+    #[cfg(feature = "_reticulum-module")]
+    scope_lifecycle: Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
     /// CIRISEdge#26 mutation surface (v0.15.1) — optional
     /// concrete-typed `Arc<dyn FederationDirectory>` retained so the
     /// UniFFI peer-mutation surface (`peer_add` / `peer_remove` /
@@ -1297,6 +1303,11 @@ pub struct EdgeBuilder {
     /// pushed into `transports` so listen+send fan-out is unchanged.
     #[cfg(feature = "_reticulum-module")]
     reticulum_transport: Option<Arc<crate::transport::reticulum::ReticulumTransport>>,
+    /// CIRISEdge#499 — the convergence window, when the operator has opted
+    /// into scope-native addressing. `None` (the default) leaves the address
+    /// table uninstalled and every scope-native path declining.
+    #[cfg(feature = "_reticulum-module")]
+    scope_native_convergence: Option<std::time::Duration>,
     /// CIRISEdge#34 (v0.14.0 wiring) — optionally pre-built
     /// reachability tracker so a Reticulum transport constructed BEFORE
     /// Edge (the pyo3 cohabitation init order) can share the same
@@ -1536,6 +1547,8 @@ impl Edge {
             events: None,
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: None,
+            #[cfg(feature = "_reticulum-module")]
+            scope_native_convergence: None,
             reachability: None,
             derived_schema: None,
             canonical_bootstrap_peers: Vec::new(),
@@ -3169,6 +3182,145 @@ impl Edge {
         }
     }
 
+    /// CIRISEdge#499 — fetch a chunk from a holder at the address its
+    /// content's SCOPE requires.
+    ///
+    /// The scope-native sibling of [`Self::fetch_blob_chunk`]. It takes a
+    /// [`BlobRecipient`], which is constructible only by
+    /// [`BlobScopeRouter::route`](crate::blob_swarm::BlobScopeRouter::route):
+    /// holding one is proof that the content's scope was determined and an
+    /// address resolved for it. There is no overload that takes a bare peer id
+    /// and a scope — that would let a caller name a scope the address does not
+    /// match, which is exactly the mistake the newtype exists to make
+    /// unrepresentable.
+    ///
+    /// The correlation half (the pending-map keyed by
+    /// `(blob_sha256, chunk_sha256)`, the timeout, the cleanup on every exit)
+    /// is IDENTICAL to [`Self::fetch_blob_chunk`] and shared with it. Only the
+    /// send differs:
+    ///
+    /// - [`BlobRoute::Federation`] — delegates to the unscoped path verbatim,
+    ///   so public content is byte-identical to pre-#499.
+    /// - `Scoped` — signs the same `BlobChunkFetch` and ships it to the
+    ///   derived destination via
+    ///   [`ReticulumTransport::send_to_scoped_destination`].
+    ///
+    /// # Fail-closed
+    ///
+    /// A scoped route on a node with no Reticulum transport (HTTP-only, or a
+    /// build without the module) is an ERROR, never a downgrade: HTTP has no
+    /// scope-derived destination plane, so serving the request there would put
+    /// the scoped blob back on the federation endpoint and re-collapse the
+    /// context. The caller sees a typed refusal and can pick another holder.
+    ///
+    /// [`BlobRecipient`]: crate::blob_swarm::BlobRecipient
+    /// [`BlobRoute::Federation`]: crate::blob_swarm::scope::BlobRoute::Federation
+    /// [`ReticulumTransport::send_to_scoped_destination`]: crate::transport::reticulum::ReticulumTransport::send_to_scoped_destination
+    ///
+    /// # Errors
+    /// Every error [`Self::fetch_blob_chunk`] returns, plus
+    /// [`EdgeError::Config`] when a scoped route cannot be shipped on this
+    /// node's transports.
+    pub async fn fetch_blob_chunk_scoped(
+        &self,
+        recipient: &crate::blob_swarm::BlobRecipient,
+        blob_sha256: [u8; 32],
+        chunk_sha256: [u8; 32],
+        timeout: std::time::Duration,
+    ) -> Result<ChunkResult, EdgeError> {
+        let Some(address) = recipient.scoped_address() else {
+            // Federation route — the unscoped path, verbatim.
+            return self
+                .fetch_blob_chunk(recipient.peer_key_id(), blob_sha256, chunk_sha256, timeout)
+                .await;
+        };
+
+        let key = (blob_sha256, chunk_sha256);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self
+                .blob_chunk_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.insert(key, tx);
+        }
+
+        let forget = |edge: &Self| {
+            let mut pending = edge
+                .blob_chunk_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.remove(&key);
+        };
+
+        let fetch = crate::messages::BlobChunkFetch {
+            blob_sha256,
+            chunk_sha256,
+            response_hint: None,
+        };
+
+        // Build + sign exactly as the unscoped path does — the ENVELOPE is
+        // unchanged by scope-native addressing, only the address it rides.
+        let envelope_bytes = match self
+            .build_signed_envelope_with_cohort_scope(recipient.peer_key_id(), &fetch, None, None)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                forget(self);
+                return Err(e);
+            }
+        };
+
+        #[cfg(feature = "_reticulum-module")]
+        let sent = match self.reticulum_transport.as_ref() {
+            Some(transport) => transport
+                .send_to_scoped_destination(recipient.peer_key_id(), address, &envelope_bytes)
+                .await
+                .map(|_| ())
+                .map_err(|e| EdgeError::Config(format!("scope-native blob fetch send: {e}"))),
+            None => Err(EdgeError::Config(format!(
+                "scope-native blob fetch: holder '{}' resolved to a scope-derived \
+                 address but this node has no Reticulum transport. HTTP and packet \
+                 radio have no scope-derived destination plane, and shipping this \
+                 request on the federation endpoint would re-collapse the context the \
+                 address exists to separate — refusing (CIRISEdge#499)",
+                recipient.peer_key_id()
+            ))),
+        };
+        #[cfg(not(feature = "_reticulum-module"))]
+        let sent = {
+            // `address` is only dialled on the Reticulum arm; bind it here so
+            // the reticulum-free build does not warn on it. Deliberately NOT
+            // renamed to `_address` at the binding: the name documents what
+            // the resolved value IS on the arm that uses it.
+            let _ = (&envelope_bytes, address);
+            Err::<(), EdgeError>(EdgeError::Config(format!(
+                "scope-native blob fetch: holder '{}' resolved to a scope-derived \
+                 address but this build has no Reticulum module — refusing rather \
+                 than falling back to the federation address (CIRISEdge#499)",
+                recipient.peer_key_id()
+            )))
+        };
+        if let Err(e) = sent {
+            forget(self);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(EdgeError::Config(
+                "fetch_blob_chunk_scoped channel closed before response".into(),
+            )),
+            Err(_) => {
+                forget(self);
+                Err(EdgeError::Config(format!(
+                    "fetch_blob_chunk_scoped timeout after {timeout:?}"
+                )))
+            }
+        }
+    }
+
     /// CIRISEdge#55 — test-only sibling of
     /// [`Self::complete_pending_fetch_for_test`]: inject a fake
     /// `BlobChunkBody` / `BlobChunkMiss` outcome into the pending-chunk
@@ -3278,8 +3430,63 @@ impl Edge {
             self.canonical_peers.clone(),
             self.blob_chunk_source.as_ref(),
             self.swarm_runtime.get().as_ref(),
+            &self.blob_scope_router(),
         )
         .await;
+    }
+
+    /// CIRISEdge#499 — the blob plane's scope-address resolver.
+    ///
+    /// Derived from the Reticulum transport's installed
+    /// [`ScopeAddressTable`](crate::scope_addressing::ScopeAddressTable) rather
+    /// than held as a second copy on `Edge`. That is deliberate: the table is
+    /// also what registers the node's scoped destinations and what resolves
+    /// inbound arrivals, so a second install path would let "which addresses do
+    /// I answer on" and "which addresses do I send to" drift apart — and the
+    /// failure would be silent (an RNS hash nobody registered is simply never
+    /// delivered to). One `OnceLock`, one truth.
+    ///
+    /// Returns a router with no table — i.e. the pre-#499 federation-only
+    /// behaviour — on HTTP-only deployments, on builds without the Reticulum
+    /// module, and on any deployment that has not armed scope-native addressing
+    /// via [`EdgeBuilder::scope_native_addressing`] (the default).
+    /// CIRISEdge#499 — the scope-address lifecycle, when the operator armed it
+    /// with [`EdgeBuilder::scope_native_addressing`].
+    ///
+    /// This is how a host drives the plane: snapshot a group, install it,
+    /// advance it on every epoch change, and seal on a cadence.
+    ///
+    /// ```ignore
+    /// let life = edge.scope_lifecycle().expect("armed");
+    /// let snap = cohort_addressing::snapshot(&community).await?;  // or av_addressing::snapshot(&call)?
+    /// life.install(&scope, &snap)?;
+    /// // …on every epoch change:
+    /// life.advance(&scope, &snapshot(&community).await?, Instant::now())?;
+    /// // …and on a timer:
+    /// life.seal_due(Instant::now());
+    /// ```
+    ///
+    /// `None` when not armed, which is the default.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn scope_lifecycle(&self) -> Option<&Arc<crate::scope_lifecycle::ScopeLifecycle>> {
+        self.scope_lifecycle.as_ref()
+    }
+
+    #[must_use]
+    pub fn blob_scope_router(&self) -> crate::blob_swarm::BlobScopeRouter {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            crate::blob_swarm::BlobScopeRouter::new(
+                self.reticulum_transport
+                    .as_ref()
+                    .and_then(|t| t.scope_address_table().cloned()),
+            )
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            crate::blob_swarm::BlobScopeRouter::default()
+        }
     }
 
     /// CIRISEdge#208 — install a runtime override for the
@@ -3695,7 +3902,6 @@ impl Edge {
     /// [`EdgeBuilder::transport`] path). The Links UniFFI surface
     /// consults this; `None` → `EdgeBindingsError::Unsupported`.
     #[cfg(feature = "_reticulum-module")]
-    #[must_use]
     pub fn reticulum_transport(
         &self,
     ) -> Option<Arc<crate::transport::reticulum::ReticulumTransport>> {
@@ -3919,6 +4125,15 @@ impl Edge {
         // Clone of the `Arc<OnceLock<Arc<FountainSwarmRuntime>>>`; the
         // OnceLock load inside the dispatch is a cheap atomic.
         let swarm_runtime = self.swarm_runtime.clone();
+        // CIRISEdge#499 — the handle the blob scope gate reads its address table
+        // from. Captured as the TRANSPORT, not as a pre-built router, because
+        // `install_scope_address_table` may fire after `run` starts (the MLS
+        // layer installs as soon as the first group is joined): resolving per
+        // frame means a table installed mid-run arms the gate on the next frame,
+        // where a router built once here would stay disarmed until restart.
+        // Cost is an `Arc` clone plus a `OnceLock` load per frame.
+        #[cfg(feature = "_reticulum-module")]
+        let blob_scope_transport = self.reticulum_transport.clone();
         // CIRISEdge#119 v3.5.1 — opt-in replication routing. When the
         // OnceLock has been populated by
         // `Edge::install_replication_routing`, the inbound loop
@@ -3970,6 +4185,14 @@ impl Edge {
                     let delegation_trust_roots_clone = delegation_trust_roots.clone();
                     let blob_chunk_source_clone = blob_chunk_source.clone();
                     let swarm_runtime_clone = swarm_runtime.clone();
+                    #[cfg(feature = "_reticulum-module")]
+                    let blob_scope_router = crate::blob_swarm::BlobScopeRouter::new(
+                        blob_scope_transport
+                            .as_ref()
+                            .and_then(|t| t.scope_address_table().cloned()),
+                    );
+                    #[cfg(not(feature = "_reticulum-module"))]
+                    let blob_scope_router = crate::blob_swarm::BlobScopeRouter::default();
                     tokio::spawn(async move {
                         dispatch_inbound(
                             frame,
@@ -4004,6 +4227,7 @@ impl Edge {
                             delegation_trust_roots_clone,
                             blob_chunk_source_clone.as_ref(),
                             swarm_runtime_clone.get().as_ref(),
+                            &blob_scope_router,
                         ).await;
                     });
                 }
@@ -4218,6 +4442,20 @@ static INBOUND_VERIFY_REJECT_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 fn inbound_unroutable_crpl_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_UNROUTABLE_CRPL_LOG.get_or_init(|| {
         crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+    })
+}
+
+/// CIRISEdge#499 — a `BlobChunkFetch` withheld on scope admission. Keyed on the
+/// refusal's `reason_tag` (a three-value closed set, never attacker-chosen), so
+/// a flood from one gate collapses to a suppressed-count while each DISTINCT
+/// gate still gets a voice. The withhold COUNTER is deliberately unthrottled —
+/// a metric that under-counts is a metric that lies (CIRISEdge#433).
+static BLOB_SCOPE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+fn blob_scope_withheld_log() -> &'static crate::log_throttle::LogThrottle {
+    BLOB_SCOPE_WITHHELD_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(300), 16)
     })
 }
 
@@ -4505,6 +4743,7 @@ fn first_bytes_hex(bytes: &[u8]) -> String {
         delegation_trust_roots,
         blob_chunk_source,
         swarm_runtime,
+        blob_scope_router,
     ),
     fields(
         transport_id = %frame.transport.0,
@@ -4589,9 +4828,19 @@ async fn dispatch_inbound(
     // (verify still runs) but no runtime hook fires — same posture as
     // `blob_chunk_source` for the chunked-blob swarm.
     swarm_runtime: Option<&Arc<crate::swarm::FountainSwarmRuntime>>,
+    // CIRISEdge#499 — the blob plane's scope-address resolver, read from the
+    // transport's installed table so there is exactly ONE source of truth for
+    // "is this node scope-native". Default (no table) leaves the blob serve gate
+    // DISARMED, i.e. byte-identical to pre-#499.
+    blob_scope_router: &crate::blob_swarm::BlobScopeRouter,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
+    // CIRISEdge#499 — the receive-side ADMISSION FACT, resolved by the transport
+    // ahead of any parse (see `InboundFrame::arrival_scope`). Captured here, at
+    // the top, so every serve gate below reads the same value and none of them
+    // can accidentally re-derive it from something the requester said.
+    let arrival_scope = frame.arrival_scope.clone();
     // CIRISEdge#28 (v0.19.0) — count the bytes consumed by the
     // listener side regardless of verify outcome (the wire spent the
     // bytes; observability covers them).
@@ -5005,22 +5254,172 @@ async fn dispatch_inbound(
                 use crate::messages::{
                     BlobChunkBody, BlobChunkMiss as BlobChunkMissBody, MissReason,
                 };
-                let (response_kind, response_envelope_bytes) = match source
-                    .read_chunk(req.blob_sha256, req.chunk_sha256)
-                {
-                    Ok(Some(bytes)) => {
-                        // AV-13 size gate on outbound: refuse to
-                        // emit a chunk that exceeds the ceiling
-                        // (the peer would drop it anyway, but the
-                        // wire surface should never propose an
-                        // oversize body).
-                        if bytes.len() > max_content_body_bytes {
+
+                // CIRISEdge#499 — SCOPE ADMISSION, ahead of the read.
+                //
+                // The requester's entitlement is judged on the address the frame
+                // physically ARRIVED on, never on anything it claimed: an
+                // `arrival_scope` exists only because the destination hash
+                // matched the scope table's reverse index, and those hashes are
+                // derived from the group's MLS `exporter_secret` (RFC 9420 §8.5
+                // binds `(group_id, epoch)`), so holding one IS proof of
+                // group-secret possession. `None` means the federation address,
+                // which proves reachability and nothing more.
+                //
+                // The content's scope comes from the persist-backed consumer
+                // (`chunk_scope`); edge never infers it, and a `None` is
+                // refused rather than read as Public.
+                //
+                // Ordered BEFORE `read_chunk` so an unentitled request never
+                // touches the store — a refusal that still performed the read
+                // would leak timing and burn IO on a peer we will not answer.
+                //
+                // `chunk_scope` is consulted ONLY on a scope-native node. On a
+                // node with no address table the gate admits unconditionally, so
+                // calling it would be a consumer round-trip whose answer cannot
+                // change the outcome — and "byte-identical to pre-#499" has to
+                // mean the responder makes the same calls, not just reaches the
+                // same verdict.
+                let scope_native = blob_scope_router.is_scope_native();
+                let content_scope = if scope_native {
+                    source.chunk_scope(req.blob_sha256)
+                } else {
+                    None
+                };
+                let admission = crate::blob_swarm::admit_blob_serve(
+                    scope_native,
+                    arrival_scope.as_ref(),
+                    content_scope.as_ref(),
+                );
+                let scope_refusal = match admission {
+                    crate::blob_swarm::ServeAdmission::Admit => None,
+                    // Never a bare `continue` (CIRISEdge#425): the refusal is
+                    // BOOKED unthrottled (a metric that under-counts is a metric
+                    // that lies) and SPOKEN under the shared serve throttle, then
+                    // answered with a typed miss so the fetcher fails over to
+                    // another holder instead of hanging.
+                    crate::blob_swarm::ServeAdmission::Refuse(reason) => {
+                        metrics.inc_withhold(
+                            reason.withhold_reason(),
+                            &envelope.signing_key_id,
+                            reason.reason_tag(),
+                        );
+                        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                            blob_scope_withheld_log().check(reason.reason_tag())
+                        {
                             tracing::warn!(
-                                transport = ?transport,
-                                chunk_size = bytes.len(),
-                                max = max_content_body_bytes,
-                                "BlobChunkFetch responder: chunk exceeds AV-13 ceiling, replying NotHeld",
+                                event = "edge.blob_chunk_fetch.scope_withheld",
+                                peer_key_id = %envelope.signing_key_id,
+                                blob_sha256 = %hex::encode(&req.blob_sha256[..8]),
+                                reason = reason.reason_tag(),
+                                arrival_scope = arrival_scope
+                                    .as_ref()
+                                    .map_or("federation", |a| a.group().scope().kind_token()),
+                                suppressed_prev,
+                                "BlobChunkFetch WITHHELD on scope admission — {reason} \
+                                 (CIRISEdge#499)",
                             );
+                        }
+                        Some(reason)
+                    }
+                };
+
+                let (response_kind, response_envelope_bytes) = if scope_refusal.is_some() {
+                    // A scope refusal is a POLICY denial on the wire: the bytes
+                    // are not gone federation-wide, this node simply will not
+                    // serve them to this requester, so the scheduler's
+                    // `PolicyDenied` reaction (demote this responder, retry
+                    // elsewhere) is exactly right. The precise branch stays
+                    // LOCAL, in the withhold ledger — the wire reason must not
+                    // tell an unentitled peer which gate it failed.
+                    let miss = BlobChunkMissBody {
+                        blob_sha256: req.blob_sha256,
+                        chunk_sha256: req.chunk_sha256,
+                        reason: MissReason::PolicyDenied,
+                    };
+                    match build_chunk_response_envelope(
+                        MessageType::BlobChunkMiss,
+                        &envelope.signing_key_id,
+                        signer,
+                        &miss,
+                        body_sha256,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "BlobChunkFetch responder: failed to build scope-refusal envelope",
+                            );
+                            (MessageType::BlobChunkMiss, None)
+                        }
+                    }
+                } else {
+                    match source.read_chunk(req.blob_sha256, req.chunk_sha256) {
+                        Ok(Some(bytes)) => {
+                            // AV-13 size gate on outbound: refuse to
+                            // emit a chunk that exceeds the ceiling
+                            // (the peer would drop it anyway, but the
+                            // wire surface should never propose an
+                            // oversize body).
+                            if bytes.len() > max_content_body_bytes {
+                                tracing::warn!(
+                                    transport = ?transport,
+                                    chunk_size = bytes.len(),
+                                    max = max_content_body_bytes,
+                                    "BlobChunkFetch responder: chunk exceeds AV-13 ceiling, replying NotHeld",
+                                );
+                                let miss = BlobChunkMissBody {
+                                    blob_sha256: req.blob_sha256,
+                                    chunk_sha256: req.chunk_sha256,
+                                    reason: MissReason::NotHeld,
+                                };
+                                match build_chunk_response_envelope(
+                                    MessageType::BlobChunkMiss,
+                                    &envelope.signing_key_id,
+                                    signer,
+                                    &miss,
+                                    body_sha256,
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "BlobChunkFetch responder: failed to build miss envelope",
+                                        );
+                                        (MessageType::BlobChunkMiss, None)
+                                    }
+                                }
+                            } else {
+                                let body = BlobChunkBody {
+                                    blob_sha256: req.blob_sha256,
+                                    chunk_sha256: req.chunk_sha256,
+                                    bytes,
+                                };
+                                match build_chunk_response_envelope(
+                                    MessageType::BlobChunkBody,
+                                    &envelope.signing_key_id,
+                                    signer,
+                                    &body,
+                                    body_sha256,
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => (MessageType::BlobChunkBody, Some(bytes)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "BlobChunkFetch responder: failed to build body envelope",
+                                        );
+                                        (MessageType::BlobChunkBody, None)
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
                             let miss = BlobChunkMissBody {
                                 blob_sha256: req.blob_sha256,
                                 chunk_sha256: req.chunk_sha256,
@@ -5044,79 +5443,30 @@ async fn dispatch_inbound(
                                     (MessageType::BlobChunkMiss, None)
                                 }
                             }
-                        } else {
-                            let body = BlobChunkBody {
+                        }
+                        Err(refusal) => {
+                            let miss = BlobChunkMissBody {
                                 blob_sha256: req.blob_sha256,
                                 chunk_sha256: req.chunk_sha256,
-                                bytes,
+                                reason: refusal.to_miss_reason(),
                             };
                             match build_chunk_response_envelope(
-                                MessageType::BlobChunkBody,
+                                MessageType::BlobChunkMiss,
                                 &envelope.signing_key_id,
                                 signer,
-                                &body,
+                                &miss,
                                 body_sha256,
                             )
                             .await
                             {
-                                Ok(bytes) => (MessageType::BlobChunkBody, Some(bytes)),
+                                Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
                                 Err(e) => {
                                     tracing::warn!(
                                         error = %e,
-                                        "BlobChunkFetch responder: failed to build body envelope",
+                                        "BlobChunkFetch responder: failed to build refusal envelope",
                                     );
-                                    (MessageType::BlobChunkBody, None)
+                                    (MessageType::BlobChunkMiss, None)
                                 }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        let miss = BlobChunkMissBody {
-                            blob_sha256: req.blob_sha256,
-                            chunk_sha256: req.chunk_sha256,
-                            reason: MissReason::NotHeld,
-                        };
-                        match build_chunk_response_envelope(
-                            MessageType::BlobChunkMiss,
-                            &envelope.signing_key_id,
-                            signer,
-                            &miss,
-                            body_sha256,
-                        )
-                        .await
-                        {
-                            Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "BlobChunkFetch responder: failed to build miss envelope",
-                                );
-                                (MessageType::BlobChunkMiss, None)
-                            }
-                        }
-                    }
-                    Err(refusal) => {
-                        let miss = BlobChunkMissBody {
-                            blob_sha256: req.blob_sha256,
-                            chunk_sha256: req.chunk_sha256,
-                            reason: refusal.to_miss_reason(),
-                        };
-                        match build_chunk_response_envelope(
-                            MessageType::BlobChunkMiss,
-                            &envelope.signing_key_id,
-                            signer,
-                            &miss,
-                            body_sha256,
-                        )
-                        .await
-                        {
-                            Ok(bytes) => (MessageType::BlobChunkMiss, Some(bytes)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "BlobChunkFetch responder: failed to build refusal envelope",
-                                );
-                                (MessageType::BlobChunkMiss, None)
                             }
                         }
                     }
@@ -5848,6 +6198,66 @@ async fn dispatch_inbound(
 // ─── Builder ────────────────────────────────────────────────────────
 
 impl EdgeBuilder {
+    /// CIRISEdge#499 — arm scope-native addressing, if the operator asked.
+    ///
+    /// Extracted from [`Self::build`] so the arming reads as one decision
+    /// rather than as a block inside a 130-line constructor.
+    ///
+    /// OPT-IN, and deliberately so. Scoped addressing is ONE HOP by
+    /// constitutional ruling (CIRISConstitution#91: CC 5.4.6 binds the
+    /// emission, so a scope-derived destination can never announce and no
+    /// transport node ever learns a path to it). Enabling it is a real
+    /// operator trade — unlinkable per-context addressing in exchange for
+    /// direct-link-only reach on scoped content — and a trade like that is
+    /// chosen, never inherited from a default.
+    ///
+    /// Installing the table ARMS every scope-native path at once: the
+    /// transport's `inbound_scope`, the blob router and serve gate, and the
+    /// swarm holdings gate all read their arming from this one handle, so
+    /// "which addresses I answer on" and "which I send to" cannot drift.
+    #[cfg(feature = "_reticulum-module")]
+    fn arm_scope_native(
+        convergence: Option<std::time::Duration>,
+        transport: Option<&Arc<crate::transport::reticulum::ReticulumTransport>>,
+        own_key_id: &str,
+    ) -> Result<Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>, EdgeError> {
+        match (convergence, transport) {
+            (Some(convergence), Some(transport)) => {
+                let table = Arc::new(crate::scope_addressing::ScopeAddressTable::new(Arc::new(
+                    crate::scope_addressing::ScopePrivacyDeriver,
+                )));
+                // The transport owns the table (one source of truth) and is
+                // also the lifecycle's sink, so a registration and its table
+                // entry are made by the same object.
+                transport
+                    .install_scope_address_table(Arc::clone(&table))
+                    .map_err(|e| EdgeError::Config(format!("scope address table: {e}")))?;
+                tracing::info!(
+                    convergence_secs = convergence.as_secs(),
+                    "CIRISEdge#499 — scope-native addressing ARMED. Scoped destinations \
+                     are one-hop by CC 5.4.6 (CIRISConstitution#91): they never announce, \
+                     so scoped content reaches directly-attached peers only."
+                );
+                Ok(Some(Arc::new(crate::scope_lifecycle::ScopeLifecycle::new(
+                    table,
+                    Arc::clone(transport) as Arc<dyn crate::scope_lifecycle::ScopedDestinationSink>,
+                    own_key_id.to_owned(),
+                    convergence,
+                ))))
+            }
+            // Asked for, but no Reticulum transport to register on. Refused
+            // rather than silently ignored: a host that opted in and got the
+            // pre-#499 behaviour anyway would believe it had unlinkable
+            // addressing that it does not have.
+            (Some(_), None) => Err(EdgeError::Config(
+                "scope_native_addressing requires a Reticulum transport — the address \
+                 table has nowhere to register scoped destinations without one"
+                    .into(),
+            )),
+            (None, _) => Ok(None),
+        }
+    }
+
     /// Sovereign-mode convenience: load steward identity from
     /// filesystem seeds via `ciris-keyring`, open persist's
     /// SQLite-backed federation directory + edge outbound queue at
@@ -5970,6 +6380,55 @@ impl EdgeBuilder {
     /// additive variant. The typed handle is OPTIONAL — `link_open`
     /// returns `EdgeBindingsError::Unsupported` when no Reticulum
     /// transport is registered.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    /// CIRISEdge#499 — **arm scope-native addressing** with `convergence` as
+    /// the rotation window.
+    ///
+    /// Off by default. Calling this installs a [`ScopeAddressTable`] on the
+    /// Reticulum transport, which arms every scope-native path at once: the
+    /// transport's inbound admission, the blob router and serve gate, and the
+    /// swarm holdings gate all read their arming from that one handle, so
+    /// "which addresses I answer on" and "which I send to" cannot drift.
+    ///
+    /// # What one hop actually costs, which depends on the other flag
+    ///
+    /// Scoped destinations are **one hop**: CC 5.4.6 binds the *emission*
+    /// (ruled at CIRISConstitution#91), so a scope-derived destination never
+    /// announces and no transport node learns a path to it.
+    ///
+    /// Whether that is a cost at all depends on
+    /// [`ReticulumTransportConfig::federation_visible`] — the wizard's
+    /// *"allow me to be visible to the federation so I can use the mesh"*
+    /// question, which is the opt-in that actually decides this node's reach:
+    ///
+    /// - **Not federation-visible.** The node is point-to-point anyway. Scoped
+    ///   addressing costs it **nothing it had**, and gives it an unlinkable
+    ///   address per context instead of one `sha256(fed_pubkey)[..16]`
+    ///   everywhere. There is no trade here, only a gain.
+    /// - **Federation-visible.** The node has mesh reach on the federation
+    ///   plane, and arming this moves *scoped* flows off that plane onto
+    ///   one-hop delivery. That is the real trade, and it is why this stays a
+    ///   separate decision rather than riding the visibility flag.
+    ///
+    /// So this is opt-in because the second case exists, not because
+    /// unlinkable addressing is exotic.
+    ///
+    /// `convergence` is how long a superseded epoch stays reachable after a
+    /// rotation — see [`DEFAULT_CONVERGENCE_WINDOW`]. Seal earlier and a peer
+    /// that has not re-keyed is cut off; later and a rotated-away address stays
+    /// live longer.
+    ///
+    /// After building, drive it through [`Edge::scope_lifecycle`].
+    ///
+    /// [`ScopeAddressTable`]: crate::scope_addressing::ScopeAddressTable
+    /// [`DEFAULT_CONVERGENCE_WINDOW`]: crate::scope_lifecycle::DEFAULT_CONVERGENCE_WINDOW
+    #[cfg(feature = "_reticulum-module")]
+    pub fn scope_native_addressing(mut self, convergence: std::time::Duration) -> Self {
+        self.scope_native_convergence = Some(convergence);
+        self
+    }
+
     #[cfg(feature = "_reticulum-module")]
     #[must_use]
     pub fn reticulum_transport(
@@ -6130,6 +6589,12 @@ impl EdgeBuilder {
         self
     }
 
+    // `build` wires ~30 subsystems into one value; the 100-line threshold is
+    // arbitrary for a constructor of that shape, and splitting it would spread
+    // one wiring decision across several functions. The allow sits DIRECTLY on
+    // the fn so nothing can be inserted between it and its target — a
+    // displacement this file has already produced twice today.
+    #[allow(clippy::too_many_lines)]
     pub fn build(self) -> Result<Edge, EdgeError> {
         let directory = self
             .directory
@@ -6210,6 +6675,13 @@ impl EdgeBuilder {
         // gracefully under the same back-pressure regime.
         let (verified_envelope_tx, _) =
             broadcast::channel(self.config.event_channel_capacity.max(1));
+        #[cfg(feature = "_reticulum-module")]
+        let scope_lifecycle = Self::arm_scope_native(
+            self.scope_native_convergence,
+            self.reticulum_transport.as_ref(),
+            &signer.key_id,
+        )?;
+
         let content_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // CIRISEdge#55 — sibling pending-map for chunk fetches.
         let blob_chunk_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -6270,6 +6742,8 @@ impl EdgeBuilder {
             reachability,
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: self.reticulum_transport,
+            #[cfg(feature = "_reticulum-module")]
+            scope_lifecycle,
             federation_directory: self.federation_directory,
             detector,
             canonical_peers,
@@ -6716,17 +7190,36 @@ async fn emit_delivery_attestation(
         .map_err(|e| EdgeError::Persist(format!("attestation classical sign: {e}")))?;
     att.signature_classical_base64 = encode_signature_base64(&ed25519_sig);
 
-    // Optional PQC ML-DSA-65 over `canonical || classical_sig` per
-    // persist's AV-33 bound-signature convention (FSD §3.2.1).
-    if let Some(pqc) = signer.pqc.as_ref() {
-        let mut bound = canonical.clone();
-        bound.extend_from_slice(&ed25519_sig);
-        let pqc_sig = pqc
-            .sign(&bound)
-            .await
-            .map_err(|e| EdgeError::Persist(format!("attestation pqc sign: {e}")))?;
-        att.signature_pqc_base64 = Some(encode_signature_base64(&pqc_sig));
-    }
+    // MANDATORY PQC ML-DSA-65 over `canonical || classical_sig`, per persist's
+    // AV-33 bound-signature convention (FSD §3.2.1).
+    //
+    // This was `if let Some(pqc)` — optional — and that made edge a producer of
+    // hybrid-pending rows whenever its signer happened to be classical-only.
+    // Persist rejects those at admission under the Strict policy, so the defect
+    // surfaced as a REMOTE failure at the far end of an emit, with nothing
+    // local naming the cause.
+    //
+    // Refused HERE instead, and refused rather than degraded: no classical-only
+    // path may exist, not merely be superseded. A node that cannot sign hybrid
+    // must not emit an attestation at all — emitting one it knows will be
+    // rejected is a delivery gap dressed as an emission, and FSD §3.2's
+    // "missing-attestation-as-delivery-gap" is observable at the steward end
+    // EITHER WAY. Better the gap be loud and local than silent and remote.
+    let Some(pqc) = signer.pqc.as_ref() else {
+        return Err(EdgeError::Config(format!(
+            "delivery attestation for {} requires a PQC signer: persist's Strict \
+             policy rejects hybrid-pending rows, so emitting one would fail at \
+             admission with nothing local naming the cause (CIRISEdge#458)",
+            signer.key_id
+        )));
+    };
+    let mut bound = canonical.clone();
+    bound.extend_from_slice(&ed25519_sig);
+    let pqc_sig = pqc
+        .sign(&bound)
+        .await
+        .map_err(|e| EdgeError::Persist(format!("attestation pqc sign: {e}")))?;
+    att.signature_pqc_base64 = Some(encode_signature_base64(&pqc_sig));
 
     // Wrap in a typed envelope. Destination is the **original
     // announcement sender** (envelope.signing_key_id) — the federation
@@ -7866,6 +8359,7 @@ mod inbound_ingest_tests {
             received_at: chrono::Utc::now(),
             source_key_id: source.map(crate::transport::SourceKeyId::transport_authenticated),
             link_key_id: None,
+            arrival_scope: None,
         }
     }
 
@@ -7934,6 +8428,7 @@ mod inbound_ingest_tests {
             received_at: chrono::Utc::now(),
             source_key_id: None,
             link_key_id: link.map(str::to_string),
+            arrival_scope: None,
         };
 
         // (a) Key + link → admitted on the link's transport identity.
@@ -7982,6 +8477,7 @@ mod inbound_ingest_tests {
             received_at: chrono::Utc::now(),
             source_key_id: None,
             link_key_id: Some("fresh-peer".into()),
+            arrival_scope: None,
         };
         assert!(
             bootstrap_carve_out_source(&junk).is_none(),
@@ -8012,6 +8508,7 @@ mod inbound_ingest_tests {
                 received_at: chrono::Utc::now(),
                 source_key_id: None,
                 link_key_id: link.clone(),
+                arrival_scope: None,
             };
             // Some(link) exactly when kind is a bootstrap kind AND a link exists.
             let expected = link.filter(|_| kind.is_bootstrap());
@@ -8227,5 +8724,81 @@ mod baked_genesis_tests {
     #[test]
     fn default_config_enables_baked_genesis() {
         assert!(EdgeConfig::default().baked_canonical_genesis_enabled);
+    }
+}
+
+/// CIRISEdge#499 — the install path: arming, refusing, and staying off.
+///
+/// These build a real `Edge` rather than asserting on the builder, because
+/// the property that matters is that arming ACTUALLY INSTALLS the table —
+/// the single handle every scope-native path reads its arming from. A test
+/// that only checked the flag would pass with the install deleted.
+#[cfg(all(test, feature = "_reticulum-module"))]
+mod scope_native_install_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn builder(dir: &std::path::Path, key_id: &str) -> EdgeBuilder {
+        // `from_keyring_seed_dir` READS a seed; it does not mint one.
+        let seeds = dir.join("seeds");
+        std::fs::create_dir_all(&seeds).expect("seed dir");
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = u8::try_from(i).expect("in range") ^ 0x5a;
+        }
+        std::fs::write(seeds.join("ed25519.seed"), seed).expect("write seed");
+
+        EdgeBuilder::from_keyring_seed_dir(key_id, seeds, dir.join("edge.sqlite"))
+            .await
+            .expect("builder")
+    }
+
+    #[tokio::test]
+    async fn off_by_default_leaves_every_scope_native_path_declining() {
+        // The pre-#499 posture, and the one an existing deployment inherits
+        // by upgrading. Arming is an operator decision because scoped
+        // addressing is ONE HOP by CC 5.4.6 (CIRISConstitution#91) — a
+        // deployment must not acquire direct-link-only reach silently.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let edge = builder(tmp.path(), "edge-default")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .build()
+            .expect("build");
+
+        assert!(
+            edge.scope_lifecycle().is_none(),
+            "scope-native addressing must be OFF unless asked for",
+        );
+        assert!(
+            !edge.blob_scope_router().is_scope_native(),
+            "the blob router must stay federation-only when unarmed",
+        );
+    }
+
+    #[tokio::test]
+    async fn arming_without_a_transport_is_refused_not_silently_ignored() {
+        // THE safety property of this seam. A host that asked for unlinkable
+        // addressing and got the federation-only path anyway would believe it
+        // had a guarantee it does not have — the worst failure available here,
+        // because it is invisible and it is a privacy claim.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A transport IS configured — just not a Reticulum one. This is the
+        // dangerous shape: a host with working delivery that believes it also
+        // has unlinkable addressing.
+        let Err(err) = builder(tmp.path(), "edge-no-transport")
+            .await
+            .transport(Arc::new(crate::transport::NullTransport))
+            .scope_native_addressing(Duration::from_secs(300))
+            .build()
+        else {
+            panic!("arming without a Reticulum transport must be refused");
+        };
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scope_native_addressing") && msg.contains("Reticulum transport"),
+            "the refusal must name what is missing and why, got: {msg}",
+        );
     }
 }

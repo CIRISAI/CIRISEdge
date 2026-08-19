@@ -85,6 +85,18 @@ pub mod realtime_av_dispatcher;
 /// behind `_reticulum-module` (their only leviculum dependency).
 pub mod realtime_av_runtime;
 
+/// The A/V spine (CIRISEdge#499) — the integrating runtime that drives
+/// ONE call from join to media to heal. Owns the publisher, the relay
+/// and the scope-address lifecycle *together*, so an MLS epoch can never
+/// move without the scoped addresses that epoch derives: the gap that
+/// silently stranded peers (an RNS destination nobody registered is
+/// never delivered to, with no error anywhere). Also the only thing that
+/// drives [`crate::scope_lifecycle::ScopeLifecycle::seal_due`] on a
+/// cadence. Gated alongside the rest of the Reticulum surface because it
+/// owns a [`realtime_av_relay::RelayNode`].
+#[cfg(feature = "_reticulum-module")]
+pub mod av_spine;
+
 /// Application-Layer Multicast (ALM) — mesh-tree video built on the
 /// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
 /// CIRISEdge#128 MDC). Pure-Rust, signed [`realtime_av_alm::RelayCapacity`]
@@ -156,6 +168,17 @@ pub mod store_and_forward;
 /// with the feature off, edge behaves byte-identically to today.
 #[cfg(feature = "lxmf")]
 pub mod lxmf_propagation;
+
+/// CIRISEdge#169 — the LXMF propagation **host serve path**: this node
+/// acting as a propagation node for others, with a rostered audience, a
+/// recipient-scoped mailbox and a bounded retention window.
+///
+/// Gated on `all(_reticulum-module, lxmf)` because it exists to be driven
+/// from edge's one Reticulum event loop; a build with `lxmf` alone gets the
+/// transport-agnostic codecs in [`lxmf_propagation`] and no serve path.
+/// With either feature off, edge behaves byte-identically to today.
+#[cfg(all(feature = "_reticulum-module", feature = "lxmf"))]
+pub mod lxmf_serve;
 
 // Remaining implementations land in subsequent commits; trait shape
 // sealed Phase 1.
@@ -419,6 +442,30 @@ pub struct InboundFrame {
     /// for transports that don't carry an advisory-link identity (HTTP, packet
     /// radio, FFI — those attribute via `source_key_id` or not at all).
     pub link_key_id: Option<String>,
+    /// CIRISEdge#499 — the SCOPE-DERIVED address this frame arrived on, resolved
+    /// by the transport against its installed
+    /// [`ScopeAddressTable`](crate::scope_addressing::ScopeAddressTable).
+    ///
+    /// A `Some` here is a **cryptographic admission fact, not a hint**: the only
+    /// way this field is populated is that the frame's destination hash matched
+    /// the table's reverse index, and those hashes are derived from the group's
+    /// MLS `exporter_secret`, which binds `(group_id, epoch)` per RFC 9420 §8.5.
+    /// So arrival on one proves the sender possessed that group secret. There is
+    /// no public constructor for
+    /// [`InboundAddress`](crate::scope_addressing::InboundAddress), so this field
+    /// cannot carry a forged claim — unlike [`Self::link_key_id`], which is
+    /// deliberately a bare `String` routing hint.
+    ///
+    /// `None` means the frame arrived on the node's FEDERATION address (or on a
+    /// transport with no scope table, or with none installed — the production
+    /// state until the MLS exporter label is specified upstream). `None` is
+    /// therefore read as `CohortScope::Public` by the serve gates: reaching a
+    /// public discovery address proves reachability and nothing more.
+    ///
+    /// Resolved ONCE, at the transport, ahead of any envelope parse — which is
+    /// what lets [`admit_blob_serve`](crate::blob_swarm::admit_blob_serve) gate a
+    /// chunk request before its body is deserialized rather than after.
+    pub arrival_scope: Option<crate::scope_addressing::InboundAddress>,
 }
 
 /// The trait every transport implements. Edge holds a

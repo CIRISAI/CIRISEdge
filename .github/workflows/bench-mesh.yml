@@ -1,0 +1,151 @@
+name: Bench Mesh
+
+# The multi-container mesh harness (`bench-mesh/`). Separate containers,
+# each a distinct edge occurrence with its own identity and keystore,
+# pushing real encoded video and a real blob in fan-out across a real
+# docker network.
+#
+# This answers the question `benches/` cannot: not "what does the
+# substrate cost per operation" but "does a real edge occurrence deliver
+# real video to N peers across a network through relays while the roster
+# changes". `benches/` stays exactly as it is — it feeds the
+# deterministic instruction-count gate (CIRISEdge#461), which is the
+# cheap per-operation alarm.
+#
+# ── COST ────────────────────────────────────────────────────────────
+#
+# `workflow_dispatch` + weekly ONLY. NEVER per-PR, and NEVER on push.
+# One run builds a full release image of the crate (openmls + libcrux +
+# leviculum + persist from git) and stands up eight containers. The repo
+# has a documented runner budget; `bench.yml` guards cost the same way
+# and this is strictly heavier. If you are tempted to add a `pull_request`
+# trigger here, add an instruction-count bench instead.
+#
+# ── HONESTY ─────────────────────────────────────────────────────────
+#
+# The job's verdict comes from the harness's own JSONL, parsed by
+# `bench-mesh/run.sh`, which fails the run when ANY leg reports
+# `ran: false`. A skipped leg is a failed run, not a green one. The job
+# does not infer success from a zero exit code alone — it uploads the
+# JSONL and prints the leg census either way.
+
+on:
+  schedule:
+    # Monday 08:00 UTC — after bench.yml's 06:00, so the cheap
+    # per-operation trend lands before the expensive mesh run.
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      relays:
+        description: 'Number of relay hops (K)'
+        required: false
+        default: '1'
+      subscribers:
+        description: 'Number of subscribers (M)'
+        required: false
+        default: '2'
+      frames:
+        description: 'Frames to publish'
+        required: false
+        default: '120'
+      sweep:
+        description: 'Sweep M in {1,2,4} for the fan-out curve'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-mesh-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mesh:
+    name: mesh harness (K=${{ inputs.relays || 1 }}, M=${{ inputs.subscribers || 2 }})
+    runs-on: ubuntu-latest
+    # A stuck barrier must not burn an hour of runner budget. Every
+    # barrier inside the harness is bounded too; this is the backstop.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker preflight
+        # If docker is unavailable the job says so and fails. It does not
+        # fall back to something cheaper and report that as a mesh run.
+        run: |
+          docker version
+          docker compose version
+
+      - name: Run the mesh
+        id: mesh
+        working-directory: bench-mesh
+        env:
+          MESH_FRAMES: ${{ inputs.frames || '120' }}
+        run: |
+          set -o pipefail
+          if [ "${{ inputs.sweep }}" = "true" ]; then
+            ./run.sh --sweep --relays "${{ inputs.relays || 1 }}" --frames "${MESH_FRAMES}"
+          else
+            ./run.sh \
+              --relays "${{ inputs.relays || 1 }}" \
+              --subs   "${{ inputs.subscribers || 2 }}" \
+              --frames "${MESH_FRAMES}"
+          fi
+
+      - name: Leg census
+        # Runs even when the harness failed — the census is the point.
+        if: always()
+        working-directory: bench-mesh
+        run: |
+          shopt -s nullglob
+          files=(results/*.jsonl)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "NO RESULTS FILES — the harness measured nothing." >&2
+            exit 1
+          fi
+          python3 - "${files[@]}" <<'PY'
+          import json, sys
+          total = ran = ok = 0
+          for path in sys.argv[1:]:
+              print(f"── {path}")
+              for line in open(path):
+                  line = line.strip()
+                  if not line.startswith('{'):
+                      continue
+                  leg = json.loads(line)
+                  total += 1
+                  if leg.get("ran"):
+                      ran += 1
+                      if leg.get("ok") is True:
+                          ok += 1
+                      else:
+                          print(f"  FAILED      {leg['node']}/{leg['leg']}")
+                  else:
+                      print(f"  DID NOT RUN {leg['node']}/{leg['leg']}: {leg.get('not_run_reason')}")
+          print(f"── legs={total} ran={ran} passed={ok}")
+          PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-mesh-results
+          path: bench-mesh/results/*.jsonl
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Container logs on failure
+        if: failure()
+        working-directory: bench-mesh
+        run: |
+          docker compose -f compose.yaml \
+            --profile relays2 --profile subs2 --profile subs4 \
+            logs --no-color --tail 400 || true
+
+      - name: Tear down
+        if: always()
+        working-directory: bench-mesh
+        run: ./run.sh --clean || true

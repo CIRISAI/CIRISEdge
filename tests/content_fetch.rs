@@ -193,6 +193,8 @@ impl Transport for InjectTransport {
                 received_at: chrono::Utc::now(),
                 source_key_id: None,
                 link_key_id: None,
+                // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+                arrival_scope: None,
             };
             if sink.send(frame).await.is_err() {
                 break;

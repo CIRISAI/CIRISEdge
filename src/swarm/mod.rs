@@ -52,9 +52,21 @@
 //!
 //! See [`runtime`] for the live runtime + scheduler.
 
+//! ## v17.11.0 scope-native holdings (CIRISEdge#499)
+//!
+//! The publisher above used to broadcast every held `content_id` *and its
+//! `symbol_ids`* to every peer the cohort callback returned, with no
+//! entitlement filter at all. [`scope`] adds one: the host declares each
+//! content's scope, persist's `projection_for(Plane::FountainContent, …)`
+//! decides the audience KIND, and the node's scope-address table resolves
+//! whether a given peer is in that audience. Armed only where a
+//! `ScopeAddressTable` is installed — a deployment without one publishes
+//! byte-identically to before.
+
 pub mod diversity;
 pub mod persist_fountain_evict;
 pub mod runtime;
+pub mod scope;
 
 pub use diversity::{
     diversity_contribution, diversity_scores_for, NullRttObserver, PeerRttObserver,
@@ -68,3 +80,7 @@ pub use runtime::{
     FountainSwarmRuntime, ObservedClaim, SwarmEvent, SwarmRuntimeConfig, SwarmRuntimeEventSink,
     SwarmRuntimeOptions,
 };
+// `HOLDING_AUTHORITY` is GONE as of v37.1.0 (CIRISPersist#744): the
+// hard-coded `ProducerSteward` was the under-advertisement defect, and the
+// authority is now resolved per publisher by persist's `holdings_authority`.
+pub use scope::{HoldingAnnounce, HoldingRefusal, HoldingsPublishGate, HoldingsScopeGate};

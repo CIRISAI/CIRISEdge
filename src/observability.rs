@@ -336,6 +336,213 @@ pub enum WithholdReason {
     /// says *"we never ran the check"*, which is a wiring/timing fact, not a
     /// statement about the signer or the root.
     AccordRelayUnresolved,
+    /// CIRISPersist#731 — the wire value is not an
+    /// [`Attestation`](ciris_persist::federation::Attestation) at all: it does
+    /// not deserialize into persist's row type, so there is no row to hand the
+    /// relay verb and nothing to ask. Withheld — LOUD and named, never a silent
+    /// `continue` (CIRISEdge#425/#433). A producer/serialization fault, not a
+    /// trust statement.
+    AccordRelayObjectUnreadable,
+    /// CIRISPersist#733 — the row deserialized, but its signed
+    /// [`RowMirror`](ciris_persist::federation::envelope::RowMirror) is ABSENT
+    /// (a pre-#643 unstamped row) or DIVERGES from the typed columns, so the
+    /// columns assert nothing: persist's
+    /// [`check_row_column_binding`](ciris_persist::federation::admission::check_row_column_binding)
+    /// refuses it and its own relay verb treats that as *"I cannot judge"*.
+    ///
+    /// Never folded into [`Self::AccordRelayObjectUnreadable`]: a DIVERGENCE is a
+    /// security event (a relay rewriting a signed row's identity, verb, signer or
+    /// subject while the signature still verifies — CIRISPersist#643's whole
+    /// class), while a missing mirror is a producer-vintage problem. Different
+    /// findings, different remedies.
+    AccordRelayMirrorUnbound,
+    /// CIRISPersist#733 — persist's own classifier says the row is not on the
+    /// `accord:*` family at all
+    /// ([`AccordRootClaim::NotAccord`](ciris_persist::federation::trust_root::AccordRootClaim)),
+    /// so it "is not this predicate's to judge" and the verb refuses it.
+    /// Structurally unreachable through the serve path (the `accord:*` early-out
+    /// runs persist's own `attestation_family` first) and booked anyway, so a
+    /// classifier disagreement surfaces as a NAMED withhold rather than as an
+    /// allow.
+    AccordRelayObjectNotAccord,
+    /// CIRISPersist#733 — the row is on the `accord:*` family and **nothing in
+    /// it names the accord this object acts under**: no signed `accord_root`
+    /// key, and not the one dimension whose fallback rule persist defines. A
+    /// pre-#733 row or an unadopted producer's. "Which root?" has no
+    /// object-derived answer, and answering it from construction state instead
+    /// is precisely the permissive failure #731 reports — so it refuses. The
+    /// durable narrowing #733 accepted, not a local misconfiguration.
+    AccordRelayObjectRootUnnamed,
+    /// CIRISPersist#733 — **ONE ARTIFACT ASSERTING TWO ACCORDS**: the row's
+    /// signed `accord_root` key and the drill-dimension rule name DIFFERENT
+    /// roots. Neither is preferred (preferring the key lets an emitter relabel a
+    /// heartbeat's accord; preferring the column makes the new field
+    /// decorative), so the row is refused rather than resolved.
+    ///
+    /// Reachable at RELAY even though persist's write door refuses the same
+    /// shape: that door protects rows this node ADMITS, and relaying is exactly
+    /// when a node handles rows it never admitted. Its own variant, never folded
+    /// into [`Self::AccordRelayObjectRootUnnamed`] — "names none" sends an
+    /// operator to add a key, "names two" sends them to remove one.
+    AccordRelayObjectRootDisagrees,
+    /// CIRISEdge#499 (blob plane) — an inbound `BlobChunkFetch` was refused
+    /// because the responder could not determine the blob's SCOPE, so it could
+    /// not evaluate whether this requester is entitled to it. Fail-closed, and
+    /// its own branch: "I do not know what this content is" is a wiring fact
+    /// (`BlobChunkSource::chunk_scope` unwired or returning `None`) with an
+    /// operator remedy, not a statement about the requester.
+    BlobScopeUndeterminable,
+    /// CIRISEdge#499 (blob plane) — the blob's scope does not admit the scope
+    /// the request ARRIVED on, per the #48-A
+    /// [`allows_recipient_scope`](crate::cohort_scope::CohortScope::allows_recipient_scope)
+    /// predicate. The canonical case: family-scoped content requested over the
+    /// federation address, where reaching a public discovery endpoint proves
+    /// nothing about family membership. This is the gate working as designed.
+    BlobArrivalScopeInsufficient,
+    /// CIRISEdge#499 (blob plane) — the arrival SCOPE matched but the request
+    /// arrived on an address derived from a DIFFERENT group's MLS
+    /// `exporter_secret`. Its own branch because the scope predicate
+    /// structurally cannot see it (`Family` vs `Family` is a match), and yet
+    /// possession of one family's group secret proves nothing about another's —
+    /// folding this into [`Self::BlobArrivalScopeInsufficient`] would report a
+    /// cross-group access attempt as an ordinary scope mismatch.
+    BlobArrivalGroupMismatch,
+    /// CIRISEdge#499 (swarm holdings plane) — the publisher could not determine
+    /// a held content's SCOPE on a scope-native node, so it cannot know which
+    /// peers are entitled to learn the holding exists. Fail-closed, and its own
+    /// branch: "I do not know what this content is" is a wiring fact
+    /// ([`FountainHoldingsSource::content_scope`](crate::swarm::FountainHoldingsSource::content_scope)
+    /// unwired or returning `None`) with an operator remedy, not a statement
+    /// about any peer.
+    HoldingScopeUndeterminable,
+    /// CIRISEdge#499 (swarm holdings plane) — the host declared a scope GROUP at
+    /// `Public` cohort scope. A private roster paired with a public audience is a
+    /// contradiction, not a configuration, and is refused before any roster
+    /// lookup — never folded into [`Self::HoldingScopePeerNotInRoster`], which
+    /// would send an operator to edit a membership list instead of the
+    /// declaration.
+    HoldingScopePublicGroup,
+    /// CIRISEdge#499 (swarm holdings plane) — persist's
+    /// `projection_for(Plane::FountainContent, …)` bound this holding's audience
+    /// to the record's OWN roster (`Cohort` over a named group, or the
+    /// structurally-invisible `SelfOwn`) and the peer holds no derived address in
+    /// that group at any live epoch. **The leak this cut closes**: before it, a
+    /// family- or community-scoped holding — content id AND symbol ids — was
+    /// announced on a timer to every peer the cohort callback returned.
+    HoldingScopePeerNotInRoster,
+    /// CIRISEdge#499 (swarm holdings plane) — the projection named an audience
+    /// KIND the publisher has no peer-set mechanism for on this plane
+    /// (`Capability` / `Subject`, which `Plane::FountainContent` has no cell for
+    /// today). Structurally unreachable against persist v37's table and booked
+    /// fail-closed anyway, so a future persist widening surfaces as a NAMED
+    /// withhold rather than as an allow.
+    HoldingScopeProjectionUnsupported,
+    /// CIRISPersist#744 (swarm holdings plane) — the gate is ARMED (a scope
+    /// address table is installed) but no `FederationDirectory` is wired, so
+    /// neither `holdings_authority` nor `resolve_projection_recipients` can be
+    /// asked. A WIRING fault, not a policy decision. Refused rather than
+    /// falling back to the pre-#744 hard-coded `ProducerSteward`, which would
+    /// resurrect the under-advertisement defect invisibly.
+    HoldingScopeDirectoryMissing,
+    /// CIRISPersist#744 (swarm holdings plane) — persist's `holdings_authority`
+    /// errored: the accord-co-scrub trust-root walk over the PUBLISHER's key
+    /// could not be completed. Never folded into a `ProducerSteward` default —
+    /// a read that failed is not a statement that the publisher is a plain
+    /// producer (the #425 Exhibit C split, on the authority axis).
+    HoldingScopeAuthorityUnresolved,
+    /// CIRISPersist#744 (swarm holdings plane) — persist's
+    /// `resolve_projection_recipients` returned `set_resolvable: false`:
+    /// **"I cannot judge"** this record's recipient set. Its own variant,
+    /// never folded into [`Self::HoldingScopePeerNotInRoster`] — persist keeps
+    /// the two bools separate precisely so an admission of ignorance is not
+    /// reported as an accusation about the peer, and the remedies differ (fix
+    /// a roster table or a group registration vs. fix a membership list).
+    HoldingScopeRecipientSetUnresolved,
+    /// CIRISPersist#744 (swarm holdings plane) — persist's
+    /// `resolve_projection_recipients` returned `Err`. Distinct from
+    /// [`Self::HoldingScopeRecipientSetUnresolved`], which is a VERDICT persist
+    /// reached deliberately; this is an infrastructure fault. Persist retains
+    /// the `Result` for exactly this split.
+    HoldingScopeRecipientReadError,
+
+    // ── CIRISEdge#169 — the LXMF propagation HOST serve path ────────────
+    //
+    // These ten are the refusal taxonomy of
+    // [`crate::transport::lxmf_serve`]: this node acting as an LXMF
+    // propagation node, holding and serving THIRD-PARTY mail. They are
+    // defined unconditionally rather than under the serve path's own
+    // `cfg`, because the withhold taxonomy is a stable operator-facing
+    // vocabulary: a snapshot's reason set must not change shape with the
+    // build's feature flags, and cfg-gating variants would fork
+    // `parameter_of`'s exhaustive match across feature combinations —
+    // the proper-subset build hazard this repo keeps re-learning. A
+    // default build simply never constructs them.
+    /// #169 — a propagation request arrived and this node does NOT operate
+    /// as a propagation node ([`crate::transport::lxmf_serve::PropagationAudience::Disabled`],
+    /// the default). Serving strangers' mail is an explicit operator act,
+    /// so the OFF state is a named refusal rather than an unhandled path:
+    /// an operator who believes they enabled propagation and sees this
+    /// reason is looking at the answer.
+    LxmfPropagationDisabled,
+    /// #169 — the destination is not one this node holds mail for. Fires
+    /// on BOTH legs of the same roster (`detail` names which): an upload
+    /// whose recipient is off-roster, and a `/get` from a requester who is
+    /// off-roster. One condition, one remedy — put the destination on the
+    /// roster — so one reason.
+    LxmfDestinationNotServed,
+    /// #169 — a `/get` arrived on a link whose remote identity edge could
+    /// not resolve, so there is no destination to scope the mailbox to.
+    /// Fail-closed: an unattributed request is never answered with mail,
+    /// because "whose mailbox is this" has no answer.
+    LxmfRequesterUnidentified,
+    /// #169 — the requester asked for a transient ID that is parked for a
+    /// DIFFERENT destination. This is the cross-recipient mailbox probe
+    /// the per-destination index exists to defeat; it is reported rather
+    /// than merely omitted, because it is the one `/get` miss that is
+    /// evidence of an attack rather than of a race.
+    LxmfMailboxScopeMismatch,
+    /// #169 — an upload's proof-of-work propagation stamp did not meet the
+    /// cost this node advertises in its
+    /// [`PropagationNodeAnnounce`](leviculum_lxmf::PropagationNodeAnnounce).
+    /// The advertised cost IS the node's published term of carriage; an
+    /// upload that has not paid it has not met the rule it was offered.
+    LxmfStampBelowCost,
+    /// #169 — the bytes do not decode as the LXMF propagation wire this
+    /// endpoint speaks (`detail` names the leg: `/get` request body or
+    /// upload envelope). Distinct from [`Self::LxmfPeerSyncUnsupported`]:
+    /// these bytes are malformed, those are well-formed and for another
+    /// endpoint.
+    LxmfWireUnparseable,
+    /// #169 — a well-formed MULTI-message upload: the node-to-node
+    /// `/offer` peer-sync form, which `leviculum-lxmf` deliberately does
+    /// not implement (leviculum#209) and reports as
+    /// `PropagationError::MultipleMessages`. Its own reason because the
+    /// remedy is not "fix your client" but "you have pointed a peer sync
+    /// at a node that serves clients only".
+    LxmfPeerSyncUnsupported,
+    /// #169 — a byte or count ceiling refused carriage before any work was
+    /// done (`detail` names which: request body, upload envelope, the
+    /// transient-ID list in one request, or the per-response transfer
+    /// cap). A propagation node serves strangers by definition, so every
+    /// buffer it fills on their behalf has an explicit ceiling, and
+    /// hitting one is an event.
+    LxmfFrameOversized,
+    /// #169 — the mailbox is at a retention ceiling (total bytes, messages
+    /// for this destination, or distinct destinations) and the upload was
+    /// REFUSED rather than admitted by evicting. Refusing is the security
+    /// property: a node that evicted to admit would let an attacker flush
+    /// a victim's pending mail with junk uploads, turning a capacity bound
+    /// into a censorship lever. Contrast
+    /// [`crate::transport::store_and_forward`], which DOES evict
+    /// oldest-first — it queues this node's OWN outbound envelopes, where
+    /// there is no third party to censor.
+    LxmfMailboxFull,
+    /// #169 — a parked message reached the retention window without being
+    /// collected and was evicted undelivered. The bounded-retention
+    /// promise kept, and kept LOUDLY: a propagation node that dropped
+    /// third-party mail silently would be indistinguishable from one that
+    /// never received it.
+    LxmfRetentionExpired,
 }
 
 impl WithholdReason {
@@ -362,6 +569,32 @@ impl WithholdReason {
             Self::AccordRelaySignerNotSeated => "accord_relay_signer_not_seated",
             Self::AccordRelayNoTrustEdge => "accord_relay_no_trust_edge",
             Self::AccordRelayUnresolved => "accord_relay_unresolved",
+            Self::AccordRelayObjectUnreadable => "accord_relay_object_unreadable",
+            Self::AccordRelayMirrorUnbound => "accord_relay_mirror_unbound",
+            Self::AccordRelayObjectNotAccord => "accord_relay_object_not_accord",
+            Self::AccordRelayObjectRootUnnamed => "accord_relay_object_root_unnamed",
+            Self::AccordRelayObjectRootDisagrees => "accord_relay_object_root_disagrees",
+            Self::BlobScopeUndeterminable => "blob_scope_undeterminable",
+            Self::BlobArrivalScopeInsufficient => "blob_arrival_scope_insufficient",
+            Self::BlobArrivalGroupMismatch => "blob_arrival_group_mismatch",
+            Self::HoldingScopeUndeterminable => "holding_scope_undeterminable",
+            Self::HoldingScopePublicGroup => "holding_scope_public_group",
+            Self::HoldingScopePeerNotInRoster => "holding_scope_peer_not_in_roster",
+            Self::HoldingScopeDirectoryMissing => "holding_scope_directory_missing",
+            Self::HoldingScopeAuthorityUnresolved => "holding_scope_authority_unresolved",
+            Self::HoldingScopeRecipientSetUnresolved => "holding_scope_recipient_set_unresolved",
+            Self::HoldingScopeRecipientReadError => "holding_scope_recipient_read_error",
+            Self::HoldingScopeProjectionUnsupported => "holding_scope_projection_unsupported",
+            Self::LxmfPropagationDisabled => "lxmf_propagation_disabled",
+            Self::LxmfDestinationNotServed => "lxmf_destination_not_served",
+            Self::LxmfRequesterUnidentified => "lxmf_requester_unidentified",
+            Self::LxmfMailboxScopeMismatch => "lxmf_mailbox_scope_mismatch",
+            Self::LxmfStampBelowCost => "lxmf_stamp_below_cost",
+            Self::LxmfWireUnparseable => "lxmf_wire_unparseable",
+            Self::LxmfPeerSyncUnsupported => "lxmf_peer_sync_unsupported",
+            Self::LxmfFrameOversized => "lxmf_frame_oversized",
+            Self::LxmfMailboxFull => "lxmf_mailbox_full",
+            Self::LxmfRetentionExpired => "lxmf_retention_expired",
         }
     }
 }

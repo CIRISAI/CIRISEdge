@@ -296,6 +296,8 @@ async fn metrics_counter_increments_on_receive() {
         received_at: chrono::Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -420,6 +422,8 @@ async fn metrics_transport_bytes_io_counted() {
         received_at: chrono::Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -477,6 +481,8 @@ async fn metrics_verify_failure_classified_by_error() {
         received_at: chrono::Utc::now(),
         source_key_id: None,
         link_key_id: None,
+        // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+        arrival_scope: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 

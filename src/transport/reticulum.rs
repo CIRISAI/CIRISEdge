@@ -98,6 +98,8 @@ use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendO
 use crate::identity::LocalSigner;
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
 use crate::scope_addressing::{InboundAddress, MemberAddress, ScopeAddressTable};
+#[cfg(feature = "lxmf")]
+use crate::transport::lxmf_serve::ServeOutcome;
 use crate::verify::{
     HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
 };
@@ -1123,6 +1125,29 @@ pub struct ReticulumTransportConfig {
     /// TCP address the node listens on for inbound Reticulum links.
     /// Legacy v0.11.x field — consulted only when [`Self::interfaces`]
     /// is empty.
+    /// **"Allow me to be visible to the federation so I can use the mesh."**
+    ///
+    /// The wizard question, and the ONE opt-in that decides this node's
+    /// reachability posture. When `true` the node's named discovery
+    /// destination announces, transport nodes learn a path to it, and it
+    /// participates in the mesh. When `false` it announces nothing and is
+    /// reachable **point-to-point only** — a peer must already hold its
+    /// address to reach it.
+    ///
+    /// Getting the direction right matters, because it is easy to read
+    /// scope-native addressing (CIRISEdge#499) as a privacy feature you trade
+    /// reach for. It is not. A node that has not opted into federation
+    /// visibility is point-to-point **anyway**; scoped destinations being
+    /// one-hop (CC 5.4.6, ruled at CIRISConstitution#91) costs such a node
+    /// nothing it had. The trade only exists for a node that IS
+    /// federation-visible and is choosing to move some flows off that plane.
+    ///
+    /// Defaults to `true` — NOT because visibility is the right default, but
+    /// because flipping a deployed node to invisible on upgrade would silently
+    /// remove it from the mesh, and a silent reachability change is the one
+    /// failure mode worse than an over-visible default. A wizard MUST ask
+    /// rather than inherit this.
+    pub federation_visible: bool,
     pub listen_addr: SocketAddr,
     /// Bootstrap peer TCP addresses dialled as Reticulum TCP clients
     /// on startup. Empty is valid (listen-only / announce-discovered).
@@ -1198,6 +1223,7 @@ impl ReticulumTransportConfig {
     pub fn new(identity_path: PathBuf, local_key_id: impl Into<String>) -> Self {
         Self {
             listen_addr: "0.0.0.0:4242".parse().expect("static addr parses"),
+            federation_visible: true,
             bootstrap_peers: Vec::new(),
             identity_path,
             announce_interval: Duration::from_secs(300),
@@ -1673,6 +1699,11 @@ pub struct ReticulumTransport {
     /// `None` until installed: every scope-native lookup then declines and
     /// the federation-scope paths are unaffected.
     scope_addresses: OnceLock<Arc<ScopeAddressTable>>,
+    /// CIRISEdge#169 — the LXMF propagation serve node, when this node has
+    /// been configured to carry third-party mail. `None` (the default) means
+    /// the `RequestReceived` arm declines every propagation request.
+    #[cfg(feature = "lxmf")]
+    lxmf_serve: OnceLock<Arc<crate::transport::lxmf_serve::LxmfServeNode>>,
     /// Edge's own announce attestation app-data — built once in
     /// `new` (sign with the federation `LocalSigner`) and emitted
     /// verbatim on every announce. `None` when no signer was
@@ -2440,10 +2471,31 @@ impl ReticulumTransport {
         // adds suppression for scoped destinations (register future ones via
         // the retained `announce_policy` handle).
         let announce_policy = crate::announce_suppression::ScopePrivacyAnnouncePolicy::new();
-        announce_policy.register_destination_scope(
-            local_named_dest_hash.into_bytes(),
-            crate::cohort_scope::CohortScope::Public,
-        );
+        // The federation-visibility opt-in, and the only thing that decides
+        // whether this node is on the mesh at all.
+        //
+        // `Public` is the one scope the policy lets announce, so registering
+        // the named discovery destination as `Public` is what puts this node
+        // in the mesh. Leaving it UNregistered is not an oversight — the
+        // policy default-SUPPRESSES anything it does not know, so an invisible
+        // node falls out of the same rule that keeps scoped destinations
+        // silent, rather than needing a second mechanism to be quiet.
+        //
+        // A point-to-point node is still fully reachable by anyone who already
+        // holds its address; what it does not do is advertise so strangers can
+        // learn one.
+        if config.federation_visible {
+            announce_policy.register_destination_scope(
+                local_named_dest_hash.into_bytes(),
+                crate::cohort_scope::CohortScope::Public,
+            );
+        } else {
+            tracing::info!(
+                "federation visibility OFF — this node announces nothing and is reachable \
+                 point-to-point only. Scoped destinations were already one-hop (CC 5.4.6), \
+                 so scope-native addressing costs this posture nothing."
+            );
+        }
         node.set_announce_control(Some(Box::new(announce_policy.clone())));
 
         // Take the single event receiver before starting, then start
@@ -2494,6 +2546,8 @@ impl ReticulumTransport {
             local_transport_pubkey,
             local_identity: identity.clone(),
             scope_addresses: OnceLock::new(),
+            #[cfg(feature = "lxmf")]
+            lxmf_serve: OnceLock::new(),
             local_attestation,
             local_signer,
             self_route,
@@ -2718,6 +2772,50 @@ impl ReticulumTransport {
             .map_err(|_| TransportError::Config("scope address table already installed".to_owned()))
     }
 
+    /// CIRISEdge#169 — install the LXMF propagation serve node and register
+    /// its request handler, so this node begins carrying third-party mail.
+    ///
+    /// Called ONCE. Two things happen together on purpose: without the
+    /// registration no `RequestReceived` ever arrives, and without the node
+    /// the arm declines every one — so installing one without the other is a
+    /// node that either cannot hear or cannot answer, and both look like
+    /// silence from outside.
+    ///
+    /// The roster inside the node decides WHO is served
+    /// ([`PropagationAudience::from_cohort_membership`] — self, family, and
+    /// the communities this node is in; deliberately NOT the RNS transit
+    /// rule). This verb decides only THAT the node serves.
+    ///
+    /// # Errors
+    /// [`TransportError::Config`] if a serve node is already installed.
+    ///
+    /// [`PropagationAudience::from_cohort_membership`]:
+    ///     crate::transport::lxmf_serve::PropagationAudience::from_cohort_membership
+    #[cfg(feature = "lxmf")]
+    pub fn install_lxmf_serve(
+        &self,
+        serve: Arc<crate::transport::lxmf_serve::LxmfServeNode>,
+    ) -> Result<(), TransportError> {
+        self.lxmf_serve
+            .set(serve)
+            .map_err(|_| TransportError::Config("LXMF serve node already installed".to_owned()))?;
+        // Register on the node's NAMED discovery destination — the one a
+        // client can actually reach. An explicit-hash destination cannot be
+        // path-resolved (CC 5.4.6 / CIRISConstitution#91), so a propagation
+        // node has to be reachable on the plane that announces.
+        self.node.register_request_handler(
+            DestinationHash::new(self.local_named_dest_hash()),
+            crate::transport::lxmf_serve::MESSAGE_GET_PATH,
+            leviculum_core::RequestPolicy::AllowAll,
+        );
+        tracing::info!(
+            path = crate::transport::lxmf_serve::MESSAGE_GET_PATH,
+            "CIRISEdge#169 — LXMF propagation serve path REGISTERED. This node now \
+             carries mail for the destinations in its roster."
+        );
+        Ok(())
+    }
+
     /// CIRISEdge#499 — the installed scope-address table, if any.
     ///
     /// This is the accessor the **replication layer** uses to resolve a
@@ -2795,6 +2893,248 @@ impl ReticulumTransport {
         self.register_announce_scope(hash, scope.clone());
         self.node.register_destination(dest);
         Ok(())
+    }
+
+    /// CIRISEdge#499 — retire a scope-derived destination.
+    ///
+    /// The inverse of [`Self::register_scoped_destination`], and the
+    /// second half of the rotation: after this returns the hash is no
+    /// longer one of ours, so a peer that still holds a path and dials
+    /// it finds nobody home. Without it a superseded address keeps
+    /// answering forever, which re-confirms this node to anyone still
+    /// probing it — the reachability disclosure CIRISEdge#311 exists to
+    /// prevent, and the reason a rotation that cannot retire only ever
+    /// *adds* addresses.
+    ///
+    /// Landed in leviculum v0.20.0+ciris.1 (leviculum#54). Two contract
+    /// points edge relies on, both pinned by leviculum's own
+    /// `destination_lifecycle.rs` rather than inferred here:
+    ///
+    /// - **Idempotent** — retiring an already-gone or never-registered
+    ///   hash is a no-op. That is what lets the seal be timing-driven
+    ///   ([`crate::scope_lifecycle::ScopeLifecycle::seal_due`] may fire
+    ///   twice for one rotation).
+    /// - **Established links keep running** — a link is keyed by its
+    ///   `LinkId`, not by the destination it was dialled through, so
+    ///   only NEW link requests are refused.
+    ///
+    /// That second point is the behaviour edge wants, and edge
+    /// deliberately does NOT follow it with a `close_link` sweep.
+    /// A peer holding an established link dialled it while legitimately
+    /// in the group; tearing it down would drop a live stream, which is
+    /// exactly what the make-before-break rotation window exists to
+    /// prevent (a `DestinationHash` is used to dial and listen, never
+    /// per chunk). The unlinkability concern is about *new* probes, and
+    /// those are what retirement stops. Cutting live links is available
+    /// (`close_link` by `LinkId`) and is a separate, deliberate act.
+    ///
+    /// # Errors
+    /// [`TransportError::Config`] never, currently — retained in the
+    /// signature because the sink contract
+    /// ([`crate::scope_lifecycle::ScopedDestinationSink::retire`]) is
+    /// fallible and a future transport may not be able to retire.
+    pub fn retire_scoped_destination(
+        &self,
+        address: &MemberAddress,
+        _scope: &crate::cohort_scope::CohortScope,
+    ) -> Result<(), TransportError> {
+        let hash = *address.as_bytes();
+        self.node
+            .unregister_destination(&DestinationHash::new(hash));
+        // Drop the scope record too, so the policy map does not grow one
+        // entry per epoch per group for addresses that are no longer ours.
+        self.announce_policy.forget(&hash);
+        Ok(())
+    }
+
+    /// CIRISEdge#499 — send a byte-exact signed envelope to a peer at its
+    /// SCOPE-DERIVED address rather than its federation address.
+    ///
+    /// This is the send half of scope-native addressing, and its whole design
+    /// is in the signature. `Transport::send` deliberately grows no scope
+    /// parameter — it has 10 implementors, including HTTP and packet radio,
+    /// neither of which has a scope-derived destination plane — and this method
+    /// deliberately parses no scope. It takes a [`MemberAddress`], which has no
+    /// public byte constructor: the ONLY way a caller holds one is to have
+    /// obtained it from a [`ScopeAddressTable`] lookup keyed by a
+    /// `member_key_id`. So "this address is the right one for this content's
+    /// scope" is a property the caller already proved, above the transport,
+    /// and hands down as a value that cannot be wrong — the `ResolvedRecipient`
+    /// pattern (CIRISEdge#396/#402), applied to addressing.
+    ///
+    /// `destination_key_id` is still required, and is NOT the routing input: it
+    /// is the peer's federation key id, used only to resolve the transport-tier
+    /// Ed25519 the link proof is verified against. The dial target is the
+    /// derived address, exclusively — there is no arm of this method that falls
+    /// back to a federation candidate, because a silent fallback is precisely
+    /// the context collapse the derivation exists to remove.
+    ///
+    /// # Routability (the open upstream question)
+    ///
+    /// A scope-derived destination is registered with
+    /// [`Self::register_scoped_destination`], which builds an EXPLICIT-HASH
+    /// destination and suppresses its announce (CC 5.4 — group-scoped
+    /// destinations MUST NOT announce; announcing one would publish the very
+    /// reachability fact the derivation withholds). Reference RNS therefore
+    /// holds no learned path to it, and leviculum v0.19 answers path requests
+    /// for explicit-hash destinations with silence. So this dial is
+    /// BROADCAST-ONLY: it reaches a directly-attached neighbour and no further,
+    /// exactly like a v7 explicit-hash peer before `prime_peer`.
+    ///
+    /// **This is a RULED posture, not a gap to fix.** CIRISConstitution#91
+    /// asked whether CC 5.4.6's announce prohibition binds the *packet* or the
+    /// *leak*, and CC 1.0-rc4 ruled: **the packet, stated as the emission**. A
+    /// directed announce iterated over the roster inherits the prohibition
+    /// rather than escaping it — the clause binds the emission, not the
+    /// addressing mode. Three legs, now in-clause at 5.4.6:
+    ///
+    /// - No directed announce on RNS transport can satisfy the purposive
+    ///   gloss, because multi-hop path learning IS outsider observation, and
+    ///   the path state intermediates retain is exactly the class the subpoena
+    ///   framing promises does not exist.
+    /// - The flat `MUST NOT` was never broadcast-era shorthand: the same
+    ///   section bans the targeted, non-broadcast per-destination query in the
+    ///   same breath, so the emission class was always the object.
+    /// - A directed announce would trade *no emission exists* — structural and
+    ///   honestly claimable — for *emissions exist but resist analysis*, which
+    ///   is traffic-analysis privacy, precisely the claim CEG/RET declines to
+    ///   make outside the Anonymous Tier (CC 1.13.3.1). **A reading must not
+    ///   spend a claimable guarantee to purchase an unclaimable one.**
+    ///
+    /// The ruling also names a bind edge's own filing missed: the derivation
+    /// is EPOCH-BOUND, so an announcing scheme must either re-announce
+    /// roster-wide on every Add/Remove — a synchronized wave whose cardinality,
+    /// timing and churn are themselves the leak — or never rotate, which leaves
+    /// a removed member holding every peer's addressing forever.
+    ///
+    /// So a multi-hop scoped fetch fails at the establish timeout with
+    /// [`TransportError::NoRouteToPeer`] — loudly, and without ever having put
+    /// the scoped bytes on the federation address. **Do not "fix" this by
+    /// announcing.** Multi-hop scoped reach remains open on the amendment
+    /// plane with its bar stated: no outsider-observable emission, no
+    /// outsider-retained path state, no epoch-correlated wave.
+    ///
+    /// What the ruling DID keep is that in-group MLS distribution of addressing
+    /// material was never prohibited — the cached-directory discipline — so a
+    /// roster learning its own members' addresses over MLS stays open.
+    ///
+    /// # Why one hop is not fatal to a mesh call
+    ///
+    /// CC 1.0-rc4's Position paragraph at 5.4.6 names the reason, and it holds
+    /// in this implementation: **derivation replaces discovery, and determinism
+    /// replaces coordination.** Every member can derive every other member's
+    /// address from the group secret without asking anyone, so the candidate
+    /// set is complete without a discovery round — which is what recovers the
+    /// ⌈log_k N⌉ ALM fan-out (CC 6.1.6) that a one-hop-only reading looks like
+    /// it should destroy.
+    ///
+    /// Concretely: [`AlmJoinPlanner::plan`] takes a caller-supplied candidate
+    /// set under staleness and reachability filters. It plans over advertised
+    /// candidates and established links, never over an assumption that every
+    /// member is dialable. So the one-hop property constrains FIRST CONTACT —
+    /// which happens on the federation plane, where announces are permitted —
+    /// and not the shape of the tree built afterwards.
+    ///
+    /// [`AlmJoinPlanner::plan`]: crate::transport::realtime_av_alm::AlmJoinPlanner::plan
+    ///
+    /// # Errors
+    /// [`TransportError::BodyTooLarge`] above the AV-13 ceiling;
+    /// [`TransportError::Unreachable`] when the peer's transport identity
+    /// cannot be resolved (no signing key ⇒ no link proof);
+    /// [`TransportError::NoRouteToPeer`] / [`TransportError::Timeout`] when the
+    /// derived destination does not establish; [`TransportError::Io`] on a
+    /// leviculum fault.
+    pub async fn send_to_scoped_destination(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
+        }
+
+        let dest_hash = DestinationHash::new(*address.as_bytes());
+        // Operator deny-list first, on the DERIVED hash — a ban must not be
+        // bypassable by addressing the peer in one of its scopes.
+        self.check_blackhole(&dest_hash.into_bytes()).await?;
+
+        // The peer's transport-tier Ed25519, for the link proof. Any candidate
+        // carries it (they differ in ROUTING hash, not in signing key), so take
+        // the first. The candidate's own dest_hash is deliberately discarded:
+        // routing here is the derived address, never a federation one.
+        let Some(signing_key) = self
+            .resolve_dial_candidates(destination_key_id)
+            .await
+            .first()
+            .map(|c| c.signing_key)
+        else {
+            return Err(TransportError::Unreachable(format!(
+                "scope-native send: no transport identity resolved for \
+                 destination_key_id={destination_key_id} — cannot prove a link to its \
+                 derived address (CIRISEdge#499)"
+            )));
+        };
+
+        let (link, established) = self
+            .node
+            .connect_awaited(&dest_hash, &signing_key)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum connect (scoped): {e}")))?;
+        let link_id = *link.link_id();
+        // CIRISEdge#424 — record the dest we dialed so a reply arriving on this
+        // link attributes to this peer (leviculum's `link_destination` is `None`
+        // for our own dialed links).
+        self.dialed_link_dest
+            .lock()
+            .await
+            .insert(link_id, dest_hash);
+
+        // Explicit-hash destinations are never pathed (see the routability note
+        // above), so this is always the bootstrap-broadcast budget.
+        if !matches!(
+            with_timeout(NO_PATH_ESTABLISH_TIMEOUT, established).await,
+            Some(Ok(()))
+        ) {
+            tracing::error!(
+                key_id = %destination_key_id,
+                target_dest = %hex::encode(dest_hash.into_bytes()),
+                "scope-native send: derived destination did not establish. A derived \
+                 address is announce-suppressed by design (CC 5.4), so it is \
+                 broadcast-only — only a directly-attached neighbour answers. Making a \
+                 scoped address relay-routable without re-publishing the reachability \
+                 fact is unspecified upstream (CIRISEdge#499). NOT retried on the \
+                 federation address: that would collapse the very context this \
+                 address exists to separate."
+            );
+            return Err(TransportError::NoRouteToPeer {
+                key_id: destination_key_id.to_string(),
+                target_dest: hex::encode(dest_hash.into_bytes()),
+                has_path: false,
+                paths: self.path_table_snapshot(),
+            });
+        }
+
+        // CIRISEdge#340 — IDENTIFY before shipping, so the responder can
+        // attribute the frame. Same ordering as the federation send path.
+        self.node
+            .identify_link(&link_id, &self.local_identity)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum identify_link (scoped): {e}")))?;
+
+        self.ship_resource_on_link(
+            &link_id,
+            envelope_bytes,
+            DIAL_NO_PROGRESS_WINDOW,
+            RESOURCE_TRANSFER_TIMEOUT,
+        )
+        .await
+        .map_err(ShipError::into_transport)?;
+
+        Ok(TransportSendOutcome::Delivered)
     }
 
     /// CIRISEdge#499 — resolve an inbound destination hash to the scope
@@ -4833,6 +5173,9 @@ impl Transport for ReticulumTransport {
                         link_last_inbound_at: &self.link_last_inbound_at,
                         inbound_reasm: &self.inbound_reasm,
                         dialed_link_dest: &self.dialed_link_dest,
+                        scope_addresses: &self.scope_addresses,
+                        #[cfg(feature = "lxmf")]
+                        lxmf_serve: &self.lxmf_serve,
                     };
                     handle_event(event, &ctx).await;
 
@@ -4951,6 +5294,18 @@ struct EventCtx<'a> {
     /// same name on [`ReticulumTransport`]). Consulted in `attribute_and_deliver`
     /// when leviculum's `link_destination` is `None` for an own-dialed link.
     dialed_link_dest: &'a Mutex<HashMap<LinkId, DestinationHash>>,
+    /// CIRISEdge#499 — the scope-native address table (see the field of the same
+    /// name on [`ReticulumTransport`]). `attribute_and_deliver` probes its
+    /// reverse index once per frame to stamp `InboundFrame::arrival_scope`,
+    /// which is the receive-side admission fact the blob serve gate consumes.
+    /// Empty `OnceLock` (the production state until CIRISVerify#259's exporter
+    /// label is specified) ⇒ every frame is stamped `None`, i.e. federation
+    /// arrival, i.e. exactly pre-#499 behaviour.
+    scope_addresses: &'a OnceLock<Arc<ScopeAddressTable>>,
+    /// CIRISEdge#169 — the LXMF serve node, borrowed like every other
+    /// sub-protocol's state (the `EventCtx` field pattern).
+    #[cfg(feature = "lxmf")]
+    lxmf_serve: &'a OnceLock<Arc<crate::transport::lxmf_serve::LxmfServeNode>>,
 }
 
 /// CIRISEdge#424 — the classified result of attributing an inbound frame's link to
@@ -5310,12 +5665,34 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         // exact condition already stated upstream).
         None => None,
     };
+    // CIRISEdge#499 — resolve the SCOPE-DERIVED address this frame arrived on,
+    // here, once, BEFORE the envelope is parsed. `dest` is the link's
+    // destination, already in hand for the attribution above; the resolution is
+    // a single hash-map probe against the reverse index (the table exists
+    // precisely so the packet path never derives — see
+    // `scope_addressing::lookup_never_calls_the_deriver`).
+    //
+    // `None` — no table installed, or a hash that is not one of ours — means the
+    // frame arrived on the FEDERATION address, which downstream reads as
+    // `CohortScope::Public`. That is not a downgrade: it is the literal truth
+    // about what reaching a public discovery address demonstrates.
+    //
+    // This is a receive-side ADMISSION FACT, orthogonal to `source_key_id`: it
+    // says which group secret the sender possessed, not who the sender is. A
+    // frame can carry one without the other, and the blob serve gate needs
+    // exactly this one.
+    let arrival_scope = dest.and_then(|d| {
+        ctx.scope_addresses
+            .get()
+            .and_then(|t| t.accepts_inbound(&d.into_bytes()))
+    });
     let frame = InboundFrame {
         envelope_bytes: data,
         transport: TransportId::RETICULUM_RS,
         received_at: Utc::now(),
         source_key_id,
         link_key_id,
+        arrival_scope,
     };
     if let Err(e) = ctx.sink.send(frame).await {
         tracing::error!(error = %e, "inbound channel send failed");
@@ -5785,6 +6162,86 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 ));
             }
         }
+        // CIRISEdge#169 — the LXMF propagation HOST serve path.
+        //
+        // The decision is made by `LxmfServeNode`, which is sans-I/O: no async,
+        // no `.await`, no clock of its own. This arm does the I/O and nothing
+        // else — which is why the serve logic can be exhaustively tested
+        // without a node, and why no lock can cross a suspension point here.
+        #[cfg(feature = "lxmf")]
+        NodeEvent::RequestReceived {
+            link_id,
+            request_id,
+            ref path,
+            ref data,
+            ..
+        } if path == crate::transport::lxmf_serve::MESSAGE_GET_PATH => {
+            let Some(serve) = ctx.lxmf_serve.get() else {
+                // Not configured to carry third-party mail. Declining is the
+                // DEFAULT posture (`PropagationAudience::Disabled`), not a
+                // fault, so this is a trace rather than a withhold: nothing
+                // was refused, because nothing was ever offered.
+                tracing::trace!(
+                    %path,
+                    "LXMF propagation request on a node that carries no third-party mail"
+                );
+                return;
+            };
+
+            // The requester is the LINK's own remote identity — never a
+            // wire-supplied field. A propagation node that took the requester
+            // from the request body would serve any mailbox on demand, which
+            // is the whole attack the per-recipient scoping exists to stop.
+            let requester = ctx.node.get_remote_identity(&link_id).map(|id| {
+                let mut out = [0u8; leviculum_lxmf::constants::DESTINATION_LENGTH];
+                out.copy_from_slice(&id.hash()[..leviculum_lxmf::constants::DESTINATION_LENGTH]);
+                out
+            });
+
+            let result = serve.serve_get(requester, data, std::time::Instant::now());
+
+            // The notices carry typed `WithholdReason`s and BELONG in the
+            // counted ledger — but the transport holds no `EdgeMetrics`
+            // handle (`inc_withhold` is never called from this file). That is
+            // the serve/inbound attribution asymmetry recorded in
+            // `crate::contextual_integrity`, meeting a serve path that happens
+            // to live in the event loop. Until the transport carries a metrics
+            // handle these are LOUD but uncounted, which is stated rather than
+            // silently accepted.
+            for notice in &result.notices {
+                drop_inbound(Some(link_id), notice.reason.as_str(), notice.detail);
+            }
+
+            if let ServeOutcome::Respond(ref bytes) = result.outcome {
+                match ctx.node.send_response(&link_id, &request_id, bytes).await {
+                    Ok(()) => {
+                        // MEASURED CONTRACT (leviculum#55): `Ok` means HANDED
+                        // TO THE LINK, not delivered. If the peer vanished
+                        // before the link's death was processed, this returns
+                        // `Ok(())` and the bytes go nowhere — and for a
+                        // propagation node serving churning mobiles that is
+                        // the normal case, not the edge case.
+                        //
+                        // So the mailbox entry is NOT dropped here. Delivery
+                        // evidence has to come from the application layer —
+                        // the peer's next request implying receipt — and
+                        // `serve_get` is deliberately non-destructive for
+                        // exactly this reason.
+                        tracing::debug!(?link_id, "LXMF propagation response handed to link");
+                    }
+                    Err(e) => {
+                        // A link known to be dead answers `LinkNotFound` — the
+                        // typed signal, and the honest one.
+                        drop_inbound(
+                            Some(link_id),
+                            "lxmf-response-undeliverable",
+                            &format!("{e}"),
+                        );
+                    }
+                }
+            }
+        }
+
         // CIRISEdge#484 — `ResponseReceived` / `RequestTimedOut` are now resolved by
         // the leviculum v0.16 completion registry (fed at the dispatch layer), so
         // `link_request` no longer mirrors them here — the events fall through to the
@@ -9318,9 +9775,9 @@ mod scope_native_addressing_tests {
     use crate::scope_addressing::StubDeriver;
     use leviculum_core::AnnounceControl as _;
 
-    async fn bare_transport(dir: &std::path::Path, key_id: &str) -> ReticulumTransport {
-        // A hybrid signer, because CIRISEdge#333 refuses to build a transport
-        // that cannot self-attest its announces.
+    /// A hybrid signer — CIRISEdge#333 refuses a transport that cannot
+    /// self-attest its announces.
+    fn test_signer(key_id: &str) -> Arc<LocalSigner> {
         let mut ed_seed = [0u8; 32];
         let mut pqc_seed = [0u8; 32];
         let salt = u8::try_from(key_id.len() % 251).expect("in range");
@@ -9339,7 +9796,24 @@ mod scope_native_addressing_tests {
             )
             .expect("ml_dsa_65"),
         );
-        let signer = Arc::new(LocalSigner::new(key_id, classical, Some(pqc)));
+        Arc::new(LocalSigner::new(key_id, classical, Some(pqc)))
+    }
+
+    async fn transport_with(config: ReticulumTransportConfig, key_id: &str) -> ReticulumTransport {
+        let signer = test_signer(key_id);
+        ReticulumTransport::new(
+            config,
+            ReticulumAuth {
+                signer: Some(signer),
+                ..ReticulumAuth::default()
+            },
+        )
+        .await
+        .expect("transport")
+    }
+
+    async fn bare_transport(dir: &std::path::Path, key_id: &str) -> ReticulumTransport {
+        let signer = test_signer(key_id);
 
         // No typed interfaces, and the default `0.0.0.0:4242` server replaced
         // with an ephemeral port so these four tests can run concurrently. The
@@ -9368,6 +9842,48 @@ mod scope_native_addressing_tests {
             .install_group(scope, group_id, 1, &[9u8; 32], members)
             .expect("install group");
         table
+    }
+
+    #[tokio::test]
+    async fn federation_visibility_off_makes_the_node_announce_nothing() {
+        // The wizard's "allow me to be visible to the federation so I can use
+        // the mesh" opt-in. OFF means point-to-point only: the node announces
+        // nothing, so no stranger can learn an address for it.
+        //
+        // Asserted on the POLICY rather than on the flag, because the flag
+        // being read is not the property — the property is that the named
+        // discovery destination stops being announceable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = ReticulumTransportConfig::new(dir.path().join("t.id"), "edge-invisible");
+        config.listen_addr = "127.0.0.1:0".parse().expect("addr");
+        config.federation_visible = false;
+
+        let transport = transport_with(config, "edge-invisible").await;
+        assert!(
+            transport
+                .announce_policy
+                .should_suppress_announce(&DestinationHash::new(transport.local_named_dest_hash())),
+            "an invisible node must not announce its discovery destination",
+        );
+        assert_eq!(
+            transport.announce_policy.len(),
+            0,
+            "invisibility is the policy's DEFAULT-suppress, not a second \
+             mechanism — nothing should be registered at all",
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_visibility_on_keeps_the_node_discoverable() {
+        // The other half, so the pair cannot pass by suppressing everything.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "edge-visible").await;
+        assert!(
+            !transport
+                .announce_policy
+                .should_suppress_announce(&DestinationHash::new(transport.local_named_dest_hash())),
+            "a federation-visible node must still announce discovery",
+        );
     }
 
     #[tokio::test]
@@ -9491,6 +10007,61 @@ mod scope_native_addressing_tests {
     }
 
     #[tokio::test]
+    async fn a_scoped_destination_round_trips_register_then_retire() {
+        // leviculum#54 (v0.20.0+ciris.1) — the seal half of the rotation.
+        // Without retirement a superseded address keeps answering forever
+        // and an observer who learned it can re-confirm this node, which
+        // is the reachability disclosure the whole feature removes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = bare_transport(dir.path(), "edge-retire").await;
+
+        let scope = CohortScope::Family;
+        let table = table_with_group(&scope, "grp-r", &["member-r"]);
+        let address = table
+            .send_address(&scope, "grp-r", "member-r")
+            .expect("derived address");
+        let hash = *address.as_bytes();
+
+        let before = transport.announce_policy.len();
+        transport
+            .register_scoped_destination(&address, &scope)
+            .expect("register");
+        assert_eq!(transport.announce_policy.len(), before + 1);
+
+        transport
+            .retire_scoped_destination(&address, &scope)
+            .expect("retire");
+        // The scope record goes too, or the policy map grows one entry per
+        // epoch per group for addresses that are no longer ours.
+        assert_eq!(
+            transport.announce_policy.len(),
+            before,
+            "retiring must drop the scope record, not just the destination",
+        );
+
+        // Idempotent — leviculum pins this, and the seal is timing-driven
+        // so it may genuinely fire twice for one rotation.
+        transport
+            .retire_scoped_destination(&address, &scope)
+            .expect("retiring twice is a no-op");
+        assert_eq!(transport.announce_policy.len(), before);
+
+        // And re-registering the same address afterwards still works: a
+        // member re-admitted at a later epoch must not be poisoned by the
+        // earlier retirement.
+        transport
+            .register_scoped_destination(&address, &scope)
+            .expect("re-register after retire");
+        assert_eq!(transport.announce_policy.len(), before + 1);
+        assert!(
+            transport
+                .announce_policy
+                .should_suppress_announce(&DestinationHash::new(hash)),
+            "a re-registered scoped destination is still never announced",
+        );
+    }
+
+    #[tokio::test]
     async fn inbound_scope_declines_without_a_table_and_resolves_with_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         let transport = bare_transport(dir.path(), "edge-inbound").await;
@@ -9532,5 +10103,30 @@ mod scope_native_addressing_tests {
             transport.inbound_scope(&[0u8; 16]).is_none(),
             "an unrelated hash must not resolve",
         );
+    }
+}
+
+/// CIRISEdge#499 — the transport as the lifecycle's destination sink.
+///
+/// Keeps the two halves that must not drift — edge's address table and
+/// the leviculum node's routing table — behind one object, so a
+/// transition cannot update one and forget the other.
+impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
+    fn register(
+        &self,
+        address: &MemberAddress,
+        scope: &crate::cohort_scope::CohortScope,
+    ) -> Result<(), String> {
+        self.register_scoped_destination(address, scope)
+            .map_err(|e| e.to_string())
+    }
+
+    fn retire(
+        &self,
+        address: &MemberAddress,
+        scope: &crate::cohort_scope::CohortScope,
+    ) -> Result<(), String> {
+        self.retire_scoped_destination(address, scope)
+            .map_err(|e| e.to_string())
     }
 }

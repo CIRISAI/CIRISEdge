@@ -291,6 +291,8 @@ async fn unconsented_external_traffic_drives_observations() {
             received_at: Utc::now(),
             source_key_id: None,
             link_key_id: None,
+            // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+            arrival_scope: None,
         })
         .await;
     }
@@ -338,6 +340,8 @@ async fn peer_role_traffic_produces_no_observations() {
             received_at: Utc::now(),
             source_key_id: None,
             link_key_id: None,
+            // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+            arrival_scope: None,
         })
         .await;
     }
@@ -382,6 +386,8 @@ async fn detector_disabled_is_a_full_noop() {
             received_at: Utc::now(),
             source_key_id: None,
             link_key_id: None,
+            // CIRISEdge#499 — federation arrival (no scope table in this fixture).
+            arrival_scope: None,
         })
         .await;
     }

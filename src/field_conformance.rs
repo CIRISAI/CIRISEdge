@@ -273,9 +273,49 @@ fn check_cohort_scope_projection() -> Result<(), String> {
     // is a function of this value, so an unhandled cell would be a routing hole.
     // `authority_for` on a benign dimension gives a concrete AuthorityClass.
     let authority = authority_for("trust:example:v1").class;
+    // CIRISPersist#742 — the Attestation plane's projection varies by
+    // FAMILY, so sweeping it at one dimension is not sweeping the plane.
+    // Persist found exactly this in its own corpus (`FAMILY_DIMS` claimed
+    // "one representative per decided family" and was missing the three
+    // newest, so its dominance invariant read as total while never seeing
+    // them). Edge had the sharper version: ONE dimension, `trust:example:v1`,
+    // standing in for every family edge actually routes.
+    //
+    // Persist's fix was a compile error — an exhaustive match over
+    // `AttestationFamily` with no wildcard, so a new family fails the build
+    // until someone names its representative. **That guard does not transfer
+    // to edge.** `AttestationFamily` is `#[non_exhaustive]`, so a downstream
+    // match MUST carry a wildcard arm and can never be exhaustive; and
+    // `FAMILY_DIMS` / `all_planes()` live inside persist's own
+    // `#[cfg(test)]` module, so there is nothing to reuse. Edge's fallback is
+    // this list plus `family_representatives_still_classify_as_intended`
+    // below, which catches the drift edge CAN see (a representative that
+    // stops classifying) even though it cannot catch a family edge has never
+    // heard of.
     for plane in [
         Plane::Attestation {
             dimension: "trust:example:v1",
+        },
+        Plane::Attestation {
+            dimension: "accord:human_dignity:v1",
+        },
+        Plane::Attestation {
+            dimension: "moderation:allegation:v1",
+        },
+        Plane::Attestation {
+            dimension: "provenance:build_manifest:v1",
+        },
+        Plane::Attestation {
+            dimension: "consent:share:v1",
+        },
+        Plane::Attestation {
+            dimension: "trace:reasoning:v1",
+        },
+        Plane::Attestation {
+            dimension: "scores:alignment:v1",
+        },
+        Plane::Attestation {
+            dimension: "capacity:relay_delivery:v1",
         },
         Plane::KeyRecord,
         Plane::TransportDestination,

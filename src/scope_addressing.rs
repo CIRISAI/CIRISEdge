@@ -80,24 +80,43 @@
 //! functions), so that module is the **only** place in the stack where a
 //! destination-derivation drift is caught.
 //!
-//! # Open: which MLS exporter label feeds `exporter_secret`
+//! # Which MLS exporter label feeds `exporter_secret` — RESOLVED
 //!
 //! `k_destination` takes "the group's `exporter_secret`", but RFC 9420
-//! §8.5's exporter is a *labelled* KDF — `export_secret(label, context,
-//! len)` — so that input is only well-defined once the label is fixed,
-//! and two members agree only if they export under the same one. That
-//! label is therefore as wire-affecting as the derivation itself and is
-//! **not** edge's to choose (raised on CIRISVerify#259 after v13.4.0
-//! closed it).
+//! §8.5's exporter is a *labelled* KDF, so that input is only
+//! well-defined once the label is fixed — and two members agree only if
+//! they export under the same one. That made the label as
+//! wire-affecting as the derivation itself, and therefore verify's to
+//! choose, not edge's.
 //!
-//! One thing is already settled in the negative: edge's existing
+//! **CIRISVerify v13.5.0 settled it.** The scope-privacy family now
+//! names all three parts of the exporter call:
+//!
+//! ```text
+//! S_record = MLS-Exporter(RECORD_EXPORTER_LABEL,      EXPORTER_CONTEXT, 32) → k_record_id, k_symbol
+//! S_dest   = MLS-Exporter(DESTINATION_EXPORTER_LABEL, EXPORTER_CONTEXT, 32) → k_destination
+//! ```
+//!
+//! with `EXPORTER_CONTEXT` **empty** — the exporter already binds
+//! `(group_id, epoch)`, so a context adds nothing and is one less thing
+//! to diverge on. Edge re-exports all four constants through
+//! [`crate::scope_privacy`] and calls them verbatim; the cohort-side
+//! producer is [`crate::mls::CohortGroup::destination_secret`].
+//!
+//! The destination plane gets its OWN label rather than sharing the
+//! record plane's, and the reason is load-bearing: the two secrets
+//! reach different subsystems, and sharing one PRK would mean any
+//! compromise yielding the record secret **retroactively deanonymizes
+//! all routing** — an adversary recomputes and links every address the
+//! node ever presented, collapsing exactly the unlinkability this
+//! module exists to buy.
+//!
+//! One candidate was refused on the record by both repos: edge's
 //! `ROOT_SECRET_LABEL` (`"ciris-realtime-av-epoch-dek-seed-v1"`,
-//! `transport::realtime_av_mls`) must NOT be that input. It is a DEK
-//! seed; feeding it here would derive a routing identifier that appears
-//! in the clear on the wire from the same material that seeds the
-//! content key, collapsing two secrets the exporter exists to keep
-//! independent. Until the label is specified, the table is simply never
-//! installed in production.
+//! `transport::realtime_av_mls`) must NOT be this input. It is a DEK
+//! seed; deriving a routing identifier that appears in the clear on the
+//! wire from the material that seeds the content key would collapse two
+//! secrets §8.5 exists to keep independent.
 //!
 //! # Locking
 //!
@@ -354,6 +373,20 @@ pub enum ScopeAddressError {
     /// Catching it here turns a key-reuse bug into a loud install-time
     /// error instead of a leviculum `register_destination` displacement
     /// warning and a half-deaf group.
+    ///
+    /// The two checks compose deliberately, and the ordering gives the
+    /// leviculum-side warning a sharper meaning than it would have alone.
+    /// Because the table refuses a colliding address BEFORE
+    /// [`ReticulumTransport::register_scoped_destination`] is ever
+    /// reached, leviculum's same-hash displacement warning (v0.19.0+)
+    /// should be **unreachable** for scope-derived destinations. If it
+    /// ever fires for one, it does not mean "a collision happened" — it
+    /// means a destination was registered by a path that bypassed this
+    /// table, which is a structurally more serious thing to learn. Worth
+    /// treating as a canary rather than as noise.
+    ///
+    /// [`ReticulumTransport::register_scoped_destination`]:
+    ///     crate::transport::reticulum::ReticulumTransport::register_scoped_destination
     #[error("scope_addressing: address collision on member '{member_key_id}' (epoch {epoch}) — reused exporter_secret?")]
     AddressCollision {
         /// The member whose derived address collided.

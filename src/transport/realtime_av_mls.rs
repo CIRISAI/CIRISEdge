@@ -846,6 +846,16 @@ impl MlsSession {
     /// to compute `RosterDelta::Replace` diffs. Returns owned
     /// `String`s because the underlying openmls `members()`
     /// iterator borrows ephemeral storage.
+    /// CIRISEdge#499 — this epoch's destination secret, the input to
+    /// `k_destination`. Independent of the DEK seed by construction;
+    /// see [`export_destination_secret`].
+    ///
+    /// # Errors
+    /// [`MlsError::ExportFailed`] on corrupted group state.
+    pub fn destination_secret(&self) -> Result<[u8; 32], MlsError> {
+        export_destination_secret(&self.group, &self.provider)
+    }
+
     pub fn member_key_ids(&self) -> Vec<String> {
         self.group
             .members()
@@ -1475,6 +1485,37 @@ fn decode_wrapped_welcome(buf: &[u8]) -> Result<WrappedWelcome, MlsError> {
         inviter_pk_id,
         inviter_pk_bytes,
     })
+}
+
+/// CIRISEdge#499 — derive this A/V epoch's **destination** secret,
+/// under CIRISVerify's `DESTINATION_EXPORTER_LABEL` (v13.5.0).
+///
+/// The twin of [`export_root_secret`], and deliberately NOT the same
+/// bytes. `export_root_secret` produces the DEK seed under
+/// [`ROOT_SECRET_LABEL`]; this produces the addressing secret. Verify
+/// refused the DEK-seed label for scope-privacy inputs explicitly and
+/// on the record: deriving a routing identifier that appears in the
+/// clear on the wire from the material that seeds the content key would
+/// collapse two secrets RFC 9420 §8.5 exists to keep independent.
+///
+/// One extra `export_secret` per epoch boundary — a cold path, since
+/// epochs advance on membership change, never per chunk.
+fn export_destination_secret(
+    group: &MlsGroup,
+    provider: &LibcruxProvider,
+) -> Result<[u8; 32], MlsError> {
+    let bytes = group
+        .export_secret(
+            provider.crypto(),
+            crate::scope_privacy::DESTINATION_EXPORTER_LABEL,
+            crate::scope_privacy::EXPORTER_CONTEXT,
+            32,
+        )
+        .map_err(|e| MlsError::ExportFailed(format!("{e:?}")))?;
+    let out: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        MlsError::ExportFailed(format!("expected 32 bytes, got {}", v.len()))
+    })?;
+    Ok(out)
 }
 
 /// Derive the current epoch's [`RootSecret`] from the group's

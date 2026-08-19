@@ -48,7 +48,7 @@ The trend page carries two kinds of series, both consumed by the same
   concurrency changes, not per-packet lock-holds; see the bench's own docs
   for the A/B that established this),
   `realtime_av_fanout` (seal cost), `realtime_av_relay`,
-  `realtime_av_rekey`, `realtime_av_mesh_e2e`. Each bench's
+  `realtime_av_rekey`, `realtime_av_mdc_substrate`. Each bench's
   `required-features` (see `Cargo.toml`) is honored.
 - **Fixed-operating-point SIM metrics** (semantic values — ratios / ms /
   rounds — published **un-normalized**, emitted by the three

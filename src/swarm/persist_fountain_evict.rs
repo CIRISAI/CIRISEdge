@@ -85,6 +85,34 @@ pub trait FountainHoldingsSource: Send + Sync {
     async fn list_held_fountain_content(
         &self,
     ) -> Result<Vec<HeldFountainContent>, FountainEvictError>;
+
+    /// CIRISEdge#499 — the SCOPE this held content lives in, so the
+    /// publisher can decide which peers may be told the holding exists.
+    ///
+    /// **Edge never infers a content's scope.** Content classification is
+    /// the persist-backed consumer's, exactly as it is on the blob plane
+    /// ([`BlobChunkSource::chunk_scope`](crate::blob_swarm::BlobChunkSource::chunk_scope),
+    /// whose shape this deliberately mirrors — one seam shape for the two
+    /// planes, not two). `None` means *undeterminable*, and is NEVER read
+    /// as `Public`: on a scope-native node it withholds the announcement
+    /// ([`HoldingRefusal::ScopeUndeterminable`](super::scope::HoldingRefusal::ScopeUndeterminable)).
+    ///
+    /// The default returns `None`, which keeps every existing
+    /// implementation compiling AND keeps its behaviour byte-identical:
+    /// the publish gate is armed only where a
+    /// [`ScopeAddressTable`](crate::scope_addressing::ScopeAddressTable)
+    /// is installed, and a deployment with no table announces every
+    /// holding regardless of what this returns. A consumer that installs
+    /// an address table MUST override this or its holdings plane fails
+    /// closed — which is the correct order of operations: publish a
+    /// scoped holding only once you can say what scope it is in.
+    ///
+    /// Synchronous on purpose: it is consulted once per held content on
+    /// the publish tick, between `.await` points, and an `async` seam here
+    /// would invite a lock guard to be held across one (CIRISEdge#217).
+    fn content_scope(&self, _content_id: &str) -> Option<crate::blob_swarm::ContentScope> {
+        None
+    }
 }
 
 /// A `FountainHoldingsSource` that returns an empty list. Used in

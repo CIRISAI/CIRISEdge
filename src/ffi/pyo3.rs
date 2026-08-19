@@ -1077,7 +1077,8 @@ impl PyEdge {
                     transport: tid,
                     received_at: chrono::Utc::now(),
                     source_key_id: None,
-                    link_key_id: None, // CIRISEdge#402
+                    link_key_id: None,   // CIRISEdge#402
+                    arrival_scope: None, // CIRISEdge#499 — injected frame, federation arrival
                 };
                 inner
                     .dispatch_inbound_observed_outcome_for_test(frame)
