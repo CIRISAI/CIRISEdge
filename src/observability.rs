@@ -437,6 +437,85 @@ pub enum WithholdReason {
     /// fail-closed anyway, so a future persist widening surfaces as a NAMED
     /// withhold rather than as an allow.
     HoldingScopeProjectionUnsupported,
+
+    // ── CIRISEdge#169 — the LXMF propagation HOST serve path ────────────
+    //
+    // These ten are the refusal taxonomy of
+    // [`crate::transport::lxmf_serve`]: this node acting as an LXMF
+    // propagation node, holding and serving THIRD-PARTY mail. They are
+    // defined unconditionally rather than under the serve path's own
+    // `cfg`, because the withhold taxonomy is a stable operator-facing
+    // vocabulary: a snapshot's reason set must not change shape with the
+    // build's feature flags, and cfg-gating variants would fork
+    // `parameter_of`'s exhaustive match across feature combinations —
+    // the proper-subset build hazard this repo keeps re-learning. A
+    // default build simply never constructs them.
+    /// #169 — a propagation request arrived and this node does NOT operate
+    /// as a propagation node ([`crate::transport::lxmf_serve::PropagationAudience::Disabled`],
+    /// the default). Serving strangers' mail is an explicit operator act,
+    /// so the OFF state is a named refusal rather than an unhandled path:
+    /// an operator who believes they enabled propagation and sees this
+    /// reason is looking at the answer.
+    LxmfPropagationDisabled,
+    /// #169 — the destination is not one this node holds mail for. Fires
+    /// on BOTH legs of the same roster (`detail` names which): an upload
+    /// whose recipient is off-roster, and a `/get` from a requester who is
+    /// off-roster. One condition, one remedy — put the destination on the
+    /// roster — so one reason.
+    LxmfDestinationNotServed,
+    /// #169 — a `/get` arrived on a link whose remote identity edge could
+    /// not resolve, so there is no destination to scope the mailbox to.
+    /// Fail-closed: an unattributed request is never answered with mail,
+    /// because "whose mailbox is this" has no answer.
+    LxmfRequesterUnidentified,
+    /// #169 — the requester asked for a transient ID that is parked for a
+    /// DIFFERENT destination. This is the cross-recipient mailbox probe
+    /// the per-destination index exists to defeat; it is reported rather
+    /// than merely omitted, because it is the one `/get` miss that is
+    /// evidence of an attack rather than of a race.
+    LxmfMailboxScopeMismatch,
+    /// #169 — an upload's proof-of-work propagation stamp did not meet the
+    /// cost this node advertises in its
+    /// [`PropagationNodeAnnounce`](leviculum_lxmf::PropagationNodeAnnounce).
+    /// The advertised cost IS the node's published term of carriage; an
+    /// upload that has not paid it has not met the rule it was offered.
+    LxmfStampBelowCost,
+    /// #169 — the bytes do not decode as the LXMF propagation wire this
+    /// endpoint speaks (`detail` names the leg: `/get` request body or
+    /// upload envelope). Distinct from [`Self::LxmfPeerSyncUnsupported`]:
+    /// these bytes are malformed, those are well-formed and for another
+    /// endpoint.
+    LxmfWireUnparseable,
+    /// #169 — a well-formed MULTI-message upload: the node-to-node
+    /// `/offer` peer-sync form, which `leviculum-lxmf` deliberately does
+    /// not implement (leviculum#209) and reports as
+    /// `PropagationError::MultipleMessages`. Its own reason because the
+    /// remedy is not "fix your client" but "you have pointed a peer sync
+    /// at a node that serves clients only".
+    LxmfPeerSyncUnsupported,
+    /// #169 — a byte or count ceiling refused carriage before any work was
+    /// done (`detail` names which: request body, upload envelope, the
+    /// transient-ID list in one request, or the per-response transfer
+    /// cap). A propagation node serves strangers by definition, so every
+    /// buffer it fills on their behalf has an explicit ceiling, and
+    /// hitting one is an event.
+    LxmfFrameOversized,
+    /// #169 — the mailbox is at a retention ceiling (total bytes, messages
+    /// for this destination, or distinct destinations) and the upload was
+    /// REFUSED rather than admitted by evicting. Refusing is the security
+    /// property: a node that evicted to admit would let an attacker flush
+    /// a victim's pending mail with junk uploads, turning a capacity bound
+    /// into a censorship lever. Contrast
+    /// [`crate::transport::store_and_forward`], which DOES evict
+    /// oldest-first — it queues this node's OWN outbound envelopes, where
+    /// there is no third party to censor.
+    LxmfMailboxFull,
+    /// #169 — a parked message reached the retention window without being
+    /// collected and was evicted undelivered. The bounded-retention
+    /// promise kept, and kept LOUDLY: a propagation node that dropped
+    /// third-party mail silently would be indistinguishable from one that
+    /// never received it.
+    LxmfRetentionExpired,
 }
 
 impl WithholdReason {
@@ -475,6 +554,16 @@ impl WithholdReason {
             Self::HoldingScopePublicGroup => "holding_scope_public_group",
             Self::HoldingScopePeerNotInRoster => "holding_scope_peer_not_in_roster",
             Self::HoldingScopeProjectionUnsupported => "holding_scope_projection_unsupported",
+            Self::LxmfPropagationDisabled => "lxmf_propagation_disabled",
+            Self::LxmfDestinationNotServed => "lxmf_destination_not_served",
+            Self::LxmfRequesterUnidentified => "lxmf_requester_unidentified",
+            Self::LxmfMailboxScopeMismatch => "lxmf_mailbox_scope_mismatch",
+            Self::LxmfStampBelowCost => "lxmf_stamp_below_cost",
+            Self::LxmfWireUnparseable => "lxmf_wire_unparseable",
+            Self::LxmfPeerSyncUnsupported => "lxmf_peer_sync_unsupported",
+            Self::LxmfFrameOversized => "lxmf_frame_oversized",
+            Self::LxmfMailboxFull => "lxmf_mailbox_full",
+            Self::LxmfRetentionExpired => "lxmf_retention_expired",
         }
     }
 }
