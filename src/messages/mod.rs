@@ -61,6 +61,18 @@ pub enum MessageType {
     /// on receipt (the generic successor of the ripped inline-text
     /// subscriber pattern). No `Response`.
     OpaqueEvent,
+    /// Phase 2 typed ephemeral response — the closure of the v0.8.0
+    /// "ephemeral request-response correlation not wired" carve-out.
+    /// Body: the serialized `M::Response` of the requesting [`Message`]
+    /// impl — deliberately NOT a per-type discriminator: the requester
+    /// knows `M::Response` statically and deserializes; edge never
+    /// interprets the payload (MISSION §1.3). Correlated back to the
+    /// pending `Edge::send::<M>` via the envelope `in_reply_to` (the
+    /// request envelope's `body_sha256` — the same loop as
+    /// [`Self::OpaqueResponse`]). Excluded from the durable-ACK matcher
+    /// exactly like `OpaqueResponse`: its `in_reply_to` is
+    /// request/response correlation, not a durable-send ACK.
+    EphemeralResponse,
     /// Build-manifest publication primitive → registry. Durable.
     BuildManifestPublication,
     /// Data-subject access request — DSAR chain. Durable, requires_ack.
@@ -1525,10 +1537,15 @@ pub struct HintShape {
     /// if the held body exceeds this hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_body_bytes: Option<u64>,
-    /// If `true`, the requester prefers a chunked response (Phase 2
-    /// `ContentChunk`). Phase 1 responders ignore this — they always
-    /// answer with whole-file [`ContentBody`]. The field exists so
-    /// Phase 2 receivers can branch without a wire break.
+    /// If `true`, the requester prefers a chunked response. **Advisory
+    /// and currently IGNORED** — edge-core ships no chunked
+    /// `ContentFetch` responder: responders always answer with a
+    /// whole-file [`ContentBody`] (chunked transfer rides the separate
+    /// `BlobChunkFetch` / `BlobChunkBody` swarm plane, CIRISEdge#55).
+    /// The receive-side dispatcher logs at `debug` when the flag is
+    /// set so the ignored preference is observable rather than
+    /// silently dead. The field exists so a future chunked responder
+    /// can branch without a wire break.
     #[serde(default)]
     pub prefer_chunked: bool,
 }

@@ -192,6 +192,14 @@ async fn build_edge(
         .queue(queue)
         .signer(signer)
         .transport(transport)
+        // Phase 2 — `OpaqueRequest` sends now genuinely await a
+        // correlated response; these tests wire no responder, so a
+        // short timeout keeps each (ignored-result) send from parking
+        // for the 30 s production default.
+        .config(EdgeConfig {
+            ephemeral_response_timeout_ms: 10,
+            ..EdgeConfig::default()
+        })
         .build()
         .expect("build edge")
 }
@@ -210,13 +218,12 @@ async fn hundred_successful_sends_yield_ratio_one() {
     let edge = build_edge(&tmp, &me, &peer, transport.clone()).await;
 
     // `OpaqueRequest` rides `Delivery::Ephemeral` so `Edge::send` is the
-    // right entry point. We don't actually need a response — the
-    // ephemeral path returns `EdgeError::Config` "correlation not
-    // wired (Phase 2)" on success, which is fine: the tracker hook is
-    // executed BEFORE the correlation-channel check (the hook sits on
-    // the transport.send() result), so the counter increments
-    // regardless of whether the caller-facing `send` ultimately
-    // returns Ok or this Config error.
+    // right entry point. We don't actually need a response — with no
+    // responder wired each send times out its (Phase-2, now real)
+    // correlation await and returns `EdgeError::Unreachable`, which is
+    // fine: the tracker hook sits on the transport.send() result,
+    // BEFORE the response await, so the counter increments regardless
+    // of what the caller-facing `send` ultimately returns.
     for _ in 0..100 {
         let _ = edge
             .send(
@@ -401,6 +408,8 @@ async fn config_window_threads_to_tracker() {
     let transport = Arc::new(ToggleTransport::new(true));
     let cfg = EdgeConfig {
         reachability_window_seconds: 600, // 10 min — non-default
+        // Phase 2 — no responder wired; don't park on the await.
+        ephemeral_response_timeout_ms: 10,
         ..EdgeConfig::default()
     };
     let edge = Edge::builder()

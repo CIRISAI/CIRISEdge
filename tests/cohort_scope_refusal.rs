@@ -177,6 +177,10 @@ fn config_with_enforcement(mode: CohortScopeEnforcement) -> EdgeConfig {
     EdgeConfig {
         hybrid_policy: HybridPolicy::Ed25519Fallback,
         cohort_scope_enforcement: mode,
+        // Phase 2 — ephemeral typed sends now genuinely await a
+        // correlated response; no responder is wired in these tests,
+        // so keep the (ignored) await short.
+        ephemeral_response_timeout_ms: 10,
         ..EdgeConfig::default()
     }
 }
@@ -499,11 +503,11 @@ async fn ephemeral_delivery_with_family_scope_to_family_recipient_allowed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (edge, fam_recipient, _pub_) =
         build_edge_with_directories(&tmp, CohortScopeEnforcement::Strict, vec![]).await;
-    // `send` returns Err because ephemeral request-response correlation
-    // is not wired (Phase 2 TODO in edge.rs); the cohort_scope check
-    // must NOT block the call before reaching that point — the error
-    // we want to see is the Config(Phase 2) wire, NOT a
-    // CohortScopeRefused.
+    // `send` returns Err because no responder is wired for the
+    // (Phase-2, now real) request-response correlation — the await
+    // times out as `Unreachable`. The cohort_scope check must NOT
+    // block the call before reaching that point: the error we want to
+    // see is the transport/timeout shape, NOT a CohortScopeRefused.
     let err = edge
         .send_with_cohort_scope(
             &fam_recipient,
@@ -514,19 +518,14 @@ async fn ephemeral_delivery_with_family_scope_to_family_recipient_allowed() {
             Some(CohortScope::Family),
         )
         .await
-        .expect_err("ephemeral request-response returns Phase-2 error");
+        .expect_err("no responder wired → the correlation await errors");
     match err {
         EdgeError::CohortScopeRefusedRecipient { .. } => {
             panic!("family recipient must NOT trigger cohort_scope refusal");
         }
-        EdgeError::Config(msg) => {
-            assert!(
-                msg.contains("Phase 2") || msg.contains("correlation"),
-                "expected Phase 2 message; got {msg}"
-            );
-        }
-        // Transport-shaped errors are also acceptable — the test's
-        // point is that we DON'T see a CohortScopeRefusedRecipient.
+        // Transport-shaped errors (including the response-await
+        // timeout) are the expected outcome — the test's point is
+        // that we DON'T see a CohortScopeRefusedRecipient.
         EdgeError::Transport(_) | EdgeError::Unreachable(_) => {}
         other => panic!("unexpected error: {other:?}"),
     }

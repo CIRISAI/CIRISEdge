@@ -497,10 +497,18 @@ async fn dispatch_one(
     config: &DispatcherConfig,
     reachability: Option<&Arc<ReachabilityTracker>>,
 ) {
-    // Transport selection: first configured transport for now.
-    // TODO Phase 2 — per-row transport preference based on
-    // destination's reachability map.
-    let transport = &transports[0];
+    // Per-row transport selection (the Phase-2 closure of the
+    // "first configured transport for now" placeholder): consult the
+    // destination's per-medium reachability and prefer the medium
+    // that has actually worked for this peer; fall back to the first
+    // configured transport when nothing has measured success.
+    let transport_ids: Vec<crate::transport::TransportId> =
+        transports.iter().map(|t| t.id()).collect();
+    let transport = &transports[preferred_transport_index(
+        &transport_ids,
+        &row.destination_key_id,
+        reachability.map(|t| &**t),
+    )];
     let outcome = transport
         .send(&row.destination_key_id, &row.envelope_bytes)
         .await;
@@ -652,6 +660,48 @@ async fn dispatch_one(
     }
 }
 
+/// Per-row transport preference for the durable dispatcher (the
+/// Phase-2 closure of the `transports[0]` placeholder), consulting the
+/// [`ReachabilityTracker`] the send/dispatch hook sites populate.
+///
+/// Minimal honest rule: among the configured transports, prefer the
+/// one with the highest success ratio for this destination among media
+/// that have MEASURED SUCCESS in the rolling window (`attempts > 0 &&
+/// ratio > 0`). When nothing has measured success — a fresh peer, or a
+/// window where everything failed — fall back to index 0 (the
+/// historical default): per the [`crate::reachability::PeerMediumReachability::ratio`]
+/// contract, "no measurement" must not be read as "unreachable", and
+/// an all-failing window gives no basis to prefer any other medium
+/// over the configured-first one. Ties keep the earlier-configured
+/// transport (deterministic). Single-transport deployments
+/// short-circuit to 0 without touching the tracker.
+fn preferred_transport_index(
+    transport_ids: &[crate::transport::TransportId],
+    destination_key_id: &str,
+    reachability: Option<&ReachabilityTracker>,
+) -> usize {
+    if transport_ids.len() <= 1 {
+        return 0;
+    }
+    let Some(tracker) = reachability else {
+        return 0;
+    };
+    let snapshot = tracker.snapshot(destination_key_id);
+    let mut best: Option<(usize, f64)> = None;
+    for (idx, id) in transport_ids.iter().enumerate() {
+        if let Some(medium) = snapshot.get(id) {
+            if medium.attempts > 0 {
+                let ratio = medium.ratio();
+                // (`map_or`, not 1.82's `is_none_or` — MSRV is 1.75.)
+                if ratio > 0.0 && best.map_or(true, |(_, b)| ratio > b) {
+                    best = Some((idx, ratio));
+                }
+            }
+        }
+    }
+    best.map_or(0, |(idx, _)| idx)
+}
+
 /// Run the periodic-sweep tasks. Spawned alongside `run_dispatcher`.
 pub async fn run_sweeps(
     queue: Arc<dyn OutboundHandle>,
@@ -680,5 +730,100 @@ pub async fn run_sweeps(
                 }
             }
         }
+    }
+}
+
+/// Per-row transport preference (the Phase-2 `transports[0]` closure)
+/// — unit-driven on the exact selection function `dispatch_one` calls,
+/// against a real [`ReachabilityTracker`] populated through the same
+/// `record_attempt` surface the production hook sites use.
+#[cfg(test)]
+mod transport_preference_tests {
+    use super::*;
+    use crate::transport::TransportId;
+
+    const RETICULUM: TransportId = TransportId("pref-reticulum");
+    const HTTP: TransportId = TransportId("pref-http");
+
+    fn failure() -> AttemptOutcome {
+        AttemptOutcome::SendFailure {
+            error_class: "timeout".to_string(),
+        }
+    }
+
+    #[test]
+    fn single_transport_short_circuits_to_zero() {
+        let tracker = ReachabilityTracker::new(300);
+        // Even a recorded success elsewhere cannot move a
+        // single-transport deployment off index 0.
+        tracker.record_attempt("peer-1", HTTP, AttemptOutcome::SendSuccess);
+        assert_eq!(
+            preferred_transport_index(&[RETICULUM], "peer-1", Some(&tracker)),
+            0
+        );
+    }
+
+    #[test]
+    fn no_tracker_falls_back_to_first() {
+        assert_eq!(
+            preferred_transport_index(&[RETICULUM, HTTP], "peer-1", None),
+            0
+        );
+    }
+
+    #[test]
+    fn unmeasured_peer_falls_back_to_first() {
+        let tracker = ReachabilityTracker::new(300);
+        assert_eq!(
+            preferred_transport_index(&[RETICULUM, HTTP], "peer-unmeasured", Some(&tracker)),
+            0,
+            "no measurement must not be read as unreachable — historical default wins",
+        );
+    }
+
+    #[test]
+    fn measured_success_on_second_medium_is_preferred() {
+        let tracker = ReachabilityTracker::new(300);
+        tracker.record_attempt("peer-1", RETICULUM, failure());
+        tracker.record_attempt("peer-1", HTTP, AttemptOutcome::SendSuccess);
+        assert_eq!(
+            preferred_transport_index(&[RETICULUM, HTTP], "peer-1", Some(&tracker)),
+            1,
+            "the medium that has actually worked for this peer wins over transports[0]",
+        );
+    }
+
+    #[test]
+    fn all_failing_window_falls_back_to_first() {
+        let tracker = ReachabilityTracker::new(300);
+        tracker.record_attempt("peer-1", RETICULUM, failure());
+        tracker.record_attempt("peer-1", HTTP, failure());
+        assert_eq!(
+            preferred_transport_index(&[RETICULUM, HTTP], "peer-1", Some(&tracker)),
+            0,
+            "an all-failing window gives no basis to leave the configured-first default",
+        );
+    }
+
+    #[test]
+    fn higher_ratio_wins_and_ties_keep_first() {
+        let tracker = ReachabilityTracker::new(300);
+        // RETICULUM: 1/2 = 0.5; HTTP: 2/2 = 1.0 → HTTP.
+        tracker.record_attempt("peer-1", RETICULUM, AttemptOutcome::SendSuccess);
+        tracker.record_attempt("peer-1", RETICULUM, failure());
+        tracker.record_attempt("peer-1", HTTP, AttemptOutcome::SendSuccess);
+        tracker.record_attempt("peer-1", HTTP, AttemptOutcome::SendSuccess);
+        assert_eq!(
+            preferred_transport_index(&[RETICULUM, HTTP], "peer-1", Some(&tracker)),
+            1
+        );
+        // Tie (both 1/1) → earlier-configured transport, deterministic.
+        let tie = ReachabilityTracker::new(300);
+        tie.record_attempt("peer-2", RETICULUM, AttemptOutcome::SendSuccess);
+        tie.record_attempt("peer-2", HTTP, AttemptOutcome::SendSuccess);
+        assert_eq!(
+            preferred_transport_index(&[RETICULUM, HTTP], "peer-2", Some(&tie)),
+            0
+        );
     }
 }
