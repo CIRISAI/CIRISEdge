@@ -358,7 +358,10 @@ restoring cross-wheel installability for the persist v3.5.4+ chain.
   - D18 verify → edge linkage (CIRISEdge#37 follow-on).
   - Leviculum-fork accessor exposure (#44; gap-stubs functional).
 - **v1.1.x**:
-  - L2+ trust recursion depths.
+  - ~~L2+ trust recursion depths.~~ *(Retro-note, 2026-08: the depth knob
+    shipped as `EdgeConfig::delegation_graph_max_depth` — default 4,
+    `src/edge.rs` — threaded per CIRISEdge#51; L2+ CEWP *tier* semantics
+    remain deferred.)*
   - L1-as-CDN-edge full HTTP fetch (the prefetch stub at v0.20.1 is
     wire-shape + dispatch-path locked; full implementation deferred).
 - **Production deployments** per
