@@ -22,8 +22,8 @@
 //! - **A real `ReticulumTransport`** over real TCP interfaces on a real
 //!   docker network, and **real announce-based rooting** — a node learns
 //!   its peers by verifying their signed announce attestations against
-//!   the federation directory. No `inject_rooted_peer_for_test` on the
-//!   federation plane.
+//!   the federation directory. No `inject_rooted_peer_for_test`
+//!   anywhere in this binary.
 //! - **A real MLS `CohortGroup`** (openmls 0.8.1, X-Wing ciphersuite
 //!   0x004D), joined **across process boundaries**: the joiner mints a
 //!   real KeyPackage, ships it over the real RNS wire, and the creator's
@@ -43,11 +43,10 @@
 //!
 //! # What is a SEAM (stubbed, and named)
 //!
-//! Three things the harness cannot reach today, each behind a narrow
+//! Two things the harness cannot reach today, each behind a narrow
 //! trait so the real API drops in as a second impl without touching the
-//! measurement or the reporting. Two are APIs being built concurrently
-//! (`av_spine`, scope-native blob fetch); the third is a verb that does
-//! not exist at all yet:
+//! measurement or the reporting. Both are APIs being built concurrently
+//! (`av_spine`, scope-native blob fetch):
 //!
 //! - [`MediaLink`] — how a sealed chunk crosses the wire. Today's impl
 //!   ([`TransportMediaLink`]) uses `Transport::send`, the real RNS
@@ -62,30 +61,39 @@
 //!   holding a `ReticulumTransport` **cannot** reach the node, so it
 //!   cannot construct the real-RNS A/V sender. See the report.
 //!
-//! - [`ScopedDialer`] — how a *scope-derived* address is dialled.
-//!   `ScopeAddressTable::send_address` hands you the peer's 16 bytes and
-//!   there is no transport verb that takes them; `link_open` resolves
-//!   its signing key from the rooted-peer map, which is keyed on
-//!   federation destinations. The harness installs the missing binding
-//!   itself ([`HarnessScopedDialer`]) and says so in its output
-//!   (`dial_binding: "harness_installed"`), so no reader mistakes the
-//!   seal-retirement leg for proof that a production dial path exists.
-//!
-//!   Running it produced a second, larger finding: **a scope-derived
-//!   destination is not reachable off-link at all.** It is registered
-//!   with `Destination::with_explicit_hash`, and an explicit-hash
-//!   destination cannot announce, so no multi-hop RNS path to one can
-//!   exist. The federation destination escapes this only because a node
-//!   registers an *announceable* named destination beside it; a scoped
-//!   address has no such twin by design, since announcing one would
-//!   publish the reachability fact the derivation exists to withhold.
-//!   So the peer-dials-it half of "a sealed address finds nobody home"
-//!   is not measurable from a relayed peer today, and the leg reports
-//!   `ran: false` carrying that diagnosis. The owner-side half IS
-//!   measured, by the member's own `scope.seal` leg.
-//!
 //! Blob fetch is scope-*gated* here but not yet scope-*native*:
 //! `src/blob_swarm/` is being extended concurrently. See [`BlobPlane`].
+//!
+//! # How seal retirement is measured (CIRISEdge#499)
+//!
+//! An earlier shape of the `conformance.seal_retires` leg tried to
+//! RNS-dial the member's scope-derived address directly, through the
+//! relay. Running it proved that structurally impossible, and BY
+//! DESIGN: a scope-derived destination is registered with
+//! `Destination::with_explicit_hash`, and an explicit-hash destination
+//! cannot announce (`AnnounceError::ExplicitHashCannotAnnounce`;
+//! leviculum answers a path request for one with silence, because a
+//! path response IS an announce and an announce for a caller-supplied
+//! hash is unverifiable). No multi-hop RNS path to one can exist. The
+//! federation destination escapes this only because a node registers an
+//! *announceable* named destination beside it; a scoped address has no
+//! such twin, since announcing one would publish the very reachability
+//! fact the derivation exists to withhold. **A scoped address is an
+//! arrival discriminator, not a routable endpoint.**
+//!
+//! So the leg measures retirement at the ADMISSION SEAM instead. The
+//! publisher CAN reach the member over its announced node destination —
+//! `mesh.rooting` proves those paths exist through the relay — so it
+//! sends an application-level [`Control::AddressProbe`] naming the
+//! 16 derived bytes, and the member answers from the SAME lookup the
+//! production transport consults when it stamps
+//! `InboundFrame::arrival_scope` on every arriving frame
+//! (`ReticulumTransport::inbound_scope` →
+//! `ScopeAddressTable::accepts_inbound`, the reverse index). After the
+//! seal the superseded address must be refused (`held: false`) WHILE
+//! the live address still answers `held: true` — the live answer is the
+//! aliveness control that makes "refused" distinguishable from "node
+//! down". That is the honest network observable under #499.
 //!
 //! # Honesty
 //!
@@ -512,16 +520,6 @@ fn publish_transport_entry(mesh: &Path, entry: &TransportEntry) -> std::io::Resu
     std::fs::rename(&tmp, &final_path)
 }
 
-/// Read a peer's transport ed25519 half, or `None` if it has not
-/// published one yet.
-fn peer_transport_ed25519(mesh: &Path, key_id: &str) -> Option<[u8; 32]> {
-    let path = roster_dir(mesh).join(format!("{key_id}.transport.json"));
-    let bytes = std::fs::read(path).ok()?;
-    let entry: TransportEntry = serde_json::from_slice(&bytes).ok()?;
-    let raw = B64.decode(entry.transport_ed25519_b64).ok()?;
-    raw.try_into().ok()
-}
-
 fn read_roster(mesh: &Path) -> BTreeMap<String, RosterEntry> {
     let mut out = BTreeMap::new();
     let Ok(rd) = std::fs::read_dir(roster_dir(mesh)) else {
@@ -788,16 +786,34 @@ enum Control {
         bytes: usize,
         chunks: usize,
     },
-    /// Member → creator: "dial my live and superseded addresses BEFORE
+    /// Member → creator: "probe my live and superseded addresses BEFORE
     /// I seal". Carries no addresses: the creator derives them from its
     /// OWN table, which is additionally the cross-node agreement check —
-    /// a dial that lands proves both nodes derived the same 16 bytes.
-    /// Sent only by a member that crossed an epoch advance and therefore
-    /// has a superseded epoch to retire.
+    /// a probe answered `held: true` proves both nodes derived the same
+    /// 16 bytes. Sent only by a member that crossed an epoch advance and
+    /// therefore has a superseded epoch to retire.
     SealProbe {
         key_id: String,
         superseded_epoch: u64,
     },
+    /// Creator → member: "does your transport's arrival-admission table
+    /// currently hold this scope-derived address?" Sent over the
+    /// member's announced, rooted node destination — a scoped address
+    /// itself cannot be dialled across a relay (explicit-hash
+    /// destinations never announce), so this application-level probe is
+    /// how a peer observes admission (see the module doc). The address
+    /// travels as the raw 16 derived bytes (hex) because the answering
+    /// lookup — `ReticulumTransport::inbound_scope`, the same
+    /// `ScopeAddressTable::accepts_inbound` reverse index that stamps
+    /// `InboundFrame::arrival_scope` on every arriving frame — is keyed
+    /// on exactly those bytes.
+    AddressProbe { address_hex: String, nonce: u64 },
+    /// Member → creator: the admission answer. `held` is the production
+    /// lookup's verdict, not a parallel bookkeeping read. The ack
+    /// ARRIVING is itself the aliveness proof that distinguishes
+    /// "refused" (`held: false`) from "node down" (silence); silence is
+    /// transport loss, never an admission answer.
+    AddressProbeAck { nonce: u64, held: bool },
     /// Creator → member: "I have taken the before-reading; seal now".
     SealGo { key_id: String },
     /// Member → creator: the seal ran; here is what it did.
@@ -964,63 +980,124 @@ impl MediaLink for TransportMediaLink {
     }
 }
 
-/// **SEAM 2 — how a *scope-derived* address is dialled.**
+// ═══════════════════════════════════════════════════════════════════
+// The admission-seam address probe (`conformance.seal_retires`)
+// ═══════════════════════════════════════════════════════════════════
+//
+// See "How seal retirement is measured" in the module doc. A scoped
+// address is an arrival discriminator, not a routable endpoint, so the
+// probe rides the member's rooted node destination and the ANSWER — not
+// a link establishing — is the observable.
+
+/// Publisher side: send one [`Control::AddressProbe`] for `address` to
+/// `member` and await the matching ack.
 ///
-/// `ScopeAddressTable::send_address(scope, group, member)` hands back a
-/// peer's 16-byte derived address and there is no transport verb that
-/// accepts one: `register_scoped_destination` / `retire_scoped_
-/// destination` / `inbound_scope` cover the LISTEN half, and
-/// `link_open` resolves its peer signing key from the rooted-peer map,
-/// which is keyed on federation destinations. `send_address` has zero
-/// non-test callers in the tree.
+/// Returns `Some(held)` when the ack arrives — the member's production
+/// admission verdict for those 16 bytes — and `None` on silence, which
+/// is transport loss and never an admission answer.
 ///
-/// The harness supplies the binding itself so the seal-retirement leg
-/// can make a real *network* assertion, and stamps
-/// `dial_binding: "harness_installed"` on the result so nobody reads
-/// that leg as evidence a production dial path exists.
-#[async_trait::async_trait]
-trait ScopedDialer: Send + Sync {
-    fn binding_source(&self) -> &'static str;
-    /// Try to establish a link to a scope-derived address. `Ok(true)`
-    /// means somebody answered.
-    async fn dial(
-        &self,
-        address: &MemberAddress,
-        peer_transport_ed25519: [u8; 32],
-        timeout: Duration,
-    ) -> bool;
-}
-
-struct HarnessScopedDialer {
-    transport: Arc<ReticulumTransport>,
-}
-
-#[async_trait::async_trait]
-impl ScopedDialer for HarnessScopedDialer {
-    fn binding_source(&self) -> &'static str {
-        // Named, not hidden: the production verb does not exist yet.
-        "harness_installed"
+/// The tail of the publisher run is ONE state machine on purpose (two
+/// loops each discarding the other's messages is the shape that
+/// silently loses one), so a `Report` arriving while this waits is
+/// folded into `member_reports` rather than dropped. Stale acks from an
+/// earlier probe are skipped by nonce.
+async fn probe_scope_address(
+    transport: &ReticulumTransport,
+    mailbox: &Mailbox,
+    member: &str,
+    address: &MemberAddress,
+    nonce: u64,
+    timeout: Duration,
+    member_reports: &mut serde_json::Map<String, serde_json::Value>,
+) -> Option<bool> {
+    let probe = Control::AddressProbe {
+        address_hex: hex::encode(address.as_bytes()),
+        nonce,
+    };
+    if send_control(transport, member, &probe).await.is_err() {
+        return None;
     }
-    async fn dial(
-        &self,
-        address: &MemberAddress,
-        peer_transport_ed25519: [u8; 32],
-        timeout: Duration,
-    ) -> bool {
-        let hash = *address.as_bytes();
-        // Install exactly the (derived hash → peer transport key) binding
-        // the missing `dial_scoped` verb would resolve internally. A
-        // pseudo key id keyed on the hash keeps it out of the federation
-        // peer namespace.
-        let pseudo = format!("scoped:{}", hex::encode(hash));
-        self.transport
-            .inject_rooted_peer_for_test(&pseudo, hash, peer_transport_ed25519)
-            .await;
-        self.transport.link_open(&hash, timeout).await.is_ok()
+    let until = Instant::now() + timeout;
+    while Instant::now() < until {
+        let Ok((_s, msg)) = mailbox.next_control(Duration::from_secs(2)).await else {
+            continue;
+        };
+        match msg {
+            Control::AddressProbeAck { nonce: n, held } if n == nonce => return Some(held),
+            Control::Report { key_id, body } => {
+                member_reports.insert(key_id, body);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Member side: answer one [`Control::AddressProbe`].
+///
+/// The answer is routed through `ReticulumTransport::inbound_scope` —
+/// the SAME `ScopeAddressTable::accepts_inbound` reverse-index lookup
+/// the transport's arrival path performs to stamp
+/// `InboundFrame::arrival_scope` on every real inbound frame — so the
+/// leg measures the production admission decision, not a parallel
+/// bookkeeping read. Bytes that do not decode to a 16-byte hash are
+/// answered `held: false`: they name nothing this table could admit.
+async fn answer_address_probe(
+    transport: &ReticulumTransport,
+    to: &str,
+    address_hex: &str,
+    nonce: u64,
+) {
+    let held = hex::decode(address_hex)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        .is_some_and(|h| transport.inbound_scope(&h).is_some());
+    let _ = send_control(transport, to, &Control::AddressProbeAck { nonce, held }).await;
+}
+
+/// The `conformance.seal_retires` after-reading, as a pure verdict.
+///
+/// Inputs are exactly what [`probe_scope_address`] produces post-seal:
+/// `Some(held)` from an ack's payload, `None` on silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealAfterVerdict {
+    /// Both post-seal probes were acked and the pair is the retirement
+    /// shape: the superseded address refused (`held: false`) WHILE the
+    /// live control still answered `held: true` — the aliveness control
+    /// that makes "refused" distinguishable from "node down".
+    Retired,
+    /// Both probes were acked but the pair is not the retirement shape.
+    /// The reading is evaluable and it is a FAILURE: `old_held` means
+    /// the seal did not retire at the admission seam; `!live_held`
+    /// (from a node demonstrably alive — it acked) means the seal took
+    /// the live address down with it.
+    NotRetired { live_held: bool, old_held: bool },
+    /// A probe went silent. Silence is transport loss, not an admission
+    /// answer — a refusal is an ack carrying `held: false` — so the
+    /// reading is NOT evaluable and the leg must say `not_run` rather
+    /// than guess. `!live_answered` is the indistinguishable-from-
+    /// node-down case.
+    Unanswerable {
+        live_answered: bool,
+        old_answered: bool,
+    },
+}
+
+fn seal_after_verdict(after_live: Option<bool>, after_old: Option<bool>) -> SealAfterVerdict {
+    match (after_live, after_old) {
+        (Some(true), Some(false)) => SealAfterVerdict::Retired,
+        (Some(live_held), Some(old_held)) => SealAfterVerdict::NotRetired {
+            live_held,
+            old_held,
+        },
+        (live, old) => SealAfterVerdict::Unanswerable {
+            live_answered: live.is_some(),
+            old_answered: old.is_some(),
+        },
     }
 }
 
-/// **SEAM 3 — scope-native blob fetch.**
+/// **SEAM 2 — scope-native blob fetch.**
 ///
 /// `src/blob_swarm/` is being extended concurrently with a scope-native
 /// fetch path. Today the harness pushes the blob over the same real
@@ -1863,12 +1940,20 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     // Reports and the seal handshake interleave, so a single state
     // machine handles both. Two loops each discarding the other's
     // messages is the shape that silently loses one.
-    let dialer = HarnessScopedDialer {
-        transport: Arc::clone(&occ.transport),
-    };
-    let dial_timeout = Duration::from_secs(10);
+    let probe_timeout = Duration::from_secs(15);
+    let mut probe_nonce: u64 = 0;
     let mut member_reports = serde_json::Map::new();
-    let mut seal_probe: Option<(String, MemberAddress, MemberAddress, bool, bool)> = None;
+    // `(owner, live_addr, superseded_addr, before_live, before_old)` —
+    // the before-readings are `Option<bool>`: `Some(held)` from an ack,
+    // `None` on silence.
+    #[allow(clippy::type_complexity)]
+    let mut seal_probe: Option<(
+        String,
+        MemberAddress,
+        MemberAddress,
+        Option<bool>,
+        Option<bool>,
+    )> = None;
     // No rotation means no superseded address, so the leg says that up
     // front rather than by timing out on a probe that can never come.
     let mut seal_done = if rotated {
@@ -1926,18 +2011,44 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                     seal_done = true;
                     continue;
                 };
-                let Some(peer_key) = peer_transport_ed25519(&cfg.mesh_dir, &key_id) else {
-                    rep.not_run(
-                        "conformance.seal_retires",
-                        format!("{key_id} published no transport key, so it cannot be dialled"),
-                    );
-                    seal_done = true;
-                    continue;
-                };
-                // BEFORE. Both must answer, or the after-reading proves
-                // nothing.
-                let before_live = dialer.dial(&live_a, peer_key, dial_timeout).await;
-                let before_old = dialer.dial(&old_a, peer_key, dial_timeout).await;
+                // BEFORE-reading, at the ADMISSION SEAM (module doc:
+                // "How seal retirement is measured"). A scoped address
+                // is an explicit-hash destination — an arrival
+                // discriminator, not a routable endpoint — so it is not
+                // dialled: the probe rides the member's announced,
+                // rooted node destination through the relay (the path
+                // `mesh.rooting` proved), and the member answers from
+                // the production arrival-admission lookup. Both
+                // addresses must come back `held: true` here, or the
+                // after-reading proves nothing. Superseded first, then
+                // live — the trailing live answer re-proves the node
+                // was still answering after the superseded probe.
+                probe_nonce += 1;
+                let before_old = probe_scope_address(
+                    &occ.transport,
+                    &occ.mailbox,
+                    &key_id,
+                    &old_a,
+                    probe_nonce,
+                    probe_timeout,
+                    &mut member_reports,
+                )
+                .await;
+                probe_nonce += 1;
+                let before_live = probe_scope_address(
+                    &occ.transport,
+                    &occ.mailbox,
+                    &key_id,
+                    &live_a,
+                    probe_nonce,
+                    probe_timeout,
+                    &mut member_reports,
+                )
+                .await;
+                // SealGo goes out even when the before-reading failed:
+                // the member's own `scope.seal` leg must still run, and
+                // the verdict arm below reports the failed precondition
+                // honestly.
                 seal_probe = Some((key_id.clone(), live_a, old_a, before_live, before_old));
                 let _ = send_control(
                     &occ.transport,
@@ -1960,72 +2071,104 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 if probe_id != key_id {
                     continue;
                 }
-                let Some(peer_key) = peer_transport_ed25519(&cfg.mesh_dir, &key_id) else {
-                    continue;
-                };
-                // AFTER.
-                let after_live = dialer.dial(&live_a, peer_key, dial_timeout).await;
-                let after_old = dialer.dial(&old_a, peer_key, dial_timeout).await;
+                // AFTER-reading: superseded first, then the live
+                // control. The seal must refuse the superseded address
+                // WHILE the live one still answers — the live answer is
+                // what distinguishes "refused" from "node down".
+                probe_nonce += 1;
+                let after_old = probe_scope_address(
+                    &occ.transport,
+                    &occ.mailbox,
+                    &key_id,
+                    &old_a,
+                    probe_nonce,
+                    probe_timeout,
+                    &mut member_reports,
+                )
+                .await;
+                probe_nonce += 1;
+                let after_live = probe_scope_address(
+                    &occ.transport,
+                    &occ.mailbox,
+                    &key_id,
+                    &live_a,
+                    probe_nonce,
+                    probe_timeout,
+                    &mut member_reports,
+                )
+                .await;
                 seal_done = true;
-                if before_live && before_old {
-                    rep.ran(
-                        "conformance.seal_retires",
-                        sealed > 0
-                            && unretired == 0
-                            && after_live
-                            && !after_old,
-                        serde_json::json!({
-                            "owner": key_id,
-                            "sealed": sealed,
-                            "unretired": unretired,
-                            "dial_live_before": before_live,
-                            "dial_superseded_before": before_old,
-                            "dial_live_after": after_live,
-                            "dial_superseded_after": after_old,
-                            "live_address": hex::encode(live_a.as_bytes()),
-                            "superseded_address": hex::encode(old_a.as_bytes()),
-                            "addresses_derived_by": "the DIALLER's own table, so a landed                                                      dial also proves cross-node derivation                                                      agreement",
-                            "convergence_secs": cfg.convergence.as_secs(),
-                            "dial_binding": dialer.binding_source(),
-                            "measured_by": "a DIFFERENT node than the one that sealed",
-                            "note": "the dial-side binding is installed by the harness: no \
-                                     transport verb dials a ScopeAddressTable::send_address \
-                                     result",
-                        }),
-                    );
-                } else {
-                    // DIAGNOSED, not shrugged at. A scope-derived
-                    // destination is registered with
-                    // `Destination::with_explicit_hash`, and an
-                    // explicit-hash destination CANNOT announce
-                    // (`AnnounceError::ExplicitHashCannotAnnounce`;
-                    // leviculum answers path requests for one with
-                    // silence, because a path response IS an announce and
-                    // an announce for a caller-supplied hash is
-                    // unverifiable). It therefore has no multi-hop RNS
-                    // path, and this topology puts a relay between the
-                    // dialler and the owner.
-                    //
-                    // So the peer-dials-it form of "the superseded address
-                    // finds nobody home" is not measurable today — not
-                    // because the seal failed, but because there is no
-                    // route to dial in the first place. The owner-side
-                    // half IS measured, by the member's own `scope.seal`
-                    // leg: table closed, transport retired
-                    // (`unretired == 0`), live address still answering.
+                if before_live != Some(true) || before_old != Some(true) {
+                    // The before-reading is the leg's precondition: with
+                    // no evidence both addresses were admitted PRE-seal,
+                    // a post-seal refusal proves nothing about the seal.
+                    // (`null` = the probe went unanswered; `false` = the
+                    // member answered but did not hold the address.)
                     rep.not_run(
                         "conformance.seal_retires",
                         format!(
-                            "pre-seal dials did not establish (live={before_live}, \
-                             superseded={before_old}), so an after-reading would be \
-                             indistinguishable from a broken dial. DIAGNOSIS: a \
-                             scope-derived destination is an explicit-hash destination, \
-                             which cannot announce, so no multi-hop RNS path to it can \
-                             exist and this topology relays between dialler and owner. \
-                             The owner-side half of the claim is measured by that \
-                             member's `scope.seal` leg instead."
+                            "the before-reading did not establish both addresses held \
+                             (live={before_live:?}, superseded={before_old:?}); a post-seal \
+                             refusal could not be attributed to the seal",
                         ),
                     );
+                    continue;
+                }
+                let verdict = seal_after_verdict(after_live, after_old);
+                match verdict {
+                    SealAfterVerdict::Retired | SealAfterVerdict::NotRetired { .. } => {
+                        rep.ran(
+                            "conformance.seal_retires",
+                            sealed > 0 && unretired == 0 && verdict == SealAfterVerdict::Retired,
+                            serde_json::json!({
+                                "owner": key_id,
+                                "sealed": sealed,
+                                "unretired": unretired,
+                                "probe_live_before_held": before_live,
+                                "probe_superseded_before_held": before_old,
+                                "probe_live_after_held": after_live,
+                                "probe_superseded_after_held": after_old,
+                                "live_address": hex::encode(live_a.as_bytes()),
+                                "superseded_address": hex::encode(old_a.as_bytes()),
+                                "addresses_derived_by": "the PROBER's own table, so a \
+                                                         held=true answer also proves \
+                                                         cross-node derivation agreement",
+                                "admission_lookup": "ReticulumTransport::inbound_scope -> \
+                                                     ScopeAddressTable::accepts_inbound (the \
+                                                     arrival_scope reverse index)",
+                                "probe_plane": "application-level AddressProbe over the \
+                                                member's announced node destination, \
+                                                through the relay",
+                                "convergence_secs": cfg.convergence.as_secs(),
+                                "measured_by": "a DIFFERENT node than the one that sealed",
+                                "note": "a scoped address is an arrival discriminator, not \
+                                         a routable endpoint (explicit-hash destinations \
+                                         never announce), so admission — not link \
+                                         establishment — is the network observable",
+                            }),
+                        );
+                    }
+                    SealAfterVerdict::Unanswerable {
+                        live_answered,
+                        old_answered,
+                    } => {
+                        rep.not_run(
+                            "conformance.seal_retires",
+                            if live_answered {
+                                format!(
+                                    "the post-seal superseded-address probe went \
+                                     unanswered (old_answered={old_answered}); silence is \
+                                     transport loss, not a refusal (a refusal is an ack \
+                                     carrying held=false), so the reading is not evaluable",
+                                )
+                            } else {
+                                "the post-seal live-control probe went unanswered, so \
+                                 'superseded refused' would be indistinguishable from \
+                                 'node down'"
+                                    .to_owned()
+                            },
+                        );
+                    }
                 }
             }
             _ => {}
@@ -2740,9 +2883,15 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     //
     // Only the OWNER of an address can retire it, so this node seals and
     // the PUBLISHER takes the before/after network reading. The order is
-    // strict: probe → publisher dials → SealGo → seal → Sealed →
-    // publisher dials again. Anything else and the two readings would not
-    // bracket the seal.
+    // strict: probe → publisher's before-probes → SealGo → seal → Sealed
+    // → publisher's after-probes. Anything else and the two readings
+    // would not bracket the seal.
+    //
+    // The publisher's readings are application-level `AddressProbe`s
+    // over THIS node's announced destination (a scoped address is an
+    // arrival discriminator, not a routable endpoint — module doc), and
+    // this node answers each one from the production arrival-admission
+    // lookup, so the answers ARE the admission seam, not bookkeeping.
     let gid = occ.group_id();
     match occ
         .table
@@ -2766,18 +2915,22 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                 )
                 .await
                 .map_err(|e| format!("send SealProbe: {e}"))?;
-                // Wait for the publisher's before-reading to be taken.
+                // Wait for the publisher's before-reading to be taken,
+                // answering its address probes while doing so — the
+                // before-reading IS those probes, so a loop that only
+                // listened for SealGo would deadlock the handshake.
                 let until = Instant::now() + Duration::from_secs(90);
                 loop {
                     if Instant::now() >= until {
                         return Err("no SealGo from the publisher".to_owned());
                     }
-                    if let Ok((_s, Control::SealGo { key_id })) =
-                        occ.mailbox.next_control(Duration::from_secs(5)).await
-                    {
-                        if key_id == cfg.node_id {
-                            break;
+                    match occ.mailbox.next_control(Duration::from_secs(5)).await {
+                        Ok((_s, Control::SealGo { key_id })) if key_id == cfg.node_id => break,
+                        Ok((_s, Control::AddressProbe { address_hex, nonce })) => {
+                            answer_address_probe(&occ.transport, &publisher, &address_hex, nonce)
+                                .await;
                         }
+                        _ => {}
                     }
                 }
                 // The convergence window is what makes a seal legitimate;
@@ -2795,6 +2948,22 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                 )
                 .await
                 .map_err(|e| format!("send Sealed: {e}"))?;
+                // The publisher's after-reading is two more probes
+                // (superseded, then the live control). Service them
+                // before moving on to the Report — the seal already ran,
+                // so each answer is the POST-seal admission verdict. The
+                // count bounds the wait when both arrive; the deadline
+                // bounds it when a probe is lost in transit.
+                let mut answered = 0u8;
+                let until = Instant::now() + Duration::from_secs(60);
+                while answered < 2 && Instant::now() < until {
+                    if let Ok((_s, Control::AddressProbe { address_hex, nonce })) =
+                        occ.mailbox.next_control(Duration::from_secs(5)).await
+                    {
+                        answer_address_probe(&occ.transport, &publisher, &address_hex, nonce).await;
+                        answered += 1;
+                    }
+                }
                 Ok::<_, String>((outcome, previous))
             }
             .await;
@@ -3067,4 +3236,105 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{seal_after_verdict, SealAfterVerdict};
+
+    // Field provenance (the #336 lesson): every input below is exactly a
+    // value `probe_scope_address` produces — `Some(held)` is an
+    // `AddressProbeAck`'s payload, `None` is silence — not a convenient
+    // stand-in. The four evaluable combinations first.
+
+    #[test]
+    fn after_reading_retired_cleanly() {
+        // Superseded refused WHILE the live control still answers: the
+        // one shape that passes.
+        assert_eq!(
+            seal_after_verdict(Some(true), Some(false)),
+            SealAfterVerdict::Retired
+        );
+    }
+
+    #[test]
+    fn after_reading_superseded_still_admitted_fails() {
+        // The node acked both probes and still holds the superseded
+        // address: the seal did not retire at the admission seam.
+        assert_eq!(
+            seal_after_verdict(Some(true), Some(true)),
+            SealAfterVerdict::NotRetired {
+                live_held: true,
+                old_held: true
+            }
+        );
+    }
+
+    #[test]
+    fn after_reading_live_also_retired_fails() {
+        // Both acked, both refused: the node is demonstrably alive (it
+        // answered), so this is over-retirement — the seal took the
+        // live address down with it — and must FAIL, not not_run.
+        assert_eq!(
+            seal_after_verdict(Some(false), Some(false)),
+            SealAfterVerdict::NotRetired {
+                live_held: false,
+                old_held: false
+            }
+        );
+    }
+
+    #[test]
+    fn after_reading_inverted_pair_fails() {
+        // Live gone, superseded kept — evaluable and wrong.
+        assert_eq!(
+            seal_after_verdict(Some(false), Some(true)),
+            SealAfterVerdict::NotRetired {
+                live_held: false,
+                old_held: true
+            }
+        );
+    }
+
+    // The un-evaluable readings: silence is transport loss, never an
+    // admission answer, so no `held` payload may be invented for it.
+
+    #[test]
+    fn after_reading_live_control_silent_is_indistinguishable() {
+        // The live control went unanswered: "superseded refused" would
+        // be indistinguishable from "node down", whatever the
+        // superseded probe said.
+        assert_eq!(
+            seal_after_verdict(None, Some(false)),
+            SealAfterVerdict::Unanswerable {
+                live_answered: false,
+                old_answered: true
+            }
+        );
+    }
+
+    #[test]
+    fn after_reading_superseded_probe_silent_is_unanswerable() {
+        // The live control answered but the superseded probe was lost:
+        // a refusal is an ack carrying held=false, so silence cannot be
+        // scored as retirement.
+        assert_eq!(
+            seal_after_verdict(Some(true), None),
+            SealAfterVerdict::Unanswerable {
+                live_answered: true,
+                old_answered: false
+            }
+        );
+    }
+
+    #[test]
+    fn after_reading_both_silent_is_unanswerable() {
+        assert_eq!(
+            seal_after_verdict(None, None),
+            SealAfterVerdict::Unanswerable {
+                live_answered: false,
+                old_answered: false
+            }
+        );
+    }
 }
