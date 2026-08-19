@@ -221,11 +221,21 @@ pub fn routing_blackhole_remove(identity_hash: Vec<u8>) -> Result<(), crate::Edg
 /// NULL`) are NEVER pruned — operators must call
 /// `routing_blackhole_remove` to drop them.
 ///
-/// TODO (deferred from v0.16.1): wire a background pruner task at
-/// `init_edge_runtime` time, configurable via
-/// `EdgeConfig::blackhole_prune_interval_seconds` (default 3600).
-/// Until that lands, operators are expected to call this from the
-/// host's housekeeping loop on whatever cadence they prefer.
+/// Expired-rule reclamation runs on three complementary paths:
+///
+/// 1. OPPORTUNISTIC — the transport's send-path deny-list consult
+///    removes an expired rule the moment it is consulted (amortized,
+///    no background task; `consult_and_prune_blackhole` in
+///    `transport::reticulum`). An expired rule on a hot dial path can
+///    no longer accrete unboundedly.
+/// 2. BACKGROUND — `Edge::run` spawns a pruner loop at
+///    `EdgeConfig::blackhole_prune_interval_seconds` cadence (v0.18.0;
+///    0 disables, and the spawn is skipped when no
+///    `Arc<dyn BlackholeRules>` backend is wired). Sweeps rules for
+///    identities that are never dialed.
+/// 3. MANUAL — this FFI call, for hosts whose runtime shape does not
+///    drive `Edge::run`'s task graph, or for on-demand cleanup right
+///    after editing the deny-list.
 pub fn routing_blackhole_prune_expired() -> Result<u64, crate::EdgeBindingsError> {
     #[cfg(feature = "_reticulum-module")]
     {

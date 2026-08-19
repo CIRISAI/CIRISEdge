@@ -42,6 +42,15 @@ pub struct LocalSigner {
     pub classical: Arc<dyn HardwareSigner>,
     /// `None` during hybrid-pending bootstrap; `Some` once the
     /// `pqc_completed_at` row is filled in.
+    ///
+    /// DELIBERATELY still `Option` (CIRISEdge#481 item 5): the #458
+    /// refusal-path tests need classical-only signers to exist as
+    /// fixture witnesses, and every seam already refuses the degraded
+    /// state at runtime (persist #620 keystore "no classical-only
+    /// paths", edge init hard-refusal, the #458 emit refusal). Making
+    /// this required would delete the witnesses those refusal tests
+    /// exercise, not close a gap — unlike `PeerKexPubkeys.mlkem768_pub`
+    /// (#481 item 4), where the absent state had no legitimate owner.
     pub pqc: Option<Arc<dyn PqcSigner>>,
     /// CIRISEdge#31 — ratchet identifier surfaced via
     /// `current_ratchet_id`. Generated once at construction (the

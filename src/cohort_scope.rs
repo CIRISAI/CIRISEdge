@@ -54,9 +54,30 @@ use serde::{Deserialize, Serialize};
 // resolves through persist's `crypto_tier()` rather than enumerating
 // the 7-value lattice so future `affiliations` semantic changes flow
 // without wire-format churn.
+use ciris_persist::federation::types::cohort_scope as persist_scope;
 pub use ciris_persist::federation::types::cohort_scope::{
     crypto_tier as persist_crypto_tier, CryptoTier,
 };
+
+/// THE `"self"` scope token — single authority for the string form of
+/// [`CohortScope::SelfOnly`], routed through persist's lattice const
+/// (`cohort_scope::SELF`, the CC 4.4.3.2.1 authority) rather than a
+/// re-typed literal.
+///
+/// Consumers that DELIBERATELY share this exact token:
+///
+/// - [`CohortScope::kind_token`] — telemetry / structured logging;
+/// - the [`CohortScope::crypto_tier`] lattice call — persist's
+///   `"self"` affiliation row (InvisibleEncrypted);
+/// - the WW2 witness-leaf filter
+///   (`crate::holonomic::wholeness_witness::WW2_SELF_COHORT_SCOPE`) —
+///   self-private leaves are filtered BEFORE Merkle construction, so a
+///   drifted token there would silently PUBLISH self-scoped content;
+/// - the serde wire tag (`#[serde(rename = "self")]` on
+///   [`CohortScope::SelfOnly`]) — an attribute literal serde cannot
+///   take from a const; `tests::serde_self_tag_matches_token` pins it
+///   equal to this const so a drift fails loudly.
+pub const SELF_SCOPE_TOKEN: &str = persist_scope::SELF;
 
 /// Wire-form cohort-scope discriminator for the federation's locality
 /// dividend (CIRISEdge#48-A; FSD `FEDERATION_SCALING_MODEL.md`).
@@ -102,8 +123,11 @@ impl CohortScope {
     pub fn kind_token(&self) -> &'static str {
         match self {
             Self::Public => "public",
-            Self::SelfOnly => "self",
+            Self::SelfOnly => SELF_SCOPE_TOKEN,
             Self::Family => "family",
+            // NOTE: "cohort" here vs. "community" in `crypto_tier` is a
+            // DELIBERATE two-table divergence — see the comment on the
+            // `crypto_tier` Cohort arm before "unifying" them.
             Self::Cohort { .. } => "cohort",
         }
     }
@@ -180,10 +204,21 @@ impl CohortScope {
     #[must_use]
     pub fn crypto_tier(&self) -> CryptoTier {
         match self {
-            Self::Public => persist_crypto_tier("federation", None),
-            Self::SelfOnly => persist_crypto_tier("self", None),
-            Self::Family => persist_crypto_tier("family", None),
-            Self::Cohort { .. } => persist_crypto_tier("community", None),
+            Self::Public => persist_crypto_tier(persist_scope::FEDERATION, None),
+            Self::SelfOnly => persist_crypto_tier(SELF_SCOPE_TOKEN, None),
+            Self::Family => persist_crypto_tier(persist_scope::FAMILY, None),
+            // DELIBERATE DIVERGENCE (do NOT unify with `kind_token`):
+            // edge's wire/telemetry token for this variant is "cohort"
+            // (the serde tag + `kind_token`, wire-locked since v0.19.1),
+            // but persist's CC 4.4.3.2.1 lattice names the CommunityDek
+            // row "community". Feeding edge's wire token into the
+            // lattice (`persist_crypto_tier("cohort", ..)`) would fall
+            // through persist's negative-default arm to `Plaintext` — a
+            // silent at-rest ENCRYPTION DOWNGRADE for cohort-scoped
+            // content. Two consumers, two vocabularies, one bridge
+            // (this arm). Pinned by
+            // `tests::cohort_wire_token_vs_persist_lattice_token_diverge_deliberately`.
+            Self::Cohort { .. } => persist_crypto_tier(persist_scope::COMMUNITY, None),
         }
     }
 
@@ -371,6 +406,42 @@ mod tests {
         assert_eq!(CohortScopeEnforcement::Strict.as_str(), "strict");
         assert_eq!(CohortScopeEnforcement::WarnOnly.as_str(), "warn_only");
         assert_eq!(CohortScopeEnforcement::Off.as_str(), "off");
+    }
+
+    /// Audit pin — the serde wire tag for `SelfOnly` is an attribute
+    /// literal (`#[serde(rename = "self")]`) that cannot reference
+    /// [`SELF_SCOPE_TOKEN`]; this test is the drift alarm keeping the
+    /// wire tag equal to the one-authority token (which itself routes
+    /// through persist's lattice const).
+    #[test]
+    fn serde_self_tag_matches_token() {
+        let json = serde_json::to_string(&CohortScope::SelfOnly).unwrap();
+        assert_eq!(json, format!(r#"{{"kind":"{SELF_SCOPE_TOKEN}"}}"#));
+        assert_eq!(CohortScope::SelfOnly.kind_token(), SELF_SCOPE_TOKEN);
+    }
+
+    /// Audit pin — `kind_token` says "cohort" while `crypto_tier`
+    /// resolves through persist's "community" lattice row. These are
+    /// two DELIBERATELY different tables: edge's wire/telemetry
+    /// vocabulary (wire-locked "cohort" since v0.19.1) vs. persist's
+    /// CC 4.4.3.2.1 at-rest lattice vocabulary ("community" →
+    /// CommunityDek). The third assertion is WHY they must not be
+    /// merged: persist's lattice has no "cohort" row, so edge's wire
+    /// token would fall through the negative-default arm to Plaintext
+    /// — a silent at-rest encryption downgrade.
+    #[test]
+    fn cohort_wire_token_vs_persist_lattice_token_diverge_deliberately() {
+        let c = CohortScope::Cohort {
+            cohort_id: "alpha".into(),
+        };
+        assert_eq!(c.kind_token(), "cohort");
+        assert_eq!(c.crypto_tier(), CryptoTier::CommunityDek);
+        assert_eq!(
+            persist_crypto_tier(c.kind_token(), None),
+            CryptoTier::Plaintext,
+            "persist's lattice does NOT know edge's wire token — the \
+             divergence is load-bearing, not an oversight"
+        );
     }
 
     // ─── v6.0.0 (CIRISEdge#175) — FSD §2.1 / §3.2 surface ───────────

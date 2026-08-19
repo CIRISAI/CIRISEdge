@@ -129,6 +129,11 @@ async fn directory_with(records: Vec<KeyRecord>) -> Arc<SqliteBackend> {
 fn test_edge_config() -> EdgeConfig {
     EdgeConfig {
         hybrid_policy: HybridPolicy::Ed25519Fallback,
+        // Phase 2 — `OpaqueRequest` sends now genuinely await a
+        // correlated response; these tests wire no responder, so a
+        // short timeout keeps each (ignored-result) send from parking
+        // for the 30 s production default.
+        ephemeral_response_timeout_ms: 10,
         ..EdgeConfig::default()
     }
 }
@@ -227,10 +232,10 @@ where
 // ─── Tests ──────────────────────────────────────────────────────────
 
 /// Counter increments on a successful `Edge::send` of an ephemeral
-/// `OpaqueRequest`. Note: `Edge::send` returns Err for OpaqueRequest (the
-/// Phase-2 ephemeral request-response correlation isn't wired); we
-/// expect the transport-side counter to register regardless because the
-/// envelope DID ship before the correlation gap kicks in.
+/// `OpaqueRequest`. Note: with no responder wired, `Edge::send` times
+/// out its (Phase-2, now real) response await and returns
+/// `EdgeError::Unreachable`; the transport-side counter registers
+/// regardless because the envelope DID ship before the await.
 #[tokio::test]
 async fn metrics_counter_increments_on_send() {
     let tmp = tempfile::tempdir().unwrap();

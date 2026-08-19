@@ -558,27 +558,30 @@ impl FederationDirectoryReplicationBridge {
         self
     }
 
-    /// Workstream F — is this row in the `accord:*` family, i.e. is its
-    /// carriage the relay gate's to decide?
+    /// Workstream F / CIRISEdge#505 / CIRISPersist#743 — is this row on the
+    /// `accord:*` family, in EITHER namespace, i.e. is its carriage the relay
+    /// gate's to decide?
     ///
-    /// persist's own classifier, via
-    /// [`AccordRelayGate::dimension_is_gated`](crate::replication::accord_relay_gate::AccordRelayGate::dimension_is_gated)
-    /// — the same `namespace::attestation_family` fold
-    /// [`Self::attestation_requires_serve`] took in v17.7.0, and for the same
-    /// reason: a `dimension.starts_with("accord:")` here would be a second
-    /// owner for one wire fact. `objection:*` is deliberately NOT in this
-    /// family (CIRISPersist#713 — the co-scrub argument covers `accord:` only).
-    /// CIRISEdge#505 / CIRISPersist#743 — is this row on the `accord:*`
-    /// family, in EITHER namespace?
+    /// **The two-namespace rule.** The family rides BOTH namespaces a row can
+    /// carry it on, and persist's admission comment
+    /// (`check_reserved_prefix_admission`, the CIRISPersist#733 placement note)
+    /// is explicit: *"The `accord:*` family rides BOTH namespaces —
+    /// `accord:invoke:*` as a TYPE, `accord:human_dignity:v1` as a `scores`
+    /// DIMENSION"*. So this pre-filter reads the exact two fields persist's own
+    /// admission reads — the `attestation_type` column
+    /// (`/attestation_type`, persist's `row.attestation_type`) and the signed
+    /// envelope dimension (`/attestation_envelope/dimension`, persist's
+    /// `admission::envelope_dimension`) — and hands both to persist's own
+    /// classifier, [`ciris_persist::federation::trust_root::is_accord_family`].
+    /// `objection:*` is deliberately NOT in this family (CIRISPersist#713 —
+    /// the co-scrub argument covers `accord:` only).
     ///
     /// This read only the `dimension` until v37.1.0, and that was a live
-    /// under-gating hole: persist's own admission comment is explicit that the
-    /// family rides both namespaces — *"`accord:invoke:*` as a TYPE,
-    /// `accord:human_dignity:v1` as a `scores` DIMENSION"* — so every
-    /// `accord:invoke:*` row carried in the `attestation_type` namespace
-    /// skipped the CC 4.2.1 relay gate entirely. A false NEGATIVE: the gate
-    /// never carried something it should have refused once it looked, it
-    /// failed to look.
+    /// under-gating hole: every `accord:invoke:*` row carried in the
+    /// `attestation_type` namespace skipped the CC 4.2.1 relay gate entirely —
+    /// advertised, fetched and subject-pulled with no carriage check. A false
+    /// NEGATIVE: the gate never carried something it should have refused once
+    /// it looked, it failed to look.
     ///
     /// Persist now owns the question (`is_accord_family`), so edge stops
     /// spelling it. Edge widening the pre-filter itself would have put a
@@ -861,7 +864,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // content-hash-index; it rides the `persist_row_hash` wire. Resolve it
         // with NO cache: this retires the last in-memory fetch cache, so every
         // plane's fetch is now a direct persist read.
-        if kind == EnvelopeKind::Revocation {
+        if kind.is_row_hash_served() {
             return self.fetch_revocation_bytes(envelope_hash).await;
         }
         None
@@ -880,14 +883,33 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
-    /// CIRISEdge#416 — RAW holdings for the RECEIVE-diff axis. The Attestation
-    /// plane uses the unfiltered [`Self::list_attestation_holdings`] ("what I
-    /// hold"), NOT the projection-filtered advertise view; every other plane's
-    /// advertise view equals its holdings for round convergence, so they keep the
-    /// default ([`Self::list_envelope_refs`]).
+    /// CIRISEdge#416 — RAW holdings for the RECEIVE-diff axis: "what I hold",
+    /// NOT "what I advertise". The `want = remote ∖ holdings` diff must see
+    /// every row local state holds, or a held-but-not-advertised row sits in
+    /// `want` forever — re-fetched and re-applied as `Duplicate` every round
+    /// (the CIRISAgent#932 non-convergence).
+    ///
+    /// v18 sweep: FOUR planes filter their advertise below their holdings, not
+    /// one. Attestation (`attestation_is_advertised`, per-record) was fixed by
+    /// #416 itself; the three `SelfOwn` publish-own planes — Key /
+    /// IdentityOccurrence / TransportDestination — filter their advertise to
+    /// `subjects_for_projection(SelfOwn)`, so a FOREIGN-subject row this node
+    /// admitted (exactly what those planes replicate IN) was invisible to its
+    /// own holdings view and never converged. Each now has an unfiltered
+    /// holdings twin (the filter belongs to advertise only). The remaining
+    /// planes keep the advertise default: the membership/tombstone planes
+    /// project `Global` (own ∪ cohort — the widest set this node can
+    /// enumerate), `Revocation` likewise, and the three Cohort-scoped planes
+    /// (Family / Community / LocationProof) assume advertise == holdings for
+    /// rows the node would ever be re-offered — a cohort-filter residual of the
+    /// same class is conceivable there and is deliberately left to its own
+    /// audit rather than silently widened here.
     async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         match kind {
             EnvelopeKind::Attestation => self.list_attestation_holdings().await,
+            EnvelopeKind::Key => self.list_key_holdings().await,
+            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrence_holdings().await,
+            EnvelopeKind::TransportDestination => self.list_transport_destination_holdings().await,
             _ => self.list_envelope_refs(kind).await,
         }
     }
@@ -905,10 +927,24 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         kind: EnvelopeKind,
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Vec<Vec<u8>> {
-        if kind != EnvelopeKind::AccordQuorumEvidence {
+        // v18 — gated on the PREDICATE, not a kind literal, so this site and
+        // `is_cursor_served` cannot drift. NOTE: the body below is
+        // accord-specific; a future second cursor kind passes this gate and
+        // MUST add its own dispatch here (the protocol.rs over-ALL pin makes
+        // widening the predicate a deliberate act, and
+        // `cursor_arm_set_equals_the_predicate_over_all` binds this site).
+        if !kind.is_cursor_served() {
             return Vec::new();
         }
         let limit = self.effective_page_limit().await;
+        // v18 — the +1 TRUNCATION SENTINEL: ask persist for one bundle more
+        // than we serve. The cursor session opens from `since: None` each
+        // round, so an `operational_page_limit` / mesh-config relief smaller
+        // than the plane PERMANENTLY truncates the evidence plane at page one
+        // — until v18 with NO log. Serving `limit` of `limit + 1` read rows
+        // makes "the page limit bit" a fact, not a guess (`len == limit` alone
+        // cannot distinguish an exactly-full plane from a truncated one).
+        let serve_max = usize::try_from(limit).unwrap_or(usize::MAX);
         match self
             .directory
             .list_signed_accord_quorum_evidence_since(
@@ -921,14 +957,52 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 // each bundle (`apply_accord_quorum_evidence`), so at-least-once
                 // is correct here and a skip would be silent evidence loss.
                 since.map(|ts| (ts, String::new())),
-                limit,
+                limit.saturating_add(1),
             )
             .await
         {
-            Ok(bundles) => bundles
-                .iter()
-                .filter_map(|b| serde_json::to_vec(b).ok())
-                .collect(),
+            Ok(mut bundles) => {
+                if bundles.len() > serve_max {
+                    bundles.truncate(serve_max);
+                    tracing::warn!(
+                        page_limit = limit,
+                        since = ?since,
+                        "accord-quorum-evidence cursor page TRUNCATED at the page \
+                         limit — at least one more bundle exists beyond this page. \
+                         A session resuming from its high-water drains the backlog \
+                         over rounds, but an operator `operational_page_limit` or \
+                         mesh-config relief below the plane's size truncates a \
+                         `since: None` cold pull at page one EVERY round — the \
+                         evidence plane never fully serves (CIRISEdge#474)"
+                    );
+                }
+                let mut out = Vec::with_capacity(bundles.len());
+                for b in &bundles {
+                    match serde_json::to_vec(b) {
+                        Ok(bytes) => out.push(bytes),
+                        Err(e) => {
+                            // v18 — was a silent `filter_map(.. .ok())` two lines
+                            // from the loud read-error arm below: a bundle that
+                            // will not serialize is OMITTED from every cursor page
+                            // and never replicates from this node. Loud + booked
+                            // (#433), mirroring `advertise_since`.
+                            tracing::warn!(
+                                error = %e,
+                                "accord-quorum-evidence bundle could not be \
+                                 serialized for the wire — OMITTED from this cursor \
+                                 page; it will not replicate from this node \
+                                 (CIRISEdge#474/#433)"
+                            );
+                            self.withhold(
+                                crate::observability::WithholdReason::RowNotSerializable,
+                                "<unattributed>",
+                                "accord_evidence_since: to_vec failed",
+                            );
+                        }
+                    }
+                }
+                out
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -974,6 +1048,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// listing gate, so a peer excluded from the listing cannot obtain a
     /// `trace:*` envelope anyway by Diff/Fetch-ing a hash it learned
     /// out-of-band.
+    #[allow(clippy::too_many_lines)] // the serve-side twin set: five gates + the v18 projection twin
     async fn fetch_envelope_bytes_for_peer(
         &self,
         kind: EnvelopeKind,
@@ -1026,6 +1101,54 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     .await
                 {
                     return None;
+                }
+                // v18 — the PROJECTION twin (the last un-twinned advertise gate).
+                // `attestation_is_advertised` structurally hides a `SelfOwn`-
+                // projecting row this node did not produce (a `self`/`family`
+                // attestation is published by its own producer, never relayed —
+                // the structural-invisibility discipline), but until now ONLY on
+                // the listing: a peer that learned the hash out-of-band was
+                // served the bytes anyway. The twin matches the advertise gate's
+                // semantics INCLUDING the v16 first-party override: a peer that
+                // is this row's author or data-subject fetches its OWN testimony
+                // (the same carve `pull_ref_is_serveable` grants the subject-Pull
+                // LIST — the #462 recovery right), and that carve deliberately
+                // bypasses the whole advertise predicate, malformed-scope decline
+                // included, so LIST and FETCH agree on the subject-Pull axis.
+                // An unattributed fetch has no first party and fails closed.
+                //
+                // The booked reason BORROWS `RecipientNotInSendSet` — the
+                // closest documented audience-membership variant (the enum is a
+                // closed operator vocabulary; no variant names the projection
+                // gate, and widening the enum is not this change's to make). The
+                // `detail` string names the true branch so a ledger reader is
+                // not misled toward the consent plane.
+                let first_party =
+                    peer_key_id.is_some_and(|p| Self::attestation_is_first_party_to(inner, p));
+                if !first_party {
+                    let self_set: HashSet<String> = self
+                        .self_provider
+                        .as_ref()
+                        .map(|p| p())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+                    if !Self::attestation_is_advertised(inner, &self_set) {
+                        self.withhold(
+                            crate::observability::WithholdReason::RecipientNotInSendSet,
+                            peer_label,
+                            "projection: row not advertised by this node (SelfOwn fetch twin)",
+                        );
+                        tracing::debug!(
+                            peer = peer_label,
+                            envelope_hash = %hex::encode(&envelope_hash[..8]),
+                            "attestation withheld from direct fetch — the projection \
+                             structurally hides this row from third parties (SelfOwn \
+                             publish-own; only a first party may fetch it) (v18 \
+                             projection twin)"
+                        );
+                        return None;
+                    }
                 }
             }
             if let Some(peer) = peer_key_id {
@@ -1205,6 +1328,13 @@ impl FederationDirectoryReplicationBridge {
             // (`persist_index_kind` → None), so a ref here would be listed-then-
             // unfetchable (the LIST-vs-FETCH divergence class). It converges over
             // the dedicated cursor path (`CursorPull` → `Deliver`) instead.
+            //
+            // v18 — this arm IS `EnvelopeKind::is_cursor_served` in match form:
+            // the match must stay exhaustive (a new kind must decide its
+            // advertise read here), so the predicate cannot replace the arm.
+            // `cursor_arm_set_equals_the_predicate_over_all` asserts the arm-set
+            // equals the predicate over `ALL` — widening one without the other
+            // reds there, not on the wire.
             EnvelopeKind::AccordQuorumEvidence => Vec::new(),
         }
     }
@@ -1226,6 +1356,7 @@ impl FederationDirectoryReplicationBridge {
     /// [`Self::is_non_retainable_score`] carve) and `list_attestations_by`
     /// (records BY the subject — authorship recovery, no carve: mine to recover).
     /// Non-replicated / cohort kinds are not subject-pullable and return empty.
+    #[allow(clippy::too_many_lines)] // five per-plane arms + the v18 loud-read/booking mirrors
     async fn subject_holdings_inner(
         &self,
         kind: EnvelopeKind,
@@ -1241,56 +1372,110 @@ impl FederationDirectoryReplicationBridge {
                 });
             }
         };
+        // v18 (the #429 class) — a persist read error on this path used to be an
+        // `unwrap_or_default()`: the subject was told "no testimony" with no warn
+        // and no counter, indistinguishable from a genuinely empty axis. Every
+        // read below now warns like the cursor plane's serve read does
+        // (`accord_evidence_since`); the served result stays empty-for-this-round
+        // (the requester re-pulls next round), never a panic.
+        macro_rules! subject_read {
+            ($fut:expr, $what:literal) => {
+                match $fut.await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            subject = %subject_key_id,
+                            concat!(
+                                "subject-Pull ", $what, " read FAILED — serving an \
+                                 EMPTY axis this round (a transient read error, NOT \
+                                 a statement the subject has no testimony; the \
+                                 requester re-pulls next round) (CIRISEdge#462/#429)"
+                            )
+                        );
+                        Vec::new()
+                    }
+                }
+            };
+        }
+        // v18 — a row that cleared every gate but would not content-hash was a
+        // bare `if let Some(..)`: absent from the Pull with no trace. The
+        // advertise twins book the identical failure (`advertise_since`,
+        // `list_attestations`); these sites now mirror them.
+        let book_unhashable = |detail: &str| {
+            self.withhold(
+                crate::observability::WithholdReason::RowNotSerializable,
+                subject_key_id,
+                detail,
+            );
+        };
         match kind {
             EnvelopeKind::Key => {
-                if let Ok(Some(record)) = self.directory.lookup_public_key(subject_key_id).await {
-                    let seq = Self::ms_seq(record.valid_from);
-                    if let Some((hash, _)) = content_hash_of(&SignedKeyRecord { record }) {
-                        push(hash, seq);
+                match self.directory.lookup_public_key(subject_key_id).await {
+                    Ok(Some(record)) => {
+                        let seq = Self::ms_seq(record.valid_from);
+                        match content_hash_of(&SignedKeyRecord { record }) {
+                            Some((hash, _)) => push(hash, seq),
+                            None => book_unhashable("subject_holdings/key: content_hash_of failed"),
+                        }
+                    }
+                    Ok(None) => {} // no key row for the subject — a normal absence
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            subject = %subject_key_id,
+                            "subject-Pull key lookup FAILED — serving an EMPTY axis \
+                             this round (transient, NOT 'no testimony') \
+                             (CIRISEdge#462/#429)"
+                        );
                     }
                 }
             }
             EnvelopeKind::IdentityOccurrence => {
-                for row in self
-                    .directory
-                    .list_signed_identity_occurrences_for(subject_key_id)
-                    .await
-                    .unwrap_or_default()
-                {
+                for row in subject_read!(
+                    self.directory
+                        .list_signed_identity_occurrences_for(subject_key_id),
+                    "identity-occurrence"
+                ) {
                     let seq = Self::ms_seq(row.identity_occurrence.asserted_at);
-                    if let Some((hash, _)) = content_hash_of(&row) {
-                        push(hash, seq);
+                    match content_hash_of(&row) {
+                        Some((hash, _)) => push(hash, seq),
+                        None => book_unhashable("subject_holdings/idocc: content_hash_of failed"),
                     }
                 }
             }
             EnvelopeKind::TransportDestination => {
-                for row in self
-                    .directory
-                    .list_signed_transport_destinations_for(subject_key_id)
-                    .await
-                    .unwrap_or_default()
-                {
+                for row in subject_read!(
+                    self.directory
+                        .list_signed_transport_destinations_for(subject_key_id),
+                    "transport-destination"
+                ) {
                     let td = &row.transport_destination;
                     let seq = if td.epoch > 0 {
                         td.epoch
                     } else {
                         Self::ms_seq(td.asserted_at)
                     };
-                    if let Some((hash, _)) = content_hash_of(&row) {
-                        push(hash, seq);
+                    match content_hash_of(&row) {
+                        Some((hash, _)) => push(hash, seq),
+                        None => {
+                            book_unhashable("subject_holdings/transport: content_hash_of failed");
+                        }
                     }
                 }
             }
             EnvelopeKind::IdentityOccurrenceRevocation => {
-                for row in self
-                    .directory
-                    .list_signed_identity_occurrence_revocations_for(subject_key_id)
-                    .await
-                    .unwrap_or_default()
-                {
+                for row in subject_read!(
+                    self.directory
+                        .list_signed_identity_occurrence_revocations_for(subject_key_id),
+                    "identity-occurrence-revocation"
+                ) {
                     let seq = Self::ms_seq(row.identity_occurrence_revocation.revoked_at);
-                    if let Some((hash, _)) = content_hash_of(&row) {
-                        push(hash, seq);
+                    match content_hash_of(&row) {
+                        Some((hash, _)) => push(hash, seq),
+                        None => {
+                            book_unhashable("subject_holdings/idocc-rev: content_hash_of failed");
+                        }
                     }
                 }
             }
@@ -1298,37 +1483,39 @@ impl FederationDirectoryReplicationBridge {
                 // DATA-SUBJECT axis — records ABOUT the subject (the 84-family
                 // revocation-reachability set), MINUS the G2 self-non-retainable
                 // scores.
-                for att in self
-                    .directory
-                    .list_attestations_for(subject_key_id)
-                    .await
-                    .unwrap_or_default()
-                {
+                for att in subject_read!(
+                    self.directory.list_attestations_for(subject_key_id),
+                    "attestation (data-subject axis)"
+                ) {
                     if Self::is_non_retainable_score(&att) {
                         continue;
                     }
                     let seq = Self::ms_seq(att.asserted_at);
-                    if let Some((hash, _)) = content_hash_of(&att) {
-                        if self.pull_ref_is_serveable(&att, subject_key_id).await {
-                            push(hash, seq);
+                    match content_hash_of(&att) {
+                        Some((hash, _)) => {
+                            if self.pull_ref_is_serveable(&att, subject_key_id).await {
+                                push(hash, seq);
+                            }
                         }
+                        None => book_unhashable("subject_holdings/att-for: content_hash_of failed"),
                     }
                 }
                 // SENDER axis — records BY the subject (authorship recovery). No
                 // G2 carve (an attestation I authored is mine to recover, even a
                 // `capacity:*` score I asserted about someone else) — but the SAME
                 // serve gate, so a ref and its bytes always agree.
-                for att in self
-                    .directory
-                    .list_attestations_by(subject_key_id)
-                    .await
-                    .unwrap_or_default()
-                {
+                for att in subject_read!(
+                    self.directory.list_attestations_by(subject_key_id),
+                    "attestation (sender axis)"
+                ) {
                     let seq = Self::ms_seq(att.asserted_at);
-                    if let Some((hash, _)) = content_hash_of(&att) {
-                        if self.pull_ref_is_serveable(&att, subject_key_id).await {
-                            push(hash, seq);
+                    match content_hash_of(&att) {
+                        Some((hash, _)) => {
+                            if self.pull_ref_is_serveable(&att, subject_key_id).await {
+                                push(hash, seq);
+                            }
                         }
+                        None => book_unhashable("subject_holdings/att-by: content_hash_of failed"),
                     }
                 }
             }
@@ -1357,16 +1544,37 @@ impl FederationDirectoryReplicationBridge {
     /// about the subject serve unconditionally, while a `trace:*` row still
     /// requires the subject to hold `infra:serve`. `peer == subject` here (enforced
     /// by [`Self::subject_holdings`]).
+    /// (Projection sweep, v18: every row this gate sees is FIRST-PARTY to the
+    /// requester by construction — `subject_holdings_inner` lists only rows
+    /// ABOUT or BY the subject, and `subject_holdings` pins requester == subject
+    /// — so the fetch twin's first-party carve keeps `fetch_envelope_bytes_for_peer`
+    /// in agreement with this LIST on every ref it discloses. No projection gate
+    /// is needed here.)
     async fn pull_ref_is_serveable(&self, att: &Attestation, requester: &str) -> bool {
         let Ok(value) = serde_json::to_value(att) else {
-            return false; // an unserializable row is not disclosed
+            // An unserializable row is not disclosed — and it is BOOKED, exactly
+            // as the advertise twins book the identical failure (#433: eligible
+            // and not served is the ledger's definition; was a bare `false`).
+            self.withhold(
+                crate::observability::WithholdReason::RowNotSerializable,
+                requester,
+                "pull_ref_is_serveable: to_value failed",
+            );
+            return false;
         };
         if Self::attestation_requires_serve(&value) {
             // `trace:*` — E3 confidentiality. Withheld while the plane is paused,
             // and served only to a subject that itself holds `infra:serve`.
             if self.trace_plane_paused().await {
+                // Booked via the shared #440 helper — the subject-Pull twin of
+                // the advertise (:config-paused-advertise) and direct-fetch
+                // (:config-paused-fetch) sites; its own throttle key so neither
+                // exit can silence this one's log. Was a bare `false`.
+                self.withhold_config_paused(requester, "config-paused-subject-pull");
                 return false;
             }
+            // `peer_has_serve_capability` books its OWN per-leg reason at the
+            // deciding branch (#433) — no re-count here, same as the twins.
             if !self.peer_has_serve_capability(requester).await {
                 return false;
             }
@@ -1673,9 +1881,22 @@ impl FederationDirectoryReplicationBridge {
             .subjects_for_projection(Projection::SelfOwn)
             .into_iter()
             .collect();
+        let limit = self.effective_page_limit().await;
+        self.list_keys_page(Some(&subjects), limit).await
+    }
+
+    /// The Key plane's since-cursor page, with the `SelfOwn` publish filter as
+    /// a PARAMETER: `Some(subjects)` is the advertise view ([`Self::list_keys`]),
+    /// `None` is the raw holdings view ([`Self::list_key_holdings`], #416 — the
+    /// filter belongs to advertise only).
+    async fn list_keys_page(
+        &self,
+        subjects: Option<&HashSet<String>>,
+        limit: u32,
+    ) -> Vec<EnvelopeRef> {
         let rows: Vec<KeyAdvertiseRow> = self
             .directory
-            .list_signed_key_records_since(None, self.effective_page_limit().await)
+            .list_signed_key_records_since(None, limit)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -1686,11 +1907,22 @@ impl FederationDirectoryReplicationBridge {
             .collect();
         self.advertise_since(
             &rows,
-            |row| subjects.contains(&row.record.key_id),
+            // (`map_or(true, ..)`, not `is_none_or` — MSRV 1.75.)
+            |row| subjects.map_or(true, |s| s.contains(&row.record.key_id)),
             |row| Self::ms_seq(row.admitted_at),
             // Already hash-correct: `KeyAdvertiseRow` #[serde(skip)]s admitted_at.
             |row| row,
         )
+    }
+
+    /// CIRISEdge#416 (v18 sweep) — the RAW Key holdings: every key row in local
+    /// state, UNFILTERED. See [`Self::list_holdings`] for why the SelfOwn
+    /// publish filter must not shape the receive-diff view, and
+    /// [`Self::list_attestation_holdings`] for why the page limit is the RAW
+    /// configured one (relief bounds offers, never self-knowledge).
+    async fn list_key_holdings(&self) -> Vec<EnvelopeRef> {
+        self.list_keys_page(None, self.config.operational_page_limit)
+            .await
     }
 
     /// IdentityOccurrence plane — `SelfOwn` (publish-own): the node's OWN KEX
@@ -1701,17 +1933,40 @@ impl FederationDirectoryReplicationBridge {
             .subjects_for_projection(Projection::SelfOwn)
             .into_iter()
             .collect();
+        let limit = self.effective_page_limit().await;
+        self.list_identity_occurrences_page(Some(&subjects), limit)
+            .await
+    }
+
+    /// The IdentityOccurrence plane's since-cursor page — the `SelfOwn` filter
+    /// as a parameter, mirroring [`Self::list_keys_page`] (#416 sweep).
+    async fn list_identity_occurrences_page(
+        &self,
+        subjects: Option<&HashSet<String>>,
+        limit: u32,
+    ) -> Vec<EnvelopeRef> {
         let rows = self
             .directory
-            .list_signed_identity_occurrences_since(None, self.effective_page_limit().await)
+            .list_signed_identity_occurrences_since(None, limit)
             .await
             .unwrap_or_default();
         self.advertise_since(
             &rows,
-            |row| subjects.contains(&row.occurrence.identity_occurrence.occurrence_key_id),
+            |row| {
+                subjects.map_or(true, |s| {
+                    s.contains(&row.occurrence.identity_occurrence.occurrence_key_id)
+                })
+            },
             |row| Self::ms_seq(row.occurrence.identity_occurrence.asserted_at),
             |row| &row.occurrence,
         )
+    }
+
+    /// CIRISEdge#416 (v18 sweep) — the RAW IdentityOccurrence holdings,
+    /// unfiltered. See [`Self::list_holdings`].
+    async fn list_identity_occurrence_holdings(&self) -> Vec<EnvelopeRef> {
+        self.list_identity_occurrences_page(None, self.config.operational_page_limit)
+            .await
     }
 
     /// TransportDestination plane — `SelfOwn` (publish-own): the node's OWN
@@ -1724,14 +1979,30 @@ impl FederationDirectoryReplicationBridge {
             .subjects_for_projection(Projection::SelfOwn)
             .into_iter()
             .collect();
+        let limit = self.effective_page_limit().await;
+        self.list_transport_destinations_page(Some(&subjects), limit)
+            .await
+    }
+
+    /// The TransportDestination plane's since-cursor page — the `SelfOwn`
+    /// filter as a parameter, mirroring [`Self::list_keys_page`] (#416 sweep).
+    async fn list_transport_destinations_page(
+        &self,
+        subjects: Option<&HashSet<String>>,
+        limit: u32,
+    ) -> Vec<EnvelopeRef> {
         let rows = self
             .directory
-            .list_signed_transport_destinations_since(None, self.effective_page_limit().await)
+            .list_signed_transport_destinations_since(None, limit)
             .await
             .unwrap_or_default();
         self.advertise_since(
             &rows,
-            |row| subjects.contains(&row.destination.transport_destination.occurrence_key_id),
+            |row| {
+                subjects.map_or(true, |s| {
+                    s.contains(&row.destination.transport_destination.occurrence_key_id)
+                })
+            },
             |row| {
                 if row.destination.transport_destination.epoch > 0 {
                     row.destination.transport_destination.epoch
@@ -1741,6 +2012,13 @@ impl FederationDirectoryReplicationBridge {
             },
             |row| &row.destination,
         )
+    }
+
+    /// CIRISEdge#416 (v18 sweep) — the RAW TransportDestination holdings,
+    /// unfiltered. See [`Self::list_holdings`].
+    async fn list_transport_destination_holdings(&self) -> Vec<EnvelopeRef> {
+        self.list_transport_destinations_page(None, self.config.operational_page_limit)
+            .await
     }
 
     /// IdentityOccurrenceRevocation plane — tombstone → `Global` (anti-rollback,
@@ -2582,6 +2860,16 @@ impl FederationDirectoryReplicationBridge {
         for att in &attestations {
             // Skip only an unparseable/unhashable row (never a projection filter).
             let Some((hash, _bytes)) = content_hash_of(&att.attestation) else {
+                // v18 (#433) — the sibling advertise sweep (`list_attestations`)
+                // books this identical failure; a bare `continue` here made the
+                // HOLDINGS view silently blind to a held row, which re-enters it
+                // into `want` every round (the #416 non-convergence shape, by a
+                // different door).
+                self.withhold(
+                    crate::observability::WithholdReason::RowNotSerializable,
+                    "<unattributed>",
+                    "list_attestation_holdings: content_hash_of failed",
+                );
                 continue;
             };
             if !seen.insert(hash) {
@@ -3242,13 +3530,41 @@ impl FederationDirectoryReplicationBridge {
     /// a wire field. Supersession is `(epoch, asserted_at)`-monotonic, so a
     /// replayed older frame is `Refused`, not applied.
     ///
-    /// `Refused { reason }` is fail-closed and re-offerable — it is NOT a
-    /// transport error (the record is simply inadmissible: older epoch, or a
-    /// same-`(epoch, asserted_at)` content conflict), so we return `true`
-    /// (the frame was handled; do not retry-storm the sender). A genuine gate
-    /// failure (bad signature / unknown attesting key / not-acts-for) surfaces
-    /// as `Err` from persist → `false` → the frame is rejected. A parse failure
-    /// (a pre-v17 bare row from an un-upgraded peer) is also `false` — such a
+    /// ## The `Refused { reason }` mapping (v18 — the refusal-laundering fix)
+    ///
+    /// Until v18 this arm returned `Admitted` for EVERY persist `Refused` — the
+    /// deliberate old-`bool`-world anti-retry-storm shape — which made this the
+    /// ONE plane whose refusals evaded the #425 choke: `apply_refusals_by_kind`
+    /// under-counted, and a same-clock CONTENT CONFLICT read as an admit in
+    /// metrics. Worse, its `reason.contains("conflict")` discriminator was DEAD:
+    /// all three persist backends emit the SAME "does not supersede" reason
+    /// string for a stale epoch and for a same-clock fork (the word "conflict"
+    /// never appears), so every fork debug-logged as a routine stale epoch.
+    ///
+    /// The mapping now mirrors the Key plane's [`key_outcome_to_apply`]
+    /// precedent, and NOTHING retries on any outcome (the #425 choke counts and
+    /// logs; re-offering is driven by the want-diff, not by this value), so the
+    /// no-retry property is kept by construction:
+    ///
+    /// - `Inserted` / `Superseded` → `Admitted` (state changed);
+    /// - `Unchanged` → `Duplicate` (idempotent replay — was mis-counted as an
+    ///   admit);
+    /// - `Refused`, STALE (we hold a strictly newer `(epoch, asserted_at)`) →
+    ///   `Duplicate`, DELIBERATELY: it is routine non-progress the choke logs at
+    ///   DEBUG. Mapping it to `Refused` would WARN per redelivery every round —
+    ///   the log-noise analogue of the retry storm — while `Duplicate` still
+    ///   counts truthfully as non-admitted (`inc_duplicate`, never
+    ///   `inc_applied`). This is the documented compromise;
+    /// - `Refused`, SAME-CLOCK FORK (equal `(epoch, asserted_at)`, different
+    ///   content — the split-truth signal) → `ApplyOutcome::Refused`, loud at
+    ///   the choke AND counted on `apply_refusals_by_kind`. Because persist's
+    ///   reason string cannot distinguish the two, the classification re-reads
+    ///   the stored row's clock; an unreadable/absent stored row classifies to
+    ///   the LOUD arm (never launder what we cannot classify).
+    ///
+    /// A genuine gate failure (bad signature / unknown attesting key /
+    /// not-acts-for) surfaces as `Err` from persist → `Refused`. A parse failure
+    /// (a pre-v17 bare row from an un-upgraded peer) is `Deserialize` — such a
     /// peer's routes simply do not replicate until it adopts v17, which is the
     /// intended breaking behavior, not a silent bare-row admit.
     async fn apply_transport_destination(&self, bytes: &[u8]) -> ApplyOutcome {
@@ -3262,31 +3578,66 @@ impl FederationDirectoryReplicationBridge {
                 .await
             {
                 Ok(TransportDestinationApplyOutcome::Refused { reason }) => {
-                    // Fail-closed + re-offerable: a stale epoch is routine, but a
-                    // same-`(epoch, asserted_at)` CONTENT conflict is a split-truth
-                    // signal that must be loud (CIRISEdge#425 MEDIUM). We keep the
-                    // frame "handled" (return `Admitted`) either way so it does not
-                    // retry-storm the sender, but a conflict WARNs while a stale
-                    // epoch DEBUGs. Keyed on the low-cardinality reason, never the
-                    // attacker-influenced key_id / dest (CIRISEdge#337 §4).
-                    if reason.contains("conflict") {
-                        tracing::warn!(
-                            occurrence_key_id = %signed.transport_destination.occurrence_key_id,
-                            reason = %reason,
-                            "replicated route CONTENT CONFLICT at same (epoch, asserted_at) — \
-                             split-truth signal, not applied (CIRISEdge#338/#425)"
-                        );
-                    } else {
-                        tracing::debug!(
-                            occurrence_key_id = %signed.transport_destination.occurrence_key_id,
-                            reason = %reason,
-                            "replicated route refused (fail-closed, re-offerable): stale epoch \
-                             — not applied (CIRISEdge#338)"
-                        );
+                    let td = &signed.transport_destination;
+                    // Classify stale-vs-fork from the STORED row's clock (persist's
+                    // reason string is identical for both). `None` = the stored row
+                    // could not be read or was not found — unclassifiable, and an
+                    // unclassifiable refusal goes to the loud arm.
+                    let stored_clock = self
+                        .directory
+                        .list_signed_transport_destinations_for(&td.occurrence_key_id)
+                        .await
+                        .ok()
+                        .and_then(|rows| {
+                            rows.into_iter()
+                                .find(|r| {
+                                    r.transport_destination.transport_kind == td.transport_kind
+                                })
+                                .map(|r| {
+                                    (
+                                        r.transport_destination.epoch,
+                                        r.transport_destination.asserted_at,
+                                    )
+                                })
+                        });
+                    match stored_clock {
+                        Some(stored) if stored > (td.epoch, td.asserted_at) => {
+                            // STALE — routine; keyed on the low-cardinality reason,
+                            // never the attacker-influenced key_id/dest (#337 §4).
+                            tracing::debug!(
+                                occurrence_key_id = %td.occurrence_key_id,
+                                reason = %reason,
+                                "replicated route refused (fail-closed, re-offerable): stale \
+                                 (epoch, asserted_at) — not applied; counted as Duplicate, \
+                                 see the mapping doc (CIRISEdge#338)"
+                            );
+                            ApplyOutcome::Duplicate
+                        }
+                        _ => {
+                            // SAME-CLOCK FORK (or unclassifiable) — split truth.
+                            tracing::warn!(
+                                occurrence_key_id = %td.occurrence_key_id,
+                                reason = %reason,
+                                classified = stored_clock.is_some(),
+                                "replicated route CONTENT CONFLICT at same (epoch, \
+                                 asserted_at) — split-truth signal, not applied \
+                                 (CIRISEdge#338/#425; `classified=false` = the stored row \
+                                 could not be re-read, refusing loud rather than laundering)"
+                            );
+                            ApplyOutcome::Refused(format!(
+                                "TransportDestination: supersession refused \
+                                 (same-clock content conflict or unclassifiable): {reason}"
+                            ))
+                        }
                     }
-                    ApplyOutcome::Admitted
                 }
-                Ok(_) => ApplyOutcome::Admitted,
+                // v18 — `Unchanged` is persist's byte-identical idempotent no-op:
+                // the exact `Duplicate` semantics (was mis-counted as an admit).
+                Ok(TransportDestinationApplyOutcome::Unchanged) => ApplyOutcome::Duplicate,
+                Ok(
+                    TransportDestinationApplyOutcome::Inserted
+                    | TransportDestinationApplyOutcome::Superseded,
+                ) => ApplyOutcome::Admitted,
                 Err(e) => ApplyOutcome::Refused(format!(
                     "TransportDestination: authenticated apply gate rejected (signature / \
                      attesting-key / acts-for, CIRISEdge#337 CRITICAL-2): {e}"
@@ -3827,6 +4178,406 @@ mod tests {
             "list_attestation_holdings MUST contain the held row (#416 convergence \
              invariant) even though the advertise view excludes it"
         );
+    }
+
+    /// v18 SECURITY — the SelfOwn fetch-path projection twin. A FOREIGN-produced
+    /// `cohort_scope:"self"` attestation is structurally hidden by
+    /// `attestation_is_advertised`, and until v18 the direct fetch never
+    /// consulted that gate: any consent-included peer that learned the hash
+    /// out-of-band was served the bytes byte-for-byte. Field-exact scenario:
+    /// - a third-party peer IN the consent set, fetching by hash → refused AND
+    ///   booked (isolating the projection twin — consent cannot be the refuser);
+    /// - the row's own producer/subject → served (the v16 first-party override,
+    ///   matching the subject-Pull LIST gate);
+    /// - an advertised (federation-scope) row → unaffected for the same peer.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // e2e security scenario: full fixture + both peers + both verdicts
+    async fn foreign_self_scope_attestation_is_not_served_by_direct_fetch() {
+        let local = "this-node";
+        let producer = "other-producer";
+        let third = "third-peer";
+        let (backend, bridge) =
+            make_bridge(&[local.to_string(), producer.to_string(), third.to_string()]);
+        let metrics = crate::observability::EdgeMetrics::new();
+        let publish_set = vec![local.to_string()];
+        let selector: CohortProvider = Arc::new(move || publish_set.clone());
+        let bridge = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_self_provider(Some(selector))
+            .with_metrics(Some(metrics.clone()));
+        for kid in [local, producer, third] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        // BOTH fetching peers are consent-included by this node, so a refusal
+        // below can only be the projection twin, never the #396 item-1 bound.
+        seed_consent_membership(&backend, local, third).await;
+        seed_consent_membership(&backend, local, producer).await;
+        // The hidden row: self-scoped, produced by ANOTHER node (held here via
+        // replication; advertised only by its own producer).
+        let hidden_id = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &hidden_id,
+            producer,
+            producer,
+            "scores",
+            "self",
+            serde_json::json!({ "dimension": "identity:example:v1" }),
+        )
+        .await;
+        // An ADVERTISED control row `third` is NOT first-party to (attester =
+        // local, subject = producer): federation scope → projected → served.
+        seed_delegates_to(
+            &backend,
+            local,
+            producer,
+            &serde_json::json!(["infra:attest"]),
+        )
+        .await;
+
+        // Locate both rows by CONTENT via the raw holdings view.
+        let mut hidden_hash = None;
+        let mut advertised_hash = None;
+        for r in bridge.list_attestation_holdings().await {
+            let bytes = bridge
+                .fetch_envelope_bytes(EnvelopeKind::Attestation, &r.envelope_hash)
+                .await
+                .expect("holdings resolve to bytes");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("wire json");
+            // Read the scope through the bridge's ONE reader (#727 discipline —
+            // a raw `.get("cohort_scope")` here trips the skip_serializing_if
+            // source guard, and rightly so).
+            if FederationDirectoryReplicationBridge::attestation_cohort_scope(&v) == "self" {
+                hidden_hash = Some(r.envelope_hash);
+            } else if v
+                .get("attestation_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("delegates_to")
+            {
+                advertised_hash = Some(r.envelope_hash);
+            }
+        }
+        let hidden_hash = hidden_hash.expect("the self-scoped row is held");
+        let advertised_hash = advertised_hash.expect("the delegates_to row is held");
+
+        // The advertise view excludes the hidden row for the third party…
+        assert!(
+            !bridge
+                .list_attestations(Some(third))
+                .await
+                .iter()
+                .any(|r| r.envelope_hash == hidden_hash),
+            "a foreign self-scoped row must not be advertised to a third party"
+        );
+        // …and (v18) the direct fetch now AGREES: refused + booked.
+        let before = metrics.withholds(crate::observability::WithholdReason::RecipientNotInSendSet);
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hidden_hash, Some(third))
+                .await
+                .is_none(),
+            "SECURITY: a consent-included third party must NOT obtain a \
+             structurally-hidden self-scope row by fetching its hash out-of-band \
+             (the v18 projection twin)"
+        );
+        assert!(
+            metrics.withholds(crate::observability::WithholdReason::RecipientNotInSendSet) > before,
+            "the projection-twin refusal must be BOOKED on the withhold ledger \
+             (borrowing the closest documented audience-membership reason)"
+        );
+        // An UNATTRIBUTED fetch has no first party — fail-closed.
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hidden_hash, None)
+                .await
+                .is_none(),
+            "an unattributed fetch of a hidden row fails closed"
+        );
+        // The first party (author AND subject) still recovers its own testimony
+        // — the v16 override the twin must preserve.
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &hidden_hash,
+                    Some(producer)
+                )
+                .await
+                .is_some(),
+            "the first party fetches its own self-scope row (v16 override intact)"
+        );
+        // Advertised rows are unaffected: the same third party still fetches a
+        // projected row it is NOT first-party to.
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &advertised_hash,
+                    Some(third)
+                )
+                .await
+                .is_some(),
+            "an advertised (federation-scope) row still serves the same peer — \
+             the twin narrows nothing the advertise gate would have served"
+        );
+    }
+
+    /// v18 (#416 sweep) — the SelfOwn-plane HOLDINGS views are UNFILTERED. A
+    /// held-but-unpublished KEY (a foreign subject's row this node admitted via
+    /// replication) must appear in `list_holdings(Key)` even though the
+    /// advertise view excludes it — else the round's `want = remote ∖ holdings`
+    /// re-wants it forever (round 2 re-fetches, re-applies `Duplicate`, never
+    /// converges). Drives the two-round shape: remote advertises, local
+    /// computes `want` from holdings → empty on the second round.
+    #[tokio::test]
+    async fn held_but_unpublished_key_leaves_want_on_the_second_round() {
+        use crate::replication::summary::diff_refs;
+        let this_node = "this-node";
+        let foreign = "foreign-subject";
+        let (backend, bridge) = make_bridge(&[foreign.to_string()]);
+        for k in [this_node, foreign] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        // This node publishes only its OWN key.
+        let publish_set = vec![this_node.to_string()];
+        let selector: CohortProvider = Arc::new(move || publish_set.clone());
+        let bridge = bridge.with_self_provider(Some(selector));
+
+        // The REMOTE view: the foreign subject's own node advertises its key.
+        // Same backend = the same stored row bytes, exactly as after round 1
+        // replicated it here.
+        let remote_dir: Arc<dyn FederationDirectory> = backend.clone();
+        let remote_cohort: CohortProvider = Arc::new(Vec::new);
+        let foreign_set = vec![foreign.to_string()];
+        let remote_selector: CohortProvider = Arc::new(move || foreign_set.clone());
+        let remote = FederationDirectoryReplicationBridge::new(remote_dir, remote_cohort)
+            .with_self_provider(Some(remote_selector));
+        let remote_refs = remote.list_envelope_refs(EnvelopeKind::Key).await;
+        assert_eq!(
+            remote_refs.len(),
+            1,
+            "the remote advertises the foreign key"
+        );
+
+        // The ADVERTISE view here excludes the foreign key (SelfOwn publish-own)…
+        let advertise = bridge.list_envelope_refs(EnvelopeKind::Key).await;
+        assert!(
+            !diff_refs(&advertise, &remote_refs).is_empty(),
+            "precondition: the advertise view does NOT cover the remote ref — \
+             using it as the diff basis is exactly the pre-v18 non-convergence"
+        );
+        // …and the HOLDINGS view covers it: round 2's want is EMPTY.
+        let holdings = bridge.list_holdings(EnvelopeKind::Key).await;
+        assert!(
+            diff_refs(&holdings, &remote_refs).is_empty(),
+            "v18: `want = remote ∖ holdings` must be empty for a held \
+             foreign-subject key — the round converges instead of re-fetching \
+             it forever (#416 on the Key plane)"
+        );
+    }
+
+    /// v18 — a deterministic, REALLY-signed `SignedTransportDestination` (the
+    /// same JCS + Ed25519 + bound ML-DSA-65 construction persist verifies;
+    /// `sign_attestation_envelope` is the generic hybrid envelope signer).
+    /// `attesting == occurrence` (self-asserted, the `signer_acts_for` self
+    /// path — the same shape `self_route.rs` emits in production).
+    fn sign_transport_destination_fixture(
+        key_id: &str,
+        dest: &str,
+        epoch: u64,
+        asserted_at: chrono::DateTime<Utc>,
+    ) -> ciris_persist::federation::self_at_login::SignedTransportDestination {
+        use ciris_persist::federation::self_at_login::{
+            BindingProvenance, SignedTransportDestination, TransportDestination,
+        };
+        use ciris_verify_core::transport_binding::TransportBindingSignature;
+        let row = TransportDestination {
+            occurrence_key_id: key_id.to_string(),
+            transport_kind: "reticulum".to_string(),
+            destination: dest.to_string(),
+            asserted_at,
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: Some(B64.encode([0xbb; 32])),
+            transport_x25519_pubkey_base64: Some(B64.encode([0xcc; 32])),
+            binding_provenance: BindingProvenance::Rooted,
+            epoch,
+            retired_at: None,
+        };
+        let envelope = serde_json::to_value(&row).expect("route row serializes");
+        let (_hash, ed_sig, pqc_sig) = sign_attestation_envelope(key_id, &envelope);
+        SignedTransportDestination {
+            attesting_key_id: key_id.to_string(),
+            transport_destination: row,
+            signed_envelope: envelope,
+            signature: TransportBindingSignature {
+                ed25519_signature_base64: ed_sig,
+                mldsa65_signature_base64: pqc_sig,
+            },
+        }
+    }
+
+    /// v18 (#416 sweep, TransportDestination arm) — same convergence shape as
+    /// the Key-plane test, driven through the REAL signed-route admission.
+    #[tokio::test]
+    async fn held_but_unpublished_route_is_in_holdings() {
+        let this_node = "this-node";
+        let foreign = "foreign-subject";
+        let (backend, bridge) = make_bridge(&[foreign.to_string()]);
+        for k in [this_node, foreign] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(k, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        let publish_set = vec![this_node.to_string()];
+        let selector: CohortProvider = Arc::new(move || publish_set.clone());
+        let bridge = bridge.with_self_provider(Some(selector));
+        // Admit the FOREIGN node's signed route exactly as replication would.
+        let now = Utc::now().trunc_subsecs(6);
+        let signed = sign_transport_destination_fixture(foreign, "aa00", 3, now);
+        let outcome = bridge
+            .apply_envelope_bytes(
+                EnvelopeKind::TransportDestination,
+                &serde_json::to_vec(&signed).expect("wire"),
+                None,
+            )
+            .await;
+        assert!(
+            outcome.is_admitted(),
+            "signed route admits, got {outcome:?}"
+        );
+
+        assert!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::TransportDestination)
+                .await
+                .is_empty(),
+            "the advertise view excludes the foreign route (SelfOwn publish-own)"
+        );
+        assert_eq!(
+            bridge
+                .list_holdings(EnvelopeKind::TransportDestination)
+                .await
+                .len(),
+            1,
+            "v18: the holdings view contains the held foreign route (#416 on the \
+             TransportDestination plane)"
+        );
+    }
+
+    /// v18 — the TransportDestination refusal-laundering fix: persist outcomes
+    /// map HONESTLY (`Unchanged` → Duplicate; stale → Duplicate, quiet;
+    /// same-clock content FORK → Refused, loud) instead of everything reading
+    /// `Admitted` in metrics. Nothing here retries on any outcome — the #425
+    /// choke counts and logs, and re-offers are want-diff-driven.
+    #[tokio::test]
+    async fn apply_transport_destination_counts_refusals_honestly() {
+        let key = "route-owner";
+        let (backend, bridge) = make_bridge(&[]);
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fixture_key_record(key, identity_type::AGENT),
+            })
+            .await
+            .expect("seed key");
+        let t5 = Utc::now().trunc_subsecs(6);
+        let current = sign_transport_destination_fixture(key, "aa00", 5, t5);
+        let wire = |s: &ciris_persist::federation::self_at_login::SignedTransportDestination| {
+            serde_json::to_vec(s).expect("wire")
+        };
+
+        // Fresh insert → Admitted.
+        let r = bridge
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire(&current), None)
+            .await;
+        assert_eq!(r, ApplyOutcome::Admitted, "fresh signed route admits");
+
+        // Byte-identical replay → persist `Unchanged` → Duplicate (was
+        // mis-counted as an admit).
+        let r = bridge
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire(&current), None)
+            .await;
+        assert_eq!(
+            r,
+            ApplyOutcome::Duplicate,
+            "an idempotent replay is a Duplicate, not an admit"
+        );
+
+        // STALE: strictly older (epoch, asserted_at) → Duplicate (routine
+        // non-progress; deliberately NOT the loud Refused arm — see the
+        // mapping doc), and NEVER Admitted.
+        let stale =
+            sign_transport_destination_fixture(key, "bb11", 3, t5 - chrono::Duration::seconds(10));
+        let r = bridge
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire(&stale), None)
+            .await;
+        assert_eq!(
+            r,
+            ApplyOutcome::Duplicate,
+            "a stale-epoch re-offer counts as Duplicate — quiet, and no longer \
+             laundered into the admit metrics"
+        );
+
+        // SAME-CLOCK FORK: equal (epoch, asserted_at), DIFFERENT content →
+        // the split-truth signal must surface as a LOUD Refused at the #425
+        // choke and count on `apply_refusals_by_kind`.
+        let fork = sign_transport_destination_fixture(key, "cc22", 5, t5);
+        let r = bridge
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire(&fork), None)
+            .await;
+        assert!(
+            matches!(r, ApplyOutcome::Refused(_)),
+            "a same-clock content fork is a REFUSAL (split truth), got {r:?}"
+        );
+    }
+
+    /// v18 — the cursor-plane arm-set is BOUND to the predicate: the kinds
+    /// `list_envelope_refs_inner` declines to advertise by construction (and
+    /// `accord_evidence_since` answers) are EXACTLY `is_cursor_served` over
+    /// `ALL`. Widening the predicate without visiting the bridge's dispatch
+    /// (or vice versa) reds here, not on the wire.
+    #[tokio::test]
+    async fn cursor_arm_set_equals_the_predicate_over_all() {
+        let cursor_kinds: Vec<EnvelopeKind> = EnvelopeKind::ALL
+            .into_iter()
+            .filter(|k| k.is_cursor_served())
+            .collect();
+        assert_eq!(
+            cursor_kinds,
+            vec![EnvelopeKind::AccordQuorumEvidence],
+            "the `EnvelopeKind::AccordQuorumEvidence => Vec::new()` advertise arm \
+             and `accord_evidence_since`'s accord-specific body are written for \
+             EXACTLY this set — a new cursor kind must visit BOTH dispatch sites \
+             in bridge.rs (see the comments naming this test)"
+        );
+        let (_backend, bridge) = make_bridge(&[]);
+        for kind in EnvelopeKind::ALL {
+            if kind.is_cursor_served() {
+                assert!(
+                    bridge.list_envelope_refs(kind).await.is_empty(),
+                    "a cursor-served kind must never advertise content-hash refs \
+                     (listed-then-unfetchable otherwise): {kind:?}"
+                );
+            } else {
+                assert!(
+                    bridge.accord_evidence_since(kind, None).await.is_empty(),
+                    "a non-cursor kind must never be answered by the cursor serve \
+                     path: {kind:?}"
+                );
+            }
+        }
     }
 
     /// Bridge dedupes the same key when listed across multiple cohort
@@ -5107,6 +5858,39 @@ mod tests {
             "confidence": 0.9,
         });
         seed_raw_attestation(backend, &id, attester, scored, "scores", envelope).await;
+    }
+
+    /// CIRISEdge#505 / CIRISPersist#743 — an `accord:*` row in the **TYPE
+    /// namespace**: `attestation_type = "accord:invoke:…"`, NO `dimension` key
+    /// at all, naming its accord with the signed `accord_root` envelope key.
+    ///
+    /// This is the OTHER half of persist's two-namespace admission rule
+    /// (*"`accord:invoke:*` as a TYPE, `accord:human_dignity:v1` as a `scores`
+    /// DIMENSION"*), and the wire shape the pre-#505 pre-filter never showed
+    /// the relay gate. The invoke shape is self-attesting
+    /// (`attested_key_id` = the holder — persist #733: "the SELF-ATTESTING
+    /// HOLDER"), and admission requires the attesting key's `identity_type` to
+    /// be `accord_holder` (CC 3.4.1) plus the signed root
+    /// (`check_accord_root_binding`) — the fixture goes through the REAL write
+    /// door, so it carries what the field must carry.
+    async fn seed_accord_invoke(backend: &MemoryBackend, holder: &str, accord_root: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": id,
+            "attesting_key_id": holder,
+            "attested_key_id": holder,
+            "attestation_type": "accord:invoke:notify:halt",
+            "accord_root": accord_root,
+        });
+        seed_raw_attestation(
+            backend,
+            &id,
+            holder,
+            holder,
+            "accord:invoke:notify:halt",
+            envelope,
+        )
+        .await;
     }
 
     /// Seed a `withdraws` composer tombstoning `target_id` — the CEG un-trust
@@ -7677,10 +8461,15 @@ mod tests {
     /// the gate itself derives, so a test always aims at the row the gate will
     /// actually judge. (It previously matched the UNSIGNED top-level
     /// `attesting_key_id` column, which is not what the gate reads.)
+    /// `ty` discriminates the NAMESPACE the row rides (CIRISEdge#505): one
+    /// holder can hold both a dimension-namespace row (`ty = "scores"`) and a
+    /// type-namespace row (`ty = "accord:invoke:…"`) under the same root, and
+    /// `(root, signer)` alone no longer picks one.
     async fn locate_accord_hash(
         bridge: &FederationDirectoryReplicationBridge,
         root: &str,
         signer: &str,
+        ty: &str,
     ) -> [u8; 32] {
         use crate::replication::accord_relay_gate::AccordRelaySubject;
         for r in bridge.list_envelope_refs(EnvelopeKind::Attestation).await {
@@ -7693,13 +8482,14 @@ mod tests {
             };
             let inner = v.get("attestation").unwrap_or(&v);
             if FederationDirectoryReplicationBridge::attestation_is_accord(inner)
+                && inner.get("attestation_type").and_then(|t| t.as_str()) == Some(ty)
                 && AccordRelaySubject::of_attestation(inner)
                     .is_ok_and(|s| s.root_ref == root && s.signer_key_id == signer)
             {
                 return r.envelope_hash;
             }
         }
-        panic!("the seeded accord row by {signer} under {root} appears in the local view");
+        panic!("the seeded {ty} accord row by {signer} under {root} appears in the local view");
     }
 
     /// Workstream F, the whole property in one scenario — and deliberately BOTH
@@ -7707,13 +8497,18 @@ mod tests {
     /// a gate that is dead (the #435 / v13.10.0 lesson), while a gate only ever
     /// seen allowing proves nothing about carriage at all.
     ///
-    /// One node, one accord root, one peer, and three rows:
+    /// One node, one accord root, one peer, and five rows — the family's BOTH
+    /// namespaces (CIRISEdge#505: `accord:invoke:*` as a TYPE,
+    /// `accord:human_dignity:v1`-style rows as a `scores` DIMENSION), each with
+    /// an allow and a refuse so neither namespace can pass by being skipped:
     ///
     /// | row | expectation |
     /// |---|---|
-    /// | `accord:*` by a SEATED holder | advertised AND served — persist's `may_relay` holds |
-    /// | `accord:*` by an UNSEATED holder | withheld from BOTH paths, booked `accord_relay_signer_not_seated` |
-    /// | a non-`accord:` row | untouched — this gate narrows exactly one dimension family |
+    /// | dimension-namespace `accord:*` by a SEATED holder | advertised AND served — persist's `may_relay` holds |
+    /// | dimension-namespace `accord:*` by an UNSEATED holder | withheld from BOTH paths, booked `accord_relay_signer_not_seated` |
+    /// | TYPE-namespace `accord:invoke:*` by a SEATED holder | advertised AND served — the pre-filter admits it AND the gate allows it |
+    /// | TYPE-namespace `accord:invoke:*` by an UNSEATED holder | withheld from BOTH paths — pre-#505 this row skipped the gate and was CARRIED |
+    /// | a non-`accord:` row | untouched — this gate narrows exactly one family |
     ///
     /// The trust state is seeded the way persist's own
     /// `exercise_accord_relay_eligibility` seeds it: a KEYLESS family whose
@@ -7790,13 +8585,20 @@ mod tests {
         )
         .await;
 
-        // The rows: one accord row per holder, plus a non-accord row.
+        // The rows: per holder, one accord row in EACH namespace (dimension +
+        // type — CIRISEdge#505), plus a non-accord row.
         seed_accord_lifecycle(&backend, seated, root).await;
         seed_accord_lifecycle(&backend, unseated, root).await;
+        seed_accord_invoke(&backend, seated, root).await;
+        seed_accord_invoke(&backend, unseated, root).await;
         seed_advertised_attestation(&backend, producer).await;
 
-        let seated_hash = locate_accord_hash(&bridge, root, seated).await;
-        let unseated_hash = locate_accord_hash(&bridge, root, unseated).await;
+        let seated_hash = locate_accord_hash(&bridge, root, seated, "scores").await;
+        let unseated_hash = locate_accord_hash(&bridge, root, unseated, "scores").await;
+        let seated_invoke_hash =
+            locate_accord_hash(&bridge, root, seated, "accord:invoke:notify:halt").await;
+        let unseated_invoke_hash =
+            locate_accord_hash(&bridge, root, unseated, "accord:invoke:notify:halt").await;
         let bridge = bridge
             .with_local_key_id(Some(local.to_string()))
             .with_accord_relay_gate(Some(Arc::new(AccordRelayGate::new(
@@ -7837,6 +8639,46 @@ mod tests {
                 .await
                 .is_none(),
             "…and cannot be obtained by fetching a hash learned out-of-band"
+        );
+
+        // (B/D) THE TYPE NAMESPACE (CIRISEdge#505) — the same allow/refuse
+        // pair for `accord:invoke:*` rows, whose family membership rides the
+        // `attestation_type` and NOT the dimension. Before the pre-filter fix
+        // these rows never reached the gate at all, so the UNSEATED holder's
+        // row below was advertised and served — the under-gating hole.
+        assert!(
+            offer.iter().any(|r| r.envelope_hash == seated_invoke_hash),
+            "a seated holder's TYPE-namespace accord row is ADVERTISED — the \
+             pre-filter admits it to the gate and the gate allows it"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &seated_invoke_hash,
+                    Some(peer)
+                )
+                .await
+                .is_some(),
+            "…and SERVED on the direct-fetch twin"
+        );
+        assert!(
+            !offer
+                .iter()
+                .any(|r| r.envelope_hash == unseated_invoke_hash),
+            "an UNSEATED holder's TYPE-namespace accord row is withheld from the \
+             offer — pre-#505 the pre-filter skipped the gate and CARRIED it"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &unseated_invoke_hash,
+                    Some(peer)
+                )
+                .await
+                .is_none(),
+            "…and cannot be obtained by fetching its hash out-of-band either"
         );
 
         // The refusal is LOUD and NAMES ITS BRANCH (CIRISEdge#425/#433) — and
@@ -7901,9 +8743,31 @@ mod tests {
             "attestation_type": "accord:invoke:notify:halt",
             "attestation_envelope": { "dimension": "trust:example:v1" },
         });
+        // The shape a TYPE-namespace row actually produces on the wire: the
+        // namespace travels as the type and there is NO `dimension` key at all
+        // (persist's `is_accord_family` takes `Option<&str>` for exactly this
+        // row — `None` is not a dimension-arm match, never an error).
+        let by_type_no_dimension = serde_json::json!({
+            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_envelope": { "accord_root": "humanity-accord" },
+        });
+        // BOTH fields accord-shaped — one row, one family membership, and the
+        // caller consults ONE gate for it (the gate resolves ONE subject; see
+        // accord_relay_gate's
+        // `the_type_namespace_row_is_judged_not_skipped_and_both_namespaces_gate_once`).
+        let by_both = serde_json::json!({
+            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_envelope": { "dimension": "accord:human_dignity:v1" },
+        });
         let neither = serde_json::json!({
             "attestation_type": "scores",
             "attestation_envelope": { "dimension": "trust:example:v1" },
+        });
+        // Non-accord in the TYPE namespace with no dimension — the
+        // `delegates_to` / `withdraws` wire shape must keep bypassing the gate.
+        let neither_no_dimension = serde_json::json!({
+            "attestation_type": "delegates_to",
+            "attestation_envelope": { "scope": ["infra:attest"] },
         });
 
         assert!(FederationDirectoryReplicationBridge::attestation_is_accord(
@@ -7915,9 +8779,71 @@ mod tests {
              skipping it is the CIRISEdge#505 under-gating hole",
         );
         assert!(
+            FederationDirectoryReplicationBridge::attestation_is_accord(&by_type_no_dimension),
+            "…including with NO dimension key at all, which is the exact wire \
+             shape an `accord:invoke:*` row carries",
+        );
+        assert!(
+            FederationDirectoryReplicationBridge::attestation_is_accord(&by_both),
+            "a row accord-shaped on BOTH namespaces is on the family",
+        );
+        assert!(
             !FederationDirectoryReplicationBridge::attestation_is_accord(&neither),
             "and a non-accord row must still bypass the gate, so this cannot \
              pass by gating everything",
+        );
+        assert!(
+            !FederationDirectoryReplicationBridge::attestation_is_accord(&neither_no_dimension),
+            "a non-accord TYPE with no dimension bypasses too — widening to \
+             `None`-dimension rows must not have gated the structural verbs",
+        );
+    }
+
+    /// **THE CIRISEdge#505 RE-OPEN FENCE** — a source assertion, in the style
+    /// of `skip_serializing_if_fields_are_never_read_by_json_key_with_an_empty_default`.
+    ///
+    /// The behavioural test above proves the pre-filter's ANSWERS; this pins
+    /// its READS, because on every constructible fixture today the answers
+    /// cannot distinguish persist's `is_accord_family` from a re-inlined
+    /// prefix check or from the dimension-half helper the pre-filter consulted
+    /// before v37.1.0 (`AccordRelayGate::dimension_half_is_gated`, the fenced
+    /// remnant) — the three diverge exactly when a third namespace arm or a
+    /// registry change lands, which is when the second spelling bites.
+    #[test]
+    fn the_carriage_pre_filter_reads_is_accord_family_not_the_dimension_half() {
+        let src = include_str!("bridge.rs");
+        let start = src
+            .find("fn attestation_is_accord")
+            .expect("the pre-filter exists");
+        let end = src[start..].find("\n    }").expect("the fn body closes");
+        let body = &src[start..start + end];
+        assert!(
+            body.contains("is_accord_family"),
+            "attestation_is_accord must delegate to persist's `is_accord_family` — \
+             the ONE owner of the two-namespace accord family test (CIRISPersist#743)"
+        );
+        for (path, mirror_of) in [
+            ("\"/attestation_type\"", "`row.attestation_type`"),
+            (
+                "\"/attestation_envelope/dimension\"",
+                "`admission::envelope_dimension`",
+            ),
+        ] {
+            assert!(
+                body.contains(path),
+                "attestation_is_accord must read {path} — the exact field persist's \
+                 admission reads via {mirror_of}; dropping either re-opens CIRISEdge#505"
+            );
+        }
+        assert!(
+            !body.contains("dimension_half_is_gated") && !body.contains("dimension_is_gated"),
+            "the dimension-half helper is NOT a carriage classifier — routing the \
+             pre-filter through it is the CIRISEdge#505 under-gating hole verbatim"
+        );
+        assert!(
+            !body.contains("starts_with"),
+            "no edge-side prefix spelling — persist owns the family test \
+             (the CIRISPersist#731/#733 two-owners drift)"
         );
     }
 
@@ -8023,8 +8949,8 @@ mod tests {
         seed_accord_lifecycle(&backend, holder, accord_a).await;
         seed_accord_lifecycle(&backend, holder, accord_b).await;
 
-        let own_accord_hash = locate_accord_hash(&bridge, accord_a, holder).await;
-        let other_accord_hash = locate_accord_hash(&bridge, accord_b, holder).await;
+        let own_accord_hash = locate_accord_hash(&bridge, accord_a, holder, "scores").await;
+        let other_accord_hash = locate_accord_hash(&bridge, accord_b, holder, "scores").await;
         assert_ne!(
             own_accord_hash, other_accord_hash,
             "two distinct rows, differing only in the accord they name"
@@ -8215,8 +9141,8 @@ mod tests {
         seed_accord_scored(&backend, holder, scored, accord_a).await;
         seed_accord_scored(&backend, holder, scored, accord_b).await;
 
-        let on_a = locate_accord_hash(&bridge, accord_a, holder).await;
-        let on_b = locate_accord_hash(&bridge, accord_b, holder).await;
+        let on_a = locate_accord_hash(&bridge, accord_a, holder, "scores").await;
+        let on_b = locate_accord_hash(&bridge, accord_b, holder, "scores").await;
         assert_ne!(
             on_a, on_b,
             "the two rows are distinct on the wire — the `accord_root` key is inside the \
@@ -8342,7 +9268,7 @@ mod tests {
         // outright ("cannot judge"). Without one, nothing consults the
         // predicate.
         seed_accord_lifecycle(&backend, holder, root).await;
-        let hash = locate_accord_hash(&bridge, root, holder).await;
+        let hash = locate_accord_hash(&bridge, root, holder, "scores").await;
         let bridge = bridge.with_local_key_id(Some(local.to_string()));
 
         assert!(

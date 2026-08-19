@@ -213,9 +213,15 @@ Tracked as the bench-mesh 100% program; each seam has an owner-track:
 
 ## 7. Spec debt
 
-[`FSD/CIRIS_EDGE_TRANSPORT.md`](../FSD/CIRIS_EDGE_TRANSPORT.md) predates
-scope-native addressing and does not yet describe the derived group plane,
-`announce-suppress` inheritance, or the A/V addressing verbs. Until it does,
-CC Part 5 §5.4.4–5.4.6 and this document are the authorities on the two-plane
-design; the FSD remains the authority on the 14 EnvelopeKinds and the
-anti-entropy state machine.
+The [`FSD/CIRIS_EDGE_TRANSPORT.md`](../FSD/CIRIS_EDGE_TRANSPORT.md) refresh
+landed (2026-08, re-pinned to v18.0.2): it now covers the 15 EnvelopeKinds
+(including the #474 cursor plane), all six wire messages (`Pull`,
+`CursorPull`), the five-projection taxonomy with per-plane tombstone ceilings,
+the wire `CohortScope` mapping, and — for the scope-native plane — the §3.3
+arming condition (default-open until a `ScopeAddressTable` is installed, the
+deliberate opt-in production state). Residual gap: the FSD still does not
+specify the derived group plane's full lifecycle (epoch rotation /
+convergence sealing), `announce-suppress` inheritance, or the A/V addressing
+verbs — for those, CC Part 5 §5.4.4–5.4.6 and this document remain the
+authorities. The FSD is the authority on the EnvelopeKinds, projections, and
+the anti-entropy session.

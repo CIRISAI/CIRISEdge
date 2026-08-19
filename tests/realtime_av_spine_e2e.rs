@@ -59,7 +59,7 @@ fn fresh_joiner_xwing() -> (PeerKexPubkeys, OwnKexKeys) {
     (
         PeerKexPubkeys {
             x25519_pub: x_pk,
-            mlkem768_pub: Some(mlkem_pk.clone()),
+            mlkem768_pub: mlkem_pk.clone(),
         },
         OwnKexKeys {
             x25519_priv: x_sk,
@@ -128,7 +128,7 @@ fn hybrid_member(key_id: &str) -> Member {
         key_id: key_id.to_string(),
         kex_pubkeys: PeerKexPubkeys {
             x25519_pub: [1u8; 32],
-            mlkem768_pub: Some(vec![0xAB; 1184]),
+            mlkem768_pub: vec![0xAB; 1184],
         },
     }
 }

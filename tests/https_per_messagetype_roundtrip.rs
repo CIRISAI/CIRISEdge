@@ -480,6 +480,21 @@ async fn https_round_trip_opaque_response() {
 }
 
 #[tokio::test]
+async fn https_round_trip_ephemeral_response() {
+    // v18.2.0 typed ephemeral correlation — `EphemeralResponse` carries a
+    // typed handler's response bytes back to the `Edge::send` waiter,
+    // correlated by `in_reply_to` (excluded from the durable-ACK matcher
+    // exactly like `OpaqueResponse`). The wire body is the handler's own
+    // response serialization; any JSON round-trips.
+    https_envelope_round_trip(
+        0x4E,
+        "EphemeralResponse",
+        br#"{"status":"ok","echo":[4,5,6]}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn https_round_trip_goal_declaration() {
     https_envelope_round_trip(0x18, "GoalDeclaration", br#"{"goal_id":"g"}"#).await;
 }
@@ -633,6 +648,7 @@ fn all_message_types_have_https_round_trip_test() {
         match t {
             MessageType::OpaqueRequest => "OpaqueRequest",
             MessageType::OpaqueResponse => "OpaqueResponse",
+            MessageType::EphemeralResponse => "EphemeralResponse",
             MessageType::OpaqueEvent => "OpaqueEvent",
             MessageType::BuildManifestPublication => "BuildManifestPublication",
             MessageType::DSARRequest => "DSARRequest",

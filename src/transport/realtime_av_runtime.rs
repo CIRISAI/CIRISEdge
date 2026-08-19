@@ -964,7 +964,7 @@ mod tests {
             key_id: key_id.to_string(),
             kex_pubkeys: PeerKexPubkeys {
                 x25519_pub: [1u8; 32],
-                mlkem768_pub: Some(vec![0xAB; 1184]),
+                mlkem768_pub: vec![0xAB; 1184],
             },
         }
     }

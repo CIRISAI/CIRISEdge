@@ -38,6 +38,46 @@ use common::{
     build_reticulum_with_retry, directory_with, prime_v7_peer_pair, signed_record, TestFedKey,
 };
 
+// ─── Phase 2 typed round-trip fixture ───────────────────────────────
+//
+// A local `Message` impl with a REAL response type (`Response` is a
+// struct, not `()`), riding an otherwise-unused wire discriminator —
+// `DSARRequest`; nothing else registers or special-cases it in this
+// test topology. Exercises the full typed leg the opaque plane does
+// not cover: `Handler<M>` response bytes shipped back as a correlated
+// `MessageType::EphemeralResponse` envelope.
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+struct EchoReq {
+    text: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+struct EchoResp {
+    echoed: String,
+}
+
+impl ciris_edge::handler::Message for EchoReq {
+    const TYPE: MessageType = MessageType::DSARRequest;
+    const DELIVERY: ciris_edge::handler::Delivery = ciris_edge::handler::Delivery::Ephemeral;
+    type Response = EchoResp;
+}
+
+struct Echoer;
+
+#[async_trait::async_trait]
+impl ciris_edge::handler::Handler<EchoReq> for Echoer {
+    async fn handle(
+        &self,
+        msg: EchoReq,
+        _ctx: ciris_edge::handler::HandlerContext,
+    ) -> Result<EchoResp, ciris_edge::handler::HandlerError> {
+        Ok(EchoResp {
+            echoed: format!("echo:{}", msg.text),
+        })
+    }
+}
+
 /// Build a representative signed-shaped envelope. The signatures here
 /// are placeholder strings — the loopback test exercises *transport*
 /// byte-fidelity, not verify; the bytes just have to survive the
@@ -361,22 +401,33 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
     let _handles_a = edge_a.spawn_background_listeners(rt_a.handle());
     let _handles_b = edge_b.spawn_background_listeners(rt_b.handle());
 
+    // Phase 2 — a typed Handler<M> on A with a REAL response type.
+    // Registered before the sends so the reply leg is armed when the
+    // request arrives.
+    edge_a
+        .register_handler::<EchoReq, _>(Echoer)
+        .await
+        .expect("register typed EchoReq handler on A");
+
     // Drive the send: B → A. Ship an OpaqueRequest (kind 7) via the
-    // generic ephemeral `send` primitive. The transport accepts + ships
-    // the bytes; the ephemeral request/response correlation channel is
-    // the Phase-2 TODO in `Edge::send`, surfaced as `EdgeError::Config`
-    // — the receiver-side handler observation is what gates this test.
+    // generic ephemeral `send` primitive. Phase 2 wired the
+    // correlation, so this now completes the FULL typed round trip:
+    // B's waiter (keyed on the request envelope's body_sha256) is
+    // resolved by A's correlated OpaqueResponse reply. Pre-Phase-2
+    // this call returned the "correlation not wired" `EdgeError::Config`
+    // ON THE SUCCESS PATH and this test string-matched it.
     let req = OpaqueRequest {
         kind: 7,
         payload: b"v8.0.0 opaque hello".to_vec(),
     };
     assert_eq!(OpaqueRequest::TYPE, MessageType::OpaqueRequest);
-    match edge_b.send("edge-bg-aaaa", req).await {
-        Ok(_resp) => {}
-        Err(ciris_edge::EdgeError::Config(s))
-            if s.contains("ephemeral request-response correlation not wired") => {}
-        Err(e) => panic!("send B → A failed at transport: {e:?}"),
-    }
+    let resp = edge_b
+        .send("edge-bg-aaaa", req)
+        .await
+        .expect("typed opaque round trip B → A → B");
+    assert_eq!(resp.kind, 7);
+    assert_eq!(resp.status, 200, "A's kind-7 handler answers 200");
+    assert_eq!(resp.payload, b"ok".to_vec());
 
     // A's opaque-request handler must fire — proves the background-
     // listener path drove verify + handler dispatch all the way to the
@@ -387,6 +438,24 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
         .expect("opaque channel closed without receive");
     assert_eq!(sender_key_id, "edge-bg-bbbb");
     assert_eq!(payload, b"v8.0.0 opaque hello");
+
+    // ── Phase 2 typed round trip: request → Handler<M> → typed reply ──
+    // The reply rides a `MessageType::EphemeralResponse` envelope
+    // (in_reply_to = request body_sha256). This also pins the
+    // durable-ACK exclusion: the queue here is a real persist backend,
+    // so without the ACK-matcher guard the reply would be swallowed by
+    // the "no matching outbound row; dropping" arm and this send would
+    // time out.
+    let typed = edge_b
+        .send(
+            "edge-bg-aaaa",
+            EchoReq {
+                text: "over reticulum".to_string(),
+            },
+        )
+        .await
+        .expect("typed EchoReq round trip B → A → B");
+    assert_eq!(typed.echoed, "echo:over reticulum");
 
     // Tokio runtimes can't be dropped from within an async context,
     // so leak them; the test process exit will reclaim. Holding them

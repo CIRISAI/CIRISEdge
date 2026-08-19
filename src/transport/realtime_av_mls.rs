@@ -99,19 +99,22 @@
 //! Durable group state (sqlite-provider, custom storage) is a separate
 //! cut (filed as a follow-up by Layer 2 integration).
 //!
-//! ## HNDL discipline (pre-MLS gate)
+//! ## HNDL discipline (structural, CIRISEdge#481 item 4)
 //!
 //! The 0x004D ciphersuite already requires ML-KEM-768 by spec — a
-//! peer can't even produce a valid KeyPackage without it. This module
-//! adds a **structural pre-check** anyway: every [`Member`] passed to
-//! [`MlsSession::create`] / [`MlsSession::commit_add`] is rejected
-//! before any MLS code runs if its
-//! [`PeerKexPubkeys::mlkem768_pub`] is `None`. The motivation is
-//! defense-in-depth: a caller wiring up a peer's
-//! [`PeerKexPubkeys`] from a federation directory shouldn't have to
-//! introspect openmls's internal errors to learn that the peer is
-//! out-of-spec for this ciphersuite. See
-//! [`MlsError::PeerLacksMlkem`].
+//! peer can't even produce a valid KeyPackage without it. The gate on
+//! the PEER side is now **structural, not policy**: since #481 item 4,
+//! [`PeerKexPubkeys::mlkem768_pub`] is a required `Vec<u8>`, so an
+//! ML-KEM-less [`Member`] is unrepresentable and the old `is_none`
+//! pre-checks in [`MlsSession::create`] / [`MlsSession::commit_add`] /
+//! [`MlsSession::commit_batch`] are gone (absence is refused with a
+//! typed error at `PeerKexPubkeys::from_advertisement`, the one seam
+//! Option-shaped sources — the FFI member tuples — enter through).
+//! [`MlsError::PeerLacksMlkem`] remains for the OWN-key side:
+//! [`OwnKexKeys`] deliberately keeps its `Option` halves (degraded
+//! local-key fixtures are test witnesses for the refusal paths), so
+//! [`MlsSession::process_welcome`] and the X-Wing secret bridge still
+//! HNDL-check them.
 //!
 //! ## Identity binding (impedance with CIRIS federation)
 //!
@@ -187,7 +190,12 @@ use crate::transport::federation_session::{OwnKexKeys, PeerKexPubkeys};
 /// The MLS ciphersuite this module pins to. `0x004D` — X-Wing
 /// (ML-KEM-768 + X25519) | ChaCha20-Poly1305 | SHA-256 | Ed25519.
 /// See module docs § "0x004D code-point caveat".
-pub const CIPHERSUITE_ID: u16 = 0x004D;
+///
+/// RE-EXPORTED from the single authority
+/// [`crate::mls::cohort_group::CIPHERSUITE_ID`] — an A/V-plane pin
+/// diverging from the cohort-plane pin would be a silent PQC
+/// downgrade, so this module imports rather than duplicates.
+pub use crate::mls::cohort_group::CIPHERSUITE_ID;
 
 /// The openmls enum value the [`CIPHERSUITE_ID`] maps to.
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
@@ -210,23 +218,22 @@ const ROOT_SECRET_CONTEXT: &[u8] = b"";
 /// A participant in the MLS group, in CIRIS vocabulary.
 ///
 /// The `kex_pubkeys` field carries the peer's CIRIS-side KEX
-/// advertisement (X25519 + optional ML-KEM-768). For the 0x004D
-/// ciphersuite to operate at all the peer MUST have advertised
-/// ML-KEM-768 — that pre-check is what
-/// [`MlsError::PeerLacksMlkem`] guards. Once the pre-check passes,
-/// the field is **not** threaded into the MLS protocol layer: the
-/// actual ML-KEM ephemeral keys for path encryption are owned by
-/// openmls's `KeyPackage` lifecycle (per-(member, session), not the
-/// peer's long-term federation KEX key). See module docs §
-/// "Identity binding".
+/// advertisement (X25519 + ML-KEM-768 — BOTH required; CIRISEdge#481
+/// item 4 made an ML-KEM-less advertisement unrepresentable, so
+/// holding a `Member` proves the peer is hybrid-capable). The field is
+/// **not** threaded into the MLS protocol layer: the actual ML-KEM
+/// ephemeral keys for path encryption are owned by openmls's
+/// `KeyPackage` lifecycle (per-(member, session), not the peer's
+/// long-term federation KEX key). See module docs § "Identity
+/// binding".
 #[derive(Debug, Clone)]
 pub struct Member {
     /// CIRIS federation `key_id` — used as the `identity` field of
     /// the MLS `BasicCredential`.
     pub key_id: String,
-    /// The peer's advertised CIRIS-side KEX pubkeys. Consulted ONLY
-    /// for the HNDL pre-check (must contain `mlkem768_pub`); not
-    /// threaded into the openmls protocol layer.
+    /// The peer's advertised CIRIS-side KEX pubkeys (hybrid by
+    /// construction); the signed-Welcome path seals under them, and
+    /// they are not threaded into the openmls protocol layer.
     pub kex_pubkeys: PeerKexPubkeys,
 }
 
@@ -320,11 +327,14 @@ impl std::fmt::Debug for RootSecret {
 /// (it is human-readable diagnostic only, not a stable contract).
 #[derive(Debug, thiserror::Error)]
 pub enum MlsError {
-    /// HNDL pre-check failed — the peer named in `key_id` hasn't
-    /// advertised an ML-KEM-768 pubkey, so the 0x004D ciphersuite
-    /// would fail downstream. Refused structurally before any MLS
-    /// code runs.
-    #[error("peer {0} lacks ML-KEM-768 advertisement; required by ciphersuite 0x004D")]
+    /// HNDL pre-check failed — the identity named in `key_id` lacks
+    /// ML-KEM-768 key material, so the 0x004D ciphersuite would fail
+    /// downstream. Post-CIRISEdge#481 item 4 this fires ONLY on the
+    /// OWN-key side ([`OwnKexKeys`], whose halves deliberately stay
+    /// `Option` as refusal-path test witnesses): a PEER advertisement
+    /// without ML-KEM-768 is unrepresentable by [`PeerKexPubkeys`] and
+    /// is refused at its construction boundary instead.
+    #[error("{0} lacks ML-KEM-768 key material; required by ciphersuite 0x004D")]
     PeerLacksMlkem(String),
     /// The 0x004D ciphersuite isn't available in this build of
     /// openmls. Should be impossible at v0.8.1 (X-Wing is shipped
@@ -459,8 +469,9 @@ impl MlsSession {
     /// participants and the calling identity as group creator.
     ///
     /// The creator is identified by `own_key_id` (used as the MLS
-    /// `BasicCredential` identity); each member in `initial_members`
-    /// undergoes the HNDL pre-check before any MLS code runs.
+    /// `BasicCredential` identity). The HNDL gate on the members is
+    /// structural: holding a [`Member`] proves ML-KEM-768 presence
+    /// (CIRISEdge#481 item 4), so no pre-check runs here.
     ///
     /// Returns the new session + the initial-epoch
     /// [`RootSecret`]. Note that openmls's `MlsGroup::new` produces
@@ -471,13 +482,6 @@ impl MlsSession {
         own_key_id: &str,
         initial_members: Vec<Member>,
     ) -> Result<(Self, RootSecret), MlsError> {
-        // HNDL pre-check, BEFORE any MLS code touches the peers.
-        for m in &initial_members {
-            if m.kex_pubkeys.mlkem768_pub.is_none() {
-                return Err(MlsError::PeerLacksMlkem(m.key_id.clone()));
-            }
-        }
-
         let provider = Arc::new(LibcruxProvider::default());
 
         // Mint own signature key pair + credential.
@@ -563,17 +567,13 @@ impl MlsSession {
     /// [`Welcome`] (to ship to the new member) + the new epoch's
     /// [`RootSecret`].
     ///
-    /// Performs the HNDL pre-check on `new_member` before any MLS
-    /// code runs.
+    /// The HNDL gate on `new_member` is structural (holding a
+    /// [`Member`] proves ML-KEM-768 presence — CIRISEdge#481 item 4).
     #[allow(clippy::needless_pass_by_value)]
     pub fn commit_add(
         &mut self,
         new_member: Member,
     ) -> Result<(Commit, Welcome, RootSecret), MlsError> {
-        if new_member.kex_pubkeys.mlkem768_pub.is_none() {
-            return Err(MlsError::PeerLacksMlkem(new_member.key_id.clone()));
-        }
-
         let (kp, sig_pub) = mint_member_key_package(&self.provider, &new_member.key_id)?;
 
         let (commit_msg, welcome_msg, _group_info) = self
@@ -654,8 +654,8 @@ impl MlsSession {
     ///
     /// - `invitee_kex` — the joiner's advertised static X-Wing public key
     ///   (`x25519_pub` + `mlkem768_pub`), the HPKE recipient key `pkR`.
-    ///   Lacking the ML-KEM-768 half is [`MlsError::PeerLacksMlkem`]
-    ///   (same HNDL discipline as the roster gates).
+    ///   Both halves are present by construction (CIRISEdge#481 item 4
+    ///   — a classical-only advertisement is unrepresentable).
     /// - `inviter_signer` — the inviter's long-term ML-DSA-65 federation
     ///   signer. Its public key is what the joiner resolves from the
     ///   federation directory keyed by `inviter_pk_id`; a fresh
@@ -668,7 +668,6 @@ impl MlsSession {
     ///
     /// # Errors
     ///
-    /// - `invitee_kex` lacks ML-KEM-768 → [`MlsError::PeerLacksMlkem`]
     /// - openmls add/serialize failures → as [`Self::commit_add_published`]
     /// - HPKE seal / ML-DSA sign failure → [`MlsError::WelcomeWrapFailed`]
     pub fn commit_add_published_signed(
@@ -680,9 +679,11 @@ impl MlsSession {
         inviter_pk_id: &str,
     ) -> Result<(Commit, SignedWelcome, RootSecret), MlsError> {
         // Bridge the joiner's CIRIS-side KEX advertisement to the HPKE
-        // recipient key BEFORE touching the group, so a classical-only
-        // joiner is refused without a partial epoch advance.
-        let invitee_pk = xwing_public_from_kex(key_id, invitee_kex)?;
+        // recipient key. Infallible post-#481 item 4: the advertisement
+        // provably carries both X-Wing halves, so there is no
+        // classical-only refusal (and no partial-epoch-advance hazard)
+        // left on this path.
+        let invitee_pk = xwing_public_from_kex(invitee_kex);
 
         // Produce the bare openmls Commit + Welcome via the existing
         // (unsigned) path — this owns the roster mutation + epoch advance.
@@ -882,12 +883,14 @@ impl MlsSession {
     /// `secrets` by KeyPackageRef internally). Removes produce no
     /// Welcome entries.
     ///
-    /// ## Atomic HNDL gate
+    /// ## HNDL gate (structural)
     ///
-    /// Every `RosterOp::Add` member is HNDL-pre-checked BEFORE any
-    /// proposal is queued: a single classical-only Add rejects the
-    /// whole batch with [`MlsError::PeerLacksMlkem`] and leaves the
-    /// MLS group at its pre-call epoch. No partial state.
+    /// A classical-only `RosterOp::Add` is unrepresentable: [`Member`]
+    /// carries a required ML-KEM-768 half (CIRISEdge#481 item 4), so
+    /// the old batch-atomic pre-check is gone. Atomicity of the batch
+    /// against a bad op is still guaranteed by the Remove-resolution
+    /// pass below (a not-found Remove fails closed before any proposal
+    /// is queued).
     ///
     /// ## Empty `ops`
     ///
@@ -915,19 +918,6 @@ impl MlsSession {
 
         if ops.is_empty() {
             return Err(MlsError::EmptyBatch);
-        }
-
-        // ── Atomic HNDL gate ─────────────────────────────────────
-        // Walk the whole ops list FIRST, refusing the entire batch
-        // if ANY Add lacks ML-KEM-768. The MLS group's epoch must
-        // stay unchanged on this error so callers can retry after
-        // fixing the bad member.
-        for op in ops {
-            if let RosterOp::Add(m) = op {
-                if m.kex_pubkeys.mlkem768_pub.is_none() {
-                    return Err(MlsError::PeerLacksMlkem(m.key_id.clone()));
-                }
-            }
         }
 
         // ── Resolve all Removes to LeafNodeIndex up front ────────
@@ -1319,21 +1309,14 @@ fn serialize_mls_message(msg: &MlsMessageOut) -> Result<Vec<u8>, MlsError> {
 
 /// Bridge a joiner's CIRIS-side KEX advertisement ([`PeerKexPubkeys`]) to
 /// the HPKE recipient public key ([`XWingRecipientPublic`], `pkR`) the
-/// §3.3 wrap seals under. The X-Wing KEM requires ML-KEM-768; a
-/// classical-only advertisement is refused with the same HNDL discipline
-/// the roster gates use.
-fn xwing_public_from_kex(
-    key_id: &str,
-    kex: &PeerKexPubkeys,
-) -> Result<XWingRecipientPublic, MlsError> {
-    let mlkem768_pub = kex
-        .mlkem768_pub
-        .clone()
-        .ok_or_else(|| MlsError::PeerLacksMlkem(key_id.to_string()))?;
-    Ok(XWingRecipientPublic {
+/// §3.3 wrap seals under. Infallible since CIRISEdge#481 item 4: the
+/// advertisement type requires the ML-KEM-768 half, so the X-Wing KEM's
+/// input is complete by construction.
+fn xwing_public_from_kex(kex: &PeerKexPubkeys) -> XWingRecipientPublic {
+    XWingRecipientPublic {
         x25519_pub: kex.x25519_pub,
-        mlkem768_pub,
-    })
+        mlkem768_pub: kex.mlkem768_pub.clone(),
+    }
 }
 
 /// Bridge a joiner's own CIRIS KEX secret ([`OwnKexKeys`]) to the HPKE
@@ -1553,30 +1536,26 @@ mod tests {
     use super::*;
 
     /// Build a Member whose kex_pubkeys carry both halves (hybrid
-    /// ready). The actual bytes don't matter for these tests — they
-    /// are not consumed by openmls; only the HNDL pre-check looks at
-    /// `mlkem768_pub.is_some()`.
+    /// ready — the only representable kind post-#481 item 4). The
+    /// actual bytes don't matter for these tests; they are not
+    /// consumed by openmls.
     fn hybrid_member(key_id: &str) -> Member {
         Member {
             key_id: key_id.to_string(),
             kex_pubkeys: PeerKexPubkeys {
                 x25519_pub: [1u8; 32],
-                mlkem768_pub: Some(vec![0xAB; 1184]), // ML-KEM-768 pubkey size
+                mlkem768_pub: vec![0xAB; 1184], // ML-KEM-768 pubkey size
             },
         }
     }
 
-    /// Build a Member whose kex_pubkeys carry ONLY the X25519 half —
-    /// expected to fail the HNDL pre-check.
-    fn classical_only_member(key_id: &str) -> Member {
-        Member {
-            key_id: key_id.to_string(),
-            kex_pubkeys: PeerKexPubkeys {
-                x25519_pub: [1u8; 32],
-                mlkem768_pub: None,
-            },
-        }
-    }
+    // (No `classical_only_member` fixture: CIRISEdge#481 item 4 made
+    // the ML-KEM-less Member unrepresentable. The refusal it used to
+    // exercise lives at `PeerKexPubkeys::from_advertisement` — see
+    // `federation_session::tests::
+    // mlkem_absent_advertisement_rejected_at_construction` and the FFI
+    // boundary test `pyo3_av_session_create_rejects_classical_only_
+    // member`.)
 
     fn hybrid_own_keys() -> OwnKexKeys {
         OwnKexKeys {
@@ -1620,29 +1599,11 @@ mod tests {
         }
     }
 
-    /// HNDL discipline: a peer without ML-KEM-768 is refused at
-    /// `create`, before any MLS code runs.
-    #[test]
-    fn peer_lacking_mlkem_refused_at_create() {
-        let bad = vec![hybrid_member("alice"), classical_only_member("bob")];
-        let r = MlsSession::create("creator", bad);
-        assert!(
-            matches!(r, Err(MlsError::PeerLacksMlkem(ref k)) if k == "bob"),
-            "expected PeerLacksMlkem(bob), got {r:?}"
-        );
-    }
-
-    /// HNDL discipline: same at `commit_add`.
-    #[test]
-    fn peer_lacking_mlkem_refused_at_commit_add() {
-        let (mut session, _) = MlsSession::create("creator", vec![hybrid_member("alice")])
-            .expect("create should succeed");
-        let r = session.commit_add(classical_only_member("bob"));
-        assert!(
-            matches!(r, Err(MlsError::PeerLacksMlkem(ref k)) if k == "bob"),
-            "expected PeerLacksMlkem(bob), got {r:?}"
-        );
-    }
+    // (was: `peer_lacking_mlkem_refused_at_create` /
+    // `peer_lacking_mlkem_refused_at_commit_add` — the classical-only
+    // Member those tests fed to `create` / `commit_add` is
+    // unrepresentable post-#481 item 4; the refusal is now typed at
+    // `PeerKexPubkeys::from_advertisement` construction.)
 
     /// `commit_remove` makes the next epoch's `RootSecret` distinct
     /// from the previous epoch's — the leaver, who only ever held
@@ -1935,34 +1896,10 @@ mod tests {
         assert!(!as_strs.contains(&"bob"));
     }
 
-    /// Atomic HNDL gate at the MLS layer: a classical-only Add in
-    /// the batch fails-closed BEFORE any proposal is queued. The
-    /// group's epoch must not advance.
-    #[test]
-    fn mls_commit_batch_hndl_pre_check() {
-        let (mut session, _root0) = MlsSession::create(
-            "creator",
-            vec![hybrid_member("alice"), hybrid_member("bob")],
-        )
-        .expect("create");
-        let pre_epoch = session.epoch();
-        let pre_count = session.member_count();
-
-        let ops = vec![
-            RosterOp::Add(hybrid_member("dave")),
-            RosterOp::Add(classical_only_member("badpeer")),
-            RosterOp::Remove("alice".to_string()),
-        ];
-        let r = session.commit_batch(&ops);
-        assert!(
-            matches!(r, Err(MlsError::PeerLacksMlkem(ref k)) if k == "badpeer"),
-            "expected PeerLacksMlkem(badpeer), got {r:?}"
-        );
-
-        // No partial state — epoch + roster unchanged.
-        assert_eq!(session.epoch(), pre_epoch);
-        assert_eq!(session.member_count(), pre_count);
-    }
+    // (was: `mls_commit_batch_hndl_pre_check` — the classical-only Add
+    // is unrepresentable post-#481 item 4, so the batch HNDL gate is
+    // structural. Batch atomicity against a bad op is still covered by
+    // `mls_commit_batch_remove_unknown_fails_atomically`.)
 
     /// Empty `ops` returns `EmptyBatch` (no silent no-op).
     #[test]
@@ -2084,7 +2021,7 @@ mod tests {
         let (mlkem_sk, mlkem_pk) = ml_kem::generate_keypair().unwrap();
         let pubs = PeerKexPubkeys {
             x25519_pub: x_pk,
-            mlkem768_pub: Some(mlkem_pk.clone()),
+            mlkem768_pub: mlkem_pk.clone(),
         };
         let secret = OwnKexKeys {
             x25519_priv: x_sk,
@@ -2329,33 +2266,11 @@ mod tests {
         );
     }
 
-    /// HNDL discipline, producer side: a classical-only invitee KEX is
-    /// refused BEFORE the roster mutation, so the group epoch does not
-    /// advance (no partial state).
-    #[test]
-    fn signed_welcome_producer_rejects_classical_only_invitee() {
-        let mut inviter = inviter_session();
-        let pre_epoch = inviter.epoch();
-        let signer = MlDsa65Signer::new().unwrap();
-        let (_material, kp) = mint_joiner_key_material("carol").unwrap();
-        let classical_kex = PeerKexPubkeys {
-            x25519_pub: [1u8; 32],
-            mlkem768_pub: None,
-        };
-
-        let err = inviter
-            .commit_add_published_signed("carol", kp, &classical_kex, &signer, "inviter-fed-id")
-            .unwrap_err();
-        assert!(
-            matches!(err, MlsError::PeerLacksMlkem(ref k) if k == "carol"),
-            "got {err:?}"
-        );
-        assert_eq!(
-            inviter.epoch(),
-            pre_epoch,
-            "no partial epoch advance on producer HNDL refusal"
-        );
-    }
+    // (was: `signed_welcome_producer_rejects_classical_only_invitee` —
+    // the classical-only invitee KEX is unrepresentable post-#481
+    // item 4, so the producer-side refusal (and its partial-epoch-
+    // advance hazard) is gone by construction; `xwing_public_from_kex`
+    // is infallible.)
 
     /// The [`SignedWelcome`] wire codec is a faithful round trip, and
     /// fails closed on truncation / bad version.

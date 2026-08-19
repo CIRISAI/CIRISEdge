@@ -288,10 +288,15 @@ mod tests {
     /// mutation-verified unit with no callers is a green board over a dead
     /// protection, and it is the exact trap this repo keeps hitting.
     ///
-    /// So this asserts through the CALL SITES instead: the two public
-    /// predicates the serve path actually consults must agree with
-    /// `gates_for`, including on the unknown case. Re-inlining a `matches!`
-    /// at either site reds this.
+    /// So this asserts through the CALL SITES instead: the predicates that
+    /// consult this fold must agree with `gates_for`, including on the
+    /// unknown case. Re-inlining a `matches!` at a site reds this.
+    ///
+    /// NB (CIRISEdge#505 / v37.1.0): `dimension_half_is_gated` is no longer
+    /// the accord CARRIAGE pre-filter — that is persist's `is_accord_family`,
+    /// over BOTH namespaces, consumed by the bridge's `attestation_is_accord`
+    /// (source-asserted there). What this pins is the accord HALF of the fold
+    /// itself, so the wiring cannot drift while it still has readers.
     #[test]
     fn the_serve_paths_predicates_read_this_module_and_not_a_local_matches() {
         use crate::replication::accord_relay_gate::AccordRelayGate;
@@ -305,9 +310,9 @@ mod tests {
         ] {
             let expected = gates_for(dimension);
             assert_eq!(
-                AccordRelayGate::dimension_is_gated(dimension),
+                AccordRelayGate::dimension_half_is_gated(dimension),
                 expected.accord_relay_gated,
-                "the relay gate's pre-filter must read gates_for for {dimension:?} \
+                "the dimension half-test must read gates_for for {dimension:?} \
                  — an inline matches! returns false on an unknown family and CARRIES it",
             );
         }

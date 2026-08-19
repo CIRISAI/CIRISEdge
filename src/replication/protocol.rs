@@ -254,14 +254,33 @@ impl EnvelopeKind {
     /// CIRISEdge#474 — is this kind served over the dedicated CURSOR path
     /// (`CursorPull` → `Deliver`, resume on `evidence_at`) rather than the
     /// content-hash Summary/Diff/Fetch flow? EXACTLY the kinds with no
-    /// `signed_wire_index` entry ([`Self::persist_index_kind`] → None AND not
-    /// [`Self::Revocation`], which is index-less but rides `persist_row_hash`).
-    /// Currently only [`Self::AccordQuorumEvidence`]; checked over `ALL` in a test
-    /// so a future cursor kind is a deliberate widening, never an accident. An
-    /// Initiator round for such a kind opens with a `CursorPull`, not a Summary.
+    /// `signed_wire_index` entry ([`Self::persist_index_kind`] → None) that are
+    /// not [`Self::is_row_hash_served`] (Revocation is index-less but rides
+    /// `persist_row_hash` on the content-hash flow). Currently only
+    /// [`Self::AccordQuorumEvidence`]; checked over `ALL` in a test — and the
+    /// serve/advertise manifest's `advertise`/`receive` cursor cells are DERIVED
+    /// from this predicate in `serve_policy`'s tests, so a future cursor kind
+    /// reds that module until the manifest (and its pinned hash) move
+    /// deliberately. An Initiator round for such a kind opens with a
+    /// `CursorPull`, not a Summary.
     #[must_use]
     pub fn is_cursor_served(self) -> bool {
         matches!(self, Self::AccordQuorumEvidence)
+    }
+
+    /// CIRISEdge#396 item 3 — is this kind index-less in persist's
+    /// `signed_wire_index` yet still served on the content-hash
+    /// Summary/Diff/Fetch flow, riding `persist_row_hash` as its envelope hash?
+    /// EXACTLY [`Self::Revocation`]. This is the THIRD serve basis alongside
+    /// content-hash-indexed ([`Self::persist_index_kind`] → Some) and
+    /// cursor-served ([`Self::is_cursor_served`]); every kind has exactly one
+    /// of the three (pinned over `ALL` in
+    /// `every_kind_has_exactly_one_serve_basis`). The bridge's fetch path
+    /// resolves these kinds via their dedicated `persist_row_hash` read, never
+    /// the content-hash point-read.
+    #[must_use]
+    pub fn is_row_hash_served(self) -> bool {
+        matches!(self, Self::Revocation)
     }
 
     /// The kinds a subject sweep issues a `Pull` for — the
@@ -314,8 +333,9 @@ impl EnvelopeKind {
             Self::Key => "Key",
             Self::Attestation => "Attestation",
             // Both are absent from persist's content-hash `signed_wire_index`:
-            // Revocation rides `persist_row_hash`; AccordQuorumEvidence rides the
-            // cursor path (#474). Neither has a content-hash point-read.
+            // Revocation rides `persist_row_hash` (`is_row_hash_served`);
+            // AccordQuorumEvidence rides the cursor path (`is_cursor_served`,
+            // #474). Neither has a content-hash point-read.
             Self::Revocation | Self::AccordQuorumEvidence => return None,
             Self::IdentityOccurrence => "IdentityOccurrence",
             Self::Family => "Family",
@@ -692,9 +712,65 @@ mod tests {
             EnvelopeKind::AccordQuorumEvidence.as_wire_str(),
             "accord_quorum_evidence"
         );
-        // Revocation is index-less but is NOT cursor-served (different wire).
+        // Revocation is index-less but is NOT cursor-served — it is the one
+        // row-hash-served kind (a different wire basis).
         assert!(EnvelopeKind::Revocation.persist_index_kind().is_none());
         assert!(!EnvelopeKind::Revocation.is_cursor_served());
+        assert!(EnvelopeKind::Revocation.is_row_hash_served());
+    }
+
+    /// The three serve bases partition `ALL`: every kind is EXACTLY ONE of
+    /// content-hash-indexed (`persist_index_kind` → Some), row-hash-served
+    /// (`is_row_hash_served` — Revocation), or cursor-served
+    /// (`is_cursor_served` — AccordQuorumEvidence). A new kind that lands in
+    /// zero or two bases is a taxonomy bug this test refuses; the Revocation
+    /// partition previously lived only in prose (3 doc sites + a bridge
+    /// `== Revocation` literal), which is how prose drifts.
+    #[test]
+    fn every_kind_has_exactly_one_serve_basis() {
+        for kind in EnvelopeKind::ALL {
+            let bases = [
+                kind.persist_index_kind().is_some(),
+                kind.is_row_hash_served(),
+                kind.is_cursor_served(),
+            ];
+            assert_eq!(
+                bases.iter().filter(|b| **b).count(),
+                1,
+                "{kind:?}: must be exactly one of content-hash-indexed / \
+                 row-hash-served / cursor-served, got {bases:?}"
+            );
+            // Membership pin: row-hash-served is EXACTLY Revocation.
+            assert_eq!(
+                kind.is_row_hash_served(),
+                matches!(kind, EnvelopeKind::Revocation),
+                "{kind:?}: row-hash-served iff it is Revocation"
+            );
+        }
+    }
+
+    /// CIRISEdge#441 — `bridge::is_removal_kind` (the removal-receipt ledger's
+    /// membership predicate) is EXACTLY the four typed removal planes, pinned
+    /// over `ALL` so widening the removal class is a deliberate edit here, not
+    /// an accident. Asserted against the pub fn itself (defined in
+    /// `bridge.rs`), i.e. through the same symbol its call sites
+    /// (coordinator/bridge) consult.
+    #[test]
+    fn is_removal_kind_is_exactly_the_four_removal_planes() {
+        for kind in EnvelopeKind::ALL {
+            let expected = matches!(
+                kind,
+                EnvelopeKind::Revocation
+                    | EnvelopeKind::IdentityOccurrenceRevocation
+                    | EnvelopeKind::FamilyMembershipRevocation
+                    | EnvelopeKind::CommunityMembershipRevocation
+            );
+            assert_eq!(
+                crate::replication::bridge::is_removal_kind(kind),
+                expected,
+                "{kind:?}: removal-class iff one of the four typed removal planes"
+            );
+        }
     }
 
     /// CIRISEdge#462 — `is_subject_pullable` is EXACTLY the five replicated kinds
@@ -739,36 +815,39 @@ mod tests {
         assert!(matches!(r, Err(ProtocolError::Decode(_))));
     }
 
-    /// All ten `EnvelopeKind` variants round-trip via JSON — kind
-    /// values are wire-load-bearing per FSD §3.3.
+    /// EVERY `EnvelopeKind` variant's wire token is pinned + round-trips via
+    /// JSON — kind values are wire-load-bearing per FSD §3.3. The expected
+    /// table is an EXHAUSTIVE match (no wildcard) iterated over `ALL`, so a
+    /// new variant refuses to compile until its token is pinned here — the
+    /// hand-written 10-of-15 array this replaces silently left the five
+    /// post-v1 kinds unpinned.
     #[test]
     fn envelope_kind_wire_values_are_stable() {
-        let cases = [
-            (EnvelopeKind::Key, "key"),
-            (EnvelopeKind::Attestation, "attestation"),
-            (EnvelopeKind::Revocation, "revocation"),
-            (EnvelopeKind::IdentityOccurrence, "identity_occurrence"),
-            (EnvelopeKind::Family, "family"),
-            (EnvelopeKind::Community, "community"),
-            (
-                EnvelopeKind::IdentityOccurrenceRevocation,
-                "identity_occurrence_revocation",
-            ),
-            (
-                EnvelopeKind::FamilyMembershipRevocation,
-                "family_membership_revocation",
-            ),
-            (
-                EnvelopeKind::CommunityMembershipRevocation,
-                "community_membership_revocation",
-            ),
-            (EnvelopeKind::LocationProof, "location_proof"),
-        ];
-        for (kind, wire) in cases {
+        for kind in EnvelopeKind::ALL {
+            let wire = match kind {
+                EnvelopeKind::Key => "key",
+                EnvelopeKind::Attestation => "attestation",
+                EnvelopeKind::Revocation => "revocation",
+                EnvelopeKind::IdentityOccurrence => "identity_occurrence",
+                EnvelopeKind::Family => "family",
+                EnvelopeKind::Community => "community",
+                EnvelopeKind::IdentityOccurrenceRevocation => "identity_occurrence_revocation",
+                EnvelopeKind::FamilyMembershipRevocation => "family_membership_revocation",
+                EnvelopeKind::CommunityMembershipRevocation => "community_membership_revocation",
+                EnvelopeKind::LocationProof => "location_proof",
+                EnvelopeKind::Organization => "organization",
+                EnvelopeKind::OrgMembership => "org_membership",
+                EnvelopeKind::PartnerRecord => "partner_record",
+                EnvelopeKind::TransportDestination => "transport_destination",
+                EnvelopeKind::AccordQuorumEvidence => "accord_quorum_evidence",
+            };
+            // The serde rename, the manifest key, and the pin all agree.
+            assert_eq!(kind.as_wire_str(), wire, "{kind:?}: as_wire_str drifted");
             let m = ReplicationMessage::Summary(SummaryMessage { kind, refs: vec![] });
             let bytes = m.to_bytes();
             let s = std::str::from_utf8(&bytes).unwrap();
-            assert!(s.contains(wire), "expected `{wire}` in {s}");
+            let cell = format!(r#""kind":"{wire}""#);
+            assert!(s.contains(&cell), "expected `{cell}` in {s}");
             assert_eq!(ReplicationMessage::from_bytes(&bytes).unwrap(), m);
         }
     }
@@ -797,27 +876,22 @@ mod tests {
     }
 
     /// Wire-stability sanity: confirm no two kinds collide on their
-    /// serde rename. Catches accidental duplicates if a future
-    /// variant is added with a typo.
+    /// serde rename, over ALL kinds (not a hand-copied subset). Catches
+    /// accidental duplicates if a future variant is added with a typo, and
+    /// that the serde rename always equals `as_wire_str`.
     #[test]
     fn envelope_kind_wire_values_are_unique() {
         use std::collections::HashSet;
-        let kinds = [
-            EnvelopeKind::Key,
-            EnvelopeKind::Attestation,
-            EnvelopeKind::Revocation,
-            EnvelopeKind::IdentityOccurrence,
-            EnvelopeKind::Family,
-            EnvelopeKind::Community,
-            EnvelopeKind::IdentityOccurrenceRevocation,
-            EnvelopeKind::FamilyMembershipRevocation,
-            EnvelopeKind::CommunityMembershipRevocation,
-            EnvelopeKind::LocationProof,
-        ];
-        let wires: HashSet<String> = kinds
-            .iter()
-            .map(|k| serde_json::to_string(k).unwrap())
-            .collect();
-        assert_eq!(wires.len(), kinds.len(), "wire-name collision detected");
+        let mut wires: HashSet<String> = HashSet::new();
+        for kind in EnvelopeKind::ALL {
+            let serde_wire = serde_json::to_string(&kind).unwrap();
+            assert_eq!(
+                serde_wire,
+                format!("\"{}\"", kind.as_wire_str()),
+                "{kind:?}: serde rename and as_wire_str must agree"
+            );
+            assert!(wires.insert(serde_wire), "wire-name collision on {kind:?}");
+        }
+        assert_eq!(wires.len(), EnvelopeKind::ALL.len());
     }
 }

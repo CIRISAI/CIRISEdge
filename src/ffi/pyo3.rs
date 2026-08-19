@@ -1455,9 +1455,10 @@ impl PyEdge {
         };
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("x25519_pub_base64", b64.encode(kex.x25519_pub))?;
-        if let Some(mlkem) = kex.mlkem768_pub {
-            dict.set_item("ml_kem_768_pub_base64", b64.encode(mlkem))?;
-        }
+        // CIRISEdge#481 item 4 — `mlkem768_pub` is a required field, so
+        // the dict ALWAYS carries both halves (as the docstring above
+        // has promised since v2.4.0).
+        dict.set_item("ml_kem_768_pub_base64", b64.encode(kex.mlkem768_pub))?;
         Ok(Some(dict))
     }
 
@@ -2517,32 +2518,69 @@ impl PyEdge {
     }
 }
 
-/// Parse a wire-stable kind string into [`crate::replication::EnvelopeKind`].
-/// The token set is the 10 `#[serde(rename_all = "snake_case")]`
-/// variants per FSD §3.3.
+/// The comma-separated valid-token list for [`parse_envelope_kind`]'s error
+/// message — GENERATED from `EnvelopeKind::ALL`, so it names every accepted
+/// token (all 15) and can never go stale against the enum. (The hand-written
+/// predecessor listed 10 of 15 and omitted `accord_quorum_evidence` even
+/// after the parser accepted it.)
+fn envelope_kind_wire_tokens() -> String {
+    crate::replication::EnvelopeKind::ALL
+        .map(crate::replication::EnvelopeKind::as_wire_str)
+        .join(", ")
+}
+
+/// Parse a wire-stable kind string into [`crate::replication::EnvelopeKind`]
+/// — the exact inverse of `EnvelopeKind::as_wire_str`, TOTAL over
+/// `EnvelopeKind::ALL` by construction: the accepted set is derived from the
+/// enum (never a hand-copied match, which shipped accepting 11 of 15 kinds —
+/// the operator surface silently could not open the organization /
+/// org_membership / partner_record / transport_destination planes), and the
+/// error string is generated from the same source
+/// ([`envelope_kind_wire_tokens`]). A new variant is parseable the moment it
+/// joins `ALL`.
 fn parse_envelope_kind(s: &str) -> PyResult<crate::replication::EnvelopeKind> {
+    crate::replication::EnvelopeKind::ALL
+        .into_iter()
+        .find(|k| k.as_wire_str() == s)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown EnvelopeKind: {s:?} (valid: {})",
+                envelope_kind_wire_tokens()
+            ))
+        })
+}
+
+#[cfg(test)]
+mod parse_envelope_kind_tests {
+    use super::{envelope_kind_wire_tokens, parse_envelope_kind};
     use crate::replication::EnvelopeKind;
-    match s {
-        "key" => Ok(EnvelopeKind::Key),
-        "attestation" => Ok(EnvelopeKind::Attestation),
-        "revocation" => Ok(EnvelopeKind::Revocation),
-        "identity_occurrence" => Ok(EnvelopeKind::IdentityOccurrence),
-        "family" => Ok(EnvelopeKind::Family),
-        "community" => Ok(EnvelopeKind::Community),
-        "identity_occurrence_revocation" => Ok(EnvelopeKind::IdentityOccurrenceRevocation),
-        "family_membership_revocation" => Ok(EnvelopeKind::FamilyMembershipRevocation),
-        "community_membership_revocation" => Ok(EnvelopeKind::CommunityMembershipRevocation),
-        "location_proof" => Ok(EnvelopeKind::LocationProof),
-        // CIRISEdge#474 — activation surface for the accord-quorum-evidence cursor
-        // plane: without this an operator cannot register a
-        // `(peer, accord_quorum_evidence)` Initiator, so the plane never opens.
-        "accord_quorum_evidence" => Ok(EnvelopeKind::AccordQuorumEvidence),
-        other => Err(PyValueError::new_err(format!(
-            "unknown EnvelopeKind: {other:?} (valid: key, attestation, revocation, \
-             identity_occurrence, family, community, \
-             identity_occurrence_revocation, family_membership_revocation, \
-             community_membership_revocation, location_proof)"
-        ))),
+
+    /// `parse_envelope_kind` round-trips EVERY wire kind (`parse(as_wire_str(k))
+    /// == k` over `ALL` — a new variant is covered the moment it exists), and
+    /// the error's valid-token list names all 15 (generated, not hand-kept).
+    #[test]
+    fn parse_envelope_kind_round_trips_every_wire_kind() {
+        for kind in EnvelopeKind::ALL {
+            let parsed = parse_envelope_kind(kind.as_wire_str())
+                .unwrap_or_else(|_| panic!("{kind:?}: every ALL token must parse"));
+            assert_eq!(parsed, kind, "{kind:?}: parse must invert as_wire_str");
+        }
+        assert!(
+            parse_envelope_kind("hostile_takeover").is_err(),
+            "unknown tokens refuse"
+        );
+        let tokens = envelope_kind_wire_tokens();
+        for kind in EnvelopeKind::ALL {
+            assert!(
+                tokens.contains(kind.as_wire_str()),
+                "the error's valid list must name {kind:?}"
+            );
+        }
+        assert_eq!(
+            tokens.matches(", ").count(),
+            EnvelopeKind::ALL.len() - 1,
+            "exactly one token per kind"
+        );
     }
 }
 
@@ -6508,6 +6546,10 @@ fn seal_av_outer(
 /// remains as an explicit HNDL-strict marker for realtime A/V + key_grant DEK
 /// distribution. `"classical"` is REJECTED with `PyValueError` — the classical
 /// X25519-only KEX is retired (there is no negotiable quantum-vulnerable path).
+/// `peer_mlkem768_pub=None` is likewise REJECTED with `PyValueError` at
+/// `PeerKexPubkeys` construction (#481 item 4 — the ML-KEM-less peer is
+/// unrepresentable; the parameter stays `Option` only so the downgrade attempt
+/// parses to a typed, logged refusal instead of a `TypeError`).
 ///
 /// Returns `(handshake_msg_json_bytes, session_key, negotiated_algorithm_wire_id)`.
 /// The handshake JSON round-trips through
@@ -6524,10 +6566,12 @@ fn federation_session_initiate(
         FederationSession, KexAlgorithm, PeerKexPubkeys, SessionHandshakeMsg,
     };
     let x_pub = fixed_bytes::<32>("peer_x25519_pub", peer_x25519_pub)?;
-    let peer = PeerKexPubkeys {
-        x25519_pub: x_pub,
-        mlkem768_pub: peer_mlkem768_pub.map(<[u8]>::to_vec),
-    };
+    // CIRISEdge#481 item 4 — the ML-KEM-less peer is unrepresentable by
+    // `PeerKexPubkeys`; a Python `None` is refused HERE, at construction,
+    // with the typed `HybridRequiredButPeerLacksMlkem` (surfaced as
+    // `ValueError`, the same class the retired-"classical" refusal uses).
+    let peer = PeerKexPubkeys::from_advertisement(x_pub, peer_mlkem768_pub.map(<[u8]>::to_vec))
+        .map_err(|e| PyValueError::new_err(format!("peer_mlkem768_pub: {e}")))?;
     let requested = match algorithm {
         "hybrid" => KexAlgorithm::Hybrid,
         "hybrid-required" => KexAlgorithm::HybridRequired,
@@ -6905,9 +6949,11 @@ pub struct PyAvSession {
 }
 
 /// Convert a Python member tuple (`key_id`, `x25519_pub`,
-/// `mlkem768_pub`) into the Rust [`Member`] shape, enforcing the HNDL
-/// pre-check (mlkem768_pub MUST be Some). Failing here surfaces
-/// `PyValueError` before the openmls layer is invoked.
+/// `mlkem768_pub`) into the Rust [`Member`] shape. The HNDL pre-check
+/// is structural (CIRISEdge#481 item 4): `PeerKexPubkeys` requires the
+/// ML-KEM-768 half, so a `None` is refused by
+/// `PeerKexPubkeys::from_advertisement` at construction and surfaces
+/// as `PyValueError` before the openmls layer is invoked.
 fn member_from_py(
     label: &str,
     key_id: String,
@@ -6917,17 +6963,15 @@ fn member_from_py(
     use crate::transport::federation_session::PeerKexPubkeys;
     use crate::transport::realtime_av_mls::Member;
     let x = fixed_bytes::<32>(&format!("{label}.x25519_pub"), x25519_pub)?;
-    let Some(mlkem) = mlkem768_pub else {
-        return Err(PyValueError::new_err(format!(
-            "{label}: ML-KEM-768 pubkey required by ciphersuite 0x004D (HNDL discipline) — peer {key_id}"
-        )));
-    };
+    let kex_pubkeys = PeerKexPubkeys::from_advertisement(x, mlkem768_pub.map(<[u8]>::to_vec))
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "{label}: {e} — ciphersuite 0x004D requires ML-KEM-768; peer {key_id}"
+            ))
+        })?;
     Ok(Member {
         key_id,
-        kex_pubkeys: PeerKexPubkeys {
-            x25519_pub: x,
-            mlkem768_pub: Some(mlkem.to_vec()),
-        },
+        kex_pubkeys,
     })
 }
 

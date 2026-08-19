@@ -21,18 +21,29 @@ use super::protocol::EnvelopeKind;
 /// The per-kind serve/advertise policy edge (the responder) enforces.
 fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
     // `advertise`: the projection scope the bridge fans a kind out over.
-    //   - `per_record_projection` — persist `projection_for` decides per row
-    //     (SelfOwn / Cohort / Global from the record's own dimension/cohort_scope).
-    //   - `cohort` / `global` — the operator cohort set / the whole plane.
+    //   - `per_record_projection` — the bridge decides PER ROW (the Attestation
+    //     plane's `attestation_projection`: SelfOwn / Cohort / Capability /
+    //     Subject / Global from the record's own dimension/cohort_scope).
+    //   - `self_own` / `cohort` / `global` — ONE constant projection for the
+    //     whole plane (the node's own publish set / the operator cohort set /
+    //     the widest own∪cohort set).
     //   - `bulk_since` — the paginated since-cursor operational reads.
+    //   - `cursor:evidence_at` — the dedicated cursor plane (never
+    //     content-hash-advertised).
     // `serve`: `public` (public signed envelope) or a `capability:*` gate.
     let (advertise, serve) = match kind {
+        // These five planes do NOT consult a per-record projection: the bridge
+        // hardcodes ONE `Projection` constant per plane (`list_keys` /
+        // `list_identity_occurrences` / `list_transport_destinations` →
+        // `Projection::SelfOwn`; `list_identity_occurrence_revocations` /
+        // `list_revocations` → `Projection::Global`, the #311 tombstone rule).
+        // The manifest states that truth — the earlier `per_record_projection`
+        // claim here described a mechanism these planes never had.
         EnvelopeKind::Key
         | EnvelopeKind::IdentityOccurrence
-        | EnvelopeKind::TransportDestination
-        | EnvelopeKind::IdentityOccurrenceRevocation
-        | EnvelopeKind::Revocation => ("per_record_projection", "public"),
-        // E3: the trace plane is the sole capability-gated serve path.
+        | EnvelopeKind::TransportDestination => ("self_own", "public"),
+        // E3: the trace plane is the sole capability-gated serve path — and the
+        // ONE plane whose projection is genuinely decided per row.
         EnvelopeKind::Attestation => (
             "per_record_projection",
             "trace:* → capability:infra:serve; else public",
@@ -40,9 +51,13 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         EnvelopeKind::Family | EnvelopeKind::Community | EnvelopeKind::LocationProof => {
             ("cohort", "public")
         }
-        EnvelopeKind::FamilyMembershipRevocation | EnvelopeKind::CommunityMembershipRevocation => {
-            ("global", "public")
-        }
+        // The four `global` planes: the two tombstone planes above join the two
+        // membership-revocation planes here — all four fan out over the
+        // hardcoded widest own∪cohort set (`Projection::Global`).
+        EnvelopeKind::IdentityOccurrenceRevocation
+        | EnvelopeKind::Revocation
+        | EnvelopeKind::FamilyMembershipRevocation
+        | EnvelopeKind::CommunityMembershipRevocation => ("global", "public"),
         EnvelopeKind::Organization | EnvelopeKind::OrgMembership | EnvelopeKind::PartnerRecord => {
             ("bulk_since", "public")
         }
@@ -130,8 +145,19 @@ pub fn serve_advertise_policy_sha256() -> String {
 // appended (advertise `cursor:evidence_at`, serve `public`, receive
 // `cursor_pull:evidence_at` — the cursor plane, NOT a subject Pull). CIRISServer
 // re-pins from 6f683311… to this value alongside persist's v31 REPLICATION_POLICY_HASH.
+// (was 328d73b0…)
+//
+// serve-policy audit — re-pinned: the `advertise` column now states the TRUTH
+// for the five planes the bridge fans out over ONE hardcoded `Projection`
+// constant (they never consulted a per-record projection): Key /
+// IdentityOccurrence / TransportDestination → `self_own`,
+// IdentityOccurrenceRevocation / Revocation → `global` (the #311 tombstone
+// rule). `per_record_projection` now names only the Attestation plane, the one
+// whose projection is genuinely decided per row. NO serve-path behavior
+// changed — this is the manifest catching up to the code it witnesses.
+// **CIRISServer must mirror**: re-pin from 328d73b0… to this value.
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "328d73b0a6a5c7e2d1272b81e245ecceeca1d837dd08b0415105e1661ff4a699";
+    "20499cabaf1c0566b5a8d66f8d03c8a980b760c733e83444b7345a7733f22d74";
 
 #[cfg(test)]
 mod tests {
@@ -148,9 +174,13 @@ mod tests {
         );
     }
 
-    /// CIRISEdge#462 — the RECEIVE axis witness: EXACTLY the five replicated
-    /// kinds answer a subject Pull (`subject_pull:*`), every other kind is `none`,
-    /// and the Attestation plane is the one that names both axes + the G2 carve.
+    /// CIRISEdge#462 — the RECEIVE axis witness, DERIVED from the protocol
+    /// predicate: the manifest's `subject_pull:*` kinds are exactly
+    /// `EnvelopeKind::is_subject_pullable` over `ALL` (wire names via
+    /// `as_wire_str`, in `ALL` order). This is what makes the doc claim on
+    /// `is_subject_pullable` true: widening the predicate reds this test until
+    /// the manifest column moves (and the pinned hash flips deliberately) —
+    /// the earlier hardcoded 5-string vec asserted nothing about the predicate.
     #[test]
     fn only_the_five_replicated_kinds_answer_a_subject_pull() {
         let manifest = serve_advertise_manifest();
@@ -160,17 +190,17 @@ mod tests {
             .filter(|p| p["receive"].as_str().unwrap().starts_with("subject_pull"))
             .map(|p| p["kind"].as_str().unwrap())
             .collect();
+        let expected: Vec<&str> = EnvelopeKind::ALL
+            .into_iter()
+            .filter(|k| k.is_subject_pullable())
+            .map(EnvelopeKind::as_wire_str)
+            .collect();
         assert_eq!(
-            pullable,
-            vec![
-                "key",
-                "attestation",
-                "identity_occurrence",
-                "identity_occurrence_revocation",
-                "transport_destination",
-            ],
-            "exactly the five replicated kinds are subject-pullable (RECEIVE axis)"
+            pullable, expected,
+            "the manifest's subject_pull kinds must be EXACTLY \
+             EnvelopeKind::is_subject_pullable over ALL (RECEIVE axis)"
         );
+        assert_eq!(expected.len(), 5, "the five replicated kinds");
         // The Attestation plane is the one that sweeps both axes + carves scores.
         let att = policies
             .iter()
@@ -181,33 +211,91 @@ mod tests {
         assert!(recv.contains("G2"), "the score carve is witnessed: {recv}");
     }
 
-    /// CIRISEdge#474 — the accord-quorum-evidence plane appears in the manifest as
-    /// a CURSOR plane: advertise `cursor:evidence_at`, serve `public`, receive
-    /// `cursor_pull:*` (NOT `subject_pull:*`, so it stays out of the five
-    /// subject-pullable kinds), and never capability-gated.
+    /// CIRISEdge#474 — the cursor-plane witness, DERIVED from the protocol
+    /// predicate: for EVERY kind in `ALL`, its manifest row is a cursor plane
+    /// (advertise `cursor:evidence_at`, receive `cursor_pull:*`, serve
+    /// `public`) iff `is_cursor_served` says so. Adding a cursor kind
+    /// therefore reds this module until the manifest moves — the earlier
+    /// version looked up one hardcoded row and never consulted the predicate.
     #[test]
     fn accord_quorum_evidence_is_a_public_cursor_plane() {
         let manifest = serve_advertise_manifest();
         let policies = manifest["policies"].as_array().unwrap();
-        let aqe = policies
-            .iter()
-            .find(|p| p["kind"] == "accord_quorum_evidence")
-            .expect("accord_quorum_evidence is in the 15-kind manifest");
-        assert_eq!(aqe["advertise"], "cursor:evidence_at");
-        assert_eq!(aqe["serve"], "public");
-        let recv = aqe["receive"].as_str().unwrap();
-        assert!(
-            recv.starts_with("cursor_pull:"),
-            "cursor receive axis: {recv}"
+        for kind in EnvelopeKind::ALL {
+            let row = policies
+                .iter()
+                .find(|p| p["kind"] == kind.as_wire_str())
+                .unwrap_or_else(|| panic!("{kind:?} missing from the manifest"));
+            let advertise = row["advertise"].as_str().unwrap();
+            let recv = row["receive"].as_str().unwrap();
+            assert_eq!(
+                advertise == "cursor:evidence_at",
+                kind.is_cursor_served(),
+                "{kind:?}: cursor advertise cell iff is_cursor_served"
+            );
+            assert_eq!(
+                recv.starts_with("cursor_pull:"),
+                kind.is_cursor_served(),
+                "{kind:?}: cursor_pull receive cell iff is_cursor_served"
+            );
+            if kind.is_cursor_served() {
+                assert_eq!(row["serve"], "public");
+                assert!(
+                    !recv.starts_with("subject_pull"),
+                    "{kind:?}: NOT a subject pull — stays out of the five: {recv}"
+                );
+                assert!(
+                    !row["serve"].as_str().unwrap().contains("capability:"),
+                    "the cursor plane is public, never capability-gated"
+                );
+            }
+        }
+        // The predicate currently names exactly one cursor plane.
+        assert!(EnvelopeKind::AccordQuorumEvidence.is_cursor_served());
+    }
+
+    /// CIRISEdge#393 item 3 — the manifest's columns are TEST-LOCKED to the
+    /// `protocol.rs` predicates over `EnvelopeKind::ALL`: the manifest covers
+    /// exactly `ALL` (in order), and each row's `receive` cell agrees with
+    /// `is_subject_pullable` / `is_cursor_served` — `none` exactly when
+    /// neither holds. So a predicate edit in protocol.rs reds THIS module
+    /// until the manifest (and `SERVE_ADVERTISE_POLICY_HASH`) move
+    /// deliberately, and a manifest edit that contradicts the predicates
+    /// cannot land at all: the columns can no longer drift from the code that
+    /// enforces them.
+    #[test]
+    fn manifest_columns_are_derived_from_the_protocol_predicates() {
+        let manifest = serve_advertise_manifest();
+        let policies = manifest["policies"].as_array().unwrap();
+        assert_eq!(
+            policies.len(),
+            EnvelopeKind::ALL.len(),
+            "one manifest row per kind in ALL"
         );
-        assert!(
-            !recv.starts_with("subject_pull"),
-            "NOT a subject pull — stays out of the five: {recv}"
-        );
-        assert!(
-            !aqe["serve"].as_str().unwrap().contains("capability:"),
-            "the accord plane is public, never capability-gated"
-        );
+        for (row, kind) in policies.iter().zip(EnvelopeKind::ALL) {
+            assert_eq!(
+                row["kind"],
+                kind.as_wire_str(),
+                "manifest rows ride in ALL order (the order is hashed)"
+            );
+            let recv = row["receive"].as_str().unwrap();
+            assert_eq!(
+                recv.starts_with("subject_pull:"),
+                kind.is_subject_pullable(),
+                "{kind:?}: receive is subject_pull:* iff is_subject_pullable"
+            );
+            assert_eq!(
+                recv.starts_with("cursor_pull:"),
+                kind.is_cursor_served(),
+                "{kind:?}: receive is cursor_pull:* iff is_cursor_served"
+            );
+            if !kind.is_subject_pullable() && !kind.is_cursor_served() {
+                assert_eq!(
+                    recv, "none",
+                    "{kind:?}: neither predicate holds → the receive cell is `none`"
+                );
+            }
+        }
     }
 
     /// The load-bearing E3 fact must hold in the manifest: exactly ONE kind is

@@ -223,11 +223,13 @@ pub enum RelayRefusal {
     /// [`AccordRootClaim::NotAccord`] — persist says this row is not on the
     /// `accord:*` family at all, so it "is not this predicate's to judge" and
     /// the verb refuses it. Unreachable through
-    /// `FederationDirectoryReplicationBridge::accord_relay_withholds`, whose
-    /// `attestation_is_accord` early-out already used persist's own
-    /// [`attestation_family`] classifier — and kept anyway so a DIRECT caller of
-    /// the public entry point below fails CLOSED with a name, rather than
-    /// falling through to an allow.
+    /// `FederationDirectoryReplicationBridge::accord_relay_withholds` BY SHARED
+    /// PREDICATE (CIRISEdge#505 / v37.1.0): its `attestation_is_accord`
+    /// early-out is persist's `is_accord_family`, over both namespaces — and
+    /// `accord_root_claim` calls that same function for its own family test, so
+    /// a row the pre-filter admits cannot classify `NotAccord` here. Kept
+    /// anyway so a DIRECT caller of the public entry point below fails CLOSED
+    /// with a name, rather than falling through to an allow.
     ObjectNotAccord,
     /// [`AccordRootClaim::Unnamed`] — the row IS on the `accord:*` family and
     /// **nothing in it names the accord it acts under**: no signed
@@ -635,27 +637,34 @@ impl AccordRelayGate {
         }
     }
 
-    /// Is `dimension` in the `accord:*` family — i.e. is this gate the one that
-    /// decides its carriage?
+    /// The **DIMENSION HALF ONLY** of the `accord:*` family test — is this
+    /// `dimension` string relay-gated per [`crate::family_gates::gates_for`]?
     ///
-    /// persist's OWN classifier
-    /// ([`attestation_family`], public since v36.1.0 for exactly this fold), never
-    /// an edge-side `dimension.starts_with("accord:")`. The registry decides
-    /// which family a dimension is in; a second spelling here is two owners for
-    /// one wire fact. [`AttestationFamily`] is `#[non_exhaustive]`, so a future
-    /// decided family is additive policy rather than a build break — and
-    /// `objection:*`, the reserved-prefix sibling, is deliberately NOT in this
-    /// family (CIRISPersist#713).
+    /// **NEVER a carriage pre-filter.** The family rides BOTH namespaces —
+    /// persist's admission comment (`check_reserved_prefix_admission`) is
+    /// explicit: *"`accord:invoke:*` as a TYPE, `accord:human_dignity:v1` as a
+    /// `scores` DIMENSION"* — and using this dimension-only half to decide
+    /// whether a ROW reaches the gate is exactly the CIRISEdge#505
+    /// under-gating hole: every `accord:invoke:*` row in the
+    /// `attestation_type` namespace skipped the CC 4.2.1 relay gate and was
+    /// carried unexamined. Row-level family classification has ONE owner,
+    /// [`ciris_persist::federation::trust_root::is_accord_family`], consumed
+    /// by the bridge's `attestation_is_accord` — and a source-assertion test
+    /// there (`the_carriage_pre_filter_reads_is_accord_family_not_the_dimension_half`)
+    /// pins that the pre-filter reads it and not this.
     ///
-    /// **Reads [`crate::family_gates::gates_for`], not a local `matches!`.**
-    /// That is the whole point of the fold: an inline
-    /// `matches!(.., Accord)` returns `false` for a family this build
-    /// predates, which SKIPS the relay gate and CARRIES the row — permissive
-    /// on exactly the case `#[non_exhaustive]` exists to warn about.
-    /// `gates_for`'s wildcard is maximally gated instead, so an unknown
-    /// family is withheld and says so.
+    /// What survives here is the WIRING PIN for [`crate::family_gates`]: the
+    /// accord half of `gates_for`'s fold, exercised by that module's
+    /// through-the-call-site test and the dimension matrix below, so the fold
+    /// cannot silently drift from persist's registry (`objection:*` stays out
+    /// of the family — CIRISPersist#713; an inline `matches!` would return
+    /// `false` for a family this build predates). `#[cfg(test)]` plus the
+    /// `dimension_half_` name are the fence: in a production build this fn
+    /// does not exist, so a future caller reaching for it as a carriage
+    /// pre-filter gets a compile error, not the #505 hole.
+    #[cfg(test)]
     #[must_use]
-    pub fn dimension_is_gated(dimension: &str) -> bool {
+    pub(crate) fn dimension_half_is_gated(dimension: &str) -> bool {
         crate::family_gates::gates_for(dimension).accord_relay_gated
     }
 
@@ -921,17 +930,38 @@ mod tests {
         attested: &str,
         accord_root: Option<&str>,
     ) -> serde_json::Value {
+        typed_accord_row_value("scores", Some(dimension), attesting, attested, accord_root)
+    }
+
+    /// [`accord_row_value`] with the `attestation_type` namespace open too —
+    /// CIRISEdge#505 / CIRISPersist#743: the family rides BOTH namespaces
+    /// (*"`accord:invoke:*` as a TYPE, `accord:human_dignity:v1` as a `scores`
+    /// DIMENSION"* — persist's own admission comment), and a fixture that can
+    /// only spell the dimension shape can only ever test half of it.
+    /// `dimension: None` omits the key entirely, which is the exact wire shape
+    /// an `accord:invoke:*` row carries. The type is stamped into the signed
+    /// `row` mirror as well as the column, else `check_row_column_binding`
+    /// refuses the fixture for divergence rather than judging its family.
+    fn typed_accord_row_value(
+        attestation_type: &str,
+        dimension: Option<&str>,
+        attesting: &str,
+        attested: &str,
+        accord_root: Option<&str>,
+    ) -> serde_json::Value {
         let mut envelope = serde_json::json!({
-            "dimension": dimension,
             "asserted_at": "2026-01-01T00:00:00Z",
             "row": {
                 "attestation_id": "att-1",
                 "attesting_key_id": attesting,
-                "attestation_type": "scores",
+                "attestation_type": attestation_type,
                 "attested_key_id": attested,
                 "cohort_scope": "federation",
             },
         });
+        if let Some(dim) = dimension {
+            envelope["dimension"] = serde_json::json!(dim);
+        }
         if let Some(root) = accord_root {
             envelope["accord_root"] = serde_json::json!(root);
         }
@@ -939,7 +969,7 @@ mod tests {
             "attestation_id": "att-1",
             "attesting_key_id": attesting,
             "attested_key_id": attested,
-            "attestation_type": "scores",
+            "attestation_type": attestation_type,
             "asserted_at": "2026-01-01T00:00:00Z",
             "attestation_envelope": envelope,
             "original_content_hash": "0".repeat(64),
@@ -1235,10 +1265,11 @@ mod tests {
     }
 
     /// [`AccordRootClaim::NotAccord`] fails CLOSED at the gate's public entry
-    /// point. It is unreachable through the bridge (whose `attestation_is_accord`
-    /// early-out is persist's own [`attestation_family`] classifier, and `under`
-    /// implies `starts_with`), but the arm must not be an allow: a direct caller
-    /// of a `pub` predicate is a caller.
+    /// point. It is unreachable through the bridge by SHARED PREDICATE
+    /// (CIRISEdge#505 / v37.1.0: the bridge's `attestation_is_accord` early-out
+    /// is persist's `is_accord_family` over both namespaces, the exact family
+    /// test `accord_root_claim` itself calls), but the arm must not be an
+    /// allow: a direct caller of a `pub` predicate is a caller.
     #[test]
     fn a_row_that_is_not_accord_at_all_fails_closed_with_its_own_leg() {
         let row = accord_row("scores:reputation:v1", "holder-a", "someone", None);
@@ -1406,15 +1437,18 @@ mod tests {
 
     // ── The gate: fail-closed, and the family classifier ─────────────────
 
-    /// The dimension classifier is persist's, and it covers `accord:*` WITHOUT
-    /// covering `objection:*` (which #713 deliberately left on the
-    /// conservative row) — pinned here so an edge-side widening cannot happen
-    /// by accident.
+    /// The DIMENSION-HALF matrix (CIRISEdge#505: the half-test, never the
+    /// carriage pre-filter — see `dimension_half_is_gated`'s doc): it covers
+    /// `accord:*` WITHOUT covering `objection:*` (which #713 deliberately left
+    /// on the conservative row) — pinned here so an edge-side widening cannot
+    /// happen by accident.
     #[test]
     fn only_accord_dimensions_are_gated() {
-        assert!(AccordRelayGate::dimension_is_gated("accord:lifecycle:v1"));
-        assert!(AccordRelayGate::dimension_is_gated("accord:halt:v1"));
-        assert!(AccordRelayGate::dimension_is_gated(
+        assert!(AccordRelayGate::dimension_half_is_gated(
+            "accord:lifecycle:v1"
+        ));
+        assert!(AccordRelayGate::dimension_half_is_gated("accord:halt:v1"));
+        assert!(AccordRelayGate::dimension_half_is_gated(
             "accord:human_dignity:v1"
         ));
         for other in [
@@ -1431,7 +1465,7 @@ mod tests {
             "accord",
         ] {
             assert!(
-                !AccordRelayGate::dimension_is_gated(other),
+                !AccordRelayGate::dimension_half_is_gated(other),
                 "{other} must NOT be gated by the accord relay predicate"
             );
         }
@@ -1824,6 +1858,104 @@ mod tests {
              gate that refuses everything"
         );
         assert_eq!(gate.cached_len(), 1, "…and that one DID reach the resolver");
+    }
+
+    /// CIRISEdge#505 / CIRISPersist#743 — **a TYPE-namespace row is JUDGED,
+    /// never skipped**, and a row on BOTH namespaces is gated ONCE.
+    ///
+    /// The pre-filter fix (bridge's `attestation_is_accord` → persist's
+    /// `is_accord_family`) only puts `accord:invoke:*`-TYPED rows in front of
+    /// this gate; this pins what the gate DOES with one, on the exact wire
+    /// shape such a row produces: the namespace in `attestation_type` (column
+    /// AND signed mirror) and no `dimension` key at all. The gate needs no
+    /// type-namespace surface of its own — persist's `accord_root_claim`
+    /// (which `may_relay_accord_attestation` and
+    /// [`AccordRelaySubject::of_row`] both read) takes the TYPE arm of its own
+    /// `is_accord_family` call and reads the signed `accord_root` envelope key,
+    /// available on every namespace. Asserted here rather than assumed.
+    #[tokio::test]
+    async fn the_type_namespace_row_is_judged_not_skipped_and_both_namespaces_gate_once() {
+        let us = "t-node";
+        let signer = "t-holder";
+        let second = "t-holder-second";
+        let root = "t-accord";
+        let backend = Arc::new(MemoryBackend::new());
+        for who in [us, signer, second, root] {
+            backend.put_public_key(key(who)).await.expect("register");
+        }
+        // Both signers SEATED, so a leg that stopped judging would surface as
+        // a different answer (`no_trust_edge` / a relay), never hide behind a
+        // fail-safe default (the five-refusal test's own discipline).
+        seed_family(&backend, root, &[signer, second]).await;
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let gate = AccordRelayGate::new(dir, Some(us.to_owned()));
+        let t0 = now();
+
+        // (a) The TYPE-namespace row: `accord:invoke:*` as the type, NO
+        // dimension, naming its accord with the signed key. The subject is the
+        // signed root + the bound signer — persist's type arm, not a skip.
+        let invoke = typed_accord_row_value(
+            "accord:invoke:notify:halt",
+            None,
+            signer,
+            signer,
+            Some(root),
+        );
+        assert_eq!(
+            AccordRelaySubject::of_attestation(&invoke),
+            Ok(subject(root, signer)),
+            "the TYPE arm names the root from the signed `accord_root` key"
+        );
+        assert_eq!(
+            gate.may_relay_attestation(&invoke, t0).await,
+            RelayDecision::Refused(RelayRefusal::NoTrustEdge),
+            "the row is EVALUATED on its merits (seated signer, no consent edge \
+             seeded ⇒ leg 2) — before CIRISEdge#505 it never reached this gate"
+        );
+        assert_eq!(
+            gate.cached_len(),
+            1,
+            "…and it DID reach the resolver: one (root, signer) verdict cached"
+        );
+
+        // (a′) The same shape naming NO accord is refused on ITS merits too —
+        // fail-closed, with the object leg an operator can act on. The old
+        // pre-filter would have CARRIED this row unexamined.
+        assert_eq!(
+            gate.may_relay_attestation(
+                &typed_accord_row_value("accord:invoke:notify:halt", None, signer, signer, None),
+                t0
+            )
+            .await,
+            RelayDecision::Refused(RelayRefusal::ObjectRootUnnamed),
+            "a type-namespace row naming no accord is REFUSED, never skipped or carried"
+        );
+        assert_eq!(gate.cached_len(), 1, "an unjudgeable row parks no verdict");
+
+        // (d) BOTH namespaces accord-shaped: one row ⇒ ONE subject ⇒ ONE
+        // cached verdict — gated once, no second evaluation for the second
+        // namespace. (A second signer, so the single new entry is visible.)
+        let both = typed_accord_row_value(
+            "accord:invoke:notify:halt",
+            Some("accord:human_dignity:v1"),
+            second,
+            second,
+            Some(root),
+        );
+        assert_eq!(
+            AccordRelaySubject::of_attestation(&both),
+            Ok(subject(root, second)),
+            "two namespaces, ONE subject — the signed root answers for both"
+        );
+        assert_eq!(
+            gate.may_relay_attestation(&both, t0).await,
+            RelayDecision::Refused(RelayRefusal::NoTrustEdge),
+        );
+        assert_eq!(
+            gate.cached_len(),
+            2,
+            "one row on BOTH namespaces adds exactly ONE verdict — gated once"
+        );
     }
 
     /// The ORDERING, not the equivalence.

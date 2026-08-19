@@ -98,12 +98,19 @@ pub const DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS: u64 = 3600;
 /// `TrustScoring::trust_score`, replacing v0.19.6's hardcoded `0`).
 /// L2+ tiers are deferred to a post-v1.0 cut.
 ///
-/// Transport-posture translation (Roaming / Full / Gateway / AP)
-/// remains deferred — the v0.12.0 Leviculum interface-diversity work
-/// did not surface a `reticulum_default_posture` enum on EdgeConfig,
-/// so the v0.18.0 cut configures only the listener bind + outbound
-/// queue cap. Transport-posture follow-up tracks the v0.19.0
-/// observability cut.
+/// Transport-posture translation (Roaming / Full / Gateway / AP) is
+/// DERIVED, not configured — no posture enum will ever exist
+/// (CIRISEdge#514). Announce policy is normative (CC 5.4.6:
+/// group-scoped destinations never announce; federation visibility is
+/// the #499 opt-in). Transit/relay is CONFERRED, not configured (the
+/// #430 `infra:transport` gate + #492 per-interface transit
+/// declarations); serving is `infra:serve` conferral (#386). The
+/// mapping falls out: Roaming ≡ `Client`; Full ≡ `Server` + conferred
+/// roles; Gateway ≡ `infra:transport` conferral + interface transit
+/// scope; AP ≡ member-only transit on a local interface. A node's
+/// behavior = `AgentMode` (local resources) × conferred capabilities
+/// (directory) × per-interface transit declarations × normative
+/// announce policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentMode {
     /// Egress-only posture; the edge runtime does not bind a
@@ -522,6 +529,17 @@ pub struct EdgeConfig {
     /// via [`Edge::refresh_canonical_retirements`] regardless of this
     /// flag or of operator config.
     pub baked_canonical_genesis_enabled: bool,
+    /// Phase 2 typed ephemeral request→response — how long
+    /// `Edge::send::<M>` waits for the correlated
+    /// [`crate::MessageType::EphemeralResponse`] (or `OpaqueResponse`)
+    /// reply when `M::Response` is a real struct (not `()`). Elapsing
+    /// returns [`EdgeError::Unreachable`] and removes the pending
+    /// waiter. Fire-and-forget sends (`type Response = ()`) never
+    /// consult this — transport-Delivered IS their outcome. Default
+    /// 30_000 ms (matches the `send_opaque_request` convention of
+    /// caller-tier timeouts; this one is config-tier because `send`'s
+    /// signature carries no timeout parameter).
+    pub ephemeral_response_timeout_ms: u64,
 }
 
 impl Default for EdgeConfig {
@@ -615,6 +633,10 @@ impl Default for EdgeConfig {
             // persist's baked genesis bundle, ON by default (the #380
             // promise). `false` = the pre-#281 operator-only posture.
             baked_canonical_genesis_enabled: true,
+            // Phase 2 typed ephemeral correlation — 30 s, generous
+            // enough for a Reticulum link establish + round trip;
+            // tests shorten it to pin the timeout path.
+            ephemeral_response_timeout_ms: 30_000,
         }
     }
 }
@@ -744,6 +766,15 @@ type ErasedHandlerFn = Arc<
 
 struct RegisteredHandler {
     erased: ErasedHandlerFn,
+    /// Phase 2 — `true` iff this handler's `M::Response` is a real
+    /// struct (not `()`) AND `M` rides the Ephemeral class AND `M` is
+    /// not `OpaqueRequest` (the opaque plane owns that wire type's
+    /// reply — the kind-keyed handler / 501 responder — so a typed
+    /// reply here would race it with a second envelope). When set, the
+    /// dispatcher ships the handler's serialized response back as a
+    /// correlated [`MessageType::EphemeralResponse`] instead of
+    /// discarding it (the pre-Phase-2 behavior).
+    sends_typed_reply: bool,
 }
 
 // ─── Edge ───────────────────────────────────────────────────────────
@@ -783,6 +814,17 @@ pub(crate) type OpaqueRequestHandlerFn =
 /// oneshot. Mirrors the `content_fetch_pending` correlation pattern.
 type OpaqueRequestPendingMap =
     std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<crate::messages::OpaqueResponse>>>;
+
+/// Phase 2 typed ephemeral request→response correlation map — the
+/// closure of the v0.8.0 "correlation not wired" carve-out. Keyed by
+/// the request envelope's `body_sha256` (the token the responder
+/// echoes into the reply's `in_reply_to`); resolves with the RAW
+/// response body bytes — the waiting `Edge::send::<M>` knows
+/// `M::Response` statically and deserializes, so edge holds no typed
+/// struct here. Mirrors [`OpaqueRequestPendingMap`], including the
+/// insert-before-send discipline that closes the
+/// response-beats-waiter race.
+type EphemeralResponsePendingMap = std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<Vec<u8>>>>;
 
 /// CIRISEdge#22 Tier 3 (v0.17.0) — projection of a verified envelope
 /// onto the wire surface the `subscribe_feed` AsyncIterator delivers.
@@ -1051,6 +1093,12 @@ pub struct Edge {
     /// CC 0.7 opaque request→response correlation map (CIRISEdge#241).
     /// Keyed by the request envelope `body_sha256`.
     opaque_request_pending: Arc<OpaqueRequestPendingMap>,
+    /// Phase 2 typed ephemeral request→response correlation map. Keyed
+    /// by the request envelope `body_sha256`; resolved by the
+    /// `MessageType::EphemeralResponse` dispatch arm (and, for
+    /// `send::<OpaqueRequest>`, by the `OpaqueResponse` arm's typed
+    /// fallback) with the raw response body bytes.
+    ephemeral_response_pending: Arc<EphemeralResponsePendingMap>,
     /// CIRISEdge#22 Tier 3 (v0.17.0) — broadcast channel carrying every
     /// verified inbound `EdgeEnvelope` for the `subscribe_feed`
     /// AsyncIterator surface. Construction is unconditional; emission
@@ -1784,9 +1832,14 @@ impl Edge {
                 "resolve_peer_kex_pubkeys({occurrence_key_id}): ml-kem-768 base64 decode: {e}"
             ))
         })?;
+        // CIRISEdge#481 item 4 — `PeerKexPubkeys.mlkem768_pub` is required;
+        // this construction proves presence because persist's
+        // `EncryptionPubkeys.ml_kem_768_base64` is itself a required field
+        // (a row without it doesn't deserialize) and the decode above
+        // already failed loudly on malformed bytes.
         Ok(Some(crate::transport::federation_session::PeerKexPubkeys {
             x25519_pub,
-            mlkem768_pub: Some(mlkem768_pub),
+            mlkem768_pub,
         }))
     }
 
@@ -2046,14 +2099,46 @@ impl Edge {
             })
         });
 
+        // Phase 2 — whether dispatch ships the handler's response back
+        // as a correlated `EphemeralResponse`. `()` responses stay
+        // fire-and-forget (serialized `()` is `null` — shipping it
+        // would be wire noise the sender never awaits); non-Ephemeral
+        // classes answer through the durable-ACK path instead; the
+        // OpaqueRequest wire type is answered by the opaque plane's
+        // kind-keyed responder, never by this leg.
+        let sends_typed_reply = std::any::TypeId::of::<M::Response>()
+            != std::any::TypeId::of::<()>()
+            && matches!(M::DELIVERY, Delivery::Ephemeral)
+            && M::TYPE != MessageType::OpaqueRequest;
+
         let mut handlers = self.handlers.lock().await;
-        handlers.insert(M::TYPE, RegisteredHandler { erased });
+        handlers.insert(
+            M::TYPE,
+            RegisteredHandler {
+                erased,
+                sends_typed_reply,
+            },
+        );
         Ok(())
     }
 
     /// Send an ephemeral message. Caller-owned retry — failure is
     /// visible (OQ-09 closure). Compile-time: `M::DELIVERY` must be
     /// `Ephemeral`; runtime check rejects `Durable` mis-use.
+    ///
+    /// # Request→response (Phase 2)
+    ///
+    /// - `type Response = ()` (fire-and-forget): returns `Ok(())` as
+    ///   soon as the transport reports `Delivered`.
+    /// - A real `M::Response`: registers a correlation waiter keyed on
+    ///   the request envelope's `body_sha256` BEFORE the send, then
+    ///   awaits the peer's correlated reply (a
+    ///   [`crate::MessageType::EphemeralResponse`] envelope — or an
+    ///   `OpaqueResponse` for `send::<OpaqueRequest>`) up to
+    ///   [`EdgeConfig::ephemeral_response_timeout_ms`]. Requires the
+    ///   inbound dispatch loop to be running (`Edge::run` or
+    ///   [`Self::spawn_background_listeners`]) so the reply is
+    ///   observed.
     #[tracing::instrument(
         name = "edge.send",
         skip(self, msg),
@@ -2086,19 +2171,7 @@ impl Edge {
         msg: M,
         cohort_scope: Option<CohortScope>,
     ) -> Result<M::Response, EdgeError> {
-        if !matches!(M::DELIVERY, Delivery::Ephemeral) {
-            let declared = match M::DELIVERY {
-                Delivery::Ephemeral => "Ephemeral",
-                Delivery::Durable { .. } => "Durable",
-                Delivery::Federation { .. } => "Federation",
-                Delivery::Mandatory { .. } => "Mandatory",
-            };
-            return Err(EdgeError::DeliveryClassMismatch(
-                M::TYPE,
-                declared,
-                "Ephemeral",
-            ));
-        }
+        ensure_ephemeral_class::<M>()?;
 
         // CIRISEdge#48-A (v0.19.1) — producer-side recipient
         // enforcement BEFORE building the signed envelope. Point-to-
@@ -2116,6 +2189,21 @@ impl Edge {
         }
         let transport = &self.transports[0];
         let envelope_size = envelope_bytes.len() as u64;
+
+        // Phase 2 — typed ephemeral request→response correlation (the
+        // closure of the v0.8.0 "correlation not wired" carve-out).
+        //
+        // `type Response = ()` marks fire-and-forget: transport
+        // `Delivered` IS the outcome, no waiter is registered, and the
+        // Delivered arm below returns `Ok(())` directly. A real
+        // `M::Response` registers a waiter — INSERT BEFORE SEND (see
+        // `register_ephemeral_waiter` for the race this closes).
+        let unit = unit_response::<M>();
+        let waiter = if unit.is_none() {
+            Some(self.register_ephemeral_waiter(&envelope_bytes)?)
+        } else {
+            None
+        };
 
         // CIRISEdge#29 — record the send-path attempt against the
         // tracker. Failure-class capture covers both the
@@ -2190,25 +2278,25 @@ impl Edge {
                     error = %e,
                     "transport send error",
                 );
+                // Phase 2 — the request never left; retire the waiter.
+                self.retire_ephemeral_waiter(waiter.as_ref());
                 return Err(EdgeError::Transport(e));
             }
         };
 
         match outcome {
             TransportSendOutcome::Delivered => {
-                // Phase 1 simplification: ephemeral request-response is
-                // not yet wired through a correlation channel. Lens
-                // cutover doesn't need request-response on the outbound
-                // side; the inbound side does (handlers return typed
-                // responses, edge serializes back). Returning a default
-                // response here is incorrect for real ephemeral
-                // request-response — TODO Phase 2: wire correlation
-                // via in_reply_to + body_sha256 + a oneshot map.
-                Err(EdgeError::Config(
-                    "ephemeral request-response correlation not wired (Phase 2)".into(),
-                ))
+                // Phase 2 — fire-and-forget (`type Response = ()`):
+                // transport `Delivered` IS the success outcome.
+                if let Some(u) = unit {
+                    return Ok(u);
+                }
+                let (correlation, rx) = waiter.expect("waiter registered for non-unit Response");
+                self.await_typed_ephemeral_response::<M>(correlation, rx)
+                    .await
             }
             TransportSendOutcome::Reject { class, detail } => {
+                self.retire_ephemeral_waiter(waiter.as_ref());
                 Err(EdgeError::Unreachable(format!("reject {class}: {detail}")))
             }
             // §24 NAT-traversal (#169): a store-and-forward queue is a
@@ -2216,12 +2304,111 @@ impl Edge {
             // observe a wake-up-fetch delivery, so a queued send on the
             // ephemeral path is a config error (callers wanting
             // store-and-forward use the durable path).
-            TransportSendOutcome::Queued => Err(EdgeError::Config(
-                "store-and-forward queued send is not valid on the ephemeral request-response \
-                 path (use send_durable)"
-                    .into(),
-            )),
+            TransportSendOutcome::Queued => {
+                self.retire_ephemeral_waiter(waiter.as_ref());
+                Err(EdgeError::Config(
+                    "store-and-forward queued send is not valid on the ephemeral \
+                     request-response path (use send_durable)"
+                        .into(),
+                ))
+            }
         }
+    }
+
+    /// Phase 2 — register the correlation waiter for a typed ephemeral
+    /// request. Keys the pending map on the request envelope's
+    /// `body_sha256` (the token the responder echoes into the reply's
+    /// `in_reply_to`) — and MUST run BEFORE the transport send:
+    /// otherwise a response that arrives before the waiter is in the
+    /// map is dropped on the floor and the send hangs to timeout (the
+    /// response-beats-waiter race the opaque loop already closes with
+    /// the same insert-before-send discipline).
+    fn register_ephemeral_waiter(
+        &self,
+        envelope_bytes: &[u8],
+    ) -> Result<([u8; 32], oneshot::Receiver<Vec<u8>>), EdgeError> {
+        let envelope: EdgeEnvelope = serde_json::from_slice(envelope_bytes)
+            .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
+        let correlation = envelope_body_sha256(&envelope);
+        let (tx, rx) = oneshot::channel();
+        self.ephemeral_response_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(correlation, tx);
+        Ok((correlation, rx))
+    }
+
+    /// Phase 2 — await the correlated reply the inbound dispatcher
+    /// resolves (the `MessageType::EphemeralResponse` arm, or the
+    /// `OpaqueResponse` arm's typed fallback for
+    /// `send::<OpaqueRequest>`), bounded by
+    /// [`EdgeConfig::ephemeral_response_timeout_ms`]. Every exit is
+    /// loud; the timeout exit retires the pending entry.
+    async fn await_typed_ephemeral_response<M: Message>(
+        &self,
+        correlation: [u8; 32],
+        rx: oneshot::Receiver<Vec<u8>>,
+    ) -> Result<M::Response, EdgeError> {
+        let timeout_ms = self.config.ephemeral_response_timeout_ms;
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
+            Ok(Ok(bytes)) => serde_json::from_slice::<M::Response>(&bytes).map_err(|e| {
+                EdgeError::Config(format!(
+                    "typed ephemeral response deserialize ({}): {e}",
+                    std::any::type_name::<M::Response>(),
+                ))
+            }),
+            Ok(Err(_recv)) => Err(EdgeError::Config(
+                "ephemeral response correlation channel dropped".into(),
+            )),
+            Err(_elapsed) => {
+                self.take_pending_ephemeral(&correlation);
+                Err(EdgeError::Unreachable(format!(
+                    "ephemeral request timed out awaiting typed response after {timeout_ms}ms",
+                )))
+            }
+        }
+    }
+
+    /// Phase 2 — retire an in-flight waiter on a non-success send exit
+    /// (transport error / wire reject / store-and-forward queue). Same
+    /// discipline as `send_opaque_request`'s failure arms.
+    fn retire_ephemeral_waiter(&self, waiter: Option<&([u8; 32], oneshot::Receiver<Vec<u8>>)>) {
+        if let Some((correlation, _)) = waiter {
+            self.take_pending_ephemeral(correlation);
+        }
+    }
+
+    /// Phase 2 — remove (and return) a pending typed-ephemeral waiter.
+    /// Shared by the send error/reject/timeout exits and the test seam.
+    fn take_pending_ephemeral(&self, correlation: &[u8; 32]) -> Option<oneshot::Sender<Vec<u8>>> {
+        self.ephemeral_response_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(correlation)
+    }
+
+    /// Phase 2 test seam — resolve a pending typed-ephemeral waiter
+    /// with raw response-body bytes, as the inbound dispatcher would.
+    /// Returns `true` iff a waiter was registered AND accepted the
+    /// bytes. Mirrors [`Self::complete_pending_fetch_for_test`].
+    #[doc(hidden)]
+    pub fn complete_pending_ephemeral_for_test(
+        &self,
+        correlation: [u8; 32],
+        response_body_json: Vec<u8>,
+    ) -> bool {
+        self.take_pending_ephemeral(&correlation)
+            .is_some_and(|tx| tx.send(response_body_json).is_ok())
+    }
+
+    /// Phase 2 test seam — number of in-flight typed-ephemeral waiters.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_ephemeral_len_for_test(&self) -> usize {
+        self.ephemeral_response_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Send a durable message. Edge-owned retry; the returned handle
@@ -3020,33 +3207,28 @@ impl Edge {
             pending.insert(sha256, tx);
         }
 
-        // Build + send the ContentFetch envelope. We use the typed
-        // `crate::MessageType::ContentFetch` body shape — the
-        // existing Edge::send returns `EdgeError::Config(...)` for
-        // ephemeral request/response (the v0.8.0 "Phase 2"
-        // correlation not wired carve-out), which is exactly the
-        // success-of-transport path. We map that one specific error
-        // back to Ok so the caller's await proceeds.
+        // Build + send the ContentFetch envelope. Phase 2 closed the
+        // v0.8.0 carve-out: `ContentFetch::Response = ()`, so a
+        // transport-Delivered send now returns `Ok(())` directly (no
+        // more string-matching a Config error as the success path).
+        // The response correlation deliberately STAYS on this method's
+        // sha256-keyed pending map, NOT the body_sha256/in_reply_to
+        // loop: ContentBody / ContentMiss are separate envelopes that
+        // ANY holder may answer with (two response shapes,
+        // multi-responder), which the point-to-point typed-response
+        // loop can't subsume.
         let fetch = crate::messages::ContentFetch {
             sha256,
             response_hint: None,
         };
-        match self.send(peer_key_id, fetch).await {
-            Ok(()) => {}
-            Err(EdgeError::Config(s))
-                if s.contains("ephemeral request-response correlation not wired") =>
-            {
-                // Transport accepted the bytes — proceed to await.
-            }
-            Err(e) => {
-                // Send failed — clean the pending entry and surface.
-                let mut pending = self
-                    .content_fetch_pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                pending.remove(&sha256);
-                return Err(e);
-            }
+        if let Err(e) = self.send(peer_key_id, fetch).await {
+            // Send failed — clean the pending entry and surface.
+            let mut pending = self
+                .content_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.remove(&sha256);
+            return Err(e);
         }
 
         match tokio::time::timeout(timeout, rx).await {
@@ -3144,24 +3326,18 @@ impl Edge {
             chunk_sha256,
             response_hint: None,
         };
-        match self.send(peer_key_id, fetch).await {
-            Ok(()) => {}
-            Err(EdgeError::Config(s))
-                if s.contains("ephemeral request-response correlation not wired") =>
-            {
-                // Same v0.17.0 carve-out as fetch_content — transport
-                // accepted the bytes; the correlation rides our
-                // pending-map, not the transport's request/response
-                // primitive.
-            }
-            Err(e) => {
-                let mut pending = self
-                    .blob_chunk_fetch_pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                pending.remove(&key);
-                return Err(e);
-            }
+        // Phase 2 — `BlobChunkFetch::Response = ()`, so Delivered is
+        // `Ok(())` directly (same migration as `fetch_content`; the
+        // chunk correlation rides this method's (blob, chunk)-keyed
+        // pending map because any holder may answer with either
+        // BlobChunkBody or BlobChunkMiss).
+        if let Err(e) = self.send(peer_key_id, fetch).await {
+            let mut pending = self
+                .blob_chunk_fetch_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.remove(&key);
+            return Err(e);
         }
 
         match tokio::time::timeout(timeout, rx).await {
@@ -3406,7 +3582,8 @@ impl Edge {
             &self.opaque_subscribers,
             &self.opaque_handlers,
             &self.opaque_request_pending,
-            self.transports.first(),
+            &self.ephemeral_response_pending,
+            &self.transports,
             self.config.max_content_body_bytes,
             &directory,
             Some(&self.reachability),
@@ -4081,7 +4258,10 @@ impl Edge {
         let opaque_subs = self.opaque_subscribers.clone();
         let opaque_handlers = self.opaque_handlers.clone();
         let opaque_request_pending = self.opaque_request_pending.clone();
-        let response_transport = self.transports.first().cloned();
+        let ephemeral_response_pending = self.ephemeral_response_pending.clone();
+        // The full transport set — dispatch selects the reply transport
+        // per frame (arrival affinity, first-configured fallback).
+        let reply_transports = self.transports.clone();
         let max_content_body_bytes = self.config.max_content_body_bytes;
         let reachability = self.reachability.clone();
         let detector = self.detector.clone();
@@ -4170,7 +4350,8 @@ impl Edge {
                     let opaque_subs_clone = opaque_subs.clone();
                     let opaque_handlers_clone = opaque_handlers.clone();
                     let opaque_request_pending_clone = opaque_request_pending.clone();
-                    let response_transport_clone = response_transport.clone();
+                    let ephemeral_response_pending_clone = ephemeral_response_pending.clone();
+                    let reply_transports_clone = reply_transports.clone();
                     let reach_clone = reachability.clone();
                     let directory_clone = verify_clone.directory();
                     let detector_clone = detector.clone();
@@ -4203,7 +4384,8 @@ impl Edge {
                             &opaque_subs_clone,
                             &opaque_handlers_clone,
                             &opaque_request_pending_clone,
-                            response_transport_clone.as_ref(),
+                            &ephemeral_response_pending_clone,
+                            &reply_transports_clone,
                             max_content_body_bytes,
                             &directory_clone,
                             Some(&reach_clone),
@@ -4711,6 +4893,21 @@ fn first_bytes_hex(bytes: &[u8]) -> String {
     hex::encode(&bytes[..bytes.len().min(8)])
 }
 
+/// Reply-path transport affinity — pick the transport a response
+/// should ship on: the one the request ARRIVED on when it is in the
+/// configured set, else the first configured transport (the historical
+/// `transports[0]` behavior). `None` only when no transport is
+/// configured at all.
+fn select_reply_transport(
+    transports: &[Arc<dyn Transport>],
+    arrival: crate::transport::TransportId,
+) -> Option<&Arc<dyn Transport>> {
+    transports
+        .iter()
+        .find(|t| t.id() == arrival)
+        .or_else(|| transports.first())
+}
+
 /// Inbound dispatch: verify → maybe-ACK-match → `ContentBody`
 /// AV-13/integrity gate (CIRISEdge#21 v0.8.0) → `FederationAnnouncement`
 /// `AccordCarrier` 2-of-3 multi-sig wire-layer gate (CIRISEdge#19,
@@ -4730,7 +4927,8 @@ fn first_bytes_hex(bytes: &[u8]) -> String {
         opaque_subscribers,
         opaque_handlers,
         opaque_request_pending,
-        response_transport,
+        ephemeral_response_pending,
+        transports,
         directory,
         reachability,
         detector,
@@ -4766,7 +4964,14 @@ async fn dispatch_inbound(
     // ship the OpaqueResponse back to the request sender.
     opaque_handlers: &std::sync::Mutex<HashMap<u32, OpaqueRequestHandlerFn>>,
     opaque_request_pending: &OpaqueRequestPendingMap,
-    response_transport: Option<&Arc<dyn Transport>>,
+    // Phase 2 — typed ephemeral request→response correlation map
+    // (mirrors `opaque_request_pending`; resolved with raw body bytes).
+    ephemeral_response_pending: &EphemeralResponsePendingMap,
+    // The FULL configured transport set — the reply legs (opaque
+    // responder, typed-reply leg) prefer the transport the request
+    // ARRIVED on and fall back to the first configured one, so a
+    // request arriving on transport #2 is no longer answered on #1.
+    transports: &[Arc<dyn Transport>],
     max_content_body_bytes: usize,
     directory: &Arc<dyn VerifyDirectory>,
     reachability: Option<&Arc<ReachabilityTracker>>,
@@ -4836,6 +5041,10 @@ async fn dispatch_inbound(
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
+    // Reply-path transport affinity — answer on the medium the request
+    // arrived on when it is configured; fall back to the first
+    // configured transport (the historical behavior).
+    let response_transport = select_reply_transport(transports, transport);
     // CIRISEdge#499 — the receive-side ADMISSION FACT, resolved by the transport
     // ahead of any parse (see `InboundFrame::arrival_scope`). Captured here, at
     // the top, so every serve gate below reads the same value and none of them
@@ -5731,7 +5940,15 @@ async fn dispatch_inbound(
     // outbound row; dropping" arm swallows every OpaqueResponse before
     // it reaches its correlation — breaking `send_opaque_request`'s
     // round-trip (the #240 mesh-control-plane response leg).
-    if envelope.message_type != MessageType::OpaqueResponse {
+    //
+    // Phase 2 — EXCLUDE `EphemeralResponse` for the exact same reason:
+    // its `in_reply_to` is the typed request→response correlation
+    // token, and without this guard the ACK matcher would swallow
+    // every typed reply before it reached its pending `Edge::send`.
+    if !matches!(
+        envelope.message_type,
+        MessageType::OpaqueResponse | MessageType::EphemeralResponse
+    ) {
         if let Some(in_reply_to) = envelope.in_reply_to {
             match queue.match_ack_to_outbound(&in_reply_to).await {
                 Ok(Some(row)) => {
@@ -5921,10 +6138,28 @@ async fn dispatch_inbound(
                     if let Some(tx) = tx {
                         let _ = tx.send(resp);
                     } else {
-                        tracing::debug!(
-                            transport = ?transport,
-                            "OpaqueResponse with no matching pending request (late/duplicate)",
-                        );
+                        // Phase 2 fallback — a typed
+                        // `Edge::send::<OpaqueRequest>` registers in
+                        // the TYPED pending map, not the opaque one,
+                        // but the responder still answers with an
+                        // `OpaqueResponse` envelope (it cannot know
+                        // which surface dialed). Resolve the typed
+                        // waiter with the raw body bytes; the waiter
+                        // deserializes to `OpaqueRequest::Response`.
+                        let typed_tx = {
+                            let mut pending = ephemeral_response_pending
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            pending.remove(&correlation)
+                        };
+                        if let Some(typed_tx) = typed_tx {
+                            let _ = typed_tx.send(envelope.body.get().as_bytes().to_vec());
+                        } else {
+                            tracing::debug!(
+                                transport = ?transport,
+                                "OpaqueResponse with no matching pending request (late/duplicate)",
+                            );
+                        }
                     }
                 } else {
                     tracing::warn!(
@@ -5940,6 +6175,42 @@ async fn dispatch_inbound(
                     "OpaqueResponse body parse failed at dispatch",
                 );
             }
+        }
+    }
+
+    // Phase 2 — `EphemeralResponse` → correlate back to the pending
+    // typed `Edge::send::<M>` via the envelope `in_reply_to` (the
+    // request's body_sha256). Mirrors the OpaqueResponse arm above;
+    // resolves with the RAW body bytes because the waiter knows
+    // `M::Response` statically and deserializes on its side — edge
+    // holds no typed struct for the payload (MISSION §1.3). Every
+    // non-resolving case is logged: a missing token is a protocol
+    // fault (warn), a missing waiter is late/duplicate/timed-out
+    // traffic (debug).
+    if envelope.message_type == MessageType::EphemeralResponse {
+        if let Some(correlation) = envelope.in_reply_to {
+            let tx = {
+                let mut pending = ephemeral_response_pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.remove(&correlation)
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(envelope.body.get().as_bytes().to_vec());
+            } else {
+                tracing::debug!(
+                    transport = ?transport,
+                    sender_key_id = %envelope.signing_key_id,
+                    "EphemeralResponse with no matching pending request \
+                     (late / duplicate / already timed out)",
+                );
+            }
+        } else {
+            tracing::warn!(
+                transport = ?transport,
+                sender_key_id = %envelope.signing_key_id,
+                "EphemeralResponse missing in_reply_to correlation token",
+            );
         }
     }
 
@@ -6143,22 +6414,52 @@ async fn dispatch_inbound(
         }
     }
 
+    // CIRISEdge#21 `prefer_chunked` — the hint is ADVISORY AND
+    // CURRENTLY IGNORED (edge-core ships no chunked ContentFetch
+    // responder; chunked transfer rides the BlobChunk* swarm plane).
+    // Log at debug when a requester sets it so the ignored preference
+    // is observable rather than silently dead.
+    if envelope.message_type == MessageType::ContentFetch {
+        if let Ok(fetch) =
+            serde_json::from_str::<crate::messages::ContentFetch>(envelope.body.get())
+        {
+            if fetch
+                .response_hint
+                .as_ref()
+                .is_some_and(|h| h.prefer_chunked)
+            {
+                tracing::debug!(
+                    sender_key_id = %envelope.signing_key_id,
+                    sha256 = %hex::encode(&fetch.sha256[..8]),
+                    "ContentFetch prefer_chunked hint set — advisory and ignored: \
+                     responders always answer whole-file ContentBody (chunked \
+                     transfer rides the BlobChunkFetch/BlobChunkBody plane)",
+                );
+            }
+        }
+    }
+
     // Application handler dispatch.
     let registered = {
         let handlers = handlers.lock().await;
         handlers
             .get(&envelope.message_type)
-            .map(|h| h.erased.clone())
+            .map(|h| (h.erased.clone(), h.sends_typed_reply))
     };
-    let Some(erased) = registered else {
+    let Some((erased, sends_typed_reply)) = registered else {
         // The CC 0.7 opaque wire types are dispatched above (subscriber
         // fan-out for OpaqueEvent, kind-keyed handler + 501 for
-        // OpaqueRequest, correlation for OpaqueResponse) — a missing
-        // typed `Handler<M>` entry for them is expected, not an error.
-        // Suppress the `no handler registered` warning for those.
+        // OpaqueRequest, correlation for OpaqueResponse), and the
+        // Phase-2 EphemeralResponse is consumed by its correlation arm
+        // — a missing typed `Handler<M>` entry for them is expected,
+        // not an error. Suppress the `no handler registered` warning
+        // for those.
         if !matches!(
             envelope.message_type,
-            MessageType::OpaqueEvent | MessageType::OpaqueRequest | MessageType::OpaqueResponse
+            MessageType::OpaqueEvent
+                | MessageType::OpaqueRequest
+                | MessageType::OpaqueResponse
+                | MessageType::EphemeralResponse
         ) {
             tracing::warn!(
                 message_type = ?envelope.message_type,
@@ -6177,13 +6478,32 @@ async fn dispatch_inbound(
     };
 
     match (erased)(&envelope, ctx).await {
-        Ok(_response_bytes) => {
-            // Phase 1: response bytes are computed but not wired back
-            // through the transport's response channel. Lens cutover
-            // doesn't need outbound responses (lens always receives,
-            // never replies). When Phase 2 wires register_handler
-            // responses through the transport, this is where the
-            // response envelope assembles + signs + ships back.
+        Ok(response_bytes) => {
+            // Phase 2 — a typed `Handler<M>` whose `M::Response` is a
+            // real struct (and `M` rides the Ephemeral class) answers
+            // the sender through a correlated `EphemeralResponse`
+            // envelope, mirroring the OpaqueResponse responder leg.
+            // `()` responses stay fire-and-forget: no reply envelope
+            // (serialized `()` is `null`, and the sender never awaits
+            // one).
+            if sends_typed_reply {
+                if let Some(reply_transport) = response_transport {
+                    ship_typed_ephemeral_reply(
+                        reply_transport,
+                        signer,
+                        &envelope.signing_key_id,
+                        body_sha256,
+                        response_bytes,
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(
+                        message_type = ?envelope.message_type,
+                        "typed handler produced a response but no transport is \
+                         configured to ship it back",
+                    );
+                }
+            }
         }
         Err(e) => {
             tracing::error!(
@@ -6191,6 +6511,71 @@ async fn dispatch_inbound(
                 error = %e,
                 "handler error",
             );
+        }
+    }
+}
+
+/// Phase 2 — build + sign + ship the correlated
+/// [`MessageType::EphemeralResponse`] envelope carrying a typed
+/// handler's serialized `M::Response` back to the requester. Mirrors
+/// the OpaqueResponse responder leg at the OpaqueRequest dispatch arm;
+/// every failure path is loud (no silent drops, MISSION §6
+/// anti-pattern 7).
+async fn ship_typed_ephemeral_reply(
+    transport: &Arc<dyn Transport>,
+    signer: &Arc<LocalSigner>,
+    requester_key_id: &str,
+    request_body_sha256: [u8; 32],
+    response_bytes: Vec<u8>,
+) {
+    // The erased handler serialized `M::Response` with serde_json, so
+    // the bytes are UTF-8 JSON; wrap them as a RawValue body without
+    // re-interpreting (edge holds no typed struct for the payload).
+    let body_json = match String::from_utf8(response_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "typed reply: response bytes are not UTF-8 JSON");
+            return;
+        }
+    };
+    let raw = match serde_json::value::RawValue::from_string(body_json) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "typed reply: response bytes are not valid JSON");
+            return;
+        }
+    };
+    match build_envelope(
+        MessageType::EphemeralResponse,
+        &signer.key_id,
+        requester_key_id,
+        &raw,
+        Some(request_body_sha256),
+    ) {
+        Ok(mut resp_env) => {
+            if let Err(e) = sign_envelope(signer, &mut resp_env).await {
+                tracing::warn!(error = %e, "typed reply: EphemeralResponse sign failed");
+            } else {
+                match serde_json::to_vec(&resp_env) {
+                    Ok(bytes) => {
+                        if let Err(e) = transport.send(requester_key_id, &bytes).await {
+                            tracing::warn!(
+                                error = %e,
+                                "typed reply: EphemeralResponse transport send failed",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "typed reply: EphemeralResponse serialize failed",
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "typed reply: EphemeralResponse envelope build failed");
         }
     }
 }
@@ -6726,6 +7111,7 @@ impl EdgeBuilder {
             opaque_next_id: Arc::new(AtomicU64::new(1)),
             opaque_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             opaque_request_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ephemeral_response_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             verified_envelope_tx,
             content_fetch_pending,
             blob_chunk_fetch_pending,
@@ -6906,6 +7292,41 @@ fn transport_error_class(e: &TransportError) -> &'static str {
         // addressing/rooting fault the belt heals on the next verified announce.
         TransportError::NoRouteToPeer { .. } => "no_route_to_peer",
     }
+}
+
+/// Compile-time-declared delivery-class gate for `Edge::send` — the
+/// runtime check rejecting a non-`Ephemeral` `Message` on the
+/// ephemeral entry point with a typed
+/// [`EdgeError::DeliveryClassMismatch`].
+fn ensure_ephemeral_class<M: Message>() -> Result<(), EdgeError> {
+    if matches!(M::DELIVERY, Delivery::Ephemeral) {
+        return Ok(());
+    }
+    let declared = match M::DELIVERY {
+        Delivery::Ephemeral => "Ephemeral",
+        Delivery::Durable { .. } => "Durable",
+        Delivery::Federation { .. } => "Federation",
+        Delivery::Mandatory { .. } => "Mandatory",
+    };
+    Err(EdgeError::DeliveryClassMismatch(
+        M::TYPE,
+        declared,
+        "Ephemeral",
+    ))
+}
+
+/// Phase 2 — `()`-response detection for the typed ephemeral send.
+///
+/// Rust lacks stable specialization, so the mechanism is a `TypeId`
+/// check through `Any::downcast` (`M::Response: 'static` is already a
+/// [`Message`] trait bound): zero-touch on the ~30 existing `Message`
+/// impls, no new trait item, and the compiler folds it to a constant
+/// comparison. Returns `Some(resp)` iff `M::Response` IS `()` — the
+/// fire-and-forget marker — so the caller can return it directly on
+/// transport `Delivered` without registering a correlation waiter.
+fn unit_response<M: Message>() -> Option<M::Response> {
+    let unit: Box<dyn std::any::Any> = Box::new(());
+    unit.downcast::<M::Response>().ok().map(|b| *b)
 }
 
 fn message_type_str(mt: &MessageType) -> String {
@@ -8486,7 +8907,7 @@ mod inbound_ingest_tests {
     }
 
     proptest! {
-        /// CIRISEdge#402 — the carve-out decision, EXHAUSTIVELY over ALL 14 kinds
+        /// CIRISEdge#402 — the carve-out decision, EXHAUSTIVELY over ALL 15 kinds
         /// × link presence × arbitrary link ids. The security invariant, stated
         /// as one equation: a routing source is produced IFF the frame's kind is
         /// a self-authenticating bootstrap kind (`is_bootstrap`) AND the link
@@ -8650,6 +9071,236 @@ mod inbound_ingest_tests {
         assert!(
             std::sync::Arc::ptr_eq(&cell.get().expect("still installed"), &second),
             "same-object re-install is a no-op"
+        );
+    }
+}
+
+/// Phase 2 — the typed ephemeral request→response correlation loop
+/// (the closure of the v0.8.0 "correlation not wired" carve-out).
+/// Field-provenance discipline: these drive the REAL `Edge::send`
+/// entry point over a real builder (keyring seed + sqlite directory),
+/// with only the transport mocked — the exact seam production varies.
+#[cfg(test)]
+mod ephemeral_correlation_tests {
+    use super::*;
+    use crate::transport::NullTransport;
+
+    async fn build_edge(
+        key_id: &str,
+        transport: Arc<dyn Transport>,
+        timeout_ms: u64,
+    ) -> (Arc<Edge>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seeds = tmp.path().join("seeds");
+        std::fs::create_dir_all(&seeds).expect("seed dir");
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = u8::try_from(i).expect("in range") ^ 0xa5;
+        }
+        std::fs::write(seeds.join("ed25519.seed"), seed).expect("write seed");
+        let edge =
+            EdgeBuilder::from_keyring_seed_dir(key_id, seeds, tmp.path().join("edge.sqlite"))
+                .await
+                .expect("builder")
+                .transport(transport)
+                .config(EdgeConfig {
+                    ephemeral_response_timeout_ms: timeout_ms,
+                    cohort_scope_enforcement: CohortScopeEnforcement::Off,
+                    ..EdgeConfig::default()
+                })
+                .build()
+                .expect("build edge");
+        (Arc::new(edge), tmp)
+    }
+
+    /// The `()`-response mechanism itself: `unit_response` detects
+    /// exactly the fire-and-forget marker, never a real response type.
+    #[test]
+    fn unit_response_detects_only_unit() {
+        assert!(
+            unit_response::<crate::messages::ContentFetch>().is_some(),
+            "ContentFetch declares Response = ()",
+        );
+        assert!(
+            unit_response::<crate::messages::OpaqueRequest>().is_none(),
+            "OpaqueRequest declares Response = OpaqueResponse",
+        );
+    }
+
+    /// THE bug this wave fixes: a `type Response = ()` send returned
+    /// `Err(Config("…not wired…"))` ON THE SUCCESS PATH, after the
+    /// bytes were signed, shipped, and counted. Delivered → `Ok(())`.
+    #[tokio::test]
+    async fn unit_response_send_returns_ok_on_delivered() {
+        let (edge, _tmp) = build_edge("edge-unit-send", Arc::new(NullTransport), 30_000).await;
+        let fetch = crate::messages::ContentFetch {
+            sha256: [7u8; 32],
+            response_hint: None,
+        };
+        edge.send("peer-x", fetch).await.expect(
+            "type Response = () must return Ok(()) on transport Delivered — \
+             the Phase-1 'correlation not wired' Config error is gone",
+        );
+        assert_eq!(
+            edge.pending_ephemeral_len_for_test(),
+            0,
+            "fire-and-forget registers no correlation waiter",
+        );
+    }
+
+    /// A transport whose `send` resolves the correlated response
+    /// BEFORE returning `Delivered`. Pins insert-before-send: were the
+    /// waiter registered after the send, the response would find no
+    /// entry and the call would hang to timeout (the
+    /// response-beats-waiter race).
+    struct RespondBeforeReturn {
+        edge: Arc<std::sync::OnceLock<Arc<Edge>>>,
+        resolved_while_in_send: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for RespondBeforeReturn {
+        fn id(&self) -> crate::transport::TransportId {
+            crate::transport::TransportId("race-mock")
+        }
+        async fn send(
+            &self,
+            _destination_key_id: &str,
+            envelope_bytes: &[u8],
+        ) -> Result<TransportSendOutcome, crate::TransportError> {
+            let envelope: EdgeEnvelope =
+                serde_json::from_slice(envelope_bytes).expect("parse own request envelope");
+            let correlation = envelope_body_sha256(&envelope);
+            let edge = self.edge.get().expect("edge installed").clone();
+            let response = crate::messages::OpaqueResponse {
+                kind: 9,
+                status: 200,
+                payload: b"pong".to_vec(),
+            };
+            let resolved = edge.complete_pending_ephemeral_for_test(
+                correlation,
+                serde_json::to_vec(&response).expect("serialize response"),
+            );
+            self.resolved_while_in_send
+                .store(resolved, std::sync::atomic::Ordering::SeqCst);
+            Ok(TransportSendOutcome::Delivered)
+        }
+        async fn listen(
+            &self,
+            _sink: mpsc::Sender<InboundFrame>,
+        ) -> Result<(), crate::TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn response_beating_send_return_is_not_lost() {
+        let edge_cell: Arc<std::sync::OnceLock<Arc<Edge>>> = Arc::new(std::sync::OnceLock::new());
+        let resolved_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport = Arc::new(RespondBeforeReturn {
+            edge: edge_cell.clone(),
+            resolved_while_in_send: resolved_flag.clone(),
+        });
+        // 2 s timeout: a regression (insert-after-send) fails FAST as a
+        // timeout instead of stalling the suite for the default 30 s.
+        let (edge, _tmp) = build_edge("edge-race-send", transport, 2_000).await;
+        edge_cell.set(edge.clone()).ok().expect("install edge once");
+
+        let resp = edge
+            .send(
+                "peer-x",
+                crate::messages::OpaqueRequest {
+                    kind: 9,
+                    payload: b"ping".to_vec(),
+                },
+            )
+            .await
+            .expect("response resolved during transport.send must still be returned");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.payload, b"pong".to_vec());
+        assert!(
+            resolved_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the waiter must already be registered when transport.send runs \
+             (insert-before-send)",
+        );
+        assert_eq!(edge.pending_ephemeral_len_for_test(), 0, "waiter consumed");
+    }
+
+    /// No responder → the awaited reply times out, surfaces as
+    /// `Unreachable`, and the pending entry is retired (no leak).
+    #[tokio::test]
+    async fn typed_send_timeout_removes_pending_waiter() {
+        let (edge, _tmp) = build_edge("edge-timeout-send", Arc::new(NullTransport), 100).await;
+        let err = edge
+            .send(
+                "peer-x",
+                crate::messages::OpaqueRequest {
+                    kind: 3,
+                    payload: b"never answered".to_vec(),
+                },
+            )
+            .await
+            .expect_err("no responder → timeout");
+        assert!(
+            matches!(err, EdgeError::Unreachable(_)),
+            "timeout surfaces as Unreachable, got {err:?}",
+        );
+        assert_eq!(
+            edge.pending_ephemeral_len_for_test(),
+            0,
+            "the timeout exit must retire the pending waiter",
+        );
+    }
+
+    /// Reply-path transport affinity: the reply ships on the medium
+    /// the request arrived on; an unknown arrival falls back to the
+    /// first configured transport; no transports → None.
+    struct IdOnly(crate::transport::TransportId);
+
+    #[async_trait::async_trait]
+    impl Transport for IdOnly {
+        fn id(&self) -> crate::transport::TransportId {
+            self.0
+        }
+        async fn send(
+            &self,
+            _d: &str,
+            _b: &[u8],
+        ) -> Result<TransportSendOutcome, crate::TransportError> {
+            Ok(TransportSendOutcome::Delivered)
+        }
+        async fn listen(
+            &self,
+            _s: mpsc::Sender<InboundFrame>,
+        ) -> Result<(), crate::TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reply_transport_prefers_arrival_medium() {
+        use crate::transport::TransportId;
+        let transports: Vec<Arc<dyn Transport>> = vec![
+            Arc::new(IdOnly(TransportId("medium-a"))),
+            Arc::new(IdOnly(TransportId("medium-b"))),
+        ];
+        let picked = select_reply_transport(&transports, TransportId("medium-b"))
+            .expect("configured set is non-empty");
+        assert_eq!(
+            picked.id(),
+            TransportId("medium-b"),
+            "a request arriving on medium-b is answered on medium-b, not transports[0]",
+        );
+        let fallback = select_reply_transport(&transports, TransportId("medium-zzz"))
+            .expect("configured set is non-empty");
+        assert_eq!(
+            fallback.id(),
+            TransportId("medium-a"),
+            "unknown arrival medium falls back to the first configured transport",
+        );
+        assert!(
+            select_reply_transport(&[], TransportId("medium-a")).is_none(),
+            "no transports configured → nothing to reply on",
         );
     }
 }
