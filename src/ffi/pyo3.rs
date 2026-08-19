@@ -2517,32 +2517,69 @@ impl PyEdge {
     }
 }
 
-/// Parse a wire-stable kind string into [`crate::replication::EnvelopeKind`].
-/// The token set is the 10 `#[serde(rename_all = "snake_case")]`
-/// variants per FSD §3.3.
+/// The comma-separated valid-token list for [`parse_envelope_kind`]'s error
+/// message — GENERATED from `EnvelopeKind::ALL`, so it names every accepted
+/// token (all 15) and can never go stale against the enum. (The hand-written
+/// predecessor listed 10 of 15 and omitted `accord_quorum_evidence` even
+/// after the parser accepted it.)
+fn envelope_kind_wire_tokens() -> String {
+    crate::replication::EnvelopeKind::ALL
+        .map(crate::replication::EnvelopeKind::as_wire_str)
+        .join(", ")
+}
+
+/// Parse a wire-stable kind string into [`crate::replication::EnvelopeKind`]
+/// — the exact inverse of `EnvelopeKind::as_wire_str`, TOTAL over
+/// `EnvelopeKind::ALL` by construction: the accepted set is derived from the
+/// enum (never a hand-copied match, which shipped accepting 11 of 15 kinds —
+/// the operator surface silently could not open the organization /
+/// org_membership / partner_record / transport_destination planes), and the
+/// error string is generated from the same source
+/// ([`envelope_kind_wire_tokens`]). A new variant is parseable the moment it
+/// joins `ALL`.
 fn parse_envelope_kind(s: &str) -> PyResult<crate::replication::EnvelopeKind> {
+    crate::replication::EnvelopeKind::ALL
+        .into_iter()
+        .find(|k| k.as_wire_str() == s)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown EnvelopeKind: {s:?} (valid: {})",
+                envelope_kind_wire_tokens()
+            ))
+        })
+}
+
+#[cfg(test)]
+mod parse_envelope_kind_tests {
+    use super::{envelope_kind_wire_tokens, parse_envelope_kind};
     use crate::replication::EnvelopeKind;
-    match s {
-        "key" => Ok(EnvelopeKind::Key),
-        "attestation" => Ok(EnvelopeKind::Attestation),
-        "revocation" => Ok(EnvelopeKind::Revocation),
-        "identity_occurrence" => Ok(EnvelopeKind::IdentityOccurrence),
-        "family" => Ok(EnvelopeKind::Family),
-        "community" => Ok(EnvelopeKind::Community),
-        "identity_occurrence_revocation" => Ok(EnvelopeKind::IdentityOccurrenceRevocation),
-        "family_membership_revocation" => Ok(EnvelopeKind::FamilyMembershipRevocation),
-        "community_membership_revocation" => Ok(EnvelopeKind::CommunityMembershipRevocation),
-        "location_proof" => Ok(EnvelopeKind::LocationProof),
-        // CIRISEdge#474 — activation surface for the accord-quorum-evidence cursor
-        // plane: without this an operator cannot register a
-        // `(peer, accord_quorum_evidence)` Initiator, so the plane never opens.
-        "accord_quorum_evidence" => Ok(EnvelopeKind::AccordQuorumEvidence),
-        other => Err(PyValueError::new_err(format!(
-            "unknown EnvelopeKind: {other:?} (valid: key, attestation, revocation, \
-             identity_occurrence, family, community, \
-             identity_occurrence_revocation, family_membership_revocation, \
-             community_membership_revocation, location_proof)"
-        ))),
+
+    /// `parse_envelope_kind` round-trips EVERY wire kind (`parse(as_wire_str(k))
+    /// == k` over `ALL` — a new variant is covered the moment it exists), and
+    /// the error's valid-token list names all 15 (generated, not hand-kept).
+    #[test]
+    fn parse_envelope_kind_round_trips_every_wire_kind() {
+        for kind in EnvelopeKind::ALL {
+            let parsed = parse_envelope_kind(kind.as_wire_str())
+                .unwrap_or_else(|_| panic!("{kind:?}: every ALL token must parse"));
+            assert_eq!(parsed, kind, "{kind:?}: parse must invert as_wire_str");
+        }
+        assert!(
+            parse_envelope_kind("hostile_takeover").is_err(),
+            "unknown tokens refuse"
+        );
+        let tokens = envelope_kind_wire_tokens();
+        for kind in EnvelopeKind::ALL {
+            assert!(
+                tokens.contains(kind.as_wire_str()),
+                "the error's valid list must name {kind:?}"
+            );
+        }
+        assert_eq!(
+            tokens.matches(", ").count(),
+            EnvelopeKind::ALL.len() - 1,
+            "exactly one token per kind"
+        );
     }
 }
 

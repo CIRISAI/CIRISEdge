@@ -338,12 +338,11 @@ impl ReplicationCoordinator {
                 refused,
                 staleness,
             }),
-            ReplicationOutcome::RoundComplete { kind } => DriveStep::Complete(RoundReport {
-                kind,
-                admitted: 0,
-                refused: 0,
-                staleness: StalenessSignal::Unknown,
-            }),
+            // (An unproduced `RoundComplete` variant used to be mapped here to a
+            // Complete report with `staleness: Unknown` — dead code that would
+            // have DISGUISED unknown staleness as a cleanly completed round had
+            // anything ever produced it. Deleted; `Applied` and
+            // `SendAndComplete` are the only completion outcomes.)
             ReplicationOutcome::UnexpectedMessage => DriveStep::Refused,
         }
     }
