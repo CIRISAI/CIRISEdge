@@ -1,0 +1,12 @@
+# bench-mesh builds use the repo root as build context (compose.yaml:
+# `context: ..`). Without this file the context is the WHOLE repo —
+# observed 9.5 GB and ~7 minutes of "transferring context" PER SERVICE
+# once target/ regrows, and a week of that ballooned the BuildKit state
+# volume to 174 GB. The image build needs sources and manifests only.
+target/
+.git/
+.claude/
+bench-mesh/results/
+docs/
+evidence/
+*.log
