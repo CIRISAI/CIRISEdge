@@ -33,6 +33,45 @@ information flows only to authorized parties, and the impossibility floor
 | Announce policy | RNS announces propagate normally | **Normative prohibition** (CC 5.4.6 `announce-suppress`): a group-scoped destination never announces — *including directed announces* (multi-hop path learning is outsider observation; path state is what a subpoena reaches) |
 | Edge machinery | `src/transport/reticulum.rs` attribution gate, rooting, announce install; the federation directory via `ciris-persist` | `ScopeAddressTable` + arrival-scope admission (`src/transport/reticulum.rs`), A/V half in `src/av_addressing.rs` + `src/scope_lifecycle.rs`; the derivation itself is owned by `ciris-verify` (one derivation, no second expectation) |
 
+### 1.1 Has anyone proposed this? (the composite prior-art record)
+
+The composite — "just enough light to work, the rest private," with the light
+plane an *accountable identity directory* and the dark plane *derived* from
+it — appears unproposed. Every fragment has a nameable nearest ancestor, and
+naming them is the claim's strength (the same discipline as the
+CIRISConstitution#91 anonymity-corner survey):
+
+- **The minimal-light pattern**: Alpenhorn (OSDI '16) — public keyservers +
+  metadata-free private dialing — is the closest spirit-ancestor, but dyadic
+  (no groups, no management) and centralized-server-based. Freenet/Hyphanet
+  literally ships "opennet"/"darknet" *modes*, but as alternative connection
+  strategies for one plane, its darknet paying the out-of-band bootstrap this
+  design's derivation dissolves. Tor's public consensus + v3 onion services
+  is the pattern in infrastructure form, but onion services still *emit*
+  (blinded descriptors retained in public HSDirs) — CC 5.4.6's
+  "nearest admissible relaxation," not an instance.
+- **Machine-enforceable constitutions**: the 2025–26 agent-economy cluster
+  (AgentCity's protocol-level separation of powers; AgentBound's signed
+  constitutional policy artifacts + governance receipts) — governance stacks
+  over smart-contract substrates; no privacy theory, no groups, no wire.
+- **Contextual integrity operationalized**: Barth et al. (2006) formalized CI
+  in logic for *analysis*; MCIP (EMNLP 2025) borrows the name for MCP
+  tool-safety guardrails; the Dignity-Centric Stack (2026) names CI as one
+  pillar of a commons-governed federated *architecture* — the closest
+  ideological neighbor, but not a protocol carrying CI's five parameters as
+  signed wire fields.
+- **"Cannot express breaking" as mechanism**: the DIFC lineage
+  (Myers/Liskov → HiStar/Fabric) and object-capability systems
+  (Willow/Meadowcap, Spritely OCapN) — unforgeable *access*, but not
+  flow-appropriateness, and their namespaces are visible to sync peers.
+
+What no surveyed system combines: an attested, constitutionally governed
+identity plane (prior light planes are infrastructure metadata — relay
+lists, keyservers — never accountable identity); a group plane derived by
+pure function from it (zero-emission, vs. blinded-retained-state); CI as the
+wire grammar; the relay floor satisfied by members; and an acceptance
+harness that *measures* the privacy claims and fails when a leg doesn't run.
+
 The hybrid is the point: past systems chose one plane. The identity plane
 gives manageability its root of trust; the group plane gives groups their
 invisibility. Each buys back one of the corner's two historical prices:
