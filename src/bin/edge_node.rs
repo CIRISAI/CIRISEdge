@@ -3214,6 +3214,11 @@ fn main() -> std::process::ExitCode {
                 "peers_in_roster": occ.roster.len(),
                 "transport_dest_hash": hex::encode(occ.transport.local_dest_hash()),
                 "interfaces": occ.transport.interface_specs().len(),
+                // Intent only: the transport's own INFO wiring-decision
+                // log is the authority on the effective (config-wins,
+                // clamped) value. `null` when the env var is unset.
+                "control_channel_capacity_env":
+                    std::env::var("CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY").ok(),
             }),
         );
 

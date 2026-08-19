@@ -14,7 +14,12 @@
 #
 # Honesty: this script NEVER reports a result it did not read out of the
 # results volume, and it exits non-zero if any node exited non-zero or if
-# any leg reports `ran: false`. A leg that did not run is a failed run.
+# any node breaks its ROLE CONTRACT (census.py): every leg expected of a
+# node's role must run AND pass; a not_run outside the contract is the
+# leg's own documentation of why it did not apply (the deliberate late
+# joiner can never satisfy the two across-the-advance legs); a leg that
+# ran and failed is never excusable. `./run.sh --census-only <file>`
+# re-runs just the census on an existing JSONL, without docker.
 
 set -euo pipefail
 
@@ -26,6 +31,7 @@ SWEEP=0
 CLEAN=0
 FRAMES="${MESH_FRAMES:-120}"
 NO_BUILD=0
+CENSUS_ONLY=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,10 +41,18 @@ while [[ $# -gt 0 ]]; do
     --sweep)  SWEEP=1;     shift ;;
     --clean)  CLEAN=1;     shift ;;
     --no-build) NO_BUILD=1; shift ;;
+    --census-only) CENSUS_ONLY="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+# Census-only: hold an existing JSONL to the role contracts, no docker,
+# no lock. The late joiner is inferred from the publisher's
+# scope.rotation detail; the full-run path below passes it explicitly.
+if [[ -n "$CENSUS_ONLY" ]]; then
+  exec python3 census.py "$CENSUS_ONLY" 0
+fi
 
 # A killed build leaves an orphaned buildx process holding the
 # `sharing=locked` target-cache mount, after which every later build
@@ -192,35 +206,15 @@ run_point() {
     return 1
   fi
 
-  python3 - "$out" "$rc" <<'PY'
-import collections, json, sys
-path, rc = sys.argv[1], int(sys.argv[2])
-legs = [json.loads(l) for l in open(path) if l.strip().startswith('{')]
-
-# A (node, leg) pair may appear at most once. More than one means the
-# results volume survived a previous run and this file is several runs
-# merged — every number in it would be ambiguous, so refuse it outright
-# rather than average over a mixture.
-dupes = [k for k, n in collections.Counter(
-    (l["node"], l["leg"]) for l in legs).items() if n > 1]
-if dupes:
-    print(f"  CONTAMINATED: {len(dupes)} (node, leg) pairs appear more than once — "
-          f"this file merges multiple runs and none of its numbers can be trusted.")
-    for d in dupes[:8]:
-        print(f"    duplicated: {d[0]}/{d[1]}")
-    sys.exit(1)
-
-not_run = [l for l in legs if not l.get("ran")]
-failed  = [l for l in legs if l.get("ran") and l.get("ok") is not True]
-print(f"  legs recorded: {len(legs)}  |  did not run: {len(not_run)}  |  failed: {len(failed)}")
-for l in not_run:
-    print(f"  DID NOT RUN  {l['node']}/{l['leg']}: {l.get('not_run_reason')}")
-for l in failed:
-    print(f"  FAILED       {l['node']}/{l['leg']}: {json.dumps(l.get('detail'))[:300]}")
-if not legs:
-    print("  NO LEGS — nothing was measured."); sys.exit(1)
-sys.exit(0 if (rc == 0 and not not_run and not failed) else 1)
-PY
+  # The role-contract census (census.py): every leg EXPECTED of a node's
+  # role must be present, ran, and ok; a not_run outside the contract is
+  # allowed documentation; a leg that ran and failed is never excusable;
+  # duplicate (node, leg) rows still refuse the whole file. run.sh is the
+  # authority on the topology, so it names the late joiner and the full
+  # node roster explicitly rather than letting the census infer them.
+  python3 census.py "$out" "$rc" \
+    --late-joiner "$MESH_LATE_JOINER" \
+    --expect "$MESH_EXPECT"
 }
 
 overall=0
