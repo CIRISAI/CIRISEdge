@@ -71,10 +71,12 @@ use tokio::sync::mpsc;
 
 use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
 
-/// Maximum body size accepted on the inbound HTTP route. Mirrors
-/// AV-13 (`MAX_BODY_BYTES = 8 MiB`) at the extractor layer so
-/// oversized payloads reject before allocation.
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+// Maximum body size accepted on the inbound HTTP route (AV-13, 8 MiB),
+// enforced at the extractor layer so oversized payloads reject before
+// allocation. IMPORTED from the single transport-wide authority in
+// `frame_fragment` — not re-typed — so the HTTP admissibility ceiling
+// can never drift from the reassembly budget (one-authority body budget).
+use super::frame_fragment::MAX_BODY_BYTES;
 
 // ─── Legacy plain-HTTP config (pre-CIRISEdge#23) ────────────────────
 //

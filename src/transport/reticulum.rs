@@ -104,10 +104,12 @@ use crate::verify::{
     HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
 };
 
-/// Maximum envelope body size accepted on send. Mirrors AV-13
-/// (`MAX_BODY_BYTES = 8 MiB`); oversized payloads reject before any
-/// link is established.
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+// Maximum envelope body size accepted on send (AV-13, 8 MiB); oversized
+// payloads reject before any link is established. IMPORTED from the
+// single transport-wide authority in `frame_fragment` — not re-typed —
+// so the send-side admissibility ceiling can never drift from the
+// receive-side reassembly budget (one-authority body budget).
+use super::frame_fragment::MAX_BODY_BYTES;
 
 /// Reticulum app-name for edge's federation destination. The full
 /// destination name is `app_name` + aspects; both halves of a peering
@@ -214,7 +216,12 @@ fn effective_link_keepalive_secs(configured: Option<Duration>) -> Option<u64> {
 /// as sized for "small std platforms … servers override larger via config or
 /// builder" (leviculum-std `config.rs`), but until this knob existed edge
 /// exposed no way to take that advice — the canonical wedged with the default.
-const CONTROL_CHANNEL_CAPACITY_ENV: &str = "CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY";
+///
+/// `pub` so binaries / harnesses (e.g. `bin/edge_node.rs`) that set or
+/// document the variable reference THIS const instead of re-typing the
+/// env-var name literal (a typo'd retype silently reverts the node to
+/// leviculum's 256 default).
+pub const CONTROL_CHANNEL_CAPACITY_ENV: &str = "CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY";
 
 /// Lower clamp for [`effective_control_channel_capacity`]. Below leviculum's
 /// own 256 default is already a foot-gun; 16 exists only so a deliberate
@@ -1576,15 +1583,21 @@ pub struct RNodeInterfaceConfig {
     pub airtime_limit_long_pct: Option<f64>,
 }
 
-/// `I2PInterface` configuration — Phase 3 anonymous overlay; gate
-/// exists but runtime support deferred. Empty config for now; the
-/// shape lands when the implementation does.
+/// `I2PInterface` configuration — Phase 3 anonymous overlay; the gate
+/// compiles the TYPED CONFIG SURFACE ONLY. The runtime path is not
+/// implemented: no SAM session is ever established. This is fail-loud,
+/// NOT a silent no-op — supplying an I²P interface to the transport
+/// refuses at construction with a typed `TransportError::Config`
+/// naming the unimplemented state (see `apply_interface_config`'s
+/// `I2p` arm), so a deployment cannot believe it is riding I²P cover
+/// traffic when it is not.
 #[cfg(feature = "transport-reticulum-i2p")]
 #[derive(Debug, Clone, Default)]
 pub struct I2pInterfaceConfig {
-    /// Reserved for the I²P SAM bridge address; v0.12.0 ignored. Marked
-    /// with `#[allow(dead_code)]` so the struct can land without warning.
-    #[allow(dead_code)]
+    /// I²P SAM bridge address the Phase 3 runtime will dial when it
+    /// lands. Parsed and carried so config plumbing round-trips; read
+    /// by the `apply_interface_config` refusal (named in the error) —
+    /// never used to establish a session yet.
     pub sam_addr: Option<SocketAddr>,
 }
 
@@ -2618,6 +2631,17 @@ impl ReticulumTransport {
                 local_named_dest_hash.into_bytes(),
                 crate::cohort_scope::CohortScope::Public,
             );
+            // #489 residual — same wiring-log discipline as the keepalive /
+            // control-channel knobs above: one INFO line per node build so
+            // "is this node announcing, and which destination" is answerable
+            // from logs on BOTH branches (previously only the OFF branch
+            // below spoke).
+            tracing::info!(
+                dest = %local_named_dest_hash,
+                "federation visibility ON — named discovery destination \
+                 registered Public with the announce-suppression policy; its \
+                 auto re-announce survives default-suppression (CIRISEdge#489)"
+            );
         } else {
             tracing::info!(
                 "federation visibility OFF — this node announces nothing and is reachable \
@@ -3277,8 +3301,11 @@ impl ReticulumTransport {
     /// addressing makes the hottest path (`attribute_and_deliver`) *cheaper*
     /// rather than dearer — admission moves ahead of the parse.
     ///
-    /// Returns `None` when no table is installed, which is the production
-    /// state until the derivation lands (CIRISVerify#259).
+    /// Returns `None` when no table is installed. The derivation itself
+    /// SHIPPED (CIRISVerify#259 → verify's scope-privacy derivation,
+    /// adapted by `crate::scope_addressing::ScopePrivacyDeriver`); the
+    /// table stays empty until the operator opts in via
+    /// `EdgeBuilder::scope_native_addressing`, which installs it.
     #[must_use]
     pub fn inbound_scope(&self, dest_hash: &[u8; 16]) -> Option<InboundAddress> {
         self.scope_addresses.get()?.accepts_inbound(dest_hash)
@@ -4341,43 +4368,40 @@ impl ReticulumTransport {
             rows
         };
         let now = chrono::Utc::now();
-        for rec in rows.iter() {
-            if rec.identity_hash != identity_hash {
-                continue;
+        match consult_and_prune_blackhole(store, &rows, identity_hash, now).await {
+            BlackholeConsult::Clear => Ok(()),
+            BlackholeConsult::ExpiredPruned => {
+                // The consulted row was reclaimed — drop the snapshot so
+                // the next dial re-reads a deny-list without it (and does
+                // not re-attempt the remove).
+                self.invalidate_blackhole_cache();
+                Ok(())
             }
-            if let Some(until) = rec.until {
-                if now >= until {
-                    // Expired rule — let send proceed. A background
-                    // pruner (deferred to a follow-up cut) will drop
-                    // it lazily; in the interim operators can call
-                    // `routing_blackhole_prune_expired` manually.
-                    return Ok(());
-                }
+            BlackholeConsult::Blocked { reason, until } => {
+                // Live hit — fire-and-forget the hit-record so the
+                // counter reflects observation. `record_hit` is race-
+                // tolerant (silent no-op if the rule was removed between
+                // our check and the spawned increment), so the spawned
+                // task's outcome doesn't affect correctness.
+                let store_clone = Arc::clone(store);
+                let hash_clone = identity_hash.to_vec();
+                tokio::spawn(async move {
+                    if let Err(e) = store_clone.blackhole_record_hit(&hash_clone).await {
+                        tracing::warn!(
+                            ?hash_clone,
+                            error = %e,
+                            "blackhole_record_hit failed; the rule blocked the send \
+                             correctly but the hits counter did not advance",
+                        );
+                    }
+                });
+                Err(TransportError::PeerBlackholed {
+                    identity_hash: identity_hash.to_vec(),
+                    reason,
+                    until: until.map(|t| t.to_rfc3339()),
+                })
             }
-            // Live hit — fire-and-forget the hit-record so the
-            // counter reflects observation. `record_hit` is race-
-            // tolerant (silent no-op if the rule was removed between
-            // our check and the spawned increment), so the spawned
-            // task's outcome doesn't affect correctness.
-            let store_clone = Arc::clone(store);
-            let hash_clone = identity_hash.to_vec();
-            tokio::spawn(async move {
-                if let Err(e) = store_clone.blackhole_record_hit(&hash_clone).await {
-                    tracing::warn!(
-                        ?hash_clone,
-                        error = %e,
-                        "blackhole_record_hit failed; the rule blocked the send \
-                         correctly but the hits counter did not advance",
-                    );
-                }
-            });
-            return Err(TransportError::PeerBlackholed {
-                identity_hash: rec.identity_hash.clone(),
-                reason: rec.reason.clone(),
-                until: rec.until.map(|t| t.to_rfc3339()),
-            });
         }
-        Ok(())
     }
 
     /// Resolve a `destination_key_id` to a Reticulum peer. Consults
@@ -5427,9 +5451,11 @@ struct EventCtx<'a> {
     /// name on [`ReticulumTransport`]). `attribute_and_deliver` probes its
     /// reverse index once per frame to stamp `InboundFrame::arrival_scope`,
     /// which is the receive-side admission fact the blob serve gate consumes.
-    /// Empty `OnceLock` (the production state until CIRISVerify#259's exporter
-    /// label is specified) ⇒ every frame is stamped `None`, i.e. federation
-    /// arrival, i.e. exactly pre-#499 behaviour.
+    /// Empty `OnceLock` (the default: the derivation shipped —
+    /// CIRISVerify#259 / `ScopePrivacyDeriver` — but the table is only
+    /// installed when the operator opts in via
+    /// `EdgeBuilder::scope_native_addressing`) ⇒ every frame is stamped
+    /// `None`, i.e. federation arrival, i.e. exactly pre-#499 behaviour.
     scope_addresses: &'a OnceLock<Arc<ScopeAddressTable>>,
     /// CIRISEdge#169 — the LXMF serve node, borrowed like every other
     /// sub-protocol's state (the `EventCtx` field pattern).
@@ -8419,16 +8445,106 @@ fn apply_interface_config(
             // Phase 3 per OQ-13 — the gate is on but no runtime path
             // exists yet. Surface a typed config error so builds with
             // the gate enabled fail at construction (not at first
-            // packet) when an I²P interface is supplied.
-            let _ = cfg.sam_addr;
-            Err(TransportError::Config(
-                "I²P interface configured but Phase 3 runtime is not yet implemented; \
-                 the feature gate exists for v0.12.0 typed surface compatibility only. \
-                 See FSD §1.4 OQ-13 for the Phase 3 roadmap."
-                    .into(),
-            ))
+            // packet) when an I²P interface is supplied: the feature
+            // compiling must NEVER read as I²P working.
+            Err(TransportError::Config(format!(
+                "I²P interface configured (sam_addr: {:?}) but the \
+                 transport-reticulum-i2p feature compiles ONLY the typed config \
+                 surface — the Phase 3 runtime is NOT WIRED and no SAM session \
+                 will be established. Remove the I²P interface (or build without \
+                 the feature). See FSD §1.4 OQ-13 for the Phase 3 roadmap.",
+                cfg.sam_addr,
+            )))
         }
     }
+}
+
+// ─── Blackhole consult + opportunistic prune ────────────────────────
+
+/// Verdict of consulting the deny-list snapshot for one identity.
+/// Produced by [`consult_and_prune_blackhole`]; consumed by
+/// `check_blackhole` on the send path.
+enum BlackholeConsult {
+    /// No rule for this identity — send proceeds.
+    Clear,
+    /// A rule matched but its `until` has passed. The spent row was
+    /// reclaimed (best-effort) at consult time — send proceeds, and the
+    /// caller must invalidate its deny-list snapshot cache so the next
+    /// dial does not re-see (and re-prune) the removed row.
+    ExpiredPruned,
+    /// Live rule — send refused; the caller records the hit and builds
+    /// the typed `PeerBlackholed` error.
+    Blocked {
+        /// Operator-readable reason from the rule row.
+        reason: Option<String>,
+        /// Soft-expiry from the rule row (`None` = permanent).
+        until: Option<chrono::DateTime<chrono::Utc>>,
+    },
+}
+
+/// Scan the deny-list snapshot for `identity_hash` and, when the
+/// matching rule is EXPIRED, reclaim its row IMMEDIATELY (opportunistic
+/// prune) instead of letting the send proceed while the row accretes.
+///
+/// Pre-audit, the expired branch returned "proceed" and left the row
+/// for the background pruner / a manual `routing_blackhole_prune_expired`
+/// call — on a hosting shape with neither running, expired rows grew
+/// without bound on a hot send path. The remove is awaited inline (one
+/// row delete) rather than spawned: it is amortized to at most one
+/// round-trip per expired rule, because the caller invalidates its
+/// snapshot cache on the [`BlackholeConsult::ExpiredPruned`] verdict so
+/// subsequent dials never re-consult the reclaimed row. Removal failure
+/// is non-fatal (WARN; the send still proceeds — the rule IS expired).
+///
+/// Permanent rules (`until = None`) never reach the prune branch — they
+/// block forever until an explicit `routing_blackhole_remove`. Rules
+/// for OTHER identities are never touched here, expired or not (the
+/// scan is a consult, not a sweep — the background pruner owns the
+/// sweep). No bounded-size backstop is possible at this seam: the table
+/// is persist's durable `cirislens.blackhole_rules` behind
+/// `Arc<dyn BlackholeRules>`, whose trait surface exposes no capacity
+/// bound — reclamation (this fn + the `Edge::run` pruner) is the bound.
+///
+/// Free fn (not a method) so the audit-required test — insert expired
+/// rule, consult, assert REMOVED — runs against an in-memory
+/// `BlackholeRules` without constructing a live transport.
+async fn consult_and_prune_blackhole(
+    store: &Arc<dyn ciris_persist::federation::BlackholeRules>,
+    rows: &[ciris_persist::federation::BlackholeRecord],
+    identity_hash: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+) -> BlackholeConsult {
+    for rec in rows {
+        if rec.identity_hash != identity_hash {
+            continue;
+        }
+        if let Some(until) = rec.until {
+            if now >= until {
+                if let Err(e) = store.blackhole_remove(identity_hash).await {
+                    tracing::warn!(
+                        ?identity_hash,
+                        error = %e,
+                        "expired blackhole rule consulted but could not be \
+                         reclaimed; send proceeds — the row lingers until the \
+                         next consult or background prune",
+                    );
+                } else {
+                    tracing::debug!(
+                        ?identity_hash,
+                        until = %until,
+                        "expired blackhole rule reclaimed at consult time \
+                         (opportunistic prune)",
+                    );
+                }
+                return BlackholeConsult::ExpiredPruned;
+            }
+        }
+        return BlackholeConsult::Blocked {
+            reason: rec.reason.clone(),
+            until: rec.until,
+        };
+    }
+    BlackholeConsult::Clear
 }
 
 // ─── Runtime-agnostic timeout helper ────────────────────────────────
@@ -8456,6 +8572,142 @@ async fn with_timeout<F: std::future::Future>(dur: Duration, fut: F) -> Option<F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit item 9 — opportunistic blackhole-rule pruning: an expired
+    /// rule consulted on the send path is REMOVED then, not left to
+    /// accrete for a background task that may never run.
+    mod blackhole_opportunistic_prune {
+        use super::*;
+        use chrono::Utc;
+        use ciris_persist::federation::{BlackholeRecord, BlackholeRules};
+        use std::sync::Mutex as StdMutex;
+
+        /// Minimal in-memory `BlackholeRules` — exactly enough store to
+        /// prove the consult removes (or preserves) rows. Methods the
+        /// consult path never drives are `unreachable!` so an accidental
+        /// call fails the test loudly instead of faking success.
+        struct MemRules(StdMutex<Vec<BlackholeRecord>>);
+
+        impl MemRules {
+            fn with(rows: Vec<BlackholeRecord>) -> Arc<Self> {
+                Arc::new(Self(StdMutex::new(rows)))
+            }
+            fn rows(&self) -> Vec<BlackholeRecord> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl BlackholeRules for MemRules {
+            async fn blackhole_list(
+                &self,
+            ) -> Result<Vec<BlackholeRecord>, ciris_persist::federation::Error> {
+                Ok(self.rows())
+            }
+            async fn blackhole_upsert(
+                &self,
+                _identity_hash: &[u8],
+                _until: Option<chrono::DateTime<Utc>>,
+                _reason: Option<&str>,
+            ) -> Result<(), ciris_persist::federation::Error> {
+                unreachable!("consult path never upserts")
+            }
+            async fn blackhole_remove(
+                &self,
+                identity_hash: &[u8],
+            ) -> Result<(), ciris_persist::federation::Error> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .retain(|r| r.identity_hash != identity_hash);
+                Ok(())
+            }
+            async fn blackhole_record_hit(
+                &self,
+                _identity_hash: &[u8],
+            ) -> Result<(), ciris_persist::federation::Error> {
+                Ok(())
+            }
+            async fn blackhole_prune_expired(
+                &self,
+                _now: chrono::DateTime<Utc>,
+            ) -> Result<u64, ciris_persist::federation::Error> {
+                unreachable!("consult path prunes opportunistically, not by sweep")
+            }
+        }
+
+        fn rule(byte: u8, until: Option<chrono::DateTime<Utc>>) -> BlackholeRecord {
+            BlackholeRecord {
+                identity_hash: vec![byte; 16],
+                until,
+                reason: Some("test".into()),
+                added_at: Utc::now(),
+                hits: 0,
+                persist_row_hash: String::new(),
+            }
+        }
+
+        /// The audit-required shape: insert expired rule → consult →
+        /// assert removed (and the send proceeds).
+        #[tokio::test]
+        async fn expired_rule_is_reclaimed_on_consult() {
+            let mem = MemRules::with(vec![rule(
+                0xAA,
+                Some(Utc::now() - chrono::Duration::seconds(60)),
+            )]);
+            let store: Arc<dyn BlackholeRules> = mem.clone();
+            let rows = store.blackhole_list().await.unwrap();
+            let verdict = consult_and_prune_blackhole(&store, &rows, &[0xAA; 16], Utc::now()).await;
+            assert!(matches!(verdict, BlackholeConsult::ExpiredPruned));
+            assert!(
+                mem.rows().is_empty(),
+                "the expired row must be REMOVED at consult time, not left \
+                 for a background pruner that may never run"
+            );
+        }
+
+        #[tokio::test]
+        async fn live_rule_blocks_and_is_not_pruned() {
+            let mem = MemRules::with(vec![rule(
+                0xAA,
+                Some(Utc::now() + chrono::Duration::seconds(3600)),
+            )]);
+            let store: Arc<dyn BlackholeRules> = mem.clone();
+            let rows = store.blackhole_list().await.unwrap();
+            let verdict = consult_and_prune_blackhole(&store, &rows, &[0xAA; 16], Utc::now()).await;
+            assert!(matches!(verdict, BlackholeConsult::Blocked { .. }));
+            assert_eq!(mem.rows().len(), 1, "a live rule is never reclaimed");
+        }
+
+        #[tokio::test]
+        async fn permanent_rule_blocks_and_is_never_pruned() {
+            let mem = MemRules::with(vec![rule(0xAA, None)]);
+            let store: Arc<dyn BlackholeRules> = mem.clone();
+            let rows = store.blackhole_list().await.unwrap();
+            let verdict = consult_and_prune_blackhole(&store, &rows, &[0xAA; 16], Utc::now()).await;
+            assert!(
+                matches!(verdict, BlackholeConsult::Blocked { until: None, .. }),
+                "until = NULL is the operator's permanent signal"
+            );
+            assert_eq!(mem.rows().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn other_identitys_expired_rule_is_left_alone() {
+            let mem = MemRules::with(vec![rule(
+                0xAA,
+                Some(Utc::now() - chrono::Duration::seconds(60)),
+            )]);
+            let store: Arc<dyn BlackholeRules> = mem.clone();
+            let rows = store.blackhole_list().await.unwrap();
+            // Consult a DIFFERENT identity: verdict Clear, and the scan is
+            // a consult, not a sweep — the unrelated expired row stays for
+            // its own consult / the background pruner.
+            let verdict = consult_and_prune_blackhole(&store, &rows, &[0xBB; 16], Utc::now()).await;
+            assert!(matches!(verdict, BlackholeConsult::Clear));
+            assert_eq!(mem.rows().len(), 1);
+        }
+    }
 
     /// CIRISEdge#460 — the `LinkClosed` severity mapping. Routine turnover
     /// (`Normal`, `Stale`) is `Info`; every fault reason is `Warning`. Pins that
@@ -10130,7 +10382,8 @@ mod scope_native_addressing_tests {
 
         assert!(
             transport.scope_address_table().is_none(),
-            "a fresh transport has no table — production state until CIRISVerify#259",
+            "a fresh transport has no table — the default until the operator \
+             opts in via EdgeBuilder::scope_native_addressing",
         );
 
         let first = Arc::new(ScopeAddressTable::new(Arc::new(StubDeriver)));

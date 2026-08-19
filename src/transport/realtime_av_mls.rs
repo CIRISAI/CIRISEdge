@@ -187,7 +187,12 @@ use crate::transport::federation_session::{OwnKexKeys, PeerKexPubkeys};
 /// The MLS ciphersuite this module pins to. `0x004D` — X-Wing
 /// (ML-KEM-768 + X25519) | ChaCha20-Poly1305 | SHA-256 | Ed25519.
 /// See module docs § "0x004D code-point caveat".
-pub const CIPHERSUITE_ID: u16 = 0x004D;
+///
+/// RE-EXPORTED from the single authority
+/// [`crate::mls::cohort_group::CIPHERSUITE_ID`] — an A/V-plane pin
+/// diverging from the cohort-plane pin would be a silent PQC
+/// downgrade, so this module imports rather than duplicates.
+pub use crate::mls::cohort_group::CIPHERSUITE_ID;
 
 /// The openmls enum value the [`CIPHERSUITE_ID`] maps to.
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;

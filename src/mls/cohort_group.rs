@@ -125,15 +125,19 @@ use super::scope_state::{ScopeStateProvider, ScopeStateProviderError};
 /// public field is the whole reason the snapshot approach works).
 type MemStorage = <LibcruxProvider as OpenMlsProvider>::StorageProvider;
 
-/// The MLS ciphersuite cohort groups are pinned to: `0x004D` —
+/// The MLS ciphersuite EVERY edge MLS group is pinned to: `0x004D` —
 /// X-Wing (ML-KEM-768 + X25519) | ChaCha20-Poly1305 | SHA-256 |
 /// Ed25519.
 ///
-/// Same pin as `transport::realtime_av_mls::CIPHERSUITE_ID`,
-/// duplicated rather than imported per the workstream file boundary.
-/// If one moves the other must move with it — a cohort group and an
-/// A/V group in the same deployment negotiating different suites
-/// would be a silent interop break.
+/// SINGLE AUTHORITY for the pin.
+/// `transport::realtime_av_mls::CIPHERSUITE_ID` RE-EXPORTS this
+/// constant (it was previously a duplicated literal, per a since-
+/// retired workstream file boundary). A divergence between the cohort
+/// plane and the A/V plane would be a SILENT PQC DOWNGRADE surface —
+/// 0x004D is the hybrid post-quantum suite, so the plane whose pin
+/// slipped to a classical suite would negotiate without ML-KEM cover
+/// and nothing would fail loudly. The two planes are therefore pinned
+/// by construction, not by comment.
 pub const CIPHERSUITE_ID: u16 = 0x004D;
 
 /// The openmls enum value [`CIPHERSUITE_ID`] maps to.
