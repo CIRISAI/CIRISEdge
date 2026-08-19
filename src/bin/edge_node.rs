@@ -1001,6 +1001,14 @@ impl MediaLink for TransportMediaLink {
 /// silently loses one), so a `Report` arriving while this waits is
 /// folded into `member_reports` rather than dropped. Stale acks from an
 /// earlier probe are skipped by nonce.
+/// The publisher-loop state a probe bracket must feed instead of eat:
+/// member Reports land in the report map, and OTHER members' seal traffic
+/// (SealProbe/Sealed) is stashed for the outer loop rather than dropped.
+struct ProbeSideChannel<'a> {
+    member_reports: &'a mut serde_json::Map<String, serde_json::Value>,
+    stash: &'a mut std::collections::VecDeque<Control>,
+}
+
 async fn probe_scope_address(
     transport: &ReticulumTransport,
     mailbox: &Mailbox,
@@ -1008,7 +1016,7 @@ async fn probe_scope_address(
     address: &MemberAddress,
     nonce: u64,
     timeout: Duration,
-    member_reports: &mut serde_json::Map<String, serde_json::Value>,
+    side: &mut ProbeSideChannel<'_>,
 ) -> Option<bool> {
     let probe = Control::AddressProbe {
         address_hex: hex::encode(address.as_bytes()),
@@ -1025,8 +1033,15 @@ async fn probe_scope_address(
         match msg {
             Control::AddressProbeAck { nonce: n, held } if n == nonce => return Some(held),
             Control::Report { key_id, body } => {
-                member_reports.insert(key_id, body);
+                side.member_reports.insert(key_id, body);
             }
+            // Another member's seal traffic arriving DURING this bracket's
+            // ack-wait must not be eaten — at M≥3 several members cross the
+            // epoch and probe near-simultaneously, and a discarded SealProbe
+            // strands that member for its full 90 s SealGo wait (the M=4
+            // "no SealGo from the publisher" class). Stash for the outer
+            // loop; everything else (stale acks) still drops.
+            m @ (Control::SealProbe { .. } | Control::Sealed { .. }) => side.stash.push_back(m),
             _ => {}
         }
     }
@@ -1974,6 +1989,10 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     // then say so — waiting out the whole barrier would turn a reportable
     // fact into a hang.
     let mut probe_grace: Option<Instant> = None;
+    // Seal traffic that arrived while a probe bracket was awaiting its ack
+    // (stashed by `probe_scope_address` instead of eaten) — drained before
+    // the mailbox so no member's handshake is lost to another's bracket.
+    let mut stash: std::collections::VecDeque<Control> = std::collections::VecDeque::new();
     while Instant::now() < deadline {
         if member_reports.len() >= live.len() {
             if seal_done {
@@ -1985,17 +2004,39 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 break;
             }
         }
-        let Ok((_s, msg)) = occ.mailbox.next_control(Duration::from_secs(5)).await else {
-            continue;
+        let msg = if let Some(m) = stash.pop_front() {
+            m
+        } else {
+            let Ok((_s, msg)) = occ.mailbox.next_control(Duration::from_secs(5)).await else {
+                continue;
+            };
+            msg
         };
         match msg {
             Control::Report { key_id, body } => {
                 member_reports.insert(key_id, body);
             }
+            // EVERY member that crossed the advance probes and then waits on
+            // SealGo — at M≥3 that is several members, near-simultaneously.
+            // The network-observed bracket (`conformance.seal_retires`) is
+            // measured ONCE, on the first prober; every LATER prober gets an
+            // immediate SealGo so its own owner-side `scope.seal` leg can
+            // run — withholding it strands that member for its full 90 s
+            // wait and reds a leg this loop was starving, not measuring.
+            Control::SealProbe { key_id, .. } if seal_probe.is_some() || seal_done => {
+                let _ = send_control(
+                    &occ.transport,
+                    &key_id,
+                    &Control::SealGo {
+                        key_id: key_id.clone(),
+                    },
+                )
+                .await;
+            }
             Control::SealProbe {
                 key_id,
                 superseded_epoch,
-            } if seal_probe.is_none() => {
+            } => {
                 let gid = occ.group_id();
                 let (Some(live_a), Some(old_a)) = (
                     occ.table.send_address(&cfg.scope, &gid, &key_id),
@@ -2009,6 +2050,16 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                         ),
                     );
                     seal_done = true;
+                    // The bracket cannot run, but the member's own
+                    // `scope.seal` leg still can — don't strand it.
+                    let _ = send_control(
+                        &occ.transport,
+                        &key_id,
+                        &Control::SealGo {
+                            key_id: key_id.clone(),
+                        },
+                    )
+                    .await;
                     continue;
                 };
                 // BEFORE-reading, at the ADMISSION SEAM (module doc:
@@ -2031,7 +2082,10 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                     &old_a,
                     probe_nonce,
                     probe_timeout,
-                    &mut member_reports,
+                    &mut ProbeSideChannel {
+                        member_reports: &mut member_reports,
+                        stash: &mut stash,
+                    },
                 )
                 .await;
                 probe_nonce += 1;
@@ -2042,7 +2096,10 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                     &live_a,
                     probe_nonce,
                     probe_timeout,
-                    &mut member_reports,
+                    &mut ProbeSideChannel {
+                        member_reports: &mut member_reports,
+                        stash: &mut stash,
+                    },
                 )
                 .await;
                 // SealGo goes out even when the before-reading failed:
@@ -2083,7 +2140,10 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                     &old_a,
                     probe_nonce,
                     probe_timeout,
-                    &mut member_reports,
+                    &mut ProbeSideChannel {
+                        member_reports: &mut member_reports,
+                        stash: &mut stash,
+                    },
                 )
                 .await;
                 probe_nonce += 1;
@@ -2094,7 +2154,10 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                     &live_a,
                     probe_nonce,
                     probe_timeout,
-                    &mut member_reports,
+                    &mut ProbeSideChannel {
+                        member_reports: &mut member_reports,
+                        stash: &mut stash,
+                    },
                 )
                 .await;
                 seal_done = true;
