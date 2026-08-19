@@ -65,13 +65,32 @@ it, the recipient holds `infra:serve`, and it satisfies any `recipient_capabilit
 restriction. The recipient axis *cannot exceed* the transmission principle,
 by construction.
 
+## The two-plane hybrid
+
+Edge realizes the **lightnet/darknet split** of
+[CC 5.4.6](../CIRISConstitution/constitution/part_5_transport_substrate.md): a
+**public identity plane** (announced, rooted, attributable — no anonymity
+claim) and a **derived group plane** (per-group destinations derived from
+directory state members already hold — never announced, so group *existence*
+is structurally invisible to outsiders). Derivation replaces discovery;
+determinism replaces coordination. What that buys — private *manageable*
+groups, decentralized video over member-relays, and the posited
+occurrence-invisible ballot — and the measurement status of each claim, is in
+**[`docs/LIGHTNET_DARKNET.md`](docs/LIGHTNET_DARKNET.md)**. The proofs run as
+the multi-container acceptance bench (**[`bench-mesh/`](bench-mesh/README.md)**,
+real video + real blobs through real relays, in CI).
+
 ## Status
 
-**v14.x** — production CEG-native transport. Reticulum + HTTPS + packet-radio
-transports; the anti-entropy replication engine; the `#393` two-item attribution
-gate (Rooted∧owns_key + hybrid transport binding); the `#402` bootstrap carve-out;
-the `#396` consent-resolved fan-out + serve gates; hybrid Ed25519 + ML-DSA-65
-throughout; PyO3 + UniFFI mobile surfaces. Pinned in lockstep to `ciris-persist`
+**v18.x** — production CEG-native transport, scope-native addressing end to
+end (`#499`), and the A/V mesh spine. Reticulum + HTTPS + packet-radio
+transports; the anti-entropy replication engine; the `#393` two-item
+attribution gate (Rooted∧owns_key + hybrid transport binding); the `#402`
+bootstrap carve-out; the `#396` consent-resolved fan-out + serve gates; MLS
+cohorts (TreeKEM, X-Wing) with scope-derived addressing, seal/retirement, and
+the LXMF serve path (`#169`); mandatory hybrid Ed25519 + ML-DSA-65 on every
+producer (`#458`: no classical-only paths); PyO3 + UniFFI mobile surfaces
+(Android floor: API 24). Pinned in lockstep to `ciris-persist`
 (Registry-of-Record admission) via drift-witnessed policy hashes.
 
 ## Sister repos
