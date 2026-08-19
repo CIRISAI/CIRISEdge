@@ -98,6 +98,8 @@ use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendO
 use crate::identity::LocalSigner;
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
 use crate::scope_addressing::{InboundAddress, MemberAddress, ScopeAddressTable};
+#[cfg(feature = "lxmf")]
+use crate::transport::lxmf_serve::ServeOutcome;
 use crate::verify::{
     HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
 };
@@ -1697,6 +1699,11 @@ pub struct ReticulumTransport {
     /// `None` until installed: every scope-native lookup then declines and
     /// the federation-scope paths are unaffected.
     scope_addresses: OnceLock<Arc<ScopeAddressTable>>,
+    /// CIRISEdge#169 — the LXMF propagation serve node, when this node has
+    /// been configured to carry third-party mail. `None` (the default) means
+    /// the `RequestReceived` arm declines every propagation request.
+    #[cfg(feature = "lxmf")]
+    lxmf_serve: OnceLock<Arc<crate::transport::lxmf_serve::LxmfServeNode>>,
     /// Edge's own announce attestation app-data — built once in
     /// `new` (sign with the federation `LocalSigner`) and emitted
     /// verbatim on every announce. `None` when no signer was
@@ -2539,6 +2546,8 @@ impl ReticulumTransport {
             local_transport_pubkey,
             local_identity: identity.clone(),
             scope_addresses: OnceLock::new(),
+            #[cfg(feature = "lxmf")]
+            lxmf_serve: OnceLock::new(),
             local_attestation,
             local_signer,
             self_route,
@@ -2761,6 +2770,50 @@ impl ReticulumTransport {
         self.scope_addresses
             .set(table)
             .map_err(|_| TransportError::Config("scope address table already installed".to_owned()))
+    }
+
+    /// CIRISEdge#169 — install the LXMF propagation serve node and register
+    /// its request handler, so this node begins carrying third-party mail.
+    ///
+    /// Called ONCE. Two things happen together on purpose: without the
+    /// registration no `RequestReceived` ever arrives, and without the node
+    /// the arm declines every one — so installing one without the other is a
+    /// node that either cannot hear or cannot answer, and both look like
+    /// silence from outside.
+    ///
+    /// The roster inside the node decides WHO is served
+    /// ([`PropagationAudience::from_cohort_membership`] — self, family, and
+    /// the communities this node is in; deliberately NOT the RNS transit
+    /// rule). This verb decides only THAT the node serves.
+    ///
+    /// # Errors
+    /// [`TransportError::Config`] if a serve node is already installed.
+    ///
+    /// [`PropagationAudience::from_cohort_membership`]:
+    ///     crate::transport::lxmf_serve::PropagationAudience::from_cohort_membership
+    #[cfg(feature = "lxmf")]
+    pub fn install_lxmf_serve(
+        &self,
+        serve: Arc<crate::transport::lxmf_serve::LxmfServeNode>,
+    ) -> Result<(), TransportError> {
+        self.lxmf_serve
+            .set(serve)
+            .map_err(|_| TransportError::Config("LXMF serve node already installed".to_owned()))?;
+        // Register on the node's NAMED discovery destination — the one a
+        // client can actually reach. An explicit-hash destination cannot be
+        // path-resolved (CC 5.4.6 / CIRISConstitution#91), so a propagation
+        // node has to be reachable on the plane that announces.
+        self.node.register_request_handler(
+            DestinationHash::new(self.local_named_dest_hash()),
+            crate::transport::lxmf_serve::MESSAGE_GET_PATH,
+            leviculum_core::RequestPolicy::AllowAll,
+        );
+        tracing::info!(
+            path = crate::transport::lxmf_serve::MESSAGE_GET_PATH,
+            "CIRISEdge#169 — LXMF propagation serve path REGISTERED. This node now \
+             carries mail for the destinations in its roster."
+        );
+        Ok(())
     }
 
     /// CIRISEdge#499 — the installed scope-address table, if any.
@@ -5121,6 +5174,8 @@ impl Transport for ReticulumTransport {
                         inbound_reasm: &self.inbound_reasm,
                         dialed_link_dest: &self.dialed_link_dest,
                         scope_addresses: &self.scope_addresses,
+                        #[cfg(feature = "lxmf")]
+                        lxmf_serve: &self.lxmf_serve,
                     };
                     handle_event(event, &ctx).await;
 
@@ -5247,6 +5302,10 @@ struct EventCtx<'a> {
     /// label is specified) ⇒ every frame is stamped `None`, i.e. federation
     /// arrival, i.e. exactly pre-#499 behaviour.
     scope_addresses: &'a OnceLock<Arc<ScopeAddressTable>>,
+    /// CIRISEdge#169 — the LXMF serve node, borrowed like every other
+    /// sub-protocol's state (the `EventCtx` field pattern).
+    #[cfg(feature = "lxmf")]
+    lxmf_serve: &'a OnceLock<Arc<crate::transport::lxmf_serve::LxmfServeNode>>,
 }
 
 /// CIRISEdge#424 — the classified result of attributing an inbound frame's link to
@@ -6103,6 +6162,86 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 ));
             }
         }
+        // CIRISEdge#169 — the LXMF propagation HOST serve path.
+        //
+        // The decision is made by `LxmfServeNode`, which is sans-I/O: no async,
+        // no `.await`, no clock of its own. This arm does the I/O and nothing
+        // else — which is why the serve logic can be exhaustively tested
+        // without a node, and why no lock can cross a suspension point here.
+        #[cfg(feature = "lxmf")]
+        NodeEvent::RequestReceived {
+            link_id,
+            request_id,
+            ref path,
+            ref data,
+            ..
+        } if path == crate::transport::lxmf_serve::MESSAGE_GET_PATH => {
+            let Some(serve) = ctx.lxmf_serve.get() else {
+                // Not configured to carry third-party mail. Declining is the
+                // DEFAULT posture (`PropagationAudience::Disabled`), not a
+                // fault, so this is a trace rather than a withhold: nothing
+                // was refused, because nothing was ever offered.
+                tracing::trace!(
+                    %path,
+                    "LXMF propagation request on a node that carries no third-party mail"
+                );
+                return;
+            };
+
+            // The requester is the LINK's own remote identity — never a
+            // wire-supplied field. A propagation node that took the requester
+            // from the request body would serve any mailbox on demand, which
+            // is the whole attack the per-recipient scoping exists to stop.
+            let requester = ctx.node.get_remote_identity(&link_id).map(|id| {
+                let mut out = [0u8; leviculum_lxmf::constants::DESTINATION_LENGTH];
+                out.copy_from_slice(&id.hash()[..leviculum_lxmf::constants::DESTINATION_LENGTH]);
+                out
+            });
+
+            let result = serve.serve_get(requester, data, std::time::Instant::now());
+
+            // The notices carry typed `WithholdReason`s and BELONG in the
+            // counted ledger — but the transport holds no `EdgeMetrics`
+            // handle (`inc_withhold` is never called from this file). That is
+            // the serve/inbound attribution asymmetry recorded in
+            // `crate::contextual_integrity`, meeting a serve path that happens
+            // to live in the event loop. Until the transport carries a metrics
+            // handle these are LOUD but uncounted, which is stated rather than
+            // silently accepted.
+            for notice in &result.notices {
+                drop_inbound(Some(link_id), notice.reason.as_str(), notice.detail);
+            }
+
+            if let ServeOutcome::Respond(ref bytes) = result.outcome {
+                match ctx.node.send_response(&link_id, &request_id, bytes).await {
+                    Ok(()) => {
+                        // MEASURED CONTRACT (leviculum#55): `Ok` means HANDED
+                        // TO THE LINK, not delivered. If the peer vanished
+                        // before the link's death was processed, this returns
+                        // `Ok(())` and the bytes go nowhere — and for a
+                        // propagation node serving churning mobiles that is
+                        // the normal case, not the edge case.
+                        //
+                        // So the mailbox entry is NOT dropped here. Delivery
+                        // evidence has to come from the application layer —
+                        // the peer's next request implying receipt — and
+                        // `serve_get` is deliberately non-destructive for
+                        // exactly this reason.
+                        tracing::debug!(?link_id, "LXMF propagation response handed to link");
+                    }
+                    Err(e) => {
+                        // A link known to be dead answers `LinkNotFound` — the
+                        // typed signal, and the honest one.
+                        drop_inbound(
+                            Some(link_id),
+                            "lxmf-response-undeliverable",
+                            &format!("{e}"),
+                        );
+                    }
+                }
+            }
+        }
+
         // CIRISEdge#484 — `ResponseReceived` / `RequestTimedOut` are now resolved by
         // the leviculum v0.16 completion registry (fed at the dispatch layer), so
         // `link_request` no longer mirrors them here — the events fall through to the
