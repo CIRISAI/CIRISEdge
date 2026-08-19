@@ -1455,9 +1455,10 @@ impl PyEdge {
         };
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("x25519_pub_base64", b64.encode(kex.x25519_pub))?;
-        if let Some(mlkem) = kex.mlkem768_pub {
-            dict.set_item("ml_kem_768_pub_base64", b64.encode(mlkem))?;
-        }
+        // CIRISEdge#481 item 4 — `mlkem768_pub` is a required field, so
+        // the dict ALWAYS carries both halves (as the docstring above
+        // has promised since v2.4.0).
+        dict.set_item("ml_kem_768_pub_base64", b64.encode(kex.mlkem768_pub))?;
         Ok(Some(dict))
     }
 
@@ -6545,6 +6546,10 @@ fn seal_av_outer(
 /// remains as an explicit HNDL-strict marker for realtime A/V + key_grant DEK
 /// distribution. `"classical"` is REJECTED with `PyValueError` — the classical
 /// X25519-only KEX is retired (there is no negotiable quantum-vulnerable path).
+/// `peer_mlkem768_pub=None` is likewise REJECTED with `PyValueError` at
+/// `PeerKexPubkeys` construction (#481 item 4 — the ML-KEM-less peer is
+/// unrepresentable; the parameter stays `Option` only so the downgrade attempt
+/// parses to a typed, logged refusal instead of a `TypeError`).
 ///
 /// Returns `(handshake_msg_json_bytes, session_key, negotiated_algorithm_wire_id)`.
 /// The handshake JSON round-trips through
@@ -6561,10 +6566,12 @@ fn federation_session_initiate(
         FederationSession, KexAlgorithm, PeerKexPubkeys, SessionHandshakeMsg,
     };
     let x_pub = fixed_bytes::<32>("peer_x25519_pub", peer_x25519_pub)?;
-    let peer = PeerKexPubkeys {
-        x25519_pub: x_pub,
-        mlkem768_pub: peer_mlkem768_pub.map(<[u8]>::to_vec),
-    };
+    // CIRISEdge#481 item 4 — the ML-KEM-less peer is unrepresentable by
+    // `PeerKexPubkeys`; a Python `None` is refused HERE, at construction,
+    // with the typed `HybridRequiredButPeerLacksMlkem` (surfaced as
+    // `ValueError`, the same class the retired-"classical" refusal uses).
+    let peer = PeerKexPubkeys::from_advertisement(x_pub, peer_mlkem768_pub.map(<[u8]>::to_vec))
+        .map_err(|e| PyValueError::new_err(format!("peer_mlkem768_pub: {e}")))?;
     let requested = match algorithm {
         "hybrid" => KexAlgorithm::Hybrid,
         "hybrid-required" => KexAlgorithm::HybridRequired,
@@ -6942,9 +6949,11 @@ pub struct PyAvSession {
 }
 
 /// Convert a Python member tuple (`key_id`, `x25519_pub`,
-/// `mlkem768_pub`) into the Rust [`Member`] shape, enforcing the HNDL
-/// pre-check (mlkem768_pub MUST be Some). Failing here surfaces
-/// `PyValueError` before the openmls layer is invoked.
+/// `mlkem768_pub`) into the Rust [`Member`] shape. The HNDL pre-check
+/// is structural (CIRISEdge#481 item 4): `PeerKexPubkeys` requires the
+/// ML-KEM-768 half, so a `None` is refused by
+/// `PeerKexPubkeys::from_advertisement` at construction and surfaces
+/// as `PyValueError` before the openmls layer is invoked.
 fn member_from_py(
     label: &str,
     key_id: String,
@@ -6954,17 +6963,15 @@ fn member_from_py(
     use crate::transport::federation_session::PeerKexPubkeys;
     use crate::transport::realtime_av_mls::Member;
     let x = fixed_bytes::<32>(&format!("{label}.x25519_pub"), x25519_pub)?;
-    let Some(mlkem) = mlkem768_pub else {
-        return Err(PyValueError::new_err(format!(
-            "{label}: ML-KEM-768 pubkey required by ciphersuite 0x004D (HNDL discipline) — peer {key_id}"
-        )));
-    };
+    let kex_pubkeys = PeerKexPubkeys::from_advertisement(x, mlkem768_pub.map(<[u8]>::to_vec))
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "{label}: {e} — ciphersuite 0x004D requires ML-KEM-768; peer {key_id}"
+            ))
+        })?;
     Ok(Member {
         key_id,
-        kex_pubkeys: PeerKexPubkeys {
-            x25519_pub: x,
-            mlkem768_pub: Some(mlkem.to_vec()),
-        },
+        kex_pubkeys,
     })
 }
 

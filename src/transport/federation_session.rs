@@ -52,12 +52,21 @@
 //!   without X25519 is out-of-spec; honoring it would create a degraded
 //!   ciphersuite an attacker could force by stripping the X25519 half.
 //!
-//! `PeerKexPubkeys.mlkem768_pub` remains `Option` (rather than being made
-//! non-optional) because directory-sourced advertisements are represented
-//! with `None` and rejected at their CONSTRUCTION boundary — the FFI Member
-//! conversion and the A/V-MLS bridge both HNDL-pre-check `mlkem768_pub` is
-//! present. The retirement above enforces the same invariant at the two KEX
-//! verbs, so a classical-only peer is refused wherever it enters.
+//! **`PeerKexPubkeys.mlkem768_pub` is REQUIRED (CIRISEdge#481 item 4).**
+//! In a 100% PQC fleet the ML-KEM-less peer no longer exists, so the type
+//! no longer represents it: the field is `Vec<u8>`, not `Option`. The one
+//! seam through which "maybe-absent" ML-KEM material may still approach
+//! this type — Option-shaped FFI tuples and deserializers — is
+//! [`PeerKexPubkeys::from_advertisement`], which refuses absence with the
+//! typed [`SessionError::HybridRequiredButPeerLacksMlkem`] at CONSTRUCTION.
+//! The illegal state is unrepresentable rather than policy-checked: the
+//! old `Hybrid → Classical` fallback arm in [`FederationSession::initiate`]
+//! is gone because its predicate (`mlkem768_pub.is_some()`) can no longer
+//! be false. `OwnKexKeys.mlkem768_priv/pub` deliberately REMAIN `Option`:
+//! [`FederationSession::respond`]'s refusal paths
+//! ([`SessionError::HybridResponderMissingMlkem`]) need degraded local-key
+//! fixtures to exist as test witnesses, mirroring the #481 item-5 decision
+//! for `LocalSigner.pqc`.
 
 use ciris_crypto::hybrid_kex::{
     self, ClassicalHandshakeMsg, HybridHandshakeMsg, KEX_ALGORITHM_CLASSICAL_V1,
@@ -110,17 +119,50 @@ impl KexAlgorithm {
     }
 }
 
-/// What a peer publishes for KEX. X25519 is required (fallback safety);
-/// ML-KEM-768 is optional (a peer at older keying levels is admitted via
-/// classical fallback). A peer publishing ONLY the ML-KEM-768 half is
-/// represented by `mlkem768_pub: Some` with `x25519_pub` defaulted —
-/// callers MUST verify the X25519 half is present before constructing
-/// this type from wire input; [`FederationSession::initiate`] additionally
-/// rejects the case at runtime as defense-in-depth.
+/// What a peer publishes for KEX. BOTH halves are required
+/// (CIRISEdge#481 item 4): the hybrid X25519+ML-KEM-768 construction is
+/// mandatory, and a peer that lacks either half is not representable by
+/// this type. A peer publishing ONLY the ML-KEM-768 half is represented
+/// by `x25519_pub` defaulted to all-zero — callers MUST verify the
+/// X25519 half is present before constructing this type from wire
+/// input; [`FederationSession::initiate`] additionally rejects the
+/// all-zero case at runtime as defense-in-depth.
+///
+/// Sources that hold "maybe-absent" ML-KEM material (FFI tuples,
+/// deserializers) MUST construct through
+/// [`PeerKexPubkeys::from_advertisement`], which turns absence into the
+/// typed [`SessionError::HybridRequiredButPeerLacksMlkem`] at the
+/// construction boundary instead of a policy check downstream.
 #[derive(Debug, Clone)]
 pub struct PeerKexPubkeys {
     pub x25519_pub: [u8; 32],
-    pub mlkem768_pub: Option<Vec<u8>>,
+    pub mlkem768_pub: Vec<u8>,
+}
+
+impl PeerKexPubkeys {
+    /// Construct from an Option-shaped KEX advertisement — the ONLY
+    /// seam through which possibly-absent ML-KEM material may approach
+    /// this type (CIRISEdge#481 item 4). Absence is refused HERE, with
+    /// a typed error, so the ML-KEM-less peer is unrepresentable
+    /// everywhere downstream: `initiate` needs no fallback arm, and the
+    /// A/V-MLS roster gates need no `is_none` pre-checks.
+    ///
+    /// # Errors
+    ///
+    /// `mlkem768_pub == None` →
+    /// [`SessionError::HybridRequiredButPeerLacksMlkem`].
+    pub fn from_advertisement(
+        x25519_pub: [u8; 32],
+        mlkem768_pub: Option<Vec<u8>>,
+    ) -> Result<Self, SessionError> {
+        match mlkem768_pub {
+            Some(mlkem768_pub) => Ok(Self {
+                x25519_pub,
+                mlkem768_pub,
+            }),
+            None => Err(SessionError::HybridRequiredButPeerLacksMlkem),
+        }
+    }
 }
 
 /// The local side's KEX private keys. Required for [`FederationSession::respond`].
@@ -234,12 +276,20 @@ pub enum SessionError {
     /// key pair to decapsulate.
     #[error("hybrid responder missing ML-KEM-768 private key")]
     HybridResponderMissingMlkem,
-    /// Caller requested [`KexAlgorithm::HybridRequired`] (HNDL-strict
-    /// mode) against a peer that hasn't advertised ML-KEM-768. Refused
-    /// rather than silently negotiated down to classical — `HybridRequired`
-    /// is the caller asserting the channel content must survive into the
-    /// post-quantum era, and a classical-only outcome would violate that.
-    #[error("HybridRequired mode rejects classical-fallback peer (HNDL discipline)")]
+    /// The peer's KEX advertisement lacks the ML-KEM-768 half. Post-
+    /// CIRISEdge#481 hybrid is unconditionally required (`Hybrid` ≡
+    /// `HybridRequired`), and item 4 made the ML-KEM-less peer
+    /// UNREPRESENTABLE by [`PeerKexPubkeys`] — so this error now fires
+    /// at exactly one place: [`PeerKexPubkeys::from_advertisement`],
+    /// the construction boundary where Option-shaped sources (FFI
+    /// tuples, deserializers) are converted. It can no longer be
+    /// produced by [`FederationSession::initiate`], whose old
+    /// classical-fallback refusal arm this construction-time refusal
+    /// replaced.
+    #[error(
+        "peer KEX advertisement lacks ML-KEM-768 — hybrid X25519+ML-KEM-768 \
+         is mandatory (CIRISEdge#481, HNDL discipline)"
+    )]
     HybridRequiredButPeerLacksMlkem,
     /// CIRISEdge#481 — the classical X25519-only KEX is RETIRED. Fed TM
     /// §3.3 Gap C (harvest-now-decrypt-later) is only closed if there is
@@ -267,15 +317,17 @@ pub struct FederationSession;
 
 impl FederationSession {
     /// Initiator side. Caller supplies the peer's advertised KEX
-    /// pubkeys + the preferred algorithm. Negotiation rules per
-    /// module docs are applied here:
+    /// pubkeys + the preferred algorithm. Post-CIRISEdge#481 there is
+    /// nothing left to negotiate:
     ///
-    /// - `Hybrid` requested + peer has ML-KEM-768 → hybrid
-    /// - `Hybrid` requested + peer lacks ML-KEM-768 → classical fallback
-    /// - `Classical` requested → classical (caller already negotiated down)
-    /// - Peer has ML-KEM-768 but NO X25519 → [`SessionError::MlKemOnlyRejected`]
-    ///   even though the type system tries to make this unrepresentable
-    ///   (defense in depth for callers constructing via deserializers).
+    /// - `Hybrid` | `HybridRequired` → hybrid ([`PeerKexPubkeys`] proves
+    ///   the ML-KEM-768 half exists — item 4 made the ML-KEM-less peer
+    ///   unrepresentable, so the old classical-fallback and
+    ///   refuse-classical-peer arms are structurally gone from here)
+    /// - `Classical` requested → [`SessionError::ClassicalKexRetired`]
+    /// - Peer has ML-KEM-768 but NO X25519 (all-zero `x25519_pub`) →
+    ///   [`SessionError::MlKemOnlyRejected`] — defense in depth for
+    ///   callers constructing via deserializers that default the field.
     ///
     /// Returns the wire message to send the responder PLUS the
     /// initiator's session key.
@@ -289,42 +341,24 @@ impl FederationSession {
         // field to all zeros (which is itself a refusable pubkey — see
         // [Curve25519 small-subgroup attacks]). Treat all-zero as
         // "not advertised" and refuse.
-        if peer.x25519_pub == [0u8; 32] && peer.mlkem768_pub.is_some() {
+        if peer.x25519_pub == [0u8; 32] {
             return Err(SessionError::MlKemOnlyRejected);
         }
-        // CIRISEdge#481 — negotiation AFTER classical retirement. `Hybrid` and
-        // `HybridRequired` are now IDENTICAL on the initiate side: both REQUIRE
-        // the peer to advertise ML-KEM-768, and there is NO classical fallback.
-        // - Hybrid | HybridRequired + peer has ML-KEM → hybrid
-        // - Hybrid | HybridRequired + peer lacks ML-KEM → REJECT (no downgrade)
-        // - Classical (explicitly requested) → REJECT (retired)
-        //
-        // The silent `Hybrid + peer-lacks-ML-KEM → classical` fallback that used
-        // to live here was PRECISELY the downgrade an active attacker forces by
+        // CIRISEdge#481 — nothing to negotiate. `Hybrid` and `HybridRequired`
+        // are IDENTICAL on the initiate side, and item 4 moved the "peer lacks
+        // ML-KEM" refusal to `PeerKexPubkeys::from_advertisement`: by the time
+        // a value of this type exists, the ML-KEM half provably exists. The
+        // silent `Hybrid + peer-lacks-ML-KEM → classical` fallback that used to
+        // live here was PRECISELY the downgrade an active attacker forces by
         // stripping a peer's ML-KEM advertisement; Fed TM §3.3 Gap C is only
-        // closed once that path is gone.
-        let actual = match (requested, peer.mlkem768_pub.is_some()) {
-            (KexAlgorithm::HybridRequired | KexAlgorithm::Hybrid, true) => KexAlgorithm::Hybrid,
-            (KexAlgorithm::HybridRequired | KexAlgorithm::Hybrid, false) => {
-                return Err(SessionError::HybridRequiredButPeerLacksMlkem);
-            }
-            (KexAlgorithm::Classical, _) => return Err(SessionError::ClassicalKexRetired),
-        };
-        match actual {
-            KexAlgorithm::Hybrid => {
-                let mlkem_pub = peer.mlkem768_pub.as_deref().expect("checked above");
-                let (msg, k) = hybrid_kex::initiate_hybrid(&peer.x25519_pub, mlkem_pub)?;
+        // closed once that path is gone — now it is unwritable, not merely
+        // deleted.
+        match requested {
+            KexAlgorithm::Hybrid | KexAlgorithm::HybridRequired => {
+                let (msg, k) = hybrid_kex::initiate_hybrid(&peer.x25519_pub, &peer.mlkem768_pub)?;
                 Ok((SessionHandshakeMsg::Hybrid(msg), SessionKey(k)))
             }
-            // #481 — `actual` is `Hybrid` by construction: the explicit
-            // `Classical` request and the classical-peer case both returned
-            // `Err` above, and `HybridRequired` collapsed to `Hybrid`. The
-            // classical initiate path (`hybrid_kex::initiate_classical`) is
-            // retired and no longer reachable from this verb.
-            KexAlgorithm::Classical | KexAlgorithm::HybridRequired => unreachable!(
-                "post-#481 negotiation yields only Hybrid; classical is retired \
-                 and HybridRequired collapses to Hybrid"
-            ),
+            KexAlgorithm::Classical => Err(SessionError::ClassicalKexRetired),
         }
     }
 
@@ -387,14 +421,10 @@ mod tests {
     fn advertise(own: &OwnKexKeys) -> PeerKexPubkeys {
         PeerKexPubkeys {
             x25519_pub: x25519::public_from_secret(&own.x25519_priv),
-            mlkem768_pub: own.mlkem768_pub.clone(),
-        }
-    }
-
-    fn advertise_classical_only(own: &OwnKexKeys) -> PeerKexPubkeys {
-        PeerKexPubkeys {
-            x25519_pub: x25519::public_from_secret(&own.x25519_priv),
-            mlkem768_pub: None,
+            mlkem768_pub: own
+                .mlkem768_pub
+                .clone()
+                .expect("hybrid fixture always carries ML-KEM-768"),
         }
     }
 
@@ -431,20 +461,46 @@ mod tests {
         );
     }
 
-    /// CIRISEdge#481 — requesting `Hybrid` against a classical-only peer no
-    /// longer falls back to classical; it is REJECTED. This is the exact
-    /// active-downgrade an attacker forces by stripping the ML-KEM
-    /// advertisement (was: `..._falls_back`, which asserted the now-retired
-    /// fallback).
+    /// CIRISEdge#481 item 4 — the classical-only peer is now
+    /// UNREPRESENTABLE by `PeerKexPubkeys`; the refusal the old
+    /// `hybrid_requested_against_classical_only_peer_is_rejected` test
+    /// asserted at `initiate` now fires one layer earlier, at the
+    /// construction boundary. Field-exact fixture: the Option shape is
+    /// EXACTLY what the FFI produces (`peer_mlkem768_pub.map(<[u8]>::
+    /// to_vec)` with Python `None`) — a stripped ML-KEM advertisement
+    /// arriving from outside — with a REAL X25519 half, so the only
+    /// thing being refused is the ML-KEM absence.
     #[test]
-    fn hybrid_requested_against_classical_only_peer_is_rejected() {
+    fn mlkem_absent_advertisement_rejected_at_construction() {
         let responder = fresh_recipient();
-        let peer_view = advertise_classical_only(&responder);
-        let r = FederationSession::initiate(&peer_view, KexAlgorithm::Hybrid);
+        let x25519_pub = x25519::public_from_secret(&responder.x25519_priv);
+        let r = PeerKexPubkeys::from_advertisement(x25519_pub, None);
         assert!(
             matches!(r, Err(SessionError::HybridRequiredButPeerLacksMlkem)),
-            "hybrid vs classical-only peer must reject (no fallback), got {r:?}"
+            "ML-KEM-less advertisement must be refused at construction, got {r:?}"
         );
+    }
+
+    /// CIRISEdge#481 item 4 — the accepting half of the construction
+    /// boundary: a complete advertisement constructs, and the value
+    /// initiates a hybrid session under BOTH `Hybrid` and
+    /// `HybridRequired` (the modes are identical post-#481; this
+    /// preserves the item-2 coverage on the new constructor path).
+    #[test]
+    fn complete_advertisement_constructs_and_initiates_hybrid() {
+        let responder = fresh_recipient();
+        let peer_view = PeerKexPubkeys::from_advertisement(
+            x25519::public_from_secret(&responder.x25519_priv),
+            responder.mlkem768_pub.clone(),
+        )
+        .expect("complete advertisement must construct");
+        for mode in [KexAlgorithm::Hybrid, KexAlgorithm::HybridRequired] {
+            let (msg, initiator_key) =
+                FederationSession::initiate(&peer_view, mode).expect("initiate");
+            assert_eq!(msg.algorithm(), ALGORITHM_HYBRID_V1);
+            let responder_key = FederationSession::respond(&responder, &msg).expect("respond");
+            assert_eq!(initiator_key.as_bytes(), responder_key.as_bytes());
+        }
     }
 
     /// CIRISEdge#481 — the ACTIVE-attacker close: even a WELL-FORMED classical
@@ -476,7 +532,10 @@ mod tests {
         let responder = fresh_recipient();
         let bad_peer_view = PeerKexPubkeys {
             x25519_pub: [0u8; 32],
-            mlkem768_pub: responder.mlkem768_pub.clone(),
+            mlkem768_pub: responder
+                .mlkem768_pub
+                .clone()
+                .expect("hybrid fixture always carries ML-KEM-768"),
         };
         let r = FederationSession::initiate(&bad_peer_view, KexAlgorithm::Hybrid);
         assert!(
@@ -564,21 +623,12 @@ mod tests {
         assert_eq!(initiator_key.as_bytes(), responder_key.as_bytes());
     }
 
-    /// HNDL-strict mode refuses a classical-only peer instead of
-    /// silently degrading. This is the load-bearing assertion for
-    /// CEG §10.5.5 realtime A/V + key_grant DEK distribution: the
-    /// content's HNDL-secrecy is the caller's intent, and the substrate
-    /// honors it by refusal rather than fallback.
-    #[test]
-    fn hybrid_required_refuses_classical_only_peer() {
-        let responder = fresh_recipient();
-        let peer_view = advertise_classical_only(&responder);
-        let r = FederationSession::initiate(&peer_view, KexAlgorithm::HybridRequired);
-        assert!(
-            matches!(r, Err(SessionError::HybridRequiredButPeerLacksMlkem)),
-            "expected HybridRequiredButPeerLacksMlkem, got {r:?}"
-        );
-    }
+    // (was: `hybrid_required_refuses_classical_only_peer` — CIRISEdge#481
+    // item 4 made the classical-only peer UNREPRESENTABLE, so the HNDL-
+    // strict refusal that test asserted is now the construction-time
+    // refusal covered by `mlkem_absent_advertisement_rejected_at_
+    // construction`; there is no weaker representable peer left for
+    // `HybridRequired` to refuse.)
 
     /// HybridRequired still rejects the ML-KEM-only peer view shape
     /// (defense-in-depth — the all-zero X25519 sentinel from upstream
@@ -588,7 +638,10 @@ mod tests {
         let responder = fresh_recipient();
         let bad = PeerKexPubkeys {
             x25519_pub: [0u8; 32],
-            mlkem768_pub: responder.mlkem768_pub.clone(),
+            mlkem768_pub: responder
+                .mlkem768_pub
+                .clone()
+                .expect("hybrid fixture always carries ML-KEM-768"),
         };
         let r = FederationSession::initiate(&bad, KexAlgorithm::HybridRequired);
         assert!(matches!(r, Err(SessionError::MlKemOnlyRejected)));

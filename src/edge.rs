@@ -1784,9 +1784,14 @@ impl Edge {
                 "resolve_peer_kex_pubkeys({occurrence_key_id}): ml-kem-768 base64 decode: {e}"
             ))
         })?;
+        // CIRISEdge#481 item 4 — `PeerKexPubkeys.mlkem768_pub` is required;
+        // this construction proves presence because persist's
+        // `EncryptionPubkeys.ml_kem_768_base64` is itself a required field
+        // (a row without it doesn't deserialize) and the decode above
+        // already failed loudly on malformed bytes.
         Ok(Some(crate::transport::federation_session::PeerKexPubkeys {
             x25519_pub,
-            mlkem768_pub: Some(mlkem768_pub),
+            mlkem768_pub,
         }))
     }
 

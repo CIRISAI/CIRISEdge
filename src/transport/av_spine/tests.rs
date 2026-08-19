@@ -95,7 +95,7 @@ fn fresh_joiner_xwing() -> (PeerKexPubkeys, OwnKexKeys) {
     (
         PeerKexPubkeys {
             x25519_pub: x_pk,
-            mlkem768_pub: Some(mlkem_pk.clone()),
+            mlkem768_pub: mlkem_pk.clone(),
         },
         OwnKexKeys {
             x25519_priv: x_sk,
