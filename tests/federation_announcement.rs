@@ -70,6 +70,20 @@ impl FedKey {
         B64.encode(self.signer().public_key().expect("pubkey"))
     }
 
+    /// The PQC half. Derived from the same seed so the fixture stays
+    /// deterministic; the byte flip keeps it distinct from the Ed25519 seed.
+    fn pqc_signer(&self) -> ciris_keyring::MlDsa65SoftwareSigner {
+        let mut seed = self.seed;
+        seed[0] ^= 0x55;
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&seed, format!("{}-pqc", self.key_id))
+            .expect("ml_dsa_65 from seed")
+    }
+
+    fn pqc_pubkey_b64(&self) -> String {
+        use ciris_keyring::PqcSigner as _;
+        B64.encode(futures::executor::block_on(self.pqc_signer().public_key()).expect("pqc pubkey"))
+    }
+
     fn write_seed_dir(&self, base: &std::path::Path) -> PathBuf {
         let dir = base.join(format!("seed-{}", self.key_id));
         std::fs::create_dir_all(&dir).expect("create seed dir");
@@ -87,7 +101,11 @@ impl FedKey {
         })
         .await
         .expect("load_local_seed");
-        Arc::new(LocalSigner::new(self.key_id.clone(), classical, None))
+        // HYBRID. A classical-only signer here would make every fixture a
+        // producer of hybrid-pending rows, which persist's Strict policy
+        // rejects at admission — the shape that reddened this file.
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(self.pqc_signer());
+        Arc::new(LocalSigner::new(self.key_id.clone(), classical, Some(pqc)))
     }
 }
 
@@ -104,7 +122,7 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
     KeyRecord {
         key_id: subject.key_id.clone(),
         pubkey_ed25519_base64: subject.pubkey_b64(),
-        pubkey_ml_dsa_65_base64: None,
+        pubkey_ml_dsa_65_base64: Some(subject.pqc_pubkey_b64()),
         algorithm: "hybrid".to_string(),
         identity_type: identity_type.to_string(),
         identity_ref: subject.key_id.clone(),
@@ -553,7 +571,21 @@ async fn av_replayed_attestation_is_idempotent() {
     };
     let canonical = att.canonical_bytes().expect("canonical");
     let sig = peer.signer().sign(&canonical).expect("sign");
-    att.signature_classical_base64 = B64.encode(sig);
+    att.signature_classical_base64 = B64.encode(&sig);
+    // HYBRID, per AV-33: ML-DSA-65 over `canonical || classical_sig`. A
+    // classical-only row is hybrid-pending and Strict rejects it at admission.
+    att.signature_pqc_base64 = Some(
+        B64.encode(
+            futures::executor::block_on({
+                use ciris_keyring::PqcSigner as _;
+                let mut bound = canonical.clone();
+                bound.extend_from_slice(&sig);
+                let p = peer.pqc_signer();
+                async move { p.sign(&bound).await }
+            })
+            .expect("pqc sign"),
+        ),
+    );
 
     nc.put_delivery_attestation(att.clone())
         .await
@@ -621,6 +653,16 @@ async fn edge_emitted_attestation_passes_persist_admission() {
     let canonical = edge_att.canonical_bytes().expect("canonical");
     let sig = peer_signer.classical.sign(&canonical).await.expect("sign");
     edge_att.signature_classical_base64 = B64.encode(&sig);
+    // HYBRID, matching what edge's own producer now REQUIRES rather than
+    // treats as optional — this test asserts edge-emitted rows pass persist
+    // admission, so signing it any other way would test a shape edge can no
+    // longer emit.
+    {
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&sig);
+        let pqc = peer_signer.pqc.as_ref().expect("hybrid signer");
+        edge_att.signature_pqc_base64 = Some(B64.encode(pqc.sign(&bound).await.expect("pqc sign")));
+    }
 
     let json = serde_json::to_string(&edge_att).expect("ser");
     let persist_att: ciris_persist::cirisnode::DeliveryAttestation =

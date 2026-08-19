@@ -63,11 +63,40 @@ impl FedKey {
         B64.encode(self.signer().public_key().expect("pubkey"))
     }
 
+    /// The PQC half. Same seed with a byte flipped, so the fixture stays
+    /// deterministic while the two keys stay distinct.
+    fn pqc_signer(&self) -> ciris_keyring::MlDsa65SoftwareSigner {
+        let mut seed = self.seed;
+        seed[0] ^= 0x55;
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&seed, format!("{}-pqc", self.key_id))
+            .expect("ml_dsa_65 from seed")
+    }
+
+    fn pqc_pubkey_b64(&self) -> String {
+        use ciris_keyring::PqcSigner as _;
+        B64.encode(futures::executor::block_on(self.pqc_signer().public_key()).expect("pqc pubkey"))
+    }
+
     fn write_seed_dir(&self, base: &std::path::Path) -> PathBuf {
         let dir = base.join(format!("seed-{}", self.key_id));
         std::fs::create_dir_all(&dir).expect("create seed dir");
         std::fs::write(dir.join("ed25519.seed"), self.seed).expect("write seed");
         dir
+    }
+
+    /// A signer with NO PQC half — the shape edge's attestation producer
+    /// refuses (CIRISEdge#458: no classical-only paths, gone not superseded).
+    async fn classical_only_signer(&self, base: &std::path::Path) -> Arc<LocalSigner> {
+        let seed_dir = self.write_seed_dir(base);
+        let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
+            key_id: self.key_id.clone(),
+            key_path: seed_dir.join("ed25519.seed"),
+            pqc_key_id: None,
+            pqc_key_path: None,
+        })
+        .await
+        .expect("load_local_seed");
+        Arc::new(LocalSigner::new(self.key_id.clone(), classical, None))
     }
 
     async fn local_signer(&self, base: &std::path::Path) -> Arc<LocalSigner> {
@@ -80,7 +109,11 @@ impl FedKey {
         })
         .await
         .expect("load_local_seed");
-        Arc::new(LocalSigner::new(self.key_id.clone(), classical, None))
+        // HYBRID. Edge's attestation producer REQUIRES a PQC signer — a
+        // classical-only one emits nothing at all, because a hybrid-pending
+        // row is rejected by persist's Strict policy at admission.
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(self.pqc_signer());
+        Arc::new(LocalSigner::new(self.key_id.clone(), classical, Some(pqc)))
     }
 }
 
@@ -95,7 +128,7 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
     KeyRecord {
         key_id: subject.key_id.clone(),
         pubkey_ed25519_base64: subject.pubkey_b64(),
-        pubkey_ml_dsa_65_base64: None,
+        pubkey_ml_dsa_65_base64: Some(subject.pqc_pubkey_b64()),
         algorithm: "hybrid".to_string(),
         identity_type: identity_type.to_string(),
         identity_ref: subject.key_id.clone(),
@@ -187,6 +220,28 @@ async fn build_edge(
     subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
 ) -> Edge {
     let signer = me.local_signer(tmp.path()).await;
+    build_edge_with_signer(
+        tmp,
+        me,
+        directory,
+        queue,
+        steward_dir,
+        subscription_filter,
+        signer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_edge_with_signer(
+    _tmp: &tempfile::TempDir,
+    _me: &FedKey,
+    directory: Arc<SqliteBackend>,
+    queue: Arc<SqliteBackend>,
+    steward_dir: Arc<dyn StewardDirectory>,
+    subscription_filter: Option<Arc<dyn PeerSubscriptionFilter>>,
+    signer: Arc<LocalSigner>,
+) -> Edge {
     // Tests seed Ed25519-only rows (no PQC); accept those via the
     // sovereign-mode policy so the verify pipeline can clear them.
     // Strict (the default) would reject every test row as
@@ -411,6 +466,96 @@ async fn send_federation_with_zero_stewards_returns_typed_error() {
 /// Ask #3 — Federation-class envelopes auto-emit a `DeliveryAttestation`
 /// on verified receipt at every steward, same wire shape v0.6.0
 /// introduced for the Mandatory class. Pinned at the wire-type allow-
+/// CIRISEdge#458 — a node that cannot sign HYBRID emits no attestation at all.
+///
+/// Edge's producer signed PQC under `if let Some(pqc)`, so a classical-only
+/// signer emitted a hybrid-pending row that persist's Strict policy rejects at
+/// admission — a failure that surfaced at the FAR END of an emit, with nothing
+/// local naming the cause. It is refused at the producer now.
+///
+/// Refused rather than degraded: FSD §3.2's
+/// "missing-attestation-as-delivery-gap" is observable at the steward end
+/// either way, so the gap may as well be loud and local.
+///
+/// Drives the REAL dispatch path with a real queue. An earlier attempt
+/// asserted against a reimplementation of the guard and stayed GREEN when the
+/// real guard was deleted — verified by mutation — which is exactly the
+/// wrong-input-path trap this repo keeps paying for. The setup is duplicated
+/// from the test above rather than extracted, deliberately: refactoring a
+/// passing end-to-end test to add a sibling risks the coverage that already
+/// works.
+#[tokio::test]
+async fn a_classical_only_receiver_emits_no_attestation() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bootstrap = FedKey::new("bootstrap-steward", 0x01);
+    let sender = FedKey::new("sender-steward", 0xC0);
+    let receiver = FedKey::new("receiver-steward", 0xD0);
+
+    let directory = directory_with(vec![
+        signed_record(&bootstrap, &bootstrap, "steward"),
+        signed_record(&sender, &bootstrap, "steward"),
+        signed_record(&receiver, &bootstrap, "steward"),
+    ])
+    .await;
+    let queue = directory.clone();
+    let steward_dir: Arc<dyn StewardDirectory> = directory.clone();
+    let sender_signer = sender.local_signer(tmp.path()).await;
+
+    // The ONE difference from the hybrid test: a receiver that cannot sign PQC.
+    let receiver_edge = build_edge_with_signer(
+        &tmp,
+        &receiver,
+        directory.clone(),
+        queue.clone(),
+        steward_dir,
+        None,
+        receiver.classical_only_signer(tmp.path()).await,
+    )
+    .await;
+
+    let directive = sample_directive();
+    let mut env = build_envelope(
+        StewardDirective::TYPE,
+        &sender.key_id,
+        &receiver.key_id,
+        &directive,
+        None,
+    )
+    .expect("build_envelope");
+    sign_envelope(&sender_signer, &mut env)
+        .await
+        .expect("sign_envelope");
+
+    let frame = InboundFrame {
+        envelope_bytes: serde_json::to_vec(&env).expect("serialize env"),
+        received_at: chrono::Utc::now(),
+        transport: TransportId::HTTP,
+        source_key_id: None,
+        link_key_id: None,
+        arrival_scope: None,
+    };
+    receiver_edge.dispatch_inbound_for_test(frame).await;
+
+    let rows = OutboundHandle::list_outbound(
+        &*queue,
+        OutboundFilter {
+            message_type: Some("DeliveryAttestation".into()),
+            ..Default::default()
+        },
+        100,
+    )
+    .await
+    .expect("list_outbound");
+    assert_eq!(
+        rows.len(),
+        0,
+        "a classical-only signer must emit NOTHING — a hybrid-pending row would be \
+         rejected at persist admission, so emitting one is a delivery gap dressed \
+         as an emission"
+    );
+}
+
 /// list helper so the dispatch-side emission keys on the correct types.
 #[tokio::test]
 async fn federation_delivery_emits_attestation_per_recipient() {

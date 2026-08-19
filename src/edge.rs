@@ -7190,17 +7190,36 @@ async fn emit_delivery_attestation(
         .map_err(|e| EdgeError::Persist(format!("attestation classical sign: {e}")))?;
     att.signature_classical_base64 = encode_signature_base64(&ed25519_sig);
 
-    // Optional PQC ML-DSA-65 over `canonical || classical_sig` per
-    // persist's AV-33 bound-signature convention (FSD §3.2.1).
-    if let Some(pqc) = signer.pqc.as_ref() {
-        let mut bound = canonical.clone();
-        bound.extend_from_slice(&ed25519_sig);
-        let pqc_sig = pqc
-            .sign(&bound)
-            .await
-            .map_err(|e| EdgeError::Persist(format!("attestation pqc sign: {e}")))?;
-        att.signature_pqc_base64 = Some(encode_signature_base64(&pqc_sig));
-    }
+    // MANDATORY PQC ML-DSA-65 over `canonical || classical_sig`, per persist's
+    // AV-33 bound-signature convention (FSD §3.2.1).
+    //
+    // This was `if let Some(pqc)` — optional — and that made edge a producer of
+    // hybrid-pending rows whenever its signer happened to be classical-only.
+    // Persist rejects those at admission under the Strict policy, so the defect
+    // surfaced as a REMOTE failure at the far end of an emit, with nothing
+    // local naming the cause.
+    //
+    // Refused HERE instead, and refused rather than degraded: no classical-only
+    // path may exist, not merely be superseded. A node that cannot sign hybrid
+    // must not emit an attestation at all — emitting one it knows will be
+    // rejected is a delivery gap dressed as an emission, and FSD §3.2's
+    // "missing-attestation-as-delivery-gap" is observable at the steward end
+    // EITHER WAY. Better the gap be loud and local than silent and remote.
+    let Some(pqc) = signer.pqc.as_ref() else {
+        return Err(EdgeError::Config(format!(
+            "delivery attestation for {} requires a PQC signer: persist's Strict \
+             policy rejects hybrid-pending rows, so emitting one would fail at \
+             admission with nothing local naming the cause (CIRISEdge#458)",
+            signer.key_id
+        )));
+    };
+    let mut bound = canonical.clone();
+    bound.extend_from_slice(&ed25519_sig);
+    let pqc_sig = pqc
+        .sign(&bound)
+        .await
+        .map_err(|e| EdgeError::Persist(format!("attestation pqc sign: {e}")))?;
+    att.signature_pqc_base64 = Some(encode_signature_base64(&pqc_sig));
 
     // Wrap in a typed envelope. Destination is the **original
     // announcement sender** (envelope.signing_key_id) — the federation
