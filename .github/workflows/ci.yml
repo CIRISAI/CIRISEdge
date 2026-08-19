@@ -506,8 +506,13 @@ jobs:
         with:
           timeout_minutes: 20
           max_attempts: 3
+        # --platform 24: leviculum-std v0.20.0 pulls `if-addrs`, whose
+        # getifaddrs/freeifaddrs exist in bionic only from API 24 (Android
+        # 7.0, 2016). cargo-ndk's default (21) left them undefined and the
+        # v18.0.0 tag run's plain lanes failed at link — a TAG-ONLY lane, so
+        # no PR/main run could catch it. 24 is the Android floor now.
           command: >-
-            cargo ndk -t ${{ matrix.abi }} build --release
+            cargo ndk -t ${{ matrix.abi }} --platform 24 build --release
             --features "$MOBILE_BASE_FEATURES"
       - name: save plain .so
         if: matrix.variant == 'plain'
@@ -565,8 +570,12 @@ jobs:
         with:
           timeout_minutes: 20
           max_attempts: 3
+        # --platform 24: same getifaddrs floor as the plain build above. The
+        # PyO3 cdylib's permissive stub-link flags could let the undefined
+        # symbol through to a RUNTIME dlopen failure on <24 devices — pin the
+        # platform so it's resolved at build time on both variants.
           command: >-
-            cargo ndk -t ${{ matrix.abi }} build --release --lib
+            cargo ndk -t ${{ matrix.abi }} --platform 24 build --release --lib
             --features "$MOBILE_PYO3_FEATURES"
 
       - name: verify DT_NEEDED includes libpython3.10.so
