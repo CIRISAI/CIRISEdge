@@ -98,12 +98,12 @@
 //! `export_secret` wrapper — are duplicated below (a handful of lines
 //! each) rather than shared, so the transport module stays untouched.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError};
 
 use openmls::group::GroupId;
 use openmls::prelude::{
-    BasicCredential, Ciphersuite, CredentialWithKey, KeyPackage, KeyPackageBundle,
+    BasicCredential, Ciphersuite, ContentType, CredentialWithKey, KeyPackage, KeyPackageBundle,
     LeafNodeParameters, MlsGroup, MlsGroupCreateConfig, MlsMessageIn, MlsMessageOut,
     ProcessedMessageContent, ProtocolMessage,
 };
@@ -187,6 +187,18 @@ const HEAD_VERSION: u8 = 0x01;
 /// `rotate-forward` semantics want a short tail, not an instant
 /// horizon.
 pub const DEFAULT_RETAINED_EPOCHS: u64 = 4;
+
+/// Bound on the out-of-order hold buffer in
+/// [`CohortGroup::apply_remote_commit`]: how many future-epoch
+/// commits are held while their predecessors are still in flight.
+///
+/// Commits fan out over a transport with no ordering guarantee, so a
+/// laggard can legitimately see e+2 before e+1 — but never more than
+/// a handful of epochs ahead, because every commit is authored by a
+/// member that itself had to reach the previous epoch first. Beyond
+/// this cap the lowest-epoch held commit is dropped, loudly: a mesh
+/// that overflows it is partitioned or hostile, not merely slow.
+pub const MAX_HELD_COMMITS: usize = 8;
 
 /// Hard ceiling on a decoded snapshot's entry count. Purely a
 /// decode-side DoS guard: the blob comes out of our own sealed KV, so
@@ -437,6 +449,36 @@ impl std::fmt::Debug for CohortCommit {
     }
 }
 
+/// What [`CohortGroup::apply_remote_commit`] did with the commit it
+/// was handed.
+///
+/// Remote commits arrive over a transport with no ordering guarantee,
+/// but MLS commits are strictly sequential per epoch — so "it
+/// arrived" and "it applied" are different events. Only [`Applied`]
+/// changed the group (epoch, roster, exporter secrets); the other two
+/// are normal mesh weather and MUST NOT be treated as failures.
+///
+/// [`Applied`]: CommitApplyOutcome::Applied
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "only Applied advanced the epoch; Deferred/AlreadyApplied changed no state"]
+pub enum CommitApplyOutcome {
+    /// The commit — and any held successors it unblocked — merged and
+    /// persisted. The group is now at this epoch, durably.
+    Applied(u64),
+    /// The commit is framed in a future epoch; it is held (bounded by
+    /// [`MAX_HELD_COMMITS`]) and will be applied automatically when
+    /// its predecessors land. `held_for_epoch` is the epoch it will
+    /// advance the group to. No state change, nothing persisted.
+    Deferred {
+        /// The epoch the held commit advances to once applicable.
+        held_for_epoch: u64,
+    },
+    /// The commit's target epoch is at or behind the current one — a
+    /// duplicate or replay. Carries the epoch that commit advances
+    /// to, already reached. No state change, nothing persisted.
+    AlreadyApplied(u64),
+}
+
 // ─── Snapshot codec ─────────────────────────────────────────────────
 //
 // Layout (all integers big-endian):
@@ -684,6 +726,13 @@ struct CohortGroupInner {
     group: MlsGroup,
     store: ScopeStateProvider,
     retained_epochs: u64,
+    /// Future-epoch commits held until their predecessors land, keyed
+    /// by the epoch each is framed in (= the epoch it applies AT).
+    /// Bounded by [`MAX_HELD_COMMITS`]; deliberately NOT persisted —
+    /// a held commit is a transient wire artifact, and after a
+    /// restart the recovery path is re-delivery or a fresh Welcome,
+    /// exactly as for a commit lost in flight.
+    held_commits: BTreeMap<u64, Vec<u8>>,
 }
 
 impl CohortGroupInner {
@@ -832,6 +881,52 @@ impl CohortGroupInner {
         Ok(CohortSecret(raw))
     }
 
+    /// Decode + process + merge ONE remote commit framed in the
+    /// current epoch. Does NOT persist — [`CohortGroup::apply_remote_commit`]
+    /// persists once, after any held-commit drain, and only then
+    /// reports the epoch.
+    fn process_and_merge_commit(&mut self, commit: &[u8]) -> Result<(), CohortGroupError> {
+        let msg_in = MlsMessageIn::tls_deserialize(&mut &*commit)
+            .map_err(|e| CohortGroupError::WireDecodeFailed(format!("commit decode: {e:?}")))?;
+        let proto: ProtocolMessage = msg_in.try_into_protocol_message().map_err(|e| {
+            CohortGroupError::WireDecodeFailed(format!("not a protocol message: {e:?}"))
+        })?;
+
+        let processed = self
+            .group
+            .process_message(self.provider.as_ref(), proto)
+            .map_err(|e| CohortGroupError::ApplyFailed(format!("{e:?}")))?;
+
+        match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged) => self
+                .group
+                .merge_staged_commit(self.provider.as_ref(), *staged)
+                .map_err(|e| CohortGroupError::ApplyFailed(format!("merge_staged: {e:?}"))),
+            _ => Err(CohortGroupError::NotACommit),
+        }
+    }
+
+    /// Hold a future-epoch commit until its predecessors land.
+    ///
+    /// Bounded by [`MAX_HELD_COMMITS`]: beyond the cap the
+    /// lowest-epoch held commit is dropped — loudly, because every
+    /// drop is a hole the apply chain cannot cross without
+    /// re-delivery.
+    fn hold_commit(&mut self, framed_epoch: u64, commit: Vec<u8>) {
+        self.held_commits.insert(framed_epoch, commit);
+        while self.held_commits.len() > MAX_HELD_COMMITS {
+            if let Some((dropped, _)) = self.held_commits.pop_first() {
+                tracing::warn!(
+                    community_id = %self.community_id,
+                    dropped_epoch = dropped,
+                    cap = MAX_HELD_COMMITS,
+                    "cohort held-commit buffer overflowed; dropped the oldest held commit — \
+                     this member cannot reach later epochs without re-delivery"
+                );
+            }
+        }
+    }
+
     /// Resolve a CIRIS `key_id` to its MLS leaf index.
     fn leaf_of(&self, key_id: &str) -> Result<openmls::prelude::LeafNodeIndex, CohortGroupError> {
         self.group
@@ -938,6 +1033,7 @@ impl CohortGroup {
             group,
             store,
             retained_epochs: retained_epochs.max(1),
+            held_commits: BTreeMap::new(),
         };
 
         // Persist the genesis epoch before handing out a handle: a
@@ -1083,6 +1179,7 @@ impl CohortGroup {
             group,
             store,
             retained_epochs: retained_epochs.max(1),
+            held_commits: BTreeMap::new(),
         };
 
         // Persist the joined epoch before handing out a handle — same
@@ -1168,6 +1265,7 @@ impl CohortGroup {
                 group,
                 store,
                 retained_epochs: retained_epochs.max(1),
+                held_commits: BTreeMap::new(),
             })),
         }))
     }
@@ -1341,41 +1439,93 @@ impl CohortGroup {
     /// node behind its cohort, and MLS gives it no way to catch up
     /// without a fresh Welcome.
     ///
-    /// Returns the new epoch.
-    pub async fn apply_remote_commit(&self, commit: &[u8]) -> Result<u64, CohortGroupError> {
+    /// # Out-of-order tolerance
+    ///
+    /// Commits fan out over a transport with no ordering guarantee,
+    /// but MLS commits are strictly sequential per epoch: the only
+    /// applicable commit is the one framed in the *current* epoch.
+    /// The framed epoch is readable from the wire header without
+    /// attempting the apply, so an arrival classifies without ever
+    /// tripping openmls's `WrongEpoch`:
+    ///
+    /// - framed in the current epoch → applied, then any held
+    ///   successors are drained in order (one persist at the end) —
+    ///   [`CommitApplyOutcome::Applied`] with the final epoch;
+    /// - framed in a future epoch → held, bounded by
+    ///   [`MAX_HELD_COMMITS`] — [`CommitApplyOutcome::Deferred`], no
+    ///   state change;
+    /// - framed in a past epoch → duplicate or replay —
+    ///   [`CommitApplyOutcome::AlreadyApplied`], no state change.
+    ///
+    /// A held commit is authenticated at *apply* time, not at hold
+    /// time; one that fails then is dropped with a warning and the
+    /// drain stops (the chain cannot cross it anyway).
+    pub async fn apply_remote_commit(
+        &self,
+        commit: &[u8],
+    ) -> Result<CommitApplyOutcome, CohortGroupError> {
         let mut guard = self.inner.lock().await;
         // Disjoint field borrows — see `add_member`.
         let inner = &mut *guard;
 
-        let msg_in = MlsMessageIn::tls_deserialize(&mut &*commit)
-            .map_err(|e| CohortGroupError::WireDecodeFailed(format!("commit decode: {e:?}")))?;
-        let proto: ProtocolMessage = msg_in.try_into_protocol_message().map_err(|e| {
-            CohortGroupError::WireDecodeFailed(format!("not a protocol message: {e:?}"))
-        })?;
+        let framed_epoch = peek_commit_epoch(commit)?;
+        let current = inner.epoch();
+        if framed_epoch < current {
+            return Ok(CommitApplyOutcome::AlreadyApplied(framed_epoch + 1));
+        }
+        if framed_epoch > current {
+            inner.hold_commit(framed_epoch, commit.to_vec());
+            return Ok(CommitApplyOutcome::Deferred {
+                held_for_epoch: framed_epoch + 1,
+            });
+        }
 
-        let processed = inner
-            .group
-            .process_message(inner.provider.as_ref(), proto)
-            .map_err(|e| CohortGroupError::ApplyFailed(format!("{e:?}")))?;
+        inner.process_and_merge_commit(commit)?;
 
-        match processed.into_content() {
-            ProcessedMessageContent::StagedCommitMessage(staged) => {
-                inner
-                    .group
-                    .merge_staged_commit(inner.provider.as_ref(), *staged)
-                    .map_err(|e| CohortGroupError::ApplyFailed(format!("merge_staged: {e:?}")))?;
+        // Drain successors that arrived ahead of their predecessor.
+        loop {
+            let next = inner.epoch();
+            let Some(held) = inner.held_commits.remove(&next) else {
+                break;
+            };
+            if let Err(e) = inner.process_and_merge_commit(&held) {
+                tracing::warn!(
+                    community_id = %inner.community_id,
+                    epoch = next,
+                    error = %e,
+                    "held cohort commit failed to apply when its turn came; dropped"
+                );
+                break;
             }
-            _ => return Err(CohortGroupError::NotACommit),
         }
 
         // Merge → persist, then report the epoch. There are no wire
         // artifacts to seal here (we are the applier, not the
         // committer), so the sealed value is discarded — but the
         // persist still happens before the caller learns the epoch
-        // advanced.
+        // advanced. One persist covers the whole drained chain: the
+        // snapshot is of the final state, and intermediate epochs
+        // were never observable to the caller.
         let sealed = inner.persist_and_seal(Vec::new(), None).await?;
-        Ok(sealed.epoch())
+        Ok(CommitApplyOutcome::Applied(sealed.epoch()))
     }
+}
+
+/// Read the epoch a serialized commit is framed in, and refuse
+/// non-commit content — WITHOUT touching group state. Both fields sit
+/// in the clear in the MLS frame header (public *and* private
+/// messages), which is what makes ordering classification possible
+/// before any apply is attempted.
+fn peek_commit_epoch(commit: &[u8]) -> Result<u64, CohortGroupError> {
+    let msg_in = MlsMessageIn::tls_deserialize(&mut &*commit)
+        .map_err(|e| CohortGroupError::WireDecodeFailed(format!("commit decode: {e:?}")))?;
+    let proto: ProtocolMessage = msg_in.try_into_protocol_message().map_err(|e| {
+        CohortGroupError::WireDecodeFailed(format!("not a protocol message: {e:?}"))
+    })?;
+    if proto.content_type() != ContentType::Commit {
+        return Err(CohortGroupError::NotACommit);
+    }
+    Ok(proto.epoch().as_u64())
 }
 
 /// Overwrite an openmls in-memory storage map wholesale.
@@ -1650,8 +1800,8 @@ mod tests {
         // And it can still take part: applying the founder's next
         // commit is what proves the signer survived the round trip.
         let rotate = a.rotate().await.unwrap();
-        let new_epoch = reloaded.apply_remote_commit(rotate.commit()).await.unwrap();
-        assert_eq!(new_epoch, a.epoch().await);
+        let outcome = reloaded.apply_remote_commit(rotate.commit()).await.unwrap();
+        assert_eq!(outcome, CommitApplyOutcome::Applied(a.epoch().await));
         assert_eq!(
             reloaded.destination_secret().await.unwrap().as_bytes(),
             a.destination_secret().await.unwrap().as_bytes(),
@@ -2366,8 +2516,9 @@ mod tests {
         assert_eq!(b.epoch().await, add.epoch());
 
         let rotate = a.rotate().await.unwrap();
-        let new_epoch = b.apply_remote_commit(rotate.commit()).await.unwrap();
-        assert_eq!(new_epoch, rotate.epoch());
+        let outcome = b.apply_remote_commit(rotate.commit()).await.unwrap();
+        assert_eq!(outcome, CommitApplyOutcome::Applied(rotate.epoch()));
+        let new_epoch = rotate.epoch();
 
         // Durable at the instant the epoch is reported.
         let head = store_b
@@ -2395,6 +2546,160 @@ mod tests {
         assert_eq!(
             *b_reloaded.destination_secret().await.unwrap().as_bytes(),
             shared
+        );
+    }
+
+    // ── Out-of-order commit arrival (bench-mesh) ────────────────────
+    //
+    // Commits fan out over a transport with no ordering guarantee, so
+    // a laggard legitimately sees e+2 before e+1. These tests build
+    // the commits with the SAME producers the mesh runs — `add_member`
+    // for admissions, `rotate` for rekeys — and deliver them in the
+    // orders the wire actually produces.
+
+    #[tokio::test]
+    async fn a_commit_arriving_ahead_of_its_predecessor_is_held_then_applied() {
+        // The exact bench-mesh M=4 shape: node-b is admitted first,
+        // then two further admissions fan out — and the second
+        // admission's commit outruns the first on the wire.
+        let (a, material, welcome) = founder_and_welcome("c-ooo", "node-b").await;
+        let b = CohortGroup::join(open_store(), "c-ooo", material, &welcome, 16)
+            .await
+            .unwrap();
+
+        let (_mc, kp_c) = mint_cohort_key_material("node-c").unwrap();
+        let add_c = a.add_member("node-c", kp_c).await.unwrap();
+        let (_md, kp_d) = mint_cohort_key_material("node-d").unwrap();
+        let add_d = a.add_member("node-d", kp_d).await.unwrap();
+
+        // e+2 first. Previously this was ValidationError(WrongEpoch)
+        // and a dead member; now it is a hold, not a death.
+        let out = b.apply_remote_commit(add_d.commit()).await.unwrap();
+        assert_eq!(
+            out,
+            CommitApplyOutcome::Deferred {
+                held_for_epoch: add_d.epoch()
+            }
+        );
+        assert_eq!(b.epoch().await, 1, "a held commit must not move the epoch");
+
+        // e+1 lands: applies, then drains e+2 — one call, final epoch.
+        let out = b.apply_remote_commit(add_c.commit()).await.unwrap();
+        assert_eq!(out, CommitApplyOutcome::Applied(add_d.epoch()));
+        assert_eq!(b.epoch().await, a.epoch().await);
+        assert_eq!(
+            b.destination_secret().await.unwrap().as_bytes(),
+            a.destination_secret().await.unwrap().as_bytes(),
+            "the laggard must converge on the founder's exporter",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_commit_is_skipped_without_touching_state() {
+        let (a, material, welcome) = founder_and_welcome("c-dup", "node-b").await;
+        let store_b = open_store();
+        let b = CohortGroup::join(store_b.clone(), "c-dup", material, &welcome, 16)
+            .await
+            .unwrap();
+
+        let c1 = a.rotate().await.unwrap();
+        assert_eq!(
+            b.apply_remote_commit(c1.commit()).await.unwrap(),
+            CommitApplyOutcome::Applied(c1.epoch())
+        );
+        let secret = *b.record_secret().await.unwrap().as_bytes();
+
+        // The same wire bytes again — a replay. Not an error, and not
+        // a state change: epoch, exporter, and head pointer all hold.
+        let out = b.apply_remote_commit(c1.commit()).await.unwrap();
+        assert_eq!(out, CommitApplyOutcome::AlreadyApplied(c1.epoch()));
+        assert_eq!(b.epoch().await, c1.epoch());
+        assert_eq!(*b.record_secret().await.unwrap().as_bytes(), secret);
+        let head = store_b
+            .group_state_get("c-dup", HEAD_SLOT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_head(&head).unwrap(), c1.epoch());
+    }
+
+    #[tokio::test]
+    async fn held_commits_chain_apply_when_the_gap_fills() {
+        let (a, material, welcome) = founder_and_welcome("c-chain", "node-b").await;
+        let store_b = open_store();
+        let b = CohortGroup::join(store_b.clone(), "c-chain", material, &welcome, 16)
+            .await
+            .unwrap();
+
+        let c1 = a.rotate().await.unwrap();
+        let c2 = a.rotate().await.unwrap();
+        let c3 = a.rotate().await.unwrap();
+
+        // e+2 and e+3 arrive first; both held, nothing applied.
+        for held in [&c2, &c3] {
+            assert_eq!(
+                b.apply_remote_commit(held.commit()).await.unwrap(),
+                CommitApplyOutcome::Deferred {
+                    held_for_epoch: held.epoch()
+                }
+            );
+        }
+        assert_eq!(b.epoch().await, 1);
+
+        // The gap fills: ONE call applies all three, in order.
+        let out = b.apply_remote_commit(c1.commit()).await.unwrap();
+        assert_eq!(out, CommitApplyOutcome::Applied(c3.epoch()));
+        assert_eq!(b.epoch().await, a.epoch().await);
+        assert_eq!(
+            b.destination_secret().await.unwrap().as_bytes(),
+            a.destination_secret().await.unwrap().as_bytes(),
+        );
+        // The whole drained chain is durable at the instant it is
+        // reported — same discipline as the single-commit path.
+        let head = store_b
+            .group_state_get("c-chain", HEAD_SLOT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_head(&head).unwrap(), c3.epoch());
+    }
+
+    #[tokio::test]
+    async fn the_hold_buffer_is_bounded_and_drops_the_oldest() {
+        let (a, material, welcome) = founder_and_welcome("c-bound", "node-b").await;
+        let b = CohortGroup::join(open_store(), "c-bound", material, &welcome, 16)
+            .await
+            .unwrap();
+
+        // One applicable commit withheld, then MAX_HELD_COMMITS + 1
+        // future commits delivered — one more than the buffer holds.
+        let c1 = a.rotate().await.unwrap();
+        let mut future = Vec::new();
+        for _ in 0..=MAX_HELD_COMMITS {
+            future.push(a.rotate().await.unwrap());
+        }
+        for c in &future {
+            assert!(matches!(
+                b.apply_remote_commit(c.commit()).await.unwrap(),
+                CommitApplyOutcome::Deferred { .. }
+            ));
+        }
+
+        // The overflow dropped the OLDEST held commit (future[0]), so
+        // when the gap fills the chain applies exactly one step and
+        // stops at the hole.
+        let out = b.apply_remote_commit(c1.commit()).await.unwrap();
+        assert_eq!(out, CommitApplyOutcome::Applied(c1.epoch()));
+        assert_eq!(b.epoch().await, c1.epoch());
+
+        // Re-delivery of the dropped commit heals the chain end-to-end
+        // — the recovery path the drop warning points at.
+        let out = b.apply_remote_commit(future[0].commit()).await.unwrap();
+        assert_eq!(out, CommitApplyOutcome::Applied(a.epoch().await));
+        assert_eq!(b.epoch().await, a.epoch().await);
+        assert_eq!(
+            b.destination_secret().await.unwrap().as_bytes(),
+            a.destination_secret().await.unwrap().as_bytes(),
         );
     }
 

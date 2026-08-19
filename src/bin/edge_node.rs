@@ -123,7 +123,7 @@ use ciris_crypto::{kdf, ClassicalSigner, Ed25519Signer};
 use ciris_edge::cohort_scope::CohortScope;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::mls::cohort_group::mint_cohort_key_material;
-use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
+use ciris_edge::mls::{CohortGroup, CommitApplyOutcome, ScopeStateProvider};
 use ciris_edge::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink, TransitionOutcome};
 use ciris_edge::transport::realtime_av::{
@@ -1473,7 +1473,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         if admitted.contains(&key_id) {
             continue;
         }
-        let (welcome, _commit, _epoch) = admit(&group, &key_id, &kp_b64).await?;
+        let (welcome, commit, epoch) = admit(&group, &key_id, &kp_b64).await?;
         send_control(
             &occ.transport,
             &key_id,
@@ -1484,7 +1484,30 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         )
         .await
         .map_err(|e| format!("send Welcome to {key_id}: {e}"))?;
+        // Every already-admitted member must advance in step — a
+        // member left behind holds keys for a dead epoch and dies on
+        // the NEXT commit it sees. Distribution is awaited member by
+        // member before the next admission is taken, so at most one
+        // commit is ever outstanding toward any member; the receive
+        // side still absorbs reordering (`CommitApplyOutcome`), this
+        // just keeps the hold buffer off the happy path.
+        let commit_b64 = B64.encode(&commit);
+        for m in &admitted {
+            let _ = send_control(
+                &occ.transport,
+                m,
+                &Control::Commit {
+                    epoch,
+                    commit_b64: commit_b64.clone(),
+                },
+            )
+            .await;
+        }
         admitted.push(key_id);
+        // A short pause between successive admissions lets the fanned
+        // commit clear the transport before its successor is minted —
+        // pacing, not an ack protocol.
+        tokio_sleep(Duration::from_millis(150)).await;
     }
     rep.ran(
         "cohort.join",
@@ -2076,6 +2099,82 @@ async fn admit(
     Ok((welcome, commit_bytes, epoch))
 }
 
+/// What one inbound Commit control frame produced.
+///
+/// Mirrors [`CommitApplyOutcome`] plus the harness-side follow-through
+/// (address advance, key-ring extension). `Failed` is the only
+/// verdict-bearing arm — and it fails the LEG, never the node: a
+/// member that stops applying commits still owes the publisher its
+/// barrier traffic and its delivery report.
+enum CommitDisposition {
+    /// Applied (possibly draining held successors); addresses advanced
+    /// and the key ring now covers the new epoch.
+    Applied(u64),
+    /// Framed in a future epoch; held inside the cohort group until
+    /// its predecessor lands. Nothing to do here.
+    Held,
+    /// Duplicate/replay; already applied. Nothing to do.
+    Duplicate,
+    /// A genuine fault — bad wire bytes, a commit that failed
+    /// validation in its own epoch, or the post-apply follow-through
+    /// failing.
+    Failed(String),
+}
+
+/// Feed one base64 Commit through the cohort group and, when it
+/// applies, advance addresses and extend the key ring. Ordering
+/// weather (out-of-order arrival, duplicates) is absorbed by
+/// `apply_remote_commit`'s hold buffer; every problem comes back as a
+/// [`CommitDisposition`], never as an `Err` that would kill the node.
+///
+/// The key ring gains only the epoch the apply LANDED on. A chained
+/// drain skips intermediate epochs' keys by design: their exporters
+/// are gone once the group ratchets past them (forward secrecy), and
+/// no media is sealed under them — the publisher only seals while its
+/// epoch is stable, at the stream-start and post-rotation plateaus.
+async fn handle_commit_control(
+    occ: &Occurrence,
+    group: &CohortGroup,
+    stream_id: &StreamId,
+    key_ring: &mut BTreeMap<u64, ([u8; 32], [u8; 32])>,
+    commit_b64: &str,
+) -> CommitDisposition {
+    let bytes = match B64.decode(commit_b64) {
+        Ok(b) => b,
+        Err(e) => return CommitDisposition::Failed(format!("decode commit: {e}")),
+    };
+    match group.apply_remote_commit(&bytes).await {
+        Ok(CommitApplyOutcome::Applied(now_epoch)) => {
+            if let Err(e) = occ.advance_addresses(group).await {
+                return CommitDisposition::Failed(format!("advance_addresses: {e}"));
+            }
+            let secret = match group.record_secret().await {
+                Ok(s) => *s.as_bytes(),
+                Err(e) => return CommitDisposition::Failed(format!("record_secret: {e}")),
+            };
+            match epoch_keys(&secret, stream_id, now_epoch) {
+                Ok(keys) => {
+                    key_ring.insert(now_epoch, keys);
+                    CommitDisposition::Applied(now_epoch)
+                }
+                Err(e) => CommitDisposition::Failed(format!("epoch_keys: {e}")),
+            }
+        }
+        Ok(CommitApplyOutcome::Deferred { held_for_epoch }) => {
+            tracing::info!(
+                held_for_epoch,
+                "commit arrived ahead of its predecessor; held"
+            );
+            CommitDisposition::Held
+        }
+        Ok(CommitApplyOutcome::AlreadyApplied(epoch)) => {
+            tracing::info!(epoch, "duplicate commit; already applied");
+            CommitDisposition::Duplicate
+        }
+        Err(e) => CommitDisposition::Failed(format!("apply_remote_commit: {e}")),
+    }
+}
+
 /// What happened to one inbound media frame.
 enum MediaOutcome {
     /// Opened under the epoch's real keys.
@@ -2176,22 +2275,31 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     .map_err(|e| format!("send KeyPackage: {e}"))?;
 
     let join_start = Instant::now();
+    // Commits can outrun this node's own Welcome on an unordered
+    // transport. One consumed here is one the receive loop can never
+    // see — a permanent hole in the epoch chain — so they are stashed
+    // and fed through the normal commit path once the group exists.
+    let mut pre_welcome_commits: std::collections::VecDeque<(u64, String)> =
+        std::collections::VecDeque::new();
     let welcome = loop {
         let (_s, msg) = occ
             .mailbox
             .next_control(cfg.barrier_timeout)
             .await
             .map_err(|e| format!("waiting for Welcome: {e}"))?;
-        if let Control::Welcome {
-            key_id,
-            welcome_b64,
-        } = msg
-        {
-            if key_id == cfg.node_id {
+        match msg {
+            Control::Welcome {
+                key_id,
+                welcome_b64,
+            } if key_id == cfg.node_id => {
                 break B64
                     .decode(&welcome_b64)
                     .map_err(|e| format!("decode Welcome: {e}"))?;
             }
+            Control::Commit { epoch, commit_b64 } => {
+                pre_welcome_commits.push_back((epoch, commit_b64));
+            }
+            _ => {}
         }
     };
     let kv = Arc::new(open_sealed_kv(
@@ -2268,6 +2376,18 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     let mut deferred: Vec<(u64, u64, Vec<u8>)> = Vec::new();
     let mut deferred_dropped = 0usize;
 
+    // Commit-arrival weather, reported rather than fatal: out-of-order
+    // and duplicate arrivals are absorbed (`CommitApplyOutcome`), and
+    // even a genuinely failed apply fails a LEG, never the node — a
+    // dead member starves the publisher's barriers and cascades.
+    let mut commits_applied = 0usize;
+    let mut commits_held = 0usize;
+    let mut commits_duplicate = 0usize;
+    let mut commit_apply_fatal: Option<String> = None;
+    // Commits stashed while this node was still waiting for its own
+    // Welcome, replayed through the same arm as live arrivals.
+    let mut pending_commits = pre_welcome_commits;
+
     let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut opened = 0usize;
     let mut open_failed = 0usize;
@@ -2295,48 +2415,73 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     while Instant::now() < deadline {
         // Control first — a commit changes the keys the media path uses.
         {
-            let mut rx = occ.mailbox.control.lock().await;
-            let got = rx.try_recv().ok();
-            drop(rx);
+            // Stashed pre-Welcome commits replay through the SAME arm
+            // as live arrivals, so they get identical ordering
+            // tolerance and identical follow-through.
+            let got = if let Some((epoch, commit_b64)) = pending_commits.pop_front() {
+                Some((None, Control::Commit { epoch, commit_b64 }))
+            } else {
+                let mut rx = occ.mailbox.control.lock().await;
+                let got = rx.try_recv().ok();
+                drop(rx);
+                got
+            };
             if let Some((_s, msg)) = got {
                 match msg {
                     Control::Commit {
                         epoch: e,
                         commit_b64,
                     } => {
-                        let bytes = B64
-                            .decode(&commit_b64)
-                            .map_err(|er| format!("decode commit: {er}"))?;
-                        group
-                            .apply_remote_commit(&bytes)
-                            .await
-                            .map_err(|er| format!("apply_remote_commit: {er}"))?;
-                        let _ = occ.advance_addresses(&group).await?;
-                        let secret = *group
-                            .record_secret()
-                            .await
-                            .map_err(|er| format!("record_secret: {er}"))?
-                            .as_bytes();
-                        let now_epoch = group.epoch().await;
-                        key_ring.insert(now_epoch, epoch_keys(&secret, &stream_id, now_epoch)?);
-                        tracing::info!(epoch = e, "applied a remote commit and advanced addresses");
-                        // Drain what arrived ahead of the commit.
-                        let held = std::mem::take(&mut deferred);
-                        for (seq, ep, payload) in held {
-                            match open_media(
-                                &key_ring,
-                                ep,
-                                seq,
-                                &payload,
-                                cfg.node_id.as_bytes(),
-                                &mut recv_lat,
-                            ) {
-                                MediaOutcome::Opened => {
-                                    opened += 1;
-                                    seen.insert(seq);
+                        // Whatever this arm produces, the member LIVES:
+                        // ordering weather is absorbed, and a genuine
+                        // fault is reported as a failed leg at the end
+                        // of the run instead of `?`-ing the node away
+                        // mid-stream.
+                        match handle_commit_control(
+                            &occ,
+                            &group,
+                            &stream_id,
+                            &mut key_ring,
+                            &commit_b64,
+                        )
+                        .await
+                        {
+                            CommitDisposition::Applied(now_epoch) => {
+                                commits_applied += 1;
+                                tracing::info!(
+                                    announced_epoch = e,
+                                    applied_epoch = now_epoch,
+                                    "applied a remote commit and advanced addresses"
+                                );
+                                // Drain what arrived ahead of the commit.
+                                let held = std::mem::take(&mut deferred);
+                                for (seq, ep, payload) in held {
+                                    match open_media(
+                                        &key_ring,
+                                        ep,
+                                        seq,
+                                        &payload,
+                                        cfg.node_id.as_bytes(),
+                                        &mut recv_lat,
+                                    ) {
+                                        MediaOutcome::Opened => {
+                                            opened += 1;
+                                            seen.insert(seq);
+                                        }
+                                        MediaOutcome::Failed => open_failed += 1,
+                                        MediaOutcome::NoKeyYet => deferred.push((seq, ep, payload)),
+                                    }
                                 }
-                                MediaOutcome::Failed => open_failed += 1,
-                                MediaOutcome::NoKeyYet => deferred.push((seq, ep, payload)),
+                            }
+                            CommitDisposition::Held => commits_held += 1,
+                            CommitDisposition::Duplicate => commits_duplicate += 1,
+                            CommitDisposition::Failed(why) => {
+                                tracing::warn!(
+                                    announced_epoch = e,
+                                    error = %why,
+                                    "commit apply failed; member stays up, leg will report it"
+                                );
+                                commit_apply_fatal.get_or_insert(why);
                             }
                         }
                     }
@@ -2502,6 +2647,9 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                     "open_failures": open_failed,
                     "still_deferred_awaiting_commit": deferred.len(),
                     "deferred_dropped_over_budget": deferred_dropped,
+                    "commits_applied": commits_applied,
+                    "commits_held_for_order": commits_held,
+                    "commits_duplicate": commits_duplicate,
                     "epochs_observed": epochs_seen.iter().copied().collect::<Vec<u64>>(),
                     "time_to_first_frame_ms": first_frame_at.map(|d| d.as_millis()),
                     "open_latency": latency_json(&mut recv_lat.clone()),
@@ -2557,6 +2705,23 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
             },
         );
         rep.ran("perf.receive", delivery_ok, delivery_detail);
+    }
+
+    // A commit-apply fault surfaces HERE, as a failed leg — the member
+    // stayed up for the barriers and its delivery report above, which
+    // is what keeps one bad commit from cascading into starved
+    // publishers and null blob completions.
+    if let Some(why) = commit_apply_fatal.as_ref() {
+        rep.ran(
+            "cohort.commit_apply",
+            false,
+            serde_json::json!({
+                "error": why,
+                "commits_applied": commits_applied,
+                "commits_held_for_order": commits_held,
+                "commits_duplicate": commits_duplicate,
+            }),
+        );
     }
 
     match blob_result.clone() {
