@@ -196,6 +196,11 @@ impl FedKey {
         dir
     }
 
+    /// Classical-only signer — what envelope SENDERS use. Their directory
+    /// records deliberately carry no ML-DSA-65 pubkey (see `signed_record`),
+    /// and a hybrid-signed envelope against a classical-only record is a
+    /// HARD verify error ("PQC signature without pubkey"), not a
+    /// policy-fallback case — so senders must stay classical here.
     async fn local_signer(&self, base: &std::path::Path) -> Arc<LocalSigner> {
         let seed_dir = self.write_seed_dir(base);
         let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
@@ -207,6 +212,32 @@ impl FedKey {
         .await
         .expect("load_local_seed");
         Arc::new(LocalSigner::new(self.key_id.clone(), classical, None))
+    }
+
+    /// Hybrid signer — what the EDGE-UNDER-TEST uses. Edge's
+    /// acceptance-attestation producer refuses a classical-only signer
+    /// (CIRISEdge#458: persist's Strict admission rejects hybrid-pending
+    /// rows, so the emit is refused loudly at the source instead); with a
+    /// classical-only `me` the edge emits NO acceptance attestation and
+    /// every propagate-count assertion in this file reads 0.
+    async fn hybrid_local_signer(&self, base: &std::path::Path) -> Arc<LocalSigner> {
+        let seed_dir = self.write_seed_dir(base);
+        let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
+            key_id: self.key_id.clone(),
+            key_path: seed_dir.join("ed25519.seed"),
+            pqc_key_id: None,
+            pqc_key_path: None,
+        })
+        .await
+        .expect("load_local_seed");
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &self.seed,
+                format!("{}-pqc", self.key_id),
+            )
+            .expect("ml_dsa_65 from seed"),
+        );
+        Arc::new(LocalSigner::new(self.key_id.clone(), classical, Some(pqc)))
     }
 
     /// Sign the given canonical bytes with this identity's seed.
@@ -317,10 +348,14 @@ async fn build_edge(
     directory: Arc<SqliteBackend>,
     queue: Arc<SqliteBackend>,
 ) -> Edge {
-    let signer = me.local_signer(tmp.path()).await;
-    // Test fixtures are Ed25519-only (no ML-DSA-65 seed); relax the
-    // default `HybridPolicy::Strict` so verify accepts hybrid-pending
-    // rows. Same pattern as `tests/content_fetch.rs::test_edge_config`.
+    // Hybrid: the acceptance-attestation producer requires the PQC half
+    // (CIRISEdge#458). SENDER fixtures stay Ed25519-only, hence the
+    // relaxed envelope policy below.
+    let signer = me.hybrid_local_signer(tmp.path()).await;
+    // Sender fixtures are Ed25519-only (no ML-DSA-65 in their directory
+    // rows); relax the default `HybridPolicy::Strict` so verify accepts
+    // hybrid-pending envelopes. Same pattern as
+    // `tests/content_fetch.rs::test_edge_config`.
     let config = EdgeConfig {
         hybrid_policy: HybridPolicy::Ed25519Fallback,
         ..EdgeConfig::default()
