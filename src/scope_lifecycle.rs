@@ -426,7 +426,12 @@ impl ScopeLifecycle {
             .install_group(scope, group_id, epoch, exporter_secret, members)?;
         let own = self.own_address_or_rollback(scope, group_id, epoch)?;
         if let Err(e) = self.sink.register(&own, scope) {
-            self.table.remove_group(scope, group_id);
+            // `leave`, not a bare `remove_group`: on the JOIN path nothing was
+            // registered yet so this retires nothing, but the ADVANCE path
+            // reaches the same rollback with prior epochs already registered,
+            // and a bare remove would strand them registered-but-unattributed.
+            // One teardown verb, so the two paths cannot diverge.
+            self.leave(scope, group_id);
             return Err(ScopeLifecycleError::Register(e));
         }
         Ok(TransitionOutcome {
@@ -533,6 +538,70 @@ impl ScopeLifecycle {
         })
     }
 
+    /// **Leave a group** — retire every address this node listens on for it,
+    /// then drop it from the table.
+    ///
+    /// The teardown direction, and it was missing. `ScopeAddressTable::remove_group`
+    /// retracts the reverse index — so the address stops being *attributed* —
+    /// but it never calls the sink, so the destination stays *registered* with
+    /// leviculum. That leaves an address registered-but-unattributed: it
+    /// accepts links this node cannot place, and it is confirmable by anyone
+    /// who learned it. Exactly the disclosure CIRISEdge#499 exists to remove,
+    /// and permanent for the process lifetime.
+    ///
+    /// Retires ALL live epochs, not just the current one: a group left
+    /// mid-rotation has a superseded and possibly an installed-next address
+    /// registered too, and leaving is the one moment none of them should
+    /// survive. Unlike a seal there is no convergence window — the group is
+    /// over, so there are no stragglers to keep answering for.
+    ///
+    /// Returns how many addresses were retired. Failures are counted in
+    /// [`SealOutcome::unretired`] and WARNed, never swallowed: a leave that
+    /// could not retire has left this node answering for a group it has left.
+    pub fn leave(&self, scope: &CohortScope, group_id: &str) -> SealOutcome {
+        let mut out = SealOutcome::default();
+        for address in self.own_live_addresses(scope, group_id) {
+            match self.sink.retire(&address, scope) {
+                Ok(()) => out.sealed += 1,
+                Err(e) => {
+                    out.unretired += 1;
+                    tracing::warn!(
+                        group = %group_id,
+                        error = %e,
+                        "LEAVING a group but its destination could NOT be retired — this \
+                         node keeps answering on an address for a group it has left \
+                         (CIRISEdge#499)"
+                    );
+                }
+            }
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(scope.clone(), group_id.to_owned()));
+        self.table.remove_group(scope, group_id);
+        out
+    }
+
+    /// Every address THIS node listens on for `group_id`, across all live
+    /// epochs. Empty if the group is unknown.
+    ///
+    /// Only our own: the table holds every member's address (we dial those),
+    /// but this node ever registered exactly one per epoch.
+    fn own_live_addresses(&self, scope: &CohortScope, group_id: &str) -> Vec<MemberAddress> {
+        let Some(live) = self.table.live_epochs(scope, group_id) else {
+            return Vec::new();
+        };
+        [live.previous, Some(live.current), live.next]
+            .into_iter()
+            .flatten()
+            .filter_map(|epoch| {
+                self.table
+                    .address_at(scope, group_id, epoch, &self.own_key_id)
+            })
+            .collect()
+    }
+
     /// Seal every rotation whose convergence window has elapsed.
     ///
     /// Call on a timer. Idempotent, and cheap when nothing is due.
@@ -615,7 +684,12 @@ impl ScopeLifecycle {
         {
             return Ok(a);
         }
-        self.table.remove_group(scope, group_id);
+        // Retire before dropping. Reached from `epoch_advanced` when a roster
+        // no longer contains us (a member removed from its own group), and by
+        // then PRIOR epochs' addresses are registered. A bare `remove_group`
+        // here retracts attribution while leaving those destinations live —
+        // accepting links this node cannot place, permanently.
+        self.leave(scope, group_id);
         Err(ScopeLifecycleError::SelfNotInRoster {
             own_key_id: self.own_key_id.clone(),
             group_id: group_id.to_owned(),
@@ -951,6 +1025,78 @@ mod tests {
         assert!(table
             .accepts_inbound(third.own_address.as_bytes())
             .is_some());
+    }
+
+    #[test]
+    fn leaving_retires_every_live_epoch_not_just_the_current_one() {
+        // The teardown direction, which was missing: remove_group retracts
+        // ATTRIBUTION but never called the sink, so an address stayed
+        // REGISTERED — accepting links the node cannot place, permanently.
+        //
+        // Mid-rotation is the case that matters: a group left between an
+        // advance and its seal has a superseded address registered too, and
+        // leaving is the one moment none of them should survive.
+        let (life, table, sink) = fixture();
+        let first = life
+            .joined(&scope(), "g", 1, &[7u8; 32], &["node-self"])
+            .unwrap();
+        let t0 = Instant::now();
+        let second = life
+            .epoch_advanced(&scope(), "g", 2, &[9u8; 32], &["node-self"], t0)
+            .unwrap();
+
+        let out = life.leave(&scope(), "g");
+        assert_eq!(
+            out,
+            SealOutcome {
+                sealed: 2,
+                unretired: 0
+            },
+            "both live epochs must be retired, not only the current one",
+        );
+
+        let retired = sink.retired.lock().unwrap().clone();
+        assert!(retired.contains(first.own_address.as_bytes()));
+        assert!(retired.contains(second.own_address.as_bytes()));
+
+        // And the group is gone from the table, so nothing attributes either.
+        assert!(table
+            .accepts_inbound(first.own_address.as_bytes())
+            .is_none());
+        assert!(table
+            .accepts_inbound(second.own_address.as_bytes())
+            .is_none());
+        assert_eq!(life.pending_seals(), 0, "a left group owes no seal");
+    }
+
+    #[test]
+    fn a_roster_that_drops_us_mid_rotation_retires_what_was_registered() {
+        // The path the review flagged as latent: epoch_advanced with a roster
+        // that no longer contains us (a member removed from its own group).
+        // The rollback used to be a bare remove_group, which retracted
+        // attribution while leaving PRIOR epochs' destinations live.
+        let (life, table, sink) = fixture();
+        let first = life
+            .joined(&scope(), "g", 1, &[7u8; 32], &["node-self", "peer"])
+            .unwrap();
+
+        let err = life
+            .epoch_advanced(&scope(), "g", 2, &[9u8; 32], &["peer"], Instant::now())
+            .expect_err("a roster without us must be refused");
+        assert!(matches!(err, ScopeLifecycleError::SelfNotInRoster { .. }));
+
+        assert!(
+            sink.retired
+                .lock()
+                .unwrap()
+                .contains(first.own_address.as_bytes()),
+            "the address registered before the rollback must be RETIRED, not \
+             merely dropped from the table — otherwise it accepts links this \
+             node can no longer place",
+        );
+        assert!(table
+            .accepts_inbound(first.own_address.as_bytes())
+            .is_none());
     }
 
     #[test]
