@@ -1,7 +1,7 @@
 # `ciris-edge`
 
 **The transport and replication layer of the CIRIS Epistemic Web
-([CEWP](https://ciris.ai/cewp)).** A single Rust crate that moves the 14 signed
+([CEWP](https://ciris.ai/cewp)).** A single Rust crate that moves the 15 signed
 envelope kinds of the CEG grammar between federation peers over any medium —
 Reticulum mesh, HTTPS, packet radio — decides *who is allowed to learn a claim
 exists*, and attributes every inbound byte to a cryptographic identity **before
@@ -17,7 +17,7 @@ violate*, not promises an operator makes). Its design thesis, from
 **"the strongest flow rule is one the network cannot express breaking."**
 
 > **📖 The protocol spec: [`FSD/CIRIS_EDGE_TRANSPORT.md`](FSD/CIRIS_EDGE_TRANSPORT.md)** —
-> the 14 EnvelopeKinds, the cohort/namespace projections, the anti-entropy state
+> the 15 EnvelopeKinds, the cohort/namespace projections, the anti-entropy state
 > machine, the transport attribution pipeline, the serve/consent gates, and the
 > CEG-vs-OSI layering, with diagrams and code anchors. Start there.
 
@@ -43,13 +43,13 @@ is the production fallback so cloud deployments participate today.
 1. **[`MISSION.md`](MISSION.md)** — the WHY. Mission-Driven Development alignment to
    CIRIS Accord Meta-Goal M-1; per-module missions; anti-patterns; failure modes.
 2. **[`FSD/CIRIS_EDGE_TRANSPORT.md`](FSD/CIRIS_EDGE_TRANSPORT.md)** — the protocol.
-   State machines, the 14 kinds, namespaces, attribution, consent-routing, CEG↔OSI.
+   State machines, the 15 kinds, namespaces, attribution, consent-routing, CEG↔OSI.
 3. **[`FSD/CIRIS_EDGE.md`](FSD/CIRIS_EDGE.md)** — the architecture spec, crate shape,
    public API surface, verify-via-persist contract, test categories.
 
 ## The shape of the protocol (one-paragraph tour)
 
-Every claim is one of **14 signed [`EnvelopeKind`s](FSD/CIRIS_EDGE_TRANSPORT.md#2-the-14-envelopekinds)**,
+Every claim is one of **15 signed [`EnvelopeKind`s](FSD/CIRIS_EDGE_TRANSPORT.md#2-the-15-envelopekinds)**,
 each its own anti-entropy stream. A claim's **`cohort_scope`** (`self` → `family`
 → `community` → `affiliations` → `species` → `biosphere` → `federation`) resolves
 to a **projection** — `SelfOwn` (publish-your-own, *structurally invisible* — no
@@ -82,16 +82,25 @@ real video + real blobs through real relays, in CI).
 
 ## Status
 
-**v18.x** — production CEG-native transport, scope-native addressing end to
-end (`#499`), and the A/V mesh spine. Reticulum + HTTPS + packet-radio
+**v18.2.x — measured, not promised.** The acceptance sweep is at **100%**:
+across every tested group size, real encrypted video and files were
+delivered between separate machines through a relay that can neither read
+them nor learn the group exists; members joined mid-stream; keys rotated
+without a single lost frame; retired addresses verifiably went dark while
+their successors kept answering; outsiders were refused. Every one of those
+sentences is a test that fails loudly if it stops being true
+([`bench-mesh/`](bench-mesh/README.md); labels and evidence in
+[`docs/LIGHTNET_DARKNET.md`](docs/LIGHTNET_DARKNET.md)).
+
+Under the hood: production CEG-native transport, scope-native addressing end
+to end (`#499`), the A/V mesh spine, and the delivery-model completion cut
+(v18.2.0: every replication plane activatable, every special case a named
+tested predicate, spec re-synced to code). Reticulum + HTTPS + packet-radio
 transports; the anti-entropy replication engine; the `#393` two-item
-attribution gate (Rooted∧owns_key + hybrid transport binding); the `#402`
-bootstrap carve-out; the `#396` consent-resolved fan-out + serve gates; MLS
-cohorts (TreeKEM, X-Wing) with scope-derived addressing, seal/retirement, and
-the LXMF serve path (`#169`); mandatory hybrid Ed25519 + ML-DSA-65 on every
-producer (`#458`: no classical-only paths); PyO3 + UniFFI mobile surfaces
-(Android floor: API 24). Pinned in lockstep to `ciris-persist`
-(Registry-of-Record admission) via drift-witnessed policy hashes.
+attribution gate; MLS cohorts (TreeKEM, X-Wing) with scope-derived
+addressing and seal/retirement; mandatory hybrid Ed25519 + ML-DSA-65 on
+every producer; PyO3 + UniFFI mobile surfaces (Android floor: API 24).
+Pinned in lockstep to `ciris-persist` via drift-witnessed policy hashes.
 
 ## Sister repos
 
