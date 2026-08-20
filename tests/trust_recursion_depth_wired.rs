@@ -1,14 +1,21 @@
 //! CIRISEdge#51 (v0.20.0 RC1) — `EdgeConfig::trust_recursion_depth`
-//! is threaded into `dispatch_inbound`'s
-//! `TrustScoring::trust_score(key_id, recursion_depth)` call. v0.19.6
-//! hardcoded `0` (strict direct trust); the CEWP L0/L1 default of
-//! `1` for `AgentMode::Server` (friend-of-friends) now reaches the
-//! resolver via the config field.
+//! wiring, revised for persist v38.0.0 (CIRISPersist#748): the
+//! `TrustScoring::trust_score` trait retired its decorative
+//! `recursion_depth` argument (no impl consumed it and no attenuation
+//! rule was ever specified), so "the config depth reaches the
+//! resolver" is no longer an assertable — or even expressible — claim
+//! at this seam. What remains load-bearing, and what this file pins:
 //!
-//! Uses a recording `TrustScoring` impl that captures the
-//! `recursion_depth` argument so the test asserts byte-equivalence
-//! between `EdgeConfig::trust_recursion_depth` and the value the
-//! resolver observes.
+//! - the `dispatch_inbound` trust short-circuit consults the wired
+//!   scorer EXACTLY ONCE per envelope, with the sender's key_id;
+//! - `AgentMode::apply_defaults` still sets the CEWP tier depth and
+//!   `Edge::trust_recursion_depth()` still surfaces it (the knob now
+//!   feeds only the pyo3 `trust_resolver` callback's second argument,
+//!   captured at `install_trust_resolver` time);
+//! - configuring a non-zero depth does not perturb dispatch.
+//!
+//! Uses a recording `TrustScoring` impl that captures the key_id per
+//! call.
 
 #![cfg(feature = "transport-reticulum")]
 
@@ -34,11 +41,11 @@ use ciris_persist::store::sqlite::SqliteBackend;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-// ─── Recording scorer — captures (key_id, recursion_depth) calls ─────
+// ─── Recording scorer — captures key_id per call ─────────────────────
 
 #[derive(Default)]
 struct RecordingScorer {
-    calls: Mutex<Vec<(String, u8)>>,
+    calls: Mutex<Vec<String>>,
     score: f64,
 }
 
@@ -49,8 +56,8 @@ impl RecordingScorer {
             score,
         }
     }
-    fn last_depth(&self) -> Option<u8> {
-        self.calls.lock().unwrap().last().map(|(_, d)| *d)
+    fn last_key(&self) -> Option<String> {
+        self.calls.lock().unwrap().last().cloned()
     }
     fn call_count(&self) -> usize {
         self.calls.lock().unwrap().len()
@@ -59,15 +66,8 @@ impl RecordingScorer {
 
 #[async_trait]
 impl TrustScoring for RecordingScorer {
-    async fn trust_score(
-        &self,
-        key_id: &str,
-        recursion_depth: u8,
-    ) -> Result<f64, TrustScoringError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((key_id.to_string(), recursion_depth));
+    async fn trust_score(&self, key_id: &str) -> Result<f64, TrustScoringError> {
+        self.calls.lock().unwrap().push(key_id.to_string());
         Ok(self.score)
     }
 }
@@ -252,10 +252,12 @@ async fn dispatch(
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn dispatch_inbound_uses_config_trust_recursion_depth_for_score_lookup_l0() {
-    // L0 / Proxy default (recursion depth = 0). Above-threshold so
-    // the envelope reaches the scoring branch; we don't care about
-    // the outcome, only that the resolver observed depth = 0.
+async fn dispatch_inbound_consults_the_wired_scorer_once_with_the_sender_key() {
+    // Above-threshold so the envelope reaches the scoring branch. The
+    // scorer must be consulted EXACTLY once, with the sender's key_id
+    // — the assertable remainder of the retired depth-threading claim
+    // (persist v38.0.0 / CIRISPersist#748: `trust_score` takes only
+    // the key).
     let tmp = tempfile::tempdir().expect("tempdir");
     let (edge, remote, local_key_id, recorder) =
         build_edge_with_recursion_depth(&tmp, 0, 0.9).await;
@@ -265,61 +267,46 @@ async fn dispatch_inbound_uses_config_trust_recursion_depth_for_score_lookup_l0(
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(recorder.call_count(), 1, "exactly one score lookup");
     assert_eq!(
-        recorder.last_depth(),
-        Some(0),
-        "EdgeConfig::trust_recursion_depth = 0 must reach the resolver as 0"
+        recorder.last_key().as_deref(),
+        Some("remote-peer"),
+        "the scorer must be asked about the envelope's signing key"
     );
 }
 
 #[tokio::test]
-async fn dispatch_inbound_uses_config_trust_recursion_depth_for_score_lookup_l1() {
-    // L1 / Server default (recursion depth = 1, friend-of-friends).
-    // This is the load-bearing assertion for the v0.20.0 RC1 wiring:
-    // the value must flow EdgeConfig → dispatch_inbound → scorer.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (edge, remote, local_key_id, recorder) =
-        build_edge_with_recursion_depth(&tmp, 1, 0.9).await;
-    dispatch(&edge, &remote, &local_key_id)
-        .await
-        .expect("dispatch");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(recorder.call_count(), 1, "exactly one score lookup");
-    assert_eq!(
-        recorder.last_depth(),
-        Some(1),
-        "EdgeConfig::trust_recursion_depth = 1 (L1 friend-of-friends) \
-         must reach the resolver verbatim"
-    );
-}
-
-#[tokio::test]
-async fn dispatch_inbound_uses_operator_pinned_recursion_depth_override() {
-    // Operator override scenario: a curated server pins depth = 0
-    // (strict direct trust) even though L1 default is 1. The
-    // override flow is `apply_defaults` → operator field write →
-    // EdgeConfig → dispatch_inbound. Pinned at depth = 2 here to
-    // exercise a non-default-tier value (covers the contract shape
-    // for future L2+ deployments).
+async fn configured_nonzero_depth_does_not_perturb_dispatch() {
+    // Operator override scenario: the depth knob remains configurable
+    // (it feeds the pyo3 `trust_resolver` callback's second argument),
+    // and setting a non-default value must not change the dispatch
+    // path's scorer contract. Pinned at depth = 2 (a non-default-tier
+    // value, covering the contract shape for future L2+ deployments).
     let tmp = tempfile::tempdir().expect("tempdir");
     let (edge, remote, local_key_id, recorder) =
         build_edge_with_recursion_depth(&tmp, 2, 0.9).await;
+    assert_eq!(
+        edge.trust_recursion_depth(),
+        2,
+        "operator-pinned depth must survive to the accessor"
+    );
     dispatch(&edge, &remote, &local_key_id)
         .await
         .expect("dispatch");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
-        recorder.last_depth(),
-        Some(2),
-        "operator-pinned depth must override the AgentMode default"
+        recorder.call_count(),
+        1,
+        "a configured depth must not change the single-lookup contract"
     );
 }
 
 #[tokio::test]
 async fn agent_mode_server_apply_defaults_threads_depth_one_into_edge_config() {
     // End-to-end shape: build an `EdgeConfig` via `AgentMode::Server
-    // .apply_defaults`, then verify the Edge built around it sees
-    // depth = 1 at the dispatcher. This pins the integration between
-    // the AgentMode default and the dispatch-inbound wiring.
+    // .apply_defaults`, then verify the Edge built around it surfaces
+    // depth = 1 and still consults the scorer on dispatch. This pins
+    // the integration between the AgentMode default and the config
+    // surface (the depth itself no longer crosses the TrustScoring
+    // trait — persist v38.0.0 / CIRISPersist#748).
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let steward = FedKey::new("steward-fed", 0x01);
@@ -372,9 +359,9 @@ async fn agent_mode_server_apply_defaults_threads_depth_one_into_edge_config() {
         .expect("dispatch");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
-        recorder.last_depth(),
-        Some(1),
-        "Server-tier depth must propagate to the resolver"
+        recorder.call_count(),
+        1,
+        "the Server-tier config must still route dispatch through the scorer"
     );
 }
 
