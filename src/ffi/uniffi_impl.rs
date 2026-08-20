@@ -400,6 +400,15 @@ pub fn peer_add(
 /// permitted; the row is hidden from reads, the canonical knowledge
 /// stays in memory, and the init reseed does NOT un-hide it (persist
 /// preserves `removed_at` across the idempotent `add_peer_record`).
+///
+/// persist v38.0.0 (CIRISPersist#721) — a removal is an announced,
+/// attributed act: `remove_peer_record` now REQUIRES a `reason` and
+/// records `acting_under_delegation_id`, and both faces emit
+/// `admin_action:peer_removal` in-transaction. This mobile surface has
+/// exactly one caller class (the device operator acting on their own
+/// node), so the reason is synthesized at the boundary rather than
+/// widening the FFI signature; plumbing an operator-typed reason
+/// through the bindings is a host-UI follow-up, not this seam's call.
 pub fn peer_remove(
     handle: crate::EdgePeerHandle,
     hard: bool,
@@ -415,8 +424,13 @@ pub fn peer_remove(
     let directory = current_federation_directory()?;
     let key_id = handle.key_id;
     block_on_runtime(&edge, async move {
+        let reason = if hard {
+            "operator hard-remove via edge mobile FFI peer_remove"
+        } else {
+            "operator soft-remove via edge mobile FFI peer_remove"
+        };
         directory
-            .remove_peer_record(&key_id, hard)
+            .remove_peer_record(&key_id, hard, reason, None)
             .await
             .map_err(map_federation_err)
     })

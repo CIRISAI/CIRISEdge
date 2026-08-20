@@ -340,6 +340,17 @@ const REVERSE_PATH_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(6);
 /// mobile's ~90 s live window; a stalled transfer fails earlier via the
 /// no-progress window).
 const REVERSE_PATH_MAX_TRANSFER: Duration = Duration::from_secs(45);
+/// Defensive size bound on the `sent_resource_progress` mirror. leviculum
+/// v0.22 (#59) moved `ResourceTransferStarted` onto the droppable data
+/// plane while `ResourceCompleted` (the entry's remover) stays on the
+/// control plane, so a saturated node can deliver Started/Progress AFTER
+/// their own completion and strand an entry (the pre-existing
+/// `ResourceProgress` window, widened). Past this threshold the insert arm
+/// prunes entries idle beyond [`REVERSE_PATH_MAX_TRANSFER`] — a live
+/// transfer refreshes `last_update` every progress tick, so only orphans
+/// qualify. 4096 entries ≈ 200 KB worst case: far above any realistic
+/// concurrent-send envelope, cheap enough that the prune almost never runs.
+const SENT_RESOURCE_PROGRESS_PRUNE_THRESHOLD: usize = 4096;
 /// No-progress window for the OUTBOUND-dial path — a freshly-dialed link we
 /// control, so more lenient than the churn-prone reverse path.
 const DIAL_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(30);
@@ -6145,6 +6156,19 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             );
         }
         // TransferStarted + Progress both mean "parts are flowing" → Transferring.
+        //
+        // leviculum v0.22 (#59) reclassified `ResourceTransferStarted` from the
+        // lossless control plane to the droppable data plane (`ResourceProgress`
+        // was Data already). Both now ride a DIFFERENT channel than the Control
+        // `ResourceCompleted` that removes this entry, so under saturation a
+        // queued Started/Progress can arrive AFTER its own completion and
+        // re-insert a stale entry no one will ever remove (the waiter that
+        // owns the other removal has already returned). The insert stays (it
+        // is the self-healing arm when the `ResourceAdvertised` insert was
+        // lost to a control-plane drop), but the map gets a defensive bound:
+        // past the cap, entries idle beyond the reverse-path hard transfer
+        // cap are pruned — a live transfer refreshes `last_update` on every
+        // progress tick, so only orphans qualify.
         NodeEvent::ResourceTransferStarted {
             resource_hash,
             is_sender,
@@ -6156,7 +6180,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             ..
         } => {
             if is_sender {
-                ctx.sent_resource_progress.lock().await.insert(
+                let mut guard = ctx.sent_resource_progress.lock().await;
+                if guard.len() >= SENT_RESOURCE_PROGRESS_PRUNE_THRESHOLD {
+                    guard.retain(|_, p| p.last_update.elapsed() < REVERSE_PATH_MAX_TRANSFER);
+                }
+                guard.insert(
                     resource_hash,
                     ResourceSendProgress {
                         stage: ResourceSendStage::Transferring,

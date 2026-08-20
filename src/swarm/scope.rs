@@ -169,6 +169,18 @@ fn basis_tag(basis: RecipientBasis) -> &'static str {
         RecipientBasis::Unbounded => "unbounded",
         RecipientBasis::NoRosterForScope => "no_roster_for_scope",
         RecipientBasis::GroupUnresolvable => "group_unresolvable",
+        // persist v38.0.0 (CIRISPersist#746) — a scope-address-table id
+        // (`cohort:*` / `av-stream:*`) in the federation-key parameter
+        // is refused BY NAME, never answered as a confident
+        // `GroupUnresolvable` about a group that was never asked about.
+        // Edge never hands one over (the `ContentScope::Group` branch
+        // resolves via the address table, and the Federation branch's
+        // `group_key_id` is provably unread — see
+        // `federation_branch_never_reads_the_group_key_id`), so this
+        // arm firing means a caller wired the wrong id space; the tag
+        // names that remedy instead of flattening it into
+        // "membership list broken".
+        RecipientBasis::GroupIdNotFederationKeyed => "group_id_not_federation_keyed",
         RecipientBasis::NotRosterKeyed => "not_roster_keyed",
         _ => "unknown_basis",
     }

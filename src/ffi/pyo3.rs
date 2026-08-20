@@ -962,7 +962,7 @@ impl PyEdge {
     /// effective gate becomes:
     ///
     /// ```text
-    /// trust_score(signing_key_id, recursion_depth) < threshold
+    /// trust_score(signing_key_id) < threshold
     ///   ⇒ envelope dropped, "trust_short_circuited" event emitted
     /// ```
     ///
@@ -1016,8 +1016,16 @@ impl PyEdge {
                     }
                     Ok(())
                 })?;
+                // persist v38.0.0 (#748) retired the trait's
+                // `recursion_depth` argument; the Python callback's
+                // two-arg contract is preserved by capturing the
+                // configured depth HERE (it was always the same
+                // config-sourced value on every call).
                 let scoring: Arc<dyn ciris_persist::federation::TrustScoring> =
-                    Arc::new(PyTrustScoringAdapter { callback: cb });
+                    Arc::new(PyTrustScoringAdapter {
+                        callback: cb,
+                        depth: self.inner.trust_recursion_depth(),
+                    });
                 self.inner.install_trust_scoring_override(Some(scoring));
                 Ok(())
             }
@@ -3085,6 +3093,14 @@ fn scope_to_pydict<'py>(
 /// `AdmissionGate` unknown-key discipline).
 struct PyTrustScoringAdapter {
     callback: Py<PyAny>,
+    /// `EdgeConfig::trust_recursion_depth`, captured at
+    /// `install_trust_resolver` time. persist v38.0.0 (#748) retired
+    /// the `recursion_depth` argument from
+    /// `TrustScoring::trust_score`; the Python callback keeps its
+    /// `(signing_key_id, recursion_depth)` contract by reading the
+    /// depth from here instead — behaviour-identical, because the
+    /// dispatch path only ever passed this same config value.
+    depth: u8,
 }
 
 /// CIRISEdge#219 — `Arc<dyn RNodeChannelFactory>` adapter wrapping a
@@ -3259,8 +3275,11 @@ impl ciris_persist::federation::TrustScoring for PyTrustScoringAdapter {
     async fn trust_score(
         &self,
         key_id: &str,
-        recursion_depth: u8,
     ) -> Result<f64, ciris_persist::federation::TrustScoringError> {
+        // persist v38.0.0 (#748): the trait no longer carries a depth;
+        // the Python callback's second argument comes from the depth
+        // captured at install time.
+        let recursion_depth = self.depth;
         let key_id_owned = key_id.to_owned();
         // `block_in_place` keeps the dispatch_inbound future on its
         // current worker but moves the GIL-attach into a blocking context.
@@ -4356,9 +4375,9 @@ pub fn init_edge_runtime(
     // `trust_recursion_depth`). `Some(_)` pins the per-deployment
     // value AFTER `AgentMode::apply_defaults` runs, so a curated
     // server (e.g.) can pin depth = 0 even though L1 default is 1.
-    // `trust_recursion_depth` is clamped to `u8`'s range; persist's
-    // `TrustScoring::trust_score(_, recursion_depth: u8)` consumes it
-    // verbatim.
+    // `trust_recursion_depth` is clamped to `u8`'s range; since persist
+    // v38.0.0 (#748) retired the trait's depth argument it feeds only
+    // the Python `trust_resolver` callback's second argument.
     disk_budget_bytes: Option<u64>,
     trust_recursion_depth: Option<u8>,
     // v2.3.0 (CIRISEdge#100) — Reticulum shared-instance mode. When

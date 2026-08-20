@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "18.2.0"
+version = "18.3.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -213,7 +213,18 @@ publish = false
 # de-projects (retires) it — closing the "accepted-but-not-projected" gap that was
 # the #336 offline/pre-announce last mile. Edge threads the announce `epoch` into
 # the write-through and adopts the signed apply in `src/replication/bridge.rs`.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v37.1.0", version = "37", features = ["sqlite", "encrypted-kv"] }
+# v38.0.0 — the constitutional-ledger MAJOR. Edge-side impact: #748 retires
+# `TrustScoring::trust_score`'s decorative `recursion_depth` (edge drops the
+# dispatch threading; the pyo3 `trust_resolver` callback keeps its two-arg
+# contract via install-time capture), #721 `remove_peer_record` takes
+# `reason` + `acting_under_delegation_id` (edge synthesizes at the uniffi
+# boundary), #746 `RecipientBasis::GroupIdNotFederationKeyed` adopted in
+# `basis_tag`. NOT consumed by edge: #723 witness_diversity BAND, #671
+# GenesisPurgeAuthority, #709 seated-steward quorum, the ledgers +
+# registry_key_escrows families (additive), capsule ABI 3→4 (edge compares
+# persist's own ASYNC_EXECUTOR_ABI_VERSION const — tracks automatically).
+# persist v38 keeps CIRISVerify v13.6.1 — no cross-cdylib skew.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.0.0", version = "38", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -602,8 +613,20 @@ tempfile       = { version = "3", optional = true }
 # crate semver is now 0.16. CHANGELOG-gotcha lesson from their release: grep for
 # conflict markers before tagging (prose doesn't compile). Adoption sequenced in #484:
 # awaited variants next, then #482 item-1 buffer_unordered dispatcher.
-leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.20.0+ciris.1", version = "0.20", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.20.0+ciris.1", version = "0.20", optional = true }
+# v0.23.0+ciris.1 (CIRISEdge#508 arc) — first fixes from the live-canonical
+# incident, filed as leviculum#56–#60: #56 the completion mirror never evicts a
+# LIVE link (cap is an alarm, not an evictor; also deletes an O(n) scan under
+# the registry lock per link close), #59 resource events classified by what
+# they carry (sender-side intermediate ResourceCompleted +
+# ResourceTransferStarted → Data; receiver-side/final stay Control — completion
+# futures unaffected, registry observes at dispatch before the sink), #60 drop
+# ladder (1,2,4,8… not per-event WARN) + 80% pre-threshold warn +
+# `plane_stats()`/`PlaneStats` (additive API). #57 answered with analysis, #58
+# scoped (still open). API edge consumes is otherwise UNCHANGED. Upstream
+# catch-up carries per-interface-type IFAC size defaults (Codeberg #293) —
+# edge passes explicit config, unaffected.
+leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.23.0+ciris.1", version = "0.23", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.23.0+ciris.1", version = "0.23", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -613,7 +636,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.20.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.20.0+ciris.1", version = "0.20", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.23.0+ciris.1", version = "0.23", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
@@ -1250,7 +1273,7 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v37.1.0", version = "37", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.0.0", version = "38", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3

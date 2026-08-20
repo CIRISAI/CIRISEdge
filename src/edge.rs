@@ -93,9 +93,12 @@ pub const DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS: u64 = 3600;
 /// mapping with the full CEWP L0/L1 tier vocabulary. The
 /// `disk_budget_bytes` field is **advisory** at the edge tier (persist
 /// or the host enforces capacity-gated admission); the
-/// `trust_recursion_depth` is **consulted** at `dispatch_inbound`'s
-/// trust short-circuit (it's the `recursion_depth` argument to
-/// `TrustScoring::trust_score`, replacing v0.19.6's hardcoded `0`).
+/// `trust_recursion_depth` is edge-tier POLICY VOCABULARY only: persist
+/// v38.0.0 (#748) retired the decorative `recursion_depth` argument from
+/// `TrustScoring::trust_score` (no attenuation rule was ever specified;
+/// transitive propagation stays the consumer's, AV-29), so the value now
+/// reaches only the Python `trust_resolver` callback (captured at
+/// `install_trust_resolver` time) — never persist's trait.
 /// L2+ tiers are deferred to a post-v1.0 cut.
 ///
 /// Transport-posture translation (Roaming / Full / Gateway / AP) is
@@ -187,9 +190,10 @@ impl AgentMode {
     }
 
     /// CIRISEdge#51 (v0.20.0 RC1) — default trust recursion depth for
-    /// the mode. Consumed at [`dispatch_inbound`]'s trust short-circuit
-    /// as the `recursion_depth` argument to
-    /// `TrustScoring::trust_score` (replacing v0.19.6's hardcoded `0`).
+    /// the mode. Since persist v38.0.0 (#748) retired the trait's
+    /// `recursion_depth` argument, this reaches only the Python
+    /// `trust_resolver` callback (see `install_trust_resolver`) — it is
+    /// edge policy vocabulary, not a persist input.
     /// Client = 0 (no inbound dispatch), Proxy = 0 (strict — direct
     /// attestations only), Server = 1 (friend-of-friends — walks one
     /// `delegates_to` hop). L2+ tiers deferred to a post-v1.0 cut.
@@ -439,10 +443,12 @@ pub struct EdgeConfig {
     /// (CEWP tier as security boundary).
     pub disk_budget_bytes: u64,
     /// CIRISEdge#51 (v0.20.0 RC1) — CEWP L0/L1 trust-graph recursion
-    /// depth for the [`dispatch_inbound`] short-circuit. Threaded
-    /// into `TrustScoring::trust_score(key_id, recursion_depth)` as
-    /// the second arg (replacing v0.19.6's hardcoded `0`). Defaults
-    /// from [`AgentMode::default_trust_recursion_depth`]: Client = 0,
+    /// depth. persist v38.0.0 (#748) retired the trait's
+    /// `recursion_depth` argument (`TrustScoring::trust_score(key_id)`
+    /// now), so this field feeds ONLY the Python `trust_resolver`
+    /// callback's second argument (captured at
+    /// `install_trust_resolver` time — the callback API is unchanged).
+    /// Defaults from [`AgentMode::default_trust_recursion_depth`]: Client = 0,
     /// Proxy = 0 (strict direct trust), Server = 1 (friend-of-
     /// friends — one `delegates_to` hop). Operator override on
     /// `init_edge_runtime` (the new `trust_recursion_depth` kwarg)
@@ -1904,9 +1910,10 @@ impl Edge {
 
     /// CIRISEdge#51 (v0.20.0 RC1) — CEWP L0/L1 trust-graph recursion
     /// depth sourced from [`EdgeConfig::trust_recursion_depth`].
-    /// Threaded into `dispatch_inbound`'s `TrustScoring::trust_score`
-    /// call; exposed here so hosts can mirror the same depth on
-    /// out-of-band trust queries.
+    /// Since persist v38.0.0 (#748) the `TrustScoring` trait takes no
+    /// depth; this feeds the Python `trust_resolver` callback's second
+    /// argument and is exposed here so hosts can mirror the same depth
+    /// on out-of-band trust queries.
     #[must_use]
     pub fn trust_recursion_depth(&self) -> u8 {
         self.config.trust_recursion_depth
@@ -3598,7 +3605,6 @@ impl Edge {
             trust_scoring_ref,
             trust_threshold,
             trust_short_circuit_enabled,
-            self.config.trust_recursion_depth,
             self.config.agent_mode,
             self.config.l1_cdn_edge_enabled,
             self.config.l1_cdn_edge_external_uri_base.clone(),
@@ -4278,10 +4284,6 @@ impl Edge {
         let trust_scoring = self.trust_scoring.clone();
         let trust_threshold = self.config.trust_threshold;
         let trust_short_circuit_enabled = self.config.trust_short_circuit_enabled;
-        // CIRISEdge#51 (v0.20.0 RC1) — capture into the dispatcher loop
-        // so each spawned `dispatch_inbound` task gets the operator-
-        // configured recursion depth (CEWP L0/L1 0/1 default).
-        let trust_recursion_depth = self.config.trust_recursion_depth;
         // CIRISEdge#52 (v0.20.1) — multimedia tier knobs threaded
         // into each dispatched envelope. `agent_mode` gates the
         // L1-as-CDN-edge prefetch arm; the URI base is `Option`
@@ -4400,7 +4402,6 @@ impl Edge {
                             trust_scoring_clone.as_ref(),
                             trust_threshold,
                             trust_short_circuit_enabled,
-                            trust_recursion_depth,
                             agent_mode_for_dispatch,
                             l1_cdn_edge_enabled,
                             l1_cdn_edge_external_uri_base_clone,
@@ -5000,11 +5001,10 @@ async fn dispatch_inbound(
     trust_scoring: Option<&Arc<dyn ciris_persist::federation::TrustScoring>>,
     trust_threshold: f64,
     trust_short_circuit_enabled: bool,
-    // CIRISEdge#51 (v0.20.0 RC1) — trust-graph recursion depth threaded
-    // through to `TrustScoring::trust_score(key_id, recursion_depth)`.
-    // v0.19.6 hardcoded `0` (strict direct trust); v0.20.0 RC1 honours
-    // `EdgeConfig::trust_recursion_depth` (CEWP L0/L1 default 0/1).
-    trust_recursion_depth: u8,
+    // persist v38.0.0 (#748) retired `TrustScoring::trust_score`'s
+    // decorative `recursion_depth` argument; the depth knob no longer
+    // threads through dispatch (it feeds only the Python
+    // `trust_resolver` callback, captured at `install_trust_resolver`).
     // CIRISEdge#52 (v0.20.1) — multimedia tier: agent_mode gates
     // L1-as-CDN-edge (only `Server`/L1 acts); the cdn-edge knobs are
     // captured here so the dispatch sub-arm on `ContributionSubmit`
@@ -5252,9 +5252,7 @@ async fn dispatch_inbound(
     // SQL-backed) `trust_score` call per envelope.
     if trust_short_circuit_enabled && trust_threshold > 0.0 {
         if let Some(scorer) = trust_scoring {
-            let score = scorer
-                .trust_score(&envelope.signing_key_id, trust_recursion_depth)
-                .await;
+            let score = scorer.trust_score(&envelope.signing_key_id).await;
             let observed = match score {
                 Ok(s) => s,
                 Err(ciris_persist::federation::TrustScoringError::KeyNotFound(_)) => {
