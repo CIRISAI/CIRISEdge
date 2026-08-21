@@ -1,0 +1,127 @@
+# warm-release-cache — pre-warm the new edge CIRISCache layer the moment a
+# substrate pin (or edge's own version) bumps on main, DECOUPLED from ci.yml.
+#
+# CIRISServer#285 / CIRISEdge#216. The centipede cache key
+# (`…-p<persist>-e<edge>-v<verify>`, see .github/actions/ciriscache) is
+# version-keyed: any of those three changing mints a fresh key that nothing has
+# saved yet, so every downstream job (server client-artifacts, persist, this
+# repo's own tag run) cold-recompiles the ~200-crate edge dep graph — N× the
+# same build across jobs×platforms.
+#
+# ci.yml *does* save the edge layer on main/tags, but two facts defeat it as a
+# warm source: (1) ci.yml's main-push run and the release TAG run share one
+# SHA-keyed concurrency group with cancel-in-progress, so the tag run CANCELS
+# the main run that would have saved the layer; (2) the surviving tag run only
+# saves at the END of its ~20 min wheel matrix — long after a downstream repo,
+# triggered by the same substrate bump, has already started cold-building.
+#
+# This workflow runs in its OWN concurrency group (never cancelled by the tag),
+# fires the instant Cargo.toml's pins change, and saves the linux release layers
+# — the ones the installer + Docker + persist restore — as fast as a single
+# `cargo build --release` allows. Mirrors CIRISServer's warm-release-cache.yml;
+# edge builds inline (no reusable build-wheels.yml) so the warm job is explicit.
+name: warm-release-cache
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml # the substrate pins + edge version live here; detect filters further
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Warm even without a detected pin/version change (validate the workflow)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write # CIRISCache/save writes the GHCR blob
+
+concurrency:
+  # Distinct from ci.yml's `ci-<sha>` group — a release tag must NOT cancel the
+  # warm. Keyed on ref so a newer main push supersedes an in-flight warm.
+  group: warm-release-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      warm: ${{ steps.d.outputs.warm }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: d
+        shell: bash
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "warm=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::forced via workflow_dispatch"
+            exit 0
+          fi
+          # The centipede key is a function of edge version (E), persist tag (P),
+          # and verify tag (V). Any of the three changing mints a cold key — so
+          # warm on a diff touching the `^version =` line OR a persist/verify tag.
+          if git diff HEAD~1 HEAD -- Cargo.toml \
+             | grep -qE '^[+-](version = |.*CIRIS(Persist|Verify).*tag = "v)'; then
+            echo "warm=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::edge version or a persist/verify pin changed — warming the release cache"
+          else
+            echo "warm=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no key-affecting change in Cargo.toml — nothing to warm"
+          fi
+
+  warm:
+    needs: detect
+    if: needs.detect.outputs.warm == 'true'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      # The two linux release layers downstream actually restores: the installer
+      # + Docker path (#285's cited 14m26s cold build) is linux-x86_64; aarch64
+      # covers the ARM image. macOS/Windows are desktop-wheel-only and ride
+      # ci.yml's own save — not worth a native-runner warm here.
+      matrix:
+        include:
+          - { plat: linux-x86_64, os: ubuntu-latest }
+          - { plat: linux-aarch64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libsqlite3-dev (sqlite build dep)
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Set up sccache (shared remote when configured, GHA otherwise)
+        uses: ./.github/actions/setup-sccache
+        with:
+          webdav-endpoint: ${{ secrets.SCCACHE_WEBDAV_ENDPOINT }}
+          webdav-token: ${{ secrets.SCCACHE_WEBDAV_TOKEN }}
+      - uses: ./.github/actions/ciriscache
+        id: cachekey
+        with:
+          plat: ${{ matrix.plat }}
+      # Warm the DENSEST edge layer (transport + reticulum + pyo3 — the superset
+      # the ciriscache `edge` key names). The ~200 upstream dep crates are the
+      # expensive part and their `target/` artifacts are identical to the wheel
+      # build's, so warming them here means every later job (this repo's tag run,
+      # downstream repos) restores instead of rebuilding. NOTE: no
+      # `extension-module` — that flag only changes edge's own final cdylib link
+      # (host-provides-libpython), not the deps, and omitting it lets a plain
+      # `cargo build` link cleanly against the runner's libpython (same reason
+      # `cargo test --features pyo3` works in ci.yml).
+      - name: cargo build --release (warm the edge layer)
+        run: cargo build --release --features "transport-http transport-reticulum pyo3"
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+      - uses: CIRISAI/CIRISCache/save@v1
+        with:
+          key: ${{ steps.cachekey.outputs.key }}
+          token: ${{ secrets.GITHUB_TOKEN }}
