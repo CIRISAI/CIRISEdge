@@ -28,6 +28,17 @@
 //! so re-resolving each round makes un-trust nuclear — *"the authority to say
 //! stop stays in human hands"* (<https://ciris.ai/vision/>) enforced at the wire.
 //!
+//! **The recipient set is resolved, not literal** (CIRISEdge#524, v18.5.0).
+//! `list_consent_peers` returns the SUBJECTS the live grants name, and a
+//! consent object naturally names a PERSON. A person's key carries no
+//! transport binding, so the literal set is not a routable set: the measured
+//! field state was a whole attestation plane dark under a valid grant. The
+//! send set is therefore the consent subjects PLUS the nodes each subject is
+//! the single responsible owner of (persist v38.3.0 `nodes_owned_by`,
+//! CIRISPersist#764) — the person's own instrument, not a third party. The
+//! walk, its liveness fold and its ambiguity rule are all persist's; edge
+//! resolves once per round, caches, and invalidates (the #430 discipline).
+//!
 //! **Fail-closed corollary** (deliberate, documented — the #379/#386 gate's
 //! posture): a node with no `consent:replication` grants has an empty send set
 //! and advertises NO consentable claims until consent explicitly grants them.
@@ -55,6 +66,17 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct ResolvedPeerSet {
     send_set: Arc<HashSet<String>>,
+    /// CIRISEdge#524 (v18.5.0, persist v38.3.0 `nodes_owned_by` / #764) — the
+    /// NODES reachable because a grant SUBJECT is their single responsible
+    /// owner. See [`Self::widened_by_owner_binding`] for why this widening is
+    /// the same transmission principle rather than a loosening of it.
+    owned_nodes: Arc<HashSet<String>>,
+    /// CIRISEdge#524 — did the owner-binding walk answer for EVERY grant
+    /// subject? `false` means at least one subject's `nodes_owned_by` read
+    /// errored, so this set is NARROWER than the live consent projection.
+    /// Recorded rather than hidden: a fail-closed narrowing is still a
+    /// narrowing, and the withhold line must be able to say which one this is.
+    owner_walk_complete: bool,
 }
 
 impl ResolvedPeerSet {
@@ -62,36 +84,105 @@ impl ResolvedPeerSet {
     /// operator-addressing half of the intersection is applied by the caller's
     /// serve path (only a connected peer is ever tested), so this holds the
     /// consent side alone. The `Arc` makes [`Clone`] O(1) for the memo.
+    ///
+    /// The result is DIRECT-NAMED only. Production goes on to
+    /// [`Self::widened_by_owner_binding`]; a set that never does simply routes
+    /// nothing by owner-binding, which is the pre-v18.5.0 behaviour.
     pub(crate) fn from_consent_peers(peers: Vec<String>) -> Self {
         Self {
             send_set: Arc::new(peers.into_iter().collect()),
+            owned_nodes: Arc::new(HashSet::new()),
+            owner_walk_complete: true,
         }
     }
 
-    /// A send-authorization for `peer_key_id`, IFF consent includes it. `None`
-    /// means edge must advertise nothing consentable to `peer_key_id` this
-    /// round — the peer is not in the transmission principle's recipient set.
-    /// This is the ONLY constructor of [`ResolvedRecipient`], so no code path
-    /// can serve a consentable claim to a peer persist's consent projection did
-    /// not authorize.
+    /// **CIRISEdge#524 — the routing half, closed against persist v38.3.0's
+    /// `nodes_owned_by` (CIRISPersist#764).**
+    ///
+    /// `owned_nodes` is the union of `nodes_owned_by(subject)` over the grant
+    /// subjects this set was built from: the nodes each subject is the SINGLE
+    /// RESPONSIBLE OWNER of (CC 1.13.3.3 / CIRISConstitution#23), resolved by
+    /// persist, live-folded (expiry + admitted `withdraws`), never derived here.
+    ///
+    /// # Why this is the same transmission principle, not a wider one
+    ///
+    /// A `consent:replication:v1` grant naming a PERSON is the natural shape —
+    /// consent is between people — and was silently unroutable, because a
+    /// person's key carries no transport binding and edge resolves recipients
+    /// by exact key match. Nissenbaum's *recipient* parameter is the person;
+    /// their own bound node is the INSTRUMENT through which that person is
+    /// reached, not a third party. Delivering to it is delivering to them. The
+    /// equivalence is persist's and is exact: `nodes_owned_by` takes candidates
+    /// from the granter-side index and gives each one to `owner_of` for its
+    /// verdict, so `n ∈ nodes_owned_by(U) ⟺ owner_of(n) == U` holds by
+    /// construction, and a node with two live owners (`AmbiguousNodeOwner`) is
+    /// SKIPPED — an ambiguous owner is never a resolvable recipient.
+    ///
+    /// # Why it enters HERE and not at the call site
+    ///
+    /// [`Self::recipient`] stays the ONE door that mints a
+    /// [`ResolvedRecipient`], and stays a pure set-membership test. Resolving
+    /// the owner axis per-peer at the serve site would have needed either a
+    /// second minting constructor or a directory read inside the funnel — a
+    /// side door, which is exactly what #396's by-construction argument spends
+    /// its safety on. Widening the SET keeps one door.
+    ///
+    /// `complete = false` records that at least one subject's walk errored, so
+    /// the set is narrower than consent authorizes (fail-closed) and the
+    /// withhold line can say so.
+    pub(crate) fn widened_by_owner_binding(
+        mut self,
+        owned_nodes: Vec<String>,
+        complete: bool,
+    ) -> Self {
+        self.owned_nodes = Arc::new(owned_nodes.into_iter().collect());
+        self.owner_walk_complete = complete;
+        self
+    }
+
+    /// A send-authorization for `peer_key_id`, IFF consent includes it —
+    /// either because a grant NAMES it, or because a grant names the person
+    /// this node is the bound instrument of ([`Self::widened_by_owner_binding`]).
+    /// `None` means edge must advertise nothing consentable to `peer_key_id`
+    /// this round — the peer is not in the transmission principle's recipient
+    /// set. This is the ONLY constructor of [`ResolvedRecipient`], so no code
+    /// path can serve a consentable claim to a peer persist's consent
+    /// projection did not authorize.
     pub(crate) fn recipient(&self, peer_key_id: &str) -> Option<ResolvedRecipient> {
-        self.send_set
-            .contains(peer_key_id)
+        (self.send_set.contains(peer_key_id) || self.owned_nodes.contains(peer_key_id))
             .then(|| ResolvedRecipient(peer_key_id.to_owned()))
     }
 
     /// **CIRISEdge#524 — DIAGNOSTIC ONLY.** Does the send-set NAME `key_id`?
     ///
     /// Answers *"who did the grant name?"* for the withhold log, and returns a
-    /// `bool` — never a [`ResolvedRecipient`]. Minting the send authorization
-    /// stays the sole privilege of [`Self::recipient`], so this cannot be used
-    /// to serve anything: the by-construction funnel is intact. It exists
-    /// because a `consent:replication:v1` grant naming a PERSON is silently
-    /// unroutable (a person's key has no transport binding, and edge resolves
-    /// recipients by EXACT key match), and a withhold that cannot say *that*
-    /// costs the operator a harness build.
+    /// `bool` — never a [`ResolvedRecipient`]. Deliberately the DIRECT-named
+    /// projection only: it is what separates "the grant named this peer" from
+    /// "the grant named this peer's owner", which is the whole content of the
+    /// person/node diagnostic and of [`Self::routes_by_owner_binding`].
     pub(crate) fn names(&self, key_id: &str) -> bool {
         self.send_set.contains(key_id)
+    }
+
+    /// CIRISEdge#524 — was `key_id` reached by the OWNER-BINDING walk rather
+    /// than by a grant naming it? Observability only (the serve line + the
+    /// counter); it mints nothing.
+    pub(crate) fn routes_by_owner_binding(&self, key_id: &str) -> bool {
+        self.owned_nodes.contains(key_id)
+    }
+
+    /// CIRISEdge#524 — how many owner-bound nodes the walk contributed. Pairs
+    /// with [`Self::len`] in the withhold line: `0` here with a non-empty
+    /// send-set says the grant subjects own no live-bound nodes.
+    pub(crate) fn owner_routed_len(&self) -> usize {
+        self.owned_nodes.len()
+    }
+
+    /// CIRISEdge#524 — did the owner-binding walk answer for every subject?
+    /// `false` = this set is fail-closed NARROW and self-heals at the next
+    /// memo refresh.
+    pub(crate) fn owner_walk_complete(&self) -> bool {
+        self.owner_walk_complete
     }
 
     /// CIRISEdge#524 — how many subjects the live grant projection named. Part
@@ -105,9 +196,13 @@ impl ResolvedPeerSet {
     /// Test-only: do two handles share the SAME memoized set (the O(1)
     /// `Arc` clone)? The regression witness for CIRISEdge#400 — a memo HIT
     /// returns a clone of the same `Arc`; a re-read would allocate a new one.
+    /// BOTH halves are checked: the owner-binding walk (#524) is the more
+    /// expensive of the two reads, so a memo that shared only the consent half
+    /// would still pay the regression this witnesses.
     #[cfg(test)]
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.send_set, &other.send_set)
+            && Arc::ptr_eq(&self.owned_nodes, &other.owned_nodes)
     }
 }
 

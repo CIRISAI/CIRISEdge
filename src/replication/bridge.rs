@@ -558,6 +558,19 @@ pub struct FederationDirectoryReplicationBridge {
     /// directory walk per cohort member" is a claim that has to be checkable
     /// rather than asserted. `Relaxed` — a counter nobody orders against.
     owner_reads: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#524 — how many times the bridge asked persist's
+    /// `nodes_owned_by` for a consent grant subject (i.e. the send-set memo
+    /// MISSED and the owner-binding walk ran). The same "the claim has to be
+    /// checkable" discipline as [`Self::owner_reads`]: this walk is the more
+    /// expensive of the two, and "one round's advertise + N fetches pay for it
+    /// ONCE" is exactly the CIRISEdge#400 property that must not silently
+    /// regress. `Relaxed`.
+    owner_route_walks: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#524 — how many peers were minted as recipients by the
+    /// OWNER-BINDING axis rather than by a grant naming them: the routing half
+    /// of #524 actually firing. Stays zero on a fleet whose grants all name
+    /// nodes. `Relaxed`.
+    owner_routed_recipients: std::sync::atomic::AtomicUsize,
 }
 
 /// CIRISEdge#523 — one memoized owner-binding resolution for one node.
@@ -689,6 +702,8 @@ impl FederationDirectoryReplicationBridge {
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
+            owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
+            owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -728,6 +743,8 @@ impl FederationDirectoryReplicationBridge {
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
+            owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
+            owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -3091,15 +3108,34 @@ impl FederationDirectoryReplicationBridge {
             return None;
         };
         let resolved = set.recipient(peer);
-        if resolved.is_none() {
-            // CIRISEdge#524 — the line that must NAME the peer. See
-            // [`Self::log_send_set_withhold`].
-            self.log_send_set_withhold(peer, &set).await;
-            self.withhold(
-                WithholdReason::RecipientNotInSendSet,
-                Self::peer_label(peer),
-                "attestation: not consent-included",
-            );
+        match &resolved {
+            // CIRISEdge#524 — the ROUTING half. The mint came through the same
+            // one door either way; this only says WHICH axis put the peer in
+            // the set, because "a grant naming a person reached that person's
+            // node" is the thing the field could not previously see happen.
+            Some(_) if set.routes_by_owner_binding(peer) && !set.names(peer) => {
+                self.owner_routed_recipients
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    peer = peer_label,
+                    send_set_size = set.len(),
+                    owner_routed = set.owner_routed_len(),
+                    "attestation plane served by OWNER-BINDING: no grant names this peer, \
+                     but a grant names the person it is the bound instrument of \
+                     (persist `nodes_owned_by`, CIRISEdge#524)"
+                );
+            }
+            Some(_) => {}
+            None => {
+                // CIRISEdge#524 — the line that must NAME the peer. See
+                // [`Self::log_send_set_withhold`].
+                self.log_send_set_withhold(peer, &set).await;
+                self.withhold(
+                    WithholdReason::RecipientNotInSendSet,
+                    Self::peer_label(peer),
+                    "attestation: not consent-included",
+                );
+            }
         }
         resolved
     }
@@ -3126,13 +3162,31 @@ impl FederationDirectoryReplicationBridge {
     ///    live grant projection does not name this peer but DOES name the peer's
     ///    OWNER, the operator is looking at CIRISEdge#524's routing class: a
     ///    grant naming a person — the natural thing for a consent OBJECT to
-    ///    name, since consent is between people — which edge cannot route,
-    ///    because it resolves recipients by exact key match and a person's key
-    ///    has no transport binding. This is DIAGNOSIS ONLY. It reads
-    ///    [`ResolvedPeerSet::names`], which cannot mint a `ResolvedRecipient`,
-    ///    so nothing is served on the strength of an owner match: the send-side
-    ///    walk needs persist's reverse index (person → bound nodes) and is filed
-    ///    as CIRISPersist#764.
+    ///    name, since consent is between people.
+    ///
+    /// # v18.5.0 — what an owner match MEANS now
+    ///
+    /// Persist v38.3.0 shipped the reverse walk (`nodes_owned_by`,
+    /// CIRISPersist#764), so edge ROUTES that case: the send-set carries the
+    /// grant subjects' bound nodes and [`ResolvedPeerSet::recipient`] mints for
+    /// them. Reaching this branch therefore no longer means "edge cannot route
+    /// a person-named grant" — it means the FORWARD walk (`owner_of`, the #523
+    /// memo) and the REVERSE walk disagreed about this peer, and there are
+    /// exactly two ways that happens:
+    ///
+    /// - the binding is not live from the reverse walk's side — an
+    ///   `AmbiguousNodeOwner` candidate is SKIPPED by `nodes_owned_by` (one
+    ///   poisoned node must not unroute its owner's every grant) while the
+    ///   forward walk fails closed on it; or
+    /// - the two memos are momentarily out of step — the owner memo re-resolved
+    ///   after a binding landed while the send-set memo still serves the
+    ///   pre-binding expansion (bounded by [`CONSENT_SEND_SET_MEMO_TTL`]) — or
+    ///   that subject's walk ERRORED, which
+    ///   [`ResolvedPeerSet::owner_walk_complete`] reports and the line states.
+    ///
+    /// Both are named, because they are different things to go look at. The
+    /// branch stays DIAGNOSIS ONLY: it reads [`ResolvedPeerSet::names`], which
+    /// cannot mint a `ResolvedRecipient`.
     ///
     /// The owner probe rides the CIRISEdge#523 memo, so a withheld round costs
     /// no extra directory walk; the WARN is throttled to a floor (never to
@@ -3161,6 +3215,8 @@ impl FederationDirectoryReplicationBridge {
             tracing::debug!(
                 peer = peer_label,
                 send_set_size,
+                owner_routed = set.owner_routed_len(),
+                owner_walk_complete = set.owner_walk_complete(),
                 "attestation plane withheld — recipient is not in this node's live \
                  consent:replication send-set (CIRISEdge#396 item 1)"
             );
@@ -3173,13 +3229,20 @@ impl FederationDirectoryReplicationBridge {
                 peer = peer_label,
                 grant_subject = %owner,
                 send_set_size,
+                owner_routed = set.owner_routed_len(),
+                owner_walk_complete = set.owner_walk_complete(),
                 suppressed_prev,
                 "attestation plane withheld — the live consent:replication send-set does NOT \
-                 name this peer, but DOES name its OWNER. A grant naming a PERSON is not \
-                 routable: edge resolves recipients by exact key match and a person's key \
-                 carries no transport binding. Re-emit the grant naming the peer NODE \
-                 (CIRISServer#472); the send-side owner walk needs persist's reverse index \
-                 (CIRISPersist#764, tracked as CIRISEdge#524) (CIRISEdge#396 item 1)"
+                 name this peer, but DOES name its OWNER, and the reverse owner-binding walk \
+                 (persist `nodes_owned_by`, CIRISPersist#764) did NOT return this peer. Since \
+                 v18.5.0 a person-named grant IS routed to that person's bound nodes, so the \
+                 two walks disagreeing means one of: the node carries more than one live \
+                 owner (`AmbiguousNodeOwner` — the reverse walk skips it, and an ambiguous \
+                 owner is not a resolvable recipient), or the owner-binding landed inside the \
+                 send-set memo window and routes next round, or `owner_walk_complete=false` \
+                 (this subject's walk errored and its nodes are fail-closed OUT this round). \
+                 A grant naming the peer NODE (CIRISServer#472) sidesteps all three \
+                 (CIRISEdge#524, CIRISEdge#396 item 1)"
             );
         }
     }
@@ -3205,6 +3268,30 @@ impl FederationDirectoryReplicationBridge {
     /// caller fails closed) only on a directory error. The `Arc`-backed
     /// [`ResolvedPeerSet`] makes the memo-hit clone O(1); the `std` mutex is
     /// never held across the `await`.
+    ///
+    /// # CIRISEdge#524 — the memo now covers the owner-binding walk too
+    ///
+    /// The set is the consent subjects PLUS their bound nodes
+    /// ([`Self::nodes_owned_by_grant_subjects`]), so the memo saves the more
+    /// expensive read as well. Two honest consequences:
+    ///
+    /// - **Freshness is TTL + event, not exact.** An owner-binding ADMITTED on
+    ///   the apply path drops this memo ([`Self::invalidate_owner_memo`]), so
+    ///   the common case is exact. What the TTL still backstops is what no
+    ///   apply event announces: a binding whose `expires_at` passes, a CC
+    ///   3.4.12 `valid_until` that lapses, and a binding admitted by some path
+    ///   that does not run through the bridge's apply loop. Bounded by
+    ///   [`CONSENT_SEND_SET_MEMO_TTL`], i.e. under one round.
+    /// - **A PARTIAL walk is memoized.** If a subject's walk errors, the
+    ///   narrower set is still stored (with `owner_walk_complete = false`)
+    ///   rather than re-read per envelope. Not caching it would re-create
+    ///   CIRISEdge#400's per-envelope re-resolution inside the reply assembly —
+    ///   the harder-won lesson — and the stale value here is NARROWER than the
+    ///   truth, which is the fail-closed direction and self-heals at the next
+    ///   refresh. This is the one place this file's rule differs from #523's
+    ///   "never cache a failure", and the difference is deliberate: #523 caches
+    ///   ONE node's verdict (a cached failure pins that node dark), while this
+    ///   caches a SET whose failure only omits members.
     async fn resolved_peer_set(&self, local: &str) -> Option<ResolvedPeerSet> {
         if let Ok(memo) = self.consent_memo.lock() {
             if let Some((set, resolved_at)) = memo.as_ref() {
@@ -3220,11 +3307,81 @@ impl FederationDirectoryReplicationBridge {
                 return None;
             }
         };
-        let set = ResolvedPeerSet::from_consent_peers(peers);
+        // CIRISEdge#524 — resolve the grant subjects' bound nodes BEFORE the
+        // set is minted, so `recipient` stays the one door and stays pure.
+        let (owned_nodes, complete) = self.nodes_owned_by_grant_subjects(&peers).await;
+        let set = ResolvedPeerSet::from_consent_peers(peers)
+            .widened_by_owner_binding(owned_nodes, complete);
         if let Ok(mut memo) = self.consent_memo.lock() {
             *memo = Some((set.clone(), Instant::now()));
         }
         Some(set)
+    }
+
+    /// **CIRISEdge#524 — the send-set's owner-binding walk** (persist v38.3.0
+    /// `nodes_owned_by`, CIRISPersist#764): every node the grant subjects are
+    /// the single responsible owner of, so a grant naming a PERSON routes to
+    /// that person's bound nodes.
+    ///
+    /// Returns `(owned_nodes, complete)`. `complete = false` means at least one
+    /// subject's walk errored, so the widening is NARROWER than consent
+    /// authorizes — the fail-closed direction, booked (never silent) and
+    /// self-healing at the next memo refresh.
+    ///
+    /// # Cost, and where it is paid
+    ///
+    /// One `nodes_owned_by` per grant subject, per memo refresh — i.e. about
+    /// ONCE PER ROUND for the whole round's advertise + N fetches, because it
+    /// runs inside [`Self::resolved_peer_set`] behind
+    /// [`CONSENT_SEND_SET_MEMO_TTL`]. Doing it per-peer at the serve site would
+    /// have re-created CIRISEdge#400 (the per-envelope re-resolution that blew
+    /// the round budget) on a walk that is strictly more expensive than the one
+    /// #400 was about.
+    ///
+    /// EVERY subject is walked, including one that is itself a node: which
+    /// subjects can own a node is persist's question, and pre-filtering by
+    /// identity type here would be edge re-deriving a rule it does not own —
+    /// and would silently narrow routing if the rule ever widened. A node
+    /// subject's walk is simply empty.
+    async fn nodes_owned_by_grant_subjects(&self, subjects: &[String]) -> (Vec<String>, bool) {
+        let mut owned = Vec::new();
+        let mut complete = true;
+        for subject in subjects {
+            self.owner_route_walks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match ciris_persist::federation::admission::nodes_owned_by(
+                &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+                subject,
+            )
+            .await
+            {
+                Ok(nodes) => owned.extend(nodes),
+                Err(e) => {
+                    complete = false;
+                    tracing::debug!(
+                        grant_subject = %subject,
+                        error = %e,
+                        "the consent send-set's owner-binding walk failed for this grant \
+                         subject — its bound nodes are NOT routed this round (fail-closed, \
+                         CIRISEdge#524)"
+                    );
+                    // The #523 borrow discipline: `WithholdReason` is a closed
+                    // operator vocabulary, no variant names the owner walk, and
+                    // widening it is not this change's to make. This is the
+                    // closest variant in KIND — "the audience projection could
+                    // not be READ" — and the detail names the true branch. The
+                    // subject is booked as the entity that failed to resolve,
+                    // because no single PEER is responsible for this narrowing.
+                    self.withhold(
+                        crate::observability::WithholdReason::SendSetUnresolved,
+                        Self::peer_label(subject),
+                        "nodes_owned_by unresolved — this grant subject's bound nodes are \
+                         not in the send-set (CIRISEdge#524)",
+                    );
+                }
+            }
+        }
+        (owned, complete)
     }
 
     /// CIRISEdge#416 — the RAW Attestation holdings: the content-hash of EVERY
@@ -3662,9 +3819,33 @@ impl FederationDirectoryReplicationBridge {
     /// CIRISEdge#523 — drop the memoized owner-binding for `key_id` and for any
     /// node it owns. Called from the apply path on the three events that move
     /// `owner_of`; see [`OWNER_BINDING_MEMO_TTL`] for what the TTL still covers.
+    ///
+    /// # CIRISEdge#524 — the SECOND owner-derived memo
+    ///
+    /// The consent send-set is now owner-derived too (its widening is
+    /// `nodes_owned_by` over the grant subjects), so the same events move it
+    /// and it is dropped here as well. The two directions do NOT share an
+    /// invalidation KEY, which is why this is a whole-memo drop rather than a
+    /// keyed one:
+    ///
+    /// - node → owner (#523) moves when a binding naming THAT NODE lands or
+    ///   dies, and [`OwnerCache::invalidate`] can key on either endpoint;
+    /// - person → nodes (#524) also moves when a binding names a node the memo
+    ///   has never heard of — a NEW instrument appearing under an existing
+    ///   grant subject. There is no key to evict, because the answer that
+    ///   changed is the SET.
+    ///
+    /// Dropping the whole send-set memo costs one `list_consent_peers` plus one
+    /// walk per subject on the next resolve, and only on an ownership event
+    /// (rare); keeping it would leave a newly bound node dark for up to
+    /// [`CONSENT_SEND_SET_MEMO_TTL`]. Same trade the #523 memo took, made in
+    /// the same direction.
     fn invalidate_owner_memo(&self, key_id: &str) {
         if let Ok(mut cache) = self.owner_cache.lock() {
             cache.invalidate(key_id);
+        }
+        if let Ok(mut memo) = self.consent_memo.lock() {
+            *memo = None;
         }
     }
 
@@ -7125,7 +7306,33 @@ mod tests {
         attester: &str,
         subject: &str,
         attestation_type: &str,
+        envelope: serde_json::Value,
+    ) -> Attestation {
+        build_scoped_federation_attestation(
+            id,
+            attester,
+            subject,
+            attestation_type,
+            envelope,
+            "federation",
+        )
+    }
+
+    /// v18.5.0 (persist v38.3.0 / CIRISPersist#765) —
+    /// [`build_federation_attestation`] with an explicit `cohort_scope`, so a
+    /// test can drive a `community`-scoped row through the REAL receive path.
+    /// Federation TIER is not a parameter: persist's
+    /// `check_targeted_cohort_requires_federation_tier` refuses a targeted
+    /// cohort at any other tier (a lower tier is signature-exempt, so the
+    /// membership claim would be mintable by anyone), and a fixture that could
+    /// express the refused shape would be testing a door that is already shut.
+    fn build_scoped_federation_attestation(
+        id: &str,
+        attester: &str,
+        subject: &str,
+        attestation_type: &str,
         mut envelope: serde_json::Value,
+        cohort_scope: &str,
     ) -> Attestation {
         let now = Utc::now().trunc_subsecs(6); // #598 microsecond floor
         bind_attestation_envelope(
@@ -7136,7 +7343,7 @@ mod tests {
             attestation_type,
             subject,
             &[subject],
-            "federation",
+            cohort_scope,
         );
         let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attester, &envelope);
         Attestation {
@@ -7158,7 +7365,7 @@ mod tests {
             subject_key_ids: vec![subject.to_string()],
             withdraws_admission_rule: None,
             additional_scrubs: Vec::new(),
-            cohort_scope: "federation".to_string(),
+            cohort_scope: cohort_scope.to_string(),
             tier: "federation".to_string(),
             promoted_at: None,
         }
@@ -11412,6 +11619,32 @@ mod tests {
         backend
     }
 
+    /// v18.5.0 — [`fixture_community`] with a **seated moderator**.
+    ///
+    /// `check_no_moderator_federate_apply` (CC 4.5.4 / §11.11) re-checks live
+    /// `moderate`-holder existence on every federation apply step keyed on a
+    /// community this node KNOWS, and refuses when none resolves. A roster
+    /// whose member holds persist's own [`MEMBER_ROLE_FOUNDER`] is a zero-hop
+    /// named moderator provided that member is steward-bound — and a `user`
+    /// key self-anchors (clause 1 of `steward_bindings_of`), which is why
+    /// `owner_axis_backend` registers the people as `user`.
+    ///
+    /// [`fixture_community`] deliberately keeps `role: None`: it pins the E4
+    /// pass-through plane, where the moderator question never comes up because
+    /// nothing federation-applies keyed on it. THIS is the roster a chat row
+    /// can actually land into, and building it was the blocker v18.4.0 named
+    /// when it deferred the positive convergence arm.
+    ///
+    /// The role string is imported from persist, never spelled locally — an
+    /// invented `"founder"` literal would make this fixture green against a
+    /// predicate the field does not run.
+    fn fixture_moderated_community(community_key_id: &str, member_key_id: &str) -> Community {
+        let mut community = fixture_community(community_key_id, member_key_id);
+        community.members[0].role =
+            Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_string());
+        community
+    }
+
     /// Build a bridge over an existing backend with `cohort`.
     fn bridge_over(
         backend: &Arc<MemoryBackend>,
@@ -11865,20 +12098,31 @@ mod tests {
         );
     }
 
-    /// The person-named-grant diagnostic (#524's cheap half): when the live
-    /// send-set does not name the peer but DOES name the peer's OWNER, that is
-    /// the routing class — and the gate can see it, because the #523 memo
-    /// already resolved the owner. It says so and STILL withholds: the send-side
-    /// walk needs persist's reverse index (CIRISPersist#764).
+    // ─── CIRISEdge#524 — the ROUTING half (persist v38.3.0 `nodes_owned_by`) ──
+    //
+    // **A DELIBERATELY CHANGED PINNED BEHAVIOUR.** v18.4.0 pinned the opposite
+    // assertion — `a_person_named_grant_is_diagnosed_but_never_routed`, "an
+    // owner match must NOT serve" — because the send-side reverse index did not
+    // exist and diagnosing without routing was the honest half to ship. persist
+    // v38.3.0 (CIRISPersist#764) shipped `nodes_owned_by`, so that pin is now
+    // the wrong behaviour to hold, and it is replaced below by its inverse plus
+    // the negative controls that keep the widening from becoming
+    // "serve everyone". The by-construction funnel is UNCHANGED:
+    // `ResolvedPeerSet::recipient` is still the only constructor of a
+    // `ResolvedRecipient`, and `names` still returns a `bool`.
+
+    /// **The #524 routing pin.** The live grant names a PERSON — the natural
+    /// thing for a consent object to name, and exactly what CIRISServer emitted
+    /// — and the peer is the NODE that person owns. The peer is now a
+    /// recipient, minted through the same one door every other recipient comes
+    /// through.
     #[tokio::test]
-    async fn a_person_named_grant_is_diagnosed_but_never_routed() {
+    async fn a_person_named_grant_routes_to_that_persons_bound_node() {
         let local = "this-node";
         let backend = owner_axis_backend(true).await;
         register_fixture_keys(&backend, &[(local, identity_type::AGENT)]).await;
         let bridge =
             bridge_over(&backend, &["node-bob"]).with_local_key_id(Some(local.to_string()));
-        // The grant names the PERSON — the natural thing for a consent object to
-        // name, and exactly what CIRISServer emitted.
         seed_consent_membership(&backend, local, "person-bob").await;
 
         let set = bridge
@@ -11891,18 +12135,376 @@ mod tests {
         );
         assert!(
             !set.names("node-bob"),
-            "…and NOT the node, which is why the plane went dark"
+            "…and NOT the node: `names` stays the DIRECT projection, which is what \
+             makes the person/node diagnostic readable"
         );
-        // The owner probe the WARN uses sees the join…
-        assert_eq!(
-            bridge.owner_of_cached("node-bob").await,
-            OwnerLookup::Owner("person-bob".to_string()),
-            "the #523 memo resolves the peer's owner, so the diagnostic is free"
-        );
-        // …and the plane is STILL withheld: diagnosis, never routing.
         assert!(
-            bridge.list_attestations(Some("node-bob")).await.is_empty(),
-            "an owner match must NOT serve — the send-side walk is CIRISPersist#764"
+            set.routes_by_owner_binding("node-bob"),
+            "…but the reverse owner-binding walk (persist `nodes_owned_by`) puts the \
+             person's bound node in the send-set (CIRISEdge#524)"
+        );
+        assert!(
+            set.recipient("node-bob").is_some(),
+            "…so the ONE minting door authorizes it — no side door was added"
+        );
+        assert!(
+            set.owner_walk_complete(),
+            "the walk answered for every grant subject"
+        );
+        assert_eq!(
+            set.owner_routed_len(),
+            1,
+            "exactly the one bound node, not a widening to everything"
+        );
+    }
+
+    /// The negative controls, on the SAME backend as the pin above: the
+    /// widening reaches the grant subject's bound node and NOTHING else. An
+    /// unowned node, and a node owned by a person NO grant names, are both
+    /// still withheld — the fail-closed shape #396 item 1 rests on.
+    #[tokio::test]
+    async fn the_owner_binding_widening_reaches_only_the_grant_subjects_nodes() {
+        let local = "this-node";
+        let backend = owner_axis_backend(true).await;
+        register_fixture_keys(&backend, &[(local, identity_type::AGENT)]).await;
+        let bridge = bridge_over(&backend, &["node-bob", "node-stranger"])
+            .with_local_key_id(Some(local.to_string()));
+        // The grant names person-ALICE, who owns nothing.
+        seed_consent_membership(&backend, local, "person-alice").await;
+
+        let set = bridge
+            .resolved_peer_set(local)
+            .await
+            .expect("the send-set resolves");
+        assert_eq!(
+            set.owner_routed_len(),
+            0,
+            "a grant subject who owns no live-bound node widens the set by nothing"
+        );
+        assert!(
+            set.recipient("node-bob").is_none(),
+            "node-bob's owner (person-bob) is named by NO grant — the widening is per \
+             grant subject, never 'every node with an owner'"
+        );
+        assert!(
+            set.recipient("node-stranger").is_none(),
+            "an unowned node is reached by neither axis"
+        );
+    }
+
+    /// The routing half on the REAL serve path, end to end: the plane the field
+    /// measured dark is served, and only to the owner-bound node. This is the
+    /// assertion CIRISServer's ladder was missing — 7 rows on the link under a
+    /// node-named grant, 0 under a person-named one.
+    #[tokio::test]
+    async fn the_attestation_plane_is_served_to_the_grant_subjects_bound_node() {
+        let local = "this-node";
+        let producer = "agent-producer";
+        let backend = owner_axis_backend(true).await;
+        register_fixture_keys(
+            &backend,
+            &[
+                (local, identity_type::AGENT),
+                (producer, identity_type::AGENT),
+            ],
+        )
+        .await;
+        seed_advertised_attestation(&backend, producer).await;
+        seed_consent_membership(&backend, local, "person-bob").await;
+        let bridge =
+            bridge_over(&backend, &["node-bob"]).with_local_key_id(Some(local.to_string()));
+
+        let baseline = bridge.list_attestations(None).await;
+        assert!(
+            !baseline.is_empty(),
+            "the seeded attestation is advertised in the ungated local view"
+        );
+        let served = bridge.list_attestations(Some("node-bob")).await;
+        assert_eq!(
+            served.len(),
+            baseline.len(),
+            "the person-named grant now reaches that person's bound NODE — the plane \
+             the field measured dark (CIRISEdge#524); got {served:?}"
+        );
+        assert!(
+            bridge
+                .owner_routed_recipients
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "…and it was booked as an owner-BINDING route, so an operator can tell this \
+             from a grant that simply named the node"
+        );
+        // The negative control on the same serve path.
+        assert!(
+            bridge
+                .list_attestations(Some("node-stranger"))
+                .await
+                .is_empty(),
+            "an unrelated node is still served nothing"
+        );
+    }
+
+    /// The owner-binding walk rides the CIRISEdge#400 memo: a round's advertise
+    /// + N fetches pay for it ONCE, not per envelope. This walk is strictly
+    /// more expensive than the `list_consent_peers` read #400 was about, so the
+    /// regression it guards against is the same one, worse.
+    #[tokio::test]
+    async fn the_owner_binding_walk_is_memoized_across_the_round() {
+        use std::sync::atomic::Ordering;
+        let local = "this-node";
+        let backend = owner_axis_backend(true).await;
+        register_fixture_keys(&backend, &[(local, identity_type::AGENT)]).await;
+        let bridge =
+            bridge_over(&backend, &["node-bob"]).with_local_key_id(Some(local.to_string()));
+        seed_consent_membership(&backend, local, "person-bob").await;
+
+        let set1 = bridge.resolved_peer_set(local).await.expect("resolve 1");
+        let after_first = bridge.owner_route_walks.load(Ordering::Relaxed);
+        assert_eq!(
+            after_first, 1,
+            "one grant subject → exactly one `nodes_owned_by` walk"
+        );
+        let set2 = bridge.resolved_peer_set(local).await.expect("resolve 2");
+        assert_eq!(
+            bridge.owner_route_walks.load(Ordering::Relaxed),
+            after_first,
+            "the second resolve inside the TTL walks the directory ZERO more times"
+        );
+        assert!(
+            set1.ptr_eq(&set2),
+            "…and it is the same memoized set, BOTH halves (the O(1) `Arc` clone)"
+        );
+    }
+
+    /// End-to-end invalidation for the direction the #523 memo cannot key on:
+    /// an owner-binding for a node the send-set memo has never heard of. There
+    /// is no entry to evict — the answer that changed is the SET — so the memo
+    /// is dropped whole, and the newly bound node routes in the SAME round
+    /// rather than one TTL later.
+    #[tokio::test]
+    async fn an_admitted_owner_binding_reroutes_the_send_set_in_the_same_round() {
+        let local = "this-node";
+        let backend = owner_axis_backend(false).await; // NOT bound yet
+        register_fixture_keys(&backend, &[(local, identity_type::AGENT)]).await;
+        let bridge =
+            bridge_over(&backend, &["node-bob"]).with_local_key_id(Some(local.to_string()));
+        seed_consent_membership(&backend, local, "person-bob").await;
+
+        assert!(
+            bridge
+                .resolved_peer_set(local)
+                .await
+                .expect("resolve")
+                .recipient("node-bob")
+                .is_none(),
+            "unbound node → not a recipient (and the narrow set is memoized)"
+        );
+
+        // The binding arrives ON THE WIRE and is ADMITTED — the real receive
+        // path, which is where the invalidation hangs.
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = build_federation_attestation(
+            &id,
+            "person-bob",
+            "node-bob",
+            "delegates_to",
+            owner_binding_envelope(&id, "person-bob", "node-bob"),
+        );
+        let wire = serde_json::to_vec(&row).expect("serialize owner-binding");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
+            .await;
+        assert!(
+            outcome.is_admitted(),
+            "the owner-binding must be admitted; got {outcome:?}"
+        );
+
+        assert!(
+            bridge
+                .resolved_peer_set(local)
+                .await
+                .expect("resolve")
+                .recipient("node-bob")
+                .is_some(),
+            "the admitted owner-binding dropped the send-set memo — the person's new \
+             instrument routes in the SAME round, not one TTL later (CIRISEdge#524)"
+        );
+    }
+
+    // ─── persist v38.3.0 / CIRISPersist#765 — the transient that can now ───
+    // ─── actually TRANSITION (the positive arm v18.4.0 deferred)         ───
+
+    /// **The convergence arm: roster applies → the row lands.**
+    ///
+    /// v18.4.0 classified `WriteScopeRefused(NoCommunityMembership)` as
+    /// `retry_after_community_roster` — TRANSIENT, re-offered next round — and
+    /// pinned that reading with a pure classifier test, but could not pin the
+    /// second half ("…and then it converges") for two reasons, both now gone:
+    ///
+    /// 1. persist v38.2.0 resolved a NODE writer to ITSELF (its
+    ///    identity-occurrence row is self-referential), so it asked AV-45's
+    ///    membership question about the instrument. The roster's members are
+    ///    PERSONS, so no roster arrival could ever satisfy it — the "transient"
+    ///    could not transition, which is the ladder CIRISServer measured.
+    ///    persist v38.3.0's principal fold (#765) walks the live owner-binding
+    ///    when the occurrence axis is self-referential.
+    /// 2. The fixture could not seat a moderator, so §11.11's federate-apply
+    ///    re-check refused a row keyed on a KNOWN community regardless. See
+    ///    [`fixture_moderated_community`].
+    ///
+    /// So this asserts the disposition end to end, on the REAL receive path:
+    /// the same bytes refuse TRANSIENTLY before the roster and are ADMITTED
+    /// after it, with no operator action and no retry queue — convergence by
+    /// construction (a refused row is not stored, so the node still lacks its
+    /// hash and the next Summary/Diff re-offers it).
+    #[tokio::test]
+    async fn a_bound_nodes_community_row_lands_once_the_roster_applies() {
+        let backend = owner_axis_backend(true).await;
+        let metrics = crate::observability::EdgeMetrics::default();
+        let bridge = bridge_over(&backend, &["node-bob"]).with_metrics(Some(metrics.clone()));
+
+        // The on-behalf chat row: signed by the NODE, about its OWNER, into the
+        // owner's room. Exactly the shape CIRISServer's ladder emits.
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = build_scoped_federation_attestation(
+            &id,
+            "node-bob",
+            "person-bob",
+            "scores",
+            serde_json::json!({
+                "id": id,
+                "dimension": "chat:message:v1",
+                "community_id": "chat-room",
+                "on_behalf_of_key_id": "person-bob",
+            }),
+            "community",
+        );
+        let wire = serde_json::to_vec(&row).expect("serialize chat row");
+
+        // (1) BEFORE the roster lands — refused, and refused TRANSIENTLY.
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
+            .await;
+        match &outcome {
+            ApplyOutcome::Refused(reason) => {
+                assert!(
+                    reason.contains("class=retry_after_community_roster"),
+                    "the roster has not landed — this is the transient class: {reason}"
+                );
+                assert!(reason.contains("TRANSIENT"), "{reason}");
+            }
+            other => panic!("expected a roster-ordering refusal, got {other:?}"),
+        }
+        assert_eq!(
+            metrics
+                .snapshot()
+                .apply_refusals_by_class
+                .get("retry_after_community_roster"),
+            Some(&1),
+            "…and it is COUNTED on the closed-set axis, not mixed into `by_kind`"
+        );
+
+        // (2) The roster applies (in the field: the Community plane's own
+        // envelope, one round earlier or later — the ordering nobody controls).
+        backend
+            .put_community(sign_community_fixture(
+                "room-authority",
+                fixture_moderated_community("chat-room", "person-bob"),
+            ))
+            .await
+            .expect("seed the roster");
+
+        // (3) The SAME bytes, re-offered — and now they LAND. The membership
+        // question is asked about the PRINCIPAL (persist#765): the node resolves
+        // through its live owner-binding to person-bob, who is on the roster.
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
+            .await;
+        assert!(
+            outcome.is_admitted(),
+            "the roster landed, so the transient must TRANSITION — this is the arm that \
+             was impossible at persist v38.2.0, where the membership question was asked \
+             about the instrument instead of the principal (CIRISPersist#765); got \
+             {outcome:?}"
+        );
+    }
+
+    /// The other half of #765's equivalence, held from edge's side: it widens
+    /// to the single live OWNER and never past it. An UNBOUND node inherits
+    /// nothing, so its identical row keeps refusing after the roster lands —
+    /// and keeps refusing as the SAME transient class, because "this writer is
+    /// nobody's principal" is indistinguishable from "the roster has not
+    /// landed" at the membership door, and edge must not invent a distinction
+    /// persist does not draw.
+    #[tokio::test]
+    async fn an_unbound_node_inherits_no_membership_from_the_roster() {
+        let backend = owner_axis_backend(true).await;
+        backend
+            .put_community(sign_community_fixture(
+                "room-authority",
+                fixture_moderated_community("chat-room", "person-bob"),
+            ))
+            .await
+            .expect("seed the roster");
+        let bridge = bridge_over(&backend, &["node-stranger"]);
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = build_scoped_federation_attestation(
+            &id,
+            "node-stranger", // owned by nobody
+            "person-bob",
+            "scores",
+            serde_json::json!({
+                "id": id,
+                "dimension": "chat:message:v1",
+                "community_id": "chat-room",
+                "on_behalf_of_key_id": "person-bob",
+            }),
+            "community",
+        );
+        let wire = serde_json::to_vec(&row).expect("serialize chat row");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-stranger"))
+            .await;
+        match &outcome {
+            ApplyOutcome::Refused(reason) => assert!(
+                reason.contains("class=retry_after_community_roster"),
+                "an unbound node must not inherit anyone's membership — the principal \
+                 fold widens to the single live owner and NEVER past it, and the door it \
+                 refuses at is still the MEMBERSHIP door: {reason}"
+            ),
+            other => panic!("an unbound node must not inherit anyone's membership; got {other:?}"),
+        }
+    }
+
+    /// The fail-closed rule, on the set itself: a walk that could not answer
+    /// NARROWS and says so. Pure, because the branch is not reachable through a
+    /// `MemoryBackend` fixture (an in-memory directory read does not fail) —
+    /// the same reason `widen_cohort_by_owners` is pinned pure, and the same
+    /// discipline: pin the value that decides, with the shape the field
+    /// produces.
+    #[test]
+    fn an_incomplete_owner_walk_narrows_and_is_never_silent() {
+        let complete = ResolvedPeerSet::from_consent_peers(vec!["person-bob".to_string()])
+            .widened_by_owner_binding(vec!["node-bob".to_string()], true);
+        assert!(complete.recipient("node-bob").is_some());
+        assert!(complete.owner_walk_complete());
+
+        // The same grant, with the walk unable to answer for its subject.
+        let narrowed = ResolvedPeerSet::from_consent_peers(vec!["person-bob".to_string()])
+            .widened_by_owner_binding(Vec::new(), false);
+        assert!(
+            narrowed.recipient("node-bob").is_none(),
+            "an unresolvable owner walk must NARROW — never widen, never guess"
+        );
+        assert!(
+            narrowed.recipient("person-bob").is_some(),
+            "…and it must not disturb the DIRECT half: the grant still names its subject"
+        );
+        assert!(
+            !narrowed.owner_walk_complete(),
+            "…and the narrowing is observable, not silent (it is stated in the withhold \
+             line and booked as a withhold)"
         );
     }
 }
