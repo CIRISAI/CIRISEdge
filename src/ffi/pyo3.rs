@@ -2237,6 +2237,11 @@ impl PyEdge {
     ///   # persist's stable token (closed, append-only 9-token contract).
     ///   "apply_refusals_by_kind": {"key": 3, ...},
     ///   "key_apply_refusals_by_reason": {"pubkey_swap": 3, ...},
+    ///   # CIRISEdge#522 / persist v38.2.0 — the apply-DOOR class axis:
+    ///   # "retry_after_community_roster" (transient, converges once the
+    ///   # roster applies), "third_party_row" (AV-84 verdict about the row),
+    ///   # "community_roster_fork" (two authorities, one community id).
+    ///   "apply_refusals_by_class": {"retry_after_community_roster": 4, ...},
     /// }
     /// ```
     // A flat projection of EdgeMetricsBundle into a PyDict — one block per
@@ -2369,6 +2374,17 @@ impl PyEdge {
             refusals_reason.set_item(token.as_str(), *v)?;
         }
         root.set_item("key_apply_refusals_by_reason", refusals_reason)?;
+
+        // CIRISEdge#522 (persist v38.2.0) — the apply-door CLASS axis. Without
+        // it, `apply_refusals_by_kind` mixes a node mid-sync whose roster has
+        // not landed (transient, self-healing) with a third-party-row policy
+        // verdict and with a community roster FORK — three situations, one
+        // number. Tokens come from the closed `ApplyRefusalClass` set.
+        let refusals_class = pyo3::types::PyDict::new(py);
+        for (token, v) in &bundle.apply_refusals_by_class {
+            refusals_class.set_item(token.as_str(), *v)?;
+        }
+        root.set_item("apply_refusals_by_class", refusals_class)?;
 
         // CIRISEdge#457 — the receive plane's accepted-apply counters
         // (Admitted = new state, Duplicate = already held), the mirror of the

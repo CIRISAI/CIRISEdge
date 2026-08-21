@@ -178,13 +178,28 @@ pub fn gates_for(dimension: &str) -> FamilyGates {
         // individually rather than folded into the wildcard, because
         // the wildcard means "this build does not know" and these are
         // known.
+        //
+        // `Chat` (persist v38.2.0, CIRISPersist#757) joins them by persist's
+        // OWN registry row, not by taste. Read from `projection_for`: the
+        // `chat:*` arm answers `SelfOwn` at `self`/`family` and `Cohort` at
+        // EVERY commons tier (`community | affiliations | species |
+        // biosphere | federation`), with NO `authority` branch — "a trust
+        // root is not a party to someone else's conversation". There is no
+        // `Projection::Capability` cell anywhere in the row, which is the
+        // shape that would have implied edge's E3 serve-capability gate
+        // (`trace:*` is the only family carrying one), and `chat:` is not
+        // `accord:`, so the CC 4.2.1 relay gate does not key on it either.
+        // Persist's row therefore decides NO family-conditioned edge gate —
+        // the Cohort ceiling is enforced by the projection filter edge
+        // already applies per-row, which is a COMMON gate, not one of these.
         AttestationFamily::Consent
         | AttestationFamily::Scores
         | AttestationFamily::Capacity
         | AttestationFamily::ContentClass
         | AttestationFamily::SubstrateHealth
         | AttestationFamily::Moderation
-        | AttestationFamily::ProvenanceBuildManifest => FamilyGates::NONE,
+        | AttestationFamily::ProvenanceBuildManifest
+        | AttestationFamily::Chat => FamilyGates::NONE,
 
         // `Unknown` is NOT the unknown-family case, and conflating the two
         // was a real bug in this module — invisible for as long as it had no
@@ -218,6 +233,17 @@ mod tests {
 
     /// One representative per family edge knows about. Kept beside the
     /// match so the two drift together or not at all.
+    ///
+    /// **This list must name EVERY family [`gates_for`] names**, and for a
+    /// cut it did not: the match named nine and this named seven, so
+    /// `Moderation` and `ProvenanceBuildManifest` were unpinned — a persist
+    /// rename of either stem would have dropped them into the wildcard and
+    /// started maximally gating them, silently, with every test here still
+    /// green. That is the same defect this module's own header describes
+    /// (persist's `FAMILY_DIMS` missing its three newest families), reproduced
+    /// one layer out in the drift test written to catch it. Repaired in
+    /// v18.4.0 alongside the `Chat` adoption; adding a family to `gates_for`
+    /// without adding its representative here re-opens it.
     const REPRESENTATIVES: &[(&str, &str)] = &[
         ("trace:reasoning:v1", "Trace"),
         ("accord:human_dignity:v1", "Accord"),
@@ -226,6 +252,15 @@ mod tests {
         ("capacity:relay_delivery:v1", "Capacity"),
         ("content_class:nsfw:v1", "ContentClass"),
         ("transport:reachability:v1", "SubstrateHealth"),
+        ("moderation:allegation:v1", "Moderation"),
+        (
+            "provenance:build_manifest:release:v1",
+            "ProvenanceBuildManifest",
+        ),
+        // persist v38.2.0 (CIRISPersist#757) — the whole `chat:` prefix is
+        // one family, so the representative is a plain message dimension
+        // (persist's own `FAMILY_DIMS` representative is `chat:message:v1`).
+        ("chat:message:v1", "Chat"),
     ];
 
     #[test]
@@ -358,6 +393,38 @@ mod tests {
                 "{dimension:?} has no family, so no family-conditioned gate applies",
             );
         }
+    }
+
+    /// persist v38.2.0 (CIRISPersist#757) — the `chat:*` adoption, pinned
+    /// against the REASON rather than the value.
+    ///
+    /// Without the arm, `chat:message:v1` reaches the wildcard and is
+    /// `MAXIMAL_UNKNOWN` — withheld from every peer lacking `infra:serve`,
+    /// which is the module working exactly as designed and still wrong to
+    /// ship. The arm's VALUE is persist's registry row: `projection_for`'s
+    /// `Chat` arm is `SelfOwn` at self/family and `Cohort` at every commons
+    /// tier with no `authority` branch and no `Projection::Capability` cell
+    /// anywhere — so neither of edge's two family-conditioned gates keys on
+    /// it. The Cohort ceiling is real, and it is enforced by the per-row
+    /// projection filter (a COMMON gate), not here.
+    #[test]
+    fn chat_is_a_known_family_carrying_no_family_conditioned_gate() {
+        for dimension in ["chat:message:v1", "chat:reaction:v1", "chat:receipt:v1"] {
+            let gates = gates_for(dimension);
+            assert!(
+                !gates.unknown_family,
+                "{dimension} must be a KNOWN family — the wildcard would withhold every \
+                 chat row from any peer without `infra:serve`",
+            );
+            assert_eq!(
+                gates,
+                FamilyGates::NONE,
+                "persist's `chat:*` registry row decides no family-conditioned edge gate",
+            );
+        }
+        // ...and the stem boundary is persist's, not a prefix match here.
+        assert!(!gates_for("chat:").unknown_family);
+        assert_eq!(gates_for("chatter:not:chat:v1"), FamilyGates::NONE);
     }
 
     #[test]

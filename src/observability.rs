@@ -903,6 +903,29 @@ pub struct EdgeMetrics {
     /// holds what was offered. Extends per-plane as persist types more
     /// refusals.
     pub key_apply_refusals_by_reason: Arc<RwLock<HashMap<String, u64>>>,
+    /// CIRISEdge#522 (persist v38.2.0) — the receive plane's **door-class**
+    /// axis: per-[`crate::replication::bridge::ApplyRefusalClass`] count of
+    /// applies refused by one of the three doors that moved in persist
+    /// v38.2.0. Keyed by the class's stable `as_str()` token, so cardinality
+    /// is bounded by that closed enum, never by traffic — the same contract
+    /// [`Self::key_apply_refusals_by_reason`] holds on the Key plane.
+    ///
+    /// # The state this exists to make visible
+    ///
+    /// [`Self::apply_refusals_by_kind`] answers "how many Attestation applies
+    /// were refused". After v38.2.0 that number silently mixes three
+    /// different situations: a node mid-sync whose community roster has not
+    /// landed yet (self-healing, expected, `retry_after_community_roster`), a
+    /// peer pushing rows about third parties into a cohort plane
+    /// (`third_party_row`, a policy verdict someone should read), and two
+    /// authorities disagreeing about one `community_key_id`
+    /// (`community_roster_fork`, a fork). Before this ledger they were one
+    /// number and one WARN each; a transient refusal nobody could name is
+    /// exactly the silent-narrowing class this repo keeps closing.
+    ///
+    /// Booked at the bridge's single `refuse` site, alongside — never instead
+    /// of — the kind axis, so a class-carrying refusal appears on both.
+    pub apply_refusals_by_class: Arc<RwLock<HashMap<String, u64>>>,
     /// CIRISEdge#441 — the removal-receipt ledger (revocation-class rows'
     /// per-peer delivery states; the pull-plane's missing arrival
     /// instrument). Fed by the bridge's serve exit (offers) + the
@@ -1117,6 +1140,15 @@ impl EdgeMetrics {
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#522 — count one v38.2.0 door-class refusal by its stable
+    /// token. `token` comes from
+    /// [`ApplyRefusalClass::as_str`](crate::replication::bridge::ApplyRefusalClass::as_str)
+    /// — a closed set, so this map's cardinality is bounded by that enum.
+    pub fn inc_apply_refusal_class(&self, token: &str) {
+        let mut guard = self.apply_refusals_by_class.write();
+        *guard.entry(token.to_string()).or_insert(0) += 1;
+    }
+
     /// Update the per-peer reachability ratio gauge. Replaces (does
     /// not accumulate) — the underlying tracker computes the rolling
     /// ratio and the gauge mirrors it.
@@ -1153,6 +1185,7 @@ impl EdgeMetrics {
                 .clone(),
             apply_refusals_by_kind: self.apply_refusals_by_kind.read().clone(),
             key_apply_refusals_by_reason: self.key_apply_refusals_by_reason.read().clone(),
+            apply_refusals_by_class: self.apply_refusals_by_class.read().clone(),
             replication_applied_total: self.replication_applied_total.read().clone(),
             replication_duplicate_total: self.replication_duplicate_total.read().clone(),
             removal_delivery: self.removal_receipts.read().delta(),
@@ -1199,6 +1232,10 @@ pub struct EdgeMetricsBundle {
     /// persist v24.2.0 / #565 — typed Key-plane policy refusals by persist's
     /// stable token (closed, append-only 9-token contract).
     pub key_apply_refusals_by_reason: HashMap<String, u64>,
+    /// CIRISEdge#522 — snapshot of
+    /// [`EdgeMetrics::apply_refusals_by_class`]: the three v38.2.0 apply-door
+    /// classes by their stable tokens.
+    pub apply_refusals_by_class: HashMap<String, u64>,
     /// CIRISEdge#457 — per-kind accepted applies that changed local state.
     pub replication_applied_total: HashMap<EnvelopeKind, u64>,
     /// CIRISEdge#457 — per-kind already-held applies (distinct from applied).

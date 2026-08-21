@@ -80,6 +80,28 @@ impl ResolvedPeerSet {
             .then(|| ResolvedRecipient(peer_key_id.to_owned()))
     }
 
+    /// **CIRISEdge#524 — DIAGNOSTIC ONLY.** Does the send-set NAME `key_id`?
+    ///
+    /// Answers *"who did the grant name?"* for the withhold log, and returns a
+    /// `bool` — never a [`ResolvedRecipient`]. Minting the send authorization
+    /// stays the sole privilege of [`Self::recipient`], so this cannot be used
+    /// to serve anything: the by-construction funnel is intact. It exists
+    /// because a `consent:replication:v1` grant naming a PERSON is silently
+    /// unroutable (a person's key has no transport binding, and edge resolves
+    /// recipients by EXACT key match), and a withhold that cannot say *that*
+    /// costs the operator a harness build.
+    pub(crate) fn names(&self, key_id: &str) -> bool {
+        self.send_set.contains(key_id)
+    }
+
+    /// CIRISEdge#524 — how many subjects the live grant projection named. Part
+    /// of the same diagnostic: `0` is a fleet-wide consent problem while `n > 0`
+    /// with no match is a per-peer addressing problem, and the withhold line
+    /// should not make an operator guess which.
+    pub(crate) fn len(&self) -> usize {
+        self.send_set.len()
+    }
+
     /// Test-only: do two handles share the SAME memoized set (the O(1)
     /// `Arc` clone)? The regression witness for CIRISEdge#400 — a memo HIT
     /// returns a clone of the same `Arc`; a re-read would allocate a new one.

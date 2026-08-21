@@ -138,6 +138,155 @@ fn apply_refusal_reason(
     )
 }
 
+/// persist v38.2.0 (CIRISEdge#522) — **the closed set of apply-door refusals
+/// edge has something to SAY about**, beyond persist's own stable `kind()`.
+///
+/// # Why a second axis exists next to `kind()`
+///
+/// [`ciris_persist::federation::Error::kind`] answers *which persist error*.
+/// It cannot answer the question the apply loop actually has to act on, which
+/// is *what does a relay DO about this row*: a `federation_write_scope_refused`
+/// is a permanent policy verdict when the writer is genuinely not a member and
+/// a self-healing ordering artefact when the roster simply has not landed on
+/// this node yet — the SAME token, opposite operational meaning. Persist is
+/// right not to distinguish them (it cannot: only the receiving node knows
+/// whether it is mid-sync), and #522 asks the receiver to.
+///
+/// The three v38.2.0 doors map onto three answers:
+///
+/// - [`CommunityRosterFork`](Self::CommunityRosterFork) — **surface, do not
+///   retry.** A differing roster under an occupied `community_key_id`
+///   (persist#758's typed `Error::Conflict`). Retrying spins; logging and
+///   dropping hides a fork.
+/// - [`RetryAfterCommunityRoster`](Self::RetryAfterCommunityRoster) /
+///   [`RetryAfterFamilyRoster`](Self::RetryAfterFamilyRoster) — **transient,
+///   converges on its own.** AV-45 at the put door (persist#757) refuses a
+///   member's cohort-scoped row that arrives before this node applied the
+///   cohort's roster. Correct and temporary. The REMOVED-member half of the
+///   revocation pairing lands in the same class and is indistinguishable from
+///   here on purpose: both are "this node's roster does not show the writer as
+///   an active member", both are decided by state that is still moving, and
+///   both converge — one when the roster arrives, the other when the sender's
+///   roster catches up and it stops offering the row. Neither is terminal
+///   *at this door*, which is exactly what the apply loop needs to know.
+/// - [`ThirdPartyRow`](Self::ThirdPartyRow) — **a verdict about the ROW.**
+///   AV-84 at the put door: a family/community-targeted row naming anyone but
+///   its producer. Never a delivery problem, so it must never be counted or
+///   reported as one.
+///
+/// Closed and small ON PURPOSE — this is a metric key, so its cardinality is
+/// bounded by this enum rather than by traffic, exactly like persist's
+/// [`KeyRefusalReason`] on the Key plane. [`Self::ALL`] is the drift anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApplyRefusalClass {
+    /// persist#758 — a DIFFERING community roster under an occupied
+    /// `community_key_id`. The fork signal.
+    CommunityRosterFork,
+    /// persist#757 (AV-45) — a `community`-scoped row whose writer this node
+    /// cannot yet see as a member, because it has not applied that
+    /// community's roster.
+    RetryAfterCommunityRoster,
+    /// persist#757 (AV-45) — the family mirror of
+    /// [`Self::RetryAfterCommunityRoster`].
+    RetryAfterFamilyRoster,
+    /// persist#757 (AV-84) — a targeted-cohort row naming a party other than
+    /// its own producer.
+    ThirdPartyRow,
+}
+
+impl ApplyRefusalClass {
+    /// Every class, for the drift test + any consumer enumerating the ledger's
+    /// key space without traffic.
+    pub const ALL: &'static [Self] = &[
+        Self::CommunityRosterFork,
+        Self::RetryAfterCommunityRoster,
+        Self::RetryAfterFamilyRoster,
+        Self::ThirdPartyRow,
+    ];
+
+    /// The stable, low-cardinality metric token. Consumers key on THIS, never
+    /// on message prose — edge deleted a `reason.contains("conflict")`
+    /// discriminator in v18.2.0 and must not grow another.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommunityRosterFork => "community_roster_fork",
+            Self::RetryAfterCommunityRoster => "retry_after_community_roster",
+            Self::RetryAfterFamilyRoster => "retry_after_family_roster",
+            Self::ThirdPartyRow => "third_party_row",
+        }
+    }
+
+    /// Is this refusal expected to resolve itself once more state lands, with
+    /// no operator action?
+    ///
+    /// TRUE for the two roster-ordering classes and **only** those: a refused
+    /// row is not stored, so this node still lacks its hash and the next
+    /// Summary/Diff re-offers it — convergence is by construction, not by a
+    /// retry queue. FALSE for a fork and for a third-party row: neither
+    /// changes on its own, and both are decisions someone has to see.
+    #[must_use]
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::RetryAfterCommunityRoster | Self::RetryAfterFamilyRoster
+        )
+    }
+
+    /// Classify a persist apply-door `Err` on the **attestation** doors —
+    /// AV-45 and AV-84, both of which persist types (`WriteScopeRefused`
+    /// carries a [`ScopeRefusalReason`](ciris_persist::scope::ScopeRefusalReason);
+    /// `CohortStandingRefused` is its own variant). `None` = an error outside
+    /// the #522 door set, which stays a plain `Refused` carrying persist's own
+    /// `kind()`.
+    ///
+    /// Matched on the TYPED variants, never on the message text. The
+    /// `Conflict` fork class is deliberately absent here: `Error::Conflict` is
+    /// generic across planes and only means "roster fork" at the Community
+    /// door, so [`FederationDirectoryReplicationBridge::apply_community`]
+    /// names it at the site that knows the plane.
+    #[must_use]
+    pub fn classify(err: &ciris_persist::federation::Error) -> Option<Self> {
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+        match err {
+            E::WriteScopeRefused(R::NoCommunityMembership) => Some(Self::RetryAfterCommunityRoster),
+            E::WriteScopeRefused(R::NoFamilyMembership) => Some(Self::RetryAfterFamilyRoster),
+            E::CohortStandingRefused { .. } => Some(Self::ThirdPartyRow),
+            _ => None,
+        }
+    }
+}
+
+/// The `Refused` reason for a classified apply-door refusal: persist's own
+/// message + token, then edge's class and what a relay does about it.
+///
+/// The persist half is byte-identical to [`apply_refusal_reason`] so existing
+/// correlation (content hash, `kind()` token) is unchanged; the class is
+/// APPENDED. That ordering matters — the class is edge's reading, and it must
+/// not displace the substrate's own verdict in the log line.
+fn classified_refusal_reason(
+    plane: &str,
+    content_hash: &str,
+    err: &ciris_persist::federation::Error,
+    class: ApplyRefusalClass,
+) -> String {
+    let disposition = if class.is_transient() {
+        "TRANSIENT — THIS NODE'S view of the cohort roster decided it, and the row is \
+         not stored, so the node still lacks it and the next round re-offers it. It \
+         lands once the roster shows the writer as an ACTIVE member, and keeps \
+         refusing while the roster shows the member removed — the same discipline \
+         covers both halves of the revocation pairing (CIRISEdge#522)"
+    } else {
+        "TERMINAL — this does not resolve by retrying (CIRISEdge#522)"
+    };
+    format!(
+        "{}; class={} [{disposition}]",
+        apply_refusal_reason(plane, content_hash, err),
+        class.as_str(),
+    )
+}
+
 /// persist v24.2.0 (CIRISPersist#565) — map the typed Key-plane apply outcome to
 /// edge's [`ApplyOutcome`], returning alongside it the stable refusal TOKEN to
 /// count on the receive-plane mirror ledger (`None` when nothing was refused).
@@ -213,9 +362,10 @@ macro_rules! apply_signed_plane {
                     content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
                 match $self.directory.$put(record).await {
                     Ok(()) => ApplyOutcome::Admitted,
-                    Err(e) => {
-                        ApplyOutcome::Refused(apply_refusal_reason($plane, &content_hash, &e))
-                    }
+                    // CIRISEdge#522 — through `refuse`, so a v38.2.0 door class
+                    // (AV-45 roster ordering, AV-84 third-party) is named and
+                    // counted whichever plane surfaces it.
+                    Err(e) => $self.refuse($plane, &content_hash, &e),
                 }
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason($plane, $bytes, &e)),
@@ -399,6 +549,90 @@ pub struct FederationDirectoryReplicationBridge {
     /// bytes, so this is an ON/OFF choice, never a choice of which accord to
     /// believe in.
     accord_relay_gate: Option<Arc<crate::replication::accord_relay_gate::AccordRelayGate>>,
+    /// CIRISEdge#523 — the resolved owner-binding memo backing the Cohort-scoped
+    /// advertise widening (`node_key_id → owner`). See [`OwnerCache`].
+    owner_cache: Mutex<OwnerCache>,
+    /// CIRISEdge#523 — how many times the bridge actually asked persist's
+    /// `owner_of` (i.e. the memo MISSED). The cache's own witness: the advertise
+    /// path runs per round per plane, so "three planes in one round cost ONE
+    /// directory walk per cohort member" is a claim that has to be checkable
+    /// rather than asserted. `Relaxed` — a counter nobody orders against.
+    owner_reads: std::sync::atomic::AtomicUsize,
+}
+
+/// CIRISEdge#523 — one memoized owner-binding resolution for one node.
+#[derive(Debug, Clone)]
+struct CachedOwner {
+    /// `Some(owner)` = persist resolved a single live owner-binding; `None` =
+    /// the node is provably unowned (persist's `Ok(None)`). A FAILED resolution
+    /// (read error / [`ciris_persist::federation::Error::AmbiguousNodeOwner`])
+    /// is NEVER stored: caching a failure would pin a plane dark across the
+    /// event that fixes it, and the fallback is already the safe direction.
+    owner: Option<String>,
+    resolved_at: Instant,
+}
+
+/// CIRISEdge#523 — the pure, directory-free owner memo. Split out from the
+/// bridge (the [`crate::transport::realtime_av_alm::transit_gate`] `VerdictCache`
+/// shape) so the freshness + invalidation rules are unit-testable without a
+/// federation fixture; the resolution correctness itself is persist's.
+#[derive(Debug, Default)]
+struct OwnerCache {
+    by_node: HashMap<String, CachedOwner>,
+}
+
+impl OwnerCache {
+    /// The memoized answer for `node` iff the entry is still fresh. `None` is
+    /// "no usable entry — go resolve"; it is deliberately a DIFFERENT value from
+    /// `Some(OwnerLookup::Unowned)`, because collapsing "unowned" into "unknown"
+    /// is the #425 absent-vs-empty class of bug. The storage stays two-valued
+    /// ([`CachedOwner::owner`]), so [`OwnerLookup::Unresolved`] is unrepresentable
+    /// here by construction — a failed resolution is never cached.
+    fn get_fresh(&self, node: &str, now: Instant) -> Option<OwnerLookup> {
+        let entry = self.by_node.get(node)?;
+        (now.duration_since(entry.resolved_at) < OWNER_BINDING_MEMO_TTL).then(|| {
+            entry
+                .owner
+                .clone()
+                .map_or(OwnerLookup::Unowned, OwnerLookup::Owner)
+        })
+    }
+
+    fn put(&mut self, node: &str, owner: Option<String>, now: Instant) {
+        self.by_node.insert(
+            node.to_string(),
+            CachedOwner {
+                owner,
+                resolved_at: now,
+            },
+        );
+    }
+
+    /// Drop every entry a change naming `key_id` could falsify: the node whose
+    /// binding it is, and any node whose memoized OWNER is `key_id` (a revoked
+    /// owner key stops conferring membership on the nodes it owns). Event-driven
+    /// from the apply path; [`OWNER_BINDING_MEMO_TTL`] is the backstop.
+    fn invalidate(&mut self, key_id: &str) {
+        self.by_node
+            .retain(|node, e| node != key_id && e.owner.as_deref() != Some(key_id));
+    }
+}
+
+/// CIRISEdge#523 — the outcome of one owner resolution, kept as three values
+/// rather than `Option<String>` so "unowned" can never be read as "we could not
+/// tell". Only [`Self::Unresolved`] changes the gate's behaviour (it narrows to
+/// the pre-#523 direct-key test); the other two are answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnerLookup {
+    /// A single live owner-binding names this user as the node's owner.
+    Owner(String),
+    /// The node carries no live owner-binding (persist's `Ok(None)`).
+    Unowned,
+    /// The resolution FAILED — a directory read error, or
+    /// `AmbiguousNodeOwner` (a node with two live owners is not a resolvable
+    /// membership claim, CIRISConstitution#23 consumer-fail-closed). Never
+    /// cached, never widens.
+    Unresolved,
 }
 
 /// CIRISEdge#430 — the revoked-key listener installed via
@@ -411,6 +645,21 @@ pub type RevocationObserver = Arc<dyn Fn(&str) + Send + Sync>;
 /// bounded by the scheduler's 10 s round budget) while staying well under the
 /// default 30 s cadence, so the item-1 bound still re-resolves every round.
 const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
+
+/// CIRISEdge#523 — how long a resolved owner-binding stays fresh.
+///
+/// Sized at the default anti-entropy cadence, so the widened cohort is resolved
+/// about ONCE PER ROUND per cohort member and shared by all three Cohort-scoped
+/// planes in that round (the #430 "resolve once, cache, invalidate" discipline;
+/// this walk is persist's, and edge must not pay for it three times a round).
+///
+/// The TTL is a BACKSTOP, not the mechanism: `apply` invalidates on an admitted
+/// owner-binding, on an admitted `withdraws`/`recants` naming the node, and on
+/// an admitted `Revocation` naming either side. It is nonetheless LOAD-BEARING
+/// for the two liveness clauses no apply event announces — a `delegates_to`
+/// whose `expires_at` passes, and a CC 3.4.12 `valid_until` that lapses — both
+/// of which are time-driven, so a TTL is the only thing that can observe them.
+const OWNER_BINDING_MEMO_TTL: Duration = Duration::from_secs(30);
 
 impl FederationDirectoryReplicationBridge {
     /// Construct with default [`BridgeConfig`], **v1-only** (no v2
@@ -438,6 +687,8 @@ impl FederationDirectoryReplicationBridge {
             revocation_observer: None,
             mesh_config: None,
             accord_relay_gate: None,
+            owner_cache: Mutex::new(OwnerCache::default()),
+            owner_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -475,6 +726,8 @@ impl FederationDirectoryReplicationBridge {
             revocation_observer: None,
             mesh_config: None,
             accord_relay_gate: None,
+            owner_cache: Mutex::new(OwnerCache::default()),
+            owner_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -904,6 +1157,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// rows the node would ever be re-offered — a cohort-filter residual of the
     /// same class is conceivable there and is deliberately left to its own
     /// audit rather than silently widened here.
+    ///
+    /// CIRISEdge#523 is that audit, and the residual was real: those three
+    /// planes' cohort filter is NODE-keyed while their rosters name PERSONS, so
+    /// the advertise — and therefore this holdings view — was empty by
+    /// construction. [`Self::cohort_set_with_owners`] widens the FILTER, which
+    /// repairs both axes at once and keeps advertise == holdings, exactly as
+    /// this arm's `_ =>` fall-through assumes.
     async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         match kind {
             EnvelopeKind::Attestation => self.list_attestation_holdings().await,
@@ -1658,6 +1918,44 @@ impl FederationDirectoryReplicationBridge {
                 .is_some_and(ciris_persist::federation::namespace::is_subject_retainable)
     }
 
+    /// CIRISEdge#522 — **the ONE place a persist apply-door `Err` becomes an
+    /// [`ApplyOutcome::Refused`]**, so a v38.2.0 door class cannot be booked at
+    /// one call site and dropped at the next.
+    ///
+    /// Classifies via the TYPED variant ([`ApplyRefusalClass::classify`]),
+    /// books the class on the reason-axis ledger when there is one, and folds
+    /// the class into the message the #425 choke logs. An unclassified error
+    /// takes the unchanged pre-#522 path: persist's message + its `kind()`
+    /// token, counted on the kind axis at the choke like every other refusal.
+    fn refuse(
+        &self,
+        plane: &str,
+        content_hash: &str,
+        err: &ciris_persist::federation::Error,
+    ) -> ApplyOutcome {
+        match ApplyRefusalClass::classify(err) {
+            Some(class) => self.refuse_as(plane, content_hash, err, class),
+            None => ApplyOutcome::Refused(apply_refusal_reason(plane, content_hash, err)),
+        }
+    }
+
+    /// [`Self::refuse`] with the class supplied by the CALLER — for the one
+    /// door whose class is not derivable from the error alone
+    /// ([`Self::apply_community`]: `Error::Conflict` means "roster fork" only
+    /// on the Community plane).
+    fn refuse_as(
+        &self,
+        plane: &str,
+        content_hash: &str,
+        err: &ciris_persist::federation::Error,
+        class: ApplyRefusalClass,
+    ) -> ApplyOutcome {
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_apply_refusal_class(class.as_str());
+        }
+        ApplyOutcome::Refused(classified_refusal_reason(plane, content_hash, err, class))
+    }
+
     /// The per-kind apply dispatch behind the #425 choke —
     /// [`StateApplier::apply_envelope_bytes`] wraps this with the #426
     /// source-peer trace and the #565 refusal counter.
@@ -1682,6 +1980,12 @@ impl FederationDirectoryReplicationBridge {
                         // holder or the root itself; either way its cached
                         // relay verdict is now false.
                         self.invalidate_accord_relay(&[&r.revocation.revoked_key_id]);
+                        // CIRISEdge#523 — and it can be either SIDE of an
+                        // owner-binding: the node whose owner is memoized, or
+                        // the owner key itself (which stops conferring
+                        // membership on every node it owns). `invalidate`
+                        // drops both directions.
+                        self.invalidate_owner_memo(&r.revocation.revoked_key_id);
                     }
                 }
                 outcome
@@ -2758,45 +3062,138 @@ impl FederationDirectoryReplicationBridge {
 
     async fn resolve_attestation_recipient(&self, peer: &str) -> Option<ResolvedRecipient> {
         use crate::observability::WithholdReason;
+        // CIRISEdge#524 — every withhold on this path names the peer it
+        // evaluated, including the one the field measured as `peer=` empty.
+        let peer_label = Self::peer_label(peer);
         let Some(local) = self.local_key_id.as_deref() else {
             tracing::warn!(
-                peer,
+                peer = peer_label,
                 "attestation plane withheld — no `local_key_id` to resolve the CIRISEdge#396 \
                  consent send-set; wire ReplicationRuntimeConfig::local_key_id"
             );
             self.withhold(
                 WithholdReason::LocalIdentityMissing,
-                peer,
+                peer_label,
                 "consent-send-set: no local_key_id",
             );
             return None;
         };
         let Some(set) = self.resolved_peer_set(local).await else {
             tracing::debug!(
-                peer,
+                peer = peer_label,
                 "attestation plane withheld — consent send-set unresolved (fail-closed)"
             );
             self.withhold(
                 WithholdReason::SendSetUnresolved,
-                peer,
+                peer_label,
                 "list_consent_peers read failed",
             );
             return None;
         };
         let resolved = set.recipient(peer);
         if resolved.is_none() {
-            tracing::debug!(
-                peer,
-                "attestation plane withheld — recipient is not in this node's live \
-                 consent:replication send-set (CIRISEdge#396 item 1)"
-            );
+            // CIRISEdge#524 — the line that must NAME the peer. See
+            // [`Self::log_send_set_withhold`].
+            self.log_send_set_withhold(peer, &set).await;
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
-                peer,
+                Self::peer_label(peer),
                 "attestation: not consent-included",
             );
         }
         resolved
+    }
+
+    /// **CIRISEdge#524 — a withhold that can name its peer.**
+    ///
+    /// The field-measured line was
+    /// `attestation plane withheld — recipient is not in this node's live
+    /// consent:replication send-set (CIRISEdge#396 item 1) peer=` — with the
+    /// peer EMPTY. A withhold that cannot say who it withheld from turns a
+    /// five-minute diagnosis into a harness build; CIRISServer's team paid the
+    /// latter. Three things changed here:
+    ///
+    /// 1. **The label is never empty.** An empty `peer` reaches this gate as
+    ///    `<empty-peer-id>`, not as blank space — and it says so LOUDLY, because
+    ///    an inbound round attributed to nobody is a WIRING fault (the link
+    ///    authenticated no one) rather than a consent decision. Note the empty
+    ///    id is deliberately NOT normalized to "unattributed" anywhere upstream:
+    ///    `list_envelope_refs_for_peer(kind, None)` is the peer-BLIND projection
+    ///    view, so mapping `""` to `None` would WIDEN what gets served.
+    /// 2. **The send-set's size is stated.** `0` is a fleet-wide consent problem;
+    ///    `n > 0` with no match is a per-peer addressing problem.
+    /// 3. **The person/node axis is named when it is what happened.** If the
+    ///    live grant projection does not name this peer but DOES name the peer's
+    ///    OWNER, the operator is looking at CIRISEdge#524's routing class: a
+    ///    grant naming a person — the natural thing for a consent OBJECT to
+    ///    name, since consent is between people — which edge cannot route,
+    ///    because it resolves recipients by exact key match and a person's key
+    ///    has no transport binding. This is DIAGNOSIS ONLY. It reads
+    ///    [`ResolvedPeerSet::names`], which cannot mint a `ResolvedRecipient`,
+    ///    so nothing is served on the strength of an owner match: the send-side
+    ///    walk needs persist's reverse index (person → bound nodes) and is filed
+    ///    as CIRISPersist#764.
+    ///
+    /// The owner probe rides the CIRISEdge#523 memo, so a withheld round costs
+    /// no extra directory walk; the WARN is throttled to a floor (never to
+    /// silence) because a peer can trigger it every round.
+    async fn log_send_set_withhold(&self, peer: &str, set: &ResolvedPeerSet) {
+        let peer_label = Self::peer_label(peer);
+        let send_set_size = set.len();
+        if peer.is_empty() {
+            tracing::warn!(
+                peer = peer_label,
+                send_set_size,
+                "attestation plane withheld — the inbound round is attributed to an EMPTY \
+                 peer key_id, so no consent:replication grant can ever match it. This is a \
+                 WIRING fault in the host's listen loop (the peer id handed to \
+                 `route_inbound_bytes`), not a consent decision (CIRISEdge#524)"
+            );
+            return;
+        }
+        // The #523 memo answers this without a fresh walk in the common case.
+        // `Unowned` / `Unresolved` simply mean there is no owner story to tell.
+        let owner_named = match self.owner_of_cached(peer).await {
+            OwnerLookup::Owner(owner) if set.names(&owner) => Some(owner),
+            _ => None,
+        };
+        let Some(owner) = owner_named else {
+            tracing::debug!(
+                peer = peer_label,
+                send_set_size,
+                "attestation plane withheld — recipient is not in this node's live \
+                 consent:replication send-set (CIRISEdge#396 item 1)"
+            );
+            return;
+        };
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            serve_gate_withheld_log().check(&format!("consent-send-set:{peer_label}"))
+        {
+            tracing::warn!(
+                peer = peer_label,
+                grant_subject = %owner,
+                send_set_size,
+                suppressed_prev,
+                "attestation plane withheld — the live consent:replication send-set does NOT \
+                 name this peer, but DOES name its OWNER. A grant naming a PERSON is not \
+                 routable: edge resolves recipients by exact key match and a person's key \
+                 carries no transport binding. Re-emit the grant naming the peer NODE \
+                 (CIRISServer#472); the send-side owner walk needs persist's reverse index \
+                 (CIRISPersist#764, tracked as CIRISEdge#524) (CIRISEdge#396 item 1)"
+            );
+        }
+    }
+
+    /// CIRISEdge#524 — a peer id that is always safe to print. An EMPTY id is
+    /// the measured failure (`peer=` with nothing after it), and it is a
+    /// distinct thing from an ABSENT one — hence a distinct label, never the
+    /// `<unattributed>` the `None` paths use.
+    fn peer_label(peer: &str) -> &str {
+        if peer.is_empty() {
+            "<empty-peer-id>"
+        } else {
+            peer
+        }
     }
 
     /// CIRISEdge#400 — the memoized consent send-set. Returns the live
@@ -3099,13 +3496,213 @@ impl FederationDirectoryReplicationBridge {
     // matching the pre-v21 `subjects_for_projection(Global)` subject set).
 
     /// The operator-configured cohort as a set, for the Cohort-scoped advertise
-    /// filters.
+    /// filters. This is the DIRECT key test — a roster entry naming a peer NODE
+    /// outright — and CIRISEdge#523 leaves it exactly as it was; the owner
+    /// widening in [`Self::cohort_set_with_owners`] is added BESIDE it, never
+    /// in place of it.
     fn cohort_set(&self) -> HashSet<String> {
         (self.cohort)().into_iter().collect()
     }
 
+    /// **CIRISEdge#523 — the person/node identity axis on the SERVE side.**
+    ///
+    /// The three Cohort-scoped planes (Family / Community / LocationProof) test
+    /// roster membership against the anti-entropy cohort, and that cohort is
+    /// NODE-keyed (`ReplicationPeer::peer_key_id`). A Community's or Family's
+    /// members are PERSONS — owner fed-IDs — so the intersection is empty *by
+    /// construction*, and the plane is unservable to exactly the entities that
+    /// transport it. Measured on CIRISServer's two-node chat ladder: 0
+    /// `federation_communities` rows served for a room the peer's owner is a
+    /// member of, while 7 attestation rows landed on the same link in the same
+    /// rounds.
+    ///
+    /// The fix runs in the FAVORABLE direction, so it needs no new persist
+    /// surface: the requesting peer IS a node, and persist already exposes
+    /// [`owner_of`](ciris_persist::federation::admission::owner_of) — the
+    /// dimension-precise single owner, revocation-folded, which edge already
+    /// consumes at `edge.rs`'s `key_is_own_node`. So each cohort node
+    /// contributes BOTH itself and its owner to the membership test. The walk
+    /// itself stays persist's (the #430 discipline: zero trust logic in edge —
+    /// resolve once, cache, invalidate).
+    ///
+    /// Fail-closed means **do not widen**: an unresolved owner ([`OwnerLookup::Unresolved`]
+    /// — read error or `AmbiguousNodeOwner`) contributes nothing, leaving the
+    /// gate at its exact pre-#523 behaviour, and books a withhold so the
+    /// narrowing is never silent.
+    ///
+    /// # The serve-side twin
+    ///
+    /// v18.2.0's lesson (the `SelfOwn` fetch path with no projection twin) is
+    /// that an advertise gate and its direct-fetch gate must agree. These three
+    /// planes have **no fetch-side gate at all**:
+    /// [`Self::fetch_envelope_bytes_for_peer`] applies policy only to
+    /// `EnvelopeKind::Attestation`, and every other kind resolves straight
+    /// through the content-hash point-read. So the advertise filter was, and
+    /// remains, the only gate — strictly NARROWER than the fetch. Widening it
+    /// moves LIST toward FETCH and closes an asymmetry rather than opening one;
+    /// there is no twin to widen, and this is the note that says so, so the next
+    /// reader does not go looking for one.
+    ///
+    /// The subject-scoped Pull (`subject_holdings`) is a different axis — it
+    /// pins requester == subject and is an ENTITLEMENT question, not an
+    /// advertise scope — and is deliberately untouched here (its own
+    /// owner-delegation follow-up is noted at that site).
+    async fn cohort_set_with_owners(&self) -> HashSet<String> {
+        let direct = self.cohort_set();
+        // Resolve over a snapshot: the owners are inserted into the SAME set the
+        // membership test reads, so iterating it while inserting is not an option.
+        let mut lookups: Vec<(String, OwnerLookup)> = Vec::with_capacity(direct.len());
+        for node in direct.iter().cloned().collect::<Vec<_>>() {
+            let lookup = self.owner_of_cached(&node).await;
+            lookups.push((node, lookup));
+        }
+        let (widened, unresolved) = Self::widen_cohort_by_owners(direct, lookups);
+        for node in unresolved {
+            // CIRISEdge#433 — booked, because a Cohort plane silently narrowing
+            // back to the pre-#523 gate is precisely the invisible-withhold
+            // class the ledger exists for.
+            //
+            // The reason BORROWS [`crate::observability::WithholdReason::SendSetUnresolved`]:
+            // the enum is a closed operator vocabulary, no variant names the
+            // owner walk, and widening it is not this change's to make (the same
+            // borrow discipline the v18 `SelfOwn` fetch twin used for
+            // `RecipientNotInSendSet`). It is the closest documented variant in
+            // KIND — "the audience projection could not be READ, and a transient
+            // failure is not a verdict about the peer" — and the `detail` names
+            // the true branch so a ledger reader is not sent to the consent plane.
+            self.withhold(
+                crate::observability::WithholdReason::SendSetUnresolved,
+                &node,
+                "owner_of unresolved — cohort advertise falls back to the \
+                 direct-key test (CIRISEdge#523)",
+            );
+        }
+        widened
+    }
+
+    /// CIRISEdge#523 — the pure half of [`Self::cohort_set_with_owners`]: fold
+    /// resolved owner lookups into the membership set, and name the nodes whose
+    /// lookup failed so the caller can book them.
+    ///
+    /// Split out because the fail-closed rule — **`Unresolved` contributes
+    /// NOTHING** — is the whole security content of this change, and it is not
+    /// reachable through a `MemoryBackend` fixture (persist's single-owner
+    /// admission gate refuses a second owner-binding, so `AmbiguousNodeOwner`
+    /// cannot be seeded, and an in-memory directory read does not fail). Pinning
+    /// it here tests the branch that decides, with the exact three inputs the
+    /// field produces, instead of testing nothing and calling it covered.
+    fn widen_cohort_by_owners(
+        direct: HashSet<String>,
+        lookups: Vec<(String, OwnerLookup)>,
+    ) -> (HashSet<String>, Vec<String>) {
+        let mut widened = direct;
+        let mut unresolved = Vec::new();
+        for (node, lookup) in lookups {
+            match lookup {
+                OwnerLookup::Owner(owner) => {
+                    widened.insert(owner);
+                }
+                // A node with no owner adds nothing — and that is an ANSWER, not
+                // a failure: it is the unowned self-anchor case.
+                OwnerLookup::Unowned => {}
+                OwnerLookup::Unresolved => unresolved.push(node),
+            }
+        }
+        (widened, unresolved)
+    }
+
+    /// CIRISEdge#523 — `owner_of(node)` behind the round-scoped memo.
+    ///
+    /// The advertise sweep runs per round PER PLANE, and `owner_of` is a
+    /// directory walk (persist's `live_delegation_granters` over the node's
+    /// incoming `delegates_to` rows, revocation- and expiry-folded). Without a
+    /// memo the three Cohort planes would pay for it three times a round, per
+    /// cohort member — the exact per-envelope re-resolution CIRISEdge#400 had to
+    /// undo on the consent plane. `OWNER_BINDING_MEMO_TTL` bounds staleness; the
+    /// apply path invalidates on the events that move the answer.
+    ///
+    /// A failed resolution is NOT cached (see [`CachedOwner::owner`]).
+    async fn owner_of_cached(&self, node_key_id: &str) -> OwnerLookup {
+        if let Ok(cache) = self.owner_cache.lock() {
+            if let Some(hit) = cache.get_fresh(node_key_id, Instant::now()) {
+                return hit;
+            }
+        }
+        // The `std` mutex is never held across the await (the #400 shape).
+        self.owner_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let resolved = ciris_persist::federation::admission::owner_of(
+            &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+            node_key_id,
+        )
+        .await;
+        match resolved {
+            Ok(owner) => {
+                if let Ok(mut cache) = self.owner_cache.lock() {
+                    cache.put(node_key_id, owner.clone(), Instant::now());
+                }
+                owner.map_or(OwnerLookup::Unowned, OwnerLookup::Owner)
+            }
+            // Mirrors `edge.rs`'s `key_is_own_node` error handling exactly:
+            // `AmbiguousNodeOwner` and a read error are the SAME fail-closed
+            // outcome — a `self`/ownership boundary is never resolved from an
+            // ambiguous owner (CIRISConstitution#23).
+            Err(e) => {
+                tracing::debug!(
+                    node = node_key_id,
+                    error = %e,
+                    "owner_of unresolved — the Cohort-scoped advertise keeps the \
+                     direct-key test only (CIRISEdge#523 fail-closed)"
+                );
+                OwnerLookup::Unresolved
+            }
+        }
+    }
+
+    /// CIRISEdge#523 — drop the memoized owner-binding for `key_id` and for any
+    /// node it owns. Called from the apply path on the three events that move
+    /// `owner_of`; see [`OWNER_BINDING_MEMO_TTL`] for what the TTL still covers.
+    fn invalidate_owner_memo(&self, key_id: &str) {
+        if let Ok(mut cache) = self.owner_cache.lock() {
+            cache.invalidate(key_id);
+        }
+    }
+
+    /// CIRISEdge#523 — the node whose `owner_of` an ADMITTED attestation could
+    /// have moved, if any. Three shapes, and the split is deliberate:
+    ///
+    /// - a `delegates_to` is an owner-binding only when persist's OWN predicate
+    ///   ([`is_owner_binding_envelope`](ciris_persist::federation::admission::is_owner_binding_envelope))
+    ///   says so — never a locally re-derived dimension string (the capability-token
+    ///   provenance rule: import the authority's predicate, don't reinvent it);
+    /// - a `withdraws` / `recants` carries NO owner-binding dimension of its own
+    ///   — it names the edge it retracts by `references_attestation_id` — so it
+    ///   is impossible to tell from the row alone whether it retracts one. We
+    ///   drop the entry for its subject regardless: a memo eviction costs one
+    ///   directory walk, and the other direction is a node keeping a withdrawn
+    ///   owner for a whole TTL;
+    /// - everything else (`scores`, `supersedes`, …) moves nothing, so the
+    ///   highest-volume plane pays only a string compare.
+    fn owner_binding_touched(attestation: &Attestation) -> Option<&str> {
+        use ciris_persist::federation::types::attestation_type;
+        match attestation.attestation_type.as_str() {
+            attestation_type::DELEGATES_TO => {
+                ciris_persist::federation::admission::is_owner_binding_envelope(
+                    &attestation.attestation_envelope,
+                )
+                .then_some(attestation.attested_key_id.as_str())
+            }
+            attestation_type::WITHDRAWS | attestation_type::RECANTS => {
+                Some(attestation.attested_key_id.as_str())
+            }
+            _ => None,
+        }
+    }
+
     async fn list_families(&self) -> Vec<EnvelopeRef> {
-        let cohort = self.cohort_set();
+        // CIRISEdge#523 — plane 1 of 3. A Family's members are PERSONS; the
+        // cohort is NODE-keyed. See [`Self::cohort_set_with_owners`].
+        let cohort = self.cohort_set_with_owners().await;
         let rows = self
             .directory
             .list_signed_families_since(None, self.effective_page_limit().await)
@@ -3126,7 +3723,10 @@ impl FederationDirectoryReplicationBridge {
     }
 
     async fn list_communities(&self) -> Vec<EnvelopeRef> {
-        let cohort = self.cohort_set();
+        // CIRISEdge#523 — plane 2 of 3, and the one the ladder MEASURED: the
+        // recipient held 0 `federation_communities` rows for a room its owner
+        // is a member of. See [`Self::cohort_set_with_owners`].
+        let cohort = self.cohort_set_with_owners().await;
         let rows = self
             .directory
             .list_signed_communities_since(None, self.effective_page_limit().await)
@@ -3185,7 +3785,11 @@ impl FederationDirectoryReplicationBridge {
     }
 
     async fn list_location_proofs(&self) -> Vec<EnvelopeRef> {
-        let cohort = self.cohort_set();
+        // CIRISEdge#523 — plane 3 of 3. A LocationProof's `subject_key_id` is
+        // whoever the proof is ABOUT, which for a person's presence claim is a
+        // person fed-ID: the same empty intersection with a node-keyed cohort.
+        // See [`Self::cohort_set_with_owners`].
+        let cohort = self.cohort_set_with_owners().await;
         let rows = self
             .directory
             .list_signed_location_proofs_since(None, self.effective_page_limit().await)
@@ -3355,18 +3959,30 @@ impl FederationDirectoryReplicationBridge {
                             record.attestation.attested_key_id.clone(),
                         )
                     });
+                // CIRISEdge#523 — the node (if any) whose memoized `owner_of`
+                // this row could move once ADMITTED. Resolved before the move
+                // into `put_attestation`; `None` for every non-ownership row,
+                // so the high-volume `scores` plane pays one string compare.
+                let owner_invalidation: Option<String> =
+                    Self::owner_binding_touched(&record.attestation).map(ToOwned::to_owned);
                 match self.directory.put_attestation(record).await {
                     Ok(()) => {
                         if let Some((author, subject)) = relay_invalidation {
                             self.invalidate_accord_relay(&[&author, &subject]);
                         }
+                        if let Some(node) = owner_invalidation {
+                            self.invalidate_owner_memo(&node);
+                        }
                         ApplyOutcome::Admitted
                     }
-                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
-                        "Attestation",
-                        &content_hash,
-                        &e,
-                    )),
+                    // persist v38.2.0 (CIRISEdge#522) — THIS is the door the
+                    // cut moved. AV-45 membership now gates community/family
+                    // -scoped rows here (target resolved from the producer's
+                    // SIGNED envelope, no replicated-row bypass) and AV-84
+                    // refuses a targeted row naming a third party. Both arrive
+                    // as typed persist variants and `refuse` names + counts
+                    // them; everything else keeps the pre-#522 shape.
+                    Err(e) => self.refuse("Attestation", &content_hash, &e),
                 }
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Attestation", bytes, &e)),
@@ -3419,8 +4035,79 @@ impl FederationDirectoryReplicationBridge {
         apply_signed_plane!(self, "Family", bytes, SignedFamily, put_family)
     }
 
+    /// persist v38.2.0 / CIRISPersist#758 (CIRISEdge#522) — the Community door
+    /// stopped being an insert and became a **verdict**, so this plane leaves
+    /// [`apply_signed_plane!`] behind.
+    ///
+    /// Three outcomes now, where the macro could only express two:
+    ///
+    /// - **fresh row → `Admitted`.** Unchanged.
+    /// - **identical re-put → `Duplicate`.** Convergent derivation (a pair
+    ///   chat mints one deterministic community per pair) means two nodes
+    ///   author BYTE-IDENTICAL content and each signs as itself, so a
+    ///   re-offered copy is the COMMON case, not an anomaly. persist answers
+    ///   `Ok` and leaves the stored row and its first-accepted authority
+    ///   signature untouched. The macro would have called that `Admitted` —
+    ///   claiming anti-entropy progress on every round that re-offers a
+    ///   community this node already holds, which is the "applied all N" /
+    ///   "nothing moved" collapse #457 exists to prevent.
+    /// - **differing roster under an occupied id → `Refused`, named.**
+    ///   persist returns the TYPED
+    ///   [`Error::Conflict`](ciris_persist::federation::Error::Conflict); edge
+    ///   books it as [`ApplyRefusalClass::CommunityRosterFork`]. It is not
+    ///   retryable (retrying spins) and must not be dropped (dropping hides a
+    ///   fork). Roster CHANGES travel as supersedes, never as a differing
+    ///   re-put, so this can only mean two authorities disagree about one id.
+    ///
+    /// # Why the pre-read, and why it is honest
+    ///
+    /// `put_community` returns `Result<(), Error>`: `Ok` alone cannot say
+    /// whether a row was inserted or absorbed. Persist decides by comparing
+    /// the stored `persist_row_hash` to the offered one; edge asks the
+    /// equivalent question with the read it already has — *was this
+    /// `community_key_id` occupied before we knocked?* Occupied + `Ok` is
+    /// exactly persist's identical-re-put branch, because the differing branch
+    /// is the `Conflict` above. Recomputing the hash here instead would
+    /// re-implement `compute_persist_row_hash`'s stamping rules downstream of
+    /// the authority that owns them — a second spelling that can drift.
+    ///
+    /// A concurrent insert between the read and the put mislabels one row
+    /// `Admitted` that was really a duplicate. That is a counter's rounding,
+    /// not a safety property: the stored state is whatever persist's verdict
+    /// made it either way, and the honest direction (over-reporting progress
+    /// once) is the one that cannot hide a fork. Communities are rare and this
+    /// costs one point-read per applied community row.
     async fn apply_community(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(self, "Community", bytes, SignedCommunity, put_community)
+        let record: SignedCommunity = match serde_json::from_slice(bytes) {
+            Ok(r) => r,
+            Err(e) => return ApplyOutcome::Deserialize(apply_deser_reason("Community", bytes, &e)),
+        };
+        let content_hash =
+            content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
+        // Read BEFORE the put — see the doc comment. A read ERROR is not an
+        // occupancy answer: fall back to `false`, which can only mislabel a
+        // duplicate as admitted, never invent a refusal.
+        let was_occupied = self
+            .directory
+            .lookup_community(&record.community.community_key_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        match self.directory.put_community(record).await {
+            Ok(()) if was_occupied => ApplyOutcome::Duplicate,
+            Ok(()) => ApplyOutcome::Admitted,
+            // The FORK signal. Matched on the typed variant — edge deleted a
+            // `reason.contains("conflict")` discriminator in v18.2.0 and this
+            // is not the place to grow another.
+            Err(e @ ciris_persist::federation::Error::Conflict(_)) => self.refuse_as(
+                "Community",
+                &content_hash,
+                &e,
+                ApplyRefusalClass::CommunityRosterFork,
+            ),
+            Err(e) => self.refuse("Community", &content_hash, &e),
+        }
     }
 
     async fn apply_identity_occurrence_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
@@ -3700,11 +4387,7 @@ impl FederationDirectoryReplicationBridge {
                     .map_or_else(String::new, |(h, _)| hex::encode(h));
                 match self.directory.put_organization(s).await {
                     Ok(()) => ApplyOutcome::Admitted,
-                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
-                        "Organization",
-                        &content_hash,
-                        &e,
-                    )),
+                    Err(e) => self.refuse("Organization", &content_hash, &e),
                 }
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Organization", bytes, &e)),
@@ -3731,11 +4414,7 @@ impl FederationDirectoryReplicationBridge {
                     .map_or_else(String::new, |(h, _)| hex::encode(h));
                 match self.directory.put_org_membership(s).await {
                     Ok(()) => ApplyOutcome::Admitted,
-                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
-                        "OrgMembership",
-                        &content_hash,
-                        &e,
-                    )),
+                    Err(e) => self.refuse("OrgMembership", &content_hash, &e),
                 }
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("OrgMembership", bytes, &e)),
@@ -5310,6 +5989,371 @@ mod tests {
         .await;
     }
 
+    // ── persist v38.2.0 / CIRISEdge#522 — the three apply-door adoptions ──
+
+    /// The classifier, over the TYPED persist variants — the unit the three
+    /// door adoptions all funnel through.
+    ///
+    /// This is a pure test on purpose. Two of the three doors
+    /// (`retry_after_*_roster`, `third_party_row`) are persist gates whose
+    /// preconditions persist itself certifies per backend; what is EDGE's to
+    /// get right is the reading — that the typed variant maps to the right
+    /// class, that the class carries the right disposition, and that the match
+    /// is on the variant and not on the message. A `Display`-shaped
+    /// discriminator would pass a prose test and fail the day persist rewords
+    /// a message, which is why v18.2.0 deleted the last one.
+    #[test]
+    fn the_typed_door_verdicts_classify_and_carry_their_disposition() {
+        use ciris_persist::federation::admission::CohortStandingRefusal;
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+
+        // AV-45 (persist#757) — the two roster-ordering classes. TRANSIENT:
+        // the roster simply has not landed on this node yet.
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::WriteScopeRefused(R::NoCommunityMembership)),
+            Some(ApplyRefusalClass::RetryAfterCommunityRoster),
+        );
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::WriteScopeRefused(R::NoFamilyMembership)),
+            Some(ApplyRefusalClass::RetryAfterFamilyRoster),
+        );
+        assert!(ApplyRefusalClass::RetryAfterCommunityRoster.is_transient());
+        assert!(ApplyRefusalClass::RetryAfterFamilyRoster.is_transient());
+
+        // AV-84 (persist#757) — a policy verdict about the ROW's content, and
+        // NOT a delivery problem. Terminal: nothing about it changes by
+        // waiting or by retrying.
+        for reason in [
+            CohortStandingRefusal::AttestedParty,
+            CohortStandingRefusal::NamedSubject,
+        ] {
+            let err = E::CohortStandingRefused {
+                cohort_scope: "community".to_owned(),
+                producer_key_id: "producer".to_owned(),
+                foreign_key_id: "somebody-else".to_owned(),
+                reason,
+            };
+            assert_eq!(
+                ApplyRefusalClass::classify(&err),
+                Some(ApplyRefusalClass::ThirdPartyRow),
+            );
+        }
+        assert!(!ApplyRefusalClass::ThirdPartyRow.is_transient());
+        assert!(!ApplyRefusalClass::CommunityRosterFork.is_transient());
+
+        // The OTHER `WriteScopeRefused` reasons are NOT roster-ordering. A
+        // wildcard-first classifier would have swept `WrongIdentity` into
+        // "retry after the roster lands", which is a permanent refusal wearing
+        // a transient label — the exact inversion of the silent-narrowing bug
+        // this ledger exists to prevent.
+        for reason in [
+            R::WrongIdentity,
+            R::BoundaryAuthFailed,
+            R::UnauthenticatedSuppressedCohort,
+            R::InvalidCohortScope("nonsense".to_owned()),
+        ] {
+            assert_eq!(
+                ApplyRefusalClass::classify(&E::WriteScopeRefused(reason)),
+                None,
+                "only the two MEMBERSHIP reasons are roster-ordering",
+            );
+        }
+        // And an error outside the #522 door set keeps the pre-adopt shape.
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::InvalidArgument("whatever".to_owned())),
+            None,
+        );
+        // `Conflict` is generic across planes — it means "roster fork" only at
+        // the Community door, which names it at the site that knows the plane.
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::Conflict("whatever".to_owned())),
+            None,
+        );
+    }
+
+    /// The ledger's key space is CLOSED and its tokens are distinct — the
+    /// bounded-cardinality contract `apply_refusals_by_class` rests on.
+    #[test]
+    fn the_apply_refusal_classes_have_distinct_stable_tokens() {
+        let tokens: std::collections::BTreeSet<&str> =
+            ApplyRefusalClass::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            tokens.len(),
+            ApplyRefusalClass::ALL.len(),
+            "two classes collapsed onto one metric key: {tokens:?}",
+        );
+        // Snake-case, no whitespace — these are metric keys, not prose.
+        for token in &tokens {
+            assert!(
+                token
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit()),
+                "{token} is not a metric-safe token",
+            );
+        }
+    }
+
+    /// The refusal MESSAGE keeps persist's own verdict first and appends
+    /// edge's reading — so the existing `kind()` correlation still works and
+    /// the class never displaces the substrate's answer.
+    #[test]
+    fn a_classified_refusal_names_persists_verdict_and_then_edges_class() {
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+        let err = E::WriteScopeRefused(R::NoCommunityMembership);
+        let msg = classified_refusal_reason(
+            "Attestation",
+            "deadbeef",
+            &err,
+            ApplyRefusalClass::RetryAfterCommunityRoster,
+        );
+        assert!(
+            msg.starts_with(&apply_refusal_reason("Attestation", "deadbeef", &err)),
+            "persist's message + kind() token lead: {msg}",
+        );
+        assert!(msg.contains("federation_write_scope_refused"), "{msg}");
+        assert!(msg.contains("class=retry_after_community_roster"), "{msg}");
+        assert!(msg.contains("TRANSIENT"), "{msg}");
+        let terminal = classified_refusal_reason(
+            "Community",
+            "deadbeef",
+            &E::Conflict("forked".to_owned()),
+            ApplyRefusalClass::CommunityRosterFork,
+        );
+        assert!(
+            terminal.contains("class=community_roster_fork"),
+            "{terminal}"
+        );
+        assert!(terminal.contains("TERMINAL"), "{terminal}");
+    }
+
+    /// persist#758 (CIRISEdge#522 item 1) — the Community door's THREE
+    /// verdicts, driven through edge's real apply path on all three arms.
+    ///
+    /// The convergent re-put is the one that would have been silently wrong:
+    /// before v38.2.0 the memory backend OVERWROTE the stored row (and its
+    /// first-accepted authority signature) on a re-put, and edge's macro
+    /// reported `Admitted` either way — anti-entropy progress claimed on every
+    /// round that re-offers a community this node already holds.
+    #[tokio::test]
+    async fn the_community_door_verdicts_are_duplicate_and_named_fork() {
+        let cohort = vec!["fork-member".to_string()];
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+        register_fixture_keys(
+            &backend,
+            &[
+                ("fork-authority", identity_type::AGENT),
+                ("fork-community", identity_type::AGENT),
+                // CC 3.2 steward-binding: a non-infra community member must
+                // root in an accountable human — a `user` self-anchors.
+                ("fork-member", identity_type::USER),
+            ],
+        )
+        .await;
+
+        let signed = sign_community_fixture(
+            "fork-authority",
+            fixture_community("fork-community", "fork-member"),
+        );
+        let wire = serde_json::to_vec(&signed).expect("signed community serializes");
+
+        // 1. Fresh row — real progress.
+        assert_eq!(
+            bridge
+                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
+                .await,
+            ApplyOutcome::Admitted,
+        );
+
+        // 2. The SAME bytes again — persist#758's idempotent `Ok` no-op. Not
+        //    progress, and not a refusal either: a duplicate.
+        assert_eq!(
+            bridge
+                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
+                .await,
+            ApplyOutcome::Duplicate,
+            "a convergent re-put is an idempotent no-op, not fresh state",
+        );
+
+        // 3. DIFFERING content under the occupied id — the fork.
+        let mut forked = fixture_community("fork-community", "fork-member");
+        forked.community_name = "A DIFFERENT CO-OP".to_string();
+        let forked_wire = serde_json::to_vec(&sign_community_fixture("fork-authority", forked))
+            .expect("forked community serializes");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Community, &forked_wire, None)
+            .await;
+        let ApplyOutcome::Refused(msg) = &outcome else {
+            panic!("a differing roster under an occupied id must be REFUSED, got {outcome:?}");
+        };
+        assert!(
+            msg.contains(ApplyRefusalClass::CommunityRosterFork.as_str()),
+            "the fork must be NAMED, not just refused: {msg}",
+        );
+        assert!(
+            msg.contains("TERMINAL"),
+            "an apply loop must not read a fork as retryable: {msg}",
+        );
+
+        // ...and it is COUNTED. A fork nobody can see from a scrape is the
+        // log-and-drop failure #522 names.
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.apply_refusals_by_class
+                .get(ApplyRefusalClass::CommunityRosterFork.as_str())
+                .copied(),
+            Some(1),
+            "the class axis books the fork once: {:?}",
+            snap.apply_refusals_by_class,
+        );
+        assert_eq!(
+            snap.apply_refusals_by_kind
+                .get(&EnvelopeKind::Community)
+                .copied(),
+            Some(1),
+            "and the kind axis still books it at the #425 choke",
+        );
+        // The DUPLICATE is not a refusal on either axis (#457's distinct
+        // states): it books as a duplicate and nothing else.
+        assert_eq!(
+            snap.replication_duplicate_total
+                .get(&EnvelopeKind::Community)
+                .copied(),
+            Some(1),
+        );
+        assert_eq!(
+            snap.replication_applied_total
+                .get(&EnvelopeKind::Community)
+                .copied(),
+            Some(1),
+            "exactly ONE apply changed state across three offers",
+        );
+
+        // The stored row is the FIRST one — the fork did not overwrite it.
+        let stored = backend
+            .lookup_community("fork-community")
+            .await
+            .expect("lookup")
+            .expect("the community is stored");
+        assert_eq!(stored.community_name, "E4 Pin Co-op");
+    }
+
+    /// persist#757 (CIRISEdge#522 item 2) — AV-45 at the PUT door, including
+    /// replicated rows, and edge's closure over it.
+    ///
+    /// A member's community-scoped row that reaches a node before that node
+    /// applied the community's roster refuses — correctly. The whole ask is
+    /// that the apply loop must not read that as terminal and must not read it
+    /// as a transport failure. Edge's closure is classification, not
+    /// re-ordering, and the two properties that make it a closure are asserted
+    /// here: the refusal is NAMED transient on the class axis, and the row is
+    /// NOT in local state afterwards — so this node still lacks its hash and
+    /// the next Summary/Diff re-offers it. Convergence is by construction; the
+    /// thing that was missing was the ability to TELL this apart from a real
+    /// policy refusal.
+    #[tokio::test]
+    async fn a_community_scoped_row_ahead_of_its_roster_refuses_as_named_transient() {
+        let cohort = vec!["chat-member".to_string()];
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+        register_fixture_keys(&backend, &[("chat-member", identity_type::USER)]).await;
+
+        // A `chat:*` row the member signs about ITSELF (AV-84-clean), naming
+        // its community in the SIGNED envelope — the target persist v38.2.0
+        // resolves at the put door where it used to pass a hardcoded `None`.
+        // Deliberately applied to a node that has NEVER seen `chat-community`.
+        let wire = community_scoped_chat_row("chat-member", "chat-community");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("some-peer"))
+            .await;
+        let ApplyOutcome::Refused(msg) = &outcome else {
+            panic!("AV-45 must refuse a row ahead of its roster, got {outcome:?}");
+        };
+        assert!(
+            msg.contains(ApplyRefusalClass::RetryAfterCommunityRoster.as_str()),
+            "the refusal must NAME itself retry-after-roster: {msg}",
+        );
+        assert!(
+            msg.contains("TRANSIENT"),
+            "an apply loop must not read this as terminal: {msg}",
+        );
+        assert!(
+            msg.contains("federation_write_scope_refused"),
+            "persist's own typed token is still the leading evidence: {msg}",
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.apply_refusals_by_class
+                .get(ApplyRefusalClass::RetryAfterCommunityRoster.as_str())
+                .copied(),
+            Some(1),
+            "a transient refusal no counter sees is the silent-narrowing class: {:?}",
+            snap.apply_refusals_by_class,
+        );
+
+        // NOT stored ⇒ still wanted ⇒ re-offered. This is the retry: there is
+        // no queue to drain and nothing to re-drive by hand.
+        assert!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Attestation)
+                .await
+                .is_empty(),
+            "the refused row must NOT be in local state — that absence is what \
+             makes the next round ask for it again",
+        );
+    }
+
+    /// A community-scoped `chat:*` attestation, signed by `member` about
+    /// itself, naming `community_id` in the SIGNED envelope. Third-party-clean
+    /// by construction (`attested_key_id` is the producer, `subject_key_ids`
+    /// empty), so AV-84 has nothing to refuse and the AV-45 membership
+    /// question is the one under test.
+    fn community_scoped_chat_row(member: &str, community: &str) -> Vec<u8> {
+        let now = Utc::now().trunc_subsecs(6);
+        let mut envelope = serde_json::json!({
+            "dimension": "chat:message:v1",
+            "community_id": community,
+            "body_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        });
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            "chat-row-1",
+            member,
+            ciris_persist::federation::types::attestation_type::SCORES,
+            member,
+            &[],
+            "community",
+        );
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(member, &envelope);
+        let attestation = Attestation {
+            attestation_id: "chat-row-1".to_string(),
+            attesting_key_id: member.to_string(),
+            attested_key_id: member.to_string(),
+            attestation_type: ciris_persist::federation::types::attestation_type::SCORES
+                .to_string(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: member.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            additional_scrubs: Vec::new(),
+            cohort_scope: "community".to_string(),
+            tier: "federation".to_string(),
+            promoted_at: None,
+        };
+        serde_json::to_vec(&attestation).expect("attestation serializes")
+    }
+
     #[tokio::test]
     async fn e4_family_membership_revocation_forward_path_preserves_authority_signature() {
         // FK: family_key_id AND removed_identity_key_id must exist in
@@ -6068,6 +7112,56 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .expect("seed trust-graph attestation");
+    }
+
+    /// CIRISEdge#523 — [`seed_scoped_attestation`]'s row WITHOUT the put: the
+    /// signed, bound `Attestation` a peer would hand edge on the wire. Needed
+    /// wherever a test must drive a row through `apply_envelope_bytes` (the real
+    /// receive path, which is where the memo invalidation hangs) rather than
+    /// side-loading it into the backend — seeding first and applying second
+    /// collides on `attestation_id`.
+    fn build_federation_attestation(
+        id: &str,
+        attester: &str,
+        subject: &str,
+        attestation_type: &str,
+        mut envelope: serde_json::Value,
+    ) -> Attestation {
+        let now = Utc::now().trunc_subsecs(6); // #598 microsecond floor
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            id,
+            attester,
+            attestation_type,
+            subject,
+            &[subject],
+            "federation",
+        );
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attester, &envelope);
+        Attestation {
+            attestation_id: id.to_string(),
+            attesting_key_id: attester.to_string(),
+            attested_key_id: subject.to_string(),
+            attestation_type: attestation_type.to_string(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: attester.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![subject.to_string()],
+            withdraws_admission_rule: None,
+            additional_scrubs: Vec::new(),
+            cohort_scope: "federation".to_string(),
+            tier: "federation".to_string(),
+            promoted_at: None,
+        }
     }
 
     /// CIRISEdge#462 — build a minimal `Attestation` carrying `dimension` inside
@@ -10253,6 +11347,562 @@ mod tests {
                 .iter()
                 .any(|r| r.envelope_hash == a_hash),
             "(6) a release marker lifts the withhold — the control is reversible"
+        );
+    }
+
+    // ─── CIRISEdge#523 — the person/node identity axis on the SERVE side ───
+    //
+    // The measurement (CIRISServer's two-node chat ladder, release-read run):
+    // the recipient held 0 `federation_communities` rows for a room the sender
+    // created, while 7 sender-authored attestation rows landed on the SAME link
+    // in the SAME rounds. Mechanism: the three Cohort-scoped planes test roster
+    // membership against a NODE-keyed cohort, and Community/Family rosters name
+    // PERSONS — an empty intersection by construction.
+    //
+    // Every fixture below is field-provenance-exact: the roster names a `user`
+    // key, the cohort holds a `node` key, and the two are joined by a live
+    // CC 1.13.3.3 owner-binding built from persist's OWN dimension constant.
+
+    /// Seed a live owner-binding `delegates_to(owner → node)` — the exact edge
+    /// `owner_of` resolves. The dimension + purpose come from persist's own
+    /// `owner_binding` module, never a local string literal: an invented
+    /// dimension would make every test below green against a predicate the
+    /// field does not run.
+    fn owner_binding_envelope(id: &str, owner: &str, node: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "attesting_key_id": owner,
+            "attested_key_id": node,
+            "attestation_type": "delegates_to",
+            // CC 4.4.3.4.3 — a `node`-role delegate may carry ONLY `infra:*`.
+            "scope": ["infra:network_presence"],
+            "dimension": ciris_persist::federation::types::owner_binding::DIMENSION,
+            "delegation_purpose": ciris_persist::federation::types::owner_binding::PURPOSE,
+        })
+    }
+
+    async fn seed_owner_binding(backend: &MemoryBackend, owner: &str, node: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = owner_binding_envelope(&id, owner, node);
+        seed_raw_attestation(backend, &id, owner, node, "delegates_to", envelope).await;
+        id
+    }
+
+    /// The #523 fixture in one place: a PERSON (`user`), a NODE (`node`) owned
+    /// by that person, and an unrelated node owned by nobody. Returns a backend
+    /// whose keys are registered and (when `bind`) whose owner-binding is live.
+    async fn owner_axis_backend(bind: bool) -> Arc<MemoryBackend> {
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-alice", identity_type::USER),
+                ("person-bob", identity_type::USER),
+                ("node-bob", identity_type::NODE),
+                ("node-stranger", identity_type::NODE),
+                ("room-authority", identity_type::AGENT),
+                ("chat-room", identity_type::AGENT),
+                ("household", identity_type::AGENT),
+            ],
+        )
+        .await;
+        if bind {
+            seed_owner_binding(&backend, "person-bob", "node-bob").await;
+        }
+        backend
+    }
+
+    /// Build a bridge over an existing backend with `cohort`.
+    fn bridge_over(
+        backend: &Arc<MemoryBackend>,
+        cohort: &[&str],
+    ) -> FederationDirectoryReplicationBridge {
+        let dir: Arc<dyn FederationDirectory> = backend.clone();
+        let cohort: Vec<String> = cohort.iter().map(|s| (*s).to_string()).collect();
+        let cohort_cb: CohortProvider = Arc::new(move || cohort.clone());
+        FederationDirectoryReplicationBridge::new(dir, cohort_cb)
+    }
+
+    /// Seed a Community whose SOLE member is `member` (a person, in the field).
+    async fn seed_community_with_member(backend: &MemoryBackend, member: &str) {
+        backend
+            .put_community(sign_community_fixture(
+                "room-authority",
+                fixture_community("chat-room", member),
+            ))
+            .await
+            .expect("seed community");
+    }
+
+    /// **The CIRISEdge#523 regression pin.** A Community whose member list names
+    /// a PERSON, requested by a NODE that person owns → the row IS advertised.
+    /// Pre-fix this returned 0 refs — the measured field state.
+    #[tokio::test]
+    async fn community_advertises_to_a_node_whose_owner_is_a_member() {
+        let backend = owner_axis_backend(true).await;
+        seed_community_with_member(&backend, "person-bob").await;
+        let bridge = bridge_over(&backend, &["node-bob"]);
+
+        let refs = bridge.list_envelope_refs(EnvelopeKind::Community).await;
+        assert_eq!(
+            refs.len(),
+            1,
+            "a room whose member is the requesting node's OWNER must be advertised \
+             — the person/node axis (CIRISEdge#523); got {refs:?}"
+        );
+    }
+
+    /// The pre-fix shape as the NEGATIVE CONTROL: an unrelated node — no owner
+    /// match, not directly named — is still served nothing. The widening must
+    /// not become "advertise to everyone".
+    #[tokio::test]
+    async fn community_stays_withheld_from_an_unrelated_node() {
+        let backend = owner_axis_backend(true).await;
+        seed_community_with_member(&backend, "person-bob").await;
+        // `node-stranger` has no owner-binding at all, and is not a member.
+        let bridge = bridge_over(&backend, &["node-stranger"]);
+
+        assert!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Community)
+                .await
+                .is_empty(),
+            "an unrelated node is neither a member nor a member's node — nothing advertised"
+        );
+    }
+
+    /// A node whose owner is a member of a DIFFERENT roster gets nothing: the
+    /// widening joins on the owner-binding, not on "has an owner".
+    #[tokio::test]
+    async fn community_stays_withheld_when_the_owner_is_not_a_member() {
+        let backend = owner_axis_backend(true).await;
+        // The room's member is alice; the cohort node is owned by BOB.
+        seed_community_with_member(&backend, "person-alice").await;
+        let bridge = bridge_over(&backend, &["node-bob"]);
+
+        assert!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Community)
+                .await
+                .is_empty(),
+            "an owner who is not on the roster confers nothing"
+        );
+    }
+
+    /// The DIRECT path is widened, never replaced: a roster entry naming the
+    /// node itself still advertises. The node carries an owner-binding because
+    /// CC 3.2 requires one — persist refuses an `UnstewardedCommunityMember`, so
+    /// "a node-named roster entry with no owner" is not a field-realizable
+    /// shape. Its owner is deliberately NOT a member, so only the direct test
+    /// can be what admits this row.
+    #[tokio::test]
+    async fn community_still_advertises_to_a_directly_named_node() {
+        let backend = owner_axis_backend(true).await;
+        seed_community_with_member(&backend, "node-bob").await;
+        let bridge = bridge_over(&backend, &["node-bob"]);
+
+        assert_eq!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Community)
+                .await
+                .len(),
+            1,
+            "a member entry naming the NODE directly keeps working (no regression \
+             on the pre-#523 path)"
+        );
+    }
+
+    /// Plane 2 of 3 — Family carries the identical gate shape.
+    #[tokio::test]
+    async fn family_advertises_to_a_node_whose_owner_is_a_member() {
+        let backend = owner_axis_backend(true).await;
+        backend
+            .put_family(sign_family_fixture(
+                "room-authority",
+                fixture_family("household", "person-bob"),
+            ))
+            .await
+            .expect("seed family");
+
+        assert_eq!(
+            bridge_over(&backend, &["node-bob"])
+                .list_envelope_refs(EnvelopeKind::Family)
+                .await
+                .len(),
+            1,
+            "Family shares the Community gate shape (CIRISEdge#523 plane 2)"
+        );
+        assert!(
+            bridge_over(&backend, &["node-stranger"])
+                .list_envelope_refs(EnvelopeKind::Family)
+                .await
+                .is_empty(),
+            "…and the same negative control holds"
+        );
+    }
+
+    /// Plane 3 of 3 — LocationProof keys on `subject_key_id`, which for a
+    /// person's presence claim is a person fed-ID.
+    #[tokio::test]
+    async fn location_proof_advertises_to_a_node_whose_owner_is_the_subject() {
+        let backend = owner_axis_backend(true).await;
+        // CIRISPersist#734 — location is SELF-KNOWLEDGE: a distinct authority is
+        // admissible only as a LIVE delegate of the subject.
+        seed_delegates_to(
+            &backend,
+            "person-bob",
+            "room-authority",
+            &serde_json::json!(["infra:attest"]),
+        )
+        .await;
+        backend
+            .put_location_proof(sign_location_proof_fixture(
+                "room-authority",
+                LocationProof {
+                    subject_key_id: "person-bob".to_string(),
+                    cell_id: "87283472bffffff".to_string(),
+                    cell_resolution: 7,
+                    asserted_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                    valid_until: None,
+                    attestation_evidence: None,
+                    withdrawn_at: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect("seed location proof");
+
+        assert_eq!(
+            bridge_over(&backend, &["node-bob"])
+                .list_envelope_refs(EnvelopeKind::LocationProof)
+                .await
+                .len(),
+            1,
+            "LocationProof shares the gate shape (CIRISEdge#523 plane 3)"
+        );
+        assert!(
+            bridge_over(&backend, &["node-stranger"])
+                .list_envelope_refs(EnvelopeKind::LocationProof)
+                .await
+                .is_empty(),
+            "…and the same negative control holds"
+        );
+    }
+
+    /// **The fail-closed rule.** An UNRESOLVED owner (`owner_of` errored, or
+    /// persist reported `AmbiguousNodeOwner`) contributes NOTHING: the gate
+    /// falls back to the direct-key test — exactly the pre-#523 behaviour — and
+    /// the node is handed back for booking.
+    ///
+    /// Pinned at `widen_cohort_by_owners` rather than end-to-end because the
+    /// error is not reachable through a `MemoryBackend` fixture: persist's
+    /// single-owner ADMISSION gate refuses a second owner-binding (so
+    /// `AmbiguousNodeOwner` cannot be seeded), and an in-memory directory read
+    /// does not fail. Testing the branch that decides, with the three inputs the
+    /// field produces, beats testing nothing.
+    #[test]
+    fn an_unresolved_owner_does_not_widen_the_cohort() {
+        let direct: HashSet<String> = ["node-a", "node-b", "node-c"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let (widened, unresolved) = FederationDirectoryReplicationBridge::widen_cohort_by_owners(
+            direct.clone(),
+            vec![
+                ("node-a".to_string(), OwnerLookup::Owner("person-a".into())),
+                ("node-b".to_string(), OwnerLookup::Unowned),
+                ("node-c".to_string(), OwnerLookup::Unresolved),
+            ],
+        );
+        assert!(
+            widened.contains("person-a"),
+            "a RESOLVED owner joins the membership test"
+        );
+        assert!(
+            !widened.contains("person-c"),
+            "an UNRESOLVED owner adds nothing — the gate narrows to the direct test"
+        );
+        assert_eq!(
+            widened.len(),
+            direct.len() + 1,
+            "exactly one owner was added; Unowned and Unresolved widen nothing"
+        );
+        assert!(
+            direct.iter().all(|n| widened.contains(n)),
+            "the DIRECT key test survives untouched — widened BESIDE it, not instead"
+        );
+        assert_eq!(
+            unresolved,
+            vec!["node-c".to_string()],
+            "the unresolved node is named so the caller can book the withhold"
+        );
+    }
+
+    /// **The memo.** All three Cohort planes in one round cost ONE `owner_of`
+    /// walk per cohort member — the #430 "resolve once, cache" discipline. The
+    /// witness is the bridge's own `owner_reads` counter (incremented only on a
+    /// memo MISS, i.e. an actual directory walk).
+    #[tokio::test]
+    async fn owner_lookups_are_memoized_across_planes_in_one_round() {
+        use std::sync::atomic::Ordering;
+        let backend = owner_axis_backend(true).await;
+        seed_community_with_member(&backend, "person-bob").await;
+        let bridge = bridge_over(&backend, &["node-bob", "node-stranger"]);
+
+        let _ = bridge.list_envelope_refs(EnvelopeKind::Community).await;
+        let after_first = bridge.owner_reads.load(Ordering::Relaxed);
+        assert_eq!(
+            after_first, 2,
+            "the first plane resolves each of the 2 cohort members exactly once"
+        );
+
+        let _ = bridge.list_envelope_refs(EnvelopeKind::Family).await;
+        let _ = bridge.list_envelope_refs(EnvelopeKind::LocationProof).await;
+        assert_eq!(
+            bridge.owner_reads.load(Ordering::Relaxed),
+            after_first,
+            "the other two planes in the same round re-read the directory ZERO times \
+             (CIRISEdge#523 memo; the #400 per-envelope-re-resolution regression)"
+        );
+    }
+
+    /// The memo's freshness + invalidation rules, pure (the `VerdictCache`
+    /// shape). `Unowned` is a cached ANSWER and must not read back as "unknown".
+    #[test]
+    fn owner_cache_freshness_and_invalidation() {
+        let t0 = Instant::now();
+        let mut cache = OwnerCache::default();
+        cache.put("node-bob", Some("person-bob".to_string()), t0);
+        cache.put("node-orphan", None, t0);
+
+        assert_eq!(
+            cache.get_fresh("node-bob", t0),
+            Some(OwnerLookup::Owner("person-bob".to_string())),
+            "a fresh entry is a HIT"
+        );
+        assert_eq!(
+            cache.get_fresh("node-orphan", t0),
+            Some(OwnerLookup::Unowned),
+            "`unowned` is a cached ANSWER, never a miss — and never `Unresolved`, \
+             which the two-valued storage makes unrepresentable"
+        );
+        assert_eq!(
+            cache.get_fresh("node-unknown", t0),
+            None,
+            "an absent entry is a MISS"
+        );
+        assert_eq!(
+            cache.get_fresh("node-bob", t0 + OWNER_BINDING_MEMO_TTL),
+            None,
+            "the TTL expires the entry (the backstop for the time-driven \
+             `expires_at` / `valid_until` clauses no apply event announces)"
+        );
+
+        // Invalidation drops BOTH directions of the binding.
+        cache.put("node-bob", Some("person-bob".to_string()), t0);
+        cache.invalidate("node-bob");
+        assert_eq!(
+            cache.get_fresh("node-bob", t0),
+            None,
+            "the node's own entry is dropped"
+        );
+        cache.put("node-bob", Some("person-bob".to_string()), t0);
+        cache.invalidate("person-bob");
+        assert_eq!(
+            cache.get_fresh("node-bob", t0),
+            None,
+            "a revoked OWNER key drops every node it owned (the value side)"
+        );
+    }
+
+    /// The apply-path invalidation predicate, over the exact row shapes the
+    /// field produces. `delegates_to` is owner-binding-only per persist's OWN
+    /// predicate; retractions are conservative (they carry no dimension of their
+    /// own); everything else moves nothing.
+    #[test]
+    fn owner_binding_touched_recognizes_only_ownership_rows() {
+        let mut owner_binding = att_with_dimension(Some(
+            ciris_persist::federation::types::owner_binding::DIMENSION,
+        ));
+        owner_binding.attestation_type = "delegates_to".to_string();
+        owner_binding.attested_key_id = "node-bob".to_string();
+        assert_eq!(
+            FederationDirectoryReplicationBridge::owner_binding_touched(&owner_binding),
+            Some("node-bob"),
+            "an owner-binding delegates_to moves owner_of(subject)"
+        );
+
+        let mut plain_delegation = att_with_dimension(Some("some:other:dimension:v1"));
+        plain_delegation.attestation_type = "delegates_to".to_string();
+        assert_eq!(
+            FederationDirectoryReplicationBridge::owner_binding_touched(&plain_delegation),
+            None,
+            "an act-on-behalf / hierarchy delegates_to is NOT an owner-binding \
+             (persist's `is_owner_binding_envelope` decides, not a local literal)"
+        );
+
+        let mut withdrawal = att_with_dimension(None);
+        withdrawal.attestation_type = "withdraws".to_string();
+        withdrawal.attested_key_id = "node-bob".to_string();
+        assert_eq!(
+            FederationDirectoryReplicationBridge::owner_binding_touched(&withdrawal),
+            Some("node-bob"),
+            "a retraction carries no dimension, so it is treated conservatively"
+        );
+
+        let mut scores = att_with_dimension(Some("trace:complete:v1"));
+        scores.attestation_type = "scores".to_string();
+        assert_eq!(
+            FederationDirectoryReplicationBridge::owner_binding_touched(&scores),
+            None,
+            "the high-volume plane pays one string compare and moves nothing"
+        );
+    }
+
+    /// End-to-end invalidation: an ADMITTED owner-binding drops the memoized
+    /// `Unowned` verdict for that node, so the next round's advertise sees the
+    /// new owner instead of waiting out the TTL.
+    #[tokio::test]
+    async fn an_admitted_owner_binding_invalidates_the_memo() {
+        use std::sync::atomic::Ordering;
+        let backend = owner_axis_backend(false).await; // NOT bound yet
+        seed_community_with_member(&backend, "person-bob").await;
+        let bridge = bridge_over(&backend, &["node-bob"]);
+
+        assert!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Community)
+                .await
+                .is_empty(),
+            "unowned node → the room is not advertised (and `Unowned` is memoized)"
+        );
+        let reads_before = bridge.owner_reads.load(Ordering::Relaxed);
+
+        // The owner-binding arrives ON THE WIRE and is ADMITTED — the real
+        // receive path, which is where the invalidation hangs.
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = build_federation_attestation(
+            &id,
+            "person-bob",
+            "node-bob",
+            "delegates_to",
+            owner_binding_envelope(&id, "person-bob", "node-bob"),
+        );
+        let wire = serde_json::to_vec(&row).expect("serialize owner-binding");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
+            .await;
+        assert!(
+            outcome.is_admitted(),
+            "the owner-binding must be admitted (idempotent re-put); got {outcome:?}"
+        );
+
+        assert_eq!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Community)
+                .await
+                .len(),
+            1,
+            "the admitted owner-binding invalidated the memo — the room is advertised \
+             in the SAME round, not one TTL later"
+        );
+        assert!(
+            bridge.owner_reads.load(Ordering::Relaxed) > reads_before,
+            "…and it did so by re-walking the directory, not by serving a stale hit"
+        );
+    }
+
+    // ─── CIRISEdge#524 — the withhold that could not name its peer ─────────
+
+    /// The measured line was
+    /// `attestation plane withheld — … send-set (CIRISEdge#396 item 1) peer=`
+    /// with the peer EMPTY. The ledger record — same label the log field and the
+    /// throttle key carry — must now name what was evaluated.
+    #[test]
+    fn a_peer_label_is_never_empty() {
+        assert_eq!(
+            FederationDirectoryReplicationBridge::peer_label(""),
+            "<empty-peer-id>",
+            "an empty peer id is NAMED, and named distinctly from an absent one"
+        );
+        assert_eq!(
+            FederationDirectoryReplicationBridge::peer_label("node-bob"),
+            "node-bob",
+            "a real peer id passes through verbatim"
+        );
+    }
+
+    /// The #524 fix on the real withhold path: the ledger entry names the peer
+    /// the gate actually evaluated, including the empty-id wiring fault.
+    #[tokio::test]
+    async fn the_send_set_withhold_names_the_peer_it_evaluated() {
+        let local = "this-node";
+        let (backend, bridge) = make_bridge(&[local.to_string()]);
+        let metrics = crate::observability::EdgeMetrics::default();
+        let bridge = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_metrics(Some(metrics.clone()));
+        register_fixture_keys(&backend, &[(local, identity_type::AGENT)]).await;
+
+        // No consent grant at all → every peer is withheld (item 1, fail-closed).
+        assert!(bridge.list_attestations(Some("")).await.is_empty());
+        assert!(bridge.list_attestations(Some("node-bob")).await.is_empty());
+
+        let peers: Vec<String> = metrics
+            .recent_withholds
+            .read()
+            .iter()
+            .map(|w| w.peer_key_id.clone())
+            .collect();
+        assert!(
+            peers.contains(&"<empty-peer-id>".to_string()),
+            "an EMPTY peer id is booked under a name, not as blank space \
+             (CIRISEdge#524); got {peers:?}"
+        );
+        assert!(
+            peers.contains(&"node-bob".to_string()),
+            "a real peer is booked under its own id; got {peers:?}"
+        );
+    }
+
+    /// The person-named-grant diagnostic (#524's cheap half): when the live
+    /// send-set does not name the peer but DOES name the peer's OWNER, that is
+    /// the routing class — and the gate can see it, because the #523 memo
+    /// already resolved the owner. It says so and STILL withholds: the send-side
+    /// walk needs persist's reverse index (CIRISPersist#764).
+    #[tokio::test]
+    async fn a_person_named_grant_is_diagnosed_but_never_routed() {
+        let local = "this-node";
+        let backend = owner_axis_backend(true).await;
+        register_fixture_keys(&backend, &[(local, identity_type::AGENT)]).await;
+        let bridge =
+            bridge_over(&backend, &["node-bob"]).with_local_key_id(Some(local.to_string()));
+        // The grant names the PERSON — the natural thing for a consent object to
+        // name, and exactly what CIRISServer emitted.
+        seed_consent_membership(&backend, local, "person-bob").await;
+
+        let set = bridge
+            .resolved_peer_set(local)
+            .await
+            .expect("the send-set resolves");
+        assert!(
+            set.names("person-bob"),
+            "the grant names the person (the field's shape)"
+        );
+        assert!(
+            !set.names("node-bob"),
+            "…and NOT the node, which is why the plane went dark"
+        );
+        // The owner probe the WARN uses sees the join…
+        assert_eq!(
+            bridge.owner_of_cached("node-bob").await,
+            OwnerLookup::Owner("person-bob".to_string()),
+            "the #523 memo resolves the peer's owner, so the diagnostic is free"
+        );
+        // …and the plane is STILL withheld: diagnosis, never routing.
+        assert!(
+            bridge.list_attestations(Some("node-bob")).await.is_empty(),
+            "an owner match must NOT serve — the send-side walk is CIRISPersist#764"
         );
     }
 }
