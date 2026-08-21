@@ -264,11 +264,30 @@ jobs:
           # must still BUILD (a compile break is caught by every other feature combo),
           # so this tolerates only the run, never a silent no-op of the whole lane.
           run_bench_tolerant() {
-            local features="$1" bench="$2"
-            echo "::group::bench ${bench} (TOLERANT; features: ${features:-default})"
-            cargo bench --features "$features" --bench "$bench" -- --output-format bencher \
-              | tee -a bench-output-raw.txt \
-              || echo "::warning title=tolerant bench flaked::${bench} produced no trend point this run (real-transport timing) — not a failure"
+            # CIRISEdge#369 — ROCK-SOLID on flaky runners. The real-multi-node
+            # concurrency bench's fixture (N+2-node discovery over loopback) can flake
+            # on a loaded runner — but a bench built to measure LOW-RESOURCE FLAKY-LINK
+            # behaviour must not itself vanish from the trend on a flaky runner. So it
+            # RETRIES up to 3× in FRESH processes (a panicked build leaks no state
+            # across attempts), publishing ONLY a successful attempt's output; and even
+            # if all 3 flake it is a WARNING, never a red job. A single green attempt is
+            # near-certain given the per-attempt hardening (few nodes, generous
+            # timeouts) — so the trend point reliably lands.
+            local features="$1" bench="$2" attempts=3 i rc
+            echo "::group::bench ${bench} (TOLERANT, up to ${attempts} attempts; features: ${features:-default})"
+            for i in $(seq 1 "$attempts"); do
+              rc=0
+              cargo bench --features "$features" --bench "$bench" -- --output-format bencher \
+                > bench-tolerant.tmp || rc=$?
+              cat bench-tolerant.tmp
+              if [ "$rc" -eq 0 ]; then
+                cat bench-tolerant.tmp >> bench-output-raw.txt   # publish the winning run only
+                echo "::endgroup::"
+                return 0
+              fi
+              echo "::warning::${bench} attempt ${i}/${attempts} flaked (real-transport timing) — retrying in a fresh process"
+            done
+            echo "::warning title=tolerant bench flaked::${bench} produced no trend point after ${attempts} attempts — not a failure (trend gap this run only)"
             echo "::endgroup::"
           }
           # RNS/transport + envelope plane (default features)
