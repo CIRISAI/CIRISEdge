@@ -138,6 +138,155 @@ fn apply_refusal_reason(
     )
 }
 
+/// persist v38.2.0 (CIRISEdge#522) — **the closed set of apply-door refusals
+/// edge has something to SAY about**, beyond persist's own stable `kind()`.
+///
+/// # Why a second axis exists next to `kind()`
+///
+/// [`ciris_persist::federation::Error::kind`] answers *which persist error*.
+/// It cannot answer the question the apply loop actually has to act on, which
+/// is *what does a relay DO about this row*: a `federation_write_scope_refused`
+/// is a permanent policy verdict when the writer is genuinely not a member and
+/// a self-healing ordering artefact when the roster simply has not landed on
+/// this node yet — the SAME token, opposite operational meaning. Persist is
+/// right not to distinguish them (it cannot: only the receiving node knows
+/// whether it is mid-sync), and #522 asks the receiver to.
+///
+/// The three v38.2.0 doors map onto three answers:
+///
+/// - [`CommunityRosterFork`](Self::CommunityRosterFork) — **surface, do not
+///   retry.** A differing roster under an occupied `community_key_id`
+///   (persist#758's typed `Error::Conflict`). Retrying spins; logging and
+///   dropping hides a fork.
+/// - [`RetryAfterCommunityRoster`](Self::RetryAfterCommunityRoster) /
+///   [`RetryAfterFamilyRoster`](Self::RetryAfterFamilyRoster) — **transient,
+///   converges on its own.** AV-45 at the put door (persist#757) refuses a
+///   member's cohort-scoped row that arrives before this node applied the
+///   cohort's roster. Correct and temporary. The REMOVED-member half of the
+///   revocation pairing lands in the same class and is indistinguishable from
+///   here on purpose: both are "this node's roster does not show the writer as
+///   an active member", both are decided by state that is still moving, and
+///   both converge — one when the roster arrives, the other when the sender's
+///   roster catches up and it stops offering the row. Neither is terminal
+///   *at this door*, which is exactly what the apply loop needs to know.
+/// - [`ThirdPartyRow`](Self::ThirdPartyRow) — **a verdict about the ROW.**
+///   AV-84 at the put door: a family/community-targeted row naming anyone but
+///   its producer. Never a delivery problem, so it must never be counted or
+///   reported as one.
+///
+/// Closed and small ON PURPOSE — this is a metric key, so its cardinality is
+/// bounded by this enum rather than by traffic, exactly like persist's
+/// [`KeyRefusalReason`] on the Key plane. [`Self::ALL`] is the drift anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApplyRefusalClass {
+    /// persist#758 — a DIFFERING community roster under an occupied
+    /// `community_key_id`. The fork signal.
+    CommunityRosterFork,
+    /// persist#757 (AV-45) — a `community`-scoped row whose writer this node
+    /// cannot yet see as a member, because it has not applied that
+    /// community's roster.
+    RetryAfterCommunityRoster,
+    /// persist#757 (AV-45) — the family mirror of
+    /// [`Self::RetryAfterCommunityRoster`].
+    RetryAfterFamilyRoster,
+    /// persist#757 (AV-84) — a targeted-cohort row naming a party other than
+    /// its own producer.
+    ThirdPartyRow,
+}
+
+impl ApplyRefusalClass {
+    /// Every class, for the drift test + any consumer enumerating the ledger's
+    /// key space without traffic.
+    pub const ALL: &'static [Self] = &[
+        Self::CommunityRosterFork,
+        Self::RetryAfterCommunityRoster,
+        Self::RetryAfterFamilyRoster,
+        Self::ThirdPartyRow,
+    ];
+
+    /// The stable, low-cardinality metric token. Consumers key on THIS, never
+    /// on message prose — edge deleted a `reason.contains("conflict")`
+    /// discriminator in v18.2.0 and must not grow another.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommunityRosterFork => "community_roster_fork",
+            Self::RetryAfterCommunityRoster => "retry_after_community_roster",
+            Self::RetryAfterFamilyRoster => "retry_after_family_roster",
+            Self::ThirdPartyRow => "third_party_row",
+        }
+    }
+
+    /// Is this refusal expected to resolve itself once more state lands, with
+    /// no operator action?
+    ///
+    /// TRUE for the two roster-ordering classes and **only** those: a refused
+    /// row is not stored, so this node still lacks its hash and the next
+    /// Summary/Diff re-offers it — convergence is by construction, not by a
+    /// retry queue. FALSE for a fork and for a third-party row: neither
+    /// changes on its own, and both are decisions someone has to see.
+    #[must_use]
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::RetryAfterCommunityRoster | Self::RetryAfterFamilyRoster
+        )
+    }
+
+    /// Classify a persist apply-door `Err` on the **attestation** doors —
+    /// AV-45 and AV-84, both of which persist types (`WriteScopeRefused`
+    /// carries a [`ScopeRefusalReason`](ciris_persist::scope::ScopeRefusalReason);
+    /// `CohortStandingRefused` is its own variant). `None` = an error outside
+    /// the #522 door set, which stays a plain `Refused` carrying persist's own
+    /// `kind()`.
+    ///
+    /// Matched on the TYPED variants, never on the message text. The
+    /// `Conflict` fork class is deliberately absent here: `Error::Conflict` is
+    /// generic across planes and only means "roster fork" at the Community
+    /// door, so [`FederationDirectoryReplicationBridge::apply_community`]
+    /// names it at the site that knows the plane.
+    #[must_use]
+    pub fn classify(err: &ciris_persist::federation::Error) -> Option<Self> {
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+        match err {
+            E::WriteScopeRefused(R::NoCommunityMembership) => Some(Self::RetryAfterCommunityRoster),
+            E::WriteScopeRefused(R::NoFamilyMembership) => Some(Self::RetryAfterFamilyRoster),
+            E::CohortStandingRefused { .. } => Some(Self::ThirdPartyRow),
+            _ => None,
+        }
+    }
+}
+
+/// The `Refused` reason for a classified apply-door refusal: persist's own
+/// message + token, then edge's class and what a relay does about it.
+///
+/// The persist half is byte-identical to [`apply_refusal_reason`] so existing
+/// correlation (content hash, `kind()` token) is unchanged; the class is
+/// APPENDED. That ordering matters — the class is edge's reading, and it must
+/// not displace the substrate's own verdict in the log line.
+fn classified_refusal_reason(
+    plane: &str,
+    content_hash: &str,
+    err: &ciris_persist::federation::Error,
+    class: ApplyRefusalClass,
+) -> String {
+    let disposition = if class.is_transient() {
+        "TRANSIENT — THIS NODE'S view of the cohort roster decided it, and the row is \
+         not stored, so the node still lacks it and the next round re-offers it. It \
+         lands once the roster shows the writer as an ACTIVE member, and keeps \
+         refusing while the roster shows the member removed — the same discipline \
+         covers both halves of the revocation pairing (CIRISEdge#522)"
+    } else {
+        "TERMINAL — this does not resolve by retrying (CIRISEdge#522)"
+    };
+    format!(
+        "{}; class={} [{disposition}]",
+        apply_refusal_reason(plane, content_hash, err),
+        class.as_str(),
+    )
+}
+
 /// persist v24.2.0 (CIRISPersist#565) — map the typed Key-plane apply outcome to
 /// edge's [`ApplyOutcome`], returning alongside it the stable refusal TOKEN to
 /// count on the receive-plane mirror ledger (`None` when nothing was refused).
@@ -213,9 +362,10 @@ macro_rules! apply_signed_plane {
                     content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
                 match $self.directory.$put(record).await {
                     Ok(()) => ApplyOutcome::Admitted,
-                    Err(e) => {
-                        ApplyOutcome::Refused(apply_refusal_reason($plane, &content_hash, &e))
-                    }
+                    // CIRISEdge#522 — through `refuse`, so a v38.2.0 door class
+                    // (AV-45 roster ordering, AV-84 third-party) is named and
+                    // counted whichever plane surfaces it.
+                    Err(e) => $self.refuse($plane, &content_hash, &e),
                 }
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason($plane, $bytes, &e)),
@@ -1656,6 +1806,44 @@ impl FederationDirectoryReplicationBridge {
                 .pointer("/dimension")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(ciris_persist::federation::namespace::is_subject_retainable)
+    }
+
+    /// CIRISEdge#522 — **the ONE place a persist apply-door `Err` becomes an
+    /// [`ApplyOutcome::Refused`]**, so a v38.2.0 door class cannot be booked at
+    /// one call site and dropped at the next.
+    ///
+    /// Classifies via the TYPED variant ([`ApplyRefusalClass::classify`]),
+    /// books the class on the reason-axis ledger when there is one, and folds
+    /// the class into the message the #425 choke logs. An unclassified error
+    /// takes the unchanged pre-#522 path: persist's message + its `kind()`
+    /// token, counted on the kind axis at the choke like every other refusal.
+    fn refuse(
+        &self,
+        plane: &str,
+        content_hash: &str,
+        err: &ciris_persist::federation::Error,
+    ) -> ApplyOutcome {
+        match ApplyRefusalClass::classify(err) {
+            Some(class) => self.refuse_as(plane, content_hash, err, class),
+            None => ApplyOutcome::Refused(apply_refusal_reason(plane, content_hash, err)),
+        }
+    }
+
+    /// [`Self::refuse`] with the class supplied by the CALLER — for the one
+    /// door whose class is not derivable from the error alone
+    /// ([`Self::apply_community`]: `Error::Conflict` means "roster fork" only
+    /// on the Community plane).
+    fn refuse_as(
+        &self,
+        plane: &str,
+        content_hash: &str,
+        err: &ciris_persist::federation::Error,
+        class: ApplyRefusalClass,
+    ) -> ApplyOutcome {
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_apply_refusal_class(class.as_str());
+        }
+        ApplyOutcome::Refused(classified_refusal_reason(plane, content_hash, err, class))
     }
 
     /// The per-kind apply dispatch behind the #425 choke —
@@ -3362,11 +3550,14 @@ impl FederationDirectoryReplicationBridge {
                         }
                         ApplyOutcome::Admitted
                     }
-                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
-                        "Attestation",
-                        &content_hash,
-                        &e,
-                    )),
+                    // persist v38.2.0 (CIRISEdge#522) — THIS is the door the
+                    // cut moved. AV-45 membership now gates community/family
+                    // -scoped rows here (target resolved from the producer's
+                    // SIGNED envelope, no replicated-row bypass) and AV-84
+                    // refuses a targeted row naming a third party. Both arrive
+                    // as typed persist variants and `refuse` names + counts
+                    // them; everything else keeps the pre-#522 shape.
+                    Err(e) => self.refuse("Attestation", &content_hash, &e),
                 }
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Attestation", bytes, &e)),
@@ -3419,8 +3610,79 @@ impl FederationDirectoryReplicationBridge {
         apply_signed_plane!(self, "Family", bytes, SignedFamily, put_family)
     }
 
+    /// persist v38.2.0 / CIRISPersist#758 (CIRISEdge#522) — the Community door
+    /// stopped being an insert and became a **verdict**, so this plane leaves
+    /// [`apply_signed_plane!`] behind.
+    ///
+    /// Three outcomes now, where the macro could only express two:
+    ///
+    /// - **fresh row → `Admitted`.** Unchanged.
+    /// - **identical re-put → `Duplicate`.** Convergent derivation (a pair
+    ///   chat mints one deterministic community per pair) means two nodes
+    ///   author BYTE-IDENTICAL content and each signs as itself, so a
+    ///   re-offered copy is the COMMON case, not an anomaly. persist answers
+    ///   `Ok` and leaves the stored row and its first-accepted authority
+    ///   signature untouched. The macro would have called that `Admitted` —
+    ///   claiming anti-entropy progress on every round that re-offers a
+    ///   community this node already holds, which is the "applied all N" /
+    ///   "nothing moved" collapse #457 exists to prevent.
+    /// - **differing roster under an occupied id → `Refused`, named.**
+    ///   persist returns the TYPED
+    ///   [`Error::Conflict`](ciris_persist::federation::Error::Conflict); edge
+    ///   books it as [`ApplyRefusalClass::CommunityRosterFork`]. It is not
+    ///   retryable (retrying spins) and must not be dropped (dropping hides a
+    ///   fork). Roster CHANGES travel as supersedes, never as a differing
+    ///   re-put, so this can only mean two authorities disagree about one id.
+    ///
+    /// # Why the pre-read, and why it is honest
+    ///
+    /// `put_community` returns `Result<(), Error>`: `Ok` alone cannot say
+    /// whether a row was inserted or absorbed. Persist decides by comparing
+    /// the stored `persist_row_hash` to the offered one; edge asks the
+    /// equivalent question with the read it already has — *was this
+    /// `community_key_id` occupied before we knocked?* Occupied + `Ok` is
+    /// exactly persist's identical-re-put branch, because the differing branch
+    /// is the `Conflict` above. Recomputing the hash here instead would
+    /// re-implement `compute_persist_row_hash`'s stamping rules downstream of
+    /// the authority that owns them — a second spelling that can drift.
+    ///
+    /// A concurrent insert between the read and the put mislabels one row
+    /// `Admitted` that was really a duplicate. That is a counter's rounding,
+    /// not a safety property: the stored state is whatever persist's verdict
+    /// made it either way, and the honest direction (over-reporting progress
+    /// once) is the one that cannot hide a fork. Communities are rare and this
+    /// costs one point-read per applied community row.
     async fn apply_community(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(self, "Community", bytes, SignedCommunity, put_community)
+        let record: SignedCommunity = match serde_json::from_slice(bytes) {
+            Ok(r) => r,
+            Err(e) => return ApplyOutcome::Deserialize(apply_deser_reason("Community", bytes, &e)),
+        };
+        let content_hash =
+            content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
+        // Read BEFORE the put — see the doc comment. A read ERROR is not an
+        // occupancy answer: fall back to `false`, which can only mislabel a
+        // duplicate as admitted, never invent a refusal.
+        let was_occupied = self
+            .directory
+            .lookup_community(&record.community.community_key_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        match self.directory.put_community(record).await {
+            Ok(()) if was_occupied => ApplyOutcome::Duplicate,
+            Ok(()) => ApplyOutcome::Admitted,
+            // The FORK signal. Matched on the typed variant — edge deleted a
+            // `reason.contains("conflict")` discriminator in v18.2.0 and this
+            // is not the place to grow another.
+            Err(e @ ciris_persist::federation::Error::Conflict(_)) => self.refuse_as(
+                "Community",
+                &content_hash,
+                &e,
+                ApplyRefusalClass::CommunityRosterFork,
+            ),
+            Err(e) => self.refuse("Community", &content_hash, &e),
+        }
     }
 
     async fn apply_identity_occurrence_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
@@ -3700,11 +3962,7 @@ impl FederationDirectoryReplicationBridge {
                     .map_or_else(String::new, |(h, _)| hex::encode(h));
                 match self.directory.put_organization(s).await {
                     Ok(()) => ApplyOutcome::Admitted,
-                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
-                        "Organization",
-                        &content_hash,
-                        &e,
-                    )),
+                    Err(e) => self.refuse("Organization", &content_hash, &e),
                 }
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Organization", bytes, &e)),
@@ -3731,11 +3989,7 @@ impl FederationDirectoryReplicationBridge {
                     .map_or_else(String::new, |(h, _)| hex::encode(h));
                 match self.directory.put_org_membership(s).await {
                     Ok(()) => ApplyOutcome::Admitted,
-                    Err(e) => ApplyOutcome::Refused(apply_refusal_reason(
-                        "OrgMembership",
-                        &content_hash,
-                        &e,
-                    )),
+                    Err(e) => self.refuse("OrgMembership", &content_hash, &e),
                 }
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("OrgMembership", bytes, &e)),
@@ -5308,6 +5562,371 @@ mod tests {
             |s| s.community.signing_envelope(),
         )
         .await;
+    }
+
+    // ── persist v38.2.0 / CIRISEdge#522 — the three apply-door adoptions ──
+
+    /// The classifier, over the TYPED persist variants — the unit the three
+    /// door adoptions all funnel through.
+    ///
+    /// This is a pure test on purpose. Two of the three doors
+    /// (`retry_after_*_roster`, `third_party_row`) are persist gates whose
+    /// preconditions persist itself certifies per backend; what is EDGE's to
+    /// get right is the reading — that the typed variant maps to the right
+    /// class, that the class carries the right disposition, and that the match
+    /// is on the variant and not on the message. A `Display`-shaped
+    /// discriminator would pass a prose test and fail the day persist rewords
+    /// a message, which is why v18.2.0 deleted the last one.
+    #[test]
+    fn the_typed_door_verdicts_classify_and_carry_their_disposition() {
+        use ciris_persist::federation::admission::CohortStandingRefusal;
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+
+        // AV-45 (persist#757) — the two roster-ordering classes. TRANSIENT:
+        // the roster simply has not landed on this node yet.
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::WriteScopeRefused(R::NoCommunityMembership)),
+            Some(ApplyRefusalClass::RetryAfterCommunityRoster),
+        );
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::WriteScopeRefused(R::NoFamilyMembership)),
+            Some(ApplyRefusalClass::RetryAfterFamilyRoster),
+        );
+        assert!(ApplyRefusalClass::RetryAfterCommunityRoster.is_transient());
+        assert!(ApplyRefusalClass::RetryAfterFamilyRoster.is_transient());
+
+        // AV-84 (persist#757) — a policy verdict about the ROW's content, and
+        // NOT a delivery problem. Terminal: nothing about it changes by
+        // waiting or by retrying.
+        for reason in [
+            CohortStandingRefusal::AttestedParty,
+            CohortStandingRefusal::NamedSubject,
+        ] {
+            let err = E::CohortStandingRefused {
+                cohort_scope: "community".to_owned(),
+                producer_key_id: "producer".to_owned(),
+                foreign_key_id: "somebody-else".to_owned(),
+                reason,
+            };
+            assert_eq!(
+                ApplyRefusalClass::classify(&err),
+                Some(ApplyRefusalClass::ThirdPartyRow),
+            );
+        }
+        assert!(!ApplyRefusalClass::ThirdPartyRow.is_transient());
+        assert!(!ApplyRefusalClass::CommunityRosterFork.is_transient());
+
+        // The OTHER `WriteScopeRefused` reasons are NOT roster-ordering. A
+        // wildcard-first classifier would have swept `WrongIdentity` into
+        // "retry after the roster lands", which is a permanent refusal wearing
+        // a transient label — the exact inversion of the silent-narrowing bug
+        // this ledger exists to prevent.
+        for reason in [
+            R::WrongIdentity,
+            R::BoundaryAuthFailed,
+            R::UnauthenticatedSuppressedCohort,
+            R::InvalidCohortScope("nonsense".to_owned()),
+        ] {
+            assert_eq!(
+                ApplyRefusalClass::classify(&E::WriteScopeRefused(reason)),
+                None,
+                "only the two MEMBERSHIP reasons are roster-ordering",
+            );
+        }
+        // And an error outside the #522 door set keeps the pre-adopt shape.
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::InvalidArgument("whatever".to_owned())),
+            None,
+        );
+        // `Conflict` is generic across planes — it means "roster fork" only at
+        // the Community door, which names it at the site that knows the plane.
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::Conflict("whatever".to_owned())),
+            None,
+        );
+    }
+
+    /// The ledger's key space is CLOSED and its tokens are distinct — the
+    /// bounded-cardinality contract `apply_refusals_by_class` rests on.
+    #[test]
+    fn the_apply_refusal_classes_have_distinct_stable_tokens() {
+        let tokens: std::collections::BTreeSet<&str> =
+            ApplyRefusalClass::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            tokens.len(),
+            ApplyRefusalClass::ALL.len(),
+            "two classes collapsed onto one metric key: {tokens:?}",
+        );
+        // Snake-case, no whitespace — these are metric keys, not prose.
+        for token in &tokens {
+            assert!(
+                token
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit()),
+                "{token} is not a metric-safe token",
+            );
+        }
+    }
+
+    /// The refusal MESSAGE keeps persist's own verdict first and appends
+    /// edge's reading — so the existing `kind()` correlation still works and
+    /// the class never displaces the substrate's answer.
+    #[test]
+    fn a_classified_refusal_names_persists_verdict_and_then_edges_class() {
+        use ciris_persist::federation::Error as E;
+        use ciris_persist::scope::ScopeRefusalReason as R;
+        let err = E::WriteScopeRefused(R::NoCommunityMembership);
+        let msg = classified_refusal_reason(
+            "Attestation",
+            "deadbeef",
+            &err,
+            ApplyRefusalClass::RetryAfterCommunityRoster,
+        );
+        assert!(
+            msg.starts_with(&apply_refusal_reason("Attestation", "deadbeef", &err)),
+            "persist's message + kind() token lead: {msg}",
+        );
+        assert!(msg.contains("federation_write_scope_refused"), "{msg}");
+        assert!(msg.contains("class=retry_after_community_roster"), "{msg}");
+        assert!(msg.contains("TRANSIENT"), "{msg}");
+        let terminal = classified_refusal_reason(
+            "Community",
+            "deadbeef",
+            &E::Conflict("forked".to_owned()),
+            ApplyRefusalClass::CommunityRosterFork,
+        );
+        assert!(
+            terminal.contains("class=community_roster_fork"),
+            "{terminal}"
+        );
+        assert!(terminal.contains("TERMINAL"), "{terminal}");
+    }
+
+    /// persist#758 (CIRISEdge#522 item 1) — the Community door's THREE
+    /// verdicts, driven through edge's real apply path on all three arms.
+    ///
+    /// The convergent re-put is the one that would have been silently wrong:
+    /// before v38.2.0 the memory backend OVERWROTE the stored row (and its
+    /// first-accepted authority signature) on a re-put, and edge's macro
+    /// reported `Admitted` either way — anti-entropy progress claimed on every
+    /// round that re-offers a community this node already holds.
+    #[tokio::test]
+    async fn the_community_door_verdicts_are_duplicate_and_named_fork() {
+        let cohort = vec!["fork-member".to_string()];
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+        register_fixture_keys(
+            &backend,
+            &[
+                ("fork-authority", identity_type::AGENT),
+                ("fork-community", identity_type::AGENT),
+                // CC 3.2 steward-binding: a non-infra community member must
+                // root in an accountable human — a `user` self-anchors.
+                ("fork-member", identity_type::USER),
+            ],
+        )
+        .await;
+
+        let signed = sign_community_fixture(
+            "fork-authority",
+            fixture_community("fork-community", "fork-member"),
+        );
+        let wire = serde_json::to_vec(&signed).expect("signed community serializes");
+
+        // 1. Fresh row — real progress.
+        assert_eq!(
+            bridge
+                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
+                .await,
+            ApplyOutcome::Admitted,
+        );
+
+        // 2. The SAME bytes again — persist#758's idempotent `Ok` no-op. Not
+        //    progress, and not a refusal either: a duplicate.
+        assert_eq!(
+            bridge
+                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
+                .await,
+            ApplyOutcome::Duplicate,
+            "a convergent re-put is an idempotent no-op, not fresh state",
+        );
+
+        // 3. DIFFERING content under the occupied id — the fork.
+        let mut forked = fixture_community("fork-community", "fork-member");
+        forked.community_name = "A DIFFERENT CO-OP".to_string();
+        let forked_wire = serde_json::to_vec(&sign_community_fixture("fork-authority", forked))
+            .expect("forked community serializes");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Community, &forked_wire, None)
+            .await;
+        let ApplyOutcome::Refused(msg) = &outcome else {
+            panic!("a differing roster under an occupied id must be REFUSED, got {outcome:?}");
+        };
+        assert!(
+            msg.contains(ApplyRefusalClass::CommunityRosterFork.as_str()),
+            "the fork must be NAMED, not just refused: {msg}",
+        );
+        assert!(
+            msg.contains("TERMINAL"),
+            "an apply loop must not read a fork as retryable: {msg}",
+        );
+
+        // ...and it is COUNTED. A fork nobody can see from a scrape is the
+        // log-and-drop failure #522 names.
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.apply_refusals_by_class
+                .get(ApplyRefusalClass::CommunityRosterFork.as_str())
+                .copied(),
+            Some(1),
+            "the class axis books the fork once: {:?}",
+            snap.apply_refusals_by_class,
+        );
+        assert_eq!(
+            snap.apply_refusals_by_kind
+                .get(&EnvelopeKind::Community)
+                .copied(),
+            Some(1),
+            "and the kind axis still books it at the #425 choke",
+        );
+        // The DUPLICATE is not a refusal on either axis (#457's distinct
+        // states): it books as a duplicate and nothing else.
+        assert_eq!(
+            snap.replication_duplicate_total
+                .get(&EnvelopeKind::Community)
+                .copied(),
+            Some(1),
+        );
+        assert_eq!(
+            snap.replication_applied_total
+                .get(&EnvelopeKind::Community)
+                .copied(),
+            Some(1),
+            "exactly ONE apply changed state across three offers",
+        );
+
+        // The stored row is the FIRST one — the fork did not overwrite it.
+        let stored = backend
+            .lookup_community("fork-community")
+            .await
+            .expect("lookup")
+            .expect("the community is stored");
+        assert_eq!(stored.community_name, "E4 Pin Co-op");
+    }
+
+    /// persist#757 (CIRISEdge#522 item 2) — AV-45 at the PUT door, including
+    /// replicated rows, and edge's closure over it.
+    ///
+    /// A member's community-scoped row that reaches a node before that node
+    /// applied the community's roster refuses — correctly. The whole ask is
+    /// that the apply loop must not read that as terminal and must not read it
+    /// as a transport failure. Edge's closure is classification, not
+    /// re-ordering, and the two properties that make it a closure are asserted
+    /// here: the refusal is NAMED transient on the class axis, and the row is
+    /// NOT in local state afterwards — so this node still lacks its hash and
+    /// the next Summary/Diff re-offers it. Convergence is by construction; the
+    /// thing that was missing was the ability to TELL this apart from a real
+    /// policy refusal.
+    #[tokio::test]
+    async fn a_community_scoped_row_ahead_of_its_roster_refuses_as_named_transient() {
+        let cohort = vec!["chat-member".to_string()];
+        let (backend, bridge, metrics) = make_metered_bridge(&cohort);
+        register_fixture_keys(&backend, &[("chat-member", identity_type::USER)]).await;
+
+        // A `chat:*` row the member signs about ITSELF (AV-84-clean), naming
+        // its community in the SIGNED envelope — the target persist v38.2.0
+        // resolves at the put door where it used to pass a hardcoded `None`.
+        // Deliberately applied to a node that has NEVER seen `chat-community`.
+        let wire = community_scoped_chat_row("chat-member", "chat-community");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("some-peer"))
+            .await;
+        let ApplyOutcome::Refused(msg) = &outcome else {
+            panic!("AV-45 must refuse a row ahead of its roster, got {outcome:?}");
+        };
+        assert!(
+            msg.contains(ApplyRefusalClass::RetryAfterCommunityRoster.as_str()),
+            "the refusal must NAME itself retry-after-roster: {msg}",
+        );
+        assert!(
+            msg.contains("TRANSIENT"),
+            "an apply loop must not read this as terminal: {msg}",
+        );
+        assert!(
+            msg.contains("federation_write_scope_refused"),
+            "persist's own typed token is still the leading evidence: {msg}",
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.apply_refusals_by_class
+                .get(ApplyRefusalClass::RetryAfterCommunityRoster.as_str())
+                .copied(),
+            Some(1),
+            "a transient refusal no counter sees is the silent-narrowing class: {:?}",
+            snap.apply_refusals_by_class,
+        );
+
+        // NOT stored ⇒ still wanted ⇒ re-offered. This is the retry: there is
+        // no queue to drain and nothing to re-drive by hand.
+        assert!(
+            bridge
+                .list_envelope_refs(EnvelopeKind::Attestation)
+                .await
+                .is_empty(),
+            "the refused row must NOT be in local state — that absence is what \
+             makes the next round ask for it again",
+        );
+    }
+
+    /// A community-scoped `chat:*` attestation, signed by `member` about
+    /// itself, naming `community_id` in the SIGNED envelope. Third-party-clean
+    /// by construction (`attested_key_id` is the producer, `subject_key_ids`
+    /// empty), so AV-84 has nothing to refuse and the AV-45 membership
+    /// question is the one under test.
+    fn community_scoped_chat_row(member: &str, community: &str) -> Vec<u8> {
+        let now = Utc::now().trunc_subsecs(6);
+        let mut envelope = serde_json::json!({
+            "dimension": "chat:message:v1",
+            "community_id": community,
+            "body_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        });
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            "chat-row-1",
+            member,
+            ciris_persist::federation::types::attestation_type::SCORES,
+            member,
+            &[],
+            "community",
+        );
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(member, &envelope);
+        let attestation = Attestation {
+            attestation_id: "chat-row-1".to_string(),
+            attesting_key_id: member.to_string(),
+            attested_key_id: member.to_string(),
+            attestation_type: ciris_persist::federation::types::attestation_type::SCORES
+                .to_string(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: member.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            additional_scrubs: Vec::new(),
+            cohort_scope: "community".to_string(),
+            tier: "federation".to_string(),
+            promoted_at: None,
+        };
+        serde_json::to_vec(&attestation).expect("attestation serializes")
     }
 
     #[tokio::test]

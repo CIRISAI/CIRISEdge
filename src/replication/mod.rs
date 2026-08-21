@@ -140,8 +140,8 @@ pub use accord_relay_gate::{
 };
 #[doc(inline)]
 pub use bridge::{
-    BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge, KeyDirectoryProvider,
-    OperationalProviders, RootStewardsProvider, StewardRosterProvider,
+    ApplyRefusalClass, BridgeConfig, CohortProvider, FederationDirectoryReplicationBridge,
+    KeyDirectoryProvider, OperationalProviders, RootStewardsProvider, StewardRosterProvider,
 };
 #[doc(inline)]
 pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
