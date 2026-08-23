@@ -386,18 +386,202 @@ pub struct BridgeConfig {
     /// pagination. Operators with very large operational rosters tune
     /// this downward and accept multiple round trips per round.
     pub operational_page_limit: u32,
+
+    /// CIRISEdge#531 — how many bulk advertise/holdings sweeps may be
+    /// MATERIALISED at the same time across the whole node. See
+    /// [`Self::DEFAULT_ADVERTISE_SWEEP_PERMITS`] for the arithmetic; `0`
+    /// disables the bound entirely (the pre-#531 behaviour) and is an escape
+    /// hatch, not a supported production setting.
+    pub advertise_sweep_permits: usize,
 }
 
 impl BridgeConfig {
     /// Default for [`Self::operational_page_limit`].
     pub const DEFAULT_OPERATIONAL_PAGE_LIMIT: u32 = u32::MAX;
+
+    /// CIRISEdge#531 — default for [`Self::advertise_sweep_permits`]: **2**.
+    ///
+    /// ## What this bounds
+    ///
+    /// This is the WIDTH axis of #531, not the DEPTH one. Every bulk sweep
+    /// still reads its whole table (`list_*_since(None, page_limit)`); what
+    /// this caps is how many of those `Vec`s are alive AT ONCE. The OOM is a
+    /// PRODUCT — planes × peers × (advertise + holdings) — and the scheduler
+    /// spawns one independent task per `(peer, kind)` on a shared cadence
+    /// (`scheduler::spawn_coord`), so today every one of them materialises in
+    /// the same tick. Bounding the product is the cheap half; the cursor that
+    /// bounds one sweep's depth is CIRISEdge#531's other, larger half.
+    ///
+    /// ## The arithmetic (measured, CIRISServer#476)
+    ///
+    /// The production node that OOMed carried 14,616 federation attestations
+    /// = **194.8 MiB of payload**, and reached **2.8 GB RSS** on a 3.9 GB box
+    /// with ~6 peers' Attestation coordinators sweeping in the same tick:
+    ///
+    /// ```text
+    ///   2.8 GB RSS − ~0.4 GB baseline ≈ 2.4 GB over ~6 in-flight sweeps
+    ///   ⇒ ~400 MiB resident per in-flight sweep
+    ///   ⇒ ~2× the 194.8 MiB payload (parsed rows + the per-row Value + refs)
+    ///
+    ///   peak ≈ permits × corpus_payload × 2
+    ///        = 2 × 194.8 MiB × 2  ≈  780 MiB
+    /// ```
+    ///
+    /// ~780 MiB of sweep + ~400 MiB of baseline ≈ **1.2 GB on a 3.9 GB box**,
+    /// against 2.8 GB unbounded — headroom for the same corpus to roughly
+    /// double before the box is at risk again.
+    ///
+    /// ## Why not 1
+    ///
+    /// 1 would halve the peak again, but it serialises every plane behind the
+    /// slowest one and makes the node's whole replication throughput one
+    /// sweep deep. 2 keeps a cheap plane (Key, TransportDestination — sweeps
+    /// measured in milliseconds) moving while an Attestation sweep runs.
+    ///
+    /// ## Why this does not serialise a healthy mesh
+    ///
+    /// At the default 30 s cadence with ~6 peers × 6 planes = ~36 coordinators
+    /// (plus responders), the queue drains at 2 sweeps at a time. The
+    /// expensive plane is Attestation (~1.5 s/sweep on the measured corpus,
+    /// ~12 sweeps/tick counting responders); every other plane's sweep is
+    /// sub-10 ms and drains behind it. Worst case ≈ 12/2 × 1.5 s ≈ 9 s of
+    /// queueing inside a 30 s cadence, and a round whose tick is missed is
+    /// SKIPPED rather than burst-replayed
+    /// (`MissedTickBehavior::Skip`) — so queueing costs latency, never a
+    /// compounding backlog.
+    pub const DEFAULT_ADVERTISE_SWEEP_PERMITS: usize = 2;
+
+    /// CIRISEdge#531 — process-level override for
+    /// [`Self::advertise_sweep_permits`], read ONCE at runtime assembly
+    /// (`replication::runtime::build_bridge`).
+    ///
+    /// The reason this exists at all: the deployment that OOMed —
+    /// CIRISServer — rides `ReplicationRuntime` and never constructs a
+    /// [`BridgeConfig`], so the field alone is not reachable by an operator
+    /// on a wedged box without a downstream release. The env var is the
+    /// out-of-band lever; the DEFAULT is still what production runs, and is
+    /// chosen to need no tuning.
+    ///
+    /// Parsed as a `usize`; `0` disables the bound (pre-#531 behaviour). An
+    /// unparseable value is IGNORED with a WARN rather than fail-closing to
+    /// zero permits — a typo must not deadlock replication.
+    pub const ADVERTISE_SWEEP_PERMITS_ENV: &'static str = "CIRIS_EDGE_ADVERTISE_SWEEP_PERMITS";
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
             operational_page_limit: Self::DEFAULT_OPERATIONAL_PAGE_LIMIT,
+            advertise_sweep_permits: Self::DEFAULT_ADVERTISE_SWEEP_PERMITS,
         }
+    }
+}
+
+// ─── CIRISEdge#531 — the advertise-sweep width bound ─────────────────
+
+/// CIRISEdge#531 — the node-wide bound on how many bulk sweeps are
+/// MATERIALISED simultaneously, plus its own high-water witness.
+///
+/// ## Why a semaphore and not a lock
+///
+/// The failure is a memory PRODUCT, not a data race: N sweeps each holding a
+/// whole-table `Vec` live at the same instant. A mutex would serialise to one
+/// (throughput cliff) and, worse, would not be fair. [`tokio::sync::Semaphore`]
+/// is documented FIFO-fair on the `acquire` family — *"this method uses a queue
+/// to fairly distribute permits in the order they were requested"* — which is
+/// what turns "bound the memory" into something that cannot become a liveness
+/// bug: a plane that queues is at a FIXED position behind a bounded number of
+/// bounded holds, so no plane can be indefinitely overtaken by a busier one.
+/// (`try_acquire` is deliberately NOT used anywhere here — it is the one path
+/// that can jump the queue, and a fast plane repeatedly barging a slow one is
+/// exactly the starvation this must not have.)
+///
+/// ## Release is structural
+///
+/// [`SweepGate::enter`] hands back a [`SweepPermit`] whose `Drop` releases both
+/// the permit and the in-flight count. Every exit path out of a sweep —
+/// `return`, `?`, an early `Vec::new()` refusal, a panic unwinding through the
+/// `block_in_place` bridge — runs it. There is no manual release to forget.
+///
+/// ## Re-entrancy
+///
+/// The gate is entered at EXACTLY ONE layer: the [`ReplicationDirectory`] impl
+/// methods on the bridge. `list_envelope_refs_for_peer` and `list_holdings`
+/// both fall through to the shared advertise builder, so they call the
+/// permit-free `list_envelope_refs_unbounded` rather than the trait method — a
+/// second acquire while already holding one would self-deadlock at
+/// `permits == 1`. `sweep_gate_is_not_re_entrant` pins that for every kind.
+#[derive(Debug)]
+struct SweepGate {
+    /// `None` = unbounded (`advertise_sweep_permits == 0`), so the disabled
+    /// path costs nothing — not even an uncontended atomic on the semaphore.
+    sem: Option<Arc<tokio::sync::Semaphore>>,
+    /// Sweeps currently inside the gate. `SeqCst` so `max` is a real
+    /// high-water mark rather than a plausible one — this counter exists to be
+    /// ASSERTED on, and a relaxed read could observe a stale peak.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// The high-water mark of [`Self::in_flight`] over the process's life. The
+    /// bound's own witness: "at most N sweeps materialise at once" is a claim
+    /// that has to be checkable rather than asserted (the same discipline as
+    /// `owner_reads` above).
+    max_in_flight: std::sync::atomic::AtomicUsize,
+}
+
+impl SweepGate {
+    fn new(permits: usize) -> Self {
+        Self {
+            sem: (permits > 0).then(|| Arc::new(tokio::sync::Semaphore::new(permits))),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Acquire one sweep permit, FIFO-fair. Held only for the caller's
+    /// materialising section; released by [`SweepPermit`]'s `Drop`.
+    ///
+    /// A CLOSED semaphore (nothing closes it today; the gate lives as long as
+    /// the bridge) degrades to unbounded rather than refusing the sweep —
+    /// replication going dark is a strictly worse failure than replication
+    /// using more memory, and a closed gate is a shutdown state, not a policy.
+    async fn enter(&self) -> SweepPermit<'_> {
+        let permit = match self.sem.as_ref() {
+            None => None,
+            Some(sem) => Arc::clone(sem).acquire_owned().await.ok(),
+        };
+        let now = self
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max_in_flight
+            .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        SweepPermit {
+            gate: self,
+            _permit: permit,
+        }
+    }
+}
+
+/// RAII half of [`SweepGate`]. Dropping it releases the semaphore permit (via
+/// the owned permit's own `Drop`) and decrements the in-flight count, in that
+/// order-independent way — neither is load-bearing for the other.
+///
+/// `#[must_use]` because the ONE way to silently un-bound the sweep is
+/// `self.sweep_gate.enter().await;` as a bare statement: the permit would be
+/// taken and dropped before the materialisation it is supposed to cover, and
+/// nothing else about the code would look wrong.
+#[must_use = "the sweep permit must be BOUND for the whole materialising \
+              section — dropping it immediately silently un-bounds the sweep \
+              (CIRISEdge#531)"]
+struct SweepPermit<'a> {
+    gate: &'a SweepGate,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for SweepPermit<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -571,6 +755,13 @@ pub struct FederationDirectoryReplicationBridge {
     /// of #524 actually firing. Stays zero on a fleet whose grants all name
     /// nodes. `Relaxed`.
     owner_routed_recipients: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#531 — the node-wide bound on SIMULTANEOUS bulk sweeps. Built
+    /// from [`BridgeConfig::advertise_sweep_permits`]. Lives on the bridge
+    /// rather than on `BridgeConfig` so the config stays `Copy`, and because
+    /// the ONE production bridge is shared by every coordinator (initiators,
+    /// the #312 responder factory, hot-adds) — so one gate here IS the
+    /// node-wide bound, with no separate registry to keep in sync.
+    sweep_gate: SweepGate,
 }
 
 /// CIRISEdge#523 — one memoized owner-binding resolution for one node.
@@ -704,6 +895,7 @@ impl FederationDirectoryReplicationBridge {
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
+            sweep_gate: SweepGate::new(config.advertise_sweep_permits),
         }
     }
 
@@ -745,6 +937,7 @@ impl FederationDirectoryReplicationBridge {
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
+            sweep_gate: SweepGate::new(config.advertise_sweep_permits),
         }
     }
 
@@ -1090,13 +1283,19 @@ impl FederationDirectoryReplicationBridge {
         out.copy_from_slice(&bytes);
         Some(out)
     }
-}
 
-// ─── ReplicationDirectory impl ──────────────────────────────────────
-
-#[async_trait]
-impl ReplicationDirectory for FederationDirectoryReplicationBridge {
-    async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+    /// CIRISEdge#531 — the advertise build WITHOUT the sweep permit.
+    ///
+    /// Exists so the three [`ReplicationDirectory`] entry points that fall
+    /// through to the advertise view (`list_envelope_refs`,
+    /// `list_envelope_refs_for_peer`'s non-Attestation arm, `list_holdings`'
+    /// `_ =>` arm) can each take the permit ONCE at their own boundary instead
+    /// of nesting an acquire inside an acquire. This is the whole re-entrancy
+    /// discipline: a permit is taken at the trait layer and never below it.
+    ///
+    /// Do NOT call this from outside the trait impl — it is the unbounded path
+    /// by construction.
+    async fn list_envelope_refs_unbounded(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         let refs = self.list_envelope_refs_inner(kind).await;
         // CIRISEdge#441 — removal-class rows enter the receipt ledger the
         // moment they are advertisable; the serve exit records offers and
@@ -1109,6 +1308,36 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             }
         }
         refs
+    }
+
+    /// CIRISEdge#531 — the high-water mark of simultaneously-materialised bulk
+    /// sweeps this bridge has ever reached. The width bound's own witness: a
+    /// value above [`BridgeConfig::advertise_sweep_permits`] means a sweep
+    /// escaped the gate (a new bulk read wired past the trait layer).
+    #[must_use]
+    pub fn max_sweeps_in_flight(&self) -> usize {
+        self.sweep_gate
+            .max_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+// ─── ReplicationDirectory impl ──────────────────────────────────────
+
+#[async_trait]
+impl ReplicationDirectory for FederationDirectoryReplicationBridge {
+    async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        // CIRISEdge#531 — WIDTH bound. Held across the whole builder because
+        // the builder IS the materialisation: the `Vec` this returns is small
+        // (32-byte hash + seq per row), but the whole-table `Vec` of parsed
+        // rows the builder reads to produce it is not, and that one lives from
+        // the `list_*_since` read to the end of the projection loop. Every
+        // `.await` inside the section is this sweep's OWN directory work
+        // (the bulk read, and the per-row gate resolutions that must see the
+        // rows); none of it is unrelated, and none of it is the round — the
+        // permit is gone before a byte goes on the wire.
+        let _permit = self.sweep_gate.enter().await;
+        self.list_envelope_refs_unbounded(kind).await
     }
 
     async fn fetch_envelope_bytes(
@@ -1147,9 +1376,14 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         kind: EnvelopeKind,
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
+        // CIRISEdge#531 — WIDTH bound, taken ONCE here. The `_ =>` arm calls
+        // the permit-FREE `list_envelope_refs_unbounded`, not the trait
+        // method: acquiring again while holding a permit self-deadlocks at
+        // `permits == 1` (`sweep_gate_is_not_re_entrant` pins it).
+        let _permit = self.sweep_gate.enter().await;
         match (kind, peer_key_id) {
             (EnvelopeKind::Attestation, Some(peer)) => self.list_attestations(Some(peer)).await,
-            _ => self.list_envelope_refs(kind).await,
+            _ => self.list_envelope_refs_unbounded(kind).await,
         }
     }
 
@@ -1182,12 +1416,19 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// repairs both axes at once and keeps advertise == holdings, exactly as
     /// this arm's `_ =>` fall-through assumes.
     async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        // CIRISEdge#531 — WIDTH bound. The holdings view is the OTHER
+        // whole-table read per plane per round (`want = remote ∖ holdings`),
+        // and #523/v18.2.0 deliberately routed four planes' holdings to
+        // UNFILTERED twins at the raw page limit — so this path materialises
+        // as much as the advertise one and must be under the same bound. Same
+        // one-acquire discipline: the `_ =>` arm takes the permit-free builder.
+        let _permit = self.sweep_gate.enter().await;
         match kind {
             EnvelopeKind::Attestation => self.list_attestation_holdings().await,
             EnvelopeKind::Key => self.list_key_holdings().await,
             EnvelopeKind::IdentityOccurrence => self.list_identity_occurrence_holdings().await,
             EnvelopeKind::TransportDestination => self.list_transport_destination_holdings().await,
-            _ => self.list_envelope_refs(kind).await,
+            _ => self.list_envelope_refs_unbounded(kind).await,
         }
     }
 
@@ -1213,6 +1454,12 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         if !kind.is_cursor_served() {
             return Vec::new();
         }
+        // CIRISEdge#531 — WIDTH bound. This one returns BYTES, not refs: the
+        // whole page of bundles is JSON-serialized into memory before it is
+        // handed back, so it is the heaviest single sweep per unit of corpus
+        // on the node. Taken AFTER the non-cursor early return so a kind that
+        // is not cursor-served never queues at all.
+        let _permit = self.sweep_gate.enter().await;
         let limit = self.effective_page_limit().await;
         // v18 — the +1 TRUNCATION SENTINEL: ask persist for one bundle more
         // than we serve. The cursor session opens from `since: None` each
@@ -1306,6 +1553,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     ) -> Vec<EnvelopeRef> {
         match peer_key_id {
             Some(p) if p == subject_key_id => {
+                // CIRISEdge#531 — WIDTH bound on the subject-Pull sweep too:
+                // it is per-subject rather than whole-table, but the
+                // Attestation arm sweeps BOTH testimonial axes and a
+                // high-degree subject is not small. Taken INSIDE the entitled
+                // arm so the fail-closed refusal below never queues behind a
+                // sweep — refusing costs nothing and must stay instant.
+                let _permit = self.sweep_gate.enter().await;
                 self.subject_holdings_inner(kind, subject_key_id).await
             }
             other => {
@@ -12506,5 +12760,320 @@ mod tests {
             "…and the narrowing is observable, not silent (it is stated in the withhold \
              line and booked as a withhold)"
         );
+    }
+}
+
+// ─── CIRISEdge#531 — the advertise-sweep WIDTH bound ─────────────────
+//
+// Two layers, deliberately:
+//
+//   * [`SweepGate`] on its own — deterministic saturation, RAII release
+//     (including off the error and panic paths), and the anti-starvation
+//     property. These hold the permit across a `sleep`, so the bound is
+//     actually exercised rather than trivially satisfied by a fast sweep.
+//   * the REAL bridge over a real `MemoryBackend` — that the gate is entered
+//     at exactly ONE layer, so the `list_holdings` /
+//     `list_envelope_refs_for_peer` fall-through into the shared advertise
+//     builder cannot self-deadlock at `permits == 1`. That is the failure mode
+//     a width bound most easily introduces, and a HANG is what it looks like,
+//     so every call there is under a `timeout`.
+#[cfg(test)]
+mod sweep_width_tests {
+    use super::*;
+    use ciris_persist::store::MemoryBackend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration as StdDuration;
+
+    fn make_bridge_with_permits(
+        permits: usize,
+    ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
+        let backend = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> = backend.clone();
+        let cohort: CohortProvider = Arc::new(Vec::new);
+        let bridge = FederationDirectoryReplicationBridge::with_config(
+            dir,
+            cohort,
+            BridgeConfig {
+                advertise_sweep_permits: permits,
+                ..BridgeConfig::default()
+            },
+        );
+        (backend, bridge)
+    }
+
+    /// The DEFAULT is what production runs — CIRISServer never constructs a
+    /// [`BridgeConfig`] — so it is pinned here rather than left to whatever a
+    /// later edit finds convenient. Changing it is then a deliberate act, with
+    /// the arithmetic on `DEFAULT_ADVERTISE_SWEEP_PERMITS` to answer to.
+    #[test]
+    fn default_config_bounds_the_sweep_width() {
+        assert_eq!(
+            BridgeConfig::default().advertise_sweep_permits,
+            2,
+            "the production default must BOUND the width (CIRISEdge#531); \
+             0 would restore the unbounded pre-#531 fan-out"
+        );
+        assert_eq!(
+            BridgeConfig::DEFAULT_ADVERTISE_SWEEP_PERMITS,
+            BridgeConfig::default().advertise_sweep_permits
+        );
+    }
+
+    /// THE concurrency pin: with `permits = N`, at most N sweeps are inside the
+    /// materialising section at the same instant — and, because the holds here
+    /// overlap by construction, exactly N are, so this also catches a bound that
+    /// had silently become a full serialization.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn at_most_n_sweeps_materialise_simultaneously() {
+        for permits in [1usize, 2, 3] {
+            let gate = Arc::new(SweepGate::new(permits));
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let gate = Arc::clone(&gate);
+                handles.push(tokio::spawn(async move {
+                    let _permit = gate.enter().await;
+                    // Hold across a real await so the windows genuinely overlap;
+                    // a zero-length hold would satisfy any bound vacuously.
+                    tokio::time::sleep(StdDuration::from_millis(40)).await;
+                }));
+            }
+            for h in handles {
+                h.await.expect("sweep task joined");
+            }
+            assert_eq!(
+                gate.max_in_flight.load(Ordering::SeqCst),
+                permits,
+                "8 overlapping sweeps under {permits} permits must saturate the \
+                 bound and never exceed it (CIRISEdge#531)"
+            );
+            assert_eq!(
+                gate.in_flight.load(Ordering::SeqCst),
+                0,
+                "every permit released"
+            );
+        }
+    }
+
+    /// `advertise_sweep_permits = 0` is the documented escape hatch back to the
+    /// pre-#531 unbounded fan-out. Pinned so "disabled" cannot silently become
+    /// "zero permits", which would deadlock replication rather than unbound it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zero_permits_means_unbounded_not_deadlocked() {
+        let gate = Arc::new(SweepGate::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let gate = Arc::clone(&gate);
+            handles.push(tokio::spawn(async move {
+                let _permit = gate.enter().await;
+                tokio::time::sleep(StdDuration::from_millis(40)).await;
+            }));
+        }
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            for h in handles {
+                h.await.expect("sweep task joined");
+            }
+        })
+        .await
+        .expect("0 permits must not block — it disables the bound");
+        assert_eq!(
+            gate.max_in_flight.load(Ordering::SeqCst),
+            8,
+            "with the bound disabled all 8 sweeps materialise at once — the shape \
+             CIRISEdge#531 exists to stop, kept reachable only as an explicit \
+             operator opt-out"
+        );
+    }
+
+    /// Release is STRUCTURAL, not a manual call an early return can skip. Both
+    /// non-happy exits are covered: an error return out of the middle of a
+    /// sweep, and a panic unwinding through it (the `block_in_place` bridge the
+    /// production provider uses can carry one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn permit_is_released_on_every_exit_path() {
+        /// A sweep that takes the gate and then bails out mid-way, the shape
+        /// every `unwrap_or_default()` / early-`return Vec::new()` exit in the
+        /// bridge's bulk readers has.
+        async fn sweep_that_fails(gate: &SweepGate) -> Result<(), &'static str> {
+            let _permit = gate.enter().await;
+            Err("persist read failed mid-sweep")
+        }
+
+        let gate = Arc::new(SweepGate::new(1));
+
+        // (a) early return with an error.
+        assert!(sweep_that_fails(&gate).await.is_err());
+        assert_eq!(
+            gate.in_flight.load(Ordering::SeqCst),
+            0,
+            "the error path released the permit"
+        );
+
+        // (b) panic unwinding out of the held section.
+        let panicking = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                let _permit = gate.enter().await;
+                panic!("sweep panicked while holding a permit");
+            })
+        };
+        assert!(
+            panicking.await.is_err(),
+            "the spawned sweep panicked as intended"
+        );
+        assert_eq!(
+            gate.in_flight.load(Ordering::SeqCst),
+            0,
+            "the panic path released the permit too — Drop, not a manual release"
+        );
+
+        // The single permit is still obtainable, i.e. neither exit leaked it.
+        let regained = tokio::time::timeout(StdDuration::from_secs(10), gate.enter())
+            .await
+            .expect("the one permit is still available after both failure exits");
+        assert_eq!(gate.in_flight.load(Ordering::SeqCst), 1);
+        drop(regained);
+        assert_eq!(gate.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// A width bound a busy plane can monopolise turns a memory bug into a
+    /// liveness bug. Two properties together rule that out:
+    ///
+    ///   * tokio's `acquire_owned` is FIFO-fair (*"uses a queue to fairly
+    ///     distribute permits in the order they were requested"*), so a waiter
+    ///     holds a FIXED queue position — it cannot be overtaken. `try_acquire`,
+    ///     the one path that CAN jump the queue, is used nowhere in the gate.
+    ///   * every hold is bounded (one sweep), so a fixed position is a bounded
+    ///     wait.
+    ///
+    /// Asserted at `permits = 1` — maximum contention — with one "plane"
+    /// deliberately far slower than the rest: every plane still completes, and
+    /// the fast planes' repeated re-acquires never push the slow one out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_plane_is_starved_under_contention() {
+        let gate = Arc::new(SweepGate::new(1));
+        let completed: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let slow_rounds = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        // Five fast planes, each taking the gate repeatedly — the "busy mesh"
+        // an unfair bound would let starve the sixth.
+        for _ in 0..5 {
+            let gate = Arc::clone(&gate);
+            let completed = Arc::clone(&completed);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..20 {
+                    let _permit = gate.enter().await;
+                    tokio::task::yield_now().await;
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        // One slow plane (the Attestation sweep's shape).
+        {
+            let gate = Arc::clone(&gate);
+            let completed = Arc::clone(&completed);
+            let slow_rounds = Arc::clone(&slow_rounds);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..5 {
+                    let _permit = gate.enter().await;
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                    slow_rounds.fetch_add(1, Ordering::SeqCst);
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        tokio::time::timeout(StdDuration::from_secs(60), async {
+            for h in handles {
+                h.await.expect("plane task joined");
+            }
+        })
+        .await
+        .expect("every plane completed — no starvation, no deadlock");
+
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            6,
+            "all six planes finished their rounds under a single permit"
+        );
+        assert_eq!(
+            slow_rounds.load(Ordering::SeqCst),
+            5,
+            "the SLOW plane got every one of its rounds — the fast planes' 100 \
+             re-acquires could not overtake it (tokio Semaphore is FIFO-fair)"
+        );
+        assert_eq!(gate.max_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    /// The re-entrancy pin, and the one that would fail as a HANG rather than an
+    /// assertion: `list_envelope_refs_for_peer` and `list_holdings` both fall
+    /// through to the shared advertise builder, so if either called the trait
+    /// method (which takes a permit) instead of `list_envelope_refs_unbounded`,
+    /// a single-permit node would self-deadlock on its first round for that kind.
+    ///
+    /// Driven over the REAL bridge at `permits = 1`, across every
+    /// [`EnvelopeKind`] and every gated entry point, each under a timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sweep_gate_is_not_re_entrant() {
+        let (_backend, bridge) = make_bridge_with_permits(1);
+        for kind in EnvelopeKind::ALL {
+            tokio::time::timeout(StdDuration::from_secs(30), async {
+                let _ = bridge.list_envelope_refs(kind).await;
+                let _ = bridge.list_envelope_refs_for_peer(kind, None).await;
+                let _ = bridge
+                    .list_envelope_refs_for_peer(kind, Some("some-peer"))
+                    .await;
+                let _ = bridge.list_holdings(kind).await;
+                let _ = bridge.subject_holdings(kind, "subj", Some("subj")).await;
+                let _ = bridge.subject_holdings(kind, "subj", Some("other")).await;
+                let _ = bridge.accord_evidence_since(kind, None).await;
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{kind:?}: a gated entry point re-acquired the sweep permit while \
+                     already holding it — self-deadlock at permits == 1 (CIRISEdge#531)"
+                )
+            });
+        }
+        assert!(
+            bridge.max_sweeps_in_flight() <= 1,
+            "never more than the configured permit count materialised at once"
+        );
+    }
+
+    /// The bound holds on the real bridge under real concurrency, not only on
+    /// the gate in isolation: many peers' entry points hammered at once, and the
+    /// bridge's own high-water witness stays at or under the configured permits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_bridge_never_exceeds_its_permits() {
+        for permits in [1usize, 2] {
+            let (_backend, bridge) = make_bridge_with_permits(permits);
+            let bridge = Arc::new(bridge);
+            let mut handles = Vec::new();
+            for i in 0..24 {
+                let bridge = Arc::clone(&bridge);
+                let kind = EnvelopeKind::ALL[i % EnvelopeKind::ALL.len()];
+                let peer = format!("peer-{i}");
+                handles.push(tokio::spawn(async move {
+                    let _ = bridge.list_envelope_refs_for_peer(kind, Some(&peer)).await;
+                    let _ = bridge.list_holdings(kind).await;
+                    let _ = bridge.list_envelope_refs(kind).await;
+                }));
+            }
+            tokio::time::timeout(StdDuration::from_secs(60), async {
+                for h in handles {
+                    h.await.expect("sweep task joined");
+                }
+            })
+            .await
+            .expect("every concurrent sweep completed under the width bound");
+            assert!(
+                bridge.max_sweeps_in_flight() <= permits,
+                "high-water {} exceeded the {permits}-permit bound — a bulk read \
+                 was wired past the trait layer (CIRISEdge#531)",
+                bridge.max_sweeps_in_flight()
+            );
+        }
     }
 }
