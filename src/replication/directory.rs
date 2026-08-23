@@ -134,10 +134,19 @@ pub trait ReplicationDirectory: Send + Sync {
     /// directly). Bounded by the impl's page limit; the requester re-pulls from its
     /// new high-water to drain a backlog. Defaults to empty: only the production
     /// bridge (holding the persist `FederationDirectory`) answers it.
+    ///
+    /// CIRISEdge#531 — `peer_key_id` is the AUTHENTICATED requester, and it is
+    /// here for the DEPTH bound rather than for policy: the responder keeps a
+    /// per-peer serve watermark so a byte-budgeted page continues on the next
+    /// round instead of re-serving page one forever (edge initiators open every
+    /// cursor round from `since: None`, so without a responder-side position a
+    /// truncated page would never be passed). `None` = unattributed: one
+    /// budgeted page from the declared floor, no position kept.
     async fn accord_evidence_since(
         &self,
         _kind: EnvelopeKind,
         _since: Option<chrono::DateTime<chrono::Utc>>,
+        _peer_key_id: Option<&str>,
     ) -> Vec<Vec<u8>> {
         Vec::new()
     }
@@ -296,9 +305,15 @@ impl StateProvider for DirectoryStateAdapter {
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Vec<Vec<u8>> {
         let inner = Arc::clone(&self.inner);
+        // CIRISEdge#531 — the bound peer travels with the pull so the impl can
+        // keep a per-peer serve watermark under the page's byte budget.
+        let peer = self.peer_key_id.clone();
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { inner.accord_evidence_since(kind, since).await })
+            tokio::runtime::Handle::current().block_on(async move {
+                inner
+                    .accord_evidence_since(kind, since, peer.as_deref())
+                    .await
+            })
         })
     }
 }
