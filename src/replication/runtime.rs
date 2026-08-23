@@ -121,11 +121,12 @@ fn build_bridge(
     self_provider: Option<CohortProvider>,
     mesh_config: Option<Arc<MeshConfigReader>>,
 ) -> Arc<FederationDirectoryReplicationBridge> {
+    let bridge_config = resolve_sweep_permits(config.bridge);
     Arc::new(
         FederationDirectoryReplicationBridge::with_config(
             Arc::clone(directory),
             cohort,
-            config.bridge,
+            bridge_config,
         )
         .with_self_provider(self_provider)
         .with_local_key_id(config.local_key_id.clone())
@@ -144,6 +145,46 @@ fn build_bridge(
             ))
         })),
     )
+}
+
+/// CIRISEdge#531 — apply the [`BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV`]
+/// override, if the operator set one, to the runtime's bridge config.
+///
+/// This is the ONE production assembly point every downstream reaches
+/// (`ReplicationRuntime::start` → [`build_bridge`]), including the ones —
+/// CIRISServer — that never construct a [`BridgeConfig`] of their own and so
+/// cannot reach the field. Deliberately NOT in `BridgeConfig::default()`: an
+/// env read inside `Default` would make every test construction in the repo
+/// environment-sensitive, which is how a green suite starts lying.
+///
+/// A missing var leaves the configured value (the default, 2) alone. An
+/// unparseable one WARNS and leaves it alone too — a typo in an env var must
+/// not be able to change the node's memory posture, in either direction.
+fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
+    let Ok(raw) = std::env::var(BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV) else {
+        return config;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) => {
+            tracing::info!(
+                permits = n,
+                configured = config.advertise_sweep_permits,
+                env = BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV,
+                "advertise-sweep width bound overridden from the environment \
+                 (0 = unbounded, the pre-CIRISEdge#531 behaviour)"
+            );
+            config.advertise_sweep_permits = n;
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            raw = %raw,
+            env = BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV,
+            keeping = config.advertise_sweep_permits,
+            "advertise-sweep width bound override is not a usize — IGNORED, \
+             keeping the configured value (CIRISEdge#531)"
+        ),
+    }
+    config
 }
 
 /// CIRISEdge#440 — the ONE resolved mesh-config reader, shared by the bridge
