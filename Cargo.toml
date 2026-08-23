@@ -254,13 +254,10 @@ publish = false
 # `tier: federation` with no cohort alias in the envelope, so all four are
 # no-ops on it; `put_touch_claim` is a different door and is untouched by the
 # cut. v38.2.0 still pins CIRISVerify v13.6.1 — no cross-cdylib skew.
-# v38.3.0 — the CHAT LADDER'S LAST DOOR, adopted as an RC by **git rev**
-# because the tag is not minted yet. This `rev =` pin is TRANSIENT and is the
-# one sanctioned exception to the tag-only rule the `cargo <-> pyproject`
-# pin-skew hook enforces (the commit that introduced it was made with
-# `--no-verify`); it flips to `tag = "v38.3.0"` the moment the tag exists, and
-# no edge artifact ships on a rev pin. The pyproject floor `>=38,<39` is
-# unchanged — a MINOR bump.
+# v38.3.0 — the CHAT LADDER'S LAST DOOR. Adopted as an RC by git rev while the
+# tag was unminted; now pinned by `tag` (the RC exception is spent — no edge
+# artifact ships on a rev pin). The pyproject floor `>=38,<39` is unchanged —
+# a MINOR bump.
 #   * #765 the writer-admission PRINCIPAL fold (`admission_identity_for_writer`):
 #     occurrence axis first, then the live `delegates_to(owner → node)`
 #     owner-binding axis via `owner_of`. v38.2.0 resolved a NODE to itself (its
@@ -279,8 +276,40 @@ publish = false
 #     `n ∈ nodes_owned_by(U) ⟺ owner_of(n) == U` holds by construction; an
 #     `AmbiguousNodeOwner` candidate is SKIPPED (one poisoned node must not
 #     unroute its owner's every grant) while the forward walk still fails closed.
-# v38.3.0 still pins CIRISVerify v13.6.1 — no cross-cdylib skew.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.3.0", version = "38", features = ["sqlite", "encrypted-kv"] }
+# v38.4.0 — the PRODUCTION-RETENTION cut (#767/#768). Storage/retention only:
+# it adds no admit door, changes no row shape, and — verified by set-diffing
+# every `pub enum` variant across the whole crate at both tags — adds ZERO enum
+# variants. That last check is the standing trap on this pin: a persist minor
+# that adds an `AttestationFamily` arm silently lands in `family_gates.rs`'s
+# wildcard as MAXIMAL_UNKNOWN and withholds the whole family (how `Chat` nearly
+# shipped withheld at v38.2.0). `AttestationFamily` lives in
+# `federation/namespace/mod.rs`, which this cut does not touch at all.
+#   * #767 `StorageSummary` is now enumerated FROM THE CATALOGUE
+#     (`tables: BTreeMap<String, TableUsage>` + `dark_bytes` + `bytes_measurable`),
+#     so a table can no longer enter the schema and stay invisible — and SQLite
+#     per-table `bytes` are REAL now (`dbstat` was always available; it had been
+#     hardcoded 0 for six releases). This is what CIRISEdge#530 was filed
+#     against: `transport_destinations` and `announced_peers` were two of the
+#     five unnamed tables holding the weight. Edge consumes none of this
+#     directly (no `StorageSummary` reference anywhere in `src/`) — the operator
+#     surface is persist's/the server's.
+#   * #767 ask 2 — bounded observation-table prunes, behind Engine facades:
+#     `prune_{announced_peers,transport_destinations}_not_seen_since`. Edge does
+#     NOT call these; see the note on CIRISEdge#530 in `transport/reticulum.rs`
+#     for why (edge does not emit the liveness signal their cutoff reads).
+#   * #768 `reap_expired_attestations` — drives the per-row `purge_attestation_v31`
+#     door, so `supersedes`/`withdraws`/`recants`/`delegates_to` refusals still
+#     apply. Not called by edge.
+#   * #768 the WAL bound — `journal_size_limit = 64 MiB` at boot. Edge gets this
+#     for free on every sqlite-backed node: persist owns the pragmas, and no
+#     consumer could have fixed a 218 MB `-wal` against a 1.26 GB store.
+# Producer sweep (`build_delivery_row`, `touch_claim`, the attestation/refusal
+# emitters): the v38.3.0..v38.4.0 diff is PURELY ADDITIVE in `federation/mod.rs`
+# and the stores (the one deleted line is the sqlite PRAGMA string being
+# extended), so no producer's admit shape moves.
+# v38.4.0 still pins CIRISVerify v13.6.1 — `cargo tree -i ciris-verify-core`
+# resolves exactly ONE, shared by edge and persist. No cross-cdylib skew.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.4.0", version = "38", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -1329,9 +1358,10 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-# v38.3.0 RC — pinned by `rev` in lockstep with the runtime pin above (a split
-# would resolve TWO `ciris-persist` graphs). Flips to `tag = "v38.3.0"` with it.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.3.0", version = "38", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
+# v38.4.0 — pinned by `tag` in LOCKSTEP with the runtime pin above. A split
+# between the two would resolve TWO `ciris-persist` graphs (and, through them,
+# two `ciris-verify-core` cdylibs — the empty-stdout SIGSEGV class).
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.4.0", version = "38", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3
