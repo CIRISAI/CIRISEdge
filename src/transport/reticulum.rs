@@ -511,6 +511,21 @@ static LINK_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 static ROUTE_SUPERSESSION_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 
+// CIRISEdge#530 — announce-intake capacity evictions (WARN).
+static ANNOUNCE_INTAKE_EVICT_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#530 — announce-intake capacity eviction (WARN). Keyed on the FIXED
+/// token `"cap"`, never on the evicted `key_id`: the population this reports is
+/// attacker-mintable, so keying by peer would size the throttle's own map with
+/// the flood it exists to describe. One key, so a node at cap speaks a bounded
+/// number of times per window and carries `suppressed_prev` for the rest — the
+/// exact count lives on the metrics counter, which is never throttled.
+fn announce_intake_evict_log() -> &'static crate::log_throttle::LogThrottle {
+    ANNOUNCE_INTAKE_EVICT_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1))
+}
+
 /// Point 1 — peer-admitted (INFO). Keyed on `provenance` (2 values), so the
 /// rare `Rooted` admit logs freely while a flood of junk `Advisory` admits is
 /// capped. A tiny key map suffices.
@@ -1183,6 +1198,28 @@ struct RootedPeer {
     /// attribution on: an Advisory or non-owning binding is never attributed, so
     /// it can never be served a peer's `trace:*` corpus.
     owns_key: bool,
+    /// CIRISEdge#530 — when this binding was last CONFIRMED BY AN ANNOUNCE
+    /// (insert, route/trust update, or a same-epoch re-announce that changed
+    /// nothing). This is the LRU victim-selection input for the `MAX_PEERS`
+    /// capacity bound — never a validity clock.
+    ///
+    /// The distinction is the whole point (leviculum#49, persist#551/#557):
+    /// clock-based validity was removed from this stack on purpose, because two
+    /// decay mechanisms on different schedules is the two-lists-that-disagree
+    /// class. Nothing expires because `last_seen` is old; a binding is evicted
+    /// only when the map is at CAPACITY, and then the least-recently-confirmed
+    /// UNRETAINED entry is the victim. Pressure is the trigger, recency is only
+    /// the ordering.
+    ///
+    /// Deliberately touched on `IgnoreStale` too. A steady-state peer
+    /// re-announcing at an unchanged epoch is the single most common event on
+    /// this path and is *proof of liveness*, even though it updates no route
+    /// field — ordering by "last route CHANGE" would evict exactly the stable,
+    /// healthy peers first.
+    ///
+    /// `Instant` (monotonic), not a wall clock: victim ordering must not invert
+    /// when the host's clock steps.
+    last_seen: std::time::Instant,
     /// CIRISEdge#436 — the FULL 64-byte transport identity
     /// (`x25519 ‖ ed25519`) this entry was admitted with (the announce's own
     /// `public_key`). `transport_identity_hash` above is derived from exactly
@@ -1744,6 +1781,11 @@ pub struct TransportSpec {
 /// too and stashed for `listen` to claim exactly once.
 pub struct ReticulumTransport {
     config: ReticulumTransportConfig,
+    /// CIRISEdge#530 — optional metrics handle, attached with
+    /// [`ReticulumTransport::with_metrics`] and moved into the announce worker's
+    /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
+    /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
+    metrics: Option<crate::observability::EdgeMetrics>,
     /// The Leviculum node — built + started in `new`. Shared; `send`
     /// borrows it, `listen` drains its event channel.
     node: Arc<ReticulumNode>,
@@ -2703,6 +2745,8 @@ impl ReticulumTransport {
 
         Ok(Self {
             config,
+            // CIRISEdge#530 — off by default; attach with `with_metrics`.
+            metrics: None,
             node: Arc::new(node),
             local_dest_hash,
             local_named_dest_hash,
@@ -2744,6 +2788,22 @@ impl ReticulumTransport {
             store_and_forward: None,
             delivery: crate::transport::PendingDelivery::LiveOnly,
         })
+    }
+
+    /// CIRISEdge#530 — attach a metrics handle so announce-intake capacity
+    /// evictions are COUNTED (`EdgeMetrics::announce_intake_evictions`).
+    ///
+    /// Same builder shape as `ReplicationCoordinator::with_metrics` /
+    /// `ReplicationBridge::with_metrics`: takes an `Option` by value, since
+    /// `EdgeMetrics` is a cheap `Arc`-per-field clone. Optional on purpose — the
+    /// transport has never carried an `EdgeMetrics` (see the serve path's
+    /// uncounted `inc_withhold` note), so leaving it unset must stay a compiling,
+    /// working configuration. Unset, evictions remain loud via the throttled WARN
+    /// but contribute to no counter.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// CIRISEdge#437 — register (or replace) a peer's presented
@@ -3460,6 +3520,9 @@ impl ReticulumTransport {
                     pk[32..].copy_from_slice(&signing_key_ed25519);
                     pk
                 },
+                // #530 — a primed binding is `Rooted`, so it is pinned and can
+                // never be a capacity victim; the stamp is for shape only.
+                last_seen: std::time::Instant::now(),
                 manifest_commitment: None,
             },
         );
@@ -3500,6 +3563,8 @@ impl ReticulumTransport {
                 // owning peer (the precondition #340 attribution needs).
                 owns_key: true,
                 transport_pubkey64,
+                // #530 — `Rooted`, therefore pinned; stamp is for shape only.
+                last_seen: std::time::Instant::now(),
                 manifest_commitment: None,
             },
         );
@@ -5268,6 +5333,8 @@ impl Transport for ReticulumTransport {
             hybrid_policy: self.hybrid_policy,
             transport_binding_enforcement: self.transport_binding_enforcement,
             bundle_save_gate: self.bundle_save_gate,
+            // CIRISEdge#530 — cheap clone (every `EdgeMetrics` field is an `Arc`).
+            metrics: self.metrics.clone(),
         };
         let (announce_tx, mut announce_rx) =
             mpsc::channel::<leviculum_core::ReceivedAnnounce>(ANNOUNCE_QUEUE_DEPTH);
@@ -5400,6 +5467,13 @@ struct AnnounceCtx {
     hybrid_policy: HybridPolicy,
     transport_binding_enforcement: TransportBindingEnforcement,
     bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
+    /// CIRISEdge#530 — optional metrics handle, so an announce-intake capacity
+    /// eviction is COUNTED and not merely logged. `None` leaves the eviction
+    /// loud-but-uncounted (the throttled WARN still fires), which is the same
+    /// stated posture the serve path in this file records for `inc_withhold`:
+    /// the transport historically carries no `EdgeMetrics`, and #530 threads one
+    /// only along the path it needs rather than converting the whole file.
+    metrics: Option<crate::observability::EdgeMetrics>,
 }
 
 /// Shared handles the event loop hands to [`handle_event`].
@@ -7653,6 +7727,17 @@ async fn resolve_announce_cold_start(
                 // (the bundle still has to verify the full chain) and gated on
                 // proven ownership, so a spoofer can never repoint a victim's
                 // commitment (its announce fails `owns_key` upstream).
+                // CIRISEdge#530 — a stale re-announce updates no route field, but
+                // it is the strongest liveness evidence this path ever sees: the
+                // steady state of a healthy peer. Touch the LRU stamp for EVERY
+                // resident peer (not only `owns_key` ones, which is a trust
+                // question and not a liveness one), so capacity eviction sheds
+                // peers nothing has heard from rather than peers whose route
+                // simply has not changed. This is victim ORDERING only — nothing
+                // here expires anything.
+                if let Some(existing) = peers.get_mut(&key_id) {
+                    existing.last_seen = std::time::Instant::now();
+                }
                 if owns_key {
                     if let Some(existing) = peers.get_mut(&key_id) {
                         if existing.manifest_commitment != attestation.manifest_commitment {
@@ -7688,6 +7773,10 @@ async fn resolve_announce_cold_start(
                     // commitment is the owner's current one).
                     existing.transport_pubkey64 = binding_pubkey64;
                     existing.manifest_commitment = attestation.manifest_commitment;
+                    // CIRISEdge#530 — a heal is a confirmation; refresh the LRU
+                    // stamp so a peer churning through reroutes is not ordered as
+                    // if it had gone quiet.
+                    existing.last_seen = std::time::Instant::now();
                     // Persist the PRESERVED Rooted provenance, not the incoming
                     // Advisory verdict, so a boot-reload keeps the binding rooted.
                     persist_provenance = existing.provenance;
@@ -7817,22 +7906,50 @@ async fn resolve_announce_cold_start(
                 // is full of rooted peers (unrealistic — accord-bounded), the new
                 // entry is still admitted; the cap targets advisory growth only.
                 if !peers.contains_key(&key_id) && peers.len() >= MAX_PEERS {
-                    let evict = peers
-                        .iter()
-                        .find(|(_, rp)| {
-                            matches!(
-                                rp.provenance,
-                                ciris_persist::federation::self_at_login::BindingProvenance::Advisory
-                            )
-                        })
-                        .map(|(k, _)| k.clone());
+                    // CIRISEdge#530 — LEAST-RECENTLY-CONFIRMED victim, not an
+                    // arbitrary one. The #318 original took `.iter().find(..)`,
+                    // i.e. the first Advisory entry in HASH order, so a peer that
+                    // announced a second ago was as likely to be dropped as one
+                    // last heard from days ago. Under sustained advisory churn
+                    // that evicts live peers, and every evicted-then-re-announcing
+                    // peer re-enters as a fresh admit — which re-issues the
+                    // durable write-through below. Arbitrary selection therefore
+                    // did not just pick badly, it kept the durable tables in
+                    // permanent write churn. LRU converges instead: the entries
+                    // that lose are the ones nothing has heard from.
+                    //
+                    // `min_by_key` over the UNRETAINED subset only — the filter IS
+                    // the retention pin. A `Rooted` binding is never a candidate,
+                    // so "retained is never evicted" holds by construction rather
+                    // than by a comparison someone could later reorder. If the map
+                    // is entirely Rooted (accord-bounded, so not a real shape) the
+                    // new entry is still admitted and the cap is exceeded — the
+                    // cap targets advisory growth, never accord-blessed peers.
+                    let evict = select_capacity_victim(&peers);
                     if let Some(evict) = evict {
                         peers.remove(&evict);
-                        tracing::debug!(
-                            evicted = %evict,
-                            cap = MAX_PEERS,
-                            "peers map at cap — evicted an advisory binding (CIRISEdge#318)"
-                        );
+                        // CIRISEdge#530 — NEVER SILENT. A fleet sitting at cap and
+                        // shedding routing hints must be legible; the pre-#530
+                        // `debug!` alone was not, since production does not run at
+                        // debug. Counter first (always), then a THROTTLED warn so
+                        // the eviction is visible even where no metrics handle is
+                        // attached — without letting an attacker minting keypairs
+                        // turn the log into the flood it is reporting.
+                        if let Some(m) = ctx.metrics.as_ref() {
+                            m.inc_announce_intake_eviction();
+                        }
+                        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                            announce_intake_evict_log().check("cap")
+                        {
+                            tracing::warn!(
+                                evicted = %evict,
+                                cap = MAX_PEERS,
+                                suppressed_prev,
+                                "announce intake at CAPACITY — evicted the \
+                                 least-recently-confirmed ADVISORY binding \
+                                 (CIRISEdge#530; Rooted bindings are pinned)"
+                            );
+                        }
                     }
                 }
                 peers.insert(
@@ -7852,6 +7969,9 @@ async fn resolve_announce_cold_start(
                         // commitment it carried, consumed by the link-borne
                         // bundle's one-motion Advisory→Rooted upgrade.
                         transport_pubkey64: binding_pubkey64,
+                        // CIRISEdge#530 — this admit IS the confirmation; start
+                        // the LRU clock here.
+                        last_seen: std::time::Instant::now(),
                         manifest_commitment: attestation.manifest_commitment,
                     },
                 );
@@ -7896,6 +8016,38 @@ async fn resolve_announce_cold_start(
                 attestation.epoch,
             )
             .await;
+        // ─── CIRISEdge#530: why the DURABLE half is not wired here ───────────
+        //
+        // persist v38.4.0 ships `Engine::prune_transport_destinations_not_seen_since`
+        // and `prune_announced_peers_not_seen_since`. Edge deliberately calls
+        // NEITHER in this cut, and the reason is a property of THIS function, not
+        // a preference:
+        //
+        // Both durable writes below are reached only when `newly_rooted_key` is
+        // `Some` — a brand-new key or a strictly-newer epoch. The steady state of
+        // a healthy peer is `RouteSupersession::IgnoreStale` (same epoch, no
+        // upgrade, no heal), which returns `None` and writes NOTHING. So a peer
+        // that has been announcing every few seconds for a month still carries a
+        // `transport_destinations.asserted_at` / `announced_peers.last_seen_at`
+        // frozen at its last epoch ROTATION.
+        //
+        // Those columns are exactly what the new prunes age on
+        // (`COALESCE(last_seen_at, asserted_at)` and `last_seen_at`). Edge is not
+        // emitting the liveness signal their victim selection reads, so calling
+        // them today would delete the routes of peers that are alive and
+        // announcing right now — with `announced_peers` having no keep-predicate
+        // at all, and no `ObjectRef::AnnouncedPeer` arm in persist's
+        // `is_load_bearing`, so nothing would refuse the delete on that table.
+        //
+        // Wiring the prune therefore needs the heartbeat first (a cheap
+        // liveness-only touch on the IgnoreStale path, which is a durable-write
+        // amplification decision of its own), and even then its trigger is a
+        // CLOCK — the one thing this table class' house pattern rules out
+        // (leviculum#49; clock-based validity was removed on purpose in
+        // persist#551/#557). What edge bounds instead is its own INTAKE, above:
+        // capacity backpressure over the unretained population, LRU victim,
+        // retained pinned, evictions counted.
+        //
         // CIRISEdge#362 (seeder bridge, persist v17.8.0) — also record the
         // announced peer as a non-canonical, untrusted directory BOOKMARK so a
         // LAN-announced peer surfaces in the server's `GET /v1/federation/peers`
@@ -7916,6 +8068,43 @@ async fn resolve_announce_cold_start(
             )
             .await;
     }
+}
+
+/// CIRISEdge#530 — choose the capacity-eviction victim: the
+/// **least-recently-confirmed UNRETAINED** binding, or `None` when every
+/// resident binding is retained.
+///
+/// Extracted from the admit path so the decision is unit-testable against the
+/// exact field shape the announce path produces, rather than only observable
+/// through a 4096-entry integration setup. The three properties it exists to
+/// hold, in the order they matter:
+///
+/// 1. **Retained is never a candidate.** `Rooted` bindings are filtered out
+///    BEFORE ordering, so no recency comparison can ever select one. The pin is
+///    structural, not a tie-break someone could later reorder into a bug.
+/// 2. **Victim selection is LRU, never arbitrary.** The pre-#530 code took the
+///    first `Advisory` entry in `HashMap` iteration (hash) order — a live peer
+///    was as likely to go as a long-dead one.
+/// 3. **Pressure is the only trigger.** This function is called ONLY at the cap.
+///    An old `last_seen` never evicts anything on its own; there is no clock-
+///    based validity here, which is the whole point (leviculum#49,
+///    persist#551/#557 — two decay mechanisms on different schedules is the
+///    two-lists-that-disagree class).
+///
+/// `None` means the map is all-retained; the caller admits the new entry anyway
+/// and exceeds the cap, because the cap targets advisory growth and must never
+/// shed an accord-blessed peer.
+fn select_capacity_victim(peers: &HashMap<String, RootedPeer>) -> Option<String> {
+    peers
+        .iter()
+        .filter(|(_, rp)| {
+            matches!(
+                rp.provenance,
+                ciris_persist::federation::self_at_login::BindingProvenance::Advisory
+            )
+        })
+        .min_by_key(|(_, rp)| rp.last_seen)
+        .map(|(k, _)| k.clone())
 }
 
 /// Verify the announce attestation signature against the **Ed25519
@@ -8600,6 +8789,148 @@ async fn with_timeout<F: std::future::Future>(dur: Duration, fut: F) -> Option<F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CIRISEdge#530 — the announce-intake capacity bound's victim selection.
+    ///
+    /// Driven through [`select_capacity_victim`] with the SAME `RootedPeer`
+    /// shape the announce admit path builds (the field-provenance discipline:
+    /// a decision function tested on convenient inputs is a green test on the
+    /// wrong path). Every arm below is a property the leviculum#49 house
+    /// pattern names explicitly.
+    mod announce_intake_capacity_bound {
+        use super::*;
+        use ciris_persist::federation::self_at_login::BindingProvenance;
+        use std::time::{Duration, Instant};
+
+        /// A binding in the exact shape the admit path inserts, with a chosen
+        /// provenance and LRU stamp. Everything else is the announce path's
+        /// own default for a test-injected peer.
+        fn peer(provenance: BindingProvenance, last_seen: Instant) -> RootedPeer {
+            RootedPeer {
+                peer: ResolvedPeer {
+                    dest_hash: DestinationHash::new([7u8; 16]),
+                    signing_key: [9u8; 32],
+                },
+                epoch: 0,
+                chain: None,
+                provenance,
+                transport_identity_hash: [0u8; 16],
+                owns_key: false,
+                transport_pubkey64: [0u8; 64],
+                last_seen,
+                manifest_commitment: None,
+            }
+        }
+
+        fn map<S: Into<String>>(
+            entries: Vec<(S, BindingProvenance, Instant)>,
+        ) -> HashMap<String, RootedPeer> {
+            entries
+                .into_iter()
+                .map(|(k, p, t)| (k.into(), peer(p, t)))
+                .collect()
+        }
+
+        /// PROPERTY 1 — LRU, not arbitrary. The least-recently-confirmed
+        /// Advisory binding is the victim, and the result must not depend on
+        /// `HashMap` iteration order (the pre-#530 `.find()` bug). Enough
+        /// entries that hash order is very unlikely to coincide with age order.
+        #[test]
+        fn victim_is_the_least_recently_confirmed_advisory() {
+            // Recency is built by ADDING to a base instant, never by subtracting
+            // from `now` — `Instant - Duration` can panic and the crate lints it.
+            // Larger offset = more recently confirmed.
+            let base = Instant::now();
+            let mut entries = vec![("stale-peer".to_string(), BindingProvenance::Advisory, base)];
+            for i in 1..64 {
+                entries.push((
+                    format!("fresh-{i}"),
+                    BindingProvenance::Advisory,
+                    base + Duration::from_secs(i),
+                ));
+            }
+            let peers = map(entries);
+            assert_eq!(
+                select_capacity_victim(&peers).as_deref(),
+                Some("stale-peer"),
+                "the oldest Advisory binding must be the victim regardless of hash order"
+            );
+        }
+
+        /// PROPERTY 2 — RETAINED IS NEVER EVICTED. A `Rooted` binding that is
+        /// far older than every Advisory one must still not be selected. This
+        /// is the arm that would red if the retention filter were ever
+        /// demoted to a tie-break inside the ordering.
+        #[test]
+        fn a_rooted_binding_is_never_the_victim_however_old() {
+            let base = Instant::now();
+            let peers = map(vec![
+                // The Rooted entry is the OLDEST thing in the map by a wide
+                // margin; the Advisory one is the newest. LRU alone would pick
+                // the Rooted one — the retention filter is what must not.
+                ("ancient-rooted", BindingProvenance::Rooted, base),
+                (
+                    "recent-advisory",
+                    BindingProvenance::Advisory,
+                    base + Duration::from_secs(1_000_000),
+                ),
+            ]);
+            assert_eq!(
+                select_capacity_victim(&peers).as_deref(),
+                Some("recent-advisory"),
+                "a Rooted binding must be pinned even when it is the oldest entry"
+            );
+        }
+
+        /// PROPERTY 3 — an ALL-RETAINED map yields no victim. The caller then
+        /// admits the new entry and exceeds the cap on purpose: the bound
+        /// targets advisory growth and must never shed an accord-blessed peer.
+        #[test]
+        fn an_all_rooted_map_has_no_victim() {
+            let base = Instant::now();
+            let peers = map(vec![
+                ("r1", BindingProvenance::Rooted, base),
+                (
+                    "r2",
+                    BindingProvenance::Rooted,
+                    base + Duration::from_secs(9),
+                ),
+            ]);
+            assert_eq!(
+                select_capacity_victim(&peers),
+                None,
+                "no unretained candidate must yield None, never a Rooted victim"
+            );
+        }
+
+        /// An empty map yields no victim (the cap is never reached, but the
+        /// function must not panic on the degenerate input).
+        #[test]
+        fn an_empty_map_has_no_victim() {
+            assert_eq!(select_capacity_victim(&HashMap::new()), None);
+        }
+
+        /// PROPERTY 4 — the counter is the "never silent" half of the pattern.
+        /// `EdgeMetrics` starts at zero and each eviction is one increment,
+        /// visible through the snapshot projection an operator actually reads.
+        #[test]
+        fn evictions_are_counted_and_surface_in_the_snapshot() {
+            let m = crate::observability::EdgeMetrics::new();
+            assert_eq!(
+                m.announce_intake_evictions(),
+                0,
+                "a fresh node has shed nothing"
+            );
+            m.inc_announce_intake_eviction();
+            m.inc_announce_intake_eviction();
+            assert_eq!(m.announce_intake_evictions(), 2);
+            assert_eq!(
+                m.snapshot().announce_intake_evictions,
+                2,
+                "the counter must reach the bundle an operator reads, not just the handle"
+            );
+        }
+    }
 
     /// Audit item 9 — opportunistic blackhole-rule pruning: an expired
     /// rule consulted on the send path is REMOVED then, not left to
@@ -9828,6 +10159,7 @@ mod tests {
                     transport_identity_hash: identity_hash_of64(&pk),
                     owns_key: false,
                     transport_pubkey64: pk,
+                    last_seen: std::time::Instant::now(),
                     manifest_commitment: commitment,
                 },
             );

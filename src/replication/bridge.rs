@@ -24,6 +24,40 @@
 //!   plane (the one kind persist does not index); every other plane's
 //!   fetch is the content-hash point-read below.
 //!
+//! ## How much of a plane one sweep reads (CIRISEdge#531)
+//!
+//! A production node runs one bulk sweep per `(peer, plane)` per round, times
+//! TWO — the advertise view and the holdings view — and the scheduler starts
+//! them phase-aligned, so ~72 sweeps enter a bulk read in the same millisecond
+//! at 6 peers × 6 planes. Two bounds shape that, and they are different
+//! resources:
+//!
+//! * **WIDTH** ([`SweepGate`], v18.6.0) — how many sweeps MATERIALISE at once.
+//!   A FIFO-fair semaphore, default 2 permits.
+//! * **DEPTH** ([`PlaneWatermark`] / [`SweepCursors`] / [`SweepWindow`]) — how
+//!   much of a plane ONE sweep reads. Width alone bounds
+//!   `permits × corpus × 2`, which still grows with the table; a page bounds it
+//!   at `permits × page × 2`, which does not.
+//!
+//! Depth has two windows, and which one a sweep gets is a CORRECTNESS choice,
+//! not a tuning one:
+//!
+//! * the **advertise** (send) axis is [`SweepWindow::Watermark`]: one page
+//!   budget per round against a per-`(peer, plane)` position — new rows first,
+//!   then a page of a rolling re-sweep that wraps. Reach is unbounded;
+//!   convergence is spread across rounds. The re-sweep is load-bearing, not
+//!   decorative: it is what lets a row refused TRANSIENTLY (AV-45), deferred by
+//!   a Deliver byte budget, or lost with a frame be offered again;
+//! * the **holdings** (receive) axis is [`SweepWindow::Full`]: paged for memory,
+//!   but COMPLETE in result. `want = remote ∖ holdings`, so a partial holdings
+//!   view leaves held rows in `want` forever and re-fetches them every round —
+//!   CIRISEdge#416's non-convergence, recreated by the fix for the memory.
+//!
+//! The cursor edge resumes from is persist's `(serve_position, resume_id)` PAIR
+//! ([`ResumeCursor`], CIRISPersist#668), never the instant alone: a page
+//! boundary inside a group of rows sharing one instant would otherwise skip the
+//! group's remainder, silently and permanently.
+//!
 //! ## envelope_hash semantics — content-hash (CIRISEdge#397)
 //!
 //! The envelope identity is each row's **content-hash**:
@@ -385,6 +419,16 @@ pub struct BridgeConfig {
     /// O(orgs × partners), far below the wire MTU concern that motivated
     /// pagination. Operators with very large operational rosters tune
     /// this downward and accept multiple round trips per round.
+    ///
+    /// CIRISEdge#531 — that last sentence was UNSAFE until the watermark
+    /// landed. The reads are `ORDER BY (pos, id) ASC`, so a cap with a `None`
+    /// cursor served the OLDEST N rows every round, forever: new rows —
+    /// including every new chat message — would stop being advertised the
+    /// moment the corpus exceeded the cap. Lowering this is safe now because
+    /// [`SweepWindow::Watermark`] carries the position between rounds; it is
+    /// still the REACH bound (what a node is willing to offer and serve), while
+    /// [`Self::sweep_page_rows`] is the MEMORY bound. The effective page is the
+    /// `min`.
     pub operational_page_limit: u32,
 
     /// CIRISEdge#531 — how many bulk advertise/holdings sweeps may be
@@ -393,11 +437,76 @@ pub struct BridgeConfig {
     /// disables the bound entirely (the pre-#531 behaviour) and is an escape
     /// hatch, not a supported production setting.
     pub advertise_sweep_permits: usize,
+
+    /// CIRISEdge#531 **DEPTH** — rows per SWEEP PAGE: how much of a plane one
+    /// bulk read materialises at a time. See
+    /// [`Self::DEFAULT_SWEEP_PAGE_ROWS`]. `0` disables paging (one whole-table
+    /// read per sweep — the pre-DEPTH behaviour), and is an escape hatch, not
+    /// a supported production setting.
+    ///
+    /// This is the knob that makes the memory FLAT. [`Self::advertise_sweep_permits`]
+    /// bounds `permits × corpus × 2`, which still grows with the table; with a
+    /// finite page the same product becomes `permits × page × 2`, which does
+    /// not. It is a separate field from [`Self::operational_page_limit`]
+    /// because that one is the operator's *reach* bound (and the accord
+    /// cursor's truncation sentinel keys on it); this one is a *materialisation*
+    /// bound that costs nothing but rounds. The effective page is the `min` of
+    /// the two.
+    pub sweep_page_rows: u32,
 }
 
 impl BridgeConfig {
     /// Default for [`Self::operational_page_limit`].
     pub const DEFAULT_OPERATIONAL_PAGE_LIMIT: u32 = u32::MAX;
+
+    /// CIRISEdge#531 DEPTH — default for [`Self::sweep_page_rows`]: **1024**.
+    ///
+    /// ## Why a page at all
+    ///
+    /// [`Self::DEFAULT_ADVERTISE_SWEEP_PERMITS`] bounds how many whole-table
+    /// `Vec`s are alive at once; it does not bound the table. On the measured
+    /// box (CIRISServer#476) the corpus was 14,616 attestations = 194.8 MiB,
+    /// and a second node on the same host carried 52,125 rows. `permits ×
+    /// corpus × 2` grows with the corpus, so the width bound buys time, not
+    /// safety. A page turns the same product into a constant:
+    ///
+    /// ```text
+    ///   1024 rows × ~24.5 KiB/row (the trace family, the heaviest)  ≈ 25 MiB
+    ///   peak ≈ permits × page_payload × 2  =  2 × 25 MiB × 2  ≈  100 MiB
+    /// ```
+    ///
+    /// — flat in the corpus, against 780 MiB at 14.6k rows and ~2.8 GB
+    /// unbounded.
+    ///
+    /// ## Why 1024 and not smaller
+    ///
+    /// The page also sets the ROLLING RE-SWEEP period: after a peer's
+    /// watermark catches up, every row is re-offered once per
+    /// `ceil(corpus / page)` rounds (see [`SweepCursors`]). At 52k rows and
+    /// the 30 s default cadence that is ~51 rounds ≈ 25 min — the outer bound
+    /// on how long a TRANSIENTLY-refused row (AV-45 `retry_after_community_roster`)
+    /// can wait for its next offer. Halving the page halves the memory and
+    /// doubles that wait. 1024 keeps both defensible without tuning; an
+    /// operator on a big corpus who cares more about re-offer latency than
+    /// about 25 MiB raises it.
+    ///
+    /// ## Why paging is not an I/O regression
+    ///
+    /// Every `list_*_since` cursor is index-backed as of persist v36
+    /// (migration `V130__serve_cursor_local_admission_instants` creates
+    /// `<table>_admitted ON (COALESCE(admitted_at, …), <id>)` for all 13
+    /// planes), so a page is an index RANGE SCAN — `O(page)`, not a re-sort
+    /// of the table. Without that index, paging would have turned one full
+    /// scan per round into many, and this change would be wrong; it is the
+    /// load-bearing fact under the whole DEPTH design.
+    pub const DEFAULT_SWEEP_PAGE_ROWS: u32 = 1024;
+
+    /// CIRISEdge#531 DEPTH — process-level override for
+    /// [`Self::sweep_page_rows`], read ONCE at runtime assembly, for the same
+    /// reason [`Self::ADVERTISE_SWEEP_PERMITS_ENV`] exists: the deployment
+    /// that OOMed never constructs a [`BridgeConfig`]. `0` disables paging;
+    /// an unparseable value is IGNORED with a WARN.
+    pub const SWEEP_PAGE_ROWS_ENV: &'static str = "CIRIS_EDGE_SWEEP_PAGE_ROWS";
 
     /// CIRISEdge#531 — default for [`Self::advertise_sweep_permits`]: **2**.
     ///
@@ -473,6 +582,7 @@ impl Default for BridgeConfig {
         Self {
             operational_page_limit: Self::DEFAULT_OPERATIONAL_PAGE_LIMIT,
             advertise_sweep_permits: Self::DEFAULT_ADVERTISE_SWEEP_PERMITS,
+            sweep_page_rows: Self::DEFAULT_SWEEP_PAGE_ROWS,
         }
     }
 }
@@ -505,12 +615,21 @@ impl Default for BridgeConfig {
 ///
 /// ## Re-entrancy
 ///
-/// The gate is entered at EXACTLY ONE layer: the [`ReplicationDirectory`] impl
-/// methods on the bridge. `list_envelope_refs_for_peer` and `list_holdings`
-/// both fall through to the shared advertise builder, so they call the
-/// permit-free `list_envelope_refs_unbounded` rather than the trait method — a
-/// second acquire while already holding one would self-deadlock at
-/// `permits == 1`. `sweep_gate_is_not_re_entrant` pins that for every kind.
+/// The gate is entered at EXACTLY ONE layer, and CIRISEdge#531 DEPTH moved
+/// which layer that is: v18.6.0 took the permit at the [`ReplicationDirectory`]
+/// trait boundary, once per sweep; it is now taken around exactly ONE PAGE's
+/// read plus that page's projection — [`FederationDirectoryReplicationBridge::sweep_paged`],
+/// `attestation_page`, `accord_evidence_page`, and `fan_out_for_member`'s
+/// per-member read. Nothing above those takes one.
+///
+/// The move is what keeps the bound from becoming a liveness bug once a sweep
+/// is many reads: a `Full` holdings drain of a large plane would otherwise hold
+/// one of two permits for its whole duration, and a FIFO-fair queue behind a
+/// long hold is a long queue for every other plane. The invariant is also
+/// stronger to state than the boundary version — *a permit covers one page,
+/// never a caller of one* — and a second acquire while holding one still
+/// self-deadlocks at `permits == 1`, which is what
+/// `sweep_gate_is_not_re_entrant` pins for every kind and every entry point.
 #[derive(Debug)]
 struct SweepGate {
     /// `None` = unbounded (`advertise_sweep_permits == 0`), so the disabled
@@ -525,14 +644,42 @@ struct SweepGate {
     /// that has to be checkable rather than asserted (the same discipline as
     /// `owner_reads` above).
     max_in_flight: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#531 DEPTH — CUMULATIVE entries. The depth fix moved the
+    /// acquire from "once per sweep" to "once per PAGE", and that is a claim
+    /// with a number attached: a `Full` drain of `ceil(rows / page)` pages must
+    /// show that many entries, not one. Without this the difference between
+    /// "released between pages" and "held across the whole drain" is invisible
+    /// to a test, and holding it across the drain is the exact starvation shape
+    /// the width bound was built to avoid.
+    entries: std::sync::atomic::AtomicUsize,
 }
 
 impl SweepGate {
+    /// CIRISEdge#531 (review finding, v18.6.0 follow-up) — the permit count is
+    /// CLAMPED to [`tokio::sync::Semaphore::MAX_PERMITS`] (`usize::MAX >> 3`)
+    /// before construction.
+    ///
+    /// `Semaphore::new` PANICS above that ceiling. The documented contract for
+    /// [`BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV`] is that a bad value is
+    /// ignored and the default retained — and a value that parses as a `usize`
+    /// but exceeds the ceiling (`18446744073709551615`) sailed past the parse
+    /// check and took the node down AT BOOT, on an operator typo, in the one
+    /// code path whose entire purpose is keeping a wedged box alive. The env
+    /// resolver now rejects such a value with a WARN
+    /// (`replication::runtime::resolve_sweep_permits`); this clamp is the belt
+    /// under that brace, because `advertise_sweep_permits` is also a plain
+    /// public field any downstream may set directly.
+    ///
+    /// Clamping rather than refusing: a caller asking for `usize::MAX` permits
+    /// is asking for "effectively unbounded", and `MAX_PERMITS` IS effectively
+    /// unbounded — honouring the intent beats panicking on the arithmetic.
     fn new(permits: usize) -> Self {
+        let permits = permits.min(tokio::sync::Semaphore::MAX_PERMITS);
         Self {
             sem: (permits > 0).then(|| Arc::new(tokio::sync::Semaphore::new(permits))),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            entries: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -554,6 +701,8 @@ impl SweepGate {
             + 1;
         self.max_in_flight
             .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        self.entries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         SweepPermit {
             gate: self,
             _permit: permit,
@@ -584,6 +733,284 @@ impl Drop for SweepPermit<'_> {
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
+
+// ─── CIRISEdge#531 DEPTH — the advertise WATERMARK ───────────────────
+
+/// persist v36 (CIRISPersist#668) keyset-pagination cursor: the
+/// `(serve_position, resume_id)` PAIR every `Served*` wrapper yields from its
+/// `resume_pair()`, and the value every `list_*_since` takes back.
+///
+/// The pair, never the instant alone — that is the whole of #531's
+/// "timestamp-collision skip" hazard, and persist already solved it: the page
+/// is ordered by `(pos, id)` and filtered `pos > ?1 OR (pos = ?1 AND id > ?2)`,
+/// so a tie LARGER than one page resumes into the middle of the tie instead of
+/// skipping its remainder. Edge's job is only to stop throwing the pair away.
+type ResumeCursor = (chrono::DateTime<chrono::Utc>, String);
+
+/// CIRISEdge#531 DEPTH — one peer's advertise position on one plane.
+///
+/// ## Why there are TWO cursors and not one
+///
+/// A single monotonic cursor bounds memory and breaks convergence. Three
+/// things a peer must still be offered live BEHIND a cursor that has passed
+/// them:
+///
+///   1. a row the peer refused TRANSIENTLY (v18.4.0's AV-45
+///      `retry_after_community_roster`: correctly refused now, admissible once
+///      the roster lands). The refusal happens on the RECEIVER and is never
+///      reported back, so the sender cannot keep a "recently refused" replay
+///      set — it does not know. `ApplyRefusalClass::is_transient`'s documented
+///      guarantee is literally *"the next Summary/Diff re-offers it"*, which is
+///      a claim about the SENDER's advertise set;
+///   2. a row the peer wanted but whose `Deliver` did not fit the round's byte
+///      budget (`session::pack_bounded_deliver` defers the remainder to "the
+///      peer's `want` next round" — which only works if we still advertise it);
+///   3. a row lost with a dropped frame.
+///
+/// So the watermark must be an OPTIMISATION, never a one-way door. The second
+/// cursor is that door-stop: a rolling re-sweep that walks the whole plane from
+/// the beginning, one page per round, and wraps.
+///
+/// ## The round
+///
+/// * **[`Self::high_water`]** — the NEW-ROWS cursor. Read first, with the whole
+///   page budget. In steady state this is empty or a handful of rows, and a row
+///   admitted between rounds (every new chat message) is offered in the NEXT
+///   round, not one re-sweep cycle later. This is why new rows do not pay the
+///   backfill's latency.
+/// * **[`Self::backfill`]** — the rolling re-sweep cursor. Gets whatever page
+///   budget the new-rows read did not spend, so a busy plane cannot starve it
+///   to zero and an idle one gives it the whole page. Wraps to `None` at the
+///   end of the plane.
+/// * **[`Self::caught_up`]** — until the new-rows walk has reached the end of
+///   the plane once, that walk IS the first re-sweep pass, so the backfill
+///   tracks it and no second read happens. This is what keeps a COLD peer's
+///   catch-up at one page per round instead of two.
+///
+/// ## Lifecycle
+///
+/// In memory, per process. A restart re-sweeps every peer from the beginning —
+/// which costs WORK and converges, rather than costing correctness. That is a
+/// deliberate v1 choice: persisting the watermark would make a mis-persisted
+/// cursor able to strand rows across restarts, which is the failure this whole
+/// design refuses to have. Evicted by [`SweepCursors`]'s cap, which is likewise
+/// only a re-sweep.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PlaneWatermark {
+    /// Highest `(pos, id)` this peer has been offered on this plane.
+    high_water: Option<ResumeCursor>,
+    /// The rolling re-sweep position. `None` = start over from the beginning.
+    backfill: Option<ResumeCursor>,
+    /// Has [`Self::high_water`] reached the end of the plane at least once?
+    caught_up: bool,
+    /// Monotonic touch tick, for the cap's least-recently-used eviction.
+    touched: u64,
+}
+
+/// CIRISEdge#531 DEPTH — the second page of a round, when the new-rows read
+/// left budget for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackfillPage {
+    since: Option<ResumeCursor>,
+    budget: u32,
+}
+
+/// CIRISEdge#531 DEPTH — the per-`(peer, plane)` advertise watermarks.
+///
+/// PURE: no directory, no clock, no I/O. The convergence properties of the
+/// whole DEPTH change are properties of this state machine, so it is separated
+/// from everything that would need a federation fixture to exercise (the same
+/// discipline as [`OwnerCache`]).
+#[derive(Debug, Default)]
+struct SweepCursors {
+    by_peer_plane: HashMap<(String, EnvelopeKind), PlaneWatermark>,
+    /// Monotonic tick, incremented on every touch, so eviction can be LRU
+    /// without a clock.
+    tick: u64,
+}
+
+/// CIRISEdge#531 DEPTH — how many `(peer, plane)` watermarks are retained.
+///
+/// Peers churn (CIRISEdge#532's link churn is on the same node), and an
+/// unreapable per-peer map is exactly the shape CIRISEdge#530 is open about on
+/// the announce plane. 512 entries ≈ 40 peers × 13 planes; a `PlaneWatermark`
+/// is two small cursors, so the whole map is kilobytes. Evicting the
+/// least-recently-touched entry costs that peer one re-sweep from the
+/// beginning — the same "costs work, not correctness" trade the restart makes.
+const MAX_TRACKED_SWEEP_CURSORS: usize = 512;
+
+impl SweepCursors {
+    /// The `since` for this round's NEW-ROWS page.
+    fn head(&mut self, key: &(String, EnvelopeKind)) -> Option<ResumeCursor> {
+        self.touch(key).high_water.clone()
+    }
+
+    /// Record the new-rows page and decide whether a backfill page follows.
+    ///
+    /// `served` is how many rows the read RETURNED (not how many survived the
+    /// projection gates — the gates shape the offer, the cursor tracks the
+    /// READ), `budget` is what was asked for, and `last` is the final row's
+    /// [`ResumeCursor`].
+    fn after_head(
+        &mut self,
+        key: &(String, EnvelopeKind),
+        served: usize,
+        budget: u32,
+        last: Option<ResumeCursor>,
+    ) -> Option<BackfillPage> {
+        let wm = self.touch(key);
+        let short = served < budget as usize;
+        if let Some(c) = last {
+            wm.high_water = Some(c);
+        }
+        if !wm.caught_up {
+            if short {
+                // First time the forward walk has reached the end of the
+                // plane: that walk WAS the first full pass, so the rolling
+                // re-sweep starts over from the beginning NEXT round rather
+                // than re-reading the tail we have just read.
+                wm.caught_up = true;
+                wm.backfill = None;
+            } else {
+                // Still catching up. The forward walk is the sweep; a second
+                // read would double a cold peer's per-round cost for nothing.
+                wm.backfill.clone_from(&wm.high_water);
+            }
+            return None;
+        }
+        let remaining = budget.saturating_sub(u32::try_from(served).unwrap_or(u32::MAX));
+        (remaining > 0).then(|| BackfillPage {
+            since: wm.backfill.clone(),
+            budget: remaining,
+        })
+    }
+
+    /// Record the backfill page: advance, or WRAP to the beginning when the
+    /// page came back short (the end of the plane).
+    fn after_backfill(
+        &mut self,
+        key: &(String, EnvelopeKind),
+        served: usize,
+        budget: u32,
+        last: Option<ResumeCursor>,
+    ) {
+        let wm = self.touch(key);
+        if served < budget as usize {
+            wm.backfill = None;
+        } else if let Some(c) = last {
+            wm.backfill = Some(c);
+        }
+    }
+
+    /// Fetch-or-create, stamping the LRU tick and enforcing the cap.
+    fn touch(&mut self, key: &(String, EnvelopeKind)) -> &mut PlaneWatermark {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        if !self.by_peer_plane.contains_key(key)
+            && self.by_peer_plane.len() >= MAX_TRACKED_SWEEP_CURSORS
+        {
+            self.evict_oldest();
+        }
+        let wm = self.by_peer_plane.entry(key.clone()).or_default();
+        wm.touched = tick;
+        wm
+    }
+
+    /// Drop the least-recently-touched entry. Costs that peer a re-sweep from
+    /// the beginning, never a skipped row.
+    fn evict_oldest(&mut self) {
+        let Some(victim) = self
+            .by_peer_plane
+            .iter()
+            .min_by_key(|(_, wm)| wm.touched)
+            .map(|(k, _)| k.clone())
+        else {
+            return;
+        };
+        tracing::debug!(
+            peer = %victim.0,
+            kind = ?victim.1,
+            cap = MAX_TRACKED_SWEEP_CURSORS,
+            "advertise watermark EVICTED at the cap — this peer/plane re-sweeps \
+             from the beginning (costs a cycle of work, never a skipped row; \
+             CIRISEdge#531)"
+        );
+        self.by_peer_plane.remove(&victim);
+    }
+}
+
+/// CIRISEdge#531 DEPTH — how much of a plane ONE sweep is allowed to see.
+///
+/// The distinction is not cosmetic: [`Self::Watermark`] is the SEND axis (what
+/// this node OFFERS a peer this round — a page, converging over rounds), and
+/// [`Self::Full`] is the RECEIVE axis (`want = remote ∖ holdings`), which MUST
+/// be complete. Watermarking the holdings view would leave a held-but-unlisted
+/// row in `want` forever and re-fetch it every round — CIRISEdge#416's
+/// non-convergence, re-created by the fix for the memory. `Full` is still
+/// PAGED — it just keeps every page's refs instead of only the last one's, so
+/// its memory is `O(page rows + corpus × 40 bytes)` rather than
+/// `O(corpus rows)`. On the measured corpus that is ~25 MiB + 2 MiB against
+/// 195 MiB.
+#[derive(Debug, Clone, Copy)]
+enum SweepWindow<'a> {
+    /// Drain every page; the RESULT is the complete set.
+    Full,
+    /// One page budget against this peer's watermark for this plane.
+    Watermark(&'a str),
+}
+
+/// CIRISEdge#531 DEPTH — the Attestation sweep's per-ROUND state, threaded
+/// across the round's pages.
+///
+/// Every field was already a once-per-sweep fact when a sweep was one read.
+/// Paging turned "per sweep" into "per page" unless they are hoisted, and the
+/// two caches here are directory reads: `serve_allowed` is one KeyRecord
+/// capability lookup, `grant_cache` one consent-grant parse per owner, and
+/// `quarantine_memo` one standing read per distinct author. Re-resolving them
+/// per page is the CIRISEdge#400 shape (a per-record re-resolution that blew
+/// the round budget), so they live here rather than inside
+/// [`FederationDirectoryReplicationBridge::attestation_page`].
+struct AttestationSweepCtx {
+    /// The consent-membership proof for this peer (`None` = peer-blind view).
+    resolved_recipient: Option<ResolvedRecipient>,
+    /// The `SelfOwn` publish set for the projection filter.
+    self_set: HashSet<String>,
+    /// CIRISEdge#379 — the peer's `infra:serve` capability, resolved lazily on
+    /// the first gated row and then for the whole round.
+    serve_allowed: Option<bool>,
+    /// CIRISEdge#396 item 6 — per-owner parsed consent grants.
+    grant_cache: HashMap<String, Vec<ConsentTransferPolicy>>,
+    /// CIRISEdge#440 — is the `trace:*` plane paused by a live relief?
+    trace_paused: bool,
+    /// Book the pause ONCE per round, not once per page and not once per row.
+    trace_pause_booked: bool,
+    /// CIRISEdge#440 ask 3 — per-author quarantine standing.
+    quarantine_memo: HashMap<String, QuarantineConsult>,
+}
+
+/// CIRISEdge#531 DEPTH — the hard stop on a [`SweepWindow::Full`] drain.
+///
+/// A `Full` drain loops until a page comes back short. Every exit depends on
+/// persist returning fewer rows than asked for eventually; a backend that
+/// ignored `limit`, or a cursor that could not advance, would spin forever
+/// inside a permit. 4096 pages × the default 1024 rows = 4.2M rows per plane,
+/// far above any real corpus and far below "forever". Hitting it is LOUD and
+/// truncates the holdings view for that round — which re-wants rows we hold
+/// (wasteful, self-correcting) rather than hanging the node.
+const MAX_FULL_DRAIN_PAGES: usize = 4096;
+
+/// CIRISEdge#531 — the byte budget on ONE accord-quorum-evidence cursor page.
+///
+/// Every other `Deliver` on the wire is byte-bounded
+/// ([`crate::replication::session::MAX_DELIVER_ENVELOPE_BYTES`] for the
+/// Diff-driven path, [`crate::replication::session::PROACTIVE_PUSH_BUDGET_BYTES`]
+/// for the proactive push); the cursor plane's Deliver was the ONE that was not
+/// — it served a whole page of serialized bundles, and that page then stayed
+/// resident through the send. This is the same 512 KiB the Diff path uses, for
+/// the same reason: it bounds the frame so its fragment count stays
+/// reassemblable under loss, and here it also bounds RETENTION, which the sweep
+/// permit cannot (the permit is gone before the bytes reach the session).
+const CURSOR_PAGE_BUDGET_BYTES: usize = 512 * 1024;
 
 /// Type alias for the cohort provider — an operator-configured
 /// callback yielding the federation key_ids we want to anti-entropy
@@ -762,6 +1189,26 @@ pub struct FederationDirectoryReplicationBridge {
     /// the #312 responder factory, hot-adds) — so one gate here IS the
     /// node-wide bound, with no separate registry to keep in sync.
     sweep_gate: SweepGate,
+    /// CIRISEdge#531 DEPTH — the per-`(peer, plane)` advertise watermarks. See
+    /// [`SweepCursors`] / [`PlaneWatermark`]. On the bridge for the same reason
+    /// [`Self::sweep_gate`] is: the ONE production bridge is shared by every
+    /// coordinator, so a peer's position is the same fact whichever task
+    /// observes it — an initiator sweep and the #312 responder sweep for the
+    /// same `(peer, kind)` share one cursor and therefore cannot re-offer the
+    /// same page twice per round.
+    ///
+    /// `std::sync::Mutex`, never held across an `.await`: the lock is taken to
+    /// read a cursor, dropped, the page is read, then taken again to record it.
+    sweep_cursors: Mutex<SweepCursors>,
+    /// CIRISEdge#531 DEPTH — the largest row count ANY single page read has
+    /// returned on this bridge. The flat bound's own witness, in the same
+    /// discipline as [`Self::sweep_gate`]'s `max_in_flight` and
+    /// [`Self::owner_reads`]: "one sweep materialises at most one page" is a
+    /// claim, and a claim about memory that no test can observe is the kind
+    /// that silently stops being true. A value above the configured budget
+    /// means a bulk read was wired past the page driver. `SeqCst` because it
+    /// exists to be asserted on.
+    sweep_max_page_rows: std::sync::atomic::AtomicUsize,
 }
 
 /// CIRISEdge#523 — one memoized owner-binding resolution for one node.
@@ -896,6 +1343,8 @@ impl FederationDirectoryReplicationBridge {
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
+            sweep_cursors: Mutex::new(SweepCursors::default()),
+            sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -938,6 +1387,8 @@ impl FederationDirectoryReplicationBridge {
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
+            sweep_cursors: Mutex::new(SweepCursors::default()),
+            sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1212,6 +1663,300 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// CIRISEdge#531 DEPTH — the row budget ONE sweep page may materialise.
+    ///
+    /// `min` of the operator's reach bound ([`Self::effective_page_limit`],
+    /// which a mesh-config relief can shrink further) and the materialisation
+    /// bound ([`BridgeConfig::sweep_page_rows`]). Never zero: a zero budget
+    /// would make a [`SweepWindow::Full`] drain read empty pages forever, so
+    /// the floor is one row — a pathological config costs rounds, never a spin.
+    async fn sweep_page_budget(&self) -> u32 {
+        let limit = self.effective_page_limit().await;
+        match self.config.sweep_page_rows {
+            // 0 = paging disabled (the documented escape hatch): one page IS
+            // the operator's whole reach bound, i.e. the pre-DEPTH read.
+            0 => limit,
+            rows => rows.min(limit),
+        }
+        .max(1)
+    }
+
+    /// CIRISEdge#531 DEPTH — the watermark key for this sweep, or `None` for a
+    /// [`SweepWindow::Full`] drain (which has no peer and keeps no position).
+    fn watermark_key(
+        window: SweepWindow<'_>,
+        kind: EnvelopeKind,
+    ) -> Option<(String, EnvelopeKind)> {
+        match window {
+            SweepWindow::Full => None,
+            SweepWindow::Watermark(peer) => Some((peer.to_owned(), kind)),
+        }
+    }
+
+    /// CIRISEdge#531 DEPTH — this round's NEW-ROWS `since` for `key`.
+    fn sweep_head(&self, key: &(String, EnvelopeKind)) -> Option<ResumeCursor> {
+        self.sweep_cursors.lock().ok().and_then(|mut c| c.head(key))
+    }
+
+    /// CIRISEdge#531 DEPTH — record the new-rows page; get the backfill plan.
+    fn sweep_after_head(
+        &self,
+        key: &(String, EnvelopeKind),
+        served: usize,
+        budget: u32,
+        last: Option<ResumeCursor>,
+    ) -> Option<BackfillPage> {
+        self.sweep_cursors
+            .lock()
+            .ok()
+            .and_then(|mut c| c.after_head(key, served, budget, last))
+    }
+
+    /// CIRISEdge#531 DEPTH — the LATER of two cursor positions, treating
+    /// `None` as "from the beginning" (i.e. the earliest possible position).
+    ///
+    /// Used to combine a peer's watermark with the floor its `CursorPull`
+    /// declared: neither may pull the serve position BACKWARD, so the answer is
+    /// whichever is further along.
+    fn later_cursor(a: Option<ResumeCursor>, b: Option<ResumeCursor>) -> Option<ResumeCursor> {
+        match (a, b) {
+            (None, x) | (x, None) => x,
+            (Some(x), Some(y)) => Some(if x >= y { x } else { y }),
+        }
+    }
+
+    /// CIRISEdge#531 DEPTH — read ONE accord-evidence page and serialize it
+    /// under the byte budget.
+    ///
+    /// Returns `(bytes, page_len_for_the_cursor, last_SERVED_resume_pair)`.
+    ///
+    /// The two subtleties, both load-bearing:
+    ///
+    ///  * the cursor advances to the last bundle actually **served**, never the
+    ///    last one read. Everywhere else in this file the watermark tracks the
+    ///    READ (policy gates shape the offer, not the position); here the
+    ///    truncation is a BUDGET, so advancing past an unserved bundle would
+    ///    skip it for a whole re-sweep cycle;
+    ///  * the length reported to the cursor machine is the READ length. A page
+    ///    cut short by bytes was still a FULL read, and reporting the served
+    ///    count would look like "end of plane" and wrap the re-sweep early.
+    async fn accord_evidence_page(
+        &self,
+        since: Option<ResumeCursor>,
+        budget: u32,
+    ) -> (Vec<Vec<u8>>, usize, Option<ResumeCursor>) {
+        let bundles = match self
+            .directory
+            .list_signed_accord_quorum_evidence_since(since, budget)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "accord-quorum-evidence cursor serve read failed (CIRISEdge#474)"
+                );
+                return (Vec::new(), 0, None);
+            }
+        };
+        let read = bundles.len();
+        self.record_page(read);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut bytes_used = 0usize;
+        let mut last: Option<ResumeCursor> = None;
+        for b in &bundles {
+            let encoded = match serde_json::to_vec(b) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // v18 — was a silent `filter_map(.. .ok())` two lines from
+                    // the loud read-error arm above: a bundle that will not
+                    // serialize is OMITTED from every cursor page and never
+                    // replicates from this node. Loud + booked (#433).
+                    //
+                    // The cursor still advances past it (`last` is stamped
+                    // below): a bundle that cannot serialize will not serialize
+                    // next round either, and wedging the whole peer's position
+                    // behind one poison row would strand every bundle after it.
+                    tracing::warn!(
+                        error = %e,
+                        "accord-quorum-evidence bundle could not be serialized for \
+                         the wire — OMITTED from this cursor page; it will not \
+                         replicate from this node (CIRISEdge#474/#433)"
+                    );
+                    self.withhold(
+                        crate::observability::WithholdReason::RowNotSerializable,
+                        "<unattributed>",
+                        "accord_evidence_since: to_vec failed",
+                    );
+                    last = Some((b.evidence_at, b.proposal.digest()));
+                    continue;
+                }
+            };
+            // A single bundle larger than the whole budget still ships, ALONE —
+            // a budget must bound the batch, never strand an envelope (the
+            // `session::pack_bounded_deliver` rule, applied to the one Deliver
+            // path that never had it).
+            if !out.is_empty() && bytes_used + encoded.len() > CURSOR_PAGE_BUDGET_BYTES {
+                break;
+            }
+            bytes_used += encoded.len();
+            out.push(encoded);
+            last = Some((b.evidence_at, b.proposal.digest()));
+        }
+        if out.len() < read {
+            tracing::debug!(
+                read,
+                served = out.len(),
+                bytes_used,
+                budget_bytes = CURSOR_PAGE_BUDGET_BYTES,
+                "accord-quorum-evidence page cut at the BYTE budget — the remainder \
+                 rides the next round from this peer's watermark (CIRISEdge#531)"
+            );
+        }
+        (out, read, last)
+    }
+
+    /// CIRISEdge#531 DEPTH — record the backfill page (advance, or wrap).
+    fn sweep_after_backfill(
+        &self,
+        key: &(String, EnvelopeKind),
+        served: usize,
+        budget: u32,
+        last: Option<ResumeCursor>,
+    ) {
+        if let Ok(mut c) = self.sweep_cursors.lock() {
+            c.after_backfill(key, served, budget, last);
+        }
+    }
+
+    /// CIRISEdge#531 DEPTH — drive one plane's round under `window`, turning
+    /// each page into refs and dropping that page's ROWS before the next read.
+    ///
+    /// This is the whole flat-memory mechanism for the 12 planes whose per-row
+    /// projection is pure. The Attestation plane runs the identical page plan
+    /// with its own loop, because its per-row gates are `async` and carry
+    /// per-sweep memos ([`Self::list_attestations`]).
+    ///
+    /// ## The permit is per PAGE
+    ///
+    /// v18.6.0 held one [`SweepGate`] permit across a whole sweep, which was
+    /// right when a sweep was one read. Now a `Full` drain is many reads, and
+    /// holding one permit across all of them would turn the FIFO-fair gate
+    /// into a long queue for every other plane — the starvation the width fix
+    /// was careful not to create. So the permit is acquired around exactly one
+    /// page's read + projection and released between pages: the bound becomes
+    /// `permits × page`, which is both flat AND short-held.
+    // Eight parameters, and each is a distinct axis of ONE plane's sweep:
+    // which plane, how much of it, how to read a page, how to resume, which
+    // rows are in scope, what their `seq` is, and what gets hashed. Bundling
+    // them into a struct would just move the same eight behind a name and cost
+    // every call site a builder. The alternative — 13 hand-written page loops —
+    // is what this exists to prevent.
+    #[allow(clippy::too_many_arguments)]
+    async fn sweep_paged<S, Read, Fut, T, IN, RS, TS, C>(
+        &self,
+        kind: EnvelopeKind,
+        window: SweepWindow<'_>,
+        read: Read,
+        resume: RS,
+        in_scope: IN,
+        seq_of: TS,
+        content_of: C,
+    ) -> Vec<EnvelopeRef>
+    where
+        T: serde::Serialize,
+        Read: Fn(Option<ResumeCursor>, u32) -> Fut,
+        Fut: std::future::Future<Output = Vec<S>>,
+        RS: Fn(&S) -> ResumeCursor,
+        IN: Fn(&S) -> bool,
+        TS: Fn(&S) -> u64,
+        C: Fn(&S) -> &T,
+    {
+        let budget = self.sweep_page_budget().await;
+        let mut refs = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let Some(key) = Self::watermark_key(window, kind) else {
+            // ── FULL drain: page for MEMORY, keep every page's refs. ──
+            let mut since: Option<ResumeCursor> = None;
+            for page in 0..MAX_FULL_DRAIN_PAGES {
+                let (served, last) = {
+                    let _permit = self.sweep_gate.enter().await;
+                    let rows = read(since.clone(), budget).await;
+                    self.record_page(rows.len());
+                    self.advertise_page_into(
+                        &rows,
+                        &in_scope,
+                        &seq_of,
+                        &content_of,
+                        &mut refs,
+                        &mut seen,
+                    );
+                    (rows.len(), rows.last().map(&resume))
+                };
+                if served < budget as usize {
+                    return refs;
+                }
+                if last.is_none() || last == since {
+                    // Cannot advance: a backend returned a FULL page and either
+                    // no cursor or the same cursor twice. Stopping is the only
+                    // safe move — looping would spin inside a permit — but it
+                    // truncates the holdings view, so it never does it quietly.
+                    tracing::warn!(
+                        kind = ?kind,
+                        budget,
+                        "holdings drain CANNOT ADVANCE — a full page came back with \
+                         no new resume cursor, so this round's holdings view is \
+                         truncated and rows past it are re-wanted from peers even \
+                         though they are held (CIRISEdge#531)"
+                    );
+                    break;
+                }
+                since = last;
+                if page + 1 == MAX_FULL_DRAIN_PAGES {
+                    tracing::warn!(
+                        kind = ?kind,
+                        pages = MAX_FULL_DRAIN_PAGES,
+                        budget,
+                        "holdings drain hit the page CAP — this round's holdings view is \
+                         TRUNCATED, so rows past the cap are re-wanted from peers even \
+                         though they are held (wasteful, self-correcting). Raise \
+                         `sweep_page_rows` or investigate a plane this large \
+                         (CIRISEdge#531)"
+                    );
+                }
+            }
+            return refs;
+        };
+
+        // ── WATERMARK: new rows first, then the rolling re-sweep. ──
+        let head = self.sweep_head(&key);
+        let (served, last) = {
+            let _permit = self.sweep_gate.enter().await;
+            let rows = read(head, budget).await;
+            self.record_page(rows.len());
+            self.advertise_page_into(&rows, &in_scope, &seq_of, &content_of, &mut refs, &mut seen);
+            (rows.len(), rows.last().map(&resume))
+        };
+        if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
+            let (b_served, b_last) = {
+                let _permit = self.sweep_gate.enter().await;
+                let rows = read(plan.since, plan.budget).await;
+                self.record_page(rows.len());
+                self.advertise_page_into(
+                    &rows,
+                    &in_scope,
+                    &seq_of,
+                    &content_of,
+                    &mut refs,
+                    &mut seen,
+                );
+                (rows.len(), rows.last().map(&resume))
+            };
+            self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
+        }
+        refs
+    }
+
     /// CIRISEdge#440 — is the `trace:*` plane paused by a live
     /// `feature.trace_replication=0` relief? `false` on every absence path.
     async fn trace_plane_paused(&self) -> bool {
@@ -1284,19 +2029,24 @@ impl FederationDirectoryReplicationBridge {
         Some(out)
     }
 
-    /// CIRISEdge#531 — the advertise build WITHOUT the sweep permit.
+    /// CIRISEdge#531 — the advertise build plus the removal-receipt bookkeeping.
     ///
-    /// Exists so the three [`ReplicationDirectory`] entry points that fall
-    /// through to the advertise view (`list_envelope_refs`,
-    /// `list_envelope_refs_for_peer`'s non-Attestation arm, `list_holdings`'
-    /// `_ =>` arm) can each take the permit ONCE at their own boundary instead
-    /// of nesting an acquire inside an acquire. This is the whole re-entrancy
-    /// discipline: a permit is taken at the trait layer and never below it.
-    ///
-    /// Do NOT call this from outside the trait impl — it is the unbounded path
-    /// by construction.
-    async fn list_envelope_refs_unbounded(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        let refs = self.list_envelope_refs_inner(kind).await;
+    /// v18.6.0 (WIDTH) had the [`ReplicationDirectory`] entry points take a
+    /// sweep permit at the trait boundary and call this permit-FREE builder
+    /// below it, so an acquire could never nest. CIRISEdge#531 DEPTH moves the
+    /// acquire DOWN, to exactly one page's read + projection
+    /// ([`Self::sweep_paged`], [`Self::attestation_page`],
+    /// [`Self::fan_out_for_member`]) — a `Full` drain is now many reads, and one
+    /// permit held across all of them would make the FIFO-fair gate a long queue
+    /// for every other plane. The re-entrancy discipline is unchanged in
+    /// substance and stronger in statement: a permit is held around ONE PAGE and
+    /// never around a caller of one. `sweep_gate_is_not_re_entrant` pins it.
+    async fn list_envelope_refs_unbounded(
+        &self,
+        kind: EnvelopeKind,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
+        let refs = self.list_envelope_refs_inner(kind, window).await;
         // CIRISEdge#441 — removal-class rows enter the receipt ledger the
         // moment they are advertisable; the serve exit records offers and
         // the coordinator's Summary observer records protocol-native acks.
@@ -1320,6 +2070,32 @@ impl FederationDirectoryReplicationBridge {
             .max_in_flight
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// CIRISEdge#531 DEPTH — the largest single page read this bridge has
+    /// materialised. See [`Self::sweep_max_page_rows`]: this is what makes
+    /// "memory is flat in the corpus" checkable rather than asserted.
+    #[must_use]
+    pub fn max_sweep_page_rows(&self) -> usize {
+        self.sweep_max_page_rows
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// CIRISEdge#531 DEPTH — how many sweep permits have been taken over this
+    /// bridge's life. One per PAGE, so a multi-page drain shows multiple.
+    #[must_use]
+    pub fn sweep_permits_taken(&self) -> usize {
+        self.sweep_gate
+            .entries
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// CIRISEdge#531 DEPTH — record one page's materialised row count. Called
+    /// at EVERY page read site; a site that forgets is exactly the regression
+    /// [`Self::max_sweep_page_rows`] exists to catch, so keep them together.
+    fn record_page(&self, rows: usize) {
+        self.sweep_max_page_rows
+            .fetch_max(rows, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 // ─── ReplicationDirectory impl ──────────────────────────────────────
@@ -1327,17 +2103,16 @@ impl FederationDirectoryReplicationBridge {
 #[async_trait]
 impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        // CIRISEdge#531 — WIDTH bound. Held across the whole builder because
-        // the builder IS the materialisation: the `Vec` this returns is small
-        // (32-byte hash + seq per row), but the whole-table `Vec` of parsed
-        // rows the builder reads to produce it is not, and that one lives from
-        // the `list_*_since` read to the end of the projection loop. Every
-        // `.await` inside the section is this sweep's OWN directory work
-        // (the bulk read, and the per-row gate resolutions that must see the
-        // rows); none of it is unrelated, and none of it is the round — the
-        // permit is gone before a byte goes on the wire.
-        let _permit = self.sweep_gate.enter().await;
-        self.list_envelope_refs_unbounded(kind).await
+        // CIRISEdge#531 DEPTH — the PEER-BLIND projection view (diagnostics and
+        // tests; every production provider is peer-bound via
+        // `DirectoryStateAdapter::with_peer`). No peer means no watermark to
+        // keep, and callers of this surface expect the WHOLE projection — so it
+        // is a `Full` drain: paged for memory, complete in result.
+        //
+        // The width permit is no longer taken here; it is taken per page
+        // inside the sweep. See [`Self::list_envelope_refs_unbounded`].
+        self.list_envelope_refs_unbounded(kind, SweepWindow::Full)
+            .await
     }
 
     async fn fetch_envelope_bytes(
@@ -1376,14 +2151,18 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         kind: EnvelopeKind,
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
-        // CIRISEdge#531 — WIDTH bound, taken ONCE here. The `_ =>` arm calls
-        // the permit-FREE `list_envelope_refs_unbounded`, not the trait
-        // method: acquiring again while holding a permit self-deadlocks at
-        // `permits == 1` (`sweep_gate_is_not_re_entrant` pins it).
-        let _permit = self.sweep_gate.enter().await;
+        // CIRISEdge#531 DEPTH — this is THE advertise axis, and the only one
+        // that carries a watermark: a bound peer gets one page budget per
+        // round (new rows first, then a page of the rolling re-sweep), so the
+        // node's advertise memory is flat in the corpus instead of merely
+        // bounded by the width permit. An UNBOUND peer (`None`) has no
+        // watermark to key on and falls through to the complete `Full` view.
+        let window = peer_key_id.map_or(SweepWindow::Full, SweepWindow::Watermark);
         match (kind, peer_key_id) {
-            (EnvelopeKind::Attestation, Some(peer)) => self.list_attestations(Some(peer)).await,
-            _ => self.list_envelope_refs_unbounded(kind).await,
+            (EnvelopeKind::Attestation, Some(peer)) => {
+                self.list_attestations(Some(peer), window).await
+            }
+            _ => self.list_envelope_refs_unbounded(kind, window).await,
         }
     }
 
@@ -1416,19 +2195,27 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// repairs both axes at once and keeps advertise == holdings, exactly as
     /// this arm's `_ =>` fall-through assumes.
     async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        // CIRISEdge#531 — WIDTH bound. The holdings view is the OTHER
-        // whole-table read per plane per round (`want = remote ∖ holdings`),
-        // and #523/v18.2.0 deliberately routed four planes' holdings to
-        // UNFILTERED twins at the raw page limit — so this path materialises
-        // as much as the advertise one and must be under the same bound. Same
-        // one-acquire discipline: the `_ =>` arm takes the permit-free builder.
-        let _permit = self.sweep_gate.enter().await;
+        // CIRISEdge#531 DEPTH — the holdings view is the OTHER whole-table
+        // read per plane per round (`want = remote ∖ holdings`), and
+        // #523/v18.2.0 deliberately routed four planes' holdings to UNFILTERED
+        // twins at the raw page limit — so a cursored advertise against an
+        // uncursored holdings would still materialise the corpus and the fix
+        // would be half. Every arm here is now PAGED.
+        //
+        // But NEVER watermarked: `want` is computed against this set, so a
+        // partial holdings view leaves held rows in `want` forever and
+        // re-fetches them every round — CIRISEdge#416's non-convergence,
+        // recreated by the memory fix. `SweepWindow::Full` is the type-level
+        // statement of that: pages for memory, complete in result.
         match kind {
             EnvelopeKind::Attestation => self.list_attestation_holdings().await,
             EnvelopeKind::Key => self.list_key_holdings().await,
             EnvelopeKind::IdentityOccurrence => self.list_identity_occurrence_holdings().await,
             EnvelopeKind::TransportDestination => self.list_transport_destination_holdings().await,
-            _ => self.list_envelope_refs_unbounded(kind).await,
+            _ => {
+                self.list_envelope_refs_unbounded(kind, SweepWindow::Full)
+                    .await
+            }
         }
     }
 
@@ -1444,6 +2231,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         &self,
         kind: EnvelopeKind,
         since: Option<chrono::DateTime<chrono::Utc>>,
+        peer_key_id: Option<&str>,
     ) -> Vec<Vec<u8>> {
         // v18 — gated on the PREDICATE, not a kind literal, so this site and
         // `is_cursor_served` cannot drift. NOTE: the body below is
@@ -1454,87 +2242,56 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         if !kind.is_cursor_served() {
             return Vec::new();
         }
-        // CIRISEdge#531 — WIDTH bound. This one returns BYTES, not refs: the
-        // whole page of bundles is JSON-serialized into memory before it is
-        // handed back, so it is the heaviest single sweep per unit of corpus
-        // on the node. Taken AFTER the non-cursor early return so a kind that
-        // is not cursor-served never queues at all.
+        // ── CIRISEdge#531 — RETENTION, not just materialisation ─────────
+        //
+        // The v18.6.0 width permit bounds how many pages are BUILT at once. It
+        // does not bound how many are HELD: this method returns owned bytes,
+        // the permit drops at `return`, and the `Vec<Vec<u8>>` then lives on
+        // through `Session::on_cursor_pull` → `DeliverMessage` → the send —
+        // potentially a whole round. So peak RETAINED memory scaled with PEER
+        // COUNT while peak materialised memory scaled with permits, and for
+        // this plane (the only one that hands back bytes rather than 40-byte
+        // refs) those diverge badly.
+        //
+        // The fix is a BYTE budget on the page, not a longer permit. Extending
+        // the permit through consumption would make a slow peer's send hold a
+        // sweep permit for its whole duration — the FIFO starvation the width
+        // bound was careful not to create — and retention and materialisation
+        // are genuinely different resources. With the budget, retention per
+        // response is bounded by a constant an operator can multiply by their
+        // peer count (6 peers × 512 KiB ≈ 3 MiB) instead of by the corpus.
+        //
+        // The budget is only SAFE because of the watermark below. Before it,
+        // the initiator opened every round from `since: None`
+        // (`Session::start_round`), so truncating a page meant the bundles past
+        // it were never served — the plane would silently stop converging,
+        // which is strictly worse than the memory. The responder-side watermark
+        // is what turns "truncated" into "continued next round".
         let _permit = self.sweep_gate.enter().await;
-        let limit = self.effective_page_limit().await;
-        // v18 — the +1 TRUNCATION SENTINEL: ask persist for one bundle more
-        // than we serve. The cursor session opens from `since: None` each
-        // round, so an `operational_page_limit` / mesh-config relief smaller
-        // than the plane PERMANENTLY truncates the evidence plane at page one
-        // — until v18 with NO log. Serving `limit` of `limit + 1` read rows
-        // makes "the page limit bit" a fact, not a guess (`len == limit` alone
-        // cannot distinguish an exactly-full plane from a truncated one).
-        let serve_max = usize::try_from(limit).unwrap_or(usize::MAX);
-        match self
-            .directory
-            .list_signed_accord_quorum_evidence_since(
-                // v36 (CIRISPersist#668) — cursors resume from the
-                // `(admitted_at, id)` PAIR. Edge's CursorPull wire carries only
-                // the timestamp, so pair it with the EMPTY id: that sorts before
-                // every real id, so a tie at `since` is RE-delivered rather than
-                // skipped. Persist documents duplicates-on-resume with
-                // "callers must be idempotent by id", and edge's apply re-tallies
-                // each bundle (`apply_accord_quorum_evidence`), so at-least-once
-                // is correct here and a skip would be silent evidence loss.
-                since.map(|ts| (ts, String::new())),
-                limit.saturating_add(1),
-            )
-            .await
-        {
-            Ok(mut bundles) => {
-                if bundles.len() > serve_max {
-                    bundles.truncate(serve_max);
-                    tracing::warn!(
-                        page_limit = limit,
-                        since = ?since,
-                        "accord-quorum-evidence cursor page TRUNCATED at the page \
-                         limit — at least one more bundle exists beyond this page. \
-                         A session resuming from its high-water drains the backlog \
-                         over rounds, but an operator `operational_page_limit` or \
-                         mesh-config relief below the plane's size truncates a \
-                         `since: None` cold pull at page one EVERY round — the \
-                         evidence plane never fully serves (CIRISEdge#474)"
-                    );
-                }
-                let mut out = Vec::with_capacity(bundles.len());
-                for b in &bundles {
-                    match serde_json::to_vec(b) {
-                        Ok(bytes) => out.push(bytes),
-                        Err(e) => {
-                            // v18 — was a silent `filter_map(.. .ok())` two lines
-                            // from the loud read-error arm below: a bundle that
-                            // will not serialize is OMITTED from every cursor page
-                            // and never replicates from this node. Loud + booked
-                            // (#433), mirroring `advertise_since`.
-                            tracing::warn!(
-                                error = %e,
-                                "accord-quorum-evidence bundle could not be \
-                                 serialized for the wire — OMITTED from this cursor \
-                                 page; it will not replicate from this node \
-                                 (CIRISEdge#474/#433)"
-                            );
-                            self.withhold(
-                                crate::observability::WithholdReason::RowNotSerializable,
-                                "<unattributed>",
-                                "accord_evidence_since: to_vec failed",
-                            );
-                        }
-                    }
-                }
-                out
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "accord-quorum-evidence cursor serve read failed (CIRISEdge#474)"
-                );
-                Vec::new()
-            }
+        let budget = self.sweep_page_budget().await;
+        // The wire `since` is a FLOOR the requester declared ("I hold
+        // everything up to here"), never a position we may fall behind: pair it
+        // with the EMPTY id, which sorts before every real digest, so a tie at
+        // the floor is re-delivered rather than skipped (persist documents
+        // duplicates-on-resume; edge's apply re-tallies, so at-least-once is
+        // correct here and a skip would be silent evidence loss).
+        let floor = since.map(|ts| (ts, String::new()));
+        let Some(key) = peer_key_id.map(|p| (p.to_owned(), kind)) else {
+            // An UNATTRIBUTED pull keeps no position — there is no peer to keep
+            // it for. It gets one budgeted page from the declared floor, which
+            // is the pre-#531 behaviour bounded.
+            return self.accord_evidence_page(floor, budget).await.0;
+        };
+        let head = Self::later_cursor(self.sweep_head(&key), floor.clone());
+        let (mut out, served, last) = self.accord_evidence_page(head, budget).await;
+        if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
+            let (mut more, b_served, b_last) = self
+                .accord_evidence_page(Self::later_cursor(plan.since, floor), plan.budget)
+                .await;
+            out.append(&mut more);
+            self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
         }
+        out
     }
 
     /// CIRISEdge#462 — serve a subject-scoped RECEIVE-axis Pull. Entitlement is
@@ -1825,7 +2582,11 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
 }
 
 impl FederationDirectoryReplicationBridge {
-    async fn list_envelope_refs_inner(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+    async fn list_envelope_refs_inner(
+        &self,
+        kind: EnvelopeKind,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
         match kind {
             // CIRISEdge#397 §1+§2 — the five primary signed planes advertise
             // via persist v21.2.0's bulk since-cursor reads, hashing each row by
@@ -1834,26 +2595,32 @@ impl FederationDirectoryReplicationBridge {
             // TransportDestination project SelfOwn (publish-own); Attestation is
             // per-record (`attestation_is_advertised`); IdentityOccurrenceRevocation
             // is a tombstone → Global (anti-rollback).
-            EnvelopeKind::Key => self.list_keys().await,
-            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrences().await,
-            EnvelopeKind::TransportDestination => self.list_transport_destinations().await,
+            EnvelopeKind::Key => self.list_keys(window).await,
+            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrences(window).await,
+            EnvelopeKind::TransportDestination => self.list_transport_destinations(window).await,
             EnvelopeKind::IdentityOccurrenceRevocation => {
-                self.list_identity_occurrence_revocations().await
+                self.list_identity_occurrence_revocations(window).await
             }
-            EnvelopeKind::Attestation => self.list_attestations(None).await,
+            EnvelopeKind::Attestation => self.list_attestations(None, window).await,
+            // CIRISEdge#531 DEPTH — `Revocation` is the one plane persist does
+            // not expose a `_since` cursor for: it fans out per cohort member
+            // (`revocations_for`). There is no page to keep a watermark on, so
+            // the window is not consulted; the width bound moved INSIDE the
+            // fan-out (one permit per member read) so its materialisation stays
+            // one member's rows rather than the whole cohort's.
             EnvelopeKind::Revocation => self.list_revocations().await,
-            EnvelopeKind::Family => self.list_families().await,
-            EnvelopeKind::Community => self.list_communities().await,
-            EnvelopeKind::Organization => self.list_organizations().await,
-            EnvelopeKind::OrgMembership => self.list_org_memberships().await,
-            EnvelopeKind::PartnerRecord => self.list_partner_records().await,
+            EnvelopeKind::Family => self.list_families(window).await,
+            EnvelopeKind::Community => self.list_communities(window).await,
+            EnvelopeKind::Organization => self.list_organizations(window).await,
+            EnvelopeKind::OrgMembership => self.list_org_memberships(window).await,
+            EnvelopeKind::PartnerRecord => self.list_partner_records(window).await,
             EnvelopeKind::FamilyMembershipRevocation => {
-                self.list_family_membership_revocations().await
+                self.list_family_membership_revocations(window).await
             }
             EnvelopeKind::CommunityMembershipRevocation => {
-                self.list_community_membership_revocations().await
+                self.list_community_membership_revocations(window).await
             }
-            EnvelopeKind::LocationProof => self.list_location_proofs().await,
+            EnvelopeKind::LocationProof => self.list_location_proofs(window).await,
             // CIRISEdge#474 — the accord-quorum-evidence plane is NEVER advertised
             // by content-hash: it has no `signed_wire_index` entry
             // (`persist_index_kind` → None), so a ref here would be listed-then-
@@ -2384,21 +3151,32 @@ impl FederationDirectoryReplicationBridge {
     /// unfetchable split, silent on the wire and compiler-green. This is the
     /// v31 `ServedKeyRecord` lesson (`KeyAdvertiseRow`) generalized to the other
     /// 12 planes instead of re-solved 12 times: callers pass `|r| &r.<inner>`.
-    fn advertise_since<S, T, IN, TS, C>(
+    ///
+    /// The withhold DETAIL token still reads `advertise_since:` after the
+    /// CIRISEdge#531 rename: it is a stable operator-facing key that dashboards
+    /// and the ledger's key space are indexed on, and renaming a metric to match
+    /// a Rust symbol is a breaking change for the people reading it.
+    ///
+    /// CIRISEdge#531 DEPTH — this is now ONE PAGE's projection, appending into
+    /// accumulators [`Self::sweep_paged`] owns across the round's pages. The
+    /// `seen` dedupe is therefore round-wide, not page-wide: the new-rows page
+    /// and the rolling backfill page can legitimately overlap (a row admitted
+    /// just as the backfill reaches the tail), and offering the same hash twice
+    /// in one Summary would make `diff_refs` do redundant work for nothing.
+    fn advertise_page_into<S, T, IN, TS, C>(
         &self,
         rows: &[S],
         in_scope: IN,
         seq_of: TS,
         content_of: C,
-    ) -> Vec<EnvelopeRef>
-    where
+        refs: &mut Vec<EnvelopeRef>,
+        seen: &mut HashSet<[u8; 32]>,
+    ) where
         T: serde::Serialize,
         IN: Fn(&S) -> bool,
         TS: Fn(&S) -> u64,
         C: Fn(&S) -> &T,
     {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
         for row in rows.iter().filter(|r| in_scope(r)) {
             let Some((hash, _bytes)) = content_hash_of(content_of(row)) else {
                 // CIRISEdge#425 — a row that will not serialize is silently absent
@@ -2429,7 +3207,6 @@ impl FederationDirectoryReplicationBridge {
                 seq: seq_of(row),
             });
         }
-        refs
     }
 
     /// Key plane — `SelfOwn` (publish-own): the node's OWN establishment records.
@@ -2451,13 +3228,12 @@ impl FederationDirectoryReplicationBridge {
     ///   2. the resume `seq` moves from the producer's `valid_from` to the
     ///      node-local `admitted_at` — the #682 fix, so a late-admitted key sorts
     ///      by when THIS node saw it, not by a stale producer clock.
-    async fn list_keys(&self) -> Vec<EnvelopeRef> {
+    async fn list_keys(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         let subjects: HashSet<String> = self
             .subjects_for_projection(Projection::SelfOwn)
             .into_iter()
             .collect();
-        let limit = self.effective_page_limit().await;
-        self.list_keys_page(Some(&subjects), limit).await
+        self.list_keys_page(Some(&subjects), window).await
     }
 
     /// The Key plane's since-cursor page, with the `SelfOwn` publish filter as
@@ -2467,27 +3243,41 @@ impl FederationDirectoryReplicationBridge {
     async fn list_keys_page(
         &self,
         subjects: Option<&HashSet<String>>,
-        limit: u32,
+        window: SweepWindow<'_>,
     ) -> Vec<EnvelopeRef> {
-        let rows: Vec<KeyAdvertiseRow> = self
-            .directory
-            .list_signed_key_records_since(None, limit)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|served| KeyAdvertiseRow {
-                record: served.record,
-                admitted_at: served.admitted_at,
-            })
-            .collect();
-        self.advertise_since(
-            &rows,
+        // CIRISEdge#531 DEPTH — the row carries persist's `(pos, id)` resume
+        // pair BESIDE the advertise row, because the advertise row is a
+        // reshaped `KeyAdvertiseRow` (the `#[serde(skip)]` that keeps
+        // `admitted_at` out of the wire hash) and so no longer HAS the served
+        // wrapper's `resume_pair()`.
+        self.sweep_paged(
+            EnvelopeKind::Key,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_key_records_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|served| {
+                        (
+                            served.resume_pair(),
+                            KeyAdvertiseRow {
+                                record: served.record,
+                                admitted_at: served.admitted_at,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |row: &(ResumeCursor, KeyAdvertiseRow)| row.0.clone(),
             // (`map_or(true, ..)`, not `is_none_or` — MSRV 1.75.)
-            |row| subjects.map_or(true, |s| s.contains(&row.record.key_id)),
-            |row| Self::ms_seq(row.admitted_at),
+            |row| subjects.map_or(true, |s| s.contains(&row.1.record.key_id)),
+            |row| Self::ms_seq(row.1.admitted_at),
             // Already hash-correct: `KeyAdvertiseRow` #[serde(skip)]s admitted_at.
-            |row| row,
+            |row| &row.1,
         )
+        .await
     }
 
     /// CIRISEdge#416 (v18 sweep) — the RAW Key holdings: every key row in local
@@ -2496,20 +3286,18 @@ impl FederationDirectoryReplicationBridge {
     /// [`Self::list_attestation_holdings`] for why the page limit is the RAW
     /// configured one (relief bounds offers, never self-knowledge).
     async fn list_key_holdings(&self) -> Vec<EnvelopeRef> {
-        self.list_keys_page(None, self.config.operational_page_limit)
-            .await
+        self.list_keys_page(None, SweepWindow::Full).await
     }
 
     /// IdentityOccurrence plane — `SelfOwn` (publish-own): the node's OWN KEX
     /// occurrences. Scope filter is the `SelfOwn` publish set (keyed by the
     /// occurrence key_id); seq is `asserted_at`.
-    async fn list_identity_occurrences(&self) -> Vec<EnvelopeRef> {
+    async fn list_identity_occurrences(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         let subjects: HashSet<String> = self
             .subjects_for_projection(Projection::SelfOwn)
             .into_iter()
             .collect();
-        let limit = self.effective_page_limit().await;
-        self.list_identity_occurrences_page(Some(&subjects), limit)
+        self.list_identity_occurrences_page(Some(&subjects), window)
             .await
     }
 
@@ -2518,15 +3306,18 @@ impl FederationDirectoryReplicationBridge {
     async fn list_identity_occurrences_page(
         &self,
         subjects: Option<&HashSet<String>>,
-        limit: u32,
+        window: SweepWindow<'_>,
     ) -> Vec<EnvelopeRef> {
-        let rows = self
-            .directory
-            .list_signed_identity_occurrences_since(None, limit)
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::IdentityOccurrence,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_identity_occurrences_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedIdentityOccurrence::resume_pair,
             |row| {
                 subjects.map_or(true, |s| {
                     s.contains(&row.occurrence.identity_occurrence.occurrence_key_id)
@@ -2535,12 +3326,13 @@ impl FederationDirectoryReplicationBridge {
             |row| Self::ms_seq(row.occurrence.identity_occurrence.asserted_at),
             |row| &row.occurrence,
         )
+        .await
     }
 
     /// CIRISEdge#416 (v18 sweep) — the RAW IdentityOccurrence holdings,
     /// unfiltered. See [`Self::list_holdings`].
     async fn list_identity_occurrence_holdings(&self) -> Vec<EnvelopeRef> {
-        self.list_identity_occurrences_page(None, self.config.operational_page_limit)
+        self.list_identity_occurrences_page(None, SweepWindow::Full)
             .await
     }
 
@@ -2549,13 +3341,12 @@ impl FederationDirectoryReplicationBridge {
     /// the occurrence key_id); seq is the durable supersession `epoch`
     /// (CIRISPersist#443), falling back to `asserted_at` for a pre-#443
     /// producer whose projection reads epoch 0.
-    async fn list_transport_destinations(&self) -> Vec<EnvelopeRef> {
+    async fn list_transport_destinations(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         let subjects: HashSet<String> = self
             .subjects_for_projection(Projection::SelfOwn)
             .into_iter()
             .collect();
-        let limit = self.effective_page_limit().await;
-        self.list_transport_destinations_page(Some(&subjects), limit)
+        self.list_transport_destinations_page(Some(&subjects), window)
             .await
     }
 
@@ -2564,15 +3355,18 @@ impl FederationDirectoryReplicationBridge {
     async fn list_transport_destinations_page(
         &self,
         subjects: Option<&HashSet<String>>,
-        limit: u32,
+        window: SweepWindow<'_>,
     ) -> Vec<EnvelopeRef> {
-        let rows = self
-            .directory
-            .list_signed_transport_destinations_since(None, limit)
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::TransportDestination,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_transport_destinations_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedTransportDestination::resume_pair,
             |row| {
                 subjects.map_or(true, |s| {
                     s.contains(&row.destination.transport_destination.occurrence_key_id)
@@ -2587,12 +3381,13 @@ impl FederationDirectoryReplicationBridge {
             },
             |row| &row.destination,
         )
+        .await
     }
 
     /// CIRISEdge#416 (v18 sweep) — the RAW TransportDestination holdings,
     /// unfiltered. See [`Self::list_holdings`].
     async fn list_transport_destination_holdings(&self) -> Vec<EnvelopeRef> {
-        self.list_transport_destinations_page(None, self.config.operational_page_limit)
+        self.list_transport_destinations_page(None, SweepWindow::Full)
             .await
     }
 
@@ -2600,21 +3395,24 @@ impl FederationDirectoryReplicationBridge {
     /// never out-run by the stale occurrence it retracts). Scope filter is the
     /// widest own∪cohort set (keyed by the occurrence key_id); seq is
     /// `revoked_at`.
-    async fn list_identity_occurrence_revocations(&self) -> Vec<EnvelopeRef> {
+    async fn list_identity_occurrence_revocations(
+        &self,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
         let subjects: HashSet<String> = self
             .subjects_for_projection(Projection::Global)
             .into_iter()
             .collect();
-        let rows = self
-            .directory
-            .list_signed_identity_occurrence_revocations_since(
-                None,
-                self.effective_page_limit().await,
-            )
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::IdentityOccurrenceRevocation,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_identity_occurrence_revocations_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedIdentityOccurrenceRevocation::resume_pair,
             |row| {
                 subjects.contains(
                     &row.revocation
@@ -2625,6 +3423,7 @@ impl FederationDirectoryReplicationBridge {
             |row| Self::ms_seq(row.revocation.identity_occurrence_revocation.revoked_at),
             |row| &row.revocation,
         )
+        .await
     }
 
     // ─── v6.2.0 (#179, CIRISPersist#249 Cut D) — generic cohort fan-out ──
@@ -2661,6 +3460,14 @@ impl FederationDirectoryReplicationBridge {
             // #433 — keep the subject for the withhold attribution below; `fetch`
             // consumes the owned `String`.
             let subject = key_id.clone();
+            // CIRISEdge#531 — the width permit, taken PER MEMBER READ. This is
+            // the one plane with no `_since` cursor (persist exposes only
+            // `revocations_for`), so there is no page to bound and no watermark
+            // to keep; what bounds it instead is that the acquire is here, so
+            // the gate holds one member's rows rather than the whole cohort's,
+            // and a long cohort releases between members instead of parking the
+            // FIFO queue for its whole fan-out.
+            let _permit = self.sweep_gate.enter().await;
             let rows = fetch(key_id).await;
             for row in rows {
                 let Some(envelope_hash) = Self::decode_hash(hash(&row)) else {
@@ -3650,22 +4457,75 @@ impl FederationDirectoryReplicationBridge {
     /// never converged (CIRISAgent#932 responder-driver stall). The convergence
     /// invariant this restores: after admitting an attestation, its hash is here.
     /// Cheaper than the advertise sweep — it drops the per-row projection resolution.
+    ///
+    /// CIRISEdge#531 DEPTH — PAGED but never watermarked. The result set is
+    /// still COMPLETE (every held hash, every round); what changed is that the
+    /// rows are read a page at a time and each page's rows are dropped before
+    /// the next, so peak memory is one page of rows plus the (40-byte-per-row)
+    /// ref set instead of the whole corpus. Watermarking THIS view would put
+    /// held-but-unlisted rows back in `want` forever — #416 by a new door — so
+    /// the window here is hard-coded [`SweepWindow::Full`], not a parameter a
+    /// caller could get wrong.
     async fn list_attestation_holdings(&self) -> Vec<EnvelopeRef> {
-        // CIRISEdge#440 — deliberately the RAW configured limit, NOT
-        // `effective_page_limit`. This is the receive-diff "what I hold" axis:
-        // shrinking it under a page-limit relief would hide held rows from the
-        // node's own `want = remote ∖ holdings` diff, making it re-want rows it
-        // already holds — MORE wire traffic under a congestion relief, the
-        // exact inversion of what the knob is for. Relief bounds what we OFFER
-        // and SERVE, never what we admit knowing about ourselves.
-        let attestations = self
-            .directory
-            .list_attestations_since(None, self.config.operational_page_limit)
-            .await
-            .unwrap_or_default();
+        let budget = self.sweep_page_budget().await;
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for att in &attestations {
+        let mut since: Option<ResumeCursor> = None;
+        for page in 0..MAX_FULL_DRAIN_PAGES {
+            let (served, last) = {
+                // CIRISEdge#531 — one permit per PAGE, released between pages,
+                // so a many-page drain does not hold the FIFO-fair gate for the
+                // whole plane and queue every other coordinator behind it.
+                let _permit = self.sweep_gate.enter().await;
+                let attestations = self
+                    .directory
+                    .list_attestations_since(since.clone(), budget)
+                    .await
+                    .unwrap_or_default();
+                self.record_page(attestations.len());
+                self.attestation_holdings_page_into(&attestations, &mut refs, &mut seen);
+                (
+                    attestations.len(),
+                    attestations
+                        .last()
+                        .map(ciris_persist::federation::ServedAttestation::resume_pair),
+                )
+            };
+            if served < budget as usize {
+                break;
+            }
+            if last.is_none() || last == since {
+                tracing::warn!(
+                    budget,
+                    "Attestation holdings drain CANNOT ADVANCE — a full page came \
+                     back with no new resume cursor; this round's holdings view is \
+                     truncated (CIRISEdge#531)"
+                );
+                break;
+            }
+            since = last;
+            if page + 1 == MAX_FULL_DRAIN_PAGES {
+                tracing::warn!(
+                    pages = MAX_FULL_DRAIN_PAGES,
+                    budget,
+                    "Attestation holdings drain hit the page CAP — this round's holdings \
+                     view is TRUNCATED, so held rows past the cap are re-wanted from peers \
+                     (wasteful, self-correcting). Raise `sweep_page_rows` (CIRISEdge#531)"
+                );
+            }
+        }
+        refs
+    }
+
+    /// CIRISEdge#531 DEPTH — one holdings page's rows → refs. Split out of
+    /// [`Self::list_attestation_holdings`] so the page loop reads as a loop.
+    fn attestation_holdings_page_into(
+        &self,
+        attestations: &[ciris_persist::federation::ServedAttestation],
+        refs: &mut Vec<EnvelopeRef>,
+        seen: &mut HashSet<[u8; 32]>,
+    ) {
+        for att in attestations {
             // Skip only an unparseable/unhashable row (never a projection filter).
             let Some((hash, _bytes)) = content_hash_of(&att.attestation) else {
                 // v18 (#433) — the sibling advertise sweep (`list_attestations`)
@@ -3688,10 +4548,13 @@ impl FederationDirectoryReplicationBridge {
                 seq: Self::ms_seq(att.admitted_at),
             });
         }
-        refs
     }
 
-    async fn list_attestations(&self, recipient: Option<&str>) -> Vec<EnvelopeRef> {
+    async fn list_attestations(
+        &self,
+        recipient: Option<&str>,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
         // CIRISEdge#397 §1+§2 — the scores/Attestation plane reads ONE bulk
         // `list_attestations_since(None, limit)` page per round. That surface is
         // already **federation-tier only** (the E5 invariant) and cursored on the
@@ -3727,33 +4590,111 @@ impl FederationDirectoryReplicationBridge {
                 None => return Vec::new(),
             },
         };
-        let self_set: HashSet<String> = self
-            .self_provider
-            .as_ref()
-            .map(|p| p())
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let attestations = self
-            .directory
-            .list_attestations_since(None, self.effective_page_limit().await)
-            .await
-            .unwrap_or_default();
+        let peer_label = recipient.unwrap_or("<unattributed>");
+        // CIRISEdge#531 DEPTH — the per-sweep memos now outlive a single PAGE
+        // and are threaded through the round's pages in one context. They were
+        // always per-sweep facts ("this peer's serve capability", "the trace
+        // pause", "this author's quarantine standing"); re-resolving them per
+        // page would turn a bounded read into an unbounded number of directory
+        // lookups — the CIRISEdge#400 shape the memos exist to prevent.
+        let mut ctx = AttestationSweepCtx {
+            resolved_recipient,
+            self_set: self
+                .self_provider
+                .as_ref()
+                .map(|p| p())
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            serve_allowed: None,
+            grant_cache: HashMap::new(),
+            trace_paused: self.trace_plane_paused().await,
+            trace_pause_booked: false,
+            quarantine_memo: HashMap::new(),
+        };
+        let budget = self.sweep_page_budget().await;
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        // CIRISEdge#379 — lazily-resolved recipient capability (one directory
-        // lookup per listing sweep, and only when a gated row is encountered).
-        let mut serve_allowed: Option<bool> = None;
-        // CIRISEdge#396 item 6 — per-owner parsed consent grants, memoized for
-        // this sweep so a same-owner plane costs one grant read.
-        let mut grant_cache: HashMap<String, Vec<ConsentTransferPolicy>> = HashMap::new();
-        let peer_label = recipient.unwrap_or("<unattributed>");
-        // CIRISEdge#440 — the trace-plane pause, resolved ONCE per sweep (the
-        // reader's own TTL makes even that a cache hit round-to-round), and the
-        // per-author quarantine memo (one directory read per DISTINCT author).
-        let trace_paused = self.trace_plane_paused().await;
-        let mut trace_pause_booked = false;
-        let mut quarantine_memo: HashMap<String, QuarantineConsult> = HashMap::new();
+
+        let Some(key) = Self::watermark_key(window, EnvelopeKind::Attestation) else {
+            // ── The peer-blind projection view (tests / diagnostics): COMPLETE,
+            //    drained a page at a time. No peer ⇒ no watermark to keep.
+            let mut since: Option<ResumeCursor> = None;
+            for _ in 0..MAX_FULL_DRAIN_PAGES {
+                let (served, last) = self
+                    .attestation_page(
+                        since.clone(),
+                        budget,
+                        &mut ctx,
+                        peer_label,
+                        &mut refs,
+                        &mut seen,
+                    )
+                    .await;
+                if served < budget as usize || last.is_none() || last == since {
+                    break;
+                }
+                since = last;
+            }
+            return refs;
+        };
+
+        // ── The WATERMARKED advertise: this peer's new rows first, then a
+        //    page of the rolling re-sweep with whatever budget is left.
+        let head = self.sweep_head(&key);
+        let (served, last) = self
+            .attestation_page(head, budget, &mut ctx, peer_label, &mut refs, &mut seen)
+            .await;
+        if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
+            let (b_served, b_last) = self
+                .attestation_page(
+                    plan.since,
+                    plan.budget,
+                    &mut ctx,
+                    peer_label,
+                    &mut refs,
+                    &mut seen,
+                )
+                .await;
+            self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
+        }
+        refs
+    }
+
+    /// CIRISEdge#531 DEPTH — read ONE Attestation page and run the full
+    /// per-record gate stack over it, appending into the round's accumulators.
+    ///
+    /// Returns `(rows_read, last_resume_cursor)` — the CURSOR facts, deliberately
+    /// counted on the READ and not on the offer: the gates shape what a peer is
+    /// offered, the watermark tracks what this node has LOOKED AT. Conflating
+    /// them would stall the cursor on a plane whose page happens to be entirely
+    /// withheld (a peer without `infra:serve` against a page of `trace:*`, which
+    /// is 80% of the measured corpus), and that plane would then never advance
+    /// past its first page.
+    ///
+    /// The sweep permit covers the read AND the gate loop, and is released
+    /// before returning: the loop is where the `serde_json::Value` per row is
+    /// built, so it is part of the materialisation the width bound is about.
+    async fn attestation_page(
+        &self,
+        since: Option<ResumeCursor>,
+        budget: u32,
+        ctx: &mut AttestationSweepCtx,
+        peer_label: &str,
+        refs: &mut Vec<EnvelopeRef>,
+        seen: &mut HashSet<[u8; 32]>,
+    ) -> (usize, Option<ResumeCursor>) {
+        let _permit = self.sweep_gate.enter().await;
+        let attestations = self
+            .directory
+            .list_attestations_since(since, budget)
+            .await
+            .unwrap_or_default();
+        self.record_page(attestations.len());
+        let served = attestations.len();
+        let last = attestations
+            .last()
+            .map(ciris_persist::federation::ServedAttestation::resume_pair);
         for att in &attestations {
             let Ok(canonical_json) = serde_json::to_value(&att.attestation) else {
                 // CIRISEdge#433 — an attestation that will not project to a
@@ -3773,7 +4714,7 @@ impl FederationDirectoryReplicationBridge {
             // counting it would flood the ledger with by-design non-events every
             // sweep and bury the gates that ARE decisions. The audit trail for
             // projection lives in `namespace::projection_for`, not here.
-            if !Self::attestation_is_advertised(&canonical_json, &self_set) {
+            if !Self::attestation_is_advertised(&canonical_json, &ctx.self_set) {
                 continue;
             }
             // CIRISEdge#440 — the mesh-config pause: `feature.trace_replication`
@@ -3782,9 +4723,9 @@ impl FederationDirectoryReplicationBridge {
             // per row — the same shape the #379 serve-allowed memo takes), with
             // a named, throttled WARN; the pause lifts on the relief row's TTL
             // or a superseding row, with no operator action on this node.
-            if trace_paused && Self::attestation_requires_serve(&canonical_json) {
-                if !trace_pause_booked {
-                    trace_pause_booked = true;
+            if ctx.trace_paused && Self::attestation_requires_serve(&canonical_json) {
+                if !ctx.trace_pause_booked {
+                    ctx.trace_pause_booked = true;
                     self.withhold_config_paused(peer_label, "config-paused-advertise");
                 }
                 continue;
@@ -3792,7 +4733,7 @@ impl FederationDirectoryReplicationBridge {
             // CIRISEdge#440 ask 3 — quarantined-author rows are withheld from
             // the offer (retained locally; markers themselves always pass).
             if self
-                .author_quarantine_withholds(&canonical_json, &mut quarantine_memo, peer_label)
+                .author_quarantine_withholds(&canonical_json, &mut ctx.quarantine_memo, peer_label)
                 .await
             {
                 continue;
@@ -3818,15 +4759,16 @@ impl FederationDirectoryReplicationBridge {
             // untouched; a `None` recipient (projection-only view / tests)
             // is ungated — every production provider is peer-bound
             // (`DirectoryStateAdapter::with_peer`).
-            if let Some(peer) = resolved_recipient.as_ref() {
+            if let Some(peer) = ctx.resolved_recipient.as_ref() {
                 // The peer already cleared the item-1 consent-membership bound
                 // (it holds a `ResolvedRecipient`); these gates further narrow
                 // WHAT this consent-included peer receives.
                 if Self::attestation_requires_serve(&canonical_json) {
-                    if serve_allowed.is_none() {
-                        serve_allowed = Some(self.peer_has_serve_capability(peer.as_str()).await);
+                    if ctx.serve_allowed.is_none() {
+                        ctx.serve_allowed =
+                            Some(self.peer_has_serve_capability(peer.as_str()).await);
                     }
-                    if serve_allowed != Some(true) {
+                    if ctx.serve_allowed != Some(true) {
                         continue;
                     }
                 }
@@ -3837,7 +4779,7 @@ impl FederationDirectoryReplicationBridge {
                     .recipient_capability_withholds(
                         &canonical_json,
                         peer.as_str(),
-                        &mut grant_cache,
+                        &mut ctx.grant_cache,
                     )
                     .await
                 {
@@ -3862,7 +4804,7 @@ impl FederationDirectoryReplicationBridge {
                 seq: Self::ms_seq(att.admitted_at),
             });
         }
-        refs
+        (served, last)
     }
 
     async fn list_revocations(&self) -> Vec<EnvelopeRef> {
@@ -4134,17 +5076,20 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    async fn list_families(&self) -> Vec<EnvelopeRef> {
+    async fn list_families(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 1 of 3. A Family's members are PERSONS; the
         // cohort is NODE-keyed. See [`Self::cohort_set_with_owners`].
         let cohort = self.cohort_set_with_owners().await;
-        let rows = self
-            .directory
-            .list_signed_families_since(None, self.effective_page_limit().await)
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::Family,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_families_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedFamily::resume_pair,
             |s| {
                 s.family
                     .family
@@ -4155,20 +5100,24 @@ impl FederationDirectoryReplicationBridge {
             |s| Self::ms_seq(s.family.family.founded_at),
             |s| &s.family,
         )
+        .await
     }
 
-    async fn list_communities(&self) -> Vec<EnvelopeRef> {
+    async fn list_communities(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 2 of 3, and the one the ladder MEASURED: the
         // recipient held 0 `federation_communities` rows for a room its owner
         // is a member of. See [`Self::cohort_set_with_owners`].
         let cohort = self.cohort_set_with_owners().await;
-        let rows = self
-            .directory
-            .list_signed_communities_since(None, self.effective_page_limit().await)
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::Community,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_communities_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedCommunity::resume_pair,
             |s| {
                 s.community
                     .community
@@ -4179,63 +5128,76 @@ impl FederationDirectoryReplicationBridge {
             |s| Self::ms_seq(s.community.community.founded_at),
             |s| &s.community,
         )
+        .await
     }
 
-    async fn list_family_membership_revocations(&self) -> Vec<EnvelopeRef> {
+    async fn list_family_membership_revocations(
+        &self,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
         // #311 tombstone fix — membership revocation projects `Global`
         // (advertised whole, no cohort filter).
-        let rows = self
-            .directory
-            .list_signed_family_membership_revocations_since(
-                None,
-                self.effective_page_limit().await,
-            )
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::FamilyMembershipRevocation,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_family_membership_revocations_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedFamilyMembershipRevocation::resume_pair,
             |_| true,
             |s| Self::ms_seq(s.revocation.family_membership_revocation.removed_at),
             |s| &s.revocation,
         )
+        .await
     }
 
-    async fn list_community_membership_revocations(&self) -> Vec<EnvelopeRef> {
+    async fn list_community_membership_revocations(
+        &self,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
         // #311 tombstone fix — membership revocation projects `Global`
         // (advertised whole, no cohort filter).
-        let rows = self
-            .directory
-            .list_signed_community_membership_revocations_since(
-                None,
-                self.effective_page_limit().await,
-            )
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::CommunityMembershipRevocation,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_community_membership_revocations_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedCommunityMembershipRevocation::resume_pair,
             |_| true,
             |s| Self::ms_seq(s.revocation.community_membership_revocation.removed_at),
             |s| &s.revocation,
         )
+        .await
     }
 
-    async fn list_location_proofs(&self) -> Vec<EnvelopeRef> {
+    async fn list_location_proofs(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 3 of 3. A LocationProof's `subject_key_id` is
         // whoever the proof is ABOUT, which for a person's presence claim is a
         // person fed-ID: the same empty intersection with a node-keyed cohort.
         // See [`Self::cohort_set_with_owners`].
         let cohort = self.cohort_set_with_owners().await;
-        let rows = self
-            .directory
-            .list_signed_location_proofs_since(None, self.effective_page_limit().await)
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::LocationProof,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_location_proofs_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedLocationProof::resume_pair,
             |s| cohort.contains(&s.proof.location_proof.subject_key_id),
             |s| Self::ms_seq(s.proof.location_proof.asserted_at),
             |s| &s.proof,
         )
+        .await
     }
 
     // ── v2 operational-data list_* ─────────────────────────────────
@@ -4260,7 +5222,7 @@ impl FederationDirectoryReplicationBridge {
     // v2.0.x follow-up (matches the v1 trust-kinds' silent-skip on
     // decode_hash failure).
 
-    async fn list_organizations(&self) -> Vec<EnvelopeRef> {
+    async fn list_organizations(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#397 — advertise the BARE `Organization` row's content-hash.
         // Persist's `signed_wire_index` keys `Organization` on
         // `content_hash_of(&Organization)` (the bare row `list_organizations_since`
@@ -4269,37 +5231,45 @@ impl FederationDirectoryReplicationBridge {
         // re-serializes that SAME bare row. Hashing the wrapper here would
         // advertise a hash the point-read can never resolve. The receiver's
         // `apply_organization` re-wraps the bare row for `put_organization`.
-        let rows = self
-            .directory
-            .list_organizations_since(None, self.effective_page_limit().await)
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::Organization,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_organizations_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedOrganization::resume_pair,
             |_| true,
             |row| Self::ms_seq(row.admitted_at),
             |row| &row.organization,
         )
+        .await
     }
 
-    async fn list_org_memberships(&self) -> Vec<EnvelopeRef> {
+    async fn list_org_memberships(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#397 — advertise the BARE `OrgMembership` row's content-hash;
         // same bare-row basis as `list_organizations` (persist indexes + reloads
         // the bare row). `apply_org_membership` re-wraps on the receive side.
-        let rows = self
-            .directory
-            .list_org_memberships_since(None, self.effective_page_limit().await)
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::OrgMembership,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_org_memberships_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedOrgMembership::resume_pair,
             |_| true,
             |row| Self::ms_seq(row.admitted_at),
             |row| &row.org_membership,
         )
+        .await
     }
 
-    async fn list_partner_records(&self) -> Vec<EnvelopeRef> {
+    async fn list_partner_records(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // v2.0.1 — `partner_record` is **bidirectional**. CIRISPersist#194's
         // `list_signed_partner_records_since` returns the full
         // `SignedPartnerRecord` wrapper (row + steward_signatures + threshold).
@@ -4307,17 +5277,21 @@ impl FederationDirectoryReplicationBridge {
         // ([`content_hash_of`]); persist's `signed_wire_index` keys `PartnerRecord`
         // on `content_hash_of(&SignedPartnerRecord)` and its point-read reloads +
         // re-serializes the SAME wrapper, so advertise-hash == point-read here.
-        let rows = self
-            .directory
-            .list_signed_partner_records_since(None, self.effective_page_limit().await)
-            .await
-            .unwrap_or_default();
-        self.advertise_since(
-            &rows,
+        self.sweep_paged(
+            EnvelopeKind::PartnerRecord,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_partner_records_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedSignedPartnerRecord::resume_pair,
             |_| true,
             |s| Self::ms_seq(s.record.partner_record.asserted_at),
             |s| &s.record,
         )
+        .await
     }
 }
 
@@ -4907,6 +5881,18 @@ struct KeyAdvertiseRow {
     admitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// CIRISEdge#531 DEPTH — the test-side spelling of the production advertise
+/// call. `list_envelope_refs_for_peer` picks the window from whether a peer is
+/// bound; tests that reach the Attestation builder directly must make the SAME
+/// choice, or they would exercise a window production never uses.
+#[cfg(test)]
+impl FederationDirectoryReplicationBridge {
+    async fn list_attestations_for_peer(&self, recipient: Option<&str>) -> Vec<EnvelopeRef> {
+        let window = recipient.map_or(SweepWindow::Full, SweepWindow::Watermark);
+        self.list_attestations(recipient, window).await
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5277,7 +6263,7 @@ mod tests {
 
         // The ADVERTISE view (projection-filtered) EXCLUDES the row — a self-scoped
         // row from another producer is held-but-not-own, so it is not advertised.
-        let advertised = bridge.list_attestations(None).await;
+        let advertised = bridge.list_attestations_for_peer(None).await;
         assert!(
             advertised.is_empty(),
             "a self-scoped row from another producer must NOT be advertised here, got {advertised:?}"
@@ -5382,7 +6368,7 @@ mod tests {
         // The advertise view excludes the hidden row for the third party…
         assert!(
             !bridge
-                .list_attestations(Some(third))
+                .list_attestations_for_peer(Some(third))
                 .await
                 .iter()
                 .any(|r| r.envelope_hash == hidden_hash),
@@ -5686,7 +6672,10 @@ mod tests {
                 );
             } else {
                 assert!(
-                    bridge.accord_evidence_since(kind, None).await.is_empty(),
+                    bridge
+                        .accord_evidence_since(kind, None, None)
+                        .await
+                        .is_empty(),
                     "a non-cursor kind must never be answered by the cursor serve \
                      path: {kind:?}"
                 );
@@ -8627,14 +9616,14 @@ mod tests {
         seed_consent_grant(&backend, local, peer_in, "trace:", "trace:read").await;
 
         // Projection-only baseline (ungated) proves the row IS advertised.
-        let baseline = bridge.list_attestations(None).await;
+        let baseline = bridge.list_attestations_for_peer(None).await;
         assert!(
             !baseline.is_empty(),
             "the seeded federation attestation is advertised in the local view"
         );
 
         // (a) consent-INCLUDED peer → receives the advertised plane (item 1 passes).
-        let included = bridge.list_attestations(Some(peer_in)).await;
+        let included = bridge.list_attestations_for_peer(Some(peer_in)).await;
         assert_eq!(
             included.len(),
             baseline.len(),
@@ -8642,7 +9631,7 @@ mod tests {
         );
 
         // (b) consent-EXCLUDED peer → the WHOLE plane is withheld (item 1).
-        let excluded = bridge.list_attestations(Some(peer_out)).await;
+        let excluded = bridge.list_attestations_for_peer(Some(peer_out)).await;
         assert!(
             excluded.is_empty(),
             "a peer absent from the consent send-set receives no attestations (CIRISEdge#396 item 1)"
@@ -8674,12 +9663,15 @@ mod tests {
 
         // The row is advertised in the ungated view...
         assert!(
-            !bridge.list_attestations(None).await.is_empty(),
+            !bridge.list_attestations_for_peer(None).await.is_empty(),
             "the row is advertised projection-only"
         );
         // ...but WITHOUT a local_key_id the peer-bound serve fails closed.
         assert!(
-            bridge.list_attestations(Some(peer)).await.is_empty(),
+            bridge
+                .list_attestations_for_peer(Some(peer))
+                .await
+                .is_empty(),
             "no local_key_id → consent send-set unresolvable → whole plane withheld (fail-closed)"
         );
     }
@@ -11009,14 +12001,20 @@ mod tests {
         seed_consent_membership(&backend, local, peer_in).await;
 
         // The consent-INCLUDED peer serves cleanly — no withhold.
-        assert!(!bridge.list_attestations(Some(peer_in)).await.is_empty());
+        assert!(!bridge
+            .list_attestations_for_peer(Some(peer_in))
+            .await
+            .is_empty());
         assert!(
             metrics.snapshot().withholds_by_reason.is_empty(),
             "the consented peer's plane is not a withhold"
         );
 
         // The consent-EXCLUDED peer loses the WHOLE plane — and it is counted.
-        assert!(bridge.list_attestations(Some(peer_out)).await.is_empty());
+        assert!(bridge
+            .list_attestations_for_peer(Some(peer_out))
+            .await
+            .is_empty());
         let snap = metrics.snapshot();
         assert_eq!(
             snap.withholds_by_reason
@@ -11055,7 +12053,10 @@ mod tests {
         seed_advertised_attestation(&backend, producer).await;
 
         assert!(
-            bridge.list_attestations(Some(peer)).await.is_empty(),
+            bridge
+                .list_attestations_for_peer(Some(peer))
+                .await
+                .is_empty(),
             "no local_key_id → the whole plane is withheld (fail-closed)"
         );
         let snap = metrics.snapshot();
@@ -11563,10 +12564,24 @@ mod tests {
     }
 
     /// FIELD PROVENANCE, end to end — a root-authored
-    /// `antientropy.page_limit` relief bounds the bridge's since-page:
-    /// the Key plane's advertise shrinks to the relieved limit, and the same
-    /// relief expiring (TTL'd emergency row filtered at read time) restores
-    /// the configured (unbounded) page.
+    /// `antientropy.page_limit` relief bounds the bridge's since-page: the Key
+    /// plane's ADVERTISE shrinks to the relieved limit.
+    ///
+    /// CIRISEdge#531 DEPTH sharpened both halves of this, and the second half
+    /// was a latent bug:
+    ///
+    ///  1. the relief is asserted on the PEER-BOUND advertise — the actual
+    ///     offer, and the only path production takes
+    ///     (`DirectoryStateAdapter::with_peer`). It is one page per ROUND now,
+    ///     not one page forever: the peer's watermark carries the rest;
+    ///  2. the RECEIVE-axis holdings view is asserted NOT to shrink. #440's own
+    ///     note says relief "bounds what we OFFER and SERVE, never what we admit
+    ///     knowing about ourselves", and gave four planes an unfiltered holdings
+    ///     twin at the raw limit — but the other nine fell through to the
+    ///     advertise builder, so a congestion relief WAS shrinking their
+    ///     holdings, making the node re-want rows it already holds: more wire
+    ///     traffic under a relief, the exact inversion of the knob. Routing
+    ///     holdings through `SweepWindow::Full` fixes it for every plane at once.
     #[tokio::test]
     async fn page_limit_relief_bounds_the_since_page() {
         let local = "this-node";
@@ -11593,11 +12608,15 @@ mod tests {
         let bridge = bridge.with_mesh_config(Some(mesh_reader_over(&backend, local)));
 
         assert_eq!(
-            bridge.list_envelope_refs(EnvelopeKind::Key).await.len(),
+            bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-x"))
+                .await
+                .len(),
             4,
             "no relief: the full page (local + the three producers; mc-root is \
              outside the cohort projection)"
         );
+        let holdings_unrelieved = bridge.list_holdings(EnvelopeKind::Key).await.len();
 
         seed_mesh_config_relief(
             &backend,
@@ -11607,9 +12626,20 @@ mod tests {
         )
         .await;
         assert_eq!(
-            bridge.list_envelope_refs(EnvelopeKind::Key).await.len(),
+            bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-y"))
+                .await
+                .len(),
             2,
-            "relieved: the since-page is bounded to the relieved limit"
+            "relieved: the OFFER is bounded to the relieved limit (a fresh peer, \
+             so this is its first page; its watermark carries the rest)"
+        );
+        assert_eq!(
+            bridge.list_holdings(EnvelopeKind::Key).await.len(),
+            holdings_unrelieved,
+            "relieved: the RECEIVE-axis holdings view is UNCHANGED — relief bounds \
+             what we offer, never what we know we hold, or the node re-wants rows \
+             it already has under a congestion relief (CIRISEdge#440/#531)"
         );
     }
 
@@ -12332,8 +13362,11 @@ mod tests {
         register_fixture_keys(&backend, &[(local, identity_type::AGENT)]).await;
 
         // No consent grant at all → every peer is withheld (item 1, fail-closed).
-        assert!(bridge.list_attestations(Some("")).await.is_empty());
-        assert!(bridge.list_attestations(Some("node-bob")).await.is_empty());
+        assert!(bridge.list_attestations_for_peer(Some("")).await.is_empty());
+        assert!(bridge
+            .list_attestations_for_peer(Some("node-bob"))
+            .await
+            .is_empty());
 
         let peers: Vec<String> = metrics
             .recent_withholds
@@ -12468,12 +13501,12 @@ mod tests {
         let bridge =
             bridge_over(&backend, &["node-bob"]).with_local_key_id(Some(local.to_string()));
 
-        let baseline = bridge.list_attestations(None).await;
+        let baseline = bridge.list_attestations_for_peer(None).await;
         assert!(
             !baseline.is_empty(),
             "the seeded attestation is advertised in the ungated local view"
         );
-        let served = bridge.list_attestations(Some("node-bob")).await;
+        let served = bridge.list_attestations_for_peer(Some("node-bob")).await;
         assert_eq!(
             served.len(),
             baseline.len(),
@@ -12491,7 +13524,7 @@ mod tests {
         // The negative control on the same serve path.
         assert!(
             bridge
-                .list_attestations(Some("node-stranger"))
+                .list_attestations_for_peer(Some("node-stranger"))
                 .await
                 .is_empty(),
             "an unrelated node is still served nothing"
@@ -12761,6 +13794,628 @@ mod tests {
              line and booked as a withhold)"
         );
     }
+    // ─── CIRISEdge#531 DEPTH — the advertise WATERMARK ──────────────────
+    //
+    // The width bound (v18.6.0) capped how many sweeps materialise at once;
+    // this is the half that makes the memory FLAT — a page-bounded advertise
+    // with a per-(peer, plane) watermark, so `permits × corpus × 2` becomes
+    // `permits × page × 2`.
+    //
+    // CONVERGENCE is the property, so it is what is pinned. A watermark that
+    // bounds memory by never re-offering a row would trade an OOM for silent
+    // non-convergence, which this repo has closed as a bug class three times
+    // (#416, #429, #425) and which is strictly worse than the OOM. Every test
+    // below asserts a SET, not a count.
+    mod depth {
+        use super::*;
+        use std::collections::BTreeSet;
+
+        fn paged_bridge(
+            cohort: &[String],
+            page: u32,
+        ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
+            let backend = Arc::new(MemoryBackend::new());
+            let dir: Arc<dyn FederationDirectory> = backend.clone();
+            let cohort_clone = cohort.to_vec();
+            let cohort_cb: CohortProvider = Arc::new(move || cohort_clone.clone());
+            let bridge = FederationDirectoryReplicationBridge::with_config(
+                dir,
+                cohort_cb,
+                BridgeConfig {
+                    sweep_page_rows: page,
+                    ..BridgeConfig::default()
+                },
+            );
+            (backend, bridge)
+        }
+
+        /// Seed `n` key records and return the cohort naming them.
+        async fn seed_keys(backend: &Arc<MemoryBackend>, ids: &[String]) {
+            for id in ids {
+                backend
+                    .put_public_key(SignedKeyRecord {
+                        record: fixture_key_record(id, identity_type::AGENT),
+                    })
+                    .await
+                    .expect("seed key");
+            }
+        }
+
+        fn hashes(refs: &[EnvelopeRef]) -> BTreeSet<[u8; 32]> {
+            refs.iter().map(|r| r.envelope_hash).collect()
+        }
+
+        // ── the pure cursor state machine ───────────────────────────────
+
+        /// A DETERMINISTIC cursor: the state machine is pure, so its tests
+        /// must be too — a `Utc::now()` here makes two calls for "the same"
+        /// position compare unequal by nanoseconds.
+        fn cur(n: u8) -> ResumeCursor {
+            (
+                chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(n), 0)
+                    .expect("fixed cursor instant"),
+                format!("id-{n}"),
+            )
+        }
+
+        fn key() -> (String, EnvelopeKind) {
+            ("peer".to_string(), EnvelopeKind::Key)
+        }
+
+        /// A COLD peer walks forward one page per round and pays for exactly
+        /// ONE read while doing it — the catch-up walk IS the first re-sweep
+        /// pass, so a second (backfill) read would double a new peer's cost for
+        /// no coverage it does not already get.
+        #[test]
+        fn catch_up_costs_one_page_per_round_and_no_backfill_read() {
+            let mut c = SweepCursors::default();
+            let k = key();
+            assert_eq!(c.head(&k), None, "a cold peer starts at the beginning");
+            // A FULL page ⇒ still catching up.
+            assert_eq!(c.after_head(&k, 4, 4, Some(cur(1))), None);
+            assert_eq!(
+                c.head(&k),
+                Some(cur(1)),
+                "the next round resumes from the last row of the last page"
+            );
+            assert_eq!(c.after_head(&k, 4, 4, Some(cur(2))), None);
+            assert_eq!(c.head(&k), Some(cur(2)));
+        }
+
+        /// The moment the forward walk reaches the end of the plane, the
+        /// rolling re-sweep starts over from the BEGINNING — the door-stop that
+        /// keeps the watermark an optimisation rather than a one-way door.
+        #[test]
+        fn reaching_the_end_starts_the_rolling_resweep_from_the_beginning() {
+            let mut c = SweepCursors::default();
+            let k = key();
+            // A SHORT page ⇒ end of plane.
+            assert_eq!(
+                c.after_head(&k, 2, 4, Some(cur(9))),
+                None,
+                "the transition round does not also pay for a backfill read — \
+                 the tail it would read is the tail just read"
+            );
+            // Next round: nothing new, so the whole budget goes to the re-sweep,
+            // starting from the beginning.
+            let plan = c
+                .after_head(&k, 0, 4, None)
+                .expect("caught up ⇒ the spare budget rolls the re-sweep");
+            assert_eq!(plan.since, None, "the re-sweep restarts at the beginning");
+            assert_eq!(
+                plan.budget, 4,
+                "an idle plane gives the re-sweep the WHOLE page"
+            );
+        }
+
+        /// NEW ROWS come first and take the budget they need; the re-sweep gets
+        /// the remainder. A new chat message is therefore offered in the NEXT
+        /// round, not one re-sweep cycle later — which is the whole reason for
+        /// two cursors instead of one wrapping one.
+        #[test]
+        fn new_rows_are_served_before_the_rolling_resweep() {
+            let mut c = SweepCursors::default();
+            let k = key();
+            c.after_head(&k, 1, 4, Some(cur(1))); // short ⇒ caught up
+            let plan = c
+                .after_head(&k, 3, 4, Some(cur(4)))
+                .expect("some budget left");
+            assert_eq!(
+                plan.budget, 1,
+                "three new rows leave one row of re-sweep budget"
+            );
+            assert_eq!(
+                c.after_head(&k, 4, 4, Some(cur(8))),
+                None,
+                "a FULL page of new rows leaves the re-sweep nothing this round — \
+                 it resumes next round, from where it was"
+            );
+        }
+
+        /// The re-sweep WRAPS: a short backfill page means the end of the plane,
+        /// so the next pass starts over. This is what bounds the re-offer
+        /// interval at `ceil(corpus / page)` rounds instead of leaving it open.
+        #[test]
+        fn the_rolling_resweep_wraps_at_the_end_of_the_plane() {
+            let mut c = SweepCursors::default();
+            let k = key();
+            c.after_head(&k, 0, 4, None); // caught up (short page, nothing there)
+            let plan = c.after_head(&k, 0, 4, None).expect("plan");
+            assert_eq!(plan.since, None);
+            // A FULL backfill page advances it…
+            c.after_backfill(&k, 4, 4, Some(cur(3)));
+            let plan = c.after_head(&k, 0, 4, None).expect("plan");
+            assert_eq!(
+                plan.since,
+                Some(cur(3)),
+                "the re-sweep resumes where it was"
+            );
+            // …and a SHORT one wraps it.
+            c.after_backfill(&k, 1, 4, Some(cur(5)));
+            let plan = c.after_head(&k, 0, 4, None).expect("plan");
+            assert_eq!(plan.since, None, "the end of the plane WRAPS the re-sweep");
+        }
+
+        /// The map is CAPPED and evicts least-recently-touched. Peers churn,
+        /// and an unreapable per-peer map is the shape CIRISEdge#530 is open
+        /// about one plane over. Eviction costs a re-sweep, never a skipped row.
+        #[test]
+        fn the_watermark_map_is_capped_and_evicts_the_oldest() {
+            let mut c = SweepCursors::default();
+            for i in 0..MAX_TRACKED_SWEEP_CURSORS + 8 {
+                let k = (format!("peer-{i}"), EnvelopeKind::Key);
+                c.after_head(&k, 1, 4, Some(cur(1)));
+            }
+            assert!(
+                c.by_peer_plane.len() <= MAX_TRACKED_SWEEP_CURSORS,
+                "the watermark map grew past its cap ({} entries) — an unreapable \
+                 per-peer map is a leak (CIRISEdge#531/#530)",
+                c.by_peer_plane.len()
+            );
+            assert_eq!(
+                c.head(&("peer-0".to_string(), EnvelopeKind::Key)),
+                None,
+                "the least-recently-touched peer was evicted, so it re-sweeps from \
+                 the beginning — work, not a skipped row"
+            );
+        }
+
+        /// A declared floor never pulls the serve position BACKWARD, and
+        /// `None` is the earliest position rather than the latest.
+        #[test]
+        fn later_cursor_treats_none_as_the_beginning() {
+            type B = FederationDirectoryReplicationBridge;
+            assert_eq!(B::later_cursor(None, None), None);
+            assert_eq!(B::later_cursor(Some(cur(1)), None), Some(cur(1)));
+            assert_eq!(B::later_cursor(None, Some(cur(1))), Some(cur(1)));
+            assert_eq!(B::later_cursor(Some(cur(1)), Some(cur(2))), Some(cur(2)));
+            assert_eq!(B::later_cursor(Some(cur(2)), Some(cur(1))), Some(cur(2)));
+        }
+
+        // ── the real bridge, over a real backend ────────────────────────
+
+        /// **The headline property.** A corpus LARGER than the page converges:
+        /// every row is eventually offered, the union over rounds equals the
+        /// whole advertise set, and no single read ever materialises more than
+        /// one page.
+        ///
+        /// The set, not a count — a watermark that offered the right NUMBER of
+        /// rows while permanently skipping one would pass a count assertion and
+        /// be exactly the bug this is guarding.
+        #[tokio::test]
+        async fn a_corpus_larger_than_the_page_fully_converges_across_rounds() {
+            let ids: Vec<String> = (0..7).map(|i| format!("key-{i}")).collect();
+            let (backend, bridge) = paged_bridge(&ids, 2);
+            seed_keys(&backend, &ids).await;
+
+            let whole = hashes(&bridge.list_envelope_refs(EnvelopeKind::Key).await);
+            assert_eq!(whole.len(), 7, "the complete advertise set");
+
+            let mut offered: BTreeSet<[u8; 32]> = BTreeSet::new();
+            for round in 0..6 {
+                let refs = bridge
+                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-a"))
+                    .await;
+                assert!(
+                    refs.len() <= 4,
+                    "round {round}: one round offers at most the page budget \
+                     (new-rows page + re-sweep page), got {}",
+                    refs.len()
+                );
+                offered.extend(refs.iter().map(|r| r.envelope_hash));
+            }
+            assert_eq!(
+                offered, whole,
+                "the peer was never offered part of the plane — a watermark that \
+                 bounds memory by skipping rows is worse than the OOM it fixes"
+            );
+            assert!(
+                bridge.max_sweep_page_rows() <= 2,
+                "a single page materialised {} rows against a budget of 2 — a bulk \
+                 read was wired past the page driver (CIRISEdge#531)",
+                bridge.max_sweep_page_rows()
+            );
+        }
+
+        /// **The timestamp-collision hazard, which persist already closed and
+        /// edge must not re-open.**
+        ///
+        /// #531 was filed believing the serve cursor was `WHERE ts > since`
+        /// with an `ORDER BY (ts, id)` — strict on the timestamp ALONE — so a
+        /// page boundary landing inside a group of rows sharing one instant
+        /// (batch admissions do; persist truncates to microsecond resolution)
+        /// would advance past the instant and skip the group's remainder,
+        /// permanently and silently. That was true before persist v36.
+        ///
+        /// CIRISPersist#668 made every `list_*_since` a PAIR cursor —
+        /// `WHERE pos > ?1 OR (pos = ?1 AND id > ?2)`, resumed from the served
+        /// row's `resume_pair()` — so the hazard is closed at the source and
+        /// edge's only job is to hand the pair back instead of the instant.
+        /// No local dedup, and no persist ask.
+        ///
+        /// This drives the page loop over a corpus whose rows ALL share one
+        /// instant, through a reader that reproduces persist's exact predicate.
+        /// An edge that resumed on the timestamp alone would re-read the same
+        /// first page every round and converge on two rows out of five.
+        #[tokio::test]
+        async fn a_page_boundary_inside_a_timestamp_tie_skips_nothing() {
+            let (_backend, bridge) = paged_bridge(&[], 2);
+            let tie = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("instant");
+            let corpus: Vec<(ResumeCursor, String)> = (0..5)
+                .map(|i| ((tie, format!("id-{i}")), format!("row-{i}")))
+                .collect();
+
+            let mut offered: BTreeSet<[u8; 32]> = BTreeSet::new();
+            // ceil(5 / 2) = 3 rounds is the whole plane, and not one more:
+            // asserting the exact round count is what separates "resumes into
+            // the tie" from "re-reads page one forever".
+            for _ in 0..3 {
+                let corpus = corpus.clone();
+                let refs = bridge
+                    .sweep_paged(
+                        EnvelopeKind::Key,
+                        SweepWindow::Watermark("peer-tie"),
+                        move |since: Option<ResumeCursor>, limit: u32| {
+                            let corpus = corpus.clone();
+                            async move {
+                                // persist's predicate, verbatim in Rust:
+                                // ORDER BY (pos, id), strictly greater than the PAIR.
+                                corpus
+                                    .into_iter()
+                                    .filter(|(c, _)| since.as_ref().map_or(true, |sc| c > sc))
+                                    .take(limit as usize)
+                                    .collect::<Vec<_>>()
+                            }
+                        },
+                        |row: &(ResumeCursor, String)| row.0.clone(),
+                        |_| true,
+                        |_| 0u64,
+                        |row| &row.1,
+                    )
+                    .await;
+                offered.extend(refs.iter().map(|r| r.envelope_hash));
+            }
+            assert_eq!(
+                offered.len(),
+                5,
+                "a page boundary inside a one-instant tie skipped part of the group \
+                 — the watermark is resuming on the timestamp instead of the \
+                 `(pos, id)` pair persist serves (CIRISPersist#668/CIRISEdge#531)"
+            );
+        }
+
+        /// **The transient-refusal door-stop.** v18.4.0's AV-45
+        /// `retry_after_community_roster` is refused on the RECEIVER and never
+        /// reported back, so the sender cannot keep a replay set — its
+        /// documented guarantee is literally *"the next Summary/Diff re-offers
+        /// it"*. A purely monotonic watermark can never re-offer a row it has
+        /// passed, which would strand exactly those rows forever.
+        ///
+        /// So: take a row the watermark has demonstrably PASSED, and keep
+        /// sweeping. It must come back.
+        #[tokio::test]
+        async fn a_row_the_watermark_has_passed_is_re_offered_by_the_resweep() {
+            let ids: Vec<String> = (0..6).map(|i| format!("key-{i}")).collect();
+            let (backend, bridge) = paged_bridge(&ids, 2);
+            seed_keys(&backend, &ids).await;
+
+            // Round 1 offers the first page. Pick a row from it — the watermark
+            // is now past it by construction.
+            let first = bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-b"))
+                .await;
+            assert!(!first.is_empty(), "round one offers a page");
+            let passed = first[0].envelope_hash;
+
+            // …the peer refuses it transiently (a roster that has not landed),
+            // so it is NOT in the peer's holdings and only a RE-OFFER can carry
+            // it. Count how many times the re-sweep brings it back.
+            //
+            // TWICE, not once: one re-offer is satisfied by the re-sweep's FIRST
+            // pass, which a design with no wrap-around would also produce before
+            // going silent forever. Requiring a second re-offer is what actually
+            // pins the CYCLE — the property that makes the watermark an
+            // optimisation rather than a one-way door, at every future round and
+            // not just the next one.
+            let mut re_offers = 0usize;
+            for _ in 0..16 {
+                let refs = bridge
+                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-b"))
+                    .await;
+                if refs.iter().any(|r| r.envelope_hash == passed) {
+                    re_offers += 1;
+                }
+            }
+            assert!(
+                re_offers >= 2,
+                "a row the watermark passed came back {re_offers} time(s) in 16 \
+                 rounds — the rolling re-sweep is not CYCLING, so the AV-45 \
+                 transient class is stranded and `is_transient`'s \"the next \
+                 Summary/Diff re-offers it\" stops being true (CIRISEdge#531)"
+            );
+        }
+
+        /// A row admitted AFTER the peer caught up is offered in the very next
+        /// round — not one re-sweep cycle later. This is the property that
+        /// makes the design usable for chat (every new message is a new row on
+        /// the Attestation plane), and the reason the new-rows cursor is read
+        /// FIRST and with the whole page budget rather than the design being
+        /// one wrapping cursor.
+        #[tokio::test]
+        async fn a_newly_admitted_row_is_offered_in_the_next_round() {
+            // The cohort names the late row from the start; only its KEY RECORD
+            // arrives late, which is exactly what a new row looks like.
+            let mut ids: Vec<String> = (0..3).map(|i| format!("key-{i}")).collect();
+            let late = "key-late".to_string();
+            ids.push(late.clone());
+            let (backend, bridge) = paged_bridge(&ids, 2);
+            seed_keys(&backend, &ids[..3]).await;
+
+            // Sweep until this peer has caught up with the plane as it stands.
+            for _ in 0..5 {
+                let _ = bridge
+                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-c"))
+                    .await;
+            }
+            // The late row's hash, taken from the plane itself rather than
+            // recomputed: `fixture_key_record` stamps `Utc::now()`, so a
+            // rebuilt record would hash to something the plane never held —
+            // a test that then passes or fails for the wrong reason.
+            let before = hashes(&bridge.list_envelope_refs(EnvelopeKind::Key).await);
+            seed_keys(&backend, std::slice::from_ref(&late)).await;
+            let after = hashes(&bridge.list_envelope_refs(EnvelopeKind::Key).await);
+            let late_hash = *after
+                .difference(&before)
+                .next()
+                .expect("the late row entered the advertise set");
+
+            let refs = bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-c"))
+                .await;
+            assert!(
+                refs.iter().any(|r| r.envelope_hash == late_hash),
+                "the round right after a row was admitted must OFFER it — the \
+                 new-rows cursor is read first and with the whole page budget, so \
+                 a new chat message does not wait a re-sweep cycle (CIRISEdge#531)"
+            );
+        }
+
+        /// A FRESH peer converges from empty against a corpus that is already
+        /// there — the cold-start path, which is also what a restart looks like
+        /// from the other side.
+        #[tokio::test]
+        async fn a_fresh_peer_converges_from_empty() {
+            let ids: Vec<String> = (0..5).map(|i| format!("key-{i}")).collect();
+            let (backend, bridge) = paged_bridge(&ids, 2);
+            seed_keys(&backend, &ids).await;
+            // An established peer has already swept the plane.
+            for _ in 0..6 {
+                let _ = bridge
+                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-old"))
+                    .await;
+            }
+            let whole = hashes(&bridge.list_envelope_refs(EnvelopeKind::Key).await);
+            let mut offered: BTreeSet<[u8; 32]> = BTreeSet::new();
+            for _ in 0..6 {
+                let refs = bridge
+                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-new"))
+                    .await;
+                offered.extend(refs.iter().map(|r| r.envelope_hash));
+            }
+            assert_eq!(
+                offered, whole,
+                "a peer that joined late must still be offered the WHOLE plane — \
+                 watermarks are per-peer, never node-global"
+            );
+        }
+
+        /// A RESTART drops the watermarks (they are in memory, by design), and
+        /// the node re-sweeps from the beginning: it costs work and converges,
+        /// rather than costing correctness. And the re-offer is not a duplicate
+        /// APPLICATION — the refs are the same content hashes, so a peer that
+        /// already holds them computes an empty `want`.
+        #[tokio::test]
+        async fn a_restart_re_converges_without_duplicate_application() {
+            let ids: Vec<String> = (0..5).map(|i| format!("key-{i}")).collect();
+            let (backend, bridge) = paged_bridge(&ids, 2);
+            seed_keys(&backend, &ids).await;
+            let mut before: BTreeSet<[u8; 32]> = BTreeSet::new();
+            for _ in 0..6 {
+                before.extend(
+                    bridge
+                        .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-r"))
+                        .await
+                        .iter()
+                        .map(|r| r.envelope_hash),
+                );
+            }
+
+            // "Restart": a NEW bridge over the SAME state, with no watermarks.
+            let dir: Arc<dyn FederationDirectory> = backend.clone();
+            let cohort_clone = ids.clone();
+            let restarted = FederationDirectoryReplicationBridge::with_config(
+                dir,
+                Arc::new(move || cohort_clone.clone()),
+                BridgeConfig {
+                    sweep_page_rows: 2,
+                    ..BridgeConfig::default()
+                },
+            );
+            let mut after: BTreeSet<[u8; 32]> = BTreeSet::new();
+            for _ in 0..6 {
+                after.extend(
+                    restarted
+                        .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-r"))
+                        .await
+                        .iter()
+                        .map(|r| r.envelope_hash),
+                );
+            }
+            assert_eq!(
+                after, before,
+                "a restart must re-converge to the SAME advertise set"
+            );
+            // The peer's holdings after the first pass ARE `before`; a
+            // re-offer of the same hashes leaves `want` empty, so nothing is
+            // applied twice.
+            assert!(
+                after.difference(&before).next().is_none(),
+                "the re-sweep offered a hash the peer does not already hold — \
+                 that would be a duplicate application, not a re-offer"
+            );
+        }
+
+        /// The HOLDINGS axis is paged for MEMORY but never watermarked: it is
+        /// COMPLETE every round. A partial holdings view leaves held rows in
+        /// `want` forever and re-fetches them every round — CIRISEdge#416's
+        /// non-convergence, recreated by the fix for the memory.
+        #[tokio::test]
+        async fn holdings_stay_complete_under_paging() {
+            let ids: Vec<String> = (0..7).map(|i| format!("key-{i}")).collect();
+            let (backend, bridge) = paged_bridge(&ids, 2);
+            seed_keys(&backend, &ids).await;
+
+            let first = hashes(&bridge.list_holdings(EnvelopeKind::Key).await);
+            assert_eq!(first.len(), 7, "every held row, in ONE call");
+            for _ in 0..4 {
+                assert_eq!(
+                    hashes(&bridge.list_holdings(EnvelopeKind::Key).await),
+                    first,
+                    "the holdings view is the same COMPLETE set every round — it \
+                     carries no position and must never converge over rounds"
+                );
+            }
+            assert!(
+                bridge.max_sweep_page_rows() <= 2,
+                "the holdings drain materialised {} rows in one page — complete in \
+                 RESULT must not mean whole-corpus in MEMORY (CIRISEdge#531)",
+                bridge.max_sweep_page_rows()
+            );
+        }
+
+        /// The permit is taken PER PAGE, not per sweep. A multi-page holdings
+        /// drain must show one entry per page — holding one permit across the
+        /// whole drain would put every other plane behind it in a FIFO queue,
+        /// which is the starvation the width bound was built to avoid.
+        #[tokio::test]
+        async fn a_multi_page_drain_takes_one_permit_per_page() {
+            let ids: Vec<String> = (0..7).map(|i| format!("key-{i}")).collect();
+            let (backend, bridge) = paged_bridge(&ids, 2);
+            seed_keys(&backend, &ids).await;
+
+            let before = bridge.sweep_permits_taken();
+            let refs = bridge.list_holdings(EnvelopeKind::Key).await;
+            let taken = bridge.sweep_permits_taken() - before;
+            assert_eq!(refs.len(), 7);
+            assert_eq!(
+                taken, 4,
+                "7 rows at a page of 2 is 4 reads (2+2+2+1), so 4 permit \
+                 acquisitions — {taken} means the permit was held across pages \
+                 (CIRISEdge#531)"
+            );
+            assert!(
+                bridge.max_sweeps_in_flight() <= 2,
+                "the width bound still holds across the paged drain"
+            );
+        }
+
+        /// Paging DISABLED (`sweep_page_rows = 0`) is the documented escape
+        /// hatch back to one whole-table read, and it must still be correct —
+        /// an operator reaching for it on a wedged box must not also lose
+        /// convergence.
+        #[tokio::test]
+        async fn paging_disabled_is_one_read_and_the_whole_plane() {
+            let ids: Vec<String> = (0..5).map(|i| format!("key-{i}")).collect();
+            let (backend, bridge) = paged_bridge(&ids, 0);
+            seed_keys(&backend, &ids).await;
+            let refs = bridge
+                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-z"))
+                .await;
+            assert_eq!(hashes(&refs).len(), 5, "the whole plane in one page");
+            assert_eq!(
+                bridge.sweep_permits_taken(),
+                1,
+                "one read, so one permit — the pre-DEPTH shape exactly"
+            );
+        }
+
+        /// The production DEFAULTS are what CIRISServer runs — it never
+        /// constructs a `BridgeConfig` — so they are pinned here. Changing
+        /// either is then a deliberate act with the arithmetic on
+        /// `DEFAULT_SWEEP_PAGE_ROWS` to answer to.
+        #[test]
+        fn the_default_page_is_finite() {
+            // A `u32::MAX` page IS the pre-#531 whole-table read: the DEPTH fix
+            // is inert without a finite default, so the ceiling is pinned at
+            // COMPILE time — the strongest form available, and the one clippy
+            // asks for over a runtime assertion on a constant.
+            const _: () = assert!(BridgeConfig::DEFAULT_SWEEP_PAGE_ROWS < u32::MAX);
+            assert_eq!(BridgeConfig::default().sweep_page_rows, 1024);
+            assert_eq!(
+                BridgeConfig::DEFAULT_SWEEP_PAGE_ROWS,
+                BridgeConfig::default().sweep_page_rows,
+            );
+        }
+
+        /// CIRISEdge#531 (review finding) — a permit count that PARSES as a
+        /// `usize` but exceeds `Semaphore::MAX_PERMITS` must not panic the
+        /// node at boot. The documented contract is "a bad value is ignored";
+        /// a panic in the knob whose purpose is keeping a wedged box alive is
+        /// the worst possible way to break it.
+        #[tokio::test]
+        async fn an_absurd_permit_count_clamps_instead_of_panicking() {
+            let backend = Arc::new(MemoryBackend::new());
+            let dir: Arc<dyn FederationDirectory> = backend.clone();
+            let bridge = FederationDirectoryReplicationBridge::with_config(
+                dir,
+                Arc::new(Vec::new),
+                BridgeConfig {
+                    advertise_sweep_permits: usize::MAX,
+                    ..BridgeConfig::default()
+                },
+            );
+            // …and the bridge still sweeps.
+            let _ = bridge.list_holdings(EnvelopeKind::Key).await;
+            assert!(bridge.sweep_permits_taken() >= 1);
+        }
+
+        /// The cursor plane's Deliver is byte-bounded like every OTHER Deliver
+        /// on the wire. It was the one that was not: it served a whole page of
+        /// serialized bundles, and that page stayed resident through the send,
+        /// so RETAINED memory scaled with peer count while MATERIALISED memory
+        /// scaled with permits. Pinned against the Diff path's budget so the
+        /// two cannot drift apart silently.
+        #[test]
+        fn the_cursor_page_carries_the_same_byte_budget_as_every_other_deliver() {
+            assert_eq!(
+                CURSOR_PAGE_BUDGET_BYTES,
+                crate::replication::session::MAX_DELIVER_ENVELOPE_BYTES,
+                "the cursor Deliver must be bounded like the Diff-driven one — \
+                 a page that is not byte-bounded is retained memory that scales \
+                 with PEERS, which the sweep permit cannot bound (CIRISEdge#531)"
+            );
+        }
+    }
 }
 
 // ─── CIRISEdge#531 — the advertise-sweep WIDTH bound ─────────────────
@@ -13026,7 +14681,7 @@ mod sweep_width_tests {
                 let _ = bridge.list_holdings(kind).await;
                 let _ = bridge.subject_holdings(kind, "subj", Some("subj")).await;
                 let _ = bridge.subject_holdings(kind, "subj", Some("other")).await;
-                let _ = bridge.accord_evidence_since(kind, None).await;
+                let _ = bridge.accord_evidence_since(kind, None, None).await;
             })
             .await
             .unwrap_or_else(|_| {

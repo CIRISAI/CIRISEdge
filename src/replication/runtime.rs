@@ -161,10 +161,25 @@ fn build_bridge(
 /// unparseable one WARNS and leaves it alone too — a typo in an env var must
 /// not be able to change the node's memory posture, in either direction.
 fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
+    config = resolve_sweep_page_rows(config);
     let Ok(raw) = std::env::var(BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV) else {
         return config;
     };
     match raw.trim().parse::<usize>() {
+        // CIRISEdge#531 (review finding) — a value that PARSES but exceeds
+        // `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`) used to sail past this
+        // check and panic inside `Semaphore::new`, taking the node down at boot
+        // on an operator typo — in the one knob whose whole purpose is keeping a
+        // wedged box alive. It is now refused like any other bad value, and
+        // `SweepGate::new` clamps as the belt under this brace.
+        Ok(n) if n > tokio::sync::Semaphore::MAX_PERMITS => tracing::warn!(
+            raw = %raw,
+            max = tokio::sync::Semaphore::MAX_PERMITS,
+            env = BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV,
+            keeping = config.advertise_sweep_permits,
+            "advertise-sweep width bound override exceeds the semaphore maximum \
+             — IGNORED, keeping the configured value (CIRISEdge#531)"
+        ),
         Ok(n) => {
             tracing::info!(
                 permits = n,
@@ -182,6 +197,42 @@ fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
             keeping = config.advertise_sweep_permits,
             "advertise-sweep width bound override is not a usize — IGNORED, \
              keeping the configured value (CIRISEdge#531)"
+        ),
+    }
+    config
+}
+
+/// CIRISEdge#531 DEPTH — apply the [`BridgeConfig::SWEEP_PAGE_ROWS_ENV`]
+/// override. Same contract as [`resolve_sweep_permits`]: missing or
+/// unparseable leaves the configured value alone, `0` is the documented escape
+/// hatch back to one whole-table read per sweep.
+///
+/// This is the knob that makes the memory FLAT rather than merely bounded, so
+/// it deserves the same out-of-band lever: the deployment this was filed for
+/// (CIRISServer) never constructs a [`BridgeConfig`] and so cannot reach the
+/// field on a box that is already wedged.
+fn resolve_sweep_page_rows(mut config: BridgeConfig) -> BridgeConfig {
+    let Ok(raw) = std::env::var(BridgeConfig::SWEEP_PAGE_ROWS_ENV) else {
+        return config;
+    };
+    match raw.trim().parse::<u32>() {
+        Ok(n) => {
+            tracing::info!(
+                rows = n,
+                configured = config.sweep_page_rows,
+                env = BridgeConfig::SWEEP_PAGE_ROWS_ENV,
+                "sweep page size overridden from the environment (0 = one \
+                 whole-table read per sweep, the pre-DEPTH behaviour)"
+            );
+            config.sweep_page_rows = n;
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            raw = %raw,
+            env = BridgeConfig::SWEEP_PAGE_ROWS_ENV,
+            keeping = config.sweep_page_rows,
+            "sweep page size override is not a u32 — IGNORED, keeping the \
+             configured value (CIRISEdge#531)"
         ),
     }
     config

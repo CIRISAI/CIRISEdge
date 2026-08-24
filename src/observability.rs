@@ -860,6 +860,26 @@ pub struct EdgeMetrics {
     /// also show `timed_out`). Single `Arc<AtomicU64>`; the offending peer + kind
     /// ride the matching throttled WARN.
     pub replication_inbound_backpressure_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
+    /// the live announce-intake map under **capacity backpressure** (the
+    /// `MAX_PEERS` cap in `transport::reticulum`).
+    ///
+    /// The house pattern for this table class (leviculum#49) requires that
+    /// evictions-under-pressure are **never silent**: a fleet sitting at cap is
+    /// otherwise indistinguishable from a fleet with room, and the only prior
+    /// signal was a `tracing::debug!` that production does not run at. A
+    /// monotonically climbing value means announce intake is saturated and the
+    /// node is shedding the least-recently-seen advisory routing hints — benign
+    /// in isolation (the mesh re-announces, and an Advisory binding is a routing
+    /// hint, never trust), but the field signature of advisory-admit pollution
+    /// (an attacker or a QA runner minting keypairs) when it climbs fast.
+    ///
+    /// Counts ONLY pressure evictions of the unretained (`Advisory`) population.
+    /// A `Rooted` binding is pinned and never evicted, so it can never appear
+    /// here. Single `Arc<AtomicU64>` (not a per-key bag) — the evicted `key_id`
+    /// rides on the matching throttled DEBUG line, and keying by peer would make
+    /// cardinality grow with exactly the pollution this counts.
+    pub announce_intake_evictions: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#433 — the WITHHOLD LEDGER: per-[`WithholdReason`] count of rows
     /// a serving-path gate declined to serve. Shaped exactly like
     /// [`Self::send_failures_total`] (same `Arc<RwLock<HashMap<_, _>>>` lock
@@ -1016,6 +1036,22 @@ impl EdgeMetrics {
     #[must_use]
     pub fn inbound_backpressure_drops(&self) -> u64 {
         self.replication_inbound_backpressure_drops
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#530 — increment the announce-intake pressure-eviction counter.
+    /// Called once per evicted UNRETAINED binding at the `MAX_PEERS` cap, so the
+    /// previously `debug!`-only eviction is countable in production.
+    pub fn inc_announce_intake_eviction(&self) {
+        self.announce_intake_evictions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#530 — read the announce-intake pressure-eviction counter
+    /// (tests + the metrics snapshot projection).
+    #[must_use]
+    pub fn announce_intake_evictions(&self) -> u64 {
+        self.announce_intake_evictions
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1177,6 +1213,7 @@ impl EdgeMetrics {
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
+            announce_intake_evictions: self.announce_intake_evictions(),
             withholds_by_reason: self.withholds_by_reason.read().clone(),
             recent_withholds: self.recent_withholds.read().iter().cloned().collect(),
             replication_envelopes_served_total: self
@@ -1217,6 +1254,10 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#373 — cumulative inbound frames dropped on coordinator
     /// channel back-pressure (previously a silent WARN).
     pub replication_inbound_backpressure_drops: u64,
+    /// CIRISEdge#530 — cumulative UNRETAINED peer bindings evicted from the live
+    /// announce-intake map under capacity backpressure. Zero on a node with room;
+    /// climbing on one at cap. `Rooted` bindings are pinned and never counted.
+    pub announce_intake_evictions: u64,
     /// CIRISEdge#433 — cumulative per-reason withhold count. Empty on an IDLE
     /// node; non-empty on a WITHHOLDING one. That difference is the whole point.
     pub withholds_by_reason: HashMap<WithholdReason, u64>,

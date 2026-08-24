@@ -525,6 +525,16 @@ impl Session {
     /// test assert the drop directly instead of inferring it from a byte count. The
     /// budget-`break` remainder is deliberately NOT counted here: that is honest
     /// deferral to the next round, a categorically different thing from unfetchable.
+    ///
+    /// CIRISEdge#531 DEPTH — "those hashes stay in the peer's `want` next round"
+    /// is a claim about the SENDER's advertise set, and the advertise set is now
+    /// a per-round PAGE against a per-(peer, plane) watermark. The deferral still
+    /// holds, with a bound rather than immediately: a deferred hash is re-offered
+    /// when the sender's rolling re-sweep next reaches it, at most
+    /// `ceil(corpus / sweep_page_rows)` rounds away — and for any plane smaller
+    /// than one page (every plane on a small mesh) it is still the very next
+    /// round. The re-sweep is what keeps this sentence true; see
+    /// `bridge::PlaneWatermark`.
     fn pack_bounded_deliver(
         &self,
         want: &[[u8; 32]],
