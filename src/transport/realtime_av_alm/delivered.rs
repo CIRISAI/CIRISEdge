@@ -88,7 +88,9 @@ use ciris_persist::federation::admission::{
 };
 use ciris_persist::federation::hard_case::ConsentState;
 use ciris_persist::federation::types::{attestation_tier, attestation_type, cohort_scope};
-use ciris_persist::federation::{Attestation, FederationDirectory, SignedAttestation};
+use ciris_persist::federation::{
+    Attestation, AttestationOutcome, FederationDirectory, SignedAttestation,
+};
 use ciris_persist::prelude::ceg_produce_canonicalize;
 
 use crate::identity::LocalSigner;
@@ -387,9 +389,31 @@ pub enum DeliveryWithholdReason {
 /// Outcome of [`emit_delivered_observation`].
 #[derive(Debug)]
 pub enum DeliveryEmitOutcome {
-    /// The signed row was submitted and admitted by the directory.
+    /// The signed row was submitted and admitted by the directory, and it
+    /// CHANGED local state (persist `AttestationOutcome::Inserted`).
     Emitted {
         /// The deterministic (content-addressed) attestation id.
+        attestation_id: String,
+    },
+    /// persist v38.5.0 (CIRISPersist#771) — the row was submitted and the
+    /// directory already held it, byte-identically
+    /// ([`ciris_persist::federation::AttestationOutcome::AlreadyHeld`]).
+    ///
+    /// **Routine, not an error.** [`build_delivery_row`] content-addresses
+    /// `attestation_id` off the envelope hash precisely so that identical
+    /// window contents dedupe to one row, so a re-emission of an unchanged
+    /// window lands here BY DESIGN.
+    ///
+    /// It is a distinct variant on purpose. Under persist ≤ v38.4.0 this
+    /// came back as `Error::Backend("UNIQUE constraint failed …")` and edge
+    /// mapped it to [`DeliveryEmitError::Submit`] — a *fault*, for the
+    /// protocol working. Collapsing it into [`Emitted`](Self::Emitted) now
+    /// would be the opposite error and the one #771 warns about: the caller
+    /// could no longer tell "I minted a new score row" from "nothing
+    /// changed", which is #771's own defect reproduced one layer down.
+    AlreadyHeld {
+        /// The deterministic (content-addressed) attestation id — the row
+        /// that was already present.
         attestation_id: String,
     },
     /// Dry-run: the row passed every edge-side gate and is fully signed,
@@ -520,11 +544,27 @@ pub async fn emit_delivered_observation(
         });
     }
 
-    directory
+    // persist v38.5.0 (CIRISPersist#771) — the submit reports WHAT IT DID.
+    // Named exhaustively rather than `?`-discarded: `Ok(_) => Emitted` would
+    // compile silently (`AttestationOutcome` is not `#[must_use]`) and would
+    // report a fresh mint for a row that changed nothing.
+    match directory
         .put_attestation(SignedAttestation { attestation })
         .await
-        .map_err(|e| DeliveryEmitError::Submit(e.to_string()))?;
-    Ok(DeliveryEmitOutcome::Emitted { attestation_id })
+        .map_err(|e| DeliveryEmitError::Submit(e.to_string()))?
+    {
+        AttestationOutcome::Inserted => Ok(DeliveryEmitOutcome::Emitted { attestation_id }),
+        AttestationOutcome::AlreadyHeld => Ok(DeliveryEmitOutcome::AlreadyHeld { attestation_id }),
+        // `#[non_exhaustive]`, so this arm is compulsory. LOUD by choice: an
+        // outcome this build cannot classify must not be reported as either a
+        // mint or a duplicate — that is exactly how a persist minor's new
+        // variant would ship silently mis-counted (the `family_gates.rs`
+        // MAXIMAL_UNKNOWN trap, in the producer plane).
+        other => Err(DeliveryEmitError::Submit(format!(
+            "persist returned an AttestationOutcome this edge build does not know \
+             ({other:?}); adopt the persist cut that added it — CIRISPersist#771"
+        ))),
+    }
 }
 
 /// Build + hybrid-sign the scores-plane row for one observation — JCS
@@ -1219,7 +1259,11 @@ mod tests {
         assert_eq!(attestation.attestation_envelope["score"], 1.0);
 
         // Submit: persist's REAL put-gates (hybrid ingest + B1 + B5) admit it.
-        let out = emit_delivered_observation(&*backend, &signer, &obs, false, Utc::now())
+        // The emit clock is BOUND, not re-read: `asserted_at` is signed into the
+        // row (#598) but is not part of the content-addressed id, so the
+        // re-emission assertions below need to control it deliberately.
+        let emitted_at = Utc::now();
+        let out = emit_delivered_observation(&*backend, &signer, &obs, false, emitted_at)
             .await
             .expect("submission admits through persist's own gates");
         let DeliveryEmitOutcome::Emitted { attestation_id } = out else {
@@ -1240,6 +1284,78 @@ mod tests {
             CAPACITY_RELAY_DELIVERY_DIMENSION
         );
         assert_eq!(found.attesting_key_id, consumer);
+
+        // persist v38.5.0 (CIRISPersist#771) — BOTH HALVES OF THE RE-PUT
+        // VERDICT, on edge's only production `put_attestation` producer.
+        //
+        // `attestation_id` is content-addressed off the STABLE (pre-binding)
+        // envelope, which does NOT contain `asserted_at` — while `asserted_at`
+        // IS signed into the row (#598). So the id is a function of the WINDOW
+        // and the row bytes are a function of the window AND the emit clock,
+        // and persist's `attestation_reput_verdict` splits precisely on that:
+        //
+        //   * same window, same `now` → byte-identical row → `AlreadyHeld`;
+        //   * same window, different `now` → same id, DIFFERENT bytes →
+        //     `Error::Conflict`.
+        //
+        // Both are asserted, because the pair is the whole point of the cut:
+        // quieting duplicates must not become accepting anything. This is also
+        // the trap persist hit in its own fixtures (a stable `uid()` re-offered
+        // under a fresh `Utc::now()`), so pinning it on edge's producer is what
+        // stops the same mistake landing here.
+
+        // (a) IDENTICAL bytes — the same emit clock — is idempotent success.
+        // Under persist <= v38.4.0 this came back
+        // `Error::Backend("UNIQUE constraint failed …")` and edge reported
+        // `DeliveryEmitError::Submit`: a FAULT, for the dedupe working as
+        // designed. It is now a named, non-error outcome — and NOT `Emitted`,
+        // because a caller that cannot tell a new score row from an unchanged
+        // one is #771 reproduced one layer down.
+        let again = emit_delivered_observation(&*backend, &signer, &obs, false, emitted_at)
+            .await
+            .expect("a byte-identical re-emission is NOT a submit fault");
+        let DeliveryEmitOutcome::AlreadyHeld {
+            attestation_id: held_id,
+        } = again
+        else {
+            panic!("expected AlreadyHeld on the identical re-emission, got {again:?}");
+        };
+        assert_eq!(
+            held_id, attestation_id,
+            "the already-held row is the SAME content-addressed id — the dedupe \
+             this producer is designed around, not a second row",
+        );
+        assert_eq!(
+            backend
+                .list_attestations_for(relay)
+                .await
+                .expect("list_attestations_for")
+                .iter()
+                .filter(|a| a.attestation_id == attestation_id)
+                .count(),
+            1,
+            "…and quieting the duplicate did not admit a second copy",
+        );
+
+        // (b) A DIFFERING row under the occupied id is still REFUSED — two rows
+        // claiming one identity is a real disagreement, not a duplicate. Same
+        // window, later clock ⇒ same id, different signed `asserted_at`.
+        let later = emit_delivered_observation(
+            &*backend,
+            &signer,
+            &obs,
+            false,
+            emitted_at + chrono::Duration::seconds(30),
+        )
+        .await;
+        let Err(DeliveryEmitError::Submit(msg)) = &later else {
+            panic!("a DIFFERING row under an occupied id must refuse, got {later:?}");
+        };
+        assert!(
+            msg.contains("DIFFERENT content"),
+            "and it must refuse as persist's typed re-put CONFLICT — naming both \
+             row hashes — not as an opaque backend failure: {msg}",
+        );
     }
 
     /// Consent is revocable and the edge gate re-closes: a NEWER
