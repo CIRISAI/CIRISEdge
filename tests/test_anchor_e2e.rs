@@ -42,6 +42,10 @@ fn canonical_bytes(envelope: &serde_json::Value) -> Vec<u8> {
 }
 
 #[tokio::test]
+// One end-to-end scenario — trust root, peer registration, canonical signing,
+// then the rooting assertion. Splitting it would hand each half a partial
+// fixture and hide which step actually broke.
+#[allow(clippy::too_many_lines)]
 async fn test_anchor_peer_roots_through_edge_root_binding() {
     // ── 1. The SW test trust root (hybrid: Ed25519 + ML-DSA-65). ──────────
     let root_ed = Ed25519Signer::from_seed(&[0x11; 32]).expect("root ed25519");

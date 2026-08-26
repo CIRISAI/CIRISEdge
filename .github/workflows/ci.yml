@@ -1276,7 +1276,13 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 60
           shell: bash
-          command: cargo clippy --features "transport-http transport-reticulum pyo3 test-anchor" -- -D warnings
+          # `--all-targets` (v18.9.0): without it this step lints only the lib,
+          # and `test-anchor` is the ONLY combo that compiles
+          # `tests/test_anchor_e2e.rs` — so that file was invisible to clippy
+          # from v16.0.0 until a local --all-features --all-targets run caught
+          # a `too_many_lines` in it. A feature-gated integration test needs
+          # the gate that enables the feature to also reach the test target.
+          command: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 test-anchor" -- -D warnings
       - name: cargo test --features test-anchor (edge-tier test-model e2e)
         uses: nick-fields/retry@v3
         with:

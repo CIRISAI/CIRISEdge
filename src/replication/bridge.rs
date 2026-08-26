@@ -109,7 +109,7 @@ use ciris_persist::federation::types::{
     SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
     SignedLocationProof, SignedRevocation,
 };
-use ciris_persist::federation::FederationDirectory;
+use ciris_persist::federation::{AttestationOutcome, FederationDirectory};
 use ciris_verify_core::threshold::ThresholdMember;
 
 use super::directory::ReplicationDirectory;
@@ -5374,8 +5374,23 @@ impl FederationDirectoryReplicationBridge {
                 // so the high-volume `scores` plane pays one string compare.
                 let owner_invalidation: Option<String> =
                     Self::owner_binding_touched(&record.attestation).map(ToOwned::to_owned);
+                // persist v38.5.0 (CIRISPersist#771) — the Attestation plane's
+                // typed outcome, the twin of the Key plane's #565
+                // `ReplicatedKeyOutcome` that `key_outcome_to_apply` above has
+                // folded since v24.2.0. Before it, an already-held row came
+                // back as `Error::Backend("UNIQUE constraint failed …")` and
+                // fell through to `refuse` — so edge WARN-logged and counted a
+                // refusal for a row it already had, which is the receive-side
+                // half of the storm #771 measured on the canonical (7,536
+                // refusals in six hours, 58% of that node's total, every one a
+                // row it held). The variants are named EXPLICITLY, never
+                // collapsed: upstream's own note is that folding `AlreadyHeld`
+                // back into `()` at a boundary would reproduce #771 one layer
+                // down, and edge's boundary is a boundary.
                 match self.directory.put_attestation(record).await {
-                    Ok(()) => {
+                    Ok(AttestationOutcome::Inserted) => {
+                        // A NEW row — the only outcome that can have moved a
+                        // cached verdict, so the only one that invalidates.
                         if let Some((author, subject)) = relay_invalidation {
                             self.invalidate_accord_relay(&[&author, &subject]);
                         }
@@ -5384,6 +5399,27 @@ impl FederationDirectoryReplicationBridge {
                         }
                         ApplyOutcome::Admitted
                     }
+                    // Byte-identical row already held: routine non-progress,
+                    // exactly like `ReplicatedKeyOutcome::Unchanged`. COUNTED
+                    // (`inc_duplicate(Attestation)` at the #425 choke, so it is
+                    // never a silent drop) and QUIET (`on_deliver` logs
+                    // Duplicate at DEBUG). No invalidation: nothing changed, so
+                    // no memoized verdict can have moved.
+                    Ok(AttestationOutcome::AlreadyHeld) => ApplyOutcome::Duplicate,
+                    // `AttestationOutcome` is `#[non_exhaustive]`, so this arm
+                    // is compulsory — and it is the MAXIMAL_UNKNOWN trap in a
+                    // second location (`family_gates.rs` is the first). A
+                    // future persist minor adding an outcome must NOT land here
+                    // as a quiet `Admitted` (a false convergence-progress
+                    // signal) or a quiet `Duplicate` (a false already-held).
+                    // It is LOUD instead: a refusal naming the variant, which
+                    // is the correct reading of "this node's persist told it
+                    // something it was not built to understand".
+                    Ok(other) => ApplyOutcome::Refused(format!(
+                        "Attestation: persist returned an AttestationOutcome this edge \
+                         build does not know ({other:?}); adopt the persist cut that \
+                         added it — CIRISPersist#771 (content_hash={content_hash})"
+                    )),
                     // persist v38.2.0 (CIRISEdge#522) — THIS is the door the
                     // cut moved. AV-45 membership now gates community/family
                     // -scoped rows here (target resolved from the producer's
@@ -13326,6 +13362,98 @@ mod tests {
         assert!(
             bridge.owner_reads.load(Ordering::Relaxed) > reads_before,
             "…and it did so by re-walking the directory, not by serving a stale hit"
+        );
+    }
+
+    /// persist v38.5.0 (CIRISPersist#771) — **a re-delivered attestation is a
+    /// DUPLICATE, not a refusal**, measured at the door the field actually
+    /// uses.
+    ///
+    /// This is the receive-side end of the storm #771 filed: on the production
+    /// canonical, 7,536 refusals in six hours — 428 distinct rows re-sent up to
+    /// 82 times each, 58% of that node's refusals and ~44% of its total WARN —
+    /// were rows the node ALREADY HELD. persist raised a UNIQUE violation, its
+    /// error mapping defaulted it to `Error::Backend`, and edge's `refuse` arm
+    /// dutifully WARN-logged and counted a policy refusal for the anti-entropy
+    /// protocol working correctly.
+    ///
+    /// Asserted through `apply_envelope_bytes` — the real receive path, on the
+    /// SAME bytes a peer re-offers — rather than over a hand-made
+    /// `AttestationOutcome`, because the value of this test is that the field's
+    /// input reaches the field's classifier. Three distinct properties, because
+    /// collapsing any one of them is a way to get this wrong:
+    ///   1. the second apply is `Duplicate`, NOT `Refused` (quiet: `on_deliver`
+    ///      logs Duplicate at DEBUG);
+    ///   2. it is COUNTED as a duplicate — quiet must not become invisible;
+    ///   3. it books NOTHING on either refusal axis (kind or class) — which is
+    ///      the 58% of refusals this cut removes.
+    #[tokio::test]
+    async fn a_re_delivered_attestation_is_a_quiet_counted_duplicate() {
+        let backend = owner_axis_backend(false).await;
+        let metrics = crate::observability::EdgeMetrics::new();
+        let bridge = bridge_over(&backend, &["node-bob"]).with_metrics(Some(metrics.clone()));
+
+        // One row, serialized ONCE — the second apply offers byte-identical
+        // wire, exactly as a peer's re-offer does.
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = build_federation_attestation(
+            &id,
+            "person-bob",
+            "node-bob",
+            "delegates_to",
+            owner_binding_envelope(&id, "person-bob", "node-bob"),
+        );
+        let wire = serde_json::to_vec(&row).expect("serialize owner-binding");
+
+        let first = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
+            .await;
+        assert_eq!(
+            first,
+            ApplyOutcome::Admitted,
+            "the first delivery changed local state — `AttestationOutcome::Inserted`"
+        );
+
+        let second = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
+            .await;
+        assert_eq!(
+            second,
+            ApplyOutcome::Duplicate,
+            "a byte-identical re-delivery is idempotent success — `AlreadyHeld` — \
+             not a refusal; under persist <= v38.4.0 this was \
+             `Error::Backend(\"UNIQUE constraint failed\")` and edge WARNed it \
+             (CIRISPersist#771)",
+        );
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.replication_applied_total
+                .get(&EnvelopeKind::Attestation)
+                .copied(),
+            Some(1),
+            "exactly ONE apply changed state",
+        );
+        assert_eq!(
+            snap.replication_duplicate_total
+                .get(&EnvelopeKind::Attestation)
+                .copied(),
+            Some(1),
+            "…and the duplicate is COUNTED — quiet is not the same as invisible",
+        );
+        assert_eq!(
+            snap.apply_refusals_by_kind
+                .get(&EnvelopeKind::Attestation)
+                .copied(),
+            None,
+            "nothing was refused: {:?}",
+            snap.apply_refusals_by_kind,
+        );
+        assert!(
+            snap.apply_refusals_by_class.is_empty(),
+            "and no refusal CLASS was booked either — the 58%-of-refusals axis \
+             #771 measured: {:?}",
+            snap.apply_refusals_by_class,
         );
     }
 
