@@ -1,6 +1,6 @@
 [package]
 name = "ciris-edge"
-version = "18.7.0"
+version = "18.8.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Eric Moore <mooreericnyc@gmail.com>"]
@@ -710,8 +710,44 @@ tempfile       = { version = "3", optional = true }
 # scoped (still open). API edge consumes is otherwise UNCHANGED. Upstream
 # catch-up carries per-interface-type IFAC size defaults (Codeberg #293) —
 # edge passes explicit config, unaffected.
-leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.23.0+ciris.1", version = "0.23", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.23.0+ciris.1", version = "0.23", optional = true }
+# v0.24.0+ciris.1 (leviculum#61/#62) — TRANSFER-LEVEL REASSEMBLY.
+# #61 was reported as an off-by-one-hex-digit typo in `RESOURCE_MAX_EFFICIENT_SIZE`
+# and was closed by NOT changing the constant: reference RNS is
+# `1 * 1024 * 1024 - 1` (`Resource.py:116`) and leviculum matches it exactly, so
+# raising it to 16 MiB would emit segments a Python receiver cannot accept — a
+# wire break traded for a consumer-side bug. What was actually wrong was a comment
+# claiming a "3-byte length encoding", which made a correct value look like a typo.
+# EDGE HOLDS THE SAME LINE: edge has NO local MDU/segment-size constant and must
+# never grow one — it reads `link_mdu()` from leviculum per link, and the segment
+# boundary is leviculum's to own.
+# #62 is the receiver-visible change: `leviculum-std` now REASSEMBLES, so a
+# transfer of any size arrives as ONE `ResourceCompleted` carrying the whole
+# payload and segment 1's metadata, delivered at `segment_index == total_segments`
+# — the shape the reference delivers (Python fires its resource callback once per
+# transfer, at the final segment). Free when unused (a batch with nothing segmented
+# takes a fast path), bounded because the segment count is peer-supplied
+# (per-transfer `ReticulumNodeBuilder::max_assembled_resource_size`, default 64 MiB;
+# aggregate across links at 4x that), and it DEGRADES rather than fails at the
+# ceiling: a transfer past it is delivered per segment with a loud
+# `RESOURCE_ASSEMBLY_DECLINED` error naming the knob — never a drop, never a
+# truncation. Correlation needed no wire or event change (a link carries at most
+# one incoming resource at a time, so `LinkId` is an exact key).
+# EDGE IMPACT — this closes a real receive-side gap. Edge's policy cap (8 MiB
+# `MAX_BODY_BYTES`) and its actually-receivable size (~1 MiB, one segment) had
+# disagreed all along: the receiver arm delivered segment 1 as if it were the whole
+# envelope and refused every later segment loudly. With the default 64 MiB per-
+# transfer ceiling an 8 MiB envelope is 9 segments projecting ~9 MiB, well inside
+# it, so edge now receives to its own cap. The receiver arm is retyped onto the new
+# contract in `src/transport/reticulum.rs`.
+# SENDER SIDE is untouched by #62 (the assembler matches `is_sender: false` only);
+# leviculum-core already emitted exactly ONE sender-side completion per transfer
+# (`link_management.rs:2872` — `SegmentAdvance::Sent => return` skips intermediate
+# segments), so the `sent_resource_progress` mirror's remover is still one-per-
+# transfer. What that completion carries for a SPLIT transfer is the FINAL
+# segment's `resource_hash`, not the one `send_resource_awaited` returned — see
+# `ship_resource_on_link`.
+leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.24.0+ciris.1", version = "0.24", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.24.0+ciris.1", version = "0.24", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -721,7 +757,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.23.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.23.0+ciris.1", version = "0.23", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.24.0+ciris.1", version = "0.24", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
