@@ -390,7 +390,58 @@ publish = false
 # not in the diff.
 # v38.5.0 still pins CIRISVerify v13.6.1 — `cargo tree -i ciris-verify-core`
 # resolves exactly ONE, shared by edge and persist. No cross-cdylib skew.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.5.0", version = "38", features = ["sqlite", "encrypted-kv"] }
+#
+# ── v38.6.0 (CIRISPersist#774 / #773, CC 3.4.7.3) ────────────────────────
+# Adopted by SHA during review, flipped to `tag` on the mint. The tag derefs to
+# `ffa66085`, which has `2566bc54` (the reviewed PR head) as an ancestor and a
+# BYTE-IDENTICAL tree — so the gates and the mesh sweep run against the PR head
+# describe exactly what this pin resolves. No edge artifact was ever shipped on
+# the transient `rev`.
+#
+# What #773 changed at edge's apply door: `put_attestation` now returns
+# `AttestationOutcome` instead of `()`, so a row persist already holds surfaces
+# as `AlreadyHeld` rather than collapsing into success. Edge routes that to
+# `ApplyOutcome::Duplicate` — counted, not silently swallowed. `AttestationOutcome`
+# is NOT `#[must_use]`, which is how the A/V producer's discard slipped past the
+# compiler; see `src/replication/bridge.rs::apply_attestation`.
+#
+# `NodeAgencyForbidden` deliberately stays OUTSIDE `ApplyRefusalClass`: it is a
+# permanent refusal, and labelling it transient would assert a convergence that
+# never arrives — spinning the #531 advertise re-sweep against a row that can
+# never land.
+#
+# What #774 changes, and why edge is source-compatible but not
+# behaviour-compatible:
+#   * `check_node_agency_admission` becomes a MEMBERSHIP test —
+#     `node ∈ identity_type` replaces `identity_type == {node}`. The old form
+#     was an escape hatch: fusing `agent` onto a node key made
+#     "infrastructure must not have agency" stop firing, so consolidating two
+#     keys into one hybrid silently repealed the property. The gate sits
+#     behind ONE door, `put_attestation`, in all three backends
+#     (memory.rs / sqlite.rs / postgres.rs), which is the door edge's
+#     replication apply path feeds. A `delegates_to` naming a `{node,agent}`
+#     or `{node,user}` hybrid recipient with any non-`infra:*` scope now
+#     REFUSES `Error::NodeAgencyForbidden` where it previously admitted.
+#     That refusal reaches edge as `kind() = "federation_node_agency_forbidden"`,
+#     falls through `ApplyRefusalClass::classify`'s `_ => None` arm, and is
+#     booked on the unchanged pre-#522 kind axis as a plain `Refused`. That is
+#     the CORRECT landing: the #522 class set carries an `is_transient()`
+#     disposition, and this refusal is a PERMANENT policy verdict — labelling
+#     it retry-able would assert convergence that will never come.
+#   * `may_act_through(agent, node)` (Clause D) is ADDITIVE and edge has no
+#     grounded caller — see the note by the #523 serve gate.
+#   * Whole-crate enum set-diff v38.5.0 → 2566bc54: ZERO delta (326 enums,
+#     1593 variants, identical both sides). `AttestationFamily` still has its
+#     11 variants, so `family_gates.rs`'s `MAXIMAL_UNKNOWN` wildcard stays
+#     unreachable and nothing is silently over-gated.
+#   * Producer sweep: edge's only production `put_attestation` producer
+#     (`delivered.rs` build_delivery_row) emits `attestation_type = scores`,
+#     never `delegates_to`, so no producer crosses this gate. Every edge
+#     `delegates_to` builder is `#[cfg(test)]`, and every edge key fixture
+#     registers a SINGLE-role `identity_type` — no fixture encoded the
+#     repealed loophole.
+#   * 2566bc54 still pins CIRISVerify v13.6.1 — one `ciris-verify-core`.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.6.0", version = "38", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -1478,7 +1529,9 @@ async-trait        = "0.1"
 # v38.5.0 — pinned by `tag` in LOCKSTEP with the runtime pin above. A split
 # between the two would resolve TWO `ciris-persist` graphs (and, through them,
 # two `ciris-verify-core` cdylibs — the empty-stdout SIGSEGV class).
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.5.0", version = "38", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
+# v38.6.0 (CIRISPersist#774) — held in lockstep with the runtime pin above
+# through the RC-adopt and back onto `tag`. These two move together, always.
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.6.0", version = "38", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3
