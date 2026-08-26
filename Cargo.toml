@@ -307,9 +307,90 @@ publish = false
 # emitters): the v38.3.0..v38.4.0 diff is PURELY ADDITIVE in `federation/mod.rs`
 # and the stores (the one deleted line is the sqlite PRAGMA string being
 # extended), so no producer's admit shape moves.
-# v38.4.0 still pins CIRISVerify v13.6.1 — `cargo tree -i ciris-verify-core`
+# v38.5.0 — THE ATTESTATION PLANE GETS A TYPED OUTCOME (#771/#772), and with it
+# the FIRST `DIRECTORY_ABI_VERSION` move since v38.0.0 (4 → 5).
+#
+#   * #771 `put_attestation` returns `AttestationOutcome { Inserted, AlreadyHeld }`
+#     instead of `()`. A re-delivered, byte-identical row used to raise a UNIQUE
+#     violation that the error mapping defaulted to `Error::Backend`, so "I
+#     already hold this" — idempotent success, the anti-entropy protocol WORKING
+#     — reached the sender wearing the same token as "the database is broken"
+#     (`federation_backend`). Measured on the production canonical: 7,536
+#     refusals in six hours, 428 distinct rows re-sent up to 82 times each, 58%
+#     of ALL refusals on that node and ~44% of its total WARN volume. This is
+#     the Attestation-plane twin of the Key plane's `ReplicatedKeyOutcome`
+#     (v24.2.0/#565), which edge already folds through `key_outcome_to_apply`.
+#     A same-id row with DIFFERENT bytes is still a typed `Error::Conflict` —
+#     quieting duplicates did not become accepting anything.
+#
+#     EDGE'S OBLIGATION, AND WHY IT IS NOT A NO-OP: upstream is explicit that
+#     "collapsing AlreadyHeld into Unit at the capsule boundary would have
+#     reproduced #771's own defect one layer down", so edge does not collapse it
+#     at ITS boundary either. Both consumers are folded onto edge's own closed
+#     apply vocabulary rather than discarded:
+#       - `replication/bridge.rs#apply_attestation` — `Inserted` → `Admitted`
+#         (+ the accord-relay / owner-memo invalidations, which only a state
+#         CHANGE can move), `AlreadyHeld` → `ApplyOutcome::Duplicate`. Duplicate
+#         is counted (`inc_duplicate(kind)` at the #425 choke) and logged at
+#         DEBUG, never WARN and never as a refusal — which is exactly the WARN
+#         volume #771 measured, now quiet at edge's end of the wire too.
+#       - `transport/realtime_av_alm/delivered.rs#emit_delivered_observation` —
+#         edge's one production `put_attestation` PRODUCER. Under v38.4.0 a
+#         re-emitted delivery row came back `Err(Backend(UNIQUE …))` and edge
+#         turned it into `DeliveryEmitError::Submit`, i.e. a FAULT; the naive
+#         adopt (`?;` on the new `Result`) would instead have silently reported
+#         `Emitted` for a row that changed nothing. Neither is honest, so
+#         `DeliveryEmitOutcome` gains `AlreadyHeld { attestation_id }`. The row
+#         is content-addressed off the envelope hash, so identical window
+#         contents dedupe to one row BY DESIGN — this is a routine outcome, not
+#         an edge case.
+#     Both matches name `Inserted` and `AlreadyHeld` EXPLICITLY, and the
+#     wildcard that `#[non_exhaustive]` forces is LOUD at both sites (a
+#     `Refused` / a `Submit` fault, each naming the unknown variant) — so a
+#     future persist minor that adds an outcome cannot be silently mis-counted
+#     as convergence progress. This is the `AttestationFamily`/MAXIMAL_UNKNOWN
+#     trap in its second location; the answer is the same one `family_gates.rs`
+#     gives: never let a wildcard be the quiet arm.
+#
+#   * `DIRECTORY_ABI_VERSION` 4 → 5, because `DirectoryOpResult` gained
+#     `AttestationOutcome(..)`. THE GATE IS NOT EDGE'S TO ASSERT: edge carries
+#     no copy of the constant (`grep -rn DIRECTORY_ABI_VERSION src/` is empty,
+#     and stays empty deliberately — a second transcription of a version is a
+#     disagreement waiting to happen). The check lives inside persist's own
+#     `build_ops_directory`, which edge calls from `ffi/pyo3.rs#init_edge_runtime`:
+#     it compares the RUNTIME wheel's `directory.vtable.abi_version` against the
+#     `DIRECTORY_ABI_VERSION` compiled into the ciris-persist edge LINKED, and
+#     refuses with "pin floor too low" rather than misdispatching. So edge's
+#     obligation is to be REBUILT against v38.5.0 — which this pin does — plus
+#     one thing a Cargo pin cannot express:
+#
+#     ⚠ THE PYPROJECT FLOOR IS THE REAL GATE. `ciris-persist>=38,<39` admits a
+#     38.4.0 WHEEL at runtime, whose capsule advertises abi_version 4 while this
+#     edge build expects 5 → `init_edge_runtime` fails at load, on device, on
+#     every mobile lane. A minor bump that moves the ABI must move the floor
+#     with it, so the floor is now `>=38.5,<39` (see pyproject.toml).
+#
+#   * Everything else in the cut is persist-internal: `attestation_reput_verdict`
+#     (the #758/#719 one-predicate absorb-then-re-read), the memory backend
+#     dropping its byte-for-byte emulation of sqlite's UNIQUE error, and fixture
+#     churn in `admission.rs`/`genesis`. No admit SHAPE moves.
+# Enum set-diff, v38.4.0 → v38.5.0 (the standing trap on this pin — a persist
+# minor that adds an `AttestationFamily` arm lands in `family_gates.rs`'s
+# wildcard as MAXIMAL_UNKNOWN and withholds the whole family, which is how
+# `Chat` nearly shipped withheld at v38.2.0): exactly ONE new `pub enum`
+# (`AttestationOutcome`) and exactly ONE new variant on an existing one
+# (`DirectoryOpResult::AttestationOutcome`, the ABI move above). Every other
+# `pub enum` in the crate is variant-identical. `AttestationFamily` lives in
+# `federation/namespace/mod.rs`, which this cut does not touch at all, so
+# `family_gates.rs#gates_for` is unmoved.
+# Producer sweep (`build_delivery_row`, `touch_claim`, the attestation/refusal
+# emitters): the admit SHAPE is untouched — `SignedAttestation`/`Attestation`
+# have no field change — so the only producer-visible move is the RETURN type,
+# swept at `delivered.rs` above. `put_touch_claim` is a different door and is
+# not in the diff.
+# v38.5.0 still pins CIRISVerify v13.6.1 — `cargo tree -i ciris-verify-core`
 # resolves exactly ONE, shared by edge and persist. No cross-cdylib skew.
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.4.0", version = "38", features = ["sqlite", "encrypted-kv"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.5.0", version = "38", features = ["sqlite", "encrypted-kv"] }
 # Keyring — Ed25519 + ML-DSA-65 hardware/software signers used by
 # Edge::send and Edge::send_durable to sign outbound envelopes.
 # v0.13.0 — bumped to v4.0.0 in lockstep with persist v3.0.0. Both
@@ -1394,10 +1475,10 @@ async-trait        = "0.1"
 # `default_outbound_pipeline::<InlineTextEnvelope>()` (Classify +
 # Scrub) over the persist pipeline surface. Dev-deps only; the normal
 # edge build does not pull these.
-# v38.4.0 — pinned by `tag` in LOCKSTEP with the runtime pin above. A split
+# v38.5.0 — pinned by `tag` in LOCKSTEP with the runtime pin above. A split
 # between the two would resolve TWO `ciris-persist` graphs (and, through them,
 # two `ciris-verify-core` cdylibs — the empty-stdout SIGSEGV class).
-ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.4.0", version = "38", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
+ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v38.5.0", version = "38", features = ["sqlite", "cirisnode", "classify", "scrub", "encrypted-kv"] }
 # CIRISEdge#23 / #49 — `tests/transport_http_hardening.rs` +
 # `tests/https_per_messagetype_roundtrip.rs` + `tests/https_pyedge_init.rs`
 # (v0.19.3) mint self-signed Ed25519 certs on the fly. v0.19.3

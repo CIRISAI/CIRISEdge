@@ -64,6 +64,36 @@ classifiers = [
 # source-build major-tracker + the co-resident version-agreement declaration, NOT
 # an install-time index requirement (so the "unresolvable from PyPI" shape is by
 # design, not a regression).
+#
+# ⚠ v18.9.0 / persist v38.5.0 — THIS FLOOR IS NOW LOAD-BEARING AT RUNTIME, AND
+# `>=38` UNDERSTATES IT. Left at `>=38,<39` per the adopt instruction; flagged
+# here because the mechanism is not visible from the Cargo pin.
+#
+# persist#771 moved `DIRECTORY_ABI_VERSION` 4 → 5 (`DirectoryOpResult` gained
+# `AttestationOutcome`). Edge does NOT carry that constant — deliberately; the
+# gate is persist's, and a second transcription of a version is a disagreement
+# waiting to happen. It fires inside persist's own `build_ops_directory`, called
+# from `ffi/pyo3.rs#init_edge_runtime`, and it compares TWO DIFFERENT COPIES OF
+# PERSIST:
+#   * `directory.vtable.abi_version` — baked into the ciris_persist WHEEL's
+#     `.so`, i.e. whatever THIS dependency line resolved at pip-install time; and
+#   * `DIRECTORY_ABI_VERSION` — compiled into the ciris-persist that the edge
+#     cdylib LINKED, i.e. the Cargo `tag` (now v38.5.0 → 5).
+# A `>=38,<39` resolution is satisfied by a 38.4.0 wheel, which advertises 4.
+# Against this edge build that is a hard `init_edge_runtime` failure at load —
+# "directory ops proxy: directory capsule ABI version mismatch … pin floor too
+# low" — on device, on every mobile lane, with no compile-time or CI signal
+# anywhere upstream of it. The Cargo pin cannot express this: the skew is
+# between the linked crate and the installed wheel, and only THIS line
+# constrains the wheel.
+#
+# So the co-resident version agreement edge now actually requires is
+# `ciris-persist>=38.5,<39`. It is a floor move on a MINOR bump because the ABI
+# moved on a minor bump — the usual "minors don't move the floor" rule does not
+# survive a `DIRECTORY_ABI_VERSION` change. Every future persist adopt should
+# diff `DIRECTORY_ABI_VERSION` (and its three siblings —
+# `ASYNC_EXECUTOR_ABI_VERSION`, `OUTBOUND_QUEUE_ABI_VERSION`,
+# `SIGNER_ABI_VERSION`, all still 1) and move this floor with any of them.
 dependencies = [
     "ciris-persist>=38,<39",
 ]
