@@ -72,6 +72,17 @@
 //! (`ResourceStrategy::AcceptAll`) and surfaces the reassembled bytes
 //! as a `NodeEvent::ResourceCompleted`, which the listener turns into
 //! an [`InboundFrame`].
+//!
+//! A transfer past leviculum's segment boundary
+//! (`RESOURCE_MAX_EFFICIENT_SIZE`, 1 MiB − 1, the reference RNS value) is split
+//! into segments on the wire. Since leviculum v0.24.0 (#62) `leviculum-std`
+//! reassembles them, so edge still sees exactly ONE `ResourceCompleted` per
+//! transfer carrying the whole payload — at `segment_index == total_segments`.
+//! Edge therefore owns NO segment-size or MDU constant of its own: the boundary
+//! is leviculum's, and the per-link MDU comes from `link_mdu()`. This is a
+//! DIFFERENT layer from [`crate::transport::frame_fragment`], which fragments
+//! oversized frames onto the sub-MDU PACKET path (`CFRG`, leviculum#39); the two
+//! reassembly paths never see each other's bytes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -350,6 +361,19 @@ const REVERSE_PATH_MAX_TRANSFER: Duration = Duration::from_secs(45);
 /// transfer refreshes `last_update` every progress tick, so only orphans
 /// qualify. 4096 entries ≈ 200 KB worst case: far above any realistic
 /// concurrent-send envelope, cheap enough that the prune almost never runs.
+///
+/// leviculum v0.24 (#62) re-audit: the bound's ASSUMPTION still holds — an entry
+/// only ever goes stale, never grows — but the orphan SOURCE is now bigger than
+/// the #59 race. A transfer past `RESOURCE_MAX_EFFICIENT_SIZE` is split, each
+/// segment is a distinct `OutgoingResource` with its OWN salted `resource_hash`,
+/// and leviculum-core emits exactly ONE sender-side `ResourceCompleted` for the
+/// whole transfer — at the FINAL segment, carrying the FINAL segment's hash
+/// (`link_management.rs:2872-2886`, `SegmentAdvance::Sent => return`). #62 did
+/// NOT change that (its assembler matches `is_sender: false` only). So an
+/// N-segment send strands N−1 entries DETERMINISTICALLY, not racily. They are
+/// still pure orphans that stop refreshing, so this prune bounds them exactly as
+/// designed; what it does NOT fix is the exact-hash lookup in
+/// `ship_resource_on_link` — see [`resource_wait_progress`].
 const SENT_RESOURCE_PROGRESS_PRUNE_THRESHOLD: usize = 4096;
 /// No-progress window for the OUTBOUND-dial path — a freshly-dialed link we
 /// control, so more lenient than the churn-prone reverse path.
@@ -383,6 +407,75 @@ impl ResourceSendStage {
 struct ResourceSendProgress {
     stage: ResourceSendStage,
     last_update: std::time::Instant,
+    /// The link this progress was observed on, recorded ONLY when the event
+    /// proved it was OUR upload (`is_sender == true`). `None` for the
+    /// `ResourceAdvertised` insert, which carries no `is_sender` and so cannot
+    /// be told from a peer advertising a resource TO us on the same link — an
+    /// inbound advertisement must never read as our own send's liveness.
+    /// Consumed by [`resource_wait_progress`].
+    link: Option<LinkId>,
+}
+
+/// Does this receiver-side `ResourceCompleted` carry the WHOLE transfer?
+///
+/// The leviculum v0.24.0 (#62) contract, as a pure predicate so the one shape
+/// edge routes is pinned by unit test rather than re-derived at a call site.
+/// `leviculum-std` reassembles multi-segment transfers and delivers the result
+/// as a single event at `segment_index == total_segments` — the same position
+/// the reference implementation treats as "the transfer concluded" (Python fires
+/// its resource callback only there). A single-segment transfer is `(1, 1)` and
+/// satisfies the same rule, so there is ONE rule, not two.
+///
+/// `false` means an INTERMEDIATE segment: leviculum declined to assemble and
+/// degraded to per-segment delivery (its documented ceiling behaviour — loud,
+/// never a drop and never a truncation). Edge refuses those rather than running
+/// a second reassembly layer.
+const fn resource_delivery_is_whole(segment_index: u32, total_segments: u32) -> bool {
+    segment_index == total_segments
+}
+
+/// How long since progress was last observed for ONE in-flight send, plus the
+/// stage it had reached — a PURE lookup so the split-transfer correlation is a
+/// unit test, not a field incident (the `reverse_path_wait_step` discipline).
+///
+/// The exact-hash lookup alone is WRONG for a split transfer, and leviculum#62
+/// is what makes that reachable: with transfer-level reassembly the receiver can
+/// finally take a multi-segment envelope, so edge's own >1 MiB sends start
+/// completing instead of being refused at the far end. Each segment is a
+/// distinct `OutgoingResource` with its OWN salted `resource_hash`, so the
+/// moment segment 1 concludes, the entry keyed by the hash
+/// `send_resource_awaited` returned stops refreshing while segments 2..N flow
+/// perfectly — and the watchdog reads a healthy transfer as
+/// `StalledNoProgress` after 6 s (reverse path) or 30 s (dial), abandoning it.
+///
+/// So the freshest sender-side progress on the SAME LINK counts too. That is
+/// exact, not a heuristic: a Reticulum link carries at most one OUTGOING
+/// resource at a time (`Link::outgoing_resource` is a single slot) — the same
+/// single-slot argument leviculum#62 uses to key receive-side assembly by
+/// `LinkId` with no `original_hash` plumbing. Bounded to entries stamped at or
+/// after `started_at`, so a previous transfer's orphan on the same link can
+/// never masquerade as this one's liveness.
+fn resource_wait_progress(
+    mirror: &HashMap<[u8; 32], ResourceSendProgress>,
+    resource_hash: &[u8; 32],
+    link_id: &LinkId,
+    started_at: std::time::Instant,
+    fallback: Duration,
+) -> (Duration, Option<ResourceSendStage>) {
+    let by_hash = mirror.get(resource_hash).copied();
+    let by_link = mirror
+        .values()
+        .filter(|p| p.link == Some(*link_id) && p.last_update >= started_at)
+        .copied()
+        .max_by_key(|p| p.last_update);
+    let freshest = match (by_hash, by_link) {
+        (Some(a), Some(b)) => Some(if a.last_update >= b.last_update { a } else { b }),
+        (Some(p), None) | (None, Some(p)) => Some(p),
+        (None, None) => None,
+    };
+    freshest.map_or((fallback, None), |p| {
+        (p.last_update.elapsed(), Some(p.stage))
+    })
 }
 
 /// One tick of the progress-aware reverse-path wait — a PURE decision so the
@@ -4940,11 +5033,20 @@ impl ReticulumTransport {
                     };
                 }
                 _ = poll.tick() => {
+                    // leviculum#62 follow-through: an exact-hash lookup alone goes
+                    // blind the moment a SPLIT transfer rolls onto segment 2 (each
+                    // segment carries its own salted hash), which would fast-fail a
+                    // perfectly healthy multi-MB send. `resource_wait_progress` also
+                    // counts sender-side progress on THIS link since this send began
+                    // — exact, because a link has one outgoing-resource slot.
                     let (since_last_progress, stage) = {
                         let guard = self.sent_resource_progress.lock().await;
-                        guard.get(&resource_hash).map_or_else(
-                            || (start.elapsed(), None),
-                            |p| (p.last_update.elapsed(), Some(p.stage)),
+                        resource_wait_progress(
+                            &guard,
+                            &resource_hash,
+                            link_id,
+                            start,
+                            start.elapsed(),
                         )
                     };
                     // `completed=false` / `link_live=true`: a proven completion or a
@@ -6219,13 +6321,17 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         // (extend the deadline) from a dead link (fast-fail), and log WHERE a
         // stalled transfer got stuck. `ResourceAdvertised` carries no `is_sender`;
         // its entry is harmless (the wait only looks up its own hash) and is
-        // cleaned on completion/failure.
+        // cleaned on completion/failure. For the same reason it records NO
+        // `link`: an advertisement whose direction we cannot tell must never be
+        // read as our own send's liveness on that link (see
+        // [`resource_wait_progress`]).
         NodeEvent::ResourceAdvertised { resource_hash, .. } => {
             ctx.sent_resource_progress.lock().await.insert(
                 resource_hash,
                 ResourceSendProgress {
                     stage: ResourceSendStage::Advertised,
                     last_update: std::time::Instant::now(),
+                    link: None,
                 },
             );
         }
@@ -6243,12 +6349,21 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         // past the cap, entries idle beyond the reverse-path hard transfer
         // cap are pruned — a live transfer refreshes `last_update` on every
         // progress tick, so only orphans qualify.
+        //
+        // leviculum v0.24 (#62) re-audit: for a SPLIT transfer these fire under
+        // each SEGMENT's own `resource_hash`, so the entry keyed by the hash
+        // `send_resource_awaited` returned stops refreshing after segment 1. The
+        // `link_id` is recorded here — where `is_sender` PROVES the direction —
+        // so [`resource_wait_progress`] can follow the transfer across its
+        // segments on the link's single outgoing-resource slot.
         NodeEvent::ResourceTransferStarted {
+            link_id,
             resource_hash,
             is_sender,
             ..
         }
         | NodeEvent::ResourceProgress {
+            link_id,
             resource_hash,
             is_sender,
             ..
@@ -6263,6 +6378,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     ResourceSendProgress {
                         stage: ResourceSendStage::Transferring,
                         last_update: std::time::Instant::now(),
+                        link: Some(link_id),
                     },
                 );
             }
@@ -6302,6 +6418,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             data,
             is_sender,
             segment_index,
+            total_segments,
             resource_hash,
             ..
         } => {
@@ -6319,11 +6436,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 // NOT process our own outbound completion as a receiver-side frame.
                 return;
             }
-            // Receiver side: the first segment carries the full envelope (edge
-            // envelopes are single-segment for the MVP — an 8 MiB cap fits one
-            // Reticulum resource). CIRISEdge#425 — these two causes used to fuse
-            // into ONE silent `return`; split + loud (a multi-segment resource is a
-            // real assumption break if leviculum ever chunks a large transfer).
+            // Receiver side. CIRISEdge#425 — these causes used to fuse into ONE
+            // silent `return`; they are split and loud, each through the
+            // `drop_inbound` choke.
             if data.is_empty() {
                 drop_inbound(
                     Some(link_id),
@@ -6332,20 +6447,55 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 );
                 return;
             }
-            if segment_index != 1 {
-                drop_inbound(
-                    Some(link_id),
-                    "multi-segment-resource",
-                    &format!(
-                        "segment_index={segment_index} — edge assumes single-segment \
-                         envelopes (MVP); segments >1 are NOT reassembled and are dropped"
-                    ),
+            // leviculum v0.24.0 / #62 — TRANSFER-LEVEL REASSEMBLY. `leviculum-std`
+            // reassembles multi-segment transfers, so the consumer gets ONE
+            // completion per transfer carrying the WHOLE payload, delivered at
+            // `segment_index == total_segments` (the reference's "transfer
+            // concluded" event: Python fires its resource callback only there).
+            // That is the ONE shape edge routes.
+            //
+            // This replaced the pre-v0.24 arm, which took `segment_index == 1` as
+            // "the whole envelope" — the leviculum#61 truncation signature. Edge's
+            // policy cap (8 MiB `MAX_BODY_BYTES`) and its actually-receivable size
+            // (~1 MiB, one segment) had disagreed all along; a >1 MiB envelope had
+            // its FIRST SEGMENT routed as if whole (a body cut at
+            // `RESOURCE_MAX_EFFICIENT_SIZE` minus the metadata block) while every
+            // later segment was refused. With the driver's default 64 MiB
+            // per-transfer assembly ceiling, an 8 MiB envelope (9 segments,
+            // ~9 MiB projected) assembles comfortably — edge now receives to its
+            // own cap. Edge does NOT define, raise, or shadow any segment-size or
+            // MDU constant to get this; the boundary is leviculum's
+            // (`RESOURCE_MAX_EFFICIENT_SIZE` == reference RNS's
+            // `1 * 1024 * 1024 - 1`), and edge reads `link_mdu()` per link.
+            //
+            // An INTERMEDIATE segment reaching us means leviculum DECLINED to
+            // assemble this transfer and degraded to per-segment delivery — the
+            // documented ceiling behaviour (`RESOURCE_ASSEMBLY_DECLINED` /
+            // `RESOURCE_ASSEMBLY_OUT_OF_ORDER` on the driver side), never a drop
+            // and never a truncation there. Edge must NOT reassemble it itself:
+            // that would be a second reassembly layer racing the driver's, and it
+            // is the very "obvious fix" upstream warned about. So it stays a loud,
+            // typed refusal naming the knob that resolves it. The degraded
+            // transfer's FINAL slice is indistinguishable from an assembled whole
+            // at this seam (same `segment_index == total_segments`); it is routed
+            // and fails envelope verification downstream, after these refusals and
+            // the driver's own error have already named the cause.
+            if !resource_delivery_is_whole(segment_index, total_segments) {
+                let detail = format!(
+                    "segment {segment_index}/{total_segments} arrived UNASSEMBLED — \
+                     leviculum-std DECLINED transfer-level reassembly for this transfer \
+                     (leviculum#62 ceiling degradation; its RESOURCE_ASSEMBLY_DECLINED / \
+                     RESOURCE_ASSEMBLY_OUT_OF_ORDER error names the cause). Edge runs no \
+                     second reassembly layer — raise \
+                     ReticulumNodeBuilder::max_assembled_resource_size. Segment dropped"
                 );
+                drop_inbound(Some(link_id), "resource-assembly-degraded", &detail);
                 return;
             }
             tracing::debug!(
                 link = ?link_id,
                 bytes = data.len(),
+                segments = total_segments,
                 "inbound envelope resource completed",
             );
             attribute_and_deliver(ctx, link_id, data).await;
@@ -9414,6 +9564,189 @@ mod tests {
                 ),
                 Done
             );
+        }
+    }
+
+    // ── leviculum v0.24.0 / #62 — the receive-side delivery contract ──
+    //
+    // Pre-v0.24 edge took `segment_index == 1` as "the whole envelope", which is
+    // the leviculum#61 truncation signature: a >1 MiB envelope had its FIRST
+    // SEGMENT routed as if whole. These pin the ONE shape edge routes now.
+    mod resource_delivery_contract {
+        use super::*;
+
+        #[test]
+        fn a_single_segment_transfer_is_whole() {
+            assert!(resource_delivery_is_whole(1, 1));
+        }
+
+        #[test]
+        fn the_assembled_multi_segment_event_is_whole() {
+            // What leviculum-std hands over after reassembly: the final position,
+            // carrying every byte (its own e2e test observes exactly (3, 3)).
+            assert!(resource_delivery_is_whole(3, 3));
+            assert!(resource_delivery_is_whole(9, 9));
+        }
+
+        #[test]
+        fn an_intermediate_segment_is_the_declined_ceiling_path_not_a_delivery() {
+            // Only reachable when leviculum DECLINED to assemble; edge refuses it
+            // loudly instead of reassembling behind the driver's back.
+            assert!(!resource_delivery_is_whole(1, 3));
+            assert!(!resource_delivery_is_whole(2, 3));
+        }
+
+        #[test]
+        fn the_pre_v0_24_rule_would_have_routed_a_truncated_first_segment() {
+            // The regression this replaced: `segment_index == 1` said "whole" for
+            // segment 1 of 3 — a body cut at the segment boundary.
+            let pre_v0_24_said_whole = 1 == 1;
+            assert!(pre_v0_24_said_whole);
+            assert!(
+                !resource_delivery_is_whole(1, 3),
+                "segment 1 of 3 is NOT the whole envelope (leviculum#61)"
+            );
+        }
+    }
+
+    // ── leviculum#62 follow-through: progress correlation across SEGMENTS ──
+    //
+    // leviculum-std's transfer-level reassembly makes edge's own >1 MiB sends
+    // land at the far end for the first time, which exposes the sender-side
+    // correlation: a split transfer's segments each carry their OWN salted
+    // `resource_hash`, so an exact-hash lookup goes blind after segment 1 and the
+    // watchdog reads a healthy transfer as stalled. Fed the EXACT shapes the
+    // field produces, not the convenient ones.
+    mod split_transfer_progress {
+        use super::*;
+
+        fn link(n: u8) -> LinkId {
+            LinkId::new([n; 16])
+        }
+
+        fn hash(n: u8) -> [u8; 32] {
+            [n; 32]
+        }
+
+        fn at(now: std::time::Instant, ago: Duration) -> std::time::Instant {
+            now.checked_sub(ago).expect("test instants stay in range")
+        }
+
+        /// Segment 1's entry is stale, but segment 2 is flowing on the same link:
+        /// the transfer is LIVE and must not read as no-progress.
+        #[test]
+        fn later_segment_progress_on_the_same_link_keeps_the_transfer_alive() {
+            let now = std::time::Instant::now();
+            let start = at(now, Duration::from_secs(40));
+            let mut mirror = HashMap::new();
+            // The hash `send_resource_awaited` returned — segment 1, concluded 30s ago.
+            mirror.insert(
+                hash(1),
+                ResourceSendProgress {
+                    stage: ResourceSendStage::Transferring,
+                    last_update: at(now, Duration::from_secs(30)),
+                    link: Some(link(7)),
+                },
+            );
+            // Segment 2, still flowing, under its OWN hash.
+            mirror.insert(
+                hash(2),
+                ResourceSendProgress {
+                    stage: ResourceSendStage::Transferring,
+                    last_update: at(now, Duration::from_millis(200)),
+                    link: Some(link(7)),
+                },
+            );
+            let (since, stage) =
+                resource_wait_progress(&mirror, &hash(1), &link(7), start, Duration::from_secs(99));
+            assert!(
+                since < Duration::from_secs(1),
+                "segment 2's progress must count as this transfer's progress, got {since:?}"
+            );
+            assert_eq!(stage, Some(ResourceSendStage::Transferring));
+        }
+
+        /// A genuinely stalled transfer still reads as stalled — the fix must not
+        /// blunt the #353b fast-fail.
+        #[test]
+        fn a_genuinely_stalled_transfer_still_reads_stalled() {
+            let now = std::time::Instant::now();
+            let start = at(now, Duration::from_secs(20));
+            let mut mirror = HashMap::new();
+            mirror.insert(
+                hash(1),
+                ResourceSendProgress {
+                    stage: ResourceSendStage::Advertised,
+                    last_update: at(now, Duration::from_secs(19)),
+                    link: Some(link(7)),
+                },
+            );
+            let (since, stage) =
+                resource_wait_progress(&mirror, &hash(1), &link(7), start, Duration::ZERO);
+            assert!(since >= Duration::from_secs(19), "got {since:?}");
+            assert_eq!(stage, Some(ResourceSendStage::Advertised));
+        }
+
+        /// Progress on a DIFFERENT link is another send entirely.
+        #[test]
+        fn progress_on_another_link_is_not_our_liveness() {
+            let now = std::time::Instant::now();
+            let start = at(now, Duration::from_secs(20));
+            let mut mirror = HashMap::new();
+            mirror.insert(
+                hash(9),
+                ResourceSendProgress {
+                    stage: ResourceSendStage::Transferring,
+                    last_update: now,
+                    link: Some(link(8)),
+                },
+            );
+            let (since, stage) =
+                resource_wait_progress(&mirror, &hash(1), &link(7), start, Duration::from_secs(20));
+            assert_eq!(since, Duration::from_secs(20), "falls back to send age");
+            assert_eq!(stage, None);
+        }
+
+        /// An INBOUND advertisement rides the same link and carries no `is_sender`,
+        /// so it records no link and must never mask our own send's stall.
+        #[test]
+        fn an_inbound_advertisement_on_the_link_does_not_mask_our_stall() {
+            let now = std::time::Instant::now();
+            let start = at(now, Duration::from_secs(20));
+            let mut mirror = HashMap::new();
+            mirror.insert(
+                hash(5),
+                ResourceSendProgress {
+                    stage: ResourceSendStage::Advertised,
+                    last_update: now,
+                    link: None,
+                },
+            );
+            let (since, stage) =
+                resource_wait_progress(&mirror, &hash(1), &link(7), start, Duration::from_secs(20));
+            assert_eq!(since, Duration::from_secs(20));
+            assert_eq!(stage, None);
+        }
+
+        /// A PREVIOUS transfer's orphan on the same link is older than this send's
+        /// start, so it cannot masquerade as this transfer's liveness.
+        #[test]
+        fn a_previous_transfers_orphan_on_the_link_is_excluded() {
+            let now = std::time::Instant::now();
+            let start = at(now, Duration::from_secs(10));
+            let mut mirror = HashMap::new();
+            mirror.insert(
+                hash(3),
+                ResourceSendProgress {
+                    stage: ResourceSendStage::Transferring,
+                    last_update: at(now, Duration::from_secs(12)),
+                    link: Some(link(7)),
+                },
+            );
+            let (since, stage) =
+                resource_wait_progress(&mirror, &hash(1), &link(7), start, Duration::from_secs(10));
+            assert_eq!(since, Duration::from_secs(10), "falls back to send age");
+            assert_eq!(stage, None);
         }
     }
 

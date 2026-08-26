@@ -27,6 +27,23 @@
 //! memory against never-completing frames (lost fragments / attacker floods) with
 //! an LRU cap on in-flight messages.
 //!
+//! ## NOT the same layer as leviculum's resource segmentation (leviculum#62)
+//! There are two reassembly paths on an established link and they must never be
+//! conflated or double-applied. THIS module owns the PACKET path: `CFRG` pieces
+//! sized to the link MDU, rebuilt by [`Reassembler::accept`]. leviculum owns the
+//! RESOURCE path: a transfer past `RESOURCE_MAX_EFFICIENT_SIZE` is split into
+//! segments on the wire and, since leviculum v0.24.0 (#62), reassembled inside
+//! `leviculum-std` so edge sees one whole-payload `ResourceCompleted`. Adopting
+//! #62 changed NOTHING here: this module imports nothing from leviculum, both
+//! [`fragment`] call sites are packet-path sends (`LinkHandle::try_send`) while
+//! `ship_resource_on_link` hands the resource path its bytes UNFRAGMENTED, and
+//! `accept` dispatches on the `CFRG` magic — so a resource-path payload,
+//! assembled or not, passes through it untouched. The size constants below
+//! ([`MAX_BODY_BYTES`], `WIRE_ENVELOPE_MAX_BYTES`) are packet-path and
+//! admissibility ceilings; neither is a segment-size or MDU constant, and edge
+//! defines no such constant anywhere — the segment boundary is leviculum's and
+//! the per-link MDU comes from `link_mdu()`.
+//!
 //! ## The whole-frame-retry ceiling — and its ARQ closure (CIRISEdge#422)
 //! Because whole-frame retry is at whole-frame granularity, a frame that needs
 //! THOUSANDS of fragments has a vanishing per-round reassembly probability under
