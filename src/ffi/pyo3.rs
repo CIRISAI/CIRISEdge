@@ -4189,6 +4189,26 @@ fn node_alias(keystore_alias: &str) -> String {
 /// can refuse. Split out so every fail-closed path is unit-testable without a
 /// Python interpreter or a persist executor; the async key-id derivation stays
 /// in the caller.
+/// Does `require_local_signer` apply to the engine's local-signer capsule?
+///
+/// By its own error text, `require_local_signer` guards exactly ONE thing: that
+/// the Reticulum TRANSPORT IDENTITY is the attested 32-byte Ed25519 path rather
+/// than the keyring fallback (which yields a 65-byte P-256 pubkey under
+/// `hardware_hsm_only` and an un-attested announce — CIRISEdge#289 / AV-42).
+///
+/// CIRISEdge#541 — under `use_node_identity` the transport identity does not come
+/// from that capsule at all. It is the sealed node keystore entry: verified
+/// hybrid, and already fail-closed if it cannot be opened. The guard's premise is
+/// false in that mode, and enforcing it would reject a deployment whose transport
+/// identity is *better* attested than the one the flag was written to demand.
+///
+/// The capsule then supplies only the ENVELOPE author's in-memory fast path,
+/// whose absence is a performance fallback (CIRISEdge#50), not an attestation
+/// gap — so it must not be fatal.
+const fn require_actor_capsule(require_local_signer: bool, use_node_identity: bool) -> bool {
+    require_local_signer && !use_node_identity
+}
+
 /// The classical half, the PQC half, and the keystore alias they live under.
 type NodeIdentityHalves = (
     Arc<dyn ciris_keyring::HardwareSigner>,
@@ -5294,15 +5314,15 @@ pub fn init_edge_runtime(
                 .ok()
                 .and_then(|v| v.extract().ok())
                 .flatten();
-            if readback.as_deref() == Some(derived_signer_key_id.as_str()) {
+            if readback.as_deref() == Some(advertised_key_id.as_str()) {
                 tracing::info!(
-                    self_key_id = %derived_signer_key_id,
+                    self_key_id = %advertised_key_id,
                     "de-admission gate ARMED — engine.self_key_id set + read back \
                      (CIRISEdge#427 §3 / AV-77)"
                 );
             } else {
                 tracing::warn!(
-                    self_key_id = %derived_signer_key_id,
+                    self_key_id = %advertised_key_id,
                     readback = ?readback,
                     "engine.set_self_key_id did NOT read back — in-band de-admission may be \
                      DORMANT; a peer sanction will not enforce (CIRISEdge#427 §3)"
@@ -5377,6 +5397,16 @@ pub fn init_edge_runtime(
     // (CIRISEdge#50, headless darwin / locked Keychain). That job is independent
     // of which identity the transport advertises, and conflating the two would
     // silently drop the fast path the moment #541's flag was set.
+    let require_actor_capsule = require_actor_capsule(require_local_signer, use_node_identity);
+    if require_local_signer && !require_actor_capsule {
+        tracing::info!(
+            "require_local_signer=True is satisfied STRUCTURALLY under \
+             use_node_identity=True: the transport identity is the sealed node \
+             keystore entry (verified hybrid, fail-closed), not the engine capsule. \
+             The capsule is now only the envelope author's fast path, so its \
+             absence is not fatal (CIRISEdge#541)."
+        );
+    }
     let actor_local_signer: Arc<LocalSigner> = {
         match extract_local_signer(&engine) {
             Ok(local_signer_arc) => {
@@ -5428,7 +5458,7 @@ pub fn init_edge_runtime(
                 // into `require_local_signer=True`; the silent keyring fallback
                 // (65-byte P-256 under hardware_hsm_only → unrooted announce)
                 // is a hard error instead.
-                if require_local_signer {
+                if require_actor_capsule {
                     return Err(PyRuntimeError::new_err(
                         "require_local_signer=True but ciris_persist.Engine raised \
                      local_signer_unavailable from local_signer_capsule(): the \
@@ -5457,7 +5487,7 @@ pub fn init_edge_runtime(
             }
             Err(LocalSignerCapsuleError::MethodAbsent) => {
                 // CIRISEdge#289 — same fail-loud opt-in as the Unavailable arm.
-                if require_local_signer {
+                if require_actor_capsule {
                     return Err(PyRuntimeError::new_err(
                         "require_local_signer=True but ciris_persist.Engine does not \
                      expose local_signer_capsule() (persist < 3.1.1): the \
@@ -11073,6 +11103,24 @@ mod pyo3_tier2_tests {
 #[cfg(feature = "transport-reticulum")]
 mod node_identity_tests {
     use super::{node_alias, open_node_identity_halves, NODE_ALIAS_SUFFIX};
+
+    /// `require_local_signer` guards the TRANSPORT identity's attestation. Under
+    /// `use_node_identity` that identity comes from the sealed node keystore, so
+    /// the engine capsule is only the envelope author's fast path and its absence
+    /// must not be fatal. All four combinations pinned, because the interesting
+    /// one is a deliberate NON-refusal and a future edit could "tidy" it away.
+    #[test]
+    fn the_capsule_requirement_applies_only_when_the_actor_is_also_the_transport() {
+        use super::require_actor_capsule;
+        // Legacy mode: the capsule IS the transport identity, so the guard bites.
+        assert!(require_actor_capsule(true, false));
+        assert!(!require_actor_capsule(false, false));
+        // Node mode: the transport identity is the sealed node key. The guard's
+        // premise is false, so an absent capsule must not block startup — the
+        // node identity path is itself fail-closed and strictly better attested.
+        assert!(!require_actor_capsule(true, true));
+        assert!(!require_actor_capsule(false, true));
+    }
 
     /// Pins edge's copy of the alias rule against CIRISServer's
     /// `node_key::node_alias` (0.5.189). Edge cannot import it — CIRISServer
