@@ -5245,6 +5245,29 @@ pub fn init_edge_runtime(
         derived_key_id = %derived_signer_key_id,
         "init_edge_runtime: federation key_id derived (alias → derived)",
     );
+
+    // CIRISEdge#541 — resolve the node transport identity HERE, before the
+    // de-admission gate below is armed. The identity edge ADVERTISES is the one
+    // a sanction is addressed to, so `set_self_key_id`, the announce
+    // attestation's `federation_key_id`, and the key that signs it must be the
+    // same identity or the node is unreachable in exactly the ways that matter:
+    // a `revocation:peer_admission:v1` aimed at the advertised id would not
+    // match the engine's self, and an attestation advertising one id while
+    // signing with another key is a public-key mismatch at every receiver — it
+    // could never root, and could never supersede an existing rooted route.
+    let node_transport_identity: Option<Arc<LocalSigner>> = if use_node_identity {
+        Some(resolve_node_transport_identity(
+            &executor,
+            node_identity_dir,
+            &signer_handle.key_id,
+        )?)
+    } else {
+        None
+    };
+    // The identity this node advertises and is addressable as.
+    let advertised_key_id: String = node_transport_identity
+        .as_ref()
+        .map_or_else(|| derived_signer_key_id.clone(), |s| s.key_id.clone());
     // CIRISEdge#427 §3 / CIRISPersist#543 (AV-77) — declare THIS node's federation
     // identity to the shared persist Engine so in-band peer de-admission
     // (`revocation:peer_admission:v1`) is reachable. Without it the gate is dormant
@@ -5253,7 +5276,7 @@ pub fn init_edge_runtime(
     // engine lacks the method → the gate stays dormant (fail-open by design), but
     // it says so. The read-back assert catches a silently-ignored setter — the
     // exact "witness reached past the Engine" blind spot #427 §3 was fixed for.
-    match engine.call_method1("set_self_key_id", (derived_signer_key_id.clone(),)) {
+    match engine.call_method1("set_self_key_id", (advertised_key_id.clone(),)) {
         Ok(_) => {
             let readback: Option<String> = engine
                 .call_method0("self_key_id")
@@ -5338,15 +5361,12 @@ pub fn init_edge_runtime(
     // `resolve_node_transport_identity` errors rather than falling through to the
     // engine-derived (agency-bearing) identity below.
     //
-    // Note what this deliberately does NOT change: `Edge::scrub_signer` selects
-    // `local_signer` only when its `key_id` matches the hot-path `signer.key_id`,
-    // so a node-keyed transport identity makes envelope authorship fall back to
-    // the actor's signer BY CONSTRUCTION — which is exactly the required split
-    // ("the engine keeps signing as the actor"). Pinned by
-    // `a_node_transport_identity_leaves_envelope_authorship_with_the_actor`.
-    let reticulum_identity_signer: Arc<LocalSigner> = if use_node_identity {
-        resolve_node_transport_identity(&executor, node_identity_dir, &signer_handle.key_id)?
-    } else {
+    // The ACTOR's in-memory signer. Resolved unconditionally, because it is what
+    // AUTHORS envelopes — the v1.1.1 fast path that skips platform-keyring IPC
+    // (CIRISEdge#50, headless darwin / locked Keychain). That job is independent
+    // of which identity the transport advertises, and conflating the two would
+    // silently drop the fast path the moment #541's flag was set.
+    let actor_local_signer: Arc<LocalSigner> = {
         match extract_local_signer(&engine) {
             Ok(local_signer_arc) => {
                 // Adapt persist's `Arc<LocalSigner>` to
@@ -5460,6 +5480,15 @@ pub fn init_edge_runtime(
         }
     };
 
+    // The TRANSPORT identity: the node's own key when the caller opted in,
+    // otherwise the actor's, exactly as before. This is what ReticulumAuth
+    // retains as `local_signer` and what the SelfSignedRouteProducer signs the
+    // #393 item-2 SignedTransportDestination with — so it must agree with
+    // `advertised_key_id` above, which it does by construction (that id is read
+    // off this very signer).
+    let reticulum_identity_signer: Arc<LocalSigner> =
+        node_transport_identity.unwrap_or_else(|| Arc::clone(&actor_local_signer));
+
     // ── Step 4: parse the Reticulum transport config.
     let listen_addr = listen_addr
         .parse()
@@ -5473,7 +5502,7 @@ pub fn init_edge_runtime(
         })
         .collect::<PyResult<Vec<_>>>()?;
     let mut transport_config =
-        ReticulumTransportConfig::new(PathBuf::from(identity_path), signer.key_id.clone());
+        ReticulumTransportConfig::new(PathBuf::from(identity_path), advertised_key_id.clone());
     // v0.18.0 (CIRISEdge#45) — Reticulum still binds its TCP listener
     // by default; an explicit Client posture from the operator
     // (agent_mode="client") signals "egress only". The
@@ -6422,7 +6451,7 @@ pub fn init_edge_runtime(
         // self.local_signer stayed None and signing routed through
         // the forensic keyring path — identical behavior to v1.1.0
         // on headless darwin. This line completes the fix.
-        .local_signer(reticulum_identity_signer.clone())
+        .local_signer(actor_local_signer.clone())
         .events(Arc::clone(&event_bus))
         .reachability(Arc::clone(&reachability_tracker))
         // v0.17.0 (CIRISEdge#39 emit_verdict flip) — wire the persist

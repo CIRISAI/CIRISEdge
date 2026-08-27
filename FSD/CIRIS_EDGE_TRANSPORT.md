@@ -440,11 +440,22 @@ Three properties are load-bearing:
   identity — a node handed the actor's key under a flag claiming to have cured
   the defect would reproduce it. Edge **opens** and never **mints**: a minted
   key is registered by no directory and owner-bound by nobody.
-- **Envelope authorship stays with the actor.** `Edge::scrub_signer` selects the
-  local signer only when its `key_id` matches the hot-path signer's, so a
-  node-keyed transport identity leaves CEG-row authorship on the actor *by
-  construction* (`local_signer_authors_envelopes`, pinned by
-  `a_node_transport_identity_leaves_envelope_authorship_with_the_actor`).
+- **One identity, advertised and addressable.** `set_self_key_id`, the announce
+  attestation's `federation_key_id` (`ReticulumTransportConfig::local_key_id`),
+  and the key that signs that attestation are all the node's under this flag.
+  They have to agree: an attestation advertising one id while signing with
+  another key is a public-key mismatch at every receiver — it could never root
+  and could never supersede an existing rooted route — and a
+  `revocation:peer_admission:v1` aimed at the advertised id would not match the
+  engine's self, leaving the node un-de-admittable.
+- **Envelope authorship stays with the actor**, and so does its fast path. The
+  transport identity and the envelope author are *different jobs*: edge keeps
+  the ACTOR's in-memory signer in `Edge::local_signer` regardless of this flag,
+  so the v1.1.1 keyring-IPC bypass (`#50`, headless darwin / locked Keychain)
+  survives it. `local_signer_authors_envelopes` is the guard that makes the
+  separation safe rather than merely intended: a non-actor signer reaching that
+  slot falls back to the forensic signer instead of quietly authoring CEG rows
+  under an identity that holds no agency.
 
 Absent or `false`, behaviour is byte-for-byte what it was.
 
