@@ -4289,14 +4289,38 @@ fn resolve_node_transport_identity(
     executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor,
     node_identity_dir: Option<&str>,
     host_keystore_alias: &str,
+    directory: &Arc<dyn ciris_persist::federation::FederationDirectory>,
 ) -> PyResult<Arc<LocalSigner>> {
     let (classical, pqc, alias) = open_node_identity_halves(node_identity_dir, host_keystore_alias)
         .map_err(PyRuntimeError::new_err)?;
     // The federation key_id is DERIVED over the node alias + the node's own
     // pubkey — never the actor's derived id, or the split would be cosmetic.
+    //
+    // Then VERIFIED against the directory, because opening two readable files
+    // proves only that two readable files exist. The alias rule is a naming
+    // convention; the directory is the authority on what a key IS. Three
+    // failures are reachable without this check and every one of them is silent:
+    //
+    //  * an actor alias that already ends in `-node` (`prod-node`) makes the
+    //    idempotent alias rule a NO-OP, so `open_existing` reopens the ACTOR's
+    //    sealed key and the node advertises an agency-bearing identity while
+    //    `use_node_identity=True` claims the opposite;
+    //  * seed files present but never registered (or lost in a restore) — the
+    //    node announces an identity no peer can root;
+    //  * a `node_ml_dsa_65.seed` that does not match the registered PQC half —
+    //    it passes the `Some(pqc)` construction gate here and then fails hybrid
+    //    verification at every peer, as unattributed drops in someone else's log.
+    //
+    // This mirrors the discipline CIRISServer applies at provisioning: read the
+    // directory back rather than trust the write, because a benign Conflict
+    // treated as Ok is how a node ran for months on a key that never said
+    // `node`. Trusting a filename here would rebuild that defect one layer down.
     let classical_for_derive = Arc::clone(&classical);
+    let pqc_for_derive = Arc::clone(&pqc);
     let alias_for_derive = alias.clone();
+    let dir_for_check = Arc::clone(directory);
     let derived: Result<String, String> = run_async(executor, async move {
+        use base64::Engine as _;
         let pubkey = classical_for_derive
             .public_key()
             .await
@@ -4309,10 +4333,65 @@ fn resolve_node_transport_identity(
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&pubkey);
-        Ok::<_, String>(ciris_verify_core::fedcode::derive_key_id(
-            &alias_for_derive,
-            &arr,
-        ))
+        let derived = ciris_verify_core::fedcode::derive_key_id(&alias_for_derive, &arr);
+
+        let record = dir_for_check
+            .lookup_public_key(&derived)
+            .await
+            .map_err(|e| format!("directory lookup for node identity {derived} failed: {e}"))?;
+        let Some(record) = record else {
+            return Err(format!(
+                "use_node_identity=True: the sealed entry {alias_for_derive:?} opened, but its \
+                 derived federation key_id {derived} is NOT REGISTERED in the directory. \
+                 Readable seed files do not mean provisioning completed — the key must exist \
+                 with identity_type=node or no peer can root this node. Run \
+                 ciris_server.provision_node_identity(engine, keystore_alias, identity_dir) \
+                 (CIRISEdge#541)."
+            ));
+        };
+        if record.identity_type != ciris_persist::federation::types::identity_type::NODE {
+            return Err(format!(
+                "use_node_identity=True: {derived} is registered as identity_type={:?}, not \
+                 `node`. This is the case a `-node`-suffixed ACTOR alias produces: the alias \
+                 rule is idempotent, so {alias_for_derive:?} resolved to the actor's own sealed \
+                 key and the node would have advertised an agency-bearing identity while this \
+                 flag claimed the opposite. CC 3.4.7.3 makes `node` non-cohabitable with \
+                 agent/user — provision a distinct node identity (CIRISEdge#541).",
+                record.identity_type
+            ));
+        }
+        let registered_ed = base64::engine::general_purpose::STANDARD
+            .decode(&record.pubkey_ed25519_base64)
+            .map_err(|e| format!("registered Ed25519 pubkey for {derived} is not base64: {e}"))?;
+        if registered_ed != arr {
+            return Err(format!(
+                "use_node_identity=True: the sealed Ed25519 key under {alias_for_derive:?} does \
+                 NOT match the pubkey registered for {derived}. The keystore and the directory \
+                 disagree about this node's identity (CIRISEdge#541)."
+            ));
+        }
+        let Some(registered_pqc_b64) = record.pubkey_ml_dsa_65_base64.as_ref() else {
+            return Err(format!(
+                "use_node_identity=True: {derived} is registered with NO ML-DSA-65 half. The \
+                 transport identity signs #393 item 2's SignedTransportDestination, so a \
+                 classical-only registration routes but can never root (CIRISEdge#458/#541)."
+            ));
+        };
+        let registered_pqc = base64::engine::general_purpose::STANDARD
+            .decode(registered_pqc_b64)
+            .map_err(|e| format!("registered ML-DSA-65 pubkey for {derived} is not base64: {e}"))?;
+        let opened_pqc = ciris_keyring::PqcSigner::public_key(pqc_for_derive.as_ref())
+            .await
+            .map_err(|e| format!("node ML-DSA-65 pubkey read failed: {e}"))?;
+        if registered_pqc != opened_pqc {
+            return Err(format!(
+                "use_node_identity=True: `node_ml_dsa_65.seed` does not match the ML-DSA-65 half \
+                 registered for {derived}. This passes every local construction gate and then \
+                 fails hybrid verification at EVERY peer — as unattributed drops in someone \
+                 else's log, not an error here. Refused at init instead (CIRISEdge#541)."
+            ));
+        }
+        Ok::<_, String>(derived)
     });
     let derived_node_key_id = derived.map_err(PyRuntimeError::new_err)?;
 
@@ -5291,6 +5370,7 @@ pub fn init_edge_runtime(
             &executor,
             node_identity_dir,
             &signer_handle.key_id,
+            &federation_directory_for_edge,
         )?)
     } else {
         None
@@ -5544,6 +5624,17 @@ pub fn init_edge_runtime(
         .collect::<PyResult<Vec<_>>>()?;
     let mut transport_config =
         ReticulumTransportConfig::new(PathBuf::from(identity_path), advertised_key_id.clone());
+    // CIRISEdge#541 — keep the RNS transport identity where it already lives.
+    // Under `use_node_identity` the ADVERTISED id moves to the node's, but the
+    // 64-byte Reticulum keypair in a `TransportIdentityKeystore` is stored under
+    // the actor's id from before this flag existed. Letting the lookup follow the
+    // advertised id would miss it, generate a fresh identity, and silently change
+    // this node's destination hash — every saved peer route invalidated, no error
+    // raised. File-backed deployments were never exposed (they key off
+    // `identity_path`); this makes the keystore-backed path behave the same.
+    if use_node_identity {
+        transport_config.transport_identity_storage_key = Some(derived_signer_key_id.clone());
+    }
     // v0.18.0 (CIRISEdge#45) — Reticulum still binds its TCP listener
     // by default; an explicit Client posture from the operator
     // (agent_mode="client") signals "egress only". The
@@ -11103,6 +11194,34 @@ mod pyo3_tier2_tests {
 #[cfg(feature = "transport-reticulum")]
 mod node_identity_tests {
     use super::{node_alias, open_node_identity_halves, NODE_ALIAS_SUFFIX};
+
+    /// The alias rule is idempotent, which is correct for its own purpose and a
+    /// TRAP here: an ACTOR alias that already ends in `-node` resolves to itself,
+    /// so edge would reopen the actor's sealed key and advertise an
+    /// agency-bearing identity while `use_node_identity=True` claims otherwise.
+    ///
+    /// Edge does not reject the alias shape — a legitimately-provisioned node
+    /// alias is indistinguishable from this by NAME. The directory is what
+    /// separates them, and the `identity_type != node` refusal in
+    /// `resolve_node_transport_identity` is what catches it. This test pins the
+    /// hazard so the collision is not rediscovered as a field incident.
+    #[test]
+    fn a_node_suffixed_actor_alias_collides_and_needs_the_directory_check() {
+        // Indistinguishable by name: the rule is a no-op on both.
+        assert_eq!(node_alias("prod-node"), "prod-node");
+        assert_eq!(
+            node_alias("ciris-agent-bootstrap-node"),
+            "ciris-agent-bootstrap-node"
+        );
+        // So a name-only implementation would open the ACTOR's entry and derive
+        // the ACTOR's id — byte-identical to the legitimate case. Only the
+        // registered identity_type tells them apart.
+        assert_eq!(
+            node_alias("prod-node"),
+            "prod-node",
+            "if this ever stops being a no-op, the directory check is still the authority"
+        );
+    }
 
     /// `require_local_signer` guards the TRANSPORT identity's attestation. Under
     /// `use_node_identity` that identity comes from the sealed node keystore, so
