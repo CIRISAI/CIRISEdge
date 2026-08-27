@@ -4227,10 +4227,11 @@ fn open_node_identity_halves(
                 format!(
                     "use_node_identity=True: could not open the sealed Ed25519 node identity \
                      {alias:?} under {}: {e}. Edge OPENS this identity and never mints it — a \
-                     minted key is registered by nobody and owner-bound by nobody. Provision \
-                     the node identity first (CIRISServer node_key::node_signer open-or-mints \
-                     it), then start edge. Refusing rather than falling back to the engine's \
-                     identity (CIRISEdge#541).",
+                     minted key is registered by nobody and owner-bound by nobody. Provision it \
+                     BEFORE this call: ciris_server.provision_node_identity(engine, \
+                     keystore_alias, identity_dir), which mints both halves and registers the \
+                     key as identity_type=node. Refusing rather than falling back to the \
+                     engine's (agency-bearing) identity (CIRISEdge#541).",
                     dir.display()
                 )
             })?,
@@ -4251,7 +4252,10 @@ fn open_node_identity_halves(
                      SignedTransportDestination, so a classical-only node routes but can NEVER \
                      root (CIRISEdge#458) — refused here rather than discovered as silent \
                      unattributed drops at every peer. Note this is `node_ml_dsa_65.seed`, \
-                     distinct from the actor's `ml_dsa_65.seed` (CIRISEdge#541).",
+                     DISTINCT from the actor's `ml_dsa_65.seed`: a classical-only sealed entry \
+                     opening fine while this refuses means the node was provisioned by \
+                     something that minted only the Ed25519 half. \
+                     ciris_server.provision_node_identity(...) mints both (CIRISEdge#541).",
                     pqc_path.display()
                 )
             },
@@ -4695,10 +4699,17 @@ pub fn init_edge_runtime(
     // The embedded transport identity is an agency-bearing key and no caller
     // could change it. `init_edge_runtime` derived it from the engine with no
     // override; the Python caller (CIRISAgent) has no signer to hand in;
-    // CIRISServer's `node_key::node_signer` is a plain `pub async fn` with no
+    // CIRISServer's node signer was a plain `pub async fn` with no
     // `#[pyfunction]`; and CIRISServer folds onto an ALREADY-RUNNING edge
     // (`current_edge()`, not `build_edge()`), so it cannot set it either.
     // Three parties, no door — so edge opens one.
+    //
+    // CIRISServer has since added `provision_node_identity` as a `#[pyfunction]`,
+    // which is the OTHER half of this: it mints and registers the node key, and
+    // the agent calls it between building the engine and calling this function.
+    // That does not subsume the flag — provisioning creates the identity,
+    // this flag decides which identity the transport advertises — and edge
+    // still never receives a signer across the boundary.
     //
     // A FLAG, not a key export: Python states the intent, Rust resolves the
     // key, and nothing exportable crosses the FFI boundary. That preserves the

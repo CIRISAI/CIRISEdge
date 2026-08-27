@@ -457,6 +457,24 @@ Three properties are load-bearing:
   slot falls back to the forensic signer instead of quietly authoring CEG rows
   under an identity that holds no agency.
 
+### Provisioning comes first, and edge does not do it
+
+Edge **opens** the node identity; it never creates one. The mint belongs to the
+party that owns the node identity's lifecycle, so the boot order is:
+
+1. the agent builds the engine;
+2. the agent calls `ciris_server.provision_node_identity(engine, keystore_alias,
+   identity_dir)` — mints `<alias>-node` plus both seed halves, registers the key
+   `identity_type = node`, and returns the key_id;
+3. the agent calls `init_edge_runtime(…, use_node_identity=True,
+   node_identity_dir=…)` — the key now exists, so `open_existing` succeeds;
+4. CIRISServer folds on and finds the identity already there.
+
+Step 2 is idempotent across boots (it open-or-mints), and step 3 re-opens rather
+than re-mints. A deployment that sets the flag without step 2 ahead of it gets a
+refusal at init rather than a degraded start — that is the intended behaviour,
+and the error names the provisioning call rather than an internal symbol.
+
 Absent or `false`, behaviour is byte-for-byte what it was.
 
 ---
