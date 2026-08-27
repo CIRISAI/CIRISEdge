@@ -4136,6 +4136,175 @@ fn extract_trust_scoring(
 /// error.
 #[cfg(feature = "transport-reticulum")]
 #[allow(unsafe_code)]
+/// The keystore alias suffix a node's own key lives under.
+///
+/// MIRRORS `CIRISServer::node_key::NODE_ALIAS_SUFFIX` (0.5.189). Edge cannot
+/// import it: CIRISServer RIDES edge, so a dependency in that direction would
+/// invert the substrate relationship. The rule is one line and it is pinned by
+/// `node_alias_matches_the_server_rule` below; if it ever drifts, that test is
+/// where it surfaces.
+const NODE_ALIAS_SUFFIX: &str = "-node";
+
+/// The keystore alias the node's own key lives under, given the host's alias.
+///
+/// Idempotent, exactly as CIRISServer's `node_key::node_alias` is: a host that
+/// already passes `<x>-node` does not get `<x>-node-node`.
+fn node_alias(keystore_alias: &str) -> String {
+    if keystore_alias.ends_with(NODE_ALIAS_SUFFIX) {
+        return keystore_alias.to_owned();
+    }
+    format!("{keystore_alias}{NODE_ALIAS_SUFFIX}")
+}
+
+/// CIRISEdge#541 — resolve the NODE's own transport identity from the sealed
+/// keystore, or refuse.
+///
+/// # Why this exists
+///
+/// CC 3.4.7.3 (CIRISConstitution#95) makes `node` non-cohabitable with
+/// `agent`/`user`, because persist's agency gate constrains a recipient
+/// resolving to a node-only identity — fusing the roles onto one key does not
+/// blur "infrastructure must not have agency", it switches the rule OFF.
+/// CIRISServer 0.5.189 split every CEG row; the transport identity was the one
+/// thing left, and it is the identity that walks through the lightnet door:
+/// `is_bootstrap()` kinds (`Key | IdentityOccurrence | TransportDestination`)
+/// are exempt from `Rooted ∧ owns_key` and attributed via the LINK's transport
+/// identity, publicly visible to anyone on the interface. It also resolves
+/// #393 item 2's `SignedTransportDestination` and the de-admission self.
+///
+/// # Fail-closed, deliberately
+///
+/// Every failure here is an error, never a fallback to the engine's signer. A
+/// node that asked for its node identity and was silently handed the actor's
+/// would reproduce the exact defect under a flag claiming to have cured it —
+/// that is the failure shape this whole arc has been about.
+///
+/// This also means edge OPENS and never MINTS. `SealedEd25519Signer::open_existing`,
+/// not `open_or_create`: minting here would produce an identity that no
+/// directory has registered as `identity_type = node` and no owner-binding
+/// covers, and persist's own diagnostic names that act as "what CIRISAgent#1009
+/// was". Provisioning belongs to whoever registers the key; edge only consumes it.
+/// The two halves of the node identity, opened from the sealed keystore — the
+/// part of [`resolve_node_transport_identity`] that touches the filesystem and
+/// can refuse. Split out so every fail-closed path is unit-testable without a
+/// Python interpreter or a persist executor; the async key-id derivation stays
+/// in the caller.
+/// The classical half, the PQC half, and the keystore alias they live under.
+type NodeIdentityHalves = (
+    Arc<dyn ciris_keyring::HardwareSigner>,
+    Arc<dyn ciris_keyring::PqcSigner>,
+    String,
+);
+
+fn open_node_identity_halves(
+    node_identity_dir: Option<&str>,
+    host_keystore_alias: &str,
+) -> Result<NodeIdentityHalves, String> {
+    // Returns a plain `String` rather than a `PyErr`: constructing a `PyErr`
+    // requires a live interpreter, which would make every fail-closed path here
+    // untestable without one. The FFI boundary lifts these into
+    // `PyRuntimeError` — building the message and choosing the exception type
+    // are different jobs and belong on different sides of that line.
+    let Some(dir) = node_identity_dir else {
+        return Err(
+            "use_node_identity=True but node_identity_dir was not supplied. Edge cannot \
+             recover the sealed-keystore directory from the engine — persist's \
+             LocalSignerHardwareAdapter reports StorageDescriptor::InMemory and notes that \
+             the seed path is owned by the construction config, not the live signer. Pass \
+             the same directory you pass to Engine(identity_dir=...). Refusing rather than \
+             falling back to the engine's (agency-bearing) identity (CIRISEdge#541)."
+                .to_owned(),
+        );
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let alias = node_alias(host_keystore_alias);
+
+    // Classical half: the sealed Ed25519 entry beside the one the engine opened.
+    let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::from(
+        ciris_keyring::SealedEd25519Signer::open_existing(alias.clone(), dir.clone())
+            .map(|s| Box::new(s) as Box<dyn ciris_keyring::HardwareSigner>)
+            .map_err(|e| {
+                format!(
+                    "use_node_identity=True: could not open the sealed Ed25519 node identity \
+                     {alias:?} under {}: {e}. Edge OPENS this identity and never mints it — a \
+                     minted key is registered by nobody and owner-bound by nobody. Provision \
+                     the node identity first (CIRISServer node_key::node_signer open-or-mints \
+                     it), then start edge. Refusing rather than falling back to the engine's \
+                     identity (CIRISEdge#541).",
+                    dir.display()
+                )
+            })?,
+    );
+
+    // PQC half: a BARE 32-byte ML-DSA-65 seed at `node_ml_dsa_65.seed` — a
+    // DIFFERENT file from the actor's `ml_dsa_65.seed`, which is what makes the
+    // split complete on BOTH halves rather than only the classical one. The
+    // filename and the `-pqc` alias suffix both mirror CIRISServer 0.5.189.
+    let pqc_alias = format!("{alias}-pqc");
+    let pqc_path = dir.join("node_ml_dsa_65.seed");
+    let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_file(&pqc_path, pqc_alias).map_err(
+            |e| {
+                format!(
+                    "use_node_identity=True: the node's ML-DSA-65 seed at {} is missing or \
+                     unusable: {e}. The transport identity signs #393 item 2's \
+                     SignedTransportDestination, so a classical-only node routes but can NEVER \
+                     root (CIRISEdge#458) — refused here rather than discovered as silent \
+                     unattributed drops at every peer. Note this is `node_ml_dsa_65.seed`, \
+                     distinct from the actor's `ml_dsa_65.seed` (CIRISEdge#541).",
+                    pqc_path.display()
+                )
+            },
+        )?,
+    );
+
+    Ok((classical, pqc, alias))
+}
+
+fn resolve_node_transport_identity(
+    executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor,
+    node_identity_dir: Option<&str>,
+    host_keystore_alias: &str,
+) -> PyResult<Arc<LocalSigner>> {
+    let (classical, pqc, alias) = open_node_identity_halves(node_identity_dir, host_keystore_alias)
+        .map_err(PyRuntimeError::new_err)?;
+    // The federation key_id is DERIVED over the node alias + the node's own
+    // pubkey — never the actor's derived id, or the split would be cosmetic.
+    let classical_for_derive = Arc::clone(&classical);
+    let alias_for_derive = alias.clone();
+    let derived: Result<String, String> = run_async(executor, async move {
+        let pubkey = classical_for_derive
+            .public_key()
+            .await
+            .map_err(|e| format!("node transport identity pubkey read failed: {e}"))?;
+        if pubkey.len() != 32 {
+            return Err(format!(
+                "node transport identity pubkey is {} bytes, not Ed25519's 32",
+                pubkey.len()
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&pubkey);
+        Ok::<_, String>(ciris_verify_core::fedcode::derive_key_id(
+            &alias_for_derive,
+            &arr,
+        ))
+    });
+    let derived_node_key_id = derived.map_err(PyRuntimeError::new_err)?;
+
+    tracing::info!(
+        keystore_alias = %alias,
+        derived_key_id = %derived_node_key_id,
+        "Reticulum transport identity: NODE identity resolved from the sealed \
+         keystore (use_node_identity=True, CIRISEdge#541)"
+    );
+    Ok(Arc::new(LocalSigner::new(
+        derived_node_key_id,
+        classical,
+        Some(pqc),
+    )))
+}
+
 fn extract_local_signer(
     engine: &Bound<'_, PyAny>,
 ) -> Result<Arc<ciris_persist::signing::LocalSigner>, LocalSignerCapsuleError> {
@@ -4348,6 +4517,10 @@ enum LocalInstanceRole {
     ifac_netname = None,
     ifac_passphrase = None,
     ifac_size = None,
+    // CIRISEdge#541 — opt-in node transport identity. Absent/false preserves
+    // today's behaviour byte-for-byte.
+    use_node_identity = false,
+    node_identity_dir = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -4518,6 +4691,30 @@ pub fn init_edge_runtime(
     ifac_netname: Option<String>,
     ifac_passphrase: Option<String>,
     ifac_size: Option<usize>,
+    // ── CIRISEdge#541 ────────────────────────────────────────────────────────
+    // The embedded transport identity is an agency-bearing key and no caller
+    // could change it. `init_edge_runtime` derived it from the engine with no
+    // override; the Python caller (CIRISAgent) has no signer to hand in;
+    // CIRISServer's `node_key::node_signer` is a plain `pub async fn` with no
+    // `#[pyfunction]`; and CIRISServer folds onto an ALREADY-RUNNING edge
+    // (`current_edge()`, not `build_edge()`), so it cannot set it either.
+    // Three parties, no door — so edge opens one.
+    //
+    // A FLAG, not a key export: Python states the intent, Rust resolves the
+    // key, and nothing exportable crosses the FFI boundary. That preserves the
+    // two boundaries already drawn deliberately upstream — CIRISServer's
+    // `resolve_user_signer` as "the one place the fed-ID is released", and
+    // `ConsentGrantOptions::author_signer` passing a signer WITHIN Rust.
+    //
+    // `node_identity_dir` is the sealed-keystore directory. Edge cannot recover
+    // it from the engine: persist's `LocalSignerHardwareAdapter` reports
+    // `StorageDescriptor::InMemory` and its own comment says "the seed path is
+    // owned by the construction config, not the live signer". A directory path
+    // is configuration, not key material, and the Python caller already passes
+    // this exact value to `Engine(identity_dir=…)`, so asking for it here adds
+    // no new secret to the boundary.
+    use_node_identity: bool,
+    node_identity_dir: Option<&str>,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -5136,59 +5333,73 @@ pub fn init_edge_runtime(
     // v3.2.0 (BlackholeRules); the capsule was added at v3.1.1 so this
     // branch only fires against severely-stale persist installs the
     // v3.2.0 floor is already pulling forward.
-    let reticulum_identity_signer: Arc<LocalSigner> = match extract_local_signer(&engine) {
-        Ok(local_signer_arc) => {
-            // Adapt persist's `Arc<LocalSigner>` to
-            // `Arc<dyn HardwareSigner>` via persist's adapter — the
-            // adapter's `public_key()` returns the 32-byte raw Ed25519
-            // (`SigningKey::verifying_key().to_bytes()`). We thread it
-            // into edge's `LocalSigner` `classical` slot; the PQC half
-            // forwarded below completes the hybrid pair.
-            //
-            // CIRISEdge#458 — forward persist's transport-identity ML-DSA-65
-            // (PQC) half. persist v30.4.0's `local_signer_capsule` carries the
-            // node's OWN hybrid identity — the keystore
-            // `<identity_dir>/ml_dsa_65.seed` (CIRISPersist#616) or the
-            // `from_shared_with_local` PQC pair — and `pqc_signer()` yields it.
-            // This transport-identity signer becomes `ReticulumAuth.signer`,
-            // which the transport retains as `local_signer` and the
-            // `SelfSignedRouteProducer` signs the #393 item-2
-            // `SignedTransportDestination` with. So it MUST be hybrid or the
-            // node routes but can never root (peers drop its frames UNATTRIBUTED
-            // at the E3 gate). This slot historically hard-coded `None` because
-            // the Reticulum attestation only signed the Ed25519 transport
-            // identity — but #406/#393 made this same signer responsible for the
-            // hybrid item-2 mint, so dropping the PQC here WAS the #458 fault.
-            // Extract it BEFORE the adapter consumes `local_signer_arc`.
-            let identity_pqc = local_signer_arc.pqc_signer();
-            let adapter: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
-                ciris_persist::signing::LocalSignerHardwareAdapter::new(local_signer_arc),
-            );
-            // v7.0.6 (CIRISEdge#203) — Reticulum identity signer also stamps
-            // the **derived** federation key_id, so its admission attestations
-            // FK-resolve against the same `federation_keys` row the hot-path
-            // signer's scrub envelopes target.
-            // CIRISEdge#289 — this is the ATTESTED (32-byte Ed25519) path a
-            // bare agent's announce needs to root at Node A (AV-42).
-            tracing::info!(
-                key_id = %derived_signer_key_id,
-                "Reticulum transport identity: attested 32-byte Ed25519 \
-                 local_signer path (engine.local_signer_capsule())"
-            );
-            Arc::new(LocalSigner::new(
-                derived_signer_key_id.clone(),
-                adapter,
-                identity_pqc,
-            ))
-        }
-        Err(LocalSignerCapsuleError::Unavailable) => {
-            // CIRISEdge#289 — a bare agent that must announce ATTESTED opts
-            // into `require_local_signer=True`; the silent keyring fallback
-            // (65-byte P-256 under hardware_hsm_only → unrooted announce)
-            // is a hard error instead.
-            if require_local_signer {
-                return Err(PyRuntimeError::new_err(
-                    "require_local_signer=True but ciris_persist.Engine raised \
+    // CIRISEdge#541 — when the caller opts in, the transport identity is the
+    // NODE's own key, resolved inside Rust from the sealed keystore. Fail-closed:
+    // `resolve_node_transport_identity` errors rather than falling through to the
+    // engine-derived (agency-bearing) identity below.
+    //
+    // Note what this deliberately does NOT change: `Edge::scrub_signer` selects
+    // `local_signer` only when its `key_id` matches the hot-path `signer.key_id`,
+    // so a node-keyed transport identity makes envelope authorship fall back to
+    // the actor's signer BY CONSTRUCTION — which is exactly the required split
+    // ("the engine keeps signing as the actor"). Pinned by
+    // `a_node_transport_identity_leaves_envelope_authorship_with_the_actor`.
+    let reticulum_identity_signer: Arc<LocalSigner> = if use_node_identity {
+        resolve_node_transport_identity(&executor, node_identity_dir, &signer_handle.key_id)?
+    } else {
+        match extract_local_signer(&engine) {
+            Ok(local_signer_arc) => {
+                // Adapt persist's `Arc<LocalSigner>` to
+                // `Arc<dyn HardwareSigner>` via persist's adapter — the
+                // adapter's `public_key()` returns the 32-byte raw Ed25519
+                // (`SigningKey::verifying_key().to_bytes()`). We thread it
+                // into edge's `LocalSigner` `classical` slot; the PQC half
+                // forwarded below completes the hybrid pair.
+                //
+                // CIRISEdge#458 — forward persist's transport-identity ML-DSA-65
+                // (PQC) half. persist v30.4.0's `local_signer_capsule` carries the
+                // node's OWN hybrid identity — the keystore
+                // `<identity_dir>/ml_dsa_65.seed` (CIRISPersist#616) or the
+                // `from_shared_with_local` PQC pair — and `pqc_signer()` yields it.
+                // This transport-identity signer becomes `ReticulumAuth.signer`,
+                // which the transport retains as `local_signer` and the
+                // `SelfSignedRouteProducer` signs the #393 item-2
+                // `SignedTransportDestination` with. So it MUST be hybrid or the
+                // node routes but can never root (peers drop its frames UNATTRIBUTED
+                // at the E3 gate). This slot historically hard-coded `None` because
+                // the Reticulum attestation only signed the Ed25519 transport
+                // identity — but #406/#393 made this same signer responsible for the
+                // hybrid item-2 mint, so dropping the PQC here WAS the #458 fault.
+                // Extract it BEFORE the adapter consumes `local_signer_arc`.
+                let identity_pqc = local_signer_arc.pqc_signer();
+                let adapter: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+                    ciris_persist::signing::LocalSignerHardwareAdapter::new(local_signer_arc),
+                );
+                // v7.0.6 (CIRISEdge#203) — Reticulum identity signer also stamps
+                // the **derived** federation key_id, so its admission attestations
+                // FK-resolve against the same `federation_keys` row the hot-path
+                // signer's scrub envelopes target.
+                // CIRISEdge#289 — this is the ATTESTED (32-byte Ed25519) path a
+                // bare agent's announce needs to root at Node A (AV-42).
+                tracing::info!(
+                    key_id = %derived_signer_key_id,
+                    "Reticulum transport identity: attested 32-byte Ed25519 \
+                     local_signer path (engine.local_signer_capsule())"
+                );
+                Arc::new(LocalSigner::new(
+                    derived_signer_key_id.clone(),
+                    adapter,
+                    identity_pqc,
+                ))
+            }
+            Err(LocalSignerCapsuleError::Unavailable) => {
+                // CIRISEdge#289 — a bare agent that must announce ATTESTED opts
+                // into `require_local_signer=True`; the silent keyring fallback
+                // (65-byte P-256 under hardware_hsm_only → unrooted announce)
+                // is a hard error instead.
+                if require_local_signer {
+                    return Err(PyRuntimeError::new_err(
+                        "require_local_signer=True but ciris_persist.Engine raised \
                      local_signer_unavailable from local_signer_capsule(): the \
                      engine was not built with a local signer, so the Reticulum \
                      transport identity cannot use the attested 32-byte Ed25519 \
@@ -5197,10 +5408,10 @@ pub fn init_edge_runtime(
                      (local_key_id + local_key_path, persist v2.12.0+ / #112), \
                      or pass require_local_signer=False to allow the keyring \
                      fallback.",
-                ));
-            }
-            tracing::warn!(
-                "ciris_persist.Engine raised local_signer_unavailable from \
+                    ));
+                }
+                tracing::warn!(
+                    "ciris_persist.Engine raised local_signer_unavailable from \
                  local_signer_capsule(); falling back to keyring_signer for \
                  Reticulum transport identity. Under keyring_storage_kind = \
                  hardware_hsm_only this fallback will fail at \
@@ -5210,24 +5421,24 @@ pub fn init_edge_runtime(
                  local_key_path (Engine.from_shared_with_local, persist \
                  v2.12.0+ / #112), or set require_local_signer=True to fail \
                  loud instead of announcing un-attested."
-            );
-            signer.clone()
-        }
-        Err(LocalSignerCapsuleError::MethodAbsent) => {
-            // CIRISEdge#289 — same fail-loud opt-in as the Unavailable arm.
-            if require_local_signer {
-                return Err(PyRuntimeError::new_err(
-                    "require_local_signer=True but ciris_persist.Engine does not \
+                );
+                signer.clone()
+            }
+            Err(LocalSignerCapsuleError::MethodAbsent) => {
+                // CIRISEdge#289 — same fail-loud opt-in as the Unavailable arm.
+                if require_local_signer {
+                    return Err(PyRuntimeError::new_err(
+                        "require_local_signer=True but ciris_persist.Engine does not \
                      expose local_signer_capsule() (persist < 3.1.1): the \
                      Reticulum transport identity cannot use the attested \
                      32-byte Ed25519 path and the announce would not carry \
                      attestation (AV-42). Upgrade persist to the v3.2.0+ floor, \
                      or pass require_local_signer=False to allow the keyring \
                      fallback.",
-                ));
-            }
-            tracing::warn!(
-                "ciris_persist.Engine does not expose local_signer_capsule() \
+                    ));
+                }
+                tracing::warn!(
+                    "ciris_persist.Engine does not expose local_signer_capsule() \
                  (persist < 3.1.1); falling back to keyring_signer for \
                  Reticulum transport identity. Under keyring_storage_kind = \
                  hardware_hsm_only this fallback will fail at \
@@ -5236,15 +5447,16 @@ pub fn init_edge_runtime(
                  `tag = \"v3.2.0\"`; this branch indicates a forced-pin \
                  mismatch on the consumer side. Set require_local_signer=True \
                  to fail loud instead of announcing un-attested."
-            );
-            signer.clone()
-        }
-        Err(LocalSignerCapsuleError::Other(e)) => {
-            // Non-typed failure (capsule cast failure, etc.) — surface
-            // as a hard error rather than silently fall back. This
-            // preserves the v0.13.0 "loud failure on unexpected
-            // capsule shape" contract.
-            return Err(e);
+                );
+                signer.clone()
+            }
+            Err(LocalSignerCapsuleError::Other(e)) => {
+                // Non-typed failure (capsule cast failure, etc.) — surface
+                // as a hard error rather than silently fall back. This
+                // preserves the v0.13.0 "loud failure on unexpected
+                // capsule shape" contract.
+                return Err(e);
+            }
         }
     };
 
@@ -9695,6 +9907,9 @@ mod pyo3_tier2_tests {
                 None,  // ifac_netname
                 None,  // ifac_passphrase
                 None,  // ifac_size
+                false, // use_node_identity (CIRISEdge#541 — default preserves
+                // the engine-derived transport identity byte-for-byte)
+                None, // node_identity_dir
             )?;
             Ok(edge.signer_key_id())
         });
@@ -9813,6 +10028,9 @@ mod pyo3_tier2_tests {
                 None,  // ifac_netname
                 None,  // ifac_passphrase
                 None,  // ifac_size
+                false, // use_node_identity (CIRISEdge#541 — default preserves
+                // the engine-derived transport identity byte-for-byte)
+                None, // node_identity_dir
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -9970,6 +10188,9 @@ mod pyo3_tier2_tests {
                 None,  // ifac_netname
                 None,  // ifac_passphrase
                 None,  // ifac_size
+                false, // use_node_identity (CIRISEdge#541 — default preserves
+                // the engine-derived transport identity byte-for-byte)
+                None, // node_identity_dir
             )?;
             Ok(())
         });
@@ -10080,6 +10301,9 @@ mod pyo3_tier2_tests {
                 None,  // ifac_netname
                 None,  // ifac_passphrase
                 None,  // ifac_size
+                false, // use_node_identity (CIRISEdge#541 — default preserves
+                // the engine-derived transport identity byte-for-byte)
+                None, // node_identity_dir
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -10256,6 +10480,9 @@ mod pyo3_tier2_tests {
                 None,  // ifac_netname
                 None,  // ifac_passphrase
                 None,  // ifac_size
+                false, // use_node_identity (CIRISEdge#541 — default preserves
+                // the engine-derived transport identity byte-for-byte)
+                None, // node_identity_dir
             )?;
             Ok(edge.signer_key_id())
         });
@@ -10420,6 +10647,8 @@ mod pyo3_tier2_tests {
                 None,       // ifac_netname
                 None,       // ifac_passphrase
                 None,       // ifac_size
+                false,      // use_node_identity (CIRISEdge#541 — default)
+                None,       // node_identity_dir
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -10544,6 +10773,9 @@ mod pyo3_tier2_tests {
                 None,  // ifac_netname
                 None,  // ifac_passphrase
                 None,  // ifac_size
+                false, // use_node_identity (CIRISEdge#541 — default preserves
+                // the engine-derived transport identity byte-for-byte)
+                None, // node_identity_dir
             )?;
             Ok(edge.signer_key_id())
         });
@@ -10792,6 +11024,81 @@ mod pyo3_tier2_tests {
             baseline + 1,
             "durable_queue_depth[durable] must increment by 1 per send_durable_inline_text \
              (baseline={baseline}, post={post})"
+        );
+    }
+}
+
+// ── CIRISEdge#541: the node transport identity ──────────────────────────────
+#[cfg(test)]
+#[cfg(feature = "transport-reticulum")]
+mod node_identity_tests {
+    use super::{node_alias, open_node_identity_halves, NODE_ALIAS_SUFFIX};
+
+    /// Pins edge's copy of the alias rule against CIRISServer's
+    /// `node_key::node_alias` (0.5.189). Edge cannot import it — CIRISServer
+    /// RIDES edge, and a dependency in that direction would invert the substrate
+    /// relationship — so the rule is duplicated ON PURPOSE, and this test is what
+    /// catches the drift that duplication invites.
+    #[test]
+    fn node_alias_matches_the_server_rule() {
+        assert_eq!(NODE_ALIAS_SUFFIX, "-node");
+        assert_eq!(
+            node_alias("ciris-agent-bootstrap"),
+            "ciris-agent-bootstrap-node"
+        );
+        // Idempotent, exactly as the server's is: a host already passing
+        // `<x>-node` must not get `<x>-node-node`.
+        assert_eq!(
+            node_alias("ciris-agent-bootstrap-node"),
+            "ciris-agent-bootstrap-node"
+        );
+    }
+
+    /// The flag without the directory REFUSES. It must never quietly fall through
+    /// to the engine's identity — that substitution is the defect the flag exists
+    /// to cure.
+    #[test]
+    fn a_missing_identity_dir_refuses_rather_than_falling_back() {
+        let Err(msg) = open_node_identity_halves(None, "ciris-agent-bootstrap") else {
+            panic!("no directory must refuse — it must never fall back to the engine identity");
+        };
+        assert!(
+            msg.contains("CIRISEdge#541"),
+            "must cite the issue. Got: {msg}"
+        );
+        assert!(
+            msg.contains("node_identity_dir"),
+            "must name the missing knob. Got: {msg}"
+        );
+    }
+
+    /// An UNPROVISIONED directory refuses too — edge OPENS the node identity and
+    /// never MINTS it. A minted key is registered by no directory and owner-bound
+    /// by nobody, so silently creating one would hand the node a transport
+    /// identity the federation has never heard of.
+    #[test]
+    fn an_unprovisioned_keystore_refuses_and_does_not_mint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_str().expect("utf8").to_owned();
+
+        let Err(msg) = open_node_identity_halves(Some(&path), "ciris-agent-bootstrap") else {
+            panic!("an unprovisioned keystore dir must refuse");
+        };
+        assert!(
+            msg.contains("CIRISEdge#541"),
+            "must cite the issue. Got: {msg}"
+        );
+
+        // The refusal must not have left an identity behind. Nothing edge does on
+        // this path may create key material.
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "edge must OPEN the node identity, never MINT it — but it created: {leftovers:?}"
         );
     }
 }

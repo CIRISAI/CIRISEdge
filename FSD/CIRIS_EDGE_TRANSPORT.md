@@ -409,6 +409,45 @@ carve-out admits *exactly* the three
 (`bootstrap_carve_out_source_holds_over_all_kinds`,
 [`edge.rs:8488`](../src/edge.rs)).
 
+### 5.5 The node transport identity (`#541`)
+
+The carve-out above attributes a bootstrap frame on **the link's transport
+identity**. That identity is therefore the one that walks through the lightnet
+door, publicly visible to anyone on the interface — and it also resolves
+§5.2's item 2 `SignedTransportDestination` and the de-admission self.
+
+CC **3.4.7.3** makes `node` non-cohabitable with `agent`/`user`: persist's agency
+gate constrains a recipient resolving to a **node-only** identity, so fusing the
+roles onto one key does not blur "infrastructure must not have agency" — it
+switches the rule off. Historically `init_edge_runtime` derived the transport
+identity from the engine with no override, so the key at this door was
+agency-bearing and **no caller could change it**: the caller is Python, the
+node signer has no `#[pyfunction]`, and CIRISServer folds onto an
+already-running edge.
+
+`init_edge_runtime(use_node_identity=True, node_identity_dir=…)` resolves the
+node's own key instead — the `<alias>-node` sealed keystore entry beside the one
+the engine opened, plus its **own** `node_ml_dsa_65.seed` (a different file from
+the actor's `ml_dsa_65.seed`, so the split is complete on both halves).
+
+Three properties are load-bearing:
+
+- **A flag, not a key export.** Python states the intent; Rust resolves the key.
+  Nothing exportable crosses the FFI boundary. `node_identity_dir` is
+  configuration the caller already passes to `Engine(identity_dir=…)`, not key
+  material.
+- **Fail-closed.** Every failure is an error, never a fallback to the engine's
+  identity — a node handed the actor's key under a flag claiming to have cured
+  the defect would reproduce it. Edge **opens** and never **mints**: a minted
+  key is registered by no directory and owner-bound by nobody.
+- **Envelope authorship stays with the actor.** `Edge::scrub_signer` selects the
+  local signer only when its `key_id` matches the hot-path signer's, so a
+  node-keyed transport identity leaves CEG-row authorship on the actor *by
+  construction* (`local_signer_authors_envelopes`, pinned by
+  `a_node_transport_identity_leaves_envelope_authorship_with_the_actor`).
+
+Absent or `false`, behaviour is byte-for-byte what it was.
+
 ---
 
 ## 6. Serve & consent — consent *is* routing (Attestation plane only)
