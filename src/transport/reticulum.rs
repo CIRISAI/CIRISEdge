@@ -1391,6 +1391,22 @@ pub struct ReticulumTransportConfig {
     /// Edge's own federation `key_id`, advertised in the announce
     /// attestation so peers can root + map `key_id → destination`.
     pub local_key_id: String,
+    /// CIRISEdge#541 — the key the RNS transport identity is STORED under in a
+    /// `TransportIdentityKeystore`, when that differs from the id being
+    /// advertised.
+    ///
+    /// These were one value because they had always been the same value. They
+    /// are not the same job: one is what peers are told this node is, the other
+    /// is a lookup key for a 64-byte Reticulum keypair on local disk. Once
+    /// `use_node_identity` can move the advertised id, coupling them would make
+    /// an existing keystore-backed deployment MISS its stored entry, fall
+    /// through to `generate_and_store`, and silently change its destination
+    /// hash — invalidating every saved peer route, with no error anywhere.
+    ///
+    /// `None` means "same as `local_key_id`", which is exactly the historical
+    /// behaviour and what every file-backed deployment already does (the
+    /// file-backed path keys off `identity_path`, not this).
+    pub transport_identity_storage_key: Option<String>,
     /// Transport-identity rotation epoch carried in edge's own
     /// announce attestation. Monotonic per `local_key_id` — bump it
     /// when the transport identity rotates so peers supersede their
@@ -1466,6 +1482,7 @@ impl ReticulumTransportConfig {
             identity_path,
             announce_interval: Duration::from_secs(300),
             local_key_id: local_key_id.into(),
+            transport_identity_storage_key: None,
             local_epoch: 0,
             interfaces: Vec::new(),
             enable_transport: false,
@@ -2391,7 +2408,10 @@ impl ReticulumTransport {
         let identity = if let Some(keystore) = transport_identity_keystore.as_ref() {
             load_or_adopt_or_generate_identity_with_keystore(
                 &config.identity_path,
-                &config.local_key_id,
+                config
+                    .transport_identity_storage_key
+                    .as_deref()
+                    .unwrap_or(&config.local_key_id),
                 keystore.as_ref(),
             )?
         } else {
@@ -10897,6 +10917,14 @@ mod tests {
     fn config_new_defaults() {
         let cfg = ReticulumTransportConfig::new(PathBuf::from("/tmp/x.id"), "edge-key-1");
         assert_eq!(cfg.local_key_id, "edge-key-1");
+        // CIRISEdge#541 — the RNS storage key defaults to "same as advertised",
+        // which is the historical behaviour byte-for-byte. It only diverges when
+        // `use_node_identity` moves the advertised id out from under an existing
+        // keystore entry.
+        assert!(
+            cfg.transport_identity_storage_key.is_none(),
+            "default must be None so keystore lookups keep using local_key_id"
+        );
         assert!(cfg.bootstrap_peers.is_empty());
         assert_eq!(cfg.announce_interval, Duration::from_secs(300));
     }

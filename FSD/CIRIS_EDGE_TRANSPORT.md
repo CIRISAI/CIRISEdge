@@ -409,6 +409,74 @@ carve-out admits *exactly* the three
 (`bootstrap_carve_out_source_holds_over_all_kinds`,
 [`edge.rs:8488`](../src/edge.rs)).
 
+### 5.5 The node transport identity (`#541`)
+
+The carve-out above attributes a bootstrap frame on **the link's transport
+identity**. That identity is therefore the one that walks through the lightnet
+door, publicly visible to anyone on the interface — and it also resolves
+§5.2's item 2 `SignedTransportDestination` and the de-admission self.
+
+CC **3.4.7.3** makes `node` non-cohabitable with `agent`/`user`: persist's agency
+gate constrains a recipient resolving to a **node-only** identity, so fusing the
+roles onto one key does not blur "infrastructure must not have agency" — it
+switches the rule off. Historically `init_edge_runtime` derived the transport
+identity from the engine with no override, so the key at this door was
+agency-bearing and **no caller could change it**: the caller is Python, the
+node signer has no `#[pyfunction]`, and CIRISServer folds onto an
+already-running edge.
+
+`init_edge_runtime(use_node_identity=True, node_identity_dir=…)` resolves the
+node's own key instead — the `<alias>-node` sealed keystore entry beside the one
+the engine opened, plus its **own** `node_ml_dsa_65.seed` (a different file from
+the actor's `ml_dsa_65.seed`, so the split is complete on both halves).
+
+Three properties are load-bearing:
+
+- **A flag, not a key export.** Python states the intent; Rust resolves the key.
+  Nothing exportable crosses the FFI boundary. `node_identity_dir` is
+  configuration the caller already passes to `Engine(identity_dir=…)`, not key
+  material.
+- **Fail-closed.** Every failure is an error, never a fallback to the engine's
+  identity — a node handed the actor's key under a flag claiming to have cured
+  the defect would reproduce it. Edge **opens** and never **mints**: a minted
+  key is registered by no directory and owner-bound by nobody.
+- **One identity, advertised and addressable.** `set_self_key_id`, the announce
+  attestation's `federation_key_id` (`ReticulumTransportConfig::local_key_id`),
+  and the key that signs that attestation are all the node's under this flag.
+  They have to agree: an attestation advertising one id while signing with
+  another key is a public-key mismatch at every receiver — it could never root
+  and could never supersede an existing rooted route — and a
+  `revocation:peer_admission:v1` aimed at the advertised id would not match the
+  engine's self, leaving the node un-de-admittable.
+- **Envelope authorship stays with the actor**, and so does its fast path. The
+  transport identity and the envelope author are *different jobs*: edge keeps
+  the ACTOR's in-memory signer in `Edge::local_signer` regardless of this flag,
+  so the v1.1.1 keyring-IPC bypass (`#50`, headless darwin / locked Keychain)
+  survives it. `local_signer_authors_envelopes` is the guard that makes the
+  separation safe rather than merely intended: a non-actor signer reaching that
+  slot falls back to the forensic signer instead of quietly authoring CEG rows
+  under an identity that holds no agency.
+
+### Provisioning comes first, and edge does not do it
+
+Edge **opens** the node identity; it never creates one. The mint belongs to the
+party that owns the node identity's lifecycle, so the boot order is:
+
+1. the agent builds the engine;
+2. the agent calls `ciris_server.provision_node_identity(engine, keystore_alias,
+   identity_dir)` — mints `<alias>-node` plus both seed halves, registers the key
+   `identity_type = node`, and returns the key_id;
+3. the agent calls `init_edge_runtime(…, use_node_identity=True,
+   node_identity_dir=…)` — the key now exists, so `open_existing` succeeds;
+4. CIRISServer folds on and finds the identity already there.
+
+Step 2 is idempotent across boots (it open-or-mints), and step 3 re-opens rather
+than re-mints. A deployment that sets the flag without step 2 ahead of it gets a
+refusal at init rather than a degraded start — that is the intended behaviour,
+and the error names the provisioning call rather than an internal symbol.
+
+Absent or `false`, behaviour is byte-for-byte what it was.
+
 ---
 
 ## 6. Serve & consent — consent *is* routing (Attestation plane only)

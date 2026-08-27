@@ -3972,9 +3972,33 @@ impl Edge {
     /// signing.
     fn scrub_signer(&self) -> &Arc<LocalSigner> {
         match self.local_signer.as_ref() {
-            Some(local) if local.key_id == self.signer.key_id => local,
+            Some(local)
+                if Self::local_signer_authors_envelopes(&local.key_id, &self.signer.key_id) =>
+            {
+                local
+            }
             _ => &self.signer,
         }
+    }
+
+    /// Does the in-memory local signer author envelopes, or only hold the transport
+    /// identity?
+    ///
+    /// It authors ONLY when it is the same key as the hot-path forensic signer —
+    /// then it is a faster route to the same signature (v1.1.1, mirroring
+    /// CIRISPersist#137/#138 `select_signer`).
+    ///
+    /// CIRISEdge#541 makes the negative case load-bearing as a GUARD. Under
+    /// `use_node_identity=True` the transport identity becomes the node's key,
+    /// but `init_edge_runtime` deliberately keeps the ACTOR's signer here — the
+    /// two are different jobs, and conflating them would have silently dropped
+    /// this fast path the moment the flag was set. This comparison is what makes
+    /// that separation safe rather than merely intended: if a non-actor signer
+    /// ever reaches this slot, envelope authorship falls back to the actor's
+    /// forensic signer instead of quietly authoring CEG rows under an identity
+    /// that holds no agency (CC 3.4.7.3).
+    fn local_signer_authors_envelopes(local_key_id: &str, hot_path_key_id: &str) -> bool {
+        local_key_id == hot_path_key_id
     }
 
     /// CIRISEdge#26 (v0.13.0 UniFFI cut) — Rust-level accessor returning
@@ -9449,5 +9473,49 @@ mod scope_native_install_tests {
             msg.contains("scope_native_addressing") && msg.contains("Reticulum transport"),
             "the refusal must name what is missing and why, got: {msg}",
         );
+    }
+}
+
+#[cfg(test)]
+mod envelope_authorship_tests {
+    //! CIRISEdge#541 — who authors envelopes once the transport identity can be
+    //! the node's key.
+    //!
+    //! `init_edge_runtime` keeps the ACTOR's signer in `Edge::local_signer` even
+    //! under `use_node_identity=True`, so the positive case below is what
+    //! production takes and the v1.1.1 in-memory fast path (CIRISEdge#50,
+    //! headless darwin / locked Keychain) survives the flag. The negative case
+    //! is the guard: a non-actor signer reaching that slot must never author.
+    //!
+    //! Exercised with the exact key-id shapes the field produces (a derived
+    //! federation id per side), not convenient placeholders: the whole point of
+    //! the actor/node split is that these two ids DIFFER, so a test using the
+    //! same string on both sides would prove nothing about the case that matters.
+    use super::Edge;
+
+    /// v1.1.1's original case: the local signer IS the hot-path signer, so it is
+    /// simply a faster route to the same signature.
+    #[test]
+    fn the_same_key_on_both_sides_authors_envelopes() {
+        assert!(Edge::local_signer_authors_envelopes(
+            "fed_7f3a9c21e4b8",
+            "fed_7f3a9c21e4b8"
+        ));
+    }
+
+    /// The guard. A node-keyed signer reaching `Edge::local_signer` must NOT
+    /// author envelopes: CC 3.4.7.3 requires the engine to keep signing as the
+    /// actor, and a node-only identity holds no agency to author CEG rows with.
+    /// Today `init_edge_runtime` never puts the node signer here — this is the
+    /// belt that keeps a future refactor from making it dangerous silently.
+    #[test]
+    fn a_node_keyed_signer_never_authors_envelopes() {
+        let actor = "fed_7f3a9c21e4b8";
+        let node = "fed_02d5be6610af";
+        assert_ne!(
+            actor, node,
+            "the split is only meaningful when the ids differ"
+        );
+        assert!(!Edge::local_signer_authors_envelopes(node, actor));
     }
 }
