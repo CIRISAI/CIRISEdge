@@ -234,7 +234,20 @@ impl Reporter {
                 .append(true)
                 .open(p)
             {
-                let _ = writeln!(f, "{line}");
+                // ONE write, newline included. Every node in the mesh appends to
+                // the SAME file on a shared volume, and `writeln!` formats —
+                // which can issue the line and the newline as separate `write()`
+                // syscalls. Two nodes finishing a leg at the same moment then
+                // interleave into a single line carrying two JSON objects, and
+                // the census dies with `JSONDecodeError: Extra data` — observed
+                // at M=4, the point with the most concurrent deliveries.
+                //
+                // A single `write_all` of the complete record under `O_APPEND`
+                // is the atomic-append shape: the kernel takes one offset and
+                // writes one buffer, so records cannot split into each other.
+                let mut record = line.into_bytes();
+                record.push(b'\n');
+                let _ = f.write_all(&record);
             }
         }
         self.legs
