@@ -601,13 +601,61 @@ def _host_note(state_rows):
     return lines
 
 
+def _read_leg_rows(path):
+    """Parse a results JSONL, recovering lines that carry more than one record.
+
+    Returns `(rows, corrupt_reason_or_None)`.
+
+    Every node in the mesh appends to ONE file on a shared volume. A non-atomic
+    append can therefore put two complete JSON objects on a single line, which
+    `json.loads` rejects as `Extra data` — observed at M=4, the point with the
+    most concurrent deliveries. The writer now emits each record in a single
+    `write()` (CIRISEdge#532), but this reader must not depend on that: an older
+    node image writing into a newer harness is exactly the mixed-version case a
+    mesh harness exists to run.
+
+    Concatenated COMPLETE objects are unambiguous, so they are recovered rather
+    than discarded — throwing away a ten-minute M=4 run over a formatting
+    artifact would be its own kind of dishonesty. Anything genuinely unparseable
+    is reported, and the caller refuses the verdict.
+    """
+    rows, decoder = [], json.JSONDecoder()
+    with open(path) as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line.startswith("{"):
+                continue
+            idx = 0
+            while idx < len(line):
+                try:
+                    obj, end = decoder.raw_decode(line, idx)
+                except ValueError as exc:
+                    return rows, f"line {lineno} is not valid JSON ({exc})"
+                rows.append(obj)
+                idx = end
+                while idx < len(line) and line[idx].isspace():
+                    idx += 1
+    return rows, None
+
+
 def census(path, rc, late_joiner=INFER, expect_nodes=None):
     """Returns (exit_code, printed lines). Never prints a number it did
     not read out of the file."""
     out = []
     # `all_rows`, not `rows`: the per-node loop below rebinds `rows` to
     # one node's slice, and a name collision there would be silent.
-    all_rows = [json.loads(l) for l in open(path) if l.strip().startswith("{")]
+    all_rows, corrupt = _read_leg_rows(path)
+    if corrupt:
+        # A results file we cannot fully read is a run we cannot report on.
+        # Same doctrine as the host pre-flight (#536): refuse the verdict
+        # rather than produce one from whatever happened to parse. A partial
+        # file would under-count legs, and an under-counted census reads as
+        # "legs did not run" — a measurement fault wearing a contract
+        # violation's clothes, which is the worst of both.
+        out.append(f"  NOT MEASURED  {path}: {corrupt}")
+        out.append("  the results file could not be read in full — refusing to "
+                   "report a leg census from a partial file")
+        return NOT_MEASURED, out
 
     # Rule 4: duplicates refuse the file outright (a merged file). Host
     # rows are included on purpose — a merged file duplicates those too,
@@ -1135,6 +1183,42 @@ def self_test():
         print(f"── self-test [{name}]: exit={code} want={want_exit}  {verdict}")
         for line in out:
             print(line)
+
+    def check_raw(name, text, want_exit):
+        """Like `check`, but writes the file BYTE-EXACTLY — the concurrency
+        artifacts below are properties of the bytes on disk, and round-tripping
+        them through `json.dumps` per row would erase the very thing under test.
+        """
+        nonlocal failures
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False, dir=tempfile.gettempdir()
+        ) as f:
+            f.write(text)
+            path = f.name
+        try:
+            code, out = census(path, 0)
+        finally:
+            os.unlink(path)
+        verdict = "ok" if code == want_exit else "SELF-TEST FAILURE"
+        if code != want_exit:
+            failures += 1
+        print(f"── self-test [{name}]: exit={code} want={want_exit}  {verdict}")
+
+    # CIRISEdge#532 — every node appends to ONE file on a shared volume, so a
+    # non-atomic append can land two complete records on one line. This killed a
+    # ten-minute M=4 run with `JSONDecodeError: Extra data` — a MEASUREMENT
+    # fault that presented as a failed run. Two complete objects are unambiguous,
+    # so they are recovered; the run is reported, not thrown away.
+    golden_text = "".join(json.dumps(r) + "\n" for r in _golden())
+    glued = golden_text.replace("}\n{", "}{", 1)
+    check_raw("two records glued onto one line are RECOVERED, not fatal", glued, 0)
+
+    # But a TORN record is not recoverable, and guessing at one would be worse
+    # than refusing. NOT MEASURED, like the host pre-flight — never a verdict
+    # assembled from a partial file, which would under-count legs and read as
+    # "legs did not run".
+    torn = golden_text + '{"node":"sub-9","le\n'
+    check_raw("a torn record refuses the verdict (NOT MEASURED)", torn, NOT_MEASURED)
 
     check("golden: all contracts met, late-joiner skips allowed", _golden(), 0)
 
