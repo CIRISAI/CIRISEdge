@@ -2144,16 +2144,38 @@ pub struct ReticulumTransport {
     /// (#317/#340), so reusing one would trade churn for silent non-delivery.
     /// Identification is per-LINK and persists for its lifetime, which is what
     /// makes skipping the establish+identify sequence on reuse correct.
-    reusable_dialed_link: Arc<Mutex<HashMap<DestinationHash, LinkId>>>,
-    /// CIRISEdge#532 — per-destination dial gate (single-flight).
     ///
-    /// Reuse alone does not close the churn: N coordinators firing concurrently
-    /// at the same peer all miss the empty map and all dial, which is the
-    /// 29-establish : 25-identify gap in the issue — links whose establish cost
-    /// was paid and then discarded. The gate serialises dials PER DESTINATION so
-    /// the first caller dials and the rest wait and reuse. Per-destination, not
-    /// global: two different peers must still dial in parallel.
-    dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Mutex<()>>>>>,
+    /// A POOL, not one link — and that is not an optimisation, it is the
+    /// correctness constraint. Reticulum permits ONE resource transfer per link
+    /// at a time (the same rule `#353`'s reverse-path collision note names), so
+    /// handing one shared link to concurrent senders serialises every transfer
+    /// to that peer behind one lane. The first cut of this fix did exactly that
+    /// and the mesh harness caught it at M=4 — 24 contract violations and
+    /// `resource transfer failed: Timeout`, while M=2 and M=1 passed clean.
+    ///
+    /// Which means the churn was doing WORK: N links were N parallel lanes. The
+    /// fix has to remove the re-establishing without removing the parallelism,
+    /// so links are reused only while IDLE and the pool grows to demand.
+    reusable_dialed_link: Arc<Mutex<HashMap<DestinationHash, Vec<LinkId>>>>,
+    /// CIRISEdge#532 — links with a resource transfer in flight. A link in here
+    /// is NOT handed out for reuse; a concurrent send takes another pooled link
+    /// or dials one. This is what keeps reuse from becoming a queue.
+    link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#532 — per-destination dial gate: BOUNDED concurrency, not
+    /// exclusion.
+    ///
+    /// Reuse alone does not close the churn: N coordinators firing at one peer
+    /// all miss an idle link and all dial — the 29-establish : 25-identify gap,
+    /// links whose establish cost was paid and discarded.
+    ///
+    /// But a mutex here would be the previous mistake one layer over. When every
+    /// pooled link is mid-transfer, the additional dials are exactly the
+    /// PARALLEL LANES the peer needs; serialising them puts each waiter's
+    /// resource-transfer clock behind someone else's handshake, which is how the
+    /// M=4 timeouts happen. A semaphore bounds the herd without forbidding the
+    /// second lane — and Tokio's is FIFO-fair, so a waiter cannot be starved by
+    /// a steady arrival of new senders.
+    dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Semaphore>>>>,
     /// CIRISEdge#33 — operator-configured deny-list. Keyed by the
     /// 16-byte Reticulum identity hash of the blocked peer. `send`
     /// consults this BEFORE the leviculum connect call; a hit
@@ -2919,6 +2941,7 @@ impl ReticulumTransport {
             )),
             dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
             reusable_dialed_link: Arc::new(Mutex::new(HashMap::new())),
+            link_in_flight: Arc::new(Mutex::new(HashSet::new())),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             blackhole: blackhole_rules,
             blackhole_cache: std::sync::Mutex::new((0, None)),
@@ -3946,10 +3969,14 @@ impl ReticulumTransport {
         // identity guard: only retract THIS link, never a newer one to the peer.
         if let Some(dest) = self.dialed_link_dest.lock().await.remove(&link_id) {
             let mut reusable = self.reusable_dialed_link.lock().await;
-            if reusable.get(&dest) == Some(&link_id) {
-                reusable.remove(&dest);
+            if let Some(pool) = reusable.get_mut(&dest) {
+                pool.retain(|id| *id != link_id);
+                if pool.is_empty() {
+                    reusable.remove(&dest);
+                }
             }
         }
+        self.link_in_flight.lock().await.remove(&link_id);
         Ok(())
     }
 
@@ -4855,7 +4882,9 @@ impl ReticulumTransport {
         self.reusable_dialed_link
             .lock()
             .await
-            .insert(peer.dest_hash, link_id);
+            .entry(peer.dest_hash)
+            .or_default()
+            .push(link_id);
 
         Ok(link_id)
     }
@@ -4869,13 +4898,33 @@ impl ReticulumTransport {
     /// registry, and leviculum is the authority.
     async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
         let mut map = self.reusable_dialed_link.lock().await;
-        let id = *map.get(dest)?;
-        if self.node.link_is_established(&id) {
-            Some(id)
-        } else {
+        let pool = map.get_mut(dest)?;
+        // Drop links leviculum no longer holds, so a dead entry cannot occupy a
+        // pool slot forever. The map is a cache over the link registry and the
+        // registry is the authority.
+        pool.retain(|id| self.node.link_is_established(id));
+        if pool.is_empty() {
             map.remove(dest);
-            None
+            return None;
         }
+        let in_flight = self.link_in_flight.lock().await;
+        // IDLE only. A link mid-transfer is not available: Reticulum runs one
+        // resource per link, so handing it out serialises the caller behind the
+        // transfer already on it — which is the regression the M=4 sweep caught.
+        pool.iter().find(|id| !in_flight.contains(*id)).copied()
+    }
+
+    /// CIRISEdge#532 — claim a link for a transfer, or report it already busy.
+    ///
+    /// Returned as a bool the caller must honour rather than a guard type
+    /// because the release has to happen on EVERY exit path from the ship,
+    /// including the error paths the durable dispatcher retries through.
+    async fn claim_link_for_transfer(&self, link_id: LinkId) -> bool {
+        self.link_in_flight.lock().await.insert(link_id)
+    }
+
+    async fn release_link_after_transfer(&self, link_id: LinkId) {
+        self.link_in_flight.lock().await.remove(&link_id);
     }
 
     /// CIRISEdge#532 — the per-destination dial gate handle (single-flight).
@@ -4884,14 +4933,10 @@ impl ReticulumTransport {
     /// map lock; a dial takes an establish timeout, and holding the map would
     /// serialise dials to DIFFERENT peers behind it — trading link churn for a
     /// convoy, which is not an improvement.
-    async fn dial_gate_for(&self, dest: DestinationHash) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(
-            self.dial_gate
-                .lock()
-                .await
-                .entry(dest)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
+    async fn dial_gate_for(&self, dest: DestinationHash) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(self.dial_gate.lock().await.entry(dest).or_insert_with(|| {
+            Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS_PER_DEST))
+        }))
     }
 
     async fn live_attributed_link_to(&self, destination_key_id: &str) -> Option<LinkId> {
@@ -5481,7 +5526,10 @@ impl Transport for ReticulumTransport {
             // gap in #532, where the cost of a link is paid and then discarded.
             // The gate is per-destination so other peers still dial in parallel.
             let gate = self.dial_gate_for(peer.dest_hash).await;
-            let _dial_permit = gate.lock().await;
+            let _dial_permit = gate
+                .acquire()
+                .await
+                .map_err(|e| TransportError::Io(format!("dial gate closed: {e}")))?;
             // Double-check: a concurrent dial we queued behind may have just
             // published a reusable link. Checking only before the gate would
             // make the gate a queue of redundant dials rather than a filter.
@@ -5499,19 +5547,32 @@ impl Transport for ReticulumTransport {
             }
         };
 
-        // The outbound-dial path we just established this link; a `Busy`
-        // collision here is not the reverse-path retry case, so both variants
-        // surface as the send's transport error (the durable dispatcher retries).
-        // Freshly-dialed link we control: lenient no-progress window, full
-        // [`RESOURCE_TRANSFER_TIMEOUT`] hard cap (v13.6.1 progress-aware wait).
-        self.ship_resource_on_link(
-            &link_id,
-            envelope_bytes,
-            DIAL_NO_PROGRESS_WINDOW,
-            RESOURCE_TRANSFER_TIMEOUT,
-        )
-        .await
-        .map_err(ShipError::into_transport)?;
+        // CIRISEdge#532 — hold the link for the duration of the transfer, so a
+        // concurrent send to this peer takes another pooled link or dials one
+        // rather than queueing behind this resource. Reticulum runs ONE resource
+        // per link; without this the pool would hand the same link to everyone
+        // and reuse would become serialisation.
+        //
+        // Released on EVERY exit path, including the error paths the durable
+        // dispatcher retries through — a leaked marker would retire the link
+        // from the pool permanently while it sat there perfectly usable.
+        let claimed = self.claim_link_for_transfer(link_id).await;
+        // A `Busy` collision here is not the reverse-path retry case, so both
+        // variants surface as the send's transport error (the durable dispatcher
+        // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
+        // hard cap (v13.6.1 progress-aware wait).
+        let shipped = self
+            .ship_resource_on_link(
+                &link_id,
+                envelope_bytes,
+                DIAL_NO_PROGRESS_WINDOW,
+                RESOURCE_TRANSFER_TIMEOUT,
+            )
+            .await;
+        if claimed {
+            self.release_link_after_transfer(link_id).await;
+        }
+        shipped.map_err(ShipError::into_transport)?;
 
         Ok(TransportSendOutcome::Delivered)
     }
@@ -5663,6 +5724,7 @@ impl Transport for ReticulumTransport {
                         event_bus: self.event_bus.as_deref(),
                         link_established_at: &self.link_established_at,
                         reusable_dialed_link: &self.reusable_dialed_link,
+                        link_in_flight: &self.link_in_flight,
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                         link_last_inbound_at: &self.link_last_inbound_at,
                         inbound_reasm: &self.inbound_reasm,
@@ -5776,7 +5838,9 @@ struct EventCtx<'a> {
     /// `LinkStale`.
     link_established_at: &'a Mutex<HashMap<LinkId, u64>>,
     /// CIRISEdge#532 — so a closed link stops being offered for reuse.
-    reusable_dialed_link: &'a Mutex<HashMap<DestinationHash, LinkId>>,
+    reusable_dialed_link: &'a Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
+    /// CIRISEdge#532 — so a closed link does not leak an in-flight marker.
+    link_in_flight: &'a Mutex<HashSet<LinkId>>,
     /// v3.5.1 (CIRISEdge#119 + #120) — per-link rooted-peer
     /// attribution. Populated on `NodeEvent::LinkIdentified` after
     /// matching the link's remote identity to a rooted peer; consumed
@@ -6720,10 +6784,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // one's close event.
             if let Some(dest) = closed_dest {
                 let mut reusable = ctx.reusable_dialed_link.lock().await;
-                if reusable.get(&dest) == Some(&link_id) {
-                    reusable.remove(&dest);
+                if let Some(pool) = reusable.get_mut(&dest) {
+                    pool.retain(|id| *id != link_id);
+                    if pool.is_empty() {
+                        reusable.remove(&dest);
+                    }
                 }
             }
+            // CIRISEdge#532 — a closed link cannot still be "transferring"; leaving
+            // it marked would leak a pool slot that is never handed out again.
+            ctx.link_in_flight.lock().await.remove(&link_id);
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.
@@ -11496,6 +11566,30 @@ impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
     }
 }
 
+/// CIRISEdge#532 — how many dials to one peer may be in flight at once.
+///
+/// Not 1: when every pooled link is mid-transfer the extra dials ARE the peer's
+/// additional resource lanes, and Reticulum allows one transfer per link. Not
+/// unbounded: unbounded is the 29-establishes-per-minute state this fixes. Four
+/// is the working set a coordinator fan-out actually needs — the mesh runs six
+/// coordinators per peer, but they do not all ship simultaneously, and a link
+/// returns to the pool the moment its transfer ends.
+const MAX_CONCURRENT_DIALS_PER_DEST: usize = 4;
+// A cap of 1 is a mutex, and a mutex here is the M=4 regression one layer up:
+// each waiter's resource-transfer clock would sit behind someone else's
+// handshake. Guarded at COMPILE time because the value is a constant and a
+// runtime test of a constant proves nothing about the build that ships.
+const _: () = assert!(
+    MAX_CONCURRENT_DIALS_PER_DEST > 1,
+    "CIRISEdge#532: a per-destination dial cap of 1 serialises the peer's \
+     parallel resource lanes — that is the M=4 timeout regression, not a fix"
+);
+const _: () = assert!(
+    MAX_CONCURRENT_DIALS_PER_DEST < 29,
+    "CIRISEdge#532: the cap must stay far below the 29 establishes/minute this \
+     bounds, or it stops bounding anything"
+);
+
 // ── CIRISEdge#537: edge's body cap must fit what the transport will DELIVER ──
 //
 // The production symptom was 765 decode failures all at column 1048570 — a body
@@ -11578,9 +11672,38 @@ mod link_reuse_tests {
         assert!(!should_retract(None, link(1)));
     }
 
-    /// The gate is keyed PER DESTINATION. A global dial lock would serialise
-    /// dials to different peers behind one slow handshake — trading link churn
-    /// for a convoy, which is not an improvement on a 2-core box.
+    /// The regression the M=4 sweep caught, as an invariant.
+    ///
+    /// Reticulum runs ONE resource transfer per link, so a link mid-transfer
+    /// must not be handed to a concurrent sender — the first cut of this fix did
+    /// exactly that and turned N parallel lanes into one queue: 24 contract
+    /// violations and `resource transfer failed: Timeout` at M=4, while M=2 and
+    /// M=1 (less concurrency) passed clean. Reuse is IDLE-only for that reason,
+    /// and it is the reason, not a tidy-up.
+    #[test]
+    fn a_link_mid_transfer_is_not_offered_for_reuse() {
+        let pool = [link(1), link(2)];
+        let in_flight: std::collections::HashSet<LinkId> = std::iter::once(link(1)).collect();
+        let picked = pool.iter().find(|id| !in_flight.contains(*id)).copied();
+        assert_eq!(
+            picked,
+            Some(link(2)),
+            "the busy link must be skipped in favour of an idle one"
+        );
+
+        // Every pooled link busy ⇒ no reuse ⇒ the caller dials another lane,
+        // rather than queueing behind a transfer already in progress.
+        let all_busy: std::collections::HashSet<LinkId> = pool.iter().copied().collect();
+        assert_eq!(
+            pool.iter().find(|id| !all_busy.contains(*id)).copied(),
+            None,
+            "with every lane busy the answer is dial, not wait"
+        );
+    }
+
+    /// The gate is keyed PER DESTINATION. A global gate would bound dials to
+    /// different peers against each other — trading link churn for a convoy,
+    /// which is not an improvement on a 2-core box.
     #[test]
     fn the_dial_gate_is_per_destination_not_global() {
         let mut gates: HashMap<DestinationHash, u32> = HashMap::new();
