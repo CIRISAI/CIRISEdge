@@ -2130,6 +2130,30 @@ pub struct ReticulumTransport {
     /// of "I dialed link L to dest D", consulted when `link_destination` is `None`.
     /// Removed on `LinkClosed`.
     dialed_link_dest: Arc<Mutex<HashMap<LinkId, DestinationHash>>>,
+    /// CIRISEdge#532 — the peer's REUSABLE outbound link, keyed by the dest we
+    /// dialed. This is the fix for 29 establishes/minute across 20 links on a
+    /// 3-peer mesh: `connect_awaited` creates a NEW link on EVERY call (it is
+    /// `inner.connect()`, with no dedupe), and edge's only reuse selector
+    /// (`live_attributed_link_to`) is consulted on the REVERSE path alone. So
+    /// every send that could not ride an inbound link dialed — and with a
+    /// coordinator per plane per peer per round, the establish rate scaled with
+    /// PLANES (issue #532 question 3, answered: yes, effectively per-plane).
+    ///
+    /// Populated ONLY after `identify_link` succeeds. An unidentified link is
+    /// not reusable: the responder drops frames on it as `SkippedNoSourceKeyId`
+    /// (#317/#340), so reusing one would trade churn for silent non-delivery.
+    /// Identification is per-LINK and persists for its lifetime, which is what
+    /// makes skipping the establish+identify sequence on reuse correct.
+    reusable_dialed_link: Arc<Mutex<HashMap<DestinationHash, LinkId>>>,
+    /// CIRISEdge#532 — per-destination dial gate (single-flight).
+    ///
+    /// Reuse alone does not close the churn: N coordinators firing concurrently
+    /// at the same peer all miss the empty map and all dial, which is the
+    /// 29-establish : 25-identify gap in the issue — links whose establish cost
+    /// was paid and then discarded. The gate serialises dials PER DESTINATION so
+    /// the first caller dials and the rest wait and reuse. Per-destination, not
+    /// global: two different peers must still dial in parallel.
+    dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Mutex<()>>>>>,
     /// CIRISEdge#33 — operator-configured deny-list. Keyed by the
     /// 16-byte Reticulum identity hash of the blocked peer. `send`
     /// consults this BEFORE the leviculum connect call; a hit
@@ -2894,6 +2918,8 @@ impl ReticulumTransport {
                 crate::transport::frame_fragment::Reassembler::new(),
             )),
             dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
+            reusable_dialed_link: Arc::new(Mutex::new(HashMap::new())),
+            dial_gate: Arc::new(Mutex::new(HashMap::new())),
             blackhole: blackhole_rules,
             blackhole_cache: std::sync::Mutex::new((0, None)),
             binding_cache: std::sync::Mutex::new(HashMap::new()),
@@ -3915,6 +3941,15 @@ impl ReticulumTransport {
         // Eagerly remove so a second teardown is the no-op above.
         self.established_links.lock().await.remove(&link_id);
         self.link_established_at.lock().await.remove(&link_id);
+        // CIRISEdge#532 — an explicitly torn-down link must stop being offered
+        // for reuse here too, not only via the event loop's LinkClosed. Same
+        // identity guard: only retract THIS link, never a newer one to the peer.
+        if let Some(dest) = self.dialed_link_dest.lock().await.remove(&link_id) {
+            let mut reusable = self.reusable_dialed_link.lock().await;
+            if reusable.get(&dest) == Some(&link_id) {
+                reusable.remove(&dest);
+            }
+        }
         Ok(())
     }
 
@@ -4713,6 +4748,152 @@ impl ReticulumTransport {
     /// links leviculum still holds `Active` (`link_is_established` resolves
     /// the #66 re-key alias, so a re-keyed inbound link still matches).
     /// Newest-established wins when a peer holds several.
+    /// CIRISEdge#532 — dial a peer and bring the link all the way to USABLE:
+    /// established, identified, and bundle-served. Extracted from `send` so the
+    /// reuse and single-flight decisions above read as one choice instead of
+    /// being threaded through a linear sequence.
+    ///
+    /// On success the link is published to `reusable_dialed_link`, which is what
+    /// lets the next send — and every other coordinator's send to this peer —
+    /// skip all of this.
+    async fn dial_and_identify(
+        &self,
+        destination_key_id: &str,
+        peer: &ResolvedPeer,
+        has_path: bool,
+        establish_timeout: Duration,
+    ) -> Result<LinkId, TransportError> {
+        // CIRISEdge#484 — leviculum v0.16 `connect_awaited` returns the handle
+        // immediately AND a completion future for `LinkEstablished`, registered
+        // BEFORE dispatch (edge no longer needs to observe the event loop `listen`
+        // owns). The future keys on the ORIGINAL dial id — the #342/#66 alias the old
+        // `link_is_established` poll resolved — takes NO node lock, and resolves
+        // `Err(LinkClosed)` on link death. Caller owns the wall-clock bound.
+        let (link, established) = self
+            .node
+            .connect_awaited(&peer.dest_hash, &peer.signing_key)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
+        let link_id = *link.link_id();
+        // CIRISEdge#424 — record the dest we dialed for THIS link so an inbound
+        // reply arriving over it (the initiator-side reverse path a NAT'd peer's
+        // responder uses) attributes to this peer even though leviculum's
+        // `link_destination` returns `None` for our own dialed links.
+        self.dialed_link_dest
+            .lock()
+            .await
+            .insert(link_id, peer.dest_hash);
+
+        // Await `LinkEstablished` on BOTH ends — the peer must have accepted the
+        // LINK_REQUEST or a resource transfer cannot start. `established` resolves
+        // `Ok(())` on establishment, `Err(LinkClosed)` if the peer refused / the link
+        // died first; a timeout means no route or a stalled dial.
+        let established_ok = matches!(
+            with_timeout(establish_timeout, established).await,
+            Some(Ok(()))
+        );
+        if !established_ok {
+            // CIRISEdge#336 — a no-path target that never established is
+            // un-routable, not slow: fail fast with the self-diagnosing error
+            // (naming target dest, key_id, and the paths we DO hold — the
+            // routable named dest for this peer usually appears there, making
+            // the explicit-vs-named mismatch obvious). A had-a-path target that
+            // stalled is a genuine slow/dead link → the opaque timeout stands.
+            if !has_path {
+                let target_dest = hex::encode(peer.dest_hash.into_bytes());
+                let paths = self.path_table_snapshot();
+                tracing::error!(
+                    key_id = %destination_key_id,
+                    target_dest = %target_dest,
+                    has_path,
+                    known_paths = %paths,
+                    "link_request target has no route — un-routable dest (CIRISEdge#336). \
+                     A no-path dest is broadcast-only and no directly-attached neighbor \
+                     answered; if the peer is relay-reachable it must be addressed on its \
+                     announced (named) dest, which appears in known_paths."
+                );
+                return Err(TransportError::NoRouteToPeer {
+                    key_id: destination_key_id.to_string(),
+                    target_dest,
+                    has_path,
+                    paths,
+                });
+            }
+            log_nat_topology_diagnosis(destination_key_id, establish_timeout);
+            return Err(TransportError::Timeout(establish_timeout));
+        }
+
+        // CIRISEdge#340 — IDENTIFY the link before sending. A Reticulum link is
+        // anonymous by default; only the initiator may identify it, and the
+        // responder emits `LinkIdentified` (→ populates its `link_to_peer_key_id`
+        // via the #314 identity-hash match → attributes our inbound frame) ONLY
+        // if we do. Without this, every replication frame we send lands on the
+        // responder as `source_key_id=None` and is dropped `SkippedNoSourceKeyId`
+        // (#317) — the field-confirmed reason attribution never fired and
+        // CIRISServer#235 was never verified end-to-end. Ordered before
+        // `send_resource` on the same link so the LINKIDENTIFY is processed
+        // first. A failure here means the responder cannot attribute the frame,
+        // so fail the send (the durable dispatcher retries) rather than ship an
+        // unattributable resource that will be silently dropped.
+        self.node
+            .identify_link(&link_id, &self.local_identity)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
+
+        // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
+        // LINKIDENTIFY (so the responder attributes it) and BEFORE the
+        // resource ship (the fragments ride the link Channel, which never
+        // contends with the resource lane — leviculum#27).
+        if let Some(own) = self.own_bundle.as_ref() {
+            push_own_bundle_frames(&self.node, own, &link_id).await;
+        }
+
+        // PUBLISH LAST. Only now is the link established AND identified AND
+        // bundle-served — the three things a reusing sender skips. Publishing
+        // any earlier would hand another coordinator a link the responder will
+        // drop frames on (`SkippedNoSourceKeyId`, #317/#340).
+        self.reusable_dialed_link
+            .lock()
+            .await
+            .insert(peer.dest_hash, link_id);
+
+        Ok(link_id)
+    }
+
+    /// CIRISEdge#532 — the live, identified link we already hold to this dest,
+    /// if any. `None` means a dial is required.
+    ///
+    /// Liveness uses the same `link_is_established` gate the reverse-path
+    /// selector does. A stale entry is EVICTED on the way out rather than left
+    /// to fail the next send too — the map is a cache over leviculum's link
+    /// registry, and leviculum is the authority.
+    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
+        let mut map = self.reusable_dialed_link.lock().await;
+        let id = *map.get(dest)?;
+        if self.node.link_is_established(&id) {
+            Some(id)
+        } else {
+            map.remove(dest);
+            None
+        }
+    }
+
+    /// CIRISEdge#532 — the per-destination dial gate handle (single-flight).
+    ///
+    /// Cloned out under a short lock so the dial itself is NOT held under the
+    /// map lock; a dial takes an establish timeout, and holding the map would
+    /// serialise dials to DIFFERENT peers behind it — trading link churn for a
+    /// convoy, which is not an improvement.
+    async fn dial_gate_for(&self, dest: DestinationHash) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.dial_gate
+                .lock()
+                .await
+                .entry(dest)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
     async fn live_attributed_link_to(&self, destination_key_id: &str) -> Option<LinkId> {
         let candidates: Vec<LinkId> = self
             .link_to_peer_key_id
@@ -5274,90 +5455,49 @@ impl Transport for ReticulumTransport {
             NO_PATH_ESTABLISH_TIMEOUT
         };
 
-        // CIRISEdge#484 — leviculum v0.16 `connect_awaited` returns the handle
-        // immediately AND a completion future for `LinkEstablished`, registered
-        // BEFORE dispatch (edge no longer needs to observe the event loop `listen`
-        // owns). The future keys on the ORIGINAL dial id — the #342/#66 alias the old
-        // `link_is_established` poll resolved — takes NO node lock, and resolves
-        // `Err(LinkClosed)` on link death. Caller owns the wall-clock bound.
-        let (link, established) = self
-            .node
-            .connect_awaited(&peer.dest_hash, &peer.signing_key)
-            .await
-            .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
-        let link_id = *link.link_id();
-        // CIRISEdge#424 — record the dest we dialed for THIS link so an inbound
-        // reply arriving over it (the initiator-side reverse path a NAT'd peer's
-        // responder uses) attributes to this peer even though leviculum's
-        // `link_destination` returns `None` for our own dialed links.
-        self.dialed_link_dest
-            .lock()
-            .await
-            .insert(link_id, peer.dest_hash);
-
-        // Await `LinkEstablished` on BOTH ends — the peer must have accepted the
-        // LINK_REQUEST or a resource transfer cannot start. `established` resolves
-        // `Ok(())` on establishment, `Err(LinkClosed)` if the peer refused / the link
-        // died first; a timeout means no route or a stalled dial.
-        let established_ok = matches!(
-            with_timeout(establish_timeout, established).await,
-            Some(Ok(()))
-        );
-        if !established_ok {
-            // CIRISEdge#336 — a no-path target that never established is
-            // un-routable, not slow: fail fast with the self-diagnosing error
-            // (naming target dest, key_id, and the paths we DO hold — the
-            // routable named dest for this peer usually appears there, making
-            // the explicit-vs-named mismatch obvious). A had-a-path target that
-            // stalled is a genuine slow/dead link → the opaque timeout stands.
-            if !has_path {
-                let target_dest = hex::encode(peer.dest_hash.into_bytes());
-                let paths = self.path_table_snapshot();
-                tracing::error!(
+        // ── CIRISEdge#532: REUSE BEFORE DIALING ──────────────────────────────
+        // A live, identified link to this dest is a finished handshake. Sending
+        // on it is the whole point of having established it; dialing a second
+        // one pays the establish cost again and abandons the first. This is the
+        // 29-establishes-per-minute loop, and the reason it scaled with planes:
+        // every coordinator's send took the dial path independently.
+        //
+        // Everything the dial path does after `connect_awaited` — recording the
+        // dialed dest (#424), awaiting establishment, `identify_link` (#340),
+        // and the initiator-side bundle serve (#436) — is per-LINK setup that
+        // already happened for a reused link. Skipping it is not an omission;
+        // repeating it per send was the waste.
+        let reused = self.reusable_link_to(&peer.dest_hash).await;
+        let link_id = if let Some(existing) = reused {
+            tracing::trace!(
+                key_id = %destination_key_id,
+                link = ?existing,
+                "reusing the live identified link to this peer (CIRISEdge#532)"
+            );
+            existing
+        } else {
+            // SINGLE-FLIGHT. Without this, N coordinators firing at the same
+            // peer all observe "no link" and all dial — the establish:identify
+            // gap in #532, where the cost of a link is paid and then discarded.
+            // The gate is per-destination so other peers still dial in parallel.
+            let gate = self.dial_gate_for(peer.dest_hash).await;
+            let _dial_permit = gate.lock().await;
+            // Double-check: a concurrent dial we queued behind may have just
+            // published a reusable link. Checking only before the gate would
+            // make the gate a queue of redundant dials rather than a filter.
+            if let Some(existing) = self.reusable_link_to(&peer.dest_hash).await {
+                tracing::trace!(
                     key_id = %destination_key_id,
-                    target_dest = %target_dest,
-                    has_path,
-                    known_paths = %paths,
-                    "link_request target has no route — un-routable dest (CIRISEdge#336). \
-                     A no-path dest is broadcast-only and no directly-attached neighbor \
-                     answered; if the peer is relay-reachable it must be addressed on its \
-                     announced (named) dest, which appears in known_paths."
+                    link = ?existing,
+                    "another send established this peer's link while we waited on \
+                     the dial gate — reusing it (CIRISEdge#532)"
                 );
-                return Err(TransportError::NoRouteToPeer {
-                    key_id: destination_key_id.to_string(),
-                    target_dest,
-                    has_path,
-                    paths,
-                });
+                existing
+            } else {
+                self.dial_and_identify(destination_key_id, &peer, has_path, establish_timeout)
+                    .await?
             }
-            log_nat_topology_diagnosis(destination_key_id, establish_timeout);
-            return Err(TransportError::Timeout(establish_timeout));
-        }
-
-        // CIRISEdge#340 — IDENTIFY the link before sending. A Reticulum link is
-        // anonymous by default; only the initiator may identify it, and the
-        // responder emits `LinkIdentified` (→ populates its `link_to_peer_key_id`
-        // via the #314 identity-hash match → attributes our inbound frame) ONLY
-        // if we do. Without this, every replication frame we send lands on the
-        // responder as `source_key_id=None` and is dropped `SkippedNoSourceKeyId`
-        // (#317) — the field-confirmed reason attribution never fired and
-        // CIRISServer#235 was never verified end-to-end. Ordered before
-        // `send_resource` on the same link so the LINKIDENTIFY is processed
-        // first. A failure here means the responder cannot attribute the frame,
-        // so fail the send (the durable dispatcher retries) rather than ship an
-        // unattributable resource that will be silently dropped.
-        self.node
-            .identify_link(&link_id, &self.local_identity)
-            .await
-            .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
-
-        // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
-        // LINKIDENTIFY (so the responder attributes it) and BEFORE the
-        // resource ship (the fragments ride the link Channel, which never
-        // contends with the resource lane — leviculum#27).
-        if let Some(own) = self.own_bundle.as_ref() {
-            push_own_bundle_frames(&self.node, own, &link_id).await;
-        }
+        };
 
         // The outbound-dial path we just established this link; a `Busy`
         // collision here is not the reverse-path retry case, so both variants
@@ -5522,6 +5662,7 @@ impl Transport for ReticulumTransport {
                         own_bundle: self.own_bundle.as_ref(),
                         event_bus: self.event_bus.as_deref(),
                         link_established_at: &self.link_established_at,
+                        reusable_dialed_link: &self.reusable_dialed_link,
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                         link_last_inbound_at: &self.link_last_inbound_at,
                         inbound_reasm: &self.inbound_reasm,
@@ -5634,6 +5775,8 @@ struct EventCtx<'a> {
     /// populated on `LinkEstablished` / cleared on `LinkClosed` /
     /// `LinkStale`.
     link_established_at: &'a Mutex<HashMap<LinkId, u64>>,
+    /// CIRISEdge#532 — so a closed link stops being offered for reuse.
+    reusable_dialed_link: &'a Mutex<HashMap<DestinationHash, LinkId>>,
     /// v3.5.1 (CIRISEdge#119 + #120) — per-link rooted-peer
     /// attribution. Populated on `NodeEvent::LinkIdentified` after
     /// matching the link's remote identity to a rooted peer; consumed
@@ -6569,7 +6712,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // closed link can never win the reverse-path selector.
             ctx.link_last_inbound_at.lock().await.remove(&link_id);
             // CIRISEdge#424 — drop the dialed-dest record for the closed link.
-            ctx.dialed_link_dest.lock().await.remove(&link_id);
+            let closed_dest = ctx.dialed_link_dest.lock().await.remove(&link_id);
+            // CIRISEdge#532 — and drop it as this dest's REUSABLE link, so the
+            // next send dials instead of handing a dead link to every
+            // coordinator. Keyed by dest, so remove only if THIS link is the one
+            // published: a newer link to the same peer must survive an older
+            // one's close event.
+            if let Some(dest) = closed_dest {
+                let mut reusable = ctx.reusable_dialed_link.lock().await;
+                if reusable.get(&dest) == Some(&link_id) {
+                    reusable.remove(&dest);
+                }
+            }
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.
@@ -11339,5 +11493,101 @@ impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
     ) -> Result<(), String> {
         self.retire_scoped_destination(address, scope)
             .map_err(|e| e.to_string())
+    }
+}
+
+// ── CIRISEdge#537: edge's body cap must fit what the transport will DELIVER ──
+//
+// The production symptom was 765 decode failures all at column 1048570 — a body
+// cut at `RESOURCE_MAX_EFFICIENT_SIZE` minus the metadata block, attributed to
+// the SENDER as a decode error several layers above the truncation. v18.8.0
+// fixed the cause (`resource_delivery_is_whole` replaced an arm that routed
+// segment 1 as if it were the whole transfer), but nothing compared the two
+// limits, so the relationship could invert again from either side.
+//
+// The constant to compare against is NOT `RESOURCE_MAX_EFFICIENT_SIZE`
+// (1_048_575). That is the SEGMENTATION THRESHOLD — when leviculum splits a
+// transfer — not a delivery ceiling, and asserting `8 MiB <= 1 MiB` would both
+// fail to build and forbid the entirely legitimate multi-segment path.
+//
+// What governs deliverability is the per-transfer ASSEMBLY ceiling. Edge never
+// calls `ReticulumNodeBuilder::max_assembled_resource_size`, so the driver
+// default IS the effective ceiling: an 8 MiB envelope is ~9 segments and
+// assembles comfortably under 64 MiB.
+//
+// This assert is what keeps the degraded-transfer hole UNREACHABLE. Past the
+// assembly ceiling leviculum declines to assemble and falls back to per-segment
+// delivery, whose FINAL slice is indistinguishable from an assembled whole at
+// edge's seam (both are `segment_index == total_segments`) — it would be routed
+// and fail verification downstream. Holding the body cap under the ceiling means
+// edge never submits a body that can reach that state.
+const _: () = assert!(
+    MAX_BODY_BYTES <= leviculum_std::driver::DEFAULT_MAX_ASSEMBLED_RESOURCE_SIZE,
+    "CIRISEdge#537: edge admits a body larger than the transport will assemble — \
+     bodies between the two limits degrade to per-segment delivery, whose final \
+     slice routes as if whole and fails verification at the receiver"
+);
+
+// ── CIRISEdge#532: link reuse + single-flight dialing ───────────────────────
+#[cfg(test)]
+mod link_reuse_tests {
+    //! The churn #532 measured — 29 establishes/minute across 20 links on a
+    //! 3-peer mesh — came from `connect_awaited` creating a NEW link on every
+    //! call while edge's only reuse selector was consulted on the reverse path
+    //! alone. These pin the two decisions that close it, as pure functions over
+    //! the state the field produces.
+    use super::{DestinationHash, LinkId};
+    use std::collections::HashMap;
+
+    /// The eviction identity guard, extracted as the predicate it is: a close
+    /// event retracts the peer's reusable link ONLY if the closing link is the
+    /// one currently published.
+    fn should_retract(published: Option<LinkId>, closing: LinkId) -> bool {
+        published == Some(closing)
+    }
+
+    fn link(n: u8) -> LinkId {
+        LinkId::from([n; 16])
+    }
+
+    fn dest(n: u8) -> DestinationHash {
+        DestinationHash::new([n; 16])
+    }
+
+    /// A link closing retracts its own reuse entry.
+    #[test]
+    fn a_closing_link_retracts_its_own_reuse_entry() {
+        assert!(should_retract(Some(link(1)), link(1)));
+    }
+
+    /// The subtle one. A peer can hold a NEWER link while an OLDER one's close
+    /// event is still in flight — the reverse-path work (#353) exists precisely
+    /// because peers hold several links over a lifetime. Retracting on identity
+    /// rather than on destination keeps the old close from evicting the live
+    /// link, which would send the next round back to dialing and quietly
+    /// reintroduce the churn this fix removes.
+    #[test]
+    fn an_older_links_close_does_not_evict_the_peers_newer_link() {
+        assert!(!should_retract(Some(link(2)), link(1)));
+    }
+
+    /// Nothing published, nothing to retract — a close for a link that was
+    /// never reusable (dial failed before identify) is a no-op, not a panic.
+    #[test]
+    fn closing_an_unpublished_link_is_a_no_op() {
+        assert!(!should_retract(None, link(1)));
+    }
+
+    /// The gate is keyed PER DESTINATION. A global dial lock would serialise
+    /// dials to different peers behind one slow handshake — trading link churn
+    /// for a convoy, which is not an improvement on a 2-core box.
+    #[test]
+    fn the_dial_gate_is_per_destination_not_global() {
+        let mut gates: HashMap<DestinationHash, u32> = HashMap::new();
+        *gates.entry(dest(1)).or_default() += 1;
+        *gates.entry(dest(2)).or_default() += 1;
+        *gates.entry(dest(1)).or_default() += 1;
+        assert_eq!(gates.len(), 2, "two peers must get two independent gates");
+        assert_eq!(gates[&dest(1)], 2, "same peer shares one gate");
     }
 }

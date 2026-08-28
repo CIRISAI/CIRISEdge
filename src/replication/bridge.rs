@@ -3569,6 +3569,31 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// The equivalence pin any future pushdown must keep green:
     /// `advertise_projection_boundary_and_ledger_are_pinned`.
+    /// CIRISEdge#531 (second half) — the projection of a row that the advertise
+    /// gates actually consume.
+    ///
+    /// The gates read four strings: `cohort_scope`, `attestation_type`,
+    /// `attesting_key_id`, and `attestation_envelope.dimension`. Building those
+    /// directly is O(4 short strings); `serde_json::to_value` over the row was
+    /// O(whole signed envelope), and the envelope is the large part.
+    ///
+    /// Deliberately returns a `Value` rather than changing the gates to take a
+    /// typed row: the same gates are reached from the direct-fetch twin and the
+    /// pull-serve path, which hold a `Value` and not an `Attestation`. Keeping
+    /// one gate signature keeps the advertise and fetch answers IDENTICAL by
+    /// construction — the `#429` advertised-then-unfetchable shape is exactly
+    /// what a second, subtly different gate path reintroduces.
+    fn advertise_gate_view(att: &ciris_persist::federation::Attestation) -> serde_json::Value {
+        serde_json::json!({
+            "attesting_key_id": att.attesting_key_id,
+            "attestation_type": att.attestation_type,
+            "cohort_scope": att.cohort_scope,
+            "attestation_envelope": {
+                "dimension": att.attestation_envelope.get("dimension"),
+            },
+        })
+    }
+
     fn attestation_is_advertised(
         canonical_json: &serde_json::Value,
         self_set: &HashSet<String>,
@@ -4696,17 +4721,27 @@ impl FederationDirectoryReplicationBridge {
             .last()
             .map(ciris_persist::federation::ServedAttestation::resume_pair);
         for att in &attestations {
-            let Ok(canonical_json) = serde_json::to_value(&att.attestation) else {
-                // CIRISEdge#433 — an attestation that will not project to a
-                // `Value` is invisible to every gate below AND absent from the
-                // advertise set. Was a bare `continue`.
-                self.withhold(
-                    crate::observability::WithholdReason::RowNotSerializable,
-                    peer_label,
-                    "list_attestations: to_value failed",
-                );
-                continue;
-            };
+            // CIRISEdge#531, SECOND HALF — the gates below read exactly FOUR
+            // strings, and this used to hand them a full `serde_json::to_value`
+            // of the whole row: ~19 fields serialised AND a deep clone of the
+            // entire signed `attestation_envelope`, per row, per plane, per
+            // peer, per round. On the measured corpora (14,564 and 52,125 rows)
+            // across six coordinators that is the constant factor the issue
+            // names — and with the cursor already bounding MEMORY (v18.7.0),
+            // it is what remained on the CPU side.
+            //
+            // Every field is a direct read off the typed row; the envelope is
+            // ALREADY a `Value`, so the one nested field is a borrow, not a
+            // re-serialisation. `Attestation` carries no `rename_all`, so these
+            // keys are byte-identical to what `to_value` produced and the gates
+            // are untouched.
+            //
+            // The #433 `RowNotSerializable` withhold is gone from here because
+            // it is now unreachable here — this construction cannot fail. That
+            // failure CLASS is still covered: `content_hash_of` below serialises
+            // the same row and withholds on failure, so a row that will not
+            // serialise is still refused loudly rather than silently advertised.
+            let canonical_json = Self::advertise_gate_view(&att.attestation);
             // NOTE (#433, deliberate): the projection filter below is NOT a
             // withhold. `attestation_is_advertised` defines which rows this node
             // is the publisher OF (a `self`/`family` row is published by its own
@@ -4746,11 +4781,36 @@ impl FederationDirectoryReplicationBridge {
             // the direct-fetch twin in AGREEMENT, so a row this node may not
             // carry is never offered and then refused (the #429
             // advertised-then-unfetchable shape).
-            if self
-                .accord_relay_withholds(&canonical_json, peer_label, "advertise")
-                .await
-            {
-                continue;
+            // CIRISEdge#531 — THE ONE GATE THAT NEEDS THE WHOLE ROW. The relay
+            // gate hands the row to persist's taking verb, which DESERIALISES it
+            // to read the accord and the signer out (CIRISPersist#733) — four
+            // fields cannot satisfy that, and passing the view here silently
+            // withheld every accord row (caught by
+            // `accord_row_is_relayed_when_the_gate_allows_and_withheld_when_it_refuses`).
+            //
+            // So the full materialisation is not removed, it is made LAZY: paid
+            // only for rows persist's own classifier calls `accord:*`, which the
+            // cheap view can decide on its own. Every other row — the vast
+            // majority — never pays it.
+            if Self::attestation_is_accord(&canonical_json) {
+                let Ok(full_row) = serde_json::to_value(&att.attestation) else {
+                    // CIRISEdge#433 — this is where `RowNotSerializable` is now
+                    // reachable: an accord row that will not serialise cannot be
+                    // put to the gate, so it is withheld loudly rather than
+                    // relayed ungated.
+                    self.withhold(
+                        crate::observability::WithholdReason::RowNotSerializable,
+                        peer_label,
+                        "list_attestations: accord row to_value failed",
+                    );
+                    continue;
+                };
+                if self
+                    .accord_relay_withholds(&full_row, peer_label, "advertise")
+                    .await
+                {
+                    continue;
+                }
             }
             // CIRISEdge#379 — RECIPIENT gate (the contextual-integrity
             // Recipient parameter): a `trace:*` scores-attestation is
@@ -9480,6 +9540,61 @@ mod tests {
         }
     }
 
+    /// CIRISEdge#531 (second half) — the gate view must be INDISTINGUISHABLE
+    /// from `serde_json::to_value` as far as the gates can tell.
+    ///
+    /// This is the whole safety argument for dropping the full materialisation:
+    /// not "the fields look right" but "every gate returns the same verdict on
+    /// both values, for the same row". Compared on ONE typed fixture so the two
+    /// values cannot drift apart the way two hand-written shapes would
+    /// ([[feedback_test_field_provenance]]).
+    #[test]
+    fn the_gate_view_answers_every_gate_exactly_as_full_serialization_did() {
+        let producer = "fed_producer_1";
+        let att = trace_row_att(producer);
+        let full = serde_json::to_value(&att).expect("serialize trace row");
+        let view = FederationDirectoryReplicationBridge::advertise_gate_view(&att);
+
+        // Fields the gates read verbatim.
+        assert_eq!(full.get("attesting_key_id"), view.get("attesting_key_id"));
+        assert_eq!(full.get("attestation_type"), view.get("attestation_type"));
+        assert_eq!(
+            full.pointer("/attestation_envelope/dimension"),
+            view.pointer("/attestation_envelope/dimension"),
+            "the one nested read the gates make"
+        );
+
+        // `cohort_scope` is deliberately NOT compared by key presence, and the
+        // reason is load-bearing: persist declares it
+        // `skip_serializing_if = "is_default_cohort_scope"`, so `to_value`
+        // OMITS the key when the scope is `federation`, while the view always
+        // carries it. Edge does not replicate that predicate — duplicating an
+        // upstream serde rule is the drift this codebase keeps paying for.
+        //
+        // It is safe because the gate's own contract already collapses the two:
+        // a MISSING key means `federation` (persist's serde default), a present
+        // one is used as-is, and an EMPTY one is malformed and declines. So the
+        // verdicts agree for every scope, which is what the loop actually asks.
+        // Checked across all three cases rather than asserted.
+        let self_set: HashSet<String> = std::iter::once(producer.to_string()).collect();
+        for scope in ["federation", "self", "cohort", ""] {
+            let mut row = trace_row_att(producer);
+            row.cohort_scope = scope.to_string();
+            let full = serde_json::to_value(&row).expect("serialize trace row");
+            let view = FederationDirectoryReplicationBridge::advertise_gate_view(&row);
+            assert_eq!(
+                FederationDirectoryReplicationBridge::attestation_is_advertised(&full, &self_set),
+                FederationDirectoryReplicationBridge::attestation_is_advertised(&view, &self_set),
+                "advertise verdict must not change for cohort_scope={scope:?}"
+            );
+            assert_eq!(
+                FederationDirectoryReplicationBridge::attestation_requires_serve(&full),
+                FederationDirectoryReplicationBridge::attestation_requires_serve(&view),
+                "serve-gate verdict must not change for cohort_scope={scope:?}"
+            );
+        }
+    }
+
     /// A `trace:complete:v1` row's canonical JSON in EXACTLY the shape
     /// `list_attestations` feeds the item-6 gate — `serde_json::to_value` over an
     /// `Attestation` ([[feedback_test_field_provenance]]: the gate reads
@@ -9489,6 +9604,13 @@ mod tests {
     /// (a `#[cfg]`-gated lib test never runs in CI's lanes); the gate reads the
     /// projected value, not the store, so this isolates item 6 faithfully.
     fn trace_row_json(producer: &str) -> serde_json::Value {
+        serde_json::to_value(trace_row_att(producer)).expect("serialize trace row")
+    }
+
+    /// The same fixture as a TYPED row, so the #531 gate-view equivalence can be
+    /// checked against `to_value` on identical input rather than on two
+    /// separately hand-written shapes (which would prove nothing).
+    fn trace_row_att(producer: &str) -> Attestation {
         let now = Utc::now();
         let envelope = serde_json::json!({
             "id": "trace-fixture-1",
@@ -9500,7 +9622,7 @@ mod tests {
             "agent_id_hash": "ah-fixture-1",
             "trace": { "steps": [] },
         });
-        let att = Attestation {
+        Attestation {
             attestation_id: "trace-fixture-1".to_string(),
             attesting_key_id: producer.to_string(),
             attested_key_id: producer.to_string(),
@@ -9522,8 +9644,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: "federation".to_string(),
             promoted_at: None,
-        };
-        serde_json::to_value(&att).expect("serialize trace row")
+        }
     }
 
     /// CIRISEdge#396 item 6 — the `recipient_capability` serve control (the #393
