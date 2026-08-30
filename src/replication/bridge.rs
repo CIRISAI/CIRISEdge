@@ -93,6 +93,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
+use super::refusal_backoff::{RefusalBackoff, RetryDisposition};
 use super::resolved_state::{ResolvedPeerSet, ResolvedRecipient};
 use ciris_persist::federation::admission::has_accord_conferred_role;
 use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
@@ -267,6 +268,21 @@ impl ApplyRefusalClass {
         )
     }
 
+    /// CIRISEdge#544 — the same disposition, in the vocabulary the RETRY loop
+    /// consumes. Derived from [`Self::is_transient`] rather than re-decided, so
+    /// there is exactly one place the four #522 door classes say whether they
+    /// converge; the log line the receiver already prints
+    /// ([`classified_refusal_reason`]) and the window the receiver now backs off
+    /// for cannot disagree.
+    #[must_use]
+    pub fn retry(self) -> RetryDisposition {
+        if self.is_transient() {
+            RetryDisposition::Transient
+        } else {
+            RetryDisposition::Terminal
+        }
+    }
+
     /// Classify a persist apply-door `Err` on the **attestation** doors —
     /// AV-45 and AV-84, both of which persist types (`WriteScopeRefused`
     /// carries a [`ScopeRefusalReason`](ciris_persist::scope::ScopeRefusalReason);
@@ -321,6 +337,69 @@ fn classified_refusal_reason(
     )
 }
 
+/// CIRISEdge#544 — does re-offering the IDENTICAL bytes that earned this
+/// Key-plane refusal have any chance of a different answer?
+///
+/// The issue's measured row is here: `conflicting_version`, one `Key` record,
+/// 55 re-offers in 30 minutes, same content hash every time. The disposition is
+/// read off persist's own doc-comments on
+/// [`KeyRefusalReason`](ciris_persist::federation::register::KeyRefusalReason) —
+/// they are the authority on what each branch is a function of, and edge keys on
+/// the typed variant, never on the message prose (#565's whole point).
+///
+/// # TERMINAL — the verdict is a function of state replication cannot move
+///
+/// - `PubkeySwap` — "replication may never swap an identity's keys". The verdict
+///   compares the stored pubkey with the offered one; replication is structurally
+///   barred from changing the first, and the second is fixed by the bytes.
+/// - `Downgrade` — "Monotonic — never demote an anchored row". The stored row can
+///   only become MORE anchored, so a self-signed record's answer can only stay no.
+/// - `ConflictingVersion` — "First-seen wins", and these bytes did not. Terminal
+///   in every reachable successor state too: if the stored self-signed row is
+///   later anchor-scrubbed, the same offer becomes a `Downgrade` — still refused.
+///
+/// # TRANSIENT — decided by state that is still moving, or by a token that
+/// collapses a recoverable arm with an unrecoverable one
+///
+/// - `StoreConflict` — persist says it outright: "the record is safe to re-offer".
+///   A lost plan/act race on a planning backend.
+/// - `UnverifiableSignature` — the token covers a malformed record (terminal) AND
+///   an **unregistered signer** (recoverable: the scrub key is itself a Key-plane
+///   row that replicates, so this is ordinary bootstrap ordering). Indistinguishable
+///   from here, and dropping a record whose signer key is merely still in flight
+///   would silently strand a key registration — so: transient, bounded by backoff.
+/// - `ReScrub` — likewise mixed: "not canonical-scoped" / "valid_from not newer"
+///   cannot move, but "the m-of-n quorum re-verify … failed" can — quorum evidence
+///   replicates on its own cursor plane (#474). A canonical KEY SUPERSEDE is the
+///   single worst row to drop for being early, so it stays re-askable.
+/// - `OwnerAbsent` / `OwnerAmbiguous` — `owner_of` is resolved from replicated
+///   ownership rows; both readings change when those rows (or a revocation of a
+///   duplicate claim) land. Fail-closed, per persist — not permanent.
+/// - `AlreadyAnchoredIdentical` — unreachable here: [`key_outcome_to_apply`] maps
+///   it to [`ApplyOutcome::Duplicate`] (the receiver already holds what was
+///   offered), so it never reaches a refusal memory. Listed transient because a
+///   duplicate is the opposite of a thing to stop asking for, and because the
+///   compiler must see every variant answered.
+///
+/// The asymmetry is deliberate and is the rule for any future variant: a
+/// permanent refusal called transient costs a decaying trickle of re-asks; a
+/// recoverable one called terminal withholds state. When a token is ambiguous,
+/// it is transient.
+#[must_use]
+fn key_refusal_retry(reason: KeyRefusalReason) -> RetryDisposition {
+    match reason {
+        KeyRefusalReason::PubkeySwap
+        | KeyRefusalReason::Downgrade
+        | KeyRefusalReason::ConflictingVersion => RetryDisposition::Terminal,
+        KeyRefusalReason::ReScrub
+        | KeyRefusalReason::AlreadyAnchoredIdentical
+        | KeyRefusalReason::UnverifiableSignature
+        | KeyRefusalReason::OwnerAbsent
+        | KeyRefusalReason::OwnerAmbiguous
+        | KeyRefusalReason::StoreConflict => RetryDisposition::Transient,
+    }
+}
+
 /// persist v24.2.0 (CIRISPersist#565) — map the typed Key-plane apply outcome to
 /// edge's [`ApplyOutcome`], returning alongside it the stable refusal TOKEN to
 /// count on the receive-plane mirror ledger (`None` when nothing was refused).
@@ -355,15 +434,29 @@ fn key_outcome_to_apply(
                 reason: KeyRefusalReason::AlreadyAnchoredIdentical,
             },
         ) => (ApplyOutcome::Duplicate, None),
-        Ok(ReplicatedKeyOutcome::Refused { reason }) => (
-            ApplyOutcome::Refused(format!(
-                "Key: admission refused ({}; content_hash={content_hash})",
-                reason.as_str()
-            )),
-            Some(reason.as_str()),
-        ),
+        // CIRISEdge#544 — the disposition rides the SAME typed value the token
+        // does. `key_refusal_retry` carries the per-variant reasoning; the
+        // message states the verdict so an operator reading one WARN line knows
+        // whether to wait or to supersede.
+        Ok(ReplicatedKeyOutcome::Refused { reason }) => {
+            let retry = key_refusal_retry(reason);
+            (
+                ApplyOutcome::Refused {
+                    reason: format!(
+                        "Key: admission refused ({}; content_hash={content_hash}) [retry={}]",
+                        reason.as_str(),
+                        retry.as_str(),
+                    ),
+                    retry,
+                },
+                Some(reason.as_str()),
+            )
+        }
+        // A persist `Err` on this door is NOT one of the typed policy branches —
+        // it is a backend/plumbing failure, which is the definition of moving
+        // state. Transient (bounded by the short backoff), never terminal.
         Err(e) => (
-            ApplyOutcome::Refused(apply_refusal_reason("Key", content_hash, &e)),
+            ApplyOutcome::refused(apply_refusal_reason("Key", content_hash, &e)),
             None,
         ),
     }
@@ -1209,6 +1302,26 @@ pub struct FederationDirectoryReplicationBridge {
     /// means a bulk read was wired past the page driver. `SeqCst` because it
     /// exists to be asserted on.
     sweep_max_page_rows: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#544 — the node-wide refusal memory: which `(plane, content
+    /// hash)` this node has already refused, and until when it should stop
+    /// ASKING for it. Populated at the apply choke
+    /// ([`Self::apply_envelope_bytes`]), read by the round's want-diff through
+    /// [`ReplicationDirectory::retry_suppressed`].
+    ///
+    /// On the bridge for the same reason [`Self::sweep_cursors`] is: the ONE
+    /// production bridge backs every per-peer provider AND the single shared
+    /// applier, so a refusal learned from one peer's Deliver removes the row
+    /// from every peer's next `want`. A per-session memory would re-learn the
+    /// same verdict once per peer and keep paying for it once per peer, which is
+    /// the amplification the issue measured.
+    refusal_backoff: RefusalBackoff,
+    /// CIRISEdge#544 — how many wanted hashes the backoff has actually removed
+    /// from a round's `want`. The memory's own witness, in the discipline of
+    /// [`Self::owner_reads`] and [`Self::sweep_max_page_rows`]: "the retry storm
+    /// stopped" is a claim, and a claim about traffic that did NOT happen is
+    /// exactly the kind nothing else can observe. `Relaxed` — a counter nobody
+    /// orders against.
+    retry_suppressions: std::sync::atomic::AtomicUsize,
 }
 
 /// CIRISEdge#523 — one memoized owner-binding resolution for one node.
@@ -1345,6 +1458,11 @@ impl FederationDirectoryReplicationBridge {
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
+            // CIRISEdge#544 — always on. It is a rate limiter on asking for what
+            // this node just refused, not a policy, so there is no configuration
+            // in which asking flat-out is the right answer.
+            refusal_backoff: RefusalBackoff::new(),
+            retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1389,6 +1507,11 @@ impl FederationDirectoryReplicationBridge {
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
+            // CIRISEdge#544 — always on. It is a rate limiter on asking for what
+            // this node just refused, not a policy, so there is no configuration
+            // in which asking flat-out is the right answer.
+            refusal_backoff: RefusalBackoff::new(),
+            retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -2569,7 +2692,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             match &outcome {
                 ApplyOutcome::Admitted => m.inc_applied(kind),
                 ApplyOutcome::Duplicate => m.inc_duplicate(kind),
-                ApplyOutcome::Refused(_) => m.inc_apply_refusal_kind(kind),
+                ApplyOutcome::Refused { .. } => m.inc_apply_refusal_kind(kind),
                 // Deserialize is a malformed-bytes drop, not an apply outcome
                 // on a well-formed row — it stays uncounted here (the choke's
                 // `on_deliver` logs it loud; a metrics kind-count of undecodable
@@ -2577,7 +2700,22 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 ApplyOutcome::Deserialize(_) => {}
             }
         }
+        self.remember_outcome(kind, envelope_bytes, &outcome);
         outcome
+    }
+
+    /// CIRISEdge#544 — the round's want-diff asks this before putting a hash on
+    /// the wire. Pure in-memory probe of the refusal memory; counts the drops so
+    /// the traffic that did NOT happen is observable.
+    fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
+        let hit = self
+            .refusal_backoff
+            .suppressed_at(kind, envelope_hash, Instant::now());
+        if hit {
+            self.retry_suppressions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        hit
     }
 }
 
@@ -2973,7 +3111,13 @@ impl FederationDirectoryReplicationBridge {
     ) -> ApplyOutcome {
         match ApplyRefusalClass::classify(err) {
             Some(class) => self.refuse_as(plane, content_hash, err, class),
-            None => ApplyOutcome::Refused(apply_refusal_reason(plane, content_hash, err)),
+            // CIRISEdge#544 — an UNCLASSIFIED persist error keeps the pre-#522
+            // message AND takes the conservative retry disposition. We do not
+            // know what moved it, so we may not assert that nothing will: the
+            // short transient backoff bounds the cost of being wrong here, while
+            // guessing terminal on an unread error would silently strand rows on
+            // every plane at once.
+            None => ApplyOutcome::refused(apply_refusal_reason(plane, content_hash, err)),
         }
     }
 
@@ -2991,7 +3135,80 @@ impl FederationDirectoryReplicationBridge {
         if let Some(m) = self.metrics.as_ref() {
             m.inc_apply_refusal_class(class.as_str());
         }
-        ApplyOutcome::Refused(classified_refusal_reason(plane, content_hash, err, class))
+        // CIRISEdge#544 — the class already decided this; `retry()` just says it
+        // in the retry loop's vocabulary, so the "[TERMINAL — …]" prose in the
+        // message and the backoff window the receiver installs are the same
+        // verdict rather than two that can drift.
+        ApplyOutcome::Refused {
+            reason: classified_refusal_reason(plane, content_hash, err, class),
+            retry: class.retry(),
+        }
+    }
+
+    /// CIRISEdge#544 — fold one apply outcome into the node-wide refusal memory.
+    /// Called once, at the [`StateApplier::apply_envelope_bytes`] choke, for the
+    /// same reason #425 put the logging there: a per-plane call site is a
+    /// per-plane opportunity to forget.
+    ///
+    /// # Why the key is `sha256(envelope_bytes)`
+    ///
+    /// The wire identity of a row IS its content hash — `sha256(serde_json::
+    /// to_vec(row))` ([`content_hash_of`]) — and the serve path is persist's
+    /// `signed_wire_index` point-read, which reloads and re-serializes that same
+    /// row. So the bytes delivered here hash to the value the peer advertised in
+    /// its Summary and the value this node put in `want` (see the module's
+    /// `envelope_hash semantics` note). Hashing the DELIVERED BYTES rather than
+    /// re-deriving the hash per plane keeps this one line instead of thirteen,
+    /// and fails in the safe direction: if a peer ever serves bytes that do not
+    /// hash to what it advertised, the key simply never matches a future want
+    /// and the row stays fully re-askable.
+    ///
+    /// `Admitted` / `Duplicate` CLEAR rather than skip: the row is now held, so
+    /// the diff drops it on its own, and any refusal history for those bytes is
+    /// obsolete — leaving it would let a stale attempt count lengthen the
+    /// backoff of an unrelated later refusal of the same record.
+    fn remember_outcome(&self, kind: EnvelopeKind, envelope_bytes: &[u8], outcome: &ApplyOutcome) {
+        use sha2::{Digest as _, Sha256};
+        let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+        match outcome.retry_disposition() {
+            None => self.refusal_backoff.clear(kind, &hash),
+            Some(disposition) => {
+                let window =
+                    self.refusal_backoff
+                        .record_at(kind, hash, disposition, Instant::now());
+                // DEBUG: the refusal itself already WARNs at the #425 choke with
+                // its reason and disposition. This line answers only "and for how
+                // long will the node stop asking", which is the operator's next
+                // question when a row goes quiet.
+                tracing::debug!(
+                    kind = ?kind,
+                    envelope_hash = %hex::encode(&hash[..8]),
+                    retry = disposition.as_str(),
+                    backoff_secs = window.as_secs(),
+                    remembered = self.refusal_backoff.len(),
+                    "apply refused — the round's want will skip these bytes until the \
+                     backoff window elapses (CIRISEdge#544)"
+                );
+            }
+        }
+    }
+
+    /// CIRISEdge#544 — how many wanted hashes the refusal memory has removed
+    /// from a round's `want` since construction. The witness for "the re-offer
+    /// storm stopped": traffic that did not happen has no other observable.
+    #[must_use]
+    pub fn retry_suppressions(&self) -> usize {
+        self.retry_suppressions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#544 — how many `(plane, content hash)` rows are currently
+    /// remembered as refused. Bounded by
+    /// [`refusal_backoff::DEFAULT_MAX_KEYS`](super::refusal_backoff::DEFAULT_MAX_KEYS);
+    /// a bound nobody can read is a bound that silently stops holding.
+    #[must_use]
+    pub fn refusal_memory_len(&self) -> usize {
+        self.refusal_backoff.len()
     }
 
     /// The per-kind apply dispatch behind the #425 choke —
@@ -5475,7 +5692,13 @@ impl FederationDirectoryReplicationBridge {
                     // It is LOUD instead: a refusal naming the variant, which
                     // is the correct reading of "this node's persist told it
                     // something it was not built to understand".
-                    Ok(other) => ApplyOutcome::Refused(format!(
+                    // CIRISEdge#544 — TERMINAL: the verdict is a property of THIS
+                    // BUILD's vocabulary, and the identical bytes will produce the
+                    // identical unknown variant every round. The event that fixes
+                    // it (adopting the persist cut) restarts the process and empties
+                    // the refusal memory, so "terminal" here means exactly
+                    // "until this node runs a build that understands it".
+                    Ok(other) => ApplyOutcome::refused_terminal(format!(
                         "Attestation: persist returned an AttestationOutcome this edge \
                          build does not know ({other:?}); adopt the persist cut that \
                          added it — CIRISPersist#771 (content_hash={content_hash})"
@@ -5699,7 +5922,12 @@ impl FederationDirectoryReplicationBridge {
                     ApplyOutcome::Duplicate
                 }
             }
-            Err(e) => ApplyOutcome::Refused(format!(
+            // CIRISEdge#544 — transient: this plane's refusals turn on trust
+            // state (a root's standing, a seat's conferral) that is itself
+            // replicating, and the cursor plane re-pulls from a watermark
+            // rather than from a want-diff, so the backoff is the only rate
+            // limit it has.
+            Err(e) => ApplyOutcome::refused(format!(
                 "AccordQuorumEvidence: admission refused (refusal={}): {e}",
                 e.kind(),
             )),
@@ -5753,6 +5981,10 @@ impl FederationDirectoryReplicationBridge {
     ///   reason string cannot distinguish the two, the classification re-reads
     ///   the stored row's clock; an unreadable/absent stored row classifies to
     ///   the LOUD arm (never launder what we cannot classify).
+    ///   CIRISEdge#544 — the two loud sub-arms take DIFFERENT retry
+    ///   dispositions: a classified same-clock fork is terminal (the stored
+    ///   clock can only move forward, after which these bytes are merely stale),
+    ///   an unclassifiable one is transient (a failed re-read is not a verdict).
     ///
     /// A genuine gate failure (bad signature / unknown attesting key /
     /// not-acts-for) surfaces as `Err` from persist → `Refused`. A parse failure
@@ -5816,10 +6048,33 @@ impl FederationDirectoryReplicationBridge {
                                  (CIRISEdge#338/#425; `classified=false` = the stored row \
                                  could not be re-read, refusing loud rather than laundering)"
                             );
-                            ApplyOutcome::Refused(format!(
-                                "TransportDestination: supersession refused \
-                                 (same-clock content conflict or unclassifiable): {reason}"
-                            ))
+                            // CIRISEdge#544 — the two sub-arms this branch fuses
+                            // have OPPOSITE dispositions, and `stored_clock`
+                            // already separates them, so name them separately
+                            // rather than take the worse of the two:
+                            //  - a CLASSIFIED same-clock fork is terminal. The
+                            //    stored row's `(epoch, asserted_at)` equals the
+                            //    offer's; if the stored row later moves it can
+                            //    only move FORWARD, at which point these bytes
+                            //    become the stale arm (Duplicate) — never
+                            //    admitted. The fix is a new epoch, i.e. new
+                            //    bytes, i.e. a hash this memory does not hold.
+                            //  - an UNCLASSIFIABLE refusal (the stored row could
+                            //    not be re-read) is a failed READ, not a verdict
+                            //    about the row. Transient: the read may succeed
+                            //    next round and classify it properly.
+                            if stored_clock.is_some() {
+                                ApplyOutcome::refused_terminal(format!(
+                                    "TransportDestination: supersession refused \
+                                     (same-clock content conflict): {reason}"
+                                ))
+                            } else {
+                                ApplyOutcome::refused(format!(
+                                    "TransportDestination: supersession refused \
+                                     (unclassifiable — the stored row could not be \
+                                     re-read): {reason}"
+                                ))
+                            }
                         }
                     }
                 }
@@ -5830,7 +6085,13 @@ impl FederationDirectoryReplicationBridge {
                     TransportDestinationApplyOutcome::Inserted
                     | TransportDestinationApplyOutcome::Superseded,
                 ) => ApplyOutcome::Admitted,
-                Err(e) => ApplyOutcome::Refused(format!(
+                // CIRISEdge#544 — transient: the gate fuses "bad signature"
+                // (terminal) with "attesting key not registered here yet" and
+                // "acts-for not yet visible" (both ordinary bootstrap ordering
+                // over rows that replicate). Dropping a route because its
+                // attesting key is still in flight would strand reachability, so
+                // the ambiguous token stays re-askable under backoff.
+                Err(e) => ApplyOutcome::refused(format!(
                     "TransportDestination: authenticated apply gate rejected (signature / \
                      attesting-key / acts-for, CIRISEdge#337 CRITICAL-2): {e}"
                 )),
@@ -5873,7 +6134,15 @@ impl FederationDirectoryReplicationBridge {
         // `OperationalProviders` silently declined every delivered Organization,
         // while the round reported healthy. Now it yields a reason the choke logs.
         if self.operational.is_none() {
-            return ApplyOutcome::refused(
+            // CIRISEdge#544 — TERMINAL. `operational` is fixed at bridge
+            // construction (`with_operational`), so within this process no
+            // amount of re-asking makes an opted-out node admit the plane. Left
+            // transient, an edge without operational providers re-pulls every
+            // Organization/OrgMembership/PartnerRecord row its peers hold, every
+            // round, forever — the #544 pattern with a whole plane in it rather
+            // than one row. Wiring the providers is a restart, which empties the
+            // memory.
+            return ApplyOutcome::refused_terminal(
                 "Organization: operational providers not configured on this edge — \
                  operational-kind admission is opted out",
             );
@@ -5902,7 +6171,15 @@ impl FederationDirectoryReplicationBridge {
     async fn apply_org_membership(&self, bytes: &[u8]) -> ApplyOutcome {
         // CIRISEdge#425 Exhibit B — the second escaped early return.
         if self.operational.is_none() {
-            return ApplyOutcome::refused(
+            // CIRISEdge#544 — TERMINAL. `operational` is fixed at bridge
+            // construction (`with_operational`), so within this process no
+            // amount of re-asking makes an opted-out node admit the plane. Left
+            // transient, an edge without operational providers re-pulls every
+            // Organization/OrgMembership/PartnerRecord row its peers hold, every
+            // round, forever — the #544 pattern with a whole plane in it rather
+            // than one row. Wiring the providers is a restart, which empties the
+            // memory.
+            return ApplyOutcome::refused_terminal(
                 "OrgMembership: operational providers not configured on this edge — \
                  operational-kind admission is opted out",
             );
@@ -5929,7 +6206,15 @@ impl FederationDirectoryReplicationBridge {
     async fn apply_partner_record(&self, bytes: &[u8]) -> ApplyOutcome {
         // CIRISEdge#425 Exhibit B — the third escaped early return.
         if self.operational.is_none() {
-            return ApplyOutcome::refused(
+            // CIRISEdge#544 — TERMINAL. `operational` is fixed at bridge
+            // construction (`with_operational`), so within this process no
+            // amount of re-asking makes an opted-out node admit the plane. Left
+            // transient, an edge without operational providers re-pulls every
+            // Organization/OrgMembership/PartnerRecord row its peers hold, every
+            // round, forever — the #544 pattern with a whole plane in it rather
+            // than one row. Wiring the providers is a restart, which empties the
+            // memory.
+            return ApplyOutcome::refused_terminal(
                 "PartnerRecord: operational providers not configured on this edge — \
                  operational-kind admission is opted out",
             );
@@ -6734,7 +7019,7 @@ mod tests {
             .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire(&fork), None)
             .await;
         assert!(
-            matches!(r, ApplyOutcome::Refused(_)),
+            matches!(r, ApplyOutcome::Refused { .. }),
             "a same-clock content fork is a REFUSAL (split truth), got {r:?}"
         );
     }
@@ -6843,7 +7128,7 @@ mod tests {
                 continue;
             }
             let (a, t) = key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h");
-            let ApplyOutcome::Refused(msg) = &a else {
+            let ApplyOutcome::Refused { reason: msg, .. } = &a else {
                 panic!("{} must map to Refused, got {a:?}", reason.as_str());
             };
             assert!(
@@ -6853,6 +7138,154 @@ mod tests {
             );
             assert_eq!(t, Some(reason.as_str()), "the mirror counts the token");
         }
+    }
+
+    /// CIRISEdge#544 — the classification the issue turns on, asserted through
+    /// the EXACT value persist hands the field: `ReplicatedKeyOutcome::Refused
+    /// { reason }`, one per closed-set variant, not a hand-written message.
+    ///
+    /// `conflicting_version` is the measured row (55 re-offers in 30 minutes of
+    /// byte-identical bytes); it and the two other first-seen/monotonic verdicts
+    /// are TERMINAL. Every reason whose token fuses a recoverable arm with an
+    /// unrecoverable one stays TRANSIENT — mislabelling a permanent refusal
+    /// transient costs a decaying trickle, mislabelling a recoverable one
+    /// terminal withholds state.
+    #[test]
+    fn conflicting_version_is_terminal_and_the_ambiguous_key_reasons_stay_transient() {
+        let terminal = [
+            KeyRefusalReason::PubkeySwap,
+            KeyRefusalReason::Downgrade,
+            KeyRefusalReason::ConflictingVersion,
+        ];
+        for &reason in KeyRefusalReason::ALL {
+            // Drive the mapping the field drives, not the private fn alone.
+            let (outcome, _) =
+                key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h");
+            let want = if terminal.contains(&reason) {
+                RetryDisposition::Terminal
+            } else {
+                RetryDisposition::Transient
+            };
+            // `already_anchored_identical` never reaches a refusal at all — it is
+            // the receiver already holding what was offered.
+            if matches!(reason, KeyRefusalReason::AlreadyAnchoredIdentical) {
+                assert_eq!(outcome.retry_disposition(), None, "{}", reason.as_str());
+                continue;
+            }
+            assert_eq!(
+                outcome.retry_disposition(),
+                Some(want),
+                "{} must be {} — see key_refusal_retry for the per-variant reasoning",
+                reason.as_str(),
+                want.as_str()
+            );
+            let ApplyOutcome::Refused { reason: msg, .. } = &outcome else {
+                panic!("{} must map to Refused, got {outcome:?}", reason.as_str());
+            };
+            assert!(
+                msg.contains(want.as_str()),
+                "an operator reading ONE line must be able to tell wait-for-state \
+                 from supersede-it: {msg}"
+            );
+        }
+    }
+
+    /// CIRISEdge#544 — the whole loop, end to end, on the real apply choke: a
+    /// terminally-refused row is remembered, and the round's want-diff stops
+    /// asking for it.
+    ///
+    /// Driven on the operational plane because its terminal verdict is
+    /// structural rather than backend-dependent (an edge built without
+    /// `OperationalProviders` cannot admit the plane in this process, whatever
+    /// the store does), so the assertion is about edge's decision and not about
+    /// which branch `MemoryBackend` happens to take. The suppression key is
+    /// `sha256(delivered bytes)` — the same value the peer advertised and the
+    /// same value `diff_refs` puts in `want`.
+    #[tokio::test]
+    async fn a_terminally_refused_row_is_dropped_from_the_next_rounds_want() {
+        let (_backend, bridge) = make_bridge(&["k1".into()]);
+        let bytes = br#"{"organization": {
+            "attestation_id": "att-1",
+            "org_id": "org-acme",
+            "name": "ACME",
+            "org_type": "internal",
+            "status": "active",
+            "asserted_at": "2026-06-10T20:00:00Z",
+            "attesting_key_id": "k1",
+            "signed_envelope": {},
+            "ed25519_signature_base64": ""
+        }}"#;
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+
+        // Before the refusal the node asks for it like any other missing row.
+        assert!(
+            !bridge.retry_suppressed(EnvelopeKind::Organization, &hash),
+            "a row this node has never refused must stay wanted"
+        );
+
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Organization, bytes, Some("peer-x"))
+            .await;
+        assert!(
+            matches!(&outcome, ApplyOutcome::Refused { retry, .. } if retry.is_terminal()),
+            "got {outcome:?}"
+        );
+
+        // …and now it does not. This is the 55-per-30-minutes becoming one.
+        assert!(
+            bridge.retry_suppressed(EnvelopeKind::Organization, &hash),
+            "the round's want must skip bytes this node just terminally refused"
+        );
+        assert_eq!(bridge.refusal_memory_len(), 1);
+        assert_eq!(
+            bridge.retry_suppressions(),
+            1,
+            "the suppression is counted — traffic that did not happen has no \
+             other observable"
+        );
+        // The suppression is on THESE bytes only: a corrected, superseding
+        // record hashes differently and is asked for immediately, which is the
+        // way forward the issue says a stuck sender needs.
+        let superseding: [u8; 32] = Sha256::digest(b"a corrected version of the row").into();
+        assert!(!bridge.retry_suppressed(EnvelopeKind::Organization, &superseding));
+        // …and it is scoped to the plane the verdict was reached on.
+        assert!(!bridge.retry_suppressed(EnvelopeKind::Key, &hash));
+    }
+
+    /// CIRISEdge#544 — suppression gates the ASK, never the ADMIT. A row this
+    /// node stopped asking for is still applied on its merits if a peer pushes
+    /// it (the #927 proactive-publish shape), so an over-eager memory can delay
+    /// a row but can never withhold one.
+    #[tokio::test]
+    async fn a_suppressed_row_is_still_applied_when_a_peer_pushes_it_anyway() {
+        let (_backend, bridge) = make_bridge(&["k1".into()]);
+        let record = fixture_key_record("k1", identity_type::NODE);
+        let bytes = serde_json::to_vec(&SignedKeyRecord { record }).expect("serialize offer");
+        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+        // Pre-load the memory as if a previous round had refused these bytes.
+        bridge.refusal_backoff.record_at(
+            EnvelopeKind::Key,
+            hash,
+            crate::replication::refusal_backoff::RetryDisposition::Terminal,
+            Instant::now(),
+        );
+        assert!(bridge.retry_suppressed(EnvelopeKind::Key, &hash));
+
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Key, &bytes, Some("peer-x"))
+            .await;
+        assert!(
+            outcome.is_admitted(),
+            "the apply path must not consult the retry memory — it gates asking, \
+             not admitting; got {outcome:?}"
+        );
+        // …and admitting CLEARS the history, so a later refusal of the same
+        // bytes starts its backoff from the base rather than inheriting a stale
+        // attempt count.
+        assert!(
+            !bridge.retry_suppressed(EnvelopeKind::Key, &hash),
+            "an admitted row's refusal history is obsolete"
+        );
     }
 
     /// persist v24.2.0 / #565 — the wire drive: a pubkey swap offered through
@@ -6879,7 +7312,7 @@ mod tests {
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Key, &bytes, Some("peer-x"))
             .await;
-        let ApplyOutcome::Refused(msg) = &outcome else {
+        let ApplyOutcome::Refused { reason: msg, .. } = &outcome else {
             panic!("a pubkey swap must be Refused, got {outcome:?}");
         };
         // WHICH branch classifies is persist's unit (certified upstream; on the
@@ -7145,7 +7578,10 @@ mod tests {
             // CIRISEdge#425 — garbage must classify as a NAMED non-admit (a reason
             // the choke point logs), never a bare drop.
             assert!(
-                matches!(r, ApplyOutcome::Refused(_) | ApplyOutcome::Deserialize(_)),
+                matches!(
+                    r,
+                    ApplyOutcome::Refused { .. } | ApplyOutcome::Deserialize(_)
+                ),
                 "garbage must be a named Refused/Deserialize for {kind:?}, got {r:?}"
             );
         }
@@ -7704,7 +8140,7 @@ mod tests {
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Community, &forked_wire, None)
             .await;
-        let ApplyOutcome::Refused(msg) = &outcome else {
+        let ApplyOutcome::Refused { reason: msg, .. } = &outcome else {
             panic!("a differing roster under an occupied id must be REFUSED, got {outcome:?}");
         };
         assert!(
@@ -7786,7 +8222,7 @@ mod tests {
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("some-peer"))
             .await;
-        let ApplyOutcome::Refused(msg) = &outcome else {
+        let ApplyOutcome::Refused { reason: msg, .. } = &outcome else {
             panic!("AV-45 must refuse a row ahead of its roster, got {outcome:?}");
         };
         assert!(
@@ -8099,7 +8535,7 @@ mod tests {
         for (kind, bytes) in unsigned {
             let outcome = bridge.apply_envelope_bytes(kind, &bytes, None).await;
             assert!(
-                matches!(outcome, ApplyOutcome::Refused(_)),
+                matches!(outcome, ApplyOutcome::Refused { .. }),
                 "an unsigned {kind:?} must be REFUSED at persist's E4 gate \
                  (not admitted, not a wire-shape error); got {outcome:?}"
             );
@@ -10377,9 +10813,11 @@ mod tests {
         // CIRISEdge#425 — fail-closed AND named: the escaped early return now yields
         // a `Refused` reason the choke point logs, not a silent `false`.
         assert!(
-            matches!(&outcome, ApplyOutcome::Refused(r) if r.contains("operational providers")),
+            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry } if r.contains("operational providers") && retry.is_terminal()),
             "v2 operational admission MUST fail-close with a NAMED refusal without \
-             OperationalProviders, got {outcome:?}"
+             OperationalProviders — and TERMINAL (CIRISEdge#544): the providers are \
+             fixed at construction, so re-asking every round for a plane this node \
+             opted out of admitting can never succeed. Got {outcome:?}"
         );
     }
 
@@ -10402,8 +10840,9 @@ mod tests {
             .apply_envelope_bytes(EnvelopeKind::OrgMembership, bytes, None)
             .await;
         assert!(
-            matches!(&outcome, ApplyOutcome::Refused(r) if r.contains("operational providers")),
-            "org_membership must fail-close with a named refusal, got {outcome:?}"
+            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry } if r.contains("operational providers") && retry.is_terminal()),
+            "org_membership must fail-close with a named TERMINAL refusal \
+             (CIRISEdge#544), got {outcome:?}"
         );
     }
 
@@ -10426,8 +10865,9 @@ mod tests {
             .apply_envelope_bytes(EnvelopeKind::PartnerRecord, bytes, None)
             .await;
         assert!(
-            matches!(&outcome, ApplyOutcome::Refused(r) if r.contains("operational providers")),
-            "partner_record must fail-close with a named refusal, got {outcome:?}"
+            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry } if r.contains("operational providers") && retry.is_terminal()),
+            "partner_record must fail-close with a named TERMINAL refusal \
+             (CIRISEdge#544), got {outcome:?}"
         );
     }
 
@@ -13922,7 +14362,7 @@ mod tests {
             .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
             .await;
         match &outcome {
-            ApplyOutcome::Refused(reason) => {
+            ApplyOutcome::Refused { reason, .. } => {
                 assert!(
                     reason.contains("class=retry_after_community_roster"),
                     "the roster has not landed — this is the transient class: {reason}"
@@ -14003,7 +14443,7 @@ mod tests {
             .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-stranger"))
             .await;
         match &outcome {
-            ApplyOutcome::Refused(reason) => assert!(
+            ApplyOutcome::Refused { reason, .. } => assert!(
                 reason.contains("class=retry_after_community_roster"),
                 "an unbound node must not inherit anyone's membership — the principal \
                  fold widens to the single live owner and NEVER past it, and the door it \
