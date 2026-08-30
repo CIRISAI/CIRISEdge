@@ -53,6 +53,44 @@
 //! per-peer mutation surface to expose. Hot-changing the cohort
 //! membership is the replication runtime's job; the swarm runtime
 //! follows.
+//!
+//! ## CIRISEdge#546 — the config plane governs a RUNNING swarm
+//!
+//! Until #546 the *configuration* was equally frozen, and for no such
+//! reason: [`FountainSwarmRuntime::start`] took [`SwarmRuntimeConfig`] by
+//! value and copied each field into the spawned tasks, so the only moment
+//! a value could ever be applied was composition. That is what kept
+//! CIRISServer#365's four redundancy keys at `consumed: false` — a
+//! boot-only consumer is strictly WORSE than none on a TTL-evaluated
+//! plane, because a relief whose TTL expires keeps applying until a
+//! restart nobody performs (the eternal 72-hour emergency).
+//!
+//! Two seams close it, and they meet in one place on purpose:
+//!
+//! 1. **The operator's ceiling** is a [`watch`] channel.
+//!    [`FountainSwarmRuntime::set_config`] replaces it; publisher and
+//!    converger re-read it every tick, so an operator change is live
+//!    without a restart.
+//! 2. **The mesh-config plane's relief** is
+//!    [`crate::replication::mesh_config::MeshConfigReader`], resolved on
+//!    the converger tick (a cached read inside the reader's TTL) and
+//!    folded onto the ceiling by
+//!    [`SwarmRuntimeConfig::with_mesh_relief`].
+//!
+//! Because the relief is re-resolved every tick rather than latched,
+//! *"the emergency expired"* and *"the operator changed it"* are the SAME
+//! code path — the fold simply stops reporting the key and `min` walks
+//! the value back to the ceiling. Which is what the issue asked for in
+//! its option 2, expressed in the seam edge already uses everywhere else
+//! (`relief()` at the round/tick boundary) rather than a second one.
+//!
+//! **Relief can only SHRINK.** Every knob is `min(configured, relieved)`,
+//! the discipline [`crate::replication::bridge`]'s `effective_page_limit`
+//! sets: persist's fold already enforces relieve-never-expand against ITS
+//! baseline, but that baseline is persist's `owner_default` ceiling (64
+//! holders), not this node's configured 30 — so a row relieving 64 → 40
+//! is a genuine relief upstream and would still be an EXPANSION here. The
+//! `min` at the consumer is what makes that impossible.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -75,6 +113,7 @@ use crate::holonomic::swarm_rarity::{
 };
 use crate::identity::{build_envelope, sign_envelope, LocalSigner};
 use crate::messages::MessageType;
+use crate::replication::mesh_config::{MeshConfigReader, MeshConfigRelief};
 use crate::transport::Transport;
 
 /// `target_holders` default — the recommended `H` from §R-policy
@@ -126,7 +165,15 @@ pub struct ObservedClaim {
 
 /// Configuration for the swarm orchestration runtime. All fields are
 /// tunable per deployment; defaults match the v3.10.0 §R-policy.
-#[derive(Debug, Clone)]
+///
+/// CIRISEdge#546 — this is the OPERATOR'S CEILING, not necessarily what a
+/// tick runs: [`FountainSwarmRuntime::set_config`] replaces it live, and
+/// [`Self::with_mesh_relief`] narrows it (never widens it) by whatever the
+/// mesh-config plane is currently asking for. `PartialEq` is derived
+/// because the converger compares consecutive *effective* configs to decide
+/// whether a change is worth an INFO line — the comparison must cover every
+/// field, so deriving it is safer than hand-listing the ones we remembered.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwarmRuntimeConfig {
     /// How often the publisher walks the operator's held content
     /// and broadcasts a [`FountainHoldingClaim`] per content.
@@ -161,6 +208,74 @@ impl Default for SwarmRuntimeConfig {
             observed_claim_ttl: DEFAULT_OBSERVED_CLAIM_TTL,
             policy: recommended_policy(),
         }
+    }
+}
+
+/// CIRISEdge#546 — the one arithmetic the whole relief seam rests on:
+/// **a relief may shrink a bound and may never raise it.**
+///
+/// `None` (no root spoke, or the row's TTL expired since the last read) is
+/// the configured value untouched — absence is not a value. A `Some` is
+/// `min`'d against the configured value rather than replacing it, because
+/// persist's relieve-never-expand holds against persist's OWN baseline
+/// (`owner_default`, e.g. 64 holders), which is a ceiling above what this
+/// node actually runs. A row moving 64 → 40 is a relief up there and an
+/// expansion down here; the `min` is what makes it a no-op instead.
+const fn shrink_to(configured: u32, relieved: Option<u32>) -> u32 {
+    match relieved {
+        None => configured,
+        // `Ord::min` is not const; the branch is.
+        Some(r) if r < configured => r,
+        Some(_) => configured,
+    }
+}
+
+impl SwarmRuntimeConfig {
+    /// CIRISEdge#546 — this configuration narrowed by one mesh-config relief
+    /// snapshot: the config a converger tick actually runs under.
+    ///
+    /// Pure and total, so it is unit-testable against the exact
+    /// [`MeshConfigRelief`] the reader produces rather than against a
+    /// convenient stand-in. [`MeshConfigRelief::NONE`] — what an empty
+    /// plane, an unresolvable plane, and an EXPIRED emergency row all
+    /// resolve to — returns `self` field-for-field, which is why expiry
+    /// needs no code path of its own.
+    ///
+    /// Only the four `redundancy.*` keys land here. `publish_cadence` /
+    /// `observe_cadence` / `observed_claim_ttl` / `eviction_grace_pct` have
+    /// no registered key (`antientropy.round_secs` is the REPLICATION
+    /// scheduler's cadence, a different loop — routing it here would be a
+    /// second consumer for one key), so they move only by
+    /// [`FountainSwarmRuntime::set_config`].
+    ///
+    /// A relief may take `policy` outside the §R-policy relations the
+    /// `const _: () = assert!(…)` block in
+    /// [`crate::holonomic::fountain_defaults`] locks. That is deliberate and
+    /// not a violation: those asserts bind the recommended DEFAULTS at
+    /// compile time, while a root relieving `k_repair` to 2 is asking this
+    /// node to hold less — the whole point of a restrict-only plane. The
+    /// survival floor degrades exactly as the root asked it to.
+    #[must_use]
+    pub fn with_mesh_relief(&self, relief: &MeshConfigRelief) -> Self {
+        let mut out = self.clone();
+        out.target_holders = shrink_to(self.target_holders, relief.target_holders);
+        out.min_viable = shrink_to(self.min_viable, relief.min_viable_holders);
+        // `policy.target_holders` — NOT a duplicate of the field above.
+        // `SwarmRuntimeConfig::target_holders` is the declared knob (and the
+        // one CIRISServer#365's `redundancy.target_holders` names), but the
+        // value the ejection verdict actually reads is
+        // `policy.target_holders`, via `should_eject_above_target`'s
+        // `policy.target_holders + safety` threshold. Relieving only the
+        // declared field would land a green test on a knob the field never
+        // consults; both move, or the key is decorative.
+        out.policy.target_holders = shrink_to(self.policy.target_holders, relief.target_holders);
+        out.policy.k_repair = shrink_to(self.policy.k_repair, relief.k_repair_symbols);
+        out.policy.min_viable_symbols =
+            shrink_to(self.policy.min_viable_symbols, relief.min_viable_symbols);
+        // `policy.n_source` is untouched: the RaptorQ source-symbol count is
+        // the content's own encoding parameter (changing it invalidates
+        // already-encoded symbols), and persist registers no key for it.
+        out
     }
 }
 
@@ -236,6 +351,14 @@ pub type SwarmRuntimeEventSink = Arc<dyn Fn(SwarmEvent) + Send + Sync>;
 ///   withholds are logged but not counted; production threads `Edge`'s
 ///   handle, mirroring
 ///   `FederationDirectoryReplicationBridge::with_metrics`.
+/// - `mesh_config` (CIRISEdge#546): the resolved mesh-config read seam.
+///   `Some` lets a root's TTL'd relief shrink the four `redundancy.*`
+///   knobs on the RUNNING converger; `None` is byte-identical pre-#546
+///   behaviour. Hosts wire
+///   [`crate::replication::runtime::ReplicationRuntime::mesh_config_reader`]
+///   here — the SAME `Arc` the bridge, the scheduler and the A/V transit
+///   gate read, so the whole node shares one fold resolution per TTL
+///   window instead of each loop opening its own.
 ///
 /// All optionals MAY be `None`; the runtime stays operational on every
 /// combination of present/absent fields. New optionals land here
@@ -255,6 +378,10 @@ pub struct SwarmRuntimeOptions {
     /// CIRISEdge#433 — withhold-ledger handle. Every holding withheld from
     /// a peer is booked here with its named reason.
     pub metrics: Option<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#546 — the mesh-config relief seam. `Some` ARMS the
+    /// converger's per-tick `redundancy.*` re-resolution; `None` leaves the
+    /// operator's configured values as the only input (pre-#546).
+    pub mesh_config: Option<Arc<MeshConfigReader>>,
 }
 
 impl std::fmt::Debug for SwarmRuntimeOptions {
@@ -264,6 +391,7 @@ impl std::fmt::Debug for SwarmRuntimeOptions {
             .field("rtt_observer_present", &self.rtt_observer.is_some())
             .field("scope_native", &self.scope_table.is_some())
             .field("metrics_present", &self.metrics.is_some())
+            .field("mesh_config_armed", &self.mesh_config.is_some())
             .finish()
     }
 }
@@ -275,7 +403,16 @@ impl std::fmt::Debug for SwarmRuntimeOptions {
 /// the lifetime of the application; call [`Self::shutdown`] to stop
 /// the background tasks.
 pub struct FountainSwarmRuntime {
-    config: SwarmRuntimeConfig,
+    /// CIRISEdge#546 — the OPERATOR'S CEILING, live. Was a plain
+    /// `SwarmRuntimeConfig` copied into the tasks at `start`, which is why
+    /// nothing filed after composition could ever apply. Both tasks hold a
+    /// receiver and re-read it, so [`Self::set_config`] governs a running
+    /// swarm.
+    config_tx: watch::Sender<SwarmRuntimeConfig>,
+    /// CIRISEdge#546 — kept alongside the tasks' own clone so
+    /// [`Self::effective_config`] can answer *"what is this node actually
+    /// running right now"* for telemetry without racing the converger.
+    mesh_config: Option<Arc<MeshConfigReader>>,
     observed: Arc<RwLock<ObservedClaims>>,
     cancel_tx: watch::Sender<bool>,
     publisher_task: Option<JoinHandle<()>>,
@@ -426,6 +563,10 @@ impl FountainSwarmRuntime {
     ) -> Self {
         let observed = Arc::new(RwLock::new(ObservedClaims::default()));
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        // CIRISEdge#546 — the config the tasks read. `config` is no longer
+        // copied field-by-field into the spawned loops; both hold a receiver
+        // and re-read at their tick boundary, so `set_config` is live.
+        let (config_tx, config_rx) = watch::channel(config);
         let rtt_observer: Arc<dyn PeerRttObserver> = options
             .rtt_observer
             .clone()
@@ -448,11 +589,29 @@ impl FountainSwarmRuntime {
             options.metrics.clone(),
         );
 
+        // CIRISEdge#546 — the WIRING decision, logged ONCE here rather than
+        // on every relief read: whether this swarm can be governed by the
+        // mesh-config plane at all is a composition fact, and an operator
+        // diagnosing "my config row did nothing" needs to see it in the boot
+        // log. Throttled anyway because `install_swarm_runtime` is
+        // LAST-WINS (CIRISEdge#391) — a host that re-composes in a loop must
+        // not turn this into a log flood.
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            swarm_config_plane_log().check("wiring")
+        {
+            tracing::info!(
+                mesh_config_armed = options.mesh_config.is_some(),
+                suppressed_prev,
+                "swarm_runtime: config plane wired (CIRISEdge#546) — set_config governs the \
+                 running swarm; mesh-config relief shrinks the redundancy.* knobs when armed"
+            );
+        }
+
         let publisher_task = {
             let holdings = Arc::clone(&holdings);
             let transport = Arc::clone(&transport);
             let cohort = Arc::clone(&cohort);
-            let cadence = config.publish_cadence;
+            let config_rx = config_rx.clone();
             let cancel_rx = cancel_rx.clone();
             let sink = sink.clone();
             let local_peer = local_peer_id.clone();
@@ -463,7 +622,7 @@ impl FountainSwarmRuntime {
                     transport,
                     cohort,
                     local_peer,
-                    cadence,
+                    config_rx,
                     cancel_rx,
                     sink,
                     signer,
@@ -477,19 +636,28 @@ impl FountainSwarmRuntime {
             let observed = Arc::clone(&observed);
             let holdings = Arc::clone(&holdings);
             let directory = Arc::clone(&directory);
-            let cfg = config.clone();
             let local_peer = local_peer_id.clone();
             let rtt = Arc::clone(&rtt_observer);
+            let mesh_config = options.mesh_config.clone();
             tokio::spawn(async move {
                 run_converger(
-                    observed, holdings, directory, cfg, cancel_rx, sink, local_peer, rtt,
+                    observed,
+                    holdings,
+                    directory,
+                    config_rx,
+                    mesh_config,
+                    cancel_rx,
+                    sink,
+                    local_peer,
+                    rtt,
                 )
                 .await;
             })
         };
 
         Self {
-            config,
+            config_tx,
+            mesh_config: options.mesh_config.clone(),
             observed,
             cancel_tx,
             publisher_task: Some(publisher_task),
@@ -517,9 +685,86 @@ impl FountainSwarmRuntime {
         Arc::clone(&self.observed)
     }
 
-    /// The active runtime configuration.
-    pub fn config(&self) -> &SwarmRuntimeConfig {
-        &self.config
+    /// The active runtime configuration — the OPERATOR'S CEILING, i.e. what
+    /// [`Self::set_config`] last stored (composition's value until then).
+    ///
+    /// CIRISEdge#546 changed this from `&SwarmRuntimeConfig` to an owned
+    /// clone: the config lives behind a [`watch`] channel now, and handing
+    /// out a borrow into it would either pin a `watch::Ref` across the
+    /// caller's `await`s or lie about being live. Use
+    /// [`Self::effective_config`] for what a tick actually runs under.
+    #[must_use]
+    pub fn config(&self) -> SwarmRuntimeConfig {
+        self.config_tx.borrow().clone()
+    }
+
+    /// CIRISEdge#546 — **the setter the mesh-config plane needed.** Replace
+    /// the operator's ceiling on a RUNNING swarm; both loops pick it up
+    /// without a restart (the publisher rebuilds its interval at once, the
+    /// converger at its next tick boundary).
+    ///
+    /// This is the OPERATOR's axis, so it is deliberately unbounded: a node's
+    /// owner may set their own node to anything. The bound that matters —
+    /// *"a config row must never exceed the operator's ceiling"* — is applied
+    /// on the other axis, in [`SwarmRuntimeConfig::with_mesh_relief`], which
+    /// re-reads THIS value every tick. Handing a folded mesh-config result to
+    /// this method instead would invert that: the fold's own baseline is
+    /// persist's `owner_default` ceiling, not this node's configured value,
+    /// so a "relief" of 64 → 40 holders would land as an expansion past a
+    /// configured 30. Hosts should set what the operator configured and arm
+    /// [`SwarmRuntimeOptions::mesh_config`]; the plane then relieves it.
+    ///
+    /// `watch::Sender::send_replace`, not `send`: the value must be stored
+    /// even if both task receivers are already gone (post-[`Self::shutdown`]),
+    /// so [`Self::config`] never answers with a superseded value.
+    pub fn set_config(&self, config: SwarmRuntimeConfig) {
+        let previous = self.config_tx.send_replace(config);
+        // Only a real change is worth a line, and only within the throttle's
+        // budget — `set_config` is operator-driven and therefore rare, but a
+        // host polling a control plane into it must not be able to make this
+        // a per-poll write.
+        let changed = *self.config_tx.borrow() != previous;
+        if changed {
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                swarm_config_plane_log().check("set_config")
+            {
+                let now = self.config_tx.borrow().clone();
+                tracing::info!(
+                    target_holders = now.target_holders,
+                    min_viable = now.min_viable,
+                    publish_cadence_secs = now.publish_cadence.as_secs_f64(),
+                    observe_cadence_secs = now.observe_cadence.as_secs_f64(),
+                    suppressed_prev,
+                    "swarm_runtime: operator config replaced on a RUNNING swarm \
+                     (CIRISEdge#546)"
+                );
+            }
+        }
+    }
+
+    /// CIRISEdge#546 — a receiver over the operator's ceiling, for a host
+    /// that wants to mirror the value it set (a status endpoint, a config
+    /// reconciler). Carries the CEILING, not the effective value: the relief
+    /// is resolved on the converger's tick, so there is nothing to publish
+    /// here that would not be stale by construction.
+    #[must_use]
+    pub fn subscribe_config(&self) -> watch::Receiver<SwarmRuntimeConfig> {
+        self.config_tx.subscribe()
+    }
+
+    /// CIRISEdge#546 — the configuration a converger tick would run under
+    /// **right now**: the operator's ceiling narrowed by the live
+    /// mesh-config relief.
+    ///
+    /// With no reader armed this is exactly [`Self::config`]. With one
+    /// armed it is a cached read inside the reader's TTL, so a telemetry
+    /// caller polling this does not add fold resolutions — and it answers
+    /// with the operator's values again the moment an emergency row's TTL
+    /// expires, because [`MeshConfigRelief::NONE`] is what the fold then
+    /// yields.
+    pub async fn effective_config(&self) -> SwarmRuntimeConfig {
+        let configured = self.config();
+        effective_swarm_config(&configured, self.mesh_config.as_ref()).await
     }
 
     /// Signal both tasks to stop + await clean exit. Idempotent.
@@ -540,12 +785,16 @@ async fn run_publisher(
     transport: Arc<dyn Transport>,
     cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     local_peer_id: String,
-    cadence: Duration,
+    mut config_rx: watch::Receiver<SwarmRuntimeConfig>,
     mut cancel_rx: watch::Receiver<bool>,
     sink: Option<SwarmRuntimeEventSink>,
     signer: Option<Arc<LocalSigner>>,
     publish_gate: HoldingsPublishGate,
 ) {
+    // CIRISEdge#546 — the cadence is now READ, not captured. No mesh-config
+    // key governs it (`antientropy.round_secs` is the replication scheduler's
+    // knob, a different loop), so this axis moves only by `set_config`.
+    let mut cadence = config_rx.borrow_and_update().publish_cadence;
     let mut ticker = tokio::time::interval(cadence);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -554,6 +803,36 @@ async fn run_publisher(
                 if *cancel_rx.borrow() {
                     tracing::info!("swarm_runtime.publisher: shutdown");
                     return;
+                }
+            }
+            changed = config_rx.changed() => {
+                if changed.is_err() {
+                    // The runtime was dropped without `shutdown()`, so the
+                    // config sender is gone and `changed()` would return
+                    // `Err` immediately, forever — a busy loop. Exit on the
+                    // same terms `shutdown` would give us.
+                    tracing::debug!("swarm_runtime.publisher: config channel closed; exiting");
+                    return;
+                }
+                let next = config_rx.borrow_and_update().publish_cadence;
+                if next != cadence {
+                    // `interval_at(now + next, next)` schedules the first
+                    // tick one full NEW cadence out — the scheduler's
+                    // `antientropy.round_secs` idiom (CIRISEdge#440): a
+                    // changed cadence takes effect from the next interval,
+                    // never as an immediate catch-up burst.
+                    tracing::info!(
+                        from_secs = cadence.as_secs_f64(),
+                        to_secs = next.as_secs_f64(),
+                        "swarm_runtime.publisher: cadence changed by set_config \
+                         (CIRISEdge#546)"
+                    );
+                    cadence = next;
+                    ticker = tokio::time::interval_at(
+                        tokio::time::Instant::now() + cadence,
+                        cadence,
+                    );
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 }
             }
             _ = ticker.tick() => {
@@ -715,18 +994,72 @@ async fn build_and_sign_holding_claim_envelope(
         .map_err(|e| FountainEvictError::HardDeleteFailed(format!("envelope serialize: {e}")))
 }
 
+/// CIRISEdge#546 — the config one converger tick runs under: the operator's
+/// ceiling, narrowed by the live mesh-config relief.
+///
+/// The reader memoizes within its TTL, so calling this every tick costs one
+/// fold resolution per TTL window, not one per tick — the same freshness
+/// contract the scheduler's `antientropy.round_secs` read rides. And because
+/// it RE-RESOLVES rather than latching, an expired emergency row and an
+/// operator edit reach the converger by one path: the fold stops naming the
+/// key, [`SwarmRuntimeConfig::with_mesh_relief`] sees `None`, and the value
+/// is the ceiling again.
+async fn effective_swarm_config(
+    configured: &SwarmRuntimeConfig,
+    mesh_config: Option<&Arc<MeshConfigReader>>,
+) -> SwarmRuntimeConfig {
+    match mesh_config {
+        // No reader wired: byte-identical pre-#546 behaviour. Relief is not a
+        // gate — an unwired plane must not change what the converger does.
+        None => configured.clone(),
+        Some(reader) => configured.with_mesh_relief(&reader.relief().await),
+    }
+}
+
+/// CIRISEdge#546 — announce an effective-config change ONCE, at INFO,
+/// throttled. Fires only on a real transition (the converger holds the
+/// previous value), so a steady relief costs nothing per tick; the throttle
+/// is the backstop for a plane FLAPPING between two folds, which would
+/// otherwise write a line every tick for as long as it flaps.
+fn log_effective_config_change(previous: &SwarmRuntimeConfig, next: &SwarmRuntimeConfig) {
+    let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        swarm_config_plane_log().check("effective")
+    else {
+        return;
+    };
+    tracing::info!(
+        target_holders_from = previous.policy.target_holders,
+        target_holders_to = next.policy.target_holders,
+        min_viable_from = previous.min_viable,
+        min_viable_to = next.min_viable,
+        k_repair_from = previous.policy.k_repair,
+        k_repair_to = next.policy.k_repair,
+        min_viable_symbols_from = previous.policy.min_viable_symbols,
+        min_viable_symbols_to = next.policy.min_viable_symbols,
+        suppressed_prev,
+        "swarm_runtime.converger: effective config changed — a mesh-config relief \
+         took effect, expired, or the operator moved the ceiling (CIRISEdge#546)"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_converger(
     observed: Arc<RwLock<ObservedClaims>>,
     holdings: Arc<dyn FountainHoldingsSource>,
     directory: Arc<dyn FederationDirectory>,
-    config: SwarmRuntimeConfig,
+    mut config_rx: watch::Receiver<SwarmRuntimeConfig>,
+    mesh_config: Option<Arc<MeshConfigReader>>,
     mut cancel_rx: watch::Receiver<bool>,
     sink: Option<SwarmRuntimeEventSink>,
     local_peer_id: String,
     rtt: Arc<dyn PeerRttObserver>,
 ) {
-    let mut ticker = tokio::time::interval(config.observe_cadence);
+    // CIRISEdge#546 — the ceiling, re-read whenever `set_config` fires; the
+    // `watch::Ref` is cloned out immediately and never held across an await.
+    let mut configured = config_rx.borrow_and_update().clone();
+    let mut effective = effective_swarm_config(&configured, mesh_config.as_ref()).await;
+    let mut cadence = effective.observe_cadence;
+    let mut ticker = tokio::time::interval(cadence);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -736,12 +1069,38 @@ async fn run_converger(
                     return;
                 }
             }
+            changed = config_rx.changed() => {
+                if changed.is_err() {
+                    // Sender gone (runtime dropped without `shutdown()`) —
+                    // `changed()` would spin. See `run_publisher`.
+                    tracing::debug!("swarm_runtime.converger: config channel closed; exiting");
+                    return;
+                }
+                configured = config_rx.borrow_and_update().clone();
+            }
             _ = ticker.tick() => {
+                // Re-resolve at the TICK BOUNDARY, every tick. This is the
+                // whole point of #546: a boot-only read would keep applying
+                // a relief whose TTL expired until a restart nobody performs,
+                // which is a NEW lie rather than the existing gap.
+                let next = effective_swarm_config(&configured, mesh_config.as_ref()).await;
+                if next != effective {
+                    log_effective_config_change(&effective, &next);
+                    effective = next;
+                }
+                if effective.observe_cadence != cadence {
+                    cadence = effective.observe_cadence;
+                    ticker = tokio::time::interval_at(
+                        tokio::time::Instant::now() + cadence,
+                        cadence,
+                    );
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                }
                 converger_tick(
                     &observed,
                     &holdings,
                     directory.as_ref(),
-                    &config,
+                    &effective,
                     sink.as_ref(),
                     &local_peer_id,
                     rtt.as_ref(),
@@ -978,6 +1337,21 @@ fn corpus_kind_for(
     local_by_content
         .get(content_id)
         .map_or_else(|| "fountain-corpus".to_string(), |h| h.corpus_kind.clone())
+}
+
+/// CIRISEdge#546 — the swarm config plane's log gate. Keyed on a THREE-VALUE
+/// closed set (`"wiring"`, `"set_config"`, `"effective"`), never on anything
+/// a peer can choose, so the bounded key map is a formality here — the
+/// budget is what matters. Generous per key (each is a genuine governance
+/// event an operator needs in the log), with a wide window so a flapping
+/// mesh-config plane collapses to a suppressed count instead of a line per
+/// converger tick.
+static SWARM_CONFIG_PLANE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+fn swarm_config_plane_log() -> &'static crate::log_throttle::LogThrottle {
+    SWARM_CONFIG_PLANE_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(300), 8))
 }
 
 fn current_unix_ms() -> i64 {
@@ -1654,5 +2028,295 @@ mod tests {
         .await;
         assert!(sends.is_empty());
         assert!(metrics.withholds(WithholdReason::HoldingScopeUndeterminable) > 0);
+    }
+
+    // ─── CIRISEdge#546 — the config plane governs a RUNNING swarm ─────
+    //
+    // Half of these are pure (`with_mesh_relief` is the whole ceiling
+    // arithmetic), half drive the REAL converger loop — because "there is
+    // no setter" was a LOOP defect, not an arithmetic one, and a green
+    // pure test over a loop that still copies its config at start would
+    // be exactly the false confirmation the issue exists to remove.
+
+    /// The relief shape a root's row produces once it has been through
+    /// persist's fold: only the keys a root actually moved off the
+    /// baseline are `Some`. Built field-by-field rather than by mutating
+    /// `NONE` so a new field added to `MeshConfigRelief` breaks this
+    /// helper instead of silently defaulting past these assertions.
+    const fn redundancy_relief(
+        k_repair_symbols: Option<u32>,
+        min_viable_symbols: Option<u32>,
+        target_holders: Option<u32>,
+        min_viable_holders: Option<u32>,
+    ) -> MeshConfigRelief {
+        MeshConfigRelief {
+            round_cadence: None,
+            page_limit: None,
+            trace_replication_paused: false,
+            av_streams_paused: false,
+            k_repair_symbols,
+            min_viable_symbols,
+            target_holders,
+            min_viable_holders,
+        }
+    }
+
+    /// EXPIRY, stated as the identity it is. `MeshConfigRelief::NONE` is
+    /// what an empty plane, an unreadable plane, and an emergency row
+    /// whose TTL has passed all resolve to — so "the emergency expired"
+    /// needs no code path of its own, and this assertion is what says so.
+    #[test]
+    fn an_expired_or_absent_relief_leaves_the_configuration_field_for_field() {
+        let configured = SwarmRuntimeConfig::default();
+        assert_eq!(
+            configured.with_mesh_relief(&MeshConfigRelief::NONE),
+            configured
+        );
+    }
+
+    /// **THE ceiling test.** Every one of the four keys folds against
+    /// persist's `owner_default` (k_repair 20, min_viable_symbols 20,
+    /// both holder keys 64), all of which sit ABOVE what this node runs.
+    /// So a root moving `target_holders` 64 → 40 is a genuine relief
+    /// upstream and would still be an EXPANSION here — 40 > the
+    /// configured 30. `min` at the consumer is what makes it a no-op.
+    #[test]
+    fn a_relief_above_the_operator_ceiling_never_raises_a_knob() {
+        let configured = SwarmRuntimeConfig::default();
+        // Field-shaped: every value below is < persist's owner_default for
+        // its key (so persist marks it `relieved`) and > edge's configured
+        // value (so a naive replacement would raise the bound).
+        let relief = redundancy_relief(Some(15), Some(12), Some(40), Some(40));
+        let effective = configured.with_mesh_relief(&relief);
+        assert_eq!(effective, configured, "a relief must never widen a bound");
+        assert_eq!(effective.target_holders, DEFAULT_TARGET_HOLDERS);
+        assert_eq!(effective.policy.target_holders, DEFAULT_TARGET_HOLDERS);
+        assert_eq!(effective.min_viable, DEFAULT_MIN_VIABLE);
+        assert_eq!(effective.policy.k_repair, configured.policy.k_repair);
+        assert_eq!(
+            effective.policy.min_viable_symbols,
+            configured.policy.min_viable_symbols
+        );
+    }
+
+    /// The relief direction is NOT blocked: below the ceiling every knob
+    /// moves. `redundancy.target_holders` moves BOTH holder fields —
+    /// `SwarmRuntimeConfig::target_holders` is the declared knob, but
+    /// `policy.target_holders` is the one `should_eject_above_target`
+    /// actually reads, and a key that moved only the declared field would
+    /// be decorative.
+    #[test]
+    fn a_relief_below_the_ceiling_shrinks_every_knob_including_the_policy_twin() {
+        let configured = SwarmRuntimeConfig::default();
+        let effective =
+            configured.with_mesh_relief(&redundancy_relief(Some(2), Some(3), Some(12), Some(1)));
+        assert_eq!(effective.target_holders, 12);
+        assert_eq!(
+            effective.policy.target_holders, 12,
+            "the field the ejection verdict reads must move with the declared knob",
+        );
+        assert_eq!(effective.min_viable, 1);
+        assert_eq!(effective.policy.k_repair, 2);
+        assert_eq!(effective.policy.min_viable_symbols, 3);
+        assert_eq!(
+            effective.policy.n_source, configured.policy.n_source,
+            "n_source is the content's own encoding parameter — no key governs it",
+        );
+        assert_eq!(
+            effective.publish_cadence, configured.publish_cadence,
+            "no redundancy key touches a cadence",
+        );
+    }
+
+    /// A converger-only rig: an empty cohort (so the publisher ships
+    /// nothing and cannot colour the sink), one locally-held content, and
+    /// `holders` distinct peer claims for it.
+    async fn converger_rig(
+        config: SwarmRuntimeConfig,
+        options: SwarmRuntimeOptions,
+        content_id: &str,
+        holders: u32,
+    ) -> (
+        FountainSwarmRuntime,
+        tokio::sync::mpsc::UnboundedReceiver<SwarmEvent>,
+    ) {
+        let holdings: Arc<dyn FountainHoldingsSource> =
+            Arc::new(VecHoldings(vec![held(content_id, vec![7])]));
+        let tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
+        let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        let (sink_tx, sink_rx) = tokio::sync::mpsc::unbounded_channel::<SwarmEvent>();
+        let sink: SwarmRuntimeEventSink = Arc::new(move |ev| {
+            let _ = sink_tx.send(ev);
+        });
+        let rt = FountainSwarmRuntime::start_with_options(
+            config,
+            holdings,
+            test_directory(),
+            tx,
+            cohort,
+            "alice".to_string(),
+            Some(sink),
+            options,
+        );
+        for i in 0..holders {
+            rt.register_observed_claim(FountainHoldingClaim::new(
+                format!("peer-{i}"),
+                content_id,
+                vec![7],
+                1_700_000_000,
+            ))
+            .await;
+        }
+        (rt, sink_rx)
+    }
+
+    /// Did the converger emit `RepairNeeded` for `content_id` since the
+    /// last drain? Also drains `Keep`, so an empty answer means the
+    /// converger ran and chose not to repair — not that it never ran.
+    fn drained_repair_and_keep(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<SwarmEvent>,
+        content_id: &str,
+    ) -> (bool, bool) {
+        let (mut repaired, mut kept) = (false, false);
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                SwarmEvent::RepairNeeded { content_id: c, .. } if c == content_id => {
+                    repaired = true;
+                }
+                SwarmEvent::Keep { content_id: c, .. } if c == content_id => kept = true,
+                _ => {}
+            }
+        }
+        (repaired, kept)
+    }
+
+    /// **THE setter test.** A `SwarmRuntimeConfig` filed AFTER `start`
+    /// changes what the converger does, on the same running tasks, with
+    /// no restart — the gap CIRISServer#365's four keys were parked on.
+    /// Asserted in both phases so it cannot pass by emitting nothing: the
+    /// first phase must show the converger running and CHOOSING not to
+    /// repair.
+    #[tokio::test]
+    async fn a_config_set_after_start_governs_the_running_converger() {
+        let content_id = "c-governed";
+        let (rt, mut rx) = converger_rig(
+            SwarmRuntimeConfig {
+                min_viable: 1,
+                ..fast_config()
+            },
+            SwarmRuntimeOptions::default(),
+            content_id,
+            2,
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (repaired, kept) = drained_repair_and_keep(&mut rx, content_id);
+        assert!(!repaired, "2 holders is above a min_viable of 1");
+        assert!(
+            kept,
+            "the converger must have RUN — a silent loop proves nothing"
+        );
+
+        // The whole issue, in one call: no restart, no re-composition.
+        rt.set_config(SwarmRuntimeConfig {
+            min_viable: 5,
+            ..fast_config()
+        });
+        assert_eq!(rt.config().min_viable, 5, "the ceiling is what was set");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (repaired, _) = drained_repair_and_keep(&mut rx, content_id);
+        let mut rt = rt;
+        rt.shutdown().await;
+        assert!(
+            repaired,
+            "a config filed after start must govern the RUNNING converger — this is \
+             the boot-only-consumer defect (CIRISEdge#546)",
+        );
+    }
+
+    /// The relief seam at the LOOP. The same fixture that repairs under
+    /// the operator's own `min_viable` stops repairing once a root's row
+    /// relieves the holder floor beneath it — resolved on the converger's
+    /// tick, not at composition.
+    #[tokio::test]
+    async fn a_mesh_config_relief_shrinks_min_viable_on_a_running_converger() {
+        let content_id = "c-relieved";
+        // Control: no reader armed ⇒ pre-#546 behaviour, 2 < 5, repair.
+        let (rt, mut rx) =
+            converger_rig(fast_config(), SwarmRuntimeOptions::default(), content_id, 2).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (unarmed_repaired, _) = drained_repair_and_keep(&mut rx, content_id);
+        let mut rt = rt;
+        rt.shutdown().await;
+        assert!(
+            unarmed_repaired,
+            "an unarmed deployment must behave exactly as before — a control that \
+             does not fire makes the armed case meaningless",
+        );
+
+        // Armed: a root relieved the holder floor 64 → 1, well under the
+        // configured 5, so 2 observed holders is no longer a shortfall.
+        let reader = Arc::new(MeshConfigReader::fixed_for_test(
+            test_directory(),
+            redundancy_relief(None, None, None, Some(1)),
+        ));
+        let (rt, mut rx) = converger_rig(
+            fast_config(),
+            SwarmRuntimeOptions {
+                mesh_config: Some(reader),
+                ..SwarmRuntimeOptions::default()
+            },
+            content_id,
+            2,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (armed_repaired, armed_kept) = drained_repair_and_keep(&mut rx, content_id);
+        let mut rt = rt;
+        rt.shutdown().await;
+        assert!(armed_kept, "the converger must still be running");
+        assert!(
+            !armed_repaired,
+            "a relieved holder floor of 1 must stop the RepairNeeded the configured \
+             floor of 5 produced",
+        );
+    }
+
+    /// The ceiling, at the LOOP rather than in the arithmetic. A root
+    /// asking for a HIGHER holder floor than the operator configured is
+    /// still a relief upstream (64 → 5 under persist's owner_default) and
+    /// must be a no-op here: the converger keeps the operator's 1.
+    #[tokio::test]
+    async fn a_relief_above_the_ceiling_cannot_raise_min_viable_on_a_running_converger() {
+        let content_id = "c-ceilinged";
+        let reader = Arc::new(MeshConfigReader::fixed_for_test(
+            test_directory(),
+            redundancy_relief(None, None, None, Some(5)),
+        ));
+        let (rt, mut rx) = converger_rig(
+            SwarmRuntimeConfig {
+                min_viable: 1,
+                ..fast_config()
+            },
+            SwarmRuntimeOptions {
+                mesh_config: Some(reader),
+                ..SwarmRuntimeOptions::default()
+            },
+            content_id,
+            2,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (repaired, kept) = drained_repair_and_keep(&mut rx, content_id);
+        let mut rt = rt;
+        rt.shutdown().await;
+        assert!(kept, "the converger must have run");
+        assert!(
+            !repaired,
+            "a config row must never push a knob PAST the operator's own configured \
+             value — min(configured, relieved), never replacement",
+        );
     }
 }
