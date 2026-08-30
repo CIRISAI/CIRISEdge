@@ -122,6 +122,7 @@ pub mod coordinator;
 pub mod directory;
 pub mod mesh_config;
 pub mod protocol;
+pub mod refusal_backoff;
 pub mod registry;
 pub mod resolved_state;
 pub mod runtime;
@@ -154,6 +155,9 @@ pub use protocol::{
     DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
     SummaryMessage,
 };
+
+#[doc(inline)]
+pub use refusal_backoff::{RefusalBackoff, RetryDisposition};
 
 pub use registry::{RegistryError, ReplicationRegistry, RouteOutcome};
 #[doc(inline)]

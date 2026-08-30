@@ -174,6 +174,22 @@ pub trait ReplicationDirectory: Send + Sync {
         self.fetch_envelope_bytes(kind, envelope_hash).await
     }
 
+    /// CIRISEdge#544 — has this node already refused `(kind, envelope_hash)`
+    /// recently enough that the round should NOT ask for it again?
+    ///
+    /// Deliberately **synchronous**: it is an in-memory probe of the
+    /// implementation's own refusal memory, consulted once per wanted hash per
+    /// round, and routing it through the adapter's `block_on` would put a
+    /// runtime hop on the hot path of a pure map lookup. It must never do I/O.
+    ///
+    /// Defaults to `false` (ask for everything, the pre-#544 behaviour) so the
+    /// mock and any host impl need no change; the bridge overrides it with the
+    /// [`RefusalBackoff`](super::refusal_backoff::RefusalBackoff) its apply path
+    /// populates.
+    fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
+        false
+    }
+
     /// Apply one envelope to local state. The implementation verifies the signed
     /// envelope's signature + canonical-bytes hash before admitting; the merge
     /// layer in persist is the canonical anti-rollback authority. Returns an
@@ -264,6 +280,16 @@ impl StateProvider for DirectoryStateAdapter {
             tokio::runtime::Handle::current()
                 .block_on(async move { inner.list_holdings(kind).await })
         })
+    }
+
+    /// CIRISEdge#544 — forward the want-suppression question to the directory,
+    /// which is the ONE shared bridge every per-peer provider sits on. No
+    /// `block_on`: the trait method is sync precisely so this stays a map probe.
+    /// Node-wide by construction — peer A's refusal removes the row from peer
+    /// B's `want` too, which is the point (the verdict is about this node's
+    /// state, not about who carried the bytes).
+    fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
+        self.inner.retry_suppressed(kind, envelope_hash)
     }
 
     fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> Option<Vec<u8>> {

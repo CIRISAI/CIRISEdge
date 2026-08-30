@@ -4136,13 +4136,20 @@ fn extract_trust_scoring(
 /// error.
 #[cfg(feature = "transport-reticulum")]
 #[allow(unsafe_code)]
-/// The keystore alias suffix a node's own key lives under.
+/// The keystore alias suffix a node's own key lives under — LEGACY FALLBACK.
 ///
-/// MIRRORS `CIRISServer::node_key::NODE_ALIAS_SUFFIX` (0.5.189). Edge cannot
-/// import it: CIRISServer RIDES edge, so a dependency in that direction would
-/// invert the substrate relationship. The rule is one line and it is pinned by
-/// `node_alias_matches_the_server_rule` below; if it ever drifts, that test is
-/// where it surfaces.
+/// CIRISEdge#548: this was a mirror of CIRISServer's rule, kept because edge
+/// cannot import from a crate that rides it. The mirror forked — server 0.5.195
+/// moved to a fixed base alias while this kept appending `-node`, so
+/// provisioning put the key where edge would never look and every first-run node
+/// failed to bring up a transport identity.
+///
+/// The lesson is narrower than "do not duplicate": edge genuinely cannot import
+/// this. What it CAN do is be TOLD. `init_edge_runtime(node_keystore_alias=…)`
+/// carries the name from whoever minted the key, which leaves exactly one
+/// component naming it. This constant survives only for callers that do not pass
+/// it yet, and no test here can guard it — a test can only compare edge against
+/// edge, which is why the previous one passed straight through the fork.
 const NODE_ALIAS_SUFFIX: &str = "-node";
 
 /// The keystore alias the node's own key lives under, given the host's alias.
@@ -4219,6 +4226,7 @@ type NodeIdentityHalves = (
 fn open_node_identity_halves(
     node_identity_dir: Option<&str>,
     host_keystore_alias: &str,
+    node_keystore_alias: Option<&str>,
 ) -> Result<NodeIdentityHalves, String> {
     // Returns a plain `String` rather than a `PyErr`: constructing a `PyErr`
     // requires a live interpreter, which would make every fail-closed path here
@@ -4237,7 +4245,22 @@ fn open_node_identity_halves(
         );
     };
     let dir = std::path::PathBuf::from(dir);
-    let alias = node_alias(host_keystore_alias);
+    // CIRISEdge#548 — the name TRAVELS when the caller supplies it. Whoever mints
+    // the key is the only component that can say what it is called, and
+    // `provision_node_identity` already returns that name; it just had nowhere to
+    // go on the way back in.
+    //
+    // Deriving it here made edge a SECOND implementation of a naming rule it does
+    // not own, and that mirror forked: server 0.5.195 moved to a fixed base alias
+    // while edge kept appending `-node`. Provisioning then succeeded and put the
+    // key somewhere edge would never look — with no caller-side workaround,
+    // because there is no alias A where the server's rule and `A + "-node"` agree.
+    //
+    // Absent, the derivation stands, so existing deployments are unaffected.
+    let alias = match node_keystore_alias {
+        Some(explicit) => explicit.to_owned(),
+        None => node_alias(host_keystore_alias),
+    };
 
     // Classical half: the sealed Ed25519 entry beside the one the engine opened.
     let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::from(
@@ -4289,10 +4312,12 @@ fn resolve_node_transport_identity(
     executor: &ciris_persist::ffi::executor_capsule::AsyncExecutor,
     node_identity_dir: Option<&str>,
     host_keystore_alias: &str,
+    node_keystore_alias: Option<&str>,
     directory: &Arc<dyn ciris_persist::federation::FederationDirectory>,
 ) -> PyResult<Arc<LocalSigner>> {
-    let (classical, pqc, alias) = open_node_identity_halves(node_identity_dir, host_keystore_alias)
-        .map_err(PyRuntimeError::new_err)?;
+    let (classical, pqc, alias) =
+        open_node_identity_halves(node_identity_dir, host_keystore_alias, node_keystore_alias)
+            .map_err(PyRuntimeError::new_err)?;
     // The federation key_id is DERIVED over the node alias + the node's own
     // pubkey — never the actor's derived id, or the split would be cosmetic.
     //
@@ -4624,6 +4649,8 @@ enum LocalInstanceRole {
     // today's behaviour byte-for-byte.
     use_node_identity = false,
     node_identity_dir = None,
+    // CIRISEdge#548 — the minted key's name, from whoever minted it.
+    node_keystore_alias = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -4825,6 +4852,12 @@ pub fn init_edge_runtime(
     // no new secret to the boundary.
     use_node_identity: bool,
     node_identity_dir: Option<&str>,
+    // CIRISEdge#548 — the node key's keystore alias, used VERBATIM when given.
+    // `provision_node_identity` mints the key and returns its name; this is the
+    // parameter that lets that name travel back in, instead of being re-derived
+    // by a component that does not own the rule. Absent, edge falls back to
+    // `node_alias(host_keystore_alias)` and existing deployments are unaffected.
+    node_keystore_alias: Option<&str>,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -5370,6 +5403,7 @@ pub fn init_edge_runtime(
             &executor,
             node_identity_dir,
             &signer_handle.key_id,
+            node_keystore_alias,
             &federation_directory_for_edge,
         )?)
     } else {
@@ -10071,6 +10105,7 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -10192,6 +10227,7 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -10352,6 +10388,7 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
             )?;
             Ok(())
         });
@@ -10465,6 +10502,7 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -10644,6 +10682,7 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -10810,6 +10849,7 @@ mod pyo3_tier2_tests {
                 None,       // ifac_size
                 false,      // use_node_identity (CIRISEdge#541 — default)
                 None,       // node_identity_dir
+                None,       // node_keystore_alias (CIRISEdge#548)
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -10937,6 +10977,7 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
             )?;
             Ok(edge.signer_key_id())
         });
@@ -11207,7 +11248,7 @@ mod node_identity_tests {
     /// hazard so the collision is not rediscovered as a field incident.
     #[test]
     fn a_node_suffixed_actor_alias_collides_and_needs_the_directory_check() {
-        // Indistinguishable by name: the rule is a no-op on both.
+        // Indistinguishable by name: the legacy rule is a no-op on both.
         assert_eq!(node_alias("prod-node"), "prod-node");
         assert_eq!(
             node_alias("ciris-agent-bootstrap-node"),
@@ -11241,13 +11282,53 @@ mod node_identity_tests {
         assert!(!require_actor_capsule(false, true));
     }
 
-    /// Pins edge's copy of the alias rule against CIRISServer's
-    /// `node_key::node_alias` (0.5.189). Edge cannot import it — CIRISServer
-    /// RIDES edge, and a dependency in that direction would invert the substrate
-    /// relationship — so the rule is duplicated ON PURPOSE, and this test is what
-    /// catches the drift that duplication invites.
+    /// CIRISEdge#548 — an explicitly supplied alias is used VERBATIM.
+    ///
+    /// The bug was that no `host_keystore_alias` could reach the server's minted
+    /// name: there is no A where `A + "-node"` equals a fixed base alias, so a
+    /// derivation could never be reconciled by configuration. The parameter has
+    /// to bypass the rule entirely, not feed it.
+    ///
+    /// Asserted through the REFUSAL message, which names the alias edge tried to
+    /// open — the only observable that proves which name reached the keystore.
     #[test]
-    fn node_alias_matches_the_server_rule() {
+    fn an_explicit_node_alias_is_used_verbatim_not_derived() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_str().expect("utf8").to_owned();
+
+        let Err(msg) = open_node_identity_halves(
+            Some(&path),
+            "ciris-agent-bootstrap",
+            Some("ciris-node-bootstrap"),
+        ) else {
+            panic!("an unprovisioned keystore must still refuse");
+        };
+        assert!(
+            msg.contains("ciris-node-bootstrap"),
+            "the explicit alias must be the one edge opens. Got: {msg}"
+        );
+        assert!(
+            !msg.contains("ciris-agent-bootstrap-node"),
+            "the derivation must be BYPASSED, not applied to the explicit name. Got: {msg}"
+        );
+    }
+
+    /// The FALLBACK derivation, and an honest statement of what this cannot do.
+    ///
+    /// CIRISEdge#548: this test used to claim it "catches the drift that
+    /// duplication invites". It does not, and it never could. It asserts edge's
+    /// copy against a hardcoded literal, so it detects only edge editing its own
+    /// implementation — the one case that was never the risk. When CIRISServer
+    /// 0.5.195 moved to a fixed base alias, the mirror forked, every first-run
+    /// node broke, and this test passed throughout.
+    ///
+    /// The real fix is that callers now pass `node_keystore_alias` and the name
+    /// travels from whoever minted the key. What remains here is a BACKWARD-
+    /// COMPATIBILITY path for deployments that do not pass it yet, so this pins
+    /// the legacy shape — nothing more. It is not a cross-repo guard, and no
+    /// test in this repo can be one.
+    #[test]
+    fn the_legacy_alias_derivation_is_unchanged() {
         assert_eq!(NODE_ALIAS_SUFFIX, "-node");
         assert_eq!(
             node_alias("ciris-agent-bootstrap"),
@@ -11266,7 +11347,7 @@ mod node_identity_tests {
     /// to cure.
     #[test]
     fn a_missing_identity_dir_refuses_rather_than_falling_back() {
-        let Err(msg) = open_node_identity_halves(None, "ciris-agent-bootstrap") else {
+        let Err(msg) = open_node_identity_halves(None, "ciris-agent-bootstrap", None) else {
             panic!("no directory must refuse — it must never fall back to the engine identity");
         };
         assert!(
@@ -11288,7 +11369,7 @@ mod node_identity_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_str().expect("utf8").to_owned();
 
-        let Err(msg) = open_node_identity_halves(Some(&path), "ciris-agent-bootstrap") else {
+        let Err(msg) = open_node_identity_halves(Some(&path), "ciris-agent-bootstrap", None) else {
             panic!("an unprovisioned keystore dir must refuse");
         };
         assert!(

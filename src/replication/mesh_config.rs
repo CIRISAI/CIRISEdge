@@ -12,15 +12,27 @@
 //! - **most-restrictive-across-roots** (CC 4.2.1 rule 2): where roots
 //!   disagree, the tightest value binds.
 //!
-//! Edge consumes exactly four of the registered keys (their `consumer` fields
+//! Edge consumes eight of the registered keys (their `consumer` fields
 //! in persist's closed registry name edge-side loops):
 //!
-//! | wire key                    | edge consumer                                  |
-//! |-----------------------------|------------------------------------------------|
-//! | `antientropy.round_secs`    | scheduler cadence (next round)                 |
-//! | `antientropy.page_limit`    | the bridge's since-page limit                  |
-//! | `feature.trace_replication` | pause the `trace:*` advertise/serve plane      |
-//! | `feature.av_streams`        | ALM admission toggle (`plan_parent_gated`)     |
+//! | wire key                         | edge consumer                             |
+//! |----------------------------------|-------------------------------------------|
+//! | `antientropy.round_secs`         | scheduler cadence (next round)            |
+//! | `antientropy.page_limit`         | the bridge's since-page limit             |
+//! | `feature.trace_replication`      | pause the `trace:*` advertise/serve plane |
+//! | `feature.av_streams`             | ALM admission toggle (`plan_parent_gated`)|
+//! | `redundancy.k_repair_symbols`    | `FountainPolicy::k_repair`                |
+//! | `redundancy.min_viable_symbols`  | `FountainPolicy::min_viable_symbols`      |
+//! | `redundancy.target_holders`      | swarm converger `target_holders` (`H`)    |
+//! | `redundancy.min_viable_holders`  | swarm converger `min_viable`              |
+//!
+//! The last four land on the swarm converger (CIRISEdge#546); persist v30.0.0
+//! (CIRISPersist#602) split the fused redundancy pair onto the SYMBOL and
+//! HOLDER axes precisely so each key names one edge field. Their consumer is
+//! [`crate::swarm::runtime::SwarmRuntimeConfig::with_mesh_relief`], applied on
+//! the converger tick — the swarm runtime had no setter at all before #546, so
+//! these four were `consumed: false` in CIRISServer#365's map for want of a
+//! place to put the answer, not for want of a mapping.
 //!
 //! ## Relief, not a gate — absence is EXACTLY today's behavior
 //!
@@ -82,6 +94,21 @@ pub struct MeshConfigRelief {
     /// `feature.av_streams` relieved to `0`: ALM admission
     /// (`plan_parent_gated`) refuses with a named error.
     pub av_streams_paused: bool,
+    /// CIRISEdge#546 — `redundancy.k_repair_symbols` iff relieved. The swarm
+    /// runtime takes `min(configured, relieved)` into
+    /// [`crate::holonomic::fountain_defaults::FountainPolicy::k_repair`].
+    pub k_repair_symbols: Option<u32>,
+    /// CIRISEdge#546 — `redundancy.min_viable_symbols` iff relieved →
+    /// [`crate::holonomic::fountain_defaults::FountainPolicy::min_viable_symbols`]
+    /// (the BLINKING_DOT floor), `min`'d against the configured value.
+    pub min_viable_symbols: Option<u32>,
+    /// CIRISEdge#546 — `redundancy.target_holders` iff relieved → the swarm
+    /// converger's `H`. Distinct axis from [`Self::k_repair_symbols`]: peers,
+    /// not symbols (CIRISPersist#602 split the fused pair for exactly this).
+    pub target_holders: Option<u32>,
+    /// CIRISEdge#546 — `redundancy.min_viable_holders` iff relieved → the
+    /// holder floor below which the converger emits `RepairNeeded`.
+    pub min_viable_holders: Option<u32>,
 }
 
 impl MeshConfigRelief {
@@ -91,6 +118,10 @@ impl MeshConfigRelief {
         page_limit: None,
         trace_replication_paused: false,
         av_streams_paused: false,
+        k_repair_symbols: None,
+        min_viable_symbols: None,
+        target_holders: None,
+        min_viable_holders: None,
     };
 
     /// Derive the relief snapshot from a resolved fold. Pure; the
@@ -103,14 +134,27 @@ impl MeshConfigRelief {
                 .map(|s| s.effective)
         };
         let paused = |key: MeshConfigKey| relieved(key).is_some_and(|v| v == 0);
+        // Every count-shaped key lands in a `u32` edge field; persist's domains
+        // cap at 4096, so the saturating conversion is a belt on an i64 that
+        // cannot be negative in-domain, never a live path.
+        let count =
+            |key: MeshConfigKey| relieved(key).map(|v| u32::try_from(v).unwrap_or(u32::MAX));
         Self {
             round_cadence: relieved(MeshConfigKey::AntientropyRoundSecs)
                 .and_then(|v| u64::try_from(v).ok())
                 .map(Duration::from_secs),
-            page_limit: relieved(MeshConfigKey::AntientropyPageLimit)
-                .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
+            page_limit: count(MeshConfigKey::AntientropyPageLimit),
             trace_replication_paused: paused(MeshConfigKey::FeatureTraceReplication),
             av_streams_paused: paused(MeshConfigKey::FeatureAvStreams),
+            // CIRISEdge#546 — the swarm converger's four. Read here and only
+            // here; the `min(configured, relieved)` bound that keeps a root
+            // from raising them past the operator's own ceiling lives at the
+            // consumer (`SwarmRuntimeConfig::with_mesh_relief`), mirroring
+            // `bridge::effective_page_limit`.
+            k_repair_symbols: count(MeshConfigKey::RedundancyKRepairSymbols),
+            min_viable_symbols: count(MeshConfigKey::RedundancyMinViableSymbols),
+            target_holders: count(MeshConfigKey::RedundancyTargetHolders),
+            min_viable_holders: count(MeshConfigKey::RedundancyMinViableHolders),
         }
     }
 }
@@ -247,6 +291,14 @@ impl MeshConfigReader {
                     page_limit = resolved.page_limit,
                     trace_replication_paused = resolved.trace_replication_paused,
                     av_streams_paused = resolved.av_streams_paused,
+                    // CIRISEdge#546 — the swarm four. Named here because the
+                    // change detection above is over the WHOLE snapshot: a line
+                    // that fires while showing only the #440 fields reads as a
+                    // spurious log rather than as the redundancy row it was.
+                    k_repair_symbols = resolved.k_repair_symbols,
+                    min_viable_symbols = resolved.min_viable_symbols,
+                    target_holders = resolved.target_holders,
+                    min_viable_holders = resolved.min_viable_holders,
                     "mesh-config relief snapshot changed (CIRISEdge#440)"
                 );
             }
@@ -520,6 +572,50 @@ mod tests {
         assert_eq!(relief.page_limit, Some(100));
         assert!(!relief.trace_replication_paused);
         assert!(!relief.av_streams_paused);
+    }
+
+    /// FIELD PROVENANCE, CIRISEdge#546 — the swarm converger's four keys,
+    /// admitted through persist's REAL door, each landing on its OWN relief
+    /// field. Every value is deliberately distinct so a fold that fused the
+    /// symbol and holder axes back together (the pre-CIRISPersist#602 shape)
+    /// shows up as a crossed assertion rather than as a passing test.
+    #[tokio::test]
+    async fn admitted_redundancy_rows_populate_each_swarm_field_separately() {
+        let backend = Arc::new(MemoryBackend::new());
+        seed_key(&backend, "node-local").await;
+        seed_key(&backend, "root-1").await;
+        seed_subscription(&backend, "node-local", "root-1").await;
+
+        // All four are `HigherMeansMoreFlow` against persist's `owner_default`
+        // ceilings (k_repair 20, min_viable_symbols 20, both holder keys 64),
+        // so every value below is a RELIEF and none is clamped away.
+        for (key, value) in [
+            (MeshConfigKey::RedundancyKRepairSymbols, 4),
+            (MeshConfigKey::RedundancyMinViableSymbols, 3),
+            (MeshConfigKey::RedundancyTargetHolders, 12),
+            (MeshConfigKey::RedundancyMinViableHolders, 2),
+        ] {
+            let row = mesh_row("root-1", key, value, MeshConfigForm::Emergency);
+            let outcome =
+                record_mesh_config_row(&*backend, "node-local", &baseline(), &row, Utc::now())
+                    .await
+                    .expect("admission door reachable");
+            assert!(
+                matches!(outcome, MeshConfigOutcome::Admitted),
+                "the REAL admission door must admit the fixture row (fixture rot \
+                 otherwise invalidates every downstream assertion): {outcome:?}"
+            );
+        }
+
+        let relief = reader_over(&backend).await.relief().await;
+        assert_eq!(relief.k_repair_symbols, Some(4));
+        assert_eq!(relief.min_viable_symbols, Some(3));
+        assert_eq!(relief.target_holders, Some(12));
+        assert_eq!(relief.min_viable_holders, Some(2));
+        assert_eq!(
+            relief.round_cadence, None,
+            "the #440 keys stay un-relieved — a redundancy row must not move them"
+        );
     }
 
     /// FIELD PROVENANCE, replication plane — feature pause rows arriving the
