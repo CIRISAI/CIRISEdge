@@ -880,6 +880,21 @@ pub struct EdgeMetrics {
     /// rides on the matching throttled DEBUG line, and keying by peer would make
     /// cardinality grow with exactly the pollution this counts.
     pub announce_intake_evictions: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#547 — unix seconds at which the last anti-entropy round
+    /// TERMINATED. `0` means "no round has completed since boot".
+    ///
+    /// These exist to answer ONE question without touching the store: is this
+    /// runtime still making progress? A canonical ran 22 hours hung — one thread
+    /// in `wait_on_page_bit_common` holding persist's single connection mutex,
+    /// six parked behind it — and went unnoticed because the health surface that
+    /// would have reported it reads the store, so it was inside the failure it
+    /// was meant to detect.
+    ///
+    /// PLAIN ATOMICS, deliberately, not the `RwLock<HashMap>` the counters
+    /// beside them use. A liveness signal must share no lock with any path that
+    /// can block on I/O; if it did, a convoy would make the liveness read hang
+    /// exactly when its answer matters. Reading these can never block.
+    pub last_round_completed_unix: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#433 — the WITHHOLD LEDGER: per-[`WithholdReason`] count of rows
     /// a serving-path gate declined to serve. Shaped exactly like
     /// [`Self::send_failures_total`] (same `Arc<RwLock<HashMap<_, _>>>` lock
@@ -1019,8 +1034,38 @@ impl EdgeMetrics {
     /// scheduler event-sink consumer (see
     /// [`crate::replication::runtime::ReplicationRuntime::start`]).
     pub fn inc_round_outcome(&self, outcome: RoundOutcome) {
+        // CIRISEdge#547 — stamp progress BEFORE taking the counter lock. The
+        // stamp is the liveness signal and must not be able to wait on anything;
+        // ordering it first means even a contended counter map cannot delay the
+        // evidence that this runtime is alive.
+        Self::stamp_now(&self.last_round_completed_unix);
         let mut guard = self.replication_round_outcomes_total.write();
         *guard.entry(outcome).or_insert(0) += 1;
+    }
+
+    /// Wall-clock seconds into an atomic. Monotonically advanced only: a clock
+    /// that steps backwards must never make progress look older than it is,
+    /// because "no progress for N seconds" is the whole signal.
+    fn stamp_now(slot: &std::sync::atomic::AtomicU64) {
+        use std::sync::atomic::Ordering;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let _ = slot.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#547 — the store-free liveness view.
+    ///
+    /// Unix seconds of the last completed round, `0` for "none since boot".
+    /// Reads ONE atomic: no store, no lock that a store-touching path holds, no
+    /// allocation. A caller can compute "seconds since progress" and answer a
+    /// health probe while the replication runtime is fully convoyed — which is
+    /// precisely the state this exists to make visible. On the hung canonical
+    /// this would have read 22 hours stale from the first minute.
+    #[must_use]
+    pub fn last_round_completed_unix(&self) -> u64 {
+        self.last_round_completed_unix
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// CIRISEdge#373 — increment the inbound-backpressure-drop counter. Called
@@ -1284,6 +1329,51 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#441 — the removal-delivery delta: per tracked removal row,
     /// offered/acked counts + peers still lacking a receipt.
     pub removal_delivery: Vec<RemovalRowDelta>,
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    //! CIRISEdge#547 — the store-free liveness stamp.
+    use super::{EdgeMetrics, RoundOutcome};
+    use std::sync::atomic::Ordering;
+
+    /// Before any round completes the answer is "nothing since boot" — a
+    /// distinct state from "a round completed at the epoch", which a bare
+    /// timestamp would conflate.
+    #[test]
+    fn no_completed_round_reads_as_zero_not_a_stale_timestamp() {
+        let m = EdgeMetrics::default();
+        assert_eq!(m.last_round_completed_unix(), 0);
+    }
+
+    /// A terminated round stamps progress, whatever its outcome. A round that
+    /// ended badly still proves the runtime is turning — which is the question
+    /// this answers, and the reason it is not gated on success.
+    #[test]
+    fn any_terminated_round_stamps_progress() {
+        let m = EdgeMetrics::default();
+        m.inc_round_outcome(RoundOutcome::Completed);
+        assert!(m.last_round_completed_unix() > 0);
+    }
+
+    /// The subtle one. The stamp advances MONOTONICALLY: a clock stepping
+    /// backwards (NTP correction, a VM restored from a snapshot) must never make
+    /// progress look older than it is, because "no progress for N seconds" is the
+    /// entire signal and an inflated N is a false alarm on a healthy node —
+    /// which is how a liveness probe gets muted by its own operators.
+    #[test]
+    fn a_backwards_clock_cannot_age_the_stamp() {
+        let m = EdgeMetrics::default();
+        let future = 4_000_000_000u64;
+        m.last_round_completed_unix.store(future, Ordering::Relaxed);
+        // A stamp taken "now" is far in the past relative to that value.
+        m.inc_round_outcome(RoundOutcome::Completed);
+        assert_eq!(
+            m.last_round_completed_unix(),
+            future,
+            "fetch_max must keep the newer stamp; a regressing clock must not age it"
+        );
+    }
 }
 
 #[cfg(test)]

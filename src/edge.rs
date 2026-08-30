@@ -1932,6 +1932,34 @@ impl Edge {
     /// (PyO3 / UniFFI projection methods, internal emission helpers,
     /// tests) call `.snapshot()` to render a typed bundle.
     #[must_use]
+    /// CIRISEdge#547 — seconds since the last anti-entropy round COMPLETED, or
+    /// `None` if none has since boot.
+    ///
+    /// The store-free liveness probe. Reads ONE atomic: it touches neither the
+    /// store nor any lock a store-touching path can hold, so it still answers
+    /// while the replication runtime is convoyed — which is the only condition
+    /// under which the answer matters.
+    ///
+    /// A canonical ran 22 hours hung (one thread in `wait_on_page_bit_common`
+    /// holding persist's single connection, the rest parked behind it) and
+    /// nobody noticed, because the health surface that would have reported it
+    /// reads the store and was therefore inside the failure it was meant to
+    /// detect. This would have read 22 hours stale from the first minute.
+    ///
+    /// Says the runtime stopped progressing. Does NOT say why — that is the
+    /// honest scope of a liveness probe, and a caller should not infer a cause.
+    #[must_use]
+    pub fn seconds_since_last_round(&self) -> Option<u64> {
+        let stamp = self.metrics.last_round_completed_unix();
+        if stamp == 0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Some(now.saturating_sub(stamp))
+    }
+
     pub fn metrics(&self) -> crate::observability::EdgeMetrics {
         self.metrics.clone()
     }
