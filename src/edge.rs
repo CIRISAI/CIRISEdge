@@ -1184,6 +1184,21 @@ pub struct Edge {
     /// frame; a fold-restart re-install is the correct idiom, not a
     /// silently-dropped call.
     swarm_runtime: Arc<ReinstallableCell<crate::swarm::FountainSwarmRuntime>>,
+    /// CIRISEdge#545 — the READ side of the holonomic claim plane.
+    ///
+    /// [`Self::swarm_runtime`] above is the WRITE side: verified inbound
+    /// `FountainHoldingClaim` envelopes go into the converger and stop
+    /// there. This is the tap that makes the converged state askable —
+    /// see [`crate::holonomic::converged_view`] for why it taps the
+    /// dispatch arm rather than projecting the converger's own map.
+    ///
+    /// NOT a `ReinstallableCell`: unlike the runtime, this is always
+    /// present (an unarmed view answers "unknown", which is the correct
+    /// answer for a node whose dispatch loop never started) and it must
+    /// keep its observation window across a fold restart — a
+    /// re-installable cell would hand back a cold view that reports a
+    /// long-known-empty mesh as unknown again.
+    converged_claims: Arc<crate::holonomic::converged_view::ConvergedClaimView>,
     /// v5.2.0 (CIRISEdge#143) — opt-in consent-decay scheduler
     /// shutdown handle. Same lifecycle as [`Self::swarm_runtime`];
     /// when set, [`Edge::shutdown_swarm_runtime`] also signals the
@@ -2081,7 +2096,55 @@ impl Edge {
     /// the same `Arc` (CIRISServer 0.5.136's process-static composition) is
     /// a debug-level no-op.
     pub fn install_swarm_runtime(&self, runtime: Arc<crate::swarm::FountainSwarmRuntime>) {
+        // CIRISEdge#545 — realign the READ side's horizons to the
+        // converger that is actually running. The reader's defaults match
+        // the converger's defaults, but a deployment that tunes
+        // `publish_cadence` / `observed_claim_ttl` would otherwise leave
+        // the two disagreeing about what "live" means: the reader would
+        // declare itself warming long after the cohort has spoken, or
+        // prune claims the converger still holds. Read before the
+        // install so the config borrow ends first.
+        {
+            let cfg = runtime.config();
+            self.converged_claims
+                .align_to_converger(cfg.observed_claim_ttl, cfg.publish_cadence);
+        }
         self.swarm_runtime.install(runtime);
+    }
+
+    /// CIRISEdge#545 — **read the converged view**: what this node has
+    /// converged about its cohort, from the signed `FountainHoldingClaim`
+    /// plane its peers publish on.
+    ///
+    /// Counts only. No peer id, `content_id`, or symbol id is reachable
+    /// through this surface — the intended consumer is a public
+    /// mesh-status endpoint (CIRISServer#498) and an enumerable member
+    /// list is a reconnaissance surface.
+    ///
+    /// Returns a two-state
+    /// [`ConvergenceReading`](crate::holonomic::converged_view::ConvergenceReading),
+    /// never a bare `Option`: "the mesh converged to nothing" and "this
+    /// node has nothing computed yet" are different answers, and a
+    /// consumer that reported the second as `0` would tell the world the
+    /// mesh is empty on the evidence of its own cold start. Map with
+    /// [`ConvergenceReading::converged`](crate::holonomic::converged_view::ConvergenceReading::converged)
+    /// — `None` ⇒ `null`, `Some(v)` ⇒ `v`'s counts, zeros included.
+    ///
+    /// Synchronous and lock-cheap: callable from a blocking FFI frame
+    /// with no tokio runtime in scope.
+    pub fn swarm_convergence(&self) -> crate::holonomic::converged_view::ConvergenceReading {
+        self.converged_claims.read()
+    }
+
+    /// CIRISEdge#545 — the converged-view handle itself, for an embedder
+    /// that wants to hold the reader directly (a status task polling on
+    /// its own cadence) or to realign its horizons without installing a
+    /// swarm runtime. Cheap clone (Arc bump).
+    #[must_use]
+    pub fn converged_claim_view(
+        &self,
+    ) -> Arc<crate::holonomic::converged_view::ConvergedClaimView> {
+        Arc::clone(&self.converged_claims)
     }
 
     /// v5.2.0 — return the installed
@@ -3608,6 +3671,12 @@ impl Edge {
         // structurally bypassed).
         let trust_short_circuit_enabled =
             override_threshold.is_some() || self.config.trust_short_circuit_enabled;
+        // CIRISEdge#545 — the harness entry point drives the same claim
+        // plane as `run`, so it arms the reader the same way. Without
+        // this, a conformance test that pushes holding claims through
+        // this door would read back "plane not armed" and never see its
+        // own claims.
+        self.converged_claims.arm();
         dispatch_inbound(
             frame,
             &self.verify,
@@ -3641,6 +3710,7 @@ impl Edge {
             self.canonical_peers.clone(),
             self.blob_chunk_source.as_ref(),
             self.swarm_runtime.get().as_ref(),
+            &self.converged_claims,
             &self.blob_scope_router(),
         )
         .await;
@@ -4359,6 +4429,16 @@ impl Edge {
         // Clone of the `Arc<OnceLock<Arc<FountainSwarmRuntime>>>`; the
         // OnceLock load inside the dispatch is a cheap atomic.
         let swarm_runtime = self.swarm_runtime.clone();
+        // CIRISEdge#545 — arm the READ side here, at the top of the
+        // inbound loop, and NOT lazily on the first observed claim.
+        // Arming is what turns silence into evidence: from this instant
+        // an empty converged view means "the cohort has said nothing",
+        // where before it meant "nobody was listening". Idempotent — a
+        // fold restart re-enters `run` and must keep the original
+        // observation window rather than re-reporting a known-empty mesh
+        // as unknown.
+        self.converged_claims.arm();
+        let converged_claims = self.converged_claims.clone();
         // CIRISEdge#499 — the handle the blob scope gate reads its address table
         // from. Captured as the TRANSPORT, not as a pre-built router, because
         // `install_scope_address_table` may fire after `run` starts (the MLS
@@ -4420,6 +4500,7 @@ impl Edge {
                     let delegation_trust_roots_clone = delegation_trust_roots.clone();
                     let blob_chunk_source_clone = blob_chunk_source.clone();
                     let swarm_runtime_clone = swarm_runtime.clone();
+                    let converged_claims_clone = converged_claims.clone();
                     #[cfg(feature = "_reticulum-module")]
                     let blob_scope_router = crate::blob_swarm::BlobScopeRouter::new(
                         blob_scope_transport
@@ -4462,6 +4543,7 @@ impl Edge {
                             delegation_trust_roots_clone,
                             blob_chunk_source_clone.as_ref(),
                             swarm_runtime_clone.get().as_ref(),
+                            &converged_claims_clone,
                             &blob_scope_router,
                         ).await;
                     });
@@ -4994,6 +5076,7 @@ fn select_reply_transport(
         delegation_trust_roots,
         blob_chunk_source,
         swarm_runtime,
+        converged_claims,
         blob_scope_router,
     ),
     fields(
@@ -5085,6 +5168,13 @@ async fn dispatch_inbound(
     // (verify still runs) but no runtime hook fires — same posture as
     // `blob_chunk_source` for the chunked-blob swarm.
     swarm_runtime: Option<&Arc<crate::swarm::FountainSwarmRuntime>>,
+    // CIRISEdge#545 — the READ side of the same claim plane. NOT
+    // `Option`: the tap fires on every verified holding claim whether or
+    // not a converger is installed, because "what has this node
+    // converged about its cohort" is a question about the claim plane,
+    // not about whether an eviction policy happens to be running. The
+    // old arm dropped the envelope entirely with no runtime installed.
+    converged_claims: &crate::holonomic::converged_view::ConvergedClaimView,
     // CIRISEdge#499 — the blob plane's scope-address resolver, read from the
     // transport's installed table so there is exactly ONE source of truth for
     // "is this node scope-native". Default (no table) leaves the blob serve gate
@@ -6126,22 +6216,35 @@ async fn dispatch_inbound(
     // gate at this point. When no runtime is installed, the envelope
     // is observed but no hook fires (same posture as `blob_chunk_source`
     // for the chunked-blob swarm).
+    //
+    // CIRISEdge#545 — the parse moved OUT of the `if let Some(runtime)`
+    // and the READ-side tap fires first, unconditionally. Two
+    // consequences, both wanted: the converged view answers on a node
+    // that never installed a converger (the claim plane is what it
+    // reports on, not the eviction policy), and a malformed body on a
+    // VERIFIED envelope now warns whether or not a runtime is listening
+    // — that warning was previously invisible on exactly the
+    // deployments least likely to notice.
     if envelope.message_type == MessageType::FountainHoldingClaim {
-        if let Some(runtime) = swarm_runtime {
-            match serde_json::from_str::<crate::holonomic::swarm_rarity::FountainHoldingClaim>(
-                envelope.body.get(),
-            ) {
-                Ok(claim) => {
+        match serde_json::from_str::<crate::holonomic::swarm_rarity::FountainHoldingClaim>(
+            envelope.body.get(),
+        ) {
+            Ok(claim) => {
+                // Tap by reference, then hand the claim to the converger
+                // by value — no clone. Both sides see the identical
+                // post-AV-9 claim.
+                converged_claims.observe(&claim);
+                if let Some(runtime) = swarm_runtime {
                     runtime.register_observed_claim(claim).await;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        transport = ?transport,
-                        sender_key_id = %envelope.signing_key_id,
-                        "FountainHoldingClaim body parse failed at dispatch (CIRISEdge#184)",
-                    );
-                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    transport = ?transport,
+                    sender_key_id = %envelope.signing_key_id,
+                    "FountainHoldingClaim body parse failed at dispatch (CIRISEdge#184)",
+                );
             }
         }
     }
@@ -7170,6 +7273,12 @@ impl EdgeBuilder {
             blob_chunk_source: self.blob_chunk_source,
             replication_registry: Arc::new(ReinstallableCell::new("replication_registry")),
             swarm_runtime: Arc::new(ReinstallableCell::new("swarm_runtime")),
+            // CIRISEdge#545 — constructed UNARMED. Until `run` (or
+            // `dispatch_inbound_for_test`) arms it, the reader answers
+            // "plane not armed", which is honest: a node whose inbound
+            // loop never started knows nothing about its cohort, and a
+            // zero here would be an artifact of a dead loop.
+            converged_claims: Arc::new(crate::holonomic::converged_view::ConvergedClaimView::new()),
             #[cfg(feature = "holonomic-consent-decay")]
             consent_decay_shutdown: Arc::new(std::sync::OnceLock::new()),
             subscription_filter: self.subscription_filter,
