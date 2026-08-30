@@ -149,6 +149,15 @@ pub struct Session {
     /// The long-lived session preserves this across the Diff →
     /// Deliver phase boundary, so [`Self::on_deliver`] computes
     /// `BoundedBy { missing }` / `InSync` instead of `Unknown`.
+    ///
+    /// CIRISEdge#544 — this counts what we ASKED FOR, which is now the wanted
+    /// set MINUS the hashes this node has already refused. That is deliberate,
+    /// and it makes the signal more honest rather than less: a terminally
+    /// refused row is not an envelope still in flight, it is one this node
+    /// declined, and counting it kept a single junk row reporting
+    /// `BoundedBy { missing: 1 }` forever — permanently degrading every consumer
+    /// that conditions τ_partial on this signal, over a row that was never going
+    /// to arrive. The refusal itself stays loud at the apply choke.
     diff_want_count: Option<usize>,
     /// Whether the round has completed from this side's view.
     completed: bool,
@@ -480,7 +489,32 @@ impl Session {
         // so `want` became "everything" or the round went dark. `local_holdings`
         // is the node's peer-blind own-state; the offer + delivery stay send-gated.
         let local = provider.local_holdings(self.kind);
-        let want = diff_refs(&local, &remote.refs);
+        let mut want = diff_refs(&local, &remote.refs);
+        // CIRISEdge#544 — the re-offer loop is RECEIVER-PULLED, and this is where
+        // the pull is decided. `want` is memoryless: a refused row is never
+        // stored, so it is absent from `local_holdings`, so it comes straight
+        // back into `want` next round and the peer — doing exactly what we asked
+        // — delivers the identical bytes again. Measured on the canonical: one
+        // `conflicting_version` Key row, 55 re-offers in 30 minutes, same content
+        // hash every time. Dropping the hashes the applier has already refused,
+        // for the window its disposition earned, is the whole fix; the sender
+        // needs to be told nothing, because it was never the one choosing.
+        let before = want.len();
+        want.retain(|h| !provider.retry_suppressed(self.kind, h));
+        let suppressed = before - want.len();
+        if suppressed > 0 {
+            // DEBUG, not WARN: the suppression is the CURE, and the refusal that
+            // caused it already logged loud at the apply choke with its reason
+            // and disposition. A WARN here would re-flood the log this exists to
+            // quiet down.
+            tracing::debug!(
+                kind = ?self.kind,
+                suppressed,
+                still_wanted = want.len(),
+                "want: dropped hashes this node already refused — backing off \
+                 instead of re-asking every round (CIRISEdge#544)"
+            );
+        }
         let mut outbound = Vec::new();
         // Responder ALSO needs to send its Summary so the
         // initiator's side of the round can progress. We include it
@@ -692,11 +726,16 @@ impl Session {
                     );
                 }
                 // A gate REFUSED a well-formed envelope — the darkens-carriage class.
-                ApplyOutcome::Refused(reason) => {
+                // CIRISEdge#544 — the line now carries the RETRY disposition, so a
+                // reader can tell "this converges once more state lands" from "this
+                // will be refused identically forever" without knowing which persist
+                // token maps to which. It is a stable token, never prose.
+                ApplyOutcome::Refused { reason, retry } => {
                     refused += 1;
                     tracing::warn!(
                         kind = ?self.kind,
                         reason = %reason,
+                        retry = retry.as_str(),
                         "delivered envelope REFUSED — not applied (CIRISEdge#425 apply choke point)"
                     );
                 }
@@ -705,6 +744,11 @@ impl Session {
                     tracing::warn!(
                         kind = ?self.kind,
                         error = %err,
+                        // Terminal by nature: the wire identity is the content hash,
+                        // so re-fetching it returns bytes that fail to parse the same
+                        // way (CIRISEdge#544).
+                        retry = crate::replication::refusal_backoff::RetryDisposition::Terminal
+                            .as_str(),
                         "delivered envelope failed to DESERIALIZE — dropped, not applied \
                          (CIRISEdge#425 apply choke point)"
                     );
@@ -1669,6 +1713,88 @@ mod tests {
                 assert_eq!(refused, 3, "every refused envelope is counted, not dropped");
             }
             o => panic!("expected Applied, got {o:?}"),
+        }
+    }
+
+    /// CIRISEdge#544 — the re-offer loop is RECEIVER-PULLED, and this is the
+    /// pull. A peer advertises two rows the node lacks; the node has already
+    /// refused one of them, so its Diff asks for the OTHER one only. Nothing is
+    /// sent to the peer to make this happen — the sender was never the one
+    /// choosing, which is why the fix needs no wire change.
+    #[test]
+    fn the_rounds_want_omits_hashes_this_node_has_already_refused() {
+        /// A provider holding nothing, that has refused exactly `refused`.
+        struct SuppressingProvider {
+            refused: [u8; 32],
+        }
+        impl StateProvider for SuppressingProvider {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retry_suppressed(&self, _kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
+                *envelope_hash == self.refused
+            }
+        }
+
+        let provider = SuppressingProvider { refused: h(1) };
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Key);
+        // The peer advertises BOTH rows — including the one we cannot admit. It
+        // has no way to know, and does not need one.
+        let remote = SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![
+                EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                },
+                EnvelopeRef {
+                    envelope_hash: h(2),
+                    seq: 2,
+                },
+            ],
+        };
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(remote),
+            &provider,
+            &NoApply,
+            None,
+        ) else {
+            panic!("a Summary must produce Summary+Diff");
+        };
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the responder answers with a Diff");
+        assert_eq!(
+            diff.want,
+            vec![h(2)],
+            "the refused hash must not be re-requested; without this the row is \
+             in `want` every round forever (55 re-offers in 30 min, CIRISEdge#544)"
+        );
+        assert_eq!(
+            session.diff_want_count,
+            Some(1),
+            "staleness must be computed from what we ACTUALLY asked for, or a \
+             suppressed row reads as permanently-missing progress"
+        );
+    }
+
+    /// An applier for want-side tests, which never see a Deliver.
+    struct NoApply;
+    impl StateApplier for NoApply {
+        fn apply_envelope(
+            &self,
+            _k: EnvelopeKind,
+            _b: &[u8],
+            _source_peer: Option<&str>,
+        ) -> ApplyOutcome {
+            ApplyOutcome::refused("no envelope should reach this applier")
         }
     }
 

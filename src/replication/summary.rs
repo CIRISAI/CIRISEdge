@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::protocol::{EnvelopeKind, EnvelopeRef};
+use super::refusal_backoff::RetryDisposition;
 
 /// Snapshot of the envelopes a peer holds locally per
 /// [`EnvelopeKind`]. The state machine consumes this to build
@@ -104,6 +105,30 @@ pub trait StateProvider: Send + Sync {
         self.local_refs(kind)
     }
 
+    /// CIRISEdge#544 — should the round's `want` DROP this hash?
+    ///
+    /// The receive axis' third question, after "what do I offer" and "what do I
+    /// hold": *what have I already refused?* `want = remote ∖ holdings` is
+    /// otherwise memoryless, so a row a gate will never admit is re-requested
+    /// every round at the same cost as a healthy one — the #544 measurement was
+    /// 55 re-offers of one `conflicting_version` `Key` row in 30 minutes.
+    ///
+    /// This gates the ASK ONLY. A peer that pushes the row unsolicited is still
+    /// applied on its merits ([`StateApplier::apply_envelope`] never consults
+    /// this), so an over-eager `true` can delay a row but can never withhold
+    /// one. Implementations MUST decay: a permanently-`true` answer is a plane
+    /// going quietly dark, which is the failure this crate spends #423/#425/#433
+    /// refusing to allow.
+    ///
+    /// Defaults to `false` — every provider without a refusal memory (the test
+    /// providers, the DST store) keeps the pre-#544 ask-every-round behaviour.
+    /// The production `DirectoryStateAdapter` forwards to the ONE shared bridge,
+    /// so the verdict is node-wide: the first peer's refusal teaches every
+    /// peer's next round.
+    fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
+        false
+    }
+
     /// Return the byte-exact signed envelope for the given content
     /// hash, or `None` if the envelope isn't in local state. Called
     /// during the Deliver-message construction step.
@@ -184,7 +209,21 @@ pub enum ApplyOutcome {
     /// `Error::kind()`, a missing operational provider, a downgrade/ambiguous-owner
     /// rejection, … This is the class that DARKENS carriage: `on_deliver` logs it
     /// at WARN with `reason` (a short, stable, low-cardinality label). NEVER silent.
-    Refused(String),
+    ///
+    /// CIRISEdge#544 — `retry` is a SECOND required field, for the same structural
+    /// reason `reason` is one: #425 made "why" unforgettable by making it
+    /// impossible to construct a refusal without it, and "does re-asking help?"
+    /// was the next thing every apply branch was silently answering `yes` to.
+    /// The receiver's `want` is `remote ∖ holdings` and a refused row is never
+    /// stored, so EVERY refusal re-pulled its own bytes next round, forever —
+    /// one `conflicting_version` row measured at 55 re-offers in 30 minutes.
+    /// A new apply branch must now state the disposition; it cannot default into
+    /// the spin. [`RetryDisposition`] documents both directions of getting it
+    /// wrong.
+    Refused {
+        reason: String,
+        retry: RetryDisposition,
+    },
     /// The delivered bytes failed to deserialize into the plane's record type — a
     /// producer/consumer wire-shape skew, not absence of work. WARN with the error.
     Deserialize(String),
@@ -198,9 +237,51 @@ impl ApplyOutcome {
         matches!(self, ApplyOutcome::Admitted)
     }
 
-    /// A `Refused` with a borrowed-then-owned reason — ergonomic constructor.
+    /// A `Refused` whose verdict is decided by state still in motion — the
+    /// CONSERVATIVE constructor, and the right default for any refusal whose
+    /// underlying token collapses a recoverable arm together with an
+    /// unrecoverable one. Re-asking is bounded by
+    /// [`RetryDisposition::Transient`]'s short backoff, so calling a genuinely
+    /// terminal refusal transient costs a trickle; calling a recoverable one
+    /// terminal would withhold state. Reach for
+    /// [`Self::refused_terminal`] only when re-offering the IDENTICAL bytes
+    /// cannot change the answer.
     pub fn refused(reason: impl Into<String>) -> Self {
-        ApplyOutcome::Refused(reason.into())
+        ApplyOutcome::Refused {
+            reason: reason.into(),
+            retry: RetryDisposition::Transient,
+        }
+    }
+
+    /// CIRISEdge#544 — a `Refused` that re-offering the identical bytes cannot
+    /// move: a first-seen-wins conflict, a row this build cannot understand, a
+    /// plane this node opted out of admitting. The receiver stops ASKING for
+    /// these bytes for a long (never infinite) window; it never stops accepting
+    /// them if a peer pushes them anyway, and a corrected SUPERSEDING record is
+    /// different bytes — a different content hash — so it is unaffected.
+    pub fn refused_terminal(reason: impl Into<String>) -> Self {
+        ApplyOutcome::Refused {
+            reason: reason.into(),
+            retry: RetryDisposition::Terminal,
+        }
+    }
+
+    /// CIRISEdge#544 — what this outcome says about ASKING for the same bytes
+    /// again, or `None` when the question does not arise (the row is now held,
+    /// so it leaves `want` on its own).
+    ///
+    /// `Deserialize` is [`RetryDisposition::Terminal`] by nature and not by a
+    /// stored field: the wire identity IS the content hash, so re-fetching that
+    /// hash returns the same bytes and the same parse failure. The one event
+    /// that changes the answer — a build that understands the shape — restarts
+    /// the process, which empties the memory anyway.
+    #[must_use]
+    pub fn retry_disposition(&self) -> Option<RetryDisposition> {
+        match self {
+            ApplyOutcome::Admitted | ApplyOutcome::Duplicate => None,
+            ApplyOutcome::Refused { retry, .. } => Some(*retry),
+            ApplyOutcome::Deserialize(_) => Some(RetryDisposition::Terminal),
+        }
     }
 }
 
