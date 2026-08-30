@@ -499,12 +499,13 @@ impl ConvergedClaimView {
             symbol_count: u32::try_from(claim.symbol_ids.len()).unwrap_or(u32::MAX),
             observed_at: at,
         };
-        match st.claims.get_mut(&key) {
-            // Freshness updates to a pair we already track are ALWAYS
-            // accepted, cap or no cap: refusing them would freeze
-            // `newest_claim_age_ms` and make a live mesh look dead.
-            Some(slot) => *slot = entry,
-            None => {
+        // Freshness updates to a pair we already track are ALWAYS accepted, cap
+        // or no cap: refusing them would freeze `newest_claim_age_ms` and make a
+        // live mesh look dead.
+        if let Some(slot) = st.claims.get_mut(&key) {
+            *slot = entry;
+        } else {
+            {
                 if st.claims.len() >= self.max_tracked {
                     st.refused = st.refused.saturating_add(1);
                     return;
@@ -728,11 +729,13 @@ mod tests {
         // from 5 minutes ago, one 10 seconds ago.
         view.observe_at(
             &field_claim("peer-old", "content-1", &[1]),
-            now - Duration::from_secs(300),
+            now.checked_sub(Duration::from_secs(300))
+                .expect("test instant"),
         );
         view.observe_at(
             &field_claim("peer-new", "content-1", &[2]),
-            now - Duration::from_secs(10),
+            now.checked_sub(Duration::from_secs(10))
+                .expect("test instant"),
         );
         let reading = view.read_at(now);
         let v = reading.converged().expect("claims present");
@@ -746,7 +749,8 @@ mod tests {
         let now = far_future_now();
         view.observe_at(
             &field_claim("peer-a", "content-1", &[1]),
-            now - Duration::from_secs(590),
+            now.checked_sub(Duration::from_secs(590))
+                .expect("test instant"),
         );
         // Inside the horizon: still counted, but visibly stale — this is
         // the signal that distinguishes a live convergence from a dead
@@ -791,7 +795,8 @@ mod tests {
         let now = far_future_now();
         view.observe_at(
             &field_claim("peer-a", "content-1", &[1]),
-            now - Duration::from_secs(300),
+            now.checked_sub(Duration::from_secs(300))
+                .expect("test instant"),
         );
         view.observe(&field_claim("peer-b", "content-2", &[1])); // refused
         view.observe_at(&field_claim("peer-a", "content-1", &[1, 2]), now);
@@ -919,13 +924,17 @@ mod tests {
                 peer_id: "peer-live",
                 content_id: "content-1",
                 symbol_count: 3,
-                observed_at: now - Duration::from_secs(10),
+                observed_at: now
+                    .checked_sub(Duration::from_secs(10))
+                    .expect("test instant"),
             },
             ClaimObservation {
                 peer_id: "peer-expired",
                 content_id: "content-2",
                 symbol_count: 99,
-                observed_at: now - Duration::from_secs(10_000),
+                observed_at: now
+                    .checked_sub(Duration::from_secs(10_000))
+                    .expect("test instant"),
             },
         ];
         let v = fold_observations(obs, now, Duration::from_secs(600), Duration::ZERO, 0);

@@ -222,11 +222,12 @@ impl Default for SwarmRuntimeConfig {
 /// node actually runs. A row moving 64 → 40 is a relief up there and an
 /// expansion down here; the `min` is what makes it a no-op instead.
 const fn shrink_to(configured: u32, relieved: Option<u32>) -> u32 {
+    // `Ord::min` is not const; the branch is. `None` and a relief that does not
+    // shrink are the same answer — the operator's value stands — so they share
+    // one arm rather than two identical ones.
     match relieved {
-        None => configured,
-        // `Ord::min` is not const; the branch is.
         Some(r) if r < configured => r,
-        Some(_) => configured,
+        _ => configured,
     }
 }
 

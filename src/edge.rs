@@ -1946,7 +1946,6 @@ impl Edge {
     /// [`crate::observability::EdgeMetrics`] bag. Cheap clone; consumers
     /// (PyO3 / UniFFI projection methods, internal emission helpers,
     /// tests) call `.snapshot()` to render a typed bundle.
-    #[must_use]
     /// CIRISEdge#547 — seconds since the last anti-entropy round COMPLETED, or
     /// `None` if none has since boot.
     ///
@@ -1975,6 +1974,7 @@ impl Edge {
         Some(now.saturating_sub(stamp))
     }
 
+    #[must_use]
     pub fn metrics(&self) -> crate::observability::EdgeMetrics {
         self.metrics.clone()
     }
