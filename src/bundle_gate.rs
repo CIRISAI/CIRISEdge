@@ -652,6 +652,10 @@ pub(crate) mod test_support {
                 roles: vec!["infra:attest".to_string()],
             },
             TS,
+            // CIRISVerify v14.0.0 — `valid_until` is a new parameter between
+            // `valid_from` and the transport hints. `None` is this fixture's
+            // pre-v14 behaviour: no producer-stated expiry.
+            None,
             &[],
         )
         .await

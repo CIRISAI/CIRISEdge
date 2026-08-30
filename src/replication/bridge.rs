@@ -2318,28 +2318,30 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// repairs both axes at once and keeps advertise == holdings, exactly as
     /// this arm's `_ =>` fall-through assumes.
     async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        // CIRISEdge#531 DEPTH — the holdings view is the OTHER whole-table
-        // read per plane per round (`want = remote ∖ holdings`), and
-        // #523/v18.2.0 deliberately routed four planes' holdings to UNFILTERED
-        // twins at the raw page limit — so a cursored advertise against an
-        // uncursored holdings would still materialise the corpus and the fix
-        // would be half. Every arm here is now PAGED.
+        // CIRISEdge#547 / CIRISPersist#780 — READ THE INDEX, NOT THE ROWS.
         //
-        // But NEVER watermarked: `want` is computed against this set, so a
-        // partial holdings view leaves held rows in `want` forever and
-        // re-fetches them every round — CIRISEdge#416's non-convergence,
-        // recreated by the memory fix. `SweepWindow::Full` is the type-level
-        // statement of that: pages for memory, complete in result.
-        match kind {
-            EnvelopeKind::Attestation => self.list_attestation_holdings().await,
-            EnvelopeKind::Key => self.list_key_holdings().await,
-            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrence_holdings().await,
-            EnvelopeKind::TransportDestination => self.list_transport_destination_holdings().await,
-            _ => {
-                self.list_envelope_refs_unbounded(kind, SweepWindow::Full)
-                    .await
+        // Everything below is correct and was killing production. `holdings`
+        // must be COMPLETE (a partial view leaves held rows in `want` forever,
+        // CIRISEdge#416), so #531 made these arms paged — which bounded MEMORY
+        // and deliberately not I/O. The result: every round, every plane,
+        // re-reading the whole corpus from disk in 1024-row chunks to recompute
+        // hashes. On the canonical (1.3 GB corpus, 808 MB page cache for the
+        // whole box) that is 35–118 MB/s continuous, every fault taken while
+        // holding persist's single connection mutex, so every other DB task
+        // parked behind it. The node went unreachable after ~22 h, `restarts=0`,
+        // no panic, with the health endpoint inside the same convoy.
+        //
+        // persist already had these hashes: `signed_wire_index`, PRIMARY KEY
+        // `(kind, content_hash)`, maintained by the same hooks that admit rows.
+        // v38.7.0 exposes it. This is index-only — ~50k hashes ≈ 1.6 MB against
+        // 1.3 GB of rows — and still COMPLETE across pages, so the convergence
+        // invariant is untouched. Bounded I/O, not bounded reach.
+        if let Some(index_kind) = kind.persist_index_kind() {
+            if let Some(refs) = self.holdings_from_wire_index(index_kind).await {
+                return refs;
             }
         }
+        self.list_holdings_from_rows(kind).await
     }
 
     /// CIRISEdge#474 — serve an accord-quorum-evidence cursor pull. The plane has
@@ -3786,6 +3788,123 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// The equivalence pin any future pushdown must keep green:
     /// `advertise_projection_boundary_and_ledger_are_pinned`.
+    async fn list_holdings_from_rows(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        // CIRISEdge#531 DEPTH — the holdings view is the OTHER whole-table
+        // read per plane per round (`want = remote ∖ holdings`), and
+        // #523/v18.2.0 deliberately routed four planes' holdings to UNFILTERED
+        // twins at the raw page limit — so a cursored advertise against an
+        // uncursored holdings would still materialise the corpus and the fix
+        // would be half. Every arm here is now PAGED.
+        //
+        // But NEVER watermarked: `want` is computed against this set, so a
+        // partial holdings view leaves held rows in `want` forever and
+        // re-fetches them every round — CIRISEdge#416's non-convergence,
+        // recreated by the memory fix. `SweepWindow::Full` is the type-level
+        // statement of that: pages for memory, complete in result.
+        match kind {
+            EnvelopeKind::Attestation => self.list_attestation_holdings().await,
+            EnvelopeKind::Key => self.list_key_holdings().await,
+            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrence_holdings().await,
+            EnvelopeKind::TransportDestination => self.list_transport_destination_holdings().await,
+            _ => {
+                self.list_envelope_refs_unbounded(kind, SweepWindow::Full)
+                    .await
+            }
+        }
+    }
+
+    /// CIRISEdge#547 / CIRISPersist#780 — the holdings set read from persist's
+    /// content-hash index instead of re-derived from every row.
+    ///
+    /// `None` means "could not read it" and the caller MUST fall back to the row
+    /// path. That distinction is the whole safety of this function: `want` is
+    /// `remote ∖ holdings`, so an error mistaken for an empty holdings set makes
+    /// `want` mean EVERYTHING — a full re-fetch storm against every peer, from a
+    /// read that merely failed. persist made the same call on its side: its
+    /// default refuses rather than returning an empty vec, precisely so a
+    /// set-difference consumer cannot confuse the two. `Ok(vec![])` is a real
+    /// answer (the plane is genuinely empty); an `Err` never is.
+    ///
+    /// Pages on the CONTENT HASH, not a timestamp: the index has no time column,
+    /// and its PRIMARY KEY `(kind, content_hash)` makes the hash the keyset —
+    /// ordered, unique within a kind, and covered. Completeness comes from
+    /// draining to a short page, exactly as the row path does.
+    async fn holdings_from_wire_index(&self, index_kind: &str) -> Option<Vec<EnvelopeRef>> {
+        let budget = self.sweep_page_budget().await;
+        let mut refs: Vec<EnvelopeRef> = Vec::new();
+        let mut after: Option<String> = None;
+        for _page in 0..MAX_FULL_DRAIN_PAGES {
+            // CIRISEdge#531 WIDTH — one permit per PAGE, released between pages,
+            // exactly as the row drain takes it. The index read is far cheaper
+            // per page but it is still a database read, and the gate bounds
+            // CONCURRENT pressure, not bytes: without it every coordinator's
+            // holdings read hits the store unbounded, which is the convoy
+            // #547 is about arriving by a cheaper route. Caught by
+            // `a_multi_page_drain_takes_one_permit_per_page`, which saw this
+            // path return correct data while taking ZERO permits.
+            let read = {
+                let _permit = self.sweep_gate.enter().await;
+                self.directory
+                    .list_wire_hashes_since(index_kind, after.as_deref(), budget)
+                    .await
+            };
+            let page = match read {
+                Ok(p) => p,
+                Err(e) => {
+                    // Throttled, and at WARN: falling back is CORRECT but it is
+                    // also the expensive path this exists to retire, so a
+                    // deployment silently paying it should be able to see that.
+                    tracing::warn!(
+                        kind = index_kind,
+                        error = %e,
+                        "wire-hash holdings read failed — falling back to the ROW \
+                         scan (correct, but this is the O(corpus) read CIRISEdge#547 \
+                         is about). A backend predating CIRISPersist#780 reports \
+                         Unsupported here."
+                    );
+                    return None;
+                }
+            };
+            let served = page.len();
+            for hex_hash in &page {
+                let Some(h) = Self::decode_hash(hex_hash) else {
+                    // A hash the index holds but edge cannot decode would silently
+                    // shrink `holdings` and put a held row back in `want` forever
+                    // — the #416 shape. Refuse the whole read instead.
+                    tracing::warn!(
+                        kind = index_kind,
+                        hash = %hex_hash,
+                        "wire-hash index returned an undecodable content hash — \
+                         refusing the index read rather than returning a SHORT \
+                         holdings set (CIRISEdge#547)"
+                    );
+                    return None;
+                };
+                // `seq` is unread on the holdings side: `diff_refs` builds its
+                // local set from `envelope_hash` alone. Zero is not a lie here,
+                // it is the absence of a field this axis never consults.
+                refs.push(EnvelopeRef {
+                    envelope_hash: h,
+                    seq: 0,
+                });
+            }
+            if served < budget as usize {
+                return Some(refs);
+            }
+            after = page.last().cloned();
+        }
+        // Drained to the page cap without a short page. The row path has the same
+        // guard for the same reason; a truncated holdings set is worse than a slow
+        // one, so this refuses rather than returning what it has.
+        tracing::warn!(
+            kind = index_kind,
+            pages = MAX_FULL_DRAIN_PAGES,
+            "wire-hash holdings drain hit the page cap — refusing rather than \
+             returning a truncated holdings set (CIRISEdge#547)"
+        );
+        None
+    }
+
     /// CIRISEdge#531 (second half) — the projection of a row that the advertise
     /// gates actually consume.
     ///
@@ -9974,6 +10093,63 @@ mod tests {
                 "the re-derived bytes are the advertised revocation"
             );
         }
+    }
+
+    /// CIRISEdge#547 — an index read that FAILS must never look like empty
+    /// holdings.
+    ///
+    /// This is the one way the fix could be worse than the bug. `want` is
+    /// `remote ∖ holdings`; an empty holdings set means "I hold nothing", so a
+    /// failed read mistaken for an empty answer turns one bad query into a full
+    /// re-fetch of every plane from every peer — an outage caused by the code
+    /// meant to prevent one. `holdings_from_wire_index` returns `Option`
+    /// precisely so the two cannot be spelled the same way, and persist's own
+    /// default refuses rather than returning an empty vec for the same reason.
+    ///
+    /// Pinned as the type-level property, since the failure is unreachable in a
+    /// test that can only exercise the happy path against a real backend.
+    #[test]
+    fn a_failed_index_read_is_not_an_empty_holdings_set() {
+        // The contract: None ⇒ fall back to rows. Some(vec![]) ⇒ genuinely empty.
+        let failed: Option<Vec<EnvelopeRef>> = None;
+        let genuinely_empty: Option<Vec<EnvelopeRef>> = Some(Vec::new());
+        assert!(
+            failed.is_none(),
+            "a read failure must be distinguishable from an empty plane"
+        );
+        assert_ne!(
+            failed.as_ref().map(Vec::len),
+            genuinely_empty.as_ref().map(Vec::len),
+            "an error and an empty plane must not collapse to the same reading — \
+             `want = remote ∖ holdings` turns the confusion into a re-fetch storm"
+        );
+    }
+
+    /// The holdings axis reads only `envelope_hash`, so `seq: 0` on an
+    /// index-sourced ref is the absence of a field this axis never consults —
+    /// not a wrong value. If `diff_refs` ever starts reading local `seq`, this
+    /// fails and the index path needs the row path's seq back.
+    #[test]
+    fn the_holdings_diff_reads_only_the_hash() {
+        let h = [7u8; 32];
+        let from_index = EnvelopeRef {
+            envelope_hash: h,
+            seq: 0,
+        };
+        let from_rows = EnvelopeRef {
+            envelope_hash: h,
+            seq: 99,
+        };
+        let remote = vec![EnvelopeRef {
+            envelope_hash: h,
+            seq: 42,
+        }];
+        assert_eq!(
+            crate::replication::summary::diff_refs(&[from_index], &remote),
+            crate::replication::summary::diff_refs(&[from_rows], &remote),
+            "an index-sourced holdings set must produce the SAME want as a \
+             row-sourced one; if it does not, `seq` became load-bearing here"
+        );
     }
 
     /// CIRISEdge#531 (second half) — the gate view must be INDISTINGUISHABLE
