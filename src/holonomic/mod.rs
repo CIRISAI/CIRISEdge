@@ -75,6 +75,19 @@
 //!   [`assemble_tier_meta_v2`](aggregation::assemble_tier_meta_v2) tier
 //!   assembly. v1 preimages stay byte-identical; new tiers emit version 2.
 //!
+//! - **v18.12.0** (CIRISEdge#545) adds [`converged_view`] — the READ
+//!   side of the claim plane the swarm converger has been consuming
+//!   write-only since v6.3.0. `install_swarm_runtime` routed verified
+//!   `FountainHoldingClaim` envelopes into the converger and the
+//!   information stopped there, so a downstream mesh-status surface
+//!   (CIRISServer#498) could only report one observer's own store.
+//!   [`converged_view::ConvergedClaimView`] taps the same post-verify
+//!   dispatch arm and answers "what has this node converged about its
+//!   cohort" in COUNTS — never peer/content identifiers, because the
+//!   consumer is a public endpoint and an enumerable member list is a
+//!   reconnaissance surface — with "nothing computed yet" typed
+//!   distinctly from "converged to nothing".
+//!
 //! See `docs/ROADMAP_TO_V4.md` for the cut sequence and the
 //! CIRISRegistry#85 + #89 absorption gates for normative CEG status.
 //!
@@ -84,6 +97,13 @@
 pub mod consent_decay;
 
 pub mod aggregation;
+/// CIRISEdge#545 — the READ side of the holonomic claim plane. The
+/// converger consumed verified `FountainHoldingClaim`s and nothing could
+/// ask it what it had converged; [`converged_view::ConvergedClaimView`]
+/// answers that in COUNTS (never contents), with unknown typed
+/// separately from zero. Ungated: a status surface must be reachable
+/// from every build, including the Python wheel.
+pub mod converged_view;
 pub mod deterministic_topology;
 pub mod fountain_defaults;
 /// §19.7.1.3 content-similarity multiplicity — the CC 6.1.2.1.2 R9 producer
