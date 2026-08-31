@@ -51,6 +51,9 @@
 pub mod blob_swarm;
 pub mod bundle_gate;
 pub mod cohort_scope;
+/// CIRISEdge#552/#554 — the contact ladder: announce → discover → request →
+/// consent → chat, with one greppable log shape per rung.
+pub mod contact;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
 pub mod delivery_mode;

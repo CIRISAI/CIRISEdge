@@ -138,9 +138,19 @@ pub enum ReplicationOutcome {
 // sake would make the type lie about that.
 #[allow(clippy::struct_excessive_bools)]
 pub struct Session {
-    /// CIRISEdge#552 — this node asked for something ON PURPOSE and the reply is
-    /// outstanding. See [`Self::expect_on_demand_reply`].
-    on_demand_reply_pending: bool,
+    /// CIRISEdge#552 — the exact hashes this node asked for ON PURPOSE. Only
+    /// these are applied under hash-first; a peer answering a Fetch cannot
+    /// append arbitrary bodies and have them accepted.
+    pending_bodies: std::collections::HashSet<[u8; 32]>,
+    /// CIRISEdge#552 — rounds for which a Pull's reply is still expected.
+    ///
+    /// A COUNTER, not a flag, and decremented rather than cleared on reset: a
+    /// Pull issued during an ordinary scheduled round would otherwise have its
+    /// exemption cleared by THAT round completing, before the subject-scoped
+    /// reply arrived. A Pull cannot name its hashes in advance — that is what it
+    /// is for — so this is the one window that must stay a window. It converts
+    /// to exact hashes the moment the reply names them.
+    pull_exempt_rounds: u8,
     role: SessionRole,
     kind: EnvelopeKind,
     /// What we sent the peer in our most recent Summary — used to
@@ -216,7 +226,8 @@ impl Session {
             role,
             kind,
             last_summary_sent: None,
-            on_demand_reply_pending: false,
+            pending_bodies: std::collections::HashSet::new(),
+            pull_exempt_rounds: 0,
             last_remote_summary: None,
             diff_want_count: None,
             completed: false,
@@ -251,12 +262,15 @@ impl Session {
         self.diff_want_count = None;
         self.completed = false;
         self.awaiting_cursor_deliver = false;
-        // CIRISEdge#552 — the on-demand exemption is ROUND-scoped, not
-        // message-scoped. It cannot be consumed by whichever reply happens to
-        // arrive first (it carries no correlation to the request), so it is
-        // released when the round it belongs to ends. That bounds the
-        // over-fetch to one round instead of exempting the session forever.
-        self.on_demand_reply_pending = false;
+        // CIRISEdge#552 — DECREMENT, never clear. A Pull issued during an
+        // ordinary scheduled round must not have its exemption killed by THAT
+        // round completing: the subject-scoped reply had not arrived yet, and
+        // clearing here made testimony recovery timing-dependent.
+        self.pull_exempt_rounds = self.pull_exempt_rounds.saturating_sub(1);
+        if self.pull_exempt_rounds == 0 {
+            // The window closed; anything still outstanding was never answered.
+            self.pending_bodies.clear();
+        }
     }
 
     pub fn role(&self) -> SessionRole {
@@ -496,8 +510,23 @@ impl Session {
     /// cannot quietly promote every later round on this session into a full body
     /// fetch — a permanent opt-out from hash-first bought with one Pull.
     pub fn expect_on_demand_reply(&mut self) {
-        self.on_demand_reply_pending = true;
+        self.pull_exempt_rounds = Self::PULL_EXEMPT_ROUNDS;
     }
+
+    /// CIRISEdge#552 — record the exact hashes a Fetch asked for.
+    ///
+    /// Precise where the Pull window cannot be: a Fetch names its want, so only
+    /// those bodies are applied. Without this, a peer answering a Fetch could
+    /// append arbitrary directory bodies and have every one accepted — the
+    /// corpus-size and address-book properties lost to a generous responder.
+    pub fn expect_bodies(&mut self, hashes: impl IntoIterator<Item = [u8; 32]>) {
+        self.pending_bodies.extend(hashes);
+    }
+
+    /// How many round-resets a Pull's exemption survives. Small: it bounds the
+    /// over-fetch, and a reply that has not arrived in three rounds is not
+    /// coming.
+    const PULL_EXEMPT_ROUNDS: u8 = 3;
 
     fn on_pull(&mut self, pull: &PullMessage, provider: &dyn StateProvider) -> ReplicationOutcome {
         if pull.kind != self.kind {
@@ -571,6 +600,13 @@ impl Session {
         // `retention_for` is not bypassable by a provider: a `HashFirst` answer
         // for a plane that RETRACTS something still comes back `Bodies`. A node
         // holding the hash of a revocation has not applied it (CIRISEdge#553).
+        // A Pull's reply names the hashes at last: convert the WINDOW into an
+        // exact set, so the Deliver that follows is checked against what we
+        // actually asked for rather than merely arriving during the window.
+        let answering_on_demand = self.pull_exempt_rounds > 0;
+        if answering_on_demand {
+            self.pending_bodies.extend(want.iter().copied());
+        }
         // An on-demand reply is never suppressed.
         //
         // PEEKED, not taken. The marker identifies "a deliberate ask is
@@ -589,7 +625,6 @@ impl Session {
         //
         // Correlating properly needs the reply to identify its request, which is
         // a wire change and its own cut.
-        let answering_on_demand = self.on_demand_reply_pending;
         if !answering_on_demand
             && retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst
         {
@@ -780,50 +815,23 @@ impl Session {
         // reasons differ. Suppression is about a row we tried and could not
         // admit; hash-first is about a body we chose not to store, and applying
         // it anyway would defeat the choice.
-        // A Fetch reply is a bare Deliver with no round behind it, so it would
-        // otherwise read as an unsolicited push. Peeked for the same reason as
-        // the Summary path: the reply carries no correlation to the request.
-        let answering_on_demand = self.on_demand_reply_pending;
+        // Only the bodies this node ASKED FOR are exempt, checked per envelope
+        // rather than per message. A peer answering a Fetch can append whatever
+        // it likes; appending does not make it requested.
+        // CIRISEdge#552 — under hash-first a body is applied only if this node
+        // ASKED for it, and the check is PER ENVELOPE (in the apply loop below).
+        // A responder can append bodies to a Fetch reply, and appending does not
+        // make them requested; gating the whole message on "any envelope
+        // matched" would let one requested body carry an arbitrary payload past
+        // the gate.
+        //
         // `unwrap_or(0) == 0`, not `is_none()`: a hash-first Summary sets
         // `diff_want_count = Some(0)`, so `is_none()` was false and a proactive
-        // publisher's Deliver — which arrives right after its Summary — sailed
-        // through and applied. The node then accumulated exactly the corpus it
-        // had just declined. The question is "did we ask for anything", and an
-        // empty ask is not an ask.
-        if !answering_on_demand
-            && self.diff_want_count.unwrap_or(0) == 0
-            && retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst
-        {
-            let learned: Vec<[u8; 32]> = deliver
-                .envelopes
-                .iter()
-                .map(|bytes| {
-                    use sha2::{Digest as _, Sha256};
-                    let h: [u8; 32] = Sha256::digest(bytes).into();
-                    h
-                })
-                .collect();
-            provider.note_known_hashes(self.kind, &learned, source_peer);
-            tracing::debug!(
-                kind = ?self.kind,
-                count = learned.len(),
-                peer = ?source_peer,
-                "hash-first: an unsolicited Deliver was LEARNED, not applied — \
-                 a proactive push must not backfill a corpus this node declined \
-                 to fetch (CIRISEdge#552)"
-            );
-            // `admitted: 0, refused: 0` is the honest pair: nothing was admitted,
-            // and nothing was REFUSED either — the bodies were declined, not
-            // rejected. The learn is not lost: it is in the known set and in this
-            // log line, which is where a "why did my push not land" question gets
-            // answered.
-            return ReplicationOutcome::Applied {
-                kind: self.kind,
-                admitted: 0,
-                refused: 0,
-                staleness: StalenessSignal::InSync,
-            };
-        }
+        // publisher's Deliver — arriving right after its Summary — sailed
+        // through and applied. An empty ask is not an ask. A NON-empty want
+        // means this exchange is ordinary solicited anti-entropy and is ungated.
+        let hash_first_active = self.diff_want_count.unwrap_or(0) == 0
+            && retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst;
         // CIRISEdge#426 — distinguish a SOLICITED Deliver (it answers a `Diff` we
         // sent this round — `diff_want_count` is set) from an UNSOLICITED one (a
         // bare push with no in-flight round we invited — the #927 proactive-publish
@@ -878,6 +886,25 @@ impl Session {
         // withholds carriage can therefore never again read as absence of work; the
         // `refused` count in the `RoundReport` always has a matching WARN saying WHY.
         for env_bytes in &deliver.envelopes {
+            // CIRISEdge#552 — PER ENVELOPE, not per message. A responder can
+            // append bodies to a Fetch reply, and appending does not make them
+            // requested. Gating the whole message on "any envelope matched"
+            // would let one requested body carry an arbitrary payload of
+            // unrequested ones past the gate.
+            if hash_first_active {
+                use sha2::{Digest as _, Sha256};
+                let h: [u8; 32] = Sha256::digest(env_bytes).into();
+                if !self.pending_bodies.remove(&h) {
+                    provider.note_known_hashes(self.kind, &[h], source_peer);
+                    tracing::debug!(
+                        kind = ?self.kind,
+                        peer = ?source_peer,
+                        "hash-first: a body this node did not ask for was LEARNED, \
+                         not applied (CIRISEdge#552)"
+                    );
+                    continue;
+                }
+            }
             match applier.apply_envelope(self.kind, env_bytes, source_peer) {
                 ApplyOutcome::Admitted => admitted += 1,
                 // Routine non-progress (a re-delivered held row) — quiet by design;
@@ -2085,7 +2112,7 @@ mod tests {
         );
     }
 
-    /// The exemption is ROUND-scoped, and released by `reset`.
+    /// The exemption survives a round it does not belong to.
     ///
     /// It cannot be message-scoped: the reply to a Pull is byte-identical in
     /// shape to an ordinary Summary, so consuming it on the next message let a
@@ -2138,7 +2165,27 @@ mod tests {
             "the exemption must survive a Summary that is not the Pull reply"
         );
 
-        // The round ends; the exemption goes with it.
+        // An UNRELATED round completes. The exemption must survive it: a Pull
+        // issued during a scheduled round would otherwise have its exemption
+        // killed by that round finishing first, and testimony recovery became
+        // timing-dependent.
+        session.reset();
+        let ReplicationOutcome::Send(mid) = session.on_message(
+            ReplicationMessage::Summary(summary(3)),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+        assert!(
+            mid.iter()
+                .any(|m| matches!(m, ReplicationMessage::Diff(d) if !d.want.is_empty())),
+            "one unrelated round completing must not kill the exemption"
+        );
+
+        // It is bounded, though: after its window it lapses.
+        session.reset();
         session.reset();
         let ReplicationOutcome::Send(msgs) = session.on_message(
             ReplicationMessage::Summary(summary(2)),
@@ -2157,7 +2204,7 @@ mod tests {
             .expect("the round sends a Diff");
         assert!(
             diff.want.is_empty(),
-            "the exemption must not outlive its round — got {} wanted after reset",
+            "the exemption is bounded — got {} wanted after its window lapsed",
             diff.want.len()
         );
     }

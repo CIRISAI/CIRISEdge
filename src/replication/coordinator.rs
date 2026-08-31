@@ -414,9 +414,15 @@ impl ReplicationCoordinator {
         }
         let fetch = ReplicationMessage::Fetch(FetchMessage {
             kind: self.kind,
-            want,
+            want: want.clone(),
         });
-        self.session.lock().await.expect_on_demand_reply();
+        // CIRISEdge#552 — record the EXACT hashes, so only these are applied.
+        // A responder can append whatever it likes to the reply; appending does
+        // not make it requested.
+        self.session
+            .lock()
+            .await
+            .expect_bodies(want.iter().copied());
         self.send_message(&fetch).await
     }
 
