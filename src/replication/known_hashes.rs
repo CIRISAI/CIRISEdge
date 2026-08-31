@@ -129,22 +129,65 @@ impl KnownHashes {
             self.entries.clear();
             return;
         }
-        // Evict by RANK, not by timestamp threshold.
+        // Evict from the LARGEST HOLDER first, then by RANK within it.
         //
-        // A threshold over-evicts on ties, and ties are the normal case here:
-        // every hash learned in one round shares a timestamp, so `retain(stamp >
-        // cutoff)` could drop a whole round's worth — far more than the batch,
-        // and precisely the entries most recently learned if the cap is hit
+        // Staleness alone is monopolizable. A peer that advertises a torrent of
+        // hashes always holds the YOUNGEST entries, so a global stalest-first
+        // pass evicts everyone ELSE — one peer can push every honest peer's
+        // directory knowledge out of a cap it is simultaneously filling. The
+        // holder map is what makes a hash actionable (it names who to fetch
+        // from), so losing it for honest peers is the whole feature degrading
+        // under exactly the hostile case the cap exists to tolerate.
+        //
+        // Charging eviction to the peer with the most entries is max-min
+        // fairness: under contention no peer can hold much more than its share,
+        // while a node talking to ONE peer still gets the whole cap — a fixed
+        // per-peer quota would waste it in the common case.
+        let mut per_peer: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for v in self.entries.values() {
+            *per_peer.entry(v.last_advertised_by.as_str()).or_insert(0) += 1;
+        }
+        // Ties broken by peer id so the choice is deterministic — an arbitrary
+        // pick would make eviction depend on map iteration order.
+        let dominant: Option<String> = per_peer
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(p, _)| p.to_owned());
+
+        // Rank, not a timestamp threshold: a threshold over-evicts on ties, and
+        // ties are the normal case here — every hash learned in one round shares
+        // a timestamp, so `retain(stamp > cutoff)` could drop a whole round's
+        // worth, precisely the entries most recently learned if the cap is hit
         // mid-round. Selecting exactly `target` keys keeps the batch a batch.
         let mut keys: Vec<(u64, (EnvelopeKind, [u8; 32]))> = self
             .entries
             .iter()
+            .filter(|(_, v)| {
+                // `map_or(true, ..)`, not `is_none_or`: that is stable since
+                // 1.82 and this crate's MSRV is 1.75.
+                dominant
+                    .as_deref()
+                    .map_or(true, |d| v.last_advertised_by == d)
+            })
             .map(|(k, v)| (v.last_advertised_unix, *k))
             .collect();
-        // `select_nth_unstable` is O(n) and needs no full sort — we want the
-        // `target` stalest, not an ordering of all of them.
-        keys.select_nth_unstable_by_key(target, |(stamp, _)| *stamp);
-        for (_, key) in keys.into_iter().take(target) {
+        // The dominant holder may hold fewer than a batch (many small peers).
+        // Then it is not monopolizing anything and the global stalest pass is
+        // the right one — take everything it has and fall back for the rest.
+        if keys.len() < target {
+            keys = self
+                .entries
+                .iter()
+                .map(|(k, v)| (v.last_advertised_unix, *k))
+                .collect();
+        }
+        let take = target.min(keys.len());
+        if take < keys.len() {
+            // `select_nth_unstable` is O(n) and needs no full sort — we want the
+            // `take` stalest, not an ordering of all of them.
+            keys.select_nth_unstable_by_key(take, |(stamp, _)| *stamp);
+        }
+        for (_, key) in keys.into_iter().take(take) {
             self.entries.remove(&key);
         }
     }
@@ -357,5 +400,84 @@ mod tests {
         k.note(EnvelopeKind::Attestation, h(1), "p", 300);
         assert_eq!(k.len(), 2);
         assert!(k.contains(EnvelopeKind::Attestation, &h(2)));
+    }
+
+    /// CIRISEdge#552 — one peer must not be able to evict every OTHER peer's
+    /// entries out of the cap.
+    ///
+    /// Staleness alone is monopolizable: a peer advertising a torrent always
+    /// holds the youngest entries, so a global stalest-first pass charges every
+    /// eviction to the quiet, honest peers. Losing their entries loses the
+    /// HOLDER — the thing that makes a hash actionable — under exactly the
+    /// hostile case the cap exists to tolerate.
+    #[test]
+    fn a_flooding_peer_cannot_evict_a_quiet_peers_entries() {
+        let mut k = KnownHashes::with_cap(64);
+
+        // A quiet, honest peer's entries, learned first and never refreshed —
+        // the stalest in the set, and under stalest-first the first to go.
+        let quiet: Vec<[u8; 32]> = (0..8).map(h).collect();
+        for hash in &quiet {
+            k.note(EnvelopeKind::Attestation, *hash, "peer-quiet", 100);
+        }
+
+        // A flooding peer advertises many times the cap, always fresher.
+        for i in 0..500u32 {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&i.to_be_bytes());
+            hash[31] = 0xFF;
+            k.note(
+                EnvelopeKind::Attestation,
+                hash,
+                "peer-flood",
+                200 + u64::from(i),
+            );
+        }
+
+        let survived = quiet
+            .iter()
+            .filter(|hash| k.contains(EnvelopeKind::Attestation, hash))
+            .count();
+        assert_eq!(
+            survived,
+            quiet.len(),
+            "the quiet peer's entries must survive a flood — eviction is charged \
+             to the LARGEST holder, not to whoever happens to be stalest"
+        );
+        assert!(
+            k.len() <= 64,
+            "the cap still bounds memory: {} entries",
+            k.len()
+        );
+        assert_eq!(
+            k.holder(EnvelopeKind::Attestation, &quiet[0]),
+            Some("peer-quiet"),
+            "and the holder map survives with them — a hash without a holder \
+             cannot be fetched"
+        );
+    }
+
+    /// The fair-share pass must not stall eviction when NO peer dominates: with
+    /// many small holders the largest may hold less than a batch, and the cap
+    /// still has to be enforced.
+    #[test]
+    fn eviction_still_bounds_the_cap_when_no_peer_dominates() {
+        let mut k = KnownHashes::with_cap(32);
+        for i in 0..400u32 {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&i.to_be_bytes());
+            // A different holder for nearly every entry.
+            k.note(
+                EnvelopeKind::Attestation,
+                hash,
+                &format!("peer-{i}"),
+                100 + u64::from(i),
+            );
+        }
+        assert!(
+            k.len() <= 32,
+            "the cap is enforced regardless of holder distribution: {} entries",
+            k.len()
+        );
     }
 }
