@@ -125,6 +125,39 @@ pub trait StateProvider: Send + Sync {
     /// The production `DirectoryStateAdapter` forwards to the ONE shared bridge,
     /// so the verdict is node-wide: the first peer's refusal teaches every
     /// peer's next round.
+    /// CIRISEdge#552 — how much of `kind` this node keeps.
+    ///
+    /// Defaults to [`Retention::Bodies`](super::retention::Retention::Bodies),
+    /// the pre-#552 behaviour, so every existing provider, mock and DST harness
+    /// is unchanged. Sync for the same reason `retry_suppressed` is: a
+    /// configuration read consulted once per round, never I/O.
+    ///
+    /// A provider cannot bypass the revocation carve-out by answering
+    /// `HashFirst` here — the round passes this through
+    /// [`retention_for`](super::retention::retention_for), which pins the
+    /// retracting planes to `Bodies` regardless.
+    fn retention(&self, _kind: EnvelopeKind) -> super::retention::Retention {
+        super::retention::Retention::Bodies
+    }
+
+    /// CIRISEdge#552 — learn that `advertised_by` offered these hashes for
+    /// `kind`, without this node fetching their bodies.
+    ///
+    /// The node knows the records exist and who to ask; it simply has not pulled
+    /// them. Defaults to a no-op, so a `Bodies` provider needs nothing.
+    ///
+    /// These are **not holdings** and must never be returned from
+    /// [`Self::local_holdings`]. `want = remote ∖ holdings`, so a
+    /// known-but-not-held hash on the holdings side makes the node conclude it
+    /// already has what it has merely heard of — and stop fetching, silently.
+    fn note_known_hashes(
+        &self,
+        _kind: EnvelopeKind,
+        _hashes: &[[u8; 32]],
+        _advertised_by: Option<&str>,
+    ) {
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }

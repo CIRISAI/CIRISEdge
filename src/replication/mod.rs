@@ -120,11 +120,18 @@ pub mod accord_relay_gate;
 pub mod bridge;
 pub mod coordinator;
 pub mod directory;
+/// CIRISEdge#552 — hashes known to exist whose bodies this node does not
+/// hold. NEVER holdings; see the module docs for why that distinction is the
+/// whole safety of the design.
+pub mod known_hashes;
 pub mod mesh_config;
 pub mod protocol;
 pub mod refusal_backoff;
 pub mod registry;
 pub mod resolved_state;
+/// CIRISEdge#552/#553 — how much of a plane this node keeps, and the
+/// revocation carve-out a configured retention cannot reach.
+pub mod retention;
 pub mod runtime;
 pub mod scheduler;
 pub mod serve_policy;

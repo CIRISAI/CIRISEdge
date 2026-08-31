@@ -39,6 +39,7 @@ use super::protocol::{
     CursorPullMessage, DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage,
     PullMessage, ReplicationMessage, SummaryMessage,
 };
+use super::retention::{retention_for, Retention};
 use super::summary::{diff_refs, ApplyOutcome, StalenessSignal, StateApplier, StateProvider};
 
 /// What role a session is playing in this round. Initiator emits
@@ -405,7 +406,7 @@ impl Session {
     ) -> ReplicationOutcome {
         match msg {
             ReplicationMessage::Summary(remote_summary) => {
-                self.on_summary(&remote_summary, provider)
+                self.on_summary(&remote_summary, provider, source_peer)
             }
             ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider, source_peer),
             ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier, source_peer),
@@ -477,6 +478,10 @@ impl Session {
         &mut self,
         remote: &SummaryMessage,
         provider: &dyn StateProvider,
+        // CIRISEdge#552 — the advertising peer. A Summary is where the holder map
+        // is learned: knowing a record exists is only actionable alongside who
+        // offered it, and this is the one arm that sees both.
+        source_peer: Option<&str>,
     ) -> ReplicationOutcome {
         if remote.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
@@ -515,6 +520,31 @@ impl Session {
                  instead of re-asking every round (CIRISEdge#544)"
             );
         }
+        // ── CIRISEdge#552: HASH-FIRST ────────────────────────────────────────
+        // Learn the peer's hashes; ask for no bodies. The node still knows every
+        // record exists and who offered it — it simply has not pulled the corpus.
+        // That is what keeps a federation-tier identity directory from being an
+        // address book: a hash is not a mailing address, and resolving one takes
+        // a fetch, which is observable and refusable.
+        //
+        // `retention_for` is not bypassable by a provider: a `HashFirst` answer
+        // for a plane that RETRACTS something still comes back `Bodies`. A node
+        // holding the hash of a revocation has not applied it (CIRISEdge#553).
+        if retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst {
+            provider.note_known_hashes(self.kind, &want, source_peer);
+            let learned = want.len();
+            want.clear();
+            if learned > 0 {
+                tracing::debug!(
+                    kind = ?self.kind,
+                    learned,
+                    peer = ?source_peer,
+                    "hash-first: learned the peer's hashes without pulling bodies \
+                     (CIRISEdge#552)"
+                );
+            }
+        }
+
         let mut outbound = Vec::new();
         // Responder ALSO needs to send its Summary so the
         // initiator's side of the round can progress. We include it
@@ -1720,6 +1750,141 @@ mod tests {
     /// pull. A peer advertises two rows the node lacks; the node has already
     /// refused one of them, so its Diff asks for the OTHER one only. Nothing is
     /// sent to the peer to make this happen — the sender was never the one
+    /// CIRISEdge#552 — under hash-first retention the round LEARNS the peer's
+    /// hashes and asks for no bodies.
+    ///
+    /// This is the whole mechanism: the node still computes what it lacks (so it
+    /// knows the record exists and who has it) but does not pull the corpus.
+    #[test]
+    fn hash_first_learns_the_hashes_and_asks_for_no_bodies() {
+        use std::sync::Mutex;
+        struct HashFirstProvider {
+            noted: Mutex<Vec<[u8; 32]>>,
+            peer: Mutex<Option<String>>,
+        }
+        impl StateProvider for HashFirstProvider {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+            fn note_known_hashes(
+                &self,
+                _kind: EnvelopeKind,
+                hashes: &[[u8; 32]],
+                peer: Option<&str>,
+            ) {
+                self.noted.lock().unwrap().extend_from_slice(hashes);
+                *self.peer.lock().unwrap() = peer.map(str::to_owned);
+            }
+        }
+
+        let provider = HashFirstProvider {
+            noted: Mutex::new(Vec::new()),
+            peer: Mutex::new(None),
+        };
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        let remote = SummaryMessage {
+            kind: EnvelopeKind::Attestation,
+            refs: vec![
+                EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                },
+                EnvelopeRef {
+                    envelope_hash: h(2),
+                    seq: 2,
+                },
+            ],
+        };
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(remote),
+            &provider,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the round still sends a Diff");
+        assert!(
+            diff.want.is_empty(),
+            "hash-first asks for NO bodies — got {} wanted",
+            diff.want.len()
+        );
+        assert_eq!(
+            provider.noted.lock().unwrap().len(),
+            2,
+            "both advertised hashes must be LEARNED, or the node cannot later \
+             discover the record exists"
+        );
+        assert_eq!(
+            provider.peer.lock().unwrap().as_deref(),
+            Some("peer-a"),
+            "the advertising peer is the holder to ask — without it the node \
+             knows a record exists but not who has it"
+        );
+    }
+
+    /// CIRISEdge#553 — the carve-out reaches the round, not just the pure
+    /// function. A node configured hash-first STILL pulls revocation bodies.
+    #[test]
+    fn a_hash_first_node_still_pulls_revocation_bodies() {
+        struct HashFirstEverywhere;
+        impl StateProvider for HashFirstEverywhere {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Revocation);
+        let remote = SummaryMessage {
+            kind: EnvelopeKind::Revocation,
+            refs: vec![EnvelopeRef {
+                envelope_hash: h(1),
+                seq: 1,
+            }],
+        };
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(remote),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the round still sends a Diff");
+        assert_eq!(
+            diff.want,
+            vec![h(1)],
+            "a node holding the HASH of a revocation has not applied it — the \
+             body must still be asked for (CIRISEdge#553)"
+        );
+    }
+
     /// choosing, which is why the fix needs no wire change.
     #[test]
     fn the_rounds_want_omits_hashes_this_node_has_already_refused() {
