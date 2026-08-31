@@ -44,7 +44,7 @@ use tokio::sync::Mutex;
 
 use crate::transport::{Transport, TransportError};
 
-use super::protocol::{EnvelopeKind, ProtocolError, PullMessage, ReplicationMessage};
+use super::protocol::{EnvelopeKind, FetchMessage, ProtocolError, PullMessage, ReplicationMessage};
 use super::session::{ReplicationOutcome, Session, SessionRole};
 use super::summary::{StalenessSignal, StateApplier, StateProvider};
 
@@ -390,8 +390,34 @@ impl ReplicationCoordinator {
         // "I need these bodies" path; hash-first suppresses bulk convergence, not
         // an explicit ask. Set BEFORE the send, so a fast reply cannot land
         // before the flag does.
-        self.session.lock().await.expect_pull_response();
+        self.session.lock().await.expect_on_demand_reply();
         self.send_message(&pull).await
+    }
+
+    /// CIRISEdge#552 — resolve known hashes to their bodies from this peer.
+    ///
+    /// The other half of a hash-first directory: converging hashes is only
+    /// useful if a node can turn one back into a record when something needs it.
+    /// The holder comes from
+    /// [`KnownHashes::holder`](super::known_hashes::KnownHashes::holder) — the
+    /// peer that last advertised it — so this is a point ask, not a broadcast.
+    ///
+    /// Marks the session first, so the `Deliver` that answers is applied rather
+    /// than learned. Without that the reply looks exactly like an unsolicited
+    /// push and hash-first would decline the very body it just asked for.
+    ///
+    /// Fire-and-forget, like [`Self::start_pull`]: the reply arrives through the
+    /// ordinary dispatch path.
+    pub async fn start_fetch(&self, want: Vec<[u8; 32]>) -> Result<(), CoordinatorError> {
+        if want.is_empty() {
+            return Ok(());
+        }
+        let fetch = ReplicationMessage::Fetch(FetchMessage {
+            kind: self.kind,
+            want,
+        });
+        self.session.lock().await.expect_on_demand_reply();
+        self.send_message(&fetch).await
     }
 
     /// Try to parse on-wire bytes as a [`ReplicationMessage`].

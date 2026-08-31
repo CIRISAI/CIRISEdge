@@ -81,7 +81,30 @@ pub const fn retention_for(kind: EnvelopeKind, configured: Retention) -> Retenti
         | EnvelopeKind::Attestation
         | EnvelopeKind::Organization
         | EnvelopeKind::OrgMembership
-        | EnvelopeKind::PartnerRecord => Retention::Bodies,
+        | EnvelopeKind::PartnerRecord
+
+        // ── ROSTER planes. Bodies, because a member READS them locally.
+        //
+        // A chat room IS a 2-member `Community`, and reading its messages goes
+        // through `active_community_members(community_id)` — the roster, which
+        // lives in the BODY. A node holding only the hash knows a community
+        // exists and cannot tell whether it is in it, who else is, or read a
+        // word of it. `Family` is the same shape.
+        //
+        // This is the line the classification turns on, and it is not about
+        // retraction: hash-first is for records a node needs to KNOW ABOUT and
+        // can fetch when something asks. A roster is a record its members need
+        // to READ, unprompted, to function at all. Holding a hash of your own
+        // chat room is not a smaller copy of it — it is not being in it.
+        | EnvelopeKind::Community
+        | EnvelopeKind::Family
+
+        // ── Accord quorum evidence. Bodies, because it carries WITHDRAWAL
+        // evidence: a participation can retract a vote, and the aggregate is
+        // what a holder evaluates. It is also the one kind persist keeps OUT of
+        // the content-hash index by construction — its hash moves as votes land
+        // — so a hash of it is not even a stable name for the thing.
+        | EnvelopeKind::AccordQuorumEvidence => Retention::Bodies,
 
         // ── Planes that cannot retract anything. These are the identity and
         // routing planes the federation directory is made of, which is exactly
@@ -91,13 +114,18 @@ pub const fn retention_for(kind: EnvelopeKind, configured: Retention) -> Retenti
         // must be classified by whoever adds it, and a new retracting plane
         // defaulting into `HashFirst` through a wildcard is how this carve-out
         // would be lost silently.
+        // ── The DIRECTORY. Who exists, and how to reach them.
+        //
+        // These are exactly what a node needs to find a person and open a
+        // channel to them, and exactly what should not be an address book
+        // sitting on every node in the federation. Nothing here is read
+        // unprompted: a node resolves one of these when it is trying to reach
+        // someone, which is precisely the fetch that makes enumeration
+        // observable and refusable.
         EnvelopeKind::Key
         | EnvelopeKind::IdentityOccurrence
-        | EnvelopeKind::Family
-        | EnvelopeKind::Community
-        | EnvelopeKind::LocationProof
         | EnvelopeKind::TransportDestination
-        | EnvelopeKind::AccordQuorumEvidence => configured,
+        | EnvelopeKind::LocationProof => configured,
     }
 }
 
@@ -106,15 +134,19 @@ mod tests {
     use super::{retention_for, Retention};
     use crate::replication::protocol::EnvelopeKind;
 
-    /// Every kind that can carry a retraction — by name OR from inside the
-    /// envelope. Spelled out here independently of the implementation, so the
-    /// test states intent rather than mirroring the code it checks.
+    /// Every kind whose BODY a node must hold, and why — spelled out here
+    /// independently of the implementation, so the test states intent rather
+    /// than mirroring the code it checks.
     ///
-    /// The last four are the ones a kind-keyed carve-out misses: they retract
-    /// per RECORD (`withdraws` / `recants`, withdrawn/revoked states), and a
-    /// receiver cannot tell without the body — which under hash-first it does
-    /// not have.
-    const RETRACTING: [EnvelopeKind; 8] = [
+    /// Two distinct reasons, and both are easy to miss:
+    ///
+    /// * it can RETRACT something, by name or from inside the envelope
+    ///   (`withdraws` / `recants`, withdrawn/revoked states) — and a receiver
+    ///   cannot tell which without the body, which under hash-first it lacks;
+    /// * it is a ROSTER its members read locally and unprompted. A chat room is
+    ///   a 2-member `Community`, and reading it goes through the roster in the
+    ///   body. Holding the hash of your own chat room is not being in it.
+    const MUST_HOLD_BODIES: [EnvelopeKind; 11] = [
         EnvelopeKind::Revocation,
         EnvelopeKind::IdentityOccurrenceRevocation,
         EnvelopeKind::FamilyMembershipRevocation,
@@ -123,18 +155,23 @@ mod tests {
         EnvelopeKind::Organization,
         EnvelopeKind::OrgMembership,
         EnvelopeKind::PartnerRecord,
+        // Roster planes: a member reads these locally, unprompted.
+        EnvelopeKind::Community,
+        EnvelopeKind::Family,
+        // Carries withdrawal evidence, and its hash moves as votes land.
+        EnvelopeKind::AccordQuorumEvidence,
     ];
 
     /// CIRISEdge#553 — the carve-out. A configured `HashFirst` must not reach a
     /// plane whose job is to retract something.
     #[test]
-    fn the_revocation_class_is_never_hash_first() {
-        for kind in RETRACTING {
+    fn a_plane_that_needs_its_body_is_never_hash_first() {
+        for kind in MUST_HOLD_BODIES {
             assert_eq!(
                 retention_for(kind, Retention::HashFirst),
                 Retention::Bodies,
-                "{kind:?} can carry a retraction — a node holding only its HASH \
-                 has not applied it, and cannot tell that it was one"
+                "{kind:?} needs its BODY — it either retracts something a hash \
+                 cannot apply, or is a roster its members must read locally"
             );
         }
     }
@@ -177,7 +214,7 @@ mod tests {
     fn every_kind_is_deliberately_classified() {
         for kind in EnvelopeKind::ALL {
             let got = retention_for(kind, Retention::HashFirst);
-            let expected = if RETRACTING.contains(&kind) {
+            let expected = if MUST_HOLD_BODIES.contains(&kind) {
                 Retention::Bodies
             } else {
                 Retention::HashFirst

@@ -125,22 +125,28 @@ impl KnownHashes {
     /// Drop the stalest slice of the set in ONE pass.
     fn evict_stalest_batch(&mut self) {
         let target = (self.cap / Self::EVICT_BATCH_FRACTION).max(1);
-        let mut stamps: Vec<u64> = self
-            .entries
-            .values()
-            .map(|v| v.last_advertised_unix)
-            .collect();
-        if stamps.len() <= target {
+        if self.entries.len() <= target {
             self.entries.clear();
             return;
         }
-        // `select_nth_unstable` is O(n) and needs no full sort — the cutoff is a
-        // rank, not an order.
-        let (_, cutoff, _) = stamps.select_nth_unstable(target);
-        let cutoff = *cutoff;
-        // `>` not `>=`: entries sharing the cutoff instant stay, so a tie cannot
-        // over-evict past the batch.
-        self.entries.retain(|_, v| v.last_advertised_unix > cutoff);
+        // Evict by RANK, not by timestamp threshold.
+        //
+        // A threshold over-evicts on ties, and ties are the normal case here:
+        // every hash learned in one round shares a timestamp, so `retain(stamp >
+        // cutoff)` could drop a whole round's worth — far more than the batch,
+        // and precisely the entries most recently learned if the cap is hit
+        // mid-round. Selecting exactly `target` keys keeps the batch a batch.
+        let mut keys: Vec<(u64, (EnvelopeKind, [u8; 32]))> = self
+            .entries
+            .iter()
+            .map(|(k, v)| (v.last_advertised_unix, *k))
+            .collect();
+        // `select_nth_unstable` is O(n) and needs no full sort — we want the
+        // `target` stalest, not an ordering of all of them.
+        keys.select_nth_unstable_by_key(target, |(stamp, _)| *stamp);
+        for (_, key) in keys.into_iter().take(target) {
+            self.entries.remove(&key);
+        }
     }
 
     /// Is this hash known (without being held)?
@@ -289,6 +295,35 @@ mod tests {
         assert!(
             k.contains(EnvelopeKind::Key, &h(19)),
             "the freshest prior entry must survive a batch eviction"
+        );
+    }
+
+    /// Ties must not over-evict, and ties are the NORMAL case: every hash
+    /// learned in one round shares a Unix second. A timestamp threshold would
+    /// drop the whole second — far more than the batch, and precisely the
+    /// entries most recently learned when the cap is hit mid-round.
+    #[test]
+    fn a_whole_round_sharing_one_second_is_not_evicted_together() {
+        let mut k = KnownHashes::with_cap(20);
+        // 18 entries all learned in the same second, plus two older ones.
+        k.note(EnvelopeKind::Key, h(200), "p", 10);
+        k.note(EnvelopeKind::Key, h(201), "p", 11);
+        for i in 0..18u8 {
+            k.note(EnvelopeKind::Key, h(i), "p", 500);
+        }
+        assert_eq!(k.len(), 20);
+
+        k.note(EnvelopeKind::Key, h(210), "p", 900);
+
+        // The batch is cap/10 = 2. Only the two genuinely older entries should
+        // go; the 18 sharing 500 must survive.
+        let survivors = (0..18u8)
+            .filter(|i| k.contains(EnvelopeKind::Key, &h(*i)))
+            .count();
+        assert!(
+            survivors >= 17,
+            "a shared timestamp must not take the whole second with it — only \
+             {survivors} of 18 survived"
         );
     }
 
