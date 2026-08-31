@@ -352,6 +352,35 @@ pub fn log_rung(rung: Rung, fed_id: &str, stall: Option<&LadderStall>) {
     }
 }
 
+/// [`RouteLens`] over the live Reticulum transport.
+///
+/// This is the half unit tests cannot reach. Resolution is pure logic and is
+/// tested against a fake lens; whether a real node can actually address a peer
+/// depends on announces having arrived and routes having been admitted, which is
+/// only true in a running mesh. `knows_peer` is the transport's own readback for
+/// "can this node address that key right now" — the same question the send path
+/// asks before it dials.
+#[cfg(feature = "transport-reticulum")]
+pub struct ReticulumRoutes<'a> {
+    transport: &'a crate::transport::reticulum::ReticulumTransport,
+}
+
+#[cfg(feature = "transport-reticulum")]
+impl<'a> ReticulumRoutes<'a> {
+    #[must_use]
+    pub fn new(transport: &'a crate::transport::reticulum::ReticulumTransport) -> Self {
+        Self { transport }
+    }
+}
+
+#[cfg(feature = "transport-reticulum")]
+#[async_trait::async_trait]
+impl RouteLens for ReticulumRoutes<'_> {
+    async fn has_destination(&self, node_key_id: &str) -> bool {
+        self.transport.knows_peer(node_key_id).await
+    }
+}
+
 /// A resolved subject that is actually CONTACTABLE.
 ///
 /// [`resolve`] proves someone owns nodes. This proves at least one of them can

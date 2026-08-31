@@ -58,6 +58,8 @@ pub mod contact;
 pub mod debug;
 pub mod delivery_mode;
 pub mod detector;
+/// CIRISEdge#554 — the receiver-side budget on unsolicited contact requests.
+pub mod invite_gate;
 // v6.1.0 (CIRISEdge#175, FSD §3.3) — announce-suppression policy
 // + edge-side registry mirroring the recommended Leviculum
 // `AnnounceControl` extension shape.
