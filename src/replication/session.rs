@@ -131,7 +131,16 @@ pub enum ReplicationOutcome {
 /// After a round completes (`Applied` outcome), call [`Self::reset`]
 /// to clear the per-round state and prepare for the next round with
 /// the same peer.
+// CIRISEdge#552 — the fourth bool. These are four INDEPENDENT one-shot round
+// facts (role-phase markers and the pull exemption), not a state enum wearing
+// booleans: no two are mutually exclusive, and collapsing them into one would
+// invent transitions the protocol does not have. Grouping them for the lint's
+// sake would make the type lie about that.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Session {
+    /// CIRISEdge#552 — a Pull we sent is awaiting its Summary. See
+    /// [`Self::expect_pull_response`].
+    pull_response_pending: bool,
     role: SessionRole,
     kind: EnvelopeKind,
     /// What we sent the peer in our most recent Summary — used to
@@ -207,6 +216,7 @@ impl Session {
             role,
             kind,
             last_summary_sent: None,
+            pull_response_pending: false,
             last_remote_summary: None,
             diff_want_count: None,
             completed: false,
@@ -460,6 +470,22 @@ impl Session {
     /// needs (`remote ∖ holdings`) is *exactly* what `on_summary` already is; the
     /// Pull's only job is to seed that machinery with a SUBJECT-scoped ref set
     /// instead of the advertise set the `SelfOwn` plane never produces.
+    /// CIRISEdge#552 — the NEXT Summary answers a Pull this node sent, so its
+    /// wants are on-demand and must be fetched even under hash-first.
+    ///
+    /// A Pull is the explicit "I need these bodies now" path (#462: a fedID
+    /// pulling its own testimony, or a moderation duty conferred on it, that no
+    /// peer would ever advertise). Hash-first exists to stop bulk convergence,
+    /// not to stop a node asking for something on purpose — and the Pull reply
+    /// arrives as an ordinary `Summary`, indistinguishable from anti-entropy
+    /// without this.
+    ///
+    /// One-shot: consumed by the Summary it was set for, so a later
+    /// anti-entropy round is not silently promoted to a body pull.
+    pub fn expect_pull_response(&mut self) {
+        self.pull_response_pending = true;
+    }
+
     fn on_pull(&mut self, pull: &PullMessage, provider: &dyn StateProvider) -> ReplicationOutcome {
         if pull.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
@@ -532,7 +558,13 @@ impl Session {
         // `retention_for` is not bypassable by a provider: a `HashFirst` answer
         // for a plane that RETRACTS something still comes back `Bodies`. A node
         // holding the hash of a revocation has not applied it (CIRISEdge#553).
-        if retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst {
+        // A Pull reply is an ON-DEMAND fetch and is never suppressed: #462 exists
+        // so a fedID can pull its own testimony, which no peer advertises. Taken
+        // (not peeked) so it cannot leak into the next anti-entropy round.
+        let answering_pull = std::mem::take(&mut self.pull_response_pending);
+        if !answering_pull
+            && retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst
+        {
             provider.note_known_hashes(self.kind, &want, source_peer);
             let learned = want.len();
             want.clear();
@@ -1899,6 +1931,118 @@ mod tests {
             Some("peer-a"),
             "the advertising peer is the holder to ask — without it the node \
              knows a record exists but not who has it"
+        );
+    }
+
+    /// CIRISEdge#552/#462 — a Pull reply is fetched even under hash-first.
+    ///
+    /// This is the path that exists so a fedID can pull its OWN testimony, or a
+    /// moderation duty conferred on it, which no peer would ever advertise.
+    /// Suppressing it would make hash-first silently break the one flow whose
+    /// entire purpose is asking for bodies on purpose — and the reply arrives as
+    /// an ordinary Summary, so nothing would have looked wrong.
+    #[test]
+    fn a_pull_reply_is_fetched_even_under_hash_first() {
+        struct HashFirstEverywhere;
+        impl StateProvider for HashFirstEverywhere {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+
+        let mut session = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        session.expect_pull_response();
+
+        let reply = SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![EnvelopeRef {
+                envelope_hash: h(1),
+                seq: 1,
+            }],
+        };
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(reply),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the round sends a Diff");
+        assert_eq!(
+            diff.want,
+            vec![h(1)],
+            "an explicitly pulled body must still be asked for (CIRISEdge#462)"
+        );
+    }
+
+    /// The flag is ONE-SHOT. A pull must not quietly promote every later
+    /// anti-entropy round on that session into a full body fetch — which would
+    /// turn one on-demand ask into a permanent opt-out from hash-first.
+    #[test]
+    fn the_pull_exemption_does_not_leak_into_the_next_round() {
+        struct HashFirstEverywhere;
+        impl StateProvider for HashFirstEverywhere {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+
+        let mut session = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        session.expect_pull_response();
+        let summary = |n: u8| SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![EnvelopeRef {
+                envelope_hash: h(n),
+                seq: 1,
+            }],
+        };
+
+        // First Summary consumes the exemption.
+        let _ = session.on_message(
+            ReplicationMessage::Summary(summary(1)),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        );
+        // Second is ordinary anti-entropy and must be hash-first again.
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(summary(2)),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the round sends a Diff");
+        assert!(
+            diff.want.is_empty(),
+            "the exemption is one-shot — got {} wanted on the following round",
+            diff.want.len()
         );
     }
 

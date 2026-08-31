@@ -385,6 +385,12 @@ impl ReplicationCoordinator {
             kind: self.kind,
             subject_key_id: subject_key_id.to_string(),
         });
+        // CIRISEdge#552 — mark the session so the Summary that answers this Pull
+        // is fetched even under hash-first retention. A Pull is the deliberate
+        // "I need these bodies" path; hash-first suppresses bulk convergence, not
+        // an explicit ask. Set BEFORE the send, so a fast reply cannot land
+        // before the flag does.
+        self.session.lock().await.expect_pull_response();
         self.send_message(&pull).await
     }
 
