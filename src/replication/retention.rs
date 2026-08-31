@@ -104,7 +104,16 @@ pub const fn retention_for(kind: EnvelopeKind, configured: Retention) -> Retenti
         // what a holder evaluates. It is also the one kind persist keeps OUT of
         // the content-hash index by construction — its hash moves as votes land
         // — so a hash of it is not even a stable name for the thing.
-        | EnvelopeKind::AccordQuorumEvidence => Retention::Bodies,
+        | EnvelopeKind::AccordQuorumEvidence
+
+        // ── LocationProof. Bodies until there is something that resolves it.
+        //
+        // Its Summary exposes only opaque hashes, and nothing in edge yet
+        // consumes a location proof by hash — so hash-first here buys no memory
+        // that matters and loses the only readable form. A plane joins hash-first
+        // when a consumer can ASK for it, not merely when it is technically able
+        // to hold hashes.
+        | EnvelopeKind::LocationProof => Retention::Bodies,
 
         // ── Planes that cannot retract anything. These are the identity and
         // routing planes the federation directory is made of, which is exactly
@@ -124,8 +133,7 @@ pub const fn retention_for(kind: EnvelopeKind, configured: Retention) -> Retenti
         // observable and refusable.
         EnvelopeKind::Key
         | EnvelopeKind::IdentityOccurrence
-        | EnvelopeKind::TransportDestination
-        | EnvelopeKind::LocationProof => configured,
+        | EnvelopeKind::TransportDestination => configured,
     }
 }
 
@@ -146,7 +154,7 @@ mod tests {
     /// * it is a ROSTER its members read locally and unprompted. A chat room is
     ///   a 2-member `Community`, and reading it goes through the roster in the
     ///   body. Holding the hash of your own chat room is not being in it.
-    const MUST_HOLD_BODIES: [EnvelopeKind; 11] = [
+    const MUST_HOLD_BODIES: [EnvelopeKind; 12] = [
         EnvelopeKind::Revocation,
         EnvelopeKind::IdentityOccurrenceRevocation,
         EnvelopeKind::FamilyMembershipRevocation,
@@ -160,9 +168,33 @@ mod tests {
         EnvelopeKind::Family,
         // Carries withdrawal evidence, and its hash moves as votes land.
         EnvelopeKind::AccordQuorumEvidence,
+        // Nothing resolves a location proof by hash yet.
+        EnvelopeKind::LocationProof,
     ];
 
     /// CIRISEdge#553 — the carve-out. A configured `HashFirst` must not reach a
+    /// CIRISEdge#552 — only a SERVER keeps a hash directory.
+    ///
+    /// Not a storage preference: if every node converged the whole hash set the
+    /// directory would be enumerable from ANY node — cheaper to carry than
+    /// bodies, and the same exposure. A proxy that learns only what concerns it
+    /// reveals only its own contacts when compromised.
+    #[test]
+    fn only_server_mode_takes_the_hash_first_posture() {
+        use crate::AgentMode;
+        let posture = |m: AgentMode| match m {
+            AgentMode::Server => Retention::HashFirst,
+            AgentMode::Proxy | AgentMode::Client => Retention::Bodies,
+        };
+        assert_eq!(posture(AgentMode::Server), Retention::HashFirst);
+        assert_eq!(
+            posture(AgentMode::Proxy),
+            Retention::Bodies,
+            "proxy is the DEFAULT — the default must not be the enumerable one"
+        );
+        assert_eq!(posture(AgentMode::Client), Retention::Bodies);
+    }
+
     /// plane whose job is to retract something.
     #[test]
     fn a_plane_that_needs_its_body_is_never_hash_first() {

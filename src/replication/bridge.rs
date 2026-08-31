@@ -546,6 +546,26 @@ pub struct BridgeConfig {
     /// bound that costs nothing but rounds. The effective page is the `min` of
     /// the two.
     pub sweep_page_rows: u32,
+
+    /// CIRISEdge#552 — this node's posture, which decides how much directory it
+    /// keeps.
+    ///
+    /// Driven by [`AgentMode`](crate::AgentMode) rather than a switch of its
+    /// own: the mode vocabulary already exists (`client` / `proxy` / `server`,
+    /// proxy by default) and a second knob meaning almost the same thing is how
+    /// two sources of truth start disagreeing.
+    ///
+    /// * **Server** — the full directory. A node with the storage to hold it and
+    ///   the role to serve it.
+    /// * **Proxy** (default) and **Client** — a RELEVANT SUBSET only: contacts,
+    ///   and the keys needed to verify what this node holds.
+    ///
+    /// That distinction is a privacy control, not a storage one. If every node
+    /// converged the whole hash set, the directory would be enumerable from ANY
+    /// node — cheaper than holding bodies, but the same exposure. A proxy that
+    /// learns only what concerns it reveals only its own contacts if it is
+    /// compromised.
+    pub mode: crate::AgentMode,
 }
 
 impl BridgeConfig {
@@ -676,6 +696,7 @@ impl Default for BridgeConfig {
             operational_page_limit: Self::DEFAULT_OPERATIONAL_PAGE_LIMIT,
             advertise_sweep_permits: Self::DEFAULT_ADVERTISE_SWEEP_PERMITS,
             sweep_page_rows: Self::DEFAULT_SWEEP_PAGE_ROWS,
+            mode: crate::AgentMode::Proxy,
         }
     }
 }
@@ -1293,6 +1314,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// `std::sync::Mutex`, never held across an `.await`: the lock is taken to
     /// read a cursor, dropped, the page is read, then taken again to record it.
     sweep_cursors: Mutex<SweepCursors>,
+    /// CIRISEdge#552 — hashes learned without their bodies, and who advertised
+    /// them. In-memory: CIRISPersist#785 is where this becomes durable, and the
+    /// advertise re-sweep re-learns anything lost to a restart.
+    known_hashes: Mutex<crate::replication::known_hashes::KnownHashes>,
     /// CIRISEdge#531 DEPTH — the largest row count ANY single page read has
     /// returned on this bridge. The flat bound's own witness, in the same
     /// discipline as [`Self::sweep_gate`]'s `max_in_flight` and
@@ -1456,6 +1481,7 @@ impl FederationDirectoryReplicationBridge {
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
+            known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -1505,6 +1531,7 @@ impl FederationDirectoryReplicationBridge {
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
+            known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -2225,6 +2252,57 @@ impl FederationDirectoryReplicationBridge {
 
 #[async_trait]
 impl ReplicationDirectory for FederationDirectoryReplicationBridge {
+    /// CIRISEdge#552 — the operator's switch, filtered through the correctness
+    /// rule. `retention_for` pins every plane that must hold bodies, so a node
+    /// configured hash-first still holds revocations, rosters, and anything else
+    /// whose body it needs — the switch cannot turn those off.
+    fn retention(&self, kind: EnvelopeKind) -> crate::replication::retention::Retention {
+        // Only a SERVER keeps a hash directory. A proxy or client holds bodies
+        // for the little it tracks — hash-first buys nothing on a small working
+        // set, and would hand a small node an enumerable directory it has no use
+        // for.
+        let configured = match self.config.mode {
+            crate::AgentMode::Server => crate::replication::retention::Retention::HashFirst,
+            crate::AgentMode::Proxy | crate::AgentMode::Client => {
+                crate::replication::retention::Retention::Bodies
+            }
+        };
+        crate::replication::retention::retention_for(kind, configured)
+    }
+
+    /// CIRISEdge#552 — record hashes learned without their bodies, with the peer
+    /// that advertised them (the holder map). In-memory and local only: this is
+    /// an OBSERVATION, not a claim, and CIRISPersist#785 is where it becomes
+    /// durable.
+    fn note_known_hashes(
+        &self,
+        kind: EnvelopeKind,
+        hashes: &[[u8; 32]],
+        advertised_by: Option<&str>,
+    ) {
+        let Some(peer) = advertised_by else {
+            // A hash with no holder is not actionable: knowing a record exists
+            // without knowing who has it cannot be resolved into anything.
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        // Only a SERVER accumulates the directory. A proxy that recorded every
+        // hash a peer advertised would end up holding the whole federation as
+        // hashes — which is the enumeration surface again, just cheaper to
+        // carry. What a proxy needs is the subset that concerns it, and that is
+        // reached through the on-demand path rather than by hoarding.
+        if !matches!(self.config.mode, crate::AgentMode::Server) {
+            return;
+        }
+        if let Ok(mut known) = self.known_hashes.lock() {
+            for h in hashes {
+                known.note(kind, *h, peer, now);
+            }
+        }
+    }
+
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         // CIRISEdge#531 DEPTH — the PEER-BLIND projection view (diagnostics and
         // tests; every production provider is peer-bound via

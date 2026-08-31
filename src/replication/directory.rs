@@ -186,6 +186,21 @@ pub trait ReplicationDirectory: Send + Sync {
     /// mock and any host impl need no change; the bridge overrides it with the
     /// [`RefusalBackoff`](super::refusal_backoff::RefusalBackoff) its apply path
     /// populates.
+    /// CIRISEdge#552 — how much of `kind` this node keeps. Defaults to
+    /// `Bodies`, the pre-#552 behaviour; the bridge overrides it from config.
+    fn retention(&self, _kind: EnvelopeKind) -> super::retention::Retention {
+        super::retention::Retention::Bodies
+    }
+
+    /// CIRISEdge#552 — learn hashes whose bodies this node did not fetch.
+    fn note_known_hashes(
+        &self,
+        _kind: EnvelopeKind,
+        _hashes: &[[u8; 32]],
+        _advertised_by: Option<&str>,
+    ) {
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }
@@ -288,6 +303,26 @@ impl StateProvider for DirectoryStateAdapter {
     /// Node-wide by construction — peer A's refusal removes the row from peer
     /// B's `want` too, which is the point (the verdict is about this node's
     /// state, not about who carried the bytes).
+    /// CIRISEdge#552 — FORWARD, do not answer.
+    ///
+    /// This adapter is the production `StateProvider`, and until it forwarded
+    /// these the whole feature was inert: every node took the trait default
+    /// (`Bodies`) no matter what the bridge was configured to do. Nothing broke,
+    /// which is exactly why it went unnoticed — a retention policy that is never
+    /// consulted looks identical to one that decides "keep everything".
+    fn retention(&self, kind: EnvelopeKind) -> super::retention::Retention {
+        self.inner.retention(kind)
+    }
+
+    fn note_known_hashes(
+        &self,
+        kind: EnvelopeKind,
+        hashes: &[[u8; 32]],
+        advertised_by: Option<&str>,
+    ) {
+        self.inner.note_known_hashes(kind, hashes, advertised_by);
+    }
+
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
         self.inner.retry_suppressed(kind, envelope_hash)
     }

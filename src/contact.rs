@@ -137,9 +137,16 @@ pub async fn resolve(lens: &dyn DirectoryLens, any_id: &str) -> Result<Subject, 
         IdentityKind::Node | IdentityKind::Agent => {
             lens.owner_of(any_id).await.ok_or_else(stall)?
         }
-        // A steward or accord holder is not a contactable person. Refusing here
-        // beats resolving to something that looks addressable and is not.
-        IdentityKind::Other(_) => return Err(stall()),
+        // A steward or accord holder is not a contactable person. TERMINAL, not
+        // `NotYetDiscovered`: the latter self-resolves, so a caller would retry
+        // forever against something that will never become contactable — and the
+        // remedy ("wait for convergence") would be advice that never comes true.
+        IdentityKind::Other(t) => {
+            return Err(LadderStall::NotContactable {
+                key_id: any_id.to_owned(),
+                identity_type: t.clone(),
+            })
+        }
     };
 
     let nodes = lens.nodes_owned_by(&fed_id).await;
@@ -227,6 +234,14 @@ pub enum LadderStall {
     ConsentNotGranted { fed_id: String },
     /// The rung before this one has not completed.
     PriorRungIncomplete { rung: Rung, prior: Rung },
+    /// The key resolves, but not to anything a person can be contacted through
+    /// — a steward, an accord holder, a partner record. TERMINAL: no amount of
+    /// convergence turns one of these into a contactable person, so a caller
+    /// that retries is retrying forever.
+    NotContactable {
+        key_id: String,
+        identity_type: String,
+    },
 }
 
 impl LadderStall {
@@ -253,6 +268,15 @@ impl LadderStall {
                 "this node has not granted replication consent to {fed_id}. Accept the \
                  contact request to make the conversation replicable in both directions."
             ),
+            Self::NotContactable {
+                key_id,
+                identity_type,
+            } => format!(
+                "{key_id} is registered as identity_type={identity_type}, which is \
+                 not a person and cannot hold a conversation. Contact its OWNER \
+                 instead, or check that the identifier is the one you meant — this \
+                 will not resolve by waiting."
+            ),
             Self::PriorRungIncomplete { rung, prior } => format!(
                 "{rung} cannot proceed because {prior} has not completed. Look at the \
                  {prior} rung on this node first — a ladder failure is nearly always \
@@ -272,7 +296,9 @@ impl LadderStall {
             Self::NotYetDiscovered { .. } | Self::Unreachable { .. } => true,
             Self::AwaitingConsent { .. }
             | Self::ConsentNotGranted { .. }
-            | Self::PriorRungIncomplete { .. } => false,
+            | Self::PriorRungIncomplete { .. }
+            // Terminal by nature: a steward does not become a person.
+            | Self::NotContactable { .. } => false,
         }
     }
 }
@@ -444,7 +470,15 @@ mod tests {
     #[tokio::test]
     async fn a_non_contactable_identity_type_stalls_rather_than_resolving() {
         let lens = frank();
-        assert!(super::resolve(&lens, "some-steward-ddd").await.is_err());
+        let Err(stall) = super::resolve(&lens, "some-steward-ddd").await else {
+            panic!("a steward is not a contactable person");
+        };
+        assert!(
+            !stall.self_resolving(),
+            "a steward never becomes contactable — a self-resolving stall would \
+             make the caller retry forever"
+        );
+        assert!(stall.remedy().contains("steward"), "{}", stall.remedy());
     }
 
     /// A key the directory has never seen is NOT an error the operator caused —

@@ -523,6 +523,11 @@ impl Session {
         self.pending_bodies.extend(hashes);
     }
 
+    /// Undo [`Self::expect_on_demand_reply`] — the request never left.
+    pub fn cancel_on_demand_reply(&mut self) {
+        self.pull_exempt_rounds = 0;
+    }
+
     /// How many round-resets a Pull's exemption survives. Small: it bounds the
     /// over-fetch, and a reply that has not arrived in three rounds is not
     /// coming.
@@ -657,6 +662,10 @@ impl Session {
             self.last_summary_sent = Some(my_summary.clone());
             outbound.push(ReplicationMessage::Summary(my_summary));
         }
+        // CIRISEdge#552 — whatever this round asks for is, by definition, wanted.
+        // Recording it here means the deliver gate has ONE source of truth for
+        // "did we ask for this", covering the on-demand and ordinary paths alike.
+        self.pending_bodies.extend(want.iter().copied());
         self.diff_want_count = Some(want.len());
         outbound.push(ReplicationMessage::Diff(DiffMessage {
             kind: self.kind,
@@ -830,8 +839,15 @@ impl Session {
         // publisher's Deliver — arriving right after its Summary — sailed
         // through and applied. An empty ask is not an ask. A NON-empty want
         // means this exchange is ordinary solicited anti-entropy and is ungated.
-        let hash_first_active = self.diff_want_count.unwrap_or(0) == 0
-            && retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst;
+        // Gated whenever the plane is hash-first — NOT only when the want was
+        // empty. A Pull's reply produces a NON-empty Diff, so keying on
+        // `diff_want_count == 0` turned the gate off for exactly the exchange
+        // where a responder is most able to append extras. Under hash-first every
+        // legitimately wanted hash is in `pending_bodies` (the Diff path puts it
+        // there), so the per-envelope check below is sufficient on its own and
+        // the want count adds nothing but a hole.
+        let hash_first_active =
+            retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst;
         // CIRISEdge#426 — distinguish a SOLICITED Deliver (it answers a `Diff` we
         // sent this round — `diff_want_count` is set) from an UNSOLICITED one (a
         // bare push with no in-flight round we invited — the #927 proactive-publish

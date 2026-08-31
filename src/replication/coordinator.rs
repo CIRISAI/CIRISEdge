@@ -391,7 +391,14 @@ impl ReplicationCoordinator {
         // an explicit ask. Set BEFORE the send, so a fast reply cannot land
         // before the flag does.
         self.session.lock().await.expect_on_demand_reply();
-        self.send_message(&pull).await
+        // Roll back if the send never left. An exemption installed for a Pull
+        // that was not sent would exempt whatever arrives next instead — a
+        // window opened for a request that does not exist.
+        let sent = self.send_message(&pull).await;
+        if sent.is_err() {
+            self.session.lock().await.cancel_on_demand_reply();
+        }
+        sent
     }
 
     /// CIRISEdge#552 — resolve known hashes to their bodies from this peer.

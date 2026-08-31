@@ -35,52 +35,64 @@
 
 use super::protocol::EnvelopeKind;
 
-/// The signer field a plane's admission resolves, if this kind has one.
+/// The fields a record can name its signer in, in the order persist's gate
+/// prefers them.
 ///
-/// Not a guess: these are the fields persist's gate reads. A row is verified
-/// against `attesting_key_id`, a revocation against `revoking_key_id`, and a key
-/// registration against `scrub_key_id` (which for a self-attested registration
-/// is the subject itself, and therefore never missing).
-#[must_use]
-pub const fn signer_field(kind: EnvelopeKind) -> &'static str {
-    match kind {
-        EnvelopeKind::Revocation
-        | EnvelopeKind::IdentityOccurrenceRevocation
-        | EnvelopeKind::FamilyMembershipRevocation
-        | EnvelopeKind::CommunityMembershipRevocation => "revoking_key_id",
-        EnvelopeKind::Key => "scrub_key_id",
-        _ => "attesting_key_id",
-    }
-}
+/// NOT a per-kind mapping. I wrote one twice and got it wrong twice: the
+/// membership-revocation planes have no `revoking_key_id` at all — they are
+/// authority-signed, carrying `authority_key_id` on the wrapper and
+/// `family_key_id` / `community_key_id` inside — so a kind-keyed guess looked
+/// for a field that does not exist, found nothing, and silently fetched no key.
+///
+/// A record names its signer in exactly one of these, so trying them in the
+/// gate's own order of specificity removes the guess. Order matters where a
+/// record carries several: a `Revocation` has BOTH `revoking_key_id` and
+/// `scrub_key_id`, and `verify_revocation_admission` reads the revoker.
+const SIGNER_FIELDS: [&str; 4] = [
+    // The revoker — read by `verify_revocation_admission`.
+    "revoking_key_id",
+    // The authority — read by the E4 keyless-declaration and roster planes
+    // (Family, Community, both membership revocations, LocationProof,
+    // Organization, OrgMembership, PartnerRecord).
+    "authority_key_id",
+    // The attester — the shared row gate's field, and the common case.
+    "attesting_key_id",
+    // A key registration's scrubber. Last because a self-attested registration
+    // names ITSELF here, and a key that is its own signer is never the missing
+    // dependency.
+    "scrub_key_id",
+];
 
 /// The key whose absence would explain an unverifiable signature on these bytes.
 ///
-/// `None` when the envelope does not name one — a malformed record, which
+/// `None` when the envelope names no signer — a malformed record, which
 /// `UnverifiableSignature` also covers and which no fetch can repair. Returning
 /// `None` there is the point: the token fuses a recoverable arm with an
 /// unrecoverable one, and only the recoverable arm names a key to go and get.
 #[must_use]
-pub fn missing_signer_of(kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<String> {
+pub fn missing_signer_of(_kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(envelope_bytes).ok()?;
-    let field = signer_field(kind);
-    // Top level first, then one level into the record wrapper: the Signed*
-    // wrappers carry the row under a single key, and the signer lives on the row.
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            value
-                .as_object()?
-                .values()
-                .find_map(|v| v.get(field).and_then(serde_json::Value::as_str))
-        })
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+    SIGNER_FIELDS.iter().find_map(|field| {
+        // Top level first, then one level into the `Signed*` wrapper: the wrapper
+        // carries the row under a single key, and some signers sit on the wrapper
+        // while others sit on the row.
+        value
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                value
+                    .as_object()?
+                    .values()
+                    .find_map(|v| v.get(*field).and_then(serde_json::Value::as_str))
+            })
+            .filter(|candidate| !candidate.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{missing_signer_of, signer_field};
+    use super::missing_signer_of;
     use crate::replication::protocol::EnvelopeKind;
 
     /// A revocation is verified against its REVOKER, not its subject. Reading
@@ -89,8 +101,31 @@ mod tests {
     /// revocation would still never admit.
     #[test]
     fn a_revocation_names_its_revoker_not_its_subject() {
-        assert_eq!(signer_field(EnvelopeKind::Revocation), "revoking_key_id");
         let bytes = br#"{"revoked_key_id":"victim-aaa","revoking_key_id":"revoker-bbb"}"#;
+        assert_eq!(
+            missing_signer_of(EnvelopeKind::Revocation, bytes).as_deref(),
+            Some("revoker-bbb")
+        );
+    }
+
+    /// An authority-signed plane names `authority_key_id`, and the membership
+    /// revocations have NO `revoking_key_id` — a kind-keyed mapping looked for
+    /// one, found nothing, and fetched no key at all.
+    #[test]
+    fn an_authority_signed_revocation_names_its_authority() {
+        let bytes = br#"{"community_key_id":"c-1","removed_identity_key_id":"v","authority_key_id":"authority-eee"}"#;
+        assert_eq!(
+            missing_signer_of(EnvelopeKind::CommunityMembershipRevocation, bytes).as_deref(),
+            Some("authority-eee")
+        );
+    }
+
+    /// A revocation carries BOTH `revoking_key_id` and `scrub_key_id`, and the
+    /// gate reads the revoker. Order of preference is the whole correctness of
+    /// a candidate list.
+    #[test]
+    fn the_revoker_wins_over_the_scrubber() {
+        let bytes = br#"{"revoking_key_id":"revoker-bbb","scrub_key_id":"scrubber-fff"}"#;
         assert_eq!(
             missing_signer_of(EnvelopeKind::Revocation, bytes).as_deref(),
             Some("revoker-bbb")
