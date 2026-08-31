@@ -34,6 +34,26 @@ pub enum Retention {
     Bodies,
 }
 
+/// CIRISEdge#552 (B) — should a stalled row's signer be recorded for an
+/// out-of-band pull, given the retention this node applies to the **`Key`**
+/// plane?
+///
+/// The row that stalled can be any kind; the row it waits on is always a Key.
+/// So this asks about `Key`'s retention, never the stalled row's.
+///
+/// Under [`Retention::Bodies`] the answer is no: the signer's Key body
+/// replicates on its own and the #544 backoff admits the row on a later round.
+/// That is the self-resolving case, and recording it would add a pull for
+/// something already in flight. Only `HashFirst` breaks that, because then the
+/// key is a hash this node never fetches and the retry spins forever.
+#[must_use]
+pub fn should_note_missing_signer(key_retention: Retention) -> bool {
+    match key_retention {
+        Retention::HashFirst => true,
+        Retention::Bodies => false,
+    }
+}
+
 /// CIRISEdge#553 — the retention this node actually applies to `kind`.
 ///
 /// **A configured `HashFirst` cannot reach the revocation class.** Persist
@@ -139,7 +159,7 @@ pub const fn retention_for(kind: EnvelopeKind, configured: Retention) -> Retenti
 
 #[cfg(test)]
 mod tests {
-    use super::{retention_for, Retention};
+    use super::{retention_for, should_note_missing_signer, Retention};
     use crate::replication::protocol::EnvelopeKind;
 
     /// Every kind whose BODY a node must hold, and why — spelled out here
@@ -255,6 +275,23 @@ mod tests {
                 got, expected,
                 "{kind:?} is not deliberately classified — a new plane must be \
                  assigned a retention by whoever adds it (CIRISEdge#553)"
+            );
+        }
+    }
+
+    /// CIRISEdge#552 (B) — the record-a-missing-signer decision, over EVERY
+    /// retention. Exhaustive rather than two asserts: a third `Retention`
+    /// variant must not silently take a default here, and the input is the
+    /// exact value the field computes — `retention(EnvelopeKind::Key)`.
+    #[test]
+    fn only_hash_first_records_a_missing_signer() {
+        for r in [Retention::HashFirst, Retention::Bodies] {
+            let expected = r == Retention::HashFirst;
+            assert_eq!(
+                should_note_missing_signer(r),
+                expected,
+                "under {r:?} the signer's Key body {} replicate on its own",
+                if expected { "does NOT" } else { "DOES" }
             );
         }
     }

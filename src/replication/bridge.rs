@@ -2299,9 +2299,8 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // admits the row on a later round — the self-resolving case the module
         // doc describes — so recording here would add a pull for something
         // already in flight.
-        if !matches!(
+        if !crate::replication::retention::should_note_missing_signer(
             self.retention(EnvelopeKind::Key),
-            crate::replication::retention::Retention::HashFirst
         ) {
             return;
         }
