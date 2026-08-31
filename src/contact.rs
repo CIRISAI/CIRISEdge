@@ -122,6 +122,23 @@ pub trait DirectoryLens: Send + Sync {
     async fn owner_of(&self, key_id: &str) -> Option<String>;
     /// Every node that person owns.
     async fn nodes_owned_by(&self, fed_id: &str) -> Vec<String>;
+
+    /// CIRISEdge#552 — ask for a key's BODY on demand, returning whether a
+    /// fetch was actually queued.
+    ///
+    /// A hash-first server holds this key's hash without its body, so
+    /// `identity_type_of` answers `None` for a key the node demonstrably knows
+    /// about. Reporting that as "wait for convergence" would be advice that
+    /// never comes true: bulk convergence is exactly what hash-first suppressed.
+    /// The fetch reuses the missing-signer queue — a resolution miss and a
+    /// stalled admission want the identical thing, a `Key` body — so it drains
+    /// through the same Key Pull on the next round.
+    ///
+    /// Defaults to `false`: a node holding bodies has nothing to request, and
+    /// its miss really is "not announced yet".
+    async fn request_key_body(&self, _key_id: &str) -> bool {
+        false
+    }
 }
 
 /// Resolve any identifier to the person and the nodes that reach them.
@@ -141,12 +158,20 @@ pub async fn resolve(lens: &dyn DirectoryLens, any_id: &str) -> Result<Subject, 
     let stall = || LadderStall::NotYetDiscovered {
         fed_id: any_id.to_owned(),
     };
-    let kind = IdentityKind::from_identity_type(
-        lens.identity_type_of(any_id)
-            .await
-            .ok_or_else(stall)?
-            .as_str(),
-    );
+    // CIRISEdge#552 — before calling a miss "not announced yet", ask whether
+    // this node is merely holding the hash. If a fetch is queued the remedy is
+    // different and the wait is bounded, so the stall must say so; a caller
+    // told to wait for an announce that already happened waits forever.
+    let Some(identity_type) = lens.identity_type_of(any_id).await else {
+        return Err(if lens.request_key_body(any_id).await {
+            LadderStall::BodyFetchQueued {
+                key_id: any_id.to_owned(),
+            }
+        } else {
+            stall()
+        });
+    };
+    let kind = IdentityKind::from_identity_type(identity_type.as_str());
 
     let fed_id = match &kind {
         IdentityKind::Person => any_id.to_owned(),
@@ -252,6 +277,11 @@ pub enum LadderStall {
     ConsentNotGranted { fed_id: String },
     /// The rung before this one has not completed.
     PriorRungIncomplete { rung: Rung, prior: Rung },
+    /// CIRISEdge#552 — this node knows the key as a HASH and has queued a fetch
+    /// for its body. Self-resolving, but for a different reason than
+    /// [`Self::NotYetDiscovered`]: nothing is waiting on the subject to
+    /// announce, only on this node's next Key round.
+    BodyFetchQueued { key_id: String },
     /// The key resolves, but not to anything a person can be contacted through
     /// — a steward, an accord holder, a partner record. TERMINAL: no amount of
     /// convergence turns one of these into a contactable person, so a caller
@@ -295,6 +325,13 @@ impl LadderStall {
                  instead, or check that the identifier is the one you meant — this \
                  will not resolve by waiting."
             ),
+            Self::BodyFetchQueued { key_id } => format!(
+                "{key_id} is known to this node as a hash, but its body was not \
+                 held — this node runs hash-first retention. A fetch is queued and \
+                 goes out on the next Key replication round; retry the lookup \
+                 after it. Waiting for the peer to announce would NOT help: it \
+                 already did."
+            ),
             Self::PriorRungIncomplete { rung, prior } => format!(
                 "{rung} cannot proceed because {prior} has not completed. Look at the \
                  {prior} rung on this node first — a ladder failure is nearly always \
@@ -311,7 +348,10 @@ impl LadderStall {
     #[must_use]
     pub const fn self_resolving(&self) -> bool {
         match self {
-            Self::NotYetDiscovered { .. } | Self::Unreachable { .. } => true,
+            Self::NotYetDiscovered { .. }
+            | Self::Unreachable { .. }
+            // The fetch is queued; the next Key round carries it.
+            | Self::BodyFetchQueued { .. } => true,
             Self::AwaitingConsent { .. }
             | Self::ConsentNotGranted { .. }
             | Self::PriorRungIncomplete { .. }
@@ -448,12 +488,32 @@ pub trait RouteLens: Send + Sync {
 /// which question.
 pub struct PersistLens<'a> {
     directory: &'a dyn ciris_persist::federation::FederationDirectory,
+    /// CIRISEdge#552 — where an on-demand body fetch is queued. `None` on a
+    /// node that holds bodies: there is nothing to fetch, and the lens must
+    /// then answer `request_key_body` with `false` so the stall stays the
+    /// honest "not announced yet".
+    replication: Option<std::sync::Arc<dyn crate::replication::directory::ReplicationDirectory>>,
 }
 
 impl<'a> PersistLens<'a> {
     #[must_use]
     pub fn new(directory: &'a dyn ciris_persist::federation::FederationDirectory) -> Self {
-        Self { directory }
+        Self {
+            directory,
+            replication: None,
+        }
+    }
+
+    /// Give the lens the replication directory, so a resolution miss on a
+    /// hash-first node can queue the body fetch instead of reporting a wait
+    /// that never ends.
+    #[must_use]
+    pub fn with_replication(
+        mut self,
+        replication: std::sync::Arc<dyn crate::replication::directory::ReplicationDirectory>,
+    ) -> Self {
+        self.replication = Some(replication);
+        self
     }
 }
 
@@ -483,6 +543,22 @@ impl DirectoryLens for PersistLens<'_> {
         ciris_persist::federation::admission::nodes_owned_by(self.directory, fed_id)
             .await
             .unwrap_or_default()
+    }
+
+    async fn request_key_body(&self, key_id: &str) -> bool {
+        let Some(replication) = self.replication.as_ref() else {
+            return false;
+        };
+        // The same gate the admission path uses: under `Bodies` the body
+        // replicates on its own, so queueing would ask for something already in
+        // flight and the stall's ordinary remedy is the right one.
+        if !crate::replication::retention::should_note_missing_signer(
+            replication.retention(crate::replication::protocol::EnvelopeKind::Key),
+        ) {
+            return false;
+        }
+        replication.note_missing_signer(crate::replication::protocol::EnvelopeKind::Key, key_id);
+        true
     }
 }
 
@@ -768,5 +844,90 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "rung names must be distinct");
         assert!(names.contains(&"request_contact"));
+    }
+
+    /// CIRISEdge#552 — a hash-first node that knows the key as a HASH must
+    /// queue the body fetch, and must say so.
+    ///
+    /// The bug this closes: `identity_type_of` answers `None` because the body
+    /// was never fetched, and the ladder reports `NotYetDiscovered`, whose
+    /// remedy is "wait for the peer to announce". The peer already announced.
+    /// Bulk convergence is exactly what hash-first suppressed, so that wait
+    /// never ends — the same shape as a kill order that cannot land.
+    #[tokio::test]
+    async fn a_resolution_miss_on_a_hash_first_node_queues_the_body_fetch() {
+        struct HashOnlyLens {
+            requested: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl super::DirectoryLens for HashOnlyLens {
+            async fn identity_type_of(&self, _key_id: &str) -> Option<String> {
+                None // the body is not held — only its hash
+            }
+            async fn owner_of(&self, _key_id: &str) -> Option<String> {
+                None
+            }
+            async fn nodes_owned_by(&self, _fed_id: &str) -> Vec<String> {
+                Vec::new()
+            }
+            async fn request_key_body(&self, key_id: &str) -> bool {
+                self.requested.lock().unwrap().push(key_id.to_owned());
+                true
+            }
+        }
+
+        let lens = HashOnlyLens {
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+        let err = super::resolve(&lens, "frank-abc123")
+            .await
+            .expect_err("the body is not held, so this cannot resolve yet");
+
+        assert_eq!(
+            lens.requested.lock().unwrap().as_slice(),
+            ["frank-abc123"],
+            "the miss must QUEUE the fetch — without it the lookup can never \
+             succeed on a hash-first node"
+        );
+        match &err {
+            LadderStall::BodyFetchQueued { key_id } => {
+                assert_eq!(key_id, "frank-abc123");
+            }
+            other => panic!("expected BodyFetchQueued, got {other:?}"),
+        }
+        assert!(err.self_resolving(), "the next Key round carries the fetch");
+        assert!(
+            err.remedy().contains("already did"),
+            "the remedy must NOT tell an operator to wait for an announce that \
+             already happened: {}",
+            err.remedy()
+        );
+    }
+
+    /// A node that holds bodies has nothing to fetch, so its miss really is
+    /// "not announced yet" — the default must not manufacture a fetch.
+    #[tokio::test]
+    async fn a_bodies_node_still_reports_not_yet_discovered() {
+        struct BodiesLens;
+        #[async_trait::async_trait]
+        impl super::DirectoryLens for BodiesLens {
+            async fn identity_type_of(&self, _key_id: &str) -> Option<String> {
+                None
+            }
+            async fn owner_of(&self, _key_id: &str) -> Option<String> {
+                None
+            }
+            async fn nodes_owned_by(&self, _fed_id: &str) -> Vec<String> {
+                Vec::new()
+            }
+        }
+        let err = super::resolve(&BodiesLens, "frank-abc123")
+            .await
+            .expect_err("unknown key");
+        assert!(
+            matches!(err, LadderStall::NotYetDiscovered { .. }),
+            "a bodies-retention node's miss is an ordinary not-yet-discovered, \
+             got {err:?}"
+        );
     }
 }
