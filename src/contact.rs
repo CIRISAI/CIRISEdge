@@ -11,9 +11,27 @@
 //! why the ladder had never been walked end to end, and why nobody could say
 //! which rung was broken.
 //!
-//! So the surface here takes a **fedID and nothing else**. `discover(fed_id)`,
-//! `request_contact(fed_id)`, `accept_contact(fed_id)`, `open_chat(fed_id)`.
-//! Anything a caller must look up first is a rung they can get wrong.
+//! So the surface here takes a **fedID and nothing else**. Anything a caller
+//! must look up first is a rung they can get wrong.
+//!
+//! # What lives here, and what deliberately does not
+//!
+//! Edge owns the rungs that are about REACHING someone:
+//!
+//! * [`resolve`] — any identifier (fedID, nodeID, agentID) to the person and the
+//!   nodes that reach them;
+//! * [`discover`] — that, plus a transport destination, so "discovered" means
+//!   contactable rather than merely known.
+//!
+//! **Consent and chat are CIRISServer's**, and are not reimplemented here.
+//! `POST /v1/contacts` already ensures a `consent:replication:v1` grant covers
+//! `chat:`; `POST /v1/chat` already writes a 2-member `Community`;
+//! `POST /v1/chat/{id}/messages` already writes a `chat:message:v1` attestation.
+//! A second implementation of any of those in edge would be two components
+//! owning one rule — which is the failure this codebase keeps paying for, and
+//! the reason [`Rung`] names those rungs without implementing them: the ladder
+//! is a shared vocabulary for diagnosis, not a claim about who executes each
+//! step.
 //!
 //! # Multi-hop is free, and that is load-bearing
 //!
@@ -334,6 +352,66 @@ pub fn log_rung(rung: Rung, fed_id: &str, stall: Option<&LadderStall>) {
     }
 }
 
+/// A resolved subject that is actually CONTACTABLE.
+///
+/// [`resolve`] proves someone owns nodes. This proves at least one of them can
+/// be reached — which is a different claim, and the one a caller acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovered {
+    pub subject: Subject,
+    /// The nodes with a transport destination this node can dial. Never empty.
+    pub reachable: Vec<String>,
+}
+
+/// Resolve an identifier AND confirm somewhere to send.
+///
+/// `nodes_owned_by` proves ownership, not reachability: a person can own nodes
+/// this node has no route to, and reporting that as discovered hands the caller
+/// a `Subject` whose every send fails. The distinction matters because the two
+/// have different remedies — an unknown key waits for the directory, an
+/// unreachable node waits for the peer.
+///
+/// Once a destination IS known, distance stops mattering: a node publishes its
+/// RNS transport key, and Reticulum routes to it across however many hops
+/// separate the two. Edge implements no relaying to make that work.
+///
+/// # Errors
+/// [`LadderStall::NotYetDiscovered`] if the identifier does not resolve;
+/// [`LadderStall::Unreachable`] if it resolves to a person whose nodes have no
+/// route yet.
+pub async fn discover(
+    lens: &dyn DirectoryLens,
+    routes: &dyn RouteLens,
+    any_id: &str,
+) -> Result<Discovered, LadderStall> {
+    let subject = resolve(lens, any_id).await?;
+    let mut reachable = Vec::new();
+    for node in &subject.nodes {
+        if routes.has_destination(node).await {
+            reachable.push(node.clone());
+        }
+    }
+    if reachable.is_empty() {
+        let stall = LadderStall::Unreachable {
+            fed_id: subject.fed_id.clone(),
+        };
+        log_rung(Rung::Discover, &subject.fed_id, Some(&stall));
+        return Err(stall);
+    }
+    log_rung(Rung::Discover, &subject.fed_id, None);
+    Ok(Discovered { subject, reachable })
+}
+
+/// Whether this node has a transport destination for a peer.
+///
+/// Separate from [`DirectoryLens`] because it is a TRANSPORT question, not a
+/// directory one: the answer changes as announces arrive, and conflating them
+/// would make discovery look like a directory failure when it is a routing one.
+#[async_trait::async_trait]
+pub trait RouteLens: Send + Sync {
+    async fn has_destination(&self, node_key_id: &str) -> bool;
+}
+
 /// The [`DirectoryLens`] over a real persist directory.
 ///
 /// Thin on purpose: every rule that can be got wrong lives in [`resolve`] and is
@@ -509,6 +587,71 @@ mod tests {
             "the remedy must name the person we could not reach: {}",
             stall.remedy()
         );
+    }
+
+    struct AllRouted;
+    #[async_trait::async_trait]
+    impl super::RouteLens for AllRouted {
+        async fn has_destination(&self, _node: &str) -> bool {
+            true
+        }
+    }
+    struct NoRoutes;
+    #[async_trait::async_trait]
+    impl super::RouteLens for NoRoutes {
+        async fn has_destination(&self, _node: &str) -> bool {
+            false
+        }
+    }
+    struct OnlyPhone;
+    #[async_trait::async_trait]
+    impl super::RouteLens for OnlyPhone {
+        async fn has_destination(&self, node: &str) -> bool {
+            node == "frank-phone-eee"
+        }
+    }
+
+    /// Discovery means CONTACTABLE, not merely known. Owning nodes this node has
+    /// no route to is not discovery — reporting it as such hands the caller a
+    /// subject whose every send fails, with no clue why.
+    #[tokio::test]
+    async fn owning_nodes_with_no_route_is_not_discovery() {
+        let Err(stall) = super::discover(&frank(), &NoRoutes, "frank-fed-aaa").await else {
+            panic!("no route means not contactable");
+        };
+        assert!(
+            matches!(stall, super::LadderStall::Unreachable { .. }),
+            "an unreachable peer and an unknown key have DIFFERENT remedies — one \
+             waits for the peer, the other for the directory"
+        );
+        assert!(stall.self_resolving(), "the peer may simply be offline");
+    }
+
+    /// Only the nodes with a route are offered. Handing back an unroutable node
+    /// alongside a routable one invites the caller to pick the wrong one.
+    #[tokio::test]
+    async fn discovery_returns_only_the_reachable_nodes() {
+        let d = super::discover(&frank(), &OnlyPhone, "frank-laptop-bbb")
+            .await
+            .expect("one routable node is enough");
+        assert_eq!(d.reachable, vec!["frank-phone-eee".to_string()]);
+        assert_eq!(
+            d.subject.nodes.len(),
+            2,
+            "the subject still knows about both — only REACHABLE is filtered"
+        );
+    }
+
+    /// And any identifier still gets there.
+    #[tokio::test]
+    async fn discovery_works_from_any_identifier() {
+        for id in ["frank-fed-aaa", "frank-laptop-bbb", "frank-agent-ccc"] {
+            let d = super::discover(&frank(), &AllRouted, id)
+                .await
+                .expect("resolves");
+            assert_eq!(d.subject.fed_id, "frank-fed-aaa");
+            assert_eq!(d.reachable.len(), 2);
+        }
     }
 
     /// The ladder is ordered, and the order is the diagnostic. A failure is
