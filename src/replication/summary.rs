@@ -158,6 +158,23 @@ pub trait StateProvider: Send + Sync {
     ) {
     }
 
+    /// CIRISEdge#552 (B) — record a signer a transient refusal named, so the
+    /// key can be pulled out of band. See
+    /// [`ReplicationDirectory::note_missing_signer`] for why this only records.
+    ///
+    /// [`ReplicationDirectory::note_missing_signer`]:
+    ///     super::directory::ReplicationDirectory::note_missing_signer
+    fn note_missing_signer(&self, _kind: EnvelopeKind, _signer_key_id: &str) {}
+
+    /// CIRISEdge#552 (B) — take signers to pull, at most a bounded batch. The
+    /// names are REMOVED: a name that stays queued after its pull was sent would
+    /// re-pull every round. If the key still does not arrive, the row refuses
+    /// transient again and re-notes it — the retry rides the existing #544
+    /// backoff rather than a second timer.
+    fn take_missing_signers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }

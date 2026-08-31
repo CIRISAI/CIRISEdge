@@ -1196,6 +1196,16 @@ enum QuarantineConsult {
 
 // ─── The bridge ──────────────────────────────────────────────────────
 
+/// Cap on the missing-signer set (CIRISEdge#552 B). Sized for a federation's
+/// SIGNER count, not its record count: a name repeats across every row that
+/// signer signed, so the set dedupes hard. Past the cap names are dropped and
+/// the rows they gate stay transient-refused — bounded and visible, and it
+/// drains as pulls land.
+const MISSING_SIGNER_CAP: usize = 1024;
+
+/// How many missing signers become Pulls in a single round.
+const MISSING_SIGNER_DRAIN: usize = 32;
+
 /// Production-grade [`ReplicationDirectory`] implementation over
 /// persist's `FederationDirectory`.
 pub struct FederationDirectoryReplicationBridge {
@@ -1318,6 +1328,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// them. In-memory: CIRISPersist#785 is where this becomes durable, and the
     /// advertise re-sweep re-learns anything lost to a restart.
     known_hashes: Mutex<crate::replication::known_hashes::KnownHashes>,
+    /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
+    /// not hold. Bounded: a peer that offers unadmittable rows must not be able
+    /// to grow this without limit, so past the cap new names are DROPPED rather
+    /// than evicting older ones — the older names are the ones with rows already
+    /// waiting on them.
+    missing_signers: Mutex<std::collections::BTreeSet<String>>,
     /// CIRISEdge#531 DEPTH — the largest row count ANY single page read has
     /// returned on this bridge. The flat bound's own witness, in the same
     /// discipline as [`Self::sweep_gate`]'s `max_in_flight` and
@@ -1482,6 +1498,7 @@ impl FederationDirectoryReplicationBridge {
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
+            missing_signers: Mutex::new(std::collections::BTreeSet::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -1532,6 +1549,7 @@ impl FederationDirectoryReplicationBridge {
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
+            missing_signers: Mutex::new(std::collections::BTreeSet::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -2274,6 +2292,47 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// that advertised them (the holder map). In-memory and local only: this is
     /// an OBSERVATION, not a claim, and CIRISPersist#785 is where it becomes
     /// durable.
+    fn note_missing_signer(&self, _kind: EnvelopeKind, signer_key_id: &str) {
+        // Gated on the KEY plane's retention, not on this record's plane. The
+        // row that stalled can be any kind; the row it waits on is always a Key.
+        // Under `Bodies` that Key body replicates on its own and the #544 backoff
+        // admits the row on a later round — the self-resolving case the module
+        // doc describes — so recording here would add a pull for something
+        // already in flight.
+        if !matches!(
+            self.retention(EnvelopeKind::Key),
+            crate::replication::retention::Retention::HashFirst
+        ) {
+            return;
+        }
+        if let Ok(mut pending) = self.missing_signers.lock() {
+            if pending.len() >= MISSING_SIGNER_CAP && !pending.contains(signer_key_id) {
+                tracing::warn!(
+                    signer = %signer_key_id,
+                    cap = MISSING_SIGNER_CAP,
+                    "missing-signer set at cap — DROPPING this name (CIRISEdge#552)"
+                );
+                return;
+            }
+            pending.insert(signer_key_id.to_string());
+        }
+    }
+
+    fn take_missing_signers(&self) -> Vec<String> {
+        let Ok(mut pending) = self.missing_signers.lock() else {
+            return Vec::new();
+        };
+        // A bounded batch per call: the set can hold a federation's worth of
+        // names after a cold start, and turning all of them into Pulls in one
+        // round is a burst this node chose to send. The rest keep until the
+        // next round.
+        let take: Vec<String> = pending.iter().take(MISSING_SIGNER_DRAIN).cloned().collect();
+        for name in &take {
+            pending.remove(name);
+        }
+        take
+    }
+
     fn note_known_hashes(
         &self,
         kind: EnvelopeKind,

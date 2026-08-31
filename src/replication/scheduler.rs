@@ -474,6 +474,12 @@ async fn run_one_coordinator_forever(
             _ = interval.tick() => {
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
                 let _enter = span.enter();
+                // CIRISEdge#552 (B) — drain missing signers into Key Pulls
+                // BEFORE the round, not after: a Pull sent now has its reply
+                // fetched by THIS round's Summary handling, so the stalled row
+                // can admit a round earlier. No-op on every kind but `Key`, and
+                // no-op entirely unless hash-first is active.
+                coord.pull_missing_signers().await;
                 let event = match run_one_round(&coord, round_timeout).await {
                     // CIRISEdge#380 — run_one_round converts SendThenComplete to
                     // Complete after sending; the merged arm is defensive if it

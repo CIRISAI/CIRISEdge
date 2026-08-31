@@ -201,6 +201,25 @@ pub trait ReplicationDirectory: Send + Sync {
     ) {
     }
 
+    /// CIRISEdge#552 (B) — a transient refusal named a signer this node may not
+    /// hold. Recording it is all that happens here: admission stays LOCAL and
+    /// still fails transient, because the revocation admission path is the one
+    /// path that must never depend on a peer answering. Something out of band
+    /// pulls the key; the #544 backoff then re-offers the row and it admits.
+    ///
+    /// Sync by design, like [`Self::note_known_hashes`] — it sits on the apply
+    /// loop. Whether the key is genuinely absent is decided at the DRAIN, which
+    /// can afford the store lookup this cannot.
+    fn note_missing_signer(&self, _kind: EnvelopeKind, _signer_key_id: &str) {}
+
+    /// CIRISEdge#552 (B) — see [`StateProvider::take_missing_signers`].
+    ///
+    /// [`StateProvider::take_missing_signers`]:
+    ///     super::summary::StateProvider::take_missing_signers
+    fn take_missing_signers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }
@@ -321,6 +340,14 @@ impl StateProvider for DirectoryStateAdapter {
         advertised_by: Option<&str>,
     ) {
         self.inner.note_known_hashes(kind, hashes, advertised_by);
+    }
+
+    fn note_missing_signer(&self, kind: EnvelopeKind, signer_key_id: &str) {
+        self.inner.note_missing_signer(kind, signer_key_id);
+    }
+
+    fn take_missing_signers(&self) -> Vec<String> {
+        self.inner.take_missing_signers()
     }
 
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
@@ -586,6 +613,66 @@ mod tests {
     }
 
     /// apply_envelope_bytes admits new envelopes, refuses duplicates.
+    /// CIRISEdge#552 (B) — the adapter must FORWARD the missing-signer seam.
+    ///
+    /// This test exists because of how #552 (A) failed: `retention()` was
+    /// implemented on the bridge, defaulted on the trait, and never forwarded
+    /// here — so production took the default and six review rounds ran against
+    /// a feature that could not execute. A default-bodied trait method that
+    /// nothing forwards is indistinguishable from a working one until you look
+    /// for the call. So: assert the forward, in both directions.
+    #[test]
+    fn the_adapter_forwards_the_missing_signer_seam() {
+        #[derive(Default)]
+        struct RecordingDir {
+            noted: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ReplicationDirectory for RecordingDir {
+            async fn list_envelope_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            async fn fetch_envelope_bytes(
+                &self,
+                _k: EnvelopeKind,
+                _h: &[u8; 32],
+            ) -> Option<Vec<u8>> {
+                None
+            }
+            async fn apply_envelope_bytes(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> ApplyOutcome {
+                ApplyOutcome::Admitted
+            }
+            fn note_missing_signer(&self, _k: EnvelopeKind, signer: &str) {
+                self.noted.lock().unwrap().push(signer.to_string());
+            }
+            fn take_missing_signers(&self) -> Vec<String> {
+                vec!["drained-from-inner".to_string()]
+            }
+        }
+
+        let inner = Arc::new(RecordingDir::default());
+        let adapter =
+            DirectoryStateAdapter::new(Arc::clone(&inner) as Arc<dyn ReplicationDirectory>);
+
+        StateProvider::note_missing_signer(&adapter, EnvelopeKind::Attestation, "steward-xyz");
+        assert_eq!(
+            inner.noted.lock().unwrap().as_slice(),
+            ["steward-xyz"],
+            "note_missing_signer must reach the inner directory — an unforwarded \
+             seam silently takes the no-op default (the #552 A inertness bug)"
+        );
+        assert_eq!(
+            StateProvider::take_missing_signers(&adapter),
+            ["drained-from-inner"],
+            "take_missing_signers must reach the inner directory too"
+        );
+    }
+
     #[tokio::test]
     async fn apply_admits_new_refuses_duplicates() {
         let dir = MockReplicationDirectory::new();

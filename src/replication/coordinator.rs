@@ -380,6 +380,45 @@ impl ReplicationCoordinator {
     /// forget: the testimony converges over the peer's next round, matching the
     /// anti-entropy model — sending the Pull carries no session state (only the
     /// reply does), so there is nothing to await here.
+    /// CIRISEdge#552 (B) — turn recorded missing signers into Key Pulls.
+    ///
+    /// Only the `Key` coordinator does this: [`Self::start_pull`] sends a
+    /// `PullMessage { kind: self.kind, .. }`, and the row every stalled record
+    /// waits on is a Key row. Called from the scheduler after a round, so it
+    /// rides the cadence the operator already tuned rather than adding a timer.
+    ///
+    /// Returns how many Pulls were SENT. A send failure is logged and the name
+    /// is not re-queued here: the record that named it refuses transient again
+    /// on its next offer and re-notes it, so the retry rides #544's backoff and
+    /// cannot become a hot loop against an unreachable peer.
+    pub async fn pull_missing_signers(&self) -> usize {
+        if self.kind != EnvelopeKind::Key {
+            return 0;
+        }
+        let names = self.provider.take_missing_signers();
+        let mut sent = 0usize;
+        for name in names {
+            match self.start_pull(&name).await {
+                Ok(()) => sent += 1,
+                Err(e) => tracing::warn!(
+                    peer = %self.peer_key_id,
+                    signer = %name,
+                    error = %e,
+                    "missing-signer Pull send failed — the row that named it will \
+                     re-note it on its next transient refusal (CIRISEdge#552)"
+                ),
+            }
+        }
+        if sent > 0 {
+            tracing::debug!(
+                peer = %self.peer_key_id,
+                sent,
+                "pulled Key rows for signers that stalled admission (CIRISEdge#552)"
+            );
+        }
+        sent
+    }
+
     pub async fn start_pull(&self, subject_key_id: &str) -> Result<(), CoordinatorError> {
         let pull = ReplicationMessage::Pull(PullMessage {
             kind: self.kind,

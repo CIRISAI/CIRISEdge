@@ -939,6 +939,25 @@ impl Session {
                 // token maps to which. It is a stable token, never prose.
                 ApplyOutcome::Refused { reason, retry } => {
                     refused += 1;
+                    // CIRISEdge#552 (B) — a TRANSIENT refusal is the one that
+                    // waits on more state, and the state it most often waits on
+                    // is the signer's own Key row. Under hash-first that row can
+                    // be a hash this node never fetches, so the #544 backoff
+                    // would re-offer forever and a revocation whose revoker is
+                    // unknown would never land.
+                    //
+                    // Extract the candidate signer HERE (pure, no store) and
+                    // record it; whether it is genuinely absent is the drain's
+                    // question. Deliberately keyed on the DISPOSITION, not on
+                    // the reason prose — consumers key on stable tokens, and a
+                    // spurious note costs one deduped lookup at the drain.
+                    if !retry.is_terminal() {
+                        if let Some(signer) = crate::replication::missing_signer::missing_signer_of(
+                            self.kind, env_bytes,
+                        ) {
+                            provider.note_missing_signer(self.kind, &signer);
+                        }
+                    }
                     tracing::warn!(
                         kind = ?self.kind,
                         reason = %reason,
@@ -1921,6 +1940,75 @@ mod tests {
             }
             o => panic!("expected Applied, got {o:?}"),
         }
+    }
+
+    /// CIRISEdge#552 (B) — the choke point RECORDS the signer a transient
+    /// refusal named. Not "the resolver exists" — that was true while nothing
+    /// called it. This delivers a record whose signer is unknown and asserts the
+    /// name reached the PROVIDER, which is the seam that was missing.
+    #[test]
+    fn a_transient_refusal_records_the_signer_it_named() {
+        use std::sync::Mutex;
+        struct RecordingProvider(Mutex<Vec<String>>);
+        impl StateProvider for RecordingProvider {
+            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn note_missing_signer(&self, _k: EnvelopeKind, signer: &str) {
+                self.0.lock().unwrap().push(signer.to_string());
+            }
+        }
+        struct TransientRefuser;
+        impl StateApplier for TransientRefuser {
+            fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> ApplyOutcome {
+                ApplyOutcome::refused("signer not registered")
+            }
+        }
+        struct TerminalRefuser;
+        impl StateApplier for TerminalRefuser {
+            fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> ApplyOutcome {
+                ApplyOutcome::refused_terminal("this row will never admit")
+            }
+        }
+
+        let row = br#"{"revoking_key_id":"steward-abc123"}"#.to_vec();
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![row],
+        };
+
+        let provider = RecordingProvider(Mutex::new(Vec::new()));
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        responder.on_deliver(&deliver, &provider, &TransientRefuser, Some("peer-x"));
+        assert_eq!(
+            provider.0.lock().unwrap().as_slice(),
+            ["steward-abc123"],
+            "a TRANSIENT refusal must record the signer it waits on — without \
+             this the resolver is dead code and the kill order never lands"
+        );
+
+        // A terminal refusal is not waiting on anything. Pulling a key for it
+        // would be a request this node can never use.
+        let provider = RecordingProvider(Mutex::new(Vec::new()));
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        responder.on_deliver(&deliver, &provider, &TerminalRefuser, Some("peer-x"));
+        assert!(
+            provider.0.lock().unwrap().is_empty(),
+            "a TERMINAL refusal waits on nothing — it must not queue a pull"
+        );
     }
 
     /// CIRISEdge#544 — the re-offer loop is RECEIVER-PULLED, and this is the
