@@ -89,16 +89,21 @@ impl KnownHashes {
     /// wrong.
     pub fn note(&mut self, kind: EnvelopeKind, hash: [u8; 32], peer: &str, now: u64) {
         if self.entries.len() >= self.cap && !self.entries.contains_key(&(kind, hash)) {
-            // At cap: drop the least-recently-advertised entry. Evicting is
-            // recoverable — the peer's rolling re-sweep wraps and re-offers it.
-            if let Some(victim) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, v)| v.last_advertised_unix)
-                .map(|(k, _)| *k)
-            {
-                self.entries.remove(&victim);
-            }
+            // At cap: drop a BATCH of the least-recently-advertised entries, not
+            // one.
+            //
+            // Evicting one per insert meant a full map scan per advertised hash.
+            // A peer that keeps advertising fresh hashes then turns every Summary
+            // into O(page × cap) work — sustained CPU exhaustion in exactly the
+            // hostile-peer case this cap exists to tolerate, where the cap bounds
+            // memory and nothing bounds the scan. Batching amortises one scan
+            // across `EVICT_BATCH_FRACTION` of the cap, so the per-insert cost is
+            // bounded regardless of what a peer advertises.
+            //
+            // Evicting more than strictly necessary is cheap here: eviction is
+            // RECOVERABLE, because the advertise axis re-sweeps and wraps, so a
+            // dropped entry comes back around.
+            self.evict_stalest_batch();
         }
         let slot = self.entries.entry((kind, hash)).or_insert(KnownHash {
             last_advertised_unix: now,
@@ -110,6 +115,32 @@ impl KnownHashes {
             slot.last_advertised_unix = now;
             peer.clone_into(&mut slot.last_advertised_by);
         }
+    }
+
+    /// How much of the cap one eviction pass reclaims. A tenth: large enough
+    /// that the amortised scan cost per insert is ~10 comparisons, small enough
+    /// that a burst does not discard most of what the node knows.
+    const EVICT_BATCH_FRACTION: usize = 10;
+
+    /// Drop the stalest slice of the set in ONE pass.
+    fn evict_stalest_batch(&mut self) {
+        let target = (self.cap / Self::EVICT_BATCH_FRACTION).max(1);
+        let mut stamps: Vec<u64> = self
+            .entries
+            .values()
+            .map(|v| v.last_advertised_unix)
+            .collect();
+        if stamps.len() <= target {
+            self.entries.clear();
+            return;
+        }
+        // `select_nth_unstable` is O(n) and needs no full sort — the cutoff is a
+        // rank, not an order.
+        let (_, cutoff, _) = stamps.select_nth_unstable(target);
+        let cutoff = *cutoff;
+        // `>` not `>=`: entries sharing the cutoff instant stay, so a tie cannot
+        // over-evict past the batch.
+        self.entries.retain(|_, v| v.last_advertised_unix > cutoff);
     }
 
     /// Is this hash known (without being held)?
@@ -238,18 +269,47 @@ mod tests {
     /// one: eviction is recoverable via the re-sweep, so the entry furthest from
     /// its last refresh is the cheapest to re-learn.
     #[test]
-    fn at_the_cap_the_stalest_entry_is_evicted() {
-        let mut k = KnownHashes::with_cap(2);
-        k.note(EnvelopeKind::Attestation, h(1), "p", 100);
-        k.note(EnvelopeKind::Attestation, h(2), "p", 900);
-        k.note(EnvelopeKind::Attestation, h(3), "p", 950);
+    fn at_the_cap_the_stalest_entries_are_evicted() {
+        let mut k = KnownHashes::with_cap(20);
+        for i in 0..20u8 {
+            // Ascending recency: h(0) is the stalest.
+            k.note(EnvelopeKind::Key, h(i), "p", 100 + u64::from(i));
+        }
+        k.note(EnvelopeKind::Key, h(200), "p", 9_999);
 
-        assert_eq!(k.len(), 2);
+        assert!(k.len() <= 20, "the cap holds");
         assert!(
-            !k.contains(EnvelopeKind::Attestation, &h(1)),
-            "stalest goes"
+            !k.contains(EnvelopeKind::Key, &h(0)),
+            "the stalest entry must be among those dropped"
         );
-        assert!(k.contains(EnvelopeKind::Attestation, &h(3)));
+        assert!(
+            k.contains(EnvelopeKind::Key, &h(200)),
+            "the newly advertised hash must survive its own insert"
+        );
+        assert!(
+            k.contains(EnvelopeKind::Key, &h(19)),
+            "the freshest prior entry must survive a batch eviction"
+        );
+    }
+
+    /// The eviction pass is BATCHED, so a peer advertising a stream of fresh
+    /// hashes cannot turn every insert into a full scan. Without this the cap
+    /// bounds memory while nothing bounds CPU — sustained exhaustion in exactly
+    /// the hostile-peer case the cap exists for.
+    #[test]
+    fn a_flood_of_fresh_hashes_does_not_rescan_per_insert() {
+        let mut k = KnownHashes::with_cap(100);
+        for i in 0..100u8 {
+            k.note(EnvelopeKind::Key, h(i), "p", 100 + u64::from(i));
+        }
+        assert_eq!(k.len(), 100);
+
+        k.note(EnvelopeKind::Key, h(200), "p", 5_000);
+        assert!(
+            k.len() <= 100 - (100 / KnownHashes::EVICT_BATCH_FRACTION) + 1,
+            "one pass must reclaim a batch, not a single slot — got {}",
+            k.len()
+        );
     }
 
     /// Re-noting an entry at the cap must not evict anything — it is a refresh,

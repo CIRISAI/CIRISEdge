@@ -409,7 +409,9 @@ impl Session {
                 self.on_summary(&remote_summary, provider, source_peer)
             }
             ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider, source_peer),
-            ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier, source_peer),
+            ReplicationMessage::Deliver(deliver) => {
+                self.on_deliver(&deliver, provider, applier, source_peer)
+            }
             ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider, source_peer),
             ReplicationMessage::Pull(pull) => self.on_pull(&pull, provider),
             ReplicationMessage::CursorPull(cp) => self.on_cursor_pull(&cp, provider),
@@ -681,14 +683,75 @@ impl Session {
         )
     }
 
+    // CIRISEdge#552 pushed this past the 100-line bound. One scenario — decide
+    // retention, then admit — and splitting it would put the hash-first decision
+    // in a different function from the apply it guards, which is the coupling
+    // worth keeping visible.
+    #[allow(clippy::too_many_lines)]
     fn on_deliver(
         &mut self,
         deliver: &DeliverMessage,
+        // CIRISEdge#552 — the retention decision lives on the provider, and the
+        // apply path needs it: clearing `want` stops us ASKING, and stops
+        // nothing from arriving.
+        provider: &dyn StateProvider,
         applier: &dyn StateApplier,
         source_peer: Option<&str>,
     ) -> ReplicationOutcome {
         if deliver.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
+        }
+        // ── CIRISEdge#552: an UNSOLICITED body does not backfill the corpus ──
+        //
+        // Hash-first empties `want`, so under it this session asks for nothing —
+        // which means any Deliver reaching here was not invited by an
+        // anti-entropy round. A `#927` proactive publish would otherwise hand the
+        // node exactly the bodies it declined to fetch, and the corpus-size and
+        // address-book properties would be lost to a peer's generosity rather
+        // than to any decision of ours.
+        //
+        // Keyed on `diff_want_count` — the SOLICITED marker the session already
+        // keeps — so an explicit on-demand fetch still applies normally. That is
+        // the whole point of hash-first: fetch when something needs the body.
+        //
+        // `retention_for` keeps the carve-out: a retracting plane is never
+        // HashFirst, so a pushed revocation still applies. This deliberately
+        // gates the ADMIT, where #544's suppression deliberately does not — the
+        // reasons differ. Suppression is about a row we tried and could not
+        // admit; hash-first is about a body we chose not to store, and applying
+        // it anyway would defeat the choice.
+        if self.diff_want_count.is_none()
+            && retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst
+        {
+            let learned: Vec<[u8; 32]> = deliver
+                .envelopes
+                .iter()
+                .map(|bytes| {
+                    use sha2::{Digest as _, Sha256};
+                    let h: [u8; 32] = Sha256::digest(bytes).into();
+                    h
+                })
+                .collect();
+            provider.note_known_hashes(self.kind, &learned, source_peer);
+            tracing::debug!(
+                kind = ?self.kind,
+                count = learned.len(),
+                peer = ?source_peer,
+                "hash-first: an unsolicited Deliver was LEARNED, not applied — \
+                 a proactive push must not backfill a corpus this node declined \
+                 to fetch (CIRISEdge#552)"
+            );
+            // `admitted: 0, refused: 0` is the honest pair: nothing was admitted,
+            // and nothing was REFUSED either — the bodies were declined, not
+            // rejected. The learn is not lost: it is in the known set and in this
+            // log line, which is where a "why did my push not land" question gets
+            // answered.
+            return ReplicationOutcome::Applied {
+                kind: self.kind,
+                admitted: 0,
+                refused: 0,
+                staleness: StalenessSignal::InSync,
+            };
         }
         // CIRISEdge#426 — distinguish a SOLICITED Deliver (it answers a `Diff` we
         // sent this round — `diff_want_count` is set) from an UNSOLICITED one (a
@@ -1735,7 +1798,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
         };
-        match responder.on_deliver(&deliver, &RefusingApplier, Some("peer-x")) {
+        match responder.on_deliver(&deliver, &BodiesProvider, &RefusingApplier, Some("peer-x")) {
             ReplicationOutcome::Applied {
                 admitted, refused, ..
             } => {
@@ -1787,9 +1850,12 @@ mod tests {
             noted: Mutex::new(Vec::new()),
             peer: Mutex::new(None),
         };
-        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        // Key, not Attestation: the Attestation plane carries `withdraws`
+        // tombstones and is pinned to Bodies (CIRISEdge#553). Key is an identity
+        // plane that cannot retract anything, which is what hash-first is for.
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Key);
         let remote = SummaryMessage {
-            kind: EnvelopeKind::Attestation,
+            kind: EnvelopeKind::Key,
             refs: vec![
                 EnvelopeRef {
                     envelope_hash: h(1),
@@ -1950,6 +2016,18 @@ mod tests {
         );
     }
 
+    /// A provider with default retention (`Bodies`), for deliver-side tests
+    /// that are not about retention at all.
+    struct BodiesProvider;
+    impl StateProvider for BodiesProvider {
+        fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            Vec::new()
+        }
+        fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
     /// An applier for want-side tests, which never see a Deliver.
     struct NoApply;
     impl StateApplier for NoApply {
@@ -1996,7 +2074,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"x".to_vec(), b"y".to_vec()],
         };
-        responder.on_deliver(&deliver, &applier, Some("canonical-1"));
+        responder.on_deliver(&deliver, &BodiesProvider, &applier, Some("canonical-1"));
         assert_eq!(
             *applier.seen.lock().unwrap(),
             vec![

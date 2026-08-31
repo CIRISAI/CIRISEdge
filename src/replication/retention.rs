@@ -50,25 +50,52 @@ pub enum Retention {
 #[must_use]
 pub const fn retention_for(kind: EnvelopeKind, configured: Retention) -> Retention {
     match kind {
-        // The revocation class. Bodies, always, whatever is configured.
+        // ── Planes that RETRACT, by name. Bodies, always.
         EnvelopeKind::Revocation
         | EnvelopeKind::IdentityOccurrenceRevocation
         | EnvelopeKind::FamilyMembershipRevocation
-        | EnvelopeKind::CommunityMembershipRevocation => Retention::Bodies,
+        | EnvelopeKind::CommunityMembershipRevocation
 
-        // Everything else honours the configuration. Listed EXHAUSTIVELY rather
-        // than with a `_` arm: a kind added later must be classified by whoever
-        // adds it, and a new revocation plane defaulting into `HashFirst`
-        // through a wildcard is exactly how this carve-out would be lost.
-        EnvelopeKind::Key
+        // ── Planes that retract from INSIDE. Bodies, always, and this is the
+        // half a kind-keyed carve-out gets wrong.
+        //
+        // Retraction is a per-RECORD property, not a per-kind one. The
+        // Attestation plane carries `withdraws` / `recants` tombstones — the
+        // bridge passes `is_withdraw_or_revocation(attestation_type)` into the
+        // projection, and notes that "a `withdraws` tombstone gossips GLOBAL
+        // (anti-rollback) even at `self`". Organization, OrgMembership and
+        // PartnerRecord likewise carry withdrawn/revoked states inside the
+        // envelope.
+        //
+        // A node cannot tell a tombstone from an ordinary row WITHOUT THE BODY,
+        // and hash-first is precisely the state of not having it. So the
+        // classification cannot be made per record on the receive side, and
+        // these planes are pinned whole. That costs the Attestation corpus —
+        // the largest one — which is the honest price of the carve-out being
+        // correct rather than convenient.
+        //
+        // Deciding per record needs the ADVERTISER to mark retractions on the
+        // wire, which is a vocabulary change and its own cut. Until then this
+        // is the safe side of the trade, and the trade is stated rather than
+        // discovered.
         | EnvelopeKind::Attestation
+        | EnvelopeKind::Organization
+        | EnvelopeKind::OrgMembership
+        | EnvelopeKind::PartnerRecord => Retention::Bodies,
+
+        // ── Planes that cannot retract anything. These are the identity and
+        // routing planes the federation directory is made of, which is exactly
+        // what #552 needs to hold as hashes.
+        //
+        // Listed EXHAUSTIVELY rather than with a `_` arm: a kind added later
+        // must be classified by whoever adds it, and a new retracting plane
+        // defaulting into `HashFirst` through a wildcard is how this carve-out
+        // would be lost silently.
+        EnvelopeKind::Key
         | EnvelopeKind::IdentityOccurrence
         | EnvelopeKind::Family
         | EnvelopeKind::Community
         | EnvelopeKind::LocationProof
-        | EnvelopeKind::Organization
-        | EnvelopeKind::OrgMembership
-        | EnvelopeKind::PartnerRecord
         | EnvelopeKind::TransportDestination
         | EnvelopeKind::AccordQuorumEvidence => configured,
     }
@@ -79,14 +106,23 @@ mod tests {
     use super::{retention_for, Retention};
     use crate::replication::protocol::EnvelopeKind;
 
-    /// The kinds that retract something. Spelled out here, independently of the
-    /// implementation, so the test is a statement of intent rather than a mirror
-    /// of the code it checks.
-    const RETRACTING: [EnvelopeKind; 4] = [
+    /// Every kind that can carry a retraction — by name OR from inside the
+    /// envelope. Spelled out here independently of the implementation, so the
+    /// test states intent rather than mirroring the code it checks.
+    ///
+    /// The last four are the ones a kind-keyed carve-out misses: they retract
+    /// per RECORD (`withdraws` / `recants`, withdrawn/revoked states), and a
+    /// receiver cannot tell without the body — which under hash-first it does
+    /// not have.
+    const RETRACTING: [EnvelopeKind; 8] = [
         EnvelopeKind::Revocation,
         EnvelopeKind::IdentityOccurrenceRevocation,
         EnvelopeKind::FamilyMembershipRevocation,
         EnvelopeKind::CommunityMembershipRevocation,
+        EnvelopeKind::Attestation,
+        EnvelopeKind::Organization,
+        EnvelopeKind::OrgMembership,
+        EnvelopeKind::PartnerRecord,
     ];
 
     /// CIRISEdge#553 — the carve-out. A configured `HashFirst` must not reach a
@@ -97,8 +133,8 @@ mod tests {
             assert_eq!(
                 retention_for(kind, Retention::HashFirst),
                 Retention::Bodies,
-                "{kind:?} retracts something — a node holding the HASH of a \
-                 retraction has not applied it"
+                "{kind:?} can carry a retraction — a node holding only its HASH \
+                 has not applied it, and cannot tell that it was one"
             );
         }
     }
@@ -108,11 +144,15 @@ mod tests {
     #[test]
     fn a_non_retracting_kind_honours_the_configured_retention() {
         assert_eq!(
-            retention_for(EnvelopeKind::Attestation, Retention::HashFirst),
+            retention_for(EnvelopeKind::Key, Retention::HashFirst),
             Retention::HashFirst
         );
         assert_eq!(
-            retention_for(EnvelopeKind::Key, Retention::HashFirst),
+            retention_for(EnvelopeKind::IdentityOccurrence, Retention::HashFirst),
+            Retention::HashFirst
+        );
+        assert_eq!(
+            retention_for(EnvelopeKind::TransportDestination, Retention::HashFirst),
             Retention::HashFirst
         );
     }
