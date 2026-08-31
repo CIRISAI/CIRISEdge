@@ -125,6 +125,9 @@ pub mod directory;
 /// whole safety of the design.
 pub mod known_hashes;
 pub mod mesh_config;
+/// CIRISEdge#552 — which Key an unverifiable signature was missing, so it can
+/// be pulled. `Key` is the root of every admission's dependency closure.
+pub mod missing_signer;
 pub mod protocol;
 pub mod refusal_backoff;
 pub mod registry;
