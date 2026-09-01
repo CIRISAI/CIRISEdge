@@ -1,0 +1,483 @@
+//! CIRISEdge#552 — hashes this node KNOWS EXIST but whose bodies it does not
+//! hold.
+//!
+//! # The one invariant
+//!
+//! `want = remote ∖ holdings`. This set is **not holdings**. A hash in here has
+//! never been fetched, verified or admitted — it is hearsay from a peer's
+//! Summary. If it ever reaches the holdings side of that difference, the node
+//! concludes it already has everything it has merely heard of and silently
+//! stops fetching: CIRISEdge#416's non-convergence with the sign flipped, and
+//! invisible, because nothing errors and anti-entropy just goes quiet.
+//!
+//! That is why this type yields no [`EnvelopeRef`](super::protocol::EnvelopeRef)
+//! and never will. `diff_refs` takes `&[EnvelopeRef]`; a set that cannot produce
+//! one cannot be passed to it by accident. Adding such an accessor "for
+//! symmetry" is the single change that would undo this module.
+//!
+//! # Ageing
+//!
+//! Entries age on **last advertised**, never first seen. CIRISPersist#776 is the
+//! cautionary case: a prune aged on `asserted_at`, a value its writer freezes,
+//! so the cutoff never advanced — and both consumers independently refused to
+//! call it rather than reporting a fault. `last_advertised` moves because the
+//! advertise axis re-sweeps and wraps, which is also what makes eviction
+//! recoverable. Ageing column and recovery mechanism are the same fact; built
+//! from different columns, that is the bug.
+//!
+//! # Eviction
+//!
+//! The caller supplies a cutoff — never a period. Recovery latency is one wrap
+//! of the peer's rolling re-sweep (`corpus ÷ page_budget × cadence`), and all
+//! three inputs live on this side. Passing a cutoff rather than a period keeps
+//! one owner for that number instead of a frozen copy on the other side of a
+//! boundary.
+//!
+//! # Disclosure
+//!
+//! The advertising peer is recorded because it is the holder map — the
+//! difference between knowing Frank exists and knowing who to ask. It is an
+//! OBSERVATION ("this peer advertised H to me"), not a claim, it is derived from
+//! Summaries this node already received, and it is **local only**: no
+//! replication policy kind, no wire-index coverage, nothing that reaches an
+//! envelope. Serialising it "for debugging" is how it becomes a who-holds-what
+//! index for the whole corpus.
+
+use std::collections::HashMap;
+
+use super::protocol::EnvelopeKind;
+
+/// A hash known to exist, and where it was last heard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownHash {
+    /// Unix seconds when a peer last advertised it. The ageing column.
+    pub last_advertised_unix: u64,
+    /// The peer that last advertised it — the holder map. Local only.
+    pub last_advertised_by: String,
+}
+
+/// Bounded set of known-but-not-held hashes.
+#[derive(Debug)]
+pub struct KnownHashes {
+    entries: HashMap<(EnvelopeKind, [u8; 32]), KnownHash>,
+    cap: usize,
+}
+
+impl KnownHashes {
+    /// Default cap. Sized like the other bounded memories in this crate: large
+    /// enough that a real federation directory fits, small enough that a
+    /// hostile peer advertising nonsense cannot grow it without bound.
+    pub const DEFAULT_CAP: usize = 262_144;
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_cap(Self::DEFAULT_CAP)
+    }
+
+    #[must_use]
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record that `peer` advertised `hash` for `kind` at `now`.
+    ///
+    /// Re-noting an existing entry advances `last_advertised_unix` — that is the
+    /// re-sweep keeping it alive, and the reason ageing on first-seen would be
+    /// wrong.
+    pub fn note(&mut self, kind: EnvelopeKind, hash: [u8; 32], peer: &str, now: u64) {
+        if self.entries.len() >= self.cap && !self.entries.contains_key(&(kind, hash)) {
+            // At cap: drop a BATCH of the least-recently-advertised entries, not
+            // one.
+            //
+            // Evicting one per insert meant a full map scan per advertised hash.
+            // A peer that keeps advertising fresh hashes then turns every Summary
+            // into O(page × cap) work — sustained CPU exhaustion in exactly the
+            // hostile-peer case this cap exists to tolerate, where the cap bounds
+            // memory and nothing bounds the scan. Batching amortises one scan
+            // across `EVICT_BATCH_FRACTION` of the cap, so the per-insert cost is
+            // bounded regardless of what a peer advertises.
+            //
+            // Evicting more than strictly necessary is cheap here: eviction is
+            // RECOVERABLE, because the advertise axis re-sweeps and wraps, so a
+            // dropped entry comes back around.
+            self.evict_stalest_batch();
+        }
+        let slot = self.entries.entry((kind, hash)).or_insert(KnownHash {
+            last_advertised_unix: now,
+            last_advertised_by: peer.to_owned(),
+        });
+        // Monotonic: a peer with a lagging clock must not age an entry the
+        // re-sweep just refreshed.
+        if now >= slot.last_advertised_unix {
+            slot.last_advertised_unix = now;
+            peer.clone_into(&mut slot.last_advertised_by);
+        }
+    }
+
+    /// How much of the cap one eviction pass reclaims. A tenth: large enough
+    /// that the amortised scan cost per insert is ~10 comparisons, small enough
+    /// that a burst does not discard most of what the node knows.
+    const EVICT_BATCH_FRACTION: usize = 10;
+
+    /// Drop the stalest slice of the set in ONE pass.
+    fn evict_stalest_batch(&mut self) {
+        let target = (self.cap / Self::EVICT_BATCH_FRACTION).max(1);
+        if self.entries.len() <= target {
+            self.entries.clear();
+            return;
+        }
+        // Evict from the LARGEST HOLDER first, then by RANK within it.
+        //
+        // Staleness alone is monopolizable. A peer that advertises a torrent of
+        // hashes always holds the YOUNGEST entries, so a global stalest-first
+        // pass evicts everyone ELSE — one peer can push every honest peer's
+        // directory knowledge out of a cap it is simultaneously filling. The
+        // holder map is what makes a hash actionable (it names who to fetch
+        // from), so losing it for honest peers is the whole feature degrading
+        // under exactly the hostile case the cap exists to tolerate.
+        //
+        // Charging eviction to the peer with the most entries is max-min
+        // fairness: under contention no peer can hold much more than its share,
+        // while a node talking to ONE peer still gets the whole cap — a fixed
+        // per-peer quota would waste it in the common case.
+        let mut per_peer: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for v in self.entries.values() {
+            *per_peer.entry(v.last_advertised_by.as_str()).or_insert(0) += 1;
+        }
+        // Ties broken by peer id so the choice is deterministic — an arbitrary
+        // pick would make eviction depend on map iteration order.
+        let dominant: Option<String> = per_peer
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(p, _)| p.to_owned());
+
+        // Rank, not a timestamp threshold: a threshold over-evicts on ties, and
+        // ties are the normal case here — every hash learned in one round shares
+        // a timestamp, so `retain(stamp > cutoff)` could drop a whole round's
+        // worth, precisely the entries most recently learned if the cap is hit
+        // mid-round. Selecting exactly `target` keys keeps the batch a batch.
+        let mut keys: Vec<(u64, (EnvelopeKind, [u8; 32]))> = self
+            .entries
+            .iter()
+            .filter(|(_, v)| {
+                // `map_or(true, ..)`, not `is_none_or`: that is stable since
+                // 1.82 and this crate's MSRV is 1.75.
+                dominant
+                    .as_deref()
+                    .map_or(true, |d| v.last_advertised_by == d)
+            })
+            .map(|(k, v)| (v.last_advertised_unix, *k))
+            .collect();
+        // The dominant holder may hold fewer than a batch (many small peers).
+        // Then it is not monopolizing anything and the global stalest pass is
+        // the right one — take everything it has and fall back for the rest.
+        if keys.len() < target {
+            keys = self
+                .entries
+                .iter()
+                .map(|(k, v)| (v.last_advertised_unix, *k))
+                .collect();
+        }
+        let take = target.min(keys.len());
+        if take < keys.len() {
+            // `select_nth_unstable` is O(n) and needs no full sort — we want the
+            // `take` stalest, not an ordering of all of them.
+            keys.select_nth_unstable_by_key(take, |(stamp, _)| *stamp);
+        }
+        for (_, key) in keys.into_iter().take(take) {
+            self.entries.remove(&key);
+        }
+    }
+
+    /// Is this hash known (without being held)?
+    #[must_use]
+    pub fn contains(&self, kind: EnvelopeKind, hash: &[u8; 32]) -> bool {
+        self.entries.contains_key(&(kind, *hash))
+    }
+
+    /// Who last advertised it — the holder to ask. Local only.
+    #[must_use]
+    pub fn holder(&self, kind: EnvelopeKind, hash: &[u8; 32]) -> Option<&str> {
+        self.entries
+            .get(&(kind, *hash))
+            .map(|e| e.last_advertised_by.as_str())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Drop entries not advertised since `cutoff_unix`.
+    ///
+    /// The CALLER computes the cutoff, because recovery latency is one wrap of
+    /// the advertise re-sweep and its inputs live on this side. A cutoff younger
+    /// than one wrap evicts entries the re-sweep has not come back around to,
+    /// and the set thrashes against the mechanism that refills it.
+    pub fn evict_advertised_before(&mut self, cutoff_unix: u64) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, v| v.last_advertised_unix >= cutoff_unix);
+        before - self.entries.len()
+    }
+}
+
+impl Default for KnownHashes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KnownHashes;
+    use crate::replication::protocol::EnvelopeKind;
+
+    fn h(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    /// A known hash is recorded with its holder, so a later fetch knows who to
+    /// ask rather than broadcasting.
+    #[test]
+    fn a_noted_hash_is_known_and_carries_its_holder() {
+        let mut k = KnownHashes::new();
+        k.note(EnvelopeKind::Attestation, h(1), "peer-a", 100);
+        assert!(k.contains(EnvelopeKind::Attestation, &h(1)));
+        assert_eq!(k.holder(EnvelopeKind::Attestation, &h(1)), Some("peer-a"));
+    }
+
+    /// Kind is part of the key. The same content hash on two planes is two
+    /// records, and collapsing them would let a fetch on one plane satisfy a
+    /// want on another.
+    #[test]
+    fn the_same_hash_on_two_planes_is_two_entries() {
+        let mut k = KnownHashes::new();
+        k.note(EnvelopeKind::Attestation, h(1), "peer-a", 100);
+        assert!(!k.contains(EnvelopeKind::Key, &h(1)));
+        assert_eq!(k.len(), 1);
+    }
+
+    /// CIRISPersist#776's lesson, applied. Re-advertisement REFRESHES the entry;
+    /// if this aged on first-seen the cutoff would never advance for a record the
+    /// re-sweep keeps offering, and eviction would delete live knowledge.
+    #[test]
+    fn re_advertising_refreshes_the_ageing_column() {
+        let mut k = KnownHashes::new();
+        k.note(EnvelopeKind::Attestation, h(1), "peer-a", 100);
+        k.note(EnvelopeKind::Attestation, h(1), "peer-b", 500);
+
+        assert_eq!(
+            k.evict_advertised_before(400),
+            0,
+            "it was re-advertised at 500"
+        );
+        assert!(k.contains(EnvelopeKind::Attestation, &h(1)));
+        assert_eq!(
+            k.holder(EnvelopeKind::Attestation, &h(1)),
+            Some("peer-b"),
+            "the holder is the peer that most recently offered it"
+        );
+    }
+
+    /// A lagging peer clock must not age an entry backwards — the same
+    /// monotonic discipline the liveness stamp uses, for the same reason.
+    #[test]
+    fn a_backwards_clock_cannot_age_an_entry() {
+        let mut k = KnownHashes::new();
+        k.note(EnvelopeKind::Attestation, h(1), "peer-a", 500);
+        k.note(EnvelopeKind::Attestation, h(1), "peer-late", 100);
+        assert_eq!(k.evict_advertised_before(400), 0, "500 must stand");
+        assert_eq!(
+            k.holder(EnvelopeKind::Attestation, &h(1)),
+            Some("peer-a"),
+            "a stale advertisement must not take over the holder slot either"
+        );
+    }
+
+    /// Eviction drops only what the cutoff names.
+    #[test]
+    fn eviction_drops_only_entries_older_than_the_cutoff() {
+        let mut k = KnownHashes::new();
+        k.note(EnvelopeKind::Attestation, h(1), "peer-a", 100);
+        k.note(EnvelopeKind::Attestation, h(2), "peer-a", 900);
+        assert_eq!(k.evict_advertised_before(500), 1);
+        assert!(!k.contains(EnvelopeKind::Attestation, &h(1)));
+        assert!(k.contains(EnvelopeKind::Attestation, &h(2)));
+    }
+
+    /// At the cap the LEAST RECENTLY ADVERTISED entry goes, not an arbitrary
+    /// one: eviction is recoverable via the re-sweep, so the entry furthest from
+    /// its last refresh is the cheapest to re-learn.
+    #[test]
+    fn at_the_cap_the_stalest_entries_are_evicted() {
+        let mut k = KnownHashes::with_cap(20);
+        for i in 0..20u8 {
+            // Ascending recency: h(0) is the stalest.
+            k.note(EnvelopeKind::Key, h(i), "p", 100 + u64::from(i));
+        }
+        k.note(EnvelopeKind::Key, h(200), "p", 9_999);
+
+        assert!(k.len() <= 20, "the cap holds");
+        assert!(
+            !k.contains(EnvelopeKind::Key, &h(0)),
+            "the stalest entry must be among those dropped"
+        );
+        assert!(
+            k.contains(EnvelopeKind::Key, &h(200)),
+            "the newly advertised hash must survive its own insert"
+        );
+        assert!(
+            k.contains(EnvelopeKind::Key, &h(19)),
+            "the freshest prior entry must survive a batch eviction"
+        );
+    }
+
+    /// Ties must not over-evict, and ties are the NORMAL case: every hash
+    /// learned in one round shares a Unix second. A timestamp threshold would
+    /// drop the whole second — far more than the batch, and precisely the
+    /// entries most recently learned when the cap is hit mid-round.
+    #[test]
+    fn a_whole_round_sharing_one_second_is_not_evicted_together() {
+        let mut k = KnownHashes::with_cap(20);
+        // 18 entries all learned in the same second, plus two older ones.
+        k.note(EnvelopeKind::Key, h(200), "p", 10);
+        k.note(EnvelopeKind::Key, h(201), "p", 11);
+        for i in 0..18u8 {
+            k.note(EnvelopeKind::Key, h(i), "p", 500);
+        }
+        assert_eq!(k.len(), 20);
+
+        k.note(EnvelopeKind::Key, h(210), "p", 900);
+
+        // The batch is cap/10 = 2. Only the two genuinely older entries should
+        // go; the 18 sharing 500 must survive.
+        let survivors = (0..18u8)
+            .filter(|i| k.contains(EnvelopeKind::Key, &h(*i)))
+            .count();
+        assert!(
+            survivors >= 17,
+            "a shared timestamp must not take the whole second with it — only \
+             {survivors} of 18 survived"
+        );
+    }
+
+    /// The eviction pass is BATCHED, so a peer advertising a stream of fresh
+    /// hashes cannot turn every insert into a full scan. Without this the cap
+    /// bounds memory while nothing bounds CPU — sustained exhaustion in exactly
+    /// the hostile-peer case the cap exists for.
+    #[test]
+    fn a_flood_of_fresh_hashes_does_not_rescan_per_insert() {
+        let mut k = KnownHashes::with_cap(100);
+        for i in 0..100u8 {
+            k.note(EnvelopeKind::Key, h(i), "p", 100 + u64::from(i));
+        }
+        assert_eq!(k.len(), 100);
+
+        k.note(EnvelopeKind::Key, h(200), "p", 5_000);
+        assert!(
+            k.len() <= 100 - (100 / KnownHashes::EVICT_BATCH_FRACTION) + 1,
+            "one pass must reclaim a batch, not a single slot — got {}",
+            k.len()
+        );
+    }
+
+    /// Re-noting an entry at the cap must not evict anything — it is a refresh,
+    /// not an insert. Getting this wrong would make a busy set evict itself.
+    #[test]
+    fn refreshing_at_the_cap_evicts_nothing() {
+        let mut k = KnownHashes::with_cap(2);
+        k.note(EnvelopeKind::Attestation, h(1), "p", 100);
+        k.note(EnvelopeKind::Attestation, h(2), "p", 200);
+        k.note(EnvelopeKind::Attestation, h(1), "p", 300);
+        assert_eq!(k.len(), 2);
+        assert!(k.contains(EnvelopeKind::Attestation, &h(2)));
+    }
+
+    /// CIRISEdge#552 — one peer must not be able to evict every OTHER peer's
+    /// entries out of the cap.
+    ///
+    /// Staleness alone is monopolizable: a peer advertising a torrent always
+    /// holds the youngest entries, so a global stalest-first pass charges every
+    /// eviction to the quiet, honest peers. Losing their entries loses the
+    /// HOLDER — the thing that makes a hash actionable — under exactly the
+    /// hostile case the cap exists to tolerate.
+    #[test]
+    fn a_flooding_peer_cannot_evict_a_quiet_peers_entries() {
+        let mut k = KnownHashes::with_cap(64);
+
+        // A quiet, honest peer's entries, learned first and never refreshed —
+        // the stalest in the set, and under stalest-first the first to go.
+        let quiet: Vec<[u8; 32]> = (0..8).map(h).collect();
+        for hash in &quiet {
+            k.note(EnvelopeKind::Attestation, *hash, "peer-quiet", 100);
+        }
+
+        // A flooding peer advertises many times the cap, always fresher.
+        for i in 0..500u32 {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&i.to_be_bytes());
+            hash[31] = 0xFF;
+            k.note(
+                EnvelopeKind::Attestation,
+                hash,
+                "peer-flood",
+                200 + u64::from(i),
+            );
+        }
+
+        let survived = quiet
+            .iter()
+            .filter(|hash| k.contains(EnvelopeKind::Attestation, hash))
+            .count();
+        assert_eq!(
+            survived,
+            quiet.len(),
+            "the quiet peer's entries must survive a flood — eviction is charged \
+             to the LARGEST holder, not to whoever happens to be stalest"
+        );
+        assert!(
+            k.len() <= 64,
+            "the cap still bounds memory: {} entries",
+            k.len()
+        );
+        assert_eq!(
+            k.holder(EnvelopeKind::Attestation, &quiet[0]),
+            Some("peer-quiet"),
+            "and the holder map survives with them — a hash without a holder \
+             cannot be fetched"
+        );
+    }
+
+    /// The fair-share pass must not stall eviction when NO peer dominates: with
+    /// many small holders the largest may hold less than a batch, and the cap
+    /// still has to be enforced.
+    #[test]
+    fn eviction_still_bounds_the_cap_when_no_peer_dominates() {
+        let mut k = KnownHashes::with_cap(32);
+        for i in 0..400u32 {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&i.to_be_bytes());
+            // A different holder for nearly every entry.
+            k.note(
+                EnvelopeKind::Attestation,
+                hash,
+                &format!("peer-{i}"),
+                100 + u64::from(i),
+            );
+        }
+        assert!(
+            k.len() <= 32,
+            "the cap is enforced regardless of holder distribution: {} entries",
+            k.len()
+        );
+    }
+}

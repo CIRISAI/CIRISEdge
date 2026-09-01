@@ -69,6 +69,7 @@ EXPECTED = {
     "publisher": {
         "mesh.standup",
         "mesh.rooting",
+        "ladder.discover",
         "cohort.join",
         "scope.install",
         "perf.publish_fanout",
@@ -80,6 +81,7 @@ EXPECTED = {
     "subscriber": {
         "mesh.standup",
         "mesh.rooting",
+        "ladder.discover",
         "cohort.join",
         "scope.install",
         "perf.receive",
@@ -863,6 +865,10 @@ def _golden():
                        ("nonmember", "nonmember")]:
         rows.append(_row(node, role, "mesh.standup"))
         rows.append(_row(node, role, "mesh.rooting"))
+        # CIRISEdge#554 — every node that roots must also be able to ADDRESS its
+        # peers; the two are different claims and the ladder needs the second.
+        if role in ("publisher", "subscriber"):
+            rows.append(_row(node, role, "ladder.discover"))
     for leg in ["cohort.join", "scope.install", "perf.publish_fanout",
                 "perf.blob_fanout", "conformance.seal_retires",
                 "mesh.member_reports"]:

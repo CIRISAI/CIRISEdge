@@ -51,10 +51,15 @@
 pub mod blob_swarm;
 pub mod bundle_gate;
 pub mod cohort_scope;
+/// CIRISEdge#552/#554 — the contact ladder: announce → discover → request →
+/// consent → chat, with one greppable log shape per rung.
+pub mod contact;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
 pub mod delivery_mode;
 pub mod detector;
+/// CIRISEdge#554 — the receiver-side budget on unsolicited contact requests.
+pub mod invite_gate;
 // v6.1.0 (CIRISEdge#175, FSD §3.3) — announce-suppression policy
 // + edge-side registry mirroring the recommended Leviculum
 // `AnnounceControl` extension shape.

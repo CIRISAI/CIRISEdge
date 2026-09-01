@@ -546,6 +546,26 @@ pub struct BridgeConfig {
     /// bound that costs nothing but rounds. The effective page is the `min` of
     /// the two.
     pub sweep_page_rows: u32,
+
+    /// CIRISEdge#552 — this node's posture, which decides how much directory it
+    /// keeps.
+    ///
+    /// Driven by [`AgentMode`](crate::AgentMode) rather than a switch of its
+    /// own: the mode vocabulary already exists (`client` / `proxy` / `server`,
+    /// proxy by default) and a second knob meaning almost the same thing is how
+    /// two sources of truth start disagreeing.
+    ///
+    /// * **Server** — the full directory. A node with the storage to hold it and
+    ///   the role to serve it.
+    /// * **Proxy** (default) and **Client** — a RELEVANT SUBSET only: contacts,
+    ///   and the keys needed to verify what this node holds.
+    ///
+    /// That distinction is a privacy control, not a storage one. If every node
+    /// converged the whole hash set, the directory would be enumerable from ANY
+    /// node — cheaper than holding bodies, but the same exposure. A proxy that
+    /// learns only what concerns it reveals only its own contacts if it is
+    /// compromised.
+    pub mode: crate::AgentMode,
 }
 
 impl BridgeConfig {
@@ -676,6 +696,7 @@ impl Default for BridgeConfig {
             operational_page_limit: Self::DEFAULT_OPERATIONAL_PAGE_LIMIT,
             advertise_sweep_permits: Self::DEFAULT_ADVERTISE_SWEEP_PERMITS,
             sweep_page_rows: Self::DEFAULT_SWEEP_PAGE_ROWS,
+            mode: crate::AgentMode::Proxy,
         }
     }
 }
@@ -1175,6 +1196,13 @@ enum QuarantineConsult {
 
 // ─── The bridge ──────────────────────────────────────────────────────
 
+/// Cap on the missing-signer set (CIRISEdge#552 B). Sized for a federation's
+/// SIGNER count, not its record count: a name repeats across every row that
+/// signer signed, so the set dedupes hard. Past the cap names are dropped and
+/// the rows they gate stay transient-refused — bounded and visible, and it
+/// drains as pulls land.
+const MISSING_SIGNER_CAP: usize = 1024;
+
 /// Production-grade [`ReplicationDirectory`] implementation over
 /// persist's `FederationDirectory`.
 pub struct FederationDirectoryReplicationBridge {
@@ -1293,6 +1321,16 @@ pub struct FederationDirectoryReplicationBridge {
     /// `std::sync::Mutex`, never held across an `.await`: the lock is taken to
     /// read a cursor, dropped, the page is read, then taken again to record it.
     sweep_cursors: Mutex<SweepCursors>,
+    /// CIRISEdge#552 — hashes learned without their bodies, and who advertised
+    /// them. In-memory: CIRISPersist#785 is where this becomes durable, and the
+    /// advertise re-sweep re-learns anything lost to a restart.
+    known_hashes: Mutex<crate::replication::known_hashes::KnownHashes>,
+    /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
+    /// not hold. Bounded: a peer that offers unadmittable rows must not be able
+    /// to grow this without limit, so past the cap new names are DROPPED rather
+    /// than evicting older ones — the older names are the ones with rows already
+    /// waiting on them.
+    missing_signers: Mutex<std::collections::BTreeMap<String, Option<String>>>,
     /// CIRISEdge#531 DEPTH — the largest row count ANY single page read has
     /// returned on this bridge. The flat bound's own witness, in the same
     /// discipline as [`Self::sweep_gate`]'s `max_in_flight` and
@@ -1456,6 +1494,8 @@ impl FederationDirectoryReplicationBridge {
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
+            known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
+            missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -1505,6 +1545,8 @@ impl FederationDirectoryReplicationBridge {
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
+            known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
+            missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -1538,6 +1580,24 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_local_key_id(mut self, local_key_id: Option<String>) -> Self {
         self.local_key_id = local_key_id;
+        self
+    }
+
+    /// How many signer recoveries are queued (diagnostics + tests).
+    #[must_use]
+    pub fn tracked_missing_signers(&self) -> usize {
+        self.missing_signers.lock().map_or(0, |m| m.len())
+    }
+
+    /// CIRISEdge#552 — override the agent mode (builder, TEST ONLY).
+    ///
+    /// Production reads the mode from the Edge via `start_replication`; this
+    /// exists so a unit test can exercise the Server-mode branches without
+    /// standing up the Python host path.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_agent_mode_for_test(mut self, mode: crate::AgentMode) -> Self {
+        self.config.mode = mode;
         self
     }
 
@@ -2225,6 +2285,113 @@ impl FederationDirectoryReplicationBridge {
 
 #[async_trait]
 impl ReplicationDirectory for FederationDirectoryReplicationBridge {
+    /// CIRISEdge#552 — the operator's switch, filtered through the correctness
+    /// rule. `retention_for` pins every plane that must hold bodies, so a node
+    /// configured hash-first still holds revocations, rosters, and anything else
+    /// whose body it needs — the switch cannot turn those off.
+    fn retention(&self, kind: EnvelopeKind) -> crate::replication::retention::Retention {
+        // Only a SERVER keeps a hash directory. A proxy or client holds bodies
+        // for the little it tracks — hash-first buys nothing on a small working
+        // set, and would hand a small node an enumerable directory it has no use
+        // for.
+        let configured = match self.config.mode {
+            crate::AgentMode::Server => crate::replication::retention::Retention::HashFirst,
+            crate::AgentMode::Proxy | crate::AgentMode::Client => {
+                crate::replication::retention::Retention::Bodies
+            }
+        };
+        crate::replication::retention::retention_for(kind, configured)
+    }
+
+    /// CIRISEdge#552 — record hashes learned without their bodies, with the peer
+    /// that advertised them (the holder map). In-memory and local only: this is
+    /// an OBSERVATION, not a claim, and CIRISPersist#785 is where it becomes
+    /// durable.
+    fn note_missing_signer(
+        &self,
+        _kind: EnvelopeKind,
+        signer_key_id: &str,
+        source_peer: Option<&str>,
+    ) {
+        // Gated on the KEY plane's retention: the row that stalled can be any
+        // kind, but the row it waits on is always a Key. Under `Bodies` that
+        // body replicates on its own and #544 admits the row later.
+        if !crate::replication::retention::should_note_missing_signer(
+            self.retention(EnvelopeKind::Key),
+        ) {
+            return;
+        }
+        // Queue ONLY what a Pull can actually satisfy: the delivering peer's own
+        // key. A responder answers an identifier Pull on a public plane for its
+        // OWN record and refuses a third-party probe, so queueing a third-party
+        // signer would schedule a request guaranteed to come back empty — work
+        // that also consumes a recovery slot and a round.
+        //
+        // This is what bounds the queue at the root rather than by policing it
+        // afterwards: a peer can only ever enqueue ONE name, its own, so the
+        // manufacture-unique-signers flood has nothing to manufacture.
+        if source_peer != Some(signer_key_id) {
+            tracing::debug!(
+                signer = %signer_key_id,
+                source = ?source_peer,
+                "missing signer is a THIRD PARTY — no identifier Pull can fetch it, \
+                 so the row stays visibly transient-refused (CIRISEdge#552)"
+            );
+            return;
+        }
+        if let Ok(mut pending) = self.missing_signers.lock() {
+            if pending.len() >= MISSING_SIGNER_CAP && !pending.contains_key(signer_key_id) {
+                tracing::warn!(
+                    signer = %signer_key_id,
+                    cap = MISSING_SIGNER_CAP,
+                    "missing-signer set at cap — DROPPING this name (CIRISEdge#552)"
+                );
+                return;
+            }
+            pending.insert(signer_key_id.to_string(), source_peer.map(str::to_owned));
+        }
+    }
+
+    fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
+        let mut pending = self.missing_signers.lock().ok()?;
+        // Exactly the name this peer can answer for — its own. Anything else
+        // was never enqueued, because nothing else is fetchable by identifier.
+        if pending.remove(peer_key_id).is_some() {
+            Some(peer_key_id.to_owned())
+        } else {
+            None
+        }
+    }
+
+    fn note_known_hashes(
+        &self,
+        kind: EnvelopeKind,
+        hashes: &[[u8; 32]],
+        advertised_by: Option<&str>,
+    ) {
+        let Some(peer) = advertised_by else {
+            // A hash with no holder is not actionable: knowing a record exists
+            // without knowing who has it cannot be resolved into anything.
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        // Only a SERVER accumulates the directory. A proxy that recorded every
+        // hash a peer advertised would end up holding the whole federation as
+        // hashes — which is the enumeration surface again, just cheaper to
+        // carry. What a proxy needs is the subset that concerns it, and that is
+        // reached through the on-demand path rather than by hoarding.
+        if !matches!(self.config.mode, crate::AgentMode::Server) {
+            return;
+        }
+        if let Ok(mut known) = self.known_hashes.lock() {
+            for h in hashes {
+                known.note(kind, *h, peer, now);
+            }
+        }
+    }
+
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         // CIRISEdge#531 DEPTH — the PEER-BLIND projection view (diagnostics and
         // tests; every production provider is peer-bound via
@@ -2420,11 +2587,44 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#462 — serve a subject-scoped RECEIVE-axis Pull. Entitlement is
-    /// FAIL-CLOSED: a Pull for subject `S` is answered only to a requester
-    /// authenticated AS `S` (`peer_key_id == Some(S)`). A requester `P ≠ S` — or
-    /// an unattributed one — gets nothing, and it says so. (Owner-delegation, a
-    /// node key pulling for its owner fedID, needs `owner_of` and is a deliberate
-    /// follow-up, not silently permitted here.) The refs themselves come from
+    /// FAIL-CLOSED, with one narrow widening bounded by the ADVERTISE
+    /// projection (CIRISEdge#552).
+    ///
+    /// A Pull for subject `S` is answered to a requester authenticated AS `S`
+    /// (the data-subject access path), **or** — on a plane whose serve cell is
+    /// unconditionally `public` — when `S` is THIS NODE'S OWN key_id. An
+    /// unattributed requester still gets nothing, and it still says so.
+    ///
+    /// # Why the second arm stops exactly there
+    ///
+    /// `serve: public` and `advertise: self_own` answer DIFFERENT questions, and
+    /// conflating them is how the first attempt at this went wrong. `public`
+    /// says a record needs no capability gate *once it reaches you*.
+    /// `self_own` is what decides **which** records reach you at all: on these
+    /// planes a node advertises only its own. But `subject_holdings_inner`
+    /// performs an ARBITRARY subject lookup against the node's whole local
+    /// directory. Serving that to any attributed requester would let a peer
+    /// probe identifiers for third-party keys and routes that never appeared in
+    /// any Summary it received — turning a body-holding server into an
+    /// address-book oracle and destroying the opaque-directory property
+    /// hash-first exists to create. "Already public" is not "already disclosed
+    /// to you".
+    ///
+    /// Restricting `S` to this node's own record keeps the answer inside what
+    /// `self_own` already hands every peer, so it is disclosure-neutral in fact
+    /// and not merely in claim. It recovers the case that matters most: *"you
+    /// signed a row I cannot verify — send me your key."*
+    ///
+    /// A THIRD-PARTY signer remains unfetchable by identifier. That is a real
+    /// gap, and closing it needs a separately authorized, rate-limited resolver
+    /// rather than a widening here.
+    ///
+    /// `Attestation` keeps the subject-only rule outright: its serve cell is
+    /// conditional (`trace:*` → `capability:infra:serve`, plus the per-row G2
+    /// scores carve), so its entitlement is decided per RECORD.
+    ///
+    /// (Owner-delegation, a node key pulling for its owner fedID, needs
+    /// `owner_of` and is still a deliberate follow-up, not silently permitted.) The refs themselves come from
     /// [`Self::subject_holdings_inner`], which hashes the SAME struct the wire
     /// index keys on and applies the G2 capacity carve.
     async fn subject_holdings(
@@ -2434,7 +2634,14 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
         match peer_key_id {
-            Some(p) if p == subject_key_id => {
+            // The subject itself (the data-subject access path), or a request
+            // for THIS NODE'S OWN record on a public plane — which is precisely
+            // what the `self_own` advertise projection already hands every peer.
+            Some(p)
+                if p == subject_key_id
+                    || (kind.is_public_subject_pull()
+                        && self.local_key_id.as_deref() == Some(subject_key_id)) =>
+            {
                 // CIRISEdge#531 — WIDTH bound on the subject-Pull sweep too:
                 // it is per-subject rather than whole-table, but the
                 // Attestation arm sweeps BOTH testimonial axes and a
@@ -2449,8 +2656,9 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     subject = %subject_key_id,
                     requester = ?other,
                     kind = ?kind,
-                    "subject Pull refused: requester is not the subject — serving nothing \
-                     (#462 fail-closed; owner-delegation via owner_of is a follow-up)"
+                    "subject Pull refused: requester is not the subject and this kind \
+                     is not publicly pullable — serving nothing (#462 fail-closed; \
+                     #552 widened only the unconditionally-public planes)"
                 );
                 Vec::new()
             }
@@ -9521,6 +9729,125 @@ mod tests {
                 .await
                 .is_empty(),
             "an unattributed Pull serves nothing"
+        );
+    }
+
+    /// CIRISEdge#552 — only a peer's OWN key is queued for recovery, which
+    /// bounds the queue at its ROOT.
+    ///
+    /// A responder answers an identifier Pull on a public plane for its own
+    /// record and refuses a third-party probe, so a third-party signer is not
+    /// fetchable by identifier at all. Queueing one would schedule a request
+    /// guaranteed to come back empty while consuming a recovery slot and a
+    /// round.
+    ///
+    /// The security consequence is why this is the right place to stop it: a
+    /// peer can enqueue exactly ONE name, its own, so the
+    /// manufacture-unique-signers flood has nothing to manufacture and cannot
+    /// crowd out another peer's recovery. Policing the queue after the fact
+    /// left that vector open.
+    #[tokio::test]
+    async fn only_the_delivering_peers_own_key_is_queued() {
+        let (_backend, bridge) = make_bridge(&[]);
+        let bridge = bridge.with_agent_mode_for_test(crate::AgentMode::Server);
+
+        for i in 0..(MISSING_SIGNER_CAP + 500) {
+            bridge.note_missing_signer(
+                EnvelopeKind::Attestation,
+                &format!("nonexistent-{i}"),
+                Some("peer-flood"),
+            );
+        }
+        assert_eq!(
+            bridge.tracked_missing_signers(),
+            0,
+            "a third-party signer is not fetchable by identifier, so none of a \
+             flood of them is queued"
+        );
+
+        bridge.note_missing_signer(EnvelopeKind::Revocation, "peer-honest", Some("peer-honest"));
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-honest").as_deref(),
+            Some("peer-honest"),
+            "the fulfillable case survives: you signed a row I cannot verify, \
+             send me your key"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-honest"),
+            None,
+            "taken names are removed — one left queued would re-Pull every round"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("someone-else"),
+            None,
+            "and no other coordinator can consume it"
+        );
+    }
+
+    /// CIRISEdge#552 — a public plane answers a Pull for THIS NODE'S OWN
+    /// record, and refuses one that probes a third party.
+    ///
+    /// The refusal is the load-bearing half. `serve: public` says a record needs
+    /// no capability gate once it reaches you; `advertise: self_own` decides
+    /// which records reach you at all. `subject_holdings_inner` does an
+    /// arbitrary directory lookup, so serving any attributed requester about any
+    /// subject would let a peer probe identifiers for third-party keys and
+    /// routes that never appeared in its Summaries — a body-holding server as
+    /// an address-book oracle, which is the end of the opaque directory
+    /// hash-first exists to build. An earlier revision of this branch did
+    /// exactly that.
+    #[tokio::test]
+    async fn a_public_plane_serves_its_own_record_but_is_not_an_oracle() {
+        let local = "local-A";
+        let third_party = "subject-S";
+        let stranger = "stranger-X";
+        let (backend, bridge) = make_bridge(&[
+            local.to_string(),
+            third_party.to_string(),
+            stranger.to_string(),
+        ]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        for kid in [local, third_party, stranger] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+
+        assert!(
+            !bridge
+                .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
+                .await
+                .is_empty(),
+            "this node's OWN Key is what `self_own` already advertises to every \
+             peer — serving it by name discloses nothing new and is what makes \
+             \"you signed a row I cannot verify, send me your key\" work"
+        );
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                .await
+                .is_empty(),
+            "a THIRD PARTY's Key must NOT be served: the holder never advertised \
+             it to this requester, and answering would make a body-holding node \
+             an address-book oracle for guessed identifiers"
+        );
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Key, local, None)
+                .await
+                .is_empty(),
+            "an UNATTRIBUTED Pull still serves nothing"
+        );
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, local, Some(stranger))
+                .await
+                .is_empty(),
+            "Attestation's serve cell is CONDITIONAL per row — it keeps the \
+             subject-only rule even for this node's own subject"
         );
     }
 

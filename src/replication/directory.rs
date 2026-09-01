@@ -186,6 +186,50 @@ pub trait ReplicationDirectory: Send + Sync {
     /// mock and any host impl need no change; the bridge overrides it with the
     /// [`RefusalBackoff`](super::refusal_backoff::RefusalBackoff) its apply path
     /// populates.
+    /// CIRISEdge#552 — how much of `kind` this node keeps. Defaults to
+    /// `Bodies`, the pre-#552 behaviour; the bridge overrides it from config.
+    fn retention(&self, _kind: EnvelopeKind) -> super::retention::Retention {
+        super::retention::Retention::Bodies
+    }
+
+    /// CIRISEdge#552 — learn hashes whose bodies this node did not fetch.
+    fn note_known_hashes(
+        &self,
+        _kind: EnvelopeKind,
+        _hashes: &[[u8; 32]],
+        _advertised_by: Option<&str>,
+    ) {
+    }
+
+    /// CIRISEdge#552 (B) — a transient refusal named a signer this node may not
+    /// hold. Recording it is all that happens here: admission stays LOCAL and
+    /// still fails transient, because the revocation admission path is the one
+    /// path that must never depend on a peer answering. Something out of band
+    /// pulls the key; the #544 backoff then re-offers the row and it admits.
+    ///
+    /// Sync by design, like [`Self::note_known_hashes`] — it sits on the apply
+    /// loop. Whether the key is genuinely absent is decided at the DRAIN, which
+    /// can afford the store lookup this cannot.
+    fn note_missing_signer(
+        &self,
+        _kind: EnvelopeKind,
+        _signer_key_id: &str,
+        _source_peer: Option<&str>,
+    ) {
+    }
+
+    /// CIRISEdge#552 (B) — see [`StateProvider::take_missing_signers`].
+    ///
+    /// [`StateProvider::take_missing_signers`]:
+    ///     super::summary::StateProvider::take_missing_signers
+    /// CIRISEdge#552 (B) — see [`StateProvider::take_missing_signer_for`].
+    ///
+    /// [`StateProvider::take_missing_signer_for`]:
+    ///     super::summary::StateProvider::take_missing_signer_for
+    fn take_missing_signer_for(&self, _peer_key_id: &str) -> Option<String> {
+        None
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }
@@ -288,6 +332,40 @@ impl StateProvider for DirectoryStateAdapter {
     /// Node-wide by construction — peer A's refusal removes the row from peer
     /// B's `want` too, which is the point (the verdict is about this node's
     /// state, not about who carried the bytes).
+    /// CIRISEdge#552 — FORWARD, do not answer.
+    ///
+    /// This adapter is the production `StateProvider`, and until it forwarded
+    /// these the whole feature was inert: every node took the trait default
+    /// (`Bodies`) no matter what the bridge was configured to do. Nothing broke,
+    /// which is exactly why it went unnoticed — a retention policy that is never
+    /// consulted looks identical to one that decides "keep everything".
+    fn retention(&self, kind: EnvelopeKind) -> super::retention::Retention {
+        self.inner.retention(kind)
+    }
+
+    fn note_known_hashes(
+        &self,
+        kind: EnvelopeKind,
+        hashes: &[[u8; 32]],
+        advertised_by: Option<&str>,
+    ) {
+        self.inner.note_known_hashes(kind, hashes, advertised_by);
+    }
+
+    fn note_missing_signer(
+        &self,
+        kind: EnvelopeKind,
+        signer_key_id: &str,
+        source_peer: Option<&str>,
+    ) {
+        self.inner
+            .note_missing_signer(kind, signer_key_id, source_peer);
+    }
+
+    fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
+        self.inner.take_missing_signer_for(peer_key_id)
+    }
+
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
         self.inner.retry_suppressed(kind, envelope_hash)
     }
@@ -551,6 +629,80 @@ mod tests {
     }
 
     /// apply_envelope_bytes admits new envelopes, refuses duplicates.
+    /// CIRISEdge#552 (B) — the adapter must FORWARD the missing-signer seam.
+    ///
+    /// This test exists because of how #552 (A) failed: `retention()` was
+    /// implemented on the bridge, defaulted on the trait, and never forwarded
+    /// here — so production took the default and six review rounds ran against
+    /// a feature that could not execute. A default-bodied trait method that
+    /// nothing forwards is indistinguishable from a working one until you look
+    /// for the call. So: assert the forward, in both directions.
+    #[test]
+    fn the_adapter_forwards_the_missing_signer_seam() {
+        #[derive(Default)]
+        struct RecordingDir {
+            noted: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ReplicationDirectory for RecordingDir {
+            async fn list_envelope_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            async fn fetch_envelope_bytes(
+                &self,
+                _k: EnvelopeKind,
+                _h: &[u8; 32],
+            ) -> Option<Vec<u8>> {
+                None
+            }
+            async fn apply_envelope_bytes(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> ApplyOutcome {
+                ApplyOutcome::Admitted
+            }
+            fn note_missing_signer(
+                &self,
+                _k: EnvelopeKind,
+                signer: &str,
+                source_peer: Option<&str>,
+            ) {
+                self.noted
+                    .lock()
+                    .unwrap()
+                    .push(format!("{signer}@{}", source_peer.unwrap_or("-")));
+            }
+            fn take_missing_signer_for(&self, peer: &str) -> Option<String> {
+                Some(format!("drained-for-{peer}"))
+            }
+        }
+
+        let inner = Arc::new(RecordingDir::default());
+        let adapter =
+            DirectoryStateAdapter::new(Arc::clone(&inner) as Arc<dyn ReplicationDirectory>);
+
+        StateProvider::note_missing_signer(
+            &adapter,
+            EnvelopeKind::Attestation,
+            "steward-xyz",
+            Some("peer-src"),
+        );
+        assert_eq!(
+            inner.noted.lock().unwrap().as_slice(),
+            ["steward-xyz@peer-src"],
+            "note_missing_signer must reach the inner directory — an unforwarded \
+             seam silently takes the no-op default (the #552 A inertness bug)"
+        );
+        assert_eq!(
+            StateProvider::take_missing_signer_for(&adapter, "peer-src").as_deref(),
+            Some("drained-for-peer-src"),
+            "take_missing_signer_for must reach the inner directory too, carrying \
+             the peer it is routing for"
+        );
+    }
+
     #[tokio::test]
     async fn apply_admits_new_refuses_duplicates() {
         let dir = MockReplicationDirectory::new();

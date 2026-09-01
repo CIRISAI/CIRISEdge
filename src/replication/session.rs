@@ -39,6 +39,7 @@ use super::protocol::{
     CursorPullMessage, DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage,
     PullMessage, ReplicationMessage, SummaryMessage,
 };
+use super::retention::{retention_for, Retention};
 use super::summary::{diff_refs, ApplyOutcome, StalenessSignal, StateApplier, StateProvider};
 
 /// What role a session is playing in this round. Initiator emits
@@ -130,7 +131,34 @@ pub enum ReplicationOutcome {
 /// After a round completes (`Applied` outcome), call [`Self::reset`]
 /// to clear the per-round state and prepare for the next round with
 /// the same peer.
+// CIRISEdge#552 — the fourth bool. These are four INDEPENDENT one-shot round
+// facts (role-phase markers and the pull exemption), not a state enum wearing
+// booleans: no two are mutually exclusive, and collapsing them into one would
+// invent transitions the protocol does not have. Grouping them for the lint's
+// sake would make the type lie about that.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Session {
+    /// CIRISEdge#552 — the exact hashes this node asked for ON PURPOSE. Only
+    /// these are applied under hash-first; a peer answering a Fetch cannot
+    /// append arbitrary bodies and have them accepted.
+    /// Hashes this node explicitly ASKED for, each with its own remaining
+    /// lifetime in rounds (FSD-SIGNER-RECOVERY D5).
+    ///
+    /// An expectation is REQUEST state, not ROUND state. It is the only thing
+    /// that lets requested bytes past the hash-first gate, so a round completing
+    /// must not discard a request the node still wants — a `Fetch` sets no
+    /// on-demand exemption at all, and used to lose its expectation on the very
+    /// next reset.
+    pending_bodies: std::collections::HashMap<[u8; 32], u8>,
+    /// CIRISEdge#552 — rounds for which a Pull's reply is still expected.
+    ///
+    /// A COUNTER, not a flag, and decremented rather than cleared on reset: a
+    /// Pull issued during an ordinary scheduled round would otherwise have its
+    /// exemption cleared by THAT round completing, before the subject-scoped
+    /// reply arrived. A Pull cannot name its hashes in advance — that is what it
+    /// is for — so this is the one window that must stay a window. It converts
+    /// to exact hashes the moment the reply names them.
+    pull_exempt_rounds: u8,
     role: SessionRole,
     kind: EnvelopeKind,
     /// What we sent the peer in our most recent Summary — used to
@@ -206,6 +234,8 @@ impl Session {
             role,
             kind,
             last_summary_sent: None,
+            pending_bodies: std::collections::HashMap::new(),
+            pull_exempt_rounds: 0,
             last_remote_summary: None,
             diff_want_count: None,
             completed: false,
@@ -240,6 +270,20 @@ impl Session {
         self.diff_want_count = None;
         self.completed = false;
         self.awaiting_cursor_deliver = false;
+        // CIRISEdge#552 — DECREMENT, never clear. A Pull issued during an
+        // ordinary scheduled round must not have its exemption killed by THAT
+        // round completing: the subject-scoped reply had not arrived yet, and
+        // clearing here made testimony recovery timing-dependent.
+        self.pull_exempt_rounds = self.pull_exempt_rounds.saturating_sub(1);
+        // FSD-SIGNER-RECOVERY D5 — age each expectation on its OWN clock and
+        // drop only what expired. Clearing the whole set when the Pull window
+        // closed discarded `Fetch` expectations, which never open one: the
+        // request survived exactly zero rounds and its body was then treated as
+        // unsolicited and dropped.
+        self.pending_bodies.retain(|_, rounds_left| {
+            *rounds_left = rounds_left.saturating_sub(1);
+            *rounds_left > 0
+        });
     }
 
     pub fn role(&self) -> SessionRole {
@@ -405,10 +449,12 @@ impl Session {
     ) -> ReplicationOutcome {
         match msg {
             ReplicationMessage::Summary(remote_summary) => {
-                self.on_summary(&remote_summary, provider)
+                self.on_summary(&remote_summary, provider, source_peer)
             }
             ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider, source_peer),
-            ReplicationMessage::Deliver(deliver) => self.on_deliver(&deliver, applier, source_peer),
+            ReplicationMessage::Deliver(deliver) => {
+                self.on_deliver(&deliver, provider, applier, source_peer)
+            }
             ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider, source_peer),
             ReplicationMessage::Pull(pull) => self.on_pull(&pull, provider),
             ReplicationMessage::CursorPull(cp) => self.on_cursor_pull(&cp, provider),
@@ -457,6 +503,89 @@ impl Session {
     /// needs (`remote ∖ holdings`) is *exactly* what `on_summary` already is; the
     /// Pull's only job is to seed that machinery with a SUBJECT-scoped ref set
     /// instead of the advertise set the `SelfOwn` plane never produces.
+    /// CIRISEdge#552 — the next reply answers something this node asked for ON
+    /// PURPOSE, so it is fetched and applied even under hash-first.
+    ///
+    /// Covers both deliberate asks, because both are invisible without it:
+    ///
+    /// * a **Pull** (#462 — a fedID pulling its own testimony, or a moderation
+    ///   duty conferred on it, that no peer would ever advertise) replies with an
+    ///   ordinary `Summary`, indistinguishable from anti-entropy;
+    /// * a **Fetch** (resolving a known hash to its body — the whole point of
+    ///   holding a directory of hashes) replies with a bare `Deliver`, which
+    ///   without this reads as an unsolicited push and gets learned instead of
+    ///   applied.
+    ///
+    /// Hash-first suppresses BULK CONVERGENCE. It was never meant to suppress a
+    /// deliberate ask, and these are the two shapes a deliberate ask takes.
+    ///
+    /// One-shot: consumed by the reply it was set for, so a single on-demand ask
+    /// cannot quietly promote every later round on this session into a full body
+    /// fetch — a permanent opt-out from hash-first bought with one Pull.
+    pub fn expect_on_demand_reply(&mut self) {
+        self.pull_exempt_rounds = Self::PULL_EXEMPT_ROUNDS;
+    }
+
+    /// CIRISEdge#552 — record the exact hashes a Fetch asked for.
+    ///
+    /// Precise where the Pull window cannot be: a Fetch names its want, so only
+    /// those bodies are applied. Without this, a peer answering a Fetch could
+    /// append arbitrary directory bodies and have every one accepted — the
+    /// corpus-size and address-book properties lost to a generous responder.
+    pub fn expect_bodies(&mut self, hashes: impl IntoIterator<Item = [u8; 32]>) {
+        self.expect_bodies_for_rounds(hashes, Self::DEFAULT_EXPECTATION_ROUNDS);
+    }
+
+    /// Record expectations with an explicit lifetime in rounds.
+    ///
+    /// The lifetime is the answer to "how long is this node still willing to
+    /// accept the body it asked for?" — not "how long is this round?". A
+    /// request outlives the round that issued it (FSD-SIGNER-RECOVERY D5).
+    pub fn expect_bodies_for_rounds(
+        &mut self,
+        hashes: impl IntoIterator<Item = [u8; 32]>,
+        rounds: u8,
+    ) {
+        let rounds = rounds.max(1);
+        for h in hashes {
+            // Never shorten an existing expectation: a re-ask means the node
+            // wants it MORE, not less.
+            let slot = self.pending_bodies.entry(h).or_insert(rounds);
+            *slot = (*slot).max(rounds);
+        }
+    }
+
+    /// Default lifetime of an expectation, in rounds.
+    ///
+    /// Long enough to survive the round that issued it plus a peer that answers
+    /// on its next cadence tick; short enough that an unanswered request is
+    /// forgotten rather than accumulating.
+    pub const DEFAULT_EXPECTATION_ROUNDS: u8 = 3;
+
+    /// Is this hash still expected? (tests)
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_expecting_body_for_test(&self, hash: &[u8; 32]) -> bool {
+        self.pending_bodies.contains_key(hash)
+    }
+
+    /// Remaining on-demand exemption rounds (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn pull_exempt_rounds_for_test(&self) -> u8 {
+        self.pull_exempt_rounds
+    }
+
+    /// Undo [`Self::expect_on_demand_reply`] — the request never left.
+    pub fn cancel_on_demand_reply(&mut self) {
+        self.pull_exempt_rounds = 0;
+    }
+
+    /// How many round-resets a Pull's exemption survives. Small: it bounds the
+    /// over-fetch, and a reply that has not arrived in three rounds is not
+    /// coming.
+    const PULL_EXEMPT_ROUNDS: u8 = 3;
+
     fn on_pull(&mut self, pull: &PullMessage, provider: &dyn StateProvider) -> ReplicationOutcome {
         if pull.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
@@ -477,6 +606,10 @@ impl Session {
         &mut self,
         remote: &SummaryMessage,
         provider: &dyn StateProvider,
+        // CIRISEdge#552 — the advertising peer. A Summary is where the holder map
+        // is learned: knowing a record exists is only actionable alongside who
+        // offered it, and this is the one arm that sees both.
+        source_peer: Option<&str>,
     ) -> ReplicationOutcome {
         if remote.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
@@ -515,6 +648,58 @@ impl Session {
                  instead of re-asking every round (CIRISEdge#544)"
             );
         }
+        // ── CIRISEdge#552: HASH-FIRST ────────────────────────────────────────
+        // Learn the peer's hashes; ask for no bodies. The node still knows every
+        // record exists and who offered it — it simply has not pulled the corpus.
+        // That is what keeps a federation-tier identity directory from being an
+        // address book: a hash is not a mailing address, and resolving one takes
+        // a fetch, which is observable and refusable.
+        //
+        // `retention_for` is not bypassable by a provider: a `HashFirst` answer
+        // for a plane that RETRACTS something still comes back `Bodies`. A node
+        // holding the hash of a revocation has not applied it (CIRISEdge#553).
+        // A Pull's reply names the hashes at last: convert the WINDOW into an
+        // exact set, so the Deliver that follows is checked against what we
+        // actually asked for rather than merely arriving during the window.
+        let answering_on_demand = self.pull_exempt_rounds > 0;
+        if answering_on_demand {
+            self.expect_bodies_for_rounds(want.iter().copied(), Self::DEFAULT_EXPECTATION_ROUNDS);
+        }
+        // An on-demand reply is never suppressed.
+        //
+        // PEEKED, not taken. The marker identifies "a deliberate ask is
+        // outstanding", and it carries no correlation to the request — a Summary
+        // reply to a Pull is byte-identical in shape to an ordinary
+        // anti-entropy Summary. Consuming it on the next Summary meant a racing
+        // scheduled round could eat the exemption, and the actual Pull reply was
+        // then suppressed: testimony recovery broken NONDETERMINISTICALLY, which
+        // is the worst way to be broken.
+        //
+        // So the exemption stands until the round completes (see `reset`). The
+        // cost is over-fetching a round's worth of bodies on a session that
+        // pulled; the alternative is silently returning nothing for the one flow
+        // whose entire purpose is asking on purpose. Fetching too much is
+        // wasteful and visible. Fetching nothing is neither.
+        //
+        // Correlating properly needs the reply to identify its request, which is
+        // a wire change and its own cut.
+        if !answering_on_demand
+            && retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst
+        {
+            provider.note_known_hashes(self.kind, &want, source_peer);
+            let learned = want.len();
+            want.clear();
+            if learned > 0 {
+                tracing::debug!(
+                    kind = ?self.kind,
+                    learned,
+                    peer = ?source_peer,
+                    "hash-first: learned the peer's hashes without pulling bodies \
+                     (CIRISEdge#552)"
+                );
+            }
+        }
+
         let mut outbound = Vec::new();
         // Responder ALSO needs to send its Summary so the
         // initiator's side of the round can progress. We include it
@@ -530,6 +715,10 @@ impl Session {
             self.last_summary_sent = Some(my_summary.clone());
             outbound.push(ReplicationMessage::Summary(my_summary));
         }
+        // CIRISEdge#552 — whatever this round asks for is, by definition, wanted.
+        // Recording it here means the deliver gate has ONE source of truth for
+        // "did we ask for this", covering the on-demand and ordinary paths alike.
+        self.expect_bodies_for_rounds(want.iter().copied(), Self::DEFAULT_EXPECTATION_ROUNDS);
         self.diff_want_count = Some(want.len());
         outbound.push(ReplicationMessage::Diff(DiffMessage {
             kind: self.kind,
@@ -651,15 +840,67 @@ impl Session {
         )
     }
 
+    // CIRISEdge#552 pushed this past the 100-line bound. One scenario — decide
+    // retention, then admit — and splitting it would put the hash-first decision
+    // in a different function from the apply it guards, which is the coupling
+    // worth keeping visible.
+    #[allow(clippy::too_many_lines)]
     fn on_deliver(
         &mut self,
         deliver: &DeliverMessage,
+        // CIRISEdge#552 — the retention decision lives on the provider, and the
+        // apply path needs it: clearing `want` stops us ASKING, and stops
+        // nothing from arriving.
+        provider: &dyn StateProvider,
         applier: &dyn StateApplier,
         source_peer: Option<&str>,
     ) -> ReplicationOutcome {
         if deliver.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
+        // ── CIRISEdge#552: an UNSOLICITED body does not backfill the corpus ──
+        //
+        // Hash-first empties `want`, so under it this session asks for nothing —
+        // which means any Deliver reaching here was not invited by an
+        // anti-entropy round. A `#927` proactive publish would otherwise hand the
+        // node exactly the bodies it declined to fetch, and the corpus-size and
+        // address-book properties would be lost to a peer's generosity rather
+        // than to any decision of ours.
+        //
+        // Keyed on `diff_want_count` — the SOLICITED marker the session already
+        // keeps — so an explicit on-demand fetch still applies normally. That is
+        // the whole point of hash-first: fetch when something needs the body.
+        //
+        // `retention_for` keeps the carve-out: a retracting plane is never
+        // HashFirst, so a pushed revocation still applies. This deliberately
+        // gates the ADMIT, where #544's suppression deliberately does not — the
+        // reasons differ. Suppression is about a row we tried and could not
+        // admit; hash-first is about a body we chose not to store, and applying
+        // it anyway would defeat the choice.
+        // Only the bodies this node ASKED FOR are exempt, checked per envelope
+        // rather than per message. A peer answering a Fetch can append whatever
+        // it likes; appending does not make it requested.
+        // CIRISEdge#552 — under hash-first a body is applied only if this node
+        // ASKED for it, and the check is PER ENVELOPE (in the apply loop below).
+        // A responder can append bodies to a Fetch reply, and appending does not
+        // make them requested; gating the whole message on "any envelope
+        // matched" would let one requested body carry an arbitrary payload past
+        // the gate.
+        //
+        // `unwrap_or(0) == 0`, not `is_none()`: a hash-first Summary sets
+        // `diff_want_count = Some(0)`, so `is_none()` was false and a proactive
+        // publisher's Deliver — arriving right after its Summary — sailed
+        // through and applied. An empty ask is not an ask. A NON-empty want
+        // means this exchange is ordinary solicited anti-entropy and is ungated.
+        // Gated whenever the plane is hash-first — NOT only when the want was
+        // empty. A Pull's reply produces a NON-empty Diff, so keying on
+        // `diff_want_count == 0` turned the gate off for exactly the exchange
+        // where a responder is most able to append extras. Under hash-first every
+        // legitimately wanted hash is in `pending_bodies` (the Diff path puts it
+        // there), so the per-envelope check below is sufficient on its own and
+        // the want count adds nothing but a hole.
+        let hash_first_active =
+            retention_for(self.kind, provider.retention(self.kind)) == Retention::HashFirst;
         // CIRISEdge#426 — distinguish a SOLICITED Deliver (it answers a `Diff` we
         // sent this round — `diff_want_count` is set) from an UNSOLICITED one (a
         // bare push with no in-flight round we invited — the #927 proactive-publish
@@ -714,6 +955,29 @@ impl Session {
         // withholds carriage can therefore never again read as absence of work; the
         // `refused` count in the `RoundReport` always has a matching WARN saying WHY.
         for env_bytes in &deliver.envelopes {
+            // CIRISEdge#552 — PER ENVELOPE, not per message. A responder can
+            // append bodies to a Fetch reply, and appending does not make them
+            // requested. Gating the whole message on "any envelope matched"
+            // would let one requested body carry an arbitrary payload of
+            // unrequested ones past the gate.
+            let mut requested_hash: Option<[u8; 32]> = None;
+            if hash_first_active {
+                use sha2::{Digest as _, Sha256};
+                let h: [u8; 32] = Sha256::digest(env_bytes).into();
+                if self.pending_bodies.remove(&h).is_some() {
+                    // Remember it: a TRANSIENT refusal below must put it back.
+                    requested_hash = Some(h);
+                } else {
+                    provider.note_known_hashes(self.kind, &[h], source_peer);
+                    tracing::debug!(
+                        kind = ?self.kind,
+                        peer = ?source_peer,
+                        "hash-first: a body this node did not ask for was LEARNED, \
+                         not applied (CIRISEdge#552)"
+                    );
+                    continue;
+                }
+            }
             match applier.apply_envelope(self.kind, env_bytes, source_peer) {
                 ApplyOutcome::Admitted => admitted += 1,
                 // Routine non-progress (a re-delivered held row) — quiet by design;
@@ -732,6 +996,41 @@ impl Session {
                 // token maps to which. It is a stable token, never prose.
                 ApplyOutcome::Refused { reason, retry } => {
                     refused += 1;
+                    // CIRISEdge#552 — an explicitly requested body that refuses
+                    // TRANSIENTLY must stay expected. The expectation is the only
+                    // thing that lets its bytes through this gate: hash-first
+                    // suppresses the ordinary want, so a redelivery after the
+                    // dependency lands would be treated as unsolicited and
+                    // dropped, and the row this node ASKED for could never admit.
+                    // Consume the expectation on outcomes that settle it, not on
+                    // arrival.
+                    if !retry.is_terminal() {
+                        if let Some(h) = requested_hash {
+                            // Refresh, not merely restore: the node still wants
+                            // this body and has just learned its dependency is
+                            // not yet satisfied.
+                            self.expect_bodies_for_rounds([h], Self::DEFAULT_EXPECTATION_ROUNDS);
+                        }
+                    }
+                    // CIRISEdge#552 (B) — a TRANSIENT refusal is the one that
+                    // waits on more state, and the state it most often waits on
+                    // is the signer's own Key row. Under hash-first that row can
+                    // be a hash this node never fetches, so the #544 backoff
+                    // would re-offer forever and a revocation whose revoker is
+                    // unknown would never land.
+                    //
+                    // Extract the candidate signer HERE (pure, no store) and
+                    // record it; whether it is genuinely absent is the drain's
+                    // question. Deliberately keyed on the DISPOSITION, not on
+                    // the reason prose — consumers key on stable tokens, and a
+                    // spurious note costs one deduped lookup at the drain.
+                    if !retry.is_terminal() {
+                        if let Some(signer) = crate::replication::missing_signer::missing_signer_of(
+                            self.kind, env_bytes,
+                        ) {
+                            provider.note_missing_signer(self.kind, &signer, source_peer);
+                        }
+                    }
                     tracing::warn!(
                         kind = ?self.kind,
                         reason = %reason,
@@ -1705,7 +2004,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
         };
-        match responder.on_deliver(&deliver, &RefusingApplier, Some("peer-x")) {
+        match responder.on_deliver(&deliver, &BodiesProvider, &RefusingApplier, Some("peer-x")) {
             ReplicationOutcome::Applied {
                 admitted, refused, ..
             } => {
@@ -1716,10 +2015,561 @@ mod tests {
         }
     }
 
+    /// FSD-SIGNER-RECOVERY invariant 4 — an expectation SURVIVES a round reset
+    /// until its own TTL expires.
+    ///
+    /// The production path this pins: `start_fetch` records an expectation and
+    /// sets no on-demand exemption, so the old "clear the whole set once the
+    /// Pull window closes" rule discarded it on the very next reset — the
+    /// request survived zero rounds and its body was then treated as
+    /// unsolicited and dropped. An expectation is REQUEST state, not ROUND
+    /// state.
+    #[test]
+    fn an_expectation_survives_a_round_reset_until_its_own_ttl_expires() {
+        let h = [7u8; 32];
+        let mut sess = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        sess.expect_bodies([h]);
+
+        // A Fetch sets NO exemption; this is exactly the case that used to be
+        // discarded immediately.
+        assert_eq!(sess.pull_exempt_rounds_for_test(), 0);
+
+        for round in 1..Session::DEFAULT_EXPECTATION_ROUNDS {
+            sess.reset();
+            assert!(
+                sess.is_expecting_body_for_test(&h),
+                "the expectation must outlive round {round} — a round completing \
+                 does not mean the node stopped wanting the body it asked for"
+            );
+        }
+        sess.reset();
+        assert!(
+            !sess.is_expecting_body_for_test(&h),
+            "and it is forgotten once its OWN lifetime expires, so an unanswered \
+             request cannot accumulate"
+        );
+    }
+
+    /// FSD-SIGNER-RECOVERY invariant 7 — recovery never runs under
+    /// `Retention::Bodies`.
+    ///
+    /// There the signer's Key body replicates on its own and #544 admits the row
+    /// on a later round, so recording a name would schedule a Pull for something
+    /// already in flight.
+    #[test]
+    fn nothing_is_recorded_for_recovery_under_bodies_retention() {
+        use crate::replication::retention::{should_note_missing_signer, Retention};
+        assert!(
+            !should_note_missing_signer(Retention::Bodies),
+            "under Bodies the Key body arrives on its own — recovery would be \
+             duplicate work"
+        );
+        assert!(
+            should_note_missing_signer(Retention::HashFirst),
+            "under HashFirst it never arrives, which is the whole reason \
+             recovery exists"
+        );
+    }
+
+    /// CIRISEdge#552 — a requested body that refuses TRANSIENTLY stays
+    /// expected.
+    ///
+    /// The expectation is the only thing that lets those bytes through the
+    /// hash-first gate. Consuming it on ARRIVAL means that once the dependency
+    /// lands, the redelivery is treated as unsolicited and dropped — and
+    /// ordinary Summaries cannot repair it either, because hash-first records
+    /// the hash and clears the want. The row this node explicitly ASKED for
+    /// could then never admit.
+    #[test]
+    fn a_requested_body_refused_transiently_is_still_expected() {
+        use std::sync::Mutex;
+        struct P;
+        impl StateProvider for P {
+            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _k: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+        struct Refuser(Mutex<bool>);
+        impl StateApplier for Refuser {
+            fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> ApplyOutcome {
+                let mut done = self.0.lock().unwrap();
+                if *done {
+                    ApplyOutcome::Admitted
+                } else {
+                    *done = true;
+                    ApplyOutcome::refused("signer not registered yet")
+                }
+            }
+        }
+
+        use sha2::{Digest as _, Sha256};
+        let body = b"the-requested-key-row".to_vec();
+        let h: [u8; 32] = Sha256::digest(&body).into();
+
+        let mut sess = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        sess.expect_bodies([h]);
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![body.clone()],
+        };
+        let applier = Refuser(Mutex::new(false));
+
+        // First delivery: transiently refused. The expectation must survive.
+        sess.on_deliver(&deliver, &P, &applier, Some("peer-1"));
+
+        // The dependency has landed; the SAME bytes are redelivered.
+        match sess.on_deliver(&deliver, &P, &applier, Some("peer-1")) {
+            ReplicationOutcome::Applied { admitted, .. } => assert_eq!(
+                admitted, 1,
+                "the redelivered body must still be expected and therefore \
+                 applied — consuming the expectation on arrival strands the row \
+                 this node explicitly asked for"
+            ),
+            o => panic!("expected Applied, got {o:?}"),
+        }
+    }
+
+    /// CIRISEdge#552 (B) — the choke point RECORDS the signer a transient
+    /// refusal named. Not "the resolver exists" — that was true while nothing
+    /// called it. This delivers a record whose signer is unknown and asserts the
+    /// name reached the PROVIDER, which is the seam that was missing.
+    #[test]
+    fn a_transient_refusal_records_the_signer_it_named() {
+        use std::sync::Mutex;
+        struct RecordingProvider(Mutex<Vec<String>>);
+        impl StateProvider for RecordingProvider {
+            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn note_missing_signer(
+                &self,
+                _k: EnvelopeKind,
+                signer: &str,
+                source_peer: Option<&str>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{signer}@{}", source_peer.unwrap_or("-")));
+            }
+        }
+        struct TransientRefuser;
+        impl StateApplier for TransientRefuser {
+            fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> ApplyOutcome {
+                ApplyOutcome::refused("signer not registered")
+            }
+        }
+        struct TerminalRefuser;
+        impl StateApplier for TerminalRefuser {
+            fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> ApplyOutcome {
+                ApplyOutcome::refused_terminal("this row will never admit")
+            }
+        }
+
+        let row = br#"{"revoking_key_id":"steward-abc123"}"#.to_vec();
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Attestation,
+            envelopes: vec![row],
+        };
+
+        let provider = RecordingProvider(Mutex::new(Vec::new()));
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        responder.on_deliver(&deliver, &provider, &TransientRefuser, Some("peer-x"));
+        assert_eq!(
+            provider.0.lock().unwrap().as_slice(),
+            ["steward-abc123@peer-x"],
+            "a TRANSIENT refusal must record the signer it waits on, AND the peer \
+             that delivered the row — a Pull to any other peer reads that peer's \
+             own lookup_public_key and comes back empty — without \
+             this the resolver is dead code and the kill order never lands"
+        );
+
+        // A terminal refusal is not waiting on anything. Pulling a key for it
+        // would be a request this node can never use.
+        let provider = RecordingProvider(Mutex::new(Vec::new()));
+        let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+        responder.on_deliver(&deliver, &provider, &TerminalRefuser, Some("peer-x"));
+        assert!(
+            provider.0.lock().unwrap().is_empty(),
+            "a TERMINAL refusal waits on nothing — it must not queue a pull"
+        );
+    }
+
     /// CIRISEdge#544 — the re-offer loop is RECEIVER-PULLED, and this is the
     /// pull. A peer advertises two rows the node lacks; the node has already
     /// refused one of them, so its Diff asks for the OTHER one only. Nothing is
     /// sent to the peer to make this happen — the sender was never the one
+    /// CIRISEdge#552 — under hash-first retention the round LEARNS the peer's
+    /// hashes and asks for no bodies.
+    ///
+    /// This is the whole mechanism: the node still computes what it lacks (so it
+    /// knows the record exists and who has it) but does not pull the corpus.
+    #[test]
+    fn hash_first_learns_the_hashes_and_asks_for_no_bodies() {
+        use std::sync::Mutex;
+        struct HashFirstProvider {
+            noted: Mutex<Vec<[u8; 32]>>,
+            peer: Mutex<Option<String>>,
+        }
+        impl StateProvider for HashFirstProvider {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+            fn note_known_hashes(
+                &self,
+                _kind: EnvelopeKind,
+                hashes: &[[u8; 32]],
+                peer: Option<&str>,
+            ) {
+                self.noted.lock().unwrap().extend_from_slice(hashes);
+                *self.peer.lock().unwrap() = peer.map(str::to_owned);
+            }
+        }
+
+        let provider = HashFirstProvider {
+            noted: Mutex::new(Vec::new()),
+            peer: Mutex::new(None),
+        };
+        // Key, not Attestation: the Attestation plane carries `withdraws`
+        // tombstones and is pinned to Bodies (CIRISEdge#553). Key is an identity
+        // plane that cannot retract anything, which is what hash-first is for.
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Key);
+        let remote = SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![
+                EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                },
+                EnvelopeRef {
+                    envelope_hash: h(2),
+                    seq: 2,
+                },
+            ],
+        };
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(remote),
+            &provider,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the round still sends a Diff");
+        assert!(
+            diff.want.is_empty(),
+            "hash-first asks for NO bodies — got {} wanted",
+            diff.want.len()
+        );
+        assert_eq!(
+            provider.noted.lock().unwrap().len(),
+            2,
+            "both advertised hashes must be LEARNED, or the node cannot later \
+             discover the record exists"
+        );
+        assert_eq!(
+            provider.peer.lock().unwrap().as_deref(),
+            Some("peer-a"),
+            "the advertising peer is the holder to ask — without it the node \
+             knows a record exists but not who has it"
+        );
+    }
+
+    /// CIRISEdge#552 — a proactive publisher's Deliver, arriving right after its
+    /// Summary, must NOT be applied under hash-first.
+    ///
+    /// The hash-first Summary sets `diff_want_count = Some(0)`, so an
+    /// `is_none()` gate read it as solicited and let the bodies through — the
+    /// node accumulated exactly the corpus it had just declined. An empty ask is
+    /// not an ask.
+    #[test]
+    fn a_proactive_deliver_after_an_empty_hash_first_diff_is_not_applied() {
+        struct HashFirstEverywhere;
+        impl StateProvider for HashFirstEverywhere {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Key);
+        // The publisher's Summary — hash-first empties the want and sets Some(0).
+        let _ = session.on_message(
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                }],
+            }),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("publisher"),
+        );
+        // ...immediately followed by the bodies we did not ask for.
+        let applier = TrackingApplier::default();
+        let outcome = session.on_message(
+            ReplicationMessage::Deliver(DeliverMessage {
+                kind: EnvelopeKind::Key,
+                envelopes: vec![b"a-body".to_vec()],
+            }),
+            &HashFirstEverywhere,
+            &applier,
+            Some("publisher"),
+        );
+        assert!(
+            matches!(outcome, ReplicationOutcome::Applied { admitted: 0, .. }),
+            "a proactive body must be learned, not applied — got {outcome:?}"
+        );
+        assert_eq!(
+            applier.count(),
+            0,
+            "the applier must not have seen the body at all"
+        );
+    }
+
+    /// CIRISEdge#552/#462 — a Pull reply is fetched even under hash-first.
+    ///
+    /// This is the path that exists so a fedID can pull its OWN testimony, or a
+    /// moderation duty conferred on it, which no peer would ever advertise.
+    /// Suppressing it would make hash-first silently break the one flow whose
+    /// entire purpose is asking for bodies on purpose — and the reply arrives as
+    /// an ordinary Summary, so nothing would have looked wrong.
+    #[test]
+    fn a_pull_reply_is_fetched_even_under_hash_first() {
+        struct HashFirstEverywhere;
+        impl StateProvider for HashFirstEverywhere {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+
+        let mut session = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        session.expect_on_demand_reply();
+
+        let reply = SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![EnvelopeRef {
+                envelope_hash: h(1),
+                seq: 1,
+            }],
+        };
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(reply),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the round sends a Diff");
+        assert_eq!(
+            diff.want,
+            vec![h(1)],
+            "an explicitly pulled body must still be asked for (CIRISEdge#462)"
+        );
+    }
+
+    /// The exemption survives a round it does not belong to.
+    ///
+    /// It cannot be message-scoped: the reply to a Pull is byte-identical in
+    /// shape to an ordinary Summary, so consuming it on the next message let a
+    /// racing scheduled round eat it — and the actual Pull reply was then
+    /// suppressed, breaking testimony recovery nondeterministically.
+    ///
+    /// So it stands for the round and is released with it. That over-fetches a
+    /// round's worth on a session that pulled, and does NOT become a permanent
+    /// opt-out from hash-first. Fetching too much is wasteful and visible;
+    /// fetching nothing is neither.
+    #[test]
+    fn the_on_demand_exemption_is_released_when_the_round_resets() {
+        struct HashFirstEverywhere;
+        impl StateProvider for HashFirstEverywhere {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+
+        let mut session = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        session.expect_on_demand_reply();
+        let summary = |n: u8| SummaryMessage {
+            kind: EnvelopeKind::Key,
+            refs: vec![EnvelopeRef {
+                envelope_hash: h(n),
+                seq: 1,
+            }],
+        };
+
+        // Within the round the exemption stands — a racing Summary must not be
+        // able to consume it out from under the reply it was set for.
+        let ReplicationOutcome::Send(first) = session.on_message(
+            ReplicationMessage::Summary(summary(1)),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+        assert!(
+            first
+                .iter()
+                .any(|m| matches!(m, ReplicationMessage::Diff(d) if !d.want.is_empty())),
+            "the exemption must survive a Summary that is not the Pull reply"
+        );
+
+        // An UNRELATED round completes. The exemption must survive it: a Pull
+        // issued during a scheduled round would otherwise have its exemption
+        // killed by that round finishing first, and testimony recovery became
+        // timing-dependent.
+        session.reset();
+        let ReplicationOutcome::Send(mid) = session.on_message(
+            ReplicationMessage::Summary(summary(3)),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+        assert!(
+            mid.iter()
+                .any(|m| matches!(m, ReplicationMessage::Diff(d) if !d.want.is_empty())),
+            "one unrelated round completing must not kill the exemption"
+        );
+
+        // It is bounded, though: after its window it lapses.
+        session.reset();
+        session.reset();
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(summary(2)),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the round sends a Diff");
+        assert!(
+            diff.want.is_empty(),
+            "the exemption is bounded — got {} wanted after its window lapsed",
+            diff.want.len()
+        );
+    }
+
+    /// CIRISEdge#553 — the carve-out reaches the round, not just the pure
+    /// function. A node configured hash-first STILL pulls revocation bodies.
+    #[test]
+    fn a_hash_first_node_still_pulls_revocation_bodies() {
+        struct HashFirstEverywhere;
+        impl StateProvider for HashFirstEverywhere {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+
+        let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Revocation);
+        let remote = SummaryMessage {
+            kind: EnvelopeKind::Revocation,
+            refs: vec![EnvelopeRef {
+                envelope_hash: h(1),
+                seq: 1,
+            }],
+        };
+        let ReplicationOutcome::Send(msgs) = session.on_message(
+            ReplicationMessage::Summary(remote),
+            &HashFirstEverywhere,
+            &NoApply,
+            Some("peer-a"),
+        ) else {
+            panic!("a summary must produce a round");
+        };
+
+        let diff = msgs
+            .iter()
+            .find_map(|m| match m {
+                ReplicationMessage::Diff(d) => Some(d),
+                _ => None,
+            })
+            .expect("the round still sends a Diff");
+        assert_eq!(
+            diff.want,
+            vec![h(1)],
+            "a node holding the HASH of a revocation has not applied it — the \
+             body must still be asked for (CIRISEdge#553)"
+        );
+    }
+
     /// choosing, which is why the fix needs no wire change.
     #[test]
     fn the_rounds_want_omits_hashes_this_node_has_already_refused() {
@@ -1785,6 +2635,40 @@ mod tests {
         );
     }
 
+    /// A provider with default retention (`Bodies`), for deliver-side tests
+    /// that are not about retention at all.
+    struct BodiesProvider;
+    impl StateProvider for BodiesProvider {
+        fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            Vec::new()
+        }
+        fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    /// Counts what actually reached the applier.
+    #[derive(Default)]
+    struct TrackingApplier {
+        seen: std::sync::atomic::AtomicUsize,
+    }
+    impl TrackingApplier {
+        fn count(&self) -> usize {
+            self.seen.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl StateApplier for TrackingApplier {
+        fn apply_envelope(
+            &self,
+            _kind: EnvelopeKind,
+            _bytes: &[u8],
+            _peer: Option<&str>,
+        ) -> ApplyOutcome {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ApplyOutcome::Admitted
+        }
+    }
+
     /// An applier for want-side tests, which never see a Deliver.
     struct NoApply;
     impl StateApplier for NoApply {
@@ -1831,7 +2715,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"x".to_vec(), b"y".to_vec()],
         };
-        responder.on_deliver(&deliver, &applier, Some("canonical-1"));
+        responder.on_deliver(&deliver, &BodiesProvider, &applier, Some("canonical-1"));
         assert_eq!(
             *applier.seen.lock().unwrap(),
             vec![

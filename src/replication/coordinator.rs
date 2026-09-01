@@ -44,7 +44,7 @@ use tokio::sync::Mutex;
 
 use crate::transport::{Transport, TransportError};
 
-use super::protocol::{EnvelopeKind, ProtocolError, PullMessage, ReplicationMessage};
+use super::protocol::{EnvelopeKind, FetchMessage, ProtocolError, PullMessage, ReplicationMessage};
 use super::session::{ReplicationOutcome, Session, SessionRole};
 use super::summary::{StalenessSignal, StateApplier, StateProvider};
 
@@ -380,12 +380,95 @@ impl ReplicationCoordinator {
     /// forget: the testimony converges over the peer's next round, matching the
     /// anti-entropy model — sending the Pull carries no session state (only the
     /// reply does), so there is nothing to await here.
+    /// Take this peer's queued signer name and send the `Pull` that recovers it
+    /// (FSD-SIGNER-RECOVERY D4).
+    ///
+    /// Returns the name Pulled, or `None` when nothing is queued for this peer —
+    /// the common case, and the caller then runs an ordinary round.
+    ///
+    /// # What can be recovered, and why only that
+    ///
+    /// Exactly one thing: **this peer's own `Key`**, asked of this peer. The
+    /// responder answers an identifier `Pull` for the subject itself or for its
+    /// OWN record, and refuses a third-party probe — that refusal is what stops
+    /// a body-holding node becoming an address-book oracle for records it never
+    /// advertised. So "you signed a row I cannot verify, send me your key" is
+    /// the recoverable case, and a third-party signer is not fetchable by
+    /// identifier at all. Nothing else is ever queued, which is also what bounds
+    /// the queue: a peer can enqueue one name, its own.
+    ///
+    /// Only the `Key` coordinator recovers, because `start_pull` sends
+    /// `PullMessage { kind: self.kind, .. }` and the row every stalled record
+    /// waits on is a `Key` row.
+    ///
+    /// # Failure
+    ///
+    /// A send error is returned to the caller and the name is NOT re-queued
+    /// here. The record that named it re-notes it on its next transient
+    /// refusal, so the retry rides #544's existing backoff rather than a second
+    /// unbounded timer (FSD-SIGNER-RECOVERY D6).
+    pub async fn send_recovery_pull(&self) -> Result<Option<String>, CoordinatorError> {
+        if self.kind != EnvelopeKind::Key {
+            return Ok(None);
+        }
+        let Some(signer) = self.provider.take_missing_signer_for(&self.peer_key_id) else {
+            return Ok(None);
+        };
+        self.start_pull(&signer).await?;
+        Ok(Some(signer))
+    }
+
     pub async fn start_pull(&self, subject_key_id: &str) -> Result<(), CoordinatorError> {
         let pull = ReplicationMessage::Pull(PullMessage {
             kind: self.kind,
             subject_key_id: subject_key_id.to_string(),
         });
-        self.send_message(&pull).await
+        // CIRISEdge#552 — mark the session so the Summary that answers this Pull
+        // is fetched even under hash-first retention. A Pull is the deliberate
+        // "I need these bodies" path; hash-first suppresses bulk convergence, not
+        // an explicit ask. Set BEFORE the send, so a fast reply cannot land
+        // before the flag does.
+        self.session.lock().await.expect_on_demand_reply();
+        // Roll back if the send never left. An exemption installed for a Pull
+        // that was not sent would exempt whatever arrives next instead — a
+        // window opened for a request that does not exist.
+        let sent = self.send_message(&pull).await;
+        if sent.is_err() {
+            self.session.lock().await.cancel_on_demand_reply();
+        }
+        sent
+    }
+
+    /// CIRISEdge#552 — resolve known hashes to their bodies from this peer.
+    ///
+    /// The other half of a hash-first directory: converging hashes is only
+    /// useful if a node can turn one back into a record when something needs it.
+    /// The holder comes from
+    /// [`KnownHashes::holder`](super::known_hashes::KnownHashes::holder) — the
+    /// peer that last advertised it — so this is a point ask, not a broadcast.
+    ///
+    /// Marks the session first, so the `Deliver` that answers is applied rather
+    /// than learned. Without that the reply looks exactly like an unsolicited
+    /// push and hash-first would decline the very body it just asked for.
+    ///
+    /// Fire-and-forget, like [`Self::start_pull`]: the reply arrives through the
+    /// ordinary dispatch path.
+    pub async fn start_fetch(&self, want: Vec<[u8; 32]>) -> Result<(), CoordinatorError> {
+        if want.is_empty() {
+            return Ok(());
+        }
+        let fetch = ReplicationMessage::Fetch(FetchMessage {
+            kind: self.kind,
+            want: want.clone(),
+        });
+        // CIRISEdge#552 — record the EXACT hashes, so only these are applied.
+        // A responder can append whatever it likes to the reply; appending does
+        // not make it requested.
+        self.session
+            .lock()
+            .await
+            .expect_bodies(want.iter().copied());
+        self.send_message(&fetch).await
     }
 
     /// Try to parse on-wire bytes as a [`ReplicationMessage`].

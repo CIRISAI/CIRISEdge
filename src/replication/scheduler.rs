@@ -474,6 +474,39 @@ async fn run_one_coordinator_forever(
             _ = interval.tick() => {
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
                 let _enter = span.enter();
+                // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
+                // tick's ordinary round; the two never overlap. It costs one
+                // cadence tick per recovered key, and only on a tick where a
+                // name is actually queued. At most one name per peer can exist
+                // (D4), so recovery displaces at most one ordinary round per
+                // peer before it is done.
+                let recovery = match run_one_recovery_round(&coord, round_timeout).await {
+                    Ok(step) => step,
+                    Err(e) => {
+                        // A failed recovery must not also cost this peer its
+                        // ordinary round. The row stays transient-refused and
+                        // re-notes its signer on the next offer (D6).
+                        tracing::warn!(
+                            error = ?e,
+                            "signer-recovery round failed; running ordinary \
+                             anti-entropy this tick instead (FSD-SIGNER-RECOVERY D6)"
+                        );
+                        None
+                    }
+                };
+                if let Some(step) = recovery {
+                    let event = match step {
+                        DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report) => {
+                            RoundEvent::Completed(report)
+                        }
+                        DriveStep::Refused => RoundEvent::Refused,
+                        DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
+                    };
+                    if let Some(sink) = &event_sink {
+                        let _ = sink.send((peer_id.clone(), event)).await;
+                    }
+                    continue;
+                }
                 let event = match run_one_round(&coord, round_timeout).await {
                     // CIRISEdge#380 — run_one_round converts SendThenComplete to
                     // Complete after sending; the merged arm is defensive if it
@@ -560,11 +593,73 @@ impl From<CoordinatorError> for RoundError {
 /// Drive a single round end-to-end on one coordinator: start_round →
 /// loop { send_outbound; await inbound; drive_round_step } until
 /// Complete or Refused.
+/// Anti-entropy: INITIATE the exchange, then drive it to completion.
+///
+/// The initiating step is what sends this node's Summary. Recovery
+/// ([`run_one_recovery_round`]) deliberately omits it — see
+/// `docs/FSD_SIGNER_RECOVERY.md` §3, where sending a second Summary alongside a
+/// Pull is the single fact that broke three earlier attempts.
 async fn run_one_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
 ) -> Result<DriveStep, RoundError> {
-    let mut step = coord.drive_round_step(None).await?;
+    let first = coord.drive_round_step(None).await?;
+    drive_exchange_to_completion(coord, round_timeout, first).await
+}
+
+/// Signer-key recovery: send ONE `Pull` and drive **only its reply** to
+/// completion (FSD-SIGNER-RECOVERY D1/D2).
+///
+/// Returns `Ok(None)` when nothing was queued for this peer, which is the
+/// common case — the caller then runs an ordinary round instead.
+///
+/// # Why this exists as a separate round type
+///
+/// An Initiator reads inbound messages only inside the drive loop, and the
+/// loop's first step opens by sending a Summary. A Pull issued *around* an
+/// ordinary round therefore leaves two exchanges outstanding whose replies are
+/// both Summaries, with no request correlation — the scheduled reply could be
+/// consumed as the Pull's, putting the peer's whole page into `pending_bodies`
+/// on a node that had just chosen not to fetch bodies.
+///
+/// Entering the same loop with `SendThenWait(∅)` sends nothing and waits, so the
+/// only reply it can consume is the Pull's. Combined with the per-peer scheduler
+/// task being sequential — a recovery round REPLACES the tick's ordinary round —
+/// at most one exchange is ever outstanding on a coordinator. That is the
+/// correlation, achieved by construction rather than by a request id, and it
+/// needs no wire change.
+async fn run_one_recovery_round(
+    coord: &ReplicationCoordinator,
+    round_timeout: Duration,
+) -> Result<Option<DriveStep>, RoundError> {
+    let Some(signer) = coord
+        .send_recovery_pull()
+        .await
+        .map_err(RoundError::Coordinator)?
+    else {
+        return Ok(None);
+    };
+    tracing::debug!(
+        signer = %signer,
+        "recovery round: asked this peer for its own Key (FSD-SIGNER-RECOVERY)"
+    );
+    // `SendThenWait(∅)`: send nothing, wait. The Pull is already on the wire and
+    // this node must NOT put a Summary beside it.
+    drive_exchange_to_completion(coord, round_timeout, DriveStep::SendThenWait(Vec::new()))
+        .await
+        .map(Some)
+}
+
+/// The send-and-wait loop shared by both round types, given its first step.
+///
+/// Owns no policy about what OPENS an exchange — that is the caller's choice and
+/// the only difference between anti-entropy and recovery.
+async fn drive_exchange_to_completion(
+    coord: &ReplicationCoordinator,
+    round_timeout: Duration,
+    first_step: DriveStep,
+) -> Result<DriveStep, RoundError> {
+    let mut step = first_step;
     loop {
         // CIRISEdge#380 — initiator-final: send the messages, then the round
         // is complete WITHOUT waiting (the peer's last Summary confirmed full
@@ -1146,5 +1241,151 @@ mod tests {
             "a reader answering NO relief must leave the configured cadence \
              untouched (absence = today); got {unrelieved} rounds"
         );
+    }
+
+    /// A provider that hands out exactly one queued signer, once — the shape
+    /// `note_missing_signer` produces for the delivering peer's own key.
+    struct RecoveryProvider {
+        queued: std::sync::Mutex<Option<String>>,
+    }
+    impl StateProvider for RecoveryProvider {
+        fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            // Deliberately non-empty is unnecessary: invariant 1 is about what
+            // a RECOVERY round puts on the wire, and it must send no Summary
+            // even when this node has refs it would otherwise advertise.
+            vec![EnvelopeRef {
+                envelope_hash: [9u8; 32],
+                seq: 1,
+            }]
+        }
+        fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+        fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
+            let mut q = self.queued.lock().unwrap();
+            if q.as_deref() == Some(peer_key_id) {
+                q.take()
+            } else {
+                None
+            }
+        }
+    }
+
+    fn recovery_coord(
+        peer: &str,
+        queued: Option<String>,
+    ) -> (
+        Arc<ReplicationCoordinator>,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut inbox = HashMap::new();
+        inbox.insert(peer.to_string(), tx);
+        let transport = Arc::new(InMemTransport { peer_inbox: inbox });
+        let provider = Arc::new(RecoveryProvider {
+            queued: std::sync::Mutex::new(queued),
+        });
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+        let coord = Arc::new(ReplicationCoordinator::new(
+            transport,
+            peer,
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        ));
+        (coord, rx)
+    }
+
+    /// FSD-SIGNER-RECOVERY invariant 1 — **a recovery round sends no Summary.**
+    ///
+    /// This is the invariant three previous attempts violated, each in a
+    /// different way, and it is the whole reason recovery is a separate round
+    /// type. A Summary beside the Pull leaves two outstanding exchanges whose
+    /// replies are indistinguishable, so the scheduled reply can be consumed as
+    /// the Pull's — putting the peer's entire Key page into `pending_bodies` on
+    /// a node that had just chosen not to fetch bodies.
+    #[tokio::test]
+    async fn a_recovery_round_puts_only_the_pull_on_the_wire() {
+        let (coord, mut rx) = recovery_coord("peer-1", Some("peer-1".to_string()));
+
+        // Times out waiting for a reply nobody sends; the wire is what matters.
+        let _ = run_one_recovery_round(&coord, Duration::from_millis(50)).await;
+
+        let mut sent = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            sent.push(bytes);
+        }
+        assert_eq!(
+            sent.len(),
+            1,
+            "a recovery round must put EXACTLY ONE message on the wire; \
+             {} were sent",
+            sent.len()
+        );
+        let text = String::from_utf8_lossy(&sent[0]).to_string();
+        assert!(
+            text.contains("pull"),
+            "the one message must be the Pull, got: {text}"
+        );
+        assert!(
+            !text.contains("summary"),
+            "a recovery round must NOT send a Summary — that is the ambiguity \
+             that broke three earlier attempts (FSD §3), got: {text}"
+        );
+    }
+
+    /// FSD-SIGNER-RECOVERY invariant 2 — nothing queued means no recovery
+    /// exchange at all, so the tick runs an ordinary round instead.
+    ///
+    /// Without this the scheduler would burn a cadence tick per peer per round
+    /// waiting for a reply to a Pull it never sent.
+    #[tokio::test]
+    async fn no_queued_signer_means_no_recovery_exchange() {
+        let (coord, mut rx) = recovery_coord("peer-1", None);
+
+        let outcome = run_one_recovery_round(&coord, Duration::from_millis(50))
+            .await
+            .expect("no queued name is not an error");
+        assert!(
+            outcome.is_none(),
+            "with nothing queued the caller must fall through to an ordinary round"
+        );
+        assert!(rx.try_recv().is_err(), "and nothing may be put on the wire");
+    }
+
+    /// FSD-SIGNER-RECOVERY invariant 3 — only the `Key` coordinator recovers.
+    ///
+    /// `start_pull` sends `PullMessage { kind: self.kind, .. }`, and the row
+    /// every stalled record waits on is a Key row. A recovery Pull on another
+    /// plane would ask a peer for the wrong thing entirely.
+    #[tokio::test]
+    async fn only_the_key_coordinator_recovers_a_signer() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut inbox = HashMap::new();
+        inbox.insert("peer-1".to_string(), tx);
+        let transport = Arc::new(InMemTransport { peer_inbox: inbox });
+        let provider = Arc::new(RecoveryProvider {
+            queued: std::sync::Mutex::new(Some("peer-1".to_string())),
+        });
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+        let coord = Arc::new(ReplicationCoordinator::new(
+            transport,
+            "peer-1",
+            EnvelopeKind::Attestation,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        ));
+
+        assert!(
+            coord
+                .send_recovery_pull()
+                .await
+                .expect("not an error")
+                .is_none(),
+            "a non-Key coordinator must not recover"
+        );
+        assert!(rx.try_recv().is_err(), "and must send nothing");
     }
 }

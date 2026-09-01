@@ -79,6 +79,26 @@ jobs:
           docker version
           docker compose version
 
+      - name: Set the committed baselines aside
+        # bench-mesh/results/ is gitignored, but each release's acceptance
+        # baselines are force-added into it as the record of that sweep. The
+        # census globs the SAME directory, so a partial run (one config) read
+        # the other configs' baselines out of the CHECKOUT and reported them
+        # as its own — a one-config job announced "legs=106 ran=102 passed=102"
+        # when 72 of those legs came from git and never executed. Worse, a leg
+        # that regressed to absent stayed green through the committed file.
+        # Emptying the directory first means everything the census finds was
+        # produced by THIS run, and a config that did not run is ABSENT rather
+        # than silently passing.
+        working-directory: bench-mesh
+        run: |
+          shopt -s nullglob
+          mkdir -p ../baselines-from-checkout
+          for f in results/*.jsonl; do
+            echo "  baseline set aside (from the checkout, NOT run here): $f"
+            mv "$f" ../baselines-from-checkout/
+          done
+
       - name: Run the mesh
         id: mesh
         working-directory: bench-mesh
@@ -106,6 +126,7 @@ jobs:
             echo "NO RESULTS FILES — the harness measured nothing." >&2
             exit 1
           fi
+          echo "  every file below was produced by this run; baselines were set aside"
           python3 - "${files[@]}" <<'PY'
           import json, sys
           total = ran = ok = 0

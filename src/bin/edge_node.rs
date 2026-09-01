@@ -1538,6 +1538,46 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         }),
     );
 
+    // ── Ladder: discovery over the REAL route table ──────────────────
+    //
+    // CIRISEdge#554. The ladder's resolution logic is unit-tested against a fake
+    // lens; what only a running mesh can prove is that a node can actually
+    // ADDRESS the peers it has rooted. `knows_peer` is the transport's own
+    // readback — the same question the send path asks before it dials — so this
+    // leg fails exactly when a send would, rather than when a fixture disagrees.
+    //
+    // Reachability here also carries the multi-hop claim: a peer is addressable
+    // through whatever path Reticulum found, and this node did no relaying to
+    // make that true.
+    {
+        use ciris_edge::contact::{ReticulumRoutes, RouteLens as _};
+        let routes = ReticulumRoutes::new(&occ.transport);
+        let mut reachable = Vec::new();
+        let mut unreachable = Vec::new();
+        for peer in &peers {
+            if routes.has_destination(peer).await {
+                reachable.push(peer.clone());
+            } else {
+                unreachable.push(peer.clone());
+            }
+        }
+        let all_reachable = unreachable.is_empty() && !reachable.is_empty();
+        rep.ran(
+            "ladder.discover",
+            all_reachable,
+            serde_json::json!({
+                "rooted_peers": peers.len(),
+                "reachable": reachable.len(),
+                "unreachable": unreachable,
+                "readback": "transport.knows_peer",
+                // Stated so a reader of the census knows what this leg does NOT
+                // cover: identifier resolution needs owner bindings the harness
+                // does not seed, and is unit-tested instead.
+                "covers": "route reachability only; identity resolution is unit-tested",
+            }),
+        );
+    }
+
     // ── Cohort: create, admit members over the real wire ─────────────
     let kv = Arc::new(open_sealed_kv(
         &cfg.state_dir,
@@ -2471,6 +2511,40 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     // admission lands mid-stream.
     if cfg.late_joiner.as_deref() == Some(cfg.node_id.as_str()) {
         tokio_sleep(env_secs("EDGE_LATE_JOIN_DELAY_SECS", 5)).await;
+    }
+
+    // ── Ladder: discovery over the REAL route table ──────────────────
+    //
+    // CIRISEdge#554, subscriber side. Discovery must work in BOTH directions:
+    // the publisher reaching a subscriber proves nothing about a subscriber
+    // reaching back, and a contact request travels the way the publisher does
+    // not. A one-directional check passes on a mesh where half the ladder is
+    // broken.
+    {
+        use ciris_edge::contact::{ReticulumRoutes, RouteLens as _};
+        let routes = ReticulumRoutes::new(&occ.transport);
+        let mut reachable = Vec::new();
+        let mut unreachable = Vec::new();
+        // The subscriber roots against the publisher, so that is the peer whose
+        // reachability the return direction depends on.
+        for peer in std::slice::from_ref(&publisher) {
+            if routes.has_destination(peer).await {
+                reachable.push(peer.clone());
+            } else {
+                unreachable.push(peer.clone());
+            }
+        }
+        rep.ran(
+            "ladder.discover",
+            unreachable.is_empty() && !reachable.is_empty(),
+            serde_json::json!({
+                "rooted_peers": 1,
+                "reachable": reachable.len(),
+                "unreachable": unreachable,
+                "readback": "transport.knows_peer",
+                "direction": "subscriber -> publisher",
+            }),
+        );
     }
 
     // ── Real cross-process MLS join ──────────────────────────────────

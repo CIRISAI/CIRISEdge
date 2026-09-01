@@ -125,6 +125,78 @@ pub trait StateProvider: Send + Sync {
     /// The production `DirectoryStateAdapter` forwards to the ONE shared bridge,
     /// so the verdict is node-wide: the first peer's refusal teaches every
     /// peer's next round.
+    /// CIRISEdge#552 — how much of `kind` this node keeps.
+    ///
+    /// Defaults to [`Retention::Bodies`](super::retention::Retention::Bodies),
+    /// the pre-#552 behaviour, so every existing provider, mock and DST harness
+    /// is unchanged. Sync for the same reason `retry_suppressed` is: a
+    /// configuration read consulted once per round, never I/O.
+    ///
+    /// A provider cannot bypass the revocation carve-out by answering
+    /// `HashFirst` here — the round passes this through
+    /// [`retention_for`](super::retention::retention_for), which pins the
+    /// retracting planes to `Bodies` regardless.
+    fn retention(&self, _kind: EnvelopeKind) -> super::retention::Retention {
+        super::retention::Retention::Bodies
+    }
+
+    /// CIRISEdge#552 — learn that `advertised_by` offered these hashes for
+    /// `kind`, without this node fetching their bodies.
+    ///
+    /// The node knows the records exist and who to ask; it simply has not pulled
+    /// them. Defaults to a no-op, so a `Bodies` provider needs nothing.
+    ///
+    /// These are **not holdings** and must never be returned from
+    /// [`Self::local_holdings`]. `want = remote ∖ holdings`, so a
+    /// known-but-not-held hash on the holdings side makes the node conclude it
+    /// already has what it has merely heard of — and stop fetching, silently.
+    fn note_known_hashes(
+        &self,
+        _kind: EnvelopeKind,
+        _hashes: &[[u8; 32]],
+        _advertised_by: Option<&str>,
+    ) {
+    }
+
+    /// CIRISEdge#552 (B) — record a signer a transient refusal named, so the
+    /// key can be pulled out of band. See
+    /// [`ReplicationDirectory::note_missing_signer`] for why this only records.
+    ///
+    /// [`ReplicationDirectory::note_missing_signer`]:
+    ///     super::directory::ReplicationDirectory::note_missing_signer
+    fn note_missing_signer(
+        &self,
+        _kind: EnvelopeKind,
+        _signer_key_id: &str,
+        _source_peer: Option<&str>,
+    ) {
+    }
+
+    /// CIRISEdge#552 (B) — take signers to pull, at most a bounded batch. The
+    /// names are REMOVED: a name that stays queued after its pull was sent would
+    /// re-pull every round. If the key still does not arrive, the row refuses
+    /// transient again and re-notes it — the retry rides the existing #544
+    /// backoff rather than a second timer.
+    /// CIRISEdge#552 (B) — take ONE signer to pull from `peer_key_id`, removing
+    /// it.
+    ///
+    /// Per-peer and one-at-a-time, both forced by the mechanism. **Possession:**
+    /// a Pull reads the answering peer's own `lookup_public_key`, so asking an
+    /// arbitrary peer for a third party's key returns an empty Summary and
+    /// silently consumes the queued recovery. The peer that DELIVERED the
+    /// unverifiable row is the one candidate known to have handled it, so the
+    /// name is routed back to it. **Serialization:** the on-demand exemption is
+    /// a ROUND counter, not a per-request ledger, so a batch of Pulls would
+    /// outrun its own exemption and the later replies would be suppressed as
+    /// ordinary hash-first traffic.
+    ///
+    /// A name recorded with no source peer (a contact lookup, which has no
+    /// delivering peer) is offered to any coordinator, so successive rounds try
+    /// it against successive peers until one holds it.
+    fn take_missing_signer_for(&self, _peer_key_id: &str) -> Option<String> {
+        None
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }
