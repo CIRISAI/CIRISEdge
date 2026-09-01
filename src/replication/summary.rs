@@ -175,6 +175,19 @@ pub trait StateProvider: Send + Sync {
         Vec::new()
     }
 
+    /// CIRISEdge#552 (B) — take ONE recorded signer, but only if it is this
+    /// peer, removing it. Returns whether it was queued.
+    ///
+    /// A subject Pull is served only when the requester IS the subject
+    /// (`subject_holdings` refuses anything else and serves nothing), so asking
+    /// peer P for third-party S's key returns an empty Summary forever. The one
+    /// authorized case is S == P: "you signed a row I cannot verify, send me
+    /// your key." Filtering by peer keeps every other name queued for the peer
+    /// that can actually answer it.
+    fn take_missing_signer_for(&self, _peer_key_id: &str) -> bool {
+        false
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }

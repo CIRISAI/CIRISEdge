@@ -1600,6 +1600,17 @@ pub fn baked_canonical_ip_dials() -> Vec<(String, std::net::SocketAddr)> {
 }
 
 impl Edge {
+    /// CIRISEdge#552 — the mode this Edge was initialized with.
+    ///
+    /// Exposed because the replication runtime needs it: `BridgeConfig::mode`
+    /// selects retention, and without this the host path built the bridge from
+    /// `Default` and an Edge started with `agent_mode="server"` still ran the
+    /// `Proxy` default — a documented flag with no effect.
+    #[must_use]
+    pub fn agent_mode(&self) -> crate::AgentMode {
+        self.config.agent_mode
+    }
+
     #[must_use]
     pub fn builder() -> EdgeBuilder {
         EdgeBuilder {

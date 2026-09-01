@@ -2495,6 +2495,14 @@ impl PyEdge {
         if let Some(secs) = cadence_seconds {
             config.scheduler.cadence = std::time::Duration::from_secs(secs);
         }
+        // CIRISEdge#552 — carry the Edge's OWN agent_mode into the bridge.
+        // `BridgeConfig::mode` selects retention, and this entry point built the
+        // config from `Default`, so an Edge initialized with agent_mode="server"
+        // still constructed a `Proxy` bridge: every production round chose
+        // `Bodies` and the mode flag did nothing at all through the shipped host
+        // path. The mode belongs to the Edge, so it is read from the Edge rather
+        // than re-parsed or passed again by the caller.
+        config.bridge.mode = self.inner.agent_mode();
         // CIRISEdge#370 — hand the live metrics bag to the runtime so its
         // scheduler event-sink consumer folds each round's outcome into the
         // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;
@@ -11387,6 +11395,30 @@ mod node_identity_tests {
         assert!(
             leftovers.is_empty(),
             "edge must OPEN the node identity, never MINT it — but it created: {leftovers:?}"
+        );
+    }
+
+    /// CIRISEdge#552 — `start_replication` must carry the Edge's agent_mode
+    /// into the bridge config.
+    ///
+    /// A SOURCE assertion, like the `is_bootstrap` wiring pin, because no Rust
+    /// test can observe this: the effect only appears through the Python host
+    /// path, and the failure is silent — the bridge takes its `Proxy` default
+    /// and every round selects `Bodies`, so a server-mode Edge behaves exactly
+    /// like a correctly-configured proxy. That is what shipped: the mode flag
+    /// was documented, parsed, validated, and then dropped on the floor here.
+    #[test]
+    fn start_replication_propagates_the_agent_mode_into_the_bridge() {
+        let src = include_str!("pyo3.rs");
+        let start = src
+            .find("    fn start_replication(")
+            .expect("start_replication exists");
+        let body = &src[start..start + 8000];
+        assert!(
+            body.contains("config.bridge.mode = self.inner.agent_mode();"),
+            "start_replication must set config.bridge.mode from the Edge's own \
+             agent_mode — without it BridgeConfig takes its Proxy default and \
+             hash-first retention is unreachable through the shipped host path"
         );
     }
 }

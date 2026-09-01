@@ -1,5 +1,26 @@
 //! CIRISEdge#554 — the receiver-side budget on unsolicited contact requests.
 //!
+//! # WHERE THIS RUNS — it is not called inside edge, deliberately
+//!
+//! A repo-wide search finds no caller, and that is the correct state rather
+//! than an oversight: **edge has no inbound contact-request path to wire it
+//! into.** The wire carries `Summary`/`Diff`/`Fetch`/`Deliver`/`Pull`/
+//! `CursorPull` — anti-entropy verbs — and no invite verb at all. Contact
+//! requests and chat are the SERVER's tier (`POST /v1/contacts`), which is also
+//! where a human is shown the invite.
+//!
+//! Enforcing the budget at replication ADMISSION would be actively wrong. An
+//! invite that arrives as a signed `Community` record is legitimate federation
+//! state; refusing to admit it would withhold carriage of a correctly-signed
+//! row on a rate heuristic — the silent-state-withholding class CIRISEdge#425
+//! exists to make impossible. The thing being rate-limited is not the record's
+//! ARRIVAL, it is its PRESENTATION to a person, and that decision lives where
+//! the presenting happens.
+//!
+//! So this is a library the presenting tier calls, in the same position as
+//! [`crate::contact::resolve`]. Wiring it here would mean inventing a call site
+//! to make a search result look better.
+//!
 //! # The threat this covers, and why nothing else does
 //!
 //! An invite is low-volume, well-formed, correctly signed, and semantically

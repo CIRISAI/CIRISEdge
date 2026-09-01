@@ -453,7 +453,19 @@ pub async fn discover(
     routes: &dyn RouteLens,
     any_id: &str,
 ) -> Result<Discovered, LadderStall> {
-    let subject = resolve(lens, any_id).await?;
+    // Log the RESOLUTION stall here rather than `?`-ing past it. The stalls
+    // that reach this line — an unknown key, a queued body fetch, a missing
+    // owner, a non-contactable identity — are the ordinary ones in a
+    // distributed directory, and returning silently left `step=discover` in the
+    // diagnostic stream only for route failures and successes. The rung that
+    // fails most is then the one an operator cannot see.
+    let subject = match resolve(lens, any_id).await {
+        Ok(subject) => subject,
+        Err(stall) => {
+            log_rung(Rung::Discover, any_id, Some(&stall));
+            return Err(stall);
+        }
+    };
     let mut reachable = Vec::new();
     for node in &subject.nodes {
         if routes.has_destination(node).await {

@@ -220,6 +220,14 @@ pub trait ReplicationDirectory: Send + Sync {
         Vec::new()
     }
 
+    /// CIRISEdge#552 (B) — see [`StateProvider::take_missing_signer_for`].
+    ///
+    /// [`StateProvider::take_missing_signer_for`]:
+    ///     super::summary::StateProvider::take_missing_signer_for
+    fn take_missing_signer_for(&self, _peer_key_id: &str) -> bool {
+        false
+    }
+
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
         false
     }
@@ -348,6 +356,10 @@ impl StateProvider for DirectoryStateAdapter {
 
     fn take_missing_signers(&self) -> Vec<String> {
         self.inner.take_missing_signers()
+    }
+
+    fn take_missing_signer_for(&self, peer_key_id: &str) -> bool {
+        self.inner.take_missing_signer_for(peer_key_id)
     }
 
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {

@@ -2317,6 +2317,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
+    fn take_missing_signer_for(&self, peer_key_id: &str) -> bool {
+        let Ok(mut pending) = self.missing_signers.lock() else {
+            return false;
+        };
+        pending.remove(peer_key_id)
+    }
+
     fn take_missing_signers(&self) -> Vec<String> {
         let Ok(mut pending) = self.missing_signers.lock() else {
             return Vec::new();
