@@ -376,7 +376,20 @@ pub fn parse_contact_input(raw: &str) -> Result<ContactCandidate, LadderStall> {
 pub fn looks_like_fedcode(raw: &str) -> bool {
     // `trim()` already strips Unicode `White_Space` from both ends — the same
     // predicate `char::is_whitespace` matches — so nothing further is needed.
-    raw.trim().to_ascii_uppercase().starts_with("CIRIS-V")
+    let up = raw.trim().to_ascii_uppercase();
+    // The COMPLETE discriminator: `CIRIS-V` + version digits + `-`.
+    //
+    // A bare `starts_with("CIRIS-V")` also matches a perfectly valid
+    // IDENTIFIER, because a key_id's label is operator-chosen: `CIRIS-Victor-
+    // <fingerprint>` would be sent to the fedcode decoder and come back
+    // `MalformedCode`, making a real contact unreachable purely because of
+    // their name. Requiring the digits and the delimiter cannot collide with a
+    // label, since a label is followed by the fingerprint, not by `V<digits>-`.
+    let Some(rest) = up.strip_prefix("CIRIS-V") else {
+        return false;
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    !digits.is_empty() && rest[digits.len()..].starts_with('-')
 }
 
 /// Re-derive the claimed `key_id` from the carried pubkey and require a match.
@@ -402,6 +415,22 @@ fn verify_code_binds_its_key(
     let pubkey = base64::engine::general_purpose::STANDARD
         .decode(decoded.pubkey_ed25519_base64.as_bytes())
         .map_err(|_| mismatch())?;
+    // Exactly 32 bytes, or it is not an Ed25519 public key.
+    //
+    // `derive_key_id` hashes whatever it is handed, so a sender could derive a
+    // matching id from a one-byte value and receive a "verified"
+    // `CodeAdmission` whose documented contract says raw-32. The host
+    // registration gate would then reject it — a confusing failure one layer
+    // too late, and a needless admission attempt on material this layer
+    // already knows is malformed.
+    if pubkey.len() != 32 {
+        return Err(LadderStall::MalformedCode {
+            detail: format!(
+                "pubkey is {} bytes; an Ed25519 public key is exactly 32",
+                pubkey.len()
+            ),
+        });
+    }
 
     // The label is everything before the LAST hyphen: labels may contain
     // hyphens, the fingerprint never does.
@@ -1383,6 +1412,72 @@ mod tests {
             "the pubkey is the thing the directory cannot supply for a stranger"
         );
         assert_eq!(admission.alias_hint.as_deref(), Some("Frank"));
+    }
+
+    /// CIRISEdge#526 — a label that merely STARTS with V is not a fedcode.
+    ///
+    /// `key_id` is `label-fingerprint` with an operator-chosen label, so
+    /// `CIRIS-Victor-<fingerprint>` is a perfectly valid identifier. A
+    /// `starts_with("CIRIS-V")` probe would send it to the fedcode decoder and
+    /// return `MalformedCode`, making a real person unreachable because of
+    /// their name. The discriminator is the COMPLETE versioned prefix.
+    #[test]
+    fn a_label_beginning_with_v_is_an_identifier_not_a_code() {
+        for id in [
+            "CIRIS-Victor-abc123def4",
+            "CIRIS-V-abc123def4",
+            "ciris-vera-abc123def4",
+            "CIRIS-Vv2-abc123def4",
+        ] {
+            assert!(
+                !super::looks_like_fedcode(id),
+                "{id} is an identifier — a label may start with V, and a code \
+                 needs CIRIS-V<digits>-"
+            );
+            let candidate = super::parse_contact_input(id).expect("plain identifier");
+            assert_eq!(candidate.source, super::ContactInputSource::Identifier);
+        }
+        for code in ["CIRIS-V1-AAAA", "CIRIS-V2-AAAA", "ciris-v2-aaaa"] {
+            assert!(
+                super::looks_like_fedcode(code),
+                "{code} announces itself as a versioned fedcode"
+            );
+        }
+    }
+
+    /// CIRISEdge#526 — an Ed25519 public key is exactly 32 bytes.
+    ///
+    /// Tested against the BINDING CHECK directly rather than through a round
+    /// trip, because our own `encode` refuses a short key ("pubkey must be 32
+    /// raw bytes"). That defence does not cover the case that matters: a
+    /// hand-crafted code on the wire never touches our encoder. `derive_key_id`
+    /// hashes whatever it is handed, so without this length check a sender
+    /// could derive a matching id from one byte and receive a "verified"
+    /// admission whose contract promises raw-32 — rejected one layer later by
+    /// the host's registration gate, which is a confusing place to find out.
+    #[test]
+    fn a_pubkey_that_is_not_32_bytes_is_malformed() {
+        use base64::Engine as _;
+        for len in [1usize, 31, 33, 64] {
+            let bytes = vec![7u8; len];
+            // The id DERIVES correctly from these bytes, so the binding check
+            // alone would pass it. Only the length check catches it.
+            let key_id = ciris_verify_core::fedcode::derive_key_id("shorty", &bytes);
+            let hand_crafted = ciris_verify_core::fedcode::FedCode {
+                kind: ciris_verify_core::fedcode::FedKind::User,
+                key_id,
+                pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                transport_hint: None,
+                alias_hint: None,
+                group_key_id: None,
+            };
+            match super::verify_code_binds_its_key(&hand_crafted) {
+                Err(LadderStall::MalformedCode { detail }) => {
+                    assert!(detail.contains("32"), "state the contract: {detail}");
+                }
+                other => panic!("a {len}-byte pubkey is not an Ed25519 key: {other:?}"),
+            }
+        }
     }
 
     /// CIRISEdge#526 — a bare identifier still behaves exactly as before, and is

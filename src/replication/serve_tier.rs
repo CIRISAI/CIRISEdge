@@ -232,6 +232,17 @@ pub struct CachedServeTier {
     /// Millis since an arbitrary process-start epoch, 0 = never resolved.
     resolved_at_ms: std::sync::atomic::AtomicU64,
     epoch: std::time::Instant,
+    /// Single-flight gate. Concurrent callers crossing a stale boundary would
+    /// otherwise each start an independent directory walk, and whichever
+    /// finished LAST would win — so a walk begun against older state could
+    /// overwrite a newer result and mark that stale decision fresh for another
+    /// full TTL. If a conferral had just been withdrawn, that re-enables
+    /// serving; if one had just been granted, it suppresses it.
+    ///
+    /// Holding this across the await is deliberate: the second caller waits and
+    /// then finds the cache fresh, which is exactly the intent (one walk per
+    /// window), and the wait is bounded by one directory resolution.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for CachedServeTier {
@@ -255,6 +266,7 @@ impl CachedServeTier {
             tier: AtomicU8::new(ServeTier::None as u8),
             resolved_at_ms: std::sync::atomic::AtomicU64::new(0),
             epoch: std::time::Instant::now(),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -262,6 +274,17 @@ impl CachedServeTier {
     #[must_use]
     pub fn read(&self) -> ServeTier {
         ServeTier::from_u8(self.tier.load(Ordering::Relaxed))
+    }
+
+    /// Is the cached tier within its TTL?
+    fn is_fresh(&self) -> bool {
+        let resolved_at = self.resolved_at_ms.load(Ordering::Relaxed);
+        if resolved_at == 0 {
+            return false;
+        }
+        let now_ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let ttl_ms = u64::try_from(Self::TTL.as_millis()).unwrap_or(u64::MAX);
+        now_ms.saturating_sub(resolved_at) < ttl_ms
     }
 
     /// Overwrite (tests, and the refresh path).
@@ -276,10 +299,17 @@ impl CachedServeTier {
     /// may race to refresh; the result is idempotent and the extra walk is
     /// bounded by TTL, so no lock is held across the await.
     pub async fn refresh_if_stale(&self, resolver: &dyn ServeTierResolver, subject_key_id: &str) {
-        let resolved_at = self.resolved_at_ms.load(Ordering::Relaxed);
-        let now_ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let ttl_ms = u64::try_from(Self::TTL.as_millis()).unwrap_or(u64::MAX);
-        if resolved_at != 0 && now_ms.saturating_sub(resolved_at) < ttl_ms {
+        if self.is_fresh() {
+            return;
+        }
+        // SINGLE-FLIGHT. One walk per window, and the last writer is the one
+        // that started last — without this, a refresh begun against older state
+        // could land after a newer one and revive a withdrawn conferral for a
+        // whole TTL.
+        let _flight = self.refresh_lock.lock().await;
+        // Re-check under the gate: a caller that queued behind the walk we were
+        // waiting on has nothing to do.
+        if self.is_fresh() {
             return;
         }
         let tier = resolver.resolve(subject_key_id).await;
