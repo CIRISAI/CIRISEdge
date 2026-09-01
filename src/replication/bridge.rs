@@ -2326,6 +2326,26 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// rule. `retention_for` pins every plane that must hold bodies, so a node
     /// configured hash-first still holds revocations, rosters, and anything else
     /// whose body it needs — the switch cannot turn those off.
+    ///
+    /// # Freshness, and the one window that remains
+    ///
+    /// Synchronous by design: this sits on the apply loop. It reads the tier
+    /// cache, refreshed by the async calls that precede it —
+    /// `list_envelope_refs_for_peer` on the initiator round path and
+    /// `list_holdings` on the responder's, both once per round.
+    ///
+    /// **Residual:** an UNSOLICITED `Deliver` (the #927 proactive-publish
+    /// shape) reaches `Session::on_deliver` with no async provider call ahead
+    /// of it, so if one is the very first inbound after startup or after a
+    /// [`CachedServeTier::TTL`] expiry, it is processed against the
+    /// fail-closed `None` — that message's bodies are applied rather than
+    /// learned, and a signer it would have queued is not. Bounded to one
+    /// message per window and self-healing on the next round. Closing it needs
+    /// either an async hook on the deliver path or a background refresh from
+    /// the sync one; neither is worth a runtime hop on the apply loop today.
+    ///
+    /// [`CachedServeTier::TTL`]:
+    ///     crate::replication::serve_tier::CachedServeTier::TTL
     fn retention(&self, kind: EnvelopeKind) -> crate::replication::retention::Retention {
         // ROLE_MATRIX Axis 3 — only a node CONFERRED the directory role keeps a
         // hash directory. Keyed on the serving tier, NOT on `AgentMode`: mode is
@@ -2561,6 +2581,21 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// repairs both axes at once and keeps advertise == holdings, exactly as
     /// this arm's `_ =>` fall-through assumes.
     async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        // ROLE_MATRIX Axis 3 — the RESPONDER receive path's refresh point.
+        //
+        // `Session::on_summary` calls `local_holdings` and only THEN reads
+        // `provider.retention(kind)`, which is a synchronous cache read. Without
+        // a refresh here, the very first Summary after startup (and the first
+        // after any `CachedServeTier::TTL` expiry) is processed against the
+        // fail-closed `ServeTier::None`: a conferred server takes the `Bodies`
+        // branch and that round's advertised hashes are pulled as bodies
+        // instead of learned. Bounded and self-healing — the next round has a
+        // fresh cache — but a whole round of hash learning lost per window, on
+        // exactly the nodes the feature is for.
+        //
+        // Refreshing HERE rather than inside `retention()` keeps the sync
+        // readers sync: this is the async call that already precedes them.
+        self.refresh_serve_tier().await;
         // CIRISEdge#547 / CIRISPersist#780 — READ THE INDEX, NOT THE ROWS.
         //
         // Everything below is correct and was killing production. `holdings`

@@ -374,10 +374,9 @@ pub fn parse_contact_input(raw: &str) -> Result<ContactCandidate, LadderStall> {
 /// what turns a bad paste into a confusing `unknown_fed_id`.
 #[must_use]
 pub fn looks_like_fedcode(raw: &str) -> bool {
-    raw.trim()
-        .trim_start_matches(char::is_whitespace)
-        .to_ascii_uppercase()
-        .starts_with("CIRIS-V")
+    // `trim()` already strips Unicode `White_Space` from both ends — the same
+    // predicate `char::is_whitespace` matches — so nothing further is needed.
+    raw.trim().to_ascii_uppercase().starts_with("CIRIS-V")
 }
 
 /// Re-derive the claimed `key_id` from the carried pubkey and require a match.
@@ -496,7 +495,7 @@ pub async fn resolve_contact(
     // `resolve` treats these as terminal, so an admit-then-retry would end at
     // exactly this answer having registered a key for nothing.
     if let Some(admission) = candidate.admission.as_ref() {
-        if !is_contactable_code_kind(admission.identity_type) {
+        if is_roster_code_kind(admission.identity_type) {
             return Err(LadderStall::NotContactable {
                 key_id: candidate.key_id,
                 identity_type: admission.identity_type.to_string(),
@@ -522,6 +521,19 @@ pub async fn resolve_contact(
                 log_rung(Rung::Discover, &candidate.key_id, Some(&stall));
                 return Err(stall);
             }
+            // A STRANGER's node/agent code cannot produce a person. `resolve`
+            // routes a KNOWN node through `owner_of`, which is why the known
+            // case above is fine; a stranger has no owner binding here, so
+            // there is nothing to route to. Writing the node's key into
+            // `Subject.fed_id` would aim the consent rung at a machine.
+            if !code_alone_yields_a_person(admission.identity_type) {
+                let stall = LadderStall::NotContactable {
+                    key_id: candidate.key_id.clone(),
+                    identity_type: admission.identity_type.to_string(),
+                };
+                log_rung(Rung::Discover, &candidate.key_id, Some(&stall));
+                return Err(stall);
+            }
             tracing::info!(
                 key_id = %candidate.key_id,
                 identity_type = %admission.identity_type,
@@ -538,25 +550,53 @@ pub async fn resolve_contact(
     }
 }
 
-/// Can a code of this `identity_type` be a CONTACT?
+/// Is this code a ROSTER rather than anything contactable?
 ///
-/// `user`, `agent` and `node` name something a person can be reached through.
-/// `family` and `community` are rosters — [`FedKind`] can encode them and a
-/// code for one is perfectly valid, it is simply not a contact.
+/// `family` and `community` codes are perfectly valid — [`FedKind`] encodes
+/// them and a group can hand one out — they are simply not a party you open a
+/// conversation with. Refused before the caller is told to admit anything.
 ///
 /// [`FedKind`]: ciris_verify_core::fedcode::FedKind
 #[must_use]
-fn is_contactable_code_kind(identity_type: &str) -> bool {
-    matches!(identity_type, "user" | "agent" | "node")
+fn is_roster_code_kind(identity_type: &str) -> bool {
+    matches!(identity_type, "family" | "community")
+}
+
+/// Can a code of this `identity_type` yield a [`Subject`] **on its own**?
+///
+/// Only `user`. This is narrower than "can be contacted" and the difference is
+/// the invariant [`Subject`] exists to hold: `fed_id` is *the person who
+/// consents*, and a node or an agent cannot consent — its OWNER does.
+///
+/// For a KNOWN node or agent that is fine, because [`resolve`] routes them
+/// through `owner_of` and returns the owner as `fed_id`. For a STRANGER it is
+/// not: a stranger has no owner-binding attestation in this node's directory —
+/// that is what "stranger" means — so there is no owner to route to, and
+/// writing the node's key into the person slot would send a consent request to
+/// a machine. Nobody is there to accept it.
+///
+/// So a stranger's node/agent code is terminal, and its remedy is the true
+/// one: get the OWNER's code.
+#[must_use]
+fn code_alone_yields_a_person(identity_type: &str) -> bool {
+    identity_type == "user"
 }
 
 /// Build the [`Subject`] a code yields on its own.
 ///
-/// The reachable node is the code's own `key_id`: whatever the code names is
-/// the thing whose transport the hint describes, and it is what the caller
-/// dials. No directory lookup contributes here — that is the point of a code,
-/// and why this path works for someone who never announced.
+/// Only reached for a `user` code (see [`code_alone_yields_a_person`]), so
+/// `fed_id` holds a person — the invariant the type is for.
+///
+/// The reachable node is the code's own `key_id`: a user code names the person
+/// whose transport the hint describes, and it is what the caller dials. No
+/// directory lookup contributes here — that is the point of a code, and why
+/// this path works for someone who never announced.
 fn subject_from_code(candidate: &ContactCandidate, admission: &CodeAdmission) -> Subject {
+    debug_assert!(
+        code_alone_yields_a_person(admission.identity_type),
+        "subject_from_code must only build a Subject for a person: fed_id is \
+         the party who consents"
+    );
     Subject {
         fed_id: candidate.key_id.clone(),
         nodes: vec![admission.key_id.clone()],
@@ -1470,6 +1510,62 @@ mod tests {
                 "a stranger's code must yield BOTH the key to admit and a \
                  usable subject — the directory cannot supply either: {other:?}"
             ),
+        }
+    }
+
+    /// CIRISEdge#526 — a STRANGER's node/agent code never puts a machine in
+    /// the person slot.
+    ///
+    /// `Subject.fed_id` is *the party who consents*, and a node cannot consent
+    /// — its OWNER does. `resolve` upholds that for a KNOWN node by routing
+    /// through `owner_of`; a stranger has no owner binding here, so there is
+    /// nothing to route to. Building a Subject anyway would aim the consent
+    /// rung at a machine, and the harness guide keys that rung on `fed_id`.
+    ///
+    /// This was the untested crack: every other code test mints `User`, and
+    /// rosters are caught by their own guard.
+    #[tokio::test]
+    async fn a_strangers_node_code_is_terminal_not_a_person() {
+        use base64::Engine as _;
+        let empty = FakeLens {
+            types: std::collections::HashMap::new(),
+            owners: std::collections::HashMap::new(),
+            nodes: std::collections::HashMap::new(),
+        };
+
+        for (kind, wire) in [
+            (ciris_verify_core::fedcode::FedKind::Node, "node"),
+            (ciris_verify_core::fedcode::FedKind::Agent, "agent"),
+        ] {
+            let mut pubkey = [0u8; 32];
+            pubkey[0] = u8::try_from(wire.len()).unwrap_or(1);
+            let key_id = ciris_verify_core::fedcode::derive_key_id(wire, &pubkey);
+            let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+                kind,
+                key_id: key_id.clone(),
+                pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
+                transport_hint: Some("https://example.invalid".into()),
+                alias_hint: None,
+                group_key_id: None,
+            })
+            .expect("encode");
+
+            match super::resolve_contact(&empty, &code).await {
+                Err(LadderStall::NotContactable {
+                    identity_type,
+                    key_id: refused,
+                }) => {
+                    assert_eq!(identity_type, wire);
+                    assert_eq!(refused, key_id);
+                }
+                Ok(super::ContactResolution::ReadyFromCode { subject, .. }) => panic!(
+                    "a stranger's {wire} code must NOT yield a Subject — \
+                     fed_id would hold {}, a machine, and the consent rung is \
+                     keyed on it",
+                    subject.fed_id
+                ),
+                other => panic!("expected NotContactable for a stranger {wire} code: {other:?}"),
+            }
         }
     }
 
