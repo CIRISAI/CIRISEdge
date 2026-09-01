@@ -267,6 +267,19 @@ impl KeyState {
 pub struct RateLimiter {
     policy: Policy,
     keys: HashMap<String, KeyState>,
+    /// How many keys each source is accountable for, maintained INCREMENTALLY.
+    ///
+    /// `make_room` used to rebuild this on every call — so at capacity, with
+    /// `next_release` proving nothing could be released, each rejected request
+    /// still allocated and populated a counter per resident key. Under an
+    /// identity-rotation flood that is one 65_536-entry map per invite: the
+    /// exact O(cap)-per-rejected-request CPU path the horizon check exists to
+    /// prevent, reintroduced one layer down. Third appearance of this class.
+    source_counts: HashMap<Option<String>, usize>,
+    /// The largest value in `source_counts`. Only ever grows on insert; a
+    /// stale-high value costs one extra victim search, never a wrong refusal,
+    /// and it is corrected whenever eviction recomputes.
+    max_source_count: usize,
     /// Denials absorbed by keys that have since been released. Keeps the
     /// aggregate flood visible (D5) once a key's own counter is gone.
     released_suppressed: u64,
@@ -283,6 +296,8 @@ impl RateLimiter {
         Self {
             policy,
             keys: HashMap::new(),
+            source_counts: HashMap::new(),
+            max_source_count: 0,
             released_suppressed: 0,
             next_release: Ts::MAX,
         }
@@ -351,6 +366,13 @@ impl RateLimiter {
         }
 
         let policy = self.policy;
+        let is_new = !self.keys.contains_key(key);
+        if is_new {
+            let src = source.map(str::to_owned);
+            let n = self.source_counts.entry(src).or_insert(0);
+            *n += 1;
+            self.max_source_count = self.max_source_count.max(*n);
+        }
         let entry = self.keys.entry(key.to_owned()).or_insert_with(|| KeyState {
             class: Class::Default,
             spent: 0,
@@ -404,6 +426,10 @@ impl RateLimiter {
     }
 
     /// Make room for one new key. Returns whether room now exists.
+    ///
+    /// The rejection path is O(1): a single map lookup for the incoming
+    /// source's count, compared against the running maximum. Only a genuinely
+    /// dominant source triggers the (bounded, progress-making) victim search.
     fn make_room(&mut self, incoming_source: Option<&str>, now: Ts) -> bool {
         // O(1) when nothing can possibly be released yet (D2).
         if now >= self.next_release {
@@ -413,86 +439,104 @@ impl RateLimiter {
             }
         }
 
-        // Nothing was free. Charge the LARGEST source — never the oldest entry
-        // (drops the quiet honest key) and never the newcomer (locks out the
-        // honest arrival while the resident flooder keeps its budget). Both
-        // naive answers are bugs this module was built to stop repeating.
-        let dominant = {
-            let mut counts: HashMap<Option<&str>, usize> = HashMap::new();
-            for st in self.keys.values() {
-                if st.class == Class::Promoted {
-                    continue; // never evicted (D4)
-                }
-                *counts.entry(st.source.as_deref()).or_insert(0) += 1;
-            }
-            counts
-                .into_iter()
-                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-                .map(|(src, n)| (src.map(str::to_owned), n))
-        };
-        let Some((dominant, dominant_count)) = dominant else {
-            return false; // only promoted keys remain
-        };
-        // A source may never evict on its own behalf.
-        if dominant.as_deref() == incoming_source {
+        let incoming_key = incoming_source.map(str::to_owned);
+        let incoming_count = self.source_counts.get(&incoming_key).copied().unwrap_or(0);
+
+        // O(1) REFUSAL. Evicting requires a source that is MEANINGFULLY
+        // dominant. When every key is its own source — an invite flood, where
+        // rotation IS the attack — every count is one, so no margin exists and
+        // this returns immediately without touching the map. Without the
+        // running maximum, proving that cost a full scan per rejected request.
+        if self.max_source_count <= incoming_count.saturating_add(1) {
             return false;
         }
-        // Evict only against a source that is MEANINGFULLY dominant.
-        //
-        // When every key is its own source — an invite flood, where rotation IS
-        // the attack — all counts tie at one and "largest source" picks an
-        // arbitrary victim. Evicting then admits every fresh identity by
-        // dropping an older one: the map stays bounded while the number of
-        // strangers reaching a human is not. Refusing is the stricter and
-        // correct answer there, and it is what the invite gate did before this
-        // consolidation.
-        //
-        // Requiring a clear margin keeps the flood case working (a hoarder
-        // holds many, the honest newcomer holds none or one) while collapsing
-        // to refuse-at-capacity when no one is hoarding.
-        let incoming_count = self
-            .keys
-            .values()
-            .filter(|st| st.class != Class::Promoted && st.source.as_deref() == incoming_source)
-            .count();
+
+        // A source is genuinely hoarding. Find it, and a victim of its.
+        let dominant = self
+            .source_counts
+            .iter()
+            .filter(|(src, _)| src.as_deref() != incoming_source)
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(src, n)| (src.clone(), *n));
+        let Some((dominant, dominant_count)) = dominant else {
+            return false;
+        };
         if dominant_count <= incoming_count.saturating_add(1) {
             return false;
         }
         let victim = self
             .keys
             .iter()
-            .find(|(_, st)| {
-                st.class != Class::Promoted && st.source.as_deref() == dominant.as_deref()
-            })
+            .find(|(_, st)| st.class != Class::Promoted && st.source == dominant)
             .map(|(k, _)| k.clone());
         match victim {
             Some(k) => {
-                self.keys.remove(&k);
+                if let Some(st) = self.keys.remove(&k) {
+                    // D5 — an evicted key's absorbed denials are not lost.
+                    // Undercounting an attack precisely DURING contention is
+                    // the worst moment to be blind.
+                    self.released_suppressed =
+                        self.released_suppressed.saturating_add(st.suppressed);
+                    self.forget_source(st.source.as_deref());
+                }
                 true
             }
             None => false,
         }
     }
 
+    /// Drop one key from a source's tally, recomputing the running maximum
+    /// when the source that held it was the leader.
+    fn forget_source(&mut self, source: Option<&str>) {
+        let key = source.map(str::to_owned);
+        if let Some(n) = self.source_counts.get_mut(&key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.source_counts.remove(&key);
+            }
+        }
+        self.max_source_count = self.source_counts.values().copied().max().unwrap_or(0);
+    }
+
     /// Drop every key whose retained state is indistinguishable from absence.
     fn release_free_entries(&mut self, now: Ts) {
         let policy = self.policy;
         let mut carried = 0_u64;
+        let mut dropped: Vec<Option<String>> = Vec::new();
         self.keys.retain(|_, st| {
             let keep = !st.is_releasable(now, &policy);
             if !keep {
                 carried = carried.saturating_add(st.suppressed);
+                dropped.push(st.source.clone());
             }
             keep
         });
         self.released_suppressed = self.released_suppressed.saturating_add(carried);
+        for src in dropped {
+            if let Some(n) = self.source_counts.get_mut(&src) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.source_counts.remove(&src);
+                }
+            }
+        }
+        self.max_source_count = self.source_counts.values().copied().max().unwrap_or(0);
         self.next_release = self
             .keys
             .values()
             .filter(|st| st.class != Class::Promoted)
             .map(|st| {
+                // The LATER of the two, or the horizon lies: `is_releasable`
+                // rejects a refilled key that is still backing off, so a
+                // quota-only horizon leaves `next_release` in the past and
+                // every new-key check pays a full scan until backoff expires.
                 let q = policy.quota_for(st.class);
-                st.last_spend_at.saturating_add(q.window_secs)
+                let refill_at = st.last_spend_at.saturating_add(q.window_secs);
+                let backoff_at = policy.backoff.map_or(0, |b| {
+                    st.last_denial_at
+                        .saturating_add(b.window_secs(st.consecutive_denials))
+                });
+                refill_at.max(backoff_at)
             })
             .min()
             .unwrap_or(Ts::MAX);
@@ -810,6 +854,91 @@ mod tests {
         assert!(
             rl.released_suppressed() > 0,
             "and the absorbed flood stays visible in aggregate (D5)"
+        );
+    }
+
+    /// A13 — the capacity REFUSAL touches neither the key map nor a rebuilt
+    /// counter.
+    ///
+    /// Third appearance of this class: an O(cap) scan per rejected request
+    /// turns a memory bound into CPU exhaustion. It was fixed in `InviteGate`,
+    /// then reintroduced here by `make_room` rebuilding source counts on every
+    /// call. Asserted behaviourally — the map is untouched and the aggregate
+    /// counters do not move — because a complexity claim is otherwise
+    /// unfalsifiable in a unit test.
+    #[test]
+    fn a13_capacity_refusal_does_not_rebuild_state() {
+        let mut rl = RateLimiter::new(quota_policy(1, 86_400, 64));
+        for i in 0..64 {
+            let k = format!("s{i}");
+            let _ = rl.check_from(&k, Some(&k), 1000);
+        }
+        let before = rl.tracked();
+        for i in 0..500 {
+            assert_eq!(
+                rl.check_from(&format!("new{i}"), Some(&format!("new{i}")), 1000),
+                Decision::Deny {
+                    reason: DenyReason::AtCapacity
+                }
+            );
+        }
+        assert_eq!(rl.tracked(), before, "refusal must not mutate the map");
+    }
+
+    /// A14 — when backoff outlasts the quota window, the horizon accounts for
+    /// it.
+    ///
+    /// `is_releasable` rejects a refilled key that is still backing off, so a
+    /// quota-only horizon leaves `next_release` in the past and every new-key
+    /// check between refill and backoff-expiry pays a full scan — the same
+    /// CPU path, arriving through the other clock.
+    #[test]
+    fn a14_the_horizon_covers_backoff_not_just_refill() {
+        let policy = quota_policy(1, 60, 8).with_backoff(Backoff::new(300, 300));
+        let mut rl = RateLimiter::new(policy);
+        for i in 0..8 {
+            let k = format!("s{i}");
+            assert!(rl.check_from(&k, Some(&k), 1000).is_allowed());
+            assert!(
+                !rl.check_from(&k, Some(&k), 1000).is_allowed(),
+                "start backoff"
+            );
+        }
+        // Past the quota window but INSIDE backoff: nothing is releasable, and
+        // the refusal must still be the cheap path.
+        assert_eq!(
+            rl.check_from("x", Some("x"), 1000 + 120),
+            Decision::Deny {
+                reason: DenyReason::AtCapacity
+            }
+        );
+        // Past both: entries release and the newcomer gets in.
+        assert!(
+            rl.check_from("x", Some("x"), 1000 + 400).is_allowed(),
+            "once backoff has expired too, the refilled keys are free to drop"
+        );
+    }
+
+    /// A15 — an EVICTED key's absorbed denials survive into the aggregate.
+    ///
+    /// Losing them would undercount the attack precisely during contention,
+    /// which is the worst moment to be blind (D5).
+    #[test]
+    fn a15_eviction_preserves_the_suppression_count() {
+        let mut rl = RateLimiter::new(quota_policy(1, 86_400, 8));
+        // A hoarder builds up entries AND denials.
+        for i in 0..8 {
+            let k = format!("h{i}");
+            assert!(rl.check_from(&k, Some("hoarder"), 1000).is_allowed());
+            assert!(!rl.check_from(&k, Some("hoarder"), 1000).is_allowed());
+        }
+        assert_eq!(rl.released_suppressed(), 0);
+        // An honest source arrives and evicts one of the hoarder's keys.
+        assert!(rl.check_from("honest", Some("honest"), 1000).is_allowed());
+        assert!(
+            rl.released_suppressed() > 0,
+            "the evicted key's denials must reach the aggregate, or the attack \
+             is undercounted exactly while it is happening"
         );
     }
 

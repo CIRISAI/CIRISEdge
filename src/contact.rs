@@ -168,6 +168,26 @@ pub trait DirectoryLens: Send + Sync {
 /// [`LadderStall::NotYetDiscovered`] when the directory does not yet know the
 /// key, its owner, or any node to reach.
 pub async fn resolve(lens: &dyn DirectoryLens, any_id: &str) -> Result<Subject, LadderStall> {
+    resolve_inner(lens, any_id, FetchOnMiss::Yes).await
+}
+
+/// May a resolution miss QUEUE a network fetch for the identifier?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchOnMiss {
+    Yes,
+    /// The caller already holds the key — a self-contained fedcode carries it —
+    /// so a Pull would ask the mesh for something sitting in the caller's hand.
+    /// Worse than redundant: contact lookups share the bounded missing-signer
+    /// queue, so repeated direct-code contacts would displace genuine signer
+    /// recovery.
+    No,
+}
+
+async fn resolve_inner(
+    lens: &dyn DirectoryLens,
+    any_id: &str,
+    fetch_on_miss: FetchOnMiss,
+) -> Result<Subject, LadderStall> {
     let stall = || LadderStall::NotYetDiscovered {
         fed_id: any_id.to_owned(),
     };
@@ -184,13 +204,15 @@ pub async fn resolve(lens: &dyn DirectoryLens, any_id: &str) -> Result<Subject, 
                 key_id: any_id.to_owned(),
             });
         }
-        return Err(if lens.request_key_body(any_id).await {
-            LadderStall::BodyFetchQueued {
-                key_id: any_id.to_owned(),
-            }
-        } else {
-            stall()
-        });
+        return Err(
+            if fetch_on_miss == FetchOnMiss::Yes && lens.request_key_body(any_id).await {
+                LadderStall::BodyFetchQueued {
+                    key_id: any_id.to_owned(),
+                }
+            } else {
+                stall()
+            },
+        );
     };
     let kind = IdentityKind::from_identity_type(identity_type.as_str());
 
@@ -557,7 +579,15 @@ pub async fn resolve_contact(
 
     // Ask the directory first, whatever the input was: a code for someone
     // already admitted must behave like the identifier for the same person.
-    match resolve(lens, &candidate.key_id).await {
+    // A code carries the key, so a miss must not queue a fetch for it: the
+    // host can admit what it already holds, and the recovery queue is bounded
+    // and shared with genuine missing-signer work.
+    let fetch_on_miss = if candidate.admission.is_some() {
+        FetchOnMiss::No
+    } else {
+        FetchOnMiss::Yes
+    };
+    match resolve_inner(lens, &candidate.key_id, fetch_on_miss).await {
         Ok(subject) => Ok(ContactResolution::Known(subject)),
         Err(stall) => {
             let Some(admission) = candidate.admission.clone() else {
@@ -1694,6 +1724,74 @@ mod tests {
                 other => panic!("expected NotContactable for a stranger {wire} code: {other:?}"),
             }
         }
+    }
+
+    /// CIRISEdge#526 — a self-contained code must not queue a network fetch
+    /// for the key it is already carrying.
+    ///
+    /// The recovery queue is bounded and shared with genuine missing-signer
+    /// work, so repeated direct-code contacts would displace it — asking the
+    /// mesh for something sitting in the caller's hand.
+    #[tokio::test]
+    async fn a_code_does_not_queue_a_fetch_for_the_key_it_carries() {
+        use base64::Engine as _;
+        struct CountingLens {
+            requested: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl super::DirectoryLens for CountingLens {
+            async fn identity_type_of(&self, _k: &str) -> Option<String> {
+                None // hash-first: knows the hash, not the body
+            }
+            async fn owner_of(&self, _k: &str) -> Option<String> {
+                None
+            }
+            async fn nodes_owned_by(&self, _f: &str) -> Vec<String> {
+                Vec::new()
+            }
+            async fn request_key_body(&self, key_id: &str) -> bool {
+                self.requested.lock().unwrap().push(key_id.to_owned());
+                true
+            }
+        }
+
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = 21;
+        let key_id = ciris_verify_core::fedcode::derive_key_id("selfcontained", &pubkey);
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+            kind: ciris_verify_core::fedcode::FedKind::User,
+            key_id,
+            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
+            transport_hint: None,
+            alias_hint: None,
+            group_key_id: None,
+        })
+        .expect("encode");
+
+        let lens = CountingLens {
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = super::resolve_contact(&lens, &code).await;
+        assert!(
+            matches!(out, Ok(super::ContactResolution::ReadyFromCode { .. })),
+            "the code is sufficient: {out:?}"
+        );
+        assert!(
+            lens.requested.lock().unwrap().is_empty(),
+            "no fetch may be queued for a key the code already carries — the \
+             queue is bounded and shared with real signer recovery"
+        );
+
+        // A BARE identifier still queues, because nothing carries that key.
+        let lens = CountingLens {
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+        let _ = super::resolve_contact(&lens, "someone-abc234def5").await;
+        assert_eq!(
+            lens.requested.lock().unwrap().len(),
+            1,
+            "an identifier miss has nothing in hand, so it must still ask"
+        );
     }
 
     /// CIRISEdge#526 — a family/community code is refused BEFORE the caller is

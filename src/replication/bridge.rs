@@ -1175,6 +1175,17 @@ enum QuarantineConsult {
 
 // ─── The bridge ──────────────────────────────────────────────────────
 
+/// Wall-clock seconds, for the limiter's caller-supplied clock (FSD D1).
+///
+/// A backwards clock is safe by construction: `RateLimiter` uses saturating
+/// arithmetic throughout, so a jump reads as "no time passed" — it neither
+/// refills a quota early nor locks a peer out.
+fn unix_now_secs() -> crate::rate_limit::Ts {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Cap on the missing-signer set (CIRISEdge#552 B). Sized for a federation's
 /// SIGNER count, not its record count: a name repeats across every row that
 /// signer signed, so the set dedupes hard. Past the cap names are dropped and
@@ -1304,6 +1315,16 @@ pub struct FederationDirectoryReplicationBridge {
     /// them. In-memory: CIRISPersist#785 is where this becomes durable, and the
     /// advertise re-sweep re-learns anything lost to a restart.
     known_hashes: Mutex<crate::replication::known_hashes::KnownHashes>,
+    /// Per-requesting-peer budget on IDENTIFIER lookups (FSD_RATE_LIMIT §5.4).
+    ///
+    /// Option 1 concentrates bodies at conferred servers, so a conferred
+    /// responder answering by name is the one place bulk harvesting is
+    /// possible — one named subject at a time. That bound is nominal until
+    /// something enforces it: without this, an attributed peer can walk a list
+    /// of fedIDs as fast as it can send.
+    ///
+    /// Friction on a public plane, not confidentiality (CC 1.13.3.1).
+    lookup_limiter: Mutex<crate::rate_limit::RateLimiter>,
     /// ROLE_MATRIX Axis 3 — this node's own serving tier, cached (sync reads
     /// on the apply loop, async refresh once per TTL). Fail-closed: reads
     /// `None` until first resolution.
@@ -1481,6 +1502,13 @@ impl FederationDirectoryReplicationBridge {
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
+            lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
+                crate::rate_limit::Policy::quota(
+                    Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
+                    Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
+                    Self::IDENTIFIER_LOOKUP_MAX_PEERS,
+                ),
+            )),
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
@@ -1534,6 +1562,13 @@ impl FederationDirectoryReplicationBridge {
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
+            lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
+                crate::rate_limit::Policy::quota(
+                    Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
+                    Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
+                    Self::IDENTIFIER_LOOKUP_MAX_PEERS,
+                ),
+            )),
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
@@ -2782,8 +2817,37 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             }
             None => false,
         };
-        // Only the third-party public-plane arm depends on the tier.
+        // Only the third-party public-plane arm depends on the tier — and it
+        // is also the only arm that is rate limited (FSD_RATE_LIMIT §5.4).
+        //
+        // The subject and own-record arms are exempt on purpose: a data subject
+        // asking about itself is exercising an access right, and a node's own
+        // record is what `self_own` already advertises to everyone. Charging
+        // those against a harvesting budget would throttle the two flows that
+        // cannot harvest anything.
         if !entitled_without_tier && peer_key_id.is_some() && kind.is_public_subject_pull() {
+            if let Some(requester) = peer_key_id {
+                let verdict = self.lookup_limiter.lock().map_or(
+                    crate::rate_limit::Decision::Allow {
+                        suppressed_since_last_allow: 0,
+                    },
+                    |mut rl| rl.check_from(requester, Some(requester), unix_now_secs()),
+                );
+                if let crate::rate_limit::Decision::Deny { reason } = verdict {
+                    // Loud but throttled by nature: a denied peer is not asked
+                    // again this window, so this cannot itself become a flood.
+                    tracing::warn!(
+                        requester,
+                        subject = %subject_key_id,
+                        kind = ?kind,
+                        reason = reason.as_str(),
+                        "identifier lookup RATE LIMITED — a conferred server \
+                         answering by name is where bulk harvesting is possible, \
+                         one named subject at a time (FSD_RATE_LIMIT §5.4)"
+                    );
+                    return Vec::new();
+                }
+            }
             self.refresh_serve_tier().await;
         }
         match peer_key_id {
@@ -4355,6 +4419,20 @@ impl FederationDirectoryReplicationBridge {
     /// [`delegation_scope::INFRA_SERVE`]. Sourced from persist's const so the
     /// two sides cannot drift again.
     pub const SERVE_CAPABILITY: &'static str = delegation_scope::INFRA_SERVE;
+
+    /// Identifier lookups one peer may make per window (FSD_RATE_LIMIT §5.4).
+    ///
+    /// Generous for a human walking a contact list, restrictive for a script
+    /// walking a fedID dictionary — which is the only distinction that matters,
+    /// since the lookup cannot enumerate on its own (the requester must already
+    /// know the name it asks for).
+    pub const IDENTIFIER_LOOKUPS_PER_WINDOW: u32 = 60;
+    /// The window those lookups refill over.
+    pub const IDENTIFIER_LOOKUP_WINDOW_SECS: u64 = 60;
+    /// How many requesting peers are tracked — a bounded key space like every
+    /// other here. Peer ids are attributed, so this is a backstop rather than
+    /// the control.
+    pub const IDENTIFIER_LOOKUP_MAX_PEERS: usize = 16_384;
 
     /// CIRISEdge#379 — does this attestation row require the recipient to hold
     /// [`Self::SERVE_CAPABILITY`]? True iff its `dimension` (CC 2.1 — inside
@@ -10001,6 +10079,61 @@ pub(crate) mod tests {
         assert_eq!(
             bridge.take_missing_signer_for("peer-9").as_deref(),
             Some("wanted-D")
+        );
+    }
+
+    /// FSD_RATE_LIMIT §5.4 — identifier lookups are rate limited per
+    /// requesting peer; the subject and own-record arms are NOT.
+    ///
+    /// A conferred server answering by name is the one place bulk harvesting is
+    /// possible, one named subject at a time. That bound is nominal until
+    /// something enforces it. The exemptions are deliberate: a data subject
+    /// asking about itself is exercising an access right, and a node's own
+    /// record is what `self_own` already advertises to everyone — charging
+    /// either against a harvesting budget would throttle the two flows that
+    /// cannot harvest anything.
+    #[tokio::test]
+    async fn identifier_lookups_are_rate_limited_but_subject_access_is_not() {
+        let local = "local-A";
+        let third_party = "subject-S";
+        let stranger = "stranger-X";
+        let (_backend, bridge) =
+            test_fixtures::make_bridge_with_keys(&[local, third_party, stranger]).await;
+        let bridge = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::MeshServer);
+
+        // Spend the whole third-party budget.
+        let budget = FederationDirectoryReplicationBridge::IDENTIFIER_LOOKUPS_PER_WINDOW;
+        for _ in 0..budget {
+            let _ = bridge
+                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                .await;
+        }
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                .await
+                .is_empty(),
+            "past its budget a peer gets nothing — walking a fedID dictionary \
+             is the shape this bounds"
+        );
+
+        // The SUBJECT asking about itself is unaffected by that flood.
+        assert!(
+            !bridge
+                .subject_holdings(EnvelopeKind::Key, stranger, Some(stranger))
+                .await
+                .is_empty(),
+            "a data subject's access right is not a harvesting budget"
+        );
+        // And so is a request for this node's OWN record.
+        assert!(
+            !bridge
+                .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
+                .await
+                .is_empty(),
+            "the own record is what self_own already advertises to everyone"
         );
     }
 
