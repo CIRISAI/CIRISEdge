@@ -80,9 +80,13 @@ pub enum RefuseReason {
 }
 
 /// Per-(sender, receiver) invite budget. One instance per receiving node.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InviteGate {
     senders: HashMap<String, SenderState>,
+    /// Earliest time any tracked stranger can become releasable — the minimum
+    /// `last_attempt + REFILL_SECS` over the map. Before it, an at-cap refusal
+    /// is O(1) because a scan provably cannot find anything.
+    next_release: Ts,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +117,11 @@ impl InviteGate {
 
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            senders: HashMap::new(),
+            // Nothing tracked yet, so nothing can be released.
+            next_release: Ts::MAX,
+        }
     }
 
     /// How many senders one receiver tracks. Past it, strangers whose budget
@@ -136,6 +144,15 @@ impl InviteGate {
         self.senders.retain(|_, st| {
             st.ever_accepted || now.saturating_sub(st.last_attempt) < Self::REFILL_SECS
         });
+        // Recompute the horizon from what remains; `u64::MAX` when only
+        // established contacts are left, since those are never released.
+        self.next_release = self
+            .senders
+            .values()
+            .filter(|st| !st.ever_accepted)
+            .map(|st| st.last_attempt.saturating_add(Self::REFILL_SECS))
+            .min()
+            .unwrap_or(Ts::MAX);
         let released = before - self.senders.len();
         if released > 0 {
             tracing::debug!(
@@ -164,6 +181,19 @@ impl InviteGate {
         // therefore both bypassed and the memory-growth vector, which is the
         // opposite of what it was for.
         if !self.senders.contains_key(sender) && self.senders.len() >= Self::SENDER_CAP {
+            // O(1) refusal while nothing can be released.
+            //
+            // `release_refilled_strangers` is a full scan of the cap. Calling it
+            // per rejected invite let an attacker rotating identities inside the
+            // refill window force that scan on every message — the memory bound
+            // converted into sustained CPU. `next_release` is the earliest time
+            // any entry can become releasable, so before it there is provably
+            // nothing to find and the scan is skipped.
+            if now < self.next_release {
+                return InviteVerdict::Refuse {
+                    reason: RefuseReason::ReceiverAtCapacity,
+                };
+            }
             self.release_refilled_strangers(now);
             if self.senders.len() >= Self::SENDER_CAP {
                 return InviteVerdict::Refuse {
@@ -212,6 +242,12 @@ impl InviteGate {
 
         state.spent += 1;
         state.last_attempt = now;
+        let ever_accepted = state.ever_accepted;
+        // Keep the horizon honest as entries are added or refreshed: a new
+        // stranger can be releasable no later than one refill window out.
+        if !ever_accepted {
+            self.next_release = self.next_release.min(now.saturating_add(Self::REFILL_SECS));
+        }
         InviteVerdict::Allow
     }
 
@@ -233,6 +269,12 @@ impl InviteGate {
         entry.ever_accepted = true;
         // Their outstanding attempt was answered; it should not still count.
         entry.spent = 0;
+    }
+}
+
+impl Default for InviteGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

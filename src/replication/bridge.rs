@@ -1583,6 +1583,12 @@ impl FederationDirectoryReplicationBridge {
         self
     }
 
+    /// How many signer recoveries are queued (diagnostics + tests).
+    #[must_use]
+    pub fn tracked_missing_signers(&self) -> usize {
+        self.missing_signers.lock().map_or(0, |m| m.len())
+    }
+
     /// CIRISEdge#552 — override the agent mode (builder, TEST ONLY).
     ///
     /// Production reads the mode from the Edge via `start_replication`; this
@@ -2307,90 +2313,54 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         signer_key_id: &str,
         source_peer: Option<&str>,
     ) {
-        // Gated on the KEY plane's retention, not on this record's plane. The
-        // row that stalled can be any kind; the row it waits on is always a Key.
-        // Under `Bodies` that Key body replicates on its own and the #544 backoff
-        // admits the row on a later round — the self-resolving case the module
-        // doc describes — so recording here would add a pull for something
-        // already in flight.
+        // Gated on the KEY plane's retention: the row that stalled can be any
+        // kind, but the row it waits on is always a Key. Under `Bodies` that
+        // body replicates on its own and #544 admits the row later.
         if !crate::replication::retention::should_note_missing_signer(
             self.retention(EnvelopeKind::Key),
         ) {
             return;
         }
+        // Queue ONLY what a Pull can actually satisfy: the delivering peer's own
+        // key. A responder answers an identifier Pull on a public plane for its
+        // OWN record and refuses a third-party probe, so queueing a third-party
+        // signer would schedule a request guaranteed to come back empty — work
+        // that also consumes a recovery slot and a round.
+        //
+        // This is what bounds the queue at the root rather than by policing it
+        // afterwards: a peer can only ever enqueue ONE name, its own, so the
+        // manufacture-unique-signers flood has nothing to manufacture.
+        if source_peer != Some(signer_key_id) {
+            tracing::debug!(
+                signer = %signer_key_id,
+                source = ?source_peer,
+                "missing signer is a THIRD PARTY — no identifier Pull can fetch it, \
+                 so the row stays visibly transient-refused (CIRISEdge#552)"
+            );
+            return;
+        }
         if let Ok(mut pending) = self.missing_signers.lock() {
             if pending.len() >= MISSING_SIGNER_CAP && !pending.contains_key(signer_key_id) {
-                // CIRISEdge#552 — charge the cap to the LARGEST source, never to
-                // whoever arrived last.
-                //
-                // An attributed peer can manufacture entries at will: deliver
-                // envelopes naming unique nonexistent signers, each refused
-                // transient, each recorded. A flat cap then lets that one peer
-                // fill the map and starve every other peer's recovery —
-                // including the signer needed to admit a legitimate REVOCATION.
-                // It replenishes far faster than the one-per-round drain. Same
-                // monopolization shape as the known-hash cap, and the same fix.
-                let dominant = {
-                    let mut counts: std::collections::HashMap<Option<&str>, usize> =
-                        std::collections::HashMap::new();
-                    for src in pending.values() {
-                        *counts.entry(src.as_deref()).or_insert(0) += 1;
-                    }
-                    counts
-                        .into_iter()
-                        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-                        .map(|(src, _)| src.map(str::to_owned))
-                };
-                let victim = dominant.as_ref().and_then(|d| {
-                    // Never evict on behalf of the peer that IS the hog.
-                    if d.as_deref() == source_peer {
-                        return None;
-                    }
-                    pending
-                        .iter()
-                        .find(|(_, src)| src.as_deref() == d.as_deref())
-                        .map(|(name, _)| name.clone())
-                });
-                if let Some(name) = victim {
-                    pending.remove(&name);
-                    tracing::debug!(
-                        evicted = %name,
-                        for_signer = %signer_key_id,
-                        "missing-signer set at cap — released an entry from the \
-                         largest source so one peer cannot starve recovery \
-                         (CIRISEdge#552)"
-                    );
-                } else {
-                    tracing::warn!(
-                        signer = %signer_key_id,
-                        cap = MISSING_SIGNER_CAP,
-                        "missing-signer set at cap and this source is already the \
-                         largest — DROPPING this name (CIRISEdge#552)"
-                    );
-                    return;
-                }
+                tracing::warn!(
+                    signer = %signer_key_id,
+                    cap = MISSING_SIGNER_CAP,
+                    "missing-signer set at cap — DROPPING this name (CIRISEdge#552)"
+                );
+                return;
             }
-            let slot = pending.entry(signer_key_id.to_string()).or_insert(None);
-            // Never downgrade a routed name to unrouted: a known holder
-            // candidate is strictly better than "ask anyone", and a later
-            // contact lookup for the same signer must not erase it.
-            if slot.is_none() {
-                *slot = source_peer.map(str::to_owned);
-            }
+            pending.insert(signer_key_id.to_string(), source_peer.map(str::to_owned));
         }
     }
 
     fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
         let mut pending = self.missing_signers.lock().ok()?;
-        // Prefer a name this peer actually delivered; fall back to an unrouted
-        // one so a contact lookup gets tried against successive peers.
-        let pick = pending
-            .iter()
-            .find(|(_, src)| src.as_deref() == Some(peer_key_id))
-            .or_else(|| pending.iter().find(|(_, src)| src.is_none()))
-            .map(|(name, _)| name.clone())?;
-        pending.remove(&pick);
-        Some(pick)
+        // Exactly the name this peer can answer for — its own. Anything else
+        // was never enqueued, because nothing else is fetchable by identifier.
+        if pending.remove(peer_key_id).is_some() {
+            Some(peer_key_id.to_owned())
+        } else {
+            None
+        }
     }
 
     fn note_known_hashes(
@@ -2617,29 +2587,41 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#462 — serve a subject-scoped RECEIVE-axis Pull. Entitlement is
-    /// FAIL-CLOSED, with one deliberate widening (CIRISEdge#552).
+    /// FAIL-CLOSED, with one narrow widening bounded by the ADVERTISE
+    /// projection (CIRISEdge#552).
     ///
-    /// A Pull for subject `S` is answered to a requester authenticated AS `S`,
-    /// **or** to any ATTRIBUTED requester when the kind's serve cell is
-    /// unconditionally `public` ([`EnvelopeKind::is_public_subject_pull`]). An
+    /// A Pull for subject `S` is answered to a requester authenticated AS `S`
+    /// (the data-subject access path), **or** — on a plane whose serve cell is
+    /// unconditionally `public` — when `S` is THIS NODE'S OWN key_id. An
     /// unattributed requester still gets nothing, and it still says so.
     ///
-    /// The widening discloses NOTHING new. Those planes are already
-    /// `("self_own", "public")` / `("global", "public")` in the serve manifest —
-    /// public signed envelopes, no capability gate, already reachable through
-    /// ordinary anti-entropy. `subject-only` made them un-ADDRESSABLE rather
-    /// than undisclosed, because `Pull` is the only verb that names a record by
-    /// IDENTIFIER and it was written for data-subject access ("what do you hold
-    /// about me"). Under hash-first that left a node unable to ask for a public
-    /// body it had deliberately not fetched: every other read is
-    /// content-hash-addressed, and it cannot compute the hash of a record it
-    /// does not hold. A signer's Key was then permanently unfetchable, which is
-    /// a revocation that never lands.
+    /// # Why the second arm stops exactly there
     ///
-    /// `Attestation` keeps the subject-only rule: its serve cell is conditional
-    /// (`trace:*` → `capability:infra:serve`, plus the per-row G2 scores carve),
-    /// so its entitlement is decided per RECORD and a per-plane widening would
-    /// be exactly the substrate/policy conflation to avoid.
+    /// `serve: public` and `advertise: self_own` answer DIFFERENT questions, and
+    /// conflating them is how the first attempt at this went wrong. `public`
+    /// says a record needs no capability gate *once it reaches you*.
+    /// `self_own` is what decides **which** records reach you at all: on these
+    /// planes a node advertises only its own. But `subject_holdings_inner`
+    /// performs an ARBITRARY subject lookup against the node's whole local
+    /// directory. Serving that to any attributed requester would let a peer
+    /// probe identifiers for third-party keys and routes that never appeared in
+    /// any Summary it received — turning a body-holding server into an
+    /// address-book oracle and destroying the opaque-directory property
+    /// hash-first exists to create. "Already public" is not "already disclosed
+    /// to you".
+    ///
+    /// Restricting `S` to this node's own record keeps the answer inside what
+    /// `self_own` already hands every peer, so it is disclosure-neutral in fact
+    /// and not merely in claim. It recovers the case that matters most: *"you
+    /// signed a row I cannot verify — send me your key."*
+    ///
+    /// A THIRD-PARTY signer remains unfetchable by identifier. That is a real
+    /// gap, and closing it needs a separately authorized, rate-limited resolver
+    /// rather than a widening here.
+    ///
+    /// `Attestation` keeps the subject-only rule outright: its serve cell is
+    /// conditional (`trace:*` → `capability:infra:serve`, plus the per-row G2
+    /// scores carve), so its entitlement is decided per RECORD.
     ///
     /// (Owner-delegation, a node key pulling for its owner fedID, needs
     /// `owner_of` and is still a deliberate follow-up, not silently permitted.) The refs themselves come from
@@ -2652,7 +2634,14 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
         match peer_key_id {
-            Some(p) if p == subject_key_id || kind.is_public_subject_pull() => {
+            // The subject itself (the data-subject access path), or a request
+            // for THIS NODE'S OWN record on a public plane — which is precisely
+            // what the `self_own` advertise projection already hands every peer.
+            Some(p)
+                if p == subject_key_id
+                    || (kind.is_public_subject_pull()
+                        && self.local_key_id.as_deref() == Some(subject_key_id)) =>
+            {
                 // CIRISEdge#531 — WIDTH bound on the subject-Pull sweep too:
                 // it is per-subject rather than whole-table, but the
                 // Attestation arm sweeps BOTH testimonial axes and a
@@ -9743,123 +9732,82 @@ mod tests {
         );
     }
 
-    /// CIRISEdge#552 (B) — a recorded signer is routed back to the peer that
-    /// DELIVERED the unverifiable row, and taken one at a time.
+    /// CIRISEdge#552 — only a peer's OWN key is queued for recovery, which
+    /// bounds the queue at its ROOT.
     ///
-    /// A Pull is answered out of the responding peer's own `lookup_public_key`.
-    /// A node-wide queue drained by whichever coordinator ticked first would ask
-    /// an arbitrary peer for a third party's key, get an empty Summary, and
-    /// consume the recovery without ever reaching a holder.
-    #[tokio::test]
-    async fn a_missing_signer_is_routed_to_the_peer_that_delivered_the_row() {
-        let (_backend, bridge) = make_bridge(&[]);
-        // Server mode, or the note is a no-op by design (under Bodies the key
-        // body replicates on its own).
-        let bridge = bridge.with_agent_mode_for_test(crate::AgentMode::Server);
-
-        bridge.note_missing_signer(EnvelopeKind::Attestation, "signer-A", Some("peer-1"));
-        bridge.note_missing_signer(EnvelopeKind::Attestation, "signer-B", Some("peer-2"));
-
-        assert_eq!(
-            bridge.take_missing_signer_for("peer-2").as_deref(),
-            Some("signer-B"),
-            "peer-2 must get the name IT delivered, not whichever was queued first"
-        );
-        assert_eq!(
-            bridge.take_missing_signer_for("peer-1").as_deref(),
-            Some("signer-A"),
-            "and peer-1 gets its own"
-        );
-        assert_eq!(
-            bridge.take_missing_signer_for("peer-1"),
-            None,
-            "taken names are removed — a name left queued would re-Pull every round"
-        );
-    }
-
-    /// CIRISEdge#552 — one peer cannot fill the missing-signer cap and starve
-    /// another peer's recovery.
+    /// A responder answers an identifier Pull on a public plane for its own
+    /// record and refuses a third-party probe, so a third-party signer is not
+    /// fetchable by identifier at all. Queueing one would schedule a request
+    /// guaranteed to come back empty while consuming a recovery slot and a
+    /// round.
     ///
-    /// An attributed peer manufactures entries for free: deliver envelopes
-    /// naming unique nonexistent signers, each refused transient, each recorded.
-    /// A flat cap then lets that peer own the map and suppress the signer needed
-    /// to admit a legitimate REVOCATION from someone else — a safety-critical
-    /// admission blocked by a stranger's noise.
+    /// The security consequence is why this is the right place to stop it: a
+    /// peer can enqueue exactly ONE name, its own, so the
+    /// manufacture-unique-signers flood has nothing to manufacture and cannot
+    /// crowd out another peer's recovery. Policing the queue after the fact
+    /// left that vector open.
     #[tokio::test]
-    async fn a_flooding_peer_cannot_starve_another_peers_signer_recovery() {
+    async fn only_the_delivering_peers_own_key_is_queued() {
         let (_backend, bridge) = make_bridge(&[]);
         let bridge = bridge.with_agent_mode_for_test(crate::AgentMode::Server);
 
-        // The hostile peer fills the map well past the cap.
-        for i in 0..(MISSING_SIGNER_CAP + 200) {
+        for i in 0..(MISSING_SIGNER_CAP + 500) {
             bridge.note_missing_signer(
                 EnvelopeKind::Attestation,
                 &format!("nonexistent-{i}"),
                 Some("peer-flood"),
             );
         }
-        // An honest peer needs ONE signer to admit a revocation.
-        bridge.note_missing_signer(EnvelopeKind::Revocation, "revoker-key", Some("peer-honest"));
+        assert_eq!(
+            bridge.tracked_missing_signers(),
+            0,
+            "a third-party signer is not fetchable by identifier, so none of a \
+             flood of them is queued"
+        );
 
+        bridge.note_missing_signer(EnvelopeKind::Revocation, "peer-honest", Some("peer-honest"));
         assert_eq!(
             bridge.take_missing_signer_for("peer-honest").as_deref(),
-            Some("revoker-key"),
-            "the honest peer's signer must be recorded and routed to it — a flat \
-             cap let one peer's noise suppress a revocation federation-wide"
+            Some("peer-honest"),
+            "the fulfillable case survives: you signed a row I cannot verify, \
+             send me your key"
         );
-    }
-
-    /// An UNROUTED name (a contact lookup has no delivering peer) is offered to
-    /// any coordinator, so successive rounds try successive peers until one
-    /// holds it — and a later routed note must not be downgraded by it.
-    #[tokio::test]
-    async fn an_unrouted_signer_is_offered_to_any_peer() {
-        let (_backend, bridge) = make_bridge(&[]);
-        let bridge = bridge.with_agent_mode_for_test(crate::AgentMode::Server);
-
-        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-C", None);
         assert_eq!(
-            bridge.take_missing_signer_for("any-peer").as_deref(),
-            Some("wanted-C"),
-            "an unrouted name is available to whichever coordinator asks"
+            bridge.take_missing_signer_for("peer-honest"),
+            None,
+            "taken names are removed — one left queued would re-Pull every round"
         );
-
-        // A holder candidate must never be erased by a later unrouted note.
-        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-D", Some("peer-9"));
-        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-D", None);
         assert_eq!(
             bridge.take_missing_signer_for("someone-else"),
             None,
-            "the routed name stays routed — a known holder beats ask-anyone"
-        );
-        assert_eq!(
-            bridge.take_missing_signer_for("peer-9").as_deref(),
-            Some("wanted-D")
+            "and no other coordinator can consume it"
         );
     }
 
-    /// CIRISEdge#552 — a public plane answers a Pull from ANY attributed
-    /// requester; a conditional one still does not.
+    /// CIRISEdge#552 — a public plane answers a Pull for THIS NODE'S OWN
+    /// record, and refuses one that probes a third party.
     ///
-    /// This is the widening that makes hash-first survivable. `Key` serves
-    /// `public` unconditionally, so `subject-only` was making a disclosed record
-    /// un-ADDRESSABLE: a node that declined to fetch a signer's Key body had no
-    /// verb left to ask for it by name, and the rows it signed — revocations
-    /// included — could never admit.
-    ///
-    /// Three assertions, because the widening has to be exactly as wide as
-    /// claimed: public plane opens to a stranger, unattributed stays closed,
-    /// and `Attestation` — whose entitlement is per-row (`trace:*` capability,
-    /// the G2 carve) — stays subject-only.
+    /// The refusal is the load-bearing half. `serve: public` says a record needs
+    /// no capability gate once it reaches you; `advertise: self_own` decides
+    /// which records reach you at all. `subject_holdings_inner` does an
+    /// arbitrary directory lookup, so serving any attributed requester about any
+    /// subject would let a peer probe identifiers for third-party keys and
+    /// routes that never appeared in its Summaries — a body-holding server as
+    /// an address-book oracle, which is the end of the opaque directory
+    /// hash-first exists to build. An earlier revision of this branch did
+    /// exactly that.
     #[tokio::test]
-    async fn a_public_plane_answers_a_pull_from_any_attributed_requester() {
+    async fn a_public_plane_serves_its_own_record_but_is_not_an_oracle() {
         let local = "local-A";
-        let subject = "subject-S";
+        let third_party = "subject-S";
         let stranger = "stranger-X";
-        let (backend, bridge) =
-            make_bridge(&[local.to_string(), subject.to_string(), stranger.to_string()]);
+        let (backend, bridge) = make_bridge(&[
+            local.to_string(),
+            third_party.to_string(),
+            stranger.to_string(),
+        ]);
         let bridge = bridge.with_local_key_id(Some(local.to_string()));
-        for kid in [local, subject, stranger] {
+        for kid in [local, third_party, stranger] {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fixture_key_record(kid, identity_type::AGENT),
@@ -9870,28 +9818,36 @@ mod tests {
 
         assert!(
             !bridge
-                .subject_holdings(EnvelopeKind::Key, subject, Some(stranger))
+                .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
                 .await
                 .is_empty(),
-            "a Key record is a PUBLIC signed envelope — a stranger that names it \
-             must be served, or a hash-first node can never fetch a signer key \
-             and the revocations it signed never land"
+            "this node's OWN Key is what `self_own` already advertises to every \
+             peer — serving it by name discloses nothing new and is what makes \
+             \"you signed a row I cannot verify, send me your key\" work"
         );
         assert!(
             bridge
-                .subject_holdings(EnvelopeKind::Key, subject, None)
+                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
                 .await
                 .is_empty(),
-            "an UNATTRIBUTED Pull still serves nothing — #552 widened who may \
-             name a public record, not whether an unauthenticated peer is served"
+            "a THIRD PARTY's Key must NOT be served: the holder never advertised \
+             it to this requester, and answering would make a body-holding node \
+             an address-book oracle for guessed identifiers"
         );
         assert!(
             bridge
-                .subject_holdings(EnvelopeKind::Attestation, subject, Some(stranger))
+                .subject_holdings(EnvelopeKind::Key, local, None)
                 .await
                 .is_empty(),
-            "Attestation's serve cell is CONDITIONAL per row (trace:* capability, \
-             G2 scores carve) — it keeps the subject-only rule"
+            "an UNATTRIBUTED Pull still serves nothing"
+        );
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, local, Some(stranger))
+                .await
+                .is_empty(),
+            "Attestation's serve cell is CONDITIONAL per row — it keeps the \
+             subject-only rule even for this node's own subject"
         );
     }
 

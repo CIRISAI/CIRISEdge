@@ -614,27 +614,23 @@ impl DirectoryLens for PersistLens<'_> {
             .unwrap_or_default()
     }
 
-    async fn request_key_body(&self, key_id: &str) -> bool {
-        let Some(replication) = self.replication.as_ref() else {
-            return false;
-        };
-        // The same gate the admission path uses: under `Bodies` the body
-        // replicates on its own, so queueing would ask for something already in
-        // flight and the stall's ordinary remedy is the right one.
-        if !crate::replication::retention::should_note_missing_signer(
-            replication.retention(crate::replication::protocol::EnvelopeKind::Key),
-        ) {
-            return false;
-        }
-        // No delivering peer: a contact lookup is not repairing a row someone
-        // sent us, so there is no holder candidate. Recorded unrouted, which
-        // makes successive rounds try it against successive peers.
-        replication.note_missing_signer(
-            crate::replication::protocol::EnvelopeKind::Key,
-            key_id,
-            None,
-        );
-        true
+    async fn request_key_body(&self, _key_id: &str) -> bool {
+        // Deliberately always false, and the reason is a real limitation rather
+        // than an omission.
+        //
+        // A responder answers an identifier Pull on a public plane only for its
+        // OWN record; a third-party probe is refused, because
+        // `subject_holdings_inner` would otherwise turn a body-holding server
+        // into an address-book oracle for subjects it never advertised. A
+        // contact lookup is exactly a third-party request and has no delivering
+        // peer to route to, so there is no request this node can emit that any
+        // peer will answer.
+        //
+        // Reporting `BodyFetchQueued` here would promise a fetch that never
+        // happens. Resolving an unheld third-party identifier on a hash-first
+        // node needs a separately authorized, rate-limited resolver, which does
+        // not exist yet.
+        false
     }
 }
 

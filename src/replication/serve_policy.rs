@@ -69,24 +69,26 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
     };
     // CIRISEdge#462 — `receive`: whether this kind answers a subject-scoped Pull
     // (the RECEIVE axis), and under what rule. The FIVE replicated kinds are
-    // subject-pullable; entitlement is FAIL-CLOSED to the subject itself except
-    // on the four unconditionally-`public` planes, which CIRISEdge#552 widened
-    // to any attributed requester (they were already disclosed — see
+    // subject-pullable; entitlement is FAIL-CLOSED to the subject itself, plus
+    // CIRISEdge#552's own-record arm on the four unconditionally-`public`
+    // planes (bounded by the `self_own` advertise projection — see
     // `EnvelopeKind::is_public_subject_pull`); the
     // Attestation plane sweeps BOTH testimonial axes with the G2 score carve;
     // every other kind is NOT subject-pullable (`none`). This column is the
     // coordinated-cut witness CIRISServer pins alongside `serve`.
     let receive = match kind {
-        // CIRISEdge#552 — these four planes serve `public` unconditionally, so
-        // the subject-only entitlement made them un-ADDRESSABLE rather than
-        // undisclosed. Widened to any ATTRIBUTED requester; unattributed still
-        // gets nothing. Derived from `is_public_subject_pull` (test-locked
-        // below), so the predicate and this cell cannot drift.
+        // CIRISEdge#552 — on these four planes a Pull is also answered when the
+        // SUBJECT IS THE RESPONDING NODE ITSELF, which is exactly what the
+        // `self_own` advertise projection already hands every peer. Not "any
+        // attributed requester for any subject": `subject_holdings_inner` does
+        // an arbitrary directory lookup, so that would make a body-holding
+        // server an address-book oracle for subjects it never advertised.
+        // Derived from `is_public_subject_pull` (test-locked below).
         EnvelopeKind::Key
         | EnvelopeKind::IdentityOccurrence
         | EnvelopeKind::TransportDestination
         | EnvelopeKind::IdentityOccurrenceRevocation => {
-            "subject_pull:data_subject+any_attributed; public envelope"
+            "subject_pull:data_subject+own_record; within self_own projection"
         }
         EnvelopeKind::Attestation => {
             "subject_pull:data_subject+sender; subject-only; \
@@ -167,19 +169,27 @@ pub fn serve_advertise_policy_sha256() -> String {
 // changed — this is the manifest catching up to the code it witnesses.
 // **CIRISServer must mirror**: re-pin from 328d73b0… to 20499cab….
 //
-// CIRISEdge#552 — RE-PINNED AGAIN, 20499cab… → e8216fec…. The RECEIVE cell on
-// the four unconditionally-`public` planes (Key, IdentityOccurrence,
-// TransportDestination, IdentityOccurrenceRevocation) widened from
-// `subject-only` to `+any_attributed`. This is a DISCLOSURE-NEUTRAL cut: those
-// planes already serve `public` on the advertise axis and are already reachable
-// through ordinary anti-entropy. What changed is ADDRESSABILITY — `Pull` is the
-// only verb that names a record by identifier, and reserving it for
-// data-subject access left a hash-first node unable to ask for a public body it
-// had chosen not to fetch, stranding signer keys and therefore revocations.
-// `Attestation` is untouched: its serve cell is conditional per row.
+// CIRISEdge#552 — RE-PINNED, 20499cab… → e54c5677…. On the four
+// unconditionally-`public` planes (Key, IdentityOccurrence,
+// TransportDestination, IdentityOccurrenceRevocation) a subject Pull is now
+// ALSO answered when the subject is the RESPONDING NODE ITSELF.
+//
+// Bounded deliberately at the node's own record, because `serve: public` and
+// `advertise: self_own` answer different questions. `public` means no
+// capability gate once a record reaches you; `self_own` decides which records
+// reach you at all. `subject_holdings_inner` does an arbitrary directory
+// lookup, so answering any attributed requester about any subject would let a
+// peer probe identifiers for third-party keys and routes that never appeared in
+// its Summaries — a body-holding server as address-book oracle, and the end of
+// the opaque-directory property. The own-record arm stays inside what
+// `self_own` already advertises, so it is disclosure-neutral in fact.
+//
+// It recovers "you signed a row I cannot verify — send me your key". A
+// THIRD-PARTY signer stays unfetchable by identifier; that needs a separately
+// authorized, rate-limited resolver. `Attestation` is untouched.
 // **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "e8216fec51cdb2a417e2b24ce55a5854e40c661cbea2888989d4c173a29925fd";
+    "e54c56775e8d56442f9fdbaa0346397cdc169e7cc6237f5a6fe71681710dbf25";
 
 #[cfg(test)]
 mod tests {
@@ -295,7 +305,7 @@ mod tests {
                 .expect("every manifest row names a real kind");
             let recv = policy["receive"].as_str().unwrap();
             assert_eq!(
-                recv.contains("any_attributed"),
+                recv.contains("own_record"),
                 kind.is_public_subject_pull(),
                 "{kind:?}: the manifest's receive cell and \
                  is_public_subject_pull disagree — the pinned witness would \
