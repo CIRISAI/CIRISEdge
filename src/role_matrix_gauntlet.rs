@@ -91,6 +91,69 @@ async fn r2_contactability_keys_on_identity_type() {
     );
 }
 
+/// R0 — the WIRING row: the tier is resolved on the path production actually
+/// calls.
+///
+/// Every other row pins the tier with `with_serve_tier_for_test` and asks
+/// whether the DECISION is right. That is necessary and was not sufficient: the
+/// refresh was first added to `list_envelope_refs` (peer-blind — diagnostics and
+/// tests) while `DirectoryStateAdapter::local_refs` calls
+/// `list_envelope_refs_for_peer`. Every decision row stayed green while the
+/// cache sat at `ServeTier::None` forever in production, so a canonical used
+/// `Bodies` and discarded every advertised hash.
+///
+/// This row drives the bridge through the trait method production uses and
+/// asserts the resolver was consulted. A decision table cannot catch an
+/// unwired decision; only the wiring row can.
+#[tokio::test]
+async fn r0_the_tier_is_resolved_on_the_production_round_path() {
+    use crate::replication::directory::ReplicationDirectory as _;
+    use crate::replication::protocol::EnvelopeKind;
+    use crate::replication::serve_tier::{ServeTier as T, ServeTierResolver};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting(AtomicUsize);
+    #[async_trait::async_trait]
+    impl ServeTierResolver for Counting {
+        async fn resolve(&self, _s: &str) -> T {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            T::MeshServer
+        }
+    }
+
+    let resolver = std::sync::Arc::new(Counting(AtomicUsize::new(0)));
+    let (_backend, bridge) = crate::replication::bridge::test_fixtures::make_bridge(&[]);
+    let bridge = bridge
+        .with_local_key_id(Some("local-A".to_string()))
+        .with_serve_tier_resolver(Some(
+            std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn ServeTierResolver>
+        ));
+
+    assert_eq!(
+        bridge.serve_tier(),
+        T::None,
+        "fail-closed before first resolve"
+    );
+
+    // THE production round path — what `DirectoryStateAdapter::local_refs`
+    // calls. Not `list_envelope_refs`, which is the peer-blind diagnostic twin.
+    let _ = bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-1"))
+        .await;
+
+    assert_eq!(
+        resolver.0.load(Ordering::SeqCst),
+        1,
+        "the round path must consult the resolver — refreshing only on the \
+         diagnostic path leaves production pinned at tier none forever"
+    );
+    assert_eq!(
+        bridge.serve_tier(),
+        T::MeshServer,
+        "and the resolved tier must reach the cache the sync readers use"
+    );
+}
+
 /// R3 — retention keys on Axis 3 (tier), and `AgentMode` does not exist in
 /// the decision at all.
 ///

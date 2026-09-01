@@ -429,12 +429,21 @@ pub enum ContactResolution {
     /// consent rung. A re-pasted code for someone already admitted lands here
     /// too, so pasting twice is idempotent rather than an error.
     Known(Subject),
-    /// A stranger, from a code. The directory knows nothing about them and that
-    /// is EXPECTED, not a stall — the code carries what the directory cannot.
+    /// A stranger, from a code — and the code is SUFFICIENT.
     ///
-    /// Admit `admission`, then they resolve normally.
-    AdmitThenRetry {
-        candidate: Box<ContactCandidate>,
+    /// `subject` is built from the code itself, not from the directory, because
+    /// a code carries what the directory would have supplied: the identity and
+    /// a way to reach it. Admitting `admission` registers the key so the
+    /// stranger's signatures verify; nothing further needs to converge first.
+    ///
+    /// This is the shape the earlier `AdmitThenRetry` got wrong. It told the
+    /// caller to admit and re-resolve, but a re-resolve runs
+    /// `nodes_owned_by(fed_id)` against the directory — and a stranger has no
+    /// owner-binding attestations there, so the retry returned
+    /// `NotYetDiscovered` forever. Admitting a key never creates an ownership
+    /// graph. The code was always the contact.
+    ReadyFromCode {
+        subject: Subject,
         admission: Box<CodeAdmission>,
     },
 }
@@ -445,78 +454,113 @@ pub enum ContactResolution {
 /// # The gap this closes (CIRISEdge#526)
 ///
 /// Two people who have never met could not become contacts through the UI at
-/// all. Every door was shut: pasting a code posted the raw string as a `key_id`
-/// and was refused `unknown_fed_id`; the peer-claim surface is for claiming your
-/// OWN node (`cohort=self`, pre-filled with the local code); and waiting for the
-/// directory is refused by design, because a body-holding node must not answer
-/// third-party identifier probes.
+/// all. Pasting a code posted the raw string as a `key_id` and was refused
+/// `unknown_fed_id`; the peer-claim surface is for claiming your OWN node; and
+/// a directory lookup cannot help someone who never announced.
 ///
-/// The missing piece was never the directory — it was that nothing decoded the
-/// one input carrying what a stranger needs. A fedcode ships the public key
-/// alongside the address, so it works precisely when the directory cannot.
+/// A fedcode closes it because it is self-contained: identity, public key, and
+/// a transport hint travel together, so it works precisely where the directory
+/// cannot — including for a person who opted out of announcing entirely.
 ///
 /// # Contract
 ///
 /// * A **bare identifier** resolves through the directory exactly as before.
 /// * A **code for someone already known** resolves to [`Known`], so re-pasting
-///   is safe.
-/// * A **code for a stranger** returns [`AdmitThenRetry`] rather than a stall.
-///   The absence from the directory is the expected state, and reporting it as
-///   `NotYetDiscovered` — "wait for replication" — would be advice that never
-///   comes true, since replication will never deliver a stranger's key.
+///   is safe and never re-admits a registered key.
+/// * A **code for a stranger** resolves to [`ReadyFromCode`] with a usable
+///   [`Subject`] — no second round-trip, no waiting.
+/// * A code naming something that is not a contactable person — a family or
+///   community roster — is [`LadderStall::NotContactable`] here, rather than
+///   instructing the caller to admit a key and then discover the same terminal
+///   answer on retry.
 ///
 /// Admission stays the host's: edge hands over a verified, typed
 /// [`CodeAdmission`] and the caller feeds its own `register_federation_key`
 /// gate. Edge never registers a key on the strength of a pasted string.
 ///
 /// [`Known`]: ContactResolution::Known
-/// [`AdmitThenRetry`]: ContactResolution::AdmitThenRetry
+/// [`ReadyFromCode`]: ContactResolution::ReadyFromCode
 ///
 /// # Errors
 ///
 /// Every [`LadderStall`] `resolve` can produce, plus
 /// [`LadderStall::MalformedCode`] and [`LadderStall::CodeIdentityMismatch`] for
-/// a bad or forged code. Check [`LadderStall::self_resolving`] to decide whether
-/// to retry or surface.
+/// a bad or forged code.
 pub async fn resolve_contact(
     lens: &dyn DirectoryLens,
     raw: &str,
 ) -> Result<ContactResolution, LadderStall> {
     let candidate = parse_contact_input(raw)?;
 
-    // Ask the directory first, whatever the input was. A code for someone
-    // already admitted must behave like the identifier for the same person —
-    // otherwise pasting a code twice re-admits a key that is already registered.
+    // A roster is not a person. Refuse BEFORE telling anyone to admit a key:
+    // `resolve` treats these as terminal, so an admit-then-retry would end at
+    // exactly this answer having registered a key for nothing.
+    if let Some(admission) = candidate.admission.as_ref() {
+        if !is_contactable_code_kind(admission.identity_type) {
+            return Err(LadderStall::NotContactable {
+                key_id: candidate.key_id,
+                identity_type: admission.identity_type.to_string(),
+            });
+        }
+    }
+
+    // Ask the directory first, whatever the input was: a code for someone
+    // already admitted must behave like the identifier for the same person.
     match resolve(lens, &candidate.key_id).await {
         Ok(subject) => Ok(ContactResolution::Known(subject)),
         Err(stall) => {
-            // A code answers "not in the directory". Nothing else does.
-            let recoverable_by_admission = matches!(
-                stall,
-                LadderStall::NotYetDiscovered { .. } | LadderStall::BodyFetchQueued { .. }
-            );
             let Some(admission) = candidate.admission.clone() else {
                 log_rung(Rung::Discover, &candidate.key_id, Some(&stall));
                 return Err(stall);
             };
-            if !recoverable_by_admission {
-                // A terminal stall is terminal even with a code in hand: a
-                // steward is still not a contactable person, and a local
-                // backend fault is still local.
+            // A terminal stall stays terminal even with a code in hand: a code
+            // carries a key, and a key does not make a steward into a person.
+            if !matches!(
+                stall,
+                LadderStall::NotYetDiscovered { .. } | LadderStall::BodyFetchQueued { .. }
+            ) {
                 log_rung(Rung::Discover, &candidate.key_id, Some(&stall));
                 return Err(stall);
             }
             tracing::info!(
                 key_id = %candidate.key_id,
                 identity_type = %admission.identity_type,
-                "contact: stranger from a code — the directory does not know them, \
-                 which is expected; admit the carried key (CIRISEdge#526)"
+                has_transport_hint = admission.transport_hint.is_some(),
+                "contact: stranger from a code — the directory does not know \
+                 them, which is expected; the code carries what it cannot \
+                 (CIRISEdge#526)"
             );
-            Ok(ContactResolution::AdmitThenRetry {
-                candidate: Box::new(candidate),
+            Ok(ContactResolution::ReadyFromCode {
+                subject: subject_from_code(&candidate, &admission),
                 admission: Box::new(admission),
             })
         }
+    }
+}
+
+/// Can a code of this `identity_type` be a CONTACT?
+///
+/// `user`, `agent` and `node` name something a person can be reached through.
+/// `family` and `community` are rosters — [`FedKind`] can encode them and a
+/// code for one is perfectly valid, it is simply not a contact.
+///
+/// [`FedKind`]: ciris_verify_core::fedcode::FedKind
+#[must_use]
+fn is_contactable_code_kind(identity_type: &str) -> bool {
+    matches!(identity_type, "user" | "agent" | "node")
+}
+
+/// Build the [`Subject`] a code yields on its own.
+///
+/// The reachable node is the code's own `key_id`: whatever the code names is
+/// the thing whose transport the hint describes, and it is what the caller
+/// dials. No directory lookup contributes here — that is the point of a code,
+/// and why this path works for someone who never announced.
+fn subject_from_code(candidate: &ContactCandidate, admission: &CodeAdmission) -> Subject {
+    Subject {
+        fed_id: candidate.key_id.clone(),
+        nodes: vec![admission.key_id.clone()],
+        resolved_from: candidate.kind.clone(),
     }
 }
 
@@ -930,23 +974,31 @@ impl DirectoryLens for PersistLens<'_> {
             .unwrap_or_default()
     }
 
-    async fn request_key_body(&self, _key_id: &str) -> bool {
-        // Deliberately always false, and the reason is a real limitation rather
-        // than an omission.
-        //
-        // A responder answers an identifier Pull on a public plane only for its
-        // OWN record; a third-party probe is refused, because
-        // `subject_holdings_inner` would otherwise turn a body-holding server
-        // into an address-book oracle for subjects it never advertised. A
-        // contact lookup is exactly a third-party request and has no delivering
-        // peer to route to, so there is no request this node can emit that any
-        // peer will answer.
-        //
-        // Reporting `BodyFetchQueued` here would promise a fetch that never
-        // happens. Resolving an unheld third-party identifier on a hash-first
-        // node needs a separately authorized, rate-limited resolver, which does
-        // not exist yet.
-        false
+    async fn request_key_body(&self, key_id: &str) -> bool {
+        let Some(replication) = self.replication.as_ref() else {
+            return false;
+        };
+        // Under `Bodies` the signer's Key body replicates on its own and #544
+        // admits the row later, so queueing would ask for something already in
+        // flight.
+        if !crate::replication::retention::should_note_missing_signer(
+            replication.retention(crate::replication::protocol::EnvelopeKind::Key),
+        ) {
+            return false;
+        }
+        // No delivering peer — a contact lookup is not repairing a row someone
+        // sent us — so the name is recorded UNROUTED and offered to successive
+        // peers until a CONFERRED one answers. That works because of the axis-3
+        // widening: a responder holding `infra:serve` answers an identifier
+        // Pull for any subject on a public plane, which is exactly what
+        // carrying the directory means. Before that widening this had to return
+        // `false`, because no peer would have answered.
+        replication.note_missing_signer(
+            crate::replication::protocol::EnvelopeKind::Key,
+            key_id,
+            None,
+        );
+        true
     }
 }
 
@@ -1399,18 +1451,61 @@ mod tests {
         };
 
         match super::resolve_contact(&empty, &code).await {
-            Ok(super::ContactResolution::AdmitThenRetry {
-                candidate,
-                admission,
-            }) => {
-                assert_eq!(candidate.key_id, key_id);
+            Ok(super::ContactResolution::ReadyFromCode { subject, admission }) => {
                 assert_eq!(admission.key_id, key_id);
                 assert_eq!(admission.identity_type, "user");
                 assert!(!admission.pubkey_ed25519_base64.is_empty());
+                // The half that was missing: a USABLE subject, built from the
+                // code. Admitting a key never creates owner-binding
+                // attestations, so a directory retry would return
+                // NotYetDiscovered forever — the code has to be sufficient.
+                assert_eq!(subject.fed_id, key_id);
+                assert_eq!(
+                    subject.nodes,
+                    vec![key_id.clone()],
+                    "the code names what to dial; no directory lookup contributes"
+                );
             }
             other => panic!(
-                "a stranger's code must hand back the key to ADMIT — the \
-                 directory cannot supply it and never will: {other:?}"
+                "a stranger's code must yield BOTH the key to admit and a \
+                 usable subject — the directory cannot supply either: {other:?}"
+            ),
+        }
+    }
+
+    /// CIRISEdge#526 — a family/community code is refused BEFORE the caller is
+    /// told to admit anything.
+    ///
+    /// `resolve` treats these as terminal, so an admit-then-retry would end at
+    /// exactly this answer having registered a key for nothing.
+    #[tokio::test]
+    async fn a_roster_code_is_not_contactable_and_says_so_before_admission() {
+        use base64::Engine as _;
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = 3;
+        let key_id = ciris_verify_core::fedcode::derive_key_id("book-club", &pubkey);
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+            kind: ciris_verify_core::fedcode::FedKind::Community,
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
+            transport_hint: None,
+            alias_hint: None,
+            group_key_id: Some(key_id.clone()),
+        })
+        .expect("encode");
+
+        let empty = FakeLens {
+            types: std::collections::HashMap::new(),
+            owners: std::collections::HashMap::new(),
+            nodes: std::collections::HashMap::new(),
+        };
+        match super::resolve_contact(&empty, &code).await {
+            Err(LadderStall::NotContactable { identity_type, .. }) => {
+                assert_eq!(identity_type, "community");
+            }
+            other => panic!(
+                "a roster is not a person — refuse before instructing a \
+                 pointless registration: {other:?}"
             ),
         }
     }

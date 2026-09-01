@@ -2361,46 +2361,75 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         ) {
             return;
         }
-        // Queue ONLY what a Pull can actually satisfy: the delivering peer's own
-        // key. A responder answers an identifier Pull on a public plane for its
-        // OWN record and refuses a third-party probe, so queueing a third-party
-        // signer would schedule a request guaranteed to come back empty — work
-        // that also consumes a recovery slot and a round.
+        // Third-party signers ARE queueable again: a conferred server answers
+        // an identifier Pull for any subject on a public plane (ROLE_MATRIX
+        // axis 3), so a name this node cannot resolve locally is reachable by
+        // asking one. `source_peer` is kept as a ROUTING HINT — the peer that
+        // delivered the row is the best first guess — but is no longer a
+        // requirement, because an unrouted name is simply offered to successive
+        // peers until a conferred one answers.
         //
-        // This is what bounds the queue at the root rather than by policing it
-        // afterwards: a peer can only ever enqueue ONE name, its own, so the
-        // manufacture-unique-signers flood has nothing to manufacture.
-        if source_peer != Some(signer_key_id) {
-            tracing::debug!(
-                signer = %signer_key_id,
-                source = ?source_peer,
-                "missing signer is a THIRD PARTY — no identifier Pull can fetch it, \
-                 so the row stays visibly transient-refused (CIRISEdge#552)"
-            );
-            return;
-        }
+        // The flood vector that a bare cap leaves open (a peer manufacturing
+        // unique nonexistent signers) is bounded below by charging eviction to
+        // the LARGEST source rather than to whoever arrived last.
         if let Ok(mut pending) = self.missing_signers.lock() {
             if pending.len() >= MISSING_SIGNER_CAP && !pending.contains_key(signer_key_id) {
-                tracing::warn!(
-                    signer = %signer_key_id,
-                    cap = MISSING_SIGNER_CAP,
-                    "missing-signer set at cap — DROPPING this name (CIRISEdge#552)"
-                );
-                return;
+                let dominant = {
+                    let mut counts: std::collections::HashMap<Option<&str>, usize> =
+                        std::collections::HashMap::new();
+                    for src in pending.values() {
+                        *counts.entry(src.as_deref()).or_insert(0) += 1;
+                    }
+                    counts
+                        .into_iter()
+                        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                        .map(|(src, _)| src.map(str::to_owned))
+                };
+                let victim = dominant.as_ref().and_then(|d| {
+                    // Never evict on behalf of the source that IS the hog.
+                    if d.as_deref() == source_peer {
+                        return None;
+                    }
+                    pending
+                        .iter()
+                        .find(|(_, src)| src.as_deref() == d.as_deref())
+                        .map(|(name, _)| name.clone())
+                });
+                if let Some(name) = victim {
+                    pending.remove(&name);
+                } else {
+                    tracing::warn!(
+                        signer = %signer_key_id,
+                        cap = MISSING_SIGNER_CAP,
+                        "missing-signer set at cap and this source is already \
+                         the largest — DROPPING this name (CIRISEdge#552)"
+                    );
+                    return;
+                }
             }
-            pending.insert(signer_key_id.to_string(), source_peer.map(str::to_owned));
+            // Never downgrade a routed name to unrouted: a known holder
+            // candidate beats ask-anyone.
+            let slot = pending
+                .entry(signer_key_id.to_string())
+                .or_insert_with(|| source_peer.map(str::to_owned));
+            if slot.is_none() {
+                *slot = source_peer.map(str::to_owned);
+            }
         }
     }
 
     fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
         let mut pending = self.missing_signers.lock().ok()?;
-        // Exactly the name this peer can answer for — its own. Anything else
-        // was never enqueued, because nothing else is fetchable by identifier.
-        if pending.remove(peer_key_id).is_some() {
-            Some(peer_key_id.to_owned())
-        } else {
-            None
-        }
+        // Prefer a name this peer actually delivered (best holder guess), then
+        // fall back to an unrouted one so successive rounds try successive
+        // peers until a CONFERRED one answers.
+        let pick = pending
+            .iter()
+            .find(|(_, src)| src.as_deref() == Some(peer_key_id))
+            .or_else(|| pending.iter().find(|(_, src)| src.is_none()))
+            .map(|(name, _)| name.clone())?;
+        pending.remove(&pick);
+        Some(pick)
     }
 
     fn note_known_hashes(
@@ -2433,9 +2462,6 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        // ROLE_MATRIX Axis 3 — runs once per round, so the sync tier readers
-        // (`retention`, `note_known_hashes`) are at most one TTL behind.
-        self.refresh_serve_tier().await;
         // CIRISEdge#531 DEPTH — the PEER-BLIND projection view (diagnostics and
         // tests; every production provider is peer-bound via
         // `DirectoryStateAdapter::with_peer`). No peer means no watermark to
@@ -2484,6 +2510,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         kind: EnvelopeKind,
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
+        // ROLE_MATRIX Axis 3 — THE once-per-round production path.
+        // `DirectoryStateAdapter::local_refs` calls THIS, not the peer-blind
+        // `list_envelope_refs` (that one is diagnostics and tests). Refreshing
+        // only there left the cache at `ServeTier::None` forever in production:
+        // even a canonical would use `Bodies` and discard every advertised
+        // hash — the feature inert exactly where it matters.
+        self.refresh_serve_tier().await;
         // CIRISEdge#531 DEPTH — this is THE advertise axis, and the only one
         // that carries a watermark: a bound peer gets one page budget per
         // round (new rows first, then a page of the rolling re-sweep), so the
@@ -2700,7 +2733,24 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         subject_key_id: &str,
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
-        self.refresh_serve_tier().await;
+        // Authorize BEFORE resolving. The subject and own-record arms need no
+        // tier at all, and an unattributed requester needs nothing but a
+        // refusal — so neither may reach the trust-graph walk. `CachedServeTier`
+        // has no single-flight lock, so a burst of probes crossing a
+        // stale-cache boundary would otherwise buy one graph walk per request
+        // from a peer that is not even entitled to an answer.
+        let entitled_without_tier = match peer_key_id {
+            Some(p) => {
+                p == subject_key_id
+                    || (kind.is_public_subject_pull()
+                        && self.local_key_id.as_deref() == Some(subject_key_id))
+            }
+            None => false,
+        };
+        // Only the third-party public-plane arm depends on the tier.
+        if !entitled_without_tier && peer_key_id.is_some() && kind.is_public_subject_pull() {
+            self.refresh_serve_tier().await;
+        }
         match peer_key_id {
             // Three entitled cases, in the order they were established:
             //   1. the subject itself — the data-subject access path (#462);
@@ -9842,26 +9892,27 @@ pub(crate) mod tests {
         );
     }
 
-    /// CIRISEdge#552 — only a peer's OWN key is queued for recovery, which
-    /// bounds the queue at its ROOT.
+    /// CIRISEdge#552 — a third-party signer IS queued (a conferred server will
+    /// answer for it), and one peer cannot crowd out another's recovery.
     ///
-    /// A responder answers an identifier Pull on a public plane for its own
-    /// record and refuses a third-party probe, so a third-party signer is not
-    /// fetchable by identifier at all. Queueing one would schedule a request
-    /// guaranteed to come back empty while consuming a recovery slot and a
-    /// round.
+    /// The axis-3 widening is what makes third-party recovery possible: a
+    /// responder holding `infra:serve` answers an identifier Pull for any
+    /// subject on a public plane. So the queue accepts names this node cannot
+    /// resolve locally, `source_peer` is a routing HINT rather than a
+    /// requirement, and an unrouted name is offered to successive peers until a
+    /// conferred one answers.
     ///
-    /// The security consequence is why this is the right place to stop it: a
-    /// peer can enqueue exactly ONE name, its own, so the
-    /// manufacture-unique-signers flood has nothing to manufacture and cannot
-    /// crowd out another peer's recovery. Policing the queue after the fact
-    /// left that vector open.
+    /// That reopens the flood vector a bare cap leaves — a peer manufacturing
+    /// unique nonexistent signers — so eviction is charged to the LARGEST
+    /// source, never to whoever arrived last. An honest peer's one revocation
+    /// signer survives a flood of thousands.
     #[tokio::test]
-    async fn only_the_delivering_peers_own_key_is_queued() {
-        let (_backend, bridge) = make_bridge(&[]);
+    async fn a_flooding_peer_cannot_crowd_out_another_peers_signer_recovery() {
+        let (_backend, bridge) = test_fixtures::make_bridge(&[]);
         let bridge =
             bridge.with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::MeshServer);
 
+        // A hostile peer manufactures far more than the cap.
         for i in 0..(MISSING_SIGNER_CAP + 500) {
             bridge.note_missing_signer(
                 EnvelopeKind::Attestation,
@@ -9869,29 +9920,52 @@ pub(crate) mod tests {
                 Some("peer-flood"),
             );
         }
-        assert_eq!(
-            bridge.tracked_missing_signers(),
-            0,
-            "a third-party signer is not fetchable by identifier, so none of a \
-             flood of them is queued"
+        assert!(
+            bridge.tracked_missing_signers() <= MISSING_SIGNER_CAP,
+            "the queue stays bounded: {} entries",
+            bridge.tracked_missing_signers()
         );
 
-        bridge.note_missing_signer(EnvelopeKind::Revocation, "peer-honest", Some("peer-honest"));
+        // The honest peer's revocation signer — a THIRD PARTY, which is exactly
+        // what the widening made fetchable.
+        bridge.note_missing_signer(EnvelopeKind::Revocation, "revoker-key", Some("peer-honest"));
         assert_eq!(
             bridge.take_missing_signer_for("peer-honest").as_deref(),
-            Some("peer-honest"),
-            "the fulfillable case survives: you signed a row I cannot verify, \
-             send me your key"
+            Some("revoker-key"),
+            "a third-party signer must be queued and routed to the peer that \
+             delivered the row — one peer's noise may not suppress another's \
+             revocation"
         );
+    }
+
+    /// An UNROUTED name (a contact lookup has no delivering peer) is offered to
+    /// any coordinator, so successive rounds try successive peers until a
+    /// conferred server answers — and a routed name is never downgraded by it.
+    #[tokio::test]
+    async fn an_unrouted_name_is_offered_to_any_peer() {
+        let (_backend, bridge) = test_fixtures::make_bridge(&[]);
+        let bridge =
+            bridge.with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::MeshServer);
+
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-C", None);
         assert_eq!(
-            bridge.take_missing_signer_for("peer-honest"),
-            None,
-            "taken names are removed — one left queued would re-Pull every round"
+            bridge.take_missing_signer_for("any-peer").as_deref(),
+            Some("wanted-C"),
+            "an unrouted name is available to whichever coordinator asks — that \
+             is how a contact lookup reaches a conferred server"
         );
+
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-D", Some("peer-9"));
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-D", None);
         assert_eq!(
             bridge.take_missing_signer_for("someone-else"),
             None,
-            "and no other coordinator can consume it"
+            "a known holder beats ask-anyone; a later unrouted note must not \
+             erase the routing hint"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-9").as_deref(),
+            Some("wanted-D")
         );
     }
 
