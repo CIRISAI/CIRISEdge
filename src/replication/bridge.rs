@@ -1175,6 +1175,15 @@ enum QuarantineConsult {
 
 // ─── The bridge ──────────────────────────────────────────────────────
 
+/// Throttle for the rate-limit denial WARN. A denied peer keeps sending, so
+/// the log line about limiting it needs limiting too.
+fn lookup_limit_log() -> &'static crate::log_throttle::LogThrottle {
+    static T: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(60), 1024)
+    })
+}
+
 /// Wall-clock seconds, for the limiter's caller-supplied clock (FSD D1).
 ///
 /// A backwards clock is safe by construction: `RateLimiter` uses saturating
@@ -1338,6 +1347,14 @@ pub struct FederationDirectoryReplicationBridge {
     /// than evicting older ones — the older names are the ones with rows already
     /// waiting on them.
     missing_signers: Mutex<std::collections::BTreeMap<String, Option<String>>>,
+    /// Source accounting for `missing_signers`, maintained incrementally.
+    ///
+    /// FOURTH appearance of the O(cap)-per-rejection class: this map rebuilt a
+    /// source-count HashMap on every note once full, so a peer sending
+    /// unverifiable rows bought a full scan and allocation per rejected signer.
+    /// The shared [`crate::rate_limit::SourceLedger`] exists so the fix is
+    /// imported rather than re-derived a fifth time.
+    missing_signer_sources: Mutex<crate::rate_limit::SourceLedger>,
     /// CIRISEdge#531 DEPTH — the largest row count ANY single page read has
     /// returned on this bridge. The flat bound's own witness, in the same
     /// discipline as [`Self::sweep_gate`]'s `max_in_flight` and
@@ -1512,6 +1529,7 @@ impl FederationDirectoryReplicationBridge {
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
+            missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -1572,6 +1590,7 @@ impl FederationDirectoryReplicationBridge {
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
+            missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -2428,47 +2447,47 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // unique nonexistent signers) is bounded below by charging eviction to
         // the LARGEST source rather than to whoever arrived last.
         if let Ok(mut pending) = self.missing_signers.lock() {
+            let Ok(mut sources) = self.missing_signer_sources.lock() else {
+                return;
+            };
             if pending.len() >= MISSING_SIGNER_CAP && !pending.contains_key(signer_key_id) {
-                let dominant = {
-                    let mut counts: std::collections::HashMap<Option<&str>, usize> =
-                        std::collections::HashMap::new();
-                    for src in pending.values() {
-                        *counts.entry(src.as_deref()).or_insert(0) += 1;
-                    }
-                    counts
-                        .into_iter()
-                        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-                        .map(|(src, _)| src.map(str::to_owned))
-                };
-                let victim = dominant.as_ref().and_then(|d| {
-                    // Never evict on behalf of the source that IS the hog.
-                    if d.as_deref() == source_peer {
-                        return None;
-                    }
+                // O(1) rejection — a lookup and a comparison. Rebuilding the
+                // counts here handed a peer sending unverifiable rows a full
+                // scan per rejected signer.
+                if !sources.eviction_worth_considering(source_peer) {
+                    tracing::warn!(
+                        signer = %signer_key_id,
+                        cap = MISSING_SIGNER_CAP,
+                        "missing-signer set at cap with no source hoarding — \
+                         DROPPING this name (CIRISEdge#552)"
+                    );
+                    return;
+                }
+                let victim = sources.dominant_excluding(source_peer).and_then(|(d, _)| {
                     pending
                         .iter()
                         .find(|(_, src)| src.as_deref() == d.as_deref())
                         .map(|(name, _)| name.clone())
                 });
                 if let Some(name) = victim {
-                    pending.remove(&name);
+                    if let Some(src) = pending.remove(&name) {
+                        sources.forget(src.as_deref());
+                    }
                 } else {
-                    tracing::warn!(
-                        signer = %signer_key_id,
-                        cap = MISSING_SIGNER_CAP,
-                        "missing-signer set at cap and this source is already \
-                         the largest — DROPPING this name (CIRISEdge#552)"
-                    );
                     return;
                 }
             }
             // Never downgrade a routed name to unrouted: a known holder
             // candidate beats ask-anyone.
+            let is_new = !pending.contains_key(signer_key_id);
             let slot = pending
                 .entry(signer_key_id.to_string())
                 .or_insert_with(|| source_peer.map(str::to_owned));
             if slot.is_none() {
                 *slot = source_peer.map(str::to_owned);
+            }
+            if is_new {
+                sources.note(slot.as_deref());
             }
         }
     }
@@ -2483,7 +2502,11 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             .find(|(_, src)| src.as_deref() == Some(peer_key_id))
             .or_else(|| pending.iter().find(|(_, src)| src.is_none()))
             .map(|(name, _)| name.clone())?;
-        pending.remove(&pick);
+        if let Some(src) = pending.remove(&pick) {
+            if let Ok(mut sources) = self.missing_signer_sources.lock() {
+                sources.forget(src.as_deref());
+            }
+        }
         Some(pick)
     }
 
@@ -2834,17 +2857,26 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     |mut rl| rl.check_from(requester, Some(requester), unix_now_secs()),
                 );
                 if let crate::rate_limit::Decision::Deny { reason } = verdict {
-                    // Loud but throttled by nature: a denied peer is not asked
-                    // again this window, so this cannot itself become a flood.
-                    tracing::warn!(
-                        requester,
-                        subject = %subject_key_id,
-                        kind = ?kind,
-                        reason = reason.as_str(),
-                        "identifier lookup RATE LIMITED — a conferred server \
-                         answering by name is where bulk harvesting is possible, \
-                         one named subject at a time (FSD_RATE_LIMIT §5.4)"
-                    );
+                    // THROTTLED. "Not asked again this window" was wrong — the
+                    // limiter suppresses the directory work, not the peer's
+                    // sending, so a rate-limited peer that keeps asking would
+                    // buy one WARN per request. Being loud about a flood is how
+                    // you become its amplifier.
+                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                        lookup_limit_log().check(requester)
+                    {
+                        tracing::warn!(
+                            requester,
+                            subject = %subject_key_id,
+                            kind = ?kind,
+                            reason = reason.as_str(),
+                            suppressed_prev,
+                            "identifier lookup RATE LIMITED — a conferred server \
+                             answering by name is where bulk harvesting is \
+                             possible, one named subject at a time \
+                             (FSD_RATE_LIMIT §5.4)"
+                        );
+                    }
                     return Vec::new();
                 }
             }

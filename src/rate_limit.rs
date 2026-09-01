@@ -258,6 +258,85 @@ impl KeyState {
     }
 }
 
+/// Incremental accounting of "how many keys is each source responsible for".
+///
+/// Extracted because rebuilding this on demand is a bug that has now appeared
+/// FOUR times — `KnownHashes`, the missing-signer queue, `InviteGate`, and then
+/// inside `RateLimiter` itself. Every instance had the same shape: at capacity,
+/// a rejected request scans the whole map to discover it may not evict, so an
+/// attacker who fills the map buys O(cap) work per subsequent request and the
+/// memory bound becomes a CPU one.
+///
+/// Maintaining the counts as keys come and go makes the rejection a lookup and
+/// a comparison. Any bounded, source-attributed map in edge should hold one of
+/// these rather than counting on demand.
+#[derive(Debug, Default)]
+pub struct SourceLedger {
+    counts: HashMap<Option<String>, usize>,
+    /// The largest value in `counts`. Grows on insert; a stale-high value costs
+    /// one extra victim search, never a wrong refusal.
+    max_count: usize,
+}
+
+impl SourceLedger {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One more key is attributed to `source`.
+    pub fn note(&mut self, source: Option<&str>) {
+        let n = self.counts.entry(source.map(str::to_owned)).or_insert(0);
+        *n += 1;
+        self.max_count = self.max_count.max(*n);
+    }
+
+    /// One fewer key is attributed to `source`.
+    pub fn forget(&mut self, source: Option<&str>) {
+        let key = source.map(str::to_owned);
+        if let Some(n) = self.counts.get_mut(&key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.counts.remove(&key);
+            }
+        }
+        self.max_count = self.counts.values().copied().max().unwrap_or(0);
+    }
+
+    /// How many keys `source` holds.
+    #[must_use]
+    pub fn count_of(&self, source: Option<&str>) -> usize {
+        self.counts
+            .get(&source.map(str::to_owned))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Is any source hoarding relative to `incoming` — i.e. is eviction even
+    /// worth considering? **O(1)**, and the whole point of the ledger.
+    ///
+    /// A clear margin is required. When every key is its own source — identity
+    /// rotation, where the attack IS the key space — every count is one, no
+    /// margin exists, and the caller must refuse rather than evict an arbitrary
+    /// victim: churning the map admits every fresh identity while keeping the
+    /// map bounded, which bounds the wrong thing.
+    #[must_use]
+    pub fn eviction_worth_considering(&self, incoming: Option<&str>) -> bool {
+        self.max_count > self.count_of(incoming).saturating_add(1)
+    }
+
+    /// The largest source other than `incoming`, with its count. Only call once
+    /// [`Self::eviction_worth_considering`] says so.
+    #[must_use]
+    pub fn dominant_excluding(&self, incoming: Option<&str>) -> Option<(Option<String>, usize)> {
+        self.counts
+            .iter()
+            .filter(|(src, _)| src.as_deref() != incoming)
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(src, n)| (src.clone(), *n))
+    }
+}
+
 /// A keyed, bounded, fair rate limiter.
 ///
 /// `&mut self` on the decision path: the verdict mutates state, and pretending
@@ -267,19 +346,9 @@ impl KeyState {
 pub struct RateLimiter {
     policy: Policy,
     keys: HashMap<String, KeyState>,
-    /// How many keys each source is accountable for, maintained INCREMENTALLY.
-    ///
-    /// `make_room` used to rebuild this on every call — so at capacity, with
-    /// `next_release` proving nothing could be released, each rejected request
-    /// still allocated and populated a counter per resident key. Under an
-    /// identity-rotation flood that is one 65_536-entry map per invite: the
-    /// exact O(cap)-per-rejected-request CPU path the horizon check exists to
-    /// prevent, reintroduced one layer down. Third appearance of this class.
-    source_counts: HashMap<Option<String>, usize>,
-    /// The largest value in `source_counts`. Only ever grows on insert; a
-    /// stale-high value costs one extra victim search, never a wrong refusal,
-    /// and it is corrected whenever eviction recomputes.
-    max_source_count: usize,
+    /// Source accounting, maintained incrementally (see [`SourceLedger`] for
+    /// why counting on demand is a bug with four prior appearances).
+    sources: SourceLedger,
     /// Denials absorbed by keys that have since been released. Keeps the
     /// aggregate flood visible (D5) once a key's own counter is gone.
     released_suppressed: u64,
@@ -296,8 +365,7 @@ impl RateLimiter {
         Self {
             policy,
             keys: HashMap::new(),
-            source_counts: HashMap::new(),
-            max_source_count: 0,
+            sources: SourceLedger::new(),
             released_suppressed: 0,
             next_release: Ts::MAX,
         }
@@ -330,7 +398,25 @@ impl RateLimiter {
     /// new tier would mean an accepted contact starts its allowance already
     /// part-spent, and a key that was mid-backoff when it earned its way in
     /// would keep serving that sentence.
-    pub fn promote(&mut self, key: &str) {
+    pub fn promote(&mut self, key: &str) -> bool {
+        // An ABSENT key must still respect the ceiling. Promotion creates an
+        // entry that is by definition un-evictable, so unbounded promotion of
+        // unseen keys would grow the map past `max_keys` with entries nothing
+        // can ever reclaim — the hard bound quietly stops being one.
+        if !self.keys.contains_key(key) && self.keys.len() >= self.policy.max_keys {
+            let now_unbounded = self.keys.len();
+            tracing::warn!(
+                key,
+                tracked = now_unbounded,
+                cap = self.policy.max_keys,
+                "promotion REFUSED — the limiter is at capacity and a promoted \
+                 entry can never be evicted to make room later"
+            );
+            return false;
+        }
+        if !self.keys.contains_key(key) {
+            self.sources.note(None);
+        }
         let entry = self.keys.entry(key.to_owned()).or_insert_with(|| KeyState {
             class: Class::Default,
             spent: 0,
@@ -343,6 +429,7 @@ impl RateLimiter {
         entry.class = Class::Promoted;
         entry.spent = 0;
         entry.consecutive_denials = 0;
+        true
     }
 
     /// Decide, attributing the key to no particular source.
@@ -366,12 +453,8 @@ impl RateLimiter {
         }
 
         let policy = self.policy;
-        let is_new = !self.keys.contains_key(key);
-        if is_new {
-            let src = source.map(str::to_owned);
-            let n = self.source_counts.entry(src).or_insert(0);
-            *n += 1;
-            self.max_source_count = self.max_source_count.max(*n);
+        if !self.keys.contains_key(key) {
+            self.sources.note(source);
         }
         let entry = self.keys.entry(key.to_owned()).or_insert_with(|| KeyState {
             class: Class::Default,
@@ -389,7 +472,12 @@ impl RateLimiter {
         let quota = policy.quota_for(entry.class);
         if now.saturating_sub(entry.last_spend_at) >= quota.window_secs {
             entry.spent = 0;
-            entry.consecutive_denials = 0;
+            // The denial streak is NOT cleared here. When backoff outlasts the
+            // quota window, clearing it on refill would end the suppression
+            // early — a key denied at t=0 under a 60s quota and a 300s backoff
+            // would be allowed at t=60, serving 20% of its sentence. The streak
+            // resets on a successful ALLOW, which is the event that means the
+            // actor is back inside its budget.
         }
 
         // Exponential suppression, when configured.
@@ -407,6 +495,16 @@ impl RateLimiter {
             entry.consecutive_denials = entry.consecutive_denials.saturating_add(1);
             entry.suppressed = entry.suppressed.saturating_add(1);
             entry.last_denial_at = now;
+            let denial_horizon = entry.last_spend_at.saturating_add(quota.window_secs).max(
+                policy.backoff.map_or(0, |b| {
+                    now.saturating_add(b.window_secs(entry.consecutive_denials))
+                }),
+            );
+            // A key that NEVER spends — `permits == 0` is a supported quota —
+            // would otherwise leave `next_release` at its initial `Ts::MAX`, so
+            // `make_room` would never scan and every later key is refused
+            // forever. The horizon belongs to the entry, not to the allow path.
+            self.next_release = self.next_release.min(denial_horizon);
             return Decision::Deny {
                 reason: DenyReason::QuotaSpent,
             };
@@ -439,29 +537,16 @@ impl RateLimiter {
             }
         }
 
-        let incoming_key = incoming_source.map(str::to_owned);
-        let incoming_count = self.source_counts.get(&incoming_key).copied().unwrap_or(0);
-
-        // O(1) REFUSAL. Evicting requires a source that is MEANINGFULLY
-        // dominant. When every key is its own source — an invite flood, where
-        // rotation IS the attack — every count is one, so no margin exists and
-        // this returns immediately without touching the map. Without the
-        // running maximum, proving that cost a full scan per rejected request.
-        if self.max_source_count <= incoming_count.saturating_add(1) {
+        // O(1) REFUSAL — a lookup and a comparison, no map walk.
+        if !self.sources.eviction_worth_considering(incoming_source) {
             return false;
         }
 
-        // A source is genuinely hoarding. Find it, and a victim of its.
-        let dominant = self
-            .source_counts
-            .iter()
-            .filter(|(src, _)| src.as_deref() != incoming_source)
-            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-            .map(|(src, n)| (src.clone(), *n));
-        let Some((dominant, dominant_count)) = dominant else {
+        let Some((dominant, dominant_count)) = self.sources.dominant_excluding(incoming_source)
+        else {
             return false;
         };
-        if dominant_count <= incoming_count.saturating_add(1) {
+        if dominant_count <= self.sources.count_of(incoming_source).saturating_add(1) {
             return false;
         }
         let victim = self
@@ -473,29 +558,14 @@ impl RateLimiter {
             Some(k) => {
                 if let Some(st) = self.keys.remove(&k) {
                     // D5 — an evicted key's absorbed denials are not lost.
-                    // Undercounting an attack precisely DURING contention is
-                    // the worst moment to be blind.
                     self.released_suppressed =
                         self.released_suppressed.saturating_add(st.suppressed);
-                    self.forget_source(st.source.as_deref());
+                    self.sources.forget(st.source.as_deref());
                 }
                 true
             }
             None => false,
         }
-    }
-
-    /// Drop one key from a source's tally, recomputing the running maximum
-    /// when the source that held it was the leader.
-    fn forget_source(&mut self, source: Option<&str>) {
-        let key = source.map(str::to_owned);
-        if let Some(n) = self.source_counts.get_mut(&key) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                self.source_counts.remove(&key);
-            }
-        }
-        self.max_source_count = self.source_counts.values().copied().max().unwrap_or(0);
     }
 
     /// Drop every key whose retained state is indistinguishable from absence.
@@ -513,14 +583,8 @@ impl RateLimiter {
         });
         self.released_suppressed = self.released_suppressed.saturating_add(carried);
         for src in dropped {
-            if let Some(n) = self.source_counts.get_mut(&src) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    self.source_counts.remove(&src);
-                }
-            }
+            self.sources.forget(src.as_deref());
         }
-        self.max_source_count = self.source_counts.values().copied().max().unwrap_or(0);
         self.next_release = self
             .keys
             .values()
@@ -939,6 +1003,73 @@ mod tests {
             rl.released_suppressed() > 0,
             "the evicted key's denials must reach the aggregate, or the attack \
              is undercounted exactly while it is happening"
+        );
+    }
+
+    /// A16 — backoff SURVIVES a quota refill.
+    ///
+    /// When suppression outlasts the window, clearing the streak on refill ends
+    /// the sentence early: a key denied at t=0 under a 60s quota and a 300s
+    /// backoff would be allowed at t=60, serving a fifth of it.
+    #[test]
+    fn a16_backoff_outlasts_the_quota_window() {
+        let policy = quota_policy(1, 60, 100).with_backoff(Backoff::new(300, 300));
+        let mut rl = RateLimiter::new(policy);
+        assert!(rl.check("k", 1000).is_allowed());
+        assert!(!rl.check("k", 1000).is_allowed(), "quota spent");
+
+        assert_eq!(
+            rl.check("k", 1000 + 61),
+            Decision::Deny {
+                reason: DenyReason::BackingOff
+            },
+            "the quota refilled, but the SUPPRESSION has not expired"
+        );
+        assert!(
+            rl.check("k", 1000 + 301).is_allowed(),
+            "and once it has, the key is free"
+        );
+    }
+
+    /// A17 — promoting an unseen key respects the ceiling.
+    ///
+    /// A promoted entry can never be evicted, so unbounded promotion of unseen
+    /// keys grows the map past `max_keys` with entries nothing can reclaim —
+    /// the hard bound quietly stops being one.
+    #[test]
+    fn a17_promotion_of_an_unseen_key_respects_the_cap() {
+        let mut rl = RateLimiter::new(quota_policy(1, 60, 4));
+        for i in 0..4 {
+            assert!(rl.promote(&format!("p{i}")), "within the cap");
+        }
+        assert!(
+            !rl.promote("one-too-many"),
+            "promotion past the ceiling must be REFUSED — it would be              un-evictable forever"
+        );
+        assert_eq!(rl.tracked(), 4);
+    }
+
+    /// A18 — a zero-permit key still schedules its release horizon.
+    ///
+    /// `permits == 0` is a supported quota (hold a plane entirely), but such a
+    /// key never reaches the allow path, so a horizon set only there stays at
+    /// `Ts::MAX`: `make_room` never scans, and every later key is refused
+    /// forever.
+    #[test]
+    fn a18_zero_permit_keys_still_release() {
+        let mut rl = RateLimiter::new(quota_policy(0, 60, 4));
+        for i in 0..4 {
+            assert!(!rl
+                .check_from(&format!("z{i}"), Some("src"), 1000)
+                .is_allowed());
+        }
+        assert_eq!(rl.tracked(), 4);
+        // Past the window they are refilled, carry nothing, and release.
+        let _ = rl.check_from("later", Some("other"), 1000 + 61);
+        assert!(
+            rl.tracked() <= 4,
+            "the map must still be reclaimable: {} entries",
+            rl.tracked()
         );
     }
 
