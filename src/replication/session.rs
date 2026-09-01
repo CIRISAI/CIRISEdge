@@ -141,7 +141,15 @@ pub struct Session {
     /// CIRISEdge#552 — the exact hashes this node asked for ON PURPOSE. Only
     /// these are applied under hash-first; a peer answering a Fetch cannot
     /// append arbitrary bodies and have them accepted.
-    pending_bodies: std::collections::HashSet<[u8; 32]>,
+    /// Hashes this node explicitly ASKED for, each with its own remaining
+    /// lifetime in rounds (FSD-SIGNER-RECOVERY D5).
+    ///
+    /// An expectation is REQUEST state, not ROUND state. It is the only thing
+    /// that lets requested bytes past the hash-first gate, so a round completing
+    /// must not discard a request the node still wants — a `Fetch` sets no
+    /// on-demand exemption at all, and used to lose its expectation on the very
+    /// next reset.
+    pending_bodies: std::collections::HashMap<[u8; 32], u8>,
     /// CIRISEdge#552 — rounds for which a Pull's reply is still expected.
     ///
     /// A COUNTER, not a flag, and decremented rather than cleared on reset: a
@@ -226,7 +234,7 @@ impl Session {
             role,
             kind,
             last_summary_sent: None,
-            pending_bodies: std::collections::HashSet::new(),
+            pending_bodies: std::collections::HashMap::new(),
             pull_exempt_rounds: 0,
             last_remote_summary: None,
             diff_want_count: None,
@@ -267,10 +275,15 @@ impl Session {
         // round completing: the subject-scoped reply had not arrived yet, and
         // clearing here made testimony recovery timing-dependent.
         self.pull_exempt_rounds = self.pull_exempt_rounds.saturating_sub(1);
-        if self.pull_exempt_rounds == 0 {
-            // The window closed; anything still outstanding was never answered.
-            self.pending_bodies.clear();
-        }
+        // FSD-SIGNER-RECOVERY D5 — age each expectation on its OWN clock and
+        // drop only what expired. Clearing the whole set when the Pull window
+        // closed discarded `Fetch` expectations, which never open one: the
+        // request survived exactly zero rounds and its body was then treated as
+        // unsolicited and dropped.
+        self.pending_bodies.retain(|_, rounds_left| {
+            *rounds_left = rounds_left.saturating_sub(1);
+            *rounds_left > 0
+        });
     }
 
     pub fn role(&self) -> SessionRole {
@@ -520,7 +533,47 @@ impl Session {
     /// append arbitrary directory bodies and have every one accepted — the
     /// corpus-size and address-book properties lost to a generous responder.
     pub fn expect_bodies(&mut self, hashes: impl IntoIterator<Item = [u8; 32]>) {
-        self.pending_bodies.extend(hashes);
+        self.expect_bodies_for_rounds(hashes, Self::DEFAULT_EXPECTATION_ROUNDS);
+    }
+
+    /// Record expectations with an explicit lifetime in rounds.
+    ///
+    /// The lifetime is the answer to "how long is this node still willing to
+    /// accept the body it asked for?" — not "how long is this round?". A
+    /// request outlives the round that issued it (FSD-SIGNER-RECOVERY D5).
+    pub fn expect_bodies_for_rounds(
+        &mut self,
+        hashes: impl IntoIterator<Item = [u8; 32]>,
+        rounds: u8,
+    ) {
+        let rounds = rounds.max(1);
+        for h in hashes {
+            // Never shorten an existing expectation: a re-ask means the node
+            // wants it MORE, not less.
+            let slot = self.pending_bodies.entry(h).or_insert(rounds);
+            *slot = (*slot).max(rounds);
+        }
+    }
+
+    /// Default lifetime of an expectation, in rounds.
+    ///
+    /// Long enough to survive the round that issued it plus a peer that answers
+    /// on its next cadence tick; short enough that an unanswered request is
+    /// forgotten rather than accumulating.
+    pub const DEFAULT_EXPECTATION_ROUNDS: u8 = 3;
+
+    /// Is this hash still expected? (tests)
+    #[cfg(test)]
+    #[must_use]
+    pub fn is_expecting_body_for_test(&self, hash: &[u8; 32]) -> bool {
+        self.pending_bodies.contains_key(hash)
+    }
+
+    /// Remaining on-demand exemption rounds (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn pull_exempt_rounds_for_test(&self) -> u8 {
+        self.pull_exempt_rounds
     }
 
     /// Undo [`Self::expect_on_demand_reply`] — the request never left.
@@ -610,7 +663,7 @@ impl Session {
         // actually asked for rather than merely arriving during the window.
         let answering_on_demand = self.pull_exempt_rounds > 0;
         if answering_on_demand {
-            self.pending_bodies.extend(want.iter().copied());
+            self.expect_bodies_for_rounds(want.iter().copied(), Self::DEFAULT_EXPECTATION_ROUNDS);
         }
         // An on-demand reply is never suppressed.
         //
@@ -665,7 +718,7 @@ impl Session {
         // CIRISEdge#552 — whatever this round asks for is, by definition, wanted.
         // Recording it here means the deliver gate has ONE source of truth for
         // "did we ask for this", covering the on-demand and ordinary paths alike.
-        self.pending_bodies.extend(want.iter().copied());
+        self.expect_bodies_for_rounds(want.iter().copied(), Self::DEFAULT_EXPECTATION_ROUNDS);
         self.diff_want_count = Some(want.len());
         outbound.push(ReplicationMessage::Diff(DiffMessage {
             kind: self.kind,
@@ -911,7 +964,7 @@ impl Session {
             if hash_first_active {
                 use sha2::{Digest as _, Sha256};
                 let h: [u8; 32] = Sha256::digest(env_bytes).into();
-                if self.pending_bodies.remove(&h) {
+                if self.pending_bodies.remove(&h).is_some() {
                     // Remember it: a TRANSIENT refusal below must put it back.
                     requested_hash = Some(h);
                 } else {
@@ -953,7 +1006,10 @@ impl Session {
                     // arrival.
                     if !retry.is_terminal() {
                         if let Some(h) = requested_hash {
-                            self.pending_bodies.insert(h);
+                            // Refresh, not merely restore: the node still wants
+                            // this body and has just learned its dependency is
+                            // not yet satisfied.
+                            self.expect_bodies_for_rounds([h], Self::DEFAULT_EXPECTATION_ROUNDS);
                         }
                     }
                     // CIRISEdge#552 (B) — a TRANSIENT refusal is the one that
@@ -1957,6 +2013,62 @@ mod tests {
             }
             o => panic!("expected Applied, got {o:?}"),
         }
+    }
+
+    /// FSD-SIGNER-RECOVERY invariant 4 — an expectation SURVIVES a round reset
+    /// until its own TTL expires.
+    ///
+    /// The production path this pins: `start_fetch` records an expectation and
+    /// sets no on-demand exemption, so the old "clear the whole set once the
+    /// Pull window closes" rule discarded it on the very next reset — the
+    /// request survived zero rounds and its body was then treated as
+    /// unsolicited and dropped. An expectation is REQUEST state, not ROUND
+    /// state.
+    #[test]
+    fn an_expectation_survives_a_round_reset_until_its_own_ttl_expires() {
+        let h = [7u8; 32];
+        let mut sess = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        sess.expect_bodies([h]);
+
+        // A Fetch sets NO exemption; this is exactly the case that used to be
+        // discarded immediately.
+        assert_eq!(sess.pull_exempt_rounds_for_test(), 0);
+
+        for round in 1..Session::DEFAULT_EXPECTATION_ROUNDS {
+            sess.reset();
+            assert!(
+                sess.is_expecting_body_for_test(&h),
+                "the expectation must outlive round {round} — a round completing \
+                 does not mean the node stopped wanting the body it asked for"
+            );
+        }
+        sess.reset();
+        assert!(
+            !sess.is_expecting_body_for_test(&h),
+            "and it is forgotten once its OWN lifetime expires, so an unanswered \
+             request cannot accumulate"
+        );
+    }
+
+    /// FSD-SIGNER-RECOVERY invariant 7 — recovery never runs under
+    /// `Retention::Bodies`.
+    ///
+    /// There the signer's Key body replicates on its own and #544 admits the row
+    /// on a later round, so recording a name would schedule a Pull for something
+    /// already in flight.
+    #[test]
+    fn nothing_is_recorded_for_recovery_under_bodies_retention() {
+        use crate::replication::retention::{should_note_missing_signer, Retention};
+        assert!(
+            !should_note_missing_signer(Retention::Bodies),
+            "under Bodies the Key body arrives on its own — recovery would be \
+             duplicate work"
+        );
+        assert!(
+            should_note_missing_signer(Retention::HashFirst),
+            "under HashFirst it never arrives, which is the whole reason \
+             recovery exists"
+        );
     }
 
     /// CIRISEdge#552 — a requested body that refuses TRANSIENTLY stays

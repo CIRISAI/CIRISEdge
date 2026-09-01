@@ -2503,6 +2503,13 @@ impl PyEdge {
         // path. The mode belongs to the Edge, so it is read from the Edge rather
         // than re-parsed or passed again by the caller.
         config.bridge.mode = self.inner.agent_mode();
+        // CIRISEdge#552 — and its own key_id, for the same reason: the Pull
+        // responder answers an identifier request for THIS NODE'S OWN record,
+        // which it cannot recognise without knowing which key_id that is. Left
+        // `None` by `Default`, the arm can never match and the recovery path is
+        // inert through the shipped host path — the same silent-default failure
+        // as the mode above, in the same function.
+        config.local_key_id = Some(self.inner.signer_key_id().to_string());
         // CIRISEdge#370 — hand the live metrics bag to the runtime so its
         // scheduler event-sink consumer folds each round's outcome into the
         // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;
@@ -11414,6 +11421,12 @@ mod node_identity_tests {
             .find("    fn start_replication(")
             .expect("start_replication exists");
         let body = &src[start..start + 8000];
+        assert!(
+            body.contains("config.local_key_id = Some(self.inner.signer_key_id().to_string());"),
+            "start_replication must set config.local_key_id from the Edge's own \
+             signer — without it the Pull responder cannot recognise a request \
+             for its own record and missing-signer recovery is inert"
+        );
         assert!(
             body.contains("config.bridge.mode = self.inner.agent_mode();"),
             "start_replication must set config.bridge.mode from the Edge's own \

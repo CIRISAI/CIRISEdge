@@ -380,56 +380,42 @@ impl ReplicationCoordinator {
     /// forget: the testimony converges over the peer's next round, matching the
     /// anti-entropy model — sending the Pull carries no session state (only the
     /// reply does), so there is nothing to await here.
-    /// CIRISEdge#552 (B) — recover ONE signer key this peer can actually serve.
+    /// Take this peer's queued signer name and send the `Pull` that recovers it
+    /// (FSD-SIGNER-RECOVERY D4).
     ///
-    /// Only the `Key` coordinator does this: [`Self::start_pull`] sends a
-    /// `PullMessage { kind: self.kind, .. }`, and the row every stalled record
-    /// waits on is a Key row.
+    /// Returns the name Pulled, or `None` when nothing is queued for this peer —
+    /// the common case, and the caller then runs an ordinary round.
     ///
-    /// **One per round, routed to the delivering peer.** Both constraints come
-    /// from the mechanism, not from caution. A Pull is answered out of the
-    /// responding peer's own `lookup_public_key`, so a node-wide queue drained
-    /// by whichever coordinator ticked first would ask an arbitrary peer for a
-    /// third party's key, get an empty Summary, and consume the queued recovery
-    /// without reaching a holder. And the on-demand exemption is a ROUND
-    /// counter, not a per-request ledger, so a batch would outrun its own
-    /// exemption and the later replies would be suppressed as ordinary
-    /// hash-first traffic.
+    /// # What can be recovered, and why only that
     ///
-    /// A name with no recorded source (a contact lookup has no delivering peer)
-    /// is offered to any coordinator, so successive rounds try successive peers.
+    /// Exactly one thing: **this peer's own `Key`**, asked of this peer. The
+    /// responder answers an identifier `Pull` for the subject itself or for its
+    /// OWN record, and refuses a third-party probe — that refusal is what stops
+    /// a body-holding node becoming an address-book oracle for records it never
+    /// advertised. So "you signed a row I cannot verify, send me your key" is
+    /// the recoverable case, and a third-party signer is not fetchable by
+    /// identifier at all. Nothing else is ever queued, which is also what bounds
+    /// the queue: a peer can enqueue one name, its own.
     ///
-    /// Returns how many Pulls were SENT (0 or 1). A send failure is logged and
-    /// the name is not re-queued here: the record that named it refuses
-    /// transient again on its next offer and re-notes it, so the retry rides
-    /// #544's backoff rather than a hot loop against an unreachable peer.
-    pub async fn pull_missing_signers(&self) -> usize {
+    /// Only the `Key` coordinator recovers, because `start_pull` sends
+    /// `PullMessage { kind: self.kind, .. }` and the row every stalled record
+    /// waits on is a `Key` row.
+    ///
+    /// # Failure
+    ///
+    /// A send error is returned to the caller and the name is NOT re-queued
+    /// here. The record that named it re-notes it on its next transient
+    /// refusal, so the retry rides #544's existing backoff rather than a second
+    /// unbounded timer (FSD-SIGNER-RECOVERY D6).
+    pub async fn send_recovery_pull(&self) -> Result<Option<String>, CoordinatorError> {
         if self.kind != EnvelopeKind::Key {
-            return 0;
+            return Ok(None);
         }
-        let Some(name) = self.provider.take_missing_signer_for(&self.peer_key_id) else {
-            return 0;
+        let Some(signer) = self.provider.take_missing_signer_for(&self.peer_key_id) else {
+            return Ok(None);
         };
-        match self.start_pull(&name).await {
-            Ok(()) => {
-                tracing::debug!(
-                    peer = %self.peer_key_id,
-                    signer = %name,
-                    "pulled a Key row for a signer that stalled admission (CIRISEdge#552)"
-                );
-                1
-            }
-            Err(e) => {
-                tracing::warn!(
-                    peer = %self.peer_key_id,
-                    signer = %name,
-                    error = %e,
-                    "missing-signer Pull send failed — the row that named it will \
-                     re-note it on its next transient refusal (CIRISEdge#552)"
-                );
-                0
-            }
-        }
+        self.start_pull(&signer).await?;
+        Ok(Some(signer))
     }
 
     pub async fn start_pull(&self, subject_key_id: &str) -> Result<(), CoordinatorError> {
