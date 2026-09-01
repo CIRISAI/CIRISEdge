@@ -374,22 +374,45 @@ pub fn parse_contact_input(raw: &str) -> Result<ContactCandidate, LadderStall> {
 /// what turns a bad paste into a confusing `unknown_fed_id`.
 #[must_use]
 pub fn looks_like_fedcode(raw: &str) -> bool {
-    // `trim()` already strips Unicode `White_Space` from both ends — the same
-    // predicate `char::is_whitespace` matches — so nothing further is needed.
+    // `trim()` already strips Unicode `White_Space` from both ends.
     let up = raw.trim().to_ascii_uppercase();
-    // The COMPLETE discriminator: `CIRIS-V` + version digits + `-`.
-    //
-    // A bare `starts_with("CIRIS-V")` also matches a perfectly valid
-    // IDENTIFIER, because a key_id's label is operator-chosen: `CIRIS-Victor-
-    // <fingerprint>` would be sent to the fedcode decoder and come back
-    // `MalformedCode`, making a real contact unreachable purely because of
-    // their name. Requiring the digits and the delimiter cannot collide with a
-    // label, since a label is followed by the fingerprint, not by `V<digits>-`.
     let Some(rest) = up.strip_prefix("CIRIS-V") else {
         return false;
     };
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    !digits.is_empty() && rest[digits.len()..].starts_with('-')
+    if digits.is_empty() || !rest[digits.len()..].starts_with('-') {
+        return false;
+    }
+    // A version-shaped PREFIX is not enough: a label is operator-chosen and may
+    // literally be `CIRIS-V2`, making `CIRIS-V2-<fingerprint>` a perfectly
+    // valid IDENTIFIER. Anything that parses as a well-formed identifier is
+    // one, whatever it looks like — so the discriminator is the complete
+    // structure, not the prefix.
+    !is_well_formed_identifier(raw)
+}
+
+/// Does this parse as a `label-fingerprint` federation key_id?
+///
+/// The fingerprint is exactly [`KEY_ID_FINGERPRINT_LEN`] base32 characters
+/// (`derive_key_id`), and a label may contain anything else including hyphens —
+/// so the fingerprint is the LAST hyphen-separated segment. A fedcode body is
+/// a base32 payload carrying a 32-byte pubkey and a CRC; it is far longer than
+/// a fingerprint and cannot be mistaken for one.
+///
+/// [`KEY_ID_FINGERPRINT_LEN`]: ciris_verify_core::fedcode::KEY_ID_FINGERPRINT_LEN
+#[must_use]
+fn is_well_formed_identifier(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let Some((label, fingerprint)) = trimmed.rsplit_once('-') else {
+        return false;
+    };
+    if label.is_empty() {
+        return false;
+    }
+    fingerprint.len() == ciris_verify_core::fedcode::KEY_ID_FINGERPRINT_LEN
+        && fingerprint
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() && c != '0' && c != '1' && c != '8' && c != '9')
 }
 
 /// Re-derive the claimed `key_id` from the carried pubkey and require a match.
@@ -1424,10 +1447,19 @@ mod tests {
     #[test]
     fn a_label_beginning_with_v_is_an_identifier_not_a_code() {
         for id in [
-            "CIRIS-Victor-abc123def4",
-            "CIRIS-V-abc123def4",
-            "ciris-vera-abc123def4",
-            "CIRIS-Vv2-abc123def4",
+            // Fingerprints are base32 (a-z, 2-7) — `derive_key_id` lowercases
+            // the first 10 chars of the digest, so these are shaped like the
+            // real thing.
+            "CIRIS-Victor-abc234def5",
+            "CIRIS-V-abc234def5",
+            "ciris-vera-abc234def5",
+            "CIRIS-Vv2-abc234def5",
+            // The label can literally BE a version string. A prefix test —
+            // even one demanding digits and a delimiter — classifies this as a
+            // code and makes the person unreachable; only the complete
+            // structure tells them apart.
+            "CIRIS-V2-abc234def5",
+            "CIRIS-V1-zzzzzzzzzz",
         ] {
             assert!(
                 !super::looks_like_fedcode(id),

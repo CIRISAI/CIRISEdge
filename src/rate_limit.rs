@@ -244,7 +244,17 @@ impl KeyState {
         let backoff_done = policy.backoff.map_or(true, |b| {
             now.saturating_sub(self.last_denial_at) >= b.window_secs(self.consecutive_denials)
         });
-        refilled && backoff_done && self.suppressed == 0
+        // Deliberately NOT gated on `suppressed`. An earlier version required
+        // it to be zero so no denial count was ever lost — which pinned every
+        // denied key in the map forever, because `suppressed` clears only on
+        // the next Allow and a key nobody allows again never gets one. The map
+        // then fills permanently AND `next_release` stays in the past, so every
+        // subsequent admission pays a full scan: the memory bound and the O(1)
+        // property both destroyed, to preserve a counter for a key whose flood
+        // is already over. The count is carried to `released_suppressed`
+        // instead, so the aggregate stays visible (D5) without holding the map
+        // hostage.
+        refilled && backoff_done
     }
 }
 
@@ -257,6 +267,9 @@ impl KeyState {
 pub struct RateLimiter {
     policy: Policy,
     keys: HashMap<String, KeyState>,
+    /// Denials absorbed by keys that have since been released. Keeps the
+    /// aggregate flood visible (D5) once a key's own counter is gone.
+    released_suppressed: u64,
     /// Earliest time ANY key could become releasable. Before it, a capacity
     /// denial is O(1) because a scan provably cannot find anything (D2) —
     /// without this an attacker rotating identities inside the window forces a
@@ -270,6 +283,7 @@ impl RateLimiter {
         Self {
             policy,
             keys: HashMap::new(),
+            released_suppressed: 0,
             next_release: Ts::MAX,
         }
     }
@@ -278,6 +292,13 @@ impl RateLimiter {
     #[must_use]
     pub fn tracked(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Denials absorbed by keys that have since been released — the flood that
+    /// happened but whose per-key counters are gone.
+    #[must_use]
+    pub fn released_suppressed(&self) -> u64 {
+        self.released_suppressed
     }
 
     /// This key's class.
@@ -456,7 +477,15 @@ impl RateLimiter {
     /// Drop every key whose retained state is indistinguishable from absence.
     fn release_free_entries(&mut self, now: Ts) {
         let policy = self.policy;
-        self.keys.retain(|_, st| !st.is_releasable(now, &policy));
+        let mut carried = 0_u64;
+        self.keys.retain(|_, st| {
+            let keep = !st.is_releasable(now, &policy);
+            if !keep {
+                carried = carried.saturating_add(st.suppressed);
+            }
+            keep
+        });
+        self.released_suppressed = self.released_suppressed.saturating_add(carried);
         self.next_release = self
             .keys
             .values()
@@ -747,6 +776,41 @@ mod tests {
              while keeping the map bounded"
         );
         assert_eq!(rl.tracked(), 32);
+    }
+
+    /// A12 — a denied key must not be pinned in the map forever.
+    ///
+    /// The regression: `is_releasable` required `suppressed == 0`, and
+    /// `suppressed` clears only on the next Allow — which a key nobody allows
+    /// again never gets. So every denied key was immortal, the map filled
+    /// permanently, and `next_release` stayed in the past so each later
+    /// admission paid a full scan. The rotation shape reaches this in one pass:
+    /// fill the map with senders that each make a second, denied attempt.
+    #[test]
+    fn a12_denied_keys_are_released_once_their_window_refills() {
+        let mut rl = RateLimiter::new(quota_policy(1, 600, 32));
+        for i in 0..32 {
+            let k = format!("s{i}");
+            assert!(rl.check_from(&k, Some(&k), 1000).is_allowed());
+            // The second, DENIED attempt — this is what used to pin it.
+            assert!(!rl.check_from(&k, Some(&k), 1000).is_allowed());
+        }
+        assert_eq!(rl.tracked(), 32);
+
+        // Past the window everything is refilled and carries no information.
+        let later = 1000 + 600;
+        assert!(
+            rl.check_from("newcomer", Some("newcomer"), later)
+                .is_allowed(),
+            "a refilled key is state-equivalent to one never seen, so releasing \
+             it is free — pinning the map to preserve a denial counter trades a \
+             permanent outage for a statistic"
+        );
+        assert!(rl.tracked() <= 32);
+        assert!(
+            rl.released_suppressed() > 0,
+            "and the absorbed flood stays visible in aggregate (D5)"
+        );
     }
 
     /// A11 — at cap with ONLY promoted keys, a new key is refused and no
