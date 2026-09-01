@@ -2317,13 +2317,6 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
-    fn take_missing_signer_for(&self, peer_key_id: &str) -> bool {
-        let Ok(mut pending) = self.missing_signers.lock() else {
-            return false;
-        };
-        pending.remove(peer_key_id)
-    }
-
     fn take_missing_signers(&self) -> Vec<String> {
         let Ok(mut pending) = self.missing_signers.lock() else {
             return Vec::new();
@@ -2563,11 +2556,32 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#462 — serve a subject-scoped RECEIVE-axis Pull. Entitlement is
-    /// FAIL-CLOSED: a Pull for subject `S` is answered only to a requester
-    /// authenticated AS `S` (`peer_key_id == Some(S)`). A requester `P ≠ S` — or
-    /// an unattributed one — gets nothing, and it says so. (Owner-delegation, a
-    /// node key pulling for its owner fedID, needs `owner_of` and is a deliberate
-    /// follow-up, not silently permitted here.) The refs themselves come from
+    /// FAIL-CLOSED, with one deliberate widening (CIRISEdge#552).
+    ///
+    /// A Pull for subject `S` is answered to a requester authenticated AS `S`,
+    /// **or** to any ATTRIBUTED requester when the kind's serve cell is
+    /// unconditionally `public` ([`EnvelopeKind::is_public_subject_pull`]). An
+    /// unattributed requester still gets nothing, and it still says so.
+    ///
+    /// The widening discloses NOTHING new. Those planes are already
+    /// `("self_own", "public")` / `("global", "public")` in the serve manifest —
+    /// public signed envelopes, no capability gate, already reachable through
+    /// ordinary anti-entropy. `subject-only` made them un-ADDRESSABLE rather
+    /// than undisclosed, because `Pull` is the only verb that names a record by
+    /// IDENTIFIER and it was written for data-subject access ("what do you hold
+    /// about me"). Under hash-first that left a node unable to ask for a public
+    /// body it had deliberately not fetched: every other read is
+    /// content-hash-addressed, and it cannot compute the hash of a record it
+    /// does not hold. A signer's Key was then permanently unfetchable, which is
+    /// a revocation that never lands.
+    ///
+    /// `Attestation` keeps the subject-only rule: its serve cell is conditional
+    /// (`trace:*` → `capability:infra:serve`, plus the per-row G2 scores carve),
+    /// so its entitlement is decided per RECORD and a per-plane widening would
+    /// be exactly the substrate/policy conflation to avoid.
+    ///
+    /// (Owner-delegation, a node key pulling for its owner fedID, needs
+    /// `owner_of` and is still a deliberate follow-up, not silently permitted.) The refs themselves come from
     /// [`Self::subject_holdings_inner`], which hashes the SAME struct the wire
     /// index keys on and applies the G2 capacity carve.
     async fn subject_holdings(
@@ -2577,7 +2591,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
         match peer_key_id {
-            Some(p) if p == subject_key_id => {
+            Some(p) if p == subject_key_id || kind.is_public_subject_pull() => {
                 // CIRISEdge#531 — WIDTH bound on the subject-Pull sweep too:
                 // it is per-subject rather than whole-table, but the
                 // Attestation arm sweeps BOTH testimonial axes and a
@@ -2592,8 +2606,9 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     subject = %subject_key_id,
                     requester = ?other,
                     kind = ?kind,
-                    "subject Pull refused: requester is not the subject — serving nothing \
-                     (#462 fail-closed; owner-delegation via owner_of is a follow-up)"
+                    "subject Pull refused: requester is not the subject and this kind \
+                     is not publicly pullable — serving nothing (#462 fail-closed; \
+                     #552 widened only the unconditionally-public planes)"
                 );
                 Vec::new()
             }
@@ -9664,6 +9679,63 @@ mod tests {
                 .await
                 .is_empty(),
             "an unattributed Pull serves nothing"
+        );
+    }
+
+    /// CIRISEdge#552 — a public plane answers a Pull from ANY attributed
+    /// requester; a conditional one still does not.
+    ///
+    /// This is the widening that makes hash-first survivable. `Key` serves
+    /// `public` unconditionally, so `subject-only` was making a disclosed record
+    /// un-ADDRESSABLE: a node that declined to fetch a signer's Key body had no
+    /// verb left to ask for it by name, and the rows it signed — revocations
+    /// included — could never admit.
+    ///
+    /// Three assertions, because the widening has to be exactly as wide as
+    /// claimed: public plane opens to a stranger, unattributed stays closed,
+    /// and `Attestation` — whose entitlement is per-row (`trace:*` capability,
+    /// the G2 carve) — stays subject-only.
+    #[tokio::test]
+    async fn a_public_plane_answers_a_pull_from_any_attributed_requester() {
+        let local = "local-A";
+        let subject = "subject-S";
+        let stranger = "stranger-X";
+        let (backend, bridge) =
+            make_bridge(&[local.to_string(), subject.to_string(), stranger.to_string()]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        for kid in [local, subject, stranger] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(kid, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+
+        assert!(
+            !bridge
+                .subject_holdings(EnvelopeKind::Key, subject, Some(stranger))
+                .await
+                .is_empty(),
+            "a Key record is a PUBLIC signed envelope — a stranger that names it \
+             must be served, or a hash-first node can never fetch a signer key \
+             and the revocations it signed never land"
+        );
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Key, subject, None)
+                .await
+                .is_empty(),
+            "an UNATTRIBUTED Pull still serves nothing — #552 widened who may \
+             name a public record, not whether an unauthenticated peer is served"
+        );
+        assert!(
+            bridge
+                .subject_holdings(EnvelopeKind::Attestation, subject, Some(stranger))
+                .await
+                .is_empty(),
+            "Attestation's serve cell is CONDITIONAL per row (trace:* capability, \
+             G2 scores carve) — it keeps the subject-only rule"
         );
     }
 

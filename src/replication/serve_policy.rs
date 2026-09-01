@@ -69,15 +69,25 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
     };
     // CIRISEdge#462 — `receive`: whether this kind answers a subject-scoped Pull
     // (the RECEIVE axis), and under what rule. The FIVE replicated kinds are
-    // subject-pullable, entitlement FAIL-CLOSED to the subject itself; the
+    // subject-pullable; entitlement is FAIL-CLOSED to the subject itself except
+    // on the four unconditionally-`public` planes, which CIRISEdge#552 widened
+    // to any attributed requester (they were already disclosed — see
+    // `EnvelopeKind::is_public_subject_pull`); the
     // Attestation plane sweeps BOTH testimonial axes with the G2 score carve;
     // every other kind is NOT subject-pullable (`none`). This column is the
     // coordinated-cut witness CIRISServer pins alongside `serve`.
     let receive = match kind {
+        // CIRISEdge#552 — these four planes serve `public` unconditionally, so
+        // the subject-only entitlement made them un-ADDRESSABLE rather than
+        // undisclosed. Widened to any ATTRIBUTED requester; unattributed still
+        // gets nothing. Derived from `is_public_subject_pull` (test-locked
+        // below), so the predicate and this cell cannot drift.
         EnvelopeKind::Key
         | EnvelopeKind::IdentityOccurrence
         | EnvelopeKind::TransportDestination
-        | EnvelopeKind::IdentityOccurrenceRevocation => "subject_pull:data_subject; subject-only",
+        | EnvelopeKind::IdentityOccurrenceRevocation => {
+            "subject_pull:data_subject+any_attributed; public envelope"
+        }
         EnvelopeKind::Attestation => {
             "subject_pull:data_subject+sender; subject-only; \
              non-retainable scores-plane rows carved on data_subject axis \
@@ -155,9 +165,21 @@ pub fn serve_advertise_policy_sha256() -> String {
 // rule). `per_record_projection` now names only the Attestation plane, the one
 // whose projection is genuinely decided per row. NO serve-path behavior
 // changed — this is the manifest catching up to the code it witnesses.
-// **CIRISServer must mirror**: re-pin from 328d73b0… to this value.
+// **CIRISServer must mirror**: re-pin from 328d73b0… to 20499cab….
+//
+// CIRISEdge#552 — RE-PINNED AGAIN, 20499cab… → e8216fec…. The RECEIVE cell on
+// the four unconditionally-`public` planes (Key, IdentityOccurrence,
+// TransportDestination, IdentityOccurrenceRevocation) widened from
+// `subject-only` to `+any_attributed`. This is a DISCLOSURE-NEUTRAL cut: those
+// planes already serve `public` on the advertise axis and are already reachable
+// through ordinary anti-entropy. What changed is ADDRESSABILITY — `Pull` is the
+// only verb that names a record by identifier, and reserving it for
+// data-subject access left a hash-first node unable to ask for a public body it
+// had chosen not to fetch, stranding signer keys and therefore revocations.
+// `Attestation` is untouched: its serve cell is conditional per row.
+// **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "20499cabaf1c0566b5a8d66f8d03c8a980b760c733e83444b7345a7733f22d74";
+    "e8216fec51cdb2a417e2b24ce55a5854e40c661cbea2888989d4c173a29925fd";
 
 #[cfg(test)]
 mod tests {
@@ -252,6 +274,34 @@ mod tests {
         }
         // The predicate currently names exactly one cursor plane.
         assert!(EnvelopeKind::AccordQuorumEvidence.is_cursor_served());
+    }
+
+    /// CIRISEdge#552 — the RECEIVE cell's entitlement is DERIVED from
+    /// `is_public_subject_pull`, not written twice.
+    ///
+    /// The manifest is the artifact CIRISServer pins, and the gate in
+    /// `subject_holdings` reads the predicate. If those two could drift, the
+    /// pinned witness would attest to an entitlement the code does not enforce
+    /// — the manifest describing a mechanism the planes never had, which is the
+    /// error the `per_record_projection` cell had to be corrected for.
+    #[test]
+    fn the_public_pull_cell_is_derived_from_the_predicate() {
+        let manifest = serve_advertise_manifest();
+        for policy in manifest["policies"].as_array().unwrap() {
+            let wire = policy["kind"].as_str().unwrap();
+            let kind = EnvelopeKind::ALL
+                .into_iter()
+                .find(|k| k.as_wire_str() == wire)
+                .expect("every manifest row names a real kind");
+            let recv = policy["receive"].as_str().unwrap();
+            assert_eq!(
+                recv.contains("any_attributed"),
+                kind.is_public_subject_pull(),
+                "{kind:?}: the manifest's receive cell and \
+                 is_public_subject_pull disagree — the pinned witness would \
+                 attest to an entitlement the gate does not enforce"
+            );
+        }
     }
 
     /// CIRISEdge#393 item 3 — the manifest's columns are TEST-LOCKED to the

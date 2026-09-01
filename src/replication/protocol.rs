@@ -251,6 +251,36 @@ impl EnvelopeKind {
         )
     }
 
+    /// CIRISEdge#552 — does this kind answer a subject-scoped Pull from ANY
+    /// attributed requester, rather than only from the subject itself?
+    ///
+    /// EXACTLY the subject-pullable planes whose serve cell is unconditionally
+    /// `public` — a public signed envelope, no capability gate. For those, the
+    /// federation already discloses the record to anyone through ordinary
+    /// anti-entropy; `subject-only` on the RECEIVE axis made it un-ADDRESSABLE,
+    /// not undisclosed. That gap is load-bearing under hash-first retention: a
+    /// node that declined to fetch a public body has no other way to name it
+    /// (every other read is content-hash-addressed, and it cannot compute the
+    /// hash of a record it does not hold).
+    ///
+    /// `Attestation` is deliberately NOT here. Its serve cell is conditional —
+    /// `trace:*` rides `capability:infra:serve` and the G2 scores carve is
+    /// per-row — so its entitlement is genuinely decided per record and cannot
+    /// be answered by a per-plane predicate.
+    ///
+    /// A requester must still be ATTRIBUTED: this widens *who* may name a
+    /// public record, never whether an unauthenticated peer is served.
+    #[must_use]
+    pub fn is_public_subject_pull(self) -> bool {
+        matches!(
+            self,
+            Self::Key
+                | Self::IdentityOccurrence
+                | Self::TransportDestination
+                | Self::IdentityOccurrenceRevocation
+        )
+    }
+
     /// CIRISEdge#474 — is this kind served over the dedicated CURSOR path
     /// (`CursorPull` → `Deliver`, resume on `evidence_at`) rather than the
     /// content-hash Summary/Diff/Fetch flow? EXACTLY the kinds with no
@@ -777,6 +807,38 @@ mod tests {
     /// (the persist `ReplicatedKind` set), checked over ALL 14 so a new pullable
     /// kind must be a deliberate edit here. MUST agree with the serve-policy
     /// `receive` witness.
+    /// CIRISEdge#552 — the public-Pull set is a strict SUBSET of the
+    /// subject-pullable set, and excludes `Attestation`.
+    ///
+    /// Both halves matter. A kind that answers a public Pull without being
+    /// subject-pullable would be served through a path the manifest says it has
+    /// no receive axis for; and `Attestation` inside this set would blanket a
+    /// plane whose entitlement is decided per ROW (`trace:*` capability, the G2
+    /// scores carve) — the exact conflation that turns a per-record gate into a
+    /// per-plane one.
+    #[test]
+    fn the_public_subject_pull_set_is_a_subset_that_excludes_attestation() {
+        for kind in EnvelopeKind::ALL {
+            if kind.is_public_subject_pull() {
+                assert!(
+                    kind.is_subject_pullable(),
+                    "{kind:?} answers a public Pull but has no subject-pull \
+                     receive axis at all"
+                );
+            }
+        }
+        assert!(
+            !EnvelopeKind::Attestation.is_public_subject_pull(),
+            "Attestation's serve cell is CONDITIONAL (trace:* → capability, \
+             plus the per-row G2 carve) — it cannot be widened per-plane"
+        );
+        assert!(
+            EnvelopeKind::Key.is_public_subject_pull(),
+            "Key is a public signed envelope; refusing to let a peer NAME it is \
+             what stranded hash-first admission"
+        );
+    }
+
     #[test]
     fn is_subject_pullable_is_exactly_the_five_replicated_kinds() {
         for kind in EnvelopeKind::ALL {
