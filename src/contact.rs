@@ -198,9 +198,23 @@ pub async fn resolve(lens: &dyn DirectoryLens, any_id: &str) -> Result<Subject, 
         IdentityKind::Person => any_id.to_owned(),
         // A node or agent cannot consent; its OWNER does. Resolving through the
         // owner is what makes "add frank-laptop as a contact" mean "add Frank".
-        IdentityKind::Node | IdentityKind::Agent => {
-            lens.owner_of(any_id).await.ok_or_else(stall)?
-        }
+        IdentityKind::Node | IdentityKind::Agent => match lens.owner_of(any_id).await {
+            Some(owner) => owner,
+            None => {
+                // The readability probe runs only when the KEY lookup misses. A
+                // key that resolves and an owner that does not can still be a
+                // local backend failure, and reporting that as
+                // `NotYetDiscovered` tells an operator to wait for replication
+                // to repair a disk.
+                return Err(if lens.directory_readable().await {
+                    stall()
+                } else {
+                    LadderStall::DirectoryUnreadable {
+                        key_id: any_id.to_owned(),
+                    }
+                });
+            }
+        },
         // A steward or accord holder is not a contactable person. TERMINAL, not
         // `NotYetDiscovered`: the latter self-resolves, so a caller would retry
         // forever against something that will never become contactable — and the
@@ -214,6 +228,9 @@ pub async fn resolve(lens: &dyn DirectoryLens, any_id: &str) -> Result<Subject, 
     };
 
     let nodes = lens.nodes_owned_by(&fed_id).await;
+    if nodes.is_empty() && !lens.directory_readable().await {
+        return Err(LadderStall::DirectoryUnreadable { key_id: fed_id });
+    }
     if nodes.is_empty() {
         // Known person, nothing to reach. Distinct from "unknown key", and the
         // remedy is the same: wait for their announce to replicate.

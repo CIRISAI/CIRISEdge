@@ -907,10 +907,14 @@ impl Session {
             // requested. Gating the whole message on "any envelope matched"
             // would let one requested body carry an arbitrary payload of
             // unrequested ones past the gate.
+            let mut requested_hash: Option<[u8; 32]> = None;
             if hash_first_active {
                 use sha2::{Digest as _, Sha256};
                 let h: [u8; 32] = Sha256::digest(env_bytes).into();
-                if !self.pending_bodies.remove(&h) {
+                if self.pending_bodies.remove(&h) {
+                    // Remember it: a TRANSIENT refusal below must put it back.
+                    requested_hash = Some(h);
+                } else {
                     provider.note_known_hashes(self.kind, &[h], source_peer);
                     tracing::debug!(
                         kind = ?self.kind,
@@ -939,6 +943,19 @@ impl Session {
                 // token maps to which. It is a stable token, never prose.
                 ApplyOutcome::Refused { reason, retry } => {
                     refused += 1;
+                    // CIRISEdge#552 — an explicitly requested body that refuses
+                    // TRANSIENTLY must stay expected. The expectation is the only
+                    // thing that lets its bytes through this gate: hash-first
+                    // suppresses the ordinary want, so a redelivery after the
+                    // dependency lands would be treated as unsolicited and
+                    // dropped, and the row this node ASKED for could never admit.
+                    // Consume the expectation on outcomes that settle it, not on
+                    // arrival.
+                    if !retry.is_terminal() {
+                        if let Some(h) = requested_hash {
+                            self.pending_bodies.insert(h);
+                        }
+                    }
                     // CIRISEdge#552 (B) — a TRANSIENT refusal is the one that
                     // waits on more state, and the state it most often waits on
                     // is the signer's own Key row. Under hash-first that row can
@@ -1938,6 +1955,75 @@ mod tests {
                 assert_eq!(admitted, 0, "nothing admitted");
                 assert_eq!(refused, 3, "every refused envelope is counted, not dropped");
             }
+            o => panic!("expected Applied, got {o:?}"),
+        }
+    }
+
+    /// CIRISEdge#552 — a requested body that refuses TRANSIENTLY stays
+    /// expected.
+    ///
+    /// The expectation is the only thing that lets those bytes through the
+    /// hash-first gate. Consuming it on ARRIVAL means that once the dependency
+    /// lands, the redelivery is treated as unsolicited and dropped — and
+    /// ordinary Summaries cannot repair it either, because hash-first records
+    /// the hash and clears the want. The row this node explicitly ASKED for
+    /// could then never admit.
+    #[test]
+    fn a_requested_body_refused_transiently_is_still_expected() {
+        use std::sync::Mutex;
+        struct P;
+        impl StateProvider for P {
+            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+                Vec::new()
+            }
+            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn retention(&self, _k: EnvelopeKind) -> crate::replication::retention::Retention {
+                crate::replication::retention::Retention::HashFirst
+            }
+        }
+        struct Refuser(Mutex<bool>);
+        impl StateApplier for Refuser {
+            fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _p: Option<&str>,
+            ) -> ApplyOutcome {
+                let mut done = self.0.lock().unwrap();
+                if *done {
+                    ApplyOutcome::Admitted
+                } else {
+                    *done = true;
+                    ApplyOutcome::refused("signer not registered yet")
+                }
+            }
+        }
+
+        use sha2::{Digest as _, Sha256};
+        let body = b"the-requested-key-row".to_vec();
+        let h: [u8; 32] = Sha256::digest(&body).into();
+
+        let mut sess = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        sess.expect_bodies([h]);
+        let deliver = DeliverMessage {
+            kind: EnvelopeKind::Key,
+            envelopes: vec![body.clone()],
+        };
+        let applier = Refuser(Mutex::new(false));
+
+        // First delivery: transiently refused. The expectation must survive.
+        sess.on_deliver(&deliver, &P, &applier, Some("peer-1"));
+
+        // The dependency has landed; the SAME bytes are redelivered.
+        match sess.on_deliver(&deliver, &P, &applier, Some("peer-1")) {
+            ReplicationOutcome::Applied { admitted, .. } => assert_eq!(
+                admitted, 1,
+                "the redelivered body must still be expected and therefore \
+                 applied — consuming the expectation on arrival strands the row \
+                 this node explicitly asked for"
+            ),
             o => panic!("expected Applied, got {o:?}"),
         }
     }

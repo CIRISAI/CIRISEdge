@@ -2320,12 +2320,55 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
         if let Ok(mut pending) = self.missing_signers.lock() {
             if pending.len() >= MISSING_SIGNER_CAP && !pending.contains_key(signer_key_id) {
-                tracing::warn!(
-                    signer = %signer_key_id,
-                    cap = MISSING_SIGNER_CAP,
-                    "missing-signer set at cap — DROPPING this name (CIRISEdge#552)"
-                );
-                return;
+                // CIRISEdge#552 — charge the cap to the LARGEST source, never to
+                // whoever arrived last.
+                //
+                // An attributed peer can manufacture entries at will: deliver
+                // envelopes naming unique nonexistent signers, each refused
+                // transient, each recorded. A flat cap then lets that one peer
+                // fill the map and starve every other peer's recovery —
+                // including the signer needed to admit a legitimate REVOCATION.
+                // It replenishes far faster than the one-per-round drain. Same
+                // monopolization shape as the known-hash cap, and the same fix.
+                let dominant = {
+                    let mut counts: std::collections::HashMap<Option<&str>, usize> =
+                        std::collections::HashMap::new();
+                    for src in pending.values() {
+                        *counts.entry(src.as_deref()).or_insert(0) += 1;
+                    }
+                    counts
+                        .into_iter()
+                        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                        .map(|(src, _)| src.map(str::to_owned))
+                };
+                let victim = dominant.as_ref().and_then(|d| {
+                    // Never evict on behalf of the peer that IS the hog.
+                    if d.as_deref() == source_peer {
+                        return None;
+                    }
+                    pending
+                        .iter()
+                        .find(|(_, src)| src.as_deref() == d.as_deref())
+                        .map(|(name, _)| name.clone())
+                });
+                if let Some(name) = victim {
+                    pending.remove(&name);
+                    tracing::debug!(
+                        evicted = %name,
+                        for_signer = %signer_key_id,
+                        "missing-signer set at cap — released an entry from the \
+                         largest source so one peer cannot starve recovery \
+                         (CIRISEdge#552)"
+                    );
+                } else {
+                    tracing::warn!(
+                        signer = %signer_key_id,
+                        cap = MISSING_SIGNER_CAP,
+                        "missing-signer set at cap and this source is already the \
+                         largest — DROPPING this name (CIRISEdge#552)"
+                    );
+                    return;
+                }
             }
             let slot = pending.entry(signer_key_id.to_string()).or_insert(None);
             // Never downgrade a routed name to unrouted: a known holder
@@ -9731,6 +9774,38 @@ mod tests {
             bridge.take_missing_signer_for("peer-1"),
             None,
             "taken names are removed — a name left queued would re-Pull every round"
+        );
+    }
+
+    /// CIRISEdge#552 — one peer cannot fill the missing-signer cap and starve
+    /// another peer's recovery.
+    ///
+    /// An attributed peer manufactures entries for free: deliver envelopes
+    /// naming unique nonexistent signers, each refused transient, each recorded.
+    /// A flat cap then lets that peer own the map and suppress the signer needed
+    /// to admit a legitimate REVOCATION from someone else — a safety-critical
+    /// admission blocked by a stranger's noise.
+    #[tokio::test]
+    async fn a_flooding_peer_cannot_starve_another_peers_signer_recovery() {
+        let (_backend, bridge) = make_bridge(&[]);
+        let bridge = bridge.with_agent_mode_for_test(crate::AgentMode::Server);
+
+        // The hostile peer fills the map well past the cap.
+        for i in 0..(MISSING_SIGNER_CAP + 200) {
+            bridge.note_missing_signer(
+                EnvelopeKind::Attestation,
+                &format!("nonexistent-{i}"),
+                Some("peer-flood"),
+            );
+        }
+        // An honest peer needs ONE signer to admit a revocation.
+        bridge.note_missing_signer(EnvelopeKind::Revocation, "revoker-key", Some("peer-honest"));
+
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-honest").as_deref(),
+            Some("revoker-key"),
+            "the honest peer's signer must be recorded and routed to it — a flat \
+             cap let one peer's noise suppress a revocation federation-wide"
         );
     }
 

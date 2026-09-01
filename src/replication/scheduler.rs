@@ -474,12 +474,26 @@ async fn run_one_coordinator_forever(
             _ = interval.tick() => {
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
                 let _enter = span.enter();
-                // CIRISEdge#552 (B) — drain missing signers into Key Pulls
-                // BEFORE the round, not after: a Pull sent now has its reply
-                // fetched by THIS round's Summary handling, so the stalled row
-                // can admit a round earlier. No-op on every kind but `Key`, and
-                // no-op entirely unless hash-first is active.
-                coord.pull_missing_signers().await;
+                // CIRISEdge#552 (B) — a recovery Pull REPLACES this tick's
+                // ordinary round; it never overlaps it.
+                //
+                // The two exchanges are indistinguishable on the wire — both
+                // answer with a Summary, and `expect_on_demand_reply` carries no
+                // request correlation. Overlapping them let the SCHEDULED
+                // Summary be read as the Pull's reply, which put the peer's
+                // whole Key page into `pending_bodies` and fetched every body on
+                // a node that had just chosen not to — hash-first defeated by
+                // its own recovery path. Their Diff/Deliver states can also
+                // clobber each other under unordered delivery.
+                //
+                // One in-flight exchange per coordinator IS the correlation, and
+                // it is how the rest of this protocol already works: the session
+                // is a sequential per-peer state machine. Recovery costs one
+                // cadence tick, and only on a tick where a signer was actually
+                // queued.
+                if coord.pull_missing_signers().await > 0 {
+                    continue;
+                }
                 let event = match run_one_round(&coord, round_timeout).await {
                     // CIRISEdge#380 — run_one_round converts SendThenComplete to
                     // Complete after sending; the merged arm is defensive if it
