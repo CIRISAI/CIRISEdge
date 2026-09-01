@@ -1,0 +1,200 @@
+//! Compile-pin for `docs/CHAT_HARNESS_INTEGRATION.md`.
+//!
+//! The integration guide handed to CIRISServer (CIRISServer#524) names a
+//! specific public surface and tells them to build a chat harness on it. A
+//! document is the one artifact that cannot fail its own CI, so this test
+//! references every symbol the guide names.
+//!
+//! It asserts almost nothing at runtime, and that is the point: the value is
+//! entirely in COMPILING. If someone renames `LadderStall::BodyFetchQueued`,
+//! changes `discover`'s arity, or makes `Ts` private again, this file stops
+//! building and the guide is known-stale in the same commit — instead of a
+//! downstream team discovering it against a version we already shipped.
+//!
+//! Add a symbol here whenever the guide starts naming it.
+
+use ciris_edge::contact::{Discovered, IdentityKind, LadderStall, PersistLens, Rung, Subject};
+use ciris_edge::invite_gate::{InviteGate, InviteVerdict, RefuseReason, Ts};
+use ciris_edge::replication::ReplicationRuntimeConfig;
+use ciris_edge::AgentMode;
+
+/// §0 — the two fields a Rust composer must set itself, because the Python
+/// entry point sets them and a default-constructed config does not.
+#[test]
+fn the_wiring_the_guide_says_is_mandatory_exists() {
+    let mut config = ReplicationRuntimeConfig::default();
+
+    config.bridge.mode = AgentMode::Server;
+    config.local_key_id = Some("node-abc123".to_string());
+
+    assert!(
+        matches!(config.bridge.mode, AgentMode::Server),
+        "§0 tells the server to set bridge.mode; it must remain settable"
+    );
+    assert!(
+        config.local_key_id.is_some(),
+        "§0 tells the server to set local_key_id; without it the Pull responder \
+         cannot recognise a request for its own record"
+    );
+
+    // And the default really is the quiet one the guide warns about.
+    let default = ReplicationRuntimeConfig::default();
+    assert!(
+        matches!(default.bridge.mode, AgentMode::Proxy),
+        "the guide says the default is Proxy and looks correct while behaving \
+         as a proxy — if that changes, §0's warning is wrong"
+    );
+}
+
+/// §1 — the rung vocabulary, and `previous()` for pointing at the right place.
+#[test]
+fn the_rung_ladder_is_the_documented_shape() {
+    let documented = [
+        (Rung::Announce, "announce", None),
+        (Rung::Discover, "discover", Some(Rung::Announce)),
+        (
+            Rung::RequestContact,
+            "request_contact",
+            Some(Rung::Discover),
+        ),
+        (Rung::Consent, "consent", Some(Rung::RequestContact)),
+        (Rung::OpenChat, "open_chat", Some(Rung::Consent)),
+        (Rung::SendMessage, "send_message", Some(Rung::OpenChat)),
+    ];
+    for (rung, wire, prior) in documented {
+        assert_eq!(rung.as_str(), wire, "§1 prints these strings in a table");
+        assert_eq!(rung.previous(), prior, "§1 documents the ladder order");
+    }
+}
+
+/// §3 — the stall table. Every variant the guide lists, with the
+/// `self_resolving()` value it tells the harness to branch on, and a
+/// non-empty `remedy()` the guide says to surface verbatim.
+#[test]
+fn every_documented_stall_has_the_documented_disposition() {
+    let fed = || "frank-abc123".to_string();
+    let documented: Vec<(LadderStall, bool)> = vec![
+        (LadderStall::NotYetDiscovered { fed_id: fed() }, true),
+        (LadderStall::Unreachable { fed_id: fed() }, true),
+        (LadderStall::BodyFetchQueued { key_id: fed() }, true),
+        (LadderStall::AwaitingConsent { fed_id: fed() }, false),
+        (LadderStall::ConsentNotGranted { fed_id: fed() }, false),
+        (LadderStall::DirectoryUnreadable { key_id: fed() }, false),
+        (
+            LadderStall::NotContactable {
+                key_id: fed(),
+                identity_type: "steward".to_string(),
+            },
+            false,
+        ),
+        (
+            LadderStall::PriorRungIncomplete {
+                rung: Rung::Consent,
+                prior: Rung::RequestContact,
+            },
+            false,
+        ),
+    ];
+    for (stall, self_resolving) in documented {
+        assert_eq!(
+            stall.self_resolving(),
+            self_resolving,
+            "§3's table says self_resolving={self_resolving} for {stall:?}; the \
+             harness branches retry-vs-surface on exactly this"
+        );
+        assert!(
+            !stall.remedy().is_empty(),
+            "§3 tells the server to show remedy() verbatim, so every variant \
+             must have one: {stall:?}"
+        );
+    }
+}
+
+/// §4 — the invite gate's placement and promotion contract.
+#[test]
+fn the_invite_gate_behaves_as_the_guide_describes() {
+    let now: Ts = 1_000_000;
+    let mut gate = InviteGate::new();
+
+    assert!(
+        matches!(gate.admit("stranger", now), InviteVerdict::Allow),
+        "§4: a stranger's first invite reaches the person"
+    );
+    assert!(
+        matches!(
+            gate.admit("stranger", now),
+            InviteVerdict::Refuse {
+                reason: RefuseReason::AlreadyPending | RefuseReason::BudgetSpent
+            }
+        ),
+        "§4: STRANGER_BUDGET is 1"
+    );
+
+    // The line the guide warns about forgetting.
+    gate.mark_accepted("stranger");
+    assert!(
+        matches!(gate.admit("stranger", now), InviteVerdict::Allow),
+        "§4: mark_accepted promotes permanently — forgetting it leaves every \
+         established contact on the 1-invite stranger budget"
+    );
+
+    assert_eq!(InviteGate::STRANGER_BUDGET, 1, "§4 quotes this");
+    assert_eq!(InviteGate::CONTACT_BUDGET, 8, "§4 quotes this");
+    assert_eq!(InviteGate::REFILL_SECS, 86_400, "§4 quotes this");
+}
+
+/// Consume a value at a stated type. The call is what makes each line a real
+/// use rather than a no-effect binding, and the turbofish is the assertion.
+#[allow(dead_code)]
+fn pin<T>(_: T) {}
+
+/// §2/§5 — the resolution entry points and result types the harness
+/// destructures, plus the logging call.
+///
+/// Compile-only: exercising these needs a live directory, but their SHAPES are
+/// what the guide's code blocks depend on.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    clippy::diverging_sub_expression
+)]
+async fn the_documented_call_shapes_typecheck() {
+    let lens: PersistLens<'_> = unreachable!();
+
+    // §2: `resolve` — identifier in, Subject out.
+    pin::<Result<Subject, LadderStall>>(ciris_edge::contact::resolve(&lens, "frank-abc123").await);
+
+    // §2: `discover` — identifier + routes in, Discovered out.
+    let routes: &dyn ciris_edge::contact::RouteLens = unreachable!();
+    let found: Result<Discovered, LadderStall> =
+        ciris_edge::contact::discover(&lens, routes, "frank-abc123").await;
+
+    // The fields §2 tells the harness to read. `pin` consumes each one, so the
+    // reference is a real use and the TYPE is what is being asserted.
+    let found: Discovered = found.unwrap();
+    pin::<&Subject>(&found.subject);
+    pin::<&String>(&found.subject.fed_id);
+    pin::<&Vec<String>>(&found.subject.nodes);
+    pin::<&Vec<String>>(&found.reachable);
+    pin::<&IdentityKind>(&found.subject.resolved_from);
+
+    // §5's one-shape-per-rung logger.
+    ciris_edge::contact::log_rung(Rung::Discover, "frank-abc123", None);
+}
+
+/// §2 — `ReticulumRoutes` is the production `RouteLens`, and it is behind the
+/// `transport-reticulum` feature. The guide says so; this pins that it is true,
+/// because a downstream build that omits the feature gets a confusing
+/// "no `ReticulumRoutes` in `contact`" rather than a missing-feature message.
+#[cfg(feature = "transport-reticulum")]
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    clippy::diverging_sub_expression
+)]
+fn the_production_route_lens_exists_under_its_feature() {
+    let routes: ciris_edge::contact::ReticulumRoutes<'_> = unreachable!();
+    pin::<&dyn ciris_edge::contact::RouteLens>(&routes);
+}
