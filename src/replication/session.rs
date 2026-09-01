@@ -955,7 +955,7 @@ impl Session {
                         if let Some(signer) = crate::replication::missing_signer::missing_signer_of(
                             self.kind, env_bytes,
                         ) {
-                            provider.note_missing_signer(self.kind, &signer);
+                            provider.note_missing_signer(self.kind, &signer, source_peer);
                         }
                     }
                     tracing::warn!(
@@ -1957,8 +1957,16 @@ mod tests {
             fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
-            fn note_missing_signer(&self, _k: EnvelopeKind, signer: &str) {
-                self.0.lock().unwrap().push(signer.to_string());
+            fn note_missing_signer(
+                &self,
+                _k: EnvelopeKind,
+                signer: &str,
+                source_peer: Option<&str>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{signer}@{}", source_peer.unwrap_or("-")));
             }
         }
         struct TransientRefuser;
@@ -1995,8 +2003,10 @@ mod tests {
         responder.on_deliver(&deliver, &provider, &TransientRefuser, Some("peer-x"));
         assert_eq!(
             provider.0.lock().unwrap().as_slice(),
-            ["steward-abc123"],
-            "a TRANSIENT refusal must record the signer it waits on — without \
+            ["steward-abc123@peer-x"],
+            "a TRANSIENT refusal must record the signer it waits on, AND the peer \
+             that delivered the row — a Pull to any other peer reads that peer's \
+             own lookup_public_key and comes back empty — without \
              this the resolver is dead code and the kill order never lands"
         );
 

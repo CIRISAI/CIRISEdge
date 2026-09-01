@@ -1203,9 +1203,6 @@ enum QuarantineConsult {
 /// drains as pulls land.
 const MISSING_SIGNER_CAP: usize = 1024;
 
-/// How many missing signers become Pulls in a single round.
-const MISSING_SIGNER_DRAIN: usize = 32;
-
 /// Production-grade [`ReplicationDirectory`] implementation over
 /// persist's `FederationDirectory`.
 pub struct FederationDirectoryReplicationBridge {
@@ -1333,7 +1330,7 @@ pub struct FederationDirectoryReplicationBridge {
     /// to grow this without limit, so past the cap new names are DROPPED rather
     /// than evicting older ones — the older names are the ones with rows already
     /// waiting on them.
-    missing_signers: Mutex<std::collections::BTreeSet<String>>,
+    missing_signers: Mutex<std::collections::BTreeMap<String, Option<String>>>,
     /// CIRISEdge#531 DEPTH — the largest row count ANY single page read has
     /// returned on this bridge. The flat bound's own witness, in the same
     /// discipline as [`Self::sweep_gate`]'s `max_in_flight` and
@@ -1498,7 +1495,7 @@ impl FederationDirectoryReplicationBridge {
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
-            missing_signers: Mutex::new(std::collections::BTreeSet::new()),
+            missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -1549,7 +1546,7 @@ impl FederationDirectoryReplicationBridge {
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
-            missing_signers: Mutex::new(std::collections::BTreeSet::new()),
+            missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
@@ -1583,6 +1580,18 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_local_key_id(mut self, local_key_id: Option<String>) -> Self {
         self.local_key_id = local_key_id;
+        self
+    }
+
+    /// CIRISEdge#552 — override the agent mode (builder, TEST ONLY).
+    ///
+    /// Production reads the mode from the Edge via `start_replication`; this
+    /// exists so a unit test can exercise the Server-mode branches without
+    /// standing up the Python host path.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_agent_mode_for_test(mut self, mode: crate::AgentMode) -> Self {
+        self.config.mode = mode;
         self
     }
 
@@ -2292,7 +2301,12 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// that advertised them (the holder map). In-memory and local only: this is
     /// an OBSERVATION, not a claim, and CIRISPersist#785 is where it becomes
     /// durable.
-    fn note_missing_signer(&self, _kind: EnvelopeKind, signer_key_id: &str) {
+    fn note_missing_signer(
+        &self,
+        _kind: EnvelopeKind,
+        signer_key_id: &str,
+        source_peer: Option<&str>,
+    ) {
         // Gated on the KEY plane's retention, not on this record's plane. The
         // row that stalled can be any kind; the row it waits on is always a Key.
         // Under `Bodies` that Key body replicates on its own and the #544 backoff
@@ -2305,7 +2319,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             return;
         }
         if let Ok(mut pending) = self.missing_signers.lock() {
-            if pending.len() >= MISSING_SIGNER_CAP && !pending.contains(signer_key_id) {
+            if pending.len() >= MISSING_SIGNER_CAP && !pending.contains_key(signer_key_id) {
                 tracing::warn!(
                     signer = %signer_key_id,
                     cap = MISSING_SIGNER_CAP,
@@ -2313,23 +2327,27 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 );
                 return;
             }
-            pending.insert(signer_key_id.to_string());
+            let slot = pending.entry(signer_key_id.to_string()).or_insert(None);
+            // Never downgrade a routed name to unrouted: a known holder
+            // candidate is strictly better than "ask anyone", and a later
+            // contact lookup for the same signer must not erase it.
+            if slot.is_none() {
+                *slot = source_peer.map(str::to_owned);
+            }
         }
     }
 
-    fn take_missing_signers(&self) -> Vec<String> {
-        let Ok(mut pending) = self.missing_signers.lock() else {
-            return Vec::new();
-        };
-        // A bounded batch per call: the set can hold a federation's worth of
-        // names after a cold start, and turning all of them into Pulls in one
-        // round is a burst this node chose to send. The rest keep until the
-        // next round.
-        let take: Vec<String> = pending.iter().take(MISSING_SIGNER_DRAIN).cloned().collect();
-        for name in &take {
-            pending.remove(name);
-        }
-        take
+    fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
+        let mut pending = self.missing_signers.lock().ok()?;
+        // Prefer a name this peer actually delivered; fall back to an unrouted
+        // one so a contact lookup gets tried against successive peers.
+        let pick = pending
+            .iter()
+            .find(|(_, src)| src.as_deref() == Some(peer_key_id))
+            .or_else(|| pending.iter().find(|(_, src)| src.is_none()))
+            .map(|(name, _)| name.clone())?;
+        pending.remove(&pick);
+        Some(pick)
     }
 
     fn note_known_hashes(
@@ -9679,6 +9697,69 @@ mod tests {
                 .await
                 .is_empty(),
             "an unattributed Pull serves nothing"
+        );
+    }
+
+    /// CIRISEdge#552 (B) — a recorded signer is routed back to the peer that
+    /// DELIVERED the unverifiable row, and taken one at a time.
+    ///
+    /// A Pull is answered out of the responding peer's own `lookup_public_key`.
+    /// A node-wide queue drained by whichever coordinator ticked first would ask
+    /// an arbitrary peer for a third party's key, get an empty Summary, and
+    /// consume the recovery without ever reaching a holder.
+    #[tokio::test]
+    async fn a_missing_signer_is_routed_to_the_peer_that_delivered_the_row() {
+        let (_backend, bridge) = make_bridge(&[]);
+        // Server mode, or the note is a no-op by design (under Bodies the key
+        // body replicates on its own).
+        let bridge = bridge.with_agent_mode_for_test(crate::AgentMode::Server);
+
+        bridge.note_missing_signer(EnvelopeKind::Attestation, "signer-A", Some("peer-1"));
+        bridge.note_missing_signer(EnvelopeKind::Attestation, "signer-B", Some("peer-2"));
+
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-2").as_deref(),
+            Some("signer-B"),
+            "peer-2 must get the name IT delivered, not whichever was queued first"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-1").as_deref(),
+            Some("signer-A"),
+            "and peer-1 gets its own"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-1"),
+            None,
+            "taken names are removed — a name left queued would re-Pull every round"
+        );
+    }
+
+    /// An UNROUTED name (a contact lookup has no delivering peer) is offered to
+    /// any coordinator, so successive rounds try successive peers until one
+    /// holds it — and a later routed note must not be downgraded by it.
+    #[tokio::test]
+    async fn an_unrouted_signer_is_offered_to_any_peer() {
+        let (_backend, bridge) = make_bridge(&[]);
+        let bridge = bridge.with_agent_mode_for_test(crate::AgentMode::Server);
+
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-C", None);
+        assert_eq!(
+            bridge.take_missing_signer_for("any-peer").as_deref(),
+            Some("wanted-C"),
+            "an unrouted name is available to whichever coordinator asks"
+        );
+
+        // A holder candidate must never be erased by a later unrouted note.
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-D", Some("peer-9"));
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-D", None);
+        assert_eq!(
+            bridge.take_missing_signer_for("someone-else"),
+            None,
+            "the routed name stays routed — a known holder beats ask-anyone"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("peer-9").as_deref(),
+            Some("wanted-D")
         );
     }
 

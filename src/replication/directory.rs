@@ -210,14 +210,24 @@ pub trait ReplicationDirectory: Send + Sync {
     /// Sync by design, like [`Self::note_known_hashes`] — it sits on the apply
     /// loop. Whether the key is genuinely absent is decided at the DRAIN, which
     /// can afford the store lookup this cannot.
-    fn note_missing_signer(&self, _kind: EnvelopeKind, _signer_key_id: &str) {}
+    fn note_missing_signer(
+        &self,
+        _kind: EnvelopeKind,
+        _signer_key_id: &str,
+        _source_peer: Option<&str>,
+    ) {
+    }
 
     /// CIRISEdge#552 (B) — see [`StateProvider::take_missing_signers`].
     ///
     /// [`StateProvider::take_missing_signers`]:
     ///     super::summary::StateProvider::take_missing_signers
-    fn take_missing_signers(&self) -> Vec<String> {
-        Vec::new()
+    /// CIRISEdge#552 (B) — see [`StateProvider::take_missing_signer_for`].
+    ///
+    /// [`StateProvider::take_missing_signer_for`]:
+    ///     super::summary::StateProvider::take_missing_signer_for
+    fn take_missing_signer_for(&self, _peer_key_id: &str) -> Option<String> {
+        None
     }
 
     fn retry_suppressed(&self, _kind: EnvelopeKind, _envelope_hash: &[u8; 32]) -> bool {
@@ -342,12 +352,18 @@ impl StateProvider for DirectoryStateAdapter {
         self.inner.note_known_hashes(kind, hashes, advertised_by);
     }
 
-    fn note_missing_signer(&self, kind: EnvelopeKind, signer_key_id: &str) {
-        self.inner.note_missing_signer(kind, signer_key_id);
+    fn note_missing_signer(
+        &self,
+        kind: EnvelopeKind,
+        signer_key_id: &str,
+        source_peer: Option<&str>,
+    ) {
+        self.inner
+            .note_missing_signer(kind, signer_key_id, source_peer);
     }
 
-    fn take_missing_signers(&self) -> Vec<String> {
-        self.inner.take_missing_signers()
+    fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
+        self.inner.take_missing_signer_for(peer_key_id)
     }
 
     fn retry_suppressed(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
@@ -647,11 +663,19 @@ mod tests {
             ) -> ApplyOutcome {
                 ApplyOutcome::Admitted
             }
-            fn note_missing_signer(&self, _k: EnvelopeKind, signer: &str) {
-                self.noted.lock().unwrap().push(signer.to_string());
+            fn note_missing_signer(
+                &self,
+                _k: EnvelopeKind,
+                signer: &str,
+                source_peer: Option<&str>,
+            ) {
+                self.noted
+                    .lock()
+                    .unwrap()
+                    .push(format!("{signer}@{}", source_peer.unwrap_or("-")));
             }
-            fn take_missing_signers(&self) -> Vec<String> {
-                vec!["drained-from-inner".to_string()]
+            fn take_missing_signer_for(&self, peer: &str) -> Option<String> {
+                Some(format!("drained-for-{peer}"))
             }
         }
 
@@ -659,17 +683,23 @@ mod tests {
         let adapter =
             DirectoryStateAdapter::new(Arc::clone(&inner) as Arc<dyn ReplicationDirectory>);
 
-        StateProvider::note_missing_signer(&adapter, EnvelopeKind::Attestation, "steward-xyz");
+        StateProvider::note_missing_signer(
+            &adapter,
+            EnvelopeKind::Attestation,
+            "steward-xyz",
+            Some("peer-src"),
+        );
         assert_eq!(
             inner.noted.lock().unwrap().as_slice(),
-            ["steward-xyz"],
+            ["steward-xyz@peer-src"],
             "note_missing_signer must reach the inner directory — an unforwarded \
              seam silently takes the no-op default (the #552 A inertness bug)"
         );
         assert_eq!(
-            StateProvider::take_missing_signers(&adapter),
-            ["drained-from-inner"],
-            "take_missing_signers must reach the inner directory too"
+            StateProvider::take_missing_signer_for(&adapter, "peer-src").as_deref(),
+            Some("drained-for-peer-src"),
+            "take_missing_signer_for must reach the inner directory too, carrying \
+             the peer it is routing for"
         );
     }
 

@@ -72,6 +72,11 @@ pub enum RefuseReason {
     AlreadyPending,
     /// This sender has spent its budget and has not been accepted before.
     BudgetSpent,
+    /// CIRISEdge#554 — the receiver is already tracking as many strangers as it
+    /// will hold, and none could be released. A GLOBAL bound, not a per-sender
+    /// one: identity rotation defeats a per-sender budget by never reusing a
+    /// sender, so without a ceiling the map is the attack surface.
+    ReceiverAtCapacity,
 }
 
 /// Per-(sender, receiver) invite budget. One instance per receiving node.
@@ -111,9 +116,61 @@ impl InviteGate {
         Self::default()
     }
 
+    /// How many senders one receiver tracks. Past it, strangers whose budget
+    /// has fully refilled are released; if none can be, a new stranger is
+    /// refused outright rather than growing the map.
+    const SENDER_CAP: usize = 65_536;
+
+    /// Drop strangers whose budget has fully refilled.
+    ///
+    /// This is free, not a tradeoff: a stranger past `REFILL_SECS` has `spent`
+    /// reset on its next `admit`, so its retained state is
+    /// INDISTINGUISHABLE from that of a sender never seen before. Forgetting it
+    /// changes no verdict.
+    ///
+    /// `ever_accepted` senders are never released — that bit is the whole point
+    /// of the gate (an established contact must not be throttled like a
+    /// stranger), and it cannot be reconstructed from an invite.
+    fn release_refilled_strangers(&mut self, now: Ts) {
+        let before = self.senders.len();
+        self.senders.retain(|_, st| {
+            st.ever_accepted || now.saturating_sub(st.last_attempt) < Self::REFILL_SECS
+        });
+        let released = before - self.senders.len();
+        if released > 0 {
+            tracing::debug!(
+                released,
+                remaining = self.senders.len(),
+                "invite gate released refilled strangers (CIRISEdge#554)"
+            );
+        }
+    }
+
+    /// How many senders this receiver is currently tracking.
+    #[must_use]
+    pub fn tracked_senders(&self) -> usize {
+        self.senders.len()
+    }
+
     /// Decide whether an invite from `sender` reaches the person.
     #[must_use]
     pub fn admit(&mut self, sender: &str, now: Ts) -> InviteVerdict {
+        // CIRISEdge#554 — bound the map BEFORE inserting a new stranger.
+        //
+        // A per-sender budget assumes the sender is a fixed thing to charge.
+        // Rotating identities breaks that assumption completely: every first
+        // invite is a fresh sender, allowed by its fresh budget, and it costs
+        // the receiver another permanent entry. The per-sender rule was
+        // therefore both bypassed and the memory-growth vector, which is the
+        // opposite of what it was for.
+        if !self.senders.contains_key(sender) && self.senders.len() >= Self::SENDER_CAP {
+            self.release_refilled_strangers(now);
+            if self.senders.len() >= Self::SENDER_CAP {
+                return InviteVerdict::Refuse {
+                    reason: RefuseReason::ReceiverAtCapacity,
+                };
+            }
+        }
         let state = self
             .senders
             .entry(sender.to_owned())
@@ -279,6 +336,69 @@ mod tests {
             g.admit("real-person", T0 + 100),
             InviteVerdict::Allow,
             "a flood from one sender must not silence everyone else"
+        );
+    }
+
+    /// CIRISEdge#554 — rotating identities must not grow the receiver without
+    /// bound, and must not evict an established contact to do it.
+    #[test]
+    fn identity_rotation_cannot_grow_the_receiver_without_bound() {
+        let mut gate = InviteGate::new();
+        let t0: super::Ts = 1_000_000;
+
+        // An established contact, seen once and accepted. This bit is the one
+        // thing the gate cannot reconstruct, so it must survive everything.
+        assert!(matches!(gate.admit("friend", t0), InviteVerdict::Allow));
+        gate.mark_accepted("friend");
+
+        // A flood of never-repeated senders, all at the same instant so none can
+        // be released as refilled.
+        for i in 0..(InviteGate::SENDER_CAP + 500) {
+            let _ = gate.admit(&format!("rotating-{i}"), t0);
+        }
+
+        assert!(
+            gate.tracked_senders() <= InviteGate::SENDER_CAP,
+            "the map must stay bounded under identity rotation: {} entries",
+            gate.tracked_senders()
+        );
+        assert!(
+            matches!(
+                gate.admit("another-stranger", t0),
+                InviteVerdict::Refuse {
+                    reason: RefuseReason::ReceiverAtCapacity
+                }
+            ),
+            "at capacity with nothing releasable, a NEW stranger is refused \
+             outright — the global bound is the control, since a per-sender \
+             budget is exactly what rotation defeats"
+        );
+
+        // The established contact still gets through, and is not throttled as a
+        // stranger.
+        assert!(
+            matches!(gate.admit("friend", t0), InviteVerdict::Allow),
+            "an accepted contact must never be evicted or throttled by a flood \
+             of strangers — that is the anti-spam control breaking the \
+             conversations it exists to protect"
+        );
+    }
+
+    /// Once a stranger's budget has refilled, its retained state is
+    /// indistinguishable from never having been seen — so releasing it is free
+    /// and reopens capacity.
+    #[test]
+    fn refilled_strangers_are_released_to_make_room() {
+        let mut gate = InviteGate::new();
+        let t0: super::Ts = 1_000_000;
+        for i in 0..InviteGate::SENDER_CAP {
+            let _ = gate.admit(&format!("old-{i}"), t0);
+        }
+        let later = t0 + InviteGate::REFILL_SECS + 1;
+        assert!(
+            matches!(gate.admit("newcomer", later), InviteVerdict::Allow),
+            "after the refill window the old strangers are releasable, so a new \
+             sender is admitted rather than refused at capacity"
         );
     }
 }

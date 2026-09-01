@@ -380,51 +380,56 @@ impl ReplicationCoordinator {
     /// forget: the testimony converges over the peer's next round, matching the
     /// anti-entropy model — sending the Pull carries no session state (only the
     /// reply does), so there is nothing to await here.
-    /// CIRISEdge#552 (B) — turn recorded missing signers into Key Pulls.
+    /// CIRISEdge#552 (B) — recover ONE signer key this peer can actually serve.
     ///
     /// Only the `Key` coordinator does this: [`Self::start_pull`] sends a
     /// `PullMessage { kind: self.kind, .. }`, and the row every stalled record
     /// waits on is a Key row.
     ///
-    /// This asks a peer for a THIRD PARTY's key, which `subject_holdings`
-    /// refused until CIRISEdge#552 widened the four unconditionally-`public`
-    /// planes to any attributed requester. That widening is what makes this
-    /// work, and it disclosed nothing new — a Key record is a public signed
-    /// envelope; only its ADDRESSABILITY changed.
+    /// **One per round, routed to the delivering peer.** Both constraints come
+    /// from the mechanism, not from caution. A Pull is answered out of the
+    /// responding peer's own `lookup_public_key`, so a node-wide queue drained
+    /// by whichever coordinator ticked first would ask an arbitrary peer for a
+    /// third party's key, get an empty Summary, and consume the queued recovery
+    /// without reaching a holder. And the on-demand exemption is a ROUND
+    /// counter, not a per-request ledger, so a batch would outrun its own
+    /// exemption and the later replies would be suppressed as ordinary
+    /// hash-first traffic.
     ///
-    /// Called from the scheduler before a round, so the reply is fetched by that
-    /// round's Summary handling.
+    /// A name with no recorded source (a contact lookup has no delivering peer)
+    /// is offered to any coordinator, so successive rounds try successive peers.
     ///
-    /// Returns how many Pulls were SENT. A send failure is logged and the name
-    /// is not re-queued here: the record that named it refuses transient again
-    /// on its next offer and re-notes it, so the retry rides #544's backoff and
-    /// cannot become a hot loop against an unreachable peer.
+    /// Returns how many Pulls were SENT (0 or 1). A send failure is logged and
+    /// the name is not re-queued here: the record that named it refuses
+    /// transient again on its next offer and re-notes it, so the retry rides
+    /// #544's backoff rather than a hot loop against an unreachable peer.
     pub async fn pull_missing_signers(&self) -> usize {
         if self.kind != EnvelopeKind::Key {
             return 0;
         }
-        let names = self.provider.take_missing_signers();
-        let mut sent = 0usize;
-        for name in names {
-            match self.start_pull(&name).await {
-                Ok(()) => sent += 1,
-                Err(e) => tracing::warn!(
+        let Some(name) = self.provider.take_missing_signer_for(&self.peer_key_id) else {
+            return 0;
+        };
+        match self.start_pull(&name).await {
+            Ok(()) => {
+                tracing::debug!(
+                    peer = %self.peer_key_id,
+                    signer = %name,
+                    "pulled a Key row for a signer that stalled admission (CIRISEdge#552)"
+                );
+                1
+            }
+            Err(e) => {
+                tracing::warn!(
                     peer = %self.peer_key_id,
                     signer = %name,
                     error = %e,
                     "missing-signer Pull send failed — the row that named it will \
                      re-note it on its next transient refusal (CIRISEdge#552)"
-                ),
+                );
+                0
             }
         }
-        if sent > 0 {
-            tracing::debug!(
-                peer = %self.peer_key_id,
-                sent,
-                "pulled Key rows for signers that stalled admission (CIRISEdge#552)"
-            );
-        }
-        sent
     }
 
     pub async fn start_pull(&self, subject_key_id: &str) -> Result<(), CoordinatorError> {

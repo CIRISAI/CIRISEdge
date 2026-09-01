@@ -139,6 +139,19 @@ pub trait DirectoryLens: Send + Sync {
     async fn request_key_body(&self, _key_id: &str) -> bool {
         false
     }
+
+    /// CIRISEdge#552 — can this node read its directory at all?
+    ///
+    /// Separates "the key is absent" from "the local read failed", which
+    /// `identity_type_of` reports identically as `None`. Only the first is
+    /// repairable by a peer; treating the second as absence emits a Pull no
+    /// reply can satisfy while telling an operator to wait for a round that
+    /// will not help.
+    ///
+    /// Defaults to `true` — a lens with no backend to fail.
+    async fn directory_readable(&self) -> bool {
+        true
+    }
 }
 
 /// Resolve any identifier to the person and the nodes that reach them.
@@ -163,6 +176,14 @@ pub async fn resolve(lens: &dyn DirectoryLens, any_id: &str) -> Result<Subject, 
     // different and the wait is bounded, so the stall must say so; a caller
     // told to wait for an announce that already happened waits forever.
     let Some(identity_type) = lens.identity_type_of(any_id).await else {
+        // A local read failure is not an absence. Check before queueing: a Pull
+        // cannot repair a backend this node cannot read, and reporting
+        // `BodyFetchQueued` would promise a remedy that never arrives.
+        if !lens.directory_readable().await {
+            return Err(LadderStall::DirectoryUnreadable {
+                key_id: any_id.to_owned(),
+            });
+        }
         return Err(if lens.request_key_body(any_id).await {
             LadderStall::BodyFetchQueued {
                 key_id: any_id.to_owned(),
@@ -277,6 +298,10 @@ pub enum LadderStall {
     ConsentNotGranted { fed_id: String },
     /// The rung before this one has not completed.
     PriorRungIncomplete { rung: Rung, prior: Rung },
+    /// CIRISEdge#552 — the local directory could not be read. NOT
+    /// self-resolving: no peer reply repairs a local backend failure, so
+    /// retrying is the one thing that cannot help.
+    DirectoryUnreadable { key_id: String },
     /// CIRISEdge#552 — this node knows the key as a HASH and has queued a fetch
     /// for its body. Self-resolving, but for a different reason than
     /// [`Self::NotYetDiscovered`]: nothing is waiting on the subject to
@@ -325,6 +350,12 @@ impl LadderStall {
                  instead, or check that the identifier is the one you meant — this \
                  will not resolve by waiting."
             ),
+            Self::DirectoryUnreadable { key_id } => format!(
+                "the local federation directory could not be read while resolving \
+                 {key_id}. This is a LOCAL fault — no peer reply repairs it and \
+                 retrying will not help. Check the node's persist backend \
+                 (disk, permissions, migration state) before looking at the mesh."
+            ),
             Self::BodyFetchQueued { key_id } => format!(
                 "{key_id} is known to this node as a hash, but its body was not \
                  held — this node runs hash-first retention. A fetch is queued and \
@@ -356,7 +387,9 @@ impl LadderStall {
             | Self::ConsentNotGranted { .. }
             | Self::PriorRungIncomplete { .. }
             // Terminal by nature: a steward does not become a person.
-            | Self::NotContactable { .. } => false,
+            | Self::NotContactable { .. }
+            // A local backend fault: the one stall retrying cannot fix.
+            | Self::DirectoryUnreadable { .. } => false,
         }
     }
 }
@@ -532,16 +565,23 @@ impl<'a> PersistLens<'a> {
 #[async_trait::async_trait]
 impl DirectoryLens for PersistLens<'_> {
     async fn identity_type_of(&self, key_id: &str) -> Option<String> {
-        // An error and an absence are the SAME answer here on purpose: both mean
-        // "this node cannot say what that key is yet", and the ladder's stall for
-        // that is `NotYetDiscovered`, which self-resolves. Distinguishing them
-        // would produce a second diagnostic with the same remedy.
         self.directory
             .lookup_public_key(key_id)
             .await
             .ok()
             .flatten()
             .map(|record| record.identity_type)
+    }
+
+    async fn directory_readable(&self) -> bool {
+        // CIRISEdge#552 — an error and an absence were folded together here on
+        // the reasoning that both mean "cannot say yet" and share a remedy. They
+        // no longer do. An ABSENCE on a hash-first node queues a body fetch and
+        // reports `BodyFetchQueued`, whose remedy is "the next Key round carries
+        // it". A local backend failure cannot be repaired by any peer, so that
+        // remedy is false and the Pull is pointless traffic emitted on every
+        // retry. Probing the same read is enough to separate them.
+        self.directory.lookup_public_key("").await.is_ok()
     }
 
     async fn owner_of(&self, key_id: &str) -> Option<String> {
@@ -569,7 +609,14 @@ impl DirectoryLens for PersistLens<'_> {
         ) {
             return false;
         }
-        replication.note_missing_signer(crate::replication::protocol::EnvelopeKind::Key, key_id);
+        // No delivering peer: a contact lookup is not repairing a row someone
+        // sent us, so there is no holder candidate. Recorded unrouted, which
+        // makes successive rounds try it against successive peers.
+        replication.note_missing_signer(
+            crate::replication::protocol::EnvelopeKind::Key,
+            key_id,
+            None,
+        );
         true
     }
 }
@@ -912,6 +959,65 @@ mod tests {
             err.remedy().contains("already did"),
             "the remedy must NOT tell an operator to wait for an announce that \
              already happened: {}",
+            err.remedy()
+        );
+    }
+
+    /// CIRISEdge#552 — a local backend failure must NOT be reported as a
+    /// queued fetch.
+    ///
+    /// `identity_type_of` answers `None` for both "absent" and "the read
+    /// failed". Only the first is repairable by a peer. Conflating them emits a
+    /// Pull no reply can satisfy — on every retry — while telling an operator
+    /// the next Key round will resolve it, which is a remedy that never comes.
+    #[tokio::test]
+    async fn a_backend_failure_is_not_reported_as_a_queued_fetch() {
+        struct BrokenBackendLens {
+            requested: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl super::DirectoryLens for BrokenBackendLens {
+            async fn identity_type_of(&self, _key_id: &str) -> Option<String> {
+                None // indistinguishable from absence, by construction
+            }
+            async fn owner_of(&self, _key_id: &str) -> Option<String> {
+                None
+            }
+            async fn nodes_owned_by(&self, _fed_id: &str) -> Vec<String> {
+                Vec::new()
+            }
+            async fn directory_readable(&self) -> bool {
+                false
+            }
+            async fn request_key_body(&self, key_id: &str) -> bool {
+                self.requested.lock().unwrap().push(key_id.to_owned());
+                true
+            }
+        }
+
+        let lens = BrokenBackendLens {
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+        let err = super::resolve(&lens, "frank-abc123")
+            .await
+            .expect_err("a node that cannot read its directory resolves nothing");
+
+        assert!(
+            lens.requested.lock().unwrap().is_empty(),
+            "no Pull may be emitted for a LOCAL read failure — no peer reply can \
+             repair it, so the traffic is pointless on every retry"
+        );
+        assert!(
+            matches!(err, LadderStall::DirectoryUnreadable { .. }),
+            "expected DirectoryUnreadable, got {err:?}"
+        );
+        assert!(
+            !err.self_resolving(),
+            "retrying is the one thing that cannot fix a local backend fault"
+        );
+        assert!(
+            err.remedy().contains("LOCAL"),
+            "the remedy must send an operator to the node, not the mesh: {}",
             err.remedy()
         );
     }
