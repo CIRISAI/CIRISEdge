@@ -130,6 +130,19 @@ fn build_bridge(
         )
         .with_self_provider(self_provider)
         .with_local_key_id(config.local_key_id.clone())
+        // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
+        // legs live (leg A ∧ leg B against this node's own trust base), the
+        // owner-conferred rung fail-closed pending CIRISPersist#788. Installed
+        // iff a local identity exists, because leg B and the cache subject are
+        // both keyed on it; without one the tier stays fail-closed `None`.
+        .with_serve_tier_resolver(config.local_key_id.clone().map(|local| {
+            std::sync::Arc::new(
+                crate::replication::serve_tier::DirectoryServeTierResolver::new(
+                    Arc::clone(directory),
+                    local,
+                ),
+            ) as std::sync::Arc<dyn crate::replication::serve_tier::ServeTierResolver>
+        }))
         .with_metrics(config.metrics.clone())
         .with_mesh_config(mesh_config)
         // Workstream F — installed iff the operator turned enforcement ON. See

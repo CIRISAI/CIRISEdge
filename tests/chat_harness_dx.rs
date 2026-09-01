@@ -18,32 +18,33 @@ use ciris_edge::invite_gate::{InviteGate, InviteVerdict, RefuseReason, Ts};
 use ciris_edge::replication::ReplicationRuntimeConfig;
 use ciris_edge::AgentMode;
 
-/// §0 — the two fields a Rust composer must set itself, because the Python
-/// entry point sets them and a default-constructed config does not.
+/// §0 — the ONE field a Rust composer must set itself: `local_key_id`. The
+/// serve-tier resolver, the own-record Pull arm, and missing-signer recovery
+/// are all keyed on it, and a default-constructed config leaves it `None` —
+/// silently inert, not broken.
+///
+/// `AgentMode` is deliberately NOT here any more: `BridgeConfig` has no mode
+/// field. The directory role (retention, identifier lookups) keys on the
+/// node's own `infra:serve` conferral, resolved from the directory
+/// (ROLE_MATRIX axis 3) — conferred by the owner, blessed by the trust root
+/// for canonicals. Mode stays what it always was: listener + queue posture on
+/// the Edge itself.
 #[test]
 fn the_wiring_the_guide_says_is_mandatory_exists() {
-    let mut config = ReplicationRuntimeConfig::default();
-
-    config.bridge.mode = AgentMode::Server;
-    config.local_key_id = Some("node-abc123".to_string());
-
-    assert!(
-        matches!(config.bridge.mode, AgentMode::Server),
-        "§0 tells the server to set bridge.mode; it must remain settable"
-    );
+    let config = ReplicationRuntimeConfig {
+        local_key_id: Some("node-abc123".to_string()),
+        ..Default::default()
+    };
     assert!(
         config.local_key_id.is_some(),
-        "§0 tells the server to set local_key_id; without it the Pull responder \
-         cannot recognise a request for its own record"
+        "§0 tells the server to set local_key_id; without it the serve-tier \
+         resolver cannot run and the Pull responder cannot recognise its own \
+         record"
     );
 
-    // And the default really is the quiet one the guide warns about.
-    let default = ReplicationRuntimeConfig::default();
-    assert!(
-        matches!(default.bridge.mode, AgentMode::Proxy),
-        "the guide says the default is Proxy and looks correct while behaving \
-         as a proxy — if that changes, §0's warning is wrong"
-    );
+    // AgentMode still exists — on the Edge, for listener/queue. Its absence
+    // from BridgeConfig is the point: the v18.12.1 mis-key is unrepresentable.
+    assert!(matches!(AgentMode::default(), AgentMode::Proxy));
 }
 
 /// §1 — the rung vocabulary, and `previous()` for pointing at the right place.

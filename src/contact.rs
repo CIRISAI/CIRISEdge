@@ -243,6 +243,283 @@ pub async fn resolve(lens: &dyn DirectoryLens, any_id: &str) -> Result<Subject, 
     })
 }
 
+/// Where a contact request came from — a pasted code, or a bare identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactInputSource {
+    /// A `CIRIS-V…` fedcode. **Self-contained**: it carries the public key, so
+    /// it works for someone the directory has never heard of.
+    Code,
+    /// A bare `key_id`. Resolvable only if the directory already knows it,
+    /// which for a stranger it does not and will not.
+    Identifier,
+}
+
+/// The key material a pasted code carries, for the caller to ADMIT.
+///
+/// This is the whole reason a code exists. For a stranger the directory can
+/// supply nothing — that is what "stranger" means — so the pubkey has to travel
+/// with the invitation. Registering it is what turns a decoded code into a
+/// contact whose signatures this node can verify.
+///
+/// Edge deliberately does not register it: admission is the host's gate
+/// (`register_federation_key`), and edge is the substrate that hands it a
+/// verified, typed value rather than a string to re-parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeAdmission {
+    /// The federation address to register the key under. Verified to be derived
+    /// from `pubkey_ed25519_base64`.
+    pub key_id: String,
+    /// Ed25519 public key, base64 standard, raw 32 bytes.
+    pub pubkey_ed25519_base64: String,
+    /// `"user"` / `"agent"` / `"node"` / `"family"` / `"community"` — the wire
+    /// string persist's `identity_type` expects.
+    pub identity_type: &'static str,
+    /// Optional transport hint (e.g. a public base URL) the sender offered.
+    pub transport_hint: Option<String>,
+    /// Display-only alias the sender suggested. Never an authorization input.
+    pub alias_hint: Option<String>,
+}
+
+/// One pasted string, classified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactCandidate {
+    /// The federation address this refers to, either decoded from the code or
+    /// taken verbatim.
+    pub key_id: String,
+    /// What kind of entity it names.
+    pub kind: IdentityKind,
+    /// How it arrived.
+    pub source: ContactInputSource,
+    /// `Some` only for a code: the material to admit before this contact can be
+    /// verified. `None` for a bare identifier — there is nothing new to admit.
+    pub admission: Option<CodeAdmission>,
+}
+
+/// Classify what a person typed into "Add contact" — **a code or an ID**.
+///
+/// # Why this exists
+///
+/// The two inputs are not interchangeable and must never be confused. A code
+/// carries a public key; an identifier is a lookup into a directory that, for a
+/// stranger, will never contain them. Posting a code into a `key_id` field
+/// produces `unknown_fed_id` — a correct answer to the wrong question, and
+/// exactly the failure CIRISEdge#526 reported: three doors, all shut, because
+/// nothing decoded the one input that carries what a stranger needs.
+///
+/// Confusion is impossible here rather than merely discouraged: a fedcode has an
+/// unambiguous `CIRIS-V…` prefix, so anything carrying it is a code **or an
+/// error** — never silently demoted to an identifier.
+///
+/// # Security
+///
+/// A code is not a credential and this function does not treat it as one.
+/// `fedcode::decode` verifies a CRC, which proves only that the code survived
+/// transit intact; the sender authored every byte and can claim any `key_id`.
+/// So the claimed `key_id` is re-derived from the pubkey the code carries, and a
+/// mismatch is refused as [`LadderStall::CodeIdentityMismatch`]. Without that
+/// check, "paste a code to add a contact" is an impersonation primitive:
+/// register an attacker's key under a victim's address and every signature the
+/// victim should make becomes forgeable.
+///
+/// What it still does NOT establish: that the human who sent the code is who
+/// they say. Nothing in a self-issued code can. That is what the out-of-band
+/// exchange and the receiving human's judgement are for.
+///
+/// # Errors
+///
+/// [`LadderStall::MalformedCode`] for a `CIRIS-V…` string that will not decode,
+/// and [`LadderStall::CodeIdentityMismatch`] when the code's key does not derive
+/// its claimed address. Both TERMINAL — neither improves by retrying.
+pub fn parse_contact_input(raw: &str) -> Result<ContactCandidate, LadderStall> {
+    let trimmed = raw.trim();
+
+    if !looks_like_fedcode(trimmed) {
+        return Ok(ContactCandidate {
+            key_id: trimmed.to_owned(),
+            // A bare identifier says nothing about what it names; only the
+            // directory's `identity_type` can, and `resolve` asks it.
+            kind: IdentityKind::Other(String::new()),
+            source: ContactInputSource::Identifier,
+            admission: None,
+        });
+    }
+
+    let decoded =
+        ciris_verify_core::fedcode::decode(trimmed).map_err(|e| LadderStall::MalformedCode {
+            detail: e.to_string(),
+        })?;
+
+    verify_code_binds_its_key(&decoded)?;
+
+    let identity_type = decoded.kind.as_str();
+    Ok(ContactCandidate {
+        key_id: decoded.key_id.clone(),
+        kind: IdentityKind::from_identity_type(identity_type),
+        source: ContactInputSource::Code,
+        admission: Some(CodeAdmission {
+            key_id: decoded.key_id,
+            pubkey_ed25519_base64: decoded.pubkey_ed25519_base64,
+            identity_type,
+            transport_hint: decoded.transport_hint,
+            alias_hint: decoded.alias_hint,
+        }),
+    })
+}
+
+/// Does this string announce itself as a fedcode?
+///
+/// Prefix-only, and deliberately so: the question is "did the user intend a
+/// code", not "is this code valid". A malformed code must surface AS a malformed
+/// code, never fall through to be tried as an identifier — falling through is
+/// what turns a bad paste into a confusing `unknown_fed_id`.
+#[must_use]
+pub fn looks_like_fedcode(raw: &str) -> bool {
+    raw.trim()
+        .trim_start_matches(char::is_whitespace)
+        .to_ascii_uppercase()
+        .starts_with("CIRIS-V")
+}
+
+/// Re-derive the claimed `key_id` from the carried pubkey and require a match.
+///
+/// `derive_key_id(label, pubkey)` is `"<label>-<fingerprint>"` where the
+/// fingerprint is the first [`KEY_ID_FINGERPRINT_LEN`] base32 chars of
+/// `sha256(pubkey)`. The label is operator-chosen cleartext and proves nothing;
+/// the fingerprint is the binding. So the label is taken from the claim and only
+/// the fingerprint half is actually verified — which is the correct reading of
+/// the format, and the reason a re-derivation rather than a substring compare.
+///
+/// [`KEY_ID_FINGERPRINT_LEN`]: ciris_verify_core::fedcode::KEY_ID_FINGERPRINT_LEN
+fn verify_code_binds_its_key(
+    decoded: &ciris_verify_core::fedcode::FedCode,
+) -> Result<(), LadderStall> {
+    use base64::Engine as _;
+
+    let mismatch = || LadderStall::CodeIdentityMismatch {
+        claimed_key_id: decoded.key_id.clone(),
+        derived_key_id: "<undecodable pubkey>".to_string(),
+    };
+
+    let pubkey = base64::engine::general_purpose::STANDARD
+        .decode(decoded.pubkey_ed25519_base64.as_bytes())
+        .map_err(|_| mismatch())?;
+
+    // The label is everything before the LAST hyphen: labels may contain
+    // hyphens, the fingerprint never does.
+    let label = decoded
+        .key_id
+        .rsplit_once('-')
+        .map_or("", |(label, _fingerprint)| label);
+
+    let derived = ciris_verify_core::fedcode::derive_key_id(label, &pubkey);
+    if derived == decoded.key_id {
+        Ok(())
+    } else {
+        Err(LadderStall::CodeIdentityMismatch {
+            claimed_key_id: decoded.key_id.clone(),
+            derived_key_id: derived,
+        })
+    }
+}
+
+/// The outcome of "Add contact", given a code or an ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContactResolution {
+    /// The directory already knows them. Nothing to admit; proceed to the
+    /// consent rung. A re-pasted code for someone already admitted lands here
+    /// too, so pasting twice is idempotent rather than an error.
+    Known(Subject),
+    /// A stranger, from a code. The directory knows nothing about them and that
+    /// is EXPECTED, not a stall — the code carries what the directory cannot.
+    ///
+    /// Admit `admission`, then they resolve normally.
+    AdmitThenRetry {
+        candidate: Box<ContactCandidate>,
+        admission: Box<CodeAdmission>,
+    },
+}
+
+/// **The one call "Add contact" needs.** Takes a code or an ID and says what to
+/// do next.
+///
+/// # The gap this closes (CIRISEdge#526)
+///
+/// Two people who have never met could not become contacts through the UI at
+/// all. Every door was shut: pasting a code posted the raw string as a `key_id`
+/// and was refused `unknown_fed_id`; the peer-claim surface is for claiming your
+/// OWN node (`cohort=self`, pre-filled with the local code); and waiting for the
+/// directory is refused by design, because a body-holding node must not answer
+/// third-party identifier probes.
+///
+/// The missing piece was never the directory — it was that nothing decoded the
+/// one input carrying what a stranger needs. A fedcode ships the public key
+/// alongside the address, so it works precisely when the directory cannot.
+///
+/// # Contract
+///
+/// * A **bare identifier** resolves through the directory exactly as before.
+/// * A **code for someone already known** resolves to [`Known`], so re-pasting
+///   is safe.
+/// * A **code for a stranger** returns [`AdmitThenRetry`] rather than a stall.
+///   The absence from the directory is the expected state, and reporting it as
+///   `NotYetDiscovered` — "wait for replication" — would be advice that never
+///   comes true, since replication will never deliver a stranger's key.
+///
+/// Admission stays the host's: edge hands over a verified, typed
+/// [`CodeAdmission`] and the caller feeds its own `register_federation_key`
+/// gate. Edge never registers a key on the strength of a pasted string.
+///
+/// [`Known`]: ContactResolution::Known
+/// [`AdmitThenRetry`]: ContactResolution::AdmitThenRetry
+///
+/// # Errors
+///
+/// Every [`LadderStall`] `resolve` can produce, plus
+/// [`LadderStall::MalformedCode`] and [`LadderStall::CodeIdentityMismatch`] for
+/// a bad or forged code. Check [`LadderStall::self_resolving`] to decide whether
+/// to retry or surface.
+pub async fn resolve_contact(
+    lens: &dyn DirectoryLens,
+    raw: &str,
+) -> Result<ContactResolution, LadderStall> {
+    let candidate = parse_contact_input(raw)?;
+
+    // Ask the directory first, whatever the input was. A code for someone
+    // already admitted must behave like the identifier for the same person —
+    // otherwise pasting a code twice re-admits a key that is already registered.
+    match resolve(lens, &candidate.key_id).await {
+        Ok(subject) => Ok(ContactResolution::Known(subject)),
+        Err(stall) => {
+            // A code answers "not in the directory". Nothing else does.
+            let recoverable_by_admission = matches!(
+                stall,
+                LadderStall::NotYetDiscovered { .. } | LadderStall::BodyFetchQueued { .. }
+            );
+            let Some(admission) = candidate.admission.clone() else {
+                log_rung(Rung::Discover, &candidate.key_id, Some(&stall));
+                return Err(stall);
+            };
+            if !recoverable_by_admission {
+                // A terminal stall is terminal even with a code in hand: a
+                // steward is still not a contactable person, and a local
+                // backend fault is still local.
+                log_rung(Rung::Discover, &candidate.key_id, Some(&stall));
+                return Err(stall);
+            }
+            tracing::info!(
+                key_id = %candidate.key_id,
+                identity_type = %admission.identity_type,
+                "contact: stranger from a code — the directory does not know them, \
+                 which is expected; admit the carried key (CIRISEdge#526)"
+            );
+            Ok(ContactResolution::AdmitThenRetry {
+                candidate: Box::new(candidate),
+                admission: Box::new(admission),
+            })
+        }
+    }
+}
+
 /// A rung of the ladder. Stable strings — an operator greps these, and a
 /// dashboard groups by them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +592,25 @@ pub enum LadderStall {
     ConsentNotGranted { fed_id: String },
     /// The rung before this one has not completed.
     PriorRungIncomplete { rung: Rung, prior: Rung },
+    /// CIRISEdge#526 — the input looked like a fedcode (it carries the
+    /// `CIRIS-V…` prefix) but did not decode. TERMINAL: a corrupted or
+    /// truncated paste does not repair itself, and treating it as an identifier
+    /// is the bug this variant exists to prevent — that is what produced
+    /// `unknown_fed_id` for a perfectly good code.
+    MalformedCode { detail: String },
+    /// CIRISEdge#526 — the code's `key_id` is NOT derived from the public key
+    /// it carries. TERMINAL, and a security event rather than a typo.
+    ///
+    /// `fedcode::decode` verifies a CRC, which proves the code was not
+    /// corrupted in transit. It proves nothing about authorship: the sender
+    /// builds every byte, so a code can claim any `key_id` while carrying its
+    /// own key. Admitting that would register an attacker's pubkey under a
+    /// victim's federation address — every signature the victim is supposed to
+    /// make becomes forgeable by the holder of that code.
+    CodeIdentityMismatch {
+        claimed_key_id: String,
+        derived_key_id: String,
+    },
     /// CIRISEdge#552 — the local directory could not be read. NOT
     /// self-resolving: no peer reply repairs a local backend failure, so
     /// retrying is the one thing that cannot help.
@@ -367,6 +663,22 @@ impl LadderStall {
                  instead, or check that the identifier is the one you meant — this \
                  will not resolve by waiting."
             ),
+            Self::MalformedCode { detail } => format!(
+                "that looks like a CIRIS code but does not decode ({detail}). Ask \
+                 for it again — a partial copy/paste is the usual cause, and the \
+                 code is self-validating so a truncated one can always be told \
+                 from a good one. It will NOT start working by retrying."
+            ),
+            Self::CodeIdentityMismatch {
+                claimed_key_id,
+                derived_key_id,
+            } => format!(
+                "REFUSED: that code claims to be {claimed_key_id}, but the public \
+                 key inside it derives {derived_key_id}. A code proves only that \
+                 it was not corrupted in transit — anyone can build one claiming \
+                 any name. Do not admit it. If the sender is genuine, they should \
+                 re-issue the code from the node that actually holds the key."
+            ),
             Self::DirectoryUnreadable { key_id } => format!(
                 "the local federation directory could not be read while resolving \
                  {key_id}. This is a LOCAL fault — no peer reply repairs it and \
@@ -406,7 +718,11 @@ impl LadderStall {
             // Terminal by nature: a steward does not become a person.
             | Self::NotContactable { .. }
             // A local backend fault: the one stall retrying cannot fix.
-            | Self::DirectoryUnreadable { .. } => false,
+            | Self::DirectoryUnreadable { .. }
+            // A bad paste does not repair itself, and a mismatched code is a
+            // forgery attempt — retrying it is the last thing anyone should do.
+            | Self::MalformedCode { .. }
+            | Self::CodeIdentityMismatch { .. } => false,
         }
     }
 }
@@ -916,6 +1232,256 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "rung names must be distinct");
         assert!(names.contains(&"request_contact"));
+    }
+
+    /// Build a real fedcode for a freshly generated key, the way a sender's
+    /// node would.
+    fn issue_code(label: &str, kind: ciris_verify_core::fedcode::FedKind) -> (String, String) {
+        use base64::Engine as _;
+
+        // `derive_key_id` hashes the bytes; it does not care that they are a
+        // valid curve point, and neither does the binding check under test.
+        let mut pubkey = [0u8; 32];
+        pubkey[0..label.len().min(32)].copy_from_slice(&label.as_bytes()[..label.len().min(32)]);
+        pubkey[31] = u8::try_from(label.len()).unwrap_or(0);
+
+        let key_id = ciris_verify_core::fedcode::derive_key_id(label, &pubkey);
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+            kind,
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
+            transport_hint: Some("https://example.invalid".to_string()),
+            alias_hint: Some("Frank".to_string()),
+            group_key_id: None,
+        })
+        .expect("encode");
+        (code, key_id)
+    }
+
+    /// CIRISEdge#526 — a pasted code is decoded, not posted as a key_id.
+    ///
+    /// The reported failure: `addContact(keyId)` sent the raw code string as
+    /// `key_id` and the server answered `unknown_fed_id` — a correct answer to
+    /// the wrong question. The code carries the public key the directory cannot
+    /// supply for a stranger, and nothing was decoding it.
+    #[test]
+    fn a_pasted_code_is_decoded_and_carries_the_key_to_admit() {
+        let (code, key_id) = issue_code("frank", ciris_verify_core::fedcode::FedKind::User);
+
+        let candidate = super::parse_contact_input(&code).expect("a good code decodes");
+
+        assert_eq!(candidate.source, super::ContactInputSource::Code);
+        assert_eq!(
+            candidate.key_id, key_id,
+            "the key_id comes from INSIDE the code, never from the pasted string"
+        );
+        assert_eq!(
+            candidate.kind,
+            super::IdentityKind::Person,
+            "kind: user => Person"
+        );
+
+        let admission = candidate
+            .admission
+            .expect("a code must yield the material to admit — that is its whole job");
+        assert_eq!(admission.key_id, key_id);
+        assert_eq!(admission.identity_type, "user");
+        assert!(
+            !admission.pubkey_ed25519_base64.is_empty(),
+            "the pubkey is the thing the directory cannot supply for a stranger"
+        );
+        assert_eq!(admission.alias_hint.as_deref(), Some("Frank"));
+    }
+
+    /// CIRISEdge#526 — a bare identifier still behaves exactly as before, and is
+    /// never mistaken for a code.
+    #[test]
+    fn a_bare_identifier_is_passed_through_with_nothing_to_admit() {
+        let candidate = super::parse_contact_input("  frank-abc123def4  ").expect("plain id");
+        assert_eq!(candidate.source, super::ContactInputSource::Identifier);
+        assert_eq!(candidate.key_id, "frank-abc123def4", "trimmed, not parsed");
+        assert!(
+            candidate.admission.is_none(),
+            "an identifier carries no key — there is nothing new to admit"
+        );
+    }
+
+    /// CIRISEdge#526 — a code that will not decode surfaces AS a bad code.
+    ///
+    /// It must never fall through to be tried as an identifier: that is what
+    /// turned a truncated paste into a baffling `unknown_fed_id` about a string
+    /// that was obviously a code.
+    #[test]
+    fn a_truncated_code_is_a_code_error_not_an_unknown_identifier() {
+        let (code, _) = issue_code("frank", ciris_verify_core::fedcode::FedKind::User);
+        let truncated = &code[..code.len() - 6];
+
+        match super::parse_contact_input(truncated) {
+            Err(LadderStall::MalformedCode { detail }) => {
+                assert!(!detail.is_empty(), "say what was wrong with it");
+            }
+            other => panic!(
+                "a CIRIS-V… string that does not decode must be MalformedCode, \
+                 never demoted to an identifier: {other:?}"
+            ),
+        }
+    }
+
+    /// CIRISEdge#526 SECURITY — a code claiming someone else's address is
+    /// REFUSED.
+    ///
+    /// `fedcode::decode` verifies a CRC, which proves only that the code
+    /// survived transit. The sender authors every byte, so nothing stops one
+    /// claiming a victim's `key_id` while carrying its own key. Admitting that
+    /// registers an attacker's pubkey under the victim's federation address, and
+    /// every signature the victim is supposed to make becomes forgeable by
+    /// whoever holds that code.
+    #[test]
+    fn a_code_claiming_another_identity_is_refused() {
+        use base64::Engine as _;
+
+        // The victim's real address.
+        let (_, victim_key_id) = issue_code("victim", ciris_verify_core::fedcode::FedKind::User);
+
+        // The attacker's own key, presented under the victim's address.
+        let attacker_pubkey = [0xAAu8; 32];
+        let forged = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+            kind: ciris_verify_core::fedcode::FedKind::User,
+            key_id: victim_key_id.clone(),
+            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
+                .encode(attacker_pubkey),
+            transport_hint: None,
+            alias_hint: Some("Totally The Victim".to_string()),
+            group_key_id: None,
+        })
+        .expect("a forgery encodes perfectly well — that is the point");
+
+        // It decodes cleanly. The CRC is fine. Only the BINDING catches it.
+        assert!(
+            ciris_verify_core::fedcode::decode(&forged).is_ok(),
+            "the forgery is well-formed; the checksum cannot detect authorship"
+        );
+
+        match super::parse_contact_input(&forged) {
+            Err(LadderStall::CodeIdentityMismatch {
+                claimed_key_id,
+                derived_key_id,
+            }) => {
+                assert_eq!(claimed_key_id, victim_key_id);
+                assert_ne!(
+                    derived_key_id, victim_key_id,
+                    "the key inside derives a DIFFERENT address — that is the tell"
+                );
+            }
+            other => panic!(
+                "a code whose key does not derive its claimed address MUST be \
+                 refused; admitting it is an impersonation primitive: {other:?}"
+            ),
+        }
+    }
+
+    /// CIRISEdge#526 END TO END — a stranger's code yields something to DO,
+    /// not a stall.
+    ///
+    /// The directory knowing nothing about them is the expected state for a
+    /// stranger, not a failure. Reporting `NotYetDiscovered` — whose remedy is
+    /// "wait for replication" — would be advice that never comes true, because
+    /// replication will never deliver a stranger's key to a node that has no
+    /// reason to hold it.
+    #[tokio::test]
+    async fn a_strangers_code_resolves_to_admit_then_retry() {
+        let (code, key_id) = issue_code("stranger", ciris_verify_core::fedcode::FedKind::User);
+        // A directory that has never heard of them — the whole point.
+        let empty = FakeLens {
+            types: std::collections::HashMap::new(),
+            owners: std::collections::HashMap::new(),
+            nodes: std::collections::HashMap::new(),
+        };
+
+        match super::resolve_contact(&empty, &code).await {
+            Ok(super::ContactResolution::AdmitThenRetry {
+                candidate,
+                admission,
+            }) => {
+                assert_eq!(candidate.key_id, key_id);
+                assert_eq!(admission.key_id, key_id);
+                assert_eq!(admission.identity_type, "user");
+                assert!(!admission.pubkey_ed25519_base64.is_empty());
+            }
+            other => panic!(
+                "a stranger's code must hand back the key to ADMIT — the \
+                 directory cannot supply it and never will: {other:?}"
+            ),
+        }
+    }
+
+    /// CIRISEdge#526 — pasting a code for someone already admitted is
+    /// idempotent, not a re-admission.
+    #[tokio::test]
+    async fn a_code_for_a_known_person_resolves_as_known() {
+        use base64::Engine as _;
+
+        // Mint a code whose key_id is one the directory already knows.
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = 7;
+        let label = "frank-fed";
+        let key_id = ciris_verify_core::fedcode::derive_key_id(label, &pubkey);
+
+        let mut lens = frank();
+        lens.types.insert(key_id.clone(), "user".into());
+        lens.nodes
+            .insert(key_id.clone(), vec!["frank-laptop-bbb".into()]);
+
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+            kind: ciris_verify_core::fedcode::FedKind::User,
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
+            transport_hint: None,
+            alias_hint: None,
+            group_key_id: None,
+        })
+        .expect("encode");
+
+        match super::resolve_contact(&lens, &code).await {
+            Ok(super::ContactResolution::Known(subject)) => {
+                assert_eq!(subject.fed_id, key_id);
+            }
+            other => panic!(
+                "a code for someone ALREADY admitted must resolve as Known, so \
+                 pasting twice does not re-admit a registered key: {other:?}"
+            ),
+        }
+    }
+
+    /// CIRISEdge#526 — a terminal stall stays terminal even with a code in hand.
+    ///
+    /// A code carries a key; it does not make a steward into a contactable
+    /// person. Admission cannot fix what admission is not about.
+    #[tokio::test]
+    async fn a_code_does_not_rescue_a_terminal_stall() {
+        use base64::Engine as _;
+
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = 9;
+        let key_id = ciris_verify_core::fedcode::derive_key_id("steward", &pubkey);
+
+        let mut lens = frank();
+        lens.types.insert(key_id.clone(), "steward".into());
+
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+            kind: ciris_verify_core::fedcode::FedKind::User,
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
+            transport_hint: None,
+            alias_hint: None,
+            group_key_id: None,
+        })
+        .expect("encode");
+
+        match super::resolve_contact(&lens, &code).await {
+            Err(LadderStall::NotContactable { .. }) => {}
+            other => panic!("a steward is not contactable, code or no code: {other:?}"),
+        }
     }
 
     /// CIRISEdge#552 — a hash-first node that knows the key as a HASH must

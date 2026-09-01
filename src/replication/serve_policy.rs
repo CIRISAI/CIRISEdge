@@ -77,18 +77,23 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
     // every other kind is NOT subject-pullable (`none`). This column is the
     // coordinated-cut witness CIRISServer pins alongside `serve`.
     let receive = match kind {
-        // CIRISEdge#552 — on these four planes a Pull is also answered when the
-        // SUBJECT IS THE RESPONDING NODE ITSELF, which is exactly what the
-        // `self_own` advertise projection already hands every peer. Not "any
-        // attributed requester for any subject": `subject_holdings_inner` does
-        // an arbitrary directory lookup, so that would make a body-holding
-        // server an address-book oracle for subjects it never advertised.
-        // Derived from `is_public_subject_pull` (test-locked below).
+        // ROLE_MATRIX Axis 3 — on these four planes a Pull is answered for the
+        // data subject, for the RESPONDING NODE'S OWN record (what `self_own`
+        // already hands every peer), and — when the responder itself holds a
+        // verified `infra:serve` conferral — for ANY subject from an attributed
+        // requester. The identity plane is public (announced, attributable, no
+        // anonymity claim; the invisibility property lives on the GROUP plane,
+        // by derivation); a conferred server answering identifier lookups is
+        // what carrying the directory MEANS, and it is how a fedID alone
+        // reaches a stranger. An unconferred node still answers only for
+        // itself, so the enumeration surface stays with nodes that opted into
+        // the corpus. Derived from `is_public_subject_pull` (test-locked below).
         EnvelopeKind::Key
         | EnvelopeKind::IdentityOccurrence
         | EnvelopeKind::TransportDestination
         | EnvelopeKind::IdentityOccurrenceRevocation => {
-            "subject_pull:data_subject+own_record; within self_own projection"
+            "subject_pull:data_subject+own_record; +any_attributed when the \
+             responder holds infra:serve (ROLE_MATRIX axis 3)"
         }
         EnvelopeKind::Attestation => {
             "subject_pull:data_subject+sender; subject-only; \
@@ -169,27 +174,27 @@ pub fn serve_advertise_policy_sha256() -> String {
 // changed — this is the manifest catching up to the code it witnesses.
 // **CIRISServer must mirror**: re-pin from 328d73b0… to 20499cab….
 //
-// CIRISEdge#552 — RE-PINNED, 20499cab… → e54c5677…. On the four
-// unconditionally-`public` planes (Key, IdentityOccurrence,
-// TransportDestination, IdentityOccurrenceRevocation) a subject Pull is now
-// ALSO answered when the subject is the RESPONDING NODE ITSELF.
+// CIRISEdge#552 — RE-PINNED, e54c5677… → 75ceef58 (ROLE_MATRIX adoption). On
+// the four unconditionally-`public` planes a subject Pull is answered for the
+// data subject, for the responding node's OWN record, and — when the responder
+// holds a verified `infra:serve` conferral (ROLE_MATRIX axis 3) — for any
+// subject from an attributed requester.
 //
-// Bounded deliberately at the node's own record, because `serve: public` and
-// `advertise: self_own` answer different questions. `public` means no
-// capability gate once a record reaches you; `self_own` decides which records
-// reach you at all. `subject_holdings_inner` does an arbitrary directory
-// lookup, so answering any attributed requester about any subject would let a
-// peer probe identifiers for third-party keys and routes that never appeared in
-// its Summaries — a body-holding server as address-book oracle, and the end of
-// the opaque-directory property. The own-record arm stays inside what
-// `self_own` already advertises, so it is disclosure-neutral in fact.
-//
-// It recovers "you signed a row I cannot verify — send me your key". A
-// THIRD-PARTY signer stays unfetchable by identifier; that needs a separately
-// authorized, rate-limited resolver. `Attestation` is untouched.
-// **CIRISServer must mirror this pin.**
+// The earlier own-record-only bound (e54c5677…, never mirrored by server)
+// imported a confidentiality property onto the identity plane that the design
+// explicitly disclaims: the identity plane is announced, rooted, attributable
+// — the invisibility property lives on the GROUP plane, by derivation
+// (CC 5.4.6). A CONFERRED server answering identifier lookups is what carrying
+// the directory means, and it is how a fedID alone reaches a stranger: ask a
+// server, fetch bodies by content hash, canonicals hold the contents. An
+// unconferred node still answers only for itself, so the enumeration surface
+// stays with the nodes that opted into the corpus rather than following it
+// around the fabric. `Attestation` is untouched: per-row entitlement
+// (trace:* → capability, the G2 carve).
+// **CIRISServer must mirror this pin** (supersedes both e8216fec… and
+// e54c5677…, neither of which shipped server-side).
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "e54c56775e8d56442f9fdbaa0346397cdc169e7cc6237f5a6fe71681710dbf25";
+    "75ceef58162569c7a61e143cae2ac58ead1c783daf872e527642ef9d56d1ac1e";
 
 #[cfg(test)]
 mod tests {

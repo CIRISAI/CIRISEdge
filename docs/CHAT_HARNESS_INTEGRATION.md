@@ -17,24 +17,30 @@ build.
 
 ## 0. Wiring you MUST do, or the whole path is inert
 
-Edge's Python entry point sets two config fields that a **Rust composer has to set itself**. Both default to something that looks correct and behaves wrong:
+One field. A default-constructed config leaves it `None`, and the failure is
+silent — nothing breaks, three subsystems just never run:
 
 ```rust
 let mut config = ciris_edge::replication::ReplicationRuntimeConfig::default();
 
-// Selects retention. Default is Proxy => Retention::Bodies for every plane.
-// A server that wants hash-first MUST say so; there is no autodetect.
-config.bridge.mode = ciris_edge::AgentMode::Server;
-
-// The Pull responder answers an identifier request for THIS NODE'S OWN record.
-// It cannot recognise "its own" without knowing which key_id that is. Left
-// None, signer-key recovery is silently inert.
+// The serve-tier resolver, the own-record Pull responder, and missing-signer
+// recovery are ALL keyed on this. Left None, each is silently inert.
 config.local_key_id = Some(my_signer_key_id.to_string());
 ```
 
-Neither failure is loud. A server-mode node with `mode` unset behaves *exactly* like a correctly configured proxy; recovery with `local_key_id` unset just never recovers. We shipped both bugs during #556 and only found them in review — hence this section first.
+**Do NOT set a bridge "mode" — the field no longer exists, deliberately.**
+`AgentMode` (client/proxy/server) is the local-resources posture: listener
+binding and outbound queue size, on the Edge itself. Whether a node holds the
+directory and answers identifier lookups keys on a different axis entirely:
+its own **`infra:serve` conferral** (`docs/ROLE_MATRIX.md`, Axis 3) —
+conferred by the owner (a mesh server: stores and serves to help the mesh),
+blessed by the trust root (a canonical: additionally trusted for bootstrap).
+The runtime resolves the tier from the directory automatically once
+`local_key_id` is set; there is nothing to configure and no knob to get wrong.
 
-`AgentMode` is `Client | Proxy | Server`, **Proxy by default**. Only `Server` takes hash-first retention, and that is deliberate: if every node converged the whole hash set, the directory would be enumerable from any node.
+Until CIRISPersist#788 ships the owner-conferred resolver, only the canonical
+rung resolves; a node whose row claims `infra:serve` without a verifiable
+blessing logs a WARN naming that issue and serves conservatively.
 
 ---
 

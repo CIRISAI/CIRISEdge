@@ -546,26 +546,6 @@ pub struct BridgeConfig {
     /// bound that costs nothing but rounds. The effective page is the `min` of
     /// the two.
     pub sweep_page_rows: u32,
-
-    /// CIRISEdge#552 — this node's posture, which decides how much directory it
-    /// keeps.
-    ///
-    /// Driven by [`AgentMode`](crate::AgentMode) rather than a switch of its
-    /// own: the mode vocabulary already exists (`client` / `proxy` / `server`,
-    /// proxy by default) and a second knob meaning almost the same thing is how
-    /// two sources of truth start disagreeing.
-    ///
-    /// * **Server** — the full directory. A node with the storage to hold it and
-    ///   the role to serve it.
-    /// * **Proxy** (default) and **Client** — a RELEVANT SUBSET only: contacts,
-    ///   and the keys needed to verify what this node holds.
-    ///
-    /// That distinction is a privacy control, not a storage one. If every node
-    /// converged the whole hash set, the directory would be enumerable from ANY
-    /// node — cheaper than holding bodies, but the same exposure. A proxy that
-    /// learns only what concerns it reveals only its own contacts if it is
-    /// compromised.
-    pub mode: crate::AgentMode,
 }
 
 impl BridgeConfig {
@@ -696,7 +676,6 @@ impl Default for BridgeConfig {
             operational_page_limit: Self::DEFAULT_OPERATIONAL_PAGE_LIMIT,
             advertise_sweep_permits: Self::DEFAULT_ADVERTISE_SWEEP_PERMITS,
             sweep_page_rows: Self::DEFAULT_SWEEP_PAGE_ROWS,
-            mode: crate::AgentMode::Proxy,
         }
     }
 }
@@ -1325,6 +1304,13 @@ pub struct FederationDirectoryReplicationBridge {
     /// them. In-memory: CIRISPersist#785 is where this becomes durable, and the
     /// advertise re-sweep re-learns anything lost to a restart.
     known_hashes: Mutex<crate::replication::known_hashes::KnownHashes>,
+    /// ROLE_MATRIX Axis 3 — this node's own serving tier, cached (sync reads
+    /// on the apply loop, async refresh once per TTL). Fail-closed: reads
+    /// `None` until first resolution.
+    serve_tier: crate::replication::serve_tier::CachedServeTier,
+    /// The resolver behind the cache; `None` in fixtures that pin the tier.
+    serve_tier_resolver:
+        Option<std::sync::Arc<dyn crate::replication::serve_tier::ServeTierResolver>>,
     /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
     /// not hold. Bounded: a peer that offers unadmittable rows must not be able
     /// to grow this without limit, so past the cap new names are DROPPED rather
@@ -1495,6 +1481,8 @@ impl FederationDirectoryReplicationBridge {
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
+            serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
+            serve_tier_resolver: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
@@ -1546,6 +1534,8 @@ impl FederationDirectoryReplicationBridge {
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
+            serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
+            serve_tier_resolver: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
@@ -1589,16 +1579,63 @@ impl FederationDirectoryReplicationBridge {
         self.missing_signers.lock().map_or(0, |m| m.len())
     }
 
-    /// CIRISEdge#552 — override the agent mode (builder, TEST ONLY).
+    /// ROLE_MATRIX Axis 3 — install the serve-tier resolver (builder).
+    /// Production wiring passes [`DirectoryServeTierResolver`]; fixtures pin
+    /// the tier with [`Self::with_serve_tier_for_test`] instead.
     ///
-    /// Production reads the mode from the Edge via `start_replication`; this
-    /// exists so a unit test can exercise the Server-mode branches without
-    /// standing up the Python host path.
+    /// [`DirectoryServeTierResolver`]:
+    ///     crate::replication::serve_tier::DirectoryServeTierResolver
+    #[must_use]
+    pub fn with_serve_tier_resolver(
+        mut self,
+        resolver: Option<std::sync::Arc<dyn crate::replication::serve_tier::ServeTierResolver>>,
+    ) -> Self {
+        self.serve_tier_resolver = resolver;
+        self
+    }
+
+    /// Pin the serving tier (builder, TEST ONLY). With no resolver installed
+    /// the pinned value is never overwritten, so a fixture can exercise every
+    /// tier without a directory that can resolve one.
     #[cfg(test)]
     #[must_use]
-    pub fn with_agent_mode_for_test(mut self, mode: crate::AgentMode) -> Self {
-        self.config.mode = mode;
+    pub fn with_serve_tier_for_test(self, tier: crate::replication::serve_tier::ServeTier) -> Self {
+        self.serve_tier.store(tier);
         self
+    }
+
+    /// How many known hashes are recorded (tests + diagnostics).
+    #[cfg(test)]
+    #[must_use]
+    pub fn known_hash_count_for_test(&self) -> usize {
+        self.known_hashes.lock().map_or(0, |k| k.len())
+    }
+
+    /// The trace-plane serve gate, exposed for the ROLE_MATRIX gauntlet (R9).
+    #[cfg(test)]
+    pub async fn peer_has_serve_capability_for_test(&self, peer_key_id: &str) -> bool {
+        self.peer_has_serve_capability(peer_key_id).await
+    }
+
+    /// This node's serving tier, as last resolved (sync — the apply loop reads
+    /// this; async paths call [`Self::refresh_serve_tier`] first).
+    #[must_use]
+    pub fn serve_tier(&self) -> crate::replication::serve_tier::ServeTier {
+        self.serve_tier.read()
+    }
+
+    /// Re-resolve the tier if stale. Called from the async read paths that run
+    /// once per round, so the sync readers are at most [`CachedServeTier::TTL`]
+    /// behind the directory.
+    ///
+    /// [`CachedServeTier::TTL`]: crate::replication::serve_tier::CachedServeTier::TTL
+    async fn refresh_serve_tier(&self) {
+        if let (Some(resolver), Some(local)) = (
+            self.serve_tier_resolver.as_deref(),
+            self.local_key_id.as_deref(),
+        ) {
+            self.serve_tier.refresh_if_stale(resolver, local).await;
+        }
     }
 
     /// CIRISEdge#433 — install the live metrics handle (builder), enabling the
@@ -2290,15 +2327,18 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// configured hash-first still holds revocations, rosters, and anything else
     /// whose body it needs — the switch cannot turn those off.
     fn retention(&self, kind: EnvelopeKind) -> crate::replication::retention::Retention {
-        // Only a SERVER keeps a hash directory. A proxy or client holds bodies
-        // for the little it tracks — hash-first buys nothing on a small working
-        // set, and would hand a small node an enumerable directory it has no use
-        // for.
-        let configured = match self.config.mode {
-            crate::AgentMode::Server => crate::replication::retention::Retention::HashFirst,
-            crate::AgentMode::Proxy | crate::AgentMode::Client => {
-                crate::replication::retention::Retention::Bodies
-            }
+        // ROLE_MATRIX Axis 3 — only a node CONFERRED the directory role keeps a
+        // hash directory. Keyed on the serving tier, NOT on `AgentMode`: mode is
+        // the local-resources posture (listener, queue) and shipping this keyed
+        // on it was the one-variable-two-jobs bug — a node set to `server` for
+        // queue reasons silently held the federation hash-first, and a conferred
+        // server running `proxy` never did. An unconferred node holds bodies for
+        // the little it tracks; hash-first buys nothing on a small working set
+        // and would hand it an enumerable directory it has no use for.
+        let configured = if self.serve_tier().may_store_and_serve() {
+            crate::replication::retention::Retention::HashFirst
+        } else {
+            crate::replication::retention::Retention::Bodies
         };
         crate::replication::retention::retention_for(kind, configured)
     }
@@ -2377,12 +2417,12 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        // Only a SERVER accumulates the directory. A proxy that recorded every
-        // hash a peer advertised would end up holding the whole federation as
-        // hashes — which is the enumeration surface again, just cheaper to
-        // carry. What a proxy needs is the subset that concerns it, and that is
-        // reached through the on-demand path rather than by hoarding.
-        if !matches!(self.config.mode, crate::AgentMode::Server) {
+        // ROLE_MATRIX Axis 3 — only a CONFERRED server accumulates the
+        // directory. An unconferred node that recorded every hash a peer
+        // advertised would end up holding the whole federation as hashes —
+        // the enumeration surface again, just cheaper to carry. What it needs
+        // is the subset that concerns it, reached through the on-demand path.
+        if !self.serve_tier().may_store_and_serve() {
             return;
         }
         if let Ok(mut known) = self.known_hashes.lock() {
@@ -2393,6 +2433,9 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     }
 
     async fn list_envelope_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        // ROLE_MATRIX Axis 3 — runs once per round, so the sync tier readers
+        // (`retention`, `note_known_hashes`) are at most one TTL behind.
+        self.refresh_serve_tier().await;
         // CIRISEdge#531 DEPTH — the PEER-BLIND projection view (diagnostics and
         // tests; every production provider is peer-bound via
         // `DirectoryStateAdapter::with_peer`). No peer means no watermark to
@@ -2595,7 +2638,31 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// unconditionally `public` — when `S` is THIS NODE'S OWN key_id. An
     /// unattributed requester still gets nothing, and it still says so.
     ///
-    /// # Why the second arm stops exactly there
+    /// # Why a CONFERRED server answers for any subject, and others do not
+    ///
+    /// The identity plane is **public**: announced, rooted, attributable, with
+    /// no anonymity claim (README, "the two-plane hybrid"). The property this
+    /// system actually protects is on the GROUP plane — family/community
+    /// existence is structurally invisible because destinations are *derived*
+    /// from state members already hold and never announced. Derivation replaces
+    /// discovery. So a third-party lookup of a `Key` or a `TransportDestination`
+    /// discloses nothing the design withholds; treating it as a confidentiality
+    /// breach imports a property onto the one plane that disclaims it.
+    ///
+    /// What differs between nodes is not entitlement but HOLDINGS.
+    /// `AgentMode::Server` is the node that opted into carrying the directory —
+    /// storage, uptime, the whole corpus as hashes with bodies on demand.
+    /// Answering "which records do you hold for this subject" is what being one
+    /// means. A `Proxy` or `Client` holds essentially its own records, so it can
+    /// answer for itself and has nothing else to offer; that is also why the
+    /// enumeration surface does not follow the corpus around the fabric.
+    ///
+    /// A fedID is therefore sufficient to reach someone: ask a server, get the
+    /// refs, fetch the bodies by content hash — the hash-addressed path that was
+    /// always safe. Canonicals hold the contents, so the answer always exists
+    /// somewhere.
+    ///
+    /// # Why the own-record arm still exists separately
     ///
     /// `serve: public` and `advertise: self_own` answer DIFFERENT questions, and
     /// conflating them is how the first attempt at this went wrong. `public`
@@ -2633,14 +2700,19 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         subject_key_id: &str,
         peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
+        self.refresh_serve_tier().await;
         match peer_key_id {
-            // The subject itself (the data-subject access path), or a request
-            // for THIS NODE'S OWN record on a public plane — which is precisely
-            // what the `self_own` advertise projection already hands every peer.
+            // Three entitled cases, in the order they were established:
+            //   1. the subject itself — the data-subject access path (#462);
+            //   2. this node's OWN record on a public plane — exactly what the
+            //      `self_own` advertise projection already hands every peer;
+            //   3. ANY subject on a public plane, when this node is a SERVER —
+            //      because that is what a server IS.
             Some(p)
                 if p == subject_key_id
                     || (kind.is_public_subject_pull()
-                        && self.local_key_id.as_deref() == Some(subject_key_id)) =>
+                        && (self.local_key_id.as_deref() == Some(subject_key_id)
+                            || self.serve_tier().may_store_and_serve())) =>
             {
                 // CIRISEdge#531 — WIDTH bound on the subject-Pull sweep too:
                 // it is per-subject rather than whole-table, but the
@@ -6604,7 +6676,45 @@ impl FederationDirectoryReplicationBridge {
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_fixtures {
+    //! Shared fixtures for the in-crate bridge tests AND the ROLE_MATRIX
+    //! gauntlet — one construction path so the gauntlet exercises the same
+    //! bridge the unit tests do.
+    use super::{CohortProvider, FederationDirectoryReplicationBridge};
+    use ciris_persist::federation::{identity_type, FederationDirectory};
+    use ciris_persist::store::MemoryBackend;
+    use std::sync::Arc;
+
+    pub(crate) fn make_bridge(
+        cohort: &[String],
+    ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
+        let backend = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> = backend.clone();
+        let cohort_clone = cohort.to_vec();
+        let cohort_cb: CohortProvider = Arc::new(move || cohort_clone.clone());
+        let bridge = FederationDirectoryReplicationBridge::new(dir, cohort_cb);
+        (backend, bridge)
+    }
+
+    /// A bridge whose backend already holds AGENT key rows for `key_ids`.
+    pub(crate) async fn make_bridge_with_keys(
+        key_ids: &[&str],
+    ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
+        let (backend, bridge) = make_bridge(&[]);
+        for kid in key_ids {
+            backend
+                .put_public_key(ciris_persist::federation::SignedKeyRecord {
+                    record: super::tests::fixture_key_record(kid, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        (backend, bridge)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
@@ -6695,7 +6805,7 @@ mod tests {
     /// persist v9.0.0's `verify_federation_tier_ingest`. Scrub
     /// fields stay placeholders — `put_public_key` does NOT
     /// hybrid-verify the registration row.
-    fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
+    pub(crate) fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
         let now = Utc::now();
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         KeyRecord {
@@ -9749,7 +9859,8 @@ mod tests {
     #[tokio::test]
     async fn only_the_delivering_peers_own_key_is_queued() {
         let (_backend, bridge) = make_bridge(&[]);
-        let bridge = bridge.with_agent_mode_for_test(crate::AgentMode::Server);
+        let bridge =
+            bridge.with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::MeshServer);
 
         for i in 0..(MISSING_SIGNER_CAP + 500) {
             bridge.note_missing_signer(
@@ -9784,70 +9895,98 @@ mod tests {
         );
     }
 
-    /// CIRISEdge#552 — a public plane answers a Pull for THIS NODE'S OWN
-    /// record, and refuses one that probes a third party.
+    /// ROLE_MATRIX Axis 3 — a CONFERRED server answers an identifier lookup
+    /// for any subject on a public plane; an unconferred node answers only for
+    /// itself. `AgentMode` is never consulted.
     ///
-    /// The refusal is the load-bearing half. `serve: public` says a record needs
-    /// no capability gate once it reaches you; `advertise: self_own` decides
-    /// which records reach you at all. `subject_holdings_inner` does an
-    /// arbitrary directory lookup, so serving any attributed requester about any
-    /// subject would let a peer probe identifiers for third-party keys and
-    /// routes that never appeared in its Summaries — a body-holding server as
-    /// an address-book oracle, which is the end of the opaque directory
-    /// hash-first exists to build. An earlier revision of this branch did
-    /// exactly that.
+    /// The identity plane is public — announced, rooted, attributable, no
+    /// anonymity claim. What this system makes invisible is GROUP existence, by
+    /// deriving destinations from state members already hold rather than
+    /// announcing them. So a third-party `Key` lookup discloses nothing the
+    /// design withholds, and a fedID is enough to reach someone: ask a
+    /// conferred server, fetch the bodies by hash, canonicals hold the
+    /// contents.
+    ///
+    /// The line is HOLDINGS, not entitlement. A conferred server opted into
+    /// carrying the directory; answering for it is what being one means. An
+    /// unconferred node holds its own records, so it has nothing else to
+    /// answer with — which is also why the enumeration surface does not follow
+    /// the corpus around the fabric.
     #[tokio::test]
-    async fn a_public_plane_serves_its_own_record_but_is_not_an_oracle() {
+    async fn a_conferred_server_answers_lookups_and_an_unconferred_node_answers_only_for_itself() {
         let local = "local-A";
         let third_party = "subject-S";
         let stranger = "stranger-X";
-        let (backend, bridge) = make_bridge(&[
-            local.to_string(),
-            third_party.to_string(),
-            stranger.to_string(),
-        ]);
-        let bridge = bridge.with_local_key_id(Some(local.to_string()));
-        for kid in [local, third_party, stranger] {
-            backend
-                .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(kid, identity_type::AGENT),
-                })
-                .await
-                .expect("seed key");
-        }
+        let seed = |backend: &Arc<MemoryBackend>| {
+            let backend = Arc::clone(backend);
+            async move {
+                for kid in [local, third_party, stranger] {
+                    backend
+                        .put_public_key(SignedKeyRecord {
+                            record: fixture_key_record(kid, identity_type::AGENT),
+                        })
+                        .await
+                        .expect("seed key");
+                }
+            }
+        };
 
+        // ── SERVER: carries the directory, so it answers for a third party.
+        let (backend, bridge) = make_bridge(&[]);
+        seed(&backend).await;
+        let server = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::MeshServer);
         assert!(
-            !bridge
-                .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
-                .await
-                .is_empty(),
-            "this node's OWN Key is what `self_own` already advertises to every \
-             peer — serving it by name discloses nothing new and is what makes \
-             \"you signed a row I cannot verify, send me your key\" work"
-        );
-        assert!(
-            bridge
+            !server
                 .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
                 .await
                 .is_empty(),
-            "a THIRD PARTY's Key must NOT be served: the holder never advertised \
-             it to this requester, and answering would make a body-holding node \
-             an address-book oracle for guessed identifiers"
+            "a SERVER must answer an identifier lookup for a third party — that \
+             is what carrying the directory means, and it is how a fedID alone \
+             is enough to reach a stranger"
         );
+
+        // ── PROXY (the default): answers for itself, nothing else.
+        let (backend, bridge) = make_bridge(&[]);
+        seed(&backend).await;
+        let proxy = bridge
+            .with_local_key_id(Some(local.to_string()))
+            .with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::None);
         assert!(
-            bridge
-                .subject_holdings(EnvelopeKind::Key, local, None)
+            !proxy
+                .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
                 .await
                 .is_empty(),
-            "an UNATTRIBUTED Pull still serves nothing"
+            "a proxy still answers for its OWN record — that is `self_own`, which \
+             it already advertises to every peer"
         );
         assert!(
-            bridge
-                .subject_holdings(EnvelopeKind::Attestation, local, Some(stranger))
+            proxy
+                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
                 .await
                 .is_empty(),
-            "Attestation's serve cell is CONDITIONAL per row — it keeps the \
-             subject-only rule even for this node's own subject"
+            "a proxy holds essentially its own records, so it has nothing to \
+             answer with for a third party — the enumeration surface stays with \
+             the nodes that opted into the corpus"
+        );
+
+        // Unattributed is refused everywhere, and Attestation keeps subject-only
+        // even on a server: its serve cell is conditional per ROW.
+        assert!(
+            server
+                .subject_holdings(EnvelopeKind::Key, third_party, None)
+                .await
+                .is_empty(),
+            "an UNATTRIBUTED Pull serves nothing, server or not"
+        );
+        assert!(
+            server
+                .subject_holdings(EnvelopeKind::Attestation, third_party, Some(stranger))
+                .await
+                .is_empty(),
+            "Attestation's entitlement is decided per ROW (trace:* capability, \
+             the G2 carve) — a server does not blanket it"
         );
     }
 
