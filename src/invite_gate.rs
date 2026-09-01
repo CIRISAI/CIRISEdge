@@ -50,7 +50,12 @@
 use std::collections::HashMap;
 
 /// Unix seconds.
-type Ts = u64;
+///
+/// Public because it appears in [`InviteGate::admit`]'s signature: a caller that
+/// cannot NAME the type is a caller reading rustdoc for an alias it has no path
+/// to. The clock is the caller's — the gate never reads one itself, so it stays
+/// testable and a host can drive it from whatever time source it already trusts.
+pub type Ts = u64;
 
 /// What the gate decided, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
