@@ -170,19 +170,50 @@ Emits one structured line per rung with a stable `step=` field, so an operator g
 
 ---
 
-## 6. Three things that will not work, by design
+## 6. Stranger contact — a code OR a fedID
 
-Know these before you build against them:
+Both work now. They fail in different places, so know which you have.
 
-1. **A third-party identifier cannot be resolved on a hash-first node whose directory lacks the body.** `request_key_body` returns `false` always, and says why. The Pull responder answers for the subject itself or for the responding node's own record; a third-party probe is refused, because answering it would make a body-holding server an address-book oracle for records it never advertised. Closing this needs a separately authorized, rate-limited resolver — not built. See `docs/FSD_SIGNER_RECOVERY.md` §7.
-2. **`KnownHashes` records holders but nothing dispatches a point `Fetch` yet.** The learned directory is a sink until that path is wired.
-3. **Stranger contact is meant to start from a nodecode, not a directory lookup.** You hand out an identifier out-of-band, the peer dials that specific node (which serves its own record), and consent follows. Building "search the federation for a person" on top of `discover` will work only for people you already have a consented relationship with — that is the boundary, not a gap to route around.
+### A pasted code (works even if they never announced)
+
+```rust
+use ciris_edge::contact::{self, ContactResolution};
+
+match contact::resolve_contact(&lens, whatever_the_user_pasted).await? {
+    ContactResolution::Known(subject) => { /* already admitted — go to consent */ }
+    ContactResolution::ReadyFromCode { subject, admission } => {
+        // `admission` is verified, typed key material. Feed it to YOUR
+        // register_federation_key gate — edge never registers a key off a
+        // pasted string.
+        register_federation_key(&admission.key_id, &admission.pubkey_ed25519_base64, admission.identity_type)?;
+        // `subject` is USABLE NOW. Do not re-resolve and wait.
+        start_contact_request(&subject)?;
+    }
+}
+```
+
+**The subject is built from the code, not the directory, and that is load-bearing.** An earlier shape returned "admit, then retry" — but the retry runs `nodes_owned_by` against the directory, and a stranger has no owner-binding attestations there. Admitting a key never creates an ownership graph, so that retry returned `NotYetDiscovered` forever. If you find yourself re-resolving after admission and waiting for convergence, you are on the old model.
+
+`parse_contact_input` classifies by the unambiguous `CIRIS-V…` prefix, so a code is a code **or an error** — never silently posted as a `key_id`. A `CIRIS-V…` string that will not decode is `MalformedCode`, and one whose carried key does not derive its claimed address is `CodeIdentityMismatch` — refuse it and do not admit: a code's CRC proves it survived transit, never who wrote it. A family/community code is `NotContactable` **before** you are told to admit anything.
+
+### A bare fedID (needs them to have announced)
+
+Resolves through the directory as always. On a hash-first node that holds only the hash, `request_key_body` now queues a fetch and the lookup reports `BodyFetchQueued` — retry after the next Key round. That works because a **conferred** server answers an identifier Pull for any subject on a public plane (ROLE_MATRIX axis 3): ask a server, fetch bodies by content hash, canonicals hold the contents.
+
+If they opted out of announcing, no directory anywhere has them — only a code will do.
+
+## 6b. Still genuinely unbuilt
+
+1. **`KnownHashes` records holders but nothing dispatches a point `Fetch` yet.** The learned directory is a sink until that path is wired.
+2. **Owner-conferred mesh servers are recognized but inert** pending CIRISPersist#788, so hash-first and third-party serving are canonical-only in practice today.
 
 ---
 
 ## 7. Pin
 
-Adopt `SERVE_ADVERTISE_POLICY_HASH = e54c56775e8d56442f9fdbaa0346397cdc169e7cc6237f5a6fe71681710dbf25` (CIRISServer#522). `REPLICATION_POLICY_HASH` is unchanged.
+Adopt `SERVE_ADVERTISE_POLICY_HASH = 75ceef58162569c7a61e143cae2ac58ead1c783daf872e527642ef9d56d1ac1e` (CIRISServer#522) — this supersedes `e8216fec…` and `e54c5677…`, neither of which shipped. `REPLICATION_POLICY_HASH` (persist) is unchanged.
+
+Also note: **`agent_mode="server"` no longer implies directory-holding.** Retention and identifier serving key on the node's own `infra:serve` conferral (`docs/ROLE_MATRIX.md` axis 3), not on mode. If your deployment relied on mode to turn hash-first on, it was relying on a bug.
 
 ---
 

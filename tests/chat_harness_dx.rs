@@ -47,6 +47,90 @@ fn the_wiring_the_guide_says_is_mandatory_exists() {
     assert!(matches!(AgentMode::default(), AgentMode::Proxy));
 }
 
+/// §6 — the stranger-contact surface the guide's code block calls, and the
+/// shape of its success case.
+///
+/// Pinned because the guide tells the server to use `subject` DIRECTLY after
+/// admission rather than re-resolving. An earlier revision returned
+/// "admit, then retry", and that retry could never succeed: it runs
+/// `nodes_owned_by` against the directory, where a stranger has no
+/// owner-binding attestations. If this ever compiles back to a retry shape,
+/// the guide is teaching a loop that never terminates.
+#[test]
+fn the_stranger_contact_surface_matches_the_guide() {
+    use base64::Engine as _;
+    use ciris_edge::contact::LadderStall;
+
+    // A code minted the way a sender's node would.
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 77;
+    let key_id = ciris_verify_core::fedcode::derive_key_id("stranger", &pubkey);
+    let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+        kind: ciris_verify_core::fedcode::FedKind::User,
+        key_id: key_id.clone(),
+        pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
+        transport_hint: Some("https://example.invalid".into()),
+        alias_hint: None,
+        group_key_id: None,
+    })
+    .expect("encode");
+
+    // §6: classification never demotes a code to an identifier.
+    let candidate = ciris_edge::contact::parse_contact_input(&code).expect("decodes");
+    let admission = candidate
+        .admission
+        .expect("a code carries the key to admit");
+    assert_eq!(admission.key_id, key_id);
+    assert_eq!(admission.identity_type, "user");
+    assert!(
+        admission.transport_hint.is_some(),
+        "v2 carries the transport hint"
+    );
+
+    // §6: a forged code is refused, and the guide says do not admit it.
+    let forged = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+        kind: ciris_verify_core::fedcode::FedKind::User,
+        key_id,
+        pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode([0xAA_u8; 32]),
+        transport_hint: None,
+        alias_hint: None,
+        group_key_id: None,
+    })
+    .expect("a forgery encodes fine — the CRC cannot see authorship");
+    assert!(
+        matches!(
+            ciris_edge::contact::parse_contact_input(&forged),
+            Err(LadderStall::CodeIdentityMismatch { .. })
+        ),
+        "§6 tells the server to refuse this without admitting"
+    );
+
+    // §6: the success variant the guide destructures is pinned by
+    // `the_ready_from_code_shape` at module scope.
+}
+
+/// §6 — the success variant the guide's code block destructures.
+///
+/// Compile-only: building one needs a lens, but the SHAPE is what the guide
+/// depends on. `ReadyFromCode` carrying a USABLE `Subject` is the whole fix —
+/// an earlier "admit, then retry" shape could never terminate, because the
+/// retry ran `nodes_owned_by` against a directory where a stranger has no
+/// owner-binding attestations.
+#[allow(dead_code)]
+fn the_ready_from_code_shape(r: ciris_edge::contact::ContactResolution) {
+    use ciris_edge::contact::ContactResolution;
+    match r {
+        ContactResolution::Known(subject) => {
+            let _: String = subject.fed_id;
+        }
+        ContactResolution::ReadyFromCode { subject, admission } => {
+            // Usable immediately: nodes to dial, no directory round-trip.
+            let _: Vec<String> = subject.nodes;
+            let _: String = admission.key_id;
+        }
+    }
+}
+
 /// §1 — the rung vocabulary, and `previous()` for pointing at the right place.
 #[test]
 fn the_rung_ladder_is_the_documented_shape() {

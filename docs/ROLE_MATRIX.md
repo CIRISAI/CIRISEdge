@@ -149,6 +149,13 @@ A decision keying on any other axis is a bug by definition. **Enforced by
 full tier×mode cross-products; the mode column of R3 is vacuous by
 construction because `BridgeConfig` no longer has a mode field at all.
 
+**R0 is the WIRING row, and it exists because the table alone was not enough.**
+Every decision row pins the tier and asks whether the decision is right; all of
+them stayed green while the refresh sat on the peer-blind diagnostic path and
+production never resolved a tier at all. A decision table cannot catch an
+unwired decision. R0 drives the bridge through the trait method production
+calls and asserts the resolver was consulted.
+
 Axis-3 resolution status: the canonical rung resolves live (leg A ∧ leg B);
 the owner-conferred rung is fail-closed pending **CIRISPersist#788** (the
 `resolve_serve_tier` + `ServeGrants` projection ask) — a claim without a
