@@ -217,6 +217,85 @@ Resolves through the directory as always. On a hash-first node that holds only t
 
 If they opted out of announcing, no directory anywhere has them — only a code will do.
 
+## 6b-bis. Standing up replication — four footguns, all now disarmed
+
+Edge's own bench-mesh harness got every one of these wrong and ran **six**
+mesh runs at zero replication, with no error anywhere. Each is now a
+one-liner in the API. Do not hand-roll them.
+
+**1. Route inbound frames — through `InboundRouter`, not by hand.**
+
+`Transport::listen` runs in YOUR dispatch loop, so wiring replication into it
+is your job. The obvious version is wrong:
+
+```rust
+// DON'T — this deadlocks the bootstrap.
+if let Some(peer) = frame.source_key_id.as_ref() {
+    registry.route_inbound_bytes(peer.as_str(), &frame.envelope_bytes).await?;
+}
+```
+
+A peer first heard by announce is admitted **advisory** (`owns_key = false`),
+and is promoted only by anti-entropying its bootstrap planes *over that same
+link*. Demanding attribution before routing means the exchange that earns
+attribution is the exchange attribution is required for. Nothing ever converges,
+and a dropped frame looks exactly like a frame that never arrived.
+
+```rust
+let router = InboundRouter::new(runtime.registry());
+while let Some(frame) = rx.recv().await {
+    if router.try_route(&frame).await.consumed() { continue; }
+    // ... your own framing
+}
+```
+
+`try_route` returns a typed `RouteDisposition` (`Routed` / `NotReplication` /
+`Unattributed` / `Failed`) — count them. A steady stream of `Unattributed` is
+the field diagnosis for footgun 2.
+
+**2. Replicate every `BOOTSTRAP_PLANE`.**
+
+```rust
+for kind in EnvelopeKind::BOOTSTRAP_PLANES.into_iter().chain([EnvelopeKind::Attestation]) { … }
+```
+
+`Key`, `IdentityOccurrence` **and** `TransportDestination` — the third is what
+satisfies #393 item 2 (`hybrid_transport_binding_exists`). Omit any one and the
+link never promotes, so no other plane ever flows. Silently.
+
+**3. Do NOT register `EnvelopeKind::ALL`.**
+
+A coordinator exists per `(peer, kind)`. Fifteen kinds across four peers is
+**sixty** of them dialing one transport; it saturates the link pool and starves
+your own traffic (leviculum#29, CIRISEdge#508/#531). We measured it as
+`resource transfer failed: Timeout` on ordinary application sends. Register the
+bootstrap planes plus what you actually read.
+
+**4. Author a directed `consent:replication:v1` grant per peer.**
+
+The Attestation plane is consent-gated at the **recipient**, not per row: a peer
+that does not resolve to a consent-membership proof withholds the WHOLE plane,
+fail-closed, before any per-row question is asked.
+
+```rust
+let grant = attestation_bind::replication_consent_attestation(
+    &node_key_id, &peer_key_id, &attestation_bind::DEFAULT_CONSENT_PREFIXES, now, &signer,
+).await?;
+directory.put_attestation(SignedAttestation { attestation: grant }).await?;
+```
+
+Consent is **directed and self-attested** (CEG 1.0-RC29 §5.6.8.15): A granting B
+says nothing about B granting A, so each node authors its own half.
+`DEFAULT_CONSENT_PREFIXES` matches CIRISServer's list — if you restate it, you
+will drop a plane and stay green while doing it (that is how the server shipped
+eight releases moving zero traces).
+
+**And install a log subscriber.** Edge emits `tracing` events; a binary with no
+subscriber emits nothing, and its silence is indistinguishable from a code path
+that never ran. That cost us five of the six runs.
+
+---
+
 ## 6c. Waiting for the mesh — use the helper, do not write a poll loop
 
 Every plane is eventually consistent: `pull_subject_testimony` is

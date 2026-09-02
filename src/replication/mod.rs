@@ -148,6 +148,177 @@ pub mod storage_contention;
 pub mod summary;
 pub mod wire_frame;
 
+/// What [`InboundRouter::try_route`] did with a frame.
+///
+/// A typed answer rather than a `bool`, because the four cases are the field
+/// diagnosis for "replication is not converging" and an operator that cannot
+/// tell them apart is debugging blind — which is exactly how edge's own
+/// harness spent six mesh runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteDisposition {
+    /// Consumed as a replication frame. Do not process it further.
+    Routed,
+    /// Not a replication frame at all — it is yours to handle.
+    NotReplication,
+    /// A replication frame on a link with NO usable peer identity, and not a
+    /// self-authenticating bootstrap kind. Dropped.
+    ///
+    /// A steady stream of these means the link never got attributed. Check that
+    /// `Key` and `IdentityOccurrence` are among the planes you replicate — an
+    /// advisory link is promoted by anti-entropying exactly those two, and
+    /// without them nothing else will ever flow.
+    Unattributed,
+    /// The registry refused the frame. Consumed; the reason is yours to log.
+    Failed(String),
+}
+
+impl RouteDisposition {
+    /// Did replication take ownership of this frame?
+    #[must_use]
+    pub fn consumed(&self) -> bool {
+        !matches!(self, RouteDisposition::NotReplication)
+    }
+}
+
+/// **Inbound replication routing, with every footgun already disarmed.**
+///
+/// `Transport::listen` runs in the application's own dispatch loop, so wiring
+/// replication into it is the operator's job. That wiring has a non-obvious
+/// half, and edge's own bench-mesh harness got it wrong in the obvious way:
+/// route when `source_key_id` is `Some`, drop otherwise. The harness then sat
+/// at ZERO replication for six mesh runs — ~75 frames per node arriving and
+/// being discarded — with no error anywhere, because a dropped frame looks
+/// exactly like a frame that never came.
+///
+/// So this type exists to be the whole wiring:
+///
+/// ```ignore
+/// let router = InboundRouter::new(runtime.registry());
+/// while let Some(frame) = rx.recv().await {
+///     if router.try_route(&frame).await.consumed() {
+///         continue;                 // replication owns it
+///     }
+///     // ... your own framing
+/// }
+/// ```
+///
+/// # What it disarms
+///
+/// **The bootstrap deadlock.** A peer first heard by announce is admitted
+/// *advisory* (`owns_key = false`), and is promoted only by anti-entropying
+/// that peer's `Key` (transport binding) and `IdentityOccurrence` (KEX
+/// enc-keys) planes OVER THAT SAME LINK. Demanding attribution before routing
+/// therefore deadlocks: the exchange that earns attribution is the exchange
+/// attribution is required for. `try_route` applies the CIRISEdge#402 carve-out
+/// — an un-attributed frame is routed under the link's advisory `link_key_id`,
+/// but ONLY for a self-authenticating bootstrap kind, which persist verifies at
+/// admission and which can never satisfy the trace-serve gate (that requires
+/// `from_rooted_binding`). Every other kind on an un-attributed link is
+/// dropped, exactly as a hand-written version would.
+///
+/// # What it cannot do for you
+///
+/// Two things still have to be right in YOUR configuration, and both were also
+/// wrong in that harness:
+///
+/// 1. **Replicate `Key` and `IdentityOccurrence`.** Without them an advisory
+///    link is never promoted, so no other plane ever flows. See
+///    [`EnvelopeKind::BOOTSTRAP_PLANES`].
+/// 2. **Author a directed `consent:replication:v1` grant per peer.** The
+///    Attestation plane is consent-gated at the RECIPIENT: a peer that does not
+///    resolve withholds the WHOLE plane, fail-closed, before any per-row
+///    question. See
+///    [`replication_consent_attestation`](crate::replication::attestation_bind::replication_consent_attestation).
+#[derive(Clone)]
+pub struct InboundRouter {
+    registry: std::sync::Arc<ReplicationRegistry>,
+}
+
+impl InboundRouter {
+    #[must_use]
+    pub fn new(registry: std::sync::Arc<ReplicationRegistry>) -> Self {
+        Self { registry }
+    }
+
+    /// Route `frame` if it is a replication frame. See the type docs.
+    pub async fn try_route(&self, frame: &crate::transport::InboundFrame) -> RouteDisposition {
+        // Cheap reject first: a frame that is not CRPL at all is the common
+        // case in an application's dispatch loop, and must not cost an
+        // attribution lookup.
+        match wire_frame::try_unwrap(&frame.envelope_bytes) {
+            Ok(Some(_)) => {}
+            Ok(None) => return RouteDisposition::NotReplication,
+            Err(e) => return RouteDisposition::Failed(format!("malformed CRPL frame: {e}")),
+        }
+        let Some(peer) = routing_source(frame) else {
+            return RouteDisposition::Unattributed;
+        };
+        match self
+            .registry
+            .route_inbound_bytes(&peer, &frame.envelope_bytes)
+            .await
+        {
+            Ok(RouteOutcome::NotAReplicationFrame) => RouteDisposition::NotReplication,
+            Ok(_) => RouteDisposition::Routed,
+            Err(e) => RouteDisposition::Failed(e.to_string()),
+        }
+    }
+}
+
+/// **The peer id to route an inbound frame under — the whole answer, one call.**
+///
+/// Edge's `Transport::listen` runs in the application's own dispatch loop, and
+/// the module docs ask the operator for "a one-line addition" wiring
+/// [`ReplicationRegistry::route_inbound_bytes`] into it. That line needs a
+/// peer_key_id, and getting it right is the part the docs do not spell out:
+///
+/// * `source_key_id` is the E3-attributed identity (`Rooted ∧ owns_key`). When
+///   present, use it.
+/// * When it is ABSENT the frame is not necessarily junk. A peer first heard by
+///   announce is admitted **advisory** (`owns_key = false`), and it can only be
+///   promoted by anti-entropying that peer's `Key` (transport binding) and
+///   `IdentityOccurrence` (KEX enc-keys) planes OVER THAT SAME LINK. Dropping
+///   un-attributed frames therefore deadlocks the bootstrap: the exchange that
+///   would earn attribution is the exchange attribution is demanded for.
+///
+/// So an un-attributed frame is routed under the link's advisory
+/// `link_key_id` — but ONLY for a self-authenticating
+/// [bootstrap kind](EnvelopeKind::is_bootstrap) (`Key` / `IdentityOccurrence`),
+/// which persist verifies at admission and which can never satisfy the
+/// trace-serve gate (that requires `from_rooted_binding`). Every other kind on
+/// an un-attributed link returns `None` and is dropped, exactly as before.
+///
+/// # Why this is public
+///
+/// It was private to `Edge`'s dispatch loop, so an operator wiring their own
+/// listener — as edge's own bench-mesh harness does — wrote the obvious version
+/// instead: route when `source_key_id` is `Some`, drop otherwise. That harness
+/// then sat at zero replication for six mesh runs, with ~75 frames per node
+/// arriving and being discarded unattributed, and no error anywhere. The
+/// non-obvious half of the contract should not have been behind a private fn.
+///
+/// ```ignore
+/// // In your Transport::listen loop:
+/// if let Some(peer) = replication::routing_source(&frame) {
+///     registry.route_inbound_bytes(&peer, &frame.envelope_bytes).await?;
+/// }
+/// ```
+#[must_use]
+pub fn routing_source(frame: &crate::transport::InboundFrame) -> Option<String> {
+    if let Some(attributed) = frame.source_key_id.as_ref() {
+        return Some(attributed.as_str().to_owned());
+    }
+    // The bootstrap carve-out (CIRISEdge#402).
+    let link_key_id = frame.link_key_id.as_deref()?;
+    let msg = wire_frame::try_unwrap(&frame.envelope_bytes)
+        .ok()
+        .flatten()?;
+    if !msg.kind().is_bootstrap() {
+        return None;
+    }
+    Some(crate::transport::SourceKeyId::transport_authenticated(link_key_id).into_string())
+}
+
 #[doc(inline)]
 pub use accord_relay_gate::{
     AccordRelayGate, RelayDecision, RelayRefusal, RELAY_VERDICT_TTL as ACCORD_RELAY_VERDICT_TTL,

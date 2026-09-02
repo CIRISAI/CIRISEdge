@@ -1022,6 +1022,26 @@ struct InboundStats {
 }
 
 impl InboundStats {
+    fn record(&self, d: &ciris_edge::replication::RouteDisposition) {
+        use ciris_edge::replication::RouteDisposition as D;
+        use std::sync::atomic::Ordering::Relaxed;
+        match d {
+            D::Routed => {
+                self.routed.fetch_add(1, Relaxed);
+            }
+            D::NotReplication => {
+                self.not_replication.fetch_add(1, Relaxed);
+            }
+            D::Unattributed => {
+                self.unattributed.fetch_add(1, Relaxed);
+            }
+            D::Failed(e) => {
+                self.errors.fetch_add(1, Relaxed);
+                tracing::warn!(error = %e, "replication routing failed");
+            }
+        }
+    }
+
     fn as_json(&self) -> serde_json::Value {
         use std::sync::atomic::Ordering::Relaxed;
         serde_json::json!({
@@ -1048,7 +1068,7 @@ impl InboundStats {
 /// is the operator here and had not written the line.
 fn spawn_inbound(
     transport: &Arc<ReticulumTransport>,
-    replication: Arc<ciris_edge::replication::ReplicationRegistry>,
+    router: ciris_edge::replication::InboundRouter,
     stats: Arc<InboundStats>,
 ) -> Arc<Mailbox> {
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(4096);
@@ -1069,27 +1089,7 @@ fn spawn_inbound(
             let Some((kind, header, payload)) = decode_frame(&frame.envelope_bytes) else {
                 // Not harness framing — hand it to replication before giving up
                 // on it. This is THE line the module docs ask the operator for.
-                use std::sync::atomic::Ordering::Relaxed;
-                let Some(peer) = src.as_deref() else {
-                    stats.unattributed.fetch_add(1, Relaxed);
-                    continue;
-                };
-                match replication
-                    .route_inbound_bytes(peer, &frame.envelope_bytes)
-                    .await
-                {
-                    Ok(ciris_edge::replication::RouteOutcome::NotAReplicationFrame) => {
-                        stats.not_replication.fetch_add(1, Relaxed);
-                    }
-                    Ok(outcome) => {
-                        stats.routed.fetch_add(1, Relaxed);
-                        tracing::trace!(%peer, ?outcome, "routed a replication frame");
-                    }
-                    Err(e) => {
-                        stats.errors.fetch_add(1, Relaxed);
-                        tracing::warn!(%peer, error = %e, "replication routing failed");
-                    }
-                }
+                stats.record(&router.try_route(&frame).await);
                 continue;
             };
             match kind {
@@ -1466,7 +1466,37 @@ struct Occurrence {
 /// frames began timing out, so replication starved the mesh it was meant to
 /// serve (leviculum#29, CIRISEdge#508/#531). Discovery needs Key (directory
 /// rows) and Attestation (owner bindings); nothing else earns a round here.
-const DISCOVERY_PLANES: [EnvelopeKind; 2] = [EnvelopeKind::Key, EnvelopeKind::Attestation];
+const _: () = {
+    // The harness's plane list MUST contain the bootstrap pair. A compile-time
+    // check, because omitting one is silent at runtime: an advisory link simply
+    // never promotes and every later plane reports nothing new.
+    let mut i = 0;
+    while i < EnvelopeKind::BOOTSTRAP_PLANES.len() {
+        let needed = EnvelopeKind::BOOTSTRAP_PLANES[i];
+        let mut found = false;
+        let mut j = 0;
+        while j < DISCOVERY_PLANES.len() {
+            if DISCOVERY_PLANES[j] as u8 == needed as u8 {
+                found = true;
+            }
+            j += 1;
+        }
+        assert!(found, "DISCOVERY_PLANES must contain every BOOTSTRAP_PLANE");
+        i += 1;
+    }
+};
+
+const DISCOVERY_PLANES: [EnvelopeKind; 4] = [
+    // The three that PROMOTE an advisory link to an attributed one. The harness
+    // registered only `Key` and ran six mesh runs at zero replication: without
+    // `IdentityOccurrence` and `TransportDestination` the link never earns
+    // attribution, so no other plane ever flows.
+    EnvelopeKind::Key,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::TransportDestination,
+    // What discovery actually reads.
+    EnvelopeKind::Attestation,
+];
 
 /// Build the whole occurrence: keys, sealed KV, directory, transport,
 /// address table, lifecycle.
@@ -1759,7 +1789,7 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     let inbound_stats = Arc::new(InboundStats::default());
     let mailbox = spawn_inbound(
         &transport,
-        replication.registry(),
+        ciris_edge::replication::InboundRouter::new(replication.registry()),
         Arc::clone(&inbound_stats),
     );
 
