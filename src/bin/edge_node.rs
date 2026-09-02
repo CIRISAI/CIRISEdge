@@ -132,6 +132,8 @@ use ciris_edge::cohort_scope::CohortScope;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::mls::cohort_group::mint_cohort_key_material;
 use ciris_edge::mls::{CohortGroup, CommitApplyOutcome, ScopeStateProvider};
+use ciris_edge::replication::protocol::EnvelopeKind;
+use ciris_edge::replication::ReplicationPeer;
 use ciris_edge::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink, TransitionOutcome};
 use ciris_edge::transport::realtime_av::{
@@ -1364,6 +1366,9 @@ fn annexb_access_units(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 /// scope-address lifecycle driving the real transport.
 struct Occurrence {
     cfg: Config,
+    /// The real anti-entropy runtime. Owner bindings reach peers through this
+    /// and nothing else — the harness seeds no state into any peer.
+    replication: Arc<ciris_edge::replication::ReplicationRuntime>,
     transport: Arc<ReticulumTransport>,
     mailbox: Arc<Mailbox>,
     table: Arc<ScopeAddressTable>,
@@ -1555,8 +1560,59 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
 
     let mailbox = spawn_inbound(&transport);
 
+    // ── 8. THE REPLICATION PLANE ─────────────────────────────────────
+    //
+    // Without this the harness has no anti-entropy at all: each node held
+    // the steward's key records plus its OWN owner binding, and nothing ever
+    // carried a binding between nodes. `ladder.discover_by_fedid` therefore
+    // could not pass by construction — `nodes_owned_by(peer-owner)` was
+    // permanently empty, and the leg's failure was reported as
+    // `NotYetDiscovered`, which reads like slow convergence rather than an
+    // absent mechanism.
+    //
+    // Starting the real runtime is what makes the leg test the FEDERATION
+    // DIRECTORY DISCOVERY MECHANISM rather than a fixture: a peer's owner
+    // binding now arrives the way every other signed row does, over the
+    // Attestation plane, and this is also the first in-repo consumer of
+    // `ReplicationRuntime::start` — the shape a downstream chat harness
+    // copies.
+    //
+    // Cadence is tightened from the 30s default: the mesh's barriers are
+    // measured in tens of seconds, so a default-cadence node would spend the
+    // whole budget waiting for its first round.
+    let peers: Vec<ReplicationPeer> = roster
+        .keys()
+        .filter(|k| *k != &cfg.node_id)
+        .flat_map(|peer| {
+            EnvelopeKind::ALL
+                .into_iter()
+                .map(move |kind| ReplicationPeer {
+                    peer_key_id: peer.clone(),
+                    kind,
+                })
+        })
+        .collect();
+    let replication = Arc::new(
+        ciris_edge::replication::ReplicationRuntime::start(
+            Arc::clone(&directory) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+            Arc::clone(&transport) as Arc<dyn ciris_edge::transport::Transport>,
+            peers,
+            ciris_edge::replication::ReplicationRuntimeConfig {
+                scheduler: ciris_edge::replication::SchedulerConfig {
+                    cadence: Duration::from_secs(2),
+                    round_timeout: Duration::from_secs(10),
+                },
+                local_key_id: Some(cfg.node_id.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await,
+    );
+
     Ok(Occurrence {
         cfg,
+        replication,
         transport,
         mailbox,
         table,
@@ -1589,6 +1645,13 @@ async fn resolve_addr(hostport: &str, timeout: Duration) -> Result<std::net::Soc
 }
 
 impl Occurrence {
+    /// A waiter on this node's convergence signal — bumped by every ADMITTED
+    /// envelope, so a leg wakes when the row it needs lands rather than on a
+    /// poll boundary.
+    fn replication_convergence(&self) -> ciris_edge::replication::convergence::ConvergenceWaiter {
+        self.replication.convergence()
+    }
+
     /// Wait for real announce-based rooting to converge with every peer
     /// we need to talk to. No test hook: this is the production
     /// cold-start path, and a timeout is reported as a leg that did not
@@ -1751,37 +1814,40 @@ async fn run_discover_by_fedid_leg(
         return;
     };
 
-    // POLL until the peer's binding arrives, up to the barrier.
+    // WAIT for the peer's binding, through the shared helper.
     //
     // The row is replicated, not seeded, so asking once races the Attestation
     // plane and fails on timing rather than on the property under test. What
     // this leg claims is that discovery CONVERGES over the wire — so waiting
     // for convergence is the measurement, and the elapsed time is reported as
     // part of it.
-    let started = Instant::now();
-    let mut attempts = 0_u32;
-    let mut last: Option<contact::Discovered> = None;
-    let mut last_stall: Option<String> = None;
-    loop {
-        attempts += 1;
-        match contact::discover(lens, routes, &owner_id).await {
-            Ok(found) => {
-                let done = found.subject.nodes.contains(&expect_node)
-                    && found.reachable.contains(&expect_node);
-                last = Some(found);
-                if done {
-                    break;
-                }
-            }
-            Err(stall) => last_stall = Some(format!("{stall:?}")),
-        }
-        if started.elapsed() >= cfg.barrier_timeout {
-            break;
-        }
-        tokio_sleep(Duration::from_millis(500)).await;
-    }
-
-    let waited_ms = started.elapsed().as_millis();
+    //
+    // `await_until` wakes on an ADMITTED envelope rather than on a poll
+    // boundary, so this resolves the moment the binding lands. Route
+    // reachability is not signalled by admission — that lives in the
+    // transport's table — so the helper's floor covers it, and the leg does not
+    // have to know which half of its predicate is signalled.
+    // The predicate answers ONE question and captures nothing, so the closure
+    // stays `Send` and the helper needs no interior mutability from callers.
+    // The snapshot used for reporting comes from a single call afterwards —
+    // cheap, and the same shape on the converged and timed-out paths alike.
+    let outcome = occ
+        .replication_convergence()
+        .await_until(cfg.barrier_timeout, || async {
+            matches!(
+                contact::discover(lens, routes, &owner_id).await,
+                Ok(ref f)
+                    if f.subject.nodes.contains(&expect_node)
+                        && f.reachable.contains(&expect_node)
+            )
+        })
+        .await;
+    let (last, last_stall) = match contact::discover(lens, routes, &owner_id).await {
+        Ok(found) => (Some(found), None),
+        Err(stall) => (None, Some(format!("{stall:?}"))),
+    };
+    let attempts = outcome.checks();
+    let waited_ms = outcome.waited().as_millis();
     if let Some(found) = last {
         let named = found.subject.nodes.contains(&expect_node);
         let reachable = found.reachable.contains(&expect_node);

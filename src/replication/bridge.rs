@@ -1245,6 +1245,9 @@ pub struct FederationDirectoryReplicationBridge {
     /// the (extensive) test constructions below stay untouched; every PRODUCTION
     /// construction site threads `Edge`'s handle in via [`Self::with_metrics`].
     metrics: Option<crate::observability::EdgeMetrics>,
+    /// Bumped once per ADMITTED envelope so waiters wake on convergence
+    /// instead of on a poll boundary. `None` makes every bump a no-op.
+    convergence: Option<std::sync::Arc<super::convergence::ConvergenceSignal>>,
     /// CIRISEdge#430 — observer called with the revoked `key_id` after an
     /// ADMITTED Revocation apply. The transit gate's event-driven cache
     /// invalidation rides this (an in-band un-trust must drop cached hop
@@ -1515,6 +1518,7 @@ impl FederationDirectoryReplicationBridge {
             operational: None,
             consent_memo: Mutex::new(None),
             metrics: None,
+            convergence: None,
             revocation_observer: None,
             mesh_config: None,
             accord_relay_gate: None,
@@ -1587,6 +1591,7 @@ impl FederationDirectoryReplicationBridge {
             operational: Some(operational),
             consent_memo: Mutex::new(None),
             metrics: None,
+            convergence: None,
             revocation_observer: None,
             mesh_config: None,
             accord_relay_gate: None,
@@ -1747,6 +1752,18 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Install the node's convergence signal. Every ADMITTED envelope bumps it,
+    /// which is what lets a caller await a row's arrival instead of polling for
+    /// it (see [`super::convergence`]).
+    #[must_use]
+    pub fn with_convergence(
+        mut self,
+        convergence: Option<std::sync::Arc<super::convergence::ConvergenceSignal>>,
+    ) -> Self {
+        self.convergence = convergence;
         self
     }
 
@@ -3237,6 +3254,16 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 // `on_deliver` logs it loud; a metrics kind-count of undecodable
                 // bytes would conflate wire corruption with a policy decision).
                 ApplyOutcome::Deserialize(_) => {}
+            }
+        }
+        // The convergence signal, at the same choke and on the same rule as the
+        // `applied` counter: ADMITTED only. A duplicate or a refusal changed
+        // nothing a waiter can observe, and waking every waiter on the node for
+        // a row it already held would make the signal a busy-loop with extra
+        // steps.
+        if outcome.is_admitted() {
+            if let Some(signal) = &self.convergence {
+                signal.note_admitted();
             }
         }
         self.remember_outcome(kind, envelope_bytes, &outcome);

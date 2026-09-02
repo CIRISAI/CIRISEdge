@@ -119,6 +119,7 @@
 pub mod accord_relay_gate;
 pub mod attestation_bind;
 pub mod bridge;
+pub mod convergence;
 pub mod coordinator;
 pub mod directory;
 /// CIRISEdge#552 — hashes known to exist whose bodies this node does not

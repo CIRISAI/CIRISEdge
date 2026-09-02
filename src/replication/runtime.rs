@@ -120,6 +120,7 @@ fn build_bridge(
     config: &ReplicationRuntimeConfig,
     self_provider: Option<CohortProvider>,
     mesh_config: Option<Arc<MeshConfigReader>>,
+    convergence: Arc<super::convergence::ConvergenceSignal>,
 ) -> Arc<FederationDirectoryReplicationBridge> {
     let bridge_config = resolve_sweep_permits(config.bridge);
     Arc::new(
@@ -129,6 +130,7 @@ fn build_bridge(
             bridge_config,
         )
         .with_self_provider(self_provider)
+        .with_convergence(Some(convergence))
         .with_local_key_id(config.local_key_id.clone())
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
@@ -522,6 +524,10 @@ pub struct ReplicationRuntime {
     /// the-whole-message critical section (with `block_on` DB I/O inside)
     /// is gone.
     applier: Arc<dyn StateApplier>,
+    /// Bumped once per ADMITTED envelope. The thing that lets a caller AWAIT a
+    /// row's arrival rather than poll for it — see [`Self::await_convergence`]
+    /// and [`Self::pull_and_await`].
+    convergence: Arc<super::convergence::ConvergenceSignal>,
     cancel_tx: watch::Sender<bool>,
     scheduler_task: Option<JoinHandle<()>>,
     config: ReplicationRuntimeConfig,
@@ -626,12 +632,14 @@ impl ReplicationRuntime {
 
         // The ONE production bridge — shared by every coordinator below AND by the
         // #312 responder factory. See [`build_bridge`] for the #433 metrics wiring.
+        let convergence = super::convergence::ConvergenceSignal::shared();
         let bridge = build_bridge(
             &directory,
             cohort,
             &config,
             self_provider,
             mesh_config.clone(),
+            Arc::clone(&convergence),
         );
 
         let registry = Arc::new(ReplicationRegistry::new());
@@ -753,6 +761,7 @@ impl ReplicationRuntime {
             registry,
             bridge,
             applier: shared_applier,
+            convergence,
             cancel_tx,
             scheduler_task: Some(scheduler_task),
             config,
@@ -862,6 +871,81 @@ impl ReplicationRuntime {
     /// stopped) is a hard error that aborts immediately.
     ///
     /// [`PullDispatch`]: ReplicationRuntimeError::PullDispatch
+    /// Subscribe to this node's convergence signal.
+    ///
+    /// Subscribe BEFORE dispatching the work you intend to wait on: a waiter
+    /// created afterwards can miss an admission that landed in between.
+    /// [`Self::pull_and_await`] does this for you and is what most callers
+    /// want.
+    #[must_use]
+    pub fn convergence(&self) -> super::convergence::ConvergenceWaiter {
+        self.convergence.subscribe()
+    }
+
+    /// **Pull, then WAIT for the answer.** The one helper every caller that
+    /// needs a row from the mesh should use.
+    ///
+    /// [`Self::pull_subject_testimony`] is fire-and-forget by design — it
+    /// returns once the sends are queued, because the rows arrive later through
+    /// the ordinary Diff/Deliver flow. That leaves any caller who actually
+    /// needs the answer to invent a poll loop, which is how four near-identical
+    /// loops appeared in the harness and how a downstream consumer would write
+    /// a fifth.
+    ///
+    /// This subscribes FIRST, then dispatches, then waits — so a row admitted
+    /// between the send and the wait is never missed. It wakes on admission
+    /// rather than on a timer, so the common case returns as soon as the row
+    /// lands.
+    ///
+    /// `is_present` is YOUR question about observable state — "does the
+    /// directory know this key", "does this fedID own a node I can reach" — not
+    /// "did a message arrive". Keep it cheap; it runs once before any waiting
+    /// and again on every wakeup.
+    ///
+    /// Returns the dispatch error only when the Pull could not be SENT. A sent
+    /// Pull that never converges is a [`Converged::TimedOut`], not an error:
+    /// the peer may simply not hold what you asked for, and that is an answer.
+    ///
+    /// ```ignore
+    /// // "Search for a fedID" — resolve a contact, waiting for the directory.
+    /// let outcome = runtime
+    ///     .pull_and_await(&peer, &fed_id, Duration::from_secs(10), || async {
+    ///         contact::resolve(&lens, &fed_id).await.is_ok()
+    ///     })
+    ///     .await?;
+    /// if outcome.is_converged() { /* contact found */ }
+    /// ```
+    ///
+    /// [`Converged::TimedOut`]: super::convergence::Converged::TimedOut
+    pub async fn pull_and_await<F, Fut>(
+        &self,
+        peer_key_id: &str,
+        subject_key_id: &str,
+        budget: std::time::Duration,
+        is_present: F,
+    ) -> Result<super::convergence::Converged, ReplicationRuntimeError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        // Subscribe BEFORE the send. Reversing these two lines reintroduces the
+        // race the signal exists to close: the row can be admitted between the
+        // Pull leaving and the waiter parking.
+        let mut waiter = self.convergence();
+        self.pull_subject_testimony(peer_key_id, subject_key_id)
+            .await?;
+        let outcome = waiter.await_until(budget, is_present).await;
+        tracing::debug!(
+            peer = %peer_key_id,
+            subject = %subject_key_id,
+            converged = outcome.is_converged(),
+            waited_ms = outcome.waited().as_millis(),
+            checks = outcome.checks(),
+            "pull_and_await"
+        );
+        Ok(outcome)
+    }
+
     pub async fn pull_subject_testimony(
         &self,
         peer_key_id: &str,
