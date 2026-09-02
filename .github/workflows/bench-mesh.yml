@@ -158,13 +158,28 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      # `docker logs` by container NAME, not `docker compose logs`.
+      #
+      # compose interpolates `compose.yaml` before it will do anything, and the
+      # file REQUIRES `MESH_EXPECT` (`${MESH_EXPECT:?...}`) — which only
+      # `run.sh` sets. So this step died on
+      # "required variable MESH_EXPECT is missing a value" and captured
+      # NOTHING, on every failing run. Combined with the harness having no log
+      # subscriber, a failing mesh produced no node output at all: five runs
+      # were diagnosed from the leg census alone.
+      #
+      # The container names are fixed by compose's `container_name:`, so
+      # addressing them directly needs no interpolation and no env.
       - name: Container logs on failure
         if: failure()
-        working-directory: bench-mesh
         run: |
-          docker compose -f compose.yaml \
-            --profile relays2 --profile subs2 --profile subs4 \
-            logs --no-color --tail 400 || true
+          for c in bm-publisher bm-relay-1 bm-relay-2 bm-sub-1 bm-sub-2 \
+                   bm-sub-3 bm-sub-4 bm-nonmember; do
+            if docker inspect "$c" >/dev/null 2>&1; then
+              echo "───────────────────────── $c ─────────────────────────"
+              docker logs --tail 300 "$c" 2>&1 || true
+            fi
+          done
 
       - name: Tear down
         if: always()
