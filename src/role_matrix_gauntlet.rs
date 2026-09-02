@@ -154,6 +154,42 @@ async fn r0_the_tier_is_resolved_on_the_production_round_path() {
     );
 }
 
+/// R0b — the tier is resolved for the ADVERTISED identity, not the actor.
+///
+/// ROLE_MATRIX axes 2 and 3 are orthogonal, and #541 splits the identity in
+/// two: peers see the node, stored rows and agency are the actor's. A
+/// conferral is granted against the identity peers registered — the node — so
+/// resolving the tier for the actor leaves a blessed node at `ServeTier::None`
+/// with its directory role silently off. Exactly the actor/node conflation
+/// #541 exists to prevent, arriving through a new door.
+#[test]
+fn r0b_the_tier_subject_is_the_advertised_identity() {
+    let config = crate::replication::ReplicationRuntimeConfig {
+        local_key_id: Some("actor-aaa".to_string()),
+        serve_tier_subject_key_id: Some("node-bbb".to_string()),
+        ..Default::default()
+    };
+
+    // The two are DISTINCT fields. Collapsing them would move the E3 trace
+    // gate's truster identity as a side effect, which is why the tier gets its
+    // own.
+    assert_ne!(
+        config.local_key_id, config.serve_tier_subject_key_id,
+        "the tier subject and the truster are different questions"
+    );
+
+    // Unset, the tier subject falls back to local_key_id — correct wherever the
+    // two identities coincide, which is every deployment without the flag.
+    let plain = crate::replication::ReplicationRuntimeConfig {
+        local_key_id: Some("both-ccc".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        plain.serve_tier_subject_key_id.is_none(),
+        "no separate subject by default"
+    );
+}
+
 /// R3 — retention keys on Axis 3 (tier), and `AgentMode` does not exist in
 /// the decision at all.
 ///

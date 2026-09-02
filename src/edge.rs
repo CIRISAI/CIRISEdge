@@ -373,6 +373,17 @@ pub struct EdgeConfig {
     /// [`EdgeBuilder::config`]. See `AgentMode` for the wire-string
     /// codec + the full behaviour matrix.
     pub agent_mode: AgentMode,
+    /// CIRISEdge#541 — the identity this node ADVERTISES and is addressable as.
+    ///
+    /// Under `use_node_identity` this is the node's key, while the actor's
+    /// derived signer id stays the agency-bearing identity. Peers see the node;
+    /// stored rows and authorship are the actor's. Anything asking "which
+    /// identity did peers register and confer against" wants THIS, not
+    /// `signer_key_id()`.
+    ///
+    /// `None` when the two coincide, which is every deployment that does not
+    /// set the flag.
+    pub advertised_key_id: Option<String>,
     /// CIRISEdge#45 (v0.18.0) — derived from [`Self::agent_mode`] by
     /// [`AgentMode::apply_defaults`]. `true` for `proxy / server`,
     /// `false` for `client`. Hosts that bind their own listener (PyO3
@@ -586,6 +597,7 @@ impl Default for EdgeConfig {
             // EdgeConfig leaves the detector field as `None`.
             probe_pattern_observer_enabled: false,
             probe_pattern_observer_config: crate::ProbePatternConfig::default(),
+            advertised_key_id: None,
             // CIRISEdge#45 (v0.18.0) — default mode is Proxy. The
             // listener_bound + outbound_queue_max defaults mirror the
             // Proxy column of `AgentMode::apply_defaults` so an
@@ -1600,6 +1612,21 @@ pub fn baked_canonical_ip_dials() -> Vec<(String, std::net::SocketAddr)> {
 }
 
 impl Edge {
+    /// CIRISEdge#541 — the identity peers know this node as.
+    ///
+    /// The advertised (node) identity when `use_node_identity` split them, else
+    /// the actor's signer id. This is the subject a conferral is granted
+    /// against, so anything resolving a serving tier must ask for THIS —
+    /// checking the actor leaves a blessed node at `ServeTier::None` and its
+    /// directory role silently off.
+    #[must_use]
+    pub fn advertised_key_id(&self) -> String {
+        self.config
+            .advertised_key_id
+            .clone()
+            .unwrap_or_else(|| self.signer_key_id().to_string())
+    }
+
     /// CIRISEdge#552 — the mode this Edge was initialized with.
     ///
     /// Exposed because the replication runtime needs it: `BridgeConfig::mode`

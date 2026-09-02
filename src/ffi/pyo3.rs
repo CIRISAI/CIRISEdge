@@ -2508,6 +2508,11 @@ impl PyEdge {
         // inert through the shipped host path — the same silent-default failure
         // as the mode above, in the same function.
         config.local_key_id = Some(self.inner.signer_key_id().to_string());
+        // CIRISEdge#541 — and the TIER subject separately: the conferral is
+        // granted against the identity peers know this node as. These coincide
+        // unless `use_node_identity` split them, and where they differ, using
+        // the actor here silently disables a blessed node's directory role.
+        config.serve_tier_subject_key_id = Some(self.inner.advertised_key_id());
         // CIRISEdge#370 — hand the live metrics bag to the runtime so its
         // scheduler event-sink consumer folds each round's outcome into the
         // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;
@@ -6599,6 +6604,12 @@ pub fn init_edge_runtime(
         ..Default::default()
     };
     parsed_agent_mode.apply_defaults(&mut config);
+    // CIRISEdge#541/#552 — carry the advertised identity onto the Edge. The
+    // serving tier is a property of the identity peers registered and conferred
+    // against, and under `use_node_identity` that is the NODE, not the actor.
+    // Resolving the tier for the actor leaves a blessed node at
+    // `ServeTier::None` with its directory role silently off.
+    config.advertised_key_id = Some(advertised_key_id.clone());
     // v0.20.0 RC1 (CIRISEdge#51) — operator overrides for the CEWP
     // L0/L1 tier defaults. `apply_defaults` set both fields to the
     // mode-derived value; `Some(_)` here pins a per-deployment
@@ -11424,6 +11435,14 @@ mod node_identity_tests {
             "start_replication must set config.local_key_id from the Edge's own \
              signer — the serve-tier resolver, the own-record Pull arm, and \
              missing-signer recovery are all keyed on it"
+        );
+        assert!(
+            body.contains(
+                "config.serve_tier_subject_key_id = Some(self.inner.advertised_key_id());"
+            ),
+            "start_replication must resolve the serving tier for the ADVERTISED \
+             identity — under use_node_identity the conferral is on the node, \
+             and checking the actor leaves a blessed node at ServeTier::None"
         );
         assert!(
             !body.contains("config.bridge.mode"),
