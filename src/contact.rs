@@ -992,6 +992,23 @@ impl LadderStall {
 /// without parsing prose. Success is INFO because walking the ladder is a rare,
 /// meaningful event — not a hot path — and the first question after "it did not
 /// work" is always which rungs DID.
+/// Throttle for the SELF-RESOLVING stall line. `discover` is the predicate a
+/// convergence waiter re-runs every 250 ms until the directory catches up, so
+/// unthrottled it emits one line per check — 531 lines in one mesh run, the
+/// single largest source of log volume there, all saying the same thing about
+/// the same subject. Once per subject per 10 s keeps the fact visible without
+/// burying the rung that fails.
+///
+/// Keyed on `fed_id` (caller-chosen) with a bounded key map, the same DoS
+/// backstop shape as the transport's attribution-miss throttle.
+static RUNG_WAITING_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+fn rung_waiting_log() -> &'static crate::log_throttle::LogThrottle {
+    RUNG_WAITING_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(1, std::time::Duration::from_secs(10), 64)
+    })
+}
+
 pub fn log_rung(rung: Rung, fed_id: &str, stall: Option<&LadderStall>) {
     match stall {
         None => tracing::info!(
@@ -1000,13 +1017,22 @@ pub fn log_rung(rung: Rung, fed_id: &str, stall: Option<&LadderStall>) {
             outcome = "ok",
             "contact ladder: {rung} completed for {fed_id}"
         ),
-        Some(s) if s.self_resolving() => tracing::info!(
+        Some(s) if s.self_resolving() => {
+            let key = format!("{rung}:{fed_id}");
+            let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                rung_waiting_log().check(&key)
+            else {
+                return;
+            };
+            tracing::info!(
             step = rung.as_str(),
             fed_id,
             outcome = "waiting",
             remedy = %s.remedy(),
+            suppressed_prev,
             "contact ladder: {rung} is waiting — this resolves itself"
-        ),
+            );
+        }
         Some(s) => tracing::warn!(
             step = rung.as_str(),
             fed_id,

@@ -171,6 +171,11 @@ struct Leg {
     node: String,
     /// Emitting node's role.
     role: String,
+    /// When the row was emitted (RFC 3339, UTC). The census keys on `leg`
+    /// and ignores unknown members, so this is free to add — and without it
+    /// the artifact could not answer "where did the time go": no per-node
+    /// wall clock, no leg ordering, no gap between two nodes' verdicts.
+    ts: String,
     /// Did this leg actually execute end to end?
     ran: bool,
     /// Verdict. `None` iff `!ran`.
@@ -206,6 +211,7 @@ impl Reporter {
             name: leg.to_owned(),
             node: self.node.clone(),
             role: self.role.clone(),
+            ts: chrono::Utc::now().to_rfc3339(),
             ran: true,
             ok: Some(ok),
             not_run_reason: None,
@@ -219,6 +225,7 @@ impl Reporter {
             name: leg.to_owned(),
             node: self.node.clone(),
             role: self.role.clone(),
+            ts: chrono::Utc::now().to_rfc3339(),
             ran: false,
             ok: None,
             not_run_reason: Some(reason.into()),
