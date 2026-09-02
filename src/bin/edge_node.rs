@@ -1610,6 +1610,9 @@ struct Occurrence {
     lifecycle: Arc<ScopeLifecycle>,
     roster: BTreeMap<String, RosterEntry>,
     reporter: Arc<Reporter>,
+    /// This node's hybrid signer — what a chat message is attested and
+    /// signed by (the node, on the owner's behalf).
+    node_signer: Arc<LocalSigner>,
     /// This node's persist directory — what `contact::PersistLens` reads, so
     /// the discovery leg resolves against the SAME state replication feeds.
     directory: Arc<SqliteBackend>,
@@ -1849,6 +1852,9 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // Same class as the owner binding: classical-only where the federation tier
     // is PQC-mandatory. `FedKey` already carries both halves.
     let signer = Arc::new(fed.local_signer(&cfg.node_id)?);
+    // Kept for the chat legs: the NODE attests and signs a message on its
+    // owner's behalf, under the owner binding it acts under.
+    let node_signer = Arc::clone(&signer);
 
     // ── 6. The real transport, on the real docker network ────────────
     //
@@ -2009,6 +2015,7 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         lifecycle,
         roster,
         reporter,
+        node_signer,
         directory,
     })
 }
@@ -2350,6 +2357,252 @@ async fn run_discover_by_fedid_leg(
     }
 }
 
+/// The pair chat legs — `ladder.open_chat` and `ladder.send_message` — over
+/// the real mesh, through the one-verb DX (`docs/FSD_REPLICATION_DX.md`).
+///
+/// Runs on the PUBLISHER and the FIRST subscriber only; every other role
+/// reports `not_run` with the reason, which the census accepts as
+/// documentation. Two parties, one room:
+///
+/// 1. Both derive the same room id from the two OWNER fed-IDs
+///    (`chat::pair_community_key_id`, order-free) and author the pair
+///    `Community` row locally. Members are the two HUMANS, not the nodes:
+///    AV-45 at the put door resolves a node writer through `owner_of` and
+///    checks the OWNER against the roster (`admission_identity_for_writer`).
+///    Authoring it on both sides is idempotent and removes any dependency on
+///    the Community plane's replication timing.
+/// 2. The publisher authors a message — `tier: local`, `cohort_scope: self`,
+///    attested by the NODE with the human as `on_behalf_of_key_id` inside the
+///    signed envelope — stores it, and `share(With::Community)`s it.
+/// 3. The subscriber waits, through the convergence helper, until the row
+///    lands and `chat::messages_in_room` returns it — keyed on the sender's
+///    node and the derived room, read off the plane like a client would.
+///
+/// Nothing bespoke crosses the wire. The message is an ordinary
+/// federation-tier `scores` row on `chat:message:v1`, so RNS transport,
+/// the relay hop, and LXMF come along for free.
+/// The one message the pair chat sends. Fixed so the receiver can check it.
+const CHAT_BODY: &str = "hello over the mesh";
+
+async fn run_chat_legs(occ: &Occurrence) {
+    use ciris_edge::chat;
+    use ciris_edge::replication::attestation_bind::{share, Shared, With};
+    use ciris_persist::federation::types::{Community, CommunityMember, SignedCommunity};
+    use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
+
+    let rep = Arc::clone(&occ.reporter);
+    let cfg = &occ.cfg;
+
+    // publisher ↔ first subscriber. `cohort_members` is [publisher, sub-1, …].
+    let Some(publisher) = cfg.cohort_members.first().cloned() else {
+        rep.not_run("ladder.open_chat", "no cohort");
+        rep.not_run("ladder.send_message", "no cohort");
+        return;
+    };
+    let Some(first_sub) = cfg.cohort_members.get(1).cloned() else {
+        rep.not_run("ladder.open_chat", "no subscriber in the cohort");
+        rep.not_run("ladder.send_message", "no subscriber in the cohort");
+        return;
+    };
+    let (i_send, peer_node) = if cfg.node_id == publisher {
+        (true, first_sub)
+    } else if cfg.node_id == first_sub {
+        (false, publisher)
+    } else {
+        let why = "the pair chat legs run on the publisher and the first subscriber only";
+        rep.not_run("ladder.open_chat", why);
+        rep.not_run("ladder.send_message", why);
+        return;
+    };
+
+    let my_owner = format!("{}-owner", cfg.node_id);
+    let Some(peer_owner) = occ
+        .roster
+        .get(&peer_node)
+        .map(|e| e.owner_key_id.clone())
+        .filter(|o| !o.is_empty())
+    else {
+        rep.not_run("ladder.open_chat", "peer published no owner");
+        rep.not_run("ladder.send_message", "peer published no owner");
+        return;
+    };
+    let room = chat::pair_community_key_id(&my_owner, &peer_owner);
+    let founded_at: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .expect("const ts")
+            .into();
+
+    // ── open_chat: the derived pair room, authored locally ───────────
+    let mut members = vec![my_owner.clone(), peer_owner.clone()];
+    members.sort_unstable();
+    let community = Community {
+        community_key_id: room.clone(),
+        community_name: format!("{} <-> {}", members[0], members[1]),
+        members: members
+            .iter()
+            .map(|k| CommunityMember {
+                key_id: k.clone(),
+                joined_at: founded_at,
+                role: None,
+            })
+            .collect(),
+        founded_at,
+        consensus_protocol: "unanimous".to_owned(),
+        policy_blob: None,
+        persist_row_hash: String::new(),
+    };
+    let signed_room = async {
+        let canonical =
+            ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
+                .map_err(|e| format!("canonicalize room: {e}"))?;
+        let (c, q) =
+            ciris_edge::identity::sign_bound_hybrid(&occ.node_signer, &canonical, "pair community")
+                .await?;
+        Ok::<_, String>(SignedCommunity {
+            community: community.clone(),
+            authority_key_id: cfg.node_id.clone(),
+            scrub_signature_classical: c,
+            scrub_signature_pqc: q,
+        })
+    }
+    .await;
+    let opened = match signed_room {
+        Err(e) => Err(e),
+        Ok(row) => match occ.directory.put_community(row).await {
+            Ok(()) => Ok("authored"),
+            // Both ends author the same derived row; a collision means the
+            // peer's copy replicated first. Same room either way.
+            Err(ciris_persist::federation::Error::Conflict(_)) => Ok("already present"),
+            Err(e) => Err(format!("put_community: {e}")),
+        },
+    };
+    match &opened {
+        Ok(how) => rep.ran(
+            "ladder.open_chat",
+            true,
+            serde_json::json!({
+                "room": room,
+                "members": members,
+                "other_member": peer_owner,
+                "how": how,
+                "covers": "both ends derive the same two-person room from the two \
+                           owner fed-IDs and author it; members are the HUMANS, \
+                           because AV-45 resolves a node writer through owner_of",
+            }),
+        ),
+        Err(e) => {
+            tracing::error!(%room, error = %e, "open_chat failed");
+            rep.ran(
+                "ladder.open_chat",
+                false,
+                serde_json::json!({ "room": room, "error": e }),
+            );
+            rep.not_run("ladder.send_message", "open_chat failed");
+            return;
+        }
+    }
+
+    // ── send_message ─────────────────────────────────────────────────
+    if i_send {
+        let sent = async {
+            let msg = chat::chat_message_attestation(
+                &cfg.node_id,
+                &my_owner,
+                &peer_owner,
+                CHAT_BODY,
+                chrono::Utc::now(),
+                &occ.node_signer,
+            )
+            .await?;
+            occ.directory
+                .put_attestation(SignedAttestation {
+                    attestation: msg.clone(),
+                })
+                .await
+                .map_err(|e| format!("put message: {e}"))?;
+            let placed = share(&*occ.directory, &msg, With::Community, &occ.node_signer).await?;
+            Ok::<_, String>((msg.attestation_id, placed))
+        }
+        .await;
+        match sent {
+            Ok((id, placed)) => {
+                tracing::info!(%room, attestation_id = %id, ?placed, "chat message shared");
+                rep.ran(
+                    "ladder.send_message",
+                    placed == Shared::Placed,
+                    serde_json::json!({
+                        "room": room,
+                        "attestation_id": id,
+                        "shared": format!("{placed:?}"),
+                        "author": my_owner,
+                        "attested_by": cfg.node_id,
+                        "with": "community",
+                        "covers": "authored tier:local / cohort:self, then share(With::Community): \
+                                   promotion IS the federation-emit moment (CC 5.3.2.4.2)",
+                    }),
+                );
+            }
+            Err(e) => {
+                tracing::error!(%room, error = %e, "send_message failed");
+                rep.ran(
+                    "ladder.send_message",
+                    false,
+                    serde_json::json!({ "room": room, "error": e }),
+                );
+            }
+        }
+        return;
+    }
+
+    // Receiver: wait for the row to land, then read it the way a client would.
+    let dir: &dyn ciris_persist::federation::FederationDirectory = &*occ.directory;
+    let senders = vec![peer_node.clone()];
+    let budget = cfg.barrier_timeout.min(Duration::from_secs(90));
+    let outcome = occ
+        .replication_convergence()
+        .await_until(budget, || async {
+            chat::messages_in_room(dir, &senders, &room)
+                .await
+                .is_ok_and(|m| !m.is_empty())
+        })
+        .await;
+    let seen = chat::messages_in_room(dir, &senders, &room)
+        .await
+        .unwrap_or_default();
+    let ok = seen.iter().any(|m| {
+        m.body == CHAT_BODY && m.author_key_id == peer_owner && m.attesting_key_id == peer_node
+    });
+    if !ok {
+        tracing::error!(
+            %room, waited_ms = outcome.waited().as_millis(), checks = outcome.checks(),
+            messages = seen.len(),
+            "no message from the peer arrived in the room within the budget"
+        );
+    }
+    rep.ran(
+        "ladder.send_message",
+        ok,
+        serde_json::json!({
+            "room": room,
+            "converged_ms": outcome.waited().as_millis(),
+            "attempts": outcome.checks(),
+            "messages": seen.iter().map(|m| serde_json::json!({
+                "attestation_id": m.attestation_id,
+                "author": m.author_key_id,
+                "attested_by": m.attesting_key_id,
+                "body": m.body,
+            })).collect::<Vec<_>>(),
+            "expected_author": peer_owner,
+            "expected_attested_by": peer_node,
+            "inbound": occ.inbound_stats.as_json(),
+            "covers": "a community-scoped chat row from the peer's NODE, on the peer's \
+                       human's behalf, arrived over RNS through the relay and was read \
+                       back by room — keyed on the sender's id, which the receiver \
+                       cannot manufacture",
+        }),
+    );
+}
+
 /// The publisher: cohort creator, stream source, blob source, and the
 /// node that drives the mid-stream epoch advance.
 async fn run_publisher(occ: Occurrence) -> Result<(), String> {
@@ -2437,6 +2690,11 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         let routes = ReticulumRoutes::new(&occ.transport);
 
         run_discover_by_fedid_leg(&occ, &lens, &routes).await;
+    }
+
+    // ── Ladder: the pair chat, through the one-verb DX ───────────────
+    {
+        run_chat_legs(&occ).await;
     }
 
     // ── Cohort: create, admit members over the real wire ─────────────
@@ -3417,6 +3675,11 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
         let lens = PersistLens::new(occ.directory.as_ref());
         let routes = ReticulumRoutes::new(&occ.transport);
         run_discover_by_fedid_leg(&occ, &lens, &routes).await;
+    }
+
+    // ── Ladder: the pair chat, through the one-verb DX ───────────────
+    {
+        run_chat_legs(&occ).await;
     }
 
     // ── Real cross-process MLS join ──────────────────────────────────
