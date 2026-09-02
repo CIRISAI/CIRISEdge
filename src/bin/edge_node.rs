@@ -511,6 +511,24 @@ struct RosterEntry {
     /// Base64 ML-DSA-65 public key of the owner.
     #[serde(default)]
     owner_pqc_pubkey_b64: String,
+    /// This node's OWN **self-signed** `KeyRecord` (`scrub_key_id == key_id`).
+    ///
+    /// The canonical ceremony (CIRISServer `GET /v1/federation/self-key-record`
+    /// → `POST /v1/federation/peering`) admits a peer by ITS OWN self-signed
+    /// record through the fail-secure gate. That is what makes the admitted row
+    /// scrub-anchored, and therefore what lets the peer root as `Rooted`
+    /// instead of advisory.
+    ///
+    /// The harness previously had the publisher play steward and sign every
+    /// other node's record. A steward-signed row is not self-signed, so no peer
+    /// ever rooted, `owns_key` stayed false, and every inbound frame arrived
+    /// unattributed — measured as `unattributed: 37` with `routed: 650`.
+    #[serde(default)]
+    node_record: serde_json::Value,
+    /// The OWNER's own self-signed `KeyRecord`, same reason: a `user` identity
+    /// minted on this node's console, which only this node can sign for.
+    #[serde(default)]
+    owner_record: serde_json::Value,
 }
 
 /// The steward that scrub-signs the roster into `federation_keys` rows.
@@ -1527,54 +1545,80 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
             owner_pubkey_b64: owner.pubkey_b64()?,
             fed_pqc_pubkey_b64: fed.pqc_pubkey_b64(&cfg.node_id).await?,
             owner_pqc_pubkey_b64: owner.pqc_pubkey_b64(&owner_key_id).await?,
+            // SELF-signed: this node signs its own record, and the owner
+            // identity minted here signs its own. Nobody else can, and nobody
+            // else should — that is what "self-signed" is for.
+            node_record: serde_json::to_value(
+                signed_record(
+                    &cfg.node_id,
+                    &fed.pubkey_b64()?,
+                    &fed.pqc_pubkey_b64(&cfg.node_id).await?,
+                    &fed.local_signer(&cfg.node_id)?,
+                    &cfg.node_id,
+                    "node",
+                )
+                .await?,
+            )
+            .map_err(|e| format!("encode node record: {e}"))?,
+            owner_record: serde_json::to_value(
+                signed_record(
+                    &owner_key_id,
+                    &owner.pubkey_b64()?,
+                    &owner.pqc_pubkey_b64(&owner_key_id).await?,
+                    &owner.local_signer(&owner_key_id)?,
+                    &owner_key_id,
+                    "user",
+                )
+                .await?,
+            )
+            .map_err(|e| format!("encode owner record: {e}"))?,
         },
     )
     .map_err(|e| format!("publish roster entry: {e}"))?;
 
-    // ── 3. The publisher plays steward and signs the directory ───────
+    // ── 3. The publisher ASSEMBLES the directory from self-signed rows ───
+    //
+    // It does NOT sign other nodes' records. The canonical ceremony
+    // (CIRISServer `GET /v1/federation/self-key-record` →
+    // `POST /v1/federation/peering`) admits each peer by that peer's OWN
+    // self-signed record, which is what makes the admitted row scrub-anchored
+    // and lets the peer root as `Rooted` rather than advisory.
+    //
+    // Before this the publisher played steward and re-signed everyone. A
+    // steward-signed row is not self-signed, so no peer ever rooted,
+    // `owns_key` stayed false, and every inbound frame arrived unattributed —
+    // measured as `routed: 650` alongside `unattributed: 37`, with the
+    // Attestation plane never moving because attribution never completed.
+    //
+    // The publisher's only signature here is the STEWARD's own record, which is
+    // its own record to sign.
     let dir_path = directory_path(&cfg.mesh_dir);
     if cfg.role == Role::Publisher {
         let roster = await_roster(&cfg.mesh_dir, &cfg.expect, cfg.barrier_timeout).await?;
         let steward = FedKey::load_or_create(STEWARD_KEY_ID, &cfg.state_dir.join("steward"))?;
-        let steward_signer = steward.local_signer(STEWARD_KEY_ID)?;
         let mut rows = vec![
             signed_record(
                 STEWARD_KEY_ID,
                 &steward.pubkey_b64()?,
                 &steward.pqc_pubkey_b64(STEWARD_KEY_ID).await?,
-                &steward_signer,
+                &steward.local_signer(STEWARD_KEY_ID)?,
                 STEWARD_KEY_ID,
                 "steward",
             )
             .await?,
         ];
         for entry in roster.values() {
-            rows.push(
-                signed_record(
-                    &entry.key_id,
-                    &entry.fed_pubkey_b64,
-                    &entry.fed_pqc_pubkey_b64,
-                    &steward_signer,
-                    STEWARD_KEY_ID,
-                    "agent",
-                )
-                .await?,
-            );
-            // The owner, as a PERSON. `identity_type` is the authority on what
-            // an identifier names — never the string's shape — so this is what
-            // makes `resolve` route a lookup to the person rather than
-            // treating the owner as another agent.
-            if !entry.owner_key_id.is_empty() {
+            for (what, value) in [("node", &entry.node_record), ("owner", &entry.owner_record)] {
+                if value.is_null() {
+                    return Err(format!(
+                        "{}: no self-signed {what} record in the roster — a peer can only \
+                         be admitted by its OWN record",
+                        entry.key_id
+                    ));
+                }
                 rows.push(
-                    signed_record(
-                        &entry.owner_key_id,
-                        &entry.owner_pubkey_b64,
-                        &entry.owner_pqc_pubkey_b64,
-                        &steward_signer,
-                        STEWARD_KEY_ID,
-                        "user",
-                    )
-                    .await?,
+                    serde_json::from_value(value.clone())
+                        .map_err(|e| format!("{}: decode {what} record: {e}", entry.key_id))?,
                 );
             }
         }
