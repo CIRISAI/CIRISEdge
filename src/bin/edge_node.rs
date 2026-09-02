@@ -734,21 +734,30 @@ async fn emit_owner_binding(
     owner_signer: &Ed25519Signer,
     node_id: &str,
 ) -> Result<(), String> {
+    // The timestamp lives inside the SIGNED envelope, not only in the column.
+    //
+    // persist refuses otherwise (CIRISPersist#598), and the reason is worth
+    // keeping in view: folds pick a winner by the `asserted_at` COLUMN, which
+    // no signature covers. An unbound row is a replay waiting to happen — an
+    // attacker re-submits an envelope the producer really did sign, with a
+    // newer column value, and wins the fold. Binding the time into the signed
+    // material is what closes that, so the two must agree.
+    const ASSERTED_AT: &str = "2026-05-01T00:00:00Z";
+    let ts: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(ASSERTED_AT)
+        .map_err(|e| format!("ts: {e}"))?
+        .into();
     let envelope = serde_json::json!({
         "attesting_key_id": owner_key_id,
         "attested_key_id": node_id,
         "delegation_purpose": "owner_binding",
         "scope": ["infra:network_presence"],
+        "asserted_at": ASSERTED_AT,
     });
     let canonical = serde_json::to_vec(&envelope).map_err(|e| format!("canonical: {e}"))?;
     let digest = Sha256::digest(&canonical);
     let sig = owner_signer
         .sign(digest.as_slice())
         .map_err(|e| format!("owner sign: {e}"))?;
-    let ts: chrono::DateTime<chrono::Utc> =
-        chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
-            .map_err(|e| format!("ts: {e}"))?
-            .into();
 
     let att = ciris_persist::federation::Attestation {
         attestation_id: format!("owner-binding-{node_id}"),
