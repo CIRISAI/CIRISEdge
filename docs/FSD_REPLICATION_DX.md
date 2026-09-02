@@ -24,6 +24,48 @@ problem this document exists to fix.
 
 ---
 
+## 0. The surface, as built — `ciris_edge::replication::attestation_bind`
+
+For a reader who wants the API before the argument. Everything below is
+implemented and pinned by `tests/chat_message_federates.rs` (13 tests) and
+`tests/rooting_chain_walk.rs`; nothing here is proposed except where marked
+**Phase 2**.
+
+```rust
+// The verbs
+pub async fn share(dir, row, With, signer)  -> Result<Crossing, String>
+pub async fn publish(dir, row, signer)      -> Result<Crossing, String>
+pub fn keep_local(row)                      -> Result<(), String>
+pub fn describe_flow(row)                   -> Result<Flow, String>   // the direct path
+
+// The audience — every non-public cohort, in widening order
+pub enum With { MyDevices, MyFamily, Community, Affiliations, Species, Biosphere }
+impl With { fn cohort_scope(); fn is_encrypted_at_rest(); fn is_structurally_invisible(); }
+
+// What crossed, and how
+pub struct Crossing { shared: Shared, flow: Flow }
+pub enum Shared { Placed, AlreadyThere }
+pub struct Flow { information_type, sender, subject, recipient: Recipient, principle: Principle }
+pub struct Recipient { cohort_scope, may_revoke, delivery: DeliveryRequirement }
+pub struct Principle { deletion_window, expires_at, consent_prefix }
+
+// The pure verdict both verbs run first (public so it is testable without a directory)
+pub fn already_promoted_verdict(row, target_scope) -> Option<Result<Shared, String>>
+
+// Lower-level, kept as thin wrappers over the same promote_to_scope
+pub async fn share_encrypted_privately(dir, row, EncryptedCohort, signer) -> Result<bool, String>
+pub async fn share_clear_privately(dir, row, ClearCohort, signer)         -> Result<bool, String>
+pub async fn share_publicly(dir, row, signer)                             -> Result<bool, String>
+pub async fn promote_to_scope(dir, row, cohort_scope, signer)             -> Result<bool, String>
+```
+
+`share`/`publish` assemble the `AttestationReseal` persist demands
+(`RowMirror::restamp_for_scope` → JCS → hash → bound-hybrid sign) and call the
+one promotion primitive, `FederationDirectory::promote_attestation`. There is
+one promotion path in edge, not two.
+
+---
+
 ## 1. The two axes
 
 They are orthogonal, and every replication decision is a point in their
@@ -106,7 +148,7 @@ That is the API this document proposes.
 
 ---
 
-## 2. What is wrong with today's API
+## 2. What the previous API got wrong
 
 ```rust
 // What a caller writes today:
@@ -130,7 +172,7 @@ Three problems:
 
 ---
 
-## 3. Proposed DX
+## 3. The DX, as built
 
 ### One verb
 
@@ -180,7 +222,7 @@ one:
 | sender | `attesting_key_id` | the signing node |
 | recipient | `cohort_scope` + `subject_key_ids` + `delivery_mode` | **`With::…`** |
 | information type | `dimension` | the producer helper (`chat:message:v1`) |
-| transmission principle | `consent:scope` | **`Terms::…`** |
+| transmission principle | `deletion_window` · `expires_at` · the covering `consent:replication` grant | **`Flow::principle`** (temporal half on the row; permission half resolved per recipient — `Terms` is Phase 2, §3) |
 
 **Both paths present the same picture.** `share` and `publish` compute a
 [`Flow`] — all five parameters read from the row through persist's canonical
@@ -245,8 +287,12 @@ CIRISServer's non-vacuous-prefix guard exists to refuse.
   and the two never collapse into one word.
 * **Third-party placement.** A `family`/`community` placement must name no
   party but its own producer (CIRISPersist#592 / AV-84) — a placement is a
-  producer's self-declaration about its *own* content. `share` enforces this at
-  the call rather than surfacing persist's refusal at the door.
+  producer's self-declaration about its *own* content. **`share` does NOT
+  pre-check this**; persist's `check_promotion_cohort_standing` refuses it at
+  the promote door and `share` surfaces that refusal verbatim (it names both
+  the offending party and the rule). A pre-check in edge would be a second copy
+  of a gate persist already runs at both doors — see §8 — so it is deliberately
+  left where it is.
 
 ## 5. Migration
 
@@ -362,3 +408,67 @@ reconstructs the same decision reaches the same verdict. That is what lets
 edge's DX be thin: it names the audience and signs the bytes, and the
 substrate makes the inappropriate flow inexpressible rather than merely
 discouraged.
+
+---
+
+## 9. Asks of persist — what building this surfaced
+
+Each item is something edge worked around, with the evidence. None blocks
+edge; all would remove a footgun for the next consumer.
+
+1. **`Terms` on the promotion reseal (Phase 2, §3).** `AttestationReseal`
+   carries envelope · hash · both signature halves · re-signer · timestamp — no
+   consent-scope member and no `expires_at`. So the transmission principle
+   cannot be attached or narrowed at *share* time; edge refuses a `Terms`
+   argument rather than accept one that does nothing. A consent-scope member
+   in the reseal (or a `RowMirror::restamp_for_scope` variant that takes one)
+   is the substrate change that lets the fifth CI parameter be set at the
+   crossing, where the CI page says it belongs.
+
+2. **A typed "already federation" promote outcome.** `promote_attestation`
+   returns `Ok(false)` for a row already at `tier: federation` — correct and
+   idempotent by CC 5.3.2.4.2, but indistinguishable from "placed nothing for
+   another reason" without reading the row's tier first. Edge does that read
+   (`already_promoted_verdict`). A `Promoted::AlreadyFederation` variant would
+   let every consumer tell the two apart without the pre-read.
+
+3. **`effective_accord_holder_records()` is a footgun under
+   `CIRIS_TESTING_MODE`.** It falls back to the *real* baked HUMANITY_ACCORD
+   roster when the test anchor is not fully armed, so a harness that set three
+   of the six `CIRIS_TEST_TRUST_ROOT*` vars seeds production's constitutional
+   holders into a throwaway directory and looks green. Edge now calls
+   `test_anchor_genesis_records()` and hard-errors on `None`. Suggest:
+   `effective_*` refuses (or warns loudly) when `CIRIS_TESTING_MODE` is set
+   but the anchor does not resolve, instead of silently falling back.
+
+4. **`crypto_tier` is negative-default for UNKNOWN scopes.** CIRISPersist#188:
+   only self/family and community/affiliations encrypt; any scope the dispatch
+   does not recognise is plaintext. That is the safe default for the closed
+   set today, but it means a future scope added to `cohort_scope::ALL` without
+   a `crypto_tier` arm ships in the clear. A compile-time exhaustiveness pin
+   (match on the closed enum rather than a string) would make that a build
+   error. Edge pins its own grouping to `crypto_tier` by test so it cannot
+   drift, but only persist can make the substrate itself fail closed.
+
+5. **A typed transient-membership refusal for AV-45.** When a
+   `community`-scoped row arrives before the recipient holds the `Community`
+   row, the put door refuses it (correctly) and edge's re-offer carries it
+   later — measured at 11 refusals and ~5 s on `ladder.send_message`. The
+   refusal arrives as a generic `Error::InvalidArgument` string, so edge cannot
+   distinguish "back off, the roster has not landed" from "this will never
+   admit". A typed variant would let edge back off on the first and stop on
+   the second.
+
+6. **Constitution vocabulary drift, for whoever owns rc4.7.** (a) `global`
+   appears as a widened scope in CC 4.4.3.3.1 and the CC 8 worked example; the
+   wire value is `federation` (`cohort_scope::ALL` has no `global`, and
+   `is_valid` refuses it). (b) CC 4.4.3.3.1 describes promotion as a
+   `supersedes` chain with walkable lineage; CC 5.3.2.4.2 describes it as an
+   in-place tier flip with no marker in the signed bytes. persist implements
+   the second. If the lineage-walkable form is still intended for cohort
+   widening, edge's `share` should emit it alongside — but that is a decision
+   for the constitution's author, not a guess for edge to make.
+
+7. **Verify, not persist:** `test_trust_root_override` WARNs "TEST TRUST ROOT
+   active" on every anchor lookup — 449 lines per node per mesh run — with no
+   once-guard. Correct to warn; wrong to warn per call.
