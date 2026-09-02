@@ -1507,6 +1507,50 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
 
     let roster = read_roster(&cfg.mesh_dir);
 
+    // ── This node's DIRECTED consent grants ──────────────────────────
+    //
+    // The Attestation plane is consent-gated at the RECIPIENT, not per row: a
+    // peer that does not resolve to a consent-membership proof withholds the
+    // WHOLE plane, fail-closed. Without these grants every node held only its
+    // OWN owner binding and every person→node walk starved one hop out — which
+    // is exactly what the mesh reported (`identity_type: "user"` with
+    // `owned_nodes: []`, on every node) and reads as slow convergence rather
+    // than an absent grant.
+    //
+    // Consent is DIRECTED and SELF-ATTESTED (CEG 1.0-RC29 §5.6.8.15): A
+    // granting B says nothing about B granting A, so each node authors its own
+    // half — the same shape CIRISServer's `POST /v1/federation/peering` writes,
+    // which is where this pattern is taken from rather than invented.
+    let node_signer = fed.local_signer(&cfg.node_id)?;
+    for peer in roster.keys().filter(|k| *k != &cfg.node_id) {
+        let grant = ciris_edge::replication::attestation_bind::replication_consent_attestation(
+            &cfg.node_id,
+            peer,
+            &ciris_edge::replication::attestation_bind::DEFAULT_CONSENT_PREFIXES,
+            chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .map_err(|e| format!("ts: {e}"))?
+                .into(),
+            &node_signer,
+        )
+        .await?;
+        directory
+            .put_attestation(ciris_persist::federation::SignedAttestation { attestation: grant })
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    node = %cfg.node_id, %peer, error = %e,
+                    "replication consent grant REFUSED — this peer will be offered \
+                     NO attestations at all, so no owner binding reaches it"
+                );
+                format!("put consent grant for {peer}: {e}")
+            })?;
+    }
+    tracing::info!(
+        node = %cfg.node_id,
+        peers = roster.len().saturating_sub(1),
+        "directed replication consent granted"
+    );
+
     // ── 5. The federation signer, from this node's own seed ──────────
     let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
         key_id: cfg.node_id.clone(),
