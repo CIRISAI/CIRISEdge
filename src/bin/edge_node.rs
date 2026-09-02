@@ -132,6 +132,7 @@ use ciris_edge::cohort_scope::CohortScope;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::mls::cohort_group::mint_cohort_key_material;
 use ciris_edge::mls::{CohortGroup, CommitApplyOutcome, ScopeStateProvider};
+use ciris_edge::replication::convergence::ConvergenceWaiter;
 use ciris_edge::replication::protocol::EnvelopeKind;
 use ciris_edge::replication::ReplicationPeer;
 use ciris_edge::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
@@ -590,21 +591,25 @@ async fn await_roster(
     expect: &[String],
     timeout: Duration,
 ) -> Result<BTreeMap<String, RosterEntry>, String> {
-    let start = Instant::now();
-    loop {
-        let roster = read_roster(mesh);
-        let missing: Vec<&String> = expect.iter().filter(|k| !roster.contains_key(*k)).collect();
-        if missing.is_empty() {
-            return Ok(roster);
-        }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "roster barrier timed out after {}s; still missing {missing:?}",
-                timeout.as_secs()
-            ));
-        }
-        tokio_sleep(Duration::from_millis(250)).await;
+    // A roster is a file the other containers write, so nothing in the
+    // replication plane signals it — the UNSIGNALLED waiter, whose floor is
+    // exactly this barrier's old poll interval.
+    let outcome = ConvergenceWaiter::unsignalled()
+        .with_poll_floor(Duration::from_millis(250))
+        .await_until(timeout, || async {
+            let roster = read_roster(mesh);
+            expect.iter().all(|k| roster.contains_key(k))
+        })
+        .await;
+    let roster = read_roster(mesh);
+    if outcome.is_converged() {
+        return Ok(roster);
     }
+    let missing: Vec<&String> = expect.iter().filter(|k| !roster.contains_key(*k)).collect();
+    Err(format!(
+        "roster barrier timed out after {}s; still missing {missing:?}",
+        timeout.as_secs()
+    ))
 }
 
 /// Runtime-agnostic sleep (CIRISEdge#217 — never `tokio::time::sleep` on
@@ -615,22 +620,25 @@ async fn tokio_sleep(d: Duration) {
 
 /// Wait for a file to appear, then read it.
 async fn await_file(path: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
-    let start = Instant::now();
-    loop {
+    // Another container writes this file; admission does not signal it.
+    let outcome = ConvergenceWaiter::unsignalled()
+        .with_poll_floor(Duration::from_millis(250))
+        .await_until(timeout, || async {
+            std::fs::read(path).is_ok_and(|b| !b.is_empty())
+        })
+        .await;
+    if outcome.is_converged() {
         if let Ok(b) = std::fs::read(path) {
             if !b.is_empty() {
                 return Ok(b);
             }
         }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "{} did not appear within {}s",
-                path.display(),
-                timeout.as_secs()
-            ));
-        }
-        tokio_sleep(Duration::from_millis(250)).await;
     }
+    Err(format!(
+        "{} did not appear within {}s",
+        path.display(),
+        timeout.as_secs()
+    ))
 }
 
 /// A deterministic-from-seed federation identity.
@@ -1380,6 +1388,16 @@ struct Occurrence {
     directory: Arc<SqliteBackend>,
 }
 
+/// The only two planes the harness replicates.
+///
+/// `EnvelopeKind::ALL` is FIFTEEN, and a coordinator is registered per
+/// (peer, kind) — sixty of them across four peers, all dialing one Reticulum
+/// transport. That saturated the link pool and the harness's own control
+/// frames began timing out, so replication starved the mesh it was meant to
+/// serve (leviculum#29, CIRISEdge#508/#531). Discovery needs Key (directory
+/// rows) and Attestation (owner bindings); nothing else earns a round here.
+const DISCOVERY_PLANES: [EnvelopeKind; 2] = [EnvelopeKind::Key, EnvelopeKind::Attestation];
+
 /// Build the whole occurrence: keys, sealed KV, directory, transport,
 /// address table, lifecycle.
 async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, String> {
@@ -1580,11 +1598,25 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // Cadence is tightened from the 30s default: the mesh's barriers are
     // measured in tens of seconds, so a default-cadence node would spend the
     // whole budget waiting for its first round.
+    // ONLY the two planes discovery needs — Key (the directory rows) and
+    // Attestation (the owner bindings).
+    //
+    // `EnvelopeKind::ALL` is FIFTEEN kinds, and a coordinator is registered per
+    // (peer, kind): with four peers that is SIXTY of them, each opening a round
+    // on a 2s cadence over one Reticulum transport. That saturated the link
+    // pool and the harness's own control frames started timing out
+    // (`resource transfer failed: Timeout` on a KeyPackage send) — replication
+    // starved the very mesh it was supposed to serve. The concurrency ceiling
+    // is a known constraint (leviculum#29, CIRISEdge#508/#531), and this
+    // harness has to share the transport with real media fan-out.
+    //
+    // Eight coordinators on a 5s cadence leaves the barrier tens of rounds,
+    // which is many more than convergence needs.
     let peers: Vec<ReplicationPeer> = roster
         .keys()
         .filter(|k| *k != &cfg.node_id)
         .flat_map(|peer| {
-            EnvelopeKind::ALL
+            DISCOVERY_PLANES
                 .into_iter()
                 .map(move |kind| ReplicationPeer {
                     peer_key_id: peer.clone(),
@@ -1599,7 +1631,7 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
             peers,
             ciris_edge::replication::ReplicationRuntimeConfig {
                 scheduler: ciris_edge::replication::SchedulerConfig {
-                    cadence: Duration::from_secs(2),
+                    cadence: Duration::from_secs(5),
                     round_timeout: Duration::from_secs(10),
                 },
                 local_key_id: Some(cfg.node_id.clone()),
@@ -1627,21 +1659,28 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
 /// resolve until its peer is up.
 async fn resolve_addr(hostport: &str, timeout: Duration) -> Result<std::net::SocketAddr, String> {
     use std::net::ToSocketAddrs as _;
-    let start = Instant::now();
-    loop {
+    // DNS for a sibling container that may not be up yet. Unsignalled by
+    // definition — but it goes through the same helper as every other wait, so
+    // there is exactly one waiting shape in this binary.
+    let outcome = ConvergenceWaiter::unsignalled()
+        .with_poll_floor(Duration::from_millis(500))
+        .await_until(timeout, || async {
+            hostport
+                .to_socket_addrs()
+                .is_ok_and(|mut it| it.next().is_some())
+        })
+        .await;
+    if outcome.is_converged() {
         if let Ok(mut it) = hostport.to_socket_addrs() {
             if let Some(a) = it.next() {
                 return Ok(a);
             }
         }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "could not resolve {hostport} within {}s",
-                timeout.as_secs()
-            ));
-        }
-        tokio_sleep(Duration::from_millis(500)).await;
     }
+    Err(format!(
+        "could not resolve {hostport} within {}s",
+        timeout.as_secs()
+    ))
 }
 
 impl Occurrence {
@@ -1657,25 +1696,36 @@ impl Occurrence {
     /// cold-start path, and a timeout is reported as a leg that did not
     /// run.
     async fn await_rooting(&self, peers: &[String]) -> Result<Duration, String> {
-        let start = Instant::now();
-        loop {
-            let mut missing = Vec::new();
-            for p in peers {
-                if p != &self.cfg.node_id && !self.transport.knows_peer(p).await {
-                    missing.push(p.clone());
+        // Rooting is announce-driven, and an announce carries attestations that
+        // get ADMITTED — so the convergence signal is genuinely relevant here
+        // and this wakes on the admit rather than on a 500ms boundary. The
+        // floor still covers the transport's own route table, which admission
+        // does not signal.
+        let outcome = self
+            .replication_convergence()
+            .with_poll_floor(Duration::from_millis(500))
+            .await_until(self.cfg.root_timeout, || async {
+                for p in peers {
+                    if p != &self.cfg.node_id && !self.transport.knows_peer(p).await {
+                        return false;
+                    }
                 }
-            }
-            if missing.is_empty() {
-                return Ok(start.elapsed());
-            }
-            if start.elapsed() >= self.cfg.root_timeout {
-                return Err(format!(
-                    "announce rooting did not converge within {}s; unrooted: {missing:?}",
-                    self.cfg.root_timeout.as_secs()
-                ));
-            }
-            tokio_sleep(Duration::from_millis(500)).await;
+                true
+            })
+            .await;
+        if outcome.is_converged() {
+            return Ok(outcome.waited());
         }
+        let mut missing = Vec::new();
+        for p in peers {
+            if p != &self.cfg.node_id && !self.transport.knows_peer(p).await {
+                missing.push(p.clone());
+            }
+        }
+        Err(format!(
+            "announce rooting did not converge within {}s; unrooted: {missing:?}",
+            self.cfg.root_timeout.as_secs()
+        ))
     }
 
     /// Install this cohort's scope addresses through the documented two
@@ -1831,9 +1881,17 @@ async fn run_discover_by_fedid_leg(
     // stays `Send` and the helper needs no interior mutability from callers.
     // The snapshot used for reporting comes from a single call afterwards —
     // cheap, and the same shape on the converged and timed-out paths alike.
+    // A DEDICATED budget, not the whole barrier.
+    //
+    // This leg runs before `cohort.join`, so a failure that burns the entire
+    // barrier leaves the publisher not reading control frames for five
+    // minutes — its peers' KeyPackage sends then time out and EVERY later leg
+    // reports missing. One leg's failure must cost one leg, not the run: the
+    // previous attempt turned a single red cell into fifteen.
+    let discovery_budget = cfg.barrier_timeout.min(Duration::from_secs(90));
     let outcome = occ
         .replication_convergence()
-        .await_until(cfg.barrier_timeout, || async {
+        .await_until(discovery_budget, || async {
             matches!(
                 contact::discover(lens, routes, &owner_id).await,
                 Ok(ref f)
