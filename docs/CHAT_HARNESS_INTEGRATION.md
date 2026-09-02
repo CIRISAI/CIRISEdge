@@ -186,11 +186,24 @@ match contact::resolve_contact(&lens, whatever_the_user_pasted).await? {
         // register_federation_key gate — edge never registers a key off a
         // pasted string.
         register_federation_key(&admission.key_id, &admission.pubkey_ed25519_base64, admission.identity_type)?;
-        // `subject` is USABLE NOW. Do not re-resolve and wait.
-        start_contact_request(&subject)?;
+
+        // `subject.fed_id` is the PERSON — who consents, and who the
+        // conversation is with. Use it for the consent rung.
+        //
+        // `subject.nodes` is EMPTY, and that is correct: a user code names a
+        // person, not their nodes, and a stranger has no owner bindings on your
+        // node yet. Reach them through the hint that travelled with the key:
+        match admission.transport_hint.as_deref() {
+            Some(hint) => start_contact_request(&subject, hint)?,
+            // Identity you can verify, no way to contact them yet. Ask for a
+            // code that carries a hint, or wait for them to announce.
+            None => surface_no_transport(&subject),
+        }
     }
 }
 ```
+
+**Do not read `subject.nodes` on this path — it is empty by design.** An earlier revision put the person's own `key_id` there, which made callers dial a person key as though it were a node id; `RouteLens::has_destination` resolves those as nodes. Reachability for a code is `admission.transport_hint`.
 
 **The subject is built from the code, not the directory, and that is load-bearing.** An earlier shape returned "admit, then retry" — but the retry runs `nodes_owned_by` against the directory, and a stranger has no owner-binding attestations there. Admitting a key never creates an ownership graph, so that retry returned `NotYetDiscovered` forever. If you find yourself re-resolving after admission and waiting for convergence, you are on the old model.
 

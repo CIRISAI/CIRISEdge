@@ -505,9 +505,15 @@ pub enum ContactResolution {
     /// A stranger, from a code — and the code is SUFFICIENT.
     ///
     /// `subject` is built from the code itself, not from the directory, because
-    /// a code carries what the directory would have supplied: the identity and
-    /// a way to reach it. Admitting `admission` registers the key so the
-    /// stranger's signatures verify; nothing further needs to converge first.
+    /// a code carries what the directory would have supplied. Admitting
+    /// `admission` registers the key so the stranger's signatures verify;
+    /// nothing further needs to converge first.
+    ///
+    /// **`subject.nodes` is empty**: a user code names a person, not their
+    /// nodes, and a stranger has no owner bindings here. Reach them through
+    /// [`CodeAdmission::transport_hint`], which travels with the key for
+    /// exactly this reason. No hint means the code gives you an identity you
+    /// can verify and no way to contact them yet.
     ///
     /// This is the shape the earlier `AdmitThenRetry` got wrong. It told the
     /// caller to admit and re-resolve, but a re-resolve runs
@@ -669,10 +675,22 @@ fn code_alone_yields_a_person(identity_type: &str) -> bool {
 /// Only reached for a `user` code (see [`code_alone_yields_a_person`]), so
 /// `fed_id` holds a person — the invariant the type is for.
 ///
-/// The reachable node is the code's own `key_id`: a user code names the person
-/// whose transport the hint describes, and it is what the caller dials. No
-/// directory lookup contributes here — that is the point of a code, and why
-/// this path works for someone who never announced.
+/// # `nodes` is EMPTY, deliberately
+///
+/// A user code names a PERSON. It does not name their nodes, and this node has
+/// no owner-binding attestations for a stranger, so their node set is genuinely
+/// unknown — that is what "stranger" means.
+///
+/// An earlier revision put the person's own `key_id` in `nodes`. That was
+/// wrong twice over: `nodes` holds NODE ids, and `RouteLens::has_destination`
+/// resolves them as such, so a caller following the ladder would have tried to
+/// dial a person key as though it were a node. Filling a field with the only
+/// value in hand is how a type stops meaning what it says.
+///
+/// Reachability for a code comes from [`CodeAdmission::transport_hint`], which
+/// travels with the key precisely because the directory cannot supply it. When
+/// the hint is absent the code gives identity and no way to reach them — worth
+/// stating plainly rather than papering over with a node id that is not one.
 fn subject_from_code(candidate: &ContactCandidate, admission: &CodeAdmission) -> Subject {
     debug_assert!(
         code_alone_yields_a_person(admission.identity_type),
@@ -681,7 +699,7 @@ fn subject_from_code(candidate: &ContactCandidate, admission: &CodeAdmission) ->
     );
     Subject {
         fed_id: candidate.key_id.clone(),
-        nodes: vec![admission.key_id.clone()],
+        nodes: Vec::new(),
         resolved_from: candidate.kind.clone(),
     }
 }
@@ -1652,15 +1670,27 @@ mod tests {
                 assert_eq!(admission.key_id, key_id);
                 assert_eq!(admission.identity_type, "user");
                 assert!(!admission.pubkey_ed25519_base64.is_empty());
-                // The half that was missing: a USABLE subject, built from the
+                // The half that was missing: a usable identity, built from the
                 // code. Admitting a key never creates owner-binding
                 // attestations, so a directory retry would return
                 // NotYetDiscovered forever — the code has to be sufficient.
                 assert_eq!(subject.fed_id, key_id);
+                // And `nodes` is EMPTY: a user code names a PERSON, not their
+                // nodes, and a stranger has no owner bindings here. Putting the
+                // person's own key in a NODE list made a caller dial a person
+                // key as a node — filling a field with the only value in hand
+                // is how a type stops meaning what it says.
+                assert!(
+                    subject.nodes.is_empty(),
+                    "a user code does not name nodes: {:?}",
+                    subject.nodes
+                );
+                // Reachability travels as the transport hint instead.
                 assert_eq!(
-                    subject.nodes,
-                    vec![key_id.clone()],
-                    "the code names what to dial; no directory lookup contributes"
+                    admission.transport_hint.as_deref(),
+                    Some("https://example.invalid"),
+                    "the hint is how a code carries reachability, since the \
+                     directory cannot supply it for a stranger"
                 );
             }
             other => panic!(
