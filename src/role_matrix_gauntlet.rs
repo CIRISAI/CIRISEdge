@@ -190,6 +190,49 @@ fn r0b_the_tier_subject_is_the_advertised_identity() {
     );
 }
 
+/// R0c — the REFRESH uses the advertised identity, not just the resolver.
+///
+/// Half-applied fixes are their own failure mode: the resolver was built with
+/// the advertised subject while `refresh_serve_tier` still passed
+/// `local_key_id`, so a blessed node resolved as its actor exactly as before.
+/// Drives the production round path and asserts which subject the resolver was
+/// asked about.
+#[tokio::test]
+async fn r0c_the_refresh_asks_about_the_advertised_identity() {
+    use crate::replication::directory::ReplicationDirectory as _;
+    use crate::replication::protocol::EnvelopeKind;
+    use crate::replication::serve_tier::{ServeTier as T, ServeTierResolver};
+
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl ServeTierResolver for Recording {
+        async fn resolve(&self, subject: &str) -> T {
+            self.0.lock().unwrap().push(subject.to_string());
+            T::Canonical
+        }
+    }
+
+    let resolver = std::sync::Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+    let (_backend, bridge) = crate::replication::bridge::test_fixtures::make_bridge(&[]);
+    let bridge = bridge
+        .with_local_key_id(Some("actor-aaa".to_string()))
+        .with_serve_tier_subject(Some("node-bbb".to_string()))
+        .with_serve_tier_resolver(Some(
+            std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn ServeTierResolver>
+        ));
+
+    let _ = bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-1"))
+        .await;
+
+    assert_eq!(
+        resolver.0.lock().unwrap().as_slice(),
+        ["node-bbb"],
+        "the tier is a property of the identity peers registered — asking about \
+         the actor leaves a blessed node at ServeTier::None"
+    );
+}
+
 /// R3 — retention keys on Axis 3 (tier), and `AgentMode` does not exist in
 /// the decision at all.
 ///

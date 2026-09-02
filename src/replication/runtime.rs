@@ -130,6 +130,7 @@ fn build_bridge(
         )
         .with_self_provider(self_provider)
         .with_local_key_id(config.local_key_id.clone())
+        .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
         // owner-conferred rung fail-closed pending CIRISPersist#788. Installed

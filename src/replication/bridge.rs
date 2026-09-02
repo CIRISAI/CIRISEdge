@@ -1341,6 +1341,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// The resolver behind the cache; `None` in fixtures that pin the tier.
     serve_tier_resolver:
         Option<std::sync::Arc<dyn crate::replication::serve_tier::ServeTierResolver>>,
+    /// CIRISEdge#541 — the subject whose tier is resolved: the identity peers
+    /// REGISTERED and conferred against. Distinct from `local_key_id`, which is
+    /// the E3 truster and the own-record Pull subject. `None` falls back to
+    /// `local_key_id`, correct wherever the two coincide.
+    serve_tier_subject: Option<String>,
     /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
     /// not hold. Bounded: a peer that offers unadmittable rows must not be able
     /// to grow this without limit, so past the cap new names are DROPPED rather
@@ -1528,6 +1533,7 @@ impl FederationDirectoryReplicationBridge {
             )),
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
+            serve_tier_subject: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
@@ -1589,6 +1595,7 @@ impl FederationDirectoryReplicationBridge {
             )),
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
+            serve_tier_subject: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
@@ -1648,6 +1655,17 @@ impl FederationDirectoryReplicationBridge {
         self
     }
 
+    /// CIRISEdge#541 — the subject whose serving tier is resolved (builder).
+    ///
+    /// The ADVERTISED identity: a conferral is granted against the identity
+    /// peers registered, which under `use_node_identity` is the node rather
+    /// than the actor. `None` falls back to `local_key_id`.
+    #[must_use]
+    pub fn with_serve_tier_subject(mut self, subject: Option<String>) -> Self {
+        self.serve_tier_subject = subject;
+        self
+    }
+
     /// Pin the serving tier (builder, TEST ONLY). With no resolver installed
     /// the pinned value is never overwritten, so a fixture can exercise every
     /// tier without a directory that can resolve one.
@@ -1684,11 +1702,16 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// [`CachedServeTier::TTL`]: crate::replication::serve_tier::CachedServeTier::TTL
     async fn refresh_serve_tier(&self) {
-        if let (Some(resolver), Some(local)) = (
+        // The ADVERTISED identity, not the actor. Building the resolver with the
+        // right subject and then refreshing against the wrong one leaves the fix
+        // half-applied: a blessed node still resolves as its actor.
+        if let (Some(resolver), Some(subject)) = (
             self.serve_tier_resolver.as_deref(),
-            self.local_key_id.as_deref(),
+            self.serve_tier_subject
+                .as_deref()
+                .or(self.local_key_id.as_deref()),
         ) {
-            self.serve_tier.refresh_if_stale(resolver, local).await;
+            self.serve_tier.refresh_if_stale(resolver, subject).await;
         }
     }
 
@@ -2485,7 +2508,14 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             let slot = pending
                 .entry(signer_key_id.to_string())
                 .or_insert_with(|| source_peer.map(str::to_owned));
-            if slot.is_none() {
+            if slot.is_none() && source_peer.is_some() {
+                // UPGRADED from unrouted to routed — the ledger must follow, or
+                // the entry stays counted against `None` forever and fair
+                // eviction charges the wrong source.
+                if !is_new {
+                    sources.forget(None);
+                    sources.note(source_peer);
+                }
                 *slot = source_peer.map(str::to_owned);
             }
             if is_new {

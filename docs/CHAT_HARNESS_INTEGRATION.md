@@ -213,7 +213,7 @@ If they opted out of announcing, no directory anywhere has them — only a code 
 
 ## 7. Pin
 
-Adopt `SERVE_ADVERTISE_POLICY_HASH = 75ceef58162569c7a61e143cae2ac58ead1c783daf872e527642ef9d56d1ac1e` (CIRISServer#522) — this supersedes `e8216fec…` and `e54c5677…`, neither of which shipped. `REPLICATION_POLICY_HASH` (persist) is unchanged.
+Adopt `SERVE_ADVERTISE_POLICY_HASH = c0a13e031815163ac6972538a0597aff3d3396373f2e1f7d4fdbe3aa28e7d4b3` (CIRISServer#522) — this supersedes `e8216fec…`, `e54c5677…` and `75ceef58…`, none of which shipped. `REPLICATION_POLICY_HASH` (persist) is unchanged.
 
 Also note: **`agent_mode="server"` no longer implies directory-holding.** Retention and identifier serving key on the node's own `infra:serve` conferral (`docs/ROLE_MATRIX.md` axis 3), not on mode. If your deployment relied on mode to turn hash-first on, it was relying on a bug.
 

@@ -447,6 +447,11 @@ impl RateLimiter {
             && self.keys.len() >= self.policy.max_keys
             && !self.make_room(source, now)
         {
+            // Counted like any other denial (D5). There is no key to carry it
+            // on — that is the point of the refusal — so it goes straight to
+            // the aggregate, where it is exactly the signal an operator needs:
+            // a limiter turning traffic away at its ceiling.
+            self.released_suppressed = self.released_suppressed.saturating_add(1);
             return Decision::Deny {
                 reason: DenyReason::AtCapacity,
             };

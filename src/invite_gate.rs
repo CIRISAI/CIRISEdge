@@ -180,8 +180,23 @@ impl InviteGate {
     /// Promotes them out of the stranger budget permanently, and makes them
     /// un-evictable: acceptance is the one bit that cannot be reconstructed
     /// from traffic, so the map may drop anything else first.
-    pub fn mark_accepted(&mut self, sender: &str) {
-        self.limiter.promote(sender);
+    pub fn mark_accepted(&mut self, sender: &str) -> bool {
+        let promoted = self.limiter.promote(sender);
+        if !promoted {
+            // The receiver is tracking its ceiling of senders and a promoted
+            // entry can never be evicted to make room. Silently dropping this
+            // would leave an ACCEPTED contact throttled at the stranger budget
+            // forever, with nothing in the log to explain why their replies
+            // stopped arriving — the failure this gate exists to avoid.
+            tracing::warn!(
+                sender,
+                tracked = self.limiter.tracked(),
+                cap = Self::SENDER_CAP,
+                "accepted contact could NOT be promoted — the sender map is at \
+                 capacity; they remain on the stranger budget (CIRISEdge#554)"
+            );
+        }
+        promoted
     }
 }
 
