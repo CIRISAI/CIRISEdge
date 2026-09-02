@@ -1628,4 +1628,8 @@ incremental = false
 [[bin]]
 name = "edge_node"
 path = "src/bin/edge_node.rs"
-required-features = ["transport-reticulum", "mesh-harness"]
+# `test-anchor` too: the mesh roots every node under a SYNTHETIC trust root, and
+# `genesis::test_anchor_genesis_records` is compile-fenced behind that feature.
+# Without it the harness could not root a single peer, so requiring it states a
+# fact rather than adding a constraint.
+required-features = ["transport-reticulum", "mesh-harness", "test-anchor"]

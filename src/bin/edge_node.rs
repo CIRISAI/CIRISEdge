@@ -533,8 +533,11 @@ struct RosterEntry {
 /// The TEST TRUST ROOT that scrub-signs the roster into `federation_keys` rows.
 ///
 /// **This id is not cosmetic** — it is the key_id persist pins for holder slot 0
-/// under the test anchor, so a chain terminating here is the only chain that can
-/// root in a harness.
+/// under the test anchor. The terminus ROW itself is not built here: persist
+/// emits it (`genesis::test_anchor_genesis_records`) and `open_directory` seeds
+/// it into every node. This constant is only the id the harness scrub-signs
+/// AS, using the private half of the same seed, so the rows it signs chain to
+/// the row persist seeded.
 ///
 /// A node is admitted `Rooted` (rather than `Advisory`) only when its provenance
 /// chain terminates at a self-signed `steward`/`accord_holder` row **whose
@@ -955,6 +958,39 @@ async fn open_directory(rows: Vec<KeyRecord>) -> Result<Arc<SqliteBackend>, Stri
         .run_migrations()
         .await
         .map_err(|e| format!("migrate: {e}"))?;
+
+    // GENESIS FIRST — every node, before any roster row.
+    //
+    // A node is admitted `Rooted` (not `Advisory`) only when its provenance
+    // chain terminates at a row whose Ed25519 pubkey is in the pinned anchor.
+    // That anchor is secure by default (the real HUMANITY_ACCORD holders), so
+    // nothing a harness invents can ever satisfy it — before this, every peer
+    // rooted Advisory and the E3 gate attributed nothing.
+    //
+    // `test_anchor_genesis_records()` is the SYNTHETIC-ONLY accessor: `Some`
+    // exactly when the test anchor is armed. Its sibling
+    // `effective_accord_holder_records()` is the WRONG call here — it falls
+    // back to the real baked constitutional roster, so a mis-armed harness
+    // would quietly seed production's holders into a throwaway directory and
+    // look like it worked. `None` is a hard error instead.
+    //
+    // Seeded per node, not by the publisher: each node opens its own persist,
+    // and a chain is walked against the directory doing the walking.
+    let holders =
+        ciris_persist::federation::genesis::test_anchor_genesis_records().ok_or_else(|| {
+            format!(
+                "the SYNTHETIC trust root is not armed, so no node could ever root. Set \
+                 the whole CIRIS_TEST_TRUST_ROOT* block — verify reads the Ed25519 \
+                 pubkeys, persist reads the ML-DSA pubkeys AND both scrub signatures, \
+                 and {TEST_TRUST_ROOT_SEED_ENV} is the private half this harness signs \
+                 with — and build with the `test-anchor` feature."
+            )
+        })?;
+    backend
+        .seed_genesis_accord_holders(&holders)
+        .await
+        .map_err(|e| format!("seed synthetic genesis holders: {e}"))?;
+
     for rec in rows {
         backend
             .put_public_key(SignedKeyRecord { record: rec })
@@ -1646,19 +1682,7 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         let roster = await_roster(&cfg.mesh_dir, &cfg.expect, cfg.barrier_timeout).await?;
         let steward = FedKey::from_root_seed(test_trust_root_seed()?);
         let steward_signer = steward.local_signer(STEWARD_KEY_ID)?;
-        let mut rows = vec![
-            signed_record(
-                STEWARD_KEY_ID,
-                &steward.pubkey_b64()?,
-                &steward.pqc_pubkey_b64(STEWARD_KEY_ID).await?,
-                &steward_signer,
-                STEWARD_KEY_ID,
-                // `accord_holder`, not `steward`: both terminate a chain, and
-                // this row IS holder slot 0 under the test anchor.
-                "accord_holder",
-            )
-            .await?,
-        ];
+        let mut rows: Vec<KeyRecord> = Vec::new();
         for entry in roster.values() {
             // The NODE — what peers dial. `identity_type: "node"`, not
             // "agent": conflating them is what made the agent→node dial walk a
