@@ -265,6 +265,41 @@ async fn resolve_inner(
     })
 }
 
+/// The OTHER member of a two-person community — what "Chat with Y" is named
+/// after.
+///
+/// A pairwise chat has no title of its own: it is called after whoever else is
+/// in it, from each side. Deriving that from live membership rather than
+/// storing a string is what stops the label drifting from who is actually in
+/// the room — a renamed, departed, or added participant changes the answer
+/// immediately, because there is nothing else to change.
+///
+/// Returns `None` unless `members` is exactly two AND `own_key_id` is one of
+/// them. That is deliberate and each case is a different mistake:
+///
+/// * **not a pair** — a three-person room named after one participant would
+///   show a group chat under a single person's name. It needs a real title,
+///   which is a decision this function cannot make for the caller.
+/// * **not a member** — asking which peer you are talking to in a room you are
+///   not in is a caller bug. Guessing (returning "the first one") would hide it.
+///
+/// So an `Option` rather than a fallback: the caller decides what an unnamed
+/// room shows.
+///
+/// ```
+/// use ciris_edge::contact::the_other_member;
+/// let members = vec!["alice-fed".to_string(), "bob-fed".to_string()];
+/// assert_eq!(the_other_member(&members, "alice-fed"), Some("bob-fed".to_string()));
+/// assert_eq!(the_other_member(&members, "carol-fed"), None);
+/// ```
+#[must_use]
+pub fn the_other_member(members: &[String], own_key_id: &str) -> Option<String> {
+    if members.len() != 2 || !members.iter().any(|m| m == own_key_id) {
+        return None;
+    }
+    members.iter().find(|m| *m != own_key_id).cloned()
+}
+
 /// Where a contact request came from — a pasted code, or a bare identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContactInputSource {

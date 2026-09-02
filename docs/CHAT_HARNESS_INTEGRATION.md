@@ -217,6 +217,95 @@ Resolves through the directory as always. On a hash-first node that holds only t
 
 If they opted out of announcing, no directory anywhere has them — only a code will do.
 
+## 6c. Waiting for the mesh — use the helper, do not write a poll loop
+
+Every plane is eventually consistent: `pull_subject_testimony` is
+**fire-and-forget** by design (it returns once the sends are queued; the rows
+arrive later through Diff/Deliver). If you need the answer, do NOT write this:
+
+```rust
+// DON'T. This is the shape that appeared four times in our own harness.
+loop {
+    if resolve(&lens, &fed_id).await.is_ok() { break }
+    if started.elapsed() >= timeout { return Err(..) }
+    sleep(Duration::from_millis(500)).await;
+}
+```
+
+Use the one helper. It subscribes BEFORE dispatching (so a row admitted between
+the send and the wait is not missed), wakes on an **admitted envelope** rather
+than a timer, and reports how long convergence actually took:
+
+```rust
+let outcome = replication
+    .pull_and_await(&peer_key_id, &fed_id, Duration::from_secs(10), || async {
+        contact::resolve(&lens, &fed_id).await.is_ok()
+    })
+    .await?;                      // Err ONLY if the Pull could not be SENT
+
+if outcome.is_converged() {
+    // contact found; outcome.waited() / outcome.checks() are yours to log
+}
+```
+
+A sent Pull that never converges is `Converged::TimedOut`, **not** an error —
+the peer may simply not hold what you asked for, and that is an answer.
+
+Waiting on something replication does not signal (a transport route, a file)?
+Same helper, no pull:
+
+```rust
+let mut waiter = replication.convergence();          // or ConvergenceWaiter::unsignalled()
+let out = waiter.await_until(budget, || async { routes.has_destination(&node).await }).await;
+```
+
+The predicate must be a question about **observable state**, not about a message
+having arrived, and it must not capture anything mutably — keep it `Fn`-shaped
+and read what you need afterwards.
+
+---
+
+## 6d. The two-person chat, rung by rung
+
+`tests/chat_two_person_community.rs` walks the whole flow on real substrate —
+real hybrid signatures, a real persist directory, real MLS. It is the reference
+to copy; every call below is exercised there.
+
+| your UI | the call | who owns it |
+|---|---|---|
+| "search for a fedID or NodeCode" | `contact::parse_contact_input` then `contact::resolve` / `contact::discover` | edge |
+| "Contact Found, adding to contact book" | the `Subject` it returns — `fed_id` + `nodes` | edge |
+| "Send request to join chat community" | your `POST /v1/contacts` | **server** |
+| "Request received from X" + optional note | your transport of choice; edge carries the bytes | **server** |
+| accept → consent | your consent grant | **server** |
+| "Joined community with X" | `CohortGroup::create` (inviter) → `add_member` → `CohortGroup::join` (invitee, from the Welcome) | edge |
+| "Chat with Y" | `contact::the_other_member(&group.member_key_ids().await, own_key_id)` | edge |
+| send a message | `group.destination_secret()` — both sides derive the same key | edge |
+
+Four things worth knowing before you build on it:
+
+1. **A nodeID and a fedID must land on the same person.** A node cannot consent
+   and cannot be a contact, so pasting either into one search box is correct and
+   supported — `resolve` walks a node to its owner. Do not create two contact
+   entries for one human.
+2. **The invitee is a moderator, not a guest.** MLS has no owner role: whoever
+   was invited can change membership, and the founder applies their commit like
+   anyone else's. If your UI implies the creator is privileged, it is describing
+   a rule the substrate does not enforce.
+3. **"Chat with Y" is derived, never stored.** `the_other_member` returns `None`
+   unless the room is exactly two people *and* you are one of them — so a group
+   chat cannot silently render under one participant's name. Decide what an
+   unnamed room shows; do not unwrap.
+4. **The conversation key moves when membership does.** `destination_secret()`
+   changes on every membership commit, which is what stops a removed member from
+   reading on. Re-derive after applying a commit rather than caching it.
+
+Two rungs above are ours and are now proven over the real mesh, not just in
+unit tests: `bench-mesh`'s `ladder.discover_by_fedid` resolves a PEER's owner
+from a binding it learned over the Attestation plane, having seeded nothing.
+
+---
+
 ## 6b. Still genuinely unbuilt
 
 1. **`KnownHashes` records holders but nothing dispatches a point `Fetch` yet.** The learned directory is a sink until that path is wired.
