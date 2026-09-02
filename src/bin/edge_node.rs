@@ -830,7 +830,31 @@ async fn signed_record(
     signer_key_id: &str,
     identity_type: &str,
 ) -> Result<KeyRecord, String> {
-    let envelope = serde_json::json!({ "key_id": subject_key_id });
+    // The envelope must BIND the row's identity — `key_id`, `identity_type`,
+    // and BOTH pubkey legs. CIRISVerify's provenance walk requires exactly
+    // these (`ProvenanceLink::subject_binding`), and refuses a link whose
+    // signed bytes omit any of them.
+    //
+    // The attack it closes: with the identity fields outside the signed bytes,
+    // an attacker wraps a victim's genuine, validly-signed envelope in a link
+    // declaring their OWN key_id and pubkeys. The content hash matches (it
+    // really is the victim's envelope), the signatures verify (really signed by
+    // the real parent), linkage passes — and the chain roots the attacker's
+    // key. Both pubkey legs are bound, not just the name, because binding the
+    // name alone loses on a node that has not yet replicated the victim's row.
+    //
+    // A `{"key_id": …}`-only envelope is why every harness node rooted
+    // `Advisory`: each link was refused with "signed bytes do not carry
+    // `identity_type` — an absent binding is skippable by omission", so the
+    // chain never assembled and the E3 gate attributed nothing.
+    let mut envelope = serde_json::json!({
+        "key_id": subject_key_id,
+        "identity_type": identity_type,
+        "pubkey_ed25519_base64": subject_pubkey_b64,
+    });
+    if !subject_pqc_pubkey_b64.is_empty() {
+        envelope["pubkey_ml_dsa_65_base64"] = serde_json::json!(subject_pqc_pubkey_b64);
+    }
     // JCS canonicalization, and SIGN THE CANONICAL BYTES — not their digest.
     //
     // The rooting provenance walk verifies every link's scrub-signature over
