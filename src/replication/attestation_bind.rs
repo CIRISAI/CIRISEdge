@@ -231,8 +231,16 @@ pub async fn owner_binding_attestation(
 /// way is covered.
 ///
 /// [`owner_binding_delegates_to_envelope`]: ciris_persist::federation::self_at_login::owner_binding_delegates_to_envelope
-pub const DEFAULT_CONSENT_PREFIXES: [&str; 4] =
-    ["capacity:", "ownership:", "self:delegates_to:", "trace:"];
+pub const DEFAULT_CONSENT_PREFIXES: [&str; 5] = [
+    "capacity:",
+    // Chat rides `chat:message:v1`. Omit this and messages are authored,
+    // admitted locally, and NEVER offered to the contact — the plane is
+    // consent-gated at the recipient, so a missing prefix is silent.
+    crate::chat::CHAT_ATTESTATION_PREFIX,
+    "ownership:",
+    "self:delegates_to:",
+    "trace:",
+];
 
 /// Build this node's directed **`consent:replication:v1`** grant at `peer`.
 ///
@@ -358,6 +366,483 @@ pub async fn replication_consent_attestation(
         promoted_at: None,
         additional_scrubs: Vec::new(),
     })
+}
+
+/// **A cohort whose content is ENCRYPTED at rest.**
+///
+/// Named so the guarantee is in the call, not in a doc the caller may not read.
+/// The grouping is not guesswork — it is pinned against persist's own
+/// `cohort_scope::crypto_tier`, which is *negative-default* (CIRISPersist#188):
+/// only these encrypt; everything else, INCLUDING UNKNOWN FUTURE SCOPES, falls
+/// through to plaintext.
+///
+/// | cohort | at rest | can a non-member tell it exists? |
+/// |---|---|---|
+/// | [`MyOwnDevices`](EncryptedCohort::MyOwnDevices) | per-write DEK | **no** |
+/// | [`MyFamily`](EncryptedCohort::MyFamily) | per-write DEK, wrapped per member | **no** |
+/// | [`Community`](EncryptedCohort::Community) | shared per-community DEK (mandatory) | yes |
+/// | [`Affiliations`](EncryptedCohort::Affiliations) | shared DEK | yes |
+///
+/// The two properties are ORTHOGONAL. Only `self`/`family` are structurally
+/// invisible: the `holds_bytes` row IS the discovery surface, so declining to
+/// emit it is the privacy primitive. Community content is deliberately NOT
+/// suppressed (CEG 0.8 §8.1.13.3) — communities can be large and per-member
+/// byte-level invisibility is infeasible, so the community property is
+/// **cohort-filtered visibility**. "Only members can read it" is true of a
+/// community; "nobody can tell it exists" is true only of self and family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptedCohort {
+    /// **`self` — the owner's own device set, and the most important tier.**
+    ///
+    /// Not "unshared": a node has exactly one owner (CIRISConstitution#23), and
+    /// `self` widens to that owner's whole node set — so this replicates across
+    /// YOUR devices and nowhere else. Edge enforces it structurally rather than
+    /// by label: it refuses federation-class and mandatory-class fan-out, and
+    /// refuses any point-to-point emission whose recipient is not self.
+    ///
+    /// It is also the locality dividend (FEDERATION_SCALING_MODEL §9.5): self
+    /// bytes never cost the federation a directory entry. Most content should
+    /// live here and go no further.
+    MyOwnDevices,
+    /// `family` — the partnered family/group (`trust:partnered` /
+    /// `trust:direct`). Structurally invisible, like `self`.
+    MyFamily,
+    /// `community` — a named group; where a two-party chat lives.
+    Community,
+    /// `affiliations` — organisations the subject is attached to.
+    Affiliations,
+}
+
+/// **A cohort whose content is PLAINTEXT at rest**, despite naming an audience
+/// narrower than the whole federation.
+///
+/// This type exists to stop a caller reading `species` as "more private than
+/// federation". It is not: persist's negative-default dispatch encrypts only
+/// self/family and community/affiliations, so these tiers are stored in the
+/// clear and emit `holds_bytes` normally. They narrow the intended AUDIENCE;
+/// they do not protect the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearCohort {
+    /// `species` — a broader-than-community human audience. Plaintext.
+    Species,
+    /// `biosphere` — including non-human stakeholders. Plaintext.
+    Biosphere,
+}
+
+impl EncryptedCohort {
+    /// The wire `cohort_scope` value.
+    #[must_use]
+    pub fn cohort_scope(self) -> &'static str {
+        use ciris_persist::federation::types::cohort_scope as cs;
+        match self {
+            EncryptedCohort::MyOwnDevices => cs::SELF,
+            EncryptedCohort::MyFamily => cs::FAMILY,
+            EncryptedCohort::Community => cs::COMMUNITY,
+            EncryptedCohort::Affiliations => cs::AFFILIATIONS,
+        }
+    }
+
+    /// Does this tier withhold the `holds_bytes` discovery row entirely, so a
+    /// non-member cannot learn the content exists? `self` and `family` only.
+    #[must_use]
+    pub fn is_structurally_invisible(self) -> bool {
+        ciris_persist::federation::types::cohort_scope::suppresses_holds_bytes(self.cohort_scope())
+    }
+}
+
+impl ClearCohort {
+    /// The wire `cohort_scope` value.
+    #[must_use]
+    pub fn cohort_scope(self) -> &'static str {
+        use ciris_persist::federation::types::cohort_scope as cs;
+        match self {
+            ClearCohort::Species => cs::SPECIES,
+            ClearCohort::Biosphere => cs::BIOSPHERE,
+        }
+    }
+}
+
+/// **Share a row with a cohort that encrypts it at rest.** The ordinary case.
+///
+/// ```ignore
+/// // A chat message: authored `self`, then shared with the room.
+/// share_encrypted_privately(&*dir, &row, EncryptedCohort::Community, &signer).await?;
+/// ```
+///
+/// Sharing is not the whole flow. The recipient must ALSO be covered by a
+/// directed `consent:replication:v1` grant whose prefixes include this row's
+/// namespace, or the plane withholds it silently — see
+/// [`replication_consent_attestation`] and [`DEFAULT_CONSENT_PREFIXES`].
+///
+/// **Retention is not a parameter here, deliberately.** The promotion reseal
+/// carries the envelope, its hash, both signature halves, and the re-signer —
+/// not `expires_at`. A retention limit is a property of the row at AUTHORSHIP,
+/// so it is set by the producer; accepting it here would be a parameter that
+/// silently did nothing.
+///
+/// # Errors
+/// Re-stamp, canonicalization, signing, or the primitive's refusal.
+pub async fn share_encrypted_privately(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    row: &ciris_persist::federation::Attestation,
+    cohort: EncryptedCohort,
+    signer: &crate::identity::LocalSigner,
+) -> Result<bool, String> {
+    promote_to_scope(directory, row, cohort.cohort_scope(), signer).await
+}
+
+/// **Share a row with a narrower AUDIENCE, but in the clear.**
+///
+/// `species` and `biosphere` name an audience smaller than the federation and
+/// are nonetheless stored plaintext with a normal `holds_bytes` row. Separate
+/// from [`share_encrypted_privately`] so the difference cannot be missed by
+/// picking a neighbouring enum variant.
+///
+/// # Errors
+/// Re-stamp, canonicalization, signing, or the primitive's refusal.
+pub async fn share_clear_privately(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    row: &ciris_persist::federation::Attestation,
+    cohort: ClearCohort,
+    signer: &crate::identity::LocalSigner,
+) -> Result<bool, String> {
+    tracing::info!(
+        attestation_id = %row.attestation_id,
+        cohort_scope = cohort.cohort_scope(),
+        "sharing to a narrower audience but IN THE CLEAR — plaintext at rest, \
+         and a discoverable holds_bytes row"
+    );
+    promote_to_scope(directory, row, cohort.cohort_scope(), signer).await
+}
+
+/// **Publish a row to the whole federation — world-readable, in the clear.**
+///
+/// `federation` is the Commons tier: plaintext at rest, no cohort filter, and a
+/// `holds_bytes` row anyone can discover. The right home for the identity
+/// plane, which is announced and attributable by design; the wrong home for
+/// anything else.
+///
+/// A separate FUNCTION rather than a variant, on purpose. `federation` reads
+/// like "the mesh" and means "anyone at all", so a caller reaching into a scope
+/// enum can pick it while thinking about routing rather than audience.
+/// Publishing should be something you typed.
+///
+/// # Errors
+/// Re-stamp, canonicalization, signing, or the primitive's refusal.
+pub async fn share_publicly(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    row: &ciris_persist::federation::Attestation,
+    signer: &crate::identity::LocalSigner,
+) -> Result<bool, String> {
+    tracing::info!(
+        attestation_id = %row.attestation_id,
+        dimension = ?row
+            .attestation_envelope
+            .get("dimension")
+            .and_then(serde_json::Value::as_str),
+        "PUBLISHING to the federation (lightnet): world-readable and plaintext \
+         at rest. This cannot be walked back for anyone who already read it"
+    );
+    promote_to_scope(
+        directory,
+        row,
+        ciris_persist::federation::types::cohort_scope::FEDERATION,
+        signer,
+    )
+    .await
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// The one-verb surface — docs/FSD_REPLICATION_DX.md §3
+// ═══════════════════════════════════════════════════════════════════
+
+/// **Who a row is shared with.** The Recipient parameter of contextual
+/// integrity, as a type — every non-public cohort in widening order.
+///
+/// This is an OPTION over the substrate, not a gate in front of it: a row
+/// authored directly at `tier: federation` with the intended `cohort_scope`
+/// replicates exactly as well. `With` exists because the two-axis model
+/// (`tier` = on the wire at all; `cohort_scope` = who) is easy to get wrong,
+/// so it names the audience and answers the two questions callers get wrong
+/// FROM THE VALUE — delegating to persist's own classifiers rather than
+/// restating them, so a drift is a test failure, not a doc bug.
+///
+/// `federation` is deliberately absent. Publishing is [`publish`], its own
+/// verb: `federation` reads like "the mesh" and means "anyone at all, in the
+/// clear", and it should be something you typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum With {
+    /// `self` — the owner's OWN device set. A node has exactly one owner
+    /// (CC 3.2), so `self` widens to that owner's nodes and nowhere else.
+    /// Structurally invisible; the locality dividend.
+    MyDevices,
+    /// `family` — the partnered family/group. Structurally invisible.
+    MyFamily,
+    /// `community` — a named group. WHICH community is the signed
+    /// `community_id` member of the row, not a parameter here: `cohort_scope`
+    /// is the single string `community`, and a room argument would be one the
+    /// substrate never reads. Encrypted under the room DEK; discoverable.
+    Community,
+    /// `affiliations` — organisations the subject is attached to. Same tier
+    /// as `community` (CC 4.4.3.2.1).
+    Affiliations,
+    /// `species` — narrower AUDIENCE than the federation, but **plaintext**
+    /// (Commons). Check [`Self::is_encrypted_at_rest`] before assuming
+    /// otherwise.
+    Species,
+    /// `biosphere` — likewise plaintext Commons.
+    Biosphere,
+}
+
+impl With {
+    /// The wire `cohort_scope` value.
+    #[must_use]
+    pub fn cohort_scope(self) -> &'static str {
+        use ciris_persist::federation::types::cohort_scope as cs;
+        match self {
+            With::MyDevices => cs::SELF,
+            With::MyFamily => cs::FAMILY,
+            With::Community => cs::COMMUNITY,
+            With::Affiliations => cs::AFFILIATIONS,
+            With::Species => cs::SPECIES,
+            With::Biosphere => cs::BIOSPHERE,
+        }
+    }
+
+    /// Are the bytes encrypted at rest? persist's `crypto_tier` is the
+    /// authority and it is negative-default (#188): only self/family and
+    /// community/affiliations encrypt; everything else is plaintext.
+    ///
+    /// Passes `cohort_subkind = None`. A `community` whose subkind is
+    /// `infrastructure` is plaintext by carve-out — a caller placing into one
+    /// of those should consult `crypto_tier` with the subkind directly.
+    #[must_use]
+    pub fn is_encrypted_at_rest(self) -> bool {
+        use ciris_persist::federation::types::cohort_scope::{crypto_tier, CryptoTier};
+        !matches!(
+            crypto_tier(self.cohort_scope(), None),
+            CryptoTier::Plaintext
+        )
+    }
+
+    /// Can a non-member tell the content EXISTS? `false` means the
+    /// `holds_bytes` discovery row is withheld — true only of `self` and
+    /// `family` (CC 5.2). A community is cohort-filtered, not invisible.
+    #[must_use]
+    pub fn is_structurally_invisible(self) -> bool {
+        ciris_persist::federation::types::cohort_scope::suppresses_holds_bytes(self.cohort_scope())
+    }
+}
+
+/// What [`share`] / [`publish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shared {
+    /// The row was promoted and is now on the wire at that cohort.
+    Placed,
+    /// The row was ALREADY at that tier and cohort. Promotion is idempotent
+    /// by constitution (CC 5.3.2.4.2), so this is a fact, not a fault.
+    AlreadyThere,
+}
+
+/// The one pre-check both verbs share, and it is PURE: a row already at
+/// federation tier is reported as already-there (same cohort) or refused
+/// (different cohort — an authoring bug, since promotion cannot MOVE it), and
+/// never silently dropped on the substrate's `Ok(false)` arm.
+///
+/// `None` means "not promoted yet — go ahead". Public so the verdict is testable
+/// without a directory, which is also the proof that it runs before one is
+/// touched.
+#[must_use]
+pub fn already_promoted_verdict(
+    row: &ciris_persist::federation::Attestation,
+    target_scope: &str,
+) -> Option<Result<Shared, String>> {
+    use ciris_persist::federation::types::attestation_tier;
+    if row.tier != attestation_tier::FEDERATION {
+        return None;
+    }
+    if row.cohort_scope == target_scope {
+        return Some(Ok(Shared::AlreadyThere));
+    }
+    Some(Err(format!(
+        "row {} was AUTHORED at tier `federation` with cohort_scope `{}`, so it cannot be \
+         shared to `{}`: promotion is idempotent (CC 5.3.2.4.2) and only moves `local` \
+         rows. Author at `tier: local`, `cohort_scope: self`, store it, then share — \
+         or author it directly at the intended cohort, which replicates just as well.",
+        row.attestation_id, row.cohort_scope, target_scope
+    )))
+}
+
+/// **Share a row with an audience — the one verb.**
+///
+/// Promotes a `local` row to federation tier AT the chosen cohort, correctly
+/// resealed. Idempotent on a row already there. Refuses — by name — a row
+/// that was authored already-promoted at a different cohort, instead of
+/// returning the substrate's silent `Ok(false)`.
+///
+/// Sharing is not the whole flow: the recipient must ALSO be covered by a
+/// directed `consent:replication:v1` grant whose prefixes include the row's
+/// namespace, or the plane withholds it. See [`replication_consent_attestation`].
+///
+/// Terms are NOT a parameter here, on purpose: the promotion reseal carries no
+/// consent-scope member and no `expires_at`, so a `Terms` argument would be one
+/// that silently did nothing. Retention is set by the producer at authorship
+/// (FSD §3, "Honest scoping").
+///
+/// # Errors
+/// An already-promoted row at a different cohort; re-stamp, canonicalization,
+/// signing, or the primitive's refusal.
+pub async fn share(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    row: &ciris_persist::federation::Attestation,
+    with: With,
+    signer: &crate::identity::LocalSigner,
+) -> Result<Shared, String> {
+    if let Some(early) = already_promoted_verdict(row, with.cohort_scope()) {
+        return early;
+    }
+    if promote_to_scope(directory, row, with.cohort_scope(), signer).await? {
+        Ok(Shared::Placed)
+    } else {
+        // Unreachable for a `local` row by the substrate's contract; surfaced
+        // rather than mapped to AlreadyThere so a contract change shows up.
+        Err(format!(
+            "promote_attestation({}) placed nothing for a local row {}",
+            with.cohort_scope(),
+            row.attestation_id
+        ))
+    }
+}
+
+/// **Publish a row — world-readable, plaintext, federation-wide.**
+///
+/// The one act that cannot be walked back for anyone who already read it,
+/// which is why it is a separate verb and not a `With` variant. Same
+/// idempotency and same authored-already-promoted refusal as [`share`].
+///
+/// # Errors
+/// As [`share`].
+pub async fn publish(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    row: &ciris_persist::federation::Attestation,
+    signer: &crate::identity::LocalSigner,
+) -> Result<Shared, String> {
+    use ciris_persist::federation::types::cohort_scope as cs;
+    if let Some(early) = already_promoted_verdict(row, cs::FEDERATION) {
+        return early;
+    }
+    if share_publicly(directory, row, signer).await? {
+        Ok(Shared::Placed)
+    } else {
+        Err(format!(
+            "promote_attestation(federation) placed nothing for a local row {}",
+            row.attestation_id
+        ))
+    }
+}
+
+/// **State, at the call site, that a row is NOT being shared.**
+///
+/// A `local` row never crosses a wire and is readable by the producing
+/// occurrence only (CC 5.3.2.4.3) — that is already true without this call.
+/// `keep_local` exists so "I did not share it" is something you write and an
+/// audit can find, rather than something achieved by not calling anything.
+///
+/// It refuses two rows:
+///
+/// * one already at federation tier — it is not local, so the statement is
+///   false;
+/// * a **subject-side revocation** (`withdraws` / `recants` naming a subject
+///   other than the producer). Local-tier eligibility is decided by
+///   revocation authority (CC 5.3.2.4.1 / 5.3.2.2): a row another subject can
+///   revoke is federation-tier BY CLASSIFICATION, may transit local in flight,
+///   and MUST NOT rest there — the substrate drives it to promotion within a
+///   24 h SLA. Keeping it local is not a choice on offer.
+///
+/// # Errors
+/// Either refusal above, naming which.
+pub fn keep_local(row: &ciris_persist::federation::Attestation) -> Result<(), String> {
+    use ciris_persist::federation::types::attestation_tier;
+    if row.tier != attestation_tier::LOCAL {
+        return Err(format!(
+            "row {} is at tier `{}`, not `local` — it is already on the wire, so \
+             keep_local would be a false statement",
+            row.attestation_id, row.tier
+        ));
+    }
+    // CC 5.3.2.2: a revocation whose authority belongs to a subject other than
+    // the producer must not rest local. The structural revocation primitives
+    // are `withdraws` and `recants`.
+    let is_revocation = matches!(row.attestation_type.as_str(), "withdraws" | "recants");
+    let names_another_subject = row
+        .subject_key_ids
+        .iter()
+        .any(|s| s != &row.attesting_key_id);
+    if is_revocation && names_another_subject {
+        return Err(format!(
+            "row {} is a `{}` naming a subject other than its producer — a subject-side \
+             revocation is federation-tier by classification (CC 5.3.2.2) and must not \
+             rest local; it must promote within the 24h SLA",
+            row.attestation_id, row.attestation_type
+        ));
+    }
+    Ok(())
+}
+
+/// **Promote a row to a narrower cohort placement, correctly resealed.**
+///
+/// Most promotions go to `family` / `community` / `affiliations`. `federation`
+/// is the PUBLIC (lightnet) tier — a row placed there is world-readable by
+/// design, so it is the wrong destination for anything that is not meant to be
+/// public, and the right one for identity-plane rows that are.
+///
+/// # Why a bare scope change is refused
+///
+/// The placement is inside the SIGNED envelope's row mirror, so moving a row
+/// means re-stamping and re-signing it. persist refuses a promotion whose
+/// reseal it did not verify — "a caller that skips the re-stamp is REFUSED at
+/// the primitive" — because otherwise a door between the author and the store
+/// could rewrite a column and the signature would still check out.
+///
+/// This assembles that reseal: `restamp_for_scope` produces the envelope as it
+/// will be STORED, and the hash and both signature halves are computed over
+/// exactly those bytes.
+///
+/// # Errors
+/// Re-stamp, canonicalization, signing, or the primitive's own refusal.
+pub async fn promote_to_scope(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    row: &ciris_persist::federation::Attestation,
+    cohort_scope: &str,
+    signer: &crate::identity::LocalSigner,
+) -> Result<bool, String> {
+    use sha2::Digest as _;
+
+    let restamped = ciris_persist::federation::envelope::RowMirror::restamp_for_scope(
+        &row.attestation_envelope,
+        row,
+        cohort_scope,
+    )
+    .map_err(|e| format!("restamp_for_scope({cohort_scope}): {e}"))?;
+
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&restamped)
+        .map_err(|e| format!("canonicalize restamped: {e}"))?;
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        crate::identity::sign_bound_hybrid(signer, &canonical, "promotion reseal").await?;
+
+    let reseal = ciris_persist::federation::types::AttestationReseal {
+        attestation_envelope: restamped,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: signer.key_id.clone(),
+        scrub_timestamp: truncate_to_micros(chrono::Utc::now()),
+    };
+    directory
+        .promote_attestation(&row.attestation_id, cohort_scope, &reseal)
+        .await
+        .map_err(|e| format!("promote_attestation({cohort_scope}): {e}"))
 }
 
 #[cfg(test)]

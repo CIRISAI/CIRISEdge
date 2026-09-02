@@ -170,8 +170,12 @@ jobs:
       #
       # The container names are fixed by compose's `container_name:`, so
       # addressing them directly needs no interpolation and no env.
-      - name: Container logs on failure
-        if: failure()
+      # ALWAYS, not only on failure. A green run is the one whose logs answer
+      # "where did the time go" — rooting cadence, round timeouts, unattributed
+      # residue — and those are the runs that had no logs at all. 300 lines per
+      # container is cheap; a green run with no evidence is not.
+      - name: Container logs
+        if: always()
         run: |
           for c in bm-publisher bm-relay-1 bm-relay-2 bm-sub-1 bm-sub-2 \
                    bm-sub-3 bm-sub-4 bm-nonmember; do
