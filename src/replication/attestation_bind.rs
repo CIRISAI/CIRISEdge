@@ -450,6 +450,17 @@ mod admit_tests {
             "the binding must be visible to the resolver a fedID lookup uses — \
              an admitted-but-unresolvable row is the silent version of this bug"
         );
+
+        // And the FORWARD direction, which is the one discovery actually walks:
+        // a fedID resolves to the person, the person to their nodes. Asserting
+        // only `owner_of` would leave the leg's own direction unproven.
+        let owned = ciris_persist::federation::admission::nodes_owned_by(&*dir, "owner-a")
+            .await
+            .expect("nodes_owned_by must not error");
+        assert!(
+            owned.contains(&"node-b".to_string()),
+            "fedID -> owned nodes is the direction `discover` walks; got {owned:?}"
+        );
     }
 
     /// An UNBOUND envelope is refused — the guard proves persist's rule is

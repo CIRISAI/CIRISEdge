@@ -1762,9 +1762,9 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 "unreachable": unreachable,
                 "readback": "transport.knows_peer",
                 // Stated so a reader of the census knows what this leg does NOT
-                // cover: identifier resolution needs owner bindings the harness
-                // does not seed, and is unit-tested instead.
-                "covers": "route reachability only; identity resolution is unit-tested",
+                // cover: identifier resolution is the NEXT leg
+                // (`ladder.discover_by_fedid`), which walks owner bindings.
+                "covers": "route reachability only; identifier resolution is the next leg",
             }),
         );
     }
@@ -1799,37 +1799,89 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 "no peer published an owner in the roster — nothing to resolve",
             ),
             Some((owner_id, expect_node)) => {
-                match contact::discover(&lens, &routes, &owner_id).await {
-                    Ok(found) => {
-                        let named = found.subject.nodes.contains(&expect_node);
-                        let reachable = found.reachable.contains(&expect_node);
-                        rep.ran(
-                            "ladder.discover_by_fedid",
-                            named && reachable,
-                            serde_json::json!({
-                                "queried": owner_id,
-                                "resolved_person": found.subject.fed_id,
-                                "resolved_from": format!("{:?}", found.subject.resolved_from),
-                                "nodes": found.subject.nodes,
-                                "reachable": found.reachable,
-                                "expected_node": expect_node,
-                                "named_expected_node": named,
-                                "reachable_expected_node": reachable,
-                                "covers": "fedID -> person -> owned nodes -> addressable, \
-                                           against the peer's owner binding learned over the wire",
-                            }),
+                // POLL until the peer's binding arrives, up to the barrier.
+                //
+                // The row is replicated, not seeded, so asking once races the
+                // Attestation plane and fails on timing rather than on the
+                // property under test. What this leg claims is that discovery
+                // CONVERGES over the wire — so waiting for convergence is the
+                // measurement, and the elapsed time is reported as part of it.
+                let started = Instant::now();
+                let mut attempts = 0_u32;
+                let mut last: Option<contact::Discovered> = None;
+                let mut last_stall: Option<String> = None;
+                loop {
+                    attempts += 1;
+                    match contact::discover(&lens, &routes, &owner_id).await {
+                        Ok(found) => {
+                            let done = found.subject.nodes.contains(&expect_node)
+                                && found.reachable.contains(&expect_node);
+                            last = Some(found);
+                            if done {
+                                break;
+                            }
+                        }
+                        Err(stall) => last_stall = Some(format!("{stall:?}")),
+                    }
+                    if started.elapsed() >= cfg.barrier_timeout {
+                        break;
+                    }
+                    tokio_sleep(Duration::from_millis(500)).await;
+                }
+
+                let waited_ms = started.elapsed().as_millis();
+                if let Some(found) = last {
+                    let named = found.subject.nodes.contains(&expect_node);
+                    let reachable = found.reachable.contains(&expect_node);
+                    if !(named && reachable) {
+                        tracing::error!(
+                            queried = %owner_id,
+                            expected_node = %expect_node,
+                            nodes = ?found.subject.nodes,
+                            reachable = ?found.reachable,
+                            waited_ms,
+                            attempts,
+                            "discovery did not converge: the peer's owner binding \
+                             never named a reachable expected node within the barrier"
                         );
                     }
-                    Err(stall) => rep.ran(
+                    rep.ran(
+                        "ladder.discover_by_fedid",
+                        named && reachable,
+                        serde_json::json!({
+                            "queried": owner_id,
+                            "resolved_person": found.subject.fed_id,
+                            "resolved_from": format!("{:?}", found.subject.resolved_from),
+                            "nodes": found.subject.nodes,
+                            "reachable": found.reachable,
+                            "expected_node": expect_node,
+                            "named_expected_node": named,
+                            "reachable_expected_node": reachable,
+                            "converged_ms": waited_ms,
+                            "attempts": attempts,
+                            "covers": "fedID -> person -> owned nodes -> addressable, \
+                                       against the peer's owner binding learned over the wire",
+                        }),
+                    );
+                } else {
+                    tracing::error!(
+                        queried = %owner_id,
+                        stall = ?last_stall,
+                        waited_ms,
+                        attempts,
+                        "discovery never resolved the peer's owner — the owner \
+                         binding did not replicate, or did not admit at this node"
+                    );
+                    rep.ran(
                         "ladder.discover_by_fedid",
                         false,
                         serde_json::json!({
                             "queried": owner_id,
-                            "stall": format!("{stall:?}"),
-                            "self_resolving": stall.self_resolving(),
-                            "remedy": stall.remedy(),
+                            "stall": last_stall,
+                            "waited_ms": waited_ms,
+                            "attempts": attempts,
                         }),
-                    ),
+                    );
                 }
             }
         }
