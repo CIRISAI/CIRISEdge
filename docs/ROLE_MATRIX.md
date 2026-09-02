@@ -61,14 +61,39 @@ delegate (CC 4 scope table).
 | tier | established by | may do | trusted for | resolving check |
 |---|---|---|---|---|
 | **none** | — | hold own records; answer a subject Pull for **itself** and for **its own record** | nothing beyond its own signatures | (absence) |
-| **mesh server** | owner's `delegates_to(owner → node, [infra:serve])` | **store & serve to help the mesh**: hold the directory hash-first, answer third-party identifier Pulls, serve bodies by hash | *nothing* — and needs no trust: everything served is a self-authenticating signed envelope, re-verified at the receiver's admission gate | own row `claims_role(infra:serve)` **∧** the owner's grant bears the scope (a claim alone is *"visibility, never conferral"* — persist v19.0.0 `lift_envelope_attested_roles`) |
-| **canonical** | 2-of-3 accord co-scrub over a `canonical,node` registration envelope bearing `roles: ["infra:serve"]` (CC 4.4.3.8 — the same ceremony that mints a portable trust root) | everything a mesh server may, **plus** be relied on before verification is possible | **bootstrap**: the `CanonicalBootstrapPeer` set, rooting a fresh fleet, the E3 trace-plane serve gate | leg A: `has_accord_conferred_role` — the co-scrub **re-derived from the row's own cryptography** every call, so a withdrawn blessing bites immediately; leg B: `capability_roots_to_trusted_root` — chains to the resolver's root (see Axis 5) |
+| **mesh server** | owner's `delegates_to(owner → node, [infra:serve])` | **store & serve to help the mesh**: carries the directory as HASHES and serves bodies BY HASH. Does NOT answer identifier lookups — answering one requires the body, and it has chosen not to hold them | *nothing* — and needs no trust: everything served is a self-authenticating signed envelope, re-verified at the receiver's admission gate | own row `claims_role(infra:serve)` **∧** the owner's grant bears the scope (a claim alone is *"visibility, never conferral"* — persist v19.0.0 `lift_envelope_attested_roles`) |
+| **canonical** | 2-of-3 accord co-scrub over a `canonical,node` registration envelope bearing `roles: ["infra:serve"]` (CC 4.4.3.8 — the same ceremony that mints a portable trust root) | holds the directory as **BODIES**, so it is the tier that answers **identifier lookups** (rate limited per requester) — and be relied on before verification is possible | **bootstrap**: the `CanonicalBootstrapPeer` set, rooting a fresh fleet, the E3 trace-plane serve gate | leg A: `has_accord_conferred_role` — the co-scrub **re-derived from the row's own cryptography** every call, so a withdrawn blessing bites immediately; leg B: `capability_roots_to_trusted_root` — chains to the resolver's root (see Axis 5) |
 
 The load-bearing distinction: a mesh server helps **after** trust exists
 (records prove themselves); a canonical is who you lean on **before** it does
 (bootstrap is precisely the moment you cannot yet verify). *"A root serves and
 vouches, or it is inert"* — root validity minimum is `[infra:serve,
 infra:attest]` (CC 4).
+
+**Why identifier lookups are canonical-only — mechanical before policy.**
+Answering "which records do you hold for subject S" requires the BODY:
+`subject_holdings_inner` resolves through `lookup_public_key`, and persist's
+subject-scoped reads are built from the held records (`wire_refs_for_subject`
+reads `list_signed_key_records_since`, and the Key plane has no subject-indexed
+signed read at all). There is no body-free identifier path anywhere in the
+stack, so a hash-first node cannot answer whatever it is entitled to. An
+earlier revision keyed this to "any conferred server" and was therefore
+unsatisfiable.
+
+That fact lands the **anti-harvest** property in the right place. The harvest
+unit is the (identity, destination) PAIR — a destination with no owner is an
+address you cannot attribute, an ID with no destination is a name you cannot
+reach — so all three identity planes move together. Bulk enumeration is only
+possible where bodies are, and bodies concentrate at canonicals: few,
+accountable, rate limited. Mesh servers can be scraped for "these records
+exist" and nothing more. And the identifier Pull cannot enumerate on its own —
+the requester must NAME the subject, so it confirms people it already knows
+rather than discovering new ones.
+
+This is **friction on a public plane, not confidentiality**. The identity plane
+is announced, attributable, and makes no anonymity claim; the invisibility
+property lives on the GROUP plane, by derivation (CC 5.4.6). Nothing here may
+be described as privacy (CC 1.13.3.1's bounding non-goals).
 
 ## Axis 4 — announce: are your IDs with the canonicals?
 
@@ -165,10 +190,10 @@ verifiable conferral resolves `None`, loudly.
 |---|---|---|---|
 | bind a listener / queue size | Axis 1 | `AgentMode` | ✅ correct |
 | who consents / who is contactable | Axis 2 | `identity_type` via directory | ✅ correct (`contact::resolve`) |
-| retention: `Bodies` vs `HashFirst` | **Axis 3 ≥ mesh server** | own `infra:serve` conferral | ✅ `serve_tier().may_store_and_serve()` — gauntlet R3 |
-| record known-hashes from advertisements | Axis 3 ≥ mesh server | own `infra:serve` conferral | ✅ gauntlet R4 |
-| queue a missing-signer recovery | Axis 3 ≥ mesh server (via Key retention) | `should_note_missing_signer(retention)` | ✅ gauntlet R5 |
-| answer a third-party identifier Pull on a public plane | Axis 3 ≥ mesh server | own `infra:serve` conferral | ✅ gauntlet R6 |
+| retention: `Bodies` vs `HashFirst` | **Axis 3 = mesh server** | `serve_tier().holds_hash_directory()` | ✅ gauntlet R3 — a canonical holds BODIES, not a ladder |
+| record known-hashes from advertisements | Axis 3 = mesh server | `holds_hash_directory()` | ✅ gauntlet R4 |
+| queue a missing-signer recovery | Axis 3 = mesh server (via Key retention) | `should_note_missing_signer(retention)` | ✅ gauntlet R5 |
+| answer a third-party identifier Pull on a public plane | **Axis 3 = canonical** | `answers_identifier_lookups()` + per-requester rate limit | ✅ gauntlet R6 |
 | answer a subject Pull for the subject itself | always | `requester == subject` (#462) | ✅ correct |
 | answer a Pull for this node's OWN record | always | `subject == local_key_id` | ✅ correct (#556) |
 | serve trace-plane attestations | **Axis 3 = canonical** under Axis 5 | leg A ∧ leg B (`peer_has_serve_capability`) | ✅ correct (#386/#379, value-provenance-locked to persist's `INFRA_SERVE`) |

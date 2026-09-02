@@ -2401,15 +2401,17 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// [`CachedServeTier::TTL`]:
     ///     crate::replication::serve_tier::CachedServeTier::TTL
     fn retention(&self, kind: EnvelopeKind) -> crate::replication::retention::Retention {
-        // ROLE_MATRIX Axis 3 — only a node CONFERRED the directory role keeps a
-        // hash directory. Keyed on the serving tier, NOT on `AgentMode`: mode is
-        // the local-resources posture (listener, queue) and shipping this keyed
-        // on it was the one-variable-two-jobs bug — a node set to `server` for
-        // queue reasons silently held the federation hash-first, and a conferred
-        // server running `proxy` never did. An unconferred node holds bodies for
-        // the little it tracks; hash-first buys nothing on a small working set
-        // and would hand it an enumerable directory it has no use for.
-        let configured = if self.serve_tier().may_store_and_serve() {
+        // ROLE_MATRIX Axis 3 — the MESH SERVER carries hashes; a CANONICAL
+        // carries bodies. Not a ladder: answering an identifier lookup requires
+        // the body, so the tier that answers cannot be hash-first, and the tier
+        // that is hash-first cannot answer. Bodies therefore concentrate at
+        // canonicals — few, accountable, rate-limited — which is where the
+        // anti-harvest property actually lives.
+        //
+        // Keyed on the tier, NOT on `AgentMode`: mode is the local-resources
+        // posture (listener, queue), and shipping this keyed on it was the
+        // one-variable-two-jobs bug.
+        let configured = if self.serve_tier().holds_hash_directory() {
             crate::replication::retention::Retention::HashFirst
         } else {
             crate::replication::retention::Retention::Bodies
@@ -2529,7 +2531,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // advertised would end up holding the whole federation as hashes —
         // the enumeration surface again, just cheaper to carry. What it needs
         // is the subset that concerns it, reached through the on-demand path.
-        if !self.serve_tier().may_store_and_serve() {
+        if !self.serve_tier().holds_hash_directory() {
             return;
         }
         if let Ok(mut known) = self.known_hashes.lock() {
@@ -2893,7 +2895,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 if p == subject_key_id
                     || (kind.is_public_subject_pull()
                         && (self.local_key_id.as_deref() == Some(subject_key_id)
-                            || self.serve_tier().may_store_and_serve())) =>
+                            || self.serve_tier().answers_identifier_lookups())) =>
             {
                 // CIRISEdge#531 — WIDTH bound on the subject-Pull sweep too:
                 // it is per-subject rather than whole-table, but the
@@ -10133,7 +10135,11 @@ pub(crate) mod tests {
             test_fixtures::make_bridge_with_keys(&[local, third_party, stranger]).await;
         let bridge = bridge
             .with_local_key_id(Some(local.to_string()))
-            .with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::MeshServer);
+            // Canonical: the tier that HOLDS BODIES and therefore answers
+            // identifier lookups. With MeshServer this test would pass for the
+            // wrong reason — every lookup returns empty because it has no
+            // bodies, not because the budget bound it.
+            .with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::Canonical);
 
         // Spend the whole third-party budget.
         let budget = FederationDirectoryReplicationBridge::IDENTIFIER_LOOKUPS_PER_WINDOW;
@@ -10169,99 +10175,77 @@ pub(crate) mod tests {
         );
     }
 
-    /// ROLE_MATRIX Axis 3 — a CONFERRED server answers an identifier lookup
-    /// for any subject on a public plane; an unconferred node answers only for
-    /// itself. `AgentMode` is never consulted.
+    /// ROLE_MATRIX Axis 3 — a CANONICAL answers an identifier lookup; a mesh
+    /// server does not, and an unconferred node answers only for itself.
     ///
-    /// The identity plane is public — announced, rooted, attributable, no
-    /// anonymity claim. What this system makes invisible is GROUP existence, by
-    /// deriving destinations from state members already hold rather than
-    /// announcing them. So a third-party `Key` lookup discloses nothing the
-    /// design withholds, and a fedID is enough to reach someone: ask a
-    /// conferred server, fetch the bodies by hash, canonicals hold the
-    /// contents.
+    /// The canonical-only rule is mechanical before it is policy. Answering
+    /// "which records do you hold for subject S" needs the BODY:
+    /// `subject_holdings_inner` resolves through `lookup_public_key`, and
+    /// persist's subject-scoped reads are built from held records. There is no
+    /// body-free identifier path in the stack, so a hash-first mesh server
+    /// cannot answer whatever it is entitled to — which is why the earlier
+    /// "any conferred server answers" rule was unsatisfiable.
     ///
-    /// The line is HOLDINGS, not entitlement. A conferred server opted into
-    /// carrying the directory; answering for it is what being one means. An
-    /// unconferred node holds its own records, so it has nothing else to
-    /// answer with — which is also why the enumeration surface does not follow
-    /// the corpus around the fabric.
+    /// That also puts the anti-harvest property where it belongs: bodies
+    /// concentrate at canonicals — few, accountable, rate-limited — while mesh
+    /// servers carry hashes and can be scraped for "these records exist" and
+    /// nothing more. The identifier Pull cannot enumerate on its own; the
+    /// requester must NAME the subject.
     #[tokio::test]
-    async fn a_conferred_server_answers_lookups_and_an_unconferred_node_answers_only_for_itself() {
+    async fn only_a_canonical_answers_identifier_lookups() {
         let local = "local-A";
         let third_party = "subject-S";
         let stranger = "stranger-X";
-        let seed = |backend: &Arc<MemoryBackend>| {
-            let backend = Arc::clone(backend);
-            async move {
-                for kid in [local, third_party, stranger] {
-                    backend
-                        .put_public_key(SignedKeyRecord {
-                            record: fixture_key_record(kid, identity_type::AGENT),
-                        })
-                        .await
-                        .expect("seed key");
-                }
-            }
-        };
 
-        // ── SERVER: carries the directory, so it answers for a third party.
-        let (backend, bridge) = make_bridge(&[]);
-        seed(&backend).await;
-        let server = bridge
-            .with_local_key_id(Some(local.to_string()))
-            .with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::MeshServer);
-        assert!(
-            !server
-                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
-                .await
-                .is_empty(),
-            "a SERVER must answer an identifier lookup for a third party — that \
-             is what carrying the directory means, and it is how a fedID alone \
-             is enough to reach a stranger"
-        );
+        for (tier, answers) in [
+            (crate::replication::serve_tier::ServeTier::None, false),
+            (crate::replication::serve_tier::ServeTier::MeshServer, false),
+            (crate::replication::serve_tier::ServeTier::Canonical, true),
+        ] {
+            let (_backend, bridge) =
+                test_fixtures::make_bridge_with_keys(&[local, third_party, stranger]).await;
+            let bridge = bridge
+                .with_local_key_id(Some(local.to_string()))
+                .with_serve_tier_for_test(tier);
 
-        // ── PROXY (the default): answers for itself, nothing else.
-        let (backend, bridge) = make_bridge(&[]);
-        seed(&backend).await;
-        let proxy = bridge
-            .with_local_key_id(Some(local.to_string()))
-            .with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::None);
-        assert!(
-            !proxy
-                .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
-                .await
-                .is_empty(),
-            "a proxy still answers for its OWN record — that is `self_own`, which \
-             it already advertises to every peer"
-        );
-        assert!(
-            proxy
-                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
-                .await
-                .is_empty(),
-            "a proxy holds essentially its own records, so it has nothing to \
-             answer with for a third party — the enumeration surface stays with \
-             the nodes that opted into the corpus"
-        );
-
-        // Unattributed is refused everywhere, and Attestation keeps subject-only
-        // even on a server: its serve cell is conditional per ROW.
-        assert!(
-            server
-                .subject_holdings(EnvelopeKind::Key, third_party, None)
-                .await
-                .is_empty(),
-            "an UNATTRIBUTED Pull serves nothing, server or not"
-        );
-        assert!(
-            server
-                .subject_holdings(EnvelopeKind::Attestation, third_party, Some(stranger))
-                .await
-                .is_empty(),
-            "Attestation's entitlement is decided per ROW (trace:* capability, \
-             the G2 carve) — a server does not blanket it"
-        );
+            assert_eq!(
+                !bridge
+                    .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                    .await
+                    .is_empty(),
+                answers,
+                "{tier:?}: only the body-holding tier can answer for a third party"
+            );
+            // Every tier serves the subject itself and its own record.
+            assert!(
+                !bridge
+                    .subject_holdings(EnvelopeKind::Key, stranger, Some(stranger))
+                    .await
+                    .is_empty(),
+                "{tier:?}: a data subject's access right does not depend on tier"
+            );
+            assert!(
+                !bridge
+                    .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
+                    .await
+                    .is_empty(),
+                "{tier:?}: the own record is what self_own already advertises"
+            );
+            assert!(
+                bridge
+                    .subject_holdings(EnvelopeKind::Key, third_party, None)
+                    .await
+                    .is_empty(),
+                "{tier:?}: an unattributed Pull serves nothing"
+            );
+            assert!(
+                bridge
+                    .subject_holdings(EnvelopeKind::Attestation, third_party, Some(stranger))
+                    .await
+                    .is_empty(),
+                "{tier:?}: Attestation entitlement is per ROW, never per plane"
+            );
+        }
     }
 
     /// CIRISEdge#462 — seed `subject`'s `consent:state:granted` for `covers` on

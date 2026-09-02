@@ -30,26 +30,62 @@ pub enum ServeTier {
     /// the subject itself and for its own record.
     None = 0,
     /// Owner-conferred `infra:serve` — `delegates_to(owner → node,
-    /// [infra:serve])`. May store & serve to help the mesh: hold the directory
-    /// hash-first, answer third-party identifier Pulls, serve bodies by hash.
+    /// [infra:serve])`. Stores and serves to help the mesh: carries the
+    /// directory as HASHES and serves bodies BY HASH. It does not answer
+    /// identifier lookups, because answering one requires the body and it has
+    /// chosen not to hold them.
     /// Needs no one's trust to do it — everything served is a
     /// self-authenticating signed envelope, re-verified at the receiver's own
     /// admission gate.
     MeshServer = 1,
     /// Root-blessed (the 2-of-3 accord co-scrub over a `canonical,node`
     /// registration envelope bearing `roles: ["infra:serve"]` — CC 4.4.3.8).
+    /// Holds the directory as BODIES, so it is the tier that can answer an
+    /// identifier lookup — "which records do you hold for subject S" — and the
+    /// one place bulk harvesting is possible, one named subject at a time.
     /// Additionally trusted for BOOTSTRAP: the `CanonicalBootstrapPeer` set,
     /// rooting a fresh fleet, the E3 trace-plane serve gate.
     Canonical = 2,
 }
 
 impl ServeTier {
-    /// May this node hold the directory and answer identifier lookups —
-    /// the ROLE_MATRIX "≥ mesh server" predicate that retention, known-hash
-    /// recording, and the third-party Pull arm all key on?
+    /// Does this node carry the directory as HASHES, fetching bodies on
+    /// demand? Mesh servers only.
+    ///
+    /// Not a ladder: a canonical does NOT hash-first, because it must hold the
+    /// bodies (see [`Self::answers_identifier_lookups`]). The two roles carry
+    /// the directory differently rather than one carrying more of it.
     #[must_use]
-    pub fn may_store_and_serve(self) -> bool {
-        self >= ServeTier::MeshServer
+    pub fn holds_hash_directory(self) -> bool {
+        self == ServeTier::MeshServer
+    }
+
+    /// Does this node answer an identifier lookup — "which records do you hold
+    /// for subject S"? **Canonicals only**, and the reason is mechanical
+    /// before it is policy.
+    ///
+    /// Answering requires the BODY: `subject_holdings_inner` resolves a subject
+    /// through `lookup_public_key`, and persist's own subject-scoped reads are
+    /// built from the held records — `wire_refs_for_subject` reads
+    /// `list_signed_key_records_since`, and the Key plane has no subject-indexed
+    /// signed read at all. There is no body-free identifier path anywhere in
+    /// the stack. So a hash-first node CANNOT answer, whatever it is entitled
+    /// to, and pretending otherwise is what made the earlier
+    /// "≥ mesh server" rule unsatisfiable.
+    ///
+    /// That mechanical fact also lands the anti-harvest property in the right
+    /// place. Bulk enumeration is only possible where bodies are, so bodies
+    /// concentrate at canonicals — few, accountable, rate-limited — while mesh
+    /// servers carry hashes and can be scraped for "these records exist" and
+    /// nothing more. The identifier Pull cannot enumerate on its own: the
+    /// requester must NAME the subject, so it confirms people it already knows
+    /// rather than discovering new ones.
+    ///
+    /// Friction on a plane that is public by construction, not confidentiality
+    /// (CC 1.13.3.1).
+    #[must_use]
+    pub fn answers_identifier_lookups(self) -> bool {
+        self == ServeTier::Canonical
     }
 
     /// Is this node in the set a fresh fleet may lean on before verification
@@ -341,9 +377,11 @@ mod tests {
     fn the_tier_predicates_match_the_role_matrix() {
         for tier in [ServeTier::None, ServeTier::MeshServer, ServeTier::Canonical] {
             assert_eq!(
-                tier.may_store_and_serve(),
-                tier >= ServeTier::MeshServer,
-                "store-and-serve is the ≥ mesh-server predicate"
+                tier.holds_hash_directory(),
+                tier == ServeTier::MeshServer,
+                "only a mesh server carries the directory as hashes — a \
+                 canonical holds bodies, because answering an identifier lookup \
+                 requires one"
             );
             assert_eq!(
                 tier.trusted_for_bootstrap(),
@@ -359,7 +397,8 @@ mod tests {
     fn an_unresolved_cache_reads_tier_none() {
         let cache = CachedServeTier::new();
         assert_eq!(cache.read(), ServeTier::None);
-        assert!(!cache.read().may_store_and_serve());
+        assert!(!cache.read().holds_hash_directory());
+        assert!(!cache.read().answers_identifier_lookups());
     }
 
     /// The cache honors its TTL: within it, the resolver is not consulted.

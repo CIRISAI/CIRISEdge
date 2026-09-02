@@ -79,9 +79,14 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
     let receive = match kind {
         // ROLE_MATRIX Axis 3 — on these four planes a Pull is answered for the
         // data subject, for the RESPONDING NODE'S OWN record (what `self_own`
-        // already hands every peer), and — when the responder itself holds a
-        // verified `infra:serve` conferral — for ANY subject from an attributed
-        // requester. The identity plane is public (announced, attributable, no
+        // already hands every peer), and — when the responder is CANONICAL —
+        // for any subject from an attributed requester.
+        //
+        // Canonical rather than any conferred server, because answering
+        // requires the BODY and a mesh server carries hashes. That is also
+        // where the anti-harvest property lives: bodies concentrate at few
+        // accountable nodes, the lookup is rate limited per requester, and it
+        // cannot enumerate on its own — the requester must NAME the subject. The identity plane is public (announced, attributable, no
         // anonymity claim; the invisibility property lives on the GROUP plane,
         // by derivation); a conferred server answering identifier lookups is
         // what carrying the directory MEANS, and it is how a fedID alone
@@ -93,7 +98,7 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         | EnvelopeKind::TransportDestination
         | EnvelopeKind::IdentityOccurrenceRevocation => {
             "subject_pull:data_subject+own_record; +any_attributed when the \
-             responder holds infra:serve (ROLE_MATRIX axis 3)"
+             responder is CANONICAL (holds bodies; ROLE_MATRIX axis 3)"
         }
         EnvelopeKind::Attestation => {
             "subject_pull:data_subject+sender; subject-only; \
@@ -174,27 +179,35 @@ pub fn serve_advertise_policy_sha256() -> String {
 // changed — this is the manifest catching up to the code it witnesses.
 // **CIRISServer must mirror**: re-pin from 328d73b0… to 20499cab….
 //
-// CIRISEdge#552 — RE-PINNED, e54c5677… → 75ceef58 (ROLE_MATRIX adoption). On
-// the four unconditionally-`public` planes a subject Pull is answered for the
-// data subject, for the responding node's OWN record, and — when the responder
-// holds a verified `infra:serve` conferral (ROLE_MATRIX axis 3) — for any
-// subject from an attributed requester.
+// CIRISEdge#552 — RE-PINNED, 20499cab… → c0a13e03…. On the four
+// unconditionally-`public` planes a subject Pull is answered for the data
+// subject, for the responding node's OWN record, and — when the responder is
+// CANONICAL — for any subject from an attributed requester, rate limited per
+// requester.
 //
-// The earlier own-record-only bound (e54c5677…, never mirrored by server)
-// imported a confidentiality property onto the identity plane that the design
-// explicitly disclaims: the identity plane is announced, rooted, attributable
-// — the invisibility property lives on the GROUP plane, by derivation
-// (CC 5.4.6). A CONFERRED server answering identifier lookups is what carrying
-// the directory means, and it is how a fedID alone reaches a stranger: ask a
-// server, fetch bodies by content hash, canonicals hold the contents. An
-// unconferred node still answers only for itself, so the enumeration surface
-// stays with the nodes that opted into the corpus rather than following it
-// around the fabric. `Attestation` is untouched: per-row entitlement
-// (trace:* → capability, the G2 carve).
-// **CIRISServer must mirror this pin** (supersedes both e8216fec… and
-// e54c5677…, neither of which shipped server-side).
+// Canonical rather than "any conferred server", and the reason is mechanical
+// before it is policy: answering an identifier lookup requires the BODY
+// (`subject_holdings_inner` resolves through `lookup_public_key`, and
+// persist's subject-scoped reads are built from held records — there is no
+// body-free identifier path in the stack). A mesh server carries the directory
+// as HASHES and serves bodies by hash, so it cannot answer whatever it is
+// entitled to. An earlier revision keyed this to any conferred server and was
+// therefore unsatisfiable.
+//
+// That also puts the anti-harvest property where it belongs. The identity plane
+// is public — announced, attributable, no anonymity claim; the invisibility
+// property lives on the GROUP plane, by derivation (CC 5.4.6). What this bounds
+// is bulk HARVESTING: bodies concentrate at canonicals (few, accountable, rate
+// limited), mesh servers can be scraped for "these records exist" and nothing
+// more, and the identifier Pull cannot enumerate on its own because the
+// requester must NAME the subject. Friction on a public plane, never
+// confidentiality (CC 1.13.3.1).
+//
+// `Attestation` is untouched: per-row entitlement (trace:* → capability, the G2
+// carve). **CIRISServer must mirror this pin** (supersedes e8216fec…,
+// e54c5677… and 75ceef58…, none of which shipped server-side).
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "75ceef58162569c7a61e143cae2ac58ead1c783daf872e527642ef9d56d1ac1e";
+    "c0a13e031815163ac6972538a0597aff3d3396373f2e1f7d4fdbe3aa28e7d4b3";
 
 #[cfg(test)]
 mod tests {

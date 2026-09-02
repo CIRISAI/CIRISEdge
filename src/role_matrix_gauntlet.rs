@@ -206,7 +206,7 @@ fn r3_retention_keys_on_tier_across_every_mode() {
             // available proof: the wrong axis is not merely ignored, it is
             // unrepresentable. The loop is kept so the cell reads as the matrix
             // row it enforces.
-            let configured = if tier.may_store_and_serve() {
+            let configured = if tier.holds_hash_directory() {
                 Retention::HashFirst
             } else {
                 Retention::Bodies
@@ -236,7 +236,8 @@ async fn r3_bridge_retention_follows_the_tier() {
     for (tier, expected_key) in [
         (ServeTier::None, Retention::Bodies),
         (ServeTier::MeshServer, Retention::HashFirst),
-        (ServeTier::Canonical, Retention::HashFirst),
+        // A canonical holds BODIES — it must, to answer identifier lookups.
+        (ServeTier::Canonical, Retention::Bodies),
     ] {
         let (_backend, bridge) = crate::replication::bridge::test_fixtures::make_bridge(&[]);
         let bridge = bridge.with_serve_tier_for_test(tier);
@@ -265,9 +266,8 @@ async fn r4_known_hashes_key_on_tier() {
         bridge.note_known_hashes(EnvelopeKind::Key, &[[7u8; 32]], Some("peer-1"));
         assert_eq!(
             bridge.known_hash_count_for_test() > 0,
-            tier.may_store_and_serve(),
-            "{tier:?}: an unconferred node hoarding every advertised hash would \
-             carry the enumeration surface without the role"
+            tier.holds_hash_directory(),
+            "{tier:?}: only the hash-carrying tier accumulates the directory"
         );
     }
 }
@@ -277,14 +277,14 @@ async fn r4_known_hashes_key_on_tier() {
 #[test]
 fn r5_missing_signer_recovery_keys_on_key_retention() {
     for tier in ALL_TIERS {
-        let configured = if tier.may_store_and_serve() {
+        let configured = if tier.holds_hash_directory() {
             Retention::HashFirst
         } else {
             Retention::Bodies
         };
         assert_eq!(
             crate::replication::retention::should_note_missing_signer(configured),
-            tier.may_store_and_serve(),
+            tier.holds_hash_directory(),
             "{tier:?}: under Bodies the signer's Key body replicates on its own \
              and #544 admits the row later — queueing would duplicate work in \
              flight"
@@ -317,9 +317,10 @@ async fn r6_third_party_pull_keys_on_tier() {
                 .subject_holdings(EnvelopeKind::Key, "subject-S", Some("stranger-X"))
                 .await
                 .is_empty(),
-            tier.may_store_and_serve(),
-            "{tier:?}: a third-party lookup is answered exactly by the tiers \
-             that carry the directory"
+            tier.answers_identifier_lookups(),
+            "{tier:?}: an identifier lookup is answered ONLY by the tier that \
+             holds bodies — answering requires one, so a hash-first mesh server \
+             cannot, whatever it is entitled to"
         );
         // R7 — the data-subject path: EVERY tier answers the subject itself.
         assert!(
@@ -506,7 +507,8 @@ async fn ladder_a_claim_alone_confers_no_tier() {
 /// this file in the commit that makes the document stale.
 #[allow(dead_code)]
 fn the_matrix_symbols_compile() {
-    let _: fn(ServeTier) -> bool = ServeTier::may_store_and_serve;
+    let _: fn(ServeTier) -> bool = ServeTier::holds_hash_directory;
+    let _: fn(ServeTier) -> bool = ServeTier::answers_identifier_lookups;
     let _: fn(ServeTier) -> bool = ServeTier::trusted_for_bootstrap;
     let _: fn(Retention) -> bool = crate::replication::retention::should_note_missing_signer;
     let _ = crate::replication::serve_tier::CachedServeTier::TTL;
