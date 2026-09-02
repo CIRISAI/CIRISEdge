@@ -634,6 +634,173 @@ impl With {
     }
 }
 
+/// **The five flow parameters, as this row will carry them across the wire.**
+///
+/// ciris.ai/contextual-integrity embeds Nissenbaum's five parameters in the
+/// wire format. The federation crossing — promotion from `local`, or a direct
+/// federation-tier write — is the ONE moment all five must be present and
+/// correct, because it is the moment edge picks the row up and offers it to
+/// peers. So both paths present the same picture, and [`share`] / [`publish`]
+/// refuse to cross with a parameter missing rather than let the substrate
+/// refuse it one hop later.
+///
+/// Every member is read from the row through persist's canonical envelope
+/// names (`envelope::paths`) and edge's typed `delivery_mode` reader — never
+/// from a re-parse of `extra`.
+///
+/// | parameter | wire | here |
+/// |---|---|---|
+/// | data subject | `subject_key_ids` | [`Flow::subject`] |
+/// | sender | `attesting_key_id` | [`Flow::sender`] |
+/// | recipient | `cohort_scope` · `subject_key_ids` · `delivery_mode` | [`Flow::recipient`] |
+/// | information type | `dimension` | [`Flow::information_type`] |
+/// | transmission principle | `deletion_window` · `expires_at` · the covering consent grant | [`Flow::principle`] |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flow {
+    /// **Information type.** The `dimension` namespace — "a strict admission
+    /// test that keeps assertions objective and machine-verifiable". A row
+    /// without one is not a claim and does not cross.
+    pub information_type: String,
+    /// **Sender.** `attesting_key_id` — the cryptographic originator.
+    pub sender: String,
+    /// **Data subject.** `subject_key_ids` — who the claim concerns, and who
+    /// holds revocation rights at the protocol level.
+    pub subject: Vec<String>,
+    /// **Recipient**, in its three deliberately separate mechanisms.
+    pub recipient: Recipient,
+    /// **Transmission principle.** The rule governing subsequent flow.
+    pub principle: Principle,
+}
+
+/// The Recipient parameter — three mechanisms kept intentionally separate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recipient {
+    /// VISIBILITY: which cohort may see it.
+    pub cohort_scope: String,
+    /// REVOCATION: who may revoke it (the subjects).
+    pub may_revoke: Vec<String>,
+    /// ACTIVE RECEIVERS: how it is delivered — `mandatory` (a silent drop is
+    /// a security failure; edge fails loud with no path) or best-effort.
+    pub delivery: crate::delivery_mode::DeliveryRequirement,
+}
+
+/// The transmission principle as THIS ROW declares it.
+///
+/// Two halves. The temporal half rides on the row: `deletion_window` (the
+/// producer's commitment; the breach signal fires if a subject revokes and
+/// the window lapses without deletion proof) and `expires_at`. The
+/// permission half — share / analyze / train / publish — does NOT ride on an
+/// ordinary row: it is inherited from the `consent:replication:v1` grant whose
+/// `attestation_prefixes` cover this row's `dimension`, resolved PER RECIPIENT
+/// at advertise time. That is why [`Flow`] names the prefix a grant must
+/// cover, rather than pretending to know the answer before the recipient is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principle {
+    /// The producer's erasure commitment, if declared.
+    pub deletion_window: Option<String>,
+    /// The row's declared expiry, if any.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The namespace prefix a recipient's consent grant must cover for this
+    /// row to reach them — `chat:` for `chat:message:v1`.
+    pub consent_prefix: String,
+}
+
+impl Flow {
+    /// Materialise the five parameters from `row`, or say which is missing.
+    ///
+    /// The only hard refusal is an absent `dimension`: information type is the
+    /// strict admission test, and a row without one has no namespace for a
+    /// consent grant to cover. Everything else is reported as it stands —
+    /// including an empty subject list, which is a fact worth seeing.
+    ///
+    /// # Errors
+    /// No `dimension` in the signed envelope.
+    pub fn of(row: &ciris_persist::federation::Attestation) -> Result<Self, String> {
+        use ciris_persist::federation::envelope::paths;
+        let env = &row.attestation_envelope;
+        let dimension = env
+            .get(paths::DIMENSION)
+            .and_then(serde_json::Value::as_str)
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "row {} has no `dimension` — the information-type parameter is the \
+                     strict admission test, and without a namespace no consent grant can \
+                     cover it, so it must not cross the wire",
+                    row.attestation_id
+                )
+            })?
+            .to_owned();
+        let consent_prefix = dimension
+            .split_once(':')
+            .map_or_else(|| dimension.clone(), |(head, _)| format!("{head}:"));
+        Ok(Flow {
+            information_type: dimension,
+            sender: row.attesting_key_id.clone(),
+            subject: row.subject_key_ids.clone(),
+            recipient: Recipient {
+                cohort_scope: row.cohort_scope.clone(),
+                may_revoke: row.subject_key_ids.clone(),
+                delivery: crate::delivery_mode::requirement_of(env),
+            },
+            principle: Principle {
+                deletion_window: env
+                    .get(paths::DELETION_WINDOW)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                expires_at: row.expires_at,
+                consent_prefix,
+            },
+        })
+    }
+
+    /// The same five parameters with `cohort_scope` set to where the row is
+    /// GOING — what a peer will see after promotion.
+    #[must_use]
+    pub fn at_cohort(mut self, cohort_scope: &str) -> Self {
+        cohort_scope.clone_into(&mut self.recipient.cohort_scope);
+        self
+    }
+
+    /// One line, all five, for the crossing log.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "type={} sender={} subject={:?} recipient={{scope={} revoke={:?} delivery={:?}}} \
+             principle={{prefix={} deletion_window={:?} expires_at={:?}}}",
+            self.information_type,
+            self.sender,
+            self.subject,
+            self.recipient.cohort_scope,
+            self.recipient.may_revoke,
+            self.recipient.delivery,
+            self.principle.consent_prefix,
+            self.principle.deletion_window,
+            self.principle.expires_at,
+        )
+    }
+}
+
+/// **Describe what a row will carry across the wire — for the DIRECT path.**
+///
+/// A row authored straight at `tier: federation` never passes through
+/// [`share`], so this is how that path presents the same five parameters
+/// before the write. Same refusal on a missing `dimension`.
+///
+/// # Errors
+/// As [`Flow::of`].
+pub fn describe_flow(row: &ciris_persist::federation::Attestation) -> Result<Flow, String> {
+    Flow::of(row)
+}
+
+/// What a crossing did, and what crossed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crossing {
+    pub shared: Shared,
+    /// The five parameters as the row now carries them.
+    pub flow: Flow,
+}
+
 /// What [`share`] / [`publish`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shared {
@@ -697,12 +864,25 @@ pub async fn share(
     row: &ciris_persist::federation::Attestation,
     with: With,
     signer: &crate::identity::LocalSigner,
-) -> Result<Shared, String> {
+) -> Result<Crossing, String> {
+    // All five parameters, BEFORE anything moves: a row missing one is
+    // refused here, by name, rather than by a peer one hop later.
+    let flow = Flow::of(row)?.at_cohort(with.cohort_scope());
     if let Some(early) = already_promoted_verdict(row, with.cohort_scope()) {
-        return early;
+        return early.map(|shared| Crossing { shared, flow });
     }
     if promote_to_scope(directory, row, with.cohort_scope(), signer).await? {
-        Ok(Shared::Placed)
+        tracing::info!(
+            attestation_id = %row.attestation_id,
+            encrypted_at_rest = with.is_encrypted_at_rest(),
+            structurally_invisible = with.is_structurally_invisible(),
+            "CROSSING THE WIRE — {}",
+            flow.summary()
+        );
+        Ok(Crossing {
+            shared: Shared::Placed,
+            flow,
+        })
     } else {
         // Unreachable for a `local` row by the substrate's contract; surfaced
         // rather than mapped to AlreadyThere so a contract change shows up.
@@ -726,13 +906,22 @@ pub async fn publish(
     directory: &dyn ciris_persist::federation::FederationDirectory,
     row: &ciris_persist::federation::Attestation,
     signer: &crate::identity::LocalSigner,
-) -> Result<Shared, String> {
+) -> Result<Crossing, String> {
     use ciris_persist::federation::types::cohort_scope as cs;
+    let flow = Flow::of(row)?.at_cohort(cs::FEDERATION);
     if let Some(early) = already_promoted_verdict(row, cs::FEDERATION) {
-        return early;
+        return early.map(|shared| Crossing { shared, flow });
     }
     if share_publicly(directory, row, signer).await? {
-        Ok(Shared::Placed)
+        tracing::info!(
+            attestation_id = %row.attestation_id,
+            "CROSSING THE WIRE, PUBLIC — {}",
+            flow.summary()
+        );
+        Ok(Crossing {
+            shared: Shared::Placed,
+            flow,
+        })
     } else {
         Err(format!(
             "promote_attestation(federation) placed nothing for a local row {}",

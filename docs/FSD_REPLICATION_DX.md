@@ -182,6 +182,20 @@ one:
 | information type | `dimension` | the producer helper (`chat:message:v1`) |
 | transmission principle | `consent:scope` | **`Terms::…`** |
 
+**Both paths present the same picture.** `share` and `publish` compute a
+[`Flow`] — all five parameters read from the row through persist's canonical
+envelope names and edge's typed `delivery_mode` reader — BEFORE anything
+moves, log it as `CROSSING THE WIRE — type=… sender=… subject=… recipient={…}
+principle={…}`, and return it in the `Crossing`. A row authored directly at
+federation tier never passes through `share`, so `describe_flow(row)` presents
+the identical `Flow` for that path. A row with no `dimension` is refused on
+both: information type is the strict admission test, and without a namespace
+no consent grant can cover it.
+
+The federation crossing is the moment edge picks a row up and offers it to
+peers, so it is the one moment all five must be present and correct — and the
+one moment a consumer should be able to SEE all five without inferring any.
+
 `Terms` is the piece with no home today. Proposed surface, smallest first:
 
 ```rust

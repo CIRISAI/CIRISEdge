@@ -2527,20 +2527,39 @@ async fn run_chat_legs(occ: &Occurrence) {
                 })
                 .await
                 .map_err(|e| format!("put message: {e}"))?;
-            let placed = share(&*occ.directory, &msg, With::Community, &occ.node_signer).await?;
-            Ok::<_, String>((msg.attestation_id, placed))
+            let crossing = share(&*occ.directory, &msg, With::Community, &occ.node_signer).await?;
+            Ok::<_, String>((msg.attestation_id, crossing))
         }
         .await;
         match sent {
-            Ok((id, placed)) => {
-                tracing::info!(%room, attestation_id = %id, ?placed, "chat message shared");
+            Ok((id, crossing)) => {
+                tracing::info!(%room, attestation_id = %id, shared = ?crossing.shared, "chat message shared");
+                let f = &crossing.flow;
                 rep.ran(
                     "ladder.send_message",
-                    placed == Shared::Placed,
+                    crossing.shared == Shared::Placed,
                     serde_json::json!({
                         "room": room,
                         "attestation_id": id,
-                        "shared": format!("{placed:?}"),
+                        "shared": format!("{:?}", crossing.shared),
+                        // The five contextual-integrity parameters, as the row
+                        // crossed the wire — the census shows what was sent,
+                        // not just that something was.
+                        "flow": {
+                            "information_type": f.information_type,
+                            "sender": f.sender,
+                            "subject": f.subject,
+                            "recipient": {
+                                "cohort_scope": f.recipient.cohort_scope,
+                                "may_revoke": f.recipient.may_revoke,
+                                "delivery": format!("{:?}", f.recipient.delivery),
+                            },
+                            "principle": {
+                                "consent_prefix": f.principle.consent_prefix,
+                                "deletion_window": f.principle.deletion_window,
+                                "expires_at": f.principle.expires_at,
+                            },
+                        },
                         "author": my_owner,
                         "attested_by": cfg.node_id,
                         "with": "community",

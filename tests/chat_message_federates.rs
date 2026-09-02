@@ -12,8 +12,8 @@
 
 use ciris_edge::chat;
 use ciris_edge::replication::attestation_bind::{
-    already_promoted_verdict, keep_local, publish, share, share_encrypted_privately, ClearCohort,
-    EncryptedCohort, Shared, With,
+    already_promoted_verdict, describe_flow, keep_local, publish, share, share_encrypted_privately,
+    ClearCohort, EncryptedCohort, Shared, With,
 };
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
@@ -335,7 +335,22 @@ async fn share_places_then_reports_already_there() {
     let first = share(&*dir, &msg, With::Community, &alice_node)
         .await
         .unwrap();
-    assert_eq!(first, Shared::Placed);
+    assert_eq!(first.shared, Shared::Placed);
+    // ALL FIVE parameters are on the crossing, as the row now carries them.
+    let f = &first.flow;
+    assert_eq!(f.information_type, chat::CHAT_MESSAGE_DIMENSION);
+    assert_eq!(f.sender, "alice-node");
+    assert_eq!(
+        f.subject,
+        vec!["alice-node".to_string()],
+        "producer-only subject"
+    );
+    assert_eq!(
+        f.recipient.cohort_scope, "community",
+        "scope is where it WENT"
+    );
+    assert_eq!(f.principle.consent_prefix, chat::CHAT_ATTESTATION_PREFIX);
+    assert!(f.summary().contains("type=chat:message:v1"));
 
     // Re-read the row as stored (tier + scope moved) and share it again.
     let stored = dir
@@ -350,7 +365,11 @@ async fn share_places_then_reports_already_there() {
     let again = share(&*dir, &stored, With::Community, &alice_node)
         .await
         .unwrap();
-    assert_eq!(again, Shared::AlreadyThere, "idempotent, and it says so");
+    assert_eq!(
+        again.shared,
+        Shared::AlreadyThere,
+        "idempotent, and it says so"
+    );
 }
 
 /// A row authored already-promoted at another cohort is REFUSED by name —
@@ -422,10 +441,9 @@ async fn keep_local_is_a_true_statement_or_an_error() {
 async fn publish_places_at_the_public_tier() {
     let (dir, alice_node, _bob) = world().await;
     let msg = authored(&dir, &alice_node, "public").await;
-    assert_eq!(
-        publish(&*dir, &msg, &alice_node).await.unwrap(),
-        Shared::Placed
-    );
+    let crossing = publish(&*dir, &msg, &alice_node).await.unwrap();
+    assert_eq!(crossing.shared, Shared::Placed);
+    assert_eq!(crossing.flow.recipient.cohort_scope, "federation");
     let stored = dir
         .list_attestations_by("alice-node")
         .await
@@ -471,4 +489,53 @@ fn with_answers_both_questions_from_persist() {
     );
     assert!(With::Community.is_encrypted_at_rest() && !With::Community.is_structurally_invisible());
     assert!(With::MyDevices.is_structurally_invisible());
+}
+
+/// The direct path presents the SAME five parameters as the promoted path,
+/// and a row with no information type crosses on neither.
+#[tokio::test]
+async fn both_paths_present_the_same_flow_and_neither_crosses_without_a_dimension() {
+    let (dir, alice_node, _bob) = world().await;
+    let msg = authored(&dir, &alice_node, "flow").await;
+
+    // Direct-path description of the row as authored (scope = self).
+    let direct = describe_flow(&msg).unwrap();
+    assert_eq!(direct.information_type, chat::CHAT_MESSAGE_DIMENSION);
+    assert_eq!(direct.recipient.cohort_scope, "self");
+    assert_eq!(
+        direct.recipient.may_revoke, direct.subject,
+        "revocation follows the subject"
+    );
+
+    // Promoted path: identical, except the scope is where it went.
+    let crossing = share(&*dir, &msg, With::Community, &alice_node)
+        .await
+        .unwrap();
+    assert_eq!(crossing.flow.information_type, direct.information_type);
+    assert_eq!(crossing.flow.sender, direct.sender);
+    assert_eq!(crossing.flow.subject, direct.subject);
+    assert_eq!(crossing.flow.principle, direct.principle);
+    assert_eq!(crossing.flow.recipient.cohort_scope, "community");
+
+    // No dimension ⇒ not a claim ⇒ refused before anything moves, on both paths.
+    let mut bare = chat::chat_message_attestation(
+        "alice-node",
+        "alice-fed",
+        "bob-fed",
+        "x",
+        ts(),
+        &alice_node,
+    )
+    .await
+    .unwrap();
+    bare.attestation_envelope
+        .as_object_mut()
+        .unwrap()
+        .remove("dimension");
+    let e1 = describe_flow(&bare).unwrap_err();
+    let e2 = share(&*dir, &bare, With::Community, &alice_node)
+        .await
+        .unwrap_err();
+    assert!(e1.contains("no `dimension`"), "{e1}");
+    assert!(e2.contains("no `dimension`"), "{e2}");
 }
