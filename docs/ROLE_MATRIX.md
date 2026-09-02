@@ -70,7 +70,28 @@ The load-bearing distinction: a mesh server helps **after** trust exists
 vouches, or it is inert"* — root validity minimum is `[infra:serve,
 infra:attest]` (CC 4).
 
-**Why identifier lookups are canonical-only — mechanical before policy.**
+**Identifier lookups are entitled by a MUTUAL TRUST ROOT, not by a tier.**
+
+node/fed/agent IDs are **federation cohort**: servable by any peer holding
+them, to any requester under a shared root — and any node that received an ID
+may hold it, unless revoked or superseded, precisely because any ID may be
+load-bearing. That is what "federation cohort" buys, and it is why hash-first
+is a CAPACITY choice rather than a permission one.
+
+CC 4 supplies the rule: two nodes under one shared root cross-attest and
+vouch; two nodes with no shared root compose nothing. So the gate asks whether
+the requester is in the same trust domain, never what rung either node stands
+on. An earlier revision keyed this to the canonical rung and was too narrow —
+it stopped the fleet's storage helpers answering for records they legitimately
+hold.
+
+**Abuse is bounded by extraction rate, across LAYERED windows.** A single
+window cannot see a slow drain: a peer that stays under a per-minute cap
+forever still copies the directory out by hash, one compliant request at a
+time. The attack is defined by its aggregate, so only an aggregate ceiling
+sees it — hence per-minute AND per-hour AND per-day, all of which must permit.
+
+**Historical note — why the earlier "canonical-only" framing was wrong.**
 Answering "which records do you hold for subject S" requires the BODY:
 `subject_holdings_inner` resolves through `lookup_public_key`, and persist's
 subject-scoped reads are built from the held records (`wire_refs_for_subject`
@@ -196,7 +217,7 @@ conferral.
 | retention: `Bodies` vs `HashFirst` | **Axis 3 = mesh server** | `serve_tier().holds_hash_directory()` | ✅ gauntlet R3 — a canonical holds BODIES, not a ladder |
 | record known-hashes from advertisements | Axis 3 = mesh server | `holds_hash_directory()` | ✅ gauntlet R4 |
 | queue a missing-signer recovery | Axis 3 = mesh server (via Key retention) | `should_note_missing_signer(retention)` | ✅ gauntlet R5 |
-| answer a third-party identifier Pull on a public plane | **Axis 3 = canonical** | `answers_identifier_lookups()` + per-requester rate limit | ✅ gauntlet R6 |
+| answer a third-party identifier Pull on a public plane | **mutual trust root** (Axis 5), NOT a tier | `shares_a_trust_root_with(requester)` + layered per-requester ceilings | ✅ `identifier_lookups_are_entitled_by_a_mutual_trust_root`; R6 pins the negative |
 | answer a subject Pull for the subject itself | always | `requester == subject` (#462) | ✅ correct |
 | answer a Pull for this node's OWN record | always | `subject == local_key_id` | ✅ correct (#556) |
 | serve trace-plane attestations | **Axis 3 = canonical** under Axis 5 | leg A ∧ leg B (`peer_has_serve_capability`) | ✅ correct (#386/#379, value-provenance-locked to persist's `INFRA_SERVE`) |

@@ -484,6 +484,19 @@ struct RosterEntry {
     advertise: String,
     /// Base64 32-byte Ed25519 federation public key.
     fed_pubkey_b64: String,
+    /// The node's OWNER — a person (`identity_type: user`).
+    ///
+    /// Federation directory discovery resolves an identifier to the PERSON and
+    /// then to their nodes, so a fleet of owner-less agents is unresolvable by
+    /// construction: `owner_of` returns `None` and every lookup stops there.
+    /// That is why the earlier `ladder.discover` leg could only cover route
+    /// reachability. Giving each node a real owner is what makes the
+    /// fedID → person → nodes path exercisable over the wire.
+    #[serde(default)]
+    owner_key_id: String,
+    /// Base64 32-byte Ed25519 public key of that owner.
+    #[serde(default)]
+    owner_pubkey_b64: String,
 }
 
 /// The steward that scrub-signs the roster into `federation_keys` rows.
@@ -697,6 +710,76 @@ fn signed_record(
         consent_role: None,
         additional_scrubs: Vec::new(),
     })
+}
+
+/// Emit the OWNER-BINDING attestation: `owner` is responsible for `node`.
+///
+/// This is what makes federation directory discovery answerable. `owner_of`
+/// resolves through `live_owner_binding_granters`, and `nodes_owned_by` walks
+/// owner bindings — so without one, a fedID lookup finds a person with no
+/// nodes and every discovery stops there. Route reachability alone was all the
+/// harness could prove before this existed.
+///
+/// The substrate recognises a binding by `delegation_purpose: "owner_binding"`
+/// (CC 2.4.1.2's canonical marker) or by the internal dimension; the raw
+/// `delegates_to` emit path carries only the former, so that is what a producer
+/// writes. Keying on the dimension alone let the raw path bypass the
+/// single-owner gate (CIRISPersist#378), which is why both are recognised.
+///
+/// Written into this node's OWN persist. It then replicates on the Attestation
+/// plane like any other signed row — the harness seeds nothing into a peer.
+async fn emit_owner_binding(
+    dir: &Arc<SqliteBackend>,
+    owner_key_id: &str,
+    owner_signer: &Ed25519Signer,
+    node_id: &str,
+) -> Result<(), String> {
+    let envelope = serde_json::json!({
+        "attesting_key_id": owner_key_id,
+        "attested_key_id": node_id,
+        "delegation_purpose": "owner_binding",
+        "scope": ["infra:network_presence"],
+    });
+    let canonical = serde_json::to_vec(&envelope).map_err(|e| format!("canonical: {e}"))?;
+    let digest = Sha256::digest(&canonical);
+    let sig = owner_signer
+        .sign(digest.as_slice())
+        .map_err(|e| format!("owner sign: {e}"))?;
+    let ts: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .map_err(|e| format!("ts: {e}"))?
+            .into();
+
+    let att = ciris_persist::federation::Attestation {
+        attestation_id: format!("owner-binding-{node_id}"),
+        attesting_key_id: owner_key_id.to_owned(),
+        attested_key_id: node_id.to_owned(),
+        attestation_type: "delegates_to".to_owned(),
+        weight: None,
+        asserted_at: ts,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: B64.encode(sig),
+        scrub_signature_pqc: None,
+        scrub_key_id: owner_key_id.to_owned(),
+        scrub_timestamp: ts,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: vec![node_id.to_owned()],
+        withdraws_admission_rule: None,
+        cohort_scope: "federation".to_owned(),
+        // Born federation-tier: an owner binding is exactly the kind of claim
+        // that must be carriable, and a promoted row is byte-identical on the
+        // wire to a natively-federation one anyway.
+        tier: "federation".to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    };
+    dir.put_attestation(ciris_persist::federation::SignedAttestation { attestation: att })
+        .await
+        .map_err(|e| format!("put owner binding: {e}"))?;
+    Ok(())
 }
 
 /// Open a fresh per-container persist directory and seed it with `rows`.
@@ -1233,6 +1316,9 @@ struct Occurrence {
     lifecycle: Arc<ScopeLifecycle>,
     roster: BTreeMap<String, RosterEntry>,
     reporter: Arc<Reporter>,
+    /// This node's persist directory — what `contact::PersistLens` reads, so
+    /// the discovery leg resolves against the SAME state replication feeds.
+    directory: Arc<SqliteBackend>,
 }
 
 /// Build the whole occurrence: keys, sealed KV, directory, transport,
@@ -1244,6 +1330,14 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // ── 1. This node's own federation key (private; own volume only) ──
     let fed = FedKey::load_or_create(&cfg.node_id, &cfg.state_dir.join("fed"))?;
 
+    // The PERSON who owns this node. A node cannot consent and cannot be a
+    // contact — its owner is both — so directory discovery resolves an
+    // identifier to the person first and to their nodes second. Without a real
+    // owner every lookup stops at `owner_of` returning `None`, which is exactly
+    // why the route-reachability leg could not cover resolution.
+    let owner_key_id = format!("{}-owner", cfg.node_id);
+    let owner = FedKey::load_or_create(&owner_key_id, &cfg.state_dir.join("owner"))?;
+
     // ── 2. Publish the public half + reachability ────────────────────
     publish_roster_entry(
         &cfg.mesh_dir,
@@ -1252,6 +1346,8 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
             role: cfg.role.as_str().to_owned(),
             advertise: cfg.advertise.clone(),
             fed_pubkey_b64: fed.pubkey_b64()?,
+            owner_key_id: owner_key_id.clone(),
+            owner_pubkey_b64: owner.pubkey_b64()?,
         },
     )
     .map_err(|e| format!("publish roster entry: {e}"))?;
@@ -1277,6 +1373,19 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                 STEWARD_KEY_ID,
                 "agent",
             )?);
+            // The owner, as a PERSON. `identity_type` is the authority on what
+            // an identifier names — never the string's shape — so this is what
+            // makes `resolve` route a lookup to the person rather than
+            // treating the owner as another agent.
+            if !entry.owner_key_id.is_empty() {
+                rows.push(signed_record(
+                    &entry.owner_key_id,
+                    &entry.owner_pubkey_b64,
+                    &steward_signer,
+                    STEWARD_KEY_ID,
+                    "user",
+                )?);
+            }
         }
         let tmp = cfg.mesh_dir.join("directory.tmp");
         std::fs::write(
@@ -1292,6 +1401,13 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     let rows: Vec<KeyRecord> =
         serde_json::from_slice(&dir_bytes).map_err(|e| format!("decode directory: {e}"))?;
     let directory = open_directory(rows).await?;
+
+    // This node's own owner binding, written locally and replicated from here.
+    // Nothing is seeded into a peer: a peer learns this the same way it learns
+    // any other signed row, which is the point of testing discovery rather
+    // than testing a fixture.
+    emit_owner_binding(&directory, &owner_key_id, &owner.signer()?, &cfg.node_id).await?;
+
     let roster = read_roster(&cfg.mesh_dir);
 
     // ── 5. The federation signer, from this node's own seed ──────────
@@ -1373,6 +1489,7 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         lifecycle,
         roster,
         reporter,
+        directory,
     })
 }
 
@@ -1576,6 +1693,72 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 "covers": "route reachability only; identity resolution is unit-tested",
             }),
         );
+    }
+
+    // ── Ladder: DISCOVERY THROUGH THE FEDERATION DIRECTORY ───────────
+    //
+    // The rung the server's chat harness stops at, and the one only a running
+    // mesh can prove. Everything here resolves against this node's persist
+    // directory — the same state replication feeds — for a PEER's owner, whose
+    // binding this node never seeded and learned over the wire.
+    //
+    // fedID → person → their nodes → a node this node can actually address.
+    // That is the whole discovery mechanism: `identity_type` says what an
+    // identifier names, `owner_of`/`nodes_owned_by` walk the owner bindings,
+    // and `discover` refuses to report someone as found when nothing answers.
+    {
+        use ciris_edge::contact::{self, PersistLens, ReticulumRoutes};
+        let lens = PersistLens::new(occ.directory.as_ref());
+        let routes = ReticulumRoutes::new(&occ.transport);
+
+        // A PEER's owner — never our own, or this would prove only that a node
+        // can read what it just wrote.
+        let peer_owner = occ
+            .roster
+            .values()
+            .find(|e| e.key_id != occ.cfg.node_id && !e.owner_key_id.is_empty())
+            .map(|e| (e.owner_key_id.clone(), e.key_id.clone()));
+
+        match peer_owner {
+            None => rep.not_run(
+                "ladder.discover_by_fedid",
+                "no peer published an owner in the roster — nothing to resolve",
+            ),
+            Some((owner_id, expect_node)) => {
+                match contact::discover(&lens, &routes, &owner_id).await {
+                    Ok(found) => {
+                        let named = found.subject.nodes.contains(&expect_node);
+                        let reachable = found.reachable.contains(&expect_node);
+                        rep.ran(
+                            "ladder.discover_by_fedid",
+                            named && reachable,
+                            serde_json::json!({
+                                "queried": owner_id,
+                                "resolved_person": found.subject.fed_id,
+                                "resolved_from": format!("{:?}", found.subject.resolved_from),
+                                "nodes": found.subject.nodes,
+                                "reachable": found.reachable,
+                                "expected_node": expect_node,
+                                "named_expected_node": named,
+                                "reachable_expected_node": reachable,
+                                "covers": "fedID -> person -> owned nodes -> addressable, \
+                                           against the peer's owner binding learned over the wire",
+                            }),
+                        );
+                    }
+                    Err(stall) => rep.ran(
+                        "ladder.discover_by_fedid",
+                        false,
+                        serde_json::json!({
+                            "queried": owner_id,
+                            "stall": format!("{stall:?}"),
+                            "self_resolving": stall.self_resolving(),
+                            "remedy": stall.remedy(),
+                        }),
+                    ),
+                }
+            }
+        }
     }
 
     // ── Cohort: create, admit members over the real wire ─────────────

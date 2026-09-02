@@ -158,7 +158,11 @@ impl InviteGate {
                     // A stranger's single attempt is spent: they are WAITING on
                     // a human, not flooding. Saying so keeps the operator's
                     // diagnostic honest about which it is.
-                    DenyReason::QuotaSpent | DenyReason::BackingOff => {
+                    // An invite gate sets no long windows, so a drain ceiling
+                    // cannot fire here; it is folded in rather than left to a
+                    // wildcard, so adding a window later is a compile error and
+                    // not a silently mislabelled refusal.
+                    DenyReason::QuotaSpent | DenyReason::BackingOff | DenyReason::DrainCeiling => {
                         if self.limiter.class_of(&key) == Class::Promoted {
                             RefuseReason::BudgetSpent
                         } else {

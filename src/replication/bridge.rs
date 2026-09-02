@@ -1529,7 +1529,17 @@ impl FederationDirectoryReplicationBridge {
                     Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
                     Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
                     Self::IDENTIFIER_LOOKUP_MAX_PEERS,
-                ),
+                )
+                .with_long_windows([
+                    Some(crate::rate_limit::Quota::new(
+                        Self::IDENTIFIER_LOOKUPS_PER_HOUR,
+                        3_600,
+                    )),
+                    Some(crate::rate_limit::Quota::new(
+                        Self::IDENTIFIER_LOOKUPS_PER_DAY,
+                        86_400,
+                    )),
+                ]),
             )),
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
@@ -1591,7 +1601,17 @@ impl FederationDirectoryReplicationBridge {
                     Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
                     Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
                     Self::IDENTIFIER_LOOKUP_MAX_PEERS,
-                ),
+                )
+                .with_long_windows([
+                    Some(crate::rate_limit::Quota::new(
+                        Self::IDENTIFIER_LOOKUPS_PER_HOUR,
+                        3_600,
+                    )),
+                    Some(crate::rate_limit::Quota::new(
+                        Self::IDENTIFIER_LOOKUPS_PER_DAY,
+                        86_400,
+                    )),
+                ]),
             )),
             serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
             serve_tier_resolver: None,
@@ -2880,8 +2900,32 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // record is what `self_own` already advertises to everyone. Charging
         // those against a harvesting budget would throttle the two flows that
         // cannot harvest anything.
+        // Third-party identifier lookups: entitled by a MUTUAL TRUST ROOT, not
+        // by a serving tier.
+        //
+        // node/fed/agent IDs are FEDERATION COHORT — servable by any peer
+        // holding them, to any requester under a shared root. An earlier
+        // revision gated this on the canonical rung, which was too narrow: it
+        // made the fleet's storage helpers unable to answer for records they
+        // legitimately hold, and any node that received an ID may hold it
+        // (unless revoked or superseded) precisely because any ID may be
+        // load-bearing.
+        //
+        // What bounds abuse is not WHO answers but HOW MUCH any one peer may
+        // extract, across layered windows — see the drain ceilings above.
+        let mut cohort_entitled = false;
         if !entitled_without_tier && peer_key_id.is_some() && kind.is_public_subject_pull() {
             if let Some(requester) = peer_key_id {
+                cohort_entitled = self.shares_a_trust_root_with(requester).await;
+                if !cohort_entitled {
+                    tracing::debug!(
+                        requester,
+                        subject = %subject_key_id,
+                        "identifier lookup refused: no mutual trust root — two \
+                         nodes with no shared root compose nothing (CC 4)"
+                    );
+                    return Vec::new();
+                }
                 let verdict = self.lookup_limiter.lock().map_or(
                     crate::rate_limit::Decision::Allow {
                         suppressed_since_last_allow: 0,
@@ -2925,7 +2969,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 if p == subject_key_id
                     || (kind.is_public_subject_pull()
                         && (self.local_key_id.as_deref() == Some(subject_key_id)
-                            || self.serve_tier().answers_identifier_lookups())) =>
+                            || cohort_entitled)) =>
             {
                 // CIRISEdge#531 — WIDTH bound on the subject-Pull sweep too:
                 // it is per-subject rather than whole-table, but the
@@ -4484,6 +4528,30 @@ impl FederationDirectoryReplicationBridge {
     /// two sides cannot drift again.
     pub const SERVE_CAPABILITY: &'static str = delegation_scope::INFRA_SERVE;
 
+    /// Do this node and `peer` share a trust root?
+    ///
+    /// The entitlement for a federation-cohort identifier lookup. CC 4: two
+    /// nodes under one shared root cross-attest and vouch; two nodes with no
+    /// shared root compose nothing. So the question is not what tier either
+    /// node holds — it is whether they are in the same trust domain at all.
+    ///
+    /// Fail-closed on a read error; the caller logs the refusal with the
+    /// requester, and an unreadable directory is already loud elsewhere.
+    async fn shares_a_trust_root_with(&self, peer_key_id: &str) -> bool {
+        use ciris_persist::federation::trust_root::trusted_roots_of;
+        let Some(local) = self.local_key_id.as_deref() else {
+            return false;
+        };
+        let now = chrono::Utc::now();
+        let (Ok(mine), Ok(theirs)) = (
+            trusted_roots_of(&*self.directory, local, now).await,
+            trusted_roots_of(&*self.directory, peer_key_id, now).await,
+        ) else {
+            return false;
+        };
+        mine.iter().any(|r| theirs.contains(r))
+    }
+
     /// Identifier lookups one peer may make per window (FSD_RATE_LIMIT §5.4).
     ///
     /// Generous for a human walking a contact list, restrictive for a script
@@ -4493,6 +4561,16 @@ impl FederationDirectoryReplicationBridge {
     pub const IDENTIFIER_LOOKUPS_PER_WINDOW: u32 = 60;
     /// The window those lookups refill over.
     pub const IDENTIFIER_LOOKUP_WINDOW_SECS: u64 = 60;
+    /// The HOURLY ceiling, and the DAILY one. The burst quota above bounds a
+    /// spike; these bound the total, which is what a directory-copying attack
+    /// is actually made of.
+    ///
+    /// A peer that never exceeds 60/minute still walks off with 86 400 rows a
+    /// day, one compliant request at a time. A slow drain is defined by its
+    /// aggregate, so only an aggregate ceiling can see it.
+    pub const IDENTIFIER_LOOKUPS_PER_HOUR: u32 = 600;
+    /// Ditto, per day.
+    pub const IDENTIFIER_LOOKUPS_PER_DAY: u32 = 2_000;
     /// How many requesting peers are tracked — a bounded key space like every
     /// other here. Peer ids are attributed, so this is a backstop rather than
     /// the control.
@@ -10205,75 +10283,90 @@ pub(crate) mod tests {
         );
     }
 
-    /// ROLE_MATRIX Axis 3 — a CANONICAL answers an identifier lookup; a mesh
-    /// server does not, and an unconferred node answers only for itself.
+    /// Federation-cohort identifier lookups are entitled by a MUTUAL TRUST
+    /// ROOT — not by a serving tier.
     ///
-    /// The canonical-only rule is mechanical before it is policy. Answering
-    /// "which records do you hold for subject S" needs the BODY:
-    /// `subject_holdings_inner` resolves through `lookup_public_key`, and
-    /// persist's subject-scoped reads are built from held records. There is no
-    /// body-free identifier path in the stack, so a hash-first mesh server
-    /// cannot answer whatever it is entitled to — which is why the earlier
-    /// "any conferred server answers" rule was unsatisfiable.
+    /// node/fed/agent IDs are federation cohort: servable by any peer holding
+    /// them, to any requester under a shared root, and any node that received
+    /// an ID may hold it (unless revoked or superseded) because any ID may be
+    /// load-bearing. An earlier revision gated this on the canonical rung,
+    /// which was too narrow — it stopped the fleet's storage helpers answering
+    /// for records they legitimately hold.
     ///
-    /// That also puts the anti-harvest property where it belongs: bodies
-    /// concentrate at canonicals — few, accountable, rate-limited — while mesh
-    /// servers carry hashes and can be scraped for "these records exist" and
-    /// nothing more. The identifier Pull cannot enumerate on its own; the
-    /// requester must NAME the subject.
+    /// CC 4 is the rule: two nodes under one shared root cross-attest and
+    /// vouch; two nodes with no shared root compose nothing. So the question is
+    /// whether the requester is in the same trust domain, and abuse is bounded
+    /// by HOW MUCH one peer may extract, not by who may answer.
     #[tokio::test]
-    async fn only_a_canonical_answers_identifier_lookups() {
+    async fn identifier_lookups_are_entitled_by_a_mutual_trust_root() {
         let local = "local-A";
         let third_party = "subject-S";
         let stranger = "stranger-X";
+        let root = "root-R";
+        let scope = serde_json::json!(["infra:serve"]);
 
-        for (tier, answers) in [
-            (crate::replication::serve_tier::ServeTier::None, false),
-            (crate::replication::serve_tier::ServeTier::MeshServer, false),
-            (crate::replication::serve_tier::ServeTier::Canonical, true),
+        // ── No shared root: refused, whatever tier this node holds.
+        for tier in [
+            crate::replication::serve_tier::ServeTier::MeshServer,
+            crate::replication::serve_tier::ServeTier::Canonical,
         ] {
-            let (_backend, bridge) =
-                test_fixtures::make_bridge_with_keys(&[local, third_party, stranger]).await;
+            let (_b, bridge) =
+                test_fixtures::make_bridge_with_keys(&[local, third_party, stranger, root]).await;
+            let bridge = bridge
+                .with_local_key_id(Some(local.to_string()))
+                .with_serve_tier_for_test(tier);
+            assert!(
+                bridge
+                    .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                    .await
+                    .is_empty(),
+                "{tier:?}: no mutual root ⇒ nothing composes, whatever the tier"
+            );
+        }
+
+        // ── Shared root: answered, and the tier is not what decides it.
+        for tier in [
+            crate::replication::serve_tier::ServeTier::MeshServer,
+            crate::replication::serve_tier::ServeTier::Canonical,
+        ] {
+            let (backend, bridge) =
+                test_fixtures::make_bridge_with_keys(&[local, third_party, stranger, root]).await;
+            // Both hang their trust off the same root (CC 4's shape).
+            seed_delegates_to(&backend, local, root, &scope).await;
+            seed_delegates_to(&backend, stranger, root, &scope).await;
             let bridge = bridge
                 .with_local_key_id(Some(local.to_string()))
                 .with_serve_tier_for_test(tier);
 
-            assert_eq!(
+            assert!(
                 !bridge
                     .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
                     .await
                     .is_empty(),
-                answers,
-                "{tier:?}: only the body-holding tier can answer for a third party"
+                "{tier:?}: a shared root entitles the lookup — a storage helper \
+                 must be able to answer for records it legitimately holds"
             );
-            // Every tier serves the subject itself and its own record.
+            // The two arms that never depended on any of this.
             assert!(
                 !bridge
                     .subject_holdings(EnvelopeKind::Key, stranger, Some(stranger))
                     .await
                     .is_empty(),
-                "{tier:?}: a data subject's access right does not depend on tier"
-            );
-            assert!(
-                !bridge
-                    .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
-                    .await
-                    .is_empty(),
-                "{tier:?}: the own record is what self_own already advertises"
+                "{tier:?}: a data subject's own access is unconditional"
             );
             assert!(
                 bridge
                     .subject_holdings(EnvelopeKind::Key, third_party, None)
                     .await
                     .is_empty(),
-                "{tier:?}: an unattributed Pull serves nothing"
+                "{tier:?}: unattributed still serves nothing"
             );
             assert!(
                 bridge
                     .subject_holdings(EnvelopeKind::Attestation, third_party, Some(stranger))
                     .await
                     .is_empty(),
-                "{tier:?}: Attestation entitlement is per ROW, never per plane"
+                "{tier:?}: Attestation entitlement stays per ROW"
             );
         }
     }

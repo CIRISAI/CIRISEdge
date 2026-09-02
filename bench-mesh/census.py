@@ -70,6 +70,7 @@ EXPECTED = {
         "mesh.standup",
         "mesh.rooting",
         "ladder.discover",
+        "ladder.discover_by_fedid",
         "cohort.join",
         "scope.install",
         "perf.publish_fanout",
@@ -82,6 +83,7 @@ EXPECTED = {
         "mesh.standup",
         "mesh.rooting",
         "ladder.discover",
+        "ladder.discover_by_fedid",
         "cohort.join",
         "scope.install",
         "perf.receive",
@@ -869,6 +871,7 @@ def _golden():
         # peers; the two are different claims and the ladder needs the second.
         if role in ("publisher", "subscriber"):
             rows.append(_row(node, role, "ladder.discover"))
+            rows.append(_row(node, role, "ladder.discover_by_fedid"))
     for leg in ["cohort.join", "scope.install", "perf.publish_fanout",
                 "perf.blob_fanout", "conformance.seal_retires",
                 "mesh.member_reports"]:

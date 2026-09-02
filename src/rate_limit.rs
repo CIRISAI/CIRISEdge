@@ -113,6 +113,10 @@ pub enum DenyReason {
     /// This key is inside an exponential suppression window after consecutive
     /// denials.
     BackingOff,
+    /// A LONGER window's ceiling was reached — the slow-drain defence. The
+    /// burst quota was satisfied and the aggregate was not, which is exactly
+    /// the shape a single window cannot see.
+    DrainCeiling,
     /// The limiter is tracking as many keys as it will hold and none could be
     /// released. A GLOBAL bound, not a statement about this key — under
     /// identity rotation a per-key budget is exactly what fails, so the ceiling
@@ -127,6 +131,7 @@ impl DenyReason {
         match self {
             DenyReason::QuotaSpent => "quota_spent",
             DenyReason::BackingOff => "backing_off",
+            DenyReason::DrainCeiling => "drain_ceiling",
             DenyReason::AtCapacity => "at_capacity",
         }
     }
@@ -149,6 +154,18 @@ pub enum Class {
 /// The policy a limiter enforces.
 #[derive(Debug, Clone, Copy)]
 pub struct Policy {
+    /// Additional quotas that must ALSO permit, on longer windows.
+    ///
+    /// One window cannot see a SLOW DRAIN. A peer that stays just under a
+    /// per-minute cap, forever, copies the whole directory out eventually —
+    /// every individual request is compliant and the aggregate is the attack.
+    /// Layering a per-hour and per-day ceiling over the same key is what makes
+    /// the total cost visible, because the attack is defined by its total.
+    ///
+    /// Every window is evaluated and ALL must permit; the shortest one that
+    /// denies is the reason reported. Empty for callers where only burst
+    /// matters (log throttling has nothing to drain).
+    pub long_windows: [Option<Quota>; 2],
     /// Quota for [`Class::Default`].
     pub default_quota: Quota,
     /// Quota for [`Class::Promoted`]. Must not be smaller than the default —
@@ -169,6 +186,7 @@ impl Policy {
         Self {
             default_quota: q,
             promoted_quota: q,
+            long_windows: [None, None],
             backoff: None,
             max_keys,
         }
@@ -186,9 +204,20 @@ impl Policy {
         Self {
             default_quota,
             promoted_quota,
+            long_windows: [None, None],
             backoff: None,
             max_keys,
         }
+    }
+
+    /// Add longer windows that must ALSO permit — the slow-drain defence.
+    ///
+    /// Pass them longest-last; the reported denial names the shortest window
+    /// that refused, which is the one an operator can act on.
+    #[must_use]
+    pub fn with_long_windows(mut self, windows: [Option<Quota>; 2]) -> Self {
+        self.long_windows = windows;
+        self
     }
 
     /// Add exponential suppression on consecutive denial.
@@ -226,6 +255,10 @@ struct KeyState {
     /// Which source is accountable for this key existing, for fair eviction
     /// (D2). `None` = no attributable source.
     source: Option<String>,
+    /// Spend and window-start for each long window — the slow-drain ceilings.
+    /// Parallel to `Policy::long_windows`.
+    long_spent: [u32; 2],
+    long_started_at: [Ts; 2],
 }
 
 impl KeyState {
@@ -430,6 +463,8 @@ where
             consecutive_denials: 0,
             suppressed: 0,
             source: None,
+            long_spent: [0; 2],
+            long_started_at: [0; 2],
         });
         entry.class = Class::Promoted;
         entry.spent = 0;
@@ -474,6 +509,8 @@ where
             consecutive_denials: 0,
             suppressed: 0,
             source: source.map(str::to_owned),
+            long_spent: [0; 2],
+            long_started_at: [now; 2],
         });
 
         // Refill first, so a long-quiet key is not judged on ancient history.
@@ -501,6 +538,28 @@ where
             }
         }
 
+        // The long windows, evaluated BEFORE the burst quota so a drain is
+        // reported as what it is. Each rolls independently; a window that has
+        // elapsed resets and the request proceeds against a fresh ceiling.
+        for (i, long) in policy.long_windows.iter().enumerate() {
+            let Some(long) = long else { continue };
+            if now.saturating_sub(entry.long_started_at[i]) >= long.window_secs {
+                entry.long_spent[i] = 0;
+                entry.long_started_at[i] = now;
+            }
+            if entry.long_spent[i] >= long.permits {
+                entry.consecutive_denials = entry.consecutive_denials.saturating_add(1);
+                entry.suppressed = entry.suppressed.saturating_add(1);
+                entry.last_denial_at = now;
+                self.next_release = self
+                    .next_release
+                    .min(entry.long_started_at[i].saturating_add(long.window_secs));
+                return Decision::Deny {
+                    reason: DenyReason::DrainCeiling,
+                };
+            }
+        }
+
         if entry.spent >= quota.permits {
             entry.consecutive_denials = entry.consecutive_denials.saturating_add(1);
             entry.suppressed = entry.suppressed.saturating_add(1);
@@ -521,6 +580,11 @@ where
         }
 
         entry.spent = entry.spent.saturating_add(1);
+        for (i, long) in policy.long_windows.iter().enumerate() {
+            if long.is_some() {
+                entry.long_spent[i] = entry.long_spent[i].saturating_add(1);
+            }
+        }
         entry.last_spend_at = now;
         entry.consecutive_denials = 0;
         let suppressed = std::mem::take(&mut entry.suppressed);
@@ -1092,6 +1156,86 @@ mod tests {
             rl.tracked() <= 4,
             "the map must still be reclaimable: {} entries",
             rl.tracked()
+        );
+    }
+
+    /// A19 — the SLOW DRAIN. A peer that never violates the burst quota still
+    /// hits a longer ceiling.
+    ///
+    /// This is the attack a single window structurally cannot see: every
+    /// request is compliant, the aggregate is the theft. Copying a federation
+    /// directory out by hash does not need a burst — it needs patience, and
+    /// patience is exactly what a per-minute cap licenses.
+    #[test]
+    fn a19_a_slow_drain_hits_the_long_ceiling_while_each_request_is_compliant() {
+        // 10/minute burst, 100/hour aggregate.
+        let policy =
+            quota_policy(10, 60, 100).with_long_windows([Some(Quota::new(100, 3600)), None]);
+        let mut rl = RateLimiter::new(policy);
+        let k = "patient-peer".to_string();
+
+        // Perfectly behaved: 10 per minute, minute after minute. The burst
+        // quota is never violated once.
+        let mut allowed = 0;
+        let mut drained = false;
+        for minute in 0..30u64 {
+            let t = 1000 + minute * 60;
+            for _ in 0..10 {
+                match rl.check(&k, t) {
+                    Decision::Allow { .. } => allowed += 1,
+                    Decision::Deny {
+                        reason: DenyReason::DrainCeiling,
+                    } => {
+                        drained = true;
+                    }
+                    Decision::Deny { reason } => {
+                        panic!("the burst quota must never be the one that trips: {reason:?}")
+                    }
+                }
+            }
+            if drained {
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "a patient peer must eventually hit the aggregate ceiling — \
+             otherwise the directory walks out ten rows a minute, forever"
+        );
+        assert_eq!(
+            allowed, 100,
+            "and it gets exactly its hourly allowance first, not less"
+        );
+    }
+
+    /// A20 — the long window ROLLS. A drain ceiling is not a permanent ban.
+    #[test]
+    fn a20_the_long_window_rolls_rather_than_banning() {
+        let policy =
+            quota_policy(10, 60, 100).with_long_windows([Some(Quota::new(20, 3600)), None]);
+        let mut rl = RateLimiter::new(policy);
+        let k = "peer".to_string();
+        // Spend the hourly allowance WITHOUT ever tripping the burst quota:
+        // ten in one minute, ten in the next. That is the drain's own shape.
+        for minute in 0..2u64 {
+            for _ in 0..10 {
+                assert!(
+                    rl.check(&k, 1000 + minute * 60).is_allowed(),
+                    "the burst quota must not be what trips"
+                );
+            }
+        }
+        assert_eq!(
+            rl.check(&k, 1000 + 120),
+            Decision::Deny {
+                reason: DenyReason::DrainCeiling
+            },
+            "the aggregate is spent even though this minute is untouched"
+        );
+        assert!(
+            rl.check(&k, 1000 + 3601).is_allowed(),
+            "past the hour it refills — a ceiling bounds the RATE of extraction, \
+             it does not excommunicate the peer"
         );
     }
 
