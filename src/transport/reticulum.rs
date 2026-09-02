@@ -2891,7 +2891,14 @@ impl ReticulumTransport {
         if let Some(rooting_dir) = rooting.as_deref() {
             let mut named16 = [0u8; 16];
             named16.copy_from_slice(local_named_dest_hash.as_bytes());
-            let _outcome = self_route
+            // LOG THE OUTCOME. This row is the node's TRANSPORT HINT — the
+            // `(peer, dest)` binding a peer needs to satisfy CIRISEdge#393
+            // item 2 — so whether it was written decides whether any peer can
+            // ever attribute a frame from us. Discarding the outcome (as this
+            // did) made a silent no-op indistinguishable from a success: the
+            // mesh dropped every inbound frame with "item 2 FAILED" while the
+            // node believed it had published a route.
+            let outcome = self_route
                 .ensure(
                     &local_signer,
                     rooting_dir,
@@ -2900,6 +2907,33 @@ impl ReticulumTransport {
                     config.local_epoch,
                 )
                 .await;
+            match &outcome {
+                crate::transport::self_route::SelfRouteOutcome::Emitted(applied) => {
+                    tracing::info!(
+                        key_id = %local_signer.key_id,
+                        dest = %hex::encode(named16),
+                        epoch = config.local_epoch,
+                        ?applied,
+                        "CIRISEdge#406: transport hint PUBLISHED — peers can now                          satisfy #393 item 2 for this node once the row reaches them"
+                    );
+                }
+                crate::transport::self_route::SelfRouteOutcome::AlreadyCurrent => {
+                    tracing::debug!(
+                        key_id = %local_signer.key_id,
+                        dest = %hex::encode(named16),
+                        "CIRISEdge#406: transport hint already current"
+                    );
+                }
+                other => {
+                    tracing::warn!(
+                        key_id = %local_signer.key_id,
+                        dest = %hex::encode(named16),
+                        epoch = config.local_epoch,
+                        outcome = ?other,
+                        "CIRISEdge#406: transport hint NOT published. No peer can                          satisfy #393 item 2 for this node, so every frame it sends                          will be dropped at the attribution gate"
+                    );
+                }
+            }
         }
 
         Ok(Self {

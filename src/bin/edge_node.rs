@@ -1967,7 +1967,25 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                 local_key_id: Some(cfg.node_id.clone()),
                 ..Default::default()
             },
-            None,
+            // THE SELF-PUBLISH SET — the three identities this node speaks
+            // for. Built by the library helper so the harness and the server
+            // construct it the same way.
+            Some({
+                let publish = [
+                    cfg.node_id.as_str(),
+                    agent_key_id.as_str(),
+                    owner_key_id.as_str(),
+                ];
+                tracing::info!(
+                    node = %cfg.node_id,
+                    publishes = ?publish,
+                    "self-publish set installed — these identities' Key / \
+                     IdentityOccurrence / TransportDestination rows are advertised \
+                     to peers. TransportDestination is the transport hint peers \
+                     need for #393 item 2"
+                );
+                ciris_edge::replication::self_publish_set(publish)
+            }),
         )
         .await,
     );
@@ -2313,6 +2331,20 @@ async fn run_discover_by_fedid_leg(
                 "identity_type": has_key_record,
                 "owned_nodes": owned,
                 "inbound": occ.inbound_stats.as_json(),
+                // WHICH LINK IN THE CHAIN IS MISSING. Each of these is a
+                // distinct fault with a distinct remedy, and the stall alone
+                // cannot tell them apart:
+                //   key record absent  -> the steward's directory row never
+                //                         arrived
+                //   route absent       -> the peer's TransportDestination (its
+                //                         transport hint) has not replicated,
+                //                         so #393 item 2 cannot be satisfied
+                //                         and its frames are dropped
+                //   both present, no
+                //   owned nodes        -> the owner-binding attestation is what
+                //                         is missing
+                "peer_route_known": occ.transport.knows_peer(&expect_node).await,
+                "peer_key_record": lens.identity_type_of(&expect_node).await,
             }),
         );
     }

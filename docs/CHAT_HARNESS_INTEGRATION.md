@@ -217,10 +217,10 @@ Resolves through the directory as always. On a hash-first node that holds only t
 
 If they opted out of announcing, no directory anywhere has them — only a code will do.
 
-## 6b-bis. Standing up replication — four footguns, all now disarmed
+## 6b-bis. Standing up replication — five footguns, all now disarmed
 
-Edge's own bench-mesh harness got every one of these wrong and ran **six**
-mesh runs at zero replication, with no error anywhere. Each is now a
+Edge's own bench-mesh harness got every one of these wrong and burned a long
+arc of mesh runs on them, with no error anywhere. Each is now a
 one-liner in the API. Do not hand-roll them.
 
 **1. Route inbound frames — through `InboundRouter`, not by hand.**
@@ -271,7 +271,27 @@ your own traffic (leviculum#29, CIRISEdge#508/#531). We measured it as
 `resource transfer failed: Timeout` on ordinary application sends. Register the
 bootstrap planes plus what you actually read.
 
-**4. Author a directed `consent:replication:v1` grant per peer.**
+**4. Pass a self-publish set — `self_provider: None` is almost always wrong.**
+
+```rust
+Some(self_publish_set([&node_key_id, &agent_key_id, &owner_key_id]))
+```
+
+It gates the `SelfOwn` planes: your `Key`, your `IdentityOccurrence`, and your
+`TransportDestination`. That last one is your node's **transport hint** — the
+`(peer, dest)` binding a peer needs to satisfy #393 item 2 — so a node that does
+not publish it has its frames DROPPED at every peer's attribution gate, reported
+as `item 1 PASSED (Rooted ∧ owns_key) but item 2 FAILED`. The row exists on its
+author the whole time; nothing offers it. Edge's own harness lost runs to this,
+so `start` now WARNs when the set is absent.
+
+Include **every** identity the node holds. Three keys are the minimum for a
+viable agent — **human, node, agent** — and they are separate on purpose: an
+agentID resolves to its owner, the owner resolves to the nodes they own, and the
+NODE is what you dial. Conflate the agent with the node and that walk is a
+tautology; omit the owner's row and it stops one hop out.
+
+**5. Author a directed `consent:replication:v1` grant per peer.**
 
 The Attestation plane is consent-gated at the **recipient**, not per row: a peer
 that does not resolve to a consent-membership proof withholds the WHOLE plane,

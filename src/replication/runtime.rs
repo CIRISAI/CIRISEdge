@@ -102,6 +102,43 @@ async fn rebuild_signed_wire_index_fail_soft(directory: &Arc<dyn FederationDirec
     }
 }
 
+/// **The self-publish set — what this node advertises ABOUT ITSELF.**
+///
+/// Hand this to [`ReplicationRuntime::start`]'s `self_provider`. It is the set
+/// of identities this node speaks for, and it gates the `SelfOwn` planes:
+/// `Key`, `IdentityOccurrence`, and `TransportDestination`.
+///
+/// `TransportDestination` is the one that surprises people. It is the node's
+/// TRANSPORT HINT — the `(peer, dest)` binding a peer needs to satisfy
+/// CIRISEdge#393 item 2 — so a node that does not publish it has its frames
+/// DROPPED at every peer's attribution gate, reported as "item 1 PASSED
+/// (Rooted ∧ owns_key) but item 2 FAILED". The row exists on its author the
+/// whole time; nothing offers it.
+///
+/// Include every identity the node holds, not just the node key. An agent and
+/// its owner are separate identities (three keys minimum: human, node, agent),
+/// and their rows must reach peers for `resolve(agentID) -> owner -> nodes` to
+/// walk anywhere.
+///
+/// ```ignore
+/// let runtime = ReplicationRuntime::start(
+///     directory, transport, peers, config,
+///     Some(self_publish_set([&node_key_id, &agent_key_id, &owner_key_id])),
+/// ).await;
+/// ```
+#[must_use]
+pub fn self_publish_set<I, S>(identities: I) -> CohortProvider
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let set: Vec<String> = identities
+        .into_iter()
+        .map(|s| s.as_ref().to_owned())
+        .collect();
+    Arc::new(move || set.clone())
+}
+
 /// Assemble the production bridge from the runtime config. Extracted from
 /// [`ReplicationRuntime::start`] so the builder chain reads as one thing (and so
 /// `start` stays under the clippy line ceiling).
@@ -623,6 +660,27 @@ impl ReplicationRuntime {
         // complete without a return-path Diff). Capture before `self_provider` is
         // moved into the bridge.
         let proactive_publish = self_provider.is_some();
+
+        // A node with NO self-publish set advertises none of its own rows on the
+        // `SelfOwn` planes — and those are the planes carrying its `Key`, its
+        // `IdentityOccurrence`, and its `TransportDestination`.
+        //
+        // That last one is the node's TRANSPORT HINT: the `(peer, dest)` binding
+        // a peer needs to satisfy CIRISEdge#393 item 2. Without it every frame
+        // this node sends is dropped at the peer's attribution gate with
+        // "item 1 PASSED (Rooted ∧ owns_key) but item 2 FAILED", which reads
+        // like a transport fault and is a configuration one. Edge's own mesh
+        // harness lost several runs to exactly this.
+        //
+        // `None` is legitimate for a pure consumer that publishes nothing about
+        // itself, so this warns rather than refuses — but it is the wrong
+        // default for any node that expects to be reachable.
+        if self_provider.is_none() {
+            tracing::warn!(
+                local_key_id = ?config.local_key_id,
+                "replication started with NO self-publish set: this node will advertise                  none of its own Key / IdentityOccurrence / TransportDestination rows, so                  peers cannot satisfy CIRISEdge#393 item 2 for it and will DROP its                  frames unattributed. Pass `Some(self_publish_set(..))` unless this node                  is deliberately publishing nothing about itself"
+            );
+        }
 
         // CIRISEdge#397 — bring persist's signed_wire_index current for the
         // content-hash point-read fetch (once, idempotent, fail-soft).

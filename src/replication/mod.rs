@@ -345,7 +345,9 @@ pub use refusal_backoff::{RefusalBackoff, RetryDisposition};
 
 pub use registry::{RegistryError, ReplicationRegistry, RouteOutcome};
 #[doc(inline)]
-pub use runtime::{ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig};
+pub use runtime::{
+    self_publish_set, ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig,
+};
 #[doc(inline)]
 pub use scheduler::{ReplicationScheduler, RoundEvent, SchedulerConfig};
 #[doc(inline)]
