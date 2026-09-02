@@ -149,7 +149,8 @@ impl InviteGate {
         use crate::rate_limit::{Class, Decision, DenyReason};
         // Every sender is its own source: an invite flood IS identity rotation,
         // so there is no upstream party to charge the eviction to.
-        match self.limiter.check_from(sender, Some(sender), now) {
+        let key = sender.to_owned();
+        match self.limiter.check_from(&key, Some(sender), now) {
             Decision::Allow { .. } => InviteVerdict::Allow,
             Decision::Deny { reason } => {
                 let reason = match reason {
@@ -158,7 +159,7 @@ impl InviteGate {
                     // a human, not flooding. Saying so keeps the operator's
                     // diagnostic honest about which it is.
                     DenyReason::QuotaSpent | DenyReason::BackingOff => {
-                        if self.limiter.class_of(sender) == Class::Promoted {
+                        if self.limiter.class_of(&key) == Class::Promoted {
                             RefuseReason::BudgetSpent
                         } else {
                             RefuseReason::AlreadyPending
@@ -181,7 +182,7 @@ impl InviteGate {
     /// un-evictable: acceptance is the one bit that cannot be reconstructed
     /// from traffic, so the map may drop anything else first.
     pub fn mark_accepted(&mut self, sender: &str) -> bool {
-        let promoted = self.limiter.promote(sender);
+        let promoted = self.limiter.promote(&sender.to_owned());
         if !promoted {
             // The receiver is tracking its ceiling of senders and a promoted
             // entry can never be evicted to make room. Silently dropping this

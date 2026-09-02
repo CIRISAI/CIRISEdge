@@ -343,9 +343,12 @@ impl SourceLedger {
 /// otherwise behind interior mutability hid a race in one of the
 /// implementations this replaces. Callers that need sharing wrap it.
 #[derive(Debug)]
-pub struct RateLimiter {
+pub struct RateLimiter<K = String>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
     policy: Policy,
-    keys: HashMap<String, KeyState>,
+    keys: HashMap<K, KeyState>,
     /// Source accounting, maintained incrementally (see [`SourceLedger`] for
     /// why counting on demand is a bug with four prior appearances).
     sources: SourceLedger,
@@ -359,7 +362,10 @@ pub struct RateLimiter {
     next_release: Ts,
 }
 
-impl RateLimiter {
+impl<K> RateLimiter<K>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
     #[must_use]
     pub fn new(policy: Policy) -> Self {
         Self {
@@ -386,7 +392,7 @@ impl RateLimiter {
 
     /// This key's class.
     #[must_use]
-    pub fn class_of(&self, key: &str) -> Class {
+    pub fn class_of(&self, key: &K) -> Class {
         self.keys.get(key).map_or(Class::Default, |k| k.class)
     }
 
@@ -398,7 +404,7 @@ impl RateLimiter {
     /// new tier would mean an accepted contact starts its allowance already
     /// part-spent, and a key that was mid-backoff when it earned its way in
     /// would keep serving that sentence.
-    pub fn promote(&mut self, key: &str) -> bool {
+    pub fn promote(&mut self, key: &K) -> bool {
         // An ABSENT key must still respect the ceiling. Promotion creates an
         // entry that is by definition un-evictable, so unbounded promotion of
         // unseen keys would grow the map past `max_keys` with entries nothing
@@ -406,7 +412,6 @@ impl RateLimiter {
         if !self.keys.contains_key(key) && self.keys.len() >= self.policy.max_keys {
             let now_unbounded = self.keys.len();
             tracing::warn!(
-                key,
                 tracked = now_unbounded,
                 cap = self.policy.max_keys,
                 "promotion REFUSED — the limiter is at capacity and a promoted \
@@ -417,7 +422,7 @@ impl RateLimiter {
         if !self.keys.contains_key(key) {
             self.sources.note(None);
         }
-        let entry = self.keys.entry(key.to_owned()).or_insert_with(|| KeyState {
+        let entry = self.keys.entry(key.clone()).or_insert_with(|| KeyState {
             class: Class::Default,
             spent: 0,
             last_spend_at: 0,
@@ -433,7 +438,7 @@ impl RateLimiter {
     }
 
     /// Decide, attributing the key to no particular source.
-    pub fn check(&mut self, key: &str, now: Ts) -> Decision {
+    pub fn check(&mut self, key: &K, now: Ts) -> Decision {
         self.check_from(key, None, now)
     }
 
@@ -442,7 +447,7 @@ impl RateLimiter {
     /// The source is what makes eviction fair (D2): when the map is full, the
     /// largest source pays. Pass the delivering peer, the requesting peer —
     /// whatever entity would be flooding if this were an attack.
-    pub fn check_from(&mut self, key: &str, source: Option<&str>, now: Ts) -> Decision {
+    pub fn check_from(&mut self, key: &K, source: Option<&str>, now: Ts) -> Decision {
         if !self.keys.contains_key(key)
             && self.keys.len() >= self.policy.max_keys
             && !self.make_room(source, now)
@@ -461,7 +466,7 @@ impl RateLimiter {
         if !self.keys.contains_key(key) {
             self.sources.note(source);
         }
-        let entry = self.keys.entry(key.to_owned()).or_insert_with(|| KeyState {
+        let entry = self.keys.entry(key.clone()).or_insert_with(|| KeyState {
             class: Class::Default,
             spent: 0,
             last_spend_at: now,
@@ -624,16 +629,16 @@ mod tests {
     #[test]
     fn a1_a_flooding_key_is_denied_and_others_are_untouched() {
         let mut rl = RateLimiter::new(quota_policy(2, 60, 100));
-        assert!(rl.check("noisy", 1000).is_allowed());
-        assert!(rl.check("noisy", 1000).is_allowed());
+        assert!(rl.check(&"noisy".to_string(), 1000).is_allowed());
+        assert!(rl.check(&"noisy".to_string(), 1000).is_allowed());
         assert_eq!(
-            rl.check("noisy", 1000),
+            rl.check(&"noisy".to_string(), 1000),
             Decision::Deny {
                 reason: DenyReason::QuotaSpent
             }
         );
         assert!(
-            rl.check("quiet", 1000).is_allowed(),
+            rl.check(&"quiet".to_string(), 1000).is_allowed(),
             "a limiter that lets one key's flood deny another is a denial-of-\
              service amplifier, not a control"
         );
@@ -644,8 +649,8 @@ mod tests {
     #[test]
     fn a2_identity_rotation_cannot_grow_the_map() {
         let mut rl = RateLimiter::new(quota_policy(1, 3600, 64));
-        rl.promote("friend");
-        assert!(rl.check("friend", 1000).is_allowed());
+        rl.promote(&"friend".to_string());
+        assert!(rl.check(&"friend".to_string(), 1000).is_allowed());
 
         for i in 0..5_000 {
             let _ = rl.check_from(&format!("rot-{i}"), Some("attacker"), 1000);
@@ -657,7 +662,7 @@ mod tests {
             rl.tracked()
         );
         assert_eq!(
-            rl.class_of("friend"),
+            rl.class_of(&"friend".to_string()),
             Class::Promoted,
             "and the promoted key survives the flood"
         );
@@ -674,7 +679,7 @@ mod tests {
         // Same instant, same source: nothing has refilled and the source may
         // not evict on its own behalf.
         assert_eq!(
-            rl.check_from("newcomer", Some("flood"), 1000),
+            rl.check_from(&"newcomer".to_string(), Some("flood"), 1000),
             Decision::Deny {
                 reason: DenyReason::AtCapacity
             },
@@ -692,20 +697,20 @@ mod tests {
     fn a4_a_flood_evicts_the_flooder_not_the_quiet_key() {
         let mut rl = RateLimiter::new(quota_policy(1, 86_400, 16));
         assert!(rl
-            .check_from("honest", Some("peer-honest"), 1000)
+            .check_from(&"honest".to_string(), Some("peer-honest"), 1000)
             .is_allowed());
         for i in 0..64 {
             let _ = rl.check_from(&format!("f{i}"), Some("peer-flood"), 1000);
         }
         assert!(
-            rl.check_from("honest", Some("peer-honest"), 1000)
+            rl.check_from(&"honest".to_string(), Some("peer-honest"), 1000)
                 .is_allowed()
-                || rl.class_of("honest") == Class::Default,
+                || rl.class_of(&"honest".to_string()) == Class::Default,
             "the quiet peer must still be servable"
         );
         assert!(rl.tracked() <= 16);
         // The flooder is the one paying: it cannot hold the entire map.
-        let honest_still_known = rl.check_from("honest2", Some("peer-honest"), 1000);
+        let honest_still_known = rl.check_from(&"honest2".to_string(), Some("peer-honest"), 1000);
         assert!(
             honest_still_known.is_allowed(),
             "an honest source must still be able to take a slot from the \
@@ -718,14 +723,14 @@ mod tests {
     fn a5_a_promoted_key_survives_a_flood_and_keeps_its_tier() {
         let policy = Policy::tiered(Quota::new(1, 86_400), Quota::new(8, 86_400), 8);
         let mut rl = RateLimiter::new(policy);
-        rl.promote("contact");
+        rl.promote(&"contact".to_string());
         for i in 0..500 {
             let _ = rl.check_from(&format!("s{i}"), Some("flood"), 1000);
         }
-        assert_eq!(rl.class_of("contact"), Class::Promoted);
+        assert_eq!(rl.class_of(&"contact".to_string()), Class::Promoted);
         for n in 0..8 {
             assert!(
-                rl.check("contact", 1000).is_allowed(),
+                rl.check(&"contact".to_string(), 1000).is_allowed(),
                 "promoted quota is 8; attempt {n} must pass — throttling an \
                  established relationship is how the control breaks what it \
                  protects"
@@ -738,10 +743,13 @@ mod tests {
     #[test]
     fn a6_the_quota_refills_after_a_long_silence() {
         let mut rl = RateLimiter::new(quota_policy(1, 600, 100));
-        assert!(rl.check("k", 1000).is_allowed());
-        assert!(!rl.check("k", 1100).is_allowed(), "still inside the window");
+        assert!(rl.check(&"k".to_string(), 1000).is_allowed());
         assert!(
-            rl.check("k", 1000 + 600).is_allowed(),
+            !rl.check(&"k".to_string(), 1100).is_allowed(),
+            "still inside the window"
+        );
+        assert!(
+            rl.check(&"k".to_string(), 1000 + 600).is_allowed(),
             "past the window it refills in full"
         );
     }
@@ -758,23 +766,23 @@ mod tests {
         assert_eq!(b.window_secs(99), 300, "still capped, no overflow");
 
         let mut rl = RateLimiter::new(quota_policy(1, 60, 100).with_backoff(b));
-        assert!(rl.check("k", 1000).is_allowed());
+        assert!(rl.check(&"k".to_string(), 1000).is_allowed());
         // Spend, then get denied and start backing off.
         assert_eq!(
-            rl.check("k", 1000),
+            rl.check(&"k".to_string(), 1000),
             Decision::Deny {
                 reason: DenyReason::QuotaSpent
             }
         );
         assert_eq!(
-            rl.check("k", 1001),
+            rl.check(&"k".to_string(), 1001),
             Decision::Deny {
                 reason: DenyReason::BackingOff
             },
             "inside the suppression window"
         );
         // Far past both window and backoff: allowed, and the streak resets.
-        assert!(rl.check("k", 1000 + 600).is_allowed());
+        assert!(rl.check(&"k".to_string(), 1000 + 600).is_allowed());
     }
 
     /// A8 — a log flood is COUNTED and surfaced on the next allow, so the
@@ -783,16 +791,16 @@ mod tests {
     fn a8_denials_are_counted_and_surfaced_on_the_next_allow() {
         let mut rl = RateLimiter::new(quota_policy(1, 60, 100));
         assert_eq!(
-            rl.check("site", 1000),
+            rl.check(&"site".to_string(), 1000),
             Decision::Allow {
                 suppressed_since_last_allow: 0
             }
         );
         for _ in 0..99 {
-            assert!(!rl.check("site", 1000).is_allowed());
+            assert!(!rl.check(&"site".to_string(), 1000).is_allowed());
         }
         assert_eq!(
-            rl.check("site", 1060),
+            rl.check(&"site".to_string(), 1060),
             Decision::Allow {
                 suppressed_since_last_allow: 99
             },
@@ -806,14 +814,14 @@ mod tests {
     #[test]
     fn a9_a_backwards_clock_neither_panics_nor_unlocks() {
         let mut rl = RateLimiter::new(quota_policy(1, 600, 100));
-        assert!(rl.check("k", 10_000).is_allowed());
+        assert!(rl.check(&"k".to_string(), 10_000).is_allowed());
         // Clock jumps backwards past the epoch of the last spend.
         assert!(
-            !rl.check("k", 1).is_allowed(),
+            !rl.check(&"k".to_string(), 1).is_allowed(),
             "a backwards clock must not refill the quota early"
         );
         // And forward progress still works afterwards.
-        assert!(rl.check("k", 10_000 + 600).is_allowed());
+        assert!(rl.check(&"k".to_string(), 10_000 + 600).is_allowed());
     }
 
     /// A10 — two classes over one key space, each judged by its own quota.
@@ -821,21 +829,21 @@ mod tests {
     fn a10_each_class_is_judged_by_its_own_quota() {
         let policy = Policy::tiered(Quota::new(1, 3600), Quota::new(4, 3600), 100);
         let mut rl = RateLimiter::new(policy);
-        assert!(rl.check("stranger", 1000).is_allowed());
+        assert!(rl.check(&"stranger".to_string(), 1000).is_allowed());
         assert!(
-            !rl.check("stranger", 1000).is_allowed(),
+            !rl.check(&"stranger".to_string(), 1000).is_allowed(),
             "default quota is 1"
         );
 
-        rl.promote("known");
+        rl.promote(&"known".to_string());
         for n in 0..4 {
             assert!(
-                rl.check("known", 1000).is_allowed(),
+                rl.check(&"known".to_string(), 1000).is_allowed(),
                 "promoted quota is 4 (n={n})"
             );
         }
         assert!(
-            !rl.check("known", 1000).is_allowed(),
+            !rl.check(&"known".to_string(), 1000).is_allowed(),
             "and then it too is bounded"
         );
     }
@@ -850,13 +858,16 @@ mod tests {
     fn promotion_clears_the_spend_that_earned_it() {
         let policy = Policy::tiered(Quota::new(1, 3600), Quota::new(4, 3600), 100);
         let mut rl = RateLimiter::new(policy);
-        assert!(rl.check("k", 1000).is_allowed());
-        assert!(!rl.check("k", 1000).is_allowed(), "stranger budget spent");
+        assert!(rl.check(&"k".to_string(), 1000).is_allowed());
+        assert!(
+            !rl.check(&"k".to_string(), 1000).is_allowed(),
+            "stranger budget spent"
+        );
 
-        rl.promote("k");
+        rl.promote(&"k".to_string());
         for n in 0..4 {
             assert!(
-                rl.check("k", 1000).is_allowed(),
+                rl.check(&"k".to_string(), 1000).is_allowed(),
                 "the FULL promoted allowance must be available (n={n}) — the \
                  attempt that earned the promotion was answered"
             );
@@ -880,7 +891,7 @@ mod tests {
             let _ = rl.check_from(&k, Some(&k), 1000);
         }
         assert_eq!(
-            rl.check_from("newcomer", Some("newcomer"), 1000),
+            rl.check_from(&"newcomer".to_string(), Some("newcomer"), 1000),
             Decision::Deny {
                 reason: DenyReason::AtCapacity
             },
@@ -913,7 +924,7 @@ mod tests {
         // Past the window everything is refilled and carries no information.
         let later = 1000 + 600;
         assert!(
-            rl.check_from("newcomer", Some("newcomer"), later)
+            rl.check_from(&"newcomer".to_string(), Some("newcomer"), later)
                 .is_allowed(),
             "a refilled key is state-equivalent to one never seen, so releasing \
              it is free — pinning the map to preserve a denial counter trades a \
@@ -976,14 +987,15 @@ mod tests {
         // Past the quota window but INSIDE backoff: nothing is releasable, and
         // the refusal must still be the cheap path.
         assert_eq!(
-            rl.check_from("x", Some("x"), 1000 + 120),
+            rl.check_from(&"x".to_string(), Some("x"), 1000 + 120),
             Decision::Deny {
                 reason: DenyReason::AtCapacity
             }
         );
         // Past both: entries release and the newcomer gets in.
         assert!(
-            rl.check_from("x", Some("x"), 1000 + 400).is_allowed(),
+            rl.check_from(&"x".to_string(), Some("x"), 1000 + 400)
+                .is_allowed(),
             "once backoff has expired too, the refilled keys are free to drop"
         );
     }
@@ -1003,7 +1015,9 @@ mod tests {
         }
         assert_eq!(rl.released_suppressed(), 0);
         // An honest source arrives and evicts one of the hoarder's keys.
-        assert!(rl.check_from("honest", Some("honest"), 1000).is_allowed());
+        assert!(rl
+            .check_from(&"honest".to_string(), Some("honest"), 1000)
+            .is_allowed());
         assert!(
             rl.released_suppressed() > 0,
             "the evicted key's denials must reach the aggregate, or the attack \
@@ -1020,18 +1034,21 @@ mod tests {
     fn a16_backoff_outlasts_the_quota_window() {
         let policy = quota_policy(1, 60, 100).with_backoff(Backoff::new(300, 300));
         let mut rl = RateLimiter::new(policy);
-        assert!(rl.check("k", 1000).is_allowed());
-        assert!(!rl.check("k", 1000).is_allowed(), "quota spent");
+        assert!(rl.check(&"k".to_string(), 1000).is_allowed());
+        assert!(
+            !rl.check(&"k".to_string(), 1000).is_allowed(),
+            "quota spent"
+        );
 
         assert_eq!(
-            rl.check("k", 1000 + 61),
+            rl.check(&"k".to_string(), 1000 + 61),
             Decision::Deny {
                 reason: DenyReason::BackingOff
             },
             "the quota refilled, but the SUPPRESSION has not expired"
         );
         assert!(
-            rl.check("k", 1000 + 301).is_allowed(),
+            rl.check(&"k".to_string(), 1000 + 301).is_allowed(),
             "and once it has, the key is free"
         );
     }
@@ -1048,7 +1065,7 @@ mod tests {
             assert!(rl.promote(&format!("p{i}")), "within the cap");
         }
         assert!(
-            !rl.promote("one-too-many"),
+            !rl.promote(&"one-too-many".to_string()),
             "promotion past the ceiling must be REFUSED — it would be              un-evictable forever"
         );
         assert_eq!(rl.tracked(), 4);
@@ -1070,7 +1087,7 @@ mod tests {
         }
         assert_eq!(rl.tracked(), 4);
         // Past the window they are refilled, carry nothing, and release.
-        let _ = rl.check_from("later", Some("other"), 1000 + 61);
+        let _ = rl.check_from(&"later".to_string(), Some("other"), 1000 + 61);
         assert!(
             rl.tracked() <= 4,
             "the map must still be reclaimable: {} entries",
@@ -1088,7 +1105,7 @@ mod tests {
             rl.promote(&format!("p{i}"));
         }
         assert_eq!(
-            rl.check_from("newcomer", Some("someone"), 1000),
+            rl.check_from(&"newcomer".to_string(), Some("someone"), 1000),
             Decision::Deny {
                 reason: DenyReason::AtCapacity
             },
@@ -1105,7 +1122,7 @@ mod tests {
     #[test]
     fn d3_a_denial_carries_no_retry_hint() {
         let mut rl = RateLimiter::new(quota_policy(0, 60, 10));
-        match rl.check("k", 1000) {
+        match rl.check(&"k".to_string(), 1000) {
             Decision::Deny { reason } => {
                 assert_eq!(reason.as_str(), "quota_spent");
             }

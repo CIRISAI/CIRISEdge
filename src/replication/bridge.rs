@@ -2886,7 +2886,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     crate::rate_limit::Decision::Allow {
                         suppressed_since_last_allow: 0,
                     },
-                    |mut rl| rl.check_from(requester, Some(requester), unix_now_secs()),
+                    |mut rl| rl.check_from(&requester.to_owned(), Some(requester), unix_now_secs()),
                 );
                 if let crate::rate_limit::Decision::Deny { reason } = verdict {
                     // THROTTLED. "Not asked again this window" was wrong — the
