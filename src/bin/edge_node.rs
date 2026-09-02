@@ -1720,10 +1720,27 @@ async fn run_discover_by_fedid_leg(
 
     // A PEER's owner — never our own, or this would prove only that a node
     // can read what it just wrote.
-    let peer_owner = occ
+    //
+    // Prefer a COHORT peer. The roster is ordered by key_id, so the naive
+    // `.first()` picked `nonmember` — the node the harness deliberately holds
+    // at arm's length. It roots against the publisher and nothing else, drives
+    // no replication rounds, and exists to prove EXCLUSION; its owner binding
+    // is therefore not expected to converge anywhere. Targeting it made an
+    // identity-plane leg depend on a node contracted not to participate, and
+    // the leg failed with `NotYetDiscovered { nonmember-owner }` — a true
+    // report about the wrong subject.
+    //
+    // A cohort peer is one this occurrence exchanges state with by contract,
+    // which is exactly the population whose bindings must converge.
+    let candidates: Vec<&RosterEntry> = occ
         .roster
         .values()
-        .find(|e| e.key_id != cfg.node_id && !e.owner_key_id.is_empty())
+        .filter(|e| e.key_id != cfg.node_id && !e.owner_key_id.is_empty())
+        .collect();
+    let peer_owner = candidates
+        .iter()
+        .find(|e| cfg.cohort_members.contains(&e.key_id))
+        .or_else(|| candidates.first())
         .map(|e| (e.owner_key_id.clone(), e.key_id.clone()));
 
     let Some((owner_id, expect_node)) = peer_owner else {
@@ -1790,6 +1807,7 @@ async fn run_discover_by_fedid_leg(
                 "nodes": found.subject.nodes,
                 "reachable": found.reachable,
                 "expected_node": expect_node,
+                "peer_is_cohort_member": cfg.cohort_members.contains(&expect_node),
                 "named_expected_node": named,
                 "reachable_expected_node": reachable,
                 "converged_ms": waited_ms,
@@ -1799,13 +1817,25 @@ async fn run_discover_by_fedid_leg(
             }),
         );
     } else {
+        // Ask the directory the two questions the stall cannot separate. Both
+        // surface as `NotYetDiscovered`, but they have different causes and
+        // different remedies: no key record means the steward's directory row
+        // never arrived; a key record with no owned nodes means the row is here
+        // and the owner-binding ATTESTATION is what did not replicate or admit.
+        use ciris_edge::contact::DirectoryLens as _;
+        let has_key_record = lens.identity_type_of(&owner_id).await;
+        let owned = lens.nodes_owned_by(&owner_id).await;
         tracing::error!(
             queried = %owner_id,
             stall = ?last_stall,
             waited_ms,
             attempts,
-            "discovery never resolved the peer's owner — the owner binding did not \
-             replicate, or did not admit at this node"
+            identity_type = ?has_key_record,
+            owned_nodes = ?owned,
+            "discovery never resolved the peer's owner. identity_type=None means the \
+             KEY RECORD is missing; identity_type=Some with owned_nodes=[] means the \
+             record is here and the owner-binding ATTESTATION did not replicate or \
+             did not admit"
         );
         rep.ran(
             "ladder.discover_by_fedid",
@@ -1815,6 +1845,8 @@ async fn run_discover_by_fedid_leg(
                 "stall": last_stall,
                 "waited_ms": waited_ms,
                 "attempts": attempts,
+                "identity_type": has_key_record,
+                "owned_nodes": owned,
             }),
         );
     }
