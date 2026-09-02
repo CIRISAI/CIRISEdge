@@ -1699,6 +1699,127 @@ fn epoch_keys(
 // Roles
 // ═══════════════════════════════════════════════════════════════════
 
+/// The fedID-discovery leg: fedID → person → their nodes → a node this node
+/// can actually address.
+///
+/// Shared by BOTH roles. It was written inline on the publisher only, while
+/// the census expects the cell on publisher and subscriber alike — so every
+/// subscriber reported it missing, independent of whether discovery worked.
+/// Discovery must hold in both directions anyway: the publisher resolving a
+/// subscriber's owner says nothing about a subscriber resolving the
+/// publisher's, and that is the direction a contact request travels.
+async fn run_discover_by_fedid_leg(
+    occ: &Occurrence,
+    lens: &ciris_edge::contact::PersistLens<'_>,
+    routes: &ciris_edge::contact::ReticulumRoutes<'_>,
+) {
+    use ciris_edge::contact;
+
+    let rep = Arc::clone(&occ.reporter);
+    let cfg = &occ.cfg;
+
+    // A PEER's owner — never our own, or this would prove only that a node
+    // can read what it just wrote.
+    let peer_owner = occ
+        .roster
+        .values()
+        .find(|e| e.key_id != cfg.node_id && !e.owner_key_id.is_empty())
+        .map(|e| (e.owner_key_id.clone(), e.key_id.clone()));
+
+    let Some((owner_id, expect_node)) = peer_owner else {
+        rep.not_run(
+            "ladder.discover_by_fedid",
+            "no peer published an owner in the roster — nothing to resolve",
+        );
+        return;
+    };
+
+    // POLL until the peer's binding arrives, up to the barrier.
+    //
+    // The row is replicated, not seeded, so asking once races the Attestation
+    // plane and fails on timing rather than on the property under test. What
+    // this leg claims is that discovery CONVERGES over the wire — so waiting
+    // for convergence is the measurement, and the elapsed time is reported as
+    // part of it.
+    let started = Instant::now();
+    let mut attempts = 0_u32;
+    let mut last: Option<contact::Discovered> = None;
+    let mut last_stall: Option<String> = None;
+    loop {
+        attempts += 1;
+        match contact::discover(lens, routes, &owner_id).await {
+            Ok(found) => {
+                let done = found.subject.nodes.contains(&expect_node)
+                    && found.reachable.contains(&expect_node);
+                last = Some(found);
+                if done {
+                    break;
+                }
+            }
+            Err(stall) => last_stall = Some(format!("{stall:?}")),
+        }
+        if started.elapsed() >= cfg.barrier_timeout {
+            break;
+        }
+        tokio_sleep(Duration::from_millis(500)).await;
+    }
+
+    let waited_ms = started.elapsed().as_millis();
+    if let Some(found) = last {
+        let named = found.subject.nodes.contains(&expect_node);
+        let reachable = found.reachable.contains(&expect_node);
+        if !(named && reachable) {
+            tracing::error!(
+                queried = %owner_id,
+                expected_node = %expect_node,
+                nodes = ?found.subject.nodes,
+                reachable = ?found.reachable,
+                waited_ms,
+                attempts,
+                "discovery did not converge: the peer's owner binding never named \
+                 a reachable expected node within the barrier"
+            );
+        }
+        rep.ran(
+            "ladder.discover_by_fedid",
+            named && reachable,
+            serde_json::json!({
+                "queried": owner_id,
+                "resolved_person": found.subject.fed_id,
+                "resolved_from": format!("{:?}", found.subject.resolved_from),
+                "nodes": found.subject.nodes,
+                "reachable": found.reachable,
+                "expected_node": expect_node,
+                "named_expected_node": named,
+                "reachable_expected_node": reachable,
+                "converged_ms": waited_ms,
+                "attempts": attempts,
+                "covers": "fedID -> person -> owned nodes -> addressable, against the \
+                           peer's owner binding learned over the wire",
+            }),
+        );
+    } else {
+        tracing::error!(
+            queried = %owner_id,
+            stall = ?last_stall,
+            waited_ms,
+            attempts,
+            "discovery never resolved the peer's owner — the owner binding did not \
+             replicate, or did not admit at this node"
+        );
+        rep.ran(
+            "ladder.discover_by_fedid",
+            false,
+            serde_json::json!({
+                "queried": owner_id,
+                "stall": last_stall,
+                "waited_ms": waited_ms,
+                "attempts": attempts,
+            }),
+        );
+    }
+}
+
 /// The publisher: cohort creator, stream source, blob source, and the
 /// node that drives the mid-stream epoch advance.
 async fn run_publisher(occ: Occurrence) -> Result<(), String> {
@@ -1781,110 +1902,11 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     // identifier names, `owner_of`/`nodes_owned_by` walk the owner bindings,
     // and `discover` refuses to report someone as found when nothing answers.
     {
-        use ciris_edge::contact::{self, PersistLens, ReticulumRoutes};
+        use ciris_edge::contact::{PersistLens, ReticulumRoutes};
         let lens = PersistLens::new(occ.directory.as_ref());
         let routes = ReticulumRoutes::new(&occ.transport);
 
-        // A PEER's owner — never our own, or this would prove only that a node
-        // can read what it just wrote.
-        let peer_owner = occ
-            .roster
-            .values()
-            .find(|e| e.key_id != occ.cfg.node_id && !e.owner_key_id.is_empty())
-            .map(|e| (e.owner_key_id.clone(), e.key_id.clone()));
-
-        match peer_owner {
-            None => rep.not_run(
-                "ladder.discover_by_fedid",
-                "no peer published an owner in the roster — nothing to resolve",
-            ),
-            Some((owner_id, expect_node)) => {
-                // POLL until the peer's binding arrives, up to the barrier.
-                //
-                // The row is replicated, not seeded, so asking once races the
-                // Attestation plane and fails on timing rather than on the
-                // property under test. What this leg claims is that discovery
-                // CONVERGES over the wire — so waiting for convergence is the
-                // measurement, and the elapsed time is reported as part of it.
-                let started = Instant::now();
-                let mut attempts = 0_u32;
-                let mut last: Option<contact::Discovered> = None;
-                let mut last_stall: Option<String> = None;
-                loop {
-                    attempts += 1;
-                    match contact::discover(&lens, &routes, &owner_id).await {
-                        Ok(found) => {
-                            let done = found.subject.nodes.contains(&expect_node)
-                                && found.reachable.contains(&expect_node);
-                            last = Some(found);
-                            if done {
-                                break;
-                            }
-                        }
-                        Err(stall) => last_stall = Some(format!("{stall:?}")),
-                    }
-                    if started.elapsed() >= cfg.barrier_timeout {
-                        break;
-                    }
-                    tokio_sleep(Duration::from_millis(500)).await;
-                }
-
-                let waited_ms = started.elapsed().as_millis();
-                if let Some(found) = last {
-                    let named = found.subject.nodes.contains(&expect_node);
-                    let reachable = found.reachable.contains(&expect_node);
-                    if !(named && reachable) {
-                        tracing::error!(
-                            queried = %owner_id,
-                            expected_node = %expect_node,
-                            nodes = ?found.subject.nodes,
-                            reachable = ?found.reachable,
-                            waited_ms,
-                            attempts,
-                            "discovery did not converge: the peer's owner binding \
-                             never named a reachable expected node within the barrier"
-                        );
-                    }
-                    rep.ran(
-                        "ladder.discover_by_fedid",
-                        named && reachable,
-                        serde_json::json!({
-                            "queried": owner_id,
-                            "resolved_person": found.subject.fed_id,
-                            "resolved_from": format!("{:?}", found.subject.resolved_from),
-                            "nodes": found.subject.nodes,
-                            "reachable": found.reachable,
-                            "expected_node": expect_node,
-                            "named_expected_node": named,
-                            "reachable_expected_node": reachable,
-                            "converged_ms": waited_ms,
-                            "attempts": attempts,
-                            "covers": "fedID -> person -> owned nodes -> addressable, \
-                                       against the peer's owner binding learned over the wire",
-                        }),
-                    );
-                } else {
-                    tracing::error!(
-                        queried = %owner_id,
-                        stall = ?last_stall,
-                        waited_ms,
-                        attempts,
-                        "discovery never resolved the peer's owner — the owner \
-                         binding did not replicate, or did not admit at this node"
-                    );
-                    rep.ran(
-                        "ladder.discover_by_fedid",
-                        false,
-                        serde_json::json!({
-                            "queried": owner_id,
-                            "stall": last_stall,
-                            "waited_ms": waited_ms,
-                            "attempts": attempts,
-                        }),
-                    );
-                }
-            }
-        }
+        run_discover_by_fedid_leg(&occ, &lens, &routes).await;
     }
 
     // ── Cohort: create, admit members over the real wire ─────────────
@@ -2854,6 +2876,17 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                 "direction": "subscriber -> publisher",
             }),
         );
+    }
+
+    // ── Ladder: DISCOVERY THROUGH THE FEDERATION DIRECTORY ───────────
+    //
+    // Same leg the publisher runs, in the return direction: this subscriber
+    // resolves the PUBLISHER's owner from a binding it learned over the wire.
+    {
+        use ciris_edge::contact::{PersistLens, ReticulumRoutes};
+        let lens = PersistLens::new(occ.directory.as_ref());
+        let routes = ReticulumRoutes::new(&occ.transport);
+        run_discover_by_fedid_leg(&occ, &lens, &routes).await;
     }
 
     // ── Real cross-process MLS join ──────────────────────────────────

@@ -454,12 +454,12 @@ mod admit_tests {
         // And the FORWARD direction, which is the one discovery actually walks:
         // a fedID resolves to the person, the person to their nodes. Asserting
         // only `owner_of` would leave the leg's own direction unproven.
-        let owned = ciris_persist::federation::admission::nodes_owned_by(&*dir, "owner-a")
+        let owned_nodes = ciris_persist::federation::admission::nodes_owned_by(&*dir, "owner-a")
             .await
             .expect("nodes_owned_by must not error");
         assert!(
-            owned.contains(&"node-b".to_string()),
-            "fedID -> owned nodes is the direction `discover` walks; got {owned:?}"
+            owned_nodes.contains(&"node-b".to_string()),
+            "fedID -> owned nodes is the direction `discover` walks; got {owned_nodes:?}"
         );
     }
 
