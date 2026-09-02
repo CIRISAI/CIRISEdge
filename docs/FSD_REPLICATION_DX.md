@@ -370,6 +370,80 @@ one promotion path, not two.
    carry anything sensitive, that is a substrate gap worth filing rather than
    papering over in the API.
 
+### Answered against persist's FSD (`CIRISPersist/FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE.md`, 2026-09-02)
+
+4. **Delegated widening (persist OQ-1) — no.** A node may not `widen_audience`
+   an actor's claim on the actor's behalf. Subsidiarity (CC part_3 §308:
+   "decisions belong at the smallest scale competent to make them") — the
+   actor who authored the claim is that scale; the node is custody, and
+   `check_node_agency_admission` makes the refusal cryptographic. The widening
+   waits for the actor.
+
+5. **Should an actor sign at local write by default (persist OQ-2) — edge's
+   answer: yes for software-held actor keys (AgentID); at the crossing for
+   ceremony-bound keys (FedID on hardware).** A per-key-class default, not a
+   global one. Persist's own FSD decides it:
+   - **§5.1 W4** — `NodeCoScrub` over an empty-sentinel base is
+     `NoActorSignature`. The co-scrub path, the only thing in the FSD that
+     *preserves* anything, is closed to a row that carries no signature. A
+     deferred row's only road to the wire is the actor present at the
+     crossing; otherwise §5.4 parks it as `promotion_awaiting_actor`. Forever.
+   - **§5.1 W5** — `reseal.scrub_key_id != row.attesting_key_id` is
+     `CustodyIsNotTheActor`. Key rotation makes "actor gone" *routine*: a row
+     deferred under AgentID-v1 and promoted after rotation to v2 has no signer
+     that can ever sign it as v1. Signed at write, v1's signature over the
+     identical bytes stands and the node co-scrubs.
+   - **§4.5's own guarantee** ("`asserted_at` is signed, so the path cannot be
+     chosen by editing a column") is empty for a deferred row: its
+     `asserted_at` is an unsigned stamped column until the very promotion the
+     rule governs. The guarantee holds exactly for rows signed at write.
+   - **§1.2, measured** — most local rows are empty-sentinel today. Without a
+     sign-at-write default the FSD fixes transit revocations and custody
+     attribution on *immediate* promotion, and leaves "share later" exactly as
+     stranded as it is now. Requirement 1 ("human- and agent-signed rows …")
+     presupposes the rows are signed.
+   - **The carve-out is the human.** A FedID on a device where each signature
+     may cost a presence ceremony signs at the crossing — for chat the crossing
+     *is* the send, so the ceremony coincides with intent — and a human row
+     never signed, whose human is absent, correctly stays local: it is a draft
+     nobody committed. That is deferral-as-consent, not
+     deferral-as-optimisation.
+   - **Cost** (CC 5.3.2.2's "cardinality win"): for a cohabited agent the
+     hybrid sign rides an in-process, prompt-free signer on a path that already
+     canonicalises and fsyncs. Measure before deferring; if a class of row
+     measurably matters, it is the class that will never leave the producer's
+     signer's reach (self-witnessed telemetry), never a claim.
+   - **Correction to persist's OQ-2 disposition** ("for human-authored rows
+     where FedID lives on another device, the row falls to the co-scrub path or
+     waits"): the first half is false under its own W4 — an unsigned row has
+     nothing to co-scrub. It waits. The co-scrub path exists only for rows
+     signed at write. That *is* the answer to OQ-2.
+   - **Edge's practice already agrees**: every edge producer signs at write
+     (A/V rows are born federation-tier; the chat producer moves from
+     node-attester to actor-attester at the re-base). `share*` takes the
+     actor's signer: present → `ActorSigned`; absent and the row is signed →
+     `NodeCoScrub`; absent and unsigned → a typed `Shared::AwaitingActor`,
+     never a silent stay-local. "Reachable" in persist §5.4 means "the caller
+     handed over the signer" — there is no oracle, and the layer that holds
+     the key is the layer that decides.
+
+6. **Two corrections to persist §5.6, from edge's side of the wire.**
+   - `visible_to_edge: InvisibleByScope` for `self` / `family` is a mislabel.
+     `federation/self` **replicates** — to the owner's own node set
+     (`CohortScope::SelfOnly`, `src/edge.rs:2777`; the single-owner boundary),
+     and `family` to the family's nodes, by consent fan-out over resolved
+     recipients rather than by `holds_bytes` discovery. CC 5.2 makes them
+     *undiscoverable*, not un-replicated. Persist can state what the row **is**
+     (`discoverable: bool`); only edge can state where it goes
+     (`routes_to: OwnerNodes | Family | Community | Everyone`). Rename the
+     variant `Replicates { kinds, discoverable: false }`, or drop the field and
+     let edge's `Crossing` carry it.
+   - **One type, persist's.** `ContextualIntegrity` (nine axes, required,
+     refused by axis name) subsumes edge's five-axis `Flow`; edge deletes
+     `Flow`, re-exports `ContextualIntegrity` + `FederationCrossing`, and keeps
+     `With` (the audience vocabulary → `Audience`) and `Shared`. The output is
+     the input as applied, plus what edge does with it.
+
 ---
 
 ## 7. Cross-check against CIRISConstitution (rc4.6)
