@@ -630,6 +630,57 @@ mod admit_tests {
         );
     }
 
+    /// **The three-key shape**: a human owns BOTH a node and an agent, and
+    /// `owner_of` resolves each to the same person.
+    ///
+    /// Three keys are the minimum for a viable agent — human, node, agent — and
+    /// the agent needs its own owner binding or `resolve(agentID)` finds no
+    /// owner and stops before it can reach a dialable node. That walk is the
+    /// point of keeping the agent and node identities separate: conflated, it
+    /// would be a tautology.
+    #[tokio::test]
+    async fn one_human_owns_both_a_node_and_an_agent() {
+        let (dir, owner) = directory_with_owner_and_node().await;
+        // Seed the agent's own key record, then bind it to the same human.
+        let agent = signer("agent-c", 3);
+        dir.put_public_key(SignedKeyRecord {
+            record: signed_record("agent-c", pubkeys(&agent).await, &owner, "owner-a", "agent")
+                .await,
+        })
+        .await
+        .expect("seed agent record");
+
+        for subject in ["node-b", "agent-c"] {
+            let att = owner_binding_attestation("owner-a", subject, ts(), &owner)
+                .await
+                .expect("build");
+            dir.put_attestation(SignedAttestation { attestation: att })
+                .await
+                .unwrap_or_else(|e| panic!("persist must admit the {subject} binding: {e}"));
+        }
+
+        for subject in ["node-b", "agent-c"] {
+            let resolved = ciris_persist::federation::admission::owner_of(&*dir, subject)
+                .await
+                .expect("owner_of must not error");
+            assert_eq!(
+                resolved.as_deref(),
+                Some("owner-a"),
+                "{subject} must resolve to the same human — an agent that resolves \
+                 to nobody cannot be dialled, because the dial target is a NODE \
+                 reached through its owner"
+            );
+        }
+
+        let dial_targets = ciris_persist::federation::admission::nodes_owned_by(&*dir, "owner-a")
+            .await
+            .expect("nodes_owned_by");
+        assert!(
+            dial_targets.contains(&"node-b".to_string()),
+            "the human's NODE is the dial target reached from either identity: {dial_targets:?}"
+        );
+    }
+
     /// An UNBOUND envelope is refused — the guard proves persist's rule is
     /// still live, so this file's binder cannot quietly become unnecessary
     /// and then quietly become wrong again.

@@ -36,6 +36,30 @@
 
 name: ciris-edge-bench-mesh
 
+# TEST-ANCHOR trust root — one throwaway SW hybrid key, shared by every node.
+#
+# A node is admitted `Rooted` (not `Advisory`) only when its provenance chain
+# terminates at a self-signed steward/accord_holder row WHOSE ED25519 PUBKEY IS
+# IN THE PINNED ANCHOR. That anchor is secure by default: the real
+# HUMANITY_ACCORD holders (A1/B1/C1). No harness-invented steward is ever in it,
+# so without this override every peer roots Advisory, the E3 gate refuses to
+# attribute a single frame, and the Attestation plane never moves.
+#
+# The SEED blesses (the publisher scrub-signs each node's record with it); the
+# PUBKEYS are what the anchor is pinned to. ALL values derive from the one SEED:
+#
+#   CIRIS_TEST_TRUST_ROOT_SEED=<b64 32B> \
+#     cargo run --release --example test_anchor_env --features test-anchor
+#
+# Same mechanism and same throwaway seed as CIRISServer's traceflow harness —
+# never the real trust key, and compile-fenced behind `test-anchor` so it cannot
+# exist in a production artifact.
+x-test-anchor-env: &test-anchor-env
+  CIRIS_TESTING_MODE: "true"
+  CIRIS_TEST_TRUST_ROOT: "ebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ="
+  CIRIS_TEST_TRUST_ROOT_SEED: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+
+
 x-node: &node
   image: ciris-edge-bench-mesh:local
   build:
@@ -43,6 +67,7 @@ x-node: &node
     dockerfile: bench-mesh/Dockerfile
   networks: [mesh]
   environment: &node-env
+    <<: *test-anchor-env
     EDGE_LISTEN: "0.0.0.0:4242"
     EDGE_COMMUNITY: "${MESH_COMMUNITY:-bench-mesh}"
     EDGE_SCOPE: "${MESH_SCOPE:-cohort:bench}"

@@ -82,7 +82,7 @@ WORKDIR /src
 # the incremental case fast without that fragility.
 COPY . /src
 
-ARG FEATURES="transport-reticulum,mesh-harness"
+ARG FEATURES="transport-reticulum,mesh-harness,test-anchor"
 ARG PROFILE=release
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
