@@ -115,6 +115,24 @@ impl ServeTier {
     }
 }
 
+impl ServeTier {
+    /// Map persist's rung onto edge's.
+    ///
+    /// The two enums are deliberately separate types with identical shape:
+    /// edge's is what its own decision table keys on, and a compile error here
+    /// is how a future rung added on either side gets noticed. An exhaustive
+    /// match, so adding one is a deliberate edit rather than a silent default.
+    #[must_use]
+    fn from_persist(tier: ciris_persist::federation::trust_root::ServeTier) -> Self {
+        use ciris_persist::federation::trust_root::ServeTier as P;
+        match tier {
+            P::None => ServeTier::None,
+            P::MeshServer => ServeTier::MeshServer,
+            P::Canonical => ServeTier::Canonical,
+        }
+    }
+}
+
 /// Resolves a subject's serving tier. Injectable so the decision logic is
 /// testable over every tier without a directory, and so the production
 /// resolution can grow the mesh-server rung when CIRISPersist#788 ships
@@ -130,17 +148,18 @@ pub trait ServeTierResolver: Send + Sync {
     async fn resolve(&self, subject_key_id: &str) -> ServeTier;
 }
 
-/// The production resolver: persist's two canonical legs today, the
-/// mesh-server rung fail-closed pending CIRISPersist#788.
+/// The production resolver — both rungs live, delegated to persist
+/// (CIRISPersist#788, v38.8.0).
 ///
-/// | rung | resolution | status |
-/// |---|---|---|
-/// | canonical | leg A (`has_accord_conferred_role` — the co-scrub re-derived from the row's own cryptography) ∧ leg B (`capability_roots_to_trusted_root` — chains to THIS resolver's root) | live |
-/// | mesh server | the owner's `delegates_to` bearing `infra:serve` | **fail-closed**: persist has no resolver for the owner-conferred rung (`claims_role` is *visibility, never conferral*), so a row that claims the role but cannot be verified resolves `None` with a WARN naming CIRISPersist#788 |
+/// | rung | resolution |
+/// |---|---|
+/// | mesh server | the subject claims `infra:serve` **and** its owner granted it, via a live `delegates_to(owner → subject)` bearing that scope. CC 4's first granter, and resolver-INDEPENDENT: an owner's conferral over its own node is not relative to who is asking |
+/// | canonical | the 2-of-3 accord co-scrub over a `canonical,node` envelope, with the granting root walking to a trust root THIS resolver accepts. CC 4's second granter, and resolver-RELATIVE — two nodes can correctly disagree about whether the same key is canonical |
 ///
-/// Fail-closed is the right degradation: an unrecognized mesh server holds
-/// bodies and serves only its own record — it under-helps the mesh, it never
-/// over-claims a role.
+/// Both re-derive from the records' own cryptography on every call, so a
+/// withdrawn conferral bites immediately. `claims_role` alone still buys
+/// nothing: lifting an envelope-attested role creates VISIBILITY, never
+/// conferral.
 pub struct DirectoryServeTierResolver {
     directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
     /// Axis 5 — the trust base the canonical rung resolves against. Canonical
@@ -164,92 +183,36 @@ impl DirectoryServeTierResolver {
 #[async_trait::async_trait]
 impl ServeTierResolver for DirectoryServeTierResolver {
     async fn resolve(&self, subject_key_id: &str) -> ServeTier {
-        use ciris_persist::federation::admission::has_accord_conferred_role;
-        use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
-
-        // Leg A — the accord co-scrub, re-derived from the record's own
-        // cryptography on every call so a withdrawn blessing bites immediately.
-        let leg_a = match has_accord_conferred_role(
+        // CIRISPersist#788 (v38.8.0) — persist owns BOTH rungs now, and edge
+        // asks rather than re-deriving. That was always the right split: the
+        // walk reuses persist's ONE scope-parse and ONE CEG-tombstone fold, and
+        // forking either into a consumer doubles the policy the FSD insists
+        // lives in a single authority.
+        match ciris_persist::federation::trust_root::resolve_serve_tier(
             &*self.directory,
             subject_key_id,
-            crate::replication::bridge::FederationDirectoryReplicationBridge::SERVE_CAPABILITY,
+            &self.resolver_key_id,
         )
         .await
         {
-            Ok(v) => v,
+            Ok(tier) => ServeTier::from_persist(tier),
             Err(e) => {
-                // Exhibit C — a read failure is NOT "no role". Say so, resolve
-                // conservatively.
+                // Exhibit C, and persist states the same contract: a READ
+                // FAILURE is not "no serve standing". Reporting a transient
+                // failure as a confident statement about the subject sends an
+                // operator looking in the wrong place. The tier is conservative
+                // either way, because every consumer treats `None` as the safe
+                // state — hold bodies, serve only your own record.
                 tracing::warn!(
                     subject = %subject_key_id,
                     error = %e,
-                    "serve-tier leg A read FAILED — resolving conservatively to \
+                    "serve-tier resolution FAILED — resolving conservatively to \
                      tier none; this is a transient read error, not a statement \
-                     about the subject's blessing"
+                     about the subject's conferral"
                 );
-                false
-            }
-        };
-        if leg_a {
-            // Leg B — the blessing must chain to THIS resolver's trusted root.
-            match capability_roots_to_trusted_root(
-                &*self.directory,
-                &self.resolver_key_id,
-                subject_key_id,
-                crate::replication::bridge::FederationDirectoryReplicationBridge::SERVE_CAPABILITY,
-            )
-            .await
-            {
-                Ok(Some(_grant)) => return ServeTier::Canonical,
-                Ok(None) => {
-                    // Blessed under SOME root, but not one this resolver
-                    // trusts. Axis 5 working as designed, worth a debug line.
-                    tracing::debug!(
-                        subject = %subject_key_id,
-                        "accord-conferred infra:serve does not chain to this \
-                         resolver's trusted root — canonical elsewhere, not here"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        subject = %subject_key_id,
-                        error = %e,
-                        "serve-tier leg B read FAILED — resolving conservatively \
-                         below canonical"
-                    );
-                }
+                ServeTier::None
             }
         }
-
-        // Mesh-server rung — CIRISPersist#788. `claims_role` is visibility,
-        // never conferral; without the owner-grant resolver the honest answer
-        // is `None`, loudly, so an operator who conferred the role knows why
-        // the node is not yet acting on it.
-        match self.directory.lookup_public_key(subject_key_id).await {
-            Ok(Some(row))
-                if row.claims_role(
-                    crate::replication::bridge::FederationDirectoryReplicationBridge::SERVE_CAPABILITY,
-                ) =>
-            {
-                tracing::warn!(
-                    subject = %subject_key_id,
-                    "row CLAIMS infra:serve but the owner-conferred rung has no \
-                     resolver yet (CIRISPersist#788) — resolving tier NONE, \
-                     fail-closed: this node will hold bodies and serve only its \
-                     own record until the conferral can be verified"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    subject = %subject_key_id,
-                    error = %e,
-                    "serve-tier claim probe read FAILED (informational only — \
-                     the resolution was already tier none)"
-                );
-            }
-        }
-        ServeTier::None
     }
 }
 

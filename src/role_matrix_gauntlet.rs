@@ -482,6 +482,7 @@ fn r12_fedcode_is_self_contained_and_binding_checked() {
         transport_hint: Some("https://example.invalid".into()),
         alias_hint: None,
         group_key_id: None,
+        owned_nodes: Vec::new(),
     })
     .expect("encode");
     let parsed = crate::contact::parse_contact_input(&code).expect("a good code decodes");
@@ -503,6 +504,7 @@ fn r12_fedcode_is_self_contained_and_binding_checked() {
         transport_hint: None,
         alias_hint: None,
         group_key_id: None,
+        owned_nodes: Vec::new(),
     })
     .expect("a forgery encodes fine");
     assert!(

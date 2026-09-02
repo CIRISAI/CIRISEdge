@@ -300,6 +300,28 @@ pub struct CodeAdmission {
     pub transport_hint: Option<String>,
     /// Display-only alias the sender suggested. Never an authorization input.
     pub alias_hint: Option<String>,
+    /// CIRISVerify#269 (fedcode v3) — the subject's own nodes, each with the
+    /// transport pubkey a destination is derived from.
+    ///
+    /// Empty for a v1/v2 code, which names a person and not their nodes. When
+    /// non-empty this is what makes a stranger REACHABLE without the directory:
+    /// first contact, a QR across a table, an air-gapped hand-off.
+    ///
+    /// Lightnet only, by the format's own rule: federation-scope identity that
+    /// already announces publicly. A code never carries group-scoped material,
+    /// whose destinations are derived rather than emitted (CC 5.4.6).
+    pub owned_nodes: Vec<CodeOwnedNode>,
+}
+
+/// One node a code names, with the material to reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeOwnedNode {
+    /// The node's federation `key_id` — an identifier, not an address.
+    pub key_id: String,
+    /// The node's TRANSPORT Ed25519 public key, base64. A destination is
+    /// derived from this; the node's federation key is a different key for a
+    /// different job, and conflating them is the #541 split in miniature.
+    pub transport_pubkey_ed25519_base64: String,
 }
 
 /// One pasted string, classified.
@@ -384,6 +406,14 @@ pub fn parse_contact_input(raw: &str) -> Result<ContactCandidate, LadderStall> {
             identity_type,
             transport_hint: decoded.transport_hint,
             alias_hint: decoded.alias_hint,
+            owned_nodes: decoded
+                .owned_nodes
+                .into_iter()
+                .map(|n| CodeOwnedNode {
+                    key_id: n.key_id,
+                    transport_pubkey_ed25519_base64: n.transport_pubkey_ed25519_base64,
+                })
+                .collect(),
         }),
     })
 }
@@ -509,11 +539,13 @@ pub enum ContactResolution {
     /// `admission` registers the key so the stranger's signatures verify;
     /// nothing further needs to converge first.
     ///
-    /// **`subject.nodes` is empty**: a user code names a person, not their
-    /// nodes, and a stranger has no owner bindings here. Reach them through
-    /// [`CodeAdmission::transport_hint`], which travels with the key for
-    /// exactly this reason. No hint means the code gives you an identity you
-    /// can verify and no way to contact them yet.
+    /// **Reachability depends on the code's version.** A **v3** code names the
+    /// subject's own nodes ([`CodeAdmission::owned_nodes`], each with the
+    /// transport pubkey a destination derives from), and `subject.nodes` holds
+    /// them — real node ids, dialable without the directory. A **v1/v2** code
+    /// names only a person, so `subject.nodes` is EMPTY and the fallback is
+    /// [`CodeAdmission::transport_hint`]. Neither present means the code gives
+    /// an identity you can verify and no way to contact them yet.
     ///
     /// This is the shape the earlier `AdmitThenRetry` got wrong. It told the
     /// caller to admit and re-resolve, but a re-resolve runs
@@ -699,7 +731,15 @@ fn subject_from_code(candidate: &ContactCandidate, admission: &CodeAdmission) ->
     );
     Subject {
         fed_id: candidate.key_id.clone(),
-        nodes: Vec::new(),
+        // A v3 code NAMES the subject's nodes, so this is finally honest: real
+        // node ids, each with the transport pubkey a destination derives from.
+        // A v1/v2 code names only a person, and an empty list says so rather
+        // than putting a person key where a node id belongs.
+        nodes: admission
+            .owned_nodes
+            .iter()
+            .map(|n| n.key_id.clone())
+            .collect(),
         resolved_from: candidate.kind.clone(),
     }
 }
@@ -1445,6 +1485,7 @@ mod tests {
             transport_hint: Some("https://example.invalid".to_string()),
             alias_hint: Some("Frank".to_string()),
             group_key_id: None,
+            owned_nodes: Vec::new(),
         })
         .expect("encode");
         (code, key_id)
@@ -1550,6 +1591,7 @@ mod tests {
                 transport_hint: None,
                 alias_hint: None,
                 group_key_id: None,
+                owned_nodes: Vec::new(),
             };
             match super::verify_code_binds_its_key(&hand_crafted) {
                 Err(LadderStall::MalformedCode { detail }) => {
@@ -1620,6 +1662,7 @@ mod tests {
             transport_hint: None,
             alias_hint: Some("Totally The Victim".to_string()),
             group_key_id: None,
+            owned_nodes: Vec::new(),
         })
         .expect("a forgery encodes perfectly well — that is the point");
 
@@ -1700,6 +1743,62 @@ mod tests {
         }
     }
 
+    /// CIRISVerify#269 — a v3 code NAMES the subject's nodes, so `Subject.nodes`
+    /// is finally real node ids.
+    ///
+    /// v1/v2 named only a person, which is why an empty list was the honest
+    /// answer there; a person key in a NODE list made callers dial a person as
+    /// a node. v3 carries `owned_nodes`, each with the transport pubkey a
+    /// destination derives from — reachable without the directory, which is the
+    /// whole point for first contact.
+    #[tokio::test]
+    async fn a_v3_code_names_the_subjects_nodes() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut pubkey = [0u8; 32];
+        pubkey[0] = 31;
+        let key_id = ciris_verify_core::fedcode::derive_key_id("v3person", &pubkey);
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+            kind: ciris_verify_core::fedcode::FedKind::User,
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64: b64.encode(pubkey),
+            transport_hint: None,
+            alias_hint: None,
+            group_key_id: None,
+            owned_nodes: vec![ciris_verify_core::fedcode::OwnedNode {
+                key_id: "their-laptop-abc234def5".to_string(),
+                transport_pubkey_ed25519_base64: b64.encode([9u8; 32]),
+            }],
+        })
+        .expect("encode");
+
+        let empty = FakeLens {
+            types: std::collections::HashMap::new(),
+            owners: std::collections::HashMap::new(),
+            nodes: std::collections::HashMap::new(),
+        };
+        match super::resolve_contact(&empty, &code).await {
+            Ok(super::ContactResolution::ReadyFromCode { subject, admission }) => {
+                assert_eq!(subject.fed_id, key_id, "fed_id is still the PERSON");
+                assert_eq!(
+                    subject.nodes,
+                    vec!["their-laptop-abc234def5".to_string()],
+                    "and nodes are the NODES the code names — not the person key"
+                );
+                assert_eq!(admission.owned_nodes.len(), 1);
+                assert!(
+                    !admission.owned_nodes[0]
+                        .transport_pubkey_ed25519_base64
+                        .is_empty(),
+                    "the transport pubkey is what a destination derives from — \
+                     the node's federation key is a different key for a \
+                     different job"
+                );
+            }
+            other => panic!("a v3 stranger code should be ready to use: {other:?}"),
+        }
+    }
+
     /// CIRISEdge#526 — a STRANGER's node/agent code never puts a machine in
     /// the person slot.
     ///
@@ -1734,6 +1833,7 @@ mod tests {
                 transport_hint: Some("https://example.invalid".into()),
                 alias_hint: None,
                 group_key_id: None,
+                owned_nodes: Vec::new(),
             })
             .expect("encode");
 
@@ -1795,6 +1895,7 @@ mod tests {
             transport_hint: None,
             alias_hint: None,
             group_key_id: None,
+            owned_nodes: Vec::new(),
         })
         .expect("encode");
 
@@ -1842,6 +1943,7 @@ mod tests {
             transport_hint: None,
             alias_hint: None,
             group_key_id: Some(key_id.clone()),
+            owned_nodes: Vec::new(),
         })
         .expect("encode");
 
@@ -1885,6 +1987,7 @@ mod tests {
             transport_hint: None,
             alias_hint: None,
             group_key_id: None,
+            owned_nodes: Vec::new(),
         })
         .expect("encode");
 
@@ -1921,6 +2024,7 @@ mod tests {
             transport_hint: None,
             alias_hint: None,
             group_key_id: None,
+            owned_nodes: Vec::new(),
         })
         .expect("encode");
 

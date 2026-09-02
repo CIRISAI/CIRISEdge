@@ -61,7 +61,7 @@ delegate (CC 4 scope table).
 | tier | established by | may do | trusted for | resolving check |
 |---|---|---|---|---|
 | **none** | — | hold own records; answer a subject Pull for **itself** and for **its own record** | nothing beyond its own signatures | (absence) |
-| **mesh server** | owner's `delegates_to(owner → node, [infra:serve])` | **store & serve to help the mesh**: carries the directory as HASHES and serves bodies BY HASH. Does NOT answer identifier lookups — answering one requires the body, and it has chosen not to hold them | *nothing* — and needs no trust: everything served is a self-authenticating signed envelope, re-verified at the receiver's admission gate | own row `claims_role(infra:serve)` **∧** the owner's grant bears the scope (a claim alone is *"visibility, never conferral"* — persist v19.0.0 `lift_envelope_attested_roles`) |
+| **mesh server** | owner's `delegates_to(owner → node, [infra:serve])` — resolver-INDEPENDENT, since an owner's conferral over its own node does not depend on who is asking | **store & serve to help the mesh**: carries the directory as HASHES and serves bodies BY HASH. Does NOT answer identifier lookups — answering one requires the body, and it has chosen not to hold them | *nothing* — and needs no trust: everything served is a self-authenticating signed envelope, re-verified at the receiver's admission gate | own row `claims_role(infra:serve)` **∧** the owner's grant bears the scope (a claim alone is *"visibility, never conferral"* — persist v19.0.0 `lift_envelope_attested_roles`) |
 | **canonical** | 2-of-3 accord co-scrub over a `canonical,node` registration envelope bearing `roles: ["infra:serve"]` (CC 4.4.3.8 — the same ceremony that mints a portable trust root) | holds the directory as **BODIES**, so it is the tier that answers **identifier lookups** (rate limited per requester) — and be relied on before verification is possible | **bootstrap**: the `CanonicalBootstrapPeer` set, rooting a fresh fleet, the E3 trace-plane serve gate | leg A: `has_accord_conferred_role` — the co-scrub **re-derived from the row's own cryptography** every call, so a withdrawn blessing bites immediately; leg B: `capability_roots_to_trusted_root` — chains to the resolver's root (see Axis 5) |
 
 The load-bearing distinction: a mesh server helps **after** trust exists
@@ -181,10 +181,13 @@ production never resolved a tier at all. A decision table cannot catch an
 unwired decision. R0 drives the bridge through the trait method production
 calls and asserts the resolver was consulted.
 
-Axis-3 resolution status: the canonical rung resolves live (leg A ∧ leg B);
-the owner-conferred rung is fail-closed pending **CIRISPersist#788** (the
-`resolve_serve_tier` + `ServeGrants` projection ask) — a claim without a
-verifiable conferral resolves `None`, loudly.
+Axis-3 resolution status: **both rungs live** as of persist v38.8.0
+(CIRISPersist#788). Edge delegates to `resolve_serve_tier` rather than
+re-deriving either — the walk reuses persist's one scope-parse and one
+CEG-tombstone fold, and forking either into a consumer doubles the policy the
+FSD insists lives in a single authority. `claims_role` alone still buys
+nothing: lifting an envelope-attested role creates VISIBILITY, never
+conferral.
 
 | decision | keys on | correct check | status in code |
 |---|---|---|---|
