@@ -1652,15 +1652,21 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     );
 
     // ── 5. The federation signer, from this node's own seed ──────────
-    let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
-        key_id: cfg.node_id.clone(),
-        key_path: cfg.state_dir.join("fed/ed25519.seed"),
-        pqc_key_id: None,
-        pqc_key_path: None,
-    })
-    .await
-    .map_err(|e| format!("load_local_seed: {e}"))?;
-    let signer = Arc::new(LocalSigner::new(cfg.node_id.clone(), classical, None));
+    // The HYBRID signer, not a classical-only one.
+    //
+    // The transport self-publishes its own hybrid-signed
+    // `SignedTransportDestination` at construction (CIRISEdge#406) — the
+    // producer for the #393 item-2 gate, and therefore the thing that lets a
+    // peer's link become attributed at all. That producer is FAIL-OPEN and one
+    // of its documented failure modes is exactly "Ed25519-only signer": it
+    // warns and carries on, no row is ever written, item 2 can never be
+    // satisfied, and every inbound frame arrives with `source_key_id: None`
+    // forever. Which is what the harness measured — 75 unattributed frames per
+    // node, per run.
+    //
+    // Same class as the owner binding: classical-only where the federation tier
+    // is PQC-mandatory. `FedKey` already carries both halves.
+    let signer = Arc::new(fed.local_signer(&cfg.node_id)?);
 
     // ── 6. The real transport, on the real docker network ────────────
     //
