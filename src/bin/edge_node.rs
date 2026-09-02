@@ -1005,6 +1005,34 @@ struct Mailbox {
 ///
 /// `listen` may be called exactly once per transport, so this is the one
 /// place that does it.
+/// What the listener did with inbound frames.
+///
+/// Reported in `ladder.discover_by_fedid`'s detail because the JSONL is this
+/// harness's real instrument — `tracing` output is a log a reader may or may
+/// not have. If discovery fails, these four numbers say WHERE: no frames at
+/// all is a transport problem, frames routed but nothing converging is a
+/// replication problem, and `not_replication` counting everything means the
+/// peer is not speaking the protocol we think it is.
+#[derive(Default, Debug)]
+struct InboundStats {
+    routed: std::sync::atomic::AtomicUsize,
+    not_replication: std::sync::atomic::AtomicUsize,
+    unattributed: std::sync::atomic::AtomicUsize,
+    errors: std::sync::atomic::AtomicUsize,
+}
+
+impl InboundStats {
+    fn as_json(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        serde_json::json!({
+            "routed": self.routed.load(Relaxed),
+            "not_replication": self.not_replication.load(Relaxed),
+            "unattributed": self.unattributed.load(Relaxed),
+            "errors": self.errors.load(Relaxed),
+        })
+    }
+}
+
 /// Drain the transport, splitting harness frames from REPLICATION frames.
 ///
 /// `Transport::listen` claims the node's single event receiver, so whoever
@@ -1021,6 +1049,7 @@ struct Mailbox {
 fn spawn_inbound(
     transport: &Arc<ReticulumTransport>,
     replication: Arc<ciris_edge::replication::ReplicationRegistry>,
+    stats: Arc<InboundStats>,
 ) -> Arc<Mailbox> {
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(4096);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
@@ -1040,8 +1069,9 @@ fn spawn_inbound(
             let Some((kind, header, payload)) = decode_frame(&frame.envelope_bytes) else {
                 // Not harness framing — hand it to replication before giving up
                 // on it. This is THE line the module docs ask the operator for.
+                use std::sync::atomic::Ordering::Relaxed;
                 let Some(peer) = src.as_deref() else {
-                    tracing::debug!("dropping an unattributed non-harness frame");
+                    stats.unattributed.fetch_add(1, Relaxed);
                     continue;
                 };
                 match replication
@@ -1049,10 +1079,16 @@ fn spawn_inbound(
                     .await
                 {
                     Ok(ciris_edge::replication::RouteOutcome::NotAReplicationFrame) => {
-                        tracing::debug!(%peer, "dropping a frame that is neither harness nor replication");
+                        stats.not_replication.fetch_add(1, Relaxed);
                     }
-                    Ok(outcome) => tracing::trace!(%peer, ?outcome, "routed a replication frame"),
-                    Err(e) => tracing::warn!(%peer, error = %e, "replication routing failed"),
+                    Ok(outcome) => {
+                        stats.routed.fetch_add(1, Relaxed);
+                        tracing::trace!(%peer, ?outcome, "routed a replication frame");
+                    }
+                    Err(e) => {
+                        stats.errors.fetch_add(1, Relaxed);
+                        tracing::warn!(%peer, error = %e, "replication routing failed");
+                    }
                 }
                 continue;
             };
@@ -1408,6 +1444,9 @@ struct Occurrence {
     /// The real anti-entropy runtime. Owner bindings reach peers through this
     /// and nothing else — the harness seeds no state into any peer.
     replication: Arc<ciris_edge::replication::ReplicationRuntime>,
+    /// What the listener did with inbound frames — reported by the discovery
+    /// leg so a failure says WHERE, not just that it failed.
+    inbound_stats: Arc<InboundStats>,
     transport: Arc<ReticulumTransport>,
     mailbox: Arc<Mailbox>,
     table: Arc<ScopeAddressTable>,
@@ -1717,11 +1756,17 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
 
     // The listener LAST: it claims the transport's single event receiver and
     // must be able to hand replication frames to a live registry.
-    let mailbox = spawn_inbound(&transport, replication.registry());
+    let inbound_stats = Arc::new(InboundStats::default());
+    let mailbox = spawn_inbound(
+        &transport,
+        replication.registry(),
+        Arc::clone(&inbound_stats),
+    );
 
     Ok(Occurrence {
         cfg,
         replication,
+        inbound_stats,
         transport,
         mailbox,
         table,
@@ -2013,6 +2058,7 @@ async fn run_discover_by_fedid_leg(
                 "reachable_expected_node": reachable,
                 "converged_ms": waited_ms,
                 "attempts": attempts,
+                "inbound": occ.inbound_stats.as_json(),
                 "covers": "fedID -> person -> owned nodes -> addressable, against the \
                            peer's owner binding learned over the wire",
             }),
@@ -2048,6 +2094,7 @@ async fn run_discover_by_fedid_leg(
                 "attempts": attempts,
                 "identity_type": has_key_record,
                 "owned_nodes": owned,
+                "inbound": occ.inbound_stats.as_json(),
             }),
         );
     }
@@ -3890,10 +3937,26 @@ async fn run_nonmember(occ: Occurrence) -> Result<(), String> {
 // ═══════════════════════════════════════════════════════════════════
 
 fn main() -> std::process::ExitCode {
-    // No `tracing_subscriber` init: it is a dev-dependency, and a
-    // `[[bin]]` compiles against `[dependencies]` only. The JSONL on
-    // stdout is the instrument; `tracing` events compile and are
-    // available to any consumer that installs a subscriber.
+    // Logs to STDERR (the JSONL owns stdout, and mixing them would corrupt the
+    // census's input). Default `info`, overridable with `RUST_LOG`.
+    //
+    // This used to be absent, with a comment explaining that `tracing_subscriber`
+    // was a dev-dependency and a `[[bin]]` compiles against `[dependencies]`
+    // only. True, and the consequence was that every `tracing::error!` in this
+    // binary went nowhere: five consecutive mesh failures were investigated with
+    // the diagnostics that would have named the fault compiled in and silent.
+    // The dependency is now optional behind `mesh-harness`, which costs library
+    // consumers nothing.
+    #[cfg(feature = "mesh-harness")]
+    {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let _ = fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+    }
     //
     // Reticulum needs a genuine multi-thread runtime.
     let rt = match tokio::runtime::Builder::new_multi_thread()

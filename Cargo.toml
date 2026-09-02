@@ -533,6 +533,12 @@ hex         = "0.4"
 # Errors / logs
 thiserror   = "1"
 tracing     = "0.1"
+# CIRISEdge#554 — the mesh-harness binary's log subscriber. OPTIONAL, enabled
+# only by `mesh-harness`, so library consumers and every PyO3 wheel are
+# unaffected. Without it the `edge_node` binary installed NO subscriber, so
+# every `tracing::info!`/`error!` it emitted went nowhere — five consecutive
+# mesh runs were debugged blind with the diagnostics compiled in and silent.
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Federation-session KEX (CIRISEdge#54). `zeroize` for explicit
 # scrub of session keys + KEX private material — same crate used
@@ -975,6 +981,9 @@ default = []
 # trust-root check and must NEVER be present in a shipped wheel. The mesh-repro
 # QA harness (CIRISServer#258) is the only consumer that enables it.
 test-anchor = ["ciris-persist/test-anchor", "ciris-verify-core/test-anchor"]
+
+# The bench-mesh harness binary's log subscriber (see the optional dep above).
+mesh-harness = ["dep:tracing-subscriber"]
 
 # v1.1.7 (CIRISEdge#58) — opt-in panic + hang diagnostic harness.
 #
@@ -1619,4 +1628,4 @@ incremental = false
 [[bin]]
 name = "edge_node"
 path = "src/bin/edge_node.rs"
-required-features = ["transport-reticulum"]
+required-features = ["transport-reticulum", "mesh-harness"]
