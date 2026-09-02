@@ -1005,7 +1005,23 @@ struct Mailbox {
 ///
 /// `listen` may be called exactly once per transport, so this is the one
 /// place that does it.
-fn spawn_inbound(transport: &Arc<ReticulumTransport>) -> Arc<Mailbox> {
+/// Drain the transport, splitting harness frames from REPLICATION frames.
+///
+/// `Transport::listen` claims the node's single event receiver, so whoever
+/// calls it owns every inbound frame. The harness used to decode its own
+/// `MESH1` framing and DROP everything else with a debug line — which meant
+/// every replication frame a peer sent was thrown away. Rounds went out,
+/// nothing came back, and the Attestation plane never converged: exactly the
+/// `owned_nodes: []` the census reported, with no error anywhere.
+///
+/// Edge says so explicitly (`replication::runtime` module docs): *"Wiring the
+/// registry's `route_inbound_bytes` INTO that loop is operator code (a one-line
+/// addition to the application's listen-handler), not edge's job."* The harness
+/// is the operator here and had not written the line.
+fn spawn_inbound(
+    transport: &Arc<ReticulumTransport>,
+    replication: Arc<ciris_edge::replication::ReplicationRegistry>,
+) -> Arc<Mailbox> {
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(4096);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let (med_tx, med_rx) = mpsc::unbounded_channel();
@@ -1022,7 +1038,22 @@ fn spawn_inbound(transport: &Arc<ReticulumTransport>) -> Arc<Mailbox> {
         while let Some(frame) = rx.recv().await {
             let src = frame.source_key_id.as_ref().map(|k| k.as_str().to_owned());
             let Some((kind, header, payload)) = decode_frame(&frame.envelope_bytes) else {
-                tracing::debug!("dropping a non-harness inbound frame");
+                // Not harness framing — hand it to replication before giving up
+                // on it. This is THE line the module docs ask the operator for.
+                let Some(peer) = src.as_deref() else {
+                    tracing::debug!("dropping an unattributed non-harness frame");
+                    continue;
+                };
+                match replication
+                    .route_inbound_bytes(peer, &frame.envelope_bytes)
+                    .await
+                {
+                    Ok(ciris_edge::replication::RouteOutcome::NotAReplicationFrame) => {
+                        tracing::debug!(%peer, "dropping a frame that is neither harness nor replication");
+                    }
+                    Ok(outcome) => tracing::trace!(%peer, ?outcome, "routed a replication frame"),
+                    Err(e) => tracing::warn!(%peer, error = %e, "replication routing failed"),
+                }
                 continue;
             };
             match kind {
@@ -1620,8 +1651,6 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         cfg.convergence,
     ));
 
-    let mailbox = spawn_inbound(&transport);
-
     // ── 8. THE REPLICATION PLANE ─────────────────────────────────────
     //
     // Without this the harness has no anti-entropy at all: each node held
@@ -1685,6 +1714,10 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         )
         .await,
     );
+
+    // The listener LAST: it claims the transport's single event receiver and
+    // must be able to hand replication frames to a live registry.
+    let mailbox = spawn_inbound(&transport, replication.registry());
 
     Ok(Occurrence {
         cfg,
