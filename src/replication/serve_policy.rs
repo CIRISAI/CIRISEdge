@@ -77,18 +77,28 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
     // every other kind is NOT subject-pullable (`none`). This column is the
     // coordinated-cut witness CIRISServer pins alongside `serve`.
     let receive = match kind {
-        // CIRISEdge#552 — on these four planes a Pull is also answered when the
-        // SUBJECT IS THE RESPONDING NODE ITSELF, which is exactly what the
-        // `self_own` advertise projection already hands every peer. Not "any
-        // attributed requester for any subject": `subject_holdings_inner` does
-        // an arbitrary directory lookup, so that would make a body-holding
-        // server an address-book oracle for subjects it never advertised.
-        // Derived from `is_public_subject_pull` (test-locked below).
+        // ROLE_MATRIX Axis 3 — on these four planes a Pull is answered for the
+        // data subject, for the RESPONDING NODE'S OWN record (what `self_own`
+        // already hands every peer), and — when the responder is CANONICAL —
+        // for any subject from an attributed requester.
+        //
+        // Canonical rather than any conferred server, because answering
+        // requires the BODY and a mesh server carries hashes. That is also
+        // where the anti-harvest property lives: bodies concentrate at few
+        // accountable nodes, the lookup is rate limited per requester, and it
+        // cannot enumerate on its own — the requester must NAME the subject. The identity plane is public (announced, attributable, no
+        // anonymity claim; the invisibility property lives on the GROUP plane,
+        // by derivation); a conferred server answering identifier lookups is
+        // what carrying the directory MEANS, and it is how a fedID alone
+        // reaches a stranger. An unconferred node still answers only for
+        // itself, so the enumeration surface stays with nodes that opted into
+        // the corpus. Derived from `is_public_subject_pull` (test-locked below).
         EnvelopeKind::Key
         | EnvelopeKind::IdentityOccurrence
         | EnvelopeKind::TransportDestination
         | EnvelopeKind::IdentityOccurrenceRevocation => {
-            "subject_pull:data_subject+own_record; within self_own projection"
+            "subject_pull:data_subject+own_record; +any_attributed when the \
+             responder is CANONICAL (holds bodies; ROLE_MATRIX axis 3)"
         }
         EnvelopeKind::Attestation => {
             "subject_pull:data_subject+sender; subject-only; \
@@ -169,27 +179,35 @@ pub fn serve_advertise_policy_sha256() -> String {
 // changed — this is the manifest catching up to the code it witnesses.
 // **CIRISServer must mirror**: re-pin from 328d73b0… to 20499cab….
 //
-// CIRISEdge#552 — RE-PINNED, 20499cab… → e54c5677…. On the four
-// unconditionally-`public` planes (Key, IdentityOccurrence,
-// TransportDestination, IdentityOccurrenceRevocation) a subject Pull is now
-// ALSO answered when the subject is the RESPONDING NODE ITSELF.
+// CIRISEdge#552 — RE-PINNED, 20499cab… → c0a13e03…. On the four
+// unconditionally-`public` planes a subject Pull is answered for the data
+// subject, for the responding node's OWN record, and — when the responder is
+// CANONICAL — for any subject from an attributed requester, rate limited per
+// requester.
 //
-// Bounded deliberately at the node's own record, because `serve: public` and
-// `advertise: self_own` answer different questions. `public` means no
-// capability gate once a record reaches you; `self_own` decides which records
-// reach you at all. `subject_holdings_inner` does an arbitrary directory
-// lookup, so answering any attributed requester about any subject would let a
-// peer probe identifiers for third-party keys and routes that never appeared in
-// its Summaries — a body-holding server as address-book oracle, and the end of
-// the opaque-directory property. The own-record arm stays inside what
-// `self_own` already advertises, so it is disclosure-neutral in fact.
+// Canonical rather than "any conferred server", and the reason is mechanical
+// before it is policy: answering an identifier lookup requires the BODY
+// (`subject_holdings_inner` resolves through `lookup_public_key`, and
+// persist's subject-scoped reads are built from held records — there is no
+// body-free identifier path in the stack). A mesh server carries the directory
+// as HASHES and serves bodies by hash, so it cannot answer whatever it is
+// entitled to. An earlier revision keyed this to any conferred server and was
+// therefore unsatisfiable.
 //
-// It recovers "you signed a row I cannot verify — send me your key". A
-// THIRD-PARTY signer stays unfetchable by identifier; that needs a separately
-// authorized, rate-limited resolver. `Attestation` is untouched.
-// **CIRISServer must mirror this pin.**
+// That also puts the anti-harvest property where it belongs. The identity plane
+// is public — announced, attributable, no anonymity claim; the invisibility
+// property lives on the GROUP plane, by derivation (CC 5.4.6). What this bounds
+// is bulk HARVESTING: bodies concentrate at canonicals (few, accountable, rate
+// limited), mesh servers can be scraped for "these records exist" and nothing
+// more, and the identifier Pull cannot enumerate on its own because the
+// requester must NAME the subject. Friction on a public plane, never
+// confidentiality (CC 1.13.3.1).
+//
+// `Attestation` is untouched: per-row entitlement (trace:* → capability, the G2
+// carve). **CIRISServer must mirror this pin** (supersedes e8216fec…,
+// e54c5677… and 75ceef58…, none of which shipped server-side).
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "e54c56775e8d56442f9fdbaa0346397cdc169e7cc6237f5a6fe71681710dbf25";
+    "c0a13e031815163ac6972538a0597aff3d3396373f2e1f7d4fdbe3aa28e7d4b3";
 
 #[cfg(test)]
 mod tests {

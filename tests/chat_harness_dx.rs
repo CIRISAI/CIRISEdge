@@ -18,32 +18,117 @@ use ciris_edge::invite_gate::{InviteGate, InviteVerdict, RefuseReason, Ts};
 use ciris_edge::replication::ReplicationRuntimeConfig;
 use ciris_edge::AgentMode;
 
-/// §0 — the two fields a Rust composer must set itself, because the Python
-/// entry point sets them and a default-constructed config does not.
+/// §0 — the ONE field a Rust composer must set itself: `local_key_id`. The
+/// serve-tier resolver, the own-record Pull arm, and missing-signer recovery
+/// are all keyed on it, and a default-constructed config leaves it `None` —
+/// silently inert, not broken.
+///
+/// `AgentMode` is deliberately NOT here any more: `BridgeConfig` has no mode
+/// field. The directory role (retention, identifier lookups) keys on the
+/// node's own `infra:serve` conferral, resolved from the directory
+/// (ROLE_MATRIX axis 3) — conferred by the owner, blessed by the trust root
+/// for canonicals. Mode stays what it always was: listener + queue posture on
+/// the Edge itself.
 #[test]
 fn the_wiring_the_guide_says_is_mandatory_exists() {
-    let mut config = ReplicationRuntimeConfig::default();
-
-    config.bridge.mode = AgentMode::Server;
-    config.local_key_id = Some("node-abc123".to_string());
-
-    assert!(
-        matches!(config.bridge.mode, AgentMode::Server),
-        "§0 tells the server to set bridge.mode; it must remain settable"
-    );
+    let config = ReplicationRuntimeConfig {
+        local_key_id: Some("node-abc123".to_string()),
+        ..Default::default()
+    };
     assert!(
         config.local_key_id.is_some(),
-        "§0 tells the server to set local_key_id; without it the Pull responder \
-         cannot recognise a request for its own record"
+        "§0 tells the server to set local_key_id; without it the serve-tier \
+         resolver cannot run and the Pull responder cannot recognise its own \
+         record"
     );
 
-    // And the default really is the quiet one the guide warns about.
-    let default = ReplicationRuntimeConfig::default();
+    // AgentMode still exists — on the Edge, for listener/queue. Its absence
+    // from BridgeConfig is the point: the v18.12.1 mis-key is unrepresentable.
+    assert!(matches!(AgentMode::default(), AgentMode::Proxy));
+}
+
+/// §6 — the stranger-contact surface the guide's code block calls, and the
+/// shape of its success case.
+///
+/// Pinned because the guide tells the server to use `subject` DIRECTLY after
+/// admission rather than re-resolving. An earlier revision returned
+/// "admit, then retry", and that retry could never succeed: it runs
+/// `nodes_owned_by` against the directory, where a stranger has no
+/// owner-binding attestations. If this ever compiles back to a retry shape,
+/// the guide is teaching a loop that never terminates.
+#[test]
+fn the_stranger_contact_surface_matches_the_guide() {
+    use base64::Engine as _;
+    use ciris_edge::contact::LadderStall;
+
+    // A code minted the way a sender's node would.
+    let mut pubkey = [0u8; 32];
+    pubkey[0] = 77;
+    let key_id = ciris_verify_core::fedcode::derive_key_id("stranger", &pubkey);
+    let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+        kind: ciris_verify_core::fedcode::FedKind::User,
+        key_id: key_id.clone(),
+        pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
+        transport_hint: Some("https://example.invalid".into()),
+        alias_hint: None,
+        group_key_id: None,
+    })
+    .expect("encode");
+
+    // §6: classification never demotes a code to an identifier.
+    let candidate = ciris_edge::contact::parse_contact_input(&code).expect("decodes");
+    let admission = candidate
+        .admission
+        .expect("a code carries the key to admit");
+    assert_eq!(admission.key_id, key_id);
+    assert_eq!(admission.identity_type, "user");
     assert!(
-        matches!(default.bridge.mode, AgentMode::Proxy),
-        "the guide says the default is Proxy and looks correct while behaving \
-         as a proxy — if that changes, §0's warning is wrong"
+        admission.transport_hint.is_some(),
+        "v2 carries the transport hint"
     );
+
+    // §6: a forged code is refused, and the guide says do not admit it.
+    let forged = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
+        kind: ciris_verify_core::fedcode::FedKind::User,
+        key_id,
+        pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode([0xAA_u8; 32]),
+        transport_hint: None,
+        alias_hint: None,
+        group_key_id: None,
+    })
+    .expect("a forgery encodes fine — the CRC cannot see authorship");
+    assert!(
+        matches!(
+            ciris_edge::contact::parse_contact_input(&forged),
+            Err(LadderStall::CodeIdentityMismatch { .. })
+        ),
+        "§6 tells the server to refuse this without admitting"
+    );
+
+    // §6: the success variant the guide destructures is pinned by
+    // `the_ready_from_code_shape` at module scope.
+}
+
+/// §6 — the success variant the guide's code block destructures.
+///
+/// Compile-only: building one needs a lens, but the SHAPE is what the guide
+/// depends on. `ReadyFromCode` carrying a USABLE `Subject` is the whole fix —
+/// an earlier "admit, then retry" shape could never terminate, because the
+/// retry ran `nodes_owned_by` against a directory where a stranger has no
+/// owner-binding attestations.
+#[allow(dead_code)]
+fn the_ready_from_code_shape(r: ciris_edge::contact::ContactResolution) {
+    use ciris_edge::contact::ContactResolution;
+    match r {
+        ContactResolution::Known(subject) => {
+            let _: String = subject.fed_id;
+        }
+        ContactResolution::ReadyFromCode { subject, admission } => {
+            // Usable immediately: nodes to dial, no directory round-trip.
+            let _: Vec<String> = subject.nodes;
+            let _: String = admission.key_id;
+        }
+    }
 }
 
 /// §1 — the rung vocabulary, and `previous()` for pointing at the right place.

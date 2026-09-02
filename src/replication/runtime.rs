@@ -130,6 +130,27 @@ fn build_bridge(
         )
         .with_self_provider(self_provider)
         .with_local_key_id(config.local_key_id.clone())
+        .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
+        // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
+        // legs live (leg A ∧ leg B against this node's own trust base), the
+        // owner-conferred rung fail-closed pending CIRISPersist#788. Installed
+        // iff a local identity exists, because leg B and the cache subject are
+        // both keyed on it; without one the tier stays fail-closed `None`.
+        .with_serve_tier_resolver(
+            config
+                .serve_tier_subject_key_id
+                .clone()
+                .or_else(|| config.local_key_id.clone())
+                .map(|local| {
+                    std::sync::Arc::new(
+                        crate::replication::serve_tier::DirectoryServeTierResolver::new(
+                            Arc::clone(directory),
+                            local,
+                        ),
+                    )
+                        as std::sync::Arc<dyn crate::replication::serve_tier::ServeTierResolver>
+                }),
+        )
         .with_metrics(config.metrics.clone())
         .with_mesh_config(mesh_config)
         // Workstream F — installed iff the operator turned enforcement ON. See
@@ -441,6 +462,18 @@ pub struct ReplicationRuntimeConfig {
     /// cannot evaluate its own trust. The server supplies the same
     /// `node_key_id` it already threads into consent-peer resolution.
     pub local_key_id: Option<String>,
+    /// CIRISEdge#541/#552 — the subject whose SERVING TIER is resolved.
+    ///
+    /// Distinct from `local_key_id` on purpose. `local_key_id` is the truster
+    /// for the E3 trace gate's leg B and the subject of the own-record Pull
+    /// arm; the tier is a property of the identity peers REGISTERED and
+    /// conferred against, which under `use_node_identity` is the node, not the
+    /// actor. Redefining `local_key_id` would have moved a security path's
+    /// truster identity as a side effect.
+    ///
+    /// Falls back to `local_key_id` when unset — correct for every deployment
+    /// where the two identities coincide.
+    pub serve_tier_subject_key_id: Option<String>,
     /// Workstream F — does this node ENFORCE the `accord:*` relay predicate?
     /// `true` installs the
     /// [`AccordRelayGate`](crate::replication::accord_relay_gate::AccordRelayGate)

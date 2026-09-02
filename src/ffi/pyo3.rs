@@ -2495,14 +2495,12 @@ impl PyEdge {
         if let Some(secs) = cadence_seconds {
             config.scheduler.cadence = std::time::Duration::from_secs(secs);
         }
-        // CIRISEdge#552 — carry the Edge's OWN agent_mode into the bridge.
-        // `BridgeConfig::mode` selects retention, and this entry point built the
-        // config from `Default`, so an Edge initialized with agent_mode="server"
-        // still constructed a `Proxy` bridge: every production round chose
-        // `Bodies` and the mode flag did nothing at all through the shipped host
-        // path. The mode belongs to the Edge, so it is read from the Edge rather
-        // than re-parsed or passed again by the caller.
-        config.bridge.mode = self.inner.agent_mode();
+        // ROLE_MATRIX Axis 3 — `BridgeConfig` deliberately has NO mode field
+        // any more. Retention and directory-serving key on the node's OWN
+        // `infra:serve` conferral, resolved from the directory by the runtime's
+        // serve-tier resolver (installed off `local_key_id` below); `AgentMode`
+        // is the local-resources posture and keying the directory role on it
+        // was the one-variable-two-jobs bug that shipped in v18.12.1.
         // CIRISEdge#552 — and its own key_id, for the same reason: the Pull
         // responder answers an identifier request for THIS NODE'S OWN record,
         // which it cannot recognise without knowing which key_id that is. Left
@@ -2510,6 +2508,11 @@ impl PyEdge {
         // inert through the shipped host path — the same silent-default failure
         // as the mode above, in the same function.
         config.local_key_id = Some(self.inner.signer_key_id().to_string());
+        // CIRISEdge#541 — and the TIER subject separately: the conferral is
+        // granted against the identity peers know this node as. These coincide
+        // unless `use_node_identity` split them, and where they differ, using
+        // the actor here silently disables a blessed node's directory role.
+        config.serve_tier_subject_key_id = Some(self.inner.advertised_key_id());
         // CIRISEdge#370 — hand the live metrics bag to the runtime so its
         // scheduler event-sink consumer folds each round's outcome into the
         // round-outcome counter surfaced by `metrics_snapshot`. Cheap clone;
@@ -6601,6 +6604,12 @@ pub fn init_edge_runtime(
         ..Default::default()
     };
     parsed_agent_mode.apply_defaults(&mut config);
+    // CIRISEdge#541/#552 — carry the advertised identity onto the Edge. The
+    // serving tier is a property of the identity peers registered and conferred
+    // against, and under `use_node_identity` that is the NODE, not the actor.
+    // Resolving the tier for the actor leaves a blessed node at
+    // `ServeTier::None` with its directory role silently off.
+    config.advertised_key_id = Some(advertised_key_id.clone());
     // v0.20.0 RC1 (CIRISEdge#51) — operator overrides for the CEWP
     // L0/L1 tier defaults. `apply_defaults` set both fields to the
     // mode-derived value; `Some(_)` here pins a per-deployment
@@ -11424,14 +11433,22 @@ mod node_identity_tests {
         assert!(
             body.contains("config.local_key_id = Some(self.inner.signer_key_id().to_string());"),
             "start_replication must set config.local_key_id from the Edge's own \
-             signer — without it the Pull responder cannot recognise a request \
-             for its own record and missing-signer recovery is inert"
+             signer — the serve-tier resolver, the own-record Pull arm, and \
+             missing-signer recovery are all keyed on it"
         );
         assert!(
-            body.contains("config.bridge.mode = self.inner.agent_mode();"),
-            "start_replication must set config.bridge.mode from the Edge's own \
-             agent_mode — without it BridgeConfig takes its Proxy default and \
-             hash-first retention is unreachable through the shipped host path"
+            body.contains(
+                "config.serve_tier_subject_key_id = Some(self.inner.advertised_key_id());"
+            ),
+            "start_replication must resolve the serving tier for the ADVERTISED \
+             identity — under use_node_identity the conferral is on the node, \
+             and checking the actor leaves a blessed node at ServeTier::None"
+        );
+        assert!(
+            !body.contains("config.bridge.mode"),
+            "BridgeConfig has no mode field: the directory role keys on the \
+             serve-tier resolver, never on AgentMode (ROLE_MATRIX axis 3) — \
+             reintroducing this line is reintroducing the v18.12.1 mis-key"
         );
     }
 }

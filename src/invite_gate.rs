@@ -47,8 +47,6 @@
 //! borne by the node and not by the person — which is the actual point. A filter
 //! that shows you the spam and then reports it was suspicious has already failed.
 
-use std::collections::HashMap;
-
 /// Unix seconds.
 ///
 /// Public because it appears in [`InviteGate::admit`]'s signature: a caller that
@@ -84,196 +82,122 @@ pub enum RefuseReason {
     ReceiverAtCapacity,
 }
 
-/// Per-(sender, receiver) invite budget. One instance per receiving node.
-#[derive(Debug)]
-pub struct InviteGate {
-    senders: HashMap<String, SenderState>,
-    /// Earliest time any tracked stranger can become releasable — the minimum
-    /// `last_attempt + REFILL_SECS` over the map. Before it, an at-cap refusal
-    /// is O(1) because a scan provably cannot find anything.
-    next_release: Ts,
+impl RefuseReason {
+    /// Stable token for the receiver's operator logs. Never shown to the
+    /// sender: what a refused sender learns should be nothing at all.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefuseReason::AlreadyPending => "already_pending",
+            RefuseReason::BudgetSpent => "budget_spent",
+            RefuseReason::ReceiverAtCapacity => "receiver_at_capacity",
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-struct SenderState {
-    /// When the sender last spent an attempt.
-    last_attempt: Ts,
-    /// Attempts spent and not yet refilled.
-    spent: u32,
-    /// Has this receiver ever accepted anything from this sender?
-    ///
-    /// The single most important bit here. An established contact is not a
-    /// stranger and must not be throttled like one — throttling replies is how
-    /// an anti-spam control breaks the conversations it was meant to protect.
-    ever_accepted: bool,
+/// Per-(sender, receiver) invite budget. One instance per receiving node.
+///
+/// A thin policy face over [`crate::rate_limit::RateLimiter`]
+/// (`docs/FSD_RATE_LIMIT.md`): the budgets, the promotion rule and the
+/// refusal vocabulary are this module's; the bounded map, the fair eviction,
+/// the O(1) at-capacity path and the clock discipline are the shared
+/// limiter's. Those were the parts this file got wrong twice.
+#[derive(Debug)]
+pub struct InviteGate {
+    limiter: crate::rate_limit::RateLimiter,
 }
 
 impl InviteGate {
-    /// A stranger's budget. ONE: a second unanswered request is not new
-    /// information.
+    /// A stranger gets ONE attempt. Not a rate — a standing invitation to
+    /// nobody. If they are ignored, that is an answer.
     pub const STRANGER_BUDGET: u32 = 1;
-    /// An accepted contact's budget. Higher because they are not a stranger, and
-    /// still bounded because a compromised contact is the better attack.
+
+    /// An accepted contact gets a real allowance. An established contact is not
+    /// a stranger and must not be throttled like one — throttling replies is
+    /// how an anti-spam control breaks the conversations it was meant to
+    /// protect.
     pub const CONTACT_BUDGET: u32 = 8;
-    /// How long an unanswered attempt occupies the budget. Long on purpose: the
-    /// thing being rate-limited is a human's attention, which does not refill in
-    /// seconds.
+
+    /// How long until a spent budget refills.
     pub const REFILL_SECS: u64 = 86_400;
+
+    /// How many senders one receiver tracks.
+    pub const SENDER_CAP: usize = 65_536;
 
     #[must_use]
     pub fn new() -> Self {
         Self {
-            senders: HashMap::new(),
-            // Nothing tracked yet, so nothing can be released.
-            next_release: Ts::MAX,
-        }
-    }
-
-    /// How many senders one receiver tracks. Past it, strangers whose budget
-    /// has fully refilled are released; if none can be, a new stranger is
-    /// refused outright rather than growing the map.
-    const SENDER_CAP: usize = 65_536;
-
-    /// Drop strangers whose budget has fully refilled.
-    ///
-    /// This is free, not a tradeoff: a stranger past `REFILL_SECS` has `spent`
-    /// reset on its next `admit`, so its retained state is
-    /// INDISTINGUISHABLE from that of a sender never seen before. Forgetting it
-    /// changes no verdict.
-    ///
-    /// `ever_accepted` senders are never released — that bit is the whole point
-    /// of the gate (an established contact must not be throttled like a
-    /// stranger), and it cannot be reconstructed from an invite.
-    fn release_refilled_strangers(&mut self, now: Ts) {
-        let before = self.senders.len();
-        self.senders.retain(|_, st| {
-            st.ever_accepted || now.saturating_sub(st.last_attempt) < Self::REFILL_SECS
-        });
-        // Recompute the horizon from what remains; `u64::MAX` when only
-        // established contacts are left, since those are never released.
-        self.next_release = self
-            .senders
-            .values()
-            .filter(|st| !st.ever_accepted)
-            .map(|st| st.last_attempt.saturating_add(Self::REFILL_SECS))
-            .min()
-            .unwrap_or(Ts::MAX);
-        let released = before - self.senders.len();
-        if released > 0 {
-            tracing::debug!(
-                released,
-                remaining = self.senders.len(),
-                "invite gate released refilled strangers (CIRISEdge#554)"
-            );
+            limiter: crate::rate_limit::RateLimiter::new(crate::rate_limit::Policy::tiered(
+                crate::rate_limit::Quota::new(Self::STRANGER_BUDGET, Self::REFILL_SECS),
+                crate::rate_limit::Quota::new(Self::CONTACT_BUDGET, Self::REFILL_SECS),
+                Self::SENDER_CAP,
+            )),
         }
     }
 
     /// How many senders this receiver is currently tracking.
     #[must_use]
     pub fn tracked_senders(&self) -> usize {
-        self.senders.len()
+        self.limiter.tracked()
     }
 
     /// Decide whether an invite from `sender` reaches the person.
+    ///
+    /// The clock is the caller's, so a 24-hour refill is testable.
     #[must_use]
     pub fn admit(&mut self, sender: &str, now: Ts) -> InviteVerdict {
-        // CIRISEdge#554 — bound the map BEFORE inserting a new stranger.
-        //
-        // A per-sender budget assumes the sender is a fixed thing to charge.
-        // Rotating identities breaks that assumption completely: every first
-        // invite is a fresh sender, allowed by its fresh budget, and it costs
-        // the receiver another permanent entry. The per-sender rule was
-        // therefore both bypassed and the memory-growth vector, which is the
-        // opposite of what it was for.
-        if !self.senders.contains_key(sender) && self.senders.len() >= Self::SENDER_CAP {
-            // O(1) refusal while nothing can be released.
-            //
-            // `release_refilled_strangers` is a full scan of the cap. Calling it
-            // per rejected invite let an attacker rotating identities inside the
-            // refill window force that scan on every message — the memory bound
-            // converted into sustained CPU. `next_release` is the earliest time
-            // any entry can become releasable, so before it there is provably
-            // nothing to find and the scan is skipped.
-            if now < self.next_release {
-                return InviteVerdict::Refuse {
-                    reason: RefuseReason::ReceiverAtCapacity,
+        use crate::rate_limit::{Class, Decision, DenyReason};
+        // Every sender is its own source: an invite flood IS identity rotation,
+        // so there is no upstream party to charge the eviction to.
+        let key = sender.to_owned();
+        match self.limiter.check_from(&key, Some(sender), now) {
+            Decision::Allow { .. } => InviteVerdict::Allow,
+            Decision::Deny { reason } => {
+                let reason = match reason {
+                    DenyReason::AtCapacity => RefuseReason::ReceiverAtCapacity,
+                    // A stranger's single attempt is spent: they are WAITING on
+                    // a human, not flooding. Saying so keeps the operator's
+                    // diagnostic honest about which it is.
+                    DenyReason::QuotaSpent | DenyReason::BackingOff => {
+                        if self.limiter.class_of(&key) == Class::Promoted {
+                            RefuseReason::BudgetSpent
+                        } else {
+                            RefuseReason::AlreadyPending
+                        }
+                    }
                 };
+                tracing::debug!(
+                    sender,
+                    reason = reason.as_str(),
+                    "invite refused (CIRISEdge#554)"
+                );
+                InviteVerdict::Refuse { reason }
             }
-            self.release_refilled_strangers(now);
-            if self.senders.len() >= Self::SENDER_CAP {
-                return InviteVerdict::Refuse {
-                    reason: RefuseReason::ReceiverAtCapacity,
-                };
-            }
         }
-        let state = self
-            .senders
-            .entry(sender.to_owned())
-            .or_insert(SenderState {
-                last_attempt: 0,
-                spent: 0,
-                ever_accepted: false,
-            });
-
-        // Refill first, so a long-quiet sender is not judged on ancient history.
-        if now.saturating_sub(state.last_attempt) >= Self::REFILL_SECS {
-            state.spent = 0;
-        }
-
-        let budget = if state.ever_accepted {
-            Self::CONTACT_BUDGET
-        } else {
-            Self::STRANGER_BUDGET
-        };
-
-        if state.spent >= budget {
-            let reason = if state.ever_accepted {
-                RefuseReason::BudgetSpent
-            } else {
-                // A stranger with one spent attempt has a request outstanding —
-                // the more precise reason, and the one an operator reading a log
-                // wants: this is not a flood, it is someone waiting.
-                RefuseReason::AlreadyPending
-            };
-            tracing::debug!(
-                sender,
-                spent = state.spent,
-                budget,
-                ever_accepted = state.ever_accepted,
-                "invite refused at the receiver's budget (CIRISEdge#554)"
-            );
-            return InviteVerdict::Refuse { reason };
-        }
-
-        state.spent += 1;
-        state.last_attempt = now;
-        let ever_accepted = state.ever_accepted;
-        // Keep the horizon honest as entries are added or refreshed: a new
-        // stranger can be releasable no later than one refill window out.
-        if !ever_accepted {
-            self.next_release = self.next_release.min(now.saturating_add(Self::REFILL_SECS));
-        }
-        InviteVerdict::Allow
     }
 
     /// Record that this receiver ACCEPTED something from `sender`.
     ///
-    /// Promotes them out of stranger budget permanently. Called when consent is
-    /// granted — an accepted contact should never be throttled as a stranger
-    /// again, because the control exists to stop unwanted first contact, not to
-    /// ration a conversation.
-    pub fn mark_accepted(&mut self, sender: &str) {
-        let entry = self
-            .senders
-            .entry(sender.to_owned())
-            .or_insert(SenderState {
-                last_attempt: 0,
-                spent: 0,
-                ever_accepted: false,
-            });
-        entry.ever_accepted = true;
-        // Their outstanding attempt was answered; it should not still count.
-        entry.spent = 0;
+    /// Promotes them out of the stranger budget permanently, and makes them
+    /// un-evictable: acceptance is the one bit that cannot be reconstructed
+    /// from traffic, so the map may drop anything else first.
+    pub fn mark_accepted(&mut self, sender: &str) -> bool {
+        let promoted = self.limiter.promote(&sender.to_owned());
+        if !promoted {
+            // The receiver is tracking its ceiling of senders and a promoted
+            // entry can never be evicted to make room. Silently dropping this
+            // would leave an ACCEPTED contact throttled at the stranger budget
+            // forever, with nothing in the log to explain why their replies
+            // stopped arriving — the failure this gate exists to avoid.
+            tracing::warn!(
+                sender,
+                tracked = self.limiter.tracked(),
+                cap = Self::SENDER_CAP,
+                "accepted contact could NOT be promoted — the sender map is at \
+                 capacity; they remain on the stranger budget (CIRISEdge#554)"
+            );
+        }
+        promoted
     }
 }
 

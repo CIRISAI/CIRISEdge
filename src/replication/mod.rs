@@ -138,6 +138,7 @@ pub mod retention;
 pub mod runtime;
 pub mod scheduler;
 pub mod serve_policy;
+pub mod serve_tier;
 pub mod session;
 #[cfg(test)]
 mod sim;
