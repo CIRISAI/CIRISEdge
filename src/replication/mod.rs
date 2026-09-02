@@ -117,6 +117,7 @@
 //! designates canonical anyway.
 
 pub mod accord_relay_gate;
+pub mod attestation_bind;
 pub mod bridge;
 pub mod coordinator;
 pub mod directory;

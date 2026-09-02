@@ -434,3 +434,57 @@ fn random_nonce() -> [u8; 16] {
 pub fn envelope_body_sha256(envelope: &EdgeEnvelope) -> [u8; 32] {
     ciris_persist::prelude::body_sha256(&envelope.body)
 }
+
+/// Produce the detached hybrid signature halves over `bytes` with `signer`:
+/// Ed25519 over `bytes`, ML-DSA-65 over `bytes ‖ ed25519_sig` — the
+/// **bound-sig discipline**, which is what stops the two halves being
+/// separable and re-paired across envelopes.
+///
+/// Returns `(ed25519_b64, Option<mldsa65_b64>)`. The PQC half is `None` only
+/// while `signer.pqc` is `None` (hybrid-pending), in which case the row will
+/// NOT admit at persist's federation-tier Strict gate (CC 5.3.2.4.3.1) — so
+/// the absence is warned about here, at the source, naming `what` is being
+/// signed. Downstream that refusal arrives as a generic put error with the
+/// cause lost, which is an investigation rather than a one-line read.
+///
+/// # Why it is shared
+///
+/// Every federation-tier producer edge has needs exactly this, and each one
+/// that re-derives it gets a chance to get the binding wrong. It was private
+/// to `touch_claim` until the owner-binding producer needed it too.
+///
+/// # Errors
+/// Returns the signer's failure, labelled with which half failed.
+pub async fn sign_bound_hybrid(
+    signer: &LocalSigner,
+    bytes: &[u8],
+    what: &str,
+) -> Result<(String, Option<String>), String> {
+    let ed = signer
+        .classical
+        .sign(bytes)
+        .await
+        .map_err(|e| format!("ed25519: {e}"))?;
+    let ed_b64 = base64::engine::general_purpose::STANDARD.encode(&ed);
+    let Some(pqc) = signer.pqc.as_ref() else {
+        tracing::warn!(
+            key_id = %signer.key_id,
+            what,
+            "{what} signed CLASSICAL-ONLY — signer has no ML-DSA-65 (PQC) half \
+             (hybrid-pending). This row will NOT admit at the federation-tier Strict \
+             gate; provision the PQC signer half to emit an admissible hybrid \
+             signature (CIRISEdge#425)"
+        );
+        return Ok((ed_b64, None));
+    };
+    let mut bound = bytes.to_vec();
+    bound.extend_from_slice(&ed);
+    let sig = pqc
+        .sign(&bound)
+        .await
+        .map_err(|e| format!("ml-dsa-65: {e}"))?;
+    Ok((
+        ed_b64,
+        Some(base64::engine::general_purpose::STANDARD.encode(&sig)),
+    ))
+}

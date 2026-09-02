@@ -497,6 +497,17 @@ struct RosterEntry {
     /// Base64 32-byte Ed25519 public key of that owner.
     #[serde(default)]
     owner_pubkey_b64: String,
+    /// Base64 ML-DSA-65 public key of the node.
+    ///
+    /// Published alongside the classical half because the steward builds every
+    /// peer's directory record from this roster, and a record without the PQC
+    /// pubkey cannot verify a PQC signature — `verify_hybrid` takes the
+    /// signature and the pubkey both-or-neither.
+    #[serde(default)]
+    fed_pqc_pubkey_b64: String,
+    /// Base64 ML-DSA-65 public key of the owner.
+    #[serde(default)]
+    owner_pqc_pubkey_b64: String,
 }
 
 /// The steward that scrub-signs the roster into `federation_keys` rows.
@@ -628,30 +639,72 @@ async fn await_file(path: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
 /// never share one.
 struct FedKey {
     seed: [u8; 32],
+    /// The ML-DSA-65 half. NOT optional: the federation tier is PQC-mandatory
+    /// (CC 5.3.2.4.3.1) and persist verifies attestation envelopes under
+    /// `HybridPolicy::Strict`, so a classical-only harness identity produces
+    /// rows that canonicalize and hash correctly, verify their Ed25519 half,
+    /// and are then refused as hybrid-pending. A harness whose identities
+    /// cannot sign what production signs is not testing production.
+    pqc_seed: [u8; 32],
 }
 
 impl FedKey {
-    /// Load the seed at `dir/ed25519.seed`, generating it on first boot.
+    /// Load both seeds under `dir`, generating either on first boot.
     fn load_or_create(key_id: &str, dir: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let path = dir.join("ed25519.seed");
-        let seed = if path.exists() {
-            let b = std::fs::read(&path).map_err(|e| format!("read seed: {e}"))?;
-            let arr: [u8; 32] = b
-                .try_into()
-                .map_err(|_| format!("{} is not a 32-byte seed", path.display()))?;
-            arr
-        } else {
-            // Edge has no "mint a fresh federation identity" verb — every
-            // existing fixture writes the seed itself. Recorded as a DX
-            // finding; the harness does the same, from the CSPRNG.
-            let mut arr = [0u8; 32];
-            ciris_crypto::random::fill(&mut arr).map_err(|e| format!("csprng: {e}"))?;
-            std::fs::write(&path, arr).map_err(|e| format!("write seed: {e}"))?;
-            arr
-        };
         let _ = key_id;
-        Ok(Self { seed })
+        Ok(Self {
+            seed: Self::seed_at(&dir.join("ed25519.seed"))?,
+            pqc_seed: Self::seed_at(&dir.join("mldsa65.seed"))?,
+        })
+    }
+
+    /// Read a 32-byte seed, minting it from the CSPRNG on first boot.
+    ///
+    /// Edge has no "mint a fresh federation identity" verb — every existing
+    /// fixture writes its own seed. Recorded as a DX finding; the harness does
+    /// the same.
+    fn seed_at(path: &Path) -> Result<[u8; 32], String> {
+        if path.exists() {
+            let b = std::fs::read(path).map_err(|e| format!("read seed: {e}"))?;
+            return b
+                .try_into()
+                .map_err(|_| format!("{} is not a 32-byte seed", path.display()));
+        }
+        let mut arr = [0u8; 32];
+        ciris_crypto::random::fill(&mut arr).map_err(|e| format!("csprng: {e}"))?;
+        std::fs::write(path, arr).map_err(|e| format!("write seed: {e}"))?;
+        Ok(arr)
+    }
+
+    /// The full hybrid signing identity — what every federation-tier producer
+    /// in the library takes.
+    fn local_signer(&self, key_id: &str) -> Result<LocalSigner, String> {
+        let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            ciris_keyring::Ed25519SoftwareSigner::from_bytes(&self.seed, key_id)
+                .map_err(|e| format!("ed25519 signer: {e}"))?,
+        );
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &self.pqc_seed,
+                format!("{key_id}-pqc"),
+            )
+            .map_err(|e| format!("ml-dsa-65 signer: {e}"))?,
+        );
+        Ok(LocalSigner::new(key_id, classical, Some(pqc)))
+    }
+
+    /// Base64 ML-DSA-65 public key — the directory record must carry it, or
+    /// `verify_hybrid` sees a PQC signature with no pubkey to check it against
+    /// and refuses the pair outright.
+    async fn pqc_pubkey_b64(&self, key_id: &str) -> Result<String, String> {
+        let signer = self.local_signer(key_id)?;
+        let pqc = signer.pqc.as_ref().ok_or("no pqc half")?;
+        Ok(B64.encode(
+            pqc.public_key()
+                .await
+                .map_err(|e| format!("pqc pubkey: {e}"))?,
+        ))
     }
 
     fn signer(&self) -> Result<Ed25519Signer, String> {
@@ -672,26 +725,27 @@ impl FedKey {
 /// Same shape as `tests/common::signed_record` / `benches/common::
 /// signed_record` — kept in step with them deliberately: a change to the
 /// admitted row shape must break all three at once.
-fn signed_record(
+async fn signed_record(
     subject_key_id: &str,
     subject_pubkey_b64: &str,
-    signer: &Ed25519Signer,
+    subject_pqc_pubkey_b64: &str,
+    signer: &LocalSigner,
     signer_key_id: &str,
     identity_type: &str,
 ) -> Result<KeyRecord, String> {
     let envelope = serde_json::json!({ "key_id": subject_key_id });
     let canonical = serde_json::to_vec(&envelope).map_err(|e| format!("canonical: {e}"))?;
     let digest = Sha256::digest(&canonical);
-    let sig = signer
-        .sign(digest.as_slice())
-        .map_err(|e| format!("scrub sign: {e}"))?;
+    let (sig, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(signer, digest.as_slice(), "key record").await?;
     let ts = chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
         .map_err(|e| format!("ts: {e}"))?
         .into();
     Ok(KeyRecord {
         key_id: subject_key_id.to_owned(),
         pubkey_ed25519_base64: subject_pubkey_b64.to_owned(),
-        pubkey_ml_dsa_65_base64: None,
+        pubkey_ml_dsa_65_base64: (!subject_pqc_pubkey_b64.is_empty())
+            .then(|| subject_pqc_pubkey_b64.to_owned()),
         algorithm: "hybrid".to_owned(),
         identity_type: identity_type.to_owned(),
         identity_ref: subject_key_id.to_owned(),
@@ -699,8 +753,8 @@ fn signed_record(
         valid_until: None,
         registration_envelope: envelope,
         original_content_hash: hex::encode(digest),
-        scrub_signature_classical: B64.encode(sig),
-        scrub_signature_pqc: None,
+        scrub_signature_classical: sig,
+        scrub_signature_pqc: sig_pqc,
         scrub_key_id: signer_key_id.to_owned(),
         scrub_timestamp: ts,
         pqc_completed_at: None,
@@ -731,63 +785,54 @@ fn signed_record(
 async fn emit_owner_binding(
     dir: &Arc<SqliteBackend>,
     owner_key_id: &str,
-    owner_signer: &Ed25519Signer,
+    owner_signer: &LocalSigner,
     node_id: &str,
 ) -> Result<(), String> {
-    // The timestamp lives inside the SIGNED envelope, not only in the column.
-    //
-    // persist refuses otherwise (CIRISPersist#598), and the reason is worth
-    // keeping in view: folds pick a winner by the `asserted_at` COLUMN, which
-    // no signature covers. An unbound row is a replay waiting to happen — an
-    // attacker re-submits an envelope the producer really did sign, with a
-    // newer column value, and wins the fold. Binding the time into the signed
-    // material is what closes that, so the two must agree.
+    // Fixed instant so a restarted container re-emits a byte-identical row
+    // rather than a second, competing binding.
     const ASSERTED_AT: &str = "2026-05-01T00:00:00Z";
     let ts: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(ASSERTED_AT)
         .map_err(|e| format!("ts: {e}"))?
         .into();
-    let envelope = serde_json::json!({
-        "attesting_key_id": owner_key_id,
-        "attested_key_id": node_id,
-        "delegation_purpose": "owner_binding",
-        "scope": ["infra:network_presence"],
-        "asserted_at": ASSERTED_AT,
-    });
-    let canonical = serde_json::to_vec(&envelope).map_err(|e| format!("canonical: {e}"))?;
-    let digest = Sha256::digest(&canonical);
-    let sig = owner_signer
-        .sign(digest.as_slice())
-        .map_err(|e| format!("owner sign: {e}"))?;
 
-    let att = ciris_persist::federation::Attestation {
-        attestation_id: format!("owner-binding-{node_id}"),
-        attesting_key_id: owner_key_id.to_owned(),
-        attested_key_id: node_id.to_owned(),
-        attestation_type: "delegates_to".to_owned(),
-        weight: None,
-        asserted_at: ts,
-        expires_at: None,
-        attestation_envelope: envelope,
-        original_content_hash: hex::encode(digest),
-        scrub_signature_classical: B64.encode(sig),
-        scrub_signature_pqc: None,
-        scrub_key_id: owner_key_id.to_owned(),
-        scrub_timestamp: ts,
-        pqc_completed_at: None,
-        persist_row_hash: String::new(),
-        subject_key_ids: vec![node_id.to_owned()],
-        withdraws_admission_rule: None,
-        cohort_scope: "federation".to_owned(),
-        // Born federation-tier: an owner binding is exactly the kind of claim
-        // that must be carriable, and a promoted row is byte-identical on the
-        // wire to a natively-federation one anyway.
-        tier: "federation".to_owned(),
-        promoted_at: None,
-        additional_scrubs: Vec::new(),
-    };
+    // The library builds and signs it. The harness deliberately does NOT
+    // hand-roll this envelope: doing so is what produced two failed mesh runs
+    // (a missing signed `asserted_at`, then a missing `row` mirror) plus a
+    // signature over the digest instead of the canonical bytes. The producer
+    // is unit-tested against a real persist backend, so those failures are now
+    // caught in under a second instead of a full mesh round-trip.
+    let att = ciris_edge::replication::attestation_bind::owner_binding_attestation(
+        owner_key_id,
+        node_id,
+        ts,
+        owner_signer,
+    )
+    .await?;
+
+    tracing::info!(
+        owner = %owner_key_id,
+        node = %node_id,
+        attestation_id = %att.attestation_id,
+        hybrid = att.scrub_signature_pqc.is_some(),
+        "emitting owner binding"
+    );
+
     dir.put_attestation(ciris_persist::federation::SignedAttestation { attestation: att })
         .await
-        .map_err(|e| format!("put owner binding: {e}"))?;
+        .map_err(|e| {
+            // Name the refusal AT the source. Downstream this is a bare
+            // "standup failed" in a census cell, which is an investigation
+            // rather than a read.
+            tracing::error!(
+                owner = %owner_key_id,
+                node = %node_id,
+                error = %e,
+                "owner binding REFUSED by persist — federation directory discovery \
+                 cannot resolve this node's owner, so every fedID lookup against it \
+                 will stop at owner_of => None"
+            );
+            format!("put owner binding: {e}")
+        })?;
     Ok(())
 }
 
@@ -1357,6 +1402,8 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
             fed_pubkey_b64: fed.pubkey_b64()?,
             owner_key_id: owner_key_id.clone(),
             owner_pubkey_b64: owner.pubkey_b64()?,
+            fed_pqc_pubkey_b64: fed.pqc_pubkey_b64(&cfg.node_id).await?,
+            owner_pqc_pubkey_b64: owner.pqc_pubkey_b64(&owner_key_id).await?,
         },
     )
     .map_err(|e| format!("publish roster entry: {e}"))?;
@@ -1366,34 +1413,46 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     if cfg.role == Role::Publisher {
         let roster = await_roster(&cfg.mesh_dir, &cfg.expect, cfg.barrier_timeout).await?;
         let steward = FedKey::load_or_create(STEWARD_KEY_ID, &cfg.state_dir.join("steward"))?;
-        let steward_signer = steward.signer()?;
-        let mut rows = vec![signed_record(
-            STEWARD_KEY_ID,
-            &steward.pubkey_b64()?,
-            &steward_signer,
-            STEWARD_KEY_ID,
-            "steward",
-        )?];
-        for entry in roster.values() {
-            rows.push(signed_record(
-                &entry.key_id,
-                &entry.fed_pubkey_b64,
+        let steward_signer = steward.local_signer(STEWARD_KEY_ID)?;
+        let mut rows = vec![
+            signed_record(
+                STEWARD_KEY_ID,
+                &steward.pubkey_b64()?,
+                &steward.pqc_pubkey_b64(STEWARD_KEY_ID).await?,
                 &steward_signer,
                 STEWARD_KEY_ID,
-                "agent",
-            )?);
+                "steward",
+            )
+            .await?,
+        ];
+        for entry in roster.values() {
+            rows.push(
+                signed_record(
+                    &entry.key_id,
+                    &entry.fed_pubkey_b64,
+                    &entry.fed_pqc_pubkey_b64,
+                    &steward_signer,
+                    STEWARD_KEY_ID,
+                    "agent",
+                )
+                .await?,
+            );
             // The owner, as a PERSON. `identity_type` is the authority on what
             // an identifier names — never the string's shape — so this is what
             // makes `resolve` route a lookup to the person rather than
             // treating the owner as another agent.
             if !entry.owner_key_id.is_empty() {
-                rows.push(signed_record(
-                    &entry.owner_key_id,
-                    &entry.owner_pubkey_b64,
-                    &steward_signer,
-                    STEWARD_KEY_ID,
-                    "user",
-                )?);
+                rows.push(
+                    signed_record(
+                        &entry.owner_key_id,
+                        &entry.owner_pubkey_b64,
+                        &entry.owner_pqc_pubkey_b64,
+                        &steward_signer,
+                        STEWARD_KEY_ID,
+                        "user",
+                    )
+                    .await?,
+                );
             }
         }
         let tmp = cfg.mesh_dir.join("directory.tmp");
@@ -1415,7 +1474,13 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // Nothing is seeded into a peer: a peer learns this the same way it learns
     // any other signed row, which is the point of testing discovery rather
     // than testing a fixture.
-    emit_owner_binding(&directory, &owner_key_id, &owner.signer()?, &cfg.node_id).await?;
+    emit_owner_binding(
+        &directory,
+        &owner_key_id,
+        &owner.local_signer(&owner_key_id)?,
+        &cfg.node_id,
+    )
+    .await?;
 
     let roster = read_roster(&cfg.mesh_dir);
 
