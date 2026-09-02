@@ -14,12 +14,21 @@
 //! never coordinated find the same room; there is no create/join race to lose,
 //! and no roster to disagree about.
 //!
-//! # Who signs, and why it is the NODE
+//! # Who signs — and why the NODE attesting is a WORKAROUND, not the design
 //!
-//! The NODE attests and signs, on the owner's behalf, and the author rides
-//! INSIDE the signed envelope as `on_behalf_of_key_id` — so a relay cannot
-//! rewrite whose words these are, and the far side verifies attribution under
-//! the same signature it already checks.
+//! As built, the NODE attests and signs, on the owner's behalf, and the author
+//! rides INSIDE the signed envelope as `on_behalf_of_key_id` — so a relay cannot
+//! rewrite whose words these are. This copies CIRISServer's shape, and both
+//! exist for one reason: persist's `promote_attestation` re-signs with the
+//! node's key and clears `additional_scrubs`, so an actor-attested row could
+//! not survive placement at `community`. Under the two-granters rule the
+//! SENDER of a message is the actor (the human's FedID, or an AgentID) and the
+//! node is custody; a node-only key cannot carry agency
+//! (`check_node_agency_admission`). Persist's `enter_federation` /
+//! `widen_audience` make the actor the attester with the node as co-scrub;
+//! this producer re-bases onto them and this section goes away. See
+//! `docs/FSD_REPLICATION_DX.md`, correction of 2026-09-02 — the reason
+//! v18.15.0 is held.
 //!
 //! What makes that a verifiable claim rather than the node's say-so is the
 //! owner binding it acts under: `delegates_to(owner → node)` is itself a

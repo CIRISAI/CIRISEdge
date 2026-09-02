@@ -4,6 +4,21 @@
 `replication::attestation_bind` (`share`, `publish`, `keep_local`, `With`) and
 pinned by `tests/chat_message_federates.rs`.
 
+**Correction, 2026-09-02, from persist's review of this document — and the
+reason `v18.15.0` is NOT tagged.** The surface below is built over persist's
+`promote_attestation`, and that primitive re-signs the row with the NODE's key
+and **clears `additional_scrubs`** (`store/sqlite.rs`, promote body; verified).
+So `share(row, With::Community)` today destroys the actor's signature. Under
+the two-granters rule an agent's claim is attested by the AgentID and merely
+held in custody by the node, and a node-only key cannot carry agency (§8,
+`check_node_agency_admission`, "cryptographic, not policy"). This document
+originally recorded that as the design; it is a defect of the current
+substrate that edge could not see from where it stands. Persist owns the fix
+(two operations, `enter_federation` + `widen_audience`, actor-signed or
+actor-preserved with a node co-scrub); edge's verbs re-base onto them and pass
+the **actor's** signer. §3 and §9 are annotated. The vocabulary (`With`,
+`publish` as its own verb, `keep_local`, `Flow`) stands.
+
 **This surface is an OPTION, not a gate.** A row authored directly at
 `tier: federation` with the intended `cohort_scope` replicates exactly as well —
 that is the substrate's native path and nothing here changes it. This API exists
@@ -219,7 +234,7 @@ one:
 | parameter | wire | where the caller sees it |
 |---|---|---|
 | data subject | `subject_key_ids` | the producer, for a self-declaration; set by the producer helper |
-| sender | `attesting_key_id` | the signing node |
+| sender | `attesting_key_id` | **the actor** — the AgentID, or the human's FedID. The node is **custody** (`scrub_key_id`, co-scrub), never the sender: a node-only key cannot carry agency. *As built, edge's chat producer names the node as attester with the human as `on_behalf_of_key_id` — the server's workaround for the same substrate defect, retired by the re-base.* |
 | recipient | `cohort_scope` + `subject_key_ids` + `delivery_mode` | **`With::…`** |
 | information type | `dimension` | the producer helper (`chat:message:v1`) |
 | transmission principle | `deletion_window` · `expires_at` · the covering `consent:replication` grant | **`Flow::principle`** (temporal half on the row; permission half resolved per recipient — `Terms` is Phase 2, §3) |
@@ -237,6 +252,37 @@ no consent grant can cover it.
 The federation crossing is the moment edge picks a row up and offers it to
 peers, so it is the one moment all five must be present and correct — and the
 one moment a consumer should be able to SEE all five without inferring any.
+
+### The re-base — persist's two operations
+
+Persist's review resolved §6/§9.6b: the constitution's two promotion patterns
+are **two different operations**, and persist had conflated them.
+
+| operation | what it is | who signs | rows after |
+|---|---|---|---|
+| `enter_federation` | `local → federation` at the row's OWN cohort (CC 5.3.2.4.2) | the actor; or the actor's local signature preserved + node co-scrub | one row, tier flipped |
+| `widen_audience` | a wider cohort (CC 4.4.3.3.1) | the actor, as a `supersedes` row chained off the original | **two rows**: the original untouched at its cohort, the new one at the wider cohort, lineage walkable |
+
+Edge's `share`, `publish`, `keep_local` become thin over these — composing
+both when a share is also a widening — and pass the **actor's** signer, not
+the node's. Nothing else in the surface moves. One behavioural consequence
+callers will notice: `share(self-row, With::Community)` yields two federation
+rows (the original still replicates to your own devices; the widened copy to
+the room), so `Shared::Placed` will carry the new row's id. CC 8.1.5's worked
+example is this two-row shape. Delegated widening by a node is refused
+(widening an agent's claim is agency); a human-authored row whose FedID lives
+on another device takes the co-scrub path or waits.
+
+### Transmission principle — answered, not Phase 2
+
+Persist's answer to §9.1 is better than the ask: the principle rides the
+**crossing call** (`ContextualIntegrity.transmission_principle` on
+`enter_federation` / `widen_audience`) and is validated against the consent
+grant already on the row. A reseal member would change the signed bytes — the
+exact thing that would invalidate the actor's local signature and foreclose the
+co-scrub path — so it stays off the preimage. `Flow::principle` reports what
+the row carries; the call carries the rule. The paragraph below is retained as
+the record of the original ask.
 
 `Terms` is the piece with no home today. Proposed surface, smallest first:
 
@@ -416,7 +462,7 @@ discouraged.
 Each item is something edge worked around, with the evidence. None blocks
 edge; all would remove a footgun for the next consumer.
 
-1. **`Terms` on the promotion reseal (Phase 2, §3).** `AttestationReseal`
+1. **`Terms` on the promotion reseal (Phase 2, §3).** *Disposition: answered differently — on the crossing call, validated against the row's grant; see §3, Transmission principle.* `AttestationReseal`
    carries envelope · hash · both signature halves · re-signer · timestamp — no
    consent-scope member and no `expires_at`. So the transmission principle
    cannot be attached or narrowed at *share* time; edge refuses a `Terms`
@@ -425,7 +471,7 @@ edge; all would remove a footgun for the next consumer.
    is the substrate change that lets the fifth CI parameter be set at the
    crossing, where the CI page says it belongs.
 
-2. **A typed "already federation" promote outcome.** `promote_attestation`
+2. **A typed "already federation" promote outcome.** *Disposition: accepted (persist FSD §5.1).* `promote_attestation`
    returns `Ok(false)` for a row already at `tier: federation` — correct and
    idempotent by CC 5.3.2.4.2, but indistinguishable from "placed nothing for
    another reason" without reading the row's tier first. Edge does that read
@@ -433,7 +479,7 @@ edge; all would remove a footgun for the next consumer.
    let every consumer tell the two apart without the pre-read.
 
 3. **`effective_accord_holder_records()` is a footgun under
-   `CIRIS_TESTING_MODE`.** It falls back to the *real* baked HUMANITY_ACCORD
+   `CIRIS_TESTING_MODE`.** *Disposition: real, separate — persist will file it.* It falls back to the *real* baked HUMANITY_ACCORD
    roster when the test anchor is not fully armed, so a harness that set three
    of the six `CIRIS_TEST_TRUST_ROOT*` vars seeds production's constitutional
    holders into a throwaway directory and looks green. Edge now calls
@@ -441,7 +487,7 @@ edge; all would remove a footgun for the next consumer.
    `effective_*` refuses (or warns loudly) when `CIRIS_TESTING_MODE` is set
    but the anchor does not resolve, instead of silently falling back.
 
-4. **`crypto_tier` is negative-default for UNKNOWN scopes.** CIRISPersist#188:
+4. **`crypto_tier` is negative-default for UNKNOWN scopes.** *Disposition: real, separate — persist will file it (closed-enum match, build error on omission).* CIRISPersist#188:
    only self/family and community/affiliations encrypt; any scope the dispatch
    does not recognise is plaintext. That is the safe default for the closed
    set today, but it means a future scope added to `cohort_scope::ALL` without
@@ -450,7 +496,7 @@ edge; all would remove a footgun for the next consumer.
    error. Edge pins its own grouping to `crypto_tier` by test so it cannot
    drift, but only persist can make the substrate itself fail closed.
 
-5. **A typed transient-membership refusal for AV-45.** When a
+5. **A typed transient-membership refusal for AV-45.** *Disposition: real, separate — persist will file it (#737's class: absence vs deliberate).* When a
    `community`-scoped row arrives before the recipient holds the `Community`
    row, the put door refuses it (correctly) and edge's re-offer carries it
    later — measured at 11 refusals and ~5 s on `ladder.send_message`. The
@@ -459,7 +505,7 @@ edge; all would remove a footgun for the next consumer.
    admit". A typed variant would let edge back off on the first and stop on
    the second.
 
-6. **Constitution vocabulary drift, for whoever owns rc4.7.** (a) `global`
+6. **Constitution vocabulary drift, for whoever owns rc4.7.** *Disposition: (a) the constitution's, agreed; (b) answered by persist's FSD — two operations, not one; see §3, The re-base.* (a) `global`
    appears as a widened scope in CC 4.4.3.3.1 and the CC 8 worked example; the
    wire value is `federation` (`cohort_scope::ALL` has no `global`, and
    `is_valid` refuses it). (b) CC 4.4.3.3.1 describes promotion as a
@@ -472,3 +518,17 @@ edge; all would remove a footgun for the next consumer.
 7. **Verify, not persist:** `test_trust_root_override` WARNs "TEST TRUST ROOT
    active" on every anchor lookup — 449 lines per node per mesh run — with no
    once-guard. Correct to warn; wrong to warn per call.
+
+8. **CC 2.6.2 date-time canonicalization — a SHARED non-conformance.** The
+   canonical form is `YYYY-MM-DDTHH:MM:SS.sssZ`: literal `Z` (the `+00:00`
+   offset form MUST NOT be used), exactly three fractional digits, and
+   consumers MUST reject any other form when verifying a signature. Persist
+   emits `+00:00` at microsecond precision (persist's finding); **edge does
+   too** — the binder's signed `asserted_at` and the chat producer both use
+   chrono's `to_rfc3339()` — and persist admits it, so nothing rejected it.
+   Edge's fix is not cosmetic: the signed `asserted_at` must agree with the
+   typed column at the instant level (CIRISPersist#598 refuses a divergence),
+   so it is millisecond truncation **and** `Z`, in the binder, every producer,
+   and the typed column together (`truncate_to_micros` → millis). The binder
+   is on the mesh standup path, so this needs a mesh run — first item of the
+   re-base cut.
