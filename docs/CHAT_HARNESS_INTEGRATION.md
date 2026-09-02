@@ -203,7 +203,7 @@ match contact::resolve_contact(&lens, whatever_the_user_pasted).await? {
 }
 ```
 
-**Do not read `subject.nodes` on this path — it is empty by design.** An earlier revision put the person's own `key_id` there, which made callers dial a person key as though it were a node id; `RouteLens::has_destination` resolves those as nodes. Reachability for a code is `admission.transport_hint`.
+**`subject.nodes` depends on the code's version.** A **v3** code (`CIRIS-V3-…`) names the subject's own nodes — `subject.nodes` holds real node ids, and `admission.owned_nodes` carries each one's **transport** pubkey, which is what a destination derives from (the node's federation key is a different key for a different job). A **v1/v2** code names only a person, so `subject.nodes` is empty and the fallback is `admission.transport_hint`. An earlier revision put the person's own `key_id` in `nodes`, which made callers dial a person key as though it were a node.
 
 **The subject is built from the code, not the directory, and that is load-bearing.** An earlier shape returned "admit, then retry" — but the retry runs `nodes_owned_by` against the directory, and a stranger has no owner-binding attestations there. Admitting a key never creates an ownership graph, so that retry returned `NotYetDiscovered` forever. If you find yourself re-resolving after admission and waiting for convergence, you are on the old model.
 

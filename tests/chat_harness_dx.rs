@@ -72,6 +72,7 @@ fn the_stranger_contact_surface_matches_the_guide() {
         transport_hint: Some("https://example.invalid".into()),
         alias_hint: None,
         group_key_id: None,
+        owned_nodes: Vec::new(),
     })
     .expect("encode");
 
@@ -95,6 +96,7 @@ fn the_stranger_contact_surface_matches_the_guide() {
         transport_hint: None,
         alias_hint: None,
         group_key_id: None,
+        owned_nodes: Vec::new(),
     })
     .expect("a forgery encodes fine — the CRC cannot see authorship");
     assert!(
