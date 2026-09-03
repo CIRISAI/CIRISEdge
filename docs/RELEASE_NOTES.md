@@ -1,5 +1,64 @@
 # CIRISEdge Release Notes
 
+# v20.1.0 — chat attribution is the attester, never a claim (CIRISEdge#564)
+
+**2026-09-03** — SECURITY. Reported by CIRISServer against v20.0.0.
+
+## The defect
+
+`ChatMessage::from_row` preferred the envelope's `on_behalf_of_key_id` over
+`attesting_key_id`:
+
+```rust
+let author_key_id = env.get(FIELD_ON_BEHALF_OF)...
+    .map_or_else(|| a.attesting_key_id.clone(), str::to_owned);
+```
+
+That member sits inside the attester's **own signed envelope**, so the
+signature proves only that *the attester wrote that string* — never that the
+named key authored anything. Any member of a room could set it to another
+key's id and have the message render as that person's words; CIRISServer's
+repro shows a row emitted under `bob-v1` coming back with the reader's owner
+as `author` and `mine: true`.
+
+Two things made it worse. The precedence was backwards for the v19+ model —
+the human attests, `on_behalf_of_key_id` is documented "read, never written",
+so the branch never taken for edge's own rows was the only attacker-controlled
+one. And it contradicted edge's own crypto: `open_body` binds the seal to
+`attesting_key_id`, so a row could decrypt as the attester and display as the
+claim.
+
+## The fix
+
+- **`ChatMessage::author_key_id` is the ATTESTER** — the key whose hybrid
+  signature persist verified against its registered pubkeys. `from_row` never
+  reads authorship out of an envelope member.
+- **`ChatMessage::on_behalf_of_claim: Option<String>` (NEW)** carries the raw
+  member, named as what it is: an unverified claim by the attester.
+- **`messages_in_room` promotes a claim only when a live owner binding backs
+  it** (`owner_of(attester) == claim`) — the legitimate pre-v39 shape, where a
+  node speaks for its owner. A node can satisfy that for its own owner and for
+  nobody else, so the promotion is unforgeable. Fail-closed: an unresolvable or
+  ambiguous owner promotes nothing. One owner walk per distinct attester.
+
+**A minor, not a major.** `author_key_id`'s meaning changes (it no longer
+returns the claim) and `ChatMessage` gains a public field — but v20.0.0 was
+never adopted downstream, so no consumer holds the old meaning. Consumers that
+defended themselves by projecting `attesting_key_id` — as CIRISServer does —
+are already correct and can now use `author_key_id` directly.
+
+## Witness
+
+`a_forged_on_behalf_of_claim_projects_the_attester` builds a **properly
+signed** forgery (the claim goes inside the envelope and the row is re-signed,
+because mutating after signing is refused by `PromotionMovedThePreimage` — the
+substrate working, not the attack), then asserts `from_row` attributes to the
+attester, surfaces the claim separately, and that `messages_in_room` promotes
+nothing without an owner binding.
+
+Local: chat 22/22, lib 1447 passed, clippy `-D warnings` clean. Pins unchanged
+(persist v40.0.0, verify v14.1.0, leviculum v0.24.0+ciris.1).
+
 # v20.0.0 — a widening carries the claim's instant (adopt CIRISPersist v40.0.0)
 
 **2026-09-03** — BREAKING, and the break is upstream's: persist v40.0.0

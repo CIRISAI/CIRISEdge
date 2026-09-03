@@ -617,6 +617,77 @@ async fn a_widening_carries_the_claims_instant_and_records_its_own() {
     assert_eq!(seen[0].widens.as_deref(), Some(msg.attestation_id.as_str()));
 }
 
+/// **A forged `on_behalf_of_key_id` projects the ATTESTER, never the claim**
+/// (CIRISEdge#564, reported by CIRISServer). The member sits inside the
+/// attester's own signed envelope, so the signature proves only that the
+/// attester wrote that string. Preferring it let any room member render text
+/// under any key — including the reading node's owner.
+#[tokio::test]
+async fn a_forged_on_behalf_of_claim_projects_the_attester() {
+    let w = world().await;
+    // Bob emits into the room, claiming to speak for Alice.
+    let mut row =
+        chat::chat_message_attestation(&w.bob, "alice-fed", "not alice's words", ts(), &w.key_b)
+            .await
+            .unwrap();
+    // A real forger signs the lie: the claim goes INSIDE the envelope and the
+    // row is re-signed, so it is byte-consistent and persist admits it.
+    // (Mutating after signing is refused by `PromotionMovedThePreimage` —
+    // that is the substrate working, not the attack under test.)
+    row.attestation_envelope.as_object_mut().unwrap().insert(
+        chat::FIELD_ON_BEHALF_OF.to_owned(),
+        serde_json::json!("alice-fed"),
+    );
+    let canonical =
+        ciris_persist::prelude::ceg_produce_canonicalize(&row.attestation_envelope).unwrap();
+    row.original_content_hash = hex::encode(sha2::Sha256::digest(&canonical));
+    let (c, q) = ciris_edge::identity::sign_bound_hybrid(&w.bob, &canonical, "forged claim")
+        .await
+        .unwrap();
+    row.scrub_signature_classical = c;
+    row.scrub_signature_pqc = q;
+
+    let m = chat::ChatMessage::from_row(&row, &w.room, &w.key_b).expect("a chat row");
+    assert_eq!(
+        m.author_key_id, "bob-fed",
+        "attribution is the ATTESTER — a producer-asserted member cannot outrank the \
+         key persist verified the signature against"
+    );
+    assert_eq!(m.attesting_key_id, "bob-fed");
+    assert_eq!(
+        m.on_behalf_of_claim.as_deref(),
+        Some("alice-fed"),
+        "the claim is surfaced, clearly as a claim"
+    );
+
+    // And through the reader that CAN corroborate: bob-fed is a `user`, not a
+    // node with alice-fed as its owner, so nothing is promoted.
+    w.dir
+        .put_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .unwrap();
+    share(
+        &*w.dir,
+        &row,
+        w.room_with(),
+        CrossingBasis::ProducerAuthority,
+        w.bobs_signers(),
+    )
+    .await
+    .unwrap();
+    let seen = chat::messages_in_room(&*w.dir, &["bob-fed".to_string()], &w.room, &w.key_b)
+        .await
+        .unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(
+        seen[0].author_key_id, "bob-fed",
+        "an unbacked claim promotes nothing"
+    );
+    assert_eq!(seen[0].on_behalf_of_claim.as_deref(), Some("alice-fed"));
+}
+
 /// A message for a DIFFERENT room is not in this one. The room filter is on
 /// signed content, not on where the row came from.
 #[tokio::test]
