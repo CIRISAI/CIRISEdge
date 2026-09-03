@@ -292,6 +292,15 @@ ships them; v19.0.0 composes them.
 | `enter_mesh` | `local → federation` over the SAME bytes, at the row's OWN audience (CC 5.3.2.4.2) | the actor's signature, made at write or now (`ActorSigned`); or the actor's write-time signature preserved + the node's co-scrub APPENDED with `cosigned_at` (`NodeCoScrub`) | one row, tier flipped, `cohort_scope` untouched — so `(local, self)` becomes `(federation, self)`: replicated to the owner's own nodes by consent fan-out, never advertised |
 | `widen_audience` | a strictly wider audience (CC 4.4.3.3.1) | the actor, as a `supersedes` row chained off the original (`references_attestation_id`, `differs_in: ["cohort_scope"]`, body reused member by member) | **two rows**: the original untouched at its audience, the new one at the wider audience, lineage walkable |
 
+**v40.0.0 (CIRISPersist#801) — a widening carries the CLAIM's instant.**
+v39.0.0 re-minted `asserted_at` on the `supersedes` row, so the widening — the
+only row a peer ever receives, since a `self` row is structurally
+undiscoverable (CC 5.2) — asserted its *placement* time and the claim's own
+instant was unrecoverable off-node. It is now carried verbatim off the prior,
+and the placement records its own signed `widened_at`. Callers pass ONE `now`
+to `build_widening` and `stamp_and_canonicalize`. Edge's chat seal binds the
+claim instant because of this guarantee (`chat::RoomKey::body_key`).
+
 `share` is `share_plan` → `enter_mesh` → `widen_audience`, and passes the
 **actor's** signer (`Signers.actor`) alongside the node's. Who signs is
 decided from the row by `custody_for` (the table on `Signers`); there is no

@@ -1,5 +1,55 @@
 # CIRISEdge Release Notes
 
+# v20.0.0 — a widening carries the claim's instant (adopt CIRISPersist v40.0.0)
+
+**2026-09-03** — BREAKING, and the break is upstream's: persist v40.0.0
+(CIRISPersist#801, reported by CIRISServer while adopting v39.0.0) fixes a
+defect v39.0.0 shipped — `widen_audience` treated `asserted_at` as placement
+bookkeeping and re-minted it, so a widening's signed instant was *when it was
+placed*, not *when the claim was asserted*. Because a widening is the only row
+a peer ever sees (a `self` row is structurally undiscoverable, CC 5.2), the
+claim's own instant was unrecoverable off-node. v40 carries it verbatim and
+gives the placement its own signed member, `widened_at`.
+
+Persist calls it a MAJOR because `paths::WIDENED_AT` re-pins
+`ENVELOPE_VOCABULARY_SHA256`. Edge does not assert that hash, and the four
+persist hashes edge *does* pin are unchanged, as are all four ABI constants
+and the wire vocabulary hash. Verify stays at v14.1.0 and leviculum at
+v0.24.0+ciris.1 — one copy of each.
+
+## What edge changes
+
+- **`build_widening` takes the placement instant.** `attestation_bind`'s
+  widening path passes ONE `now` to both `build_widening` (which signs it as
+  `widened_at`) and `stamp_and_canonicalize`, so the act is recorded once
+  while the claim's `asserted_at` is carried off the prior rather than
+  re-minted.
+- **The chat seal binds the claim's instant again.** v19.0.0 keyed the body
+  under room + author + epoch and deliberately *excluded* the instant, because
+  v39's re-stamping meant a key derived from it would open the author's own
+  `self` copy and nothing else. v40 removes that constraint, so the HKDF info
+  is room + author + **claim instant** + epoch: a ciphertext lifted onto any
+  other row — another author's, another room's, or the same author's at a
+  different instant — no longer opens. `seal_body` / `open_body` take the
+  instant; `ChatMessage::from_row` reads it off the envelope, where a widening
+  now carries the prior's.
+
+**This is a wire break for chat.** A message sealed by v19.0.0 does not open
+under v20.0.0 — its key was derived without the instant. Chat shipped one day
+earlier with no deployed corpus, and the failure is honest
+(`Body::Unopened { reason }`), not a crash, so there is no compatibility path.
+
+## Witness
+
+`a_widening_carries_the_claims_instant_and_records_its_own` asserts the
+guarantee the seal now rests on, against real sqlite: the widening's
+`asserted_at` equals the prior's verbatim, the column agrees, `widened_at` is
+present, canonical (`.sssZ`) and not before the claim — and the far end opens
+the widened row, which is the row it actually receives.
+
+Pins: ciris-persist v40.0.0 (wheel floor `>=40,<41`), CIRISVerify v14.1.0,
+leviculum v0.24.0+ciris.1.
+
 # v19.0.0 — Promotion is two verbs and the ACTOR signs (adopt CIRISPersist v39.0.0)
 
 **2026-09-03** — BREAKING. Adopts CIRISPersist v39.0.0 (CIRISEdge#562,

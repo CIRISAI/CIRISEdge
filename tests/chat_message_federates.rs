@@ -495,32 +495,46 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     // Same key on both sides: what Alice seals, Bob opens.
     let key_a = RoomKey::of(&a).await.unwrap();
     let key_b = RoomKey::of(&b).await.unwrap();
-    let (ct, sealed) = chat::seal_body(&key_a, &room, "alice-fed", "hi").unwrap();
+    let at = "2026-05-01T00:00:00.000Z";
+    let (ct, sealed) = chat::seal_body(&key_a, &room, "alice-fed", at, "hi").unwrap();
     assert_eq!(
-        chat::open_body(&key_b, &room, "alice-fed", &ct, &sealed).unwrap(),
+        chat::open_body(&key_b, &room, "alice-fed", at, &ct, &sealed).unwrap(),
         "hi"
     );
 }
 
-/// **The wrong key, a rotated epoch, or a moved ciphertext does not open** —
-/// and the widened row (persist re-stamps its instant) DOES.
+/// **The wrong key, a rotated epoch, or a ciphertext lifted onto another row
+/// does not open** — and the widened row, which is all a peer receives, DOES.
 #[tokio::test]
 async fn a_wrong_key_epoch_or_context_does_not_open_the_body() {
     let w = world().await;
-    let (ct, sealed) = chat::seal_body(&w.key_a, &w.room, "alice-fed", BODY).unwrap();
+    let at = "2026-05-01T00:00:00.000Z";
+    let (ct, sealed) = chat::seal_body(&w.key_a, &w.room, "alice-fed", at, BODY).unwrap();
 
     let stranger = RoomKey::from_parts([7u8; 32], w.key_a.epoch());
-    let err = chat::open_body(&stranger, &w.room, "alice-fed", &ct, &sealed).unwrap_err();
+    let err = chat::open_body(&stranger, &w.room, "alice-fed", at, &ct, &sealed).unwrap_err();
     assert!(err.contains("open failed"), "{err}");
 
     let rotated = RoomKey::from_parts([0u8; 32], w.key_a.epoch() + 1);
-    let err = chat::open_body(&rotated, &w.room, "alice-fed", &ct, &sealed).unwrap_err();
+    let err = chat::open_body(&rotated, &w.room, "alice-fed", at, &ct, &sealed).unwrap_err();
     assert!(err.contains("rotated"), "{err}");
 
-    // Same key, but the ciphertext moved to another author's row or room.
-    let err = chat::open_body(&w.key_b, &w.room, "bob-fed", &ct, &sealed).unwrap_err();
+    // Same key, but the ciphertext lifted onto another author's row, another
+    // room, or the SAME author's row at a different instant (the binding
+    // persist v40.0.0 made possible by carrying the claim's instant verbatim).
+    let err = chat::open_body(&w.key_b, &w.room, "bob-fed", at, &ct, &sealed).unwrap_err();
     assert!(err.contains("open failed"), "{err}");
-    let err = chat::open_body(&w.key_b, "another-room", "alice-fed", &ct, &sealed).unwrap_err();
+    let err = chat::open_body(&w.key_b, "another-room", "alice-fed", at, &ct, &sealed).unwrap_err();
+    assert!(err.contains("open failed"), "{err}");
+    let err = chat::open_body(
+        &w.key_b,
+        &w.room,
+        "alice-fed",
+        "2026-05-01T00:00:01.000Z",
+        &ct,
+        &sealed,
+    )
+    .unwrap_err();
     assert!(err.contains("open failed"), "{err}");
 
     // And the reader reports it rather than dropping it or lying: the
@@ -548,6 +562,59 @@ async fn a_wrong_key_epoch_or_context_does_not_open_the_body() {
         seen[0].widens.is_some(),
         "the row a peer holds is the widening"
     );
+}
+
+/// **A widening carries the CLAIM's instant** (persist v40.0.0 /
+/// CIRISPersist#801) — the guarantee the seal now rests on. The widened row
+/// is the only one a peer receives, so if its `asserted_at` were the
+/// placement time (v39.0.0's behaviour) a key bound to the claim instant
+/// would open the author's own `self` copy and nothing else. The placement's
+/// own time is recorded separately, in the signed `widened_at`.
+#[tokio::test]
+async fn a_widening_carries_the_claims_instant_and_records_its_own() {
+    let w = world().await;
+    let msg = authored(&w, "when was this said").await;
+    let crossing = share(
+        &*w.dir,
+        &msg,
+        w.room_with(),
+        CrossingBasis::ProducerAuthority,
+        w.signers(),
+    )
+    .await
+    .unwrap();
+    let Shared::Placed { attestation_id } = &crossing.shared else {
+        panic!("{:?}", crossing.shared)
+    };
+    let prior = w.stored("alice-fed", &msg.attestation_id).await;
+    let widening = w.stored("alice-fed", attestation_id).await;
+
+    let claim_at = prior.attestation_envelope["asserted_at"].as_str().unwrap();
+    assert_eq!(
+        widening.attestation_envelope["asserted_at"].as_str(),
+        Some(claim_at),
+        "the widening asserts the CLAIM's instant, verbatim"
+    );
+    assert_eq!(
+        widening.asserted_at, prior.asserted_at,
+        "and the column agrees"
+    );
+    let widened_at = widening.attestation_envelope["widened_at"]
+        .as_str()
+        .expect("the placement records its own signed instant");
+    assert!(is_canonical_instant(widened_at), "{widened_at}");
+    assert!(
+        widened_at >= claim_at,
+        "the placement cannot precede the claim: claim={claim_at} widened={widened_at}"
+    );
+
+    // Which is exactly what lets the far end open the row it actually gets.
+    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &w.room, &w.key_b)
+        .await
+        .unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].body, Body::Text("when was this said".to_owned()));
+    assert_eq!(seen[0].widens.as_deref(), Some(msg.attestation_id.as_str()));
 }
 
 /// A message for a DIFFERENT room is not in this one. The room filter is on
