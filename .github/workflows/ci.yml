@@ -1248,7 +1248,7 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 60
           shell: bash
-          command: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 lxmf" -- -D warnings
+          command: cargo clippy --all-targets --features "transport-http transport-reticulum pyo3 lxmf mesh-harness test-anchor" -- -D warnings
       - name: cargo clippy (uniffi feature on)
         # v0.13.0 (CIRISEdge#36 GO) — uniffi gate. The wheel build
         # default-enables `ffi-uniffi` via `pyo3` ⇒ `ffi-uniffi`, but

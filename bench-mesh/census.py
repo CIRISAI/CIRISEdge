@@ -70,6 +70,9 @@ EXPECTED = {
         "mesh.standup",
         "mesh.rooting",
         "ladder.discover",
+        "ladder.discover_by_fedid",
+        "ladder.open_chat",
+        "ladder.send_message",
         "cohort.join",
         "scope.install",
         "perf.publish_fanout",
@@ -82,6 +85,9 @@ EXPECTED = {
         "mesh.standup",
         "mesh.rooting",
         "ladder.discover",
+        "ladder.discover_by_fedid",
+        "ladder.open_chat",
+        "ladder.send_message",
         "cohort.join",
         "scope.install",
         "perf.receive",
@@ -869,6 +875,11 @@ def _golden():
         # peers; the two are different claims and the ladder needs the second.
         if role in ("publisher", "subscriber"):
             rows.append(_row(node, role, "ladder.discover"))
+            rows.append(_row(node, role, "ladder.discover_by_fedid"))
+            # The pair chat runs on the publisher and the FIRST subscriber.
+            if node in ("publisher", "sub-1"):
+                rows.append(_row(node, role, "ladder.open_chat"))
+                rows.append(_row(node, role, "ladder.send_message"))
     for leg in ["cohort.join", "scope.install", "perf.publish_fanout",
                 "perf.blob_fanout", "conformance.seal_retires",
                 "mesh.member_reports"]:

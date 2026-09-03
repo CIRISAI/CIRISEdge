@@ -723,6 +723,43 @@ pub fn mint_cohort_key_material(
 
 /// Guarded per-cohort MLS state. All mutation runs under
 /// [`CohortGroup`]'s async mutex — see module docs § "Single writer".
+/// **The wire form of a [`KeyPackage`]** — an `MlsMessageOut` wrapping it,
+/// TLS-serialized: the form [`key_package_from_bytes`] round-trips and the
+/// one the RFC 9420 `MlsMessage` framing names. A cross-process join (the
+/// joiner publishes its KeyPackage as a directory row, the creator admits it
+/// on another node) has to make this hop; before v19.0.0 every caller did it
+/// by hand, which the mesh harness recorded as a DX finding.
+///
+/// # Errors
+/// TLS serialization failure.
+pub fn key_package_to_bytes(key_package: KeyPackage) -> Result<Vec<u8>, CohortGroupError> {
+    serialize_mls_message(&MlsMessageOut::from(key_package))
+}
+
+/// [`key_package_to_bytes`]'s inverse: decode the `MlsMessage` framing,
+/// refuse anything that is not a KeyPackage, and VALIDATE it (signature,
+/// lifetime, ciphersuite) under the same provider every edge group runs on.
+/// A validated [`KeyPackage`] is what [`CohortGroup::add_member`] takes.
+///
+/// # Errors
+/// Wire decode failure, a non-KeyPackage message, or validation failure.
+pub fn key_package_from_bytes(bytes: &[u8]) -> Result<KeyPackage, CohortGroupError> {
+    use openmls::prelude::{MlsMessageBodyIn, ProtocolVersion};
+    use openmls_traits::OpenMlsProvider as _;
+
+    let msg = MlsMessageIn::tls_deserialize(&mut &*bytes)
+        .map_err(|e| CohortGroupError::WireDecodeFailed(format!("KeyPackage: {e:?}")))?;
+    let MlsMessageBodyIn::KeyPackage(kp_in) = msg.extract() else {
+        return Err(CohortGroupError::WireDecodeFailed(
+            "the message is not a KeyPackage".to_owned(),
+        ));
+    };
+    let provider = LibcruxProvider::default();
+    kp_in
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .map_err(|e| CohortGroupError::KeyPackageBuildFailed(format!("validate: {e:?}")))
+}
+
 struct CohortGroupInner {
     community_id: String,
     provider: Arc<LibcruxProvider>,

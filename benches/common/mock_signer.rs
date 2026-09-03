@@ -43,5 +43,7 @@ pub async fn bench_local_signer(me: &BenchFedKey, tmp: &tempfile::TempDir) -> Ar
     .await
     .expect("load_local_seed");
 
-    Arc::new(LocalSigner::new(me.key_id.clone(), classical, None))
+    let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(me.ml_dsa_signer());
+
+    Arc::new(LocalSigner::new(me.key_id.clone(), classical, Some(pqc)))
 }

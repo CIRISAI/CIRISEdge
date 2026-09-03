@@ -196,11 +196,8 @@ impl FedKey {
         dir
     }
 
-    /// Classical-only signer — what envelope SENDERS use. Their directory
-    /// records deliberately carry no ML-DSA-65 pubkey (see `signed_record`),
-    /// and a hybrid-signed envelope against a classical-only record is a
-    /// HARD verify error ("PQC signature without pubkey"), not a
-    /// policy-fallback case — so senders must stay classical here.
+    /// Edge `LocalSigner` — the FULL hybrid (v19.0.0): Ed25519 from the seed
+    /// file, ML-DSA-65 from the same seed, matching the registered record.
     async fn local_signer(&self, base: &std::path::Path) -> Arc<LocalSigner> {
         let seed_dir = self.write_seed_dir(base);
         let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
@@ -211,7 +208,10 @@ impl FedKey {
         })
         .await
         .expect("load_local_seed");
-        Arc::new(LocalSigner::new(self.key_id.clone(), classical, None))
+        // v19.0.0 — every signature is the FULL hybrid, no fallback: the
+        // ML-DSA-65 half from the SAME seed the record registers.
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(self.ml_dsa_signer());
+        Arc::new(LocalSigner::new(self.key_id.clone(), classical, Some(pqc)))
     }
 
     /// Hybrid signer — what the EDGE-UNDER-TEST uses. Edge's
@@ -277,15 +277,11 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
     } else {
         None
     };
-    // CIRISEdge#359 finding 2 — accord_holder rows must register the ML-DSA-65
-    // half so `verify_hybrid_via_directory` can gate the HYBRID accord
-    // signature. Non-holder rows stay ed25519-only (their outer-envelope
-    // verify runs under the edge's `Ed25519Fallback` config policy).
-    let pubkey_ml_dsa_65_base64 = if identity_type == "accord_holder" {
-        Some(subject.ml_dsa_pubkey_b64())
-    } else {
-        None
-    };
+    // v19.0.0 — EVERY row registers the ML-DSA-65 half: every signature is
+    // the FULL hybrid (no classical-only fallback) and the verifier wants
+    // pubkey and signature both-or-neither. (CIRISEdge#359 finding 2 put it
+    // on accord_holder rows first; the rule is now universal.)
+    let pubkey_ml_dsa_65_base64 = Some(subject.ml_dsa_pubkey_b64());
     KeyRecord {
         key_id: subject.key_id.clone(),
         pubkey_ed25519_base64: subject.pubkey_b64(),

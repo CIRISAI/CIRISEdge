@@ -217,6 +217,233 @@ Resolves through the directory as always. On a hash-first node that holds only t
 
 If they opted out of announcing, no directory anywhere has them — only a code will do.
 
+## 6b-bis. Standing up replication — five footguns, all now disarmed
+
+Edge's own bench-mesh harness got every one of these wrong and burned a long
+arc of mesh runs on them, with no error anywhere. Each is now a
+one-liner in the API. Do not hand-roll them.
+
+**1. Route inbound frames — through `InboundRouter`, not by hand.**
+
+`Transport::listen` runs in YOUR dispatch loop, so wiring replication into it
+is your job. The obvious version is wrong:
+
+```rust
+// DON'T — this deadlocks the bootstrap.
+if let Some(peer) = frame.source_key_id.as_ref() {
+    registry.route_inbound_bytes(peer.as_str(), &frame.envelope_bytes).await?;
+}
+```
+
+A peer first heard by announce is admitted **advisory** (`owns_key = false`),
+and is promoted only by anti-entropying its bootstrap planes *over that same
+link*. Demanding attribution before routing means the exchange that earns
+attribution is the exchange attribution is required for. Nothing ever converges,
+and a dropped frame looks exactly like a frame that never arrived.
+
+```rust
+let router = InboundRouter::new(runtime.registry());
+while let Some(frame) = rx.recv().await {
+    if router.try_route(&frame).await.consumed() { continue; }
+    // ... your own framing
+}
+```
+
+`try_route` returns a typed `RouteDisposition` (`Routed` / `NotReplication` /
+`Unattributed` / `Failed`) — count them. A steady stream of `Unattributed` is
+the field diagnosis for footgun 2.
+
+**2. Replicate every `BOOTSTRAP_PLANE`.**
+
+```rust
+for kind in EnvelopeKind::BOOTSTRAP_PLANES.into_iter().chain([EnvelopeKind::Attestation]) { … }
+```
+
+`Key`, `IdentityOccurrence` **and** `TransportDestination` — the third is what
+satisfies #393 item 2 (`hybrid_transport_binding_exists`). Omit any one and the
+link never promotes, so no other plane ever flows. Silently.
+
+**3. Do NOT register `EnvelopeKind::ALL`.**
+
+A coordinator exists per `(peer, kind)`. Fifteen kinds across four peers is
+**sixty** of them dialing one transport; it saturates the link pool and starves
+your own traffic (leviculum#29, CIRISEdge#508/#531). We measured it as
+`resource transfer failed: Timeout` on ordinary application sends. Register the
+bootstrap planes plus what you actually read.
+
+**4. Pass a self-publish set — `self_provider: None` is almost always wrong.**
+
+```rust
+Some(self_publish_set([&node_key_id, &agent_key_id, &owner_key_id]))
+```
+
+It gates the `SelfOwn` planes: your `Key`, your `IdentityOccurrence`, and your
+`TransportDestination`. That last one is your node's **transport hint** — the
+`(peer, dest)` binding a peer needs to satisfy #393 item 2 — so a node that does
+not publish it has its frames DROPPED at every peer's attribution gate, reported
+as `item 1 PASSED (Rooted ∧ owns_key) but item 2 FAILED`. The row exists on its
+author the whole time; nothing offers it. Edge's own harness lost runs to this,
+so `start` now WARNs when the set is absent.
+
+Include **every** identity the node holds. Three keys are the minimum for a
+viable agent — **human, node, agent** — and they are separate on purpose: an
+agentID resolves to its owner, the owner resolves to the nodes they own, and the
+NODE is what you dial. Conflate the agent with the node and that walk is a
+tautology; omit the owner's row and it stops one hop out.
+
+**5. Author a directed `consent:replication:v1` grant per peer.**
+
+The Attestation plane is consent-gated at the **recipient**, not per row: a peer
+that does not resolve to a consent-membership proof withholds the WHOLE plane,
+fail-closed, before any per-row question is asked.
+
+```rust
+let grant = attestation_bind::replication_consent_attestation(
+    &node_key_id, &peer_key_id, &attestation_bind::DEFAULT_CONSENT_PREFIXES, now, &signer,
+).await?;
+directory.put_attestation(SignedAttestation { attestation: grant }).await?;
+```
+
+Consent is **directed and self-attested** (CEG 1.0-RC29 §5.6.8.15): A granting B
+says nothing about B granting A, so each node authors its own half.
+`DEFAULT_CONSENT_PREFIXES` matches CIRISServer's list — if you restate it, you
+will drop a plane and stay green while doing it (that is how the server shipped
+eight releases moving zero traces).
+
+**And install a log subscriber.** Edge emits `tracing` events; a binary with no
+subscriber emits nothing, and its silence is indistinguishable from a code path
+that never ran. That cost us five of the six runs.
+
+---
+
+## 6c. Waiting for the mesh — use the helper, do not write a poll loop
+
+Every plane is eventually consistent: `pull_subject_testimony` is
+**fire-and-forget** by design (it returns once the sends are queued; the rows
+arrive later through Diff/Deliver). If you need the answer, do NOT write this:
+
+```rust
+// DON'T. This is the shape that appeared four times in our own harness.
+loop {
+    if resolve(&lens, &fed_id).await.is_ok() { break }
+    if started.elapsed() >= timeout { return Err(..) }
+    sleep(Duration::from_millis(500)).await;
+}
+```
+
+Use the one helper. It subscribes BEFORE dispatching (so a row admitted between
+the send and the wait is not missed), wakes on an **admitted envelope** rather
+than a timer, and reports how long convergence actually took:
+
+```rust
+let outcome = replication
+    .pull_and_await(&peer_key_id, &fed_id, Duration::from_secs(10), || async {
+        contact::resolve(&lens, &fed_id).await.is_ok()
+    })
+    .await?;                      // Err ONLY if the Pull could not be SENT
+
+if outcome.is_converged() {
+    // contact found; outcome.waited() / outcome.checks() are yours to log
+}
+```
+
+A sent Pull that never converges is `Converged::TimedOut`, **not** an error —
+the peer may simply not hold what you asked for, and that is an answer.
+
+A subject Pull can only ask for rows about **yourself** or the server's own
+record. For everything else you are in the audience of — another person's
+owner binding, the rows they placed in a room you share, a KeyPackage they
+published for you — use the anti-entropy twin. It kicks a round toward the
+peer NOW instead of waiting for the cadence tick, and re-kicks on every
+admission until your predicate holds, so a walk that needs several dependent
+rounds (Key, then attribution, then Attestation) runs them back to back:
+
+```rust
+let outcome = replication
+    .sync_and_await(&peer_node, Duration::from_secs(30), || async {
+        chat::welcome_from(&*dir, &creator_fed_id, &room).await.is_ok_and(|w| w.is_some())
+    })
+    .await?;                      // Err ONLY if the scheduler has shut down
+```
+
+`bench-mesh` measured the difference: discovery went from ~19 s (four cadence
+ticks) to one kicked chain, and the chat waits from a whole tick to the round's
+wire time.
+
+Waiting on something replication does not signal (a transport route, a file)?
+Same helper, no pull:
+
+```rust
+let mut waiter = replication.convergence();          // or ConvergenceWaiter::unsignalled()
+let out = waiter.await_until(budget, || async { routes.has_destination(&node).await }).await;
+```
+
+The predicate must be a question about **observable state**, not about a message
+having arrived, and it must not capture anything mutably — keep it `Fn`-shaped
+and read what you need afterwards.
+
+---
+
+## 6d. The two-person chat, rung by rung
+
+`tests/chat_two_person_community.rs` walks the whole flow on real substrate —
+real hybrid signatures, a real persist directory, real MLS. It is the reference
+to copy; every call below is exercised there.
+
+| your UI | the call | who owns it |
+|---|---|---|
+| "search for a fedID or NodeCode" | `contact::parse_contact_input` then `contact::resolve` / `contact::discover` | edge |
+| "Contact Found, adding to contact book" | the `Subject` it returns — `fed_id` + `nodes` | edge |
+| "Send request to join chat community" | your `POST /v1/contacts` | **server** |
+| "Request received from X" + optional note | your transport of choice; edge carries the bytes | **server** |
+| accept → consent | your consent grant | **server** |
+| "Joined community with X" | `chat::signed_pair_community` (the room record, both people `founder`s) then the MLS handshake OVER THE ROOM: joiner `key_package_attestation` → creator `CohortGroup::create` + `add_member` + `welcome_attestation` → joiner `CohortGroup::join`; roles from `chat::PairRole::of` | edge |
+| "Chat with Y" | `contact::the_other_member(&group.member_key_ids().await, own_key_id)` | edge |
+| send a message | `chat::RoomKey::of(&group)` then `chat::chat_message_attestation(&author, &peer, body, now, &key)` — the body SEALED under the room's record secret — stored, then `share(.., With::Community { room }, ProducerAuthority, Signers { node, actor: Some(&author) })` | edge |
+| read the room | `chat::messages_in_room(&*dir, &[peer_fed_id], &room, &key)` — opened; a row that will not open is `Body::Unopened { reason }` | edge |
+
+Four things worth knowing before you build on it:
+
+1. **A nodeID and a fedID must land on the same person.** A node cannot consent
+   and cannot be a contact, so pasting either into one search box is correct and
+   supported — `resolve` walks a node to its owner. Do not create two contact
+   entries for one human.
+2. **The invitee is a moderator, not a guest.** MLS has no owner role: whoever
+   was invited can change membership, and the founder applies their commit like
+   anyone else's. If your UI implies the creator is privileged, it is describing
+   a rule the substrate does not enforce.
+3. **"Chat with Y" is derived, never stored.** `the_other_member` returns `None`
+   unless the room is exactly two people *and* you are one of them — so a group
+   chat cannot silently render under one participant's name. Decide what an
+   unnamed room shows; do not unwrap.
+4. **The conversation key moves when membership does.** `record_secret()` (and
+   `RoomKey::of`) changes on every membership commit, which is what stops a
+   removed member from reading on. Re-derive after applying a commit rather
+   than caching it; a message sealed at an older epoch reports
+   `Body::Unopened { reason: ".. the room rotated" }` rather than opening.
+5. **Community tier is encrypted, always.** There is no plaintext producer:
+   `chat_message_attestation` takes the `RoomKey`, the wire carries ciphertext
+   plus a `sealed { alg, epoch, nonce }` header, and the seal is keyed through
+   HKDF over the room, the author and the epoch — a ciphertext moved to
+   another author's row or another room does not open. The MLS handshake that
+   makes the key is two ordinary rows in the room (`chat:key_package:v1`,
+   `chat:welcome:v1`), each signed by the person with the FULL hybrid key
+   (there is no classical-only fallback anywhere in edge from v19.0.0), and
+   served by the audience gate to exactly the other member's nodes. Both
+   humans are `founder`s of the pair room, so it federates (§11.11) without
+   anyone appointing anyone.
+
+Every rung above is proven over the real mesh, not just in unit tests:
+`bench-mesh`'s `ladder.discover_by_fedid` resolves a PEER's owner from a
+binding it learned over the Attestation plane, having seeded nothing;
+`ladder.open_chat` runs the MLS handshake over the room between two nodes
+through a relay; `ladder.send_message` seals on one side and OPENS on the
+other, and fails the leg on a leaked `self` copy or any chat row carrying the
+plaintext. `tests/chat_message_federates.rs` is the second reference: the same
+rows on real sqlite, including the handshake rows read back through the room.
+
+---
+
 ## 6b. Still genuinely unbuilt
 
 1. **`KnownHashes` records holders but nothing dispatches a point `Fetch` yet.** The learned directory is a sink until that path is wired.

@@ -1,5 +1,191 @@
 # CIRISEdge Release Notes
 
+# v19.0.0 — Promotion is two verbs and the ACTOR signs (adopt CIRISPersist v39.0.0)
+
+**2026-09-03** — BREAKING. Adopts CIRISPersist v39.0.0 (CIRISEdge#562,
+CIRISPersist#799): the one promotion primitive is gone and two operations
+stand where it stood. `share` / `publish` now compose `enter_mesh` (tier
+crossing over the SAME bytes — the actor's signature stays the base scrub,
+the node may only APPEND a co-scrub with `cosigned_at`) and `widen_audience`
+(a `supersedes` the ACTOR signs at a strictly wider `cohort_scope`; the prior
+row is untouched). Design record: `docs/FSD_REPLICATION_DX.md` §0/§3 and
+persist's `FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE.md` (read its §11).
+
+## What broke, and why it had to
+
+Under persist ≤ v38 `promote_attestation` re-signed every promoted row with
+the NODE's key, cleared every co-scrub, and rewrote `cohort_scope` inside the
+signed envelope — so the fabric became the author of an actor's claim, and a
+row attested by anyone but the node was refused at every peer while promotion
+returned `Ok`. Edge's `share` rode it, and the chat producer named the node as
+attester with the human as `on_behalf_of_key_id` to survive it.
+
+## Edge's surface (`replication::attestation_bind`)
+
+- `share(dir, row, With, CrossingBasis, Signers)` / `publish(dir, row,
+  CrossingBasis, Signers)`. `Signers { node, actor }` — the node is CUSTODY,
+  the actor (the attester's signer, when in hand) SIGNS. `custody_for` decides
+  who signs from the row (edge's copy of persist's `Engine::custody_for`
+  table): signed at write by another key → the node co-scrubs; unsigned and
+  attested by this node → the node signs as the actor; unsigned by another
+  key with no signer → `AwaitingActor`; the WRONG key in hand → refused.
+- **A widening share yields TWO rows.** `share(self-row, With::Community
+  { .. })` leaves the original at `(federation, self)` (replicated to the
+  owner's own devices, never advertised) plus a `supersedes` at `community`
+  — the row the peer receives. `Shared::Placed { attestation_id }` carries
+  the NEW row's id. `Shared::AlreadyThere` / `AwaitingActor` are typed; a
+  narrowing is refused by name (`share_plan`, pure, before any directory).
+- `With::MyFamily { family_key_id }` / `With::Community { community_key_id }`
+  NAME their cohort (AV-45: a placement is a membership claim about one
+  cohort). `EncryptedCohort` likewise.
+- `CrossingBasis` — the `transmission_principle` axis rides the CALL
+  (`ProducerAuthority` or a named `ConsentGrant`), validated against the
+  stored grant; never a reseal member.
+- **`Flow` is deleted.** `Crossing.ci` is persist's nine-axis
+  `ContextualIntegrity` (CC 4.5.1.1: sender, data_subject, recipient_see,
+  recipient_revoke, recipient_receive, information_type,
+  transmission_principle, temporal_lifecycle, content), verified at the
+  crossing and refused by axis name. `describe_crossing` is persist's own.
+  `Crossing.routes_to` / `discoverable` say what edge does with it; `entered`
+  / `widened` carry both verb outcomes verbatim.
+- Removed: `promote_to_scope`, `describe_flow`, `already_promoted_verdict`,
+  `truncate_to_micros`.
+
+## Chat is ENCRYPTED — community tier is always encrypted
+
+- **The body is sealed under the room's MLS record secret** (`RoomKey`, the
+  group's record exporter; ciphersuite `0x004D` X-Wing) with
+  XChaCha20-Poly1305, keyed through HKDF over the room, the author and the
+  epoch. What crosses the wire — and what the relay and every non-member
+  node holds — is ciphertext inside a signed envelope. There is no plaintext
+  producer: `chat_message_attestation(author, recipient, body, at, key)`.
+  `messages_in_room(.., key)` opens; a row that will not open is
+  `Body::Unopened { reason }`, never dropped and never returned as text.
+  A wrong key, a rotated epoch, another author's row or another room does
+  not open (`a_wrong_key_epoch_or_context_does_not_open_the_body`).
+- **The MLS handshake rides the room — directory-only MLS.** The joiner
+  (`PairRole::Joiner`, the greater fed-ID) shares its KeyPackage as a
+  community-scoped row (`chat:key_package:v1`); the creator admits it and
+  shares the Welcome (`chat:welcome:v1`); the joiner joins. Both rows are
+  ordinary rows the person signs (full hybrid), admitted against their
+  directory record — that is what binds the MLS credential to the person —
+  and served by the audience gate to exactly the other member's nodes.
+  `mls::cohort_group::{key_package_to_bytes, key_package_from_bytes}` is the
+  KeyPackage byte codec the harness used to hand-roll.
+- The mesh harness now runs the handshake over the mesh (`ladder.open_chat`
+  reports role, KeyPackage/Welcome sizes and waits, epoch), seals the
+  message, and the receiver OPENS it with its own copy of the room key —
+  failing the leg on a leaked self copy OR any chat row carrying the
+  plaintext (`plaintext_on_wire`).
+
+## Trust is derived, never read — the durable-store heal re-walks the chain
+
+Found by the no-fallback rule: with every peer now hybrid, a peer whose
+steward is NOT in this node's anchor was being attributed anyway. Its own
+`SignedTransportDestination` (which `self_route` writes with
+`binding_provenance: Rooted`) replicated into this node's directory, and the
+#432 divergence heal treated the store's `Rooted` as this node's trust —
+authenticated as "the peer said so", never walked against the anchor. That is
+the confused-deputy shape #337 closed for bare rows, wearing a signature, and
+it was masked only while classical-only peers could not publish the row at
+all. `heal_or_report_attribution_miss` now re-runs `root_binding` (with the
+key's registered pubkey — `RootingDirectory::registered_pubkey_ed25519_base64`,
+new) under the transport's hybrid policy before upgrading, and a store claim
+whose chain does not root here is `DivergenceHeal::StoreClaimUnrooted`:
+logged, not laundered. `tests/route_table_e2e.rs`'s #393/#353 witnesses now
+inject the peer as ADVISORY (`inject_advisory_peer_with_transport_identity_for_test`,
+new) and are green for the reason they state — they had been green because
+the peer was hybrid-pending.
+
+## Every signature is the FULL hybrid — no classical-only fallback
+
+`identity::sign_bound_hybrid` and `identity::sign_envelope` REFUSE a signer
+without its ML-DSA-65 half, naming what was being signed. The old
+warn-and-continue produced rows and envelopes every Strict verifier refused
+one hop later with the cause lost. Every test and bench fixture moved to a
+hybrid signer with the matching pubkey on its record.
+
+## Discovery and chat waits kick the round — `sync_and_await`
+
+`ReplicationRuntime::round_now(peer)` fires an anti-entropy round toward a
+peer NOW (`SchedulerCommand::RoundNow`; a kick during a round is held and
+runs right after; the scheduled tick resets so a kick never doubles a round).
+`sync_and_await(peer, budget, is_present)` is the anti-entropy twin of
+`pull_and_await` for rows a subject Pull cannot ask for by identifier —
+another person's owner binding, the rows they placed in a room you share —
+and re-kicks on every admission until the walk resolves, so the Key →
+attribution → Attestation chain runs back to back instead of one plane per
+cadence tick. The discovery leg and every chat wait use it.
+
+## Pair rooms are authored at standup
+
+Each node authors its pair room with every roster owner before replication
+starts, so a peer's message or handshake row is admissible the moment it
+arrives (AV-45 proves membership against the room the row names; an unknown
+room was a transient refusal costing a round).
+
+## Chat (`chat`)
+
+- `chat_message_attestation(author: &LocalSigner, recipient, body, at, key)` —
+  the AUTHOR attests and signs, **at write** (persist FSD §5.4 OQ-2, answered
+  by edge: an unsigned row has nothing to co-scrub and a key rotation strands
+  it). The node is custody. `on_behalf_of_key_id` is read for pre-v39 rows,
+  never written.
+- The room member is `community_key_id` (persist's canonical cohort-target
+  alias — its widening carries the placement under that name).
+- `pair_community(a, b, founded_at)` / `signed_pair_community(.., authority)`
+  — the two-person room as a record, **both people `founder`s under
+  `unanimous`**: each is an authority root and so a zero-hop named moderator
+  by construction (§11.11 — persist refuses to federate an unmoderated
+  community), not by the accident of a protocol setting. The harness, the
+  tests and the bridge witnesses all open rooms through it; pinned by
+  `both_members_of_the_pair_room_are_moderators` against persist's own
+  `moderators_of`.
+- `messages_in_room(dir, participants, room)` lists by the humans who speak
+  and FOLDS `supersedes`: one message per thing said. `ChatMessage.widens`
+  names the `self` row a widening supersedes.
+
+## CC 2.6.2 — signed instants are canonical, millisecond
+
+Every instant edge signs (`bind_attestation_envelope`, the chat producer, the
+A/V delivery producer) renders through persist's `render_signed_instant`
+(`YYYY-MM-DDTHH:MM:SS.sssZ`) and truncates the typed column through
+`truncate_to_substrate_resolution` (now 1 ms). Consumers windowing on a raw
+`Utc::now()` can drop a row stamped "at" that instant by up to 1 ms —
+truncate the bound the way the producer truncates the row.
+
+## CC 5.2 — the AUDIENCE gate on attestation rows (found by the first v19 mesh run)
+
+Persist v39 admits `(federation, self)` at the crossing, so a self-scoped row
+now EXISTS on the wire — and edge's `SelfOwn` projection filter was
+producer-keyed and peer-blind (publish-own). Measured: the owner's `self` copy
+of a chat message landed on ANOTHER person's node; the receiver leg passed
+because it accepted any row with the right body. The roster planes had a
+per-peer owner-axis test since #523; the attestation rows did not.
+
+`bridge.rs#audience_withholds` now asks CC 5.2's question per recipient, on
+the advertise AND the direct-fetch twin: a `self` row is served only to nodes
+whose PRINCIPAL is the row's principal (persist's
+`admission_identity_for_writer` — a person is their own, a node's is its
+owner); a `family` / `community` row only to members' nodes (persist's
+`list_*_for_member`); a row naming no cohort, or a principal that will not
+resolve, is withheld and booked (`RecipientNotInSendSet`). Memoized per sweep.
+Witnessed on a real memory backend (self → the owner's other node only;
+community → members' nodes only; malformed → nobody). The harness receiver now
+requires the WIDENING and fails the leg on a leaked `self` copy
+(`leaked_self_rows` in the census).
+
+## Mesh harness
+
+`ladder.send_message` now authors with the OWNER's signer, shares with
+`Signers { node, actor: Some(owner) }`, reports the whole `Crossing` (nine
+axes, both outcomes, `routes_to`) in the census, and the receiver expects the
+row ATTESTED BY THE PEER'S HUMAN — the widening — keyed on the sender's id,
+and reports any leaked `self` copy.
+
+Pins: ciris-persist v39.0.0 (`>=39,<40` wheel floor), CIRISVerify v14.1.0
+(unchanged, one copy), leviculum v0.24.0+ciris.1 (unchanged).
+
 # v1.1.0 — Routing-table FFI flip-on (CIRISEdge#44)
 
 **2026-05-30** — Closes 5 of the 8 routing-table read surfaces that

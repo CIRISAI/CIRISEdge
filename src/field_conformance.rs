@@ -114,13 +114,13 @@ pub const DEFERRED_PENDING_PLANE: &[(&str, &str)] = &[
         "serve-time strip is UNSOUND on edge's content-addressed signed wire (#397): the \
       recipient fetches by content_hash and re-verifies the hybrid signature at \
       put_attestation, so stripping a field breaks both. persist applies StripField at \
-      PROMOTION before signing (promote_attestation_with_transforms, v21.7.0) and \
+      the WIDENING before signing (widen_audience's strip → differs_in, v39.0.0) and \
       explicitly scoped general serve-layer transforms as a follow-up — this is \
       persist-owned, not an edge processor.",
     ),
     (
         "raw_probe_payloads",
-        "same content-addressed-wire unsoundness; the strip is a persist PROMOTION-side \
+        "same content-addressed-wire unsoundness; the strip is a persist WIDENING-side \
       transform, not an edge serve-time op.",
     ),
     (

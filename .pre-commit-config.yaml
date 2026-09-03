@@ -76,8 +76,8 @@ repos:
   - repo: local
     hooks:
       - id: cargo-clippy
-        name: cargo clippy (transport-http,transport-reticulum,pyo3,lxmf) -D warnings
-        entry: cargo clippy --features "transport-http transport-reticulum pyo3 lxmf" --all-targets -- -D warnings
+        name: cargo clippy (transport-http,transport-reticulum,pyo3,lxmf,mesh-harness,test-anchor) -D warnings
+        entry: cargo clippy --features "transport-http transport-reticulum pyo3 lxmf mesh-harness test-anchor" --all-targets -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false

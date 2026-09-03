@@ -9295,6 +9295,11 @@ mod ephemeral_correlation_tests {
             *b = u8::try_from(i).expect("in range") ^ 0xa5;
         }
         std::fs::write(seeds.join("ed25519.seed"), seed).expect("write seed");
+        // The FULL hybrid (v19.0.0: no classical-only fallback) — the builder
+        // picks up `ml_dsa_65.seed` beside the ed25519 seed.
+        let mut pqc_seed = seed;
+        pqc_seed[0] ^= 0x55;
+        std::fs::write(seeds.join("ml_dsa_65.seed"), pqc_seed).expect("write pqc seed");
         let edge =
             EdgeBuilder::from_keyring_seed_dir(key_id, seeds, tmp.path().join("edge.sqlite"))
                 .await

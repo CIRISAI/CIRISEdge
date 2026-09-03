@@ -335,8 +335,13 @@ fn r5_missing_signer_recovery_keys_on_key_retention() {
     }
 }
 
-/// R6 — the third-party identifier Pull keys on Axis 3. Every tier probed
-/// against every subject class.
+/// R6 — a third-party identifier Pull is NOT decided by the tier.
+///
+/// node/fed/agent IDs are federation cohort: servable by any peer holding
+/// them, to any requester under a mutual trust root. This fixture seeds no
+/// delegations, so the honest assertion here is the NEGATIVE one — every tier
+/// refuses — which is also the regression that matters: a tier must never be
+/// able to substitute for the shared root.
 #[tokio::test]
 async fn r6_third_party_pull_keys_on_tier() {
     use crate::replication::directory::ReplicationDirectory as _;
@@ -355,15 +360,16 @@ async fn r6_third_party_pull_keys_on_tier() {
             .with_serve_tier_for_test(tier);
 
         // Third party: conferred servers only.
-        assert_eq!(
-            !bridge
+        assert!(
+            bridge
                 .subject_holdings(EnvelopeKind::Key, "subject-S", Some("stranger-X"))
                 .await
                 .is_empty(),
-            tier.answers_identifier_lookups(),
-            "{tier:?}: an identifier lookup is answered ONLY by the tier that \
-             holds bodies — answering requires one, so a hash-first mesh server \
-             cannot, whatever it is entitled to"
+            "{tier:?}: with NO mutual trust root, no tier answers a third-party \
+             lookup — entitlement is the shared root, not the rung (CC 4: two \
+             nodes with no shared root compose nothing). The positive case is \
+             `identifier_lookups_are_entitled_by_a_mutual_trust_root`, which \
+             needs seeded delegations this fixture deliberately does not carry"
         );
         // R7 — the data-subject path: EVERY tier answers the subject itself.
         assert!(
@@ -553,7 +559,6 @@ async fn ladder_a_claim_alone_confers_no_tier() {
 #[allow(dead_code)]
 fn the_matrix_symbols_compile() {
     let _: fn(ServeTier) -> bool = ServeTier::holds_hash_directory;
-    let _: fn(ServeTier) -> bool = ServeTier::answers_identifier_lookups;
     let _: fn(ServeTier) -> bool = ServeTier::trusted_for_bootstrap;
     let _: fn(Retention) -> bool = crate::replication::retention::should_note_missing_signer;
     let _ = crate::replication::serve_tier::CachedServeTier::TTL;

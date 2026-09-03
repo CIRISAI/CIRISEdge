@@ -82,7 +82,6 @@
 
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 
 use ciris_persist::federation::freshness::{
@@ -205,35 +204,9 @@ async fn sign_bound_hybrid(
     signer: &LocalSigner,
     bytes: &[u8],
 ) -> Result<(String, Option<String>), TouchClaimError> {
-    let ed = signer
-        .classical
-        .sign(bytes)
+    crate::identity::sign_bound_hybrid(signer, bytes, "touch claim")
         .await
-        .map_err(|e| TouchClaimError::Sign(format!("ed25519: {e}")))?;
-    let ed_b64 = B64.encode(&ed);
-    let mldsa_b64 = if let Some(pqc) = signer.pqc.as_ref() {
-        let mut bound = bytes.to_vec();
-        bound.extend_from_slice(&ed);
-        let sig = pqc
-            .sign(&bound)
-            .await
-            .map_err(|e| TouchClaimError::Sign(format!("ml-dsa-65: {e}")))?;
-        Some(B64.encode(&sig))
-    } else {
-        // CIRISEdge#425 — the signer has NO PQC half (hybrid-pending), so this touch
-        // is CLASSICAL-ONLY and will be REFUSED at persist's federation-tier
-        // RequireHybrid gate — surfacing later as a generic `Put` error with the
-        // cause lost. Name it HERE, at the source, so "the touch didn't admit" is a
-        // one-line read, not an investigation.
-        tracing::warn!(
-            key_id = %signer.key_id,
-            "touch claim signed CLASSICAL-ONLY — signer has no ML-DSA-65 (PQC) half \
-             (hybrid-pending). This claim will NOT admit at RequireHybrid; provision the \
-             PQC signer half to emit an admissible hybrid touch (CIRISEdge#425)"
-        );
-        None
-    };
-    Ok((ed_b64, mldsa_b64))
+        .map_err(TouchClaimError::Sign)
 }
 
 /// Build + hybrid-sign a [`SignedTouchClaim`] with `signer` as the
@@ -615,6 +588,7 @@ impl TouchClaimProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
     use ciris_persist::federation::types::{algorithm, identity_type, KeyRecord, SignedKeyRecord};
     use ciris_persist::store::MemoryBackend;

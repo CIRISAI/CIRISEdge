@@ -47,7 +47,8 @@ async fn signer_for(key: &TestFedKey, base: &std::path::Path) -> Arc<LocalSigner
     })
     .await
     .expect("load_local_seed");
-    Arc::new(LocalSigner::new(key.key_id.clone(), classical, None))
+    let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(key.pqc_signer());
+    Arc::new(LocalSigner::new(key.key_id.clone(), classical, Some(pqc)))
 }
 
 async fn auth_for(
@@ -243,8 +244,14 @@ async fn identified_link_from_advisory_peer_is_delivered_but_not_attributed_393(
     // A must know B by B's REAL transport identity (the field shape), so the
     // identity B proves when it identifies the link matches A's stored hash and
     // attribution fires. B must know A's dest so the link can establish.
+    //
+    // B is ADVISORY at A — the #393 shape (its steward is not in the pinned
+    // anchor). This witness used to inject B as Rooted and was green only
+    // because B signed classical-only, so the HYBRID leg of E3 refused; with
+    // no classical-only signer left (v19.0.0), the refusal must come from the
+    // provenance the test actually claims.
     transport_a
-        .inject_rooted_peer_with_transport_identity_for_test(
+        .inject_advisory_peer_with_transport_identity_for_test(
             "edge-key-bbbb",
             transport_b.local_dest_hash(),
             transport_b.local_transport_pubkey(),
@@ -359,9 +366,10 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
 
     // A roots B with B's REAL transport identity (so `LinkIdentified`
     // attribution fires) but a PHANTOM dest reachable on no interface — the
-    // NAT model: A structurally cannot dial B.
+    // NAT model: A structurally cannot dial B. B is ADVISORY at A (see the
+    // #393 witness above for why this is no longer injected as Rooted).
     transport_a
-        .inject_rooted_peer_with_transport_identity_for_test(
+        .inject_advisory_peer_with_transport_identity_for_test(
             "edge-key-bbbb",
             [0xab; 16],
             transport_b.local_transport_pubkey(),

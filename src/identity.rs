@@ -383,8 +383,9 @@ pub fn build_envelope<M: Serialize>(
 }
 
 /// Sign an envelope in-place. Computes canonical bytes via persist's
-/// `canonicalize_envelope_for_signing` (CIRISPersist#7 closure),
-/// signs with Ed25519 (mandatory) and ML-DSA-65 (when available).
+/// `canonicalize_envelope_for_signing` (CIRISPersist#7 closure) and signs
+/// with the FULL hybrid: Ed25519 and ML-DSA-65, both mandatory (v19.0.0 —
+/// no classical-only fallback).
 pub async fn sign_envelope(
     signer: &LocalSigner,
     envelope: &mut EdgeEnvelope,
@@ -403,20 +404,25 @@ pub async fn sign_envelope(
         .map_err(|e| crate::EdgeError::Persist(format!("classical sign: {e}")))?;
     envelope.signature = base64::engine::general_purpose::STANDARD.encode(&ed25519_sig_bytes);
 
-    // ML-DSA-65 sign (optional during hybrid-pending; required after).
-    // Per persist's AV-33 bound-signature pattern: PQC signs
-    // canonical_bytes || classical_sig (not just canonical_bytes) so
-    // signature stripping doesn't degrade hybrid → classical-only.
-    if let Some(pqc) = signer.pqc.as_ref() {
-        let mut bound = canonical.clone();
-        bound.extend_from_slice(&ed25519_sig_bytes);
-        let pqc_sig_bytes = pqc
-            .sign(&bound)
-            .await
-            .map_err(|e| crate::EdgeError::Persist(format!("pqc sign: {e}")))?;
-        envelope.signature_pqc =
-            Some(base64::engine::general_purpose::STANDARD.encode(&pqc_sig_bytes));
-    }
+    // ML-DSA-65 sign — REQUIRED (v19.0.0: no classical-only fallback; the
+    // full hybrid keypair signs or nothing does). Per persist's AV-33
+    // bound-signature pattern: PQC signs canonical_bytes || classical_sig
+    // (not just canonical_bytes) so signature stripping doesn't degrade
+    // hybrid → classical-only.
+    let Some(pqc) = signer.pqc.as_ref() else {
+        return Err(crate::EdgeError::Persist(format!(
+            "sign_envelope: signer {} has no ML-DSA-65 (PQC) half — every signature is the \
+             FULL Ed25519 + ML-DSA-65 hybrid, no fallback (CIRISEdge#425)",
+            signer.key_id
+        )));
+    };
+    let mut bound = canonical.clone();
+    bound.extend_from_slice(&ed25519_sig_bytes);
+    let pqc_sig_bytes = pqc
+        .sign(&bound)
+        .await
+        .map_err(|e| crate::EdgeError::Persist(format!("pqc sign: {e}")))?;
+    envelope.signature_pqc = Some(base64::engine::general_purpose::STANDARD.encode(&pqc_sig_bytes));
 
     Ok(())
 }
@@ -433,4 +439,123 @@ fn random_nonce() -> [u8; 16] {
 /// `in_reply_to` ACK match key (FSD/EDGE_OUTBOUND_QUEUE.md §5).
 pub fn envelope_body_sha256(envelope: &EdgeEnvelope) -> [u8; 32] {
     ciris_persist::prelude::body_sha256(&envelope.body)
+}
+
+/// Produce the detached hybrid signature halves over `bytes` with `signer`:
+/// Ed25519 over `bytes`, ML-DSA-65 over `bytes ‖ ed25519_sig` — the
+/// **bound-sig discipline**, which is what stops the two halves being
+/// separable and re-paired across envelopes.
+///
+/// Returns `(ed25519_b64, Some(mldsa65_b64))` — the `Option` is the wire
+/// type's; since v19.0.0 it is always `Some`. A signer without a PQC half is
+/// REFUSED, naming `what` was being signed: the federation tier is
+/// PQC-mandatory (CC 5.3.2.4.3.1), persist verifies under
+/// `HybridPolicy::Strict`, and the old warn-and-continue produced a row every
+/// peer refused one hop later with the cause lost.
+///
+/// # Why it is shared
+///
+/// Every federation-tier producer edge has needs exactly this, and each one
+/// that re-derives it gets a chance to get the binding wrong. It was private
+/// to `touch_claim` until the owner-binding producer needed it too.
+///
+/// # Errors
+/// Returns the signer's failure, labelled with which half failed.
+pub async fn sign_bound_hybrid(
+    signer: &LocalSigner,
+    bytes: &[u8],
+    what: &str,
+) -> Result<(String, Option<String>), String> {
+    let ed = signer
+        .classical
+        .sign(bytes)
+        .await
+        .map_err(|e| format!("ed25519: {e}"))?;
+    let ed_b64 = base64::engine::general_purpose::STANDARD.encode(&ed);
+    let Some(pqc) = signer.pqc.as_ref() else {
+        // v19.0.0 — NO classical-only fallback. The federation tier is
+        // PQC-mandatory (CC 5.3.2.4.3.1) and persist verifies under
+        // `HybridPolicy::Strict`; a half-signature was a warn-and-continue
+        // that produced a row every peer refused one hop later, with the
+        // cause lost. The full hybrid keypair signs, or nothing does.
+        return Err(format!(
+            "{what}: signer {} has no ML-DSA-65 (PQC) half — every signature is the FULL \
+             Ed25519 + ML-DSA-65 hybrid, no fallback; provision the PQC half (CIRISEdge#425)",
+            signer.key_id
+        ));
+    };
+    let mut bound = bytes.to_vec();
+    bound.extend_from_slice(&ed);
+    let sig = pqc
+        .sign(&bound)
+        .await
+        .map_err(|e| format!("ml-dsa-65: {e}"))?;
+    Ok((
+        ed_b64,
+        Some(base64::engine::general_purpose::STANDARD.encode(&sig)),
+    ))
+}
+
+/// The same bound-hybrid signature as [`sign_bound_hybrid`], as the typed
+/// [`ciris_crypto::HybridSignature`] persist's emit assembler takes
+/// (`attestation_emit::assemble`) — so a row edge emits through persist's own
+/// builder is one shape with every other emit, and the AV-33 binding
+/// (ML-DSA-65 over `canonical ‖ ed25519_sig`) is spelled in exactly one place.
+///
+/// Refuses a classical-only signer outright rather than warning: the caller
+/// is emitting at the federation tier, which is PQC-mandatory (CC 5.3.2.4.3),
+/// and a half-signature would be refused at the put door one call later.
+///
+/// # Errors
+/// A signer without a PQC half; either half's signing or public-key failure.
+pub async fn sign_hybrid_raw(
+    signer: &LocalSigner,
+    bytes: &[u8],
+    what: &str,
+) -> Result<ciris_crypto::HybridSignature, String> {
+    use ciris_crypto::{
+        ClassicalAlgorithm, PqcAlgorithm, SignatureMode, TaggedClassicalSignature,
+        TaggedPqcSignature, CRYPTO_KIND_CIRIS_V1,
+    };
+    let Some(pqc) = signer.pqc.as_ref() else {
+        return Err(format!(
+            "{what}: signer {} has no ML-DSA-65 half — the federation tier is PQC-mandatory \
+             (CC 5.3.2.4.3) and a classical-only signature is refused at the put door",
+            signer.key_id
+        ));
+    };
+    let ed = signer
+        .classical
+        .sign(bytes)
+        .await
+        .map_err(|e| format!("{what}: ed25519: {e}"))?;
+    let mut bound = bytes.to_vec();
+    bound.extend_from_slice(&ed);
+    let q = pqc
+        .sign(&bound)
+        .await
+        .map_err(|e| format!("{what}: ml-dsa-65: {e}"))?;
+    let ed_pk = signer
+        .classical
+        .public_key()
+        .await
+        .map_err(|e| format!("{what}: ed25519 public key: {e}"))?;
+    let q_pk = pqc
+        .public_key()
+        .await
+        .map_err(|e| format!("{what}: ml-dsa-65 public key: {e}"))?;
+    Ok(ciris_crypto::HybridSignature {
+        crypto_kind: CRYPTO_KIND_CIRIS_V1,
+        classical: TaggedClassicalSignature {
+            algorithm: ClassicalAlgorithm::Ed25519,
+            signature: ed,
+            public_key: ed_pk,
+        },
+        pqc: TaggedPqcSignature {
+            algorithm: PqcAlgorithm::MlDsa65,
+            signature: q,
+            public_key: q_pk,
+        },
+        mode: SignatureMode::HybridRequired,
+    })
 }

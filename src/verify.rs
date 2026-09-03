@@ -220,6 +220,16 @@ pub trait RootingDirectory: Send + Sync + 'static {
     /// Assemble the recursive-provenance chain for `key_id` without
     /// the verifying verdict — the verify-consumable read.
     async fn provenance_chain(&self, key_id: &str) -> Result<ProvenanceChain, RootingRejection>;
+    /// v19.0.0 (CIRISEdge#393) — the Ed25519 pubkey `key_id`'s directory row
+    /// REGISTERS, base64. Lets a consumer that holds only a `key_id` (the
+    /// durable-store heal) run the same [`Self::root_binding`] walk the
+    /// announce path runs, with the record's own pubkey as the claim — so
+    /// rootedness is always re-derived from the chain, never read from a
+    /// stored provenance tag. Default `None` (test doubles / no directory ⇒
+    /// fail-closed).
+    async fn registered_pubkey_ed25519_base64(&self, _key_id: &str) -> Option<String> {
+        None
+    }
 
     /// CIRISEdge#299 — **write-through** a peer's rooted transport
     /// identity so it survives a restart (reloaded via
@@ -475,6 +485,13 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
 
     async fn provenance_chain(&self, key_id: &str) -> Result<ProvenanceChain, RootingRejection> {
         persist_provenance_chain(self, key_id).await
+    }
+    async fn registered_pubkey_ed25519_base64(&self, key_id: &str) -> Option<String> {
+        FederationDirectory::lookup_public_key(self, key_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.pubkey_ed25519_base64)
     }
 
     async fn hybrid_transport_binding_exists(&self, key_id: &str, dest_hash: [u8; 16]) -> bool {

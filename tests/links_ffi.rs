@@ -60,7 +60,8 @@ async fn signer_for(key: &TestFedKey, base: &std::path::Path) -> Arc<LocalSigner
     })
     .await
     .expect("load_local_seed");
-    Arc::new(LocalSigner::new(key.key_id.clone(), classical, None))
+    let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(key.pqc_signer());
+    Arc::new(LocalSigner::new(key.key_id.clone(), classical, Some(pqc)))
 }
 
 /// Build a `ReticulumAuth` carrying an event bus + rooting directory.

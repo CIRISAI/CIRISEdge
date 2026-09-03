@@ -265,6 +265,41 @@ async fn resolve_inner(
     })
 }
 
+/// The OTHER member of a two-person community — what "Chat with Y" is named
+/// after.
+///
+/// A pairwise chat has no title of its own: it is called after whoever else is
+/// in it, from each side. Deriving that from live membership rather than
+/// storing a string is what stops the label drifting from who is actually in
+/// the room — a renamed, departed, or added participant changes the answer
+/// immediately, because there is nothing else to change.
+///
+/// Returns `None` unless `members` is exactly two AND `own_key_id` is one of
+/// them. That is deliberate and each case is a different mistake:
+///
+/// * **not a pair** — a three-person room named after one participant would
+///   show a group chat under a single person's name. It needs a real title,
+///   which is a decision this function cannot make for the caller.
+/// * **not a member** — asking which peer you are talking to in a room you are
+///   not in is a caller bug. Guessing (returning "the first one") would hide it.
+///
+/// So an `Option` rather than a fallback: the caller decides what an unnamed
+/// room shows.
+///
+/// ```
+/// use ciris_edge::contact::the_other_member;
+/// let members = vec!["alice-fed".to_string(), "bob-fed".to_string()];
+/// assert_eq!(the_other_member(&members, "alice-fed"), Some("bob-fed".to_string()));
+/// assert_eq!(the_other_member(&members, "carol-fed"), None);
+/// ```
+#[must_use]
+pub fn the_other_member(members: &[String], own_key_id: &str) -> Option<String> {
+    if members.len() != 2 || !members.iter().any(|m| m == own_key_id) {
+        return None;
+    }
+    members.iter().find(|m| *m != own_key_id).cloned()
+}
+
 /// Where a contact request came from — a pasted code, or a bare identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContactInputSource {
@@ -957,6 +992,23 @@ impl LadderStall {
 /// without parsing prose. Success is INFO because walking the ladder is a rare,
 /// meaningful event — not a hot path — and the first question after "it did not
 /// work" is always which rungs DID.
+/// Throttle for the SELF-RESOLVING stall line. `discover` is the predicate a
+/// convergence waiter re-runs every 250 ms until the directory catches up, so
+/// unthrottled it emits one line per check — 531 lines in one mesh run, the
+/// single largest source of log volume there, all saying the same thing about
+/// the same subject. Once per subject per 10 s keeps the fact visible without
+/// burying the rung that fails.
+///
+/// Keyed on `fed_id` (caller-chosen) with a bounded key map, the same DoS
+/// backstop shape as the transport's attribution-miss throttle.
+static RUNG_WAITING_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+fn rung_waiting_log() -> &'static crate::log_throttle::LogThrottle {
+    RUNG_WAITING_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(1, std::time::Duration::from_secs(10), 64)
+    })
+}
+
 pub fn log_rung(rung: Rung, fed_id: &str, stall: Option<&LadderStall>) {
     match stall {
         None => tracing::info!(
@@ -965,13 +1017,22 @@ pub fn log_rung(rung: Rung, fed_id: &str, stall: Option<&LadderStall>) {
             outcome = "ok",
             "contact ladder: {rung} completed for {fed_id}"
         ),
-        Some(s) if s.self_resolving() => tracing::info!(
+        Some(s) if s.self_resolving() => {
+            let key = format!("{rung}:{fed_id}");
+            let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                rung_waiting_log().check(&key)
+            else {
+                return;
+            };
+            tracing::info!(
             step = rung.as_str(),
             fed_id,
             outcome = "waiting",
             remedy = %s.remedy(),
+            suppressed_prev,
             "contact ladder: {rung} is waiting — this resolves itself"
-        ),
+            );
+        }
         Some(s) => tracing::warn!(
             step = rung.as_str(),
             fed_id,

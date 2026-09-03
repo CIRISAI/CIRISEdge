@@ -47,6 +47,22 @@ impl TestFedKey {
         B64.encode(self.signer().public_key().expect("pubkey"))
     }
 
+    /// The PQC half. Same seed with a byte flipped, so the fixture stays
+    /// deterministic while the two keys stay distinct. Every signature is the
+    /// FULL hybrid (v19.0.0: no classical-only fallback).
+    pub fn pqc_signer(&self) -> ciris_keyring::MlDsa65SoftwareSigner {
+        let mut seed = self.seed;
+        seed[0] ^= 0x55;
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&seed, format!("{}-pqc", self.key_id))
+            .expect("ml_dsa_65 from seed")
+    }
+
+    /// Base64 ML-DSA-65 public key of [`Self::pqc_signer`].
+    pub fn pqc_pubkey_b64(&self) -> String {
+        use ciris_keyring::PqcSigner as _;
+        B64.encode(futures::executor::block_on(self.pqc_signer().public_key()).expect("pqc pubkey"))
+    }
+
     /// Write the 32-byte raw seed file edge's keyring loader reads.
     /// Returns the directory containing `ed25519.seed`.
     pub fn write_seed_dir(&self, base: &Path) -> std::path::PathBuf {
@@ -78,7 +94,7 @@ pub fn signed_record(subject: &TestFedKey, signer: &TestFedKey, identity_type: &
     KeyRecord {
         key_id: subject.key_id.clone(),
         pubkey_ed25519_base64: subject.pubkey_b64(),
-        pubkey_ml_dsa_65_base64: None,
+        pubkey_ml_dsa_65_base64: Some(subject.pqc_pubkey_b64()),
         algorithm: "hybrid".to_string(),
         identity_type: identity_type.to_string(),
         identity_ref: subject.key_id.clone(),

@@ -232,6 +232,31 @@ impl EnvelopeKind {
         )
     }
 
+    /// **The planes that promote an advisory link — replicate ALL of them.**
+    ///
+    /// A peer first heard by announce is admitted *advisory*
+    /// (`owns_key = false`). It becomes attributed (`Rooted ∧ owns_key`) only by
+    /// anti-entropying its `Key` (the `owns_key` half of #393 item 1),
+    /// `IdentityOccurrence` (its identity binding), and `TransportDestination`
+    /// (the hybrid-signed transport binding that satisfies #393 **item 2**).
+    /// Omit ANY of the three and the link never promotes, so no other plane
+    /// ever flows to that peer — silently, because a plane that is never
+    /// offered is indistinguishable from one with nothing new in it.
+    ///
+    /// Exactly [`Self::is_bootstrap`], as a list you can register; the two are
+    /// pinned to each other in this module's tests.
+    ///
+    /// Register these for every peer, then add the planes your application
+    /// needs. Do NOT register [`Self::ALL`]: a coordinator exists per
+    /// (peer, kind), so fifteen kinds across four peers is sixty of them
+    /// dialing one transport, which saturates the link pool and starves the
+    /// application's own traffic (leviculum#29, CIRISEdge#508/#531).
+    pub const BOOTSTRAP_PLANES: [EnvelopeKind; 3] = [
+        Self::Key,
+        Self::IdentityOccurrence,
+        Self::TransportDestination,
+    ];
+
     /// CIRISEdge#462 — is this kind answerable by a subject-scoped `Pull` (the
     /// RECEIVE axis)? EXACTLY the five replicated kinds — the persist
     /// `ReplicatedKind` set the bridge's `subject_holdings` sweeps. This is the
@@ -604,6 +629,24 @@ pub enum ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    /// [`EnvelopeKind::BOOTSTRAP_PLANES`] is exactly
+    /// [`EnvelopeKind::is_bootstrap`] — a list and a predicate saying the same
+    /// thing is two places to change, and the one that gets forgotten is the
+    /// list an operator actually registers.
+    #[test]
+    fn the_bootstrap_plane_list_matches_the_bootstrap_predicate() {
+        let from_predicate: Vec<EnvelopeKind> = EnvelopeKind::ALL
+            .into_iter()
+            .filter(|k| k.is_bootstrap())
+            .collect();
+        assert_eq!(
+            from_predicate,
+            EnvelopeKind::BOOTSTRAP_PLANES.to_vec(),
+            "the registerable list and the attribution carve-out must name the \
+             same kinds, or an operator registers a set the gate does not honour"
+        );
+    }
+
     use super::*;
 
     fn fake_hash(seed: u8) -> [u8; 32] {

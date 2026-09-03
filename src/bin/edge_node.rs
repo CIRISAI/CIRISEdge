@@ -128,10 +128,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
 
 use ciris_crypto::{kdf, ClassicalSigner, Ed25519Signer};
+use ciris_edge::chat;
 use ciris_edge::cohort_scope::CohortScope;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::mls::cohort_group::mint_cohort_key_material;
 use ciris_edge::mls::{CohortGroup, CommitApplyOutcome, ScopeStateProvider};
+use ciris_edge::replication::convergence::ConvergenceWaiter;
+use ciris_edge::replication::protocol::EnvelopeKind;
+use ciris_edge::replication::ReplicationPeer;
 use ciris_edge::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink, TransitionOutcome};
 use ciris_edge::transport::realtime_av::{
@@ -168,6 +172,11 @@ struct Leg {
     node: String,
     /// Emitting node's role.
     role: String,
+    /// When the row was emitted (RFC 3339, UTC). The census keys on `leg`
+    /// and ignores unknown members, so this is free to add — and without it
+    /// the artifact could not answer "where did the time go": no per-node
+    /// wall clock, no leg ordering, no gap between two nodes' verdicts.
+    ts: String,
     /// Did this leg actually execute end to end?
     ran: bool,
     /// Verdict. `None` iff `!ran`.
@@ -203,6 +212,7 @@ impl Reporter {
             name: leg.to_owned(),
             node: self.node.clone(),
             role: self.role.clone(),
+            ts: chrono::Utc::now().to_rfc3339(),
             ran: true,
             ok: Some(ok),
             not_run_reason: None,
@@ -216,6 +226,7 @@ impl Reporter {
             name: leg.to_owned(),
             node: self.node.clone(),
             role: self.role.clone(),
+            ts: chrono::Utc::now().to_rfc3339(),
             ran: false,
             ok: None,
             not_run_reason: Some(reason.into()),
@@ -484,14 +495,107 @@ struct RosterEntry {
     advertise: String,
     /// Base64 32-byte Ed25519 federation public key.
     fed_pubkey_b64: String,
+    /// The node's OWNER — a person (`identity_type: user`).
+    ///
+    /// Federation directory discovery resolves an identifier to the PERSON and
+    /// then to their nodes, so a fleet of owner-less agents is unresolvable by
+    /// construction: `owner_of` returns `None` and every lookup stops there.
+    /// That is why the earlier `ladder.discover` leg could only cover route
+    /// reachability. Giving each node a real owner is what makes the
+    /// fedID → person → nodes path exercisable over the wire.
+    #[serde(default)]
+    owner_key_id: String,
+    /// Base64 32-byte Ed25519 public key of that owner.
+    #[serde(default)]
+    owner_pubkey_b64: String,
+    /// Base64 ML-DSA-65 public key of the node.
+    ///
+    /// Published alongside the classical half because the steward builds every
+    /// peer's directory record from this roster, and a record without the PQC
+    /// pubkey cannot verify a PQC signature — `verify_hybrid` takes the
+    /// signature and the pubkey both-or-neither.
+    #[serde(default)]
+    fed_pqc_pubkey_b64: String,
+    /// Base64 ML-DSA-65 public key of the owner.
+    #[serde(default)]
+    owner_pqc_pubkey_b64: String,
+    /// The AGENT identity running on this node.
+    ///
+    /// Three keys are the minimum for a viable agent — **human, node, agent** —
+    /// and they are deliberately separate. The harness used to mint two and
+    /// register the node's transport key as `identity_type: "agent"`, which
+    /// conflates the thing you DIAL with the thing that ACTS.
+    ///
+    /// Keeping them apart is what makes the dial path real: an agentID resolves
+    /// to its owner (an agent cannot consent), the owner resolves to the nodes
+    /// they own, and the NODE is what you address. Conflated, that walk is a
+    /// tautology — the agent id already was the transport id.
+    #[serde(default)]
+    agent_key_id: String,
+    #[serde(default)]
+    agent_pubkey_b64: String,
+    #[serde(default)]
+    agent_pqc_pubkey_b64: String,
 }
 
-/// The steward that scrub-signs the roster into `federation_keys` rows.
+/// The TEST TRUST ROOT that scrub-signs the roster into `federation_keys` rows.
 ///
-/// A federation has a trust root; in a harness the publisher plays it.
-/// Its seed lives in the publisher's own private state dir. The shared
-/// volume carries only the resulting signed *rows*.
-const STEWARD_KEY_ID: &str = "bench-mesh-steward";
+/// **This id is not cosmetic** — it is the key_id persist pins for holder slot 0
+/// under the test anchor. The terminus ROW itself is not built here: persist
+/// emits it (`genesis::test_anchor_genesis_records`) and `open_directory` seeds
+/// it into every node. This constant is only the id the harness scrub-signs
+/// AS, using the private half of the same seed, so the rows it signs chain to
+/// the row persist seeded.
+///
+/// A node is admitted `Rooted` (rather than `Advisory`) only when its provenance
+/// chain terminates at a self-signed `steward`/`accord_holder` row **whose
+/// Ed25519 pubkey is in the pinned trusted anchor**. That anchor is
+/// `accord_holder_bootstrap_anchor()`, which is secure by default: the real
+/// HUMANITY_ACCORD holders (A1/B1/C1). No harness-invented steward can ever be
+/// in it, so before this the mesh's peers were **structurally unable** to root —
+/// measured as `resolved_provenance=Advisory` on every inbound frame, with the
+/// E3 gate then refusing to attribute any of them.
+///
+/// `CIRIS_TEST_TRUST_ROOT*` (compile-fenced behind `test-anchor`, runtime-gated
+/// on `CIRIS_TESTING_MODE`) overrides that anchor with one throwaway software
+/// hybrid key — the same mechanism CIRISServer's traceflow harness uses, and
+/// generated by the same runner:
+///
+/// ```text
+/// CIRIS_TEST_TRUST_ROOT_SEED=<b64 32B> \
+///   cargo run --release --example test_anchor_env --features test-anchor
+/// ```
+///
+/// Every node roots under this one SW root exactly as a production canonical
+/// roots under an A1-scrubbed record — no operator hardware key, and never
+/// touching the real trust key.
+const STEWARD_KEY_ID: &str = "test-accord-holder-0";
+
+/// The env the test anchor is armed with. Absent ⇒ the harness refuses to
+/// start, rather than running a mesh whose peers can never root.
+const TEST_TRUST_ROOT_SEED_ENV: &str = "CIRIS_TEST_TRUST_ROOT_SEED";
+
+/// The shared test trust root's Ed25519 seed, from the environment.
+///
+/// A hard error when absent. The alternative — inventing a seed — produces a
+/// root that is not in the pinned anchor, so every peer roots `Advisory`, every
+/// frame is refused attribution, and the mesh fails several legs later with no
+/// hint of the cause. Fail here, where the remedy is one line of compose.
+fn test_trust_root_seed() -> Result<[u8; 32], String> {
+    let raw = std::env::var(TEST_TRUST_ROOT_SEED_ENV).map_err(|_| {
+        format!(
+            "{TEST_TRUST_ROOT_SEED_ENV} is unset. The mesh roots every node under a \
+             synthetic trust root; without the seed the terminus is not in the pinned \
+             anchor and NO peer can ever be admitted `Rooted`. Generate the block with \
+             `cargo run --example test_anchor_env --features test-anchor` and set it on \
+             every container."
+        )
+    })?;
+    B64.decode(raw.trim())
+        .map_err(|e| format!("{TEST_TRUST_ROOT_SEED_ENV} is not base64: {e}"))?
+        .try_into()
+        .map_err(|_| format!("{TEST_TRUST_ROOT_SEED_ENV} must decode to exactly 32 bytes"))
+}
 
 fn roster_dir(mesh: &Path) -> PathBuf {
     mesh.join("roster")
@@ -564,21 +668,25 @@ async fn await_roster(
     expect: &[String],
     timeout: Duration,
 ) -> Result<BTreeMap<String, RosterEntry>, String> {
-    let start = Instant::now();
-    loop {
-        let roster = read_roster(mesh);
-        let missing: Vec<&String> = expect.iter().filter(|k| !roster.contains_key(*k)).collect();
-        if missing.is_empty() {
-            return Ok(roster);
-        }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "roster barrier timed out after {}s; still missing {missing:?}",
-                timeout.as_secs()
-            ));
-        }
-        tokio_sleep(Duration::from_millis(250)).await;
+    // A roster is a file the other containers write, so nothing in the
+    // replication plane signals it — the UNSIGNALLED waiter, whose floor is
+    // exactly this barrier's old poll interval.
+    let outcome = ConvergenceWaiter::unsignalled()
+        .with_poll_floor(Duration::from_millis(250))
+        .await_until(timeout, || async {
+            let roster = read_roster(mesh);
+            expect.iter().all(|k| roster.contains_key(k))
+        })
+        .await;
+    let roster = read_roster(mesh);
+    if outcome.is_converged() {
+        return Ok(roster);
     }
+    let missing: Vec<&String> = expect.iter().filter(|k| !roster.contains_key(*k)).collect();
+    Err(format!(
+        "roster barrier timed out after {}s; still missing {missing:?}",
+        timeout.as_secs()
+    ))
 }
 
 /// Runtime-agnostic sleep (CIRISEdge#217 — never `tokio::time::sleep` on
@@ -589,22 +697,25 @@ async fn tokio_sleep(d: Duration) {
 
 /// Wait for a file to appear, then read it.
 async fn await_file(path: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
-    let start = Instant::now();
-    loop {
+    // Another container writes this file; admission does not signal it.
+    let outcome = ConvergenceWaiter::unsignalled()
+        .with_poll_floor(Duration::from_millis(250))
+        .await_until(timeout, || async {
+            std::fs::read(path).is_ok_and(|b| !b.is_empty())
+        })
+        .await;
+    if outcome.is_converged() {
         if let Ok(b) = std::fs::read(path) {
             if !b.is_empty() {
                 return Ok(b);
             }
         }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "{} did not appear within {}s",
-                path.display(),
-                timeout.as_secs()
-            ));
-        }
-        tokio_sleep(Duration::from_millis(250)).await;
     }
+    Err(format!(
+        "{} did not appear within {}s",
+        path.display(),
+        timeout.as_secs()
+    ))
 }
 
 /// A deterministic-from-seed federation identity.
@@ -615,30 +726,90 @@ async fn await_file(path: &Path, timeout: Duration) -> Result<Vec<u8>, String> {
 /// never share one.
 struct FedKey {
     seed: [u8; 32],
+    /// The ML-DSA-65 half. NOT optional: the federation tier is PQC-mandatory
+    /// (CC 5.3.2.4.3.1) and persist verifies attestation envelopes under
+    /// `HybridPolicy::Strict`, so a classical-only harness identity produces
+    /// rows that canonicalize and hash correctly, verify their Ed25519 half,
+    /// and are then refused as hybrid-pending. A harness whose identities
+    /// cannot sign what production signs is not testing production.
+    pqc_seed: [u8; 32],
 }
 
 impl FedKey {
-    /// Load the seed at `dir/ed25519.seed`, generating it on first boot.
+    /// Load both seeds under `dir`, generating either on first boot.
     fn load_or_create(key_id: &str, dir: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let path = dir.join("ed25519.seed");
-        let seed = if path.exists() {
-            let b = std::fs::read(&path).map_err(|e| format!("read seed: {e}"))?;
-            let arr: [u8; 32] = b
-                .try_into()
-                .map_err(|_| format!("{} is not a 32-byte seed", path.display()))?;
-            arr
-        } else {
-            // Edge has no "mint a fresh federation identity" verb — every
-            // existing fixture writes the seed itself. Recorded as a DX
-            // finding; the harness does the same, from the CSPRNG.
-            let mut arr = [0u8; 32];
-            ciris_crypto::random::fill(&mut arr).map_err(|e| format!("csprng: {e}"))?;
-            std::fs::write(&path, arr).map_err(|e| format!("write seed: {e}"))?;
-            arr
-        };
         let _ = key_id;
-        Ok(Self { seed })
+        Ok(Self {
+            seed: Self::seed_at(&dir.join("ed25519.seed"))?,
+            pqc_seed: Self::seed_at(&dir.join("mldsa65.seed"))?,
+        })
+    }
+
+    /// Read a 32-byte seed, minting it from the CSPRNG on first boot.
+    ///
+    /// Edge has no "mint a fresh federation identity" verb — every existing
+    /// fixture writes its own seed. Recorded as a DX finding; the harness does
+    /// the same.
+    fn seed_at(path: &Path) -> Result<[u8; 32], String> {
+        if path.exists() {
+            let b = std::fs::read(path).map_err(|e| format!("read seed: {e}"))?;
+            return b
+                .try_into()
+                .map_err(|_| format!("{} is not a 32-byte seed", path.display()));
+        }
+        let mut arr = [0u8; 32];
+        ciris_crypto::random::fill(&mut arr).map_err(|e| format!("csprng: {e}"))?;
+        std::fs::write(path, arr).map_err(|e| format!("write seed: {e}"))?;
+        Ok(arr)
+    }
+
+    /// Derive from an explicit Ed25519 seed rather than the node's own state
+    /// dir — for the TEST TRUST ROOT, whose seed every container shares.
+    ///
+    /// The ML-DSA half is derived exactly as CIRISServer's
+    /// `examples/test_anchor_env` and `src/test_bless.rs` derive it, because
+    /// the resulting pubkeys must equal the `CIRIS_TEST_TRUST_ROOT*` values the
+    /// anchor is pinned to. One seed, one root, both halves.
+    fn from_root_seed(seed: [u8; 32]) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"ciris-test-trust-root/mldsa/v1");
+        h.update(seed);
+        Self {
+            seed,
+            pqc_seed: h.finalize().into(),
+        }
+    }
+
+    /// The full hybrid signing identity — what every federation-tier producer
+    /// in the library takes.
+    fn local_signer(&self, key_id: &str) -> Result<LocalSigner, String> {
+        let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            ciris_keyring::Ed25519SoftwareSigner::from_bytes(&self.seed, key_id)
+                .map_err(|e| format!("ed25519 signer: {e}"))?,
+        );
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &self.pqc_seed,
+                format!("{key_id}-pqc"),
+            )
+            .map_err(|e| format!("ml-dsa-65 signer: {e}"))?,
+        );
+        Ok(LocalSigner::new(key_id, classical, Some(pqc)))
+    }
+
+    /// Base64 ML-DSA-65 public key — the directory record must carry it, or
+    /// `verify_hybrid` sees a PQC signature with no pubkey to check it against
+    /// and refuses the pair outright.
+    async fn pqc_pubkey_b64(&self, key_id: &str) -> Result<String, String> {
+        let signer = self.local_signer(key_id)?;
+        let pqc = signer.pqc.as_ref().ok_or("no pqc half")?;
+        Ok(B64.encode(
+            pqc.public_key()
+                .await
+                .map_err(|e| format!("pqc pubkey: {e}"))?,
+        ))
     }
 
     fn signer(&self) -> Result<Ed25519Signer, String> {
@@ -659,26 +830,64 @@ impl FedKey {
 /// Same shape as `tests/common::signed_record` / `benches/common::
 /// signed_record` — kept in step with them deliberately: a change to the
 /// admitted row shape must break all three at once.
-fn signed_record(
+async fn signed_record(
     subject_key_id: &str,
     subject_pubkey_b64: &str,
-    signer: &Ed25519Signer,
+    subject_pqc_pubkey_b64: &str,
+    signer: &LocalSigner,
     signer_key_id: &str,
     identity_type: &str,
 ) -> Result<KeyRecord, String> {
-    let envelope = serde_json::json!({ "key_id": subject_key_id });
-    let canonical = serde_json::to_vec(&envelope).map_err(|e| format!("canonical: {e}"))?;
+    // The envelope must BIND the row's identity — `key_id`, `identity_type`,
+    // and BOTH pubkey legs. CIRISVerify's provenance walk requires exactly
+    // these (`ProvenanceLink::subject_binding`), and refuses a link whose
+    // signed bytes omit any of them.
+    //
+    // The attack it closes: with the identity fields outside the signed bytes,
+    // an attacker wraps a victim's genuine, validly-signed envelope in a link
+    // declaring their OWN key_id and pubkeys. The content hash matches (it
+    // really is the victim's envelope), the signatures verify (really signed by
+    // the real parent), linkage passes — and the chain roots the attacker's
+    // key. Both pubkey legs are bound, not just the name, because binding the
+    // name alone loses on a node that has not yet replicated the victim's row.
+    //
+    // A `{"key_id": …}`-only envelope is why every harness node rooted
+    // `Advisory`: each link was refused with "signed bytes do not carry
+    // `identity_type` — an absent binding is skippable by omission", so the
+    // chain never assembled and the E3 gate attributed nothing.
+    let mut envelope = serde_json::json!({
+        "key_id": subject_key_id,
+        "identity_type": identity_type,
+        "pubkey_ed25519_base64": subject_pubkey_b64,
+    });
+    if !subject_pqc_pubkey_b64.is_empty() {
+        envelope["pubkey_ml_dsa_65_base64"] = serde_json::json!(subject_pqc_pubkey_b64);
+    }
+    // JCS canonicalization, and SIGN THE CANONICAL BYTES — not their digest.
+    //
+    // The rooting provenance walk verifies every link's scrub-signature over
+    // `jcs::canonicalize(registration_envelope)` (CIRISVerify `provenance.rs`).
+    // Signing the SHA-256 digest instead verifies against nothing, so the chain
+    // never assembles, every peer is admitted `Advisory` rather than `Rooted`,
+    // and the E3 gate refuses to attribute a single inbound frame. Measured as
+    // `resolved_owns_key=true, resolved_provenance=Advisory` on 123 frames —
+    // `owns_key` passed all along; the chain signature was the failure.
+    //
+    // The identical mistake was made in the attestation producer earlier in
+    // this branch and fixed there; this is the second instance of one class.
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope)
+        .map_err(|e| format!("canonicalize: {e}"))?;
     let digest = Sha256::digest(&canonical);
-    let sig = signer
-        .sign(digest.as_slice())
-        .map_err(|e| format!("scrub sign: {e}"))?;
+    let (sig, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(signer, &canonical, "key record").await?;
     let ts = chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
         .map_err(|e| format!("ts: {e}"))?
         .into();
     Ok(KeyRecord {
         key_id: subject_key_id.to_owned(),
         pubkey_ed25519_base64: subject_pubkey_b64.to_owned(),
-        pubkey_ml_dsa_65_base64: None,
+        pubkey_ml_dsa_65_base64: (!subject_pqc_pubkey_b64.is_empty())
+            .then(|| subject_pqc_pubkey_b64.to_owned()),
         algorithm: "hybrid".to_owned(),
         identity_type: identity_type.to_owned(),
         identity_ref: subject_key_id.to_owned(),
@@ -686,8 +895,8 @@ fn signed_record(
         valid_until: None,
         registration_envelope: envelope,
         original_content_hash: hex::encode(digest),
-        scrub_signature_classical: B64.encode(sig),
-        scrub_signature_pqc: None,
+        scrub_signature_classical: sig,
+        scrub_signature_pqc: sig_pqc,
         scrub_key_id: signer_key_id.to_owned(),
         scrub_timestamp: ts,
         pqc_completed_at: None,
@@ -697,6 +906,76 @@ fn signed_record(
         consent_role: None,
         additional_scrubs: Vec::new(),
     })
+}
+
+/// Emit the OWNER-BINDING attestation: `owner` is responsible for `node`.
+///
+/// This is what makes federation directory discovery answerable. `owner_of`
+/// resolves through `live_owner_binding_granters`, and `nodes_owned_by` walks
+/// owner bindings — so without one, a fedID lookup finds a person with no
+/// nodes and every discovery stops there. Route reachability alone was all the
+/// harness could prove before this existed.
+///
+/// The substrate recognises a binding by `delegation_purpose: "owner_binding"`
+/// (CC 2.4.1.2's canonical marker) or by the internal dimension; the raw
+/// `delegates_to` emit path carries only the former, so that is what a producer
+/// writes. Keying on the dimension alone let the raw path bypass the
+/// single-owner gate (CIRISPersist#378), which is why both are recognised.
+///
+/// Written into this node's OWN persist. It then replicates on the Attestation
+/// plane like any other signed row — the harness seeds nothing into a peer.
+async fn emit_owner_binding(
+    dir: &Arc<SqliteBackend>,
+    owner_key_id: &str,
+    owner_signer: &LocalSigner,
+    node_id: &str,
+) -> Result<(), String> {
+    // Fixed instant so a restarted container re-emits a byte-identical row
+    // rather than a second, competing binding.
+    const ASSERTED_AT: &str = "2026-05-01T00:00:00Z";
+    let ts: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(ASSERTED_AT)
+        .map_err(|e| format!("ts: {e}"))?
+        .into();
+
+    // The library builds and signs it. The harness deliberately does NOT
+    // hand-roll this envelope: doing so is what produced two failed mesh runs
+    // (a missing signed `asserted_at`, then a missing `row` mirror) plus a
+    // signature over the digest instead of the canonical bytes. The producer
+    // is unit-tested against a real persist backend, so those failures are now
+    // caught in under a second instead of a full mesh round-trip.
+    let att = ciris_edge::replication::attestation_bind::owner_binding_attestation(
+        owner_key_id,
+        node_id,
+        ts,
+        owner_signer,
+    )
+    .await?;
+
+    tracing::info!(
+        owner = %owner_key_id,
+        node = %node_id,
+        attestation_id = %att.attestation_id,
+        hybrid = att.scrub_signature_pqc.is_some(),
+        "emitting owner binding"
+    );
+
+    dir.put_attestation(ciris_persist::federation::SignedAttestation { attestation: att })
+        .await
+        .map_err(|e| {
+            // Name the refusal AT the source. Downstream this is a bare
+            // "standup failed" in a census cell, which is an investigation
+            // rather than a read.
+            tracing::error!(
+                owner = %owner_key_id,
+                node = %node_id,
+                error = %e,
+                "owner binding REFUSED by persist — federation directory discovery \
+                 cannot resolve this node's owner, so every fedID lookup against it \
+                 will stop at owner_of => None"
+            );
+            format!("put owner binding: {e}")
+        })?;
+    Ok(())
 }
 
 /// Open a fresh per-container persist directory and seed it with `rows`.
@@ -711,6 +990,39 @@ async fn open_directory(rows: Vec<KeyRecord>) -> Result<Arc<SqliteBackend>, Stri
         .run_migrations()
         .await
         .map_err(|e| format!("migrate: {e}"))?;
+
+    // GENESIS FIRST — every node, before any roster row.
+    //
+    // A node is admitted `Rooted` (not `Advisory`) only when its provenance
+    // chain terminates at a row whose Ed25519 pubkey is in the pinned anchor.
+    // That anchor is secure by default (the real HUMANITY_ACCORD holders), so
+    // nothing a harness invents can ever satisfy it — before this, every peer
+    // rooted Advisory and the E3 gate attributed nothing.
+    //
+    // `test_anchor_genesis_records()` is the SYNTHETIC-ONLY accessor: `Some`
+    // exactly when the test anchor is armed. Its sibling
+    // `effective_accord_holder_records()` is the WRONG call here — it falls
+    // back to the real baked constitutional roster, so a mis-armed harness
+    // would quietly seed production's holders into a throwaway directory and
+    // look like it worked. `None` is a hard error instead.
+    //
+    // Seeded per node, not by the publisher: each node opens its own persist,
+    // and a chain is walked against the directory doing the walking.
+    let holders =
+        ciris_persist::federation::genesis::test_anchor_genesis_records().ok_or_else(|| {
+            format!(
+                "the SYNTHETIC trust root is not armed, so no node could ever root. Set \
+                 the whole CIRIS_TEST_TRUST_ROOT* block — verify reads the Ed25519 \
+                 pubkeys, persist reads the ML-DSA pubkeys AND both scrub signatures, \
+                 and {TEST_TRUST_ROOT_SEED_ENV} is the private half this harness signs \
+                 with — and build with the `test-anchor` feature."
+            )
+        })?;
+    backend
+        .seed_genesis_accord_holders(&holders)
+        .await
+        .map_err(|e| format!("seed synthetic genesis holders: {e}"))?;
+
     for rec in rows {
         backend
             .put_public_key(SignedKeyRecord { record: rec })
@@ -858,7 +1170,72 @@ struct Mailbox {
 ///
 /// `listen` may be called exactly once per transport, so this is the one
 /// place that does it.
-fn spawn_inbound(transport: &Arc<ReticulumTransport>) -> Arc<Mailbox> {
+/// What the listener did with inbound frames.
+///
+/// Reported in `ladder.discover_by_fedid`'s detail because the JSONL is this
+/// harness's real instrument — `tracing` output is a log a reader may or may
+/// not have. If discovery fails, these four numbers say WHERE: no frames at
+/// all is a transport problem, frames routed but nothing converging is a
+/// replication problem, and `not_replication` counting everything means the
+/// peer is not speaking the protocol we think it is.
+#[derive(Default, Debug)]
+struct InboundStats {
+    routed: std::sync::atomic::AtomicUsize,
+    not_replication: std::sync::atomic::AtomicUsize,
+    unattributed: std::sync::atomic::AtomicUsize,
+    errors: std::sync::atomic::AtomicUsize,
+}
+
+impl InboundStats {
+    fn record(&self, d: &ciris_edge::replication::RouteDisposition) {
+        use ciris_edge::replication::RouteDisposition as D;
+        use std::sync::atomic::Ordering::Relaxed;
+        match d {
+            D::Routed => {
+                self.routed.fetch_add(1, Relaxed);
+            }
+            D::NotReplication => {
+                self.not_replication.fetch_add(1, Relaxed);
+            }
+            D::Unattributed => {
+                self.unattributed.fetch_add(1, Relaxed);
+            }
+            D::Failed(e) => {
+                self.errors.fetch_add(1, Relaxed);
+                tracing::warn!(error = %e, "replication routing failed");
+            }
+        }
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        serde_json::json!({
+            "routed": self.routed.load(Relaxed),
+            "not_replication": self.not_replication.load(Relaxed),
+            "unattributed": self.unattributed.load(Relaxed),
+            "errors": self.errors.load(Relaxed),
+        })
+    }
+}
+
+/// Drain the transport, splitting harness frames from REPLICATION frames.
+///
+/// `Transport::listen` claims the node's single event receiver, so whoever
+/// calls it owns every inbound frame. The harness used to decode its own
+/// `MESH1` framing and DROP everything else with a debug line — which meant
+/// every replication frame a peer sent was thrown away. Rounds went out,
+/// nothing came back, and the Attestation plane never converged: exactly the
+/// `owned_nodes: []` the census reported, with no error anywhere.
+///
+/// Edge says so explicitly (`replication::runtime` module docs): *"Wiring the
+/// registry's `route_inbound_bytes` INTO that loop is operator code (a one-line
+/// addition to the application's listen-handler), not edge's job."* The harness
+/// is the operator here and had not written the line.
+fn spawn_inbound(
+    transport: &Arc<ReticulumTransport>,
+    router: ciris_edge::replication::InboundRouter,
+    stats: Arc<InboundStats>,
+) -> Arc<Mailbox> {
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(4096);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let (med_tx, med_rx) = mpsc::unbounded_channel();
@@ -875,7 +1252,9 @@ fn spawn_inbound(transport: &Arc<ReticulumTransport>) -> Arc<Mailbox> {
         while let Some(frame) = rx.recv().await {
             let src = frame.source_key_id.as_ref().map(|k| k.as_str().to_owned());
             let Some((kind, header, payload)) = decode_frame(&frame.envelope_bytes) else {
-                tracing::debug!("dropping a non-harness inbound frame");
+                // Not harness framing — hand it to replication before giving up
+                // on it. This is THE line the module docs ask the operator for.
+                stats.record(&router.try_route(&frame).await);
                 continue;
             };
             match kind {
@@ -1227,13 +1606,71 @@ fn annexb_access_units(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 /// scope-address lifecycle driving the real transport.
 struct Occurrence {
     cfg: Config,
+    /// The real anti-entropy runtime. Owner bindings reach peers through this
+    /// and nothing else — the harness seeds no state into any peer.
+    replication: Arc<ciris_edge::replication::ReplicationRuntime>,
+    /// What the listener did with inbound frames — reported by the discovery
+    /// leg so a failure says WHERE, not just that it failed.
+    inbound_stats: Arc<InboundStats>,
     transport: Arc<ReticulumTransport>,
     mailbox: Arc<Mailbox>,
     table: Arc<ScopeAddressTable>,
     lifecycle: Arc<ScopeLifecycle>,
     roster: BTreeMap<String, RosterEntry>,
     reporter: Arc<Reporter>,
+    /// This node's hybrid signer — CUSTODY: it co-scrubs the owner's rows at
+    /// the crossing and signs what the node itself attests.
+    node_signer: Arc<LocalSigner>,
+    /// The OWNER's hybrid signer — the ACTOR: a chat message is attested and
+    /// signed by the human whose words it is (sign-at-write), and the
+    /// widening to the room is the human's own `supersedes`. The harness holds
+    /// it because it plays the human; a real node never does.
+    owner_signer: Arc<LocalSigner>,
+    /// This node's persist directory — what `contact::PersistLens` reads, so
+    /// the discovery leg resolves against the SAME state replication feeds.
+    directory: Arc<SqliteBackend>,
 }
+
+/// The only two planes the harness replicates.
+///
+/// `EnvelopeKind::ALL` is FIFTEEN, and a coordinator is registered per
+/// (peer, kind) — sixty of them across four peers, all dialing one Reticulum
+/// transport. That saturated the link pool and the harness's own control
+/// frames began timing out, so replication starved the mesh it was meant to
+/// serve (leviculum#29, CIRISEdge#508/#531). Discovery needs Key (directory
+/// rows) and Attestation (owner bindings); nothing else earns a round here.
+const _: () = {
+    // The harness's plane list MUST contain the bootstrap pair. A compile-time
+    // check, because omitting one is silent at runtime: an advisory link simply
+    // never promotes and every later plane reports nothing new.
+    let mut i = 0;
+    while i < EnvelopeKind::BOOTSTRAP_PLANES.len() {
+        let needed = EnvelopeKind::BOOTSTRAP_PLANES[i];
+        let mut found = false;
+        let mut j = 0;
+        while j < DISCOVERY_PLANES.len() {
+            if DISCOVERY_PLANES[j] as u8 == needed as u8 {
+                found = true;
+            }
+            j += 1;
+        }
+        assert!(found, "DISCOVERY_PLANES must contain every BOOTSTRAP_PLANE");
+        i += 1;
+    }
+};
+
+const DISCOVERY_PLANES: [EnvelopeKind; 4] = [
+    // The three that PROMOTE an advisory link to an attributed one. The harness
+    // first registered `EnvelopeKind::ALL` (sixty coordinators — it saturated
+    // the transport), then narrowed to `Key` + `Attestation`, which omits two
+    // of the three planes an advisory link needs to earn attribution. Register
+    // all three or no other plane ever flows.
+    EnvelopeKind::Key,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::TransportDestination,
+    // What discovery actually reads.
+    EnvelopeKind::Attestation,
+];
 
 /// Build the whole occurrence: keys, sealed KV, directory, transport,
 /// address table, lifecycle.
@@ -1244,6 +1681,22 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // ── 1. This node's own federation key (private; own volume only) ──
     let fed = FedKey::load_or_create(&cfg.node_id, &cfg.state_dir.join("fed"))?;
 
+    // The PERSON who owns this node. A node cannot consent and cannot be a
+    // contact — its owner is both — so directory discovery resolves an
+    // identifier to the person first and to their nodes second. Without a real
+    // owner every lookup stops at `owner_of` returning `None`, which is exactly
+    // why the route-reachability leg could not cover resolution.
+    let owner_key_id = format!("{}-owner", cfg.node_id);
+    let owner = FedKey::load_or_create(&owner_key_id, &cfg.state_dir.join("owner"))?;
+
+    // The AGENT that runs here — the third of the three keys (human, node,
+    // agent). Distinct from `cfg.node_id`, which is the NODE: the dialable
+    // transport identity. An agent is resolved to a node in order to be
+    // reached, so the two cannot be the same key without making that
+    // resolution meaningless.
+    let agent_key_id = format!("{}-agent", cfg.node_id);
+    let agent = FedKey::load_or_create(&agent_key_id, &cfg.state_dir.join("agent"))?;
+
     // ── 2. Publish the public half + reachability ────────────────────
     publish_roster_entry(
         &cfg.mesh_dir,
@@ -1252,6 +1705,13 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
             role: cfg.role.as_str().to_owned(),
             advertise: cfg.advertise.clone(),
             fed_pubkey_b64: fed.pubkey_b64()?,
+            owner_key_id: owner_key_id.clone(),
+            owner_pubkey_b64: owner.pubkey_b64()?,
+            fed_pqc_pubkey_b64: fed.pqc_pubkey_b64(&cfg.node_id).await?,
+            owner_pqc_pubkey_b64: owner.pqc_pubkey_b64(&owner_key_id).await?,
+            agent_key_id: agent_key_id.clone(),
+            agent_pubkey_b64: agent.pubkey_b64()?,
+            agent_pqc_pubkey_b64: agent.pqc_pubkey_b64(&agent_key_id).await?,
         },
     )
     .map_err(|e| format!("publish roster entry: {e}"))?;
@@ -1260,23 +1720,56 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     let dir_path = directory_path(&cfg.mesh_dir);
     if cfg.role == Role::Publisher {
         let roster = await_roster(&cfg.mesh_dir, &cfg.expect, cfg.barrier_timeout).await?;
-        let steward = FedKey::load_or_create(STEWARD_KEY_ID, &cfg.state_dir.join("steward"))?;
-        let steward_signer = steward.signer()?;
-        let mut rows = vec![signed_record(
-            STEWARD_KEY_ID,
-            &steward.pubkey_b64()?,
-            &steward_signer,
-            STEWARD_KEY_ID,
-            "steward",
-        )?];
+        let steward = FedKey::from_root_seed(test_trust_root_seed()?);
+        let steward_signer = steward.local_signer(STEWARD_KEY_ID)?;
+        let mut rows: Vec<KeyRecord> = Vec::new();
         for entry in roster.values() {
-            rows.push(signed_record(
-                &entry.key_id,
-                &entry.fed_pubkey_b64,
-                &steward_signer,
-                STEWARD_KEY_ID,
-                "agent",
-            )?);
+            // The NODE — what peers dial. `identity_type: "node"`, not
+            // "agent": conflating them is what made the agent→node dial walk a
+            // tautology.
+            rows.push(
+                signed_record(
+                    &entry.key_id,
+                    &entry.fed_pubkey_b64,
+                    &entry.fed_pqc_pubkey_b64,
+                    &steward_signer,
+                    STEWARD_KEY_ID,
+                    "node",
+                )
+                .await?,
+            );
+            // The AGENT that runs on it — a separate identity, and the third
+            // key an agent needs to be viable.
+            if !entry.agent_key_id.is_empty() {
+                rows.push(
+                    signed_record(
+                        &entry.agent_key_id,
+                        &entry.agent_pubkey_b64,
+                        &entry.agent_pqc_pubkey_b64,
+                        &steward_signer,
+                        STEWARD_KEY_ID,
+                        "agent",
+                    )
+                    .await?,
+                );
+            }
+            // The owner, as a PERSON. `identity_type` is the authority on what
+            // an identifier names — never the string's shape — so this is what
+            // makes `resolve` route a lookup to the person rather than
+            // treating the owner as another agent.
+            if !entry.owner_key_id.is_empty() {
+                rows.push(
+                    signed_record(
+                        &entry.owner_key_id,
+                        &entry.owner_pubkey_b64,
+                        &entry.owner_pqc_pubkey_b64,
+                        &steward_signer,
+                        STEWARD_KEY_ID,
+                        "user",
+                    )
+                    .await?,
+                );
+            }
         }
         let tmp = cfg.mesh_dir.join("directory.tmp");
         std::fs::write(
@@ -1292,18 +1785,125 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     let rows: Vec<KeyRecord> =
         serde_json::from_slice(&dir_bytes).map_err(|e| format!("decode directory: {e}"))?;
     let directory = open_directory(rows).await?;
+
+    // This node's own owner binding, written locally and replicated from here.
+    // Nothing is seeded into a peer: a peer learns this the same way it learns
+    // any other signed row, which is the point of testing discovery rather
+    // than testing a fixture.
+    // Bind BOTH the node and the agent to the same human.
+    //
+    // `owner_of` walks owner bindings for a node OR an agent alike, so the
+    // agent needs its own binding or `resolve(agentID)` finds no owner and the
+    // walk stops before it ever reaches a dialable node.
+    let owner_signer = Arc::new(owner.local_signer(&owner_key_id)?);
+    for subject in [&cfg.node_id, &agent_key_id] {
+        emit_owner_binding(&directory, &owner_key_id, &owner_signer, subject).await?;
+    }
+
     let roster = read_roster(&cfg.mesh_dir);
 
+    // ── This node's DIRECTED consent grants ──────────────────────────
+    //
+    // The Attestation plane is consent-gated at the RECIPIENT, not per row: a
+    // peer that does not resolve to a consent-membership proof withholds the
+    // WHOLE plane, fail-closed. Without these grants every node held only its
+    // OWN owner binding and every person→node walk starved one hop out — which
+    // is exactly what the mesh reported (`identity_type: "user"` with
+    // `owned_nodes: []`, on every node) and reads as slow convergence rather
+    // than an absent grant.
+    //
+    // Consent is DIRECTED and SELF-ATTESTED (CEG 1.0-RC29 §5.6.8.15): A
+    // granting B says nothing about B granting A, so each node authors its own
+    // half — the same shape CIRISServer's `POST /v1/federation/peering` writes,
+    // which is where this pattern is taken from rather than invented.
+    let node_signer = fed.local_signer(&cfg.node_id)?;
+    for peer in roster.keys().filter(|k| *k != &cfg.node_id) {
+        let grant = ciris_edge::replication::attestation_bind::replication_consent_attestation(
+            &cfg.node_id,
+            peer,
+            &ciris_edge::replication::attestation_bind::DEFAULT_CONSENT_PREFIXES,
+            chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+                .map_err(|e| format!("ts: {e}"))?
+                .into(),
+            &node_signer,
+        )
+        .await?;
+        directory
+            .put_attestation(ciris_persist::federation::SignedAttestation { attestation: grant })
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    node = %cfg.node_id, %peer, error = %e,
+                    "replication consent grant REFUSED — this peer will be offered \
+                     NO attestations at all, so no owner binding reaches it"
+                );
+                format!("put consent grant for {peer}: {e}")
+            })?;
+    }
+    tracing::info!(
+        node = %cfg.node_id,
+        peers = roster.len().saturating_sub(1),
+        "directed replication consent granted"
+    );
+
+    // ── This node's PAIR ROOMS with every roster owner ───────────────
+    //
+    // Authored at STANDUP, before replication starts, so a peer's message —
+    // or its MLS handshake row — is admissible the moment it arrives: AV-45
+    // proves the writer's membership against the room the row names, and a
+    // room that is not yet known is a transient refusal that costs a whole
+    // round. Both humans are FOUNDERS (`chat::pair_community`), so the room
+    // has its moderators by construction. Idempotent on both ends.
+    let founded_at: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .map_err(|e| format!("ts: {e}"))?
+            .into();
+    let mut rooms = 0usize;
+    for entry in roster.values().filter(|e| e.key_id != cfg.node_id) {
+        if entry.owner_key_id.is_empty() {
+            continue;
+        }
+        let row = chat::signed_pair_community(
+            &owner_key_id,
+            &entry.owner_key_id,
+            founded_at,
+            &node_signer,
+        )
+        .await?;
+        match directory.put_community(row).await {
+            Ok(()) | Err(ciris_persist::federation::Error::Conflict(_)) => rooms += 1,
+            Err(e) => {
+                tracing::warn!(
+                    node = %cfg.node_id, peer_owner = %entry.owner_key_id, error = %e,
+                    "pair room refused at standup — the chat legs will author it again"
+                );
+            }
+        }
+    }
+    tracing::info!(node = %cfg.node_id, rooms, "pair rooms authored at standup");
+
     // ── 5. The federation signer, from this node's own seed ──────────
-    let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
-        key_id: cfg.node_id.clone(),
-        key_path: cfg.state_dir.join("fed/ed25519.seed"),
-        pqc_key_id: None,
-        pqc_key_path: None,
-    })
-    .await
-    .map_err(|e| format!("load_local_seed: {e}"))?;
-    let signer = Arc::new(LocalSigner::new(cfg.node_id.clone(), classical, None));
+    // The HYBRID signer, not a classical-only one.
+    //
+    // The transport self-publishes its own hybrid-signed
+    // `SignedTransportDestination` at construction (CIRISEdge#406) — the
+    // producer for the #393 item-2 gate. That producer is FAIL-OPEN and one of
+    // its documented failure modes is exactly "Ed25519-only signer": it warns
+    // once and carries on, and no row is ever written.
+    //
+    // Measured effect of fixing it: inbound frames ROUTED went from 0 to ~650
+    // per node. It did not by itself make them ATTRIBUTED — the logs showed
+    // `resolved_owns_key=true, resolved_provenance=Advisory`, so `owns_key` was
+    // already passing and the chain walk was the separate failure (see
+    // `signed_record`, which was signing a digest instead of the canonical
+    // envelope the provenance walk verifies).
+    //
+    // Same class as the owner binding: classical-only where the federation tier
+    // is PQC-mandatory. `FedKey` already carries both halves.
+    let signer = Arc::new(fed.local_signer(&cfg.node_id)?);
+    // Kept for the chat legs: the NODE co-scrubs the owner's message at the
+    // crossing, under the owner binding it acts under.
+    let node_signer = Arc::clone(&signer);
 
     // ── 6. The real transport, on the real docker network ────────────
     //
@@ -1363,16 +1963,110 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         cfg.convergence,
     ));
 
-    let mailbox = spawn_inbound(&transport);
+    // ── 8. THE REPLICATION PLANE ─────────────────────────────────────
+    //
+    // Without this the harness has no anti-entropy at all: each node held
+    // the steward's key records plus its OWN owner binding, and nothing ever
+    // carried a binding between nodes. `ladder.discover_by_fedid` therefore
+    // could not pass by construction — `nodes_owned_by(peer-owner)` was
+    // permanently empty, and the leg's failure was reported as
+    // `NotYetDiscovered`, which reads like slow convergence rather than an
+    // absent mechanism.
+    //
+    // Starting the real runtime is what makes the leg test the FEDERATION
+    // DIRECTORY DISCOVERY MECHANISM rather than a fixture: a peer's owner
+    // binding now arrives the way every other signed row does, over the
+    // Attestation plane, and this is also the first in-repo consumer of
+    // `ReplicationRuntime::start` — the shape a downstream chat harness
+    // copies.
+    //
+    // Cadence is tightened from the 30s default: the mesh's barriers are
+    // measured in tens of seconds, so a default-cadence node would spend the
+    // whole budget waiting for its first round.
+    // ONLY the two planes discovery needs — Key (the directory rows) and
+    // Attestation (the owner bindings).
+    //
+    // `EnvelopeKind::ALL` is FIFTEEN kinds, and a coordinator is registered per
+    // (peer, kind): with four peers that is SIXTY of them, each opening a round
+    // on a 2s cadence over one Reticulum transport. That saturated the link
+    // pool and the harness's own control frames started timing out
+    // (`resource transfer failed: Timeout` on a KeyPackage send) — replication
+    // starved the very mesh it was supposed to serve. The concurrency ceiling
+    // is a known constraint (leviculum#29, CIRISEdge#508/#531), and this
+    // harness has to share the transport with real media fan-out.
+    //
+    // Eight coordinators on a 5s cadence leaves the barrier tens of rounds,
+    // which is many more than convergence needs.
+    let peers: Vec<ReplicationPeer> = roster
+        .keys()
+        .filter(|k| *k != &cfg.node_id)
+        .flat_map(|peer| {
+            DISCOVERY_PLANES
+                .into_iter()
+                .map(move |kind| ReplicationPeer {
+                    peer_key_id: peer.clone(),
+                    kind,
+                })
+        })
+        .collect();
+    let replication = Arc::new(
+        ciris_edge::replication::ReplicationRuntime::start(
+            Arc::clone(&directory) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+            Arc::clone(&transport) as Arc<dyn ciris_edge::transport::Transport>,
+            peers,
+            ciris_edge::replication::ReplicationRuntimeConfig {
+                scheduler: ciris_edge::replication::SchedulerConfig {
+                    cadence: Duration::from_secs(5),
+                    round_timeout: Duration::from_secs(10),
+                },
+                local_key_id: Some(cfg.node_id.clone()),
+                ..Default::default()
+            },
+            // THE SELF-PUBLISH SET — the three identities this node speaks
+            // for. Built by the library helper so the harness and the server
+            // construct it the same way.
+            Some({
+                let publish = [
+                    cfg.node_id.as_str(),
+                    agent_key_id.as_str(),
+                    owner_key_id.as_str(),
+                ];
+                tracing::info!(
+                    node = %cfg.node_id,
+                    publishes = ?publish,
+                    "self-publish set installed — these identities' Key / \
+                     IdentityOccurrence / TransportDestination rows are advertised \
+                     to peers. TransportDestination is the transport hint peers \
+                     need for #393 item 2"
+                );
+                ciris_edge::replication::self_publish_set(publish)
+            }),
+        )
+        .await,
+    );
+
+    // The listener LAST: it claims the transport's single event receiver and
+    // must be able to hand replication frames to a live registry.
+    let inbound_stats = Arc::new(InboundStats::default());
+    let mailbox = spawn_inbound(
+        &transport,
+        ciris_edge::replication::InboundRouter::new(replication.registry()),
+        Arc::clone(&inbound_stats),
+    );
 
     Ok(Occurrence {
         cfg,
+        replication,
+        inbound_stats,
         transport,
         mailbox,
         table,
         lifecycle,
         roster,
         reporter,
+        node_signer,
+        owner_signer,
+        directory,
     })
 }
 
@@ -1380,48 +2074,73 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
 /// resolve until its peer is up.
 async fn resolve_addr(hostport: &str, timeout: Duration) -> Result<std::net::SocketAddr, String> {
     use std::net::ToSocketAddrs as _;
-    let start = Instant::now();
-    loop {
+    // DNS for a sibling container that may not be up yet. Unsignalled by
+    // definition — but it goes through the same helper as every other wait, so
+    // there is exactly one waiting shape in this binary.
+    let outcome = ConvergenceWaiter::unsignalled()
+        .with_poll_floor(Duration::from_millis(500))
+        .await_until(timeout, || async {
+            hostport
+                .to_socket_addrs()
+                .is_ok_and(|mut it| it.next().is_some())
+        })
+        .await;
+    if outcome.is_converged() {
         if let Ok(mut it) = hostport.to_socket_addrs() {
             if let Some(a) = it.next() {
                 return Ok(a);
             }
         }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "could not resolve {hostport} within {}s",
-                timeout.as_secs()
-            ));
-        }
-        tokio_sleep(Duration::from_millis(500)).await;
     }
+    Err(format!(
+        "could not resolve {hostport} within {}s",
+        timeout.as_secs()
+    ))
 }
 
 impl Occurrence {
+    /// A waiter on this node's convergence signal — bumped by every ADMITTED
+    /// envelope, so a leg wakes when the row it needs lands rather than on a
+    /// poll boundary.
+    fn replication_convergence(&self) -> ciris_edge::replication::convergence::ConvergenceWaiter {
+        self.replication.convergence()
+    }
+
     /// Wait for real announce-based rooting to converge with every peer
     /// we need to talk to. No test hook: this is the production
     /// cold-start path, and a timeout is reported as a leg that did not
     /// run.
     async fn await_rooting(&self, peers: &[String]) -> Result<Duration, String> {
-        let start = Instant::now();
-        loop {
-            let mut missing = Vec::new();
-            for p in peers {
-                if p != &self.cfg.node_id && !self.transport.knows_peer(p).await {
-                    missing.push(p.clone());
+        // Rooting is announce-driven, and an announce carries attestations that
+        // get ADMITTED — so the convergence signal is genuinely relevant here
+        // and this wakes on the admit rather than on a 500ms boundary. The
+        // floor still covers the transport's own route table, which admission
+        // does not signal.
+        let outcome = self
+            .replication_convergence()
+            .with_poll_floor(Duration::from_millis(500))
+            .await_until(self.cfg.root_timeout, || async {
+                for p in peers {
+                    if p != &self.cfg.node_id && !self.transport.knows_peer(p).await {
+                        return false;
+                    }
                 }
-            }
-            if missing.is_empty() {
-                return Ok(start.elapsed());
-            }
-            if start.elapsed() >= self.cfg.root_timeout {
-                return Err(format!(
-                    "announce rooting did not converge within {}s; unrooted: {missing:?}",
-                    self.cfg.root_timeout.as_secs()
-                ));
-            }
-            tokio_sleep(Duration::from_millis(500)).await;
+                true
+            })
+            .await;
+        if outcome.is_converged() {
+            return Ok(outcome.waited());
         }
+        let mut missing = Vec::new();
+        for p in peers {
+            if p != &self.cfg.node_id && !self.transport.knows_peer(p).await {
+                missing.push(p.clone());
+            }
+        }
+        Err(format!(
+            "announce rooting did not converge within {}s; unrooted: {missing:?}",
+            self.cfg.root_timeout.as_secs()
+        ))
     }
 
     /// Install this cohort's scope addresses through the documented two
@@ -1508,6 +2227,661 @@ fn epoch_keys(
 // Roles
 // ═══════════════════════════════════════════════════════════════════
 
+/// The fedID-discovery leg: fedID → person → their nodes → a node this node
+/// can actually address.
+///
+/// Shared by BOTH roles. It was written inline on the publisher only, while
+/// the census expects the cell on publisher and subscriber alike — so every
+/// subscriber reported it missing, independent of whether discovery worked.
+/// Discovery must hold in both directions anyway: the publisher resolving a
+/// subscriber's owner says nothing about a subscriber resolving the
+/// publisher's, and that is the direction a contact request travels.
+async fn run_discover_by_fedid_leg(
+    occ: &Occurrence,
+    lens: &ciris_edge::contact::PersistLens<'_>,
+    routes: &ciris_edge::contact::ReticulumRoutes<'_>,
+) {
+    use ciris_edge::contact;
+
+    let rep = Arc::clone(&occ.reporter);
+    let cfg = &occ.cfg;
+
+    // A PEER's owner — never our own, or this would prove only that a node
+    // can read what it just wrote.
+    //
+    // Prefer a COHORT peer. The roster is ordered by key_id, so the naive
+    // `.first()` picked `nonmember` — the node the harness deliberately holds
+    // at arm's length. It roots against the publisher and nothing else, drives
+    // no replication rounds, and exists to prove EXCLUSION; its owner binding
+    // is therefore not expected to converge anywhere. Targeting it made an
+    // identity-plane leg depend on a node contracted not to participate, and
+    // the leg failed with `NotYetDiscovered { nonmember-owner }` — a true
+    // report about the wrong subject.
+    //
+    // A cohort peer is one this occurrence exchanges state with by contract,
+    // which is exactly the population whose bindings must converge.
+    let candidates: Vec<&RosterEntry> = occ
+        .roster
+        .values()
+        .filter(|e| e.key_id != cfg.node_id && !e.owner_key_id.is_empty())
+        .collect();
+    let peer_owner = candidates
+        .iter()
+        .find(|e| cfg.cohort_members.contains(&e.key_id))
+        .or_else(|| candidates.first())
+        .map(|e| (e.owner_key_id.clone(), e.key_id.clone()));
+
+    let Some((owner_id, expect_node)) = peer_owner else {
+        rep.not_run(
+            "ladder.discover_by_fedid",
+            "no peer published an owner in the roster — nothing to resolve",
+        );
+        return;
+    };
+
+    // WAIT for the peer's binding, through the shared helper.
+    //
+    // The row is replicated, not seeded, so asking once races the Attestation
+    // plane and fails on timing rather than on the property under test. What
+    // this leg claims is that discovery CONVERGES over the wire — so waiting
+    // for convergence is the measurement, and the elapsed time is reported as
+    // part of it.
+    //
+    // `await_until` wakes on an ADMITTED envelope rather than on a poll
+    // boundary, so this resolves the moment the binding lands. Route
+    // reachability is not signalled by admission — that lives in the
+    // transport's table — so the helper's floor covers it, and the leg does not
+    // have to know which half of its predicate is signalled.
+    // The predicate answers ONE question and captures nothing, so the closure
+    // stays `Send` and the helper needs no interior mutability from callers.
+    // The snapshot used for reporting comes from a single call afterwards —
+    // cheap, and the same shape on the converged and timed-out paths alike.
+    // A DEDICATED budget, not the whole barrier.
+    //
+    // This leg runs before `cohort.join`, so a failure that burns the entire
+    // barrier leaves the publisher not reading control frames for five
+    // minutes — its peers' KeyPackage sends then time out and EVERY later leg
+    // reports missing. One leg's failure must cost one leg, not the run: the
+    // previous attempt turned a single red cell into fifteen.
+    let discovery_budget = cfg.barrier_timeout.min(Duration::from_secs(90));
+    // Rounds are KICKED toward the peer and re-kicked on every admission
+    // until the walk resolves, so the Key → attribution → Attestation chain
+    // runs back to back instead of one plane per cadence tick.
+    let outcome = occ
+        .replication
+        .sync_and_await(&expect_node, discovery_budget, || async {
+            matches!(
+                contact::discover(lens, routes, &owner_id).await,
+                Ok(ref f)
+                    if f.subject.nodes.contains(&expect_node)
+                        && f.reachable.contains(&expect_node)
+            )
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "sync_and_await: scheduler unavailable");
+            ciris_edge::replication::convergence::Converged::TimedOut {
+                waited: Duration::ZERO,
+                checks: 0,
+            }
+        });
+    let (last, last_stall) = match contact::discover(lens, routes, &owner_id).await {
+        Ok(found) => (Some(found), None),
+        Err(stall) => (None, Some(format!("{stall:?}"))),
+    };
+    let attempts = outcome.checks();
+    let waited_ms = outcome.waited().as_millis();
+    if let Some(found) = last {
+        let named = found.subject.nodes.contains(&expect_node);
+        let reachable = found.reachable.contains(&expect_node);
+        if !(named && reachable) {
+            tracing::error!(
+                queried = %owner_id,
+                expected_node = %expect_node,
+                nodes = ?found.subject.nodes,
+                reachable = ?found.reachable,
+                waited_ms,
+                attempts,
+                "discovery did not converge: the peer's owner binding never named \
+                 a reachable expected node within the barrier"
+            );
+        }
+        rep.ran(
+            "ladder.discover_by_fedid",
+            named && reachable,
+            serde_json::json!({
+                "queried": owner_id,
+                "resolved_person": found.subject.fed_id,
+                "resolved_from": format!("{:?}", found.subject.resolved_from),
+                "nodes": found.subject.nodes,
+                "reachable": found.reachable,
+                "expected_node": expect_node,
+                "peer_is_cohort_member": cfg.cohort_members.contains(&expect_node),
+                "named_expected_node": named,
+                "reachable_expected_node": reachable,
+                "converged_ms": waited_ms,
+                "attempts": attempts,
+                "inbound": occ.inbound_stats.as_json(),
+                "covers": "fedID -> person -> owned nodes -> addressable, against the \
+                           peer's owner binding learned over the wire",
+            }),
+        );
+    } else {
+        // Ask the directory the two questions the stall cannot separate. Both
+        // surface as `NotYetDiscovered`, but they have different causes and
+        // different remedies: no key record means the steward's directory row
+        // never arrived; a key record with no owned nodes means the row is here
+        // and the owner-binding ATTESTATION is what did not replicate or admit.
+        use ciris_edge::contact::DirectoryLens as _;
+        let has_key_record = lens.identity_type_of(&owner_id).await;
+        let owned = lens.nodes_owned_by(&owner_id).await;
+        tracing::error!(
+            queried = %owner_id,
+            stall = ?last_stall,
+            waited_ms,
+            attempts,
+            identity_type = ?has_key_record,
+            owned_nodes = ?owned,
+            "discovery never resolved the peer's owner. identity_type=None means the \
+             KEY RECORD is missing; identity_type=Some with owned_nodes=[] means the \
+             record is here and the owner-binding ATTESTATION did not replicate or \
+             did not admit"
+        );
+        rep.ran(
+            "ladder.discover_by_fedid",
+            false,
+            serde_json::json!({
+                "queried": owner_id,
+                "stall": last_stall,
+                "waited_ms": waited_ms,
+                "attempts": attempts,
+                "identity_type": has_key_record,
+                "owned_nodes": owned,
+                "inbound": occ.inbound_stats.as_json(),
+                // WHICH LINK IN THE CHAIN IS MISSING. Each of these is a
+                // distinct fault with a distinct remedy, and the stall alone
+                // cannot tell them apart:
+                //   key record absent  -> the steward's directory row never
+                //                         arrived
+                //   route absent       -> the peer's TransportDestination (its
+                //                         transport hint) has not replicated,
+                //                         so #393 item 2 cannot be satisfied
+                //                         and its frames are dropped
+                //   both present, no
+                //   owned nodes        -> the owner-binding attestation is what
+                //                         is missing
+                "peer_route_known": occ.transport.knows_peer(&expect_node).await,
+                "peer_key_record": lens.identity_type_of(&expect_node).await,
+            }),
+        );
+    }
+}
+
+/// The pair chat legs — `ladder.open_chat` and `ladder.send_message` — over
+/// the real mesh, through the one-verb DX (`docs/FSD_REPLICATION_DX.md`).
+///
+/// Runs on the PUBLISHER and the FIRST subscriber only; every other role
+/// reports `not_run` with the reason, which the census accepts as
+/// documentation. Two parties, one room:
+///
+/// 1. Both derive the same room id from the two OWNER fed-IDs
+///    (`chat::pair_community_key_id`, order-free) and author the pair
+///    `Community` row locally. Members are the two HUMANS, not the nodes:
+///    AV-45 at the put door resolves a node writer through `owner_of` and
+///    checks the OWNER against the roster (`admission_identity_for_writer`).
+///    Authoring it on both sides is idempotent and removes any dependency on
+///    the Community plane's replication timing.
+/// 2. The publisher's OWNER authors a message — `tier: local`,
+///    `cohort_scope: self`, attested and signed by the human (sign-at-write)
+///    — stores it, and `share(With::Community)`s it: the row enters the mesh
+///    over the same bytes with the node's co-scrub, then the human's own
+///    `supersedes` places it in the room. Two rows; the peer gets the second.
+/// 3. The subscriber waits, through the convergence helper, until the row
+///    lands and `chat::messages_in_room` returns it — keyed on the sender's
+///    fed-ID and the derived room, read off the plane like a client would.
+///
+/// Nothing bespoke crosses the wire. The message is an ordinary
+/// federation-tier `scores` row on `chat:message:v1`, so RNS transport,
+/// the relay hop, and LXMF come along for free.
+/// The one message the pair chat sends. Fixed so the receiver can check it.
+const CHAT_BODY: &str = "hello over the mesh";
+
+/// Put a row and share it with the room — the ONE way a chat leg places
+/// anything: authored `self`, entered over the same bytes with the node's
+/// co-scrub, widened to `community` by the owner's own `supersedes`.
+async fn share_in_room(
+    dir: &dyn ciris_persist::federation::FederationDirectory,
+    row: ciris_persist::federation::Attestation,
+    room: &str,
+    signers: ciris_edge::replication::attestation_bind::Signers<'_>,
+) -> Result<ciris_edge::replication::attestation_bind::Shared, String> {
+    use ciris_edge::replication::attestation_bind::{share, CrossingBasis, Shared, With};
+    dir.put_attestation(ciris_persist::federation::SignedAttestation {
+        attestation: row.clone(),
+    })
+    .await
+    .map_err(|e| format!("put {}: {e}", row.attestation_id))?;
+    let crossing = share(
+        dir,
+        &row,
+        With::Community {
+            community_key_id: room.to_owned(),
+        },
+        CrossingBasis::ProducerAuthority,
+        signers,
+    )
+    .await?;
+    match crossing.shared {
+        Shared::Placed { .. } | Shared::AlreadyThere { .. } => Ok(crossing.shared),
+        Shared::AwaitingActor { .. } => Err(format!("{:?}", crossing.shared)),
+    }
+}
+
+async fn run_chat_legs(occ: &Occurrence) {
+    use ciris_edge::chat::{self, Body, PairRole, RoomKey};
+    use ciris_edge::mls::cohort_group::{
+        key_package_from_bytes, key_package_to_bytes, mint_cohort_key_material,
+    };
+    use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
+    use ciris_edge::replication::attestation_bind::Signers;
+    use ciris_persist::encrypted_kv::XChaChaKvStore;
+    use ciris_persist::federation::FederationDirectory as _;
+
+    let rep = Arc::clone(&occ.reporter);
+    let cfg = &occ.cfg;
+
+    // publisher ↔ first subscriber. `cohort_members` is [publisher, sub-1, …].
+    let Some(publisher) = cfg.cohort_members.first().cloned() else {
+        rep.not_run("ladder.open_chat", "no cohort");
+        rep.not_run("ladder.send_message", "no cohort");
+        return;
+    };
+    let Some(first_sub) = cfg.cohort_members.get(1).cloned() else {
+        rep.not_run("ladder.open_chat", "no subscriber in the cohort");
+        rep.not_run("ladder.send_message", "no subscriber in the cohort");
+        return;
+    };
+    let (i_send, peer_node) = if cfg.node_id == publisher {
+        (true, first_sub)
+    } else if cfg.node_id == first_sub {
+        (false, publisher)
+    } else {
+        let why = "the pair chat legs run on the publisher and the first subscriber only";
+        rep.not_run("ladder.open_chat", why);
+        rep.not_run("ladder.send_message", why);
+        return;
+    };
+
+    let my_owner = format!("{}-owner", cfg.node_id);
+    let Some(peer_owner) = occ
+        .roster
+        .get(&peer_node)
+        .map(|e| e.owner_key_id.clone())
+        .filter(|o| !o.is_empty())
+    else {
+        rep.not_run("ladder.open_chat", "peer published no owner");
+        rep.not_run("ladder.send_message", "peer published no owner");
+        return;
+    };
+    let room = chat::pair_community_key_id(&my_owner, &peer_owner);
+    let founded_at: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .expect("const ts")
+            .into();
+    let dir: &dyn ciris_persist::federation::FederationDirectory = &*occ.directory;
+    let signers = Signers {
+        node: &occ.node_signer,
+        actor: Some(&occ.owner_signer),
+    };
+    let budget = cfg.barrier_timeout.min(Duration::from_secs(90));
+    let mut members = vec![my_owner.clone(), peer_owner.clone()];
+    members.sort_unstable();
+
+    // ── open_chat: the room record (standup authored it; idempotent) ──
+    let room_how =
+        match chat::signed_pair_community(&my_owner, &peer_owner, founded_at, &occ.node_signer)
+            .await
+        {
+            Err(e) => Err(e),
+            Ok(row) => match occ.directory.put_community(row).await {
+                Ok(()) => Ok("authored"),
+                Err(ciris_persist::federation::Error::Conflict(_)) => Ok("already present"),
+                Err(e) => Err(format!("put_community: {e}")),
+            },
+        };
+    let room_how = match room_how {
+        Ok(how) => how,
+        Err(e) => {
+            tracing::error!(%room, error = %e, "open_chat: the room record failed");
+            rep.ran(
+                "ladder.open_chat",
+                false,
+                serde_json::json!({ "room": room, "error": e }),
+            );
+            rep.not_run("ladder.send_message", "open_chat failed");
+            return;
+        }
+    };
+
+    // ── open_chat: the MLS handshake, OVER THE ROOM ──────────────────
+    // Both rows are ordinary community-scoped attestations the owner signs;
+    // the audience gate serves each to exactly the other member's nodes.
+    let role = PairRole::of(&my_owner, &peer_owner);
+    let handshake_start = Instant::now();
+    let handshake: Result<(RoomKey, serde_json::Value), String> = async {
+        let kv = XChaChaKvStore::open_in_memory(room.as_bytes())
+            .map_err(|e| format!("open_in_memory: {e}"))?;
+        let store = ScopeStateProvider::new(Arc::new(kv));
+        match role {
+            PairRole::Creator => {
+                let group = CohortGroup::create(store, &room, &my_owner, 16)
+                    .await
+                    .map_err(|e| format!("CohortGroup::create: {e}"))?;
+                let waited = occ
+                    .replication
+                    .sync_and_await(&peer_node, budget, || async {
+                        chat::key_package_from(dir, &peer_owner, &room)
+                            .await
+                            .is_ok_and(|k| k.is_some())
+                    })
+                    .await
+                    .map_err(|e| format!("sync_and_await: {e}"))?;
+                let kp_bytes = chat::key_package_from(dir, &peer_owner, &room)
+                    .await?
+                    .ok_or_else(|| {
+                        format!(
+                            "the joiner's KeyPackage did not arrive within {} ms ({} checks)",
+                            waited.waited().as_millis(),
+                            waited.checks()
+                        )
+                    })?;
+                let kp =
+                    key_package_from_bytes(&kp_bytes).map_err(|e| format!("KeyPackage: {e}"))?;
+                let commit = group
+                    .add_member(&peer_owner, kp)
+                    .await
+                    .map_err(|e| format!("add_member: {e}"))?;
+                let epoch = commit.epoch();
+                let welcome = commit
+                    .welcome()
+                    .ok_or("add_member produced no Welcome")?
+                    .to_vec();
+                let row = chat::welcome_attestation(
+                    &occ.owner_signer,
+                    &peer_owner,
+                    &welcome,
+                    epoch,
+                    chrono::Utc::now(),
+                )
+                .await?;
+                let shared = share_in_room(dir, row, &room, signers).await?;
+                let key = RoomKey::of(&group).await?;
+                Ok((
+                    key,
+                    serde_json::json!({
+                        "role": "creator",
+                        "key_package_waited_ms": waited.waited().as_millis(),
+                        "key_package_checks": waited.checks(),
+                        "key_package_bytes": kp_bytes.len(),
+                        "welcome_bytes": welcome.len(),
+                        "welcome_shared": shared,
+                        "epoch": epoch,
+                    }),
+                ))
+            }
+            PairRole::Joiner => {
+                let (material, kp) = mint_cohort_key_material(&my_owner)
+                    .map_err(|e| format!("mint_cohort_key_material: {e}"))?;
+                let kp_bytes = key_package_to_bytes(kp).map_err(|e| format!("KeyPackage: {e}"))?;
+                let row = chat::key_package_attestation(
+                    &occ.owner_signer,
+                    &peer_owner,
+                    &kp_bytes,
+                    chrono::Utc::now(),
+                )
+                .await?;
+                let shared = share_in_room(dir, row, &room, signers).await?;
+                let waited = occ
+                    .replication
+                    .sync_and_await(&peer_node, budget, || async {
+                        chat::welcome_from(dir, &peer_owner, &room)
+                            .await
+                            .is_ok_and(|w| w.is_some())
+                    })
+                    .await
+                    .map_err(|e| format!("sync_and_await: {e}"))?;
+                let (welcome, epoch) = chat::welcome_from(dir, &peer_owner, &room)
+                    .await?
+                    .ok_or_else(|| {
+                        format!(
+                            "the creator's Welcome did not arrive within {} ms ({} checks)",
+                            waited.waited().as_millis(),
+                            waited.checks()
+                        )
+                    })?;
+                let group = CohortGroup::join(store, &room, material, &welcome, 16)
+                    .await
+                    .map_err(|e| format!("CohortGroup::join: {e}"))?;
+                let key = RoomKey::of(&group).await?;
+                Ok((
+                    key,
+                    serde_json::json!({
+                        "role": "joiner",
+                        "key_package_bytes": kp_bytes.len(),
+                        "key_package_shared": shared,
+                        "welcome_waited_ms": waited.waited().as_millis(),
+                        "welcome_checks": waited.checks(),
+                        "welcome_bytes": welcome.len(),
+                        "epoch": epoch,
+                    }),
+                ))
+            }
+        }
+    }
+    .await;
+    let handshake_ms = handshake_start.elapsed().as_millis();
+    let (key, mls) = match handshake {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(%room, ?role, error = %e, handshake_ms, "open_chat: the MLS handshake failed");
+            rep.ran(
+                "ladder.open_chat",
+                false,
+                serde_json::json!({ "room": room, "role": format!("{role:?}"), "handshake_ms": handshake_ms, "error": e }),
+            );
+            rep.not_run("ladder.send_message", "the MLS handshake failed");
+            return;
+        }
+    };
+    rep.ran(
+        "ladder.open_chat",
+        true,
+        serde_json::json!({
+            "room": room,
+            "members": members,
+            "other_member": peer_owner,
+            "how": room_how,
+            "role": format!("{role:?}"),
+            "mls": mls,
+            "handshake_ms": handshake_ms,
+            "epoch": key.epoch(),
+            "covers": "both ends derive the same two-person room from the two owner \
+                       fed-IDs (both FOUNDERS, so both moderators); the MLS handshake \
+                       (KeyPackage, Welcome; X-Wing 0x004D) rode the room as ordinary \
+                       community-scoped rows the owners signed, and both ends now hold \
+                       the room's record secret",
+        }),
+    );
+
+    // ── send_message ─────────────────────────────────────────────────
+    if i_send {
+        let sent = async {
+            let msg = chat::chat_message_attestation(
+                &occ.owner_signer,
+                &peer_owner,
+                CHAT_BODY,
+                chrono::Utc::now(),
+                &key,
+            )
+            .await?;
+            // The wire never carries the plaintext — checked at the source.
+            let wire = serde_json::to_string(&msg.attestation_envelope).unwrap_or_default();
+            if wire.contains(CHAT_BODY) {
+                return Err("PLAINTEXT ON THE WIRE: the envelope contains the body".to_owned());
+            }
+            let sealed = msg.attestation_envelope.get(chat::FIELD_SEALED).cloned();
+            let crossing = {
+                use ciris_edge::replication::attestation_bind::{share, CrossingBasis, With};
+                occ.directory
+                    .put_attestation(ciris_persist::federation::SignedAttestation {
+                        attestation: msg.clone(),
+                    })
+                    .await
+                    .map_err(|e| format!("put message: {e}"))?;
+                share(
+                    dir,
+                    &msg,
+                    With::Community {
+                        community_key_id: room.clone(),
+                    },
+                    CrossingBasis::ProducerAuthority,
+                    signers,
+                )
+                .await?
+            };
+            Ok::<_, String>((msg.attestation_id, sealed, crossing))
+        }
+        .await;
+        match sent {
+            Ok((id, sealed, crossing)) => {
+                use ciris_edge::replication::attestation_bind::Shared;
+                tracing::info!(%room, attestation_id = %id, shared = ?crossing.shared, "chat message shared (sealed)");
+                rep.ran(
+                    "ladder.send_message",
+                    matches!(crossing.shared, Shared::Placed { .. }),
+                    serde_json::json!({
+                        "room": room,
+                        "authored_attestation_id": id,
+                        "sealed": sealed,
+                        "body_on_wire_is_ciphertext": true,
+                        "crossing": crossing,
+                        "author": my_owner,
+                        "attested_by": my_owner,
+                        "custody": cfg.node_id,
+                        "with": "community",
+                        "covers": "the body SEALED under the room's MLS record secret (XChaCha20-Poly1305, \
+                                   HKDF per message), authored tier:local / cohort:self by the OWNER \
+                                   (sign-at-write, full hybrid), then share(With::Community): enter_mesh \
+                                   over the same bytes with the node's co-scrub, then the owner's own \
+                                   supersedes at community (CC 5.3.2.4.2 + 4.4.3.3.1)",
+                    }),
+                );
+            }
+            Err(e) => {
+                tracing::error!(%room, error = %e, "send_message failed");
+                rep.ran(
+                    "ladder.send_message",
+                    false,
+                    serde_json::json!({ "room": room, "error": e }),
+                );
+            }
+        }
+        return;
+    }
+
+    // Receiver: kick rounds toward the sender until the WIDENING — the
+    // `supersedes` their share wrote at `community` — is here, then OPEN it.
+    let senders = vec![peer_owner.clone()];
+    let outcome = occ
+        .replication
+        .sync_and_await(&peer_node, budget, || async {
+            chat::messages_in_room(dir, &senders, &room, &key)
+                .await
+                .is_ok_and(|m| m.iter().any(|x| x.widens.is_some()))
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "sync_and_await: scheduler unavailable");
+            ciris_edge::replication::convergence::Converged::TimedOut {
+                waited: Duration::ZERO,
+                checks: 0,
+            }
+        });
+    let seen = chat::messages_in_room(dir, &senders, &room, &key)
+        .await
+        .unwrap_or_default();
+    let opened = seen.iter().any(|m| {
+        m.widens.is_some()
+            && m.body == Body::Text(CHAT_BODY.to_owned())
+            && m.author_key_id == peer_owner
+            && m.attesting_key_id == peer_owner
+    });
+    // The RAW rows: the peer's `self` copy must not be here (CC 5.2), and no
+    // chat row may carry the plaintext.
+    let raw = dir
+        .list_attestations_by(&peer_owner)
+        .await
+        .unwrap_or_default();
+    let leaked_self_rows: Vec<String> = raw
+        .iter()
+        .filter(|a| {
+            a.cohort_scope == ciris_persist::federation::types::cohort_scope::SELF
+                && a.attestation_envelope
+                    .get("dimension")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(chat::CHAT_MESSAGE_DIMENSION)
+        })
+        .map(|a| a.attestation_id.clone())
+        .collect();
+    let plaintext_on_wire: Vec<String> = raw
+        .iter()
+        .filter(|a| {
+            serde_json::to_string(&a.attestation_envelope)
+                .unwrap_or_default()
+                .contains(CHAT_BODY)
+        })
+        .map(|a| a.attestation_id.clone())
+        .collect();
+    let ok = opened && leaked_self_rows.is_empty() && plaintext_on_wire.is_empty();
+    if !ok {
+        tracing::error!(
+            %room, waited_ms = outcome.waited().as_millis(), checks = outcome.checks(),
+            messages = seen.len(), opened, leaked_self_rows = ?leaked_self_rows,
+            plaintext_on_wire = ?plaintext_on_wire,
+            "the peer's sealed WIDENING did not arrive and open within the budget, or a \
+             self copy / plaintext leaked here"
+        );
+    }
+    rep.ran(
+        "ladder.send_message",
+        ok,
+        serde_json::json!({
+            "room": room,
+            "converged_ms": outcome.waited().as_millis(),
+            "attempts": outcome.checks(),
+            "messages": seen.iter().map(|m| serde_json::json!({
+                "attestation_id": m.attestation_id,
+                "widens": m.widens,
+                "author": m.author_key_id,
+                "attested_by": m.attesting_key_id,
+                "body": format!("{:?}", m.body),
+                "epoch": m.epoch,
+            })).collect::<Vec<_>>(),
+            "expected_author": peer_owner,
+            "expected_attested_by": peer_owner,
+            "opened_with_room_key": opened,
+            "leaked_self_rows": leaked_self_rows,
+            "plaintext_on_wire": plaintext_on_wire,
+            "peer_node": peer_node,
+            "inbound": occ.inbound_stats.as_json(),
+            "covers": "a community-scoped, SEALED chat row attested and signed by the peer's \
+                       human — the supersedes their share wrote — arrived over RNS through \
+                       the relay, was read back by room, and OPENED with the room's MLS \
+                       record secret; no self copy and no plaintext reached this node",
+        }),
+    );
+}
+
 /// The publisher: cohort creator, stream source, blob source, and the
 /// node that drives the mid-stream epoch advance.
 async fn run_publisher(occ: Occurrence) -> Result<(), String> {
@@ -1571,11 +2945,35 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 "unreachable": unreachable,
                 "readback": "transport.knows_peer",
                 // Stated so a reader of the census knows what this leg does NOT
-                // cover: identifier resolution needs owner bindings the harness
-                // does not seed, and is unit-tested instead.
-                "covers": "route reachability only; identity resolution is unit-tested",
+                // cover: identifier resolution is the NEXT leg
+                // (`ladder.discover_by_fedid`), which walks owner bindings.
+                "covers": "route reachability only; identifier resolution is the next leg",
             }),
         );
+    }
+
+    // ── Ladder: DISCOVERY THROUGH THE FEDERATION DIRECTORY ───────────
+    //
+    // The rung the server's chat harness stops at, and the one only a running
+    // mesh can prove. Everything here resolves against this node's persist
+    // directory — the same state replication feeds — for a PEER's owner, whose
+    // binding this node never seeded and learned over the wire.
+    //
+    // fedID → person → their nodes → a node this node can actually address.
+    // That is the whole discovery mechanism: `identity_type` says what an
+    // identifier names, `owner_of`/`nodes_owned_by` walk the owner bindings,
+    // and `discover` refuses to report someone as found when nothing answers.
+    {
+        use ciris_edge::contact::{PersistLens, ReticulumRoutes};
+        let lens = PersistLens::new(occ.directory.as_ref());
+        let routes = ReticulumRoutes::new(&occ.transport);
+
+        run_discover_by_fedid_leg(&occ, &lens, &routes).await;
+    }
+
+    // ── Ladder: the pair chat, through the one-verb DX ───────────────
+    {
+        run_chat_legs(&occ).await;
     }
 
     // ── Cohort: create, admit members over the real wire ─────────────
@@ -2547,6 +3945,22 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
         );
     }
 
+    // ── Ladder: DISCOVERY THROUGH THE FEDERATION DIRECTORY ───────────
+    //
+    // Same leg the publisher runs, in the return direction: this subscriber
+    // resolves the PUBLISHER's owner from a binding it learned over the wire.
+    {
+        use ciris_edge::contact::{PersistLens, ReticulumRoutes};
+        let lens = PersistLens::new(occ.directory.as_ref());
+        let routes = ReticulumRoutes::new(&occ.transport);
+        run_discover_by_fedid_leg(&occ, &lens, &routes).await;
+    }
+
+    // ── Ladder: the pair chat, through the one-verb DX ───────────────
+    {
+        run_chat_legs(&occ).await;
+    }
+
     // ── Real cross-process MLS join ──────────────────────────────────
     let (material, kp) = mint_cohort_key_material(&cfg.node_id)
         .map_err(|e| format!("mint_cohort_key_material: {e}"))?;
@@ -3315,10 +4729,26 @@ async fn run_nonmember(occ: Occurrence) -> Result<(), String> {
 // ═══════════════════════════════════════════════════════════════════
 
 fn main() -> std::process::ExitCode {
-    // No `tracing_subscriber` init: it is a dev-dependency, and a
-    // `[[bin]]` compiles against `[dependencies]` only. The JSONL on
-    // stdout is the instrument; `tracing` events compile and are
-    // available to any consumer that installs a subscriber.
+    // Logs to STDERR (the JSONL owns stdout, and mixing them would corrupt the
+    // census's input). Default `info`, overridable with `RUST_LOG`.
+    //
+    // This used to be absent, with a comment explaining that `tracing_subscriber`
+    // was a dev-dependency and a `[[bin]]` compiles against `[dependencies]`
+    // only. True, and the consequence was that every `tracing::error!` in this
+    // binary went nowhere: five consecutive mesh failures were investigated with
+    // the diagnostics that would have named the fault compiled in and silent.
+    // The dependency is now optional behind `mesh-harness`, which costs library
+    // consumers nothing.
+    #[cfg(feature = "mesh-harness")]
+    {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let _ = fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .try_init();
+    }
     //
     // Reticulum needs a genuine multi-thread runtime.
     let rt = match tokio::runtime::Builder::new_multi_thread()

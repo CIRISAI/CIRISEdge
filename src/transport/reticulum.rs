@@ -2891,7 +2891,14 @@ impl ReticulumTransport {
         if let Some(rooting_dir) = rooting.as_deref() {
             let mut named16 = [0u8; 16];
             named16.copy_from_slice(local_named_dest_hash.as_bytes());
-            let _outcome = self_route
+            // LOG THE OUTCOME. This row is the node's TRANSPORT HINT — the
+            // `(peer, dest)` binding a peer needs to satisfy CIRISEdge#393
+            // item 2 — so whether it was written decides whether any peer can
+            // ever attribute a frame from us. Discarding the outcome (as this
+            // did) made a silent no-op indistinguishable from a success: the
+            // mesh dropped every inbound frame with "item 2 FAILED" while the
+            // node believed it had published a route.
+            let outcome = self_route
                 .ensure(
                     &local_signer,
                     rooting_dir,
@@ -2900,6 +2907,33 @@ impl ReticulumTransport {
                     config.local_epoch,
                 )
                 .await;
+            match &outcome {
+                crate::transport::self_route::SelfRouteOutcome::Emitted(applied) => {
+                    tracing::info!(
+                        key_id = %local_signer.key_id,
+                        dest = %hex::encode(named16),
+                        epoch = config.local_epoch,
+                        ?applied,
+                        "CIRISEdge#406: transport hint PUBLISHED — peers can now                          satisfy #393 item 2 for this node once the row reaches them"
+                    );
+                }
+                crate::transport::self_route::SelfRouteOutcome::AlreadyCurrent => {
+                    tracing::debug!(
+                        key_id = %local_signer.key_id,
+                        dest = %hex::encode(named16),
+                        "CIRISEdge#406: transport hint already current"
+                    );
+                }
+                other => {
+                    tracing::warn!(
+                        key_id = %local_signer.key_id,
+                        dest = %hex::encode(named16),
+                        epoch = config.local_epoch,
+                        outcome = ?other,
+                        "CIRISEdge#406: transport hint NOT published. No peer can                          satisfy #393 item 2 for this node, so every frame it sends                          will be dropped at the attribution gate"
+                    );
+                }
+            }
         }
 
         Ok(Self {
@@ -3726,6 +3760,51 @@ impl ReticulumTransport {
                 owns_key: true,
                 transport_pubkey64,
                 // #530 — `Rooted`, therefore pinned; stamp is for shape only.
+                last_seen: std::time::Instant::now(),
+                manifest_commitment: None,
+            },
+        );
+    }
+
+    /// CIRISEdge#393 test seam — the ADVISORY twin of
+    /// [`Self::inject_rooted_peer_with_transport_identity_for_test`]: a peer
+    /// whose full transport identity is known (so an identified link from it
+    /// MATCHES) but whose binding is `Advisory` — the field shape of an
+    /// announce whose steward is not in the pinned anchor
+    /// (`rooting_terminus_not_in_anchor`). E3 attribution is
+    /// `Rooted ∧ owns_key ∧ hybrid`, so frames on such a link are DELIVERED
+    /// and NOT attributed. Exists because the #393/#353 witnesses used to
+    /// inject the peer as `Rooted` and were green only while every fixture
+    /// signed classical-only (the hybrid leg refused for them); v19.0.0 has
+    /// no classical-only signer, so the witness must make the peer advisory
+    /// for real.
+    #[doc(hidden)]
+    pub async fn inject_advisory_peer_with_transport_identity_for_test(
+        &self,
+        destination_key_id: &str,
+        dest_hash: [u8; 16],
+        transport_pubkey64: [u8; 64],
+    ) {
+        let x25519: [u8; 32] = transport_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
+        let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
+        let transport_identity_hash =
+            Identity::from_public_keys(&x25519, &ed25519).map_or([0u8; 16], |id| *id.hash());
+        let mut peers = self.peers.lock().await;
+        peers.insert(
+            destination_key_id.to_string(),
+            RootedPeer {
+                peer: ResolvedPeer {
+                    dest_hash: DestinationHash::new(dest_hash),
+                    signing_key: ed25519,
+                },
+                epoch: 0,
+                chain: None,
+                provenance: ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
+                transport_identity_hash,
+                // The peer owns its key (its announce proved it); what it lacks
+                // is a chain to the anchor. That is exactly the #393 case.
+                owns_key: true,
+                transport_pubkey64,
                 last_seen: std::time::Instant::now(),
                 manifest_commitment: None,
             },
@@ -5716,6 +5795,7 @@ impl Transport for ReticulumTransport {
                         sent_resource_progress: &self.sent_resource_progress,
                         sink: &sink,
                         rooting: self.rooting.as_deref(),
+                        hybrid_policy: self.hybrid_policy,
                         binding_cache: &self.binding_cache,
                         announce_tx: &announce_tx,
                         bundle_save_gate: self.bundle_save_gate,
@@ -5813,6 +5893,9 @@ struct EventCtx<'a> {
     /// Persist directory adapter for the authenticated cold-start
     /// path; `None` → announces are dropped (no rooting possible).
     rooting: Option<&'a dyn RootingDirectory>,
+    /// v19.0.0 — the transport's hybrid policy, so the durable-store heal can
+    /// re-derive rootedness under the same policy the announce path applies.
+    hybrid_policy: HybridPolicy,
     /// CIRISEdge#482 item 2 — per-`(peer, dest)` hybrid-binding memo, borrowed
     /// from the owning transport; see [`binding_exists_cached`].
     binding_cache: &'a BindingCache,
@@ -7212,8 +7295,32 @@ enum DivergenceHeal {
     /// divergence detected but NOT healable onto this link (trust must never
     /// be laundered across identities).
     IdentityMismatch,
-    /// Upgrade the live entry: `provenance = Rooted`, `owns_key = true`.
+    /// Upgrade the live entry: `provenance = Rooted`, `owns_key = true` —
+    /// AFTER the chain re-roots here ([`store_claim_roots_here`]).
     Upgrade,
+    /// v19.0.0 — the store says `Rooted` for the same identity, but the
+    /// peer's chain does not root against THIS node's anchor: the stored
+    /// value is a replicated self-claim, and trust is derived, never read.
+    StoreClaimUnrooted,
+}
+
+/// v19.0.0 (CIRISEdge#393) — does `key_id`'s provenance chain root against
+/// THIS node's pinned anchor, under its hybrid policy? The same walk the
+/// announce path runs (`root_binding`, with the record's own registered
+/// pubkey as the claim), so a durable-store heal can never confer more trust
+/// than a fresh announce would. Fail-closed on any read failure.
+async fn store_claim_roots_here(
+    rooting: &dyn RootingDirectory,
+    key_id: &str,
+    policy: HybridPolicy,
+) -> bool {
+    let Some(registered) = rooting.registered_pubkey_ed25519_base64(key_id).await else {
+        return false;
+    };
+    match rooting.root_binding(key_id, &registered).await {
+        RootingVerdict::Confirmed { chain } => hybrid_policy_accepts(policy, &chain),
+        RootingVerdict::Rejected { .. } => false,
+    }
 }
 
 /// CIRISEdge#432 — attribution-failure handler: attempt the live-map divergence
@@ -7225,6 +7332,10 @@ enum DivergenceHeal {
 /// periodic floor), so the directory point-read is flood-bounded. On a
 /// successful heal the SAME frame is attributed (item 2 permitting) — the dark
 /// plane converges in zero additional frames.
+// The heal decision, its chain re-derivation, and the three report arms are
+// one auditable sequence; splitting them would hide the order the security
+// argument depends on (decide → re-root → upgrade → report).
+#[allow(clippy::too_many_lines)]
 async fn heal_or_report_attribution_miss(
     ctx: &EventCtx<'_>,
     key_id: &str,
@@ -7244,26 +7355,48 @@ async fn heal_or_report_attribution_miss(
     // The heal arm: a live entry that fails the gate + a store that roots the
     // same link-proven identity ⇒ upgrade in place, attribute this frame.
     if let (Some((live_prov, live_ok, _)), Some(s)) = (resolved, stored.as_ref()) {
-        let (decision, dest16) = {
-            let mut peers = ctx.peers.lock().await;
-            match peers.get_mut(key_id) {
-                Some(entry) => {
-                    let d = divergence_heal_decision(
+        let (mut decision, dest16) = {
+            let peers = ctx.peers.lock().await;
+            match peers.get(key_id) {
+                Some(entry) => (
+                    Some(divergence_heal_decision(
                         live_prov,
                         live_ok,
                         entry.transport_identity_hash,
                         s,
-                    );
-                    if matches!(d, DivergenceHeal::Upgrade) {
-                        entry.provenance = Rooted;
-                        entry.owns_key = true;
-                        entry.epoch = entry.epoch.max(s.epoch);
-                    }
-                    (Some(d), Some(entry.peer.dest_hash.into_bytes()))
-                }
+                    )),
+                    Some(entry.peer.dest_hash.into_bytes()),
+                ),
                 None => (None, None),
             }
         };
+        // v19.0.0 (CIRISEdge#393) — the store is authority for ROUTE, never
+        // for TRUST. Its `Rooted` may be THIS node's own write-through of a
+        // confirmed walk (the #432 case) — or a REPLICATED
+        // `SignedTransportDestination` whose `binding_provenance` is the
+        // peer's claim about itself (`self_route.rs` writes `Rooted` for its
+        // own destination): authenticated as "the peer said so", never walked
+        // against this node's anchor. Honouring that claim rooted any hybrid
+        // peer on first identified link — the confused-deputy shape #337
+        // closed for bare rows, wearing a signature. So a heal re-derives
+        // rootedness exactly as the announce path does, and a store claim
+        // whose chain does not root here is not laundered.
+        if matches!(decision, Some(DivergenceHeal::Upgrade)) {
+            let roots_here = match ctx.rooting {
+                Some(rooting) => store_claim_roots_here(rooting, key_id, ctx.hybrid_policy).await,
+                None => false,
+            };
+            if roots_here {
+                let mut peers = ctx.peers.lock().await;
+                if let Some(entry) = peers.get_mut(key_id) {
+                    entry.provenance = Rooted;
+                    entry.owns_key = true;
+                    entry.epoch = entry.epoch.max(s.epoch);
+                }
+            } else {
+                decision = Some(DivergenceHeal::StoreClaimUnrooted);
+            }
+        }
         match decision {
             Some(DivergenceHeal::Upgrade) => {
                 tracing::warn!(
@@ -7311,6 +7444,21 @@ async fn heal_or_report_attribution_miss(
                      DIFFERENT transport identity than this link proved (stale rotation, \
                      or an identity-squat attempt); trust is never laundered across \
                      identities (CIRISEdge#432)"
+                );
+                return None;
+            }
+            Some(DivergenceHeal::StoreClaimUnrooted) => {
+                tracing::warn!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    resolved_provenance = ?live_prov,
+                    resolved_owns_key = live_ok,
+                    stored_epoch = s.epoch,
+                    suppressed_prev,
+                    "durable store holds `Rooted` for this peer but its provenance chain \
+                     does NOT root against this node's anchor — a replicated self-claim \
+                     (a peer's own SignedTransportDestination), not this node's verdict; \
+                     NOT laundered into attribution (CIRISEdge#393, v19.0.0)"
                 );
                 return None;
             }
