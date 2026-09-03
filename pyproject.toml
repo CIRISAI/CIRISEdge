@@ -95,7 +95,7 @@ classifiers = [
 # `ASYNC_EXECUTOR_ABI_VERSION`, `OUTBOUND_QUEUE_ABI_VERSION`,
 # `SIGNER_ABI_VERSION`, all still 1) and move this floor with any of them.
 dependencies = [
-    "ciris-persist>=38.5,<39",
+    "ciris-persist>=39,<40",
 ]
 dynamic = ["version"]
 

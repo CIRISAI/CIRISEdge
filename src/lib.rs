@@ -268,7 +268,8 @@ pub const PERSIST_NAMESPACE_MANIFEST_VERSION: &str = "0.3.0";
 /// the serve path — serve-time stripping is unsound on edge's content-addressed
 /// signed wire (the recipient fetches by content-hash and re-verifies the hybrid
 /// signature, so a strip breaks both; #397). The strip is a persist
-/// PROMOTION-side transform (`promote_attestation_with_transforms`); at edge's
+/// WIDENING-side transform (`widen_audience`'s `strip`, listed in `differs_in`,
+/// persist v39.0.0); at edge's
 /// serve layer `StripField` deliberately resolves to a no-op
 /// (`bridge.rs` `recipient_capability` collection) and the deferral is accounted
 /// for in `field_conformance::DEFERRED_PENDING_PLANE`. Pinning the algebra hash

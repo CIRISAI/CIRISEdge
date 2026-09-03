@@ -1,23 +1,26 @@
 # FSD — Replication DX: one verb, two axes
 
-**Status:** **adopted — this is edge's replication DX.** Implemented in
-`replication::attestation_bind` (`share`, `publish`, `keep_local`, `With`) and
-pinned by `tests/chat_message_federates.rs`.
+**Status:** **adopted — this is edge's replication DX, as shipped in
+v19.0.0 over CIRISPersist v39.0.0.** Implemented in
+`replication::attestation_bind` (`share`, `publish`, `keep_local`, `With`,
+`Signers`, `custody_for`) and pinned by `tests/chat_message_federates.rs`
+(16 tests, real sqlite substrate).
 
-**Correction, 2026-09-02, from persist's review of this document — and the
-reason `v18.15.0` is NOT tagged.** The surface below is built over persist's
-`promote_attestation`, and that primitive re-signs the row with the NODE's key
-and **clears `additional_scrubs`** (`store/sqlite.rs`, promote body; verified).
-So `share(row, With::Community)` today destroys the actor's signature. Under
-the two-granters rule an agent's claim is attested by the AgentID and merely
-held in custody by the node, and a node-only key cannot carry agency (§8,
-`check_node_agency_admission`, "cryptographic, not policy"). This document
-originally recorded that as the design; it is a defect of the current
-substrate that edge could not see from where it stands. Persist owns the fix
-(two operations, `enter_federation` + `widen_audience`, actor-signed or
-actor-preserved with a node co-scrub); edge's verbs re-base onto them and pass
-the **actor's** signer. §3 and §9 are annotated. The vocabulary (`With`,
-`publish` as its own verb, `keep_local`, `Flow`) stands.
+**History, 2026-09-02.** The first cut of this surface (`v18.15.0`, never
+tagged) was built over persist's `promote_attestation`, which re-signed the
+row with the NODE's key and cleared `additional_scrubs` — so
+`share(row, With::Community)` destroyed the actor's signature, and a row
+attested by anyone but the node was refused at every peer while promotion
+returned `Ok`. Persist's review of this document found it (the sender row in
+§3 had recorded the defect as the design), persist's
+`FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE.md` replaced the one primitive
+with two operations, and v19.0.0 re-based onto them: `enter_mesh` (same
+bytes; the actor's signature stays the base scrub, the node may only APPEND a
+co-scrub) and `widen_audience` (a `supersedes` the ACTOR signs at the wider
+audience). Edge's five-axis `Flow` was deleted for persist's nine-axis
+`ContextualIntegrity`, which is verified at the crossing and refused by axis
+name. The vocabulary (`With`, `publish` as its own verb, `keep_local`) stands;
+the signature of every verb changed (§0).
 
 **This surface is an OPTION, not a gate.** A row authored directly at
 `tier: federation` with the intended `cohort_scope` replicates exactly as well —
@@ -42,42 +45,63 @@ problem this document exists to fix.
 ## 0. The surface, as built — `ciris_edge::replication::attestation_bind`
 
 For a reader who wants the API before the argument. Everything below is
-implemented and pinned by `tests/chat_message_federates.rs` (13 tests) and
-`tests/rooting_chain_walk.rs`; nothing here is proposed except where marked
-**Phase 2**.
+implemented and pinned by `tests/chat_message_federates.rs` (16 tests) and
+`tests/rooting_chain_walk.rs`; nothing here is proposed.
 
 ```rust
-// The verbs
-pub async fn share(dir, row, With, signer)  -> Result<Crossing, String>
-pub async fn publish(dir, row, signer)      -> Result<Crossing, String>
-pub fn keep_local(row)                      -> Result<(), String>
-pub fn describe_flow(row)                   -> Result<Flow, String>   // the direct path
+// The verbs. A share is TWO substrate operations: enter_mesh over the row's
+// own bytes, then — when `With` is wider than the row's own audience — a
+// supersedes the ACTOR signs at the wider one. Idempotent on both.
+pub async fn share(dir, row, With, CrossingBasis, Signers)   -> Result<Crossing, String>
+pub async fn publish(dir, row, CrossingBasis, Signers)       -> Result<Crossing, String>
+pub fn keep_local(row)                                       -> Result<(), String>
 
-// The audience — every non-public cohort, in widening order
-pub enum With { MyDevices, MyFamily, Community, Affiliations, Species, Biosphere }
-impl With { fn cohort_scope(); fn is_encrypted_at_rest(); fn is_structurally_invisible(); }
+// The keys a crossing may sign with: the NODE (custody) and, when in hand,
+// the ACTOR (the attester). `custody_for` decides which signs, from the row.
+pub struct Signers<'a> { node: &'a LocalSigner, actor: Option<&'a LocalSigner> }
+pub async fn custody_for(row, Signers) -> Result<Option<TierPromotionCustody>, String>
 
-// What crossed, and how
-pub struct Crossing { shared: Shared, flow: Flow }
-pub enum Shared { Placed, AlreadyThere }
-pub struct Flow { information_type, sender, subject, recipient: Recipient, principle: Principle }
-pub struct Recipient { cohort_scope, may_revoke, delivery: DeliveryRequirement }
-pub struct Principle { deletion_window, expires_at, consent_prefix }
+// The audience — every non-public cohort, in widening order. `family` and
+// `community` NAME their cohort (a placement is a membership claim, AV-45).
+pub enum With { MyDevices, MyFamily { family_key_id }, Community { community_key_id },
+                Affiliations, Species, Biosphere }
+impl With { fn audience() -> Audience; fn cohort_scope(); fn is_encrypted_at_rest();
+            fn is_structurally_invisible(); }
 
-// The pure verdict both verbs run first (public so it is testable without a directory)
-pub fn already_promoted_verdict(row, target_scope) -> Option<Result<Shared, String>>
+// What crossed, and how — both verb outcomes verbatim, because a widening
+// is two rows; the nine axes as persist verified them; where edge routes it.
+pub struct Crossing { shared: Shared, ci: ContextualIntegrity, routes_to: RoutesTo,
+                      discoverable: bool, entered: MeshCrossingOutcome,
+                      widened: Option<MeshCrossingOutcome> }
+pub enum Shared { Placed { attestation_id }, AlreadyThere { attestation_id },
+                  AwaitingActor { attestation_id, age_ms } }
+pub enum RoutesTo { OwnerNodes, FamilyNodes {..}, CommunityMembers {..}, Affiliations,
+                    Species, Biosphere, Everyone }
 
-// Lower-level, kept as thin wrappers over the same promote_to_scope
-pub async fn share_encrypted_privately(dir, row, EncryptedCohort, signer) -> Result<bool, String>
-pub async fn share_clear_privately(dir, row, ClearCohort, signer)         -> Result<bool, String>
-pub async fn share_publicly(dir, row, signer)                             -> Result<bool, String>
-pub async fn promote_to_scope(dir, row, cohort_scope, signer)             -> Result<bool, String>
+// The pure plan both verbs run first (public so it is testable without a directory)
+pub fn share_plan(row, &Audience) -> Result<SharePlan, String>
+pub enum SharePlan { AlreadyThere, Enter, EnterThenWiden(Audience), Widen(Audience) }
+
+// Persist's types, re-exported — ONE vocabulary, not two
+pub use ciris_persist::federation::{Audience, ContextualIntegrity, CrossingBasis, Custody,
+    DataSubject, DeliveryMode, Lifecycle, ContentRef, MeshCrossing, MeshCrossingOutcome,
+    Replicates, RevocationAuthority, TierPromotionCustody};
+pub use ciris_persist::federation::crossing::describe as describe_crossing; // the direct path
+pub use ciris_persist::federation::admission::{render_signed_instant,         // CC 2.6.2 `.sssZ`
+                                               truncate_to_substrate_resolution};
+
+// Thin wrappers whose NAMES say what the bytes do
+pub async fn share_encrypted_privately(dir, row, EncryptedCohort, CrossingBasis, Signers)
+pub async fn share_clear_privately(dir, row, ClearCohort, CrossingBasis, Signers)
+pub async fn share_publicly(dir, row, CrossingBasis, Signers)
 ```
 
-`share`/`publish` assemble the `AttestationReseal` persist demands
-(`RowMirror::restamp_for_scope` → JCS → hash → bound-hybrid sign) and call the
-one promotion primitive, `FederationDirectory::promote_attestation`. There is
-one promotion path in edge, not two.
+There is one crossing path in edge: `share_plan` → `custody_for` →
+`FederationDirectory::enter_mesh` → (`crossing::build_widening` →
+`stamp_and_canonicalize` → the actor signs → `assemble` →
+`FederationDirectory::widen_audience`). Edge never re-signs a row; it offers
+the actor's signature or appends the node's co-scrub, and persist verifies
+every signature it admits at that door.
 
 ---
 
@@ -193,96 +217,114 @@ Three problems:
 
 ```rust
 // Share, with an audience. The verb is the same every time; the variable is
-// WHO. (Terms ride on the row at authorship — see §3 "Honest scoping".)
-share(&*dir, &row, With::MyDevices,    &signer).await?;
-share(&*dir, &row, With::MyFamily,     &signer).await?;
-share(&*dir, &row, With::Community,    &signer).await?;   // the room id is IN the row
+// WHO. The basis is the transmission-principle axis, stated at the call.
+let keys = Signers { node: &node, actor: Some(&alice) };
+share(&*dir, &row, With::MyDevices,                              ProducerAuthority, keys).await?;
+share(&*dir, &row, With::MyFamily { family_key_id: fam },        ProducerAuthority, keys).await?;
+share(&*dir, &row, With::Community { community_key_id: room },   ProducerAuthority, keys).await?;
 
 // Publishing is a different verb, because it is a different act.
-publish(&*dir, &row, &signer).await?;
+publish(&*dir, &row, ProducerAuthority, keys).await?;
 
 // And the explicit non-share, so "I did not share it" is something you can
 // write rather than something you achieve by not calling anything.
 keep_local(&row)?;
 ```
 
-`With::Community` takes no room argument on purpose: `cohort_scope` is the
-single string `community`, and WHICH community is a signed envelope member
-(`community_id`) the producer already wrote. A parameter here would be one the
-substrate never reads.
+`With::Community` NAMES the room. A cohort placement is a membership claim
+about ONE cohort, proven at the put door against the id the row carries
+(AV-45), and persist's widening writes that id into the new row under the
+canonical alias `community_key_id` — so a targeted audience without its id is
+not an audience. (The first cut of this surface took no id and read it off the
+row; persist's review corrected it.)
 
 `With` carries the audience; the type answers the two questions callers get
 wrong, from the value rather than the function name:
 
 ```rust
-With::Community.is_encrypted_at_rest()      // true  (shared room DEK)
-With::Community.is_structurally_invisible() // FALSE (holds_bytes IS emitted)
-With::MyFamily.is_structurally_invisible()  // true
-With::Species.is_encrypted_at_rest()        // FALSE — narrower audience, plaintext bytes
+With::Community { .. }.is_encrypted_at_rest()      // true  (shared room DEK)
+With::Community { .. }.is_structurally_invisible() // FALSE (holds_bytes IS emitted)
+With::MyFamily { .. }.is_structurally_invisible()  // true  — replicated to the family's nodes, never advertised
+With::Species.is_encrypted_at_rest()               // FALSE — narrower audience, plaintext bytes
 ```
 
-Both delegate to persist (`crypto_tier`, `suppresses_holds_bytes`) rather than
+Both delegate to persist (`crypto_tier`, `Audience::discoverable`) rather than
 restating the grouping, so an API that promises encryption the substrate does
 not apply is a test failure, not a doc bug.
 
-### The five flow parameters, mapped
+### The nine axes, at the crossing
 
-ciris.ai/contextual-integrity embeds five parameters in the wire. A caller
-should be able to see all five in the call or the row, and never have to infer
-one:
-
-| parameter | wire | where the caller sees it |
-|---|---|---|
-| data subject | `subject_key_ids` | the producer, for a self-declaration; set by the producer helper |
-| sender | `attesting_key_id` | **the actor** — the AgentID, or the human's FedID. The node is **custody** (`scrub_key_id`, co-scrub), never the sender: a node-only key cannot carry agency. *As built, edge's chat producer names the node as attester with the human as `on_behalf_of_key_id` — the server's workaround for the same substrate defect, retired by the re-base.* |
-| recipient | `cohort_scope` + `subject_key_ids` + `delivery_mode` | **`With::…`** |
-| information type | `dimension` | the producer helper (`chat:message:v1`) |
-| transmission principle | `deletion_window` · `expires_at` · the covering `consent:replication` grant | **`Flow::principle`** (temporal half on the row; permission half resolved per recipient — `Terms` is Phase 2, §3) |
-
-**Both paths present the same picture.** `share` and `publish` compute a
-[`Flow`] — all five parameters read from the row through persist's canonical
-envelope names and edge's typed `delivery_mode` reader — BEFORE anything
-moves, log it as `CROSSING THE WIRE — type=… sender=… subject=… recipient={…}
-principle={…}`, and return it in the `Crossing`. A row authored directly at
-federation tier never passes through `share`, so `describe_flow(row)` presents
-the identical `Flow` for that path. A row with no `dimension` is refused on
-both: information type is the strict admission test, and without a namespace
-no consent grant can cover it.
-
+CC 4.5.1.1 ratifies a closed vocabulary of nine contextual-integrity axes.
 The federation crossing is the moment edge picks a row up and offers it to
-peers, so it is the one moment all five must be present and correct — and the
-one moment a consumer should be able to SEE all five without inferring any.
+peers, so it is the one moment all nine must be present and correct — and
+persist now makes that structural: both verbs take a `ContextualIntegrity`
+with every axis required, cross-check each against the row, and refuse a
+mismatch **by the name of the axis** (`ContextualIntegrityMismatch`). Edge
+derives it from the row (`describe_crossing`, persist's own), passes it, and
+returns it in `Crossing.ci` as applied:
 
-### The re-base — persist's two operations
+| axis | wire | as edge states it |
+|---|---|---|
+| `sender` | `attesting_key_id` | **the actor** — the AgentID, or the human's FedID. MUST equal `attesting_key_id`; persist refuses otherwise. The node is **custody** (`scrub_key_id` / a co-scrub), never the sender: a node-only key cannot carry agency. |
+| `data_subject` | `subject_key_ids` | `Nobody`, or exactly the row's subjects |
+| `recipient_see` | `cohort_scope` (+ the cohort id) | **`With::…`** → `Audience` |
+| `recipient_revoke` | `subject_key_ids` (CC 2.4.1.1) | `ProducerOnly`, or the subjects — stated back so the caller SEES the authority conferred |
+| `recipient_receive` | `delivery_mode` | `BestEffort` / `Mandatory` |
+| `information_type` | `dimension` → family | the producer helper (`chat:message:v1`) |
+| `transmission_principle` | the crossing CALL | **`CrossingBasis`**: `ProducerAuthority`, or `ConsentGrant { attestation_id }` naming the live egress grant that covers this dimension at this audience — validated against the stored grant; never a reseal member (that would change the bytes the actor signed) |
+| `temporal_lifecycle` | `asserted_at` / `expires_at` (signed) | the row's own instants, stated back |
+| `content` | `original_content_hash` | the hash the crossing commits to; REUSED by a widening (CC 8.1.5) |
+
+A row with no `dimension` is refused before anything moves (`share_plan`):
+information type is the strict admission test, and without a namespace no
+consent grant can cover it. A row authored directly at federation tier never
+passes through `share`; `describe_crossing(row, audience, basis)` presents the
+identical nine axes for that path.
+
+### The two operations — as built
 
 Persist's review resolved §6/§9.6b: the constitution's two promotion patterns
-are **two different operations**, and persist had conflated them.
+are **two different operations**, and persist had conflated them. v39.0.0
+ships them; v19.0.0 composes them.
 
 | operation | what it is | who signs | rows after |
 |---|---|---|---|
-| `enter_federation` | `local → federation` at the row's OWN cohort (CC 5.3.2.4.2) | the actor; or the actor's local signature preserved + node co-scrub | one row, tier flipped |
-| `widen_audience` | a wider cohort (CC 4.4.3.3.1) | the actor, as a `supersedes` row chained off the original | **two rows**: the original untouched at its cohort, the new one at the wider cohort, lineage walkable |
+| `enter_mesh` | `local → federation` over the SAME bytes, at the row's OWN audience (CC 5.3.2.4.2) | the actor's signature, made at write or now (`ActorSigned`); or the actor's write-time signature preserved + the node's co-scrub APPENDED with `cosigned_at` (`NodeCoScrub`) | one row, tier flipped, `cohort_scope` untouched — so `(local, self)` becomes `(federation, self)`: replicated to the owner's own nodes by consent fan-out, never advertised |
+| `widen_audience` | a strictly wider audience (CC 4.4.3.3.1) | the actor, as a `supersedes` row chained off the original (`references_attestation_id`, `differs_in: ["cohort_scope"]`, body reused member by member) | **two rows**: the original untouched at its audience, the new one at the wider audience, lineage walkable |
 
-Edge's `share`, `publish`, `keep_local` become thin over these — composing
-both when a share is also a widening — and pass the **actor's** signer, not
-the node's. Nothing else in the surface moves. One behavioural consequence
-callers will notice: `share(self-row, With::Community)` yields two federation
-rows (the original still replicates to your own devices; the widened copy to
-the room), so `Shared::Placed` will carry the new row's id. CC 8.1.5's worked
-example is this two-row shape. Delegated widening by a node is refused
-(widening an agent's claim is agency); a human-authored row whose FedID lives
-on another device takes the co-scrub path or waits.
+`share` is `share_plan` → `enter_mesh` → `widen_audience`, and passes the
+**actor's** signer (`Signers.actor`) alongside the node's. Who signs is
+decided from the row by `custody_for` (the table on `Signers`); there is no
+delegated widening — a node cannot author a `supersedes` on an actor's behalf
+(CC 4.4; subsidiarity) — so a widening with only the node in hand returns
+`Shared::AwaitingActor`, typed, with the original already in the mesh.
 
-### Transmission principle — answered, not Phase 2
+**The consequence callers notice:** `share(self-row, With::Community { .. })`
+leaves TWO federation rows — the original still replicates to your own
+devices, the `supersedes` to the room — and `Shared::Placed` carries the
+**new** row's id, because that is the one a peer receives. CC 8.1.5's worked
+example is this two-row shape. Readers that key on `attestation_type` must
+fold `supersedes` (`chat::messages_in_room` does: a widening IS the claim at
+the wider audience, and the prior it references is dropped when both are
+present).
+
+**Sign at write.** Edge's producers sign at write (the chat producer signs
+with the author's key; the A/V rows are born federation-tier), because an
+unsigned row has nothing to co-scrub: persist's `NoActorSignature` closes the
+co-scrub path to it, and a key rotation strands it forever
+(`CustodyIsNotTheActor`). Deferral (CC 5.3.2.2) is reserved for
+ceremony-bound keys — a FedID on hardware signs at the crossing, which for
+chat is the send. §6 item 5 has the argument.
+
+### Transmission principle — built, not Phase 2
 
 Persist's answer to §9.1 is better than the ask: the principle rides the
 **crossing call** (`ContextualIntegrity.transmission_principle` on
-`enter_federation` / `widen_audience`) and is validated against the consent
-grant already on the row. A reseal member would change the signed bytes — the
-exact thing that would invalidate the actor's local signature and foreclose the
-co-scrub path — so it stays off the preimage. `Flow::principle` reports what
-the row carries; the call carries the rule. The paragraph below is retained as
-the record of the original ask.
+`enter_mesh` / `widen_audience`, edge's `CrossingBasis` argument to `share`)
+and is validated against the consent grant already on the row. A reseal member
+would change the signed bytes — the exact thing that would invalidate the
+actor's local signature and foreclose the co-scrub path — so it stays off the
+preimage. The paragraphs below are retained as the record of the original ask.
 
 `Terms` is the piece with no home today. Proposed surface, smallest first:
 
@@ -342,11 +384,19 @@ CIRISServer's non-vacuous-prefix guard exists to refuse.
 
 ## 5. Migration
 
-`share_encrypted_privately` / `share_clear_privately` / `share_publicly` stay
-as-is. They are already correct; they are simply lower-level than most callers
-need, and their names encode in prose what `With` encodes in a type. `share`
-and `publish` are built on the same `promote_to_scope` they are, so there is
-one promotion path, not two.
+`share_encrypted_privately` / `share_clear_privately` / `share_publicly` stay,
+thin over `share` / `publish`: their names encode in prose what `With` encodes
+in a type. There is one crossing path, not two.
+
+**From v18.x (never tagged) to v19.0.0**, every verb's signature changed:
+`share(dir, row, With, &node_signer)` → `share(dir, row, With, CrossingBasis,
+Signers { node, actor })`; `With::MyFamily` / `With::Community` gained their
+cohort id; `Flow` / `describe_flow` / `already_promoted_verdict` /
+`promote_to_scope` are gone (`ContextualIntegrity` / `describe_crossing` /
+`share_plan` / nothing); `Shared` variants carry the id on the wire and
+`AwaitingActor` is new; `chat_message_attestation` takes the AUTHOR's signer
+and no node id; `messages_in_room` lists by the humans who speak. A consumer
+that counted rows after a share now sees two.
 
 ## 6. Open questions
 
@@ -485,9 +535,9 @@ noted; where they diverge it is flagged rather than smoothed over.
    bytes. persist's `promote_attestation` is the second: it re-stamps the
    envelope for the new placement (`RowMirror::restamp_for_scope`), sets
    `promoted_at`, and UPDATEs in place. Nothing emits a `supersedes` row.
-   **Open question for the author**: is the CC 4.4.3.3.1 lineage-walkable form
-   still intended for cohort widening (in which case edge's `share` should emit
-   it *alongside* the tier flip), or has 5.3.2.4.2 superseded it? This FSD
+   **Answered (persist FSD, v39.0.0)**: both — they are two operations. Edge's
+   `share` emits the tier flip (`enter_mesh`, in place, same bytes) and then
+   the lineage-walkable `supersedes` (`widen_audience`). This FSD originally
    does not guess.
 
 3. **`witness_relation`.** CC 5.3.2.4.1 requires `witness_relation: self` for
@@ -545,7 +595,7 @@ edge; all would remove a footgun for the next consumer.
    is the substrate change that lets the fifth CI parameter be set at the
    crossing, where the CI page says it belongs.
 
-2. **A typed "already federation" promote outcome.** *Disposition: accepted (persist FSD §5.1).* `promote_attestation`
+2. **A typed "already federation" promote outcome.** *Disposition: shipped — `MeshCrossingOutcome::{Crossed, AlreadyInMesh, AlreadyWidened, AwaitingActor}`; edge folds it into `Shared`.* `promote_attestation`
    returns `Ok(false)` for a row already at `tier: federation` — correct and
    idempotent by CC 5.3.2.4.2, but indistinguishable from "placed nothing for
    another reason" without reading the row's tier first. Edge does that read
@@ -603,6 +653,12 @@ edge; all would remove a footgun for the next consumer.
    Edge's fix is not cosmetic: the signed `asserted_at` must agree with the
    typed column at the instant level (CIRISPersist#598 refuses a divergence),
    so it is millisecond truncation **and** `Z`, in the binder, every producer,
-   and the typed column together (`truncate_to_micros` → millis). The binder
-   is on the mesh standup path, so this needs a mesh run — first item of the
-   re-base cut.
+   and the typed column together. **Done in v19.0.0**: edge's binder, the
+   chat producer and the A/V producer render through persist's
+   `render_signed_instant` (`.sssZ`, millisecond floor) and truncate the column
+   through `truncate_to_substrate_resolution`; edge's own `truncate_to_micros`
+   is gone. Persist's ingest check stays microsecond-tolerant for pre-v39 rows
+   (§11 item 3 of its FSD). One consequence that reaches further than
+   promotion: a consumer that windows on a raw `Utc::now()` can drop a row
+   stamped "at" that instant by up to 1 ms — truncate the bound the way the
+   producer truncates the row.

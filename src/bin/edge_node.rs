@@ -1617,9 +1617,14 @@ struct Occurrence {
     lifecycle: Arc<ScopeLifecycle>,
     roster: BTreeMap<String, RosterEntry>,
     reporter: Arc<Reporter>,
-    /// This node's hybrid signer — what a chat message is attested and
-    /// signed by (the node, on the owner's behalf).
+    /// This node's hybrid signer — CUSTODY: it co-scrubs the owner's rows at
+    /// the crossing and signs what the node itself attests.
     node_signer: Arc<LocalSigner>,
+    /// The OWNER's hybrid signer — the ACTOR: a chat message is attested and
+    /// signed by the human whose words it is (sign-at-write), and the
+    /// widening to the room is the human's own `supersedes`. The harness holds
+    /// it because it plays the human; a real node never does.
+    owner_signer: Arc<LocalSigner>,
     /// This node's persist directory — what `contact::PersistLens` reads, so
     /// the discovery leg resolves against the SAME state replication feeds.
     directory: Arc<SqliteBackend>,
@@ -1789,7 +1794,7 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // `owner_of` walks owner bindings for a node OR an agent alike, so the
     // agent needs its own binding or `resolve(agentID)` finds no owner and the
     // walk stops before it ever reaches a dialable node.
-    let owner_signer = owner.local_signer(&owner_key_id)?;
+    let owner_signer = Arc::new(owner.local_signer(&owner_key_id)?);
     for subject in [&cfg.node_id, &agent_key_id] {
         emit_owner_binding(&directory, &owner_key_id, &owner_signer, subject).await?;
     }
@@ -1859,8 +1864,8 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // Same class as the owner binding: classical-only where the federation tier
     // is PQC-mandatory. `FedKey` already carries both halves.
     let signer = Arc::new(fed.local_signer(&cfg.node_id)?);
-    // Kept for the chat legs: the NODE attests and signs a message on its
-    // owner's behalf, under the owner binding it acts under.
+    // Kept for the chat legs: the NODE co-scrubs the owner's message at the
+    // crossing, under the owner binding it acts under.
     let node_signer = Arc::clone(&signer);
 
     // ── 6. The real transport, on the real docker network ────────────
@@ -2023,6 +2028,7 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         roster,
         reporter,
         node_signer,
+        owner_signer,
         directory,
     })
 }
@@ -2378,12 +2384,14 @@ async fn run_discover_by_fedid_leg(
 ///    checks the OWNER against the roster (`admission_identity_for_writer`).
 ///    Authoring it on both sides is idempotent and removes any dependency on
 ///    the Community plane's replication timing.
-/// 2. The publisher authors a message — `tier: local`, `cohort_scope: self`,
-///    attested by the NODE with the human as `on_behalf_of_key_id` inside the
-///    signed envelope — stores it, and `share(With::Community)`s it.
+/// 2. The publisher's OWNER authors a message — `tier: local`,
+///    `cohort_scope: self`, attested and signed by the human (sign-at-write)
+///    — stores it, and `share(With::Community)`s it: the row enters the mesh
+///    over the same bytes with the node's co-scrub, then the human's own
+///    `supersedes` places it in the room. Two rows; the peer gets the second.
 /// 3. The subscriber waits, through the convergence helper, until the row
 ///    lands and `chat::messages_in_room` returns it — keyed on the sender's
-///    node and the derived room, read off the plane like a client would.
+///    fed-ID and the derived room, read off the plane like a client would.
 ///
 /// Nothing bespoke crosses the wire. The message is an ordinary
 /// federation-tier `scores` row on `chat:message:v1`, so RNS transport,
@@ -2393,7 +2401,7 @@ const CHAT_BODY: &str = "hello over the mesh";
 
 async fn run_chat_legs(occ: &Occurrence) {
     use ciris_edge::chat;
-    use ciris_edge::replication::attestation_bind::{share, Shared, With};
+    use ciris_edge::replication::attestation_bind::{share, CrossingBasis, Shared, Signers, With};
     use ciris_persist::federation::types::{Community, CommunityMember, SignedCommunity};
     use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
 
@@ -2513,12 +2521,10 @@ async fn run_chat_legs(occ: &Occurrence) {
     if i_send {
         let sent = async {
             let msg = chat::chat_message_attestation(
-                &cfg.node_id,
-                &my_owner,
+                &occ.owner_signer,
                 &peer_owner,
                 CHAT_BODY,
                 chrono::Utc::now(),
-                &occ.node_signer,
             )
             .await?;
             occ.directory
@@ -2527,44 +2533,44 @@ async fn run_chat_legs(occ: &Occurrence) {
                 })
                 .await
                 .map_err(|e| format!("put message: {e}"))?;
-            let crossing = share(&*occ.directory, &msg, With::Community, &occ.node_signer).await?;
+            let crossing = share(
+                &*occ.directory,
+                &msg,
+                With::Community {
+                    community_key_id: room.clone(),
+                },
+                CrossingBasis::ProducerAuthority,
+                Signers {
+                    node: &occ.node_signer,
+                    actor: Some(&occ.owner_signer),
+                },
+            )
+            .await?;
             Ok::<_, String>((msg.attestation_id, crossing))
         }
         .await;
         match sent {
             Ok((id, crossing)) => {
                 tracing::info!(%room, attestation_id = %id, shared = ?crossing.shared, "chat message shared");
-                let f = &crossing.flow;
                 rep.ran(
                     "ladder.send_message",
-                    crossing.shared == Shared::Placed,
+                    matches!(crossing.shared, Shared::Placed { .. }),
                     serde_json::json!({
                         "room": room,
-                        "attestation_id": id,
-                        "shared": format!("{:?}", crossing.shared),
-                        // The five contextual-integrity parameters, as the row
-                        // crossed the wire — the census shows what was sent,
-                        // not just that something was.
-                        "flow": {
-                            "information_type": f.information_type,
-                            "sender": f.sender,
-                            "subject": f.subject,
-                            "recipient": {
-                                "cohort_scope": f.recipient.cohort_scope,
-                                "may_revoke": f.recipient.may_revoke,
-                                "delivery": format!("{:?}", f.recipient.delivery),
-                            },
-                            "principle": {
-                                "consent_prefix": f.principle.consent_prefix,
-                                "deletion_window": f.principle.deletion_window,
-                                "expires_at": f.principle.expires_at,
-                            },
-                        },
+                        "authored_attestation_id": id,
+                        // The nine CC 4.5.1.1 axes as persist VERIFIED them at
+                        // the crossing, both verb outcomes verbatim (a widening
+                        // is TWO rows), and where edge routes it — the census
+                        // shows what was sent, not just that something was.
+                        "crossing": crossing,
                         "author": my_owner,
-                        "attested_by": cfg.node_id,
+                        "attested_by": my_owner,
+                        "custody": cfg.node_id,
                         "with": "community",
-                        "covers": "authored tier:local / cohort:self, then share(With::Community): \
-                                   promotion IS the federation-emit moment (CC 5.3.2.4.2)",
+                        "covers": "authored tier:local / cohort:self by the OWNER (sign-at-write), \
+                                   then share(With::Community): enter_mesh over the same bytes with \
+                                   the node's co-scrub, then the owner's own supersedes at community \
+                                   (CC 5.3.2.4.2 + 4.4.3.3.1)",
                     }),
                 );
             }
@@ -2582,7 +2588,8 @@ async fn run_chat_legs(occ: &Occurrence) {
 
     // Receiver: wait for the row to land, then read it the way a client would.
     let dir: &dyn ciris_persist::federation::FederationDirectory = &*occ.directory;
-    let senders = vec![peer_node.clone()];
+    // The HUMAN speaks; the node is custody. Rows are listed by attester.
+    let senders = vec![peer_owner.clone()];
     let budget = cfg.barrier_timeout.min(Duration::from_secs(90));
     let outcome = occ
         .replication_convergence()
@@ -2596,7 +2603,7 @@ async fn run_chat_legs(occ: &Occurrence) {
         .await
         .unwrap_or_default();
     let ok = seen.iter().any(|m| {
-        m.body == CHAT_BODY && m.author_key_id == peer_owner && m.attesting_key_id == peer_node
+        m.body == CHAT_BODY && m.author_key_id == peer_owner && m.attesting_key_id == peer_owner
     });
     if !ok {
         tracing::error!(
@@ -2614,17 +2621,19 @@ async fn run_chat_legs(occ: &Occurrence) {
             "attempts": outcome.checks(),
             "messages": seen.iter().map(|m| serde_json::json!({
                 "attestation_id": m.attestation_id,
+                "widens": m.widens,
                 "author": m.author_key_id,
                 "attested_by": m.attesting_key_id,
                 "body": m.body,
             })).collect::<Vec<_>>(),
             "expected_author": peer_owner,
-            "expected_attested_by": peer_node,
+            "expected_attested_by": peer_owner,
+            "peer_node": peer_node,
             "inbound": occ.inbound_stats.as_json(),
-            "covers": "a community-scoped chat row from the peer's NODE, on the peer's \
-                       human's behalf, arrived over RNS through the relay and was read \
-                       back by room — keyed on the sender's id, which the receiver \
-                       cannot manufacture",
+            "covers": "a community-scoped chat row ATTESTED AND SIGNED BY THE PEER'S HUMAN \
+                       — the supersedes their share wrote — arrived over RNS through the \
+                       relay and was read back by room, keyed on the sender's id, which \
+                       the receiver cannot manufacture",
         }),
     );
 }

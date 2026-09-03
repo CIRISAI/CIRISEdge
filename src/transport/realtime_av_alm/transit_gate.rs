@@ -463,7 +463,9 @@ mod tests {
         if let Some(obj) = envelope.as_object_mut() {
             obj.insert(
                 "asserted_at".to_owned(),
-                serde_json::json!(now.to_rfc3339()),
+                serde_json::json!(ciris_persist::federation::admission::render_signed_instant(
+                    now
+                )),
             );
         }
         let mut edge = ciris_persist::federation::Attestation {

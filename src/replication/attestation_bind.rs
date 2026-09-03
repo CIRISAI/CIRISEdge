@@ -40,15 +40,17 @@ pub const ROW_MIRROR_MEMBERS: [&str; 7] = [
     "weight",
 ];
 
-/// Truncate to microseconds — the precision persist stores.
-///
-/// The signed envelope and the typed `asserted_at` COLUMN must agree exactly
-/// (that agreement is the whole point of binding), so both go through this.
-#[must_use]
-pub fn truncate_to_micros(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
-    use chrono::SubsecRound as _;
-    t.trunc_subsecs(6)
-}
+/// **The one rendering of a signed instant** (CC 2.6.2): `YYYY-MM-DDTHH:MM:SS.sssZ`
+/// — literal `Z`, exactly three fractional digits. Persist's, re-exported:
+/// `chrono::to_rfc3339()` emits `+00:00` at whatever precision the value
+/// carries, which the constitution says a consumer MUST reject when verifying
+/// a signature.
+pub use ciris_persist::federation::admission::render_signed_instant;
+/// The substrate's instant floor — **milliseconds** since persist v39.0.0
+/// (CC 2.6.2). Re-exported so every edge producer truncates through the ONE
+/// helper the substrate itself mints with; the signed envelope and the typed
+/// `asserted_at` COLUMN must agree exactly, so both go through this.
+pub use ciris_persist::federation::admission::truncate_to_substrate_resolution;
 
 /// The typed columns of the attestation being bound.
 #[derive(Debug, Clone)]
@@ -69,10 +71,10 @@ pub struct AttestationColumns<'a> {
 /// Existing members are left alone: a producer that already bound them keeps
 /// its own values, so this is safe to call on a partially-built envelope.
 ///
-/// `asserted_at` is TRUNCATED to microseconds here, because persist refuses
-/// sub-microsecond precision: postgres `TIMESTAMPTZ` cannot store it, so the
-/// same op sequence would be a strict order on sqlite and a TIE on postgres
-/// (CIRISPersist#598).
+/// `asserted_at` is TRUNCATED to the substrate floor here (milliseconds since
+/// persist v39.0.0, CC 2.6.2) and rendered in the ONE canonical form
+/// (`.sssZ`), because persist binds the envelope instant to the typed column
+/// and refuses a row whose two disagree (CIRISPersist#598).
 ///
 /// This used to be documented as the caller's job. It should not have been —
 /// `Utc::now()` is the obvious thing to pass and carries nanoseconds, so every
@@ -87,9 +89,9 @@ pub fn bind_attestation_envelope(
     let Some(obj) = envelope.as_object_mut() else {
         return;
     };
-    let asserted_at = truncate_to_micros(asserted_at);
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
     obj.entry("asserted_at")
-        .or_insert_with(|| serde_json::json!(asserted_at.to_rfc3339()));
+        .or_insert_with(|| serde_json::json!(render_signed_instant(asserted_at)));
 
     let mut row = serde_json::json!({
         "attestation_id": cols.attestation_id,
@@ -144,7 +146,7 @@ pub async fn owner_binding_attestation(
 ) -> Result<ciris_persist::federation::Attestation, String> {
     use sha2::Digest as _;
 
-    let asserted_at = truncate_to_micros(asserted_at);
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
     let attestation_id = format!("owner-binding-{node_id}");
     let subjects = vec![node_id.to_owned()];
 
@@ -282,7 +284,7 @@ pub async fn replication_consent_attestation(
 ) -> Result<ciris_persist::federation::Attestation, String> {
     use sha2::Digest as _;
 
-    let asserted_at = truncate_to_micros(asserted_at);
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
     let mut prefixes: Vec<String> = prefixes
         .iter()
         .map(|p| p.trim().to_string())
@@ -368,29 +370,152 @@ pub async fn replication_consent_attestation(
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// The share surface — docs/FSD_REPLICATION_DX.md §3, over persist v39's
+// two crossing verbs.
+//
+// A crossing is TWO operations, never one (CIRISPersist
+// FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE):
+//
+//   * `enter_mesh`     — `tier: local → federation` over the SAME bytes
+//                        (CC 5.3.2.4.2). The actor's signature, when present,
+//                        stays the base scrub; the node may only APPEND a
+//                        co-scrub. `cohort_scope` is one of the signed bytes,
+//                        so it does not move.
+//   * `widen_audience` — a NEW `supersedes` row the ACTOR signs at a strictly
+//                        wider `cohort_scope` (CC 4.4.3.3.1 / 8.1.5). The prior
+//                        row is untouched. A share that widens therefore yields
+//                        TWO rows.
+//
+// `share` composes them. What it never does is decide whose key is on the
+// row: that is persist's, and the fabric key never stands in for the actor.
+// ═══════════════════════════════════════════════════════════════════
+
+pub use ciris_persist::federation::crossing::describe as describe_crossing;
+pub use ciris_persist::federation::{
+    Audience, ContentRef, ContextualIntegrity, CrossingBasis, Custody, DataSubject, DeliveryMode,
+    Lifecycle, MeshCrossing, MeshCrossingOutcome, Replicates, RevocationAuthority,
+    TierPromotionCustody,
+};
+
+/// **Who a row is shared with.** The `recipient_see` axis of contextual
+/// integrity as a type — every non-public audience, in widening order.
+///
+/// This is an OPTION over the substrate, not a gate in front of it: a row
+/// authored directly at `tier: federation` with the intended `cohort_scope`
+/// replicates exactly as well. `With` exists because the two-axis model
+/// (`tier` = on the wire at all; `cohort_scope` = who) is easy to get wrong,
+/// so it names the audience and answers the two questions callers get wrong
+/// FROM THE VALUE — delegating to persist's own classifiers rather than
+/// restating them, so a drift is a test failure, not a doc bug.
+///
+/// `family` and `community` NAME their cohort. A cohort placement is a
+/// membership claim about ONE cohort, proven at the put door against the id
+/// the row carries (AV-45), so a targeted audience without its id is not an
+/// audience — persist's [`Audience`] says the same, and `With` maps onto it.
+///
+/// `federation` is deliberately absent. Publishing is [`publish`], its own
+/// verb: `federation` reads like "the mesh" and means "anyone at all, in the
+/// clear", and it should be something you typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum With {
+    /// `self` — the owner's OWN device set. A node has exactly one owner
+    /// (CC 3.2), so `self` widens to that owner's nodes and nowhere else.
+    /// Replicated to them by consent fan-out; never advertised (CC 5.2).
+    MyDevices,
+    /// `family` — the named partnered family. Replicated to the family's
+    /// nodes; never advertised (CC 5.2).
+    MyFamily {
+        /// The family the row is placed in.
+        family_key_id: String,
+    },
+    /// `community` — a named group. Encrypted under the room DEK; discoverable.
+    Community {
+        /// The community the row is placed in — for a two-person chat,
+        /// [`crate::chat::pair_community_key_id`].
+        community_key_id: String,
+    },
+    /// `affiliations` — organisations the subject is attached to. Same tier
+    /// as `community` (CC 4.4.3.2.1).
+    Affiliations,
+    /// `species` — narrower AUDIENCE than the federation, but **plaintext**
+    /// (Commons). Check [`Self::is_encrypted_at_rest`] before assuming
+    /// otherwise.
+    Species,
+    /// `biosphere` — likewise plaintext Commons.
+    Biosphere,
+}
+
+impl With {
+    /// The audience as persist's own type.
+    #[must_use]
+    pub fn audience(&self) -> Audience {
+        match self {
+            With::MyDevices => Audience::SelfOnly,
+            With::MyFamily { family_key_id } => Audience::Family {
+                family_key_id: family_key_id.clone(),
+            },
+            With::Community { community_key_id } => Audience::Community {
+                community_key_id: community_key_id.clone(),
+            },
+            With::Affiliations => Audience::Affiliations,
+            With::Species => Audience::Species,
+            With::Biosphere => Audience::Biosphere,
+        }
+    }
+
+    /// The wire `cohort_scope` value.
+    #[must_use]
+    pub fn cohort_scope(&self) -> &'static str {
+        self.audience().cohort_scope()
+    }
+
+    /// Are the bytes encrypted at rest? persist's `crypto_tier` is the
+    /// authority and it is negative-default (#188): only self/family and
+    /// community/affiliations encrypt; everything else is plaintext.
+    ///
+    /// Passes `cohort_subkind = None`. A `community` whose subkind is
+    /// `infrastructure` is plaintext by carve-out — a caller placing into one
+    /// of those should consult `crypto_tier` with the subkind directly.
+    #[must_use]
+    pub fn is_encrypted_at_rest(&self) -> bool {
+        use ciris_persist::federation::types::cohort_scope::{crypto_tier, CryptoTier};
+        !matches!(
+            crypto_tier(self.cohort_scope(), None),
+            CryptoTier::Plaintext
+        )
+    }
+
+    /// Can a non-member tell the content EXISTS? `false` means the
+    /// `holds_bytes` discovery row is withheld — true only of `self` and
+    /// `family` (CC 5.2). Undiscoverable is NOT un-replicated: those rows
+    /// still reach the owner's / the family's nodes by consent fan-out.
+    #[must_use]
+    pub fn is_structurally_invisible(&self) -> bool {
+        !self.audience().discoverable()
+    }
+}
+
 /// **A cohort whose content is ENCRYPTED at rest.**
 ///
-/// Named so the guarantee is in the call, not in a doc the caller may not read.
-/// The grouping is not guesswork — it is pinned against persist's own
-/// `cohort_scope::crypto_tier`, which is *negative-default* (CIRISPersist#188):
-/// only these encrypt; everything else, INCLUDING UNKNOWN FUTURE SCOPES, falls
-/// through to plaintext.
+/// Sharing has two orthogonal privacy properties, and this type carries the
+/// first (the second is [`EncryptedCohort::is_structurally_invisible`]):
 ///
-/// | cohort | at rest | can a non-member tell it exists? |
+/// | cohort | at rest | invisible to non-members? |
 /// |---|---|---|
 /// | [`MyOwnDevices`](EncryptedCohort::MyOwnDevices) | per-write DEK | **no** |
 /// | [`MyFamily`](EncryptedCohort::MyFamily) | per-write DEK, wrapped per member | **no** |
 /// | [`Community`](EncryptedCohort::Community) | shared per-community DEK (mandatory) | yes |
 /// | [`Affiliations`](EncryptedCohort::Affiliations) | shared DEK | yes |
 ///
-/// The two properties are ORTHOGONAL. Only `self`/`family` are structurally
-/// invisible: the `holds_bytes` row IS the discovery surface, so declining to
-/// emit it is the privacy primitive. Community content is deliberately NOT
-/// suppressed (CEG 0.8 §8.1.13.3) — communities can be large and per-member
-/// byte-level invisibility is infeasible, so the community property is
-/// **cohort-filtered visibility**. "Only members can read it" is true of a
-/// community; "nobody can tell it exists" is true only of self and family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ("invisible" here means the `holds_bytes` discovery row is withheld; the
+/// bytes still replicate to the cohort's nodes.) Community content is
+/// deliberately NOT suppressed (CEG 0.8 §8.1.13.3) — communities can be large
+/// and per-member byte-level invisibility is infeasible, so the community
+/// property is **cohort-filtered visibility**. "Only members can read it" is
+/// true of a community; "nobody can tell it exists" is true only of self and
+/// family.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncryptedCohort {
     /// **`self` — the owner's own device set, and the most important tier.**
     ///
@@ -404,11 +529,17 @@ pub enum EncryptedCohort {
     /// bytes never cost the federation a directory entry. Most content should
     /// live here and go no further.
     MyOwnDevices,
-    /// `family` — the partnered family/group (`trust:partnered` /
-    /// `trust:direct`). Structurally invisible, like `self`.
-    MyFamily,
+    /// `family` — the named partnered family. Structurally invisible, like
+    /// `self`.
+    MyFamily {
+        /// The family the row is placed in.
+        family_key_id: String,
+    },
     /// `community` — a named group; where a two-party chat lives.
-    Community,
+    Community {
+        /// The community the row is placed in.
+        community_key_id: String,
+    },
     /// `affiliations` — organisations the subject is attached to.
     Affiliations,
 }
@@ -430,65 +561,388 @@ pub enum ClearCohort {
 }
 
 impl EncryptedCohort {
+    /// The same audience as a [`With`].
+    #[must_use]
+    pub fn with(&self) -> With {
+        match self {
+            EncryptedCohort::MyOwnDevices => With::MyDevices,
+            EncryptedCohort::MyFamily { family_key_id } => With::MyFamily {
+                family_key_id: family_key_id.clone(),
+            },
+            EncryptedCohort::Community { community_key_id } => With::Community {
+                community_key_id: community_key_id.clone(),
+            },
+            EncryptedCohort::Affiliations => With::Affiliations,
+        }
+    }
+
     /// The wire `cohort_scope` value.
     #[must_use]
-    pub fn cohort_scope(self) -> &'static str {
-        use ciris_persist::federation::types::cohort_scope as cs;
-        match self {
-            EncryptedCohort::MyOwnDevices => cs::SELF,
-            EncryptedCohort::MyFamily => cs::FAMILY,
-            EncryptedCohort::Community => cs::COMMUNITY,
-            EncryptedCohort::Affiliations => cs::AFFILIATIONS,
-        }
+    pub fn cohort_scope(&self) -> &'static str {
+        self.with().cohort_scope()
     }
 
     /// Does this tier withhold the `holds_bytes` discovery row entirely, so a
     /// non-member cannot learn the content exists? `self` and `family` only.
     #[must_use]
-    pub fn is_structurally_invisible(self) -> bool {
-        ciris_persist::federation::types::cohort_scope::suppresses_holds_bytes(self.cohort_scope())
+    pub fn is_structurally_invisible(&self) -> bool {
+        self.with().is_structurally_invisible()
     }
 }
 
 impl ClearCohort {
+    /// The same audience as a [`With`].
+    #[must_use]
+    pub fn with(self) -> With {
+        match self {
+            ClearCohort::Species => With::Species,
+            ClearCohort::Biosphere => With::Biosphere,
+        }
+    }
+
     /// The wire `cohort_scope` value.
     #[must_use]
     pub fn cohort_scope(self) -> &'static str {
-        use ciris_persist::federation::types::cohort_scope as cs;
-        match self {
-            ClearCohort::Species => cs::SPECIES,
-            ClearCohort::Biosphere => cs::BIOSPHERE,
+        self.with().cohort_scope()
+    }
+}
+
+/// **The keys a crossing may sign with.** Two, because a crossing has two
+/// parties: the ACTOR who made the claim, and the NODE that holds it.
+///
+/// Who signs is decided by the row, not by the caller ([`custody_for`]):
+///
+/// | row | signer in hand | custody |
+/// |---|---|---|
+/// | signed at write by another key | — | the node **co-scrubs** (`additional_scrubs`, `cosigned_at`) |
+/// | signed at write by this node | — | the existing base scrub is re-offered |
+/// | unsigned, attested by this node | — | this node signs as the actor |
+/// | unsigned, attested by another key | that key's signer | the actor signs now |
+/// | unsigned, attested by another key | none | **waits** — `AwaitingActor` |
+///
+/// A widening always needs the ACTOR's signer (or this node's, when this node
+/// authored the claim): a `supersedes` is a new claim, and there is no
+/// delegated widening — a node-only key cannot carry agency (CC 4.4,
+/// `check_node_agency_admission`).
+#[derive(Clone, Copy)]
+pub struct Signers<'a> {
+    /// THIS NODE's hybrid signer — custody.
+    pub node: &'a crate::identity::LocalSigner,
+    /// The ATTESTER's signer, when the caller holds it: the human's FedID
+    /// signer as they hit send, or an AgentID signer in-process. `None` is a
+    /// statement ("the actor is not here"), and an unsigned row then waits.
+    pub actor: Option<&'a crate::identity::LocalSigner>,
+}
+
+/// **Who signs a tier crossing — the one decision, made from the row.**
+///
+/// Edge's copy of persist's `Engine::custody_for` (v39.0.0), over the
+/// directory primitive rather than the engine, so a consumer that holds a
+/// `FederationDirectory` and its own keys can cross without an `Engine`. The
+/// table is in [`Signers`]. `Ok(None)` is "the actor is not in hand" — the row
+/// waits. A signer that is in hand but is NOT the attester is refused rather
+/// than ignored: a caller handing over the wrong key is a bug worth surfacing,
+/// not a reason to wait.
+///
+/// # Errors
+/// Canonicalization or signing failure; a signer that is not the attester.
+pub async fn custody_for(
+    row: &ciris_persist::federation::Attestation,
+    signers: Signers<'_>,
+) -> Result<Option<TierPromotionCustody>, String> {
+    use ciris_persist::federation::admission::{
+        render_signed_instant, truncate_to_substrate_resolution,
+    };
+    use ciris_persist::federation::types::ScrubSig;
+    use ciris_persist::federation::{crossing, AttestationReseal};
+
+    let node = &signers.node.key_id;
+    let mut envelope = row.attestation_envelope.clone();
+    let (bytes, hash) = crossing::canonical_bytes(&mut envelope)
+        .map_err(|e| format!("canonicalize {}: {e}", row.attestation_id))?;
+    let node_is_actor = row.attesting_key_id == *node;
+
+    if !row.scrub_signature_classical.is_empty() {
+        if node_is_actor {
+            // Signed at write by this node: the base scrub already IS the
+            // actor's. Re-offer it; the directory re-verifies it.
+            return Ok(Some(TierPromotionCustody::ActorSigned(AttestationReseal {
+                attestation_envelope: envelope,
+                original_content_hash: row.original_content_hash.clone(),
+                scrub_signature_classical: row.scrub_signature_classical.clone(),
+                scrub_signature_pqc: row.scrub_signature_pqc.clone(),
+                scrub_key_id: row.scrub_key_id.clone(),
+                scrub_timestamp: row.scrub_timestamp,
+            })));
+        }
+        // Signed at write by the actor: preserve it, add custody alongside.
+        let (classical, pqc) =
+            crate::identity::sign_bound_hybrid(signers.node, &bytes, "node co-scrub").await?;
+        return Ok(Some(TierPromotionCustody::NodeCoScrub(ScrubSig {
+            scrub_key_id: node.clone(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            // The co-signer stamps the moment it signed (CC 2.6.7), here,
+            // where the signature is produced — outside the signed preimage.
+            cosigned_at: Some(render_signed_instant(chrono::Utc::now())),
+        })));
+    }
+
+    // Unsigned (CC 5.3.2.2 deferral): the actor signs now, or the row waits.
+    let signer = if node_is_actor {
+        signers.node
+    } else {
+        match signers.actor {
+            Some(a) if a.key_id == row.attesting_key_id => a,
+            Some(a) => {
+                return Err(format!(
+                    "custody is not the actor: row {} is attested by {} but the signer in hand \
+                     is {} — the fabric never replaces the actor's key \
+                     (FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE §5.1 W5)",
+                    row.attestation_id, row.attesting_key_id, a.key_id
+                ))
+            }
+            None => return Ok(None),
+        }
+    };
+    let (classical, pqc) =
+        crate::identity::sign_bound_hybrid(signer, &bytes, "actor signature at the crossing")
+            .await?;
+    Ok(Some(TierPromotionCustody::ActorSigned(AttestationReseal {
+        attestation_envelope: envelope,
+        original_content_hash: hash,
+        scrub_signature_classical: classical,
+        scrub_signature_pqc: pqc,
+        scrub_key_id: signer.key_id.clone(),
+        scrub_timestamp: truncate_to_substrate_resolution(chrono::Utc::now()),
+    })))
+}
+
+/// **Where edge routes the bytes** — the half of the consequence persist
+/// cannot state. Persist says what the row IS (`Replicates { kinds,
+/// discoverable }`); only the replicating substrate says where it GOES.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "to", rename_all = "snake_case")]
+pub enum RoutesTo {
+    /// `self` — the owner's own node set, by consent fan-out; no `holds_bytes`.
+    OwnerNodes,
+    /// `family` — the family's nodes, by consent fan-out; no `holds_bytes`.
+    FamilyNodes { family_key_id: String },
+    /// `community` — members, served on discovery.
+    CommunityMembers { community_key_id: String },
+    /// `affiliations` — served on discovery.
+    Affiliations,
+    /// `species` — served on discovery, plaintext.
+    Species,
+    /// `biosphere` — served on discovery, plaintext.
+    Biosphere,
+    /// `federation` — anyone at all, plaintext (lightnet).
+    Everyone,
+}
+
+impl RoutesTo {
+    /// Edge's routing consequence of an audience.
+    #[must_use]
+    pub fn of(audience: &Audience) -> Self {
+        match audience {
+            Audience::SelfOnly => RoutesTo::OwnerNodes,
+            Audience::Family { family_key_id } => RoutesTo::FamilyNodes {
+                family_key_id: family_key_id.clone(),
+            },
+            Audience::Community { community_key_id } => RoutesTo::CommunityMembers {
+                community_key_id: community_key_id.clone(),
+            },
+            Audience::Affiliations => RoutesTo::Affiliations,
+            Audience::Species => RoutesTo::Species,
+            Audience::Biosphere => RoutesTo::Biosphere,
+            Audience::Federation => RoutesTo::Everyone,
         }
     }
+}
+
+/// What [`share`] / [`publish`] did, in one word — plus the id a peer will
+/// see, because "it is on the wire" is only checkable by that id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "shared", rename_all = "snake_case")]
+pub enum Shared {
+    /// The row is now on the wire at the audience asked for. After a
+    /// widening this is the NEW `supersedes` row's id, not the one passed in.
+    Placed { attestation_id: String },
+    /// Already there: in the mesh at that audience, or already widened to it
+    /// by its attester. Idempotent by constitution (CC 5.3.2.4.2 / CEG §6.1),
+    /// so this is a fact, not a fault.
+    AlreadyThere { attestation_id: String },
+    /// The row WAITS for its actor: it is unsigned and no actor signer was in
+    /// hand (nothing to co-scrub), or it needs widening and only the actor can
+    /// author a `supersedes`. Typed, never a silent stay-local.
+    AwaitingActor { attestation_id: String, age_ms: i64 },
+}
+
+/// **What a crossing did, and what crossed.**
+///
+/// Two verb outcomes, verbatim, because a share that widens is two rows:
+/// `entered` is the row you passed (tier crossing), `widened` is the new
+/// `supersedes` row at the wider audience. `ci` is the nine-axis description
+/// persist verified against the row before anything moved (CC 4.5.1.1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Crossing {
+    /// The one-word summary, with the id on the wire.
+    pub shared: Shared,
+    /// All nine contextual-integrity axes, as applied at the audience asked
+    /// for — cross-checked by persist and refused by axis name on a mismatch.
+    pub ci: ContextualIntegrity,
+    /// Where edge routes it.
+    pub routes_to: RoutesTo,
+    /// CC 5.2 — whether a `holds_bytes` row advertises it. `false` for
+    /// `self`/`family`: replicated, not discoverable.
+    pub discoverable: bool,
+    /// `enter_mesh`'s outcome for the row passed in.
+    pub entered: MeshCrossingOutcome,
+    /// `widen_audience`'s outcome, when the audience asked for is wider than
+    /// the row's own. `Some(Crossed(..))` means a SECOND row now exists.
+    pub widened: Option<MeshCrossingOutcome>,
+}
+
+/// The pure plan both verbs share — decided from the row and the audience,
+/// before any directory is touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharePlan {
+    /// In the mesh at exactly this audience already.
+    AlreadyThere,
+    /// A local row whose own audience is the one asked for: tier crossing only.
+    Enter,
+    /// A local row asked for a wider audience: tier crossing, then a widening.
+    EnterThenWiden(Audience),
+    /// A row already in the mesh, asked for a wider audience: widening only.
+    Widen(Audience),
+}
+
+/// Decide what a share must do. Public so the verdict is testable without a
+/// directory, which is also the proof that it runs before one is touched.
+///
+/// Refuses, by name: a row with no `dimension` (information type is the strict
+/// admission test — without a namespace no consent grant can cover it); a
+/// `family`/`community` row naming no cohort; an audience NARROWER than the
+/// row's own (a `supersedes` widens; to narrow, withdraw — CC 4.4.3.3.1).
+///
+/// # Errors
+/// Any of the refusals above.
+pub fn share_plan(
+    row: &ciris_persist::federation::Attestation,
+    target: &Audience,
+) -> Result<SharePlan, String> {
+    use ciris_persist::federation::types::attestation_tier;
+    if ciris_persist::federation::admission::envelope_dimension(&row.attestation_envelope).is_none()
+    {
+        return Err(format!(
+            "row {} has no `dimension` — the information-type axis is the strict admission \
+             test, and without a namespace no consent grant can cover it, so it must not \
+             cross the wire",
+            row.attestation_id
+        ));
+    }
+    let current = Audience::of_row(row).map_err(|e| format!("row {}: {e}", row.attestation_id))?;
+    let local = row.tier == attestation_tier::LOCAL;
+    if *target == current {
+        return Ok(if local {
+            SharePlan::Enter
+        } else {
+            SharePlan::AlreadyThere
+        });
+    }
+    ciris_persist::federation::crossing::check_strictly_wider(row, target.cohort_scope())
+        .map_err(|e| e.to_string())?;
+    Ok(if local {
+        SharePlan::EnterThenWiden(target.clone())
+    } else {
+        SharePlan::Widen(target.clone())
+    })
+}
+
+/// **Share a row with an audience — the one verb.**
+///
+/// Enters the mesh over the row's own bytes and, when `with` is wider than
+/// the row's own audience, widens it by a `supersedes` the actor signs. The
+/// actor's signature is preserved end to end; the node only ever co-scrubs.
+/// Idempotent on a row already there. Refuses — by name — a narrowing, a row
+/// with no information type, and a signer that is not the attester.
+///
+/// `basis` is the `transmission_principle` axis: what the crossing rides on.
+/// [`CrossingBasis::ProducerAuthority`] for a producer's own claim (a chat
+/// message, a score); [`CrossingBasis::ConsentGrant`] naming the live
+/// egress grant that covers this dimension at this audience otherwise. It
+/// rides the CALL, never the reseal — a member on the reseal would change the
+/// bytes the actor signed.
+///
+/// Sharing is not the whole flow: the recipient must ALSO be covered by a
+/// directed `consent:replication:v1` grant whose prefixes include the row's
+/// namespace, or the plane withholds it. See [`replication_consent_attestation`].
+///
+/// # Errors
+/// A refusal from [`share_plan`]; canonicalization or signing failure; the
+/// substrate's own typed refusals (`CustodyIsNotTheActor`,
+/// `NoActorSignature`, `PromotionMovedThePreimage`,
+/// `ContextualIntegrityMismatch`, `AudienceNotWider`, ...), by name.
+pub async fn share(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    row: &ciris_persist::federation::Attestation,
+    with: With,
+    basis: CrossingBasis,
+    signers: Signers<'_>,
+) -> Result<Crossing, String> {
+    share_to(directory, row, with.audience(), basis, signers).await
+}
+
+/// **Publish a row — world-readable, plaintext, federation-wide.**
+///
+/// The one act that cannot be walked back for anyone who already read it,
+/// which is why it is a separate verb and not a `With` variant. Same
+/// composition, idempotency and refusals as [`share`].
+///
+/// # Errors
+/// As [`share`].
+pub async fn publish(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    row: &ciris_persist::federation::Attestation,
+    basis: CrossingBasis,
+    signers: Signers<'_>,
+) -> Result<Crossing, String> {
+    tracing::info!(
+        attestation_id = %row.attestation_id,
+        dimension = ?ciris_persist::federation::admission::envelope_dimension(&row.attestation_envelope),
+        "PUBLISHING to the federation (lightnet): world-readable and plaintext \
+         at rest. This cannot be walked back for anyone who already read it"
+    );
+    share_to(directory, row, Audience::Federation, basis, signers).await
 }
 
 /// **Share a row with a cohort that encrypts it at rest.** The ordinary case.
 ///
 /// ```ignore
 /// // A chat message: authored `self`, then shared with the room.
-/// share_encrypted_privately(&*dir, &row, EncryptedCohort::Community, &signer).await?;
+/// share_encrypted_privately(
+///     &*dir, &row,
+///     EncryptedCohort::Community { community_key_id: room },
+///     CrossingBasis::ProducerAuthority,
+///     Signers { node: &node, actor: Some(&alice) },
+/// ).await?;
 /// ```
 ///
-/// Sharing is not the whole flow. The recipient must ALSO be covered by a
-/// directed `consent:replication:v1` grant whose prefixes include this row's
-/// namespace, or the plane withholds it silently — see
-/// [`replication_consent_attestation`] and [`DEFAULT_CONSENT_PREFIXES`].
-///
-/// **Retention is not a parameter here, deliberately.** The promotion reseal
-/// carries the envelope, its hash, both signature halves, and the re-signer —
-/// not `expires_at`. A retention limit is a property of the row at AUTHORSHIP,
+/// **Retention is not a parameter here, deliberately.** A retention limit is a
+/// property of the row at AUTHORSHIP (`expires_at`, inside the signed bytes),
 /// so it is set by the producer; accepting it here would be a parameter that
 /// silently did nothing.
 ///
 /// # Errors
-/// Re-stamp, canonicalization, signing, or the primitive's refusal.
+/// As [`share`].
 pub async fn share_encrypted_privately(
     directory: &dyn ciris_persist::federation::FederationDirectory,
     row: &ciris_persist::federation::Attestation,
     cohort: EncryptedCohort,
-    signer: &crate::identity::LocalSigner,
-) -> Result<bool, String> {
-    promote_to_scope(directory, row, cohort.cohort_scope(), signer).await
+    basis: CrossingBasis,
+    signers: Signers<'_>,
+) -> Result<Crossing, String> {
+    share(directory, row, cohort.with(), basis, signers).await
 }
 
 /// **Share a row with a narrower AUDIENCE, but in the clear.**
@@ -499,435 +953,36 @@ pub async fn share_encrypted_privately(
 /// picking a neighbouring enum variant.
 ///
 /// # Errors
-/// Re-stamp, canonicalization, signing, or the primitive's refusal.
+/// As [`share`].
 pub async fn share_clear_privately(
     directory: &dyn ciris_persist::federation::FederationDirectory,
     row: &ciris_persist::federation::Attestation,
     cohort: ClearCohort,
-    signer: &crate::identity::LocalSigner,
-) -> Result<bool, String> {
+    basis: CrossingBasis,
+    signers: Signers<'_>,
+) -> Result<Crossing, String> {
     tracing::info!(
         attestation_id = %row.attestation_id,
         cohort_scope = cohort.cohort_scope(),
         "sharing to a narrower audience but IN THE CLEAR — plaintext at rest, \
          and a discoverable holds_bytes row"
     );
-    promote_to_scope(directory, row, cohort.cohort_scope(), signer).await
+    share(directory, row, cohort.with(), basis, signers).await
 }
 
 /// **Publish a row to the whole federation — world-readable, in the clear.**
 ///
-/// `federation` is the Commons tier: plaintext at rest, no cohort filter, and a
-/// `holds_bytes` row anyone can discover. The right home for the identity
-/// plane, which is announced and attributable by design; the wrong home for
-/// anything else.
-///
-/// A separate FUNCTION rather than a variant, on purpose. `federation` reads
-/// like "the mesh" and means "anyone at all", so a caller reaching into a scope
-/// enum can pick it while thinking about routing rather than audience.
-/// Publishing should be something you typed.
-///
-/// # Errors
-/// Re-stamp, canonicalization, signing, or the primitive's refusal.
-pub async fn share_publicly(
-    directory: &dyn ciris_persist::federation::FederationDirectory,
-    row: &ciris_persist::federation::Attestation,
-    signer: &crate::identity::LocalSigner,
-) -> Result<bool, String> {
-    tracing::info!(
-        attestation_id = %row.attestation_id,
-        dimension = ?row
-            .attestation_envelope
-            .get("dimension")
-            .and_then(serde_json::Value::as_str),
-        "PUBLISHING to the federation (lightnet): world-readable and plaintext \
-         at rest. This cannot be walked back for anyone who already read it"
-    );
-    promote_to_scope(
-        directory,
-        row,
-        ciris_persist::federation::types::cohort_scope::FEDERATION,
-        signer,
-    )
-    .await
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// The one-verb surface — docs/FSD_REPLICATION_DX.md §3
-// ═══════════════════════════════════════════════════════════════════
-
-/// **Who a row is shared with.** The Recipient parameter of contextual
-/// integrity, as a type — every non-public cohort in widening order.
-///
-/// This is an OPTION over the substrate, not a gate in front of it: a row
-/// authored directly at `tier: federation` with the intended `cohort_scope`
-/// replicates exactly as well. `With` exists because the two-axis model
-/// (`tier` = on the wire at all; `cohort_scope` = who) is easy to get wrong,
-/// so it names the audience and answers the two questions callers get wrong
-/// FROM THE VALUE — delegating to persist's own classifiers rather than
-/// restating them, so a drift is a test failure, not a doc bug.
-///
-/// `federation` is deliberately absent. Publishing is [`publish`], its own
-/// verb: `federation` reads like "the mesh" and means "anyone at all, in the
-/// clear", and it should be something you typed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum With {
-    /// `self` — the owner's OWN device set. A node has exactly one owner
-    /// (CC 3.2), so `self` widens to that owner's nodes and nowhere else.
-    /// Structurally invisible; the locality dividend.
-    MyDevices,
-    /// `family` — the partnered family/group. Structurally invisible.
-    MyFamily,
-    /// `community` — a named group. WHICH community is the signed
-    /// `community_id` member of the row, not a parameter here: `cohort_scope`
-    /// is the single string `community`, and a room argument would be one the
-    /// substrate never reads. Encrypted under the room DEK; discoverable.
-    Community,
-    /// `affiliations` — organisations the subject is attached to. Same tier
-    /// as `community` (CC 4.4.3.2.1).
-    Affiliations,
-    /// `species` — narrower AUDIENCE than the federation, but **plaintext**
-    /// (Commons). Check [`Self::is_encrypted_at_rest`] before assuming
-    /// otherwise.
-    Species,
-    /// `biosphere` — likewise plaintext Commons.
-    Biosphere,
-}
-
-impl With {
-    /// The wire `cohort_scope` value.
-    #[must_use]
-    pub fn cohort_scope(self) -> &'static str {
-        use ciris_persist::federation::types::cohort_scope as cs;
-        match self {
-            With::MyDevices => cs::SELF,
-            With::MyFamily => cs::FAMILY,
-            With::Community => cs::COMMUNITY,
-            With::Affiliations => cs::AFFILIATIONS,
-            With::Species => cs::SPECIES,
-            With::Biosphere => cs::BIOSPHERE,
-        }
-    }
-
-    /// Are the bytes encrypted at rest? persist's `crypto_tier` is the
-    /// authority and it is negative-default (#188): only self/family and
-    /// community/affiliations encrypt; everything else is plaintext.
-    ///
-    /// Passes `cohort_subkind = None`. A `community` whose subkind is
-    /// `infrastructure` is plaintext by carve-out — a caller placing into one
-    /// of those should consult `crypto_tier` with the subkind directly.
-    #[must_use]
-    pub fn is_encrypted_at_rest(self) -> bool {
-        use ciris_persist::federation::types::cohort_scope::{crypto_tier, CryptoTier};
-        !matches!(
-            crypto_tier(self.cohort_scope(), None),
-            CryptoTier::Plaintext
-        )
-    }
-
-    /// Can a non-member tell the content EXISTS? `false` means the
-    /// `holds_bytes` discovery row is withheld — true only of `self` and
-    /// `family` (CC 5.2). A community is cohort-filtered, not invisible.
-    #[must_use]
-    pub fn is_structurally_invisible(self) -> bool {
-        ciris_persist::federation::types::cohort_scope::suppresses_holds_bytes(self.cohort_scope())
-    }
-}
-
-/// **The five flow parameters, as this row will carry them across the wire.**
-///
-/// ciris.ai/contextual-integrity embeds Nissenbaum's five parameters in the
-/// wire format. The federation crossing — promotion from `local`, or a direct
-/// federation-tier write — is the ONE moment all five must be present and
-/// correct, because it is the moment edge picks the row up and offers it to
-/// peers. So both paths present the same picture, and [`share`] / [`publish`]
-/// refuse to cross with a parameter missing rather than let the substrate
-/// refuse it one hop later.
-///
-/// Every member is read from the row through persist's canonical envelope
-/// names (`envelope::paths`) and edge's typed `delivery_mode` reader — never
-/// from a re-parse of `extra`.
-///
-/// | parameter | wire | here |
-/// |---|---|---|
-/// | data subject | `subject_key_ids` | [`Flow::subject`] |
-/// | sender | `attesting_key_id` | [`Flow::sender`] |
-/// | recipient | `cohort_scope` · `subject_key_ids` · `delivery_mode` | [`Flow::recipient`] |
-/// | information type | `dimension` | [`Flow::information_type`] |
-/// | transmission principle | `deletion_window` · `expires_at` · the covering consent grant | [`Flow::principle`] |
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Flow {
-    /// **Information type.** The `dimension` namespace — "a strict admission
-    /// test that keeps assertions objective and machine-verifiable". A row
-    /// without one is not a claim and does not cross.
-    pub information_type: String,
-    /// **Sender.** `attesting_key_id` — the cryptographic originator.
-    pub sender: String,
-    /// **Data subject.** `subject_key_ids` — who the claim concerns, and who
-    /// holds revocation rights at the protocol level.
-    pub subject: Vec<String>,
-    /// **Recipient**, in its three deliberately separate mechanisms.
-    pub recipient: Recipient,
-    /// **Transmission principle.** The rule governing subsequent flow.
-    pub principle: Principle,
-}
-
-/// The Recipient parameter — three mechanisms kept intentionally separate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Recipient {
-    /// VISIBILITY: which cohort may see it.
-    pub cohort_scope: String,
-    /// REVOCATION: who may revoke it (the subjects).
-    pub may_revoke: Vec<String>,
-    /// ACTIVE RECEIVERS: how it is delivered — `mandatory` (a silent drop is
-    /// a security failure; edge fails loud with no path) or best-effort.
-    pub delivery: crate::delivery_mode::DeliveryRequirement,
-}
-
-/// The transmission principle as THIS ROW declares it.
-///
-/// Two halves. The temporal half rides on the row: `deletion_window` (the
-/// producer's commitment; the breach signal fires if a subject revokes and
-/// the window lapses without deletion proof) and `expires_at`. The
-/// permission half — share / analyze / train / publish — does NOT ride on an
-/// ordinary row: it is inherited from the `consent:replication:v1` grant whose
-/// `attestation_prefixes` cover this row's `dimension`, resolved PER RECIPIENT
-/// at advertise time. That is why [`Flow`] names the prefix a grant must
-/// cover, rather than pretending to know the answer before the recipient is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Principle {
-    /// The producer's erasure commitment, if declared.
-    pub deletion_window: Option<String>,
-    /// The row's declared expiry, if any.
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The namespace prefix a recipient's consent grant must cover for this
-    /// row to reach them — `chat:` for `chat:message:v1`.
-    pub consent_prefix: String,
-}
-
-impl Flow {
-    /// Materialise the five parameters from `row`, or say which is missing.
-    ///
-    /// The only hard refusal is an absent `dimension`: information type is the
-    /// strict admission test, and a row without one has no namespace for a
-    /// consent grant to cover. Everything else is reported as it stands —
-    /// including an empty subject list, which is a fact worth seeing.
-    ///
-    /// # Errors
-    /// No `dimension` in the signed envelope.
-    pub fn of(row: &ciris_persist::federation::Attestation) -> Result<Self, String> {
-        use ciris_persist::federation::envelope::paths;
-        let env = &row.attestation_envelope;
-        let dimension = env
-            .get(paths::DIMENSION)
-            .and_then(serde_json::Value::as_str)
-            .filter(|d| !d.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "row {} has no `dimension` — the information-type parameter is the \
-                     strict admission test, and without a namespace no consent grant can \
-                     cover it, so it must not cross the wire",
-                    row.attestation_id
-                )
-            })?
-            .to_owned();
-        let consent_prefix = dimension
-            .split_once(':')
-            .map_or_else(|| dimension.clone(), |(head, _)| format!("{head}:"));
-        Ok(Flow {
-            information_type: dimension,
-            sender: row.attesting_key_id.clone(),
-            subject: row.subject_key_ids.clone(),
-            recipient: Recipient {
-                cohort_scope: row.cohort_scope.clone(),
-                may_revoke: row.subject_key_ids.clone(),
-                delivery: crate::delivery_mode::requirement_of(env),
-            },
-            principle: Principle {
-                deletion_window: env
-                    .get(paths::DELETION_WINDOW)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                expires_at: row.expires_at,
-                consent_prefix,
-            },
-        })
-    }
-
-    /// The same five parameters with `cohort_scope` set to where the row is
-    /// GOING — what a peer will see after promotion.
-    #[must_use]
-    pub fn at_cohort(mut self, cohort_scope: &str) -> Self {
-        cohort_scope.clone_into(&mut self.recipient.cohort_scope);
-        self
-    }
-
-    /// One line, all five, for the crossing log.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        format!(
-            "type={} sender={} subject={:?} recipient={{scope={} revoke={:?} delivery={:?}}} \
-             principle={{prefix={} deletion_window={:?} expires_at={:?}}}",
-            self.information_type,
-            self.sender,
-            self.subject,
-            self.recipient.cohort_scope,
-            self.recipient.may_revoke,
-            self.recipient.delivery,
-            self.principle.consent_prefix,
-            self.principle.deletion_window,
-            self.principle.expires_at,
-        )
-    }
-}
-
-/// **Describe what a row will carry across the wire — for the DIRECT path.**
-///
-/// A row authored straight at `tier: federation` never passes through
-/// [`share`], so this is how that path presents the same five parameters
-/// before the write. Same refusal on a missing `dimension`.
-///
-/// # Errors
-/// As [`Flow::of`].
-pub fn describe_flow(row: &ciris_persist::federation::Attestation) -> Result<Flow, String> {
-    Flow::of(row)
-}
-
-/// What a crossing did, and what crossed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Crossing {
-    pub shared: Shared,
-    /// The five parameters as the row now carries them.
-    pub flow: Flow,
-}
-
-/// What [`share`] / [`publish`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shared {
-    /// The row was promoted and is now on the wire at that cohort.
-    Placed,
-    /// The row was ALREADY at that tier and cohort. Promotion is idempotent
-    /// by constitution (CC 5.3.2.4.2), so this is a fact, not a fault.
-    AlreadyThere,
-}
-
-/// The one pre-check both verbs share, and it is PURE: a row already at
-/// federation tier is reported as already-there (same cohort) or refused
-/// (different cohort — an authoring bug, since promotion cannot MOVE it), and
-/// never silently dropped on the substrate's `Ok(false)` arm.
-///
-/// `None` means "not promoted yet — go ahead". Public so the verdict is testable
-/// without a directory, which is also the proof that it runs before one is
-/// touched.
-#[must_use]
-pub fn already_promoted_verdict(
-    row: &ciris_persist::federation::Attestation,
-    target_scope: &str,
-) -> Option<Result<Shared, String>> {
-    use ciris_persist::federation::types::attestation_tier;
-    if row.tier != attestation_tier::FEDERATION {
-        return None;
-    }
-    if row.cohort_scope == target_scope {
-        return Some(Ok(Shared::AlreadyThere));
-    }
-    Some(Err(format!(
-        "row {} was AUTHORED at tier `federation` with cohort_scope `{}`, so it cannot be \
-         shared to `{}`: promotion is idempotent (CC 5.3.2.4.2) and only moves `local` \
-         rows. Author at `tier: local`, `cohort_scope: self`, store it, then share — \
-         or author it directly at the intended cohort, which replicates just as well.",
-        row.attestation_id, row.cohort_scope, target_scope
-    )))
-}
-
-/// **Share a row with an audience — the one verb.**
-///
-/// Promotes a `local` row to federation tier AT the chosen cohort, correctly
-/// resealed. Idempotent on a row already there. Refuses — by name — a row
-/// that was authored already-promoted at a different cohort, instead of
-/// returning the substrate's silent `Ok(false)`.
-///
-/// Sharing is not the whole flow: the recipient must ALSO be covered by a
-/// directed `consent:replication:v1` grant whose prefixes include the row's
-/// namespace, or the plane withholds it. See [`replication_consent_attestation`].
-///
-/// Terms are NOT a parameter here, on purpose: the promotion reseal carries no
-/// consent-scope member and no `expires_at`, so a `Terms` argument would be one
-/// that silently did nothing. Retention is set by the producer at authorship
-/// (FSD §3, "Honest scoping").
-///
-/// # Errors
-/// An already-promoted row at a different cohort; re-stamp, canonicalization,
-/// signing, or the primitive's refusal.
-pub async fn share(
-    directory: &dyn ciris_persist::federation::FederationDirectory,
-    row: &ciris_persist::federation::Attestation,
-    with: With,
-    signer: &crate::identity::LocalSigner,
-) -> Result<Crossing, String> {
-    // All five parameters, BEFORE anything moves: a row missing one is
-    // refused here, by name, rather than by a peer one hop later.
-    let flow = Flow::of(row)?.at_cohort(with.cohort_scope());
-    if let Some(early) = already_promoted_verdict(row, with.cohort_scope()) {
-        return early.map(|shared| Crossing { shared, flow });
-    }
-    if promote_to_scope(directory, row, with.cohort_scope(), signer).await? {
-        tracing::info!(
-            attestation_id = %row.attestation_id,
-            encrypted_at_rest = with.is_encrypted_at_rest(),
-            structurally_invisible = with.is_structurally_invisible(),
-            "CROSSING THE WIRE — {}",
-            flow.summary()
-        );
-        Ok(Crossing {
-            shared: Shared::Placed,
-            flow,
-        })
-    } else {
-        // Unreachable for a `local` row by the substrate's contract; surfaced
-        // rather than mapped to AlreadyThere so a contract change shows up.
-        Err(format!(
-            "promote_attestation({}) placed nothing for a local row {}",
-            with.cohort_scope(),
-            row.attestation_id
-        ))
-    }
-}
-
-/// **Publish a row — world-readable, plaintext, federation-wide.**
-///
-/// The one act that cannot be walked back for anyone who already read it,
-/// which is why it is a separate verb and not a `With` variant. Same
-/// idempotency and same authored-already-promoted refusal as [`share`].
+/// The same act as [`publish`], under the name the `share_*` family uses.
 ///
 /// # Errors
 /// As [`share`].
-pub async fn publish(
+pub async fn share_publicly(
     directory: &dyn ciris_persist::federation::FederationDirectory,
     row: &ciris_persist::federation::Attestation,
-    signer: &crate::identity::LocalSigner,
+    basis: CrossingBasis,
+    signers: Signers<'_>,
 ) -> Result<Crossing, String> {
-    use ciris_persist::federation::types::cohort_scope as cs;
-    let flow = Flow::of(row)?.at_cohort(cs::FEDERATION);
-    if let Some(early) = already_promoted_verdict(row, cs::FEDERATION) {
-        return early.map(|shared| Crossing { shared, flow });
-    }
-    if share_publicly(directory, row, signer).await? {
-        tracing::info!(
-            attestation_id = %row.attestation_id,
-            "CROSSING THE WIRE, PUBLIC — {}",
-            flow.summary()
-        );
-        Ok(Crossing {
-            shared: Shared::Placed,
-            flow,
-        })
-    } else {
-        Err(format!(
-            "promote_attestation(federation) placed nothing for a local row {}",
-            row.attestation_id
-        ))
-    }
+    publish(directory, row, basis, signers).await
 }
 
 /// **State, at the call site, that a row is NOT being shared.**
@@ -978,60 +1033,187 @@ pub fn keep_local(row: &ciris_persist::federation::Attestation) -> Result<(), St
     Ok(())
 }
 
-/// **Promote a row to a narrower cohort placement, correctly resealed.**
-///
-/// Most promotions go to `family` / `community` / `affiliations`. `federation`
-/// is the PUBLIC (lightnet) tier — a row placed there is world-readable by
-/// design, so it is the wrong destination for anything that is not meant to be
-/// public, and the right one for identity-plane rows that are.
-///
-/// # Why a bare scope change is refused
-///
-/// The placement is inside the SIGNED envelope's row mirror, so moving a row
-/// means re-stamping and re-signing it. persist refuses a promotion whose
-/// reseal it did not verify — "a caller that skips the re-stamp is REFUSED at
-/// the primitive" — because otherwise a door between the author and the store
-/// could rewrite a column and the signature would still check out.
-///
-/// This assembles that reseal: `restamp_for_scope` produces the envelope as it
-/// will be STORED, and the hash and both signature halves are computed over
-/// exactly those bytes.
-///
-/// # Errors
-/// Re-stamp, canonicalization, signing, or the primitive's own refusal.
-pub async fn promote_to_scope(
+/// The composition both verbs are: plan → enter → widen, each refusal named.
+async fn share_to(
     directory: &dyn ciris_persist::federation::FederationDirectory,
     row: &ciris_persist::federation::Attestation,
-    cohort_scope: &str,
-    signer: &crate::identity::LocalSigner,
-) -> Result<bool, String> {
-    use sha2::Digest as _;
+    target: Audience,
+    basis: CrossingBasis,
+    signers: Signers<'_>,
+) -> Result<Crossing, String> {
+    // Everything decidable from the row alone is decided here, before any
+    // directory is touched: no dimension, no cohort id, a narrowing.
+    let plan = share_plan(row, &target)?;
+    let current = Audience::of_row(row).map_err(|e| e.to_string())?;
 
-    let restamped = ciris_persist::federation::envelope::RowMirror::restamp_for_scope(
-        &row.attestation_envelope,
-        row,
-        cohort_scope,
-    )
-    .map_err(|e| format!("restamp_for_scope({cohort_scope}): {e}"))?;
-
-    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&restamped)
-        .map_err(|e| format!("canonicalize restamped: {e}"))?;
-    let digest = sha2::Sha256::digest(&canonical);
-    let (sig_classical, sig_pqc) =
-        crate::identity::sign_bound_hybrid(signer, &canonical, "promotion reseal").await?;
-
-    let reseal = ciris_persist::federation::types::AttestationReseal {
-        attestation_envelope: restamped,
-        original_content_hash: hex::encode(digest),
-        scrub_signature_classical: sig_classical,
-        scrub_signature_pqc: sig_pqc,
-        scrub_key_id: signer.key_id.clone(),
-        scrub_timestamp: truncate_to_micros(chrono::Utc::now()),
+    // ── enter_mesh: the row's own audience, the row's own bytes ──────
+    let (entered, entered_ci) = match &plan {
+        SharePlan::Enter | SharePlan::EnterThenWiden(_) => {
+            let ci = describe_crossing(row, current.clone(), basis.clone())
+                .map_err(|e| format!("describe {}: {e}", row.attestation_id))?;
+            let outcome = match custody_for(row, signers).await? {
+                None => MeshCrossingOutcome::AwaitingActor {
+                    attestation_id: row.attestation_id.clone(),
+                    age_ms: (chrono::Utc::now() - row.asserted_at).num_milliseconds(),
+                },
+                Some(custody) => directory
+                    .enter_mesh(&row.attestation_id, &ci, &custody)
+                    .await
+                    .map_err(|e| format!("enter_mesh({}): {e}", row.attestation_id))?,
+            };
+            (outcome, ci)
+        }
+        SharePlan::AlreadyThere | SharePlan::Widen(_) => (
+            MeshCrossingOutcome::AlreadyInMesh {
+                attestation_id: row.attestation_id.clone(),
+            },
+            describe_crossing(row, current.clone(), basis.clone())
+                .map_err(|e| format!("describe {}: {e}", row.attestation_id))?,
+        ),
     };
+
+    // ── widen_audience: a NEW row, by the actor ──────────────────────
+    let (widened, ci) = match (&plan, &entered) {
+        (
+            SharePlan::EnterThenWiden(_) | SharePlan::Widen(_),
+            MeshCrossingOutcome::AwaitingActor { .. },
+        ) => {
+            // A local row cannot be widened; it waits as a whole.
+            (None, entered_ci)
+        }
+        (SharePlan::EnterThenWiden(wider) | SharePlan::Widen(wider), _) => {
+            // The prior AS STORED — its tier moved a moment ago, and the
+            // widening's shape rule reads it.
+            let prior = directory
+                .get_attestation(&row.attestation_id)
+                .await
+                .map_err(|e| format!("get_attestation({}): {e}", row.attestation_id))?
+                .ok_or_else(|| format!("row {} vanished between verbs", row.attestation_id))?;
+            let ci = describe_crossing(&prior, wider.clone(), basis)
+                .map_err(|e| format!("describe widening of {}: {e}", row.attestation_id))?;
+            let outcome = widen(directory, &prior, wider, &ci, signers).await?;
+            (Some(outcome), ci)
+        }
+        (SharePlan::AlreadyThere | SharePlan::Enter, _) => (None, entered_ci),
+    };
+
+    let shared = summarize(&entered, widened.as_ref());
+    let discoverable = match (&widened, &entered) {
+        (Some(MeshCrossingOutcome::Crossed(mc)), _) | (None, MeshCrossingOutcome::Crossed(mc)) => {
+            mc.replicates.discoverable
+        }
+        _ => target.discoverable(),
+    };
+    let crossing = Crossing {
+        shared,
+        ci,
+        routes_to: RoutesTo::of(&target),
+        discoverable,
+        entered,
+        widened,
+    };
+    tracing::info!(
+        attestation_id = %row.attestation_id,
+        cohort_scope = target.cohort_scope(),
+        shared = ?crossing.shared,
+        discoverable,
+        "CROSSING THE WIRE — sender={} subject={:?} type={:?} basis={:?} custody={}",
+        crossing.ci.sender,
+        crossing.ci.data_subject,
+        crossing.ci.information_type,
+        crossing.ci.transmission_principle,
+        match &crossing.entered {
+            MeshCrossingOutcome::Crossed(mc) => format!("{:?}", mc.custody),
+            other => format!("{other:?}"),
+        }
+    );
+    Ok(crossing)
+}
+
+/// One `supersedes` at a wider audience, built the way every other emit is
+/// (`build_widening` → `stamp_and_canonicalize` → sign → `assemble`), signed
+/// by the prior's attester, written through the ordinary put door.
+async fn widen(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    prior: &ciris_persist::federation::Attestation,
+    wider: &Audience,
+    ci: &ContextualIntegrity,
+    signers: Signers<'_>,
+) -> Result<MeshCrossingOutcome, String> {
+    use ciris_persist::federation::{attestation_emit, crossing, SignedAttestation};
+
+    let signer = if prior.attesting_key_id == signers.node.key_id {
+        signers.node
+    } else {
+        match signers.actor {
+            Some(a) if a.key_id == prior.attesting_key_id => a,
+            Some(a) => {
+                return Err(format!(
+                    "custody is not the actor: widening {} is a new claim by {} and cannot be \
+                     signed by {} — there is no delegated widening (CC 4.4; subsidiarity)",
+                    prior.attestation_id, prior.attesting_key_id, a.key_id
+                ))
+            }
+            None => {
+                return Ok(MeshCrossingOutcome::AwaitingActor {
+                    attestation_id: prior.attestation_id.clone(),
+                    age_ms: (chrono::Utc::now() - prior.asserted_at).num_milliseconds(),
+                })
+            }
+        }
+    };
+    let mut input = crossing::build_widening(prior, wider, &[])
+        .map_err(|e| format!("build_widening({}): {e}", prior.attestation_id))?;
+    let canonical = attestation_emit::stamp_and_canonicalize(
+        &mut input,
+        &prior.attesting_key_id,
+        chrono::Utc::now(),
+    )
+    .map_err(|e| format!("stamp widening of {}: {e}", prior.attestation_id))?;
+    let sig = crate::identity::sign_hybrid_raw(signer, &canonical, "audience widening").await?;
+    let (row, _emitted) =
+        attestation_emit::assemble(prior.attesting_key_id.clone(), &canonical, sig, input)
+            .map_err(|e| format!("assemble widening of {}: {e}", prior.attestation_id))?;
     directory
-        .promote_attestation(&row.attestation_id, cohort_scope, &reseal)
+        .widen_audience(
+            &prior.attestation_id,
+            ci,
+            SignedAttestation { attestation: row },
+        )
         .await
-        .map_err(|e| format!("promote_attestation({cohort_scope}): {e}"))
+        .map_err(|e| {
+            format!(
+                "widen_audience({} → {}): {e}",
+                prior.attestation_id,
+                wider.cohort_scope()
+            )
+        })
+}
+
+fn summarize(entered: &MeshCrossingOutcome, widened: Option<&MeshCrossingOutcome>) -> Shared {
+    use MeshCrossingOutcome as O;
+    // The widening's outcome is the one that names the audience asked for;
+    // the tier crossing's stands only when no widening was needed.
+    match widened.unwrap_or(entered) {
+        O::Crossed(mc) => Shared::Placed {
+            attestation_id: mc.attestation_id.clone(),
+        },
+        O::AlreadyInMesh { attestation_id } => Shared::AlreadyThere {
+            attestation_id: attestation_id.clone(),
+        },
+        O::AlreadyWidened {
+            prior_attestation_id,
+        } => Shared::AlreadyThere {
+            attestation_id: prior_attestation_id.clone(),
+        },
+        O::AwaitingActor {
+            attestation_id,
+            age_ms,
+        } => Shared::AwaitingActor {
+            attestation_id: attestation_id.clone(),
+            age_ms: *age_ms,
+        },
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,88 @@
 # CIRISEdge Release Notes
 
+# v19.0.0 — Promotion is two verbs and the ACTOR signs (adopt CIRISPersist v39.0.0)
+
+**2026-09-03** — BREAKING. Adopts CIRISPersist v39.0.0 (CIRISEdge#562,
+CIRISPersist#799): the one promotion primitive is gone and two operations
+stand where it stood. `share` / `publish` now compose `enter_mesh` (tier
+crossing over the SAME bytes — the actor's signature stays the base scrub,
+the node may only APPEND a co-scrub with `cosigned_at`) and `widen_audience`
+(a `supersedes` the ACTOR signs at a strictly wider `cohort_scope`; the prior
+row is untouched). Design record: `docs/FSD_REPLICATION_DX.md` §0/§3 and
+persist's `FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE.md` (read its §11).
+
+## What broke, and why it had to
+
+Under persist ≤ v38 `promote_attestation` re-signed every promoted row with
+the NODE's key, cleared every co-scrub, and rewrote `cohort_scope` inside the
+signed envelope — so the fabric became the author of an actor's claim, and a
+row attested by anyone but the node was refused at every peer while promotion
+returned `Ok`. Edge's `share` rode it, and the chat producer named the node as
+attester with the human as `on_behalf_of_key_id` to survive it.
+
+## Edge's surface (`replication::attestation_bind`)
+
+- `share(dir, row, With, CrossingBasis, Signers)` / `publish(dir, row,
+  CrossingBasis, Signers)`. `Signers { node, actor }` — the node is CUSTODY,
+  the actor (the attester's signer, when in hand) SIGNS. `custody_for` decides
+  who signs from the row (edge's copy of persist's `Engine::custody_for`
+  table): signed at write by another key → the node co-scrubs; unsigned and
+  attested by this node → the node signs as the actor; unsigned by another
+  key with no signer → `AwaitingActor`; the WRONG key in hand → refused.
+- **A widening share yields TWO rows.** `share(self-row, With::Community
+  { .. })` leaves the original at `(federation, self)` (replicated to the
+  owner's own devices, never advertised) plus a `supersedes` at `community`
+  — the row the peer receives. `Shared::Placed { attestation_id }` carries
+  the NEW row's id. `Shared::AlreadyThere` / `AwaitingActor` are typed; a
+  narrowing is refused by name (`share_plan`, pure, before any directory).
+- `With::MyFamily { family_key_id }` / `With::Community { community_key_id }`
+  NAME their cohort (AV-45: a placement is a membership claim about one
+  cohort). `EncryptedCohort` likewise.
+- `CrossingBasis` — the `transmission_principle` axis rides the CALL
+  (`ProducerAuthority` or a named `ConsentGrant`), validated against the
+  stored grant; never a reseal member.
+- **`Flow` is deleted.** `Crossing.ci` is persist's nine-axis
+  `ContextualIntegrity` (CC 4.5.1.1: sender, data_subject, recipient_see,
+  recipient_revoke, recipient_receive, information_type,
+  transmission_principle, temporal_lifecycle, content), verified at the
+  crossing and refused by axis name. `describe_crossing` is persist's own.
+  `Crossing.routes_to` / `discoverable` say what edge does with it; `entered`
+  / `widened` carry both verb outcomes verbatim.
+- Removed: `promote_to_scope`, `describe_flow`, `already_promoted_verdict`,
+  `truncate_to_micros`.
+
+## Chat (`chat`)
+
+- `chat_message_attestation(author: &LocalSigner, recipient, body, at)` —
+  the AUTHOR attests and signs, **at write** (persist FSD §5.4 OQ-2, answered
+  by edge: an unsigned row has nothing to co-scrub and a key rotation strands
+  it). The node is custody. `on_behalf_of_key_id` is read for pre-v39 rows,
+  never written.
+- The room member is `community_key_id` (persist's canonical cohort-target
+  alias — its widening carries the placement under that name).
+- `messages_in_room(dir, participants, room)` lists by the humans who speak
+  and FOLDS `supersedes`: one message per thing said. `ChatMessage.widens`
+  names the `self` row a widening supersedes.
+
+## CC 2.6.2 — signed instants are canonical, millisecond
+
+Every instant edge signs (`bind_attestation_envelope`, the chat producer, the
+A/V delivery producer) renders through persist's `render_signed_instant`
+(`YYYY-MM-DDTHH:MM:SS.sssZ`) and truncates the typed column through
+`truncate_to_substrate_resolution` (now 1 ms). Consumers windowing on a raw
+`Utc::now()` can drop a row stamped "at" that instant by up to 1 ms —
+truncate the bound the way the producer truncates the row.
+
+## Mesh harness
+
+`ladder.send_message` now authors with the OWNER's signer, shares with
+`Signers { node, actor: Some(owner) }`, reports the whole `Crossing` (nine
+axes, both outcomes, `routes_to`) in the census, and the receiver expects the
+row ATTESTED BY THE PEER'S HUMAN — the widening — keyed on the sender's id.
+
+Pins: ciris-persist v39.0.0 (`>=39,<40` wheel floor), CIRISVerify v14.1.0
+(unchanged, one copy), leviculum v0.24.0+ciris.1 (unchanged).
+
 # v1.1.0 — Routing-table FFI flip-on (CIRISEdge#44)
 
 **2026-05-30** — Closes 5 of the 8 routing-table read surfaces that

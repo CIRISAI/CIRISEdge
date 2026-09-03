@@ -4543,7 +4543,7 @@ impl FederationDirectoryReplicationBridge {
 
     /// CIRISEdge#386 — the capability a peer must hold to receive `trace:*`
     /// scores-attestations (CIRISPersist#473/v18). The contextual-integrity
-    /// Recipient parameter: promotion (`attestation_promote`) consents to
+    /// Recipient parameter: the crossing (`enter_mesh` / `widen_audience`) consents to
     /// sharing with infrastructure blessed to SERVE, not with every cohort peer.
     ///
     /// v13.11.0 corrects the v13.10.0 token. #379 shipped a bare `"observer"`
