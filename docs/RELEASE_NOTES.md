@@ -60,6 +60,14 @@ attester with the human as `on_behalf_of_key_id` to survive it.
   never written.
 - The room member is `community_key_id` (persist's canonical cohort-target
   alias — its widening carries the placement under that name).
+- `pair_community(a, b, founded_at)` / `signed_pair_community(.., authority)`
+  — the two-person room as a record, **both people `founder`s under
+  `unanimous`**: each is an authority root and so a zero-hop named moderator
+  by construction (§11.11 — persist refuses to federate an unmoderated
+  community), not by the accident of a protocol setting. The harness, the
+  tests and the bridge witnesses all open rooms through it; pinned by
+  `both_members_of_the_pair_room_are_moderators` against persist's own
+  `moderators_of`.
 - `messages_in_room(dir, participants, room)` lists by the humans who speak
   and FOLDS `supersedes`: one message per thing said. `ChatMessage.widens`
   names the `self` row a widening supersedes.

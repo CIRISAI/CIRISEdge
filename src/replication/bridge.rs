@@ -15117,23 +15117,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn community_scoped_attestation_is_served_only_to_a_members_node() {
         let backend = audience_backend().await;
-        // The pair-room shape the mesh harness authors: `unanimous`, so every
-        // member is an authority and the room has a live (zero-hop) moderator
-        // — persist refuses to federate an unmoderated community (§11.11).
-        let member = |key_id: &str| ciris_persist::federation::types::CommunityMember {
-            key_id: key_id.to_owned(),
-            joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
-            role: None,
-        };
-        let room = Community {
-            community_key_id: "chat-room".to_owned(),
-            community_name: "alice <-> bob".to_owned(),
-            members: vec![member("person-alice"), member("person-bob")],
-            founded_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
-            consensus_protocol: "unanimous".to_owned(),
-            policy_blob: None,
-            persist_row_hash: String::new(),
-        };
+        // The pair-room shape everything authors (`chat::pair_community`):
+        // both humans founders, so each is a zero-hop moderator and persist
+        // will federate content keyed on the room (§11.11).
+        let mut room = crate::chat::pair_community("person-alice", "person-bob", Utc::now());
+        room.community_key_id = "chat-room".to_owned();
         backend
             .put_community(sign_community_fixture("room-authority", room))
             .await

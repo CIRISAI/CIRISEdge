@@ -22,7 +22,6 @@ use ciris_edge::replication::attestation_bind::{
     TierPromotionCustody, With,
 };
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
-use ciris_persist::federation::types::{Community, CommunityMember, SignedCommunity};
 use ciris_persist::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord};
 use ciris_persist::store::sqlite::SqliteBackend;
@@ -143,39 +142,16 @@ async fn world() -> World {
         .await
         .expect("seed record");
     }
-    // The pair room, members the two HUMANS: a `community` placement is a
-    // membership claim the put door proves against the cohort the row names
-    // (AV-45), and the WRITER of the widening is the author.
+    // The pair room, members the two HUMANS — both FOUNDERS, so both are
+    // zero-hop moderators (§11.11) by construction: a `community` placement
+    // is a membership claim the put door proves against the cohort the row
+    // names (AV-45), and persist refuses to federate an unmoderated room.
     let room = chat::pair_community_key_id("alice-fed", "bob-fed");
-    let mut members = ["alice-fed".to_owned(), "bob-fed".to_owned()];
-    members.sort_unstable();
-    let community = Community {
-        community_key_id: room.clone(),
-        community_name: "alice <-> bob".to_owned(),
-        members: members
-            .iter()
-            .map(|k| CommunityMember {
-                key_id: k.clone(),
-                joined_at: ts(),
-                role: None,
-            })
-            .collect(),
-        founded_at: ts(),
-        consensus_protocol: "unanimous".to_owned(),
-        policy_blob: None,
-        persist_row_hash: String::new(),
-    };
-    let canonical =
-        ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope()).unwrap();
-    let (c, q) = ciris_edge::identity::sign_bound_hybrid(&alice_node, &canonical, "pair community")
-        .await
-        .unwrap();
-    dir.put_community(SignedCommunity {
-        community,
-        authority_key_id: "alice-node".to_owned(),
-        scrub_signature_classical: c,
-        scrub_signature_pqc: q,
-    })
+    dir.put_community(
+        chat::signed_pair_community("alice-fed", "bob-fed", ts(), &alice_node)
+            .await
+            .expect("sign the room"),
+    )
     .await
     .expect("the pair room is admitted");
     World {
@@ -368,6 +344,29 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         "the row on the wire"
     );
     assert_eq!(m.widens.as_deref(), Some(msg.attestation_id.as_str()));
+}
+
+/// **Both members of a pair room are moderators, by construction.** Persist's
+/// own `moderators_of` names each of them for the `moderate` duty — a zero-hop
+/// appointment through the `founder` role — so the room can federate
+/// (§11.11) without anyone having to appoint anyone.
+#[tokio::test]
+async fn both_members_of_the_pair_room_are_moderators() {
+    let w = world().await;
+    let room = chat::pair_community("alice-fed", "bob-fed", ts());
+    assert!(
+        room.members
+            .iter()
+            .all(|m| m.role.as_deref() == Some("founder")),
+        "{:?}",
+        room.members
+    );
+    let mods = ciris_persist::federation::admission::moderators_of(&*w.dir, &w.room, "moderate")
+        .await
+        .expect("moderators_of");
+    for who in ["alice-fed", "bob-fed"] {
+        assert!(mods.iter().any(|m| m == who), "{who} moderates: {mods:?}");
+    }
 }
 
 /// A message for a DIFFERENT room is not in this one. The room filter is on

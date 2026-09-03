@@ -115,6 +115,75 @@ pub fn pair_community_key_id(a: &str, b: &str) -> String {
     format!("{PAIR_COMMUNITY_PREFIX}{}", hex::encode(h.finalize()))
 }
 
+/// **The two-person room, as a record — both people founders, and therefore
+/// both moderators.**
+///
+/// CC 4.5.4 / §11.11: no unmoderated federated space. Persist refuses to
+/// federate any content keyed on a community that has no live named
+/// moderator, and a named moderator exists iff the community has a
+/// steward-bound AUTHORITY root — a `founder`, or under any protocol but
+/// `founder_only`, any member. A pair room is two equals, so both are named
+/// `founder` outright: each is an authority root and a zero-hop moderator
+/// **by construction of the record**, not by the accident of a protocol
+/// setting. `unanimous` is kept so that nothing decides without both.
+///
+/// Everything that opens a pair room — the mesh harness, the tests, a
+/// consumer — builds it here, so the roster shape cannot drift between them.
+/// Sign it with [`signed_pair_community`].
+#[must_use]
+pub fn pair_community(
+    a: &str,
+    b: &str,
+    founded_at: chrono::DateTime<chrono::Utc>,
+) -> ciris_persist::federation::types::Community {
+    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+    use ciris_persist::federation::types::{consensus_protocol, Community, CommunityMember};
+    let mut members = [a, b];
+    members.sort_unstable();
+    Community {
+        community_key_id: pair_community_key_id(a, b),
+        community_name: format!("{} <-> {}", members[0], members[1]),
+        members: members
+            .iter()
+            .map(|k| CommunityMember {
+                key_id: (*k).to_owned(),
+                joined_at: founded_at,
+                role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
+            })
+            .collect(),
+        founded_at,
+        consensus_protocol: consensus_protocol::UNANIMOUS.to_owned(),
+        policy_blob: None,
+        persist_row_hash: String::new(),
+    }
+}
+
+/// [`pair_community`], hybrid-signed by `authority` — the key that vouches
+/// for the record (the node that opens the room, in the harness). Both ends
+/// author the same derived row; the second `put_community` is a `Conflict`,
+/// which is the same room either way.
+///
+/// # Errors
+/// Canonicalization or signing failure.
+pub async fn signed_pair_community(
+    a: &str,
+    b: &str,
+    founded_at: chrono::DateTime<chrono::Utc>,
+    authority: &crate::identity::LocalSigner,
+) -> Result<ciris_persist::federation::types::SignedCommunity, String> {
+    let community = pair_community(a, b, founded_at);
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
+        .map_err(|e| format!("canonicalize room: {e}"))?;
+    let (scrub_signature_classical, scrub_signature_pqc) =
+        crate::identity::sign_bound_hybrid(authority, &canonical, "pair community").await?;
+    Ok(ciris_persist::federation::types::SignedCommunity {
+        community,
+        authority_key_id: authority.key_id.clone(),
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
 /// Build a chat message: a `scores` attestation the AUTHOR attests and signs.
 ///
 /// `author` is the sender's own signer — the human's FedID as they hit send,

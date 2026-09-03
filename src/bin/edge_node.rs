@@ -2402,7 +2402,6 @@ const CHAT_BODY: &str = "hello over the mesh";
 async fn run_chat_legs(occ: &Occurrence) {
     use ciris_edge::chat;
     use ciris_edge::replication::attestation_bind::{share, CrossingBasis, Shared, Signers, With};
-    use ciris_persist::federation::types::{Community, CommunityMember, SignedCommunity};
     use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
 
     let rep = Arc::clone(&occ.reporter);
@@ -2448,39 +2447,21 @@ async fn run_chat_legs(occ: &Occurrence) {
             .into();
 
     // ── open_chat: the derived pair room, authored locally ───────────
-    let mut members = vec![my_owner.clone(), peer_owner.clone()];
-    members.sort_unstable();
-    let community = Community {
-        community_key_id: room.clone(),
-        community_name: format!("{} <-> {}", members[0], members[1]),
-        members: members
-            .iter()
-            .map(|k| CommunityMember {
-                key_id: k.clone(),
-                joined_at: founded_at,
-                role: None,
-            })
-            .collect(),
-        founded_at,
-        consensus_protocol: "unanimous".to_owned(),
-        policy_blob: None,
-        persist_row_hash: String::new(),
-    };
-    let signed_room = async {
-        let canonical =
-            ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
-                .map_err(|e| format!("canonicalize room: {e}"))?;
-        let (c, q) =
-            ciris_edge::identity::sign_bound_hybrid(&occ.node_signer, &canonical, "pair community")
-                .await?;
-        Ok::<_, String>(SignedCommunity {
-            community: community.clone(),
-            authority_key_id: cfg.node_id.clone(),
-            scrub_signature_classical: c,
-            scrub_signature_pqc: q,
+    // Both humans are FOUNDERS — each an authority root and so a zero-hop
+    // moderator (§11.11) by construction of the record; `chat::pair_community`
+    // is the one place that shape lives.
+    let signed_room =
+        chat::signed_pair_community(&my_owner, &peer_owner, founded_at, &occ.node_signer).await;
+    let members: Vec<String> = signed_room
+        .as_ref()
+        .map(|r| {
+            r.community
+                .members
+                .iter()
+                .map(|m| m.key_id.clone())
+                .collect()
         })
-    }
-    .await;
+        .unwrap_or_default();
     let opened = match signed_room {
         Err(e) => Err(e),
         Ok(row) => match occ.directory.put_community(row).await {
@@ -2501,8 +2482,9 @@ async fn run_chat_legs(occ: &Occurrence) {
                 "other_member": peer_owner,
                 "how": how,
                 "covers": "both ends derive the same two-person room from the two \
-                           owner fed-IDs and author it; members are the HUMANS, \
-                           because AV-45 resolves a node writer through owner_of",
+                           owner fed-IDs and author it; members are the HUMANS, both \
+                           FOUNDERS (each a zero-hop moderator, §11.11), because AV-45 \
+                           resolves a node writer through owner_of",
             }),
         ),
         Err(e) => {
