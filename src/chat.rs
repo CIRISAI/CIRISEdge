@@ -68,7 +68,14 @@
 //! author rode inside the envelope as `on_behalf_of_key_id`. Persist v39.0.0
 //! split promotion into `enter_mesh` (same bytes, actor's signature kept) and
 //! `widen_audience` (a `supersedes` the actor signs), and this producer moved
-//! to the design. [`ChatMessage::from_row`] still reads the old member.
+//! to the design.
+//!
+//! **Attribution is the attester, never a claim** (CIRISEdge#564).
+//! `on_behalf_of_key_id` is signed BY the attester, so it proves authorship of
+//! the string and nothing more; preferring it let any room member render text
+//! under any key. [`ChatMessage::from_row`] attributes to the attester and
+//! surfaces the raw claim separately, and only [`messages_in_room`] promotes
+//! it — after checking a live owner binding backs it.
 //!
 //! # Placement: authored `self`, shared to `community` — TWO rows
 //!
@@ -118,8 +125,17 @@ pub const PAIR_COMMUNITY_PREFIX: &str = "chat:pair:v1:";
 /// canonical cohort-target alias, so the author's row and the `supersedes`
 /// persist's widening writes name the room by the same member.
 pub const FIELD_COMMUNITY_ID: &str = "community_key_id";
-/// **Pre-v39 attribution member.** Read, never written: under persist ≤ v38
-/// the node attested and the author rode here.
+/// **Pre-v39 attribution member — an UNAUTHENTICATED claim.** Read, never
+/// written: under persist ≤ v38 the node attested and the author rode here.
+///
+/// It sits inside the attester's own signed envelope, so the signature proves
+/// only that *the attester wrote this string* — never that the named key
+/// authored anything. Treating it as authorship let any room member render
+/// text under any key (CIRISEdge#564). It is surfaced as
+/// [`ChatMessage::on_behalf_of_claim`] and promoted to
+/// [`ChatMessage::author_key_id`] ONLY by [`messages_in_room`], and only when
+/// a live owner binding proves `owner_of(attester) == claim` — which a node
+/// can satisfy for its own owner and for nobody else.
 pub const FIELD_ON_BEHALF_OF: &str = "on_behalf_of_key_id";
 /// The message body — CIPHERTEXT, base64 (see [`seal_body`]).
 pub const FIELD_BODY: &str = "body";
@@ -657,6 +673,17 @@ async fn rows_in_room(
 /// agents) who author messages. Rows are listed BY issuer because a chat row
 /// names no recipient.
 ///
+/// # Attribution (CIRISEdge#564)
+///
+/// [`ChatMessage::author_key_id`] is the ATTESTER. A pre-v39 row's
+/// `on_behalf_of_key_id` is promoted to the author **only** when this
+/// directory holds a live owner binding making the claimed key the attester's
+/// owner (`owner_of(attester) == claim`) — the legitimate "a node speaks for
+/// its owner" case, which a node can satisfy for its own owner and for nobody
+/// else. An unbacked claim stays in [`ChatMessage::on_behalf_of_claim`] and
+/// changes nothing. Fail-closed: an unresolvable or ambiguous owner promotes
+/// nothing.
+///
 /// # Errors
 /// A directory read failure.
 pub async fn messages_in_room(
@@ -665,12 +692,49 @@ pub async fn messages_in_room(
     room: &str,
     key: &RoomKey,
 ) -> Result<Vec<ChatMessage>, String> {
-    Ok(rows_in_room(directory, participants, room)
+    let mut out: Vec<ChatMessage> = rows_in_room(directory, participants, room)
         .await?
         .iter()
         .filter(|a| dimension_of(a) == Some(CHAT_MESSAGE_DIMENSION))
         .filter_map(|a| ChatMessage::from_row(a, room, key))
-        .collect())
+        .collect();
+    // Corroborate the pre-v39 claims, one owner walk per distinct attester.
+    let mut owner_of: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+    for m in &mut out {
+        let Some(claim) = m.on_behalf_of_claim.clone() else {
+            continue;
+        };
+        if !owner_of.contains_key(&m.attesting_key_id) {
+            let resolved =
+                ciris_persist::federation::admission::owner_of(directory, &m.attesting_key_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(
+                            attester = %m.attesting_key_id,
+                            error = %e,
+                            "owner_of unresolved — an on_behalf_of claim stays unpromoted \
+                             (CIRISEdge#564 fail-closed)"
+                        );
+                        None
+                    });
+            owner_of.insert(m.attesting_key_id.clone(), resolved);
+        }
+        if owner_of.get(&m.attesting_key_id).and_then(Clone::clone) == Some(claim.clone()) {
+            // The attester IS a node whose owner is the claimed key: the
+            // legitimate pre-v39 shape, and unforgeable — a node cannot name
+            // anyone but its own owner and have this hold.
+            m.author_key_id = claim;
+        } else {
+            tracing::debug!(
+                attester = %m.attesting_key_id,
+                claimed = %claim,
+                "on_behalf_of claim NOT backed by an owner binding — attributing to \
+                 the attester (CIRISEdge#564)"
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// The KeyPackage `from` shared in `room`, if it has arrived — step 1 of the
@@ -743,12 +807,23 @@ pub struct ChatMessage {
     /// The row's id — the widening's, on a peer. A value the receiver cannot
     /// manufacture, which is what makes "it arrived" checkable.
     pub attestation_id: String,
-    /// Whose words: the attester — or, on a pre-v39 row, the author the node
-    /// signed for (`on_behalf_of_key_id`).
+    /// **Whose words, established cryptographically.** The attester — the key
+    /// whose hybrid signature persist verified against its registered
+    /// pubkeys — unless [`messages_in_room`] promoted a
+    /// [`Self::on_behalf_of_claim`] that a live owner binding backs.
+    ///
+    /// Never taken from an envelope member on its own (CIRISEdge#564): a
+    /// producer-asserted field is signed by its asserter, which proves
+    /// authorship of the *string*, not of the message.
     pub author_key_id: String,
-    /// Who attested and signed the row. Equal to `author_key_id` from
-    /// persist v39 on.
+    /// Who attested and signed the row. Equal to [`Self::author_key_id`] for
+    /// every row edge produces from v19.0.0 on, where the human signs.
     pub attesting_key_id: String,
+    /// The row's raw `on_behalf_of_key_id`, if it carries one — an
+    /// **UNVERIFIED claim by the attester**. Never render it as authorship;
+    /// it is here so a caller can see what was claimed and, if it wants,
+    /// corroborate it the way [`messages_in_room`] does.
+    pub on_behalf_of_claim: Option<String>,
     /// The body, opened — or the reason it did not open.
     pub body: Body,
     pub asserted_at: chrono::DateTime<chrono::Utc>,
@@ -769,10 +844,6 @@ impl ChatMessage {
             return None;
         }
         let env = &a.attestation_envelope;
-        let author_key_id = env
-            .get(FIELD_ON_BEHALF_OF)
-            .and_then(serde_json::Value::as_str)
-            .map_or_else(|| a.attesting_key_id.clone(), str::to_owned);
         let body_wire = env.get(FIELD_BODY).and_then(serde_json::Value::as_str)?;
         // The CLAIM's instant — on a widening this is the prior's, carried
         // verbatim (persist v40.0.0), so both rows open with one key.
@@ -800,8 +871,17 @@ impl ChatMessage {
         };
         Some(Self {
             attestation_id: a.attestation_id.clone(),
-            author_key_id,
+            // CIRISEdge#564 — the ATTESTER, always. persist established this
+            // key by verifying the hybrid signature against its registered
+            // pubkeys; the envelope's `on_behalf_of_key_id` established
+            // nothing, so it cannot outrank it. `messages_in_room` may
+            // promote a claim the owner binding actually backs.
+            author_key_id: a.attesting_key_id.clone(),
             attesting_key_id: a.attesting_key_id.clone(),
+            on_behalf_of_claim: env
+                .get(FIELD_ON_BEHALF_OF)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             body,
             asserted_at: a.asserted_at,
             widens: env
