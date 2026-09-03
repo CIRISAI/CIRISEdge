@@ -151,11 +151,9 @@ pub fn signed_record(
     // hybrid accord-carrier verify (`verify_hybrid_via_directory`,
     // RequireHybrid) can gate both signatures. Other identity_types stay
     // ed25519-only (unchanged).
-    let pubkey_ml_dsa_65_base64 = if identity_type == "accord_holder" {
-        Some(subject.ml_dsa_pubkey_b64())
-    } else {
-        None
-    };
+    // v19.0.0 — every fixture row carries the ML-DSA-65 pubkey: every
+    // signature is the FULL hybrid and the verifier wants both-or-neither.
+    let pubkey_ml_dsa_65_base64 = Some(subject.ml_dsa_pubkey_b64());
 
     KeyRecord {
         key_id: subject.key_id.clone(),

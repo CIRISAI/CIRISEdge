@@ -159,6 +159,12 @@ pub enum SchedulerCommand {
         peer_key_id: String,
         kind: EnvelopeKind,
     },
+    /// v19.0.0 — fire a round NOW on every Initiator toward `peer_key_id`
+    /// (or toward every peer, `None`), instead of at the next cadence tick.
+    /// A kick during an in-flight round is held and runs right after it; a
+    /// second kick meanwhile coalesces (one permit). The scheduled tick is
+    /// reset after a kicked round, so a kick never doubles a round.
+    RoundNow { peer_key_id: Option<String> },
 }
 
 impl std::fmt::Debug for SchedulerCommand {
@@ -174,8 +180,18 @@ impl std::fmt::Debug for SchedulerCommand {
                 .field("peer_key_id", peer_key_id)
                 .field("kind", kind)
                 .finish(),
+            Self::RoundNow { peer_key_id } => f
+                .debug_struct("RoundNow")
+                .field("peer_key_id", peer_key_id)
+                .finish(),
         }
     }
+}
+
+/// One Initiator task's controls: its cancel, and its kick.
+struct CoordControl {
+    cancel: watch::Sender<bool>,
+    kick: Arc<tokio::sync::Notify>,
 }
 
 /// External handle for mutating a running scheduler's Initiator set.
@@ -207,6 +223,7 @@ impl SchedulerHandle {
     /// that pair isn't currently active.
     pub async fn remove_initiator(
         &self,
+
         peer_key_id: impl Into<String>,
         kind: EnvelopeKind,
     ) -> Result<(), SchedulerCommandError> {
@@ -214,6 +231,18 @@ impl SchedulerHandle {
             .send(SchedulerCommand::RemoveInitiator {
                 peer_key_id: peer_key_id.into(),
                 kind,
+            })
+            .await
+            .map_err(|_| SchedulerCommandError::SchedulerStopped)
+    }
+
+    /// v19.0.0 — fire a round NOW toward `peer_key_id` on every plane this
+    /// node initiates with it (`None` = every peer). See
+    /// [`SchedulerCommand::RoundNow`].
+    pub async fn round_now(&self, peer_key_id: Option<&str>) -> Result<(), SchedulerCommandError> {
+        self.command_tx
+            .send(SchedulerCommand::RoundNow {
+                peer_key_id: peer_key_id.map(str::to_owned),
             })
             .await
             .map_err(|_| SchedulerCommandError::SchedulerStopped)
@@ -322,7 +351,7 @@ impl ReplicationScheduler {
     ) {
         // Per-coord cancel senders, keyed by (peer_key_id, kind).
         // RemoveInitiator flips one entry; global cancel flips all.
-        let mut per_coord: HashMap<(String, EnvelopeKind), watch::Sender<bool>> = HashMap::new();
+        let mut per_coord: HashMap<(String, EnvelopeKind), CoordControl> = HashMap::new();
         let mut handles = Vec::with_capacity(self.coordinators.len());
 
         let mesh_config = self.mesh_config.take();
@@ -344,8 +373,8 @@ impl ReplicationScheduler {
                 biased;
                 _ = cancel.changed() => {
                     if *cancel.borrow() {
-                        for (_, tx) in per_coord.drain() {
-                            let _ = tx.send(true);
+                        for (_, c) in per_coord.drain() {
+                            let _ = c.cancel.send(true);
                         }
                         break;
                     }
@@ -378,9 +407,27 @@ impl ReplicationScheduler {
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
-                            if let Some(tx) = per_coord.remove(&(peer_key_id, kind)) {
-                                let _ = tx.send(true);
+                            if let Some(c) = per_coord.remove(&(peer_key_id, kind)) {
+                                let _ = c.cancel.send(true);
                             }
+                        }
+                        SchedulerCommand::RoundNow { peer_key_id } => {
+                            let mut kicked = 0usize;
+                            for ((peer, _kind), c) in &per_coord {
+                                let wanted = match peer_key_id.as_deref() {
+                                    None => true,
+                                    Some(p) => p == peer,
+                                };
+                                if wanted {
+                                    c.kick.notify_one();
+                                    kicked += 1;
+                                }
+                            }
+                            tracing::debug!(
+                                peer = ?peer_key_id,
+                                kicked,
+                                "scheduler: RoundNow — rounds fired ahead of the cadence"
+                            );
                         }
                     }
                 }
@@ -389,8 +436,8 @@ impl ReplicationScheduler {
                     // wait on cancel only.
                     let _ = cancel.changed().await;
                     if *cancel.borrow() {
-                        for (_, tx) in per_coord.drain() {
-                            let _ = tx.send(true);
+                        for (_, c) in per_coord.drain() {
+                            let _ = c.cancel.send(true);
                         }
                         break;
                     }
@@ -410,7 +457,7 @@ impl ReplicationScheduler {
 
 /// Spawn one coordinator task and record its per-coord cancel handle.
 fn spawn_coord(
-    per_coord: &mut HashMap<(String, EnvelopeKind), watch::Sender<bool>>,
+    per_coord: &mut HashMap<(String, EnvelopeKind), CoordControl>,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
     coord: Arc<ReplicationCoordinator>,
     cadence: Duration,
@@ -425,13 +472,21 @@ fn spawn_coord(
     );
     let key = (coord.peer_key_id().to_string(), coord.kind());
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    per_coord.insert(key, cancel_tx);
+    let kick = Arc::new(tokio::sync::Notify::new());
+    per_coord.insert(
+        key,
+        CoordControl {
+            cancel: cancel_tx,
+            kick: Arc::clone(&kick),
+        },
+    );
     let h = tokio::spawn(async move {
         run_one_coordinator_forever(
             coord,
             cadence,
             round_timeout,
             &mut cancel_rx,
+            kick,
             event_sink,
             mesh_config,
         )
@@ -445,6 +500,7 @@ async fn run_one_coordinator_forever(
     cadence: Duration,
     round_timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
+    kick: Arc<tokio::sync::Notify>,
     event_sink: Option<tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
 ) {
@@ -471,88 +527,20 @@ async fn run_one_coordinator_forever(
                     return;
                 }
             }
+            () = kick.notified() => {
+                // v19.0.0 — a caller could not wait for the cadence
+                // (`ReplicationRuntime::sync_and_await`): run the round now
+                // and push the next scheduled one a full cadence out, so a
+                // kick never doubles a round.
+                let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str, kicked = true);
+                let _enter = span.enter();
+                round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
+                interval.reset();
+            }
             _ = interval.tick() => {
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
                 let _enter = span.enter();
-                // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
-                // tick's ordinary round; the two never overlap. It costs one
-                // cadence tick per recovered key, and only on a tick where a
-                // name is actually queued. At most one name per peer can exist
-                // (D4), so recovery displaces at most one ordinary round per
-                // peer before it is done.
-                let recovery = match run_one_recovery_round(&coord, round_timeout).await {
-                    Ok(step) => step,
-                    Err(e) => {
-                        // A failed recovery must not also cost this peer its
-                        // ordinary round. The row stays transient-refused and
-                        // re-notes its signer on the next offer (D6).
-                        tracing::warn!(
-                            error = ?e,
-                            "signer-recovery round failed; running ordinary \
-                             anti-entropy this tick instead (FSD-SIGNER-RECOVERY D6)"
-                        );
-                        None
-                    }
-                };
-                if let Some(step) = recovery {
-                    let event = match step {
-                        DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report) => {
-                            RoundEvent::Completed(report)
-                        }
-                        DriveStep::Refused => RoundEvent::Refused,
-                        DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
-                    };
-                    if let Some(sink) = &event_sink {
-                        let _ = sink.send((peer_id.clone(), event)).await;
-                    }
-                    continue;
-                }
-                let event = match run_one_round(&coord, round_timeout).await {
-                    // CIRISEdge#380 — run_one_round converts SendThenComplete to
-                    // Complete after sending; the merged arm is defensive if it
-                    // ever leaks through.
-                    Ok(DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report)) => {
-                        RoundEvent::Completed(report)
-                    }
-                    Ok(DriveStep::Refused) => {
-                        tracing::warn!("round refused; resetting session");
-                        RoundEvent::Refused
-                    }
-                    Ok(DriveStep::SendThenWait(_)) => {
-                        // This shouldn't happen — run_one_round loops
-                        // until Complete or Refused. If it did, treat
-                        // as a timeout so the next tick recovers.
-                        tracing::warn!("scheduler returned mid-round; resetting");
-                        RoundEvent::TimedOut
-                    }
-                    Err(RoundError::Timeout) => {
-                        tracing::warn!("round timed out waiting for peer reply");
-                        RoundEvent::TimedOut
-                    }
-                    Err(RoundError::Coordinator(e)) => {
-                        tracing::warn!(error = %e, "coordinator error during round");
-                        RoundEvent::Error(e.to_string())
-                    }
-                    Err(RoundError::InboundClosed) => {
-                        tracing::warn!("inbound channel closed; cannot complete round");
-                        RoundEvent::Error("inbound channel closed".to_string())
-                    }
-                };
-                if let Some(sink) = &event_sink {
-                    // Sink-closed isn't a fault — the metrics consumer
-                    // dropped their receiver. Round loops continue.
-                    let _ = sink.send((peer_id.clone(), event)).await;
-                }
-                // CIRISEdge#440 — `antientropy.round_secs` relief, applied at
-                // the round boundary: resolve once per round (a cache hit
-                // within the reader's TTL), and rebuild the interval only on a
-                // CHANGE. `interval_at(now + target, target)` schedules the
-                // next round one full NEW cadence out — "a changed value takes
-                // effect next round" — and the same comparison walks the
-                // cadence back to the configured value when the relief's TTL
-                // expires. Relief can only LENGTHEN the cadence
-                // (relieve-never-expand, enforced in persist's fold), so this
-                // can never speed rounds up past what the operator configured.
+                round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
                 if let Some(reader) = &mesh_config {
                     let target = reader.relief().await.round_cadence.unwrap_or(cadence);
                     if target != current_cadence {
@@ -575,6 +563,96 @@ async fn run_one_coordinator_forever(
             }
         }
     }
+}
+
+/// One anti-entropy round toward this coordinator's peer — the signer-recovery
+/// attempt first, then the ordinary round — and its [`RoundEvent`] to the sink.
+/// Shared by the cadence tick and the [`SchedulerCommand::RoundNow`] kick.
+async fn round_and_report(
+    coord: &Arc<ReplicationCoordinator>,
+    round_timeout: Duration,
+    event_sink: Option<&tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
+    peer_id: &str,
+) {
+    // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
+    // tick's ordinary round; the two never overlap. It costs one
+    // cadence tick per recovered key, and only on a tick where a
+    // name is actually queued. At most one name per peer can exist
+    // (D4), so recovery displaces at most one ordinary round per
+    // peer before it is done.
+    let recovery = match run_one_recovery_round(coord, round_timeout).await {
+        Ok(step) => step,
+        Err(e) => {
+            // A failed recovery must not also cost this peer its
+            // ordinary round. The row stays transient-refused and
+            // re-notes its signer on the next offer (D6).
+            tracing::warn!(
+                error = ?e,
+                "signer-recovery round failed; running ordinary \
+                 anti-entropy this tick instead (FSD-SIGNER-RECOVERY D6)"
+            );
+            None
+        }
+    };
+    if let Some(step) = recovery {
+        let event = match step {
+            DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report) => {
+                RoundEvent::Completed(report)
+            }
+            DriveStep::Refused => RoundEvent::Refused,
+            DriveStep::SendThenWait(_) => RoundEvent::TimedOut,
+        };
+        if let Some(sink) = event_sink {
+            let _ = sink.send((peer_id.to_string(), event)).await;
+        }
+        return;
+    }
+    let event = match run_one_round(coord, round_timeout).await {
+        // CIRISEdge#380 — run_one_round converts SendThenComplete to
+        // Complete after sending; the merged arm is defensive if it
+        // ever leaks through.
+        Ok(DriveStep::Complete(report) | DriveStep::SendThenComplete(_, report)) => {
+            RoundEvent::Completed(report)
+        }
+        Ok(DriveStep::Refused) => {
+            tracing::warn!("round refused; resetting session");
+            RoundEvent::Refused
+        }
+        Ok(DriveStep::SendThenWait(_)) => {
+            // This shouldn't happen — run_one_round loops
+            // until Complete or Refused. If it did, treat
+            // as a timeout so the next tick recovers.
+            tracing::warn!("scheduler returned mid-round; resetting");
+            RoundEvent::TimedOut
+        }
+        Err(RoundError::Timeout) => {
+            tracing::warn!("round timed out waiting for peer reply");
+            RoundEvent::TimedOut
+        }
+        Err(RoundError::Coordinator(e)) => {
+            tracing::warn!(error = %e, "coordinator error during round");
+            RoundEvent::Error(e.to_string())
+        }
+        Err(RoundError::InboundClosed) => {
+            tracing::warn!("inbound channel closed; cannot complete round");
+            RoundEvent::Error("inbound channel closed".to_string())
+        }
+    };
+    if let Some(sink) = event_sink {
+        // Sink-closed isn't a fault — the metrics consumer
+        // dropped their receiver. Round loops continue.
+        let _ = sink.send((peer_id.to_string(), event)).await;
+    }
+    // CIRISEdge#440 — `antientropy.round_secs` relief, applied at
+    // the round boundary: resolve once per round (a cache hit
+    // within the reader's TTL), and rebuild the interval only on a
+    // CHANGE. `interval_at(now + target, target)` schedules the
+    // next round one full NEW cadence out — "a changed value takes
+    // effect next round" — and the same comparison walks the
+    // cadence back to the configured value when the relief's TTL
+    // expires. Relief can only LENGTHEN the cadence
+    // (relieve-never-expand, enforced in persist's fold), so this
+    // can never speed rounds up past what the operator configured.
 }
 
 #[derive(Debug)]

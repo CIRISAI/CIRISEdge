@@ -164,7 +164,18 @@ async fn pruner_skips_when_no_blackhole_rules_wired() {
     }
     let mut sw = Ed25519SoftwareSigner::new("test-key");
     sw.import_key(&seed).expect("import test seed");
-    let signer = Arc::new(LocalSigner::new("test-key".to_string(), Arc::new(sw), None));
+    // The FULL hybrid (v19.0.0: no classical-only fallback).
+    let mut pqc_seed = seed;
+    pqc_seed[0] ^= 0x55;
+    let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&pqc_seed, "test-key-pqc")
+            .expect("ml_dsa_65 from seed"),
+    );
+    let signer = Arc::new(LocalSigner::new(
+        "test-key".to_string(),
+        Arc::new(sw),
+        Some(pqc),
+    ));
     let auth = ReticulumAuth {
         signer: Some(signer),
         ..ReticulumAuth::default()

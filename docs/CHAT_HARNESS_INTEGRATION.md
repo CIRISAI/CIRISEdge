@@ -350,6 +350,26 @@ if outcome.is_converged() {
 A sent Pull that never converges is `Converged::TimedOut`, **not** an error —
 the peer may simply not hold what you asked for, and that is an answer.
 
+A subject Pull can only ask for rows about **yourself** or the server's own
+record. For everything else you are in the audience of — another person's
+owner binding, the rows they placed in a room you share, a KeyPackage they
+published for you — use the anti-entropy twin. It kicks a round toward the
+peer NOW instead of waiting for the cadence tick, and re-kicks on every
+admission until your predicate holds, so a walk that needs several dependent
+rounds (Key, then attribution, then Attestation) runs them back to back:
+
+```rust
+let outcome = replication
+    .sync_and_await(&peer_node, Duration::from_secs(30), || async {
+        chat::welcome_from(&*dir, &creator_fed_id, &room).await.is_ok_and(|w| w.is_some())
+    })
+    .await?;                      // Err ONLY if the scheduler has shut down
+```
+
+`bench-mesh` measured the difference: discovery went from ~19 s (four cadence
+ticks) to one kicked chain, and the chat waits from a whole tick to the round's
+wire time.
+
 Waiting on something replication does not signal (a transport route, a file)?
 Same helper, no pull:
 
@@ -377,9 +397,10 @@ to copy; every call below is exercised there.
 | "Send request to join chat community" | your `POST /v1/contacts` | **server** |
 | "Request received from X" + optional note | your transport of choice; edge carries the bytes | **server** |
 | accept → consent | your consent grant | **server** |
-| "Joined community with X" | `CohortGroup::create` (inviter) → `add_member` → `CohortGroup::join` (invitee, from the Welcome) | edge |
+| "Joined community with X" | `chat::signed_pair_community` (the room record, both people `founder`s) then the MLS handshake OVER THE ROOM: joiner `key_package_attestation` → creator `CohortGroup::create` + `add_member` + `welcome_attestation` → joiner `CohortGroup::join`; roles from `chat::PairRole::of` | edge |
 | "Chat with Y" | `contact::the_other_member(&group.member_key_ids().await, own_key_id)` | edge |
-| send a message | `group.destination_secret()` — both sides derive the same key | edge |
+| send a message | `chat::RoomKey::of(&group)` then `chat::chat_message_attestation(&author, &peer, body, now, &key)` — the body SEALED under the room's record secret — stored, then `share(.., With::Community { room }, ProducerAuthority, Signers { node, actor: Some(&author) })` | edge |
+| read the room | `chat::messages_in_room(&*dir, &[peer_fed_id], &room, &key)` — opened; a row that will not open is `Body::Unopened { reason }` | edge |
 
 Four things worth knowing before you build on it:
 
@@ -395,13 +416,31 @@ Four things worth knowing before you build on it:
    unless the room is exactly two people *and* you are one of them — so a group
    chat cannot silently render under one participant's name. Decide what an
    unnamed room shows; do not unwrap.
-4. **The conversation key moves when membership does.** `destination_secret()`
-   changes on every membership commit, which is what stops a removed member from
-   reading on. Re-derive after applying a commit rather than caching it.
+4. **The conversation key moves when membership does.** `record_secret()` (and
+   `RoomKey::of`) changes on every membership commit, which is what stops a
+   removed member from reading on. Re-derive after applying a commit rather
+   than caching it; a message sealed at an older epoch reports
+   `Body::Unopened { reason: ".. the room rotated" }` rather than opening.
+5. **Community tier is encrypted, always.** There is no plaintext producer:
+   `chat_message_attestation` takes the `RoomKey`, the wire carries ciphertext
+   plus a `sealed { alg, epoch, nonce }` header, and the seal is keyed through
+   HKDF over the room, the author and the epoch — a ciphertext moved to
+   another author's row or another room does not open. The MLS handshake that
+   makes the key is two ordinary rows in the room (`chat:key_package:v1`,
+   `chat:welcome:v1`), each signed by the person with the FULL hybrid key
+   (there is no classical-only fallback anywhere in edge from v19.0.0), and
+   served by the audience gate to exactly the other member's nodes. Both
+   humans are `founder`s of the pair room, so it federates (§11.11) without
+   anyone appointing anyone.
 
-Two rungs above are ours and are now proven over the real mesh, not just in
-unit tests: `bench-mesh`'s `ladder.discover_by_fedid` resolves a PEER's owner
-from a binding it learned over the Attestation plane, having seeded nothing.
+Every rung above is proven over the real mesh, not just in unit tests:
+`bench-mesh`'s `ladder.discover_by_fedid` resolves a PEER's owner from a
+binding it learned over the Attestation plane, having seeded nothing;
+`ladder.open_chat` runs the MLS handshake over the room between two nodes
+through a relay; `ladder.send_message` seals on one side and OPENS on the
+other, and fails the leg on a leaked `self` copy or any chat row carrying the
+plaintext. `tests/chat_message_federates.rs` is the second reference: the same
+rows on real sqlite, including the handshake rows read back through the room.
 
 ---
 

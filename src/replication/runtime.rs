@@ -1004,6 +1004,94 @@ impl ReplicationRuntime {
         Ok(outcome)
     }
 
+    /// v19.0.0 — fire an anti-entropy round toward `peer_key_id` NOW on every
+    /// plane this node initiates with it, instead of at the next cadence
+    /// tick. Fire-and-forget; [`Self::sync_and_await`] is what most callers
+    /// want.
+    ///
+    /// # Errors
+    /// The scheduler has shut down.
+    pub async fn round_now(&self, peer_key_id: &str) -> Result<(), ReplicationRuntimeError> {
+        self.scheduler_handle.round_now(Some(peer_key_id)).await?;
+        Ok(())
+    }
+
+    /// **Sync with a peer, then WAIT for the answer** — the anti-entropy twin
+    /// of [`Self::pull_and_await`], for rows a subject Pull cannot ask for by
+    /// identifier: another person's owner binding, the rows they placed in a
+    /// room you share, a KeyPackage they published for you. Those reach this
+    /// node through the ordinary per-peer advertise, whose gates decide what
+    /// you are in the audience of — this helper only decides WHEN the round
+    /// runs.
+    ///
+    /// Subscribes to the convergence signal first, kicks a round toward the
+    /// peer, and waits; on every wake-up where `is_present` is still false it
+    /// kicks again, so a walk that needs several dependent rounds (the Key
+    /// plane, then attribution, then the Attestation plane) runs them back to
+    /// back instead of one per cadence tick. Bounded by `budget`; a peer that
+    /// does not hold what you asked for is a [`Converged::TimedOut`], not an
+    /// error.
+    ///
+    /// # Errors
+    /// The scheduler has shut down.
+    ///
+    /// [`Converged::TimedOut`]: super::convergence::Converged::TimedOut
+    pub async fn sync_and_await<F, Fut>(
+        &self,
+        peer_key_id: &str,
+        budget: std::time::Duration,
+        mut is_present: F,
+    ) -> Result<super::convergence::Converged, ReplicationRuntimeError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        use super::convergence::Converged;
+        /// One kicked round's grace before the next kick: long enough for a
+        /// round's wire time, short enough that a dependent walk never idles.
+        const KICK_SLICE: std::time::Duration = std::time::Duration::from_millis(1500);
+        let start = std::time::Instant::now();
+        let mut waiter = self.convergence();
+        let mut checks = 0u32;
+        let mut kicks = 0u32;
+        loop {
+            self.round_now(peer_key_id).await?;
+            kicks += 1;
+            let remaining = budget.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let outcome = waiter
+                .await_until(remaining.min(KICK_SLICE), &mut is_present)
+                .await;
+            checks += outcome.checks();
+            if outcome.is_converged() {
+                tracing::debug!(
+                    peer = %peer_key_id,
+                    waited_ms = start.elapsed().as_millis(),
+                    kicks,
+                    checks,
+                    "sync_and_await converged"
+                );
+                return Ok(Converged::Yes {
+                    waited: start.elapsed(),
+                    checks,
+                });
+            }
+        }
+        tracing::debug!(
+            peer = %peer_key_id,
+            waited_ms = start.elapsed().as_millis(),
+            kicks,
+            checks,
+            "sync_and_await timed out"
+        );
+        Ok(Converged::TimedOut {
+            waited: start.elapsed(),
+            checks,
+        })
+    }
+
     pub async fn pull_subject_testimony(
         &self,
         peer_key_id: &str,

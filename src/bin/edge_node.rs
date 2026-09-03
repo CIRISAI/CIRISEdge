@@ -128,6 +128,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
 
 use ciris_crypto::{kdf, ClassicalSigner, Ed25519Signer};
+use ciris_edge::chat;
 use ciris_edge::cohort_scope::CohortScope;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::mls::cohort_group::mint_cohort_key_material;
@@ -1845,6 +1846,42 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         "directed replication consent granted"
     );
 
+    // ── This node's PAIR ROOMS with every roster owner ───────────────
+    //
+    // Authored at STANDUP, before replication starts, so a peer's message —
+    // or its MLS handshake row — is admissible the moment it arrives: AV-45
+    // proves the writer's membership against the room the row names, and a
+    // room that is not yet known is a transient refusal that costs a whole
+    // round. Both humans are FOUNDERS (`chat::pair_community`), so the room
+    // has its moderators by construction. Idempotent on both ends.
+    let founded_at: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .map_err(|e| format!("ts: {e}"))?
+            .into();
+    let mut rooms = 0usize;
+    for entry in roster.values().filter(|e| e.key_id != cfg.node_id) {
+        if entry.owner_key_id.is_empty() {
+            continue;
+        }
+        let row = chat::signed_pair_community(
+            &owner_key_id,
+            &entry.owner_key_id,
+            founded_at,
+            &node_signer,
+        )
+        .await?;
+        match directory.put_community(row).await {
+            Ok(()) | Err(ciris_persist::federation::Error::Conflict(_)) => rooms += 1,
+            Err(e) => {
+                tracing::warn!(
+                    node = %cfg.node_id, peer_owner = %entry.owner_key_id, error = %e,
+                    "pair room refused at standup — the chat legs will author it again"
+                );
+            }
+        }
+    }
+    tracing::info!(node = %cfg.node_id, rooms, "pair rooms authored at standup");
+
     // ── 5. The federation signer, from this node's own seed ──────────
     // The HYBRID signer, not a classical-only one.
     //
@@ -2267,9 +2304,12 @@ async fn run_discover_by_fedid_leg(
     // reports missing. One leg's failure must cost one leg, not the run: the
     // previous attempt turned a single red cell into fifteen.
     let discovery_budget = cfg.barrier_timeout.min(Duration::from_secs(90));
+    // Rounds are KICKED toward the peer and re-kicked on every admission
+    // until the walk resolves, so the Key → attribution → Attestation chain
+    // runs back to back instead of one plane per cadence tick.
     let outcome = occ
-        .replication_convergence()
-        .await_until(discovery_budget, || async {
+        .replication
+        .sync_and_await(&expect_node, discovery_budget, || async {
             matches!(
                 contact::discover(lens, routes, &owner_id).await,
                 Ok(ref f)
@@ -2277,7 +2317,14 @@ async fn run_discover_by_fedid_leg(
                         && f.reachable.contains(&expect_node)
             )
         })
-        .await;
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "sync_and_await: scheduler unavailable");
+            ciris_edge::replication::convergence::Converged::TimedOut {
+                waited: Duration::ZERO,
+                checks: 0,
+            }
+        });
     let (last, last_stall) = match contact::discover(lens, routes, &owner_id).await {
         Ok(found) => (Some(found), None),
         Err(stall) => (None, Some(format!("{stall:?}"))),
@@ -2399,10 +2446,46 @@ async fn run_discover_by_fedid_leg(
 /// The one message the pair chat sends. Fixed so the receiver can check it.
 const CHAT_BODY: &str = "hello over the mesh";
 
+/// Put a row and share it with the room — the ONE way a chat leg places
+/// anything: authored `self`, entered over the same bytes with the node's
+/// co-scrub, widened to `community` by the owner's own `supersedes`.
+async fn share_in_room(
+    dir: &dyn ciris_persist::federation::FederationDirectory,
+    row: ciris_persist::federation::Attestation,
+    room: &str,
+    signers: ciris_edge::replication::attestation_bind::Signers<'_>,
+) -> Result<ciris_edge::replication::attestation_bind::Shared, String> {
+    use ciris_edge::replication::attestation_bind::{share, CrossingBasis, Shared, With};
+    dir.put_attestation(ciris_persist::federation::SignedAttestation {
+        attestation: row.clone(),
+    })
+    .await
+    .map_err(|e| format!("put {}: {e}", row.attestation_id))?;
+    let crossing = share(
+        dir,
+        &row,
+        With::Community {
+            community_key_id: room.to_owned(),
+        },
+        CrossingBasis::ProducerAuthority,
+        signers,
+    )
+    .await?;
+    match crossing.shared {
+        Shared::Placed { .. } | Shared::AlreadyThere { .. } => Ok(crossing.shared),
+        Shared::AwaitingActor { .. } => Err(format!("{:?}", crossing.shared)),
+    }
+}
+
 async fn run_chat_legs(occ: &Occurrence) {
-    use ciris_edge::chat;
-    use ciris_edge::replication::attestation_bind::{share, CrossingBasis, Shared, Signers, With};
-    use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
+    use ciris_edge::chat::{self, Body, PairRole, RoomKey};
+    use ciris_edge::mls::cohort_group::{
+        key_package_from_bytes, key_package_to_bytes, mint_cohort_key_material,
+    };
+    use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
+    use ciris_edge::replication::attestation_bind::Signers;
+    use ciris_persist::encrypted_kv::XChaChaKvStore;
+    use ciris_persist::federation::FederationDirectory as _;
 
     let rep = Arc::clone(&occ.reporter);
     let cfg = &occ.cfg;
@@ -2445,50 +2528,31 @@ async fn run_chat_legs(occ: &Occurrence) {
         chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
             .expect("const ts")
             .into();
-
-    // ── open_chat: the derived pair room, authored locally ───────────
-    // Both humans are FOUNDERS — each an authority root and so a zero-hop
-    // moderator (§11.11) by construction of the record; `chat::pair_community`
-    // is the one place that shape lives.
-    let signed_room =
-        chat::signed_pair_community(&my_owner, &peer_owner, founded_at, &occ.node_signer).await;
-    let members: Vec<String> = signed_room
-        .as_ref()
-        .map(|r| {
-            r.community
-                .members
-                .iter()
-                .map(|m| m.key_id.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    let opened = match signed_room {
-        Err(e) => Err(e),
-        Ok(row) => match occ.directory.put_community(row).await {
-            Ok(()) => Ok("authored"),
-            // Both ends author the same derived row; a collision means the
-            // peer's copy replicated first. Same room either way.
-            Err(ciris_persist::federation::Error::Conflict(_)) => Ok("already present"),
-            Err(e) => Err(format!("put_community: {e}")),
-        },
+    let dir: &dyn ciris_persist::federation::FederationDirectory = &*occ.directory;
+    let signers = Signers {
+        node: &occ.node_signer,
+        actor: Some(&occ.owner_signer),
     };
-    match &opened {
-        Ok(how) => rep.ran(
-            "ladder.open_chat",
-            true,
-            serde_json::json!({
-                "room": room,
-                "members": members,
-                "other_member": peer_owner,
-                "how": how,
-                "covers": "both ends derive the same two-person room from the two \
-                           owner fed-IDs and author it; members are the HUMANS, both \
-                           FOUNDERS (each a zero-hop moderator, §11.11), because AV-45 \
-                           resolves a node writer through owner_of",
-            }),
-        ),
+    let budget = cfg.barrier_timeout.min(Duration::from_secs(90));
+    let mut members = vec![my_owner.clone(), peer_owner.clone()];
+    members.sort_unstable();
+
+    // ── open_chat: the room record (standup authored it; idempotent) ──
+    let room_how =
+        match chat::signed_pair_community(&my_owner, &peer_owner, founded_at, &occ.node_signer)
+            .await
+        {
+            Err(e) => Err(e),
+            Ok(row) => match occ.directory.put_community(row).await {
+                Ok(()) => Ok("authored"),
+                Err(ciris_persist::federation::Error::Conflict(_)) => Ok("already present"),
+                Err(e) => Err(format!("put_community: {e}")),
+            },
+        };
+    let room_how = match room_how {
+        Ok(how) => how,
         Err(e) => {
-            tracing::error!(%room, error = %e, "open_chat failed");
+            tracing::error!(%room, error = %e, "open_chat: the room record failed");
             rep.ran(
                 "ladder.open_chat",
                 false,
@@ -2497,7 +2561,157 @@ async fn run_chat_legs(occ: &Occurrence) {
             rep.not_run("ladder.send_message", "open_chat failed");
             return;
         }
+    };
+
+    // ── open_chat: the MLS handshake, OVER THE ROOM ──────────────────
+    // Both rows are ordinary community-scoped attestations the owner signs;
+    // the audience gate serves each to exactly the other member's nodes.
+    let role = PairRole::of(&my_owner, &peer_owner);
+    let handshake_start = Instant::now();
+    let handshake: Result<(RoomKey, serde_json::Value), String> = async {
+        let kv = XChaChaKvStore::open_in_memory(room.as_bytes())
+            .map_err(|e| format!("open_in_memory: {e}"))?;
+        let store = ScopeStateProvider::new(Arc::new(kv));
+        match role {
+            PairRole::Creator => {
+                let group = CohortGroup::create(store, &room, &my_owner, 16)
+                    .await
+                    .map_err(|e| format!("CohortGroup::create: {e}"))?;
+                let waited = occ
+                    .replication
+                    .sync_and_await(&peer_node, budget, || async {
+                        chat::key_package_from(dir, &peer_owner, &room)
+                            .await
+                            .is_ok_and(|k| k.is_some())
+                    })
+                    .await
+                    .map_err(|e| format!("sync_and_await: {e}"))?;
+                let kp_bytes = chat::key_package_from(dir, &peer_owner, &room)
+                    .await?
+                    .ok_or_else(|| {
+                        format!(
+                            "the joiner's KeyPackage did not arrive within {} ms ({} checks)",
+                            waited.waited().as_millis(),
+                            waited.checks()
+                        )
+                    })?;
+                let kp =
+                    key_package_from_bytes(&kp_bytes).map_err(|e| format!("KeyPackage: {e}"))?;
+                let commit = group
+                    .add_member(&peer_owner, kp)
+                    .await
+                    .map_err(|e| format!("add_member: {e}"))?;
+                let epoch = commit.epoch();
+                let welcome = commit
+                    .welcome()
+                    .ok_or("add_member produced no Welcome")?
+                    .to_vec();
+                let row = chat::welcome_attestation(
+                    &occ.owner_signer,
+                    &peer_owner,
+                    &welcome,
+                    epoch,
+                    chrono::Utc::now(),
+                )
+                .await?;
+                let shared = share_in_room(dir, row, &room, signers).await?;
+                let key = RoomKey::of(&group).await?;
+                Ok((
+                    key,
+                    serde_json::json!({
+                        "role": "creator",
+                        "key_package_waited_ms": waited.waited().as_millis(),
+                        "key_package_checks": waited.checks(),
+                        "key_package_bytes": kp_bytes.len(),
+                        "welcome_bytes": welcome.len(),
+                        "welcome_shared": shared,
+                        "epoch": epoch,
+                    }),
+                ))
+            }
+            PairRole::Joiner => {
+                let (material, kp) = mint_cohort_key_material(&my_owner)
+                    .map_err(|e| format!("mint_cohort_key_material: {e}"))?;
+                let kp_bytes = key_package_to_bytes(kp).map_err(|e| format!("KeyPackage: {e}"))?;
+                let row = chat::key_package_attestation(
+                    &occ.owner_signer,
+                    &peer_owner,
+                    &kp_bytes,
+                    chrono::Utc::now(),
+                )
+                .await?;
+                let shared = share_in_room(dir, row, &room, signers).await?;
+                let waited = occ
+                    .replication
+                    .sync_and_await(&peer_node, budget, || async {
+                        chat::welcome_from(dir, &peer_owner, &room)
+                            .await
+                            .is_ok_and(|w| w.is_some())
+                    })
+                    .await
+                    .map_err(|e| format!("sync_and_await: {e}"))?;
+                let (welcome, epoch) = chat::welcome_from(dir, &peer_owner, &room)
+                    .await?
+                    .ok_or_else(|| {
+                        format!(
+                            "the creator's Welcome did not arrive within {} ms ({} checks)",
+                            waited.waited().as_millis(),
+                            waited.checks()
+                        )
+                    })?;
+                let group = CohortGroup::join(store, &room, material, &welcome, 16)
+                    .await
+                    .map_err(|e| format!("CohortGroup::join: {e}"))?;
+                let key = RoomKey::of(&group).await?;
+                Ok((
+                    key,
+                    serde_json::json!({
+                        "role": "joiner",
+                        "key_package_bytes": kp_bytes.len(),
+                        "key_package_shared": shared,
+                        "welcome_waited_ms": waited.waited().as_millis(),
+                        "welcome_checks": waited.checks(),
+                        "welcome_bytes": welcome.len(),
+                        "epoch": epoch,
+                    }),
+                ))
+            }
+        }
     }
+    .await;
+    let handshake_ms = handshake_start.elapsed().as_millis();
+    let (key, mls) = match handshake {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(%room, ?role, error = %e, handshake_ms, "open_chat: the MLS handshake failed");
+            rep.ran(
+                "ladder.open_chat",
+                false,
+                serde_json::json!({ "room": room, "role": format!("{role:?}"), "handshake_ms": handshake_ms, "error": e }),
+            );
+            rep.not_run("ladder.send_message", "the MLS handshake failed");
+            return;
+        }
+    };
+    rep.ran(
+        "ladder.open_chat",
+        true,
+        serde_json::json!({
+            "room": room,
+            "members": members,
+            "other_member": peer_owner,
+            "how": room_how,
+            "role": format!("{role:?}"),
+            "mls": mls,
+            "handshake_ms": handshake_ms,
+            "epoch": key.epoch(),
+            "covers": "both ends derive the same two-person room from the two owner \
+                       fed-IDs (both FOUNDERS, so both moderators); the MLS handshake \
+                       (KeyPackage, Welcome; X-Wing 0x004D) rode the room as ordinary \
+                       community-scoped rows the owners signed, and both ends now hold \
+                       the room's record secret",
+        }),
+    );
 
     // ── send_message ─────────────────────────────────────────────────
     if i_send {
@@ -2507,52 +2721,59 @@ async fn run_chat_legs(occ: &Occurrence) {
                 &peer_owner,
                 CHAT_BODY,
                 chrono::Utc::now(),
+                &key,
             )
             .await?;
-            occ.directory
-                .put_attestation(SignedAttestation {
-                    attestation: msg.clone(),
-                })
-                .await
-                .map_err(|e| format!("put message: {e}"))?;
-            let crossing = share(
-                &*occ.directory,
-                &msg,
-                With::Community {
-                    community_key_id: room.clone(),
-                },
-                CrossingBasis::ProducerAuthority,
-                Signers {
-                    node: &occ.node_signer,
-                    actor: Some(&occ.owner_signer),
-                },
-            )
-            .await?;
-            Ok::<_, String>((msg.attestation_id, crossing))
+            // The wire never carries the plaintext — checked at the source.
+            let wire = serde_json::to_string(&msg.attestation_envelope).unwrap_or_default();
+            if wire.contains(CHAT_BODY) {
+                return Err("PLAINTEXT ON THE WIRE: the envelope contains the body".to_owned());
+            }
+            let sealed = msg.attestation_envelope.get(chat::FIELD_SEALED).cloned();
+            let crossing = {
+                use ciris_edge::replication::attestation_bind::{share, CrossingBasis, With};
+                occ.directory
+                    .put_attestation(ciris_persist::federation::SignedAttestation {
+                        attestation: msg.clone(),
+                    })
+                    .await
+                    .map_err(|e| format!("put message: {e}"))?;
+                share(
+                    dir,
+                    &msg,
+                    With::Community {
+                        community_key_id: room.clone(),
+                    },
+                    CrossingBasis::ProducerAuthority,
+                    signers,
+                )
+                .await?
+            };
+            Ok::<_, String>((msg.attestation_id, sealed, crossing))
         }
         .await;
         match sent {
-            Ok((id, crossing)) => {
-                tracing::info!(%room, attestation_id = %id, shared = ?crossing.shared, "chat message shared");
+            Ok((id, sealed, crossing)) => {
+                use ciris_edge::replication::attestation_bind::Shared;
+                tracing::info!(%room, attestation_id = %id, shared = ?crossing.shared, "chat message shared (sealed)");
                 rep.ran(
                     "ladder.send_message",
                     matches!(crossing.shared, Shared::Placed { .. }),
                     serde_json::json!({
                         "room": room,
                         "authored_attestation_id": id,
-                        // The nine CC 4.5.1.1 axes as persist VERIFIED them at
-                        // the crossing, both verb outcomes verbatim (a widening
-                        // is TWO rows), and where edge routes it — the census
-                        // shows what was sent, not just that something was.
+                        "sealed": sealed,
+                        "body_on_wire_is_ciphertext": true,
                         "crossing": crossing,
                         "author": my_owner,
                         "attested_by": my_owner,
                         "custody": cfg.node_id,
                         "with": "community",
-                        "covers": "authored tier:local / cohort:self by the OWNER (sign-at-write), \
-                                   then share(With::Community): enter_mesh over the same bytes with \
-                                   the node's co-scrub, then the owner's own supersedes at community \
-                                   (CC 5.3.2.4.2 + 4.4.3.3.1)",
+                        "covers": "the body SEALED under the room's MLS record secret (XChaCha20-Poly1305, \
+                                   HKDF per message), authored tier:local / cohort:self by the OWNER \
+                                   (sign-at-write, full hybrid), then share(With::Community): enter_mesh \
+                                   over the same bytes with the node's co-scrub, then the owner's own \
+                                   supersedes at community (CC 5.3.2.4.2 + 4.4.3.3.1)",
                     }),
                 );
             }
@@ -2568,52 +2789,67 @@ async fn run_chat_legs(occ: &Occurrence) {
         return;
     }
 
-    // Receiver: wait for the WIDENING — the `supersedes` the peer's share wrote
-    // at `community`, the only row this node is in the audience of — then read
-    // the room the way a client would.
-    let dir: &dyn ciris_persist::federation::FederationDirectory = &*occ.directory;
-    // The HUMAN speaks; the node is custody. Rows are listed by attester.
+    // Receiver: kick rounds toward the sender until the WIDENING — the
+    // `supersedes` their share wrote at `community` — is here, then OPEN it.
     let senders = vec![peer_owner.clone()];
-    let budget = cfg.barrier_timeout.min(Duration::from_secs(90));
     let outcome = occ
-        .replication_convergence()
-        .await_until(budget, || async {
-            chat::messages_in_room(dir, &senders, &room)
+        .replication
+        .sync_and_await(&peer_node, budget, || async {
+            chat::messages_in_room(dir, &senders, &room, &key)
                 .await
                 .is_ok_and(|m| m.iter().any(|x| x.widens.is_some()))
         })
-        .await;
-    let seen = chat::messages_in_room(dir, &senders, &room)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "sync_and_await: scheduler unavailable");
+            ciris_edge::replication::convergence::Converged::TimedOut {
+                waited: Duration::ZERO,
+                checks: 0,
+            }
+        });
+    let seen = chat::messages_in_room(dir, &senders, &room, &key)
         .await
         .unwrap_or_default();
-    let widening_arrived = seen.iter().any(|m| {
+    let opened = seen.iter().any(|m| {
         m.widens.is_some()
-            && m.body == CHAT_BODY
+            && m.body == Body::Text(CHAT_BODY.to_owned())
             && m.author_key_id == peer_owner
             && m.attesting_key_id == peer_owner
     });
-    // CC 5.2 — the peer's `(federation, self)` copy must NOT be here: this
-    // node belongs to a different person. Read the RAW rows, because the room
-    // fold would hide a leaked self copy behind its widening — which is
-    // exactly how the first v19 run passed while leaking.
-    let leaked_self_rows: Vec<String> = dir
+    // The RAW rows: the peer's `self` copy must not be here (CC 5.2), and no
+    // chat row may carry the plaintext.
+    let raw = dir
         .list_attestations_by(&peer_owner)
         .await
-        .unwrap_or_default()
-        .into_iter()
+        .unwrap_or_default();
+    let leaked_self_rows: Vec<String> = raw
+        .iter()
         .filter(|a| {
             a.cohort_scope == ciris_persist::federation::types::cohort_scope::SELF
-                && chat::ChatMessage::from_row(a, &room).is_some()
+                && a.attestation_envelope
+                    .get("dimension")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(chat::CHAT_MESSAGE_DIMENSION)
         })
-        .map(|a| a.attestation_id)
+        .map(|a| a.attestation_id.clone())
         .collect();
-    let ok = widening_arrived && leaked_self_rows.is_empty();
+    let plaintext_on_wire: Vec<String> = raw
+        .iter()
+        .filter(|a| {
+            serde_json::to_string(&a.attestation_envelope)
+                .unwrap_or_default()
+                .contains(CHAT_BODY)
+        })
+        .map(|a| a.attestation_id.clone())
+        .collect();
+    let ok = opened && leaked_self_rows.is_empty() && plaintext_on_wire.is_empty();
     if !ok {
         tracing::error!(
             %room, waited_ms = outcome.waited().as_millis(), checks = outcome.checks(),
-            messages = seen.len(), widening_arrived, leaked_self_rows = ?leaked_self_rows,
-            "the peer's WIDENING did not arrive in the room within the budget, or the \
-             peer's `self` copy leaked here (CC 5.2)"
+            messages = seen.len(), opened, leaked_self_rows = ?leaked_self_rows,
+            plaintext_on_wire = ?plaintext_on_wire,
+            "the peer's sealed WIDENING did not arrive and open within the budget, or a \
+             self copy / plaintext leaked here"
         );
     }
     rep.ran(
@@ -2628,20 +2864,20 @@ async fn run_chat_legs(occ: &Occurrence) {
                 "widens": m.widens,
                 "author": m.author_key_id,
                 "attested_by": m.attesting_key_id,
-                "body": m.body,
+                "body": format!("{:?}", m.body),
+                "epoch": m.epoch,
             })).collect::<Vec<_>>(),
             "expected_author": peer_owner,
             "expected_attested_by": peer_owner,
-            "widening_arrived": widening_arrived,
-            // CC 5.2 leak detector: the peer's `(federation, self)` copy is
-            // for the peer's OWN nodes; its presence here fails the leg.
+            "opened_with_room_key": opened,
             "leaked_self_rows": leaked_self_rows,
+            "plaintext_on_wire": plaintext_on_wire,
             "peer_node": peer_node,
             "inbound": occ.inbound_stats.as_json(),
-            "covers": "a community-scoped chat row ATTESTED AND SIGNED BY THE PEER'S HUMAN \
-                       — the supersedes their share wrote — arrived over RNS through the \
-                       relay and was read back by room, keyed on the sender's id, which \
-                       the receiver cannot manufacture",
+            "covers": "a community-scoped, SEALED chat row attested and signed by the peer's \
+                       human — the supersedes their share wrote — arrived over RNS through \
+                       the relay, was read back by room, and OPENED with the room's MLS \
+                       record secret; no self copy and no plaintext reached this node",
         }),
     );
 }

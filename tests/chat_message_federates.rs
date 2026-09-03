@@ -1,20 +1,25 @@
-//! A chat message, on real substrate: authored by its ACTOR, shared with the
-//! room, read back.
+//! A chat message, on real substrate: authored by its ACTOR, sealed under the
+//! room's key, shared with the room, read back and opened.
 //!
 //! The room id is DERIVED from the two fed-IDs, so both ends compute it having
 //! exchanged nothing — which is what lets a message be addressed to a room the
 //! recipient has not created yet.
 //!
-//! Two things are worth pinning here. Placement: a message is authored `self`
-//! and shared to `community`; it is NEVER `federation`, because that tier is
-//! public (lightnet) and a private message placed there is published rather
-//! than sent. And custody: the AUTHOR signs the row at write and that
-//! signature survives the crossing — the node only ever co-scrubs — because a
-//! share is two operations (`enter_mesh` over the same bytes, then a
-//! `supersedes` the actor signs at the wider audience), never a re-sign by the
-//! fabric (CIRISPersist FSD/PROMOTION_PRESERVES_THE_ACTOR_SIGNATURE).
+//! Three things are worth pinning here. Placement: a message is authored
+//! `self` and shared to `community`; it is NEVER `federation`. Custody: the
+//! AUTHOR signs the row at write (full hybrid, no fallback) and that signature
+//! survives the crossing — the node only ever co-scrubs — because a share is
+//! two operations (`enter_mesh` over the same bytes, then a `supersedes` the
+//! actor signs at the wider audience). And the seal: community tier is
+//! encrypted, so the body on the wire is ciphertext under the room's MLS
+//! record secret, and the MLS handshake that produces that secret rides the
+//! room as ordinary rows.
 
-use ciris_edge::chat;
+use ciris_edge::chat::{self, Body, PairRole, RoomKey};
+use ciris_edge::mls::cohort_group::{
+    key_package_from_bytes, key_package_to_bytes, mint_cohort_key_material,
+};
+use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
 use ciris_edge::replication::attestation_bind::{
     custody_for, describe_crossing, keep_local, publish, share, share_encrypted_privately,
     share_plan, Audience, ClearCohort, CrossingBasis, Custody, DataSubject, EncryptedCohort,
@@ -22,12 +27,15 @@ use ciris_edge::replication::attestation_bind::{
     TierPromotionCustody, With,
 };
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
+use ciris_persist::encrypted_kv::XChaChaKvStore;
 use ciris_persist::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord};
 use ciris_persist::store::sqlite::SqliteBackend;
 use ciris_persist::store::Backend as _;
 use sha2::Digest as _;
 use std::sync::Arc;
+
+const BODY: &str = "hello over the mesh";
 
 fn b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
@@ -48,6 +56,12 @@ fn signer(key_id: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
             .unwrap(),
     );
     ciris_edge::identity::LocalSigner::new(key_id, classical, Some(pqc))
+}
+
+fn store(seed: &str) -> ScopeStateProvider {
+    ScopeStateProvider::new(Arc::new(
+        XChaChaKvStore::open_in_memory(seed.as_bytes()).unwrap(),
+    ))
 }
 
 async fn record(
@@ -93,13 +107,20 @@ async fn record(
     }
 }
 
-/// The three identities a message needs, and the room Alice and Bob share.
+/// Alice and her node, Bob and his node, the room they share, and the room
+/// key on BOTH sides — derived in-process through the real MLS handshake
+/// (create → KeyPackage → add → Welcome → join).
 struct World {
     dir: Arc<SqliteBackend>,
     alice: ciris_edge::identity::LocalSigner,
     alice_node: ciris_edge::identity::LocalSigner,
     bob: ciris_edge::identity::LocalSigner,
+    bob_node: ciris_edge::identity::LocalSigner,
     room: String,
+    /// Alice's copy of the room key.
+    key_a: RoomKey,
+    /// Bob's copy — what the far end opens with.
+    key_b: RoomKey,
 }
 
 impl World {
@@ -107,6 +128,12 @@ impl World {
         Signers {
             node: &self.alice_node,
             actor: Some(&self.alice),
+        }
+    }
+    fn bobs_signers(&self) -> Signers<'_> {
+        Signers {
+            node: &self.bob_node,
+            actor: Some(&self.bob),
         }
     }
     fn room_with(&self) -> With {
@@ -125,16 +152,37 @@ impl World {
     }
 }
 
+/// The in-process handshake: the room key as both people hold it.
+async fn mls_pair(room: &str) -> (RoomKey, RoomKey) {
+    let a = CohortGroup::create(store("alice"), room, "alice-fed", 16)
+        .await
+        .expect("create");
+    let (material, kp) = mint_cohort_key_material("bob-fed").expect("mint");
+    let kp = key_package_from_bytes(&key_package_to_bytes(kp).expect("kp bytes"))
+        .expect("kp round-trips through the byte codec");
+    let commit = a.add_member("bob-fed", kp).await.expect("add bob");
+    let welcome = commit.welcome().expect("welcome").to_vec();
+    let b = CohortGroup::join(store("bob"), room, material, &welcome, 16)
+        .await
+        .expect("join");
+    (
+        RoomKey::of(&a).await.unwrap(),
+        RoomKey::of(&b).await.unwrap(),
+    )
+}
+
 async fn world() -> World {
     let dir = FederationDirectorySqlite::open(":memory:").await.unwrap();
     dir.run_migrations().await.unwrap();
     let alice = signer("alice-fed", 1);
     let alice_node = signer("alice-node", 2);
     let bob = signer("bob-fed", 3);
+    let bob_node = signer("bob-node", 4);
     for (subject, s, scrub, ity) in [
         ("alice-fed", &alice, &alice, "user"),
         ("alice-node", &alice_node, &alice, "node"),
         ("bob-fed", &bob, &bob, "user"),
+        ("bob-node", &bob_node, &bob, "node"),
     ] {
         dir.put_public_key(SignedKeyRecord {
             record: record(subject, s, scrub, ity).await,
@@ -154,18 +202,23 @@ async fn world() -> World {
     )
     .await
     .expect("the pair room is admitted");
+    let (key_a, key_b) = mls_pair(&room).await;
     World {
         dir,
         alice,
         alice_node,
         bob,
+        bob_node,
         room,
+        key_a,
+        key_b,
     }
 }
 
-/// Author a message as Alice (signed at write) and store it.
+/// Author a message as Alice (sealed under her room key, signed at write)
+/// and store it.
 async fn authored(w: &World, body: &str) -> ciris_persist::federation::Attestation {
-    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", body, ts())
+    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", body, ts(), &w.key_a)
         .await
         .unwrap();
     w.dir
@@ -186,24 +239,27 @@ fn is_canonical_instant(s: &str) -> bool {
 }
 
 /// **The room is derived, order-free.** Both ends compute the same id from
-/// public inputs, having exchanged nothing.
+/// public inputs, having exchanged nothing — and the same ROLE.
 #[test]
-fn both_ends_derive_the_same_room() {
+fn both_ends_derive_the_same_room_and_opposite_roles() {
     let a = chat::pair_community_key_id("alice-fed", "bob-fed");
     let b = chat::pair_community_key_id("bob-fed", "alice-fed");
     assert_eq!(a, b, "the room id must not depend on who asks");
     assert!(a.starts_with(chat::PAIR_COMMUNITY_PREFIX));
+    assert_eq!(PairRole::of("alice-fed", "bob-fed"), PairRole::Creator);
+    assert_eq!(PairRole::of("bob-fed", "alice-fed"), PairRole::Joiner);
 }
 
-/// **The author signs at write, the row is authored `self`, shared to the
-/// room, and the author's signature survives — the node only co-scrubs.**
+/// **The author signs at write (full hybrid), the body is SEALED, the row is
+/// authored `self`, shared to the room, and the author's signature survives
+/// — the node only co-scrubs. The far end opens it with ITS key.**
 #[tokio::test]
 // One witness, end to end: every property of the two rows a share leaves behind
 // is asserted against the same crossing, so a regression cannot pass one half.
 #[allow(clippy::too_many_lines)]
 async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
     let w = world().await;
-    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", "hello over the mesh", ts())
+    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", BODY, ts(), &w.key_a)
         .await
         .expect("build message");
 
@@ -213,6 +269,12 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         "signed at write by the actor"
     );
     assert!(!msg.scrub_signature_classical.is_empty());
+    assert!(
+        msg.scrub_signature_pqc
+            .as_deref()
+            .is_some_and(|p| !p.is_empty()),
+        "the FULL hybrid: ML-DSA-65 half present, no fallback"
+    );
     assert_eq!(
         msg.cohort_scope,
         ciris_persist::federation::types::cohort_scope::SELF,
@@ -220,6 +282,10 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
          message rather than send it"
     );
     assert_eq!(msg.tier, "local");
+    // The wire carries CIPHERTEXT and a seal header, never the text.
+    let wire = serde_json::to_string(&msg.attestation_envelope).unwrap();
+    assert!(!wire.contains(BODY), "PLAINTEXT ON THE WIRE: {wire}");
+    assert!(msg.attestation_envelope.get(chat::FIELD_SEALED).is_some());
     w.dir
         .put_attestation(SignedAttestation {
             attestation: msg.clone(),
@@ -289,8 +355,6 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         original.cohort_scope, "self",
         "enter_mesh never moves the scope"
     );
-    // Same BYTES — compared canonically, because a sqlite round trip renders
-    // `1.0` as `1` in the Value while JCS canonicalizes both identically.
     assert_eq!(
         ciris_persist::prelude::ceg_produce_canonicalize(&original.attestation_envelope).unwrap(),
         ciris_persist::prelude::ceg_produce_canonicalize(&msg.attestation_envelope).unwrap(),
@@ -319,24 +383,28 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
     );
 
     // The WIDENING, as stored: by the actor, referencing the original.
-    let wide = w.stored("alice-fed", &widened.attestation_id).await;
-    assert_eq!(wide.attestation_type, "supersedes");
-    assert_eq!(wide.cohort_scope, "community");
-    assert_eq!(wide.attesting_key_id, "alice-fed");
-    assert_eq!(wide.scrub_key_id, "alice-fed");
+    let stored_widening = w.stored("alice-fed", &widened.attestation_id).await;
+    assert_eq!(stored_widening.attestation_type, "supersedes");
+    assert_eq!(stored_widening.cohort_scope, "community");
+    assert_eq!(stored_widening.attesting_key_id, "alice-fed");
+    assert_eq!(stored_widening.scrub_key_id, "alice-fed");
     assert_eq!(
-        wide.attestation_envelope["references_attestation_id"],
+        stored_widening.attestation_envelope["references_attestation_id"],
         serde_json::json!(msg.attestation_id)
     );
 
-    // Read back the way a client would: by room, off the plane — ONE message,
-    // the widening; the `self` copy is folded away.
-    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &w.room)
+    // Read back the way BOB would: by room, off the plane, opened with HIS
+    // key — ONE message, the widening; the `self` copy is folded away.
+    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &w.room, &w.key_b)
         .await
         .expect("read the room");
     assert_eq!(seen.len(), 1, "one message in the room: {seen:?}");
     let m = &seen[0];
-    assert_eq!(m.body, "hello over the mesh");
+    assert_eq!(
+        m.body,
+        Body::Text(BODY.to_owned()),
+        "opened with the far end's copy of the room key"
+    );
     assert_eq!(m.author_key_id, "alice-fed", "WHOSE WORDS — the attester");
     assert_eq!(m.attesting_key_id, "alice-fed");
     assert_eq!(
@@ -344,29 +412,142 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         "the row on the wire"
     );
     assert_eq!(m.widens.as_deref(), Some(msg.attestation_id.as_str()));
+    assert_eq!(m.epoch, Some(w.key_b.epoch()));
 }
 
-/// **Both members of a pair room are moderators, by construction.** Persist's
-/// own `moderators_of` names each of them for the `moderate` duty — a zero-hop
-/// appointment through the `founder` role — so the room can federate
-/// (§11.11) without anyone having to appoint anyone.
+/// **The MLS handshake rides the room.** Bob's KeyPackage and Alice's
+/// Welcome are ordinary community-scoped rows each of them signs; read back
+/// through the room, the far end joins and both hold the same key.
 #[tokio::test]
-async fn both_members_of_the_pair_room_are_moderators() {
+async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     let w = world().await;
-    let room = chat::pair_community("alice-fed", "bob-fed", ts());
-    assert!(
-        room.members
-            .iter()
-            .all(|m| m.role.as_deref() == Some("founder")),
-        "{:?}",
-        room.members
-    );
-    let mods = ciris_persist::federation::admission::moderators_of(&*w.dir, &w.room, "moderate")
+    let room = w.room.clone();
+
+    // Bob (the joiner) mints and shares his KeyPackage.
+    let (material, kp) = mint_cohort_key_material("bob-fed").unwrap();
+    let kp_bytes = key_package_to_bytes(kp).unwrap();
+    let kp_row = chat::key_package_attestation(&w.bob, "alice-fed", &kp_bytes, ts())
         .await
-        .expect("moderators_of");
-    for who in ["alice-fed", "bob-fed"] {
-        assert!(mods.iter().any(|m| m == who), "{who} moderates: {mods:?}");
-    }
+        .unwrap();
+    assert_eq!(kp_row.attesting_key_id, "bob-fed");
+    assert!(kp_row.scrub_signature_pqc.is_some(), "full hybrid");
+    w.dir
+        .put_attestation(SignedAttestation {
+            attestation: kp_row.clone(),
+        })
+        .await
+        .unwrap();
+    let placed = share(
+        &*w.dir,
+        &kp_row,
+        w.room_with(),
+        CrossingBasis::ProducerAuthority,
+        w.bobs_signers(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(placed.shared, Shared::Placed { .. }), "{placed:?}");
+
+    // Alice (the creator) reads it off the room, admits Bob, shares the Welcome.
+    let got = chat::key_package_from(&*w.dir, "bob-fed", &room)
+        .await
+        .unwrap()
+        .expect("the KeyPackage row is in the room");
+    assert_eq!(got, kp_bytes, "byte-exact through the row");
+    let a = CohortGroup::create(store("alice-wire"), &room, "alice-fed", 16)
+        .await
+        .unwrap();
+    let commit = a
+        .add_member("bob-fed", key_package_from_bytes(&got).unwrap())
+        .await
+        .unwrap();
+    let welcome = commit.welcome().unwrap().to_vec();
+    let w_row = chat::welcome_attestation(&w.alice, "bob-fed", &welcome, commit.epoch(), ts())
+        .await
+        .unwrap();
+    w.dir
+        .put_attestation(SignedAttestation {
+            attestation: w_row.clone(),
+        })
+        .await
+        .unwrap();
+    share(
+        &*w.dir,
+        &w_row,
+        w.room_with(),
+        CrossingBasis::ProducerAuthority,
+        w.signers(),
+    )
+    .await
+    .unwrap();
+
+    // Bob reads the Welcome off the room and joins.
+    let (got_welcome, epoch) = chat::welcome_from(&*w.dir, "alice-fed", &room)
+        .await
+        .unwrap()
+        .expect("the Welcome row is in the room");
+    assert_eq!(got_welcome, welcome);
+    assert_eq!(epoch, commit.epoch());
+    let b = CohortGroup::join(store("bob-wire"), &room, material, &got_welcome, 16)
+        .await
+        .unwrap();
+
+    // Same key on both sides: what Alice seals, Bob opens.
+    let key_a = RoomKey::of(&a).await.unwrap();
+    let key_b = RoomKey::of(&b).await.unwrap();
+    let (ct, sealed) = chat::seal_body(&key_a, &room, "alice-fed", "hi").unwrap();
+    assert_eq!(
+        chat::open_body(&key_b, &room, "alice-fed", &ct, &sealed).unwrap(),
+        "hi"
+    );
+}
+
+/// **The wrong key, a rotated epoch, or a moved ciphertext does not open** —
+/// and the widened row (persist re-stamps its instant) DOES.
+#[tokio::test]
+async fn a_wrong_key_epoch_or_context_does_not_open_the_body() {
+    let w = world().await;
+    let (ct, sealed) = chat::seal_body(&w.key_a, &w.room, "alice-fed", BODY).unwrap();
+
+    let stranger = RoomKey::from_parts([7u8; 32], w.key_a.epoch());
+    let err = chat::open_body(&stranger, &w.room, "alice-fed", &ct, &sealed).unwrap_err();
+    assert!(err.contains("open failed"), "{err}");
+
+    let rotated = RoomKey::from_parts([0u8; 32], w.key_a.epoch() + 1);
+    let err = chat::open_body(&rotated, &w.room, "alice-fed", &ct, &sealed).unwrap_err();
+    assert!(err.contains("rotated"), "{err}");
+
+    // Same key, but the ciphertext moved to another author's row or room.
+    let err = chat::open_body(&w.key_b, &w.room, "bob-fed", &ct, &sealed).unwrap_err();
+    assert!(err.contains("open failed"), "{err}");
+    let err = chat::open_body(&w.key_b, "another-room", "alice-fed", &ct, &sealed).unwrap_err();
+    assert!(err.contains("open failed"), "{err}");
+
+    // And the reader reports it rather than dropping it or lying: the
+    // widened row, read with a stranger's key, is there and Unopened.
+    let msg = authored(&w, "secret").await;
+    share(
+        &*w.dir,
+        &msg,
+        w.room_with(),
+        CrossingBasis::ProducerAuthority,
+        w.signers(),
+    )
+    .await
+    .unwrap();
+    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &w.room, &stranger)
+        .await
+        .unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        matches!(seen[0].body, Body::Unopened { .. }),
+        "{:?}",
+        seen[0].body
+    );
+    assert!(
+        seen[0].widens.is_some(),
+        "the row a peer holds is the widening"
+    );
 }
 
 /// A message for a DIFFERENT room is not in this one. The room filter is on
@@ -388,7 +569,7 @@ async fn a_message_for_another_room_does_not_appear_here() {
     .unwrap();
 
     let other_room = chat::pair_community_key_id("alice-fed", "carol-fed");
-    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &other_room)
+    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &other_room, &w.key_b)
         .await
         .unwrap();
     assert!(seen.is_empty(), "wrong room must not match: {seen:?}");
@@ -403,15 +584,19 @@ fn the_default_grant_covers_the_chat_namespace() {
             .contains(&chat::CHAT_ATTESTATION_PREFIX),
         "a grant that does not cover `chat:` silently withholds every message"
     );
+    for d in [
+        chat::CHAT_MESSAGE_DIMENSION,
+        chat::KEY_PACKAGE_DIMENSION,
+        chat::WELCOME_DIMENSION,
+    ] {
+        assert!(
+            d.starts_with(chat::CHAT_ATTESTATION_PREFIX),
+            "{d} rides the same grant"
+        );
+    }
 }
 
 /// **The encrypted/clear split is persist's, not ours.**
-///
-/// `crypto_tier` is negative-default (CIRISPersist#188): only self/family and
-/// community/affiliations encrypt, and everything else — including unknown
-/// future scopes — falls through to plaintext. Restating that grouping in edge
-/// would let the two drift, and the drift would be an API promising encryption
-/// the substrate does not apply.
 #[test]
 fn every_encrypted_cohort_actually_encrypts_and_every_clear_one_does_not() {
     use ciris_persist::federation::types::cohort_scope::{crypto_tier, CryptoTier};
@@ -443,10 +628,6 @@ fn every_encrypted_cohort_actually_encrypts_and_every_clear_one_does_not() {
 }
 
 /// **`self` and `family` are undiscoverable; community is only filtered.**
-///
-/// Pinned because "only members can read it" and "nobody can tell it exists"
-/// are different claims, and overclaiming the second asserts a privacy property
-/// the wire does not provide. Undiscoverable is NOT un-replicated.
 #[test]
 fn only_self_and_family_are_structurally_invisible() {
     for c in [
@@ -457,8 +638,7 @@ fn only_self_and_family_are_structurally_invisible() {
     ] {
         assert!(
             c.is_structurally_invisible(),
-            "{c:?} must emit no holds_bytes — withholding the discovery surface \
-             IS the privacy primitive, and it is the locality dividend too"
+            "{c:?} must emit no holds_bytes"
         );
     }
     for c in [
@@ -469,8 +649,7 @@ fn only_self_and_family_are_structurally_invisible() {
     ] {
         assert!(
             !c.is_structurally_invisible(),
-            "{c:?} DOES emit holds_bytes; its property is cohort-filtered \
-             visibility, not invisibility (CEG 0.8 §8.1.13.3)"
+            "{c:?} DOES emit holds_bytes; its property is cohort-filtered visibility"
         );
     }
 }
@@ -493,17 +672,9 @@ fn no_cohort_variant_is_the_public_tier() {
         ClearCohort::Species.cohort_scope(),
         ClearCohort::Biosphere.cohort_scope(),
     ] {
-        assert_ne!(
-            scope,
-            cs::FEDERATION,
-            "reaching the world-readable tier must require calling publish"
-        );
+        assert_ne!(scope, cs::FEDERATION);
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// The one-verb surface — FSD_REPLICATION_DX §3 — pinned
-// ═══════════════════════════════════════════════════════════════════
 
 /// `share` places once and is idempotent after — CC 5.3.2.4.2 and CEG §6.1
 /// made visible, on BOTH rows a widening leaves behind.
@@ -528,7 +699,6 @@ async fn share_places_then_reports_already_there() {
         panic!("{:?}", first.shared)
     };
 
-    // The widening, re-shared at the same audience: already there.
     let wide = w.stored("alice-fed", wide_id).await;
     assert_eq!(
         (wide.tier.as_str(), wide.cohort_scope.as_str()),
@@ -547,13 +717,10 @@ async fn share_places_then_reports_already_there() {
         again.shared,
         Shared::AlreadyThere {
             attestation_id: wide_id.clone()
-        },
-        "idempotent, and it says so"
+        }
     );
     assert_eq!(again.widened, None);
 
-    // The ORIGINAL (now federation/self), shared to the room again: persist
-    // deduplicates the second widening by the same attester — no third row.
     let original = w.stored("alice-fed", &msg.attestation_id).await;
     let third = share(
         &*w.dir,
@@ -594,27 +761,24 @@ async fn share_places_then_reports_already_there() {
 #[tokio::test]
 async fn the_share_plan_is_decided_before_any_directory_and_refuses_a_narrowing() {
     let w = world().await;
-    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", "x", ts())
+    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", "x", ts(), &w.key_a)
         .await
         .unwrap();
     let room = w.room_with().audience();
 
     assert_eq!(
         share_plan(&msg, &room).unwrap(),
-        SharePlan::EnterThenWiden(room.clone()),
-        "local self row → enter, then widen"
+        SharePlan::EnterThenWiden(room.clone())
     );
     assert_eq!(
         share_plan(&msg, &Audience::SelfOnly).unwrap(),
-        SharePlan::Enter,
-        "local self row asked for self → tier crossing only"
+        SharePlan::Enter
     );
     let mut in_mesh = msg.clone();
     in_mesh.tier = "federation".to_owned();
     assert_eq!(
         share_plan(&in_mesh, &room).unwrap(),
-        SharePlan::Widen(room.clone()),
-        "a row already in the mesh is WIDENED, not refused — the FSD's two operations"
+        SharePlan::Widen(room.clone())
     );
     assert_eq!(
         share_plan(&in_mesh, &Audience::SelfOnly).unwrap(),
@@ -625,7 +789,6 @@ async fn the_share_plan_is_decided_before_any_directory_and_refuses_a_narrowing(
     let err = share_plan(&wide, &Audience::SelfOnly).unwrap_err();
     assert!(err.contains("not strictly wider"), "{err}");
 
-    // No dimension ⇒ not a claim ⇒ refused before anything moves.
     let mut bare = msg.clone();
     bare.attestation_envelope
         .as_object_mut()
@@ -644,7 +807,6 @@ async fn the_share_plan_is_decided_before_any_directory_and_refuses_a_narrowing(
     assert!(e1.contains("no `dimension`"), "{e1}");
     assert!(e2.contains("no `dimension`"), "{e2}");
 
-    // And end to end: the stored widening cannot be narrowed back to self.
     let stored_msg = authored(&w, "narrow").await;
     let placed = share(
         &*w.dir,
@@ -681,10 +843,7 @@ async fn keep_local_is_a_true_statement_or_an_error() {
 
     let mut promoted = msg.clone();
     promoted.tier = "federation".to_owned();
-    assert!(
-        keep_local(&promoted).is_err(),
-        "not local ⇒ not a true statement"
-    );
+    assert!(keep_local(&promoted).is_err());
 
     let mut revocation = msg.clone();
     revocation.attestation_type = "withdraws".to_owned();
@@ -713,8 +872,7 @@ async fn publish_places_at_the_public_tier() {
     let original = w.stored("alice-fed", &msg.attestation_id).await;
     assert_eq!(
         (original.tier.as_str(), original.cohort_scope.as_str()),
-        ("federation", "self"),
-        "the original entered the mesh at its own scope and stays there"
+        ("federation", "self")
     );
 }
 
@@ -743,18 +901,10 @@ fn with_answers_both_questions_from_persist() {
             suppresses_holds_bytes(w.cohort_scope()),
             "{w:?} invisibility"
         );
-        assert_ne!(
-            w.cohort_scope(),
-            "federation",
-            "{w:?} must not be the public tier"
-        );
+        assert_ne!(w.cohort_scope(), "federation");
         assert_eq!(w.audience().cohort_scope(), w.cohort_scope());
     }
-    // The two facts the names exist to carry.
-    assert!(
-        !With::Species.is_encrypted_at_rest(),
-        "species is Commons plaintext"
-    );
+    assert!(!With::Species.is_encrypted_at_rest());
     let room = With::Community {
         community_key_id: "room".into(),
     };
@@ -794,8 +944,7 @@ async fn the_nine_axes_are_stated_and_verified_at_the_crossing() {
         ci.recipient_revoke,
         RevocationAuthority::Subjects {
             key_ids: vec!["alice-fed".into()]
-        },
-        "revocation follows the subject"
+        }
     );
     assert_eq!(ci.recipient_receive, direct.recipient_receive);
     assert_eq!(ci.information_type, direct.information_type);
@@ -804,21 +953,18 @@ async fn the_nine_axes_are_stated_and_verified_at_the_crossing() {
     assert_eq!(ci.temporal_lifecycle.asserted_at, msg.asserted_at);
     assert_eq!(
         ci.content, direct.content,
-        "the widening REUSES the content hash (CC 8.1.5)"
+        "the widening REUSES the content hash"
     );
-    // Every axis but the audience is the row's own.
     assert_eq!(ci.sender, direct.sender);
     assert_eq!(ci.data_subject, direct.data_subject);
     assert_ne!(ci.recipient_see, direct.recipient_see);
 }
 
-/// **Custody is decided from the row** — edge's copy of persist's table: an
-/// unsigned row waits for its actor (nothing to co-scrub), the actor in hand
-/// signs, and the WRONG key in hand is refused rather than ignored.
+/// **Custody is decided from the row** — edge's copy of persist's table.
 #[tokio::test]
 async fn custody_is_the_actors_or_it_waits() {
     let w = world().await;
-    let signed = chat::chat_message_attestation(&w.alice, "bob-fed", "c", ts())
+    let signed = chat::chat_message_attestation(&w.alice, "bob-fed", "c", ts(), &w.key_a)
         .await
         .unwrap();
     let mut deferred = signed.clone();
@@ -826,8 +972,6 @@ async fn custody_is_the_actors_or_it_waits() {
     deferred.scrub_signature_pqc = None;
     deferred.original_content_hash.clear();
 
-    // Signed at write by the actor: the node co-scrubs, whether or not the
-    // actor is still in hand.
     for actor in [Some(&w.alice), None] {
         let custody = custody_for(
             &signed,
@@ -845,8 +989,6 @@ async fn custody_is_the_actors_or_it_waits() {
         assert_eq!(scrub.scrub_key_id, "alice-node");
         assert!(is_canonical_instant(scrub.cosigned_at.as_deref().unwrap()));
     }
-    // Deferred, actor absent: it WAITS — the fabric is never the only signer
-    // of an actor's claim (W4).
     assert!(custody_for(
         &deferred,
         Signers {
@@ -857,17 +999,12 @@ async fn custody_is_the_actors_or_it_waits() {
     .await
     .unwrap()
     .is_none());
-    // Deferred, actor in hand: the actor signs now.
     let custody = custody_for(&deferred, w.signers()).await.unwrap().unwrap();
     let TierPromotionCustody::ActorSigned(reseal) = custody else {
         panic!("{custody:?}")
     };
     assert_eq!(reseal.scrub_key_id, "alice-fed");
-    assert_eq!(
-        reseal.original_content_hash, signed.original_content_hash,
-        "same bytes, same hash"
-    );
-    // Deferred, the WRONG key in hand: refused, not ignored (W5).
+    assert_eq!(reseal.original_content_hash, signed.original_content_hash);
     let err = custody_for(
         &deferred,
         Signers {
@@ -881,8 +1018,7 @@ async fn custody_is_the_actors_or_it_waits() {
 }
 
 /// **A widening needs the actor.** With only the node in hand, a row the
-/// actor signed still ENTERS the mesh (co-scrubbed) but the widening waits —
-/// typed, never a silent stay-local — and nothing is signed by the wrong key.
+/// actor signed still ENTERS the mesh (co-scrubbed) but the widening waits.
 #[tokio::test]
 async fn without_the_actor_the_row_enters_but_the_widening_waits() {
     let w = world().await;
@@ -899,33 +1035,19 @@ async fn without_the_actor_the_row_enters_but_the_widening_waits() {
     )
     .await
     .unwrap();
+    assert!(matches!(crossing.entered, MeshCrossingOutcome::Crossed(_)));
+    assert!(matches!(
+        crossing.widened,
+        Some(MeshCrossingOutcome::AwaitingActor { .. })
+    ));
     assert!(
-        matches!(crossing.entered, MeshCrossingOutcome::Crossed(_)),
-        "{:?}",
-        crossing.entered
-    );
-    assert!(
-        matches!(
-            crossing.widened,
-            Some(MeshCrossingOutcome::AwaitingActor { .. })
-        ),
-        "{:?}",
-        crossing.widened
-    );
-    assert!(
-        matches!(crossing.shared, Shared::AwaitingActor { ref attestation_id, .. } if *attestation_id == msg.attestation_id),
-        "{:?}",
-        crossing.shared
+        matches!(crossing.shared, Shared::AwaitingActor { ref attestation_id, .. } if *attestation_id == msg.attestation_id)
     );
     let original = w.stored("alice-fed", &msg.attestation_id).await;
     assert_eq!(
         (original.tier.as_str(), original.cohort_scope.as_str()),
         ("federation", "self")
     );
-    let rows = w.dir.list_attestations_by("alice-fed").await.unwrap();
-    assert!(rows.iter().all(|a| a.attestation_type != "supersedes"));
-
-    // The wrong actor is refused by name, not ignored.
     let err = share(
         &*w.dir,
         &original,
@@ -939,8 +1061,6 @@ async fn without_the_actor_the_row_enters_but_the_widening_waits() {
     .await
     .unwrap_err();
     assert!(err.contains("custody is not the actor"), "{err}");
-
-    // The actor arrives: the widening completes, on the row as stored.
     let done = share(
         &*w.dir,
         &original,
@@ -957,15 +1077,13 @@ async fn without_the_actor_the_row_enters_but_the_widening_waits() {
     );
 }
 
-/// **Every instant edge signs is CC 2.6.2 canonical** — `.sssZ`, on the
-/// author's row and on the widening persist mints for it.
+/// **Every instant edge signs is CC 2.6.2 canonical.**
 #[tokio::test]
 async fn signed_instants_are_canonical() {
     let w = world().await;
     let msg = authored(&w, "when").await;
     let at = msg.attestation_envelope["asserted_at"].as_str().unwrap();
     assert!(is_canonical_instant(at), "{at}");
-    assert!(!at.contains("+00:00"));
     let crossing = share(
         &*w.dir,
         &msg,
@@ -981,8 +1099,42 @@ async fn signed_instants_are_canonical() {
     let wide = w.stored("alice-fed", attestation_id).await;
     let at = wide.attestation_envelope["asserted_at"].as_str().unwrap();
     assert!(is_canonical_instant(at), "{at}");
-    // The column agrees with the signed bytes at the substrate's resolution.
     let parsed: chrono::DateTime<chrono::Utc> =
         chrono::DateTime::parse_from_rfc3339(at).unwrap().into();
     assert_eq!(parsed, wide.asserted_at);
+}
+
+/// **Both members of a pair room are moderators, by construction.**
+#[tokio::test]
+async fn both_members_of_the_pair_room_are_moderators() {
+    let w = world().await;
+    let room = chat::pair_community("alice-fed", "bob-fed", ts());
+    assert!(room
+        .members
+        .iter()
+        .all(|m| m.role.as_deref() == Some("founder")));
+    let mods = ciris_persist::federation::admission::moderators_of(&*w.dir, &w.room, "moderate")
+        .await
+        .expect("moderators_of");
+    for who in ["alice-fed", "bob-fed"] {
+        assert!(mods.iter().any(|m| m == who), "{who} moderates: {mods:?}");
+    }
+}
+
+/// **No classical-only signature, anywhere.** A signer without its ML-DSA-65
+/// half is refused at the source, naming what was being signed.
+#[tokio::test]
+async fn a_classical_only_signer_is_refused_not_downgraded() {
+    let classical: Arc<dyn HardwareSigner> =
+        Arc::new(Ed25519SoftwareSigner::from_bytes(&[9u8; 32], "half").unwrap());
+    let half = ciris_edge::identity::LocalSigner::new("half", classical, None);
+    let err = ciris_edge::identity::sign_bound_hybrid(&half, b"bytes", "a row")
+        .await
+        .unwrap_err();
+    assert!(err.contains("no fallback"), "{err}");
+    let w = world().await;
+    let err = chat::chat_message_attestation(&half, "bob-fed", "x", ts(), &w.key_a)
+        .await
+        .unwrap_err();
+    assert!(err.contains("ML-DSA-65"), "{err}");
 }

@@ -62,6 +62,21 @@ impl FedKey {
         B64.encode(self.signer().public_key().expect("pubkey"))
     }
 
+    /// The PQC half. Same seed with a byte flipped, so the fixture stays
+    /// deterministic while the two keys stay distinct. Every signature is the
+    /// FULL hybrid (v19.0.0: no classical-only fallback).
+    fn pqc_signer(&self) -> ciris_keyring::MlDsa65SoftwareSigner {
+        let mut seed = self.seed;
+        seed[0] ^= 0x55;
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&seed, format!("{}-pqc", self.key_id))
+            .expect("ml_dsa_65 from seed")
+    }
+
+    fn pqc_pubkey_b64(&self) -> String {
+        use ciris_keyring::PqcSigner as _;
+        B64.encode(futures::executor::block_on(self.pqc_signer().public_key()).expect("pqc pubkey"))
+    }
+
     fn write_seed_dir(&self, base: &std::path::Path) -> PathBuf {
         let dir = base.join(format!("seed-{}", self.key_id));
         std::fs::create_dir_all(&dir).expect("create seed dir");
@@ -79,7 +94,8 @@ impl FedKey {
         })
         .await
         .expect("load_local_seed");
-        Arc::new(LocalSigner::new(self.key_id.clone(), classical, None))
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(self.pqc_signer());
+        Arc::new(LocalSigner::new(self.key_id.clone(), classical, Some(pqc)))
     }
 }
 
@@ -94,7 +110,7 @@ fn signed_record(subject: &FedKey, signer: &FedKey, identity_type: &str) -> KeyR
     KeyRecord {
         key_id: subject.key_id.clone(),
         pubkey_ed25519_base64: subject.pubkey_b64(),
-        pubkey_ml_dsa_65_base64: None,
+        pubkey_ml_dsa_65_base64: Some(subject.pqc_pubkey_b64()),
         algorithm: "hybrid".to_string(),
         identity_type: identity_type.to_string(),
         identity_ref: subject.key_id.clone(),
@@ -594,10 +610,14 @@ async fn build_signed_envelope_from_software_signer_drives_trust_gate() {
     let seed = [0xAAu8; 32];
     let mut sw = Ed25519SoftwareSigner::new("remote-peer");
     sw.import_key(&seed).expect("import seed");
+    // The FULL hybrid (v19.0.0: no classical-only fallback) — the PQC half
+    // is the fixture's, so it matches the ML-DSA pubkey its record registers.
+    let pqc: Arc<dyn ciris_keyring::PqcSigner> =
+        Arc::new(FedKey::new("remote-peer", 0xAA).pqc_signer());
     let signer = LocalSigner::new(
         "remote-peer".to_string(),
         Arc::new(sw) as Arc<dyn ciris_keyring::HardwareSigner>,
-        None,
+        Some(pqc),
     );
 
     // Build → sign → serialize: byte-for-byte what

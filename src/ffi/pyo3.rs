@@ -9851,6 +9851,8 @@ mod pyo3_tier2_tests {
     /// outbound-queue FK to `federation_keys` resolves (V007 schema).
     /// A scrub-signed self-row for the signer's key_id is inserted so
     /// durable enqueues pass the FK check.
+    // Test fixture: seeds both key records (hybrid, v19.0.0) and builds the edge.
+    #[allow(clippy::too_many_lines)]
     async fn build_test_edge() -> (Arc<Edge>, Arc<dyn OutboundHandle>) {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -9915,7 +9917,21 @@ mod pyo3_tier2_tests {
             let record = KeyRecord {
                 key_id: key_id.to_string(),
                 pubkey_ed25519_base64: pubkey_b64,
-                pubkey_ml_dsa_65_base64: None,
+                // v19.0.0 — every fixture row carries the ML-DSA-65 pubkey:
+                // every signature is the FULL hybrid, both-or-neither.
+                pubkey_ml_dsa_65_base64: Some(B64.encode({
+                    use ciris_keyring::PqcSigner as _;
+                    let mut pqc_seed = key_seed;
+                    pqc_seed[0] ^= 0x55;
+                    ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                        &pqc_seed,
+                        format!("{key_id}-pqc"),
+                    )
+                    .expect("ml_dsa_65 from seed")
+                    .public_key()
+                    .await
+                    .expect("pqc pubkey")
+                })),
                 algorithm: "hybrid".to_string(),
                 identity_type: "steward".to_string(),
                 identity_ref: key_id.to_string(),
@@ -9944,7 +9960,13 @@ mod pyo3_tier2_tests {
         }
 
         let queue: Arc<dyn OutboundHandle> = backend.clone();
-        let signer = Arc::new(LocalSigner::new("py-tier2-edge", classical, None));
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new({
+            let mut pqc_seed = [0x77u8; 32];
+            pqc_seed[0] ^= 0x55;
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&pqc_seed, "py-tier2-edge-pqc")
+                .expect("ml_dsa_65 from seed")
+        });
+        let signer = Arc::new(LocalSigner::new("py-tier2-edge", classical, Some(pqc)));
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let edge = Edge::builder()
             .directory(backend.clone() as Arc<dyn VerifyDirectory>)

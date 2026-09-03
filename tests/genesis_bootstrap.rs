@@ -79,7 +79,15 @@ async fn local_signer(tmp: &Path, key_id: &str) -> Arc<LocalSigner> {
     })
     .await
     .expect("load_local_seed");
-    Arc::new(LocalSigner::new(key_id.to_string(), classical, None))
+    // The FULL hybrid (v19.0.0: no classical-only fallback) — the PQC half
+    // from the same fixed seed with a byte flipped.
+    let mut pqc_seed = [0x42u8; 32];
+    pqc_seed[0] ^= 0x55;
+    let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+        ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&pqc_seed, format!("{key_id}-pqc"))
+            .expect("ml_dsa_65 from seed"),
+    );
+    Arc::new(LocalSigner::new(key_id.to_string(), classical, Some(pqc)))
 }
 
 async fn build_edge(
