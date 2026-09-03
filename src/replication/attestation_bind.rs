@@ -1162,14 +1162,16 @@ async fn widen(
             }
         }
     };
-    let mut input = crossing::build_widening(prior, wider, &[])
+    // ONE instant for both the act (`widened_at`, signed — persist v40.0.0 /
+    // CIRISPersist#801) and whatever `stamp_and_canonicalize` still fills, so
+    // the placement time is recorded once while the CLAIM's `asserted_at` is
+    // carried verbatim off the prior rather than re-minted.
+    let now = chrono::Utc::now();
+    let mut input = crossing::build_widening(prior, wider, &[], now)
         .map_err(|e| format!("build_widening({}): {e}", prior.attestation_id))?;
-    let canonical = attestation_emit::stamp_and_canonicalize(
-        &mut input,
-        &prior.attesting_key_id,
-        chrono::Utc::now(),
-    )
-    .map_err(|e| format!("stamp widening of {}: {e}", prior.attestation_id))?;
+    let canonical =
+        attestation_emit::stamp_and_canonicalize(&mut input, &prior.attesting_key_id, now)
+            .map_err(|e| format!("stamp widening of {}: {e}", prior.attestation_id))?;
     let sig = crate::identity::sign_hybrid_raw(signer, &canonical, "audience widening").await?;
     let (row, _emitted) =
         attestation_emit::assemble(prior.attesting_key_id.clone(), &canonical, sig, input)

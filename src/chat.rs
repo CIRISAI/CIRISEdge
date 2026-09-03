@@ -23,10 +23,13 @@
 //! about storage; it is the message. The body of every message is sealed
 //! under the room's MLS **record secret** ([`RoomKey`], the group's exporter
 //! for records) with XChaCha20-Poly1305, keyed through HKDF over the room,
-//! the author and the epoch (NOT the signed instant: a widening re-stamps
-//! `asserted_at`, and the widened row must open with the same ciphertext) —
-//! so a ciphertext moved to another author's row, another room, or another
-//! epoch does not open. What crosses the wire, and what the
+//! the author, the claim's signed instant and the epoch — so a ciphertext
+//! lifted onto any other row does not open. (The instant became bindable in
+//! persist v40.0.0, which carries the CLAIM's `asserted_at` verbatim onto a
+//! widening and gives the placement its own `widened_at`; under v39.0.0 the
+//! widening re-stamped it, so the far end — which only ever receives the
+//! widening — could not have opened a message keyed on it.) What crosses the
+//! wire, and what the
 //! relay and every node that is not a member holds, is ciphertext inside a
 //! signed envelope. There is no plaintext producer.
 //!
@@ -306,13 +309,19 @@ impl RoomKey {
     }
 
     /// The body key: HKDF-SHA256 over the record secret, salted with the
-    /// room, bound to the author and the epoch. Deliberately NOT bound to the
-    /// signed instant: persist's `widen_audience` re-stamps `asserted_at` on
-    /// the `supersedes` row (a placement member) while carrying the body
-    /// verbatim, and the widened row — the one a peer receives — must open.
-    /// Per-message uniqueness is the AEAD nonce.
-    fn body_key(&self, room: &str, author: &str) -> Result<[u8; 32], String> {
-        let info = format!("{SEAL_KDF_INFO}\n{author}\n{}", self.epoch);
+    /// room, bound to the author, the claim's signed instant and the epoch.
+    ///
+    /// `asserted_at` is the CLAIM's instant, and binding it is what stops a
+    /// ciphertext being lifted onto another of the same author's rows in the
+    /// same room and epoch. It is only bindable from persist v40.0.0
+    /// (CIRISPersist#801): v39.0.0's `widen_audience` re-stamped
+    /// `asserted_at` on the `supersedes` row while copying the body verbatim,
+    /// so a key derived from it would have opened the author's own `self` row
+    /// and nothing else — and the widening is the only row a peer receives.
+    /// v40 carries the claim's instant verbatim and records the placement's
+    /// own time in a separate signed `widened_at`.
+    fn body_key(&self, room: &str, author: &str, asserted_at: &str) -> Result<[u8; 32], String> {
+        let info = format!("{SEAL_KDF_INFO}\n{author}\n{asserted_at}\n{}", self.epoch);
         let okm =
             ciris_crypto::kdf::hkdf_sha256(&self.secret, room.as_bytes(), info.as_bytes(), 32)
                 .map_err(|e| format!("hkdf: {e}"))?;
@@ -324,16 +333,22 @@ impl RoomKey {
 /// **Seal a body under the room's key.** Returns the base64 ciphertext for
 /// [`FIELD_BODY`] and the [`FIELD_SEALED`] header that opens it.
 ///
+/// `asserted_at` is the CLAIM's instant in its canonical rendering
+/// ([`render_signed_instant`](crate::replication::attestation_bind::render_signed_instant)) —
+/// exactly the string the row carries, and the same string persist copies
+/// onto the widening (v40.0.0).
+///
 /// # Errors
 /// KDF, RNG or AEAD failure.
 pub fn seal_body(
     key: &RoomKey,
     room: &str,
     author: &str,
+    asserted_at: &str,
     plaintext: &str,
 ) -> Result<(String, serde_json::Value), String> {
     use base64::Engine as _;
-    let k = key.body_key(room, author)?;
+    let k = key.body_key(room, author, asserted_at)?;
     let nonce_vec = ciris_crypto::random::bytes(ciris_crypto::xchacha::NONCE_LEN)
         .map_err(|e| format!("rng: {e}"))?;
     let nonce: [u8; ciris_crypto::xchacha::NONCE_LEN] = nonce_vec
@@ -354,7 +369,8 @@ pub fn seal_body(
 
 /// **Open a sealed body.** Refuses a foreign algorithm, a different epoch
 /// (a rotated room), a malformed nonce, and — by the AEAD tag — any
-/// ciphertext not sealed for exactly this room and author under this key.
+/// ciphertext not sealed for exactly this room, author and claim instant
+/// under this key.
 ///
 /// # Errors
 /// As described; the reason names which check failed.
@@ -362,6 +378,7 @@ pub fn open_body(
     key: &RoomKey,
     room: &str,
     author: &str,
+    asserted_at: &str,
     body_b64: &str,
     sealed: &serde_json::Value,
 ) -> Result<String, String> {
@@ -390,9 +407,9 @@ pub fn open_body(
         .try_into()
         .map_err(|_| "sealed.nonce is not 24 bytes".to_owned())?;
     let ct = b64.decode(body_b64).map_err(|e| format!("body: {e}"))?;
-    let k = key.body_key(room, author)?;
+    let k = key.body_key(room, author, asserted_at)?;
     let pt = ciris_crypto::xchacha::open(&k, &nonce, &ct).map_err(|_| {
-        "open failed: not sealed for this room and author under this key".to_owned()
+        "open failed: not sealed for this room, author and claim instant under this key".to_owned()
     })?;
     String::from_utf8(pt).map_err(|e| format!("body is not UTF-8: {e}"))
 }
@@ -510,8 +527,14 @@ pub async fn chat_message_attestation(
     asserted_at: chrono::DateTime<chrono::Utc>,
     key: &RoomKey,
 ) -> Result<Attestation, String> {
+    use crate::replication::attestation_bind::{
+        render_signed_instant, truncate_to_substrate_resolution,
+    };
     let room = pair_community_key_id(&author.key_id, recipient_key_id);
-    let (ciphertext, sealed) = seal_body(key, &room, &author.key_id, body)?;
+    // The instant the row will carry, rendered exactly as `chat_row` binds it
+    // — and, from persist v40.0.0, exactly what the widening carries too.
+    let at = render_signed_instant(truncate_to_substrate_resolution(asserted_at));
+    let (ciphertext, sealed) = seal_body(key, &room, &author.key_id, &at, body)?;
     let mut members = serde_json::Map::new();
     members.insert(FIELD_BODY.to_owned(), serde_json::json!(ciphertext));
     members.insert(
@@ -751,13 +774,26 @@ impl ChatMessage {
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| a.attesting_key_id.clone(), str::to_owned);
         let body_wire = env.get(FIELD_BODY).and_then(serde_json::Value::as_str)?;
+        // The CLAIM's instant — on a widening this is the prior's, carried
+        // verbatim (persist v40.0.0), so both rows open with one key.
+        let asserted_at_wire = env
+            .get(paths::ASSERTED_AT)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         let sealed = env.get(FIELD_SEALED);
         let body = match sealed {
             None => Body::Unopened {
                 reason: "the row carries no `sealed` header — a community row must be sealed"
                     .to_owned(),
             },
-            Some(sealed) => match open_body(key, room, &a.attesting_key_id, body_wire, sealed) {
+            Some(sealed) => match open_body(
+                key,
+                room,
+                &a.attesting_key_id,
+                asserted_at_wire,
+                body_wire,
+                sealed,
+            ) {
                 Ok(text) => Body::Text(text),
                 Err(reason) => Body::Unopened { reason },
             },
