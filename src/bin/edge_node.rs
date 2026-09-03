@@ -2586,7 +2586,9 @@ async fn run_chat_legs(occ: &Occurrence) {
         return;
     }
 
-    // Receiver: wait for the row to land, then read it the way a client would.
+    // Receiver: wait for the WIDENING — the `supersedes` the peer's share wrote
+    // at `community`, the only row this node is in the audience of — then read
+    // the room the way a client would.
     let dir: &dyn ciris_persist::federation::FederationDirectory = &*occ.directory;
     // The HUMAN speaks; the node is custody. Rows are listed by attester.
     let senders = vec![peer_owner.clone()];
@@ -2596,20 +2598,40 @@ async fn run_chat_legs(occ: &Occurrence) {
         .await_until(budget, || async {
             chat::messages_in_room(dir, &senders, &room)
                 .await
-                .is_ok_and(|m| !m.is_empty())
+                .is_ok_and(|m| m.iter().any(|x| x.widens.is_some()))
         })
         .await;
     let seen = chat::messages_in_room(dir, &senders, &room)
         .await
         .unwrap_or_default();
-    let ok = seen.iter().any(|m| {
-        m.body == CHAT_BODY && m.author_key_id == peer_owner && m.attesting_key_id == peer_owner
+    let widening_arrived = seen.iter().any(|m| {
+        m.widens.is_some()
+            && m.body == CHAT_BODY
+            && m.author_key_id == peer_owner
+            && m.attesting_key_id == peer_owner
     });
+    // CC 5.2 — the peer's `(federation, self)` copy must NOT be here: this
+    // node belongs to a different person. Read the RAW rows, because the room
+    // fold would hide a leaked self copy behind its widening — which is
+    // exactly how the first v19 run passed while leaking.
+    let leaked_self_rows: Vec<String> = dir
+        .list_attestations_by(&peer_owner)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| {
+            a.cohort_scope == ciris_persist::federation::types::cohort_scope::SELF
+                && chat::ChatMessage::from_row(a, &room).is_some()
+        })
+        .map(|a| a.attestation_id)
+        .collect();
+    let ok = widening_arrived && leaked_self_rows.is_empty();
     if !ok {
         tracing::error!(
             %room, waited_ms = outcome.waited().as_millis(), checks = outcome.checks(),
-            messages = seen.len(),
-            "no message from the peer arrived in the room within the budget"
+            messages = seen.len(), widening_arrived, leaked_self_rows = ?leaked_self_rows,
+            "the peer's WIDENING did not arrive in the room within the budget, or the \
+             peer's `self` copy leaked here (CC 5.2)"
         );
     }
     rep.ran(
@@ -2628,6 +2650,10 @@ async fn run_chat_legs(occ: &Occurrence) {
             })).collect::<Vec<_>>(),
             "expected_author": peer_owner,
             "expected_attested_by": peer_owner,
+            "widening_arrived": widening_arrived,
+            // CC 5.2 leak detector: the peer's `(federation, self)` copy is
+            // for the peer's OWN nodes; its presence here fails the leg.
+            "leaked_self_rows": leaked_self_rows,
             "peer_node": peer_node,
             "inbound": occ.inbound_stats.as_json(),
             "covers": "a community-scoped chat row ATTESTED AND SIGNED BY THE PEER'S HUMAN \

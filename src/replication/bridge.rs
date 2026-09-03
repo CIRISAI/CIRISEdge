@@ -1079,6 +1079,29 @@ struct AttestationSweepCtx {
     trace_pause_booked: bool,
     /// CIRISEdge#440 ask 3 — per-author quarantine standing.
     quarantine_memo: HashMap<String, QuarantineConsult>,
+    /// CC 5.2 (v19.0.0) — the per-sweep principal / cohort memo for the
+    /// AUDIENCE gate ([`FederationDirectoryReplicationBridge::audience_withholds`]).
+    audience: AudienceMemo,
+}
+
+/// CC 5.2 / CIRISConstitution#23 (v19.0.0) — what the AUDIENCE gate resolves,
+/// once per sweep per key: the PRINCIPAL behind a key (a person is their own;
+/// a node's or agent's is its owner — persist's `admission_identity_for_writer`,
+/// the same spelling AV-45 uses for a writer) and the cohorts an identity
+/// belongs to (persist's `list_families_for_member` /
+/// `list_communities_for_member`, the §4.3 predicate's own fan-out reads).
+/// `None` is "unresolved", and the gate fails closed on it.
+#[derive(Default)]
+struct AudienceMemo {
+    principals: HashMap<String, Option<String>>,
+    cohorts: HashMap<String, Option<CohortsOf>>,
+}
+
+/// The cohorts one identity is a member of, by id.
+#[derive(Clone, Default)]
+struct CohortsOf {
+    families: HashSet<String>,
+    communities: HashSet<String>,
 }
 
 /// CIRISEdge#531 DEPTH — the hard stop on a [`SweepWindow::Full`] drain.
@@ -3116,6 +3139,26 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                         );
                         return None;
                     }
+                    // CC 5.2 (v19.0.0) — the AUDIENCE gate's fetch twin: agrees
+                    // with the advertise, so a row is never offered-then-refused
+                    // nor fetchable-when-unoffered.
+                    if let Some(peer) = peer_key_id {
+                        if self
+                            .audience_withholds(
+                                Self::audience_of_row_value(inner),
+                                inner
+                                    .get("attesting_key_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or(""),
+                                peer,
+                                &mut AudienceMemo::default(),
+                                "fetch",
+                            )
+                            .await
+                        {
+                            return None;
+                        }
+                    }
                 }
             }
             if let Some(peer) = peer_key_id {
@@ -4484,10 +4527,22 @@ impl FederationDirectoryReplicationBridge {
     /// construction — the `#429` advertised-then-unfetchable shape is exactly
     /// what a second, subtly different gate path reintroduces.
     fn advertise_gate_view(att: &ciris_persist::federation::Attestation) -> serde_json::Value {
+        // v19.0.0 — the cohort a `family`/`community` row NAMES (persist's
+        // resolver over every alias; a split-brain row that names two comes
+        // back as an object the audience gate reads as "malformed" and
+        // withholds). One read per row, so the gate never re-walks aliases.
+        let cohort_target = match ciris_persist::federation::admission::envelope_cohort_target(
+            &att.attestation_envelope,
+        ) {
+            Ok(Some(t)) => serde_json::json!(t),
+            Ok(None) => serde_json::Value::Null,
+            Err(e) => serde_json::json!({ "malformed": e.to_string() }),
+        };
         serde_json::json!({
             "attesting_key_id": att.attesting_key_id,
             "attestation_type": att.attestation_type,
             "cohort_scope": att.cohort_scope,
+            "cohort_target": cohort_target,
             "attestation_envelope": {
                 "dimension": att.attestation_envelope.get("dimension"),
             },
@@ -5111,6 +5166,217 @@ impl FederationDirectoryReplicationBridge {
                 .is_some_and(|arr| arr.iter().any(|s| s.as_str() == Some(peer)))
     }
 
+    /// v19.0.0 — the AUDIENCE a row names (CC 4.5.1.1 `recipient_see`), read
+    /// off the advertise gate view. `Err` is malformed — an empty scope, a
+    /// `family`/`community` row naming no cohort, or aliases that disagree —
+    /// and the gate fails closed on it.
+    fn audience_of_view(
+        view: &serde_json::Value,
+    ) -> Result<ciris_persist::federation::Audience, String> {
+        let target = match view.get("cohort_target") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(t)) => Some(t.as_str()),
+            Some(other) => return Err(format!("cohort target malformed: {other}")),
+        };
+        ciris_persist::federation::Audience::from_cohort_scope(
+            Self::attestation_cohort_scope(view),
+            target,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// [`Self::audience_of_view`] over a WIRE row (the fetch twin parses the
+    /// bytes once and hands the bare `Attestation` value here).
+    fn audience_of_row_value(
+        inner: &serde_json::Value,
+    ) -> Result<ciris_persist::federation::Audience, String> {
+        let env = inner
+            .get("attestation_envelope")
+            .unwrap_or(&serde_json::Value::Null);
+        let target = ciris_persist::federation::admission::envelope_cohort_target(env)
+            .map_err(|e| e.to_string())?;
+        ciris_persist::federation::Audience::from_cohort_scope(
+            Self::attestation_cohort_scope(inner),
+            target,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// **CC 5.2 — the AUDIENCE gate, per recipient (v19.0.0).** Is `peer` in
+    /// the audience this row NAMES?
+    ///
+    /// | `cohort_scope` | served to `peer` iff |
+    /// |---|---|
+    /// | `self` | the principal behind the attester == the principal behind the peer — the owner's OWN node set (CIRISConstitution#23) |
+    /// | `family` | the peer, or its principal, is a member of the family the row names |
+    /// | `community` | the peer, or its principal, is a member of the community the row names |
+    /// | `affiliations` / `species` / `biosphere` / `federation` | always (the consent bound already applied) |
+    ///
+    /// # Why this exists
+    ///
+    /// Persist v39 admits `(federation, self)` at the crossing, so a
+    /// self-scoped row now EXISTS on the wire. The projection filter
+    /// ([`Self::attestation_is_advertised`], `SelfOwn`) decides whether THIS
+    /// node is the publisher of a row — producer-keyed and peer-blind, which is
+    /// right for the publish-own planes it was written for (a node's own key
+    /// record) and silent about WHO may receive a self row. Measured on the
+    /// first v19 mesh run: the owner's `self` copy of a chat message landed on
+    /// another person's node, because the owner's key is in this node's
+    /// publish set. The roster planes had this test since CIRISEdge#523
+    /// ([`Self::cohort_set_with_owners`]); the attestation rows did not.
+    ///
+    /// The walks are persist's — `admission_identity_for_writer` (the ONE
+    /// spelling of "the principal behind a key", the same AV-45 uses for a
+    /// writer) and `list_*_for_member` (the §4.3 predicate's own fan-out) —
+    /// memoized per sweep. Fail-closed: an unresolvable principal or
+    /// membership withholds, and every withhold is booked
+    /// (`RecipientNotInSendSet`) so the narrowing is never silent. Applied on
+    /// the advertise AND the direct-fetch twin, which must agree (the v18.2.0
+    /// lesson); the subject-Pull is first-party by construction and untouched.
+    async fn audience_withholds(
+        &self,
+        audience: Result<ciris_persist::federation::Audience, String>,
+        attester: &str,
+        peer: &str,
+        memo: &mut AudienceMemo,
+        site: &str,
+    ) -> bool {
+        use crate::observability::WithholdReason;
+        use ciris_persist::federation::Audience;
+        let audience = match audience {
+            Ok(a) => a,
+            Err(e) => {
+                self.withhold(
+                    WithholdReason::RecipientNotInSendSet,
+                    peer,
+                    &format!("{site}: audience unreadable — {e}"),
+                );
+                return true;
+            }
+        };
+        let served = match &audience {
+            Audience::SelfOnly => {
+                let row_owner = self.principal_of(attester, memo).await;
+                let peer_owner = self.principal_of(peer, memo).await;
+                matches!((row_owner, peer_owner), (Some(a), Some(b)) if a == b)
+            }
+            Audience::Family { family_key_id } => {
+                self.peer_in_cohort(peer, memo, |c| c.families.contains(family_key_id))
+                    .await
+            }
+            Audience::Community { community_key_id } => {
+                self.peer_in_cohort(peer, memo, |c| c.communities.contains(community_key_id))
+                    .await
+            }
+            Audience::Affiliations
+            | Audience::Species
+            | Audience::Biosphere
+            | Audience::Federation => true,
+        };
+        if !served {
+            self.withhold(
+                WithholdReason::RecipientNotInSendSet,
+                peer,
+                &format!(
+                    "{site}: peer is outside the row's audience (`{}`)",
+                    audience.cohort_scope()
+                ),
+            );
+            tracing::debug!(
+                peer,
+                attester,
+                audience = audience.cohort_scope(),
+                site,
+                "attestation withheld — the recipient is not in the row's audience \
+                 (CC 5.2: self = the owner's own nodes; family/community = members' nodes)"
+            );
+        }
+        !served
+    }
+
+    /// The principal behind `key`, memoized: a person is their own, a node's
+    /// or agent's is its owner. Persist's `admission_identity_for_writer`.
+    async fn principal_of(&self, key: &str, memo: &mut AudienceMemo) -> Option<String> {
+        if let Some(hit) = memo.principals.get(key) {
+            return hit.clone();
+        }
+        let out = match ciris_persist::federation::admission::admission_identity_for_writer(
+            &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+            key,
+        )
+        .await
+        {
+            Ok(principal) => Some(principal),
+            Err(e) => {
+                tracing::debug!(
+                    key,
+                    error = %e,
+                    "principal unresolved — the audience gate fails closed (CC 5.2)"
+                );
+                None
+            }
+        };
+        memo.principals.insert(key.to_owned(), out.clone());
+        out
+    }
+
+    /// Is `peer` — directly, or through its principal — a member of the cohort
+    /// `is_member` names? The #523 shape: the roster names persons, the peer is
+    /// a node.
+    async fn peer_in_cohort(
+        &self,
+        peer: &str,
+        memo: &mut AudienceMemo,
+        is_member: impl Fn(&CohortsOf) -> bool,
+    ) -> bool {
+        let mut ids = vec![peer.to_owned()];
+        if let Some(principal) = self.principal_of(peer, memo).await {
+            if principal != peer {
+                ids.push(principal);
+            }
+        }
+        for id in ids {
+            if self
+                .cohorts_of(&id, memo)
+                .await
+                .is_some_and(|c| is_member(&c))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The cohorts `id` belongs to, memoized — persist's own membership reads.
+    async fn cohorts_of(&self, id: &str, memo: &mut AudienceMemo) -> Option<CohortsOf> {
+        if let Some(hit) = memo.cohorts.get(id) {
+            return hit.clone();
+        }
+        let dir = &*self.directory;
+        let out = match (
+            dir.list_families_for_member(id).await,
+            dir.list_communities_for_member(id).await,
+        ) {
+            (Ok(families), Ok(communities)) => Some(CohortsOf {
+                families: families.into_iter().map(|f| f.family_key_id).collect(),
+                communities: communities
+                    .into_iter()
+                    .map(|c| c.community_key_id)
+                    .collect(),
+            }),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::debug!(
+                    id,
+                    error = %e,
+                    "cohort membership unresolved — the audience gate fails closed (CC 5.2)"
+                );
+                None
+            }
+        };
+        memo.cohorts.insert(id.to_owned(), out.clone());
+        out
+    }
+
     async fn resolve_attestation_recipient(&self, peer: &str) -> Option<ResolvedRecipient> {
         use crate::observability::WithholdReason;
         // CIRISEdge#524 — every withhold on this path names the peer it
@@ -5584,6 +5850,7 @@ impl FederationDirectoryReplicationBridge {
             trace_paused: self.trace_plane_paused().await,
             trace_pause_booked: false,
             quarantine_memo: HashMap::new(),
+            audience: AudienceMemo::default(),
         };
         let budget = self.sweep_page_budget().await;
         let mut refs = Vec::new();
@@ -5788,6 +6055,24 @@ impl FederationDirectoryReplicationBridge {
                         &canonical_json,
                         peer.as_str(),
                         &mut ctx.grant_cache,
+                    )
+                    .await
+                {
+                    continue;
+                }
+                // CC 5.2 (v19.0.0) — the AUDIENCE gate: a `self` row goes to
+                // the owner's own nodes, a `family`/`community` row to its
+                // members' nodes. See `audience_withholds`.
+                if self
+                    .audience_withholds(
+                        Self::audience_of_view(&canonical_json),
+                        canonical_json
+                            .get("attesting_key_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                        peer.as_str(),
+                        &mut ctx.audience,
+                        "advertise",
                     )
                     .await
                 {
@@ -14702,6 +14987,222 @@ pub(crate) mod tests {
                 .await
                 .is_empty(),
             "…and the same negative control holds"
+        );
+    }
+
+    // ─── CC 5.2 — the AUDIENCE gate on ATTESTATION rows (v19.0.0) ───────────
+    //
+    // Persist v39 admits `(federation, self)` at the crossing, so a self-scoped
+    // row now EXISTS on the wire — and the `SelfOwn` projection filter is
+    // producer-keyed and peer-blind (publish-own). Measured on the first v19
+    // mesh run: the owner's `self` copy of a chat message landed on ANOTHER
+    // person's node. These witnesses ask CC 5.2's question — is this peer one
+    // of the row owner's nodes / a member's node — on advertise AND fetch.
+
+    /// Alice with two nodes, Bob and Carol with one each, one stranger node
+    /// nobody owns. `node-alice-a` is the local node; every other node is
+    /// consent-included by it, so a withhold below can only be the audience
+    /// gate, never the #396 item-1 bound.
+    async fn audience_backend() -> Arc<MemoryBackend> {
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-alice", identity_type::USER),
+                ("person-bob", identity_type::USER),
+                ("person-carol", identity_type::USER),
+                ("node-alice-a", identity_type::NODE),
+                ("node-alice-b", identity_type::NODE),
+                ("node-bob", identity_type::NODE),
+                ("node-carol", identity_type::NODE),
+                ("node-stranger", identity_type::NODE),
+                ("room-authority", identity_type::AGENT),
+                ("chat-room", identity_type::AGENT),
+            ],
+        )
+        .await;
+        seed_owner_binding(&backend, "person-alice", "node-alice-a").await;
+        seed_owner_binding(&backend, "person-alice", "node-alice-b").await;
+        seed_owner_binding(&backend, "person-bob", "node-bob").await;
+        seed_owner_binding(&backend, "person-carol", "node-carol").await;
+        for peer in ["node-alice-b", "node-bob", "node-carol", "node-stranger"] {
+            seed_consent_membership(&backend, "node-alice-a", peer).await;
+        }
+        backend
+    }
+
+    /// The local node's bridge: its publish set is itself AND its owner, the
+    /// three-key shape the mesh harness runs (a person-attested row is
+    /// "produced here" because the person is this node's owner).
+    fn audience_bridge(backend: &Arc<MemoryBackend>) -> FederationDirectoryReplicationBridge {
+        let publish: Vec<String> = vec!["node-alice-a".into(), "person-alice".into()];
+        let selector: CohortProvider = Arc::new(move || publish.clone());
+        bridge_over(
+            backend,
+            &["node-alice-b", "node-bob", "node-carol", "node-stranger"],
+        )
+        .with_local_key_id(Some("node-alice-a".into()))
+        .with_self_provider(Some(selector))
+    }
+
+    async fn hash_of(backend: &MemoryBackend, id: &str) -> [u8; 32] {
+        let row = backend
+            .get_attestation(id)
+            .await
+            .expect("read")
+            .expect("seeded");
+        content_hash_of(&row).expect("hashable").0
+    }
+
+    async fn is_offered(
+        bridge: &FederationDirectoryReplicationBridge,
+        peer: &str,
+        hash: [u8; 32],
+    ) -> bool {
+        bridge
+            .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+            .await
+            .iter()
+            .any(|r| r.envelope_hash == hash)
+    }
+
+    /// A `self` row is the owner's own node set — nobody else's, and never
+    /// an unowned node's (fail-closed). Advertise and fetch agree.
+    #[tokio::test]
+    async fn self_scoped_attestation_is_served_only_to_the_owners_own_nodes() {
+        let backend = audience_backend().await;
+        let bridge = audience_bridge(&backend);
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &id,
+            "person-alice",
+            "person-alice",
+            "scores",
+            "self",
+            serde_json::json!({ "dimension": "chat:message:v1", "body": "mine" }),
+        )
+        .await;
+        let hash = hash_of(&backend, &id).await;
+
+        assert!(
+            is_offered(&bridge, "node-alice-b", hash).await,
+            "the owner's OTHER node is the audience of a self row"
+        );
+        assert!(
+            !is_offered(&bridge, "node-bob", hash).await,
+            "another person's node is NOT — this is the leak the first v19 mesh run showed"
+        );
+        assert!(
+            !is_offered(&bridge, "node-stranger", hash).await,
+            "an unowned node has no principal to match — fail-closed"
+        );
+        // The fetch twin agrees with the advertise (the v18.2.0 lesson).
+        assert!(bridge
+            .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some("node-alice-b"))
+            .await
+            .is_some());
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some("node-bob"))
+                .await
+                .is_none(),
+            "a self row is not fetchable by a non-owner's node either"
+        );
+    }
+
+    /// A `community` row goes to the members' nodes — through the owner axis
+    /// (#523), so a person-rostered room reaches the node the person runs —
+    /// and to nobody else's.
+    #[tokio::test]
+    async fn community_scoped_attestation_is_served_only_to_a_members_node() {
+        let backend = audience_backend().await;
+        // The pair-room shape the mesh harness authors: `unanimous`, so every
+        // member is an authority and the room has a live (zero-hop) moderator
+        // — persist refuses to federate an unmoderated community (§11.11).
+        let member = |key_id: &str| ciris_persist::federation::types::CommunityMember {
+            key_id: key_id.to_owned(),
+            joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+            role: None,
+        };
+        let room = Community {
+            community_key_id: "chat-room".to_owned(),
+            community_name: "alice <-> bob".to_owned(),
+            members: vec![member("person-alice"), member("person-bob")],
+            founded_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+            consensus_protocol: "unanimous".to_owned(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_community(sign_community_fixture("room-authority", room))
+            .await
+            .expect("seed room");
+        let bridge = audience_bridge(&backend);
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &id,
+            "person-alice",
+            "person-alice",
+            "scores",
+            "community",
+            serde_json::json!({
+                "dimension": "chat:message:v1",
+                "community_key_id": "chat-room",
+                "body": "for the room",
+            }),
+        )
+        .await;
+        let hash = hash_of(&backend, &id).await;
+
+        assert!(
+            is_offered(&bridge, "node-bob", hash).await,
+            "a member's node receives the room's rows"
+        );
+        assert!(
+            is_offered(&bridge, "node-alice-b", hash).await,
+            "the author's own other node is a member's node too"
+        );
+        assert!(
+            !is_offered(&bridge, "node-carol", hash).await,
+            "a non-member's node does not"
+        );
+        assert!(!is_offered(&bridge, "node-stranger", hash).await);
+        assert!(bridge
+            .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some("node-bob"))
+            .await
+            .is_some());
+        assert!(bridge
+            .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some("node-carol"))
+            .await
+            .is_none());
+    }
+
+    /// A `community` row that names NO community cannot be membership-tested
+    /// and is withheld from everyone — malformed is fail-closed, not
+    /// fail-open.
+    #[tokio::test]
+    async fn community_scoped_attestation_naming_no_cohort_is_withheld() {
+        let backend = audience_backend().await;
+        seed_community_with_member(&backend, "person-bob").await;
+        let bridge = audience_bridge(&backend);
+        let view = serde_json::json!({
+            "attesting_key_id": "person-alice",
+            "attestation_type": "scores",
+            "cohort_scope": "community",
+            "cohort_target": null,
+            "attestation_envelope": { "dimension": "chat:message:v1" },
+        });
+        let err = FederationDirectoryReplicationBridge::audience_of_view(&view)
+            .expect_err("a community placement names its cohort (AV-45)");
+        assert!(err.contains("community"), "{err}");
+        let mut memo = AudienceMemo::default();
+        assert!(
+            bridge
+                .audience_withholds(Err(err), "person-alice", "node-bob", &mut memo, "test")
+                .await,
+            "unreadable audience ⇒ withheld"
         );
     }
 

@@ -382,6 +382,29 @@ CIRISServer's non-vacuous-prefix guard exists to refuse.
   of a gate persist already runs at both doors — see §8 — so it is deliberately
   left where it is.
 
+**Added in v19.0.0 — what the substrate change made NEWLY possible, and what
+edge closed the same day.** Persist v39 admits `(federation, self)` at the
+crossing, so for the first time a `self`-scoped row exists on the wire.
+Edge's advertise projection for `SelfOwn` was producer-keyed and peer-blind —
+right for the publish-own planes it was built for, silent about who may
+RECEIVE a self row — and the first v19 mesh run showed the owner's `self`
+copy of a chat message on another person's node. `bridge.rs#audience_withholds`
+(advertise + fetch twin) now makes these impossible:
+
+* a `self` row reaching a node whose principal is not the row's principal
+  (CIRISConstitution#23: the owner's own node set, resolved through persist's
+  `admission_identity_for_writer`);
+* a `family` / `community` row reaching a node that is neither a member nor a
+  member's node (persist's `list_*_for_member`);
+* a `family` / `community` row that names no cohort, or a peer whose principal
+  cannot be resolved, being served at all (fail-closed, booked).
+
+Witnessed by `self_scoped_attestation_is_served_only_to_the_owners_own_nodes`
+and `community_scoped_attestation_is_served_only_to_a_members_node` on a real
+memory backend, and by the harness receiver, which now fails the leg on a
+leaked `self` copy rather than accepting any row with the right body.
+
+
 ## 5. Migration
 
 `share_encrypted_privately` / `share_clear_privately` / `share_publicly` stay,

@@ -73,12 +73,34 @@ A/V delivery producer) renders through persist's `render_signed_instant`
 `Utc::now()` can drop a row stamped "at" that instant by up to 1 ms —
 truncate the bound the way the producer truncates the row.
 
+## CC 5.2 — the AUDIENCE gate on attestation rows (found by the first v19 mesh run)
+
+Persist v39 admits `(federation, self)` at the crossing, so a self-scoped row
+now EXISTS on the wire — and edge's `SelfOwn` projection filter was
+producer-keyed and peer-blind (publish-own). Measured: the owner's `self` copy
+of a chat message landed on ANOTHER person's node; the receiver leg passed
+because it accepted any row with the right body. The roster planes had a
+per-peer owner-axis test since #523; the attestation rows did not.
+
+`bridge.rs#audience_withholds` now asks CC 5.2's question per recipient, on
+the advertise AND the direct-fetch twin: a `self` row is served only to nodes
+whose PRINCIPAL is the row's principal (persist's
+`admission_identity_for_writer` — a person is their own, a node's is its
+owner); a `family` / `community` row only to members' nodes (persist's
+`list_*_for_member`); a row naming no cohort, or a principal that will not
+resolve, is withheld and booked (`RecipientNotInSendSet`). Memoized per sweep.
+Witnessed on a real memory backend (self → the owner's other node only;
+community → members' nodes only; malformed → nobody). The harness receiver now
+requires the WIDENING and fails the leg on a leaked `self` copy
+(`leaked_self_rows` in the census).
+
 ## Mesh harness
 
 `ladder.send_message` now authors with the OWNER's signer, shares with
 `Signers { node, actor: Some(owner) }`, reports the whole `Crossing` (nine
 axes, both outcomes, `routes_to`) in the census, and the receiver expects the
-row ATTESTED BY THE PEER'S HUMAN — the widening — keyed on the sender's id.
+row ATTESTED BY THE PEER'S HUMAN — the widening — keyed on the sender's id,
+and reports any leaked `self` copy.
 
 Pins: ciris-persist v39.0.0 (`>=39,<40` wheel floor), CIRISVerify v14.1.0
 (unchanged, one copy), leviculum v0.24.0+ciris.1 (unchanged).
