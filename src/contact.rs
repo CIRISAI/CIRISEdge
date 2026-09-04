@@ -321,7 +321,13 @@ pub enum ContactInputSource {
 /// Edge deliberately does not register it: admission is the host's gate
 /// (`register_federation_key`), and edge is the substrate that hands it a
 /// verified, typed value rather than a string to re-parse.
+///
+/// `#[non_exhaustive]`: the fedcode format grows (v3 added owned nodes, then
+/// the #272 PQC commitment), and every one of those additions is something the
+/// host wants. Marking it here — while v20 is unadopted and edge is the only
+/// constructor — makes each future field a minor rather than a break.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CodeAdmission {
     /// The federation address to register the key under. Verified to be derived
     /// from `pubkey_ed25519_base64`.
@@ -346,6 +352,45 @@ pub struct CodeAdmission {
     /// already announces publicly. A code never carries group-scoped material,
     /// whose destinations are derived rather than emitted (CC 5.4.6).
     pub owned_nodes: Vec<CodeOwnedNode>,
+    /// CIRISVerify#272 (fedcode v3) — `sha256(ml_dsa_65_pubkey)`, lowercase
+    /// hex: the code's **commitment** to the post-quantum half of this
+    /// identity. `None` for a v1/v2 code and for a v3 code minted before #272.
+    ///
+    /// **The host cannot register this key without it.** A fedcode names an
+    /// Ed25519 key and nothing else, and persist takes `federation_keys`
+    /// writes only at `algorithm: "hybrid"` — so admitting a code means
+    /// admitting the classical half plus this digest, fetching the ML-DSA body
+    /// (1952 bytes; far past what a scannable code can carry), and binding the
+    /// two before the write. Without the commitment travelling this far, the
+    /// commitment support is inert at exactly the layer that needs it and
+    /// [`ContactResolution::ReadyFromCode`] stays unreachable in practice.
+    ///
+    /// **How to use it, in one line:** call
+    /// [`ciris_verify_core::fedcode::verify_pulled_ml_dsa_65_pubkey`] with
+    /// this [`CodeAdmission`]'s source code (or a reconstructed [`FedCode`])
+    /// and the pulled key, and register only on `Ok`. That check FAILS CLOSED
+    /// when the commitment is absent — a pulled PQC key with nothing to bind
+    /// it to must not be admitted, so a v1/v2 code is not a hybrid
+    /// registration path at all.
+    ///
+    /// **Trust level, stated plainly** (verify's own words): a fedcode is
+    /// unsigned, so this commitment inherits exactly the trust of the code
+    /// that carried it and adds no authority of its own. What it buys is that
+    /// the Key Pull cannot be substituted after the fact — the puller knows
+    /// the digest before it asks. The classical and PQC halves are not
+    /// cross-signed by anyone; joint control is proven at FIRST USE instead,
+    /// because persist admits hybrid rows only and every row must verify under
+    /// both signatures.
+    ///
+    /// The pull this implies is a resource cost, and it is bounded the same
+    /// way every other body fetch is: it rides the existing missing-signer
+    /// recovery queue rather than a fresh unbounded path (see the
+    /// `FetchOnMiss::No` note in [`resolve_contact`]), and a hybrid-pending
+    /// key is an unadmitted stranger — never a pending resource this node owes
+    /// work to.
+    ///
+    /// [`FedCode`]: ciris_verify_core::fedcode::FedCode
+    pub ml_dsa_65_pubkey_sha256: Option<String>,
 }
 
 /// One node a code names, with the material to reach it.
@@ -449,6 +494,10 @@ pub fn parse_contact_input(raw: &str) -> Result<ContactCandidate, LadderStall> {
                     transport_pubkey_ed25519_base64: n.transport_pubkey_ed25519_base64,
                 })
                 .collect(),
+            // CIRISVerify#272 — carried through rather than dropped here: the
+            // host is the one that registers, so the host is the one that must
+            // be able to bind the pulled PQC half to what the code promised.
+            ml_dsa_65_pubkey_sha256: decoded.ml_dsa_65_pubkey_sha256,
         }),
     })
 }
@@ -1219,14 +1268,10 @@ impl DirectoryLens for PersistLens<'_> {
         let Some(replication) = self.replication.as_ref() else {
             return false;
         };
-        // Under `Bodies` the signer's Key body replicates on its own and #544
-        // admits the row later, so queueing would ask for something already in
-        // flight.
-        if !crate::replication::retention::should_note_missing_signer(
-            replication.retention(crate::replication::protocol::EnvelopeKind::Key),
-        ) {
-            return false;
-        }
+        // CIRISEdge#568 — no retention gate. A contact lookup that cannot
+        // resolve a key wants that key regardless of how this node stores
+        // bodies; see `note_missing_signer` for why the storage mode was never
+        // the right predicate.
         // No delivering peer — a contact lookup is not repairing a row someone
         // sent us — so the name is recorded UNROUTED and offered to successive
         // peers until a CONFERRED one answers. That works because of the axis-3
@@ -1547,6 +1592,7 @@ mod tests {
             alias_hint: Some("Frank".to_string()),
             group_key_id: None,
             owned_nodes: Vec::new(),
+            ml_dsa_65_pubkey_sha256: None,
         })
         .expect("encode");
         (code, key_id)
@@ -1653,6 +1699,7 @@ mod tests {
                 alias_hint: None,
                 group_key_id: None,
                 owned_nodes: Vec::new(),
+                ml_dsa_65_pubkey_sha256: None,
             };
             match super::verify_code_binds_its_key(&hand_crafted) {
                 Err(LadderStall::MalformedCode { detail }) => {
@@ -1724,6 +1771,7 @@ mod tests {
             alias_hint: Some("Totally The Victim".to_string()),
             group_key_id: None,
             owned_nodes: Vec::new(),
+            ml_dsa_65_pubkey_sha256: None,
         })
         .expect("a forgery encodes perfectly well — that is the point");
 
@@ -1830,6 +1878,7 @@ mod tests {
                 key_id: "their-laptop-abc234def5".to_string(),
                 transport_pubkey_ed25519_base64: b64.encode([9u8; 32]),
             }],
+            ml_dsa_65_pubkey_sha256: None,
         })
         .expect("encode");
 
@@ -1895,6 +1944,7 @@ mod tests {
                 alias_hint: None,
                 group_key_id: None,
                 owned_nodes: Vec::new(),
+                ml_dsa_65_pubkey_sha256: None,
             })
             .expect("encode");
 
@@ -1957,6 +2007,7 @@ mod tests {
             alias_hint: None,
             group_key_id: None,
             owned_nodes: Vec::new(),
+            ml_dsa_65_pubkey_sha256: None,
         })
         .expect("encode");
 
@@ -2005,6 +2056,7 @@ mod tests {
             alias_hint: None,
             group_key_id: Some(key_id.clone()),
             owned_nodes: Vec::new(),
+            ml_dsa_65_pubkey_sha256: None,
         })
         .expect("encode");
 
@@ -2049,6 +2101,7 @@ mod tests {
             alias_hint: None,
             group_key_id: None,
             owned_nodes: Vec::new(),
+            ml_dsa_65_pubkey_sha256: None,
         })
         .expect("encode");
 
@@ -2086,6 +2139,7 @@ mod tests {
             alias_hint: None,
             group_key_id: None,
             owned_nodes: Vec::new(),
+            ml_dsa_65_pubkey_sha256: None,
         })
         .expect("encode");
 

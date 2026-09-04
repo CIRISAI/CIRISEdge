@@ -2050,26 +2050,15 @@ mod tests {
         );
     }
 
-    /// FSD-SIGNER-RECOVERY invariant 7 — recovery never runs under
-    /// `Retention::Bodies`.
-    ///
-    /// There the signer's Key body replicates on its own and #544 admits the row
-    /// on a later round, so recording a name would schedule a Pull for something
-    /// already in flight.
-    #[test]
-    fn nothing_is_recorded_for_recovery_under_bodies_retention() {
-        use crate::replication::retention::{should_note_missing_signer, Retention};
-        assert!(
-            !should_note_missing_signer(Retention::Bodies),
-            "under Bodies the Key body arrives on its own — recovery would be \
-             duplicate work"
-        );
-        assert!(
-            should_note_missing_signer(Retention::HashFirst),
-            "under HashFirst it never arrives, which is the whole reason \
-             recovery exists"
-        );
-    }
+    // FSD-SIGNER-RECOVERY invariant 7 ("recovery never runs under
+    // `Retention::Bodies`") was RETIRED by CIRISEdge#568 — see
+    // `bridge::tests::a_bodies_node_records_a_missing_signer`. It rested on
+    // "the Key body replicates on its own", which is true and was never the
+    // question: it replicates on another coordinator's cadence, and the
+    // measured cost of waiting was one to three anti-entropy rounds on the
+    // critical path of every first contact. The predicate is now a property of
+    // the row, not of the storage mode, so there is no pure function left to
+    // assert here.
 
     /// CIRISEdge#552 — a requested body that refuses TRANSIENTLY stays
     /// expected.

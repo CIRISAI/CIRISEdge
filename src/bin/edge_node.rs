@@ -157,6 +157,15 @@ use ciris_persist::store::sqlite::SqliteBackend;
 // Reporting — the honesty layer
 // ═══════════════════════════════════════════════════════════════════
 
+/// CIRISEdge#568 — how long the owner-binding convergence leg waits.
+///
+/// Capped well under the run's barrier so a genuinely stalled binding is
+/// reported as a red leg with a number rather than eating the budget the chat
+/// legs below still need.
+fn budget_owner_binding(barrier: Duration) -> Duration {
+    barrier.min(Duration::from_secs(120))
+}
+
 /// One measured or attempted leg of the harness.
 ///
 /// `ran` and `ok` are deliberately separate and `ok` is `Option`: a leg
@@ -959,7 +968,8 @@ async fn emit_owner_binding(
         "emitting owner binding"
     );
 
-    dir.put_attestation(ciris_persist::federation::SignedAttestation { attestation: att })
+    // persist v41.0.0 (#804) — this node signed the binding just above.
+    dir.put_attestation_authored(ciris_persist::federation::SignedAttestation { attestation: att })
         .await
         .map_err(|e| {
             // Name the refusal AT the source. Downstream this is a bare
@@ -1828,8 +1838,12 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
             &node_signer,
         )
         .await?;
+        // persist v41.0.0 (#804) — the consent grant is minted here, by this
+        // node's own signer, one statement up.
         directory
-            .put_attestation(ciris_persist::federation::SignedAttestation { attestation: grant })
+            .put_attestation_authored(ciris_persist::federation::SignedAttestation {
+                attestation: grant,
+            })
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -2456,7 +2470,10 @@ async fn share_in_room(
     signers: ciris_edge::replication::attestation_bind::Signers<'_>,
 ) -> Result<ciris_edge::replication::attestation_bind::Shared, String> {
     use ciris_edge::replication::attestation_bind::{share, CrossingBasis, Shared, With};
-    dir.put_attestation(ciris_persist::federation::SignedAttestation {
+    // persist v41.0.0 (#804) — the local `self` placement of a row this leg
+    // authored. The authored door is what makes a chat leg's own sends immune
+    // to the per-peer quota that #804 measured refusing 652 of 900 of them.
+    dir.put_attestation_authored(ciris_persist::federation::SignedAttestation {
         attestation: row.clone(),
     })
     .await
@@ -2523,6 +2540,64 @@ async fn run_chat_legs(occ: &Occurrence) {
         rep.not_run("ladder.send_message", "peer published no owner");
         return;
     };
+
+    // ── ladder.owner_binding_converged (CIRISEdge#568) ───────────────
+    //
+    // The announce race, MEASURED. Every leg below reads the peer's owner from
+    // `cfg.cohort_members` / the roster, so none of them has ever waited on the
+    // owner→node binding actually replicating — the race was produced on every
+    // run (standup authors the binding locally and it converges over the
+    // Attestation plane like any other row; the harness seeds nothing into a
+    // peer) and observed by nothing.
+    //
+    // #568 measured it out of band: 33 s in one direction and 90 s (three
+    // rounds) in the other for the same pair of announces, because the owner's
+    // Key and the binding that names it ride two independently-scheduled
+    // planes. This leg puts that number on the artifact, per direction, so a
+    // regression is a red cell instead of a slow run nobody attributes.
+    //
+    // The pass criterion NAMES THE ROW: `owner_of(peer_node)` must resolve to
+    // the peer owner the roster names. "Some owner resolved" would go green on
+    // this node's own binding.
+    {
+        let started = std::time::Instant::now();
+        let deadline = started + budget_owner_binding(cfg.barrier_timeout);
+        let mut resolved: Option<String> = None;
+        while std::time::Instant::now() < deadline {
+            resolved = ciris_persist::federation::admission::owner_of(&*occ.directory, &peer_node)
+                .await
+                .ok()
+                .flatten();
+            if resolved.as_deref() == Some(peer_owner.as_str()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let ok = resolved.as_deref() == Some(peer_owner.as_str());
+        if !ok {
+            tracing::error!(
+                peer = %peer_node,
+                expected_owner = %peer_owner,
+                got = ?resolved,
+                elapsed_ms,
+                "owner binding never converged — every fedID lookup against this \
+                 peer stops at owner_of => None (CIRISEdge#568)"
+            );
+        }
+        rep.ran(
+            "ladder.owner_binding_converged",
+            ok,
+            serde_json::json!({
+                // Per DIRECTION: this row is what THIS node learned about the
+                // PEER, and #568's two directions differed by 57 s.
+                "peer": peer_node,
+                "expected_owner": peer_owner,
+                "resolved_owner": resolved,
+                "elapsed_ms": elapsed_ms,
+            }),
+        );
+    }
     let room = chat::pair_community_key_id(&my_owner, &peer_owner);
     let founded_at: chrono::DateTime<chrono::Utc> =
         chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
@@ -2732,8 +2807,10 @@ async fn run_chat_legs(occ: &Occurrence) {
             let sealed = msg.attestation_envelope.get(chat::FIELD_SEALED).cloned();
             let crossing = {
                 use ciris_edge::replication::attestation_bind::{share, CrossingBasis, With};
+                // persist v41.0.0 (#804) — authored: this leg sealed and
+                // signed the message a few lines up.
                 occ.directory
-                    .put_attestation(ciris_persist::federation::SignedAttestation {
+                    .put_attestation_authored(ciris_persist::federation::SignedAttestation {
                         attestation: msg.clone(),
                     })
                     .await

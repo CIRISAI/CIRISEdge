@@ -144,7 +144,27 @@ Every name states which of the two round types it belongs to.
 4. **An expectation survives a round reset** until its own TTL expires.
 5. **A transiently-refused requested body stays expected.**
 6. **A third-party subject Pull is refused by the responder** (the anti-oracle rule).
-7. **Recovery never runs under `Retention::Bodies`** — there the Key body replicates on its own.
+7. ~~**Recovery never runs under `Retention::Bodies`** — there the Key body replicates on its own.~~
+   **RETIRED by CIRISEdge#568.** The premise held; the conclusion did not. The
+   Key body does replicate on its own — on a *different coordinator's cadence*,
+   with nothing ordering the Key and Attestation planes within a tick. So an
+   owner-binding is routinely delivered a round before the owner key that
+   verifies it, and the refusal is correctly transient but costs a full tick to
+   clear. Measured on the two-node chat ladder: 33 s in one direction, 90 s
+   (three rounds) in the other, for the same pair of announces — the largest
+   single item in a 3 min 33 s claim-to-message timeline, with the room's MLS
+   KeyPackage, Welcome and first message all queued behind it.
+
+   Worse, the gate was keyed on the Key plane's retention, and `ServeTier::None`
+   — what every ordinary claimed node runs at — is `Bodies`. Recovery was off in
+   precisely the common case and on only for conferred mesh servers.
+
+   Recovery now runs whenever a transient refusal names a key this node does not
+   hold, at every tier. The duplicate-pull cost this invariant was protecting
+   against is bounded by two properties that already existed: the pending set is
+   keyed by signer name (repeat notes are idempotent) and
+   `take_missing_signer_for` removes on take, so N refusals naming one key yield
+   one Pull — which *replaces* the tick's ordinary round rather than racing it.
 
 ## 7. Out of scope
 

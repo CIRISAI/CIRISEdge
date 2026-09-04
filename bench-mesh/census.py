@@ -71,6 +71,7 @@ EXPECTED = {
         "mesh.rooting",
         "ladder.discover",
         "ladder.discover_by_fedid",
+        "ladder.owner_binding_converged",
         "ladder.open_chat",
         "ladder.send_message",
         "cohort.join",
@@ -86,6 +87,7 @@ EXPECTED = {
         "mesh.rooting",
         "ladder.discover",
         "ladder.discover_by_fedid",
+        "ladder.owner_binding_converged",
         "ladder.open_chat",
         "ladder.send_message",
         "cohort.join",
@@ -878,6 +880,8 @@ def _golden():
             rows.append(_row(node, role, "ladder.discover_by_fedid"))
             # The pair chat runs on the publisher and the FIRST subscriber.
             if node in ("publisher", "sub-1"):
+                # CIRISEdge#568 — the announce race, per direction.
+                rows.append(_row(node, role, "ladder.owner_binding_converged"))
                 rows.append(_row(node, role, "ladder.open_chat"))
                 rows.append(_row(node, role, "ladder.send_message"))
     for leg in ["cohort.join", "scope.install", "perf.publish_fanout",

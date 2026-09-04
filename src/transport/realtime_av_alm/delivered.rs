@@ -548,8 +548,14 @@ pub async fn emit_delivered_observation(
     // Named exhaustively rather than `?`-discarded: `Ok(_) => Emitted` would
     // compile silently (`AttestationOutcome` is not `#[must_use]`) and would
     // report a fresh mint for a row that changed nothing.
+    // persist v41.0.0 (CIRISPersist#804) — this node BUILT and hybrid-signed
+    // the row four lines up (`build_delivery_row`), so it is published through
+    // the authored door: charged against this node's own ingest ceiling and
+    // opening no peer bucket. Metering the owner's own emission against the
+    // per-peer stranger quota is the exact bug #804 measured (652 of 900 chat
+    // sends refused), and this is edge's own production producer of the class.
     match directory
-        .put_attestation(SignedAttestation { attestation })
+        .put_attestation_authored(SignedAttestation { attestation })
         .await
         .map_err(|e| DeliveryEmitError::Submit(e.to_string()))?
     {

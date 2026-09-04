@@ -315,23 +315,44 @@ async fn r4_known_hashes_key_on_tier() {
     }
 }
 
-/// R5 — missing-signer recovery keys on the KEY plane's retention (itself
-/// Axis 3): queued under hash-first, self-resolving under bodies.
+/// R5 — missing-signer recovery is NOT decided by the tier (CIRISEdge#568).
+///
+/// It used to be: recovery keyed on the Key plane's retention, so a
+/// `Bodies` node never asked, on the reasoning that the key replicates on its
+/// own. It does — one to three anti-entropy rounds later, because the Key and
+/// Attestation planes run on independent coordinators with no ordering between
+/// them. #568 measured 33 s and 90 s for the two directions of the same pair of
+/// announces.
+///
+/// The decision left Axis 3 because the storage mode was never what it was
+/// about. The predicate is a property of the ROW — it named a key this node
+/// does not hold — and that is equally true at every tier. This row pins that
+/// the gauntlet's other axes cannot quietly re-acquire it.
 #[test]
-fn r5_missing_signer_recovery_keys_on_key_retention() {
+fn r5_missing_signer_recovery_is_not_decided_by_the_tier() {
+    // The symbol that carried the tier decision is GONE, not merely unused: a
+    // predicate that returns the same answer for every input is a lie waiting
+    // to mislead whoever reads it next. This row asserts the shape that
+    // replaced it — every tier records, so no tier can be starved of a key by
+    // its retention.
     for tier in ALL_TIERS {
         let configured = if tier.holds_hash_directory() {
             Retention::HashFirst
         } else {
             Retention::Bodies
         };
+        // Retention still decides what this node STORES...
         assert_eq!(
-            crate::replication::retention::should_note_missing_signer(configured),
-            tier.holds_hash_directory(),
-            "{tier:?}: under Bodies the signer's Key body replicates on its own \
-             and #544 admits the row later — queueing would duplicate work in \
-             flight"
+            crate::replication::retention::retention_for(
+                crate::replication::protocol::EnvelopeKind::Key,
+                configured,
+            ),
+            configured,
+            "{tier:?}: the Key plane still honours its configured retention"
         );
+        // ...and no longer decides whether it may ASK for a key it lacks.
+        // (`note_missing_signer` takes no retention input at all — the compile
+        // is the assertion.)
     }
 }
 
@@ -489,6 +510,7 @@ fn r12_fedcode_is_self_contained_and_binding_checked() {
         alias_hint: None,
         group_key_id: None,
         owned_nodes: Vec::new(),
+        ml_dsa_65_pubkey_sha256: None,
     })
     .expect("encode");
     let parsed = crate::contact::parse_contact_input(&code).expect("a good code decodes");
@@ -511,6 +533,7 @@ fn r12_fedcode_is_self_contained_and_binding_checked() {
         alias_hint: None,
         group_key_id: None,
         owned_nodes: Vec::new(),
+        ml_dsa_65_pubkey_sha256: None,
     })
     .expect("a forgery encodes fine");
     assert!(
@@ -560,7 +583,8 @@ async fn ladder_a_claim_alone_confers_no_tier() {
 fn the_matrix_symbols_compile() {
     let _: fn(ServeTier) -> bool = ServeTier::holds_hash_directory;
     let _: fn(ServeTier) -> bool = ServeTier::trusted_for_bootstrap;
-    let _: fn(Retention) -> bool = crate::replication::retention::should_note_missing_signer;
+    let _: fn(crate::replication::protocol::EnvelopeKind, Retention) -> Retention =
+        crate::replication::retention::retention_for;
     let _ = crate::replication::serve_tier::CachedServeTier::TTL;
     let _: &str = crate::replication::serve_policy::SERVE_ADVERTISE_POLICY_HASH;
 }

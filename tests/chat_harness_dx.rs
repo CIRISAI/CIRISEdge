@@ -73,6 +73,7 @@ fn the_stranger_contact_surface_matches_the_guide() {
         alias_hint: None,
         group_key_id: None,
         owned_nodes: Vec::new(),
+        ml_dsa_65_pubkey_sha256: None,
     })
     .expect("encode");
 
@@ -97,6 +98,7 @@ fn the_stranger_contact_surface_matches_the_guide() {
         alias_hint: None,
         group_key_id: None,
         owned_nodes: Vec::new(),
+        ml_dsa_65_pubkey_sha256: None,
     })
     .expect("a forgery encodes fine — the CRC cannot see authorship");
     assert!(
