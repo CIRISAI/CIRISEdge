@@ -2512,14 +2512,31 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         signer_key_id: &str,
         source_peer: Option<&str>,
     ) {
-        // Gated on the KEY plane's retention: the row that stalled can be any
-        // kind, but the row it waits on is always a Key. Under `Bodies` that
-        // body replicates on its own and #544 admits the row later.
-        if !crate::replication::retention::should_note_missing_signer(
-            self.retention(EnvelopeKind::Key),
-        ) {
-            return;
-        }
+        // CIRISEdge#568 — NOT gated on the Key plane's retention any more.
+        //
+        // This used to record only under `HashFirst`, on the reasoning that
+        // under `Bodies` the signer's Key body "replicates on its own and #544
+        // admits the row later, so queueing would ask for something already in
+        // flight". Every clause of that is true and the conclusion was still
+        // wrong: it treats SELF-RESOLVING as RESOLVED and never counted the
+        // wait. "In flight" means in flight on a DIFFERENT coordinator's
+        // cadence, and nothing orders the two — so an owner-binding can be
+        // delivered a full round before the owner key that verifies it.
+        // Measured on the two-node chat ladder: 33 s one direction, 90 s (three
+        // rounds) the other, the largest single item in a 3m33s claim-to-message
+        // timeline, with everything downstream of discovery waiting behind it.
+        //
+        // The honest predicate was never the storage mode. `HashFirst` means
+        // "never arrives", `Bodies` means "arrives, at a latency nobody
+        // bounded" — and both are the same fact about the ROW: it named a key
+        // this node does not hold. One targeted ask is the answer to that fact,
+        // so the ask is now a function of the unmet dependency.
+        //
+        // The duplicate-pull cost the old gate was avoiding is bounded by two
+        // properties that were already here: the pending set is keyed by signer
+        // NAME (a repeat note is idempotent), and `take_missing_signer_for`
+        // removes on take. One name yields one Pull per peer, and that Pull
+        // REPLACES the tick's ordinary round rather than racing it.
         // Third-party signers ARE queueable again: a conferred server answers
         // an identifier Pull for any subject on a public plane (ROLE_MATRIX
         // axis 3), so a name this node cannot resolve locally is reachable by
@@ -3281,7 +3298,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // `Refused` leaving this choke is counted per envelope kind (the #425
         // choke already logs it; now it is also a metrics-scrape fact). The
         // typed Key-plane token axis books inside `apply_key`.
-        let outcome = self.dispatch_apply(kind, envelope_bytes).await;
+        let outcome = self.dispatch_apply(kind, envelope_bytes, source_peer).await;
         // CIRISEdge#457 — the receive plane now books EVERY outcome at this
         // choke, not just refusals: an accepted apply (Admitted = new state)
         // and a duplicate (already held) are counted distinctly, so "applied
@@ -3823,10 +3840,21 @@ impl FederationDirectoryReplicationBridge {
     /// The per-kind apply dispatch behind the #425 choke —
     /// [`StateApplier::apply_envelope_bytes`] wraps this with the #426
     /// source-peer trace and the #565 refusal counter.
-    async fn dispatch_apply(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> ApplyOutcome {
+    ///
+    /// persist v41.0.0 (CIRISPersist#804) — `source_peer` is no longer only a
+    /// trace field: the Attestation plane hands it to the privileged SYNC door
+    /// so the peer on the other end of the session is the party metered. Every
+    /// other plane still ignores it; they are threaded the day they need it,
+    /// not speculatively.
+    async fn dispatch_apply(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+        source_peer: Option<&str>,
+    ) -> ApplyOutcome {
         match kind {
             EnvelopeKind::Key => self.apply_key(envelope_bytes).await,
-            EnvelopeKind::Attestation => self.apply_attestation(envelope_bytes).await,
+            EnvelopeKind::Attestation => self.apply_attestation(envelope_bytes, source_peer).await,
             EnvelopeKind::Revocation => {
                 let outcome = self.apply_revocation(envelope_bytes).await;
                 // CIRISEdge#430 — an ADMITTED revocation is the event-driven
@@ -6633,7 +6661,9 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    async fn apply_attestation(&self, bytes: &[u8]) -> ApplyOutcome {
+    /// persist v41.0.0 (CIRISPersist#804) — `source_peer` selects the write
+    /// door. See the `put_attestation*` call below for why it is safe to pass.
+    async fn apply_attestation(&self, bytes: &[u8], source_peer: Option<&str>) -> ApplyOutcome {
         // CIRISEdge#397 — the wire is now the BARE `Attestation` (the shape
         // persist's content-hash index/point-read serves), so deserialize that
         // first and re-wrap; fall back to the pre-v14.1 `SignedAttestation`
@@ -6680,7 +6710,36 @@ impl FederationDirectoryReplicationBridge {
                 // collapsed: upstream's own note is that folding `AlreadyHeld`
                 // back into `()` at a boundary would reproduce #771 one layer
                 // down, and edge's boundary is a boundary.
-                match self.directory.put_attestation(record).await {
+                // persist v41.0.0 (CIRISPersist#804) — the door is chosen
+                // by the ORIGIN of the call, which is a fact only this layer
+                // holds: the row itself cannot say how it arrived.
+                //
+                // An ATTRIBUTED receive goes through the privileged SYNC door
+                // naming the peer, because a sync carries rows authored by
+                // many parties and `put_attestation_authored` would claim this
+                // node wrote them. What edge vouches for is exactly what
+                // persist asks for and no more — *which identity its transport
+                // authenticated* — and `source` upstream is a vetted
+                // attribution by construction (`route_attributed_frame`), with
+                // the per-peer coordinator carrying it as the authenticated
+                // sender of everything it applies this round (#426).
+                //
+                // Handing over a peer id is not handing over a budget: persist
+                // answers `shares_cohort_with` from its OWN family/community
+                // rosters, and a peer with no shared cohort is metered exactly
+                // as `put_attestation` would meter it. So the privilege edge
+                // can confer is bounded by a fact edge does not get to assert
+                // — including for a #402 bootstrap-carve-out link, whose
+                // transport identity is authenticated but whose federation
+                // attribution is only advisory.
+                //
+                // An UNATTRIBUTED receive keeps the stranger door. Absence of
+                // attribution is not a reason to reach for a cheaper meter.
+                let put = match source_peer {
+                    Some(peer) => self.directory.put_attestation_synced(record, peer).await,
+                    None => self.directory.put_attestation(record).await,
+                };
+                match put {
                     Ok(AttestationOutcome::Inserted) => {
                         // A NEW row — the only outcome that can have moved a
                         // cached verdict, so the only one that invalidates.
@@ -10456,6 +10515,317 @@ pub(crate) mod tests {
                 .await
                 .is_empty(),
             "an unattributed Pull serves nothing"
+        );
+    }
+
+    /// A real, hybrid-signed, federation-tier attestation as the WIRE carries
+    /// it (CIRISEdge#397 — bare, not the `SignedAttestation` wrap).
+    fn fixture_federation_attestation_bytes(attesting_id: &str, attested_id: &str) -> Vec<u8> {
+        let now = Utc::now().trunc_subsecs(6);
+        let attestation_id = uuid::Uuid::new_v4().to_string();
+        let mut envelope = serde_json::json!({
+            "attesting_key_id": attesting_id,
+            "attested_key_id": attested_id,
+            "attestation_type": "delegates_to",
+        });
+        bind_attestation_envelope(
+            &mut envelope,
+            now,
+            &attestation_id,
+            attesting_id,
+            "delegates_to",
+            attested_id,
+            &[],
+            "federation",
+        );
+        let (hash, ed_sig, pqc_sig) = sign_attestation_envelope(attesting_id, &envelope);
+        let att = Attestation {
+            attestation_id,
+            attesting_key_id: attesting_id.to_string(),
+            attested_key_id: attested_id.to_string(),
+            attestation_type: "delegates_to".to_string(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: hash,
+            scrub_signature_classical: ed_sig,
+            scrub_signature_pqc: pqc_sig,
+            scrub_key_id: attesting_id.to_string(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            additional_scrubs: Vec::new(),
+            cohort_scope: "federation".to_string(),
+            tier: "federation".to_string(),
+            promoted_at: None,
+        };
+        serde_json::to_vec(&att).expect("serialize")
+    }
+
+    /// persist v41.0.0 / CIRISPersist#804 — **which write door edge selects**,
+    /// pinned the way the adoption issue (CIRISEdge#569) asks for it: by the
+    /// budget the door SELECTS, observable as `tracked_peers`, never by a
+    /// refusal count. A refusal count measures the burst window's refill, which
+    /// is why two of persist's own witnesses for this cut passed for the wrong
+    /// reason.
+    ///
+    /// The ordinary `put_attestation` door opens a per-peer bucket; both
+    /// privileged doors never do. So `tracked_peers` reads back edge's choice
+    /// directly, and it reads it through edge's OWN production entry point —
+    /// `StateApplier::apply_envelope_bytes`, the #425 choke — rather than by
+    /// calling persist's door and asserting the thing we just called.
+    ///
+    /// This matters because the source-peer thread is exactly the kind of
+    /// change that compiles perfectly while selecting the wrong door: the
+    /// argument is an `Option<&str>` that was previously only ever a trace
+    /// field, and nothing else in the signature would notice it going missing.
+    #[tokio::test]
+    async fn the_source_peer_selects_the_write_door() {
+        let attesting_id = "agent-door-attester";
+        let attested_id = "agent-door-subject";
+        let bytes = fixture_federation_attestation_bytes(attesting_id, attested_id);
+
+        // UNATTRIBUTED receive → the stranger door → a peer bucket opens.
+        {
+            let (backend, bridge) =
+                test_fixtures::make_bridge_with_keys(&[attesting_id, attested_id]).await;
+            assert_eq!(
+                backend
+                    .peer_quota_observation()
+                    .expect("the memory backend reports the quota")
+                    .tracked_peers,
+                0,
+                "precondition: nothing charged yet"
+            );
+            // The quota runs at tier 0, ahead of any signature check, so the
+            // apply's own verdict is not what this test is about.
+            let _outcome = bridge
+                .apply_envelope_bytes(EnvelopeKind::Attestation, &bytes, None)
+                .await;
+            assert_eq!(
+                backend
+                    .peer_quota_observation()
+                    .expect("observation")
+                    .tracked_peers,
+                1,
+                "an unattributed receive must keep the ordinary per-peer door — \
+                 absence of attribution is not a reason to reach for a cheaper \
+                 meter"
+            );
+        }
+    }
+
+    /// persist v41.0.0 / CIRISPersist#804 — **the sync door's privilege is
+    /// bounded by a fact edge does not get to assert.**
+    ///
+    /// The security-relevant half of the door change. Edge vouches for exactly
+    /// one thing: which identity its transport authenticated. Whether that
+    /// identity is a cohort-mate is persist's own question, answered from
+    /// persist's family and community rosters. So routing a stranger through
+    /// the privileged door cannot widen their budget — they fall back to
+    /// ordinary per-peer metering, bucket and all.
+    ///
+    /// Both directions are asserted here, because only the pair is meaningful:
+    /// a test that showed a cohort-mate skipping the bucket without showing a
+    /// stranger keeping it would be equally green if the door ignored cohort
+    /// membership entirely.
+    #[tokio::test]
+    async fn the_sync_doors_privilege_is_bounded_by_cohort_membership() {
+        let attesting_id = "agent-door-attester";
+        let attested_id = "agent-door-subject";
+        let bytes = fixture_federation_attestation_bytes(attesting_id, attested_id);
+
+        // ATTRIBUTED receive from a STRANGER → the sync door is selected, and
+        // persist's own bound applies: no shared cohort ⇒ metered exactly as
+        // the wire door meters it, bucket and all.
+        //
+        // This is the security-relevant half. Edge vouches only for which
+        // identity its transport authenticated; whether that identity is a
+        // cohort-mate is persist's question, answered from persist's rosters.
+        // So edge CANNOT widen a stranger's budget by routing them here, and
+        // this assertion is what would fail if that ever stopped being true.
+        {
+            let (backend, bridge) =
+                test_fixtures::make_bridge_with_keys(&[attesting_id, attested_id]).await;
+            backend.set_self_key_id(Some("node-us".to_owned()));
+            // The quota runs at tier 0, ahead of any signature check, so the
+            // apply's own verdict is not what this test is about.
+            let _outcome = bridge
+                .apply_envelope_bytes(EnvelopeKind::Attestation, &bytes, Some("peer-a-stranger"))
+                .await;
+            assert_eq!(
+                backend
+                    .peer_quota_observation()
+                    .expect("observation")
+                    .tracked_peers,
+                1,
+                "a peer sharing no cohort is metered as a stranger however it \
+                 was routed — the privilege edge can confer is bounded by a \
+                 fact edge does not get to assert"
+            );
+        }
+
+        // ATTRIBUTED receive from a COHORT-MATE → the privileged sync budget,
+        // and no peer bucket: #804's `tracked_peers > 0` signal corruption is
+        // precisely what that protects.
+        {
+            let (backend, bridge) =
+                test_fixtures::make_bridge_with_keys(&[attesting_id, attested_id]).await;
+            // Community members are PEOPLE — an agent member must be stewarded
+            // (`UnstewardedCommunityMember`), so both sides register as users.
+            for (who, what) in [
+                ("node-us", identity_type::USER),
+                ("peer-a-cohort-mate", identity_type::USER),
+                // `community_key_id` must itself exist in federation_keys.
+                ("community-door-test", identity_type::AGENT),
+            ] {
+                backend
+                    .put_public_key(SignedKeyRecord {
+                        record: fixture_key_record(who, what),
+                    })
+                    .await
+                    .expect("seed key");
+            }
+            backend.set_self_key_id(Some("node-us".to_owned()));
+            let room = "community-door-test";
+            let mut c = fixture_community(room, "node-us");
+            c.members.push(ciris_persist::federation::CommunityMember {
+                key_id: "peer-a-cohort-mate".to_string(),
+                joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                role: None,
+            });
+            backend
+                .put_community(sign_community_fixture("node-us", c))
+                .await
+                .expect("seed the shared room");
+            // The quota runs at tier 0, ahead of any signature check, so the
+            // apply's own verdict is not what this test is about.
+            let _outcome = bridge
+                .apply_envelope_bytes(
+                    EnvelopeKind::Attestation,
+                    &bytes,
+                    Some("peer-a-cohort-mate"),
+                )
+                .await;
+            assert_eq!(
+                backend
+                    .peer_quota_observation()
+                    .expect("observation")
+                    .tracked_peers,
+                0,
+                "a cohort-mate's bulk sync takes the privileged door — it carries \
+                 rows authored by many parties, so metering it per-peer is what \
+                 stalls a catch-up"
+            );
+        }
+
+        // And the authored door, which every edge PRODUCER now uses
+        // (delivered.rs's A/V rows, the harness's own sends): no bucket either.
+        {
+            let (backend, _bridge) =
+                test_fixtures::make_bridge_with_keys(&[attesting_id, attested_id]).await;
+            backend
+                .put_attestation_authored(SignedAttestation {
+                    attestation: serde_json::from_slice(&bytes).expect("the same row"),
+                })
+                .await
+                .expect("authored put");
+            assert_eq!(
+                backend
+                    .peer_quota_observation()
+                    .expect("observation")
+                    .tracked_peers,
+                0,
+                "a row this node signed is charged to the node ceiling alone — \
+                 metering the owner as a stranger refused 652 of 900 chat sends"
+            );
+        }
+    }
+
+    /// CIRISEdge#568 — a node holding BODIES records a missing signer.
+    ///
+    /// This is the regression the issue measured, and the reason it went
+    /// unnoticed for so long: recovery used to be gated on the Key plane's
+    /// retention, and the tier every ordinary claimed node runs at
+    /// (`ServeTier::None`) is `Bodies`. So the recovery machinery was switched
+    /// off in exactly the common case — two freshly claimed nodes announcing at
+    /// each other — and on only for conferred mesh servers.
+    ///
+    /// The justification was that under `Bodies` the key "replicates on its
+    /// own". It does. On a DIFFERENT coordinator's cadence, with nothing
+    /// ordering the two: #568 measured the same pair of announces taking 33 s
+    /// one direction and 90 s (three rounds) the other, because whether the
+    /// owner-binding beats the owner key is a per-direction coin toss.
+    ///
+    /// Asserted at both `Bodies` tiers, and with a THIRD-PARTY signer delivered
+    /// by a node — the owner key named by a node's owner-binding, which is the
+    /// exact shape #568 saw refused (`attesting_key_id … does not exist in
+    /// federation_keys`, retry transient).
+    #[tokio::test]
+    async fn a_bodies_node_records_a_missing_signer() {
+        use crate::replication::serve_tier::ServeTier;
+        for tier in [ServeTier::None, ServeTier::Canonical] {
+            let (_backend, bridge) = test_fixtures::make_bridge(&[]);
+            let bridge = bridge.with_serve_tier_for_test(tier);
+            assert_eq!(
+                bridge.retention(EnvelopeKind::Key),
+                crate::replication::retention::Retention::Bodies,
+                "{tier:?} is a Bodies tier — the premise of this test"
+            );
+
+            // The row that stalled is an owner-binding on the Attestation
+            // plane; the key it waits on is its OWNER's, delivered by the NODE.
+            bridge.note_missing_signer(
+                EnvelopeKind::Attestation,
+                "ciris-node-b-user-owner01",
+                Some("ciris-node-b"),
+            );
+
+            assert_eq!(
+                bridge.take_missing_signer_for("ciris-node-b").as_deref(),
+                Some("ciris-node-b-user-owner01"),
+                "{tier:?}: a Bodies node must record the key it could not \
+                 verify against — waiting for the next cadence tick is what \
+                 cost #568 a full round"
+            );
+        }
+    }
+
+    /// CIRISEdge#568 — a repeat note is IDEMPOTENT, so the removed retention
+    /// gate cannot have traded a latency bug for a pull storm.
+    ///
+    /// The gate's stated worry was "queueing would ask for something already in
+    /// flight". Two properties bound that, and both predate this change: the
+    /// pending set is keyed by signer NAME, and `take_missing_signer_for`
+    /// removes on take. N refusals naming one key yield ONE pull.
+    #[tokio::test]
+    async fn repeated_notes_for_one_signer_yield_one_pull() {
+        let (_backend, bridge) = test_fixtures::make_bridge(&[]);
+        let bridge =
+            bridge.with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::None);
+        for _ in 0..50 {
+            bridge.note_missing_signer(
+                EnvelopeKind::Attestation,
+                "ciris-node-b-user-owner01",
+                Some("ciris-node-b"),
+            );
+        }
+        assert_eq!(
+            bridge.tracked_missing_signers(),
+            1,
+            "fifty transient refusals naming one key are one outstanding ask"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("ciris-node-b").as_deref(),
+            Some("ciris-node-b-user-owner01")
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("ciris-node-b"),
+            None,
+            "and taking it removes it — the pull is not re-sent every tick"
         );
     }
 

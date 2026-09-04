@@ -216,7 +216,7 @@ conferral.
 | who consents / who is contactable | Axis 2 | `identity_type` via directory | ✅ correct (`contact::resolve`) |
 | retention: `Bodies` vs `HashFirst` | **Axis 3 = mesh server** | `serve_tier().holds_hash_directory()` | ✅ gauntlet R3 — a canonical holds BODIES, not a ladder |
 | record known-hashes from advertisements | Axis 3 = mesh server | `holds_hash_directory()` | ✅ gauntlet R4 |
-| queue a missing-signer recovery | Axis 3 = mesh server (via Key retention) | `should_note_missing_signer(retention)` | ✅ gauntlet R5 |
+| queue a missing-signer recovery | **none — a property of the ROW**, not a tier | the row named a key this node does not hold (any transient refusal) | ✅ gauntlet R5 pins the negative (CIRISEdge#568) |
 | answer a third-party identifier Pull on a public plane | **mutual trust root** (Axis 5), NOT a tier | `shares_a_trust_root_with(requester)` + layered per-requester ceilings | ✅ `identifier_lookups_are_entitled_by_a_mutual_trust_root`; R6 pins the negative |
 | answer a subject Pull for the subject itself | always | `requester == subject` (#462) | ✅ correct |
 | answer a Pull for this node's OWN record | always | `subject == local_key_id` | ✅ correct (#556) |

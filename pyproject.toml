@@ -94,8 +94,13 @@ classifiers = [
 # diff `DIRECTORY_ABI_VERSION` (and its three siblings —
 # `ASYNC_EXECUTOR_ABI_VERSION`, `OUTBOUND_QUEUE_ABI_VERSION`,
 # `SIGNER_ABI_VERSION`, all still 1) and move this floor with any of them.
+#
+# v41.0.0 (CIRISPersist#804) moved NONE of the four — the `WriteOrigin` doors
+# are a Rust-trait change, not an ABI one. The floor still moves, because a
+# MAJOR always moves it: the constraint this line expresses is "the wheel in
+# this process is the same crate edge linked", and 40.x and 41.x are not.
 dependencies = [
-    "ciris-persist>=40,<41",
+    "ciris-persist>=41,<42",
 ]
 dynamic = ["version"]
 
