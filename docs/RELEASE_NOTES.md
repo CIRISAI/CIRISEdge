@@ -1,5 +1,49 @@
 # CIRISEdge Release Notes
 
+# v20.1.1 — republish v20.1.0's artifacts on a locked dependency graph
+
+**2026-09-03** — No code change. v20.1.0 is byte-identical in behaviour; this
+tag exists because **v20.1.0 shipped with no artifacts**.
+
+## What happened
+
+`tinyvec 1.13.0` published broken —
+
+```
+error: could not compile `tinyvec` (lib) due to 1 previous error
+note: `vec` is imported here, but it is a module, not a macro
+```
+
+— and `Cargo.lock` was gitignored, so CI re-resolved ~700 crates on every run
+and picked it up unreviewed. Every compiling job on `main` and on the v20.1.0
+tag went red on a tree that had been green minutes earlier, including the
+tag-gated artifact upload. So the v20.1.0 release carries no wheels, no
+XCFramework, no Android/iOS bundles and no signed build manifests.
+
+The tag could not simply be rebuilt: `v20.1.0` points at a tree that predates
+the lockfile, so it would re-resolve and break again — and a published tag is
+not moved.
+
+## The fix
+
+`Cargo.lock` is now committed, which **is** the pin (`tinyvec 1.12.0`) without
+adding a phantom direct dependency on a crate no edge code imports. An
+explicit upper bound would have been whack-a-mole across the whole transitive
+graph, and unsatisfiable the day another dependency needs the newer version.
+
+Edge ships binaries and a hybrid-signed build manifest, so a build whose
+dependency graph nobody pinned was attesting to something that could not be
+reproduced. Dependency updates are now a reviewable commit
+(`cargo update -p <crate>` in its own PR), handled case by case.
+
+**Downstream is unaffected**: cargo ignores a dependency's lockfile, so
+CIRISServer and CIRISAgent resolve their own graphs exactly as before. Rust
+consumers pinning the v20.1.0 tag lose nothing by staying there; adopt v20.1.1
+only if you want the published artifacts.
+
+Everything in v20.1.0 stands — chat attribution is the attester
+(CIRISEdge#564), on persist v40.0.0.
+
 # v20.1.0 — chat attribution is the attester, never a claim (CIRISEdge#564)
 
 **2026-09-03** — SECURITY. Reported by CIRISServer against v20.0.0.
