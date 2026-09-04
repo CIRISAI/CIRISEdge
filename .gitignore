@@ -1,7 +1,16 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS COMMITTED. This repo ships binaries — wheels for four
+# platforms, an XCFramework, Android/iOS bundles — and a hybrid-signed build
+# manifest; a signature over a build whose dependency graph nobody pinned
+# attests to something that cannot be reproduced. Committing the lock also
+# makes a dependency change a reviewable commit instead of a silent
+# re-resolve on every CI run. (2026-09-03: tinyvec 1.13.0 published broken and
+# took out every compiling job on `main` and on the v20.1.0 tag — including
+# the artifact upload — on a tree that had been green minutes earlier.)
+# Consumers are unaffected: cargo ignores a dependency's lockfile, so server
+# and agent resolve their own.
 
 # IDE / editor
 .idea/
