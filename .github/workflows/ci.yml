@@ -2026,11 +2026,75 @@ jobs:
           KIDS=$(python3 <<'PY'
           import json, sys
           data = json.load(open("dist/steward-key.json"))
-          deployed = [s for s in data.get("stewards", []) if s.get("deployed")]
-          if not deployed:
-              print("::error::No deployed stewards in registry response (AV-28 ephemeral-mode guard)", file=sys.stderr)
+
+          def fail(msg):
+              print(f"::error::{msg} (AV-28 ephemeral-mode guard)", file=sys.stderr)
               raise SystemExit(1)
-          print(",".join(s["key_id"] for s in deployed))
+
+          # SHAPE 2 (current) — CEG 0.2 accord bundle. `/v1/steward-key` no
+          # longer returns `stewards` at all: the root is an accord family with
+          # HOLDERS and a quorum of AUTHORIZATIONS over the bundle. There is no
+          # `deployed` flag to read, so the old filter silently produced [] and
+          # hard-failed a healthy registry (v20.2.0's manifest job).
+          #
+          # AV-28's intent is unchanged and is what is enforced here: refuse to
+          # sign a release manifest against a registry with no real root. Under
+          # this shape that means holders present AND the bundle's own declared
+          # quorum actually met — checked rather than assumed, because a bundle
+          # carrying one signature under `quorum:2/3` is exactly the ephemeral
+          # state the guard exists to catch.
+          bundle = data.get("bundle")
+          if isinstance(bundle, dict):
+              holders = [h.get("record", {}) for h in bundle.get("holders") or []]
+              holder_ids = [h.get("key_id") for h in holders if h.get("key_id")]
+              if not holder_ids:
+                  fail("registry accord bundle carries no holders")
+              signed_by = {
+                  a.get("holder_key_id")
+                  for a in bundle.get("authorizations") or []
+                  if a.get("holder_key_id")
+              }
+              proto = str(bundle.get("consensus_protocol") or "")
+              need = 0
+              if proto.startswith("quorum:"):
+                  try:
+                      need = int(proto.split(":", 1)[1].split("/", 1)[0])
+                  except (ValueError, IndexError):
+                      fail(f"unparseable consensus_protocol {proto!r}")
+              else:
+                  fail(f"unrecognised consensus_protocol {proto!r} — refusing to guess a quorum")
+              if len(signed_by) < need:
+                  fail(
+                      f"accord bundle has {len(signed_by)} authorization(s) "
+                      f"under {proto} — quorum not met"
+                  )
+              root = data.get("charter_root_key_id")
+              if not root:
+                  fail("registry response names no charter_root_key_id")
+              # Informational, never fatal: the SERVING node's own stance on
+              # this root. False is normal for an unauthenticated read, so it
+              # must not gate a release — but it should be visible.
+              served_by = data.get("served_by") or {}
+              if not served_by.get("accepts_this_root"):
+                  print(
+                      "::warning::serving node reports accepts_this_root=false for "
+                      f"{root} (informational; does not gate the release)",
+                      file=sys.stderr,
+                  )
+              print(",".join(sorted(holder_ids)))
+              raise SystemExit(0)
+
+          # SHAPE 1 (v0.8.x, kept so a registry rollback does not red the lane).
+          if "stewards" in data:
+              deployed = [s for s in data.get("stewards") or [] if s.get("deployed")]
+              if not deployed:
+                  fail("No deployed stewards in registry response")
+              print(",".join(s["key_id"] for s in deployed))
+              raise SystemExit(0)
+
+          # Neither shape. Fail CLOSED and say what arrived — a third shape is a
+          # thing to look at, never a thing to wave through.
+          fail(f"unrecognised steward-key response; top-level keys={sorted(data)}")
           PY
           )
           echo "registry deployed steward key_ids=${KIDS}" >> "$GITHUB_STEP_SUMMARY"
