@@ -1,5 +1,181 @@
 # CIRISEdge Release Notes
 
+# v20.3.0 — adopt persist v41.2.0 + leviculum v0.25.0; the dial outlives its round (#568); the pyo3 envelope helper signs hybrid (#573); the rotation seal names its hazard (leviculum#52)
+
+**2026-09-05** — Additive at every public surface. Two substrate adopts, one
+transport fix, one FFI fix.
+
+## Adopts
+
+**CIRISPersist v41.0.0 → v41.2.0.** Two minors, both currency for edge. All
+four ABI constants unchanged across both, verify stays v14.2.0, so the
+`ciris-persist>=41,<42` wheel floor holds. v41.1.0 (#807) fixes
+`list_widening_candidates` offering an announced node's owner-binding as a
+widening candidate forever. v41.2.0 (#810) adds `rejected` to the mirrored
+CIRISLens `TaskStatus` vocabulary with a SQLite V136 rebuild. **Edge drives
+none of the affected APIs** — no `TaskStatus`, no lens tables, none of the
+lens features enabled.
+
+**leviculum v0.24.0+ciris.1 → v0.25.0+ciris.1.** Three things matter here:
+
+- **leviculum#64 unbreaks our own wheels.** The upstream catch-up (+92) brought
+  a BLE interface declaring `bluer`/`dbus` unconditionally; both pull
+  `libdbus-sys`, which builds on neither macOS nor Windows. leviculum's own
+  changelog names the consumer: *"CIRISEdge's darwin and win_amd64 wheels
+  resolve this crate as a git dependency and would have failed at build
+  time."* The deps are now target-gated.
+- **leviculum#63 gives us the instrument for #568** (below).
+- **leviculum#52** is addressed below.
+
+## CIRISEdge#568 — a round no longer destroys the link it paid for
+
+The first fix for #568 (v20.2.0) addressed the missing-signer race. Re-measured
+on the two-node ladder, the number did not move: **181 s and 210 s**. The
+owner's key was on the peer at 31 s, so the key was never the bottleneck. This
+is a second, independent mechanism.
+
+**What it is.** The scheduler abandons a round at `DEFAULT_ROUND_TIMEOUT`
+(10 s). A peer with a known path is allowed `LINK_ESTABLISH_TIMEOUT` (30 s) to
+establish. The dial ran **inline inside the round's future**, so a cold dial
+could never finish inside the round that started it — that is arithmetic, not
+load — and abandoning the round **dropped the half-established link**. Every
+retry began cold; the peer converged only when it dialled us. The observed
+shape matches exactly: first Attestation round to a fresh peer times out at
++10 s, next completed round lands ~150 s later — five 30 s cadence ticks.
+
+This is the #532 establish:identify gap one layer up. #532 stopped N
+coordinators discarding *each other's* links; nothing stopped a round
+discarding *its own*.
+
+**The fix.** The dial runs in a spawned task holding a cloneable `DialCtx`, so
+abandoning a round abandons the **wait**, not the **link**. The task runs to
+completion and publishes into `reusable_dialed_link` — `dial_and_identify`'s
+existing "PUBLISH LAST" step — so the next round takes the fast reuse path
+instead of dialling cold again.
+
+`DialCtx` is a context struct rather than a `Weak<Self>` because
+`ReticulumTransport::new` returns `Self`: a self-handle would need installing
+at every construction site, and a site that forgot would silently lose the
+detach. The dial-gate permit is acquired **inside** the task, since a permit
+held by the caller would be released on cancellation while the dial it gates
+still ran — leaving #532's single-flight property true only for callers that
+survive.
+
+**Measurement, not inference.** `ladder.owner_binding_converged` now records
+leviculum#63's `retry_queued` / `retry_queue_cap` / `retry_dropped_total`
+beside `elapsed_ms`. A slow convergence with a flat retry queue and one with
+`dropped_total` climbing are different bugs that read identically as a
+stopwatch value — leviculum reported that exact pattern from the live canonical
+(*"the retry queue climbed past its warning threshold and began discarding
+traffic while the log read as quiet"*). The next run distinguishes them.
+
+**What is not claimed:** that the 181/210 s numbers are now fixed. The unit
+tests pin the mechanism; only a mesh run measures the outcome. One run each was
+not a regression call in either direction, and it is not a fix call either.
+
+## leviculum#52 — the rotation seal docstring named the wrong hazard
+
+Audited against leviculum's finding that `seal` retires the old IFAC key for
+inbound, so sealing with no dwell after `activate` strands in-flight traffic
+(~50% packet loss on a zero-dwell rotation upstream, `drops_ifac` incrementing
+exactly once each time).
+
+**Edge is exposed as the API surface, not as a driver.** It wraps and
+re-exports the three phases (`ifac_install_next` / `ifac_activate_next` /
+`ifac_seal_rotation`), and **nothing in edge sequences them** — no
+`activate → seal` pair in `src/`, `tests/` or `src/bin/`. Edge cannot commit
+the defect itself; it hands it to the operator. Two things it told that
+operator were wrong.
+
+**The docstring named the wrong hazard.** Both seal wrappers said "call after
+the convergence window". That window is about *membership* — every member
+holding the new key. Sealing also retires the old key for *inbound*, so it
+rejects packets already on the wire under the old mask, sent by the members
+that **did** re-key. An operator who followed the instruction correctly still
+stranded traffic. Worse than no guidance, because it read as complete. Both
+docstrings now name the drain hazard as distinct from membership, state that
+install/activate are make-before-break and only seal breaks, and quote the
+upstream evidence.
+
+**Seal breaks inbound only, so the gauge points the other way.** leviculum
+consults the alternate key on the inbound path alone (`verify_ifac`);
+`apply_ifac` never reads it. A node's seal rejects old-masked traffic arriving
+*from peers* — upstream's failing run showed `drops_ifac` at the relay,
+rejecting a member's in-flight output. `retry_queued` counts *this* node's
+**outbound** backlog, so reaching zero licenses this node's **peers** to seal,
+not this node. The true precondition — every peer's `retry_queued` is zero —
+is not observable from any one node. Under lockstep rotation (the only mode
+edge supports, since nothing sequences the phases) each node polling its own
+gauge to zero approximates it. The gauge is now on `PyEdge` and documented as
+a **fleet proxy, never a measurement of what this node's own seal will
+reject**. The retry queue is the long pole: packets are masked before
+enqueueing, re-sent verbatim, count-capped (1024) with no time bound.
+
+**A default — a conservative choice, not a derivation.**
+`DEFAULT_IFAC_ROTATION_DWELL` = `RESOURCE_TRANSFER_TIMEOUT` (120 s), exported
+as `default_ifac_rotation_dwell_ms()`. The drain window is bounded by peers'
+retry-queue residency, which has no time bound, so there is no principled
+number to derive; 120 s reuses edge's committed answer to how long traffic can
+legitimately remain in flight. (An earlier draft justified it by transfer
+duration and leviculum#62 — wrong: old-masked bytes stop being generated at
+`activate`, and #62 is receiver-side reassembly.) 10 s was proposed; 10 s is
+shorter than every in-flight window edge already asserts. It is the *safe*
+default: ejecting a compromised member is a reason to go lower on purpose and
+accept the drops.
+
+**Two clocks, not to be harmonized.** `install → activate` waits on key
+*distribution* — `DEFAULT_CONVERGENCE_WINDOW` (300 s); activating early only
+degrades stragglers, since upstream keeps the old key accept-only.
+`activate → seal` waits on packet *drain* — `DEFAULT_IFAC_ROTATION_DWELL`
+(120 s), the only one whose failure is silent. The pre-fix prose collapsed both
+into "the convergence window"; a later cleanup equalising the two constants
+would reintroduce the hazard. Retry-queue residency, the drain's long pole, is
+bounded by neither a clock nor any deterministic quantity: no TTL, head-of-line,
+airtime-paced, and the 1024 cap bounds *depth* — a packet at the front of a
+quiet link leaves only once 1024 arrive behind it.
+
+**No `seal_after_drain` helper, deliberately.** It would have to invent a
+policy for the queue never draining, and both answers belong to the operator:
+block forever and the member being excluded stays admitted indefinitely; time
+out and seal anyway and the hazard returns, buried in a function whose name
+promises it cannot happen.
+
+**No test, stated plainly.** Nothing in edge sequences the IFAC trio, so there
+is zero coverage and nothing to regress from. `scope.rotation` and
+`conformance.rotation_frame_loss` drive the MLS epoch advance and the
+scope-address table, not IFAC. Per upstream the natural test is a ~50% flake; a
+test worth having is a soak.
+
+Upstream Reticulum's IFAC is static config with no rotation ceremony, so there
+is no prior art and no ecosystem number to borrow — leviculum's 500 ms is a
+loopback floor it disclaims as a deployment value.
+
+## CIRISEdge#573 — the pyo3 envelope helper signs hybrid
+
+`Edge.build_signed_inbound_envelope` hard-coded `None` for the PQC half, so
+since **v19.0.0** — when every signature became the full hybrid — it could not
+build a single envelope on the wheel that ships it. Its doc justified the
+omission with two claims that were both false on this wheel.
+
+Nothing here caught it because the Rust twin the doc names as its counterpart
+(`tests/trust_short_circuit.rs::FedKey::local_signer`) *had* been moved to
+hybrid. The two codepaths the doc calls identical had silently diverged, and
+the only caller of the broken one is Python.
+
+`pqc_seed_bytes` (optional, 32 bytes) now builds the PQC half. The seed is
+**taken, not derived** from `seed_bytes`: a derivation convention has to be
+known identically by whoever REGISTERS the ML-DSA pubkey and whoever SIGNS with
+it, and when they disagree the only symptom is a verify refusal at the far end
+with nothing pointing at the cause. `Edge.derive_ml_dsa_65_pubkey_base64` gives
+the matching `federation_keys` pubkey from the same code that signs.
+
+The argument stays optional so the classical-only refusal remains reachable and
+loud. Surfaced by CIRISConformance#91; unblocks `test_230_intake_gate` and
+`test_520_wire_vocabulary::test_tier1_and_opaque_variants_accepted`, whose
+xfails are keyed on the exact refusal token rather than blanket markers.
+
+---
+
 # v20.2.1 — republish v20.2.0's artifacts past a stale registry guard
 
 **2026-09-04** — No code change. v20.2.0 is byte-identical in behaviour; this

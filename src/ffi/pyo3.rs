@@ -1122,14 +1122,36 @@ impl PyEdge {
     /// e.g. `"inline_text"`, `"accord_events_batch"`,
     /// `"contribution_submit"`).
     ///
+    /// `pqc_seed_bytes` is the 32-byte ML-DSA-65 seed for the SAME
+    /// `signing_key_id`. **Required in practice** since v19.0.0
+    /// (CIRISEdge#573): every signature is the full Ed25519 + ML-DSA-65
+    /// hybrid and `sign_envelope` refuses a signer without its PQC half,
+    /// so omitting it produces an envelope that cannot be built at all
+    /// rather than one with an optional field left empty.
+    ///
+    /// The seed is taken rather than derived from `seed_bytes` on
+    /// purpose. A convention ("same seed", "seed with byte 0 flipped")
+    /// has to be known identically by whoever REGISTERS the ML-DSA
+    /// pubkey and whoever SIGNS with it, and when the two disagree the
+    /// only symptom is a verify refusal at the far end — the failure this
+    /// codebase has already paid for twice. Passing the seed makes the
+    /// harness the single source of it. Use
+    /// [`Self::derive_ml_dsa_65_pubkey_base64`] to get the matching
+    /// pubkey for the `federation_keys` row.
+    ///
+    /// It is left OPTIONAL so the classical-only refusal stays reachable
+    /// and loud: `None` fails at `sign_envelope` naming the missing half,
+    /// which is the correct answer and not a silent downgrade.
+    ///
     /// Returns the byte-exact `EdgeEnvelope` JSON ready to feed into
-    /// [`Self::dispatch_inbound_bytes`]. The classical signature is
-    /// always Ed25519 over the persist-canonicalized envelope; PQC
-    /// (ML-DSA-65) is OMITTED at this surface — software-only signers
-    /// don't carry a PQC half, and the conformance intake-gate test runs
-    /// under the verify pipeline's `Ed25519Fallback` policy where the
-    /// PQC field is optional.
-    #[pyo3(signature = (signing_key_id, seed_bytes, destination_key_id, message_type, body_json))]
+    /// [`Self::dispatch_inbound_bytes`].
+    #[pyo3(signature = (signing_key_id, seed_bytes, destination_key_id, message_type, body_json, pqc_seed_bytes=None))]
+    // Eight, one over clippy's seven. This is a Python-facing signature whose
+    // arguments are each a distinct wire field the harness supplies; folding
+    // them into a struct would mean the caller building a dict to describe an
+    // envelope in order to build an envelope. Kept flat, and kept ADJACENT to
+    // its target — an `allow` separated from its fn silently moves.
+    #[allow(clippy::too_many_arguments)]
     fn build_signed_inbound_envelope(
         &self,
         py: Python<'_>,
@@ -1138,6 +1160,7 @@ impl PyEdge {
         destination_key_id: &str,
         message_type: &str,
         body_json: &str,
+        pqc_seed_bytes: Option<&[u8]>,
     ) -> PyResult<Py<pyo3::types::PyBytes>> {
         if seed_bytes.len() != 32 {
             return Err(PyValueError::new_err(format!(
@@ -1164,6 +1187,18 @@ impl PyEdge {
         let seed_owned: [u8; 32] = seed_bytes.try_into().map_err(|_| {
             PyValueError::new_err("build_signed_inbound_envelope: seed_bytes must be 32 bytes")
         })?;
+        // Checked HERE, not inside the async block: a wrong-length PQC seed is
+        // a caller error and should read like one, next to the Ed25519 check.
+        let pqc_seed_owned: Option<[u8; 32]> = match pqc_seed_bytes {
+            None => None,
+            Some(b) => Some(b.try_into().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "build_signed_inbound_envelope: pqc_seed_bytes must be 32 bytes \
+                     (ML-DSA-65); got {}",
+                    b.len()
+                ))
+            })?),
+        };
         let envelope_bytes: Vec<u8> = py.detach(|| {
             run_async(&self.executor, async move {
                 // Build a fresh software signer from the seed. The seed
@@ -1172,17 +1207,15 @@ impl PyEdge {
                 // one the persist OS-keyring fallback uses + matches the
                 // `tests/trust_short_circuit.rs::FedKey::local_signer`
                 // pattern byte-for-byte.
-                let mut sw = ciris_keyring::Ed25519SoftwareSigner::new(&signing_key_id);
-                sw.import_key(&seed_owned).map_err(|e| {
-                    PyValueError::new_err(format!(
-                        "build_signed_inbound_envelope: import_key failed: {e}"
-                    ))
+                // CIRISEdge#573 — the PQC half. v19.0.0 made every signature
+                // the full hybrid and this surface was not moved with it, so
+                // the helper could not build ANY envelope on the wheel that
+                // ships it. Construction lives in `software_hybrid_signer` so
+                // a Rust test drives the same code rather than a copy.
+                let signer = software_hybrid_signer(&signing_key_id, &seed_owned, pqc_seed_owned)
+                    .map_err(|e| {
+                    PyValueError::new_err(format!("build_signed_inbound_envelope: {e}"))
                 })?;
-                let signer = crate::identity::LocalSigner::new(
-                    signing_key_id.clone(),
-                    Arc::new(sw) as Arc<dyn ciris_keyring::HardwareSigner>,
-                    None,
-                );
 
                 let mut env = crate::identity::build_envelope(
                     mt,
@@ -1214,6 +1247,40 @@ impl PyEdge {
             let bytes = pyo3::types::PyBytes::new(py, &envelope_bytes);
             Ok(bytes.unbind())
         })
+    }
+
+    /// CIRISEdge#573 — the ML-DSA-65 public key a given 32-byte seed yields,
+    /// base64 (standard), for the `pubkey_ml_dsa_65_base64` column of the
+    /// `federation_keys` row.
+    ///
+    /// The companion to [`Self::build_signed_inbound_envelope`]'s
+    /// `pqc_seed_bytes`. A harness must REGISTER the same PQC key it later
+    /// SIGNS with, and deriving that pubkey independently means reimplementing
+    /// the alias-and-seed convention in Python — which is exactly how the two
+    /// sides drift apart and produce a verify refusal with no clue in it. One
+    /// seed in, one pubkey out, from the same code that does the signing.
+    #[staticmethod]
+    fn derive_ml_dsa_65_pubkey_base64(pqc_seed_bytes: &[u8]) -> PyResult<String> {
+        use base64::Engine as _;
+        use ciris_keyring::PqcSigner as _;
+        let seed: [u8; 32] = pqc_seed_bytes.try_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "derive_ml_dsa_65_pubkey_base64: pqc_seed_bytes must be 32 bytes (ML-DSA-65); got {}",
+                pqc_seed_bytes.len()
+            ))
+        })?;
+        let signer = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&seed, "derive-pqc")
+            .map_err(|e| {
+                PyValueError::new_err(format!(
+                    "derive_ml_dsa_65_pubkey_base64: ml_dsa_65 from seed failed: {e}"
+                ))
+            })?;
+        let pk = futures::executor::block_on(signer.public_key()).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "derive_ml_dsa_65_pubkey_base64: public_key failed: {e}"
+            ))
+        })?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(pk))
     }
 
     /// v7.2.0 (CIRISEdge#219) — runtime hot-plug a phone-attached LoRa
@@ -1399,8 +1466,96 @@ impl PyEdge {
 
     /// CIRISEdge#492 — IFAC rotation phase 3 (seal): drop the OLD code. A member
     /// that never re-keyed is now excluded (readmission = fresh grant + re-key).
-    /// Call after the convergence window. Returns the number of interfaces
-    /// affected.
+    /// Returns the number of interfaces affected.
+    ///
+    /// **Leave a dwell after `ifac_activate_next` (leviculum#52).** This used to
+    /// say "call after the convergence window", which named the wrong hazard:
+    /// that window is about MEMBERSHIP, and sealing also retires the old key for
+    /// INBOUND — rejecting packets already on the wire under the old mask, sent
+    /// by the members that DID re-key. Waiting for membership convergence and
+    /// then sealing still strands traffic. Upstream measured a zero-dwell
+    /// rotation losing its packet in ~50% of runs.
+    ///
+    /// `install` and `activate` are make-before-break and cannot lose a packet;
+    /// only sealing breaks. Nothing imposes the dwell — the cutover moment is
+    /// deliberately yours.
+    ///
+    /// **Seal breaks INBOUND only.** leviculum consults the alternate key on
+    /// the inbound path alone; outbound never reads it. What your seal rejects
+    /// is old-masked traffic arriving FROM PEERS — upstream's failing run
+    /// showed `drops_ifac` at the relay, rejecting a member's in-flight output.
+    ///
+    /// **So [`Self::retry_queue_gauges`] points the other way.** It counts THIS
+    /// node's OUTBOUND backlog. Reaching 0 licenses your PEERS to seal, not
+    /// you. The true precondition for you sealing is "every peer's
+    /// `retry_queued` is 0", which you cannot observe from here. Under
+    /// lockstep rotation, every node polling its own gauge to 0 approximates
+    /// that; treat your local reading as a fleet proxy, never as a measurement
+    /// of what your seal will reject. A local 0 while one congested peer still
+    /// holds 800 old-masked packets is a green light that means nothing.
+    ///
+    /// The retry queue is the long pole: packets are masked BEFORE enqueueing,
+    /// re-sent verbatim, and the queue is capped by count (1024) with no time
+    /// bound — it drains as the interface unblocks and no faster.
+    ///
+    /// **Two clocks.** `install → activate` waits on key DISTRIBUTION (the
+    /// 300 s convergence window; activating early only degrades stragglers).
+    /// `activate → seal` waits on packet DRAIN (this 120 s dwell; failure is
+    /// silent). They measure different things — do not set them equal.
+    ///
+    /// The dwell is PER-NODE, from that node's own activate; a fleet need not
+    /// seal in lockstep. With no better number, wait
+    /// [`Self::default_ifac_rotation_dwell_ms`] (120 000) after every node's
+    /// `retry_queued` has hit 0. leviculum's 500 ms is a loopback floor.
+    /// CIRISEdge#568 / leviculum#63 — `(retry_queued, retry_queue_cap,
+    /// retry_dropped_total)` for this node's transport.
+    ///
+    /// Exposed because [`Self::ifac_seal_rotation`] tells the operator to wait
+    /// for the retry queue to drain, and until now this number existed only
+    /// inside Rust. **Direction matters:** this is THIS node's OUTBOUND
+    /// backlog. Zero here is what this node's PEERS need before they seal; it
+    /// is a fleet proxy, not a measurement of what this node's own seal will
+    /// reject. See `ifac_seal_rotation`.
+    ///
+    /// Also the attribution signal for a slow replication round: a round that
+    /// took 150 s with a flat queue and one that took 150 s while
+    /// `retry_dropped_total` climbed are different bugs with the same stopwatch
+    /// reading.
+    fn retry_queue_gauges(&self) -> PyResult<(usize, usize, u64)> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err("retry_queue_gauges: edge has no Reticulum transport")
+            })?;
+            Ok(transport.retry_queue_gauges())
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            Err(PyRuntimeError::new_err(
+                "retry_queue_gauges: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
+    /// leviculum#52 — the default dwell between `ifac_activate_next` and
+    /// `ifac_seal_rotation`, in milliseconds. A conservative choice, not a
+    /// derivation: the drain window is bounded by peers' retry-queue
+    /// residency, which has no time bound (count-capped, drains as the
+    /// interface unblocks). It reuses edge's resource-transfer timeout (120 s)
+    /// because that is already edge's committed answer to how long traffic can
+    /// legitimately remain in flight — not because a transfer's duration is the
+    /// drain window; old-masked bytes stop being generated at `activate`.
+    ///
+    /// The SAFE default, not the right number for every rotation — ejecting a
+    /// compromised member is a reason to go lower on purpose and accept the
+    /// drops. See `ifac_seal_rotation` for what must drain and what edge can
+    /// observe of it.
+    #[staticmethod]
+    fn default_ifac_rotation_dwell_ms() -> u64 {
+        u64::try_from(crate::transport::reticulum::DEFAULT_IFAC_ROTATION_DWELL.as_millis())
+            .unwrap_or(u64::MAX)
+    }
+
     fn ifac_seal_rotation(&self) -> PyResult<usize> {
         #[cfg(feature = "_reticulum-module")]
         {
@@ -9043,6 +9198,40 @@ fn ciris_edge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register(m)
 }
 
+/// CIRISEdge#573 — the signer `build_signed_inbound_envelope` signs with.
+///
+/// Extracted from the pyo3 method so a Rust test can drive the SAME
+/// construction the wheel uses, rather than a copy of it that can drift. The
+/// helper shipped a hard-coded classical-only signer from v19.0.0 — when every
+/// signature became the full hybrid — until #573, so it could not build any
+/// envelope at all. Nothing in this crate caught it, because the only caller is
+/// Python.
+///
+/// `pqc_seed` is `None`-able ON PURPOSE: the classical-only refusal must stay
+/// reachable and loud. That path gets `sign_envelope`'s own "no ML-DSA-65 (PQC)
+/// half" error, which is the correct answer rather than a silent downgrade.
+fn software_hybrid_signer(
+    key_id: &str,
+    seed: &[u8; 32],
+    pqc_seed: Option<[u8; 32]>,
+) -> Result<crate::identity::LocalSigner, String> {
+    let mut sw = ciris_keyring::Ed25519SoftwareSigner::new(key_id);
+    sw.import_key(seed)
+        .map_err(|e| format!("import_key failed: {e}"))?;
+    let pqc: Option<Arc<dyn ciris_keyring::PqcSigner>> = match pqc_seed {
+        None => None,
+        Some(ps) => Some(Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&ps, format!("{key_id}-pqc"))
+                .map_err(|e| format!("ml_dsa_65 from seed failed: {e}"))?,
+        ) as Arc<dyn ciris_keyring::PqcSigner>),
+    };
+    Ok(crate::identity::LocalSigner::new(
+        key_id.to_owned(),
+        Arc::new(sw) as Arc<dyn ciris_keyring::HardwareSigner>,
+        pqc,
+    ))
+}
+
 #[cfg(test)]
 #[cfg(feature = "transport-reticulum")]
 mod tests {
@@ -9062,6 +9251,101 @@ mod tests {
     //! edge's contribution.
     use super::*;
     use crate::transport::{InboundFrame, TransportId, TransportSendOutcome};
+
+    // ── CIRISEdge#573 — the pyo3 envelope helper signs HYBRID ────────
+    //
+    // The bug: v19.0.0 made every signature the full Ed25519 + ML-DSA-65
+    // hybrid, and `build_signed_inbound_envelope` was not moved with it — it
+    // built a classical-only signer, so it could not produce ANY envelope on
+    // the wheel that ships it. Its Rust twin
+    // (`tests/trust_short_circuit.rs::FedKey::local_signer`) HAD been moved,
+    // which is exactly why nothing here noticed: the two codepaths the doc
+    // calls identical had silently stopped being so, and the only caller of
+    // this one is Python.
+    //
+    // These drive `software_hybrid_signer` — the function the pyo3 method
+    // itself calls — rather than a reconstruction of it.
+
+    #[tokio::test]
+    async fn the_envelope_helper_signs_with_the_pqc_half() {
+        let seed = [7u8; 32];
+        let pqc_seed = [9u8; 32];
+        let signer = super::software_hybrid_signer("node-573", &seed, Some(pqc_seed))
+            .expect("build the hybrid signer");
+
+        let mut env = crate::identity::build_envelope(
+            crate::messages::MessageType::OpaqueEvent,
+            "node-573",
+            "node-dest",
+            &serde_json::json!({ "kind": 7, "payload": "eA==" }),
+            None,
+        )
+        .expect("build_envelope");
+
+        crate::identity::sign_envelope(&signer, &mut env)
+            .await
+            .expect("a hybrid signer signs — this is the #573 regression");
+
+        assert!(
+            !env.signature.is_empty(),
+            "the classical half must still be present"
+        );
+        assert!(
+            env.signature_pqc.is_some(),
+            "the ML-DSA-65 half must be present — an envelope without it is \
+             refused at the far end, which is what made every conformance \
+             probe through this helper undrivable"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_pqc_seed_the_helper_still_refuses_loudly() {
+        // The `None` arm is kept REACHABLE on purpose. It must fail at
+        // `sign_envelope` naming the missing half — never quietly emit a
+        // classical-only envelope that dies at someone else's verifier.
+        let signer = super::software_hybrid_signer("node-573-classical", &[7u8; 32], None)
+            .expect("a classical-only signer still CONSTRUCTS");
+        let mut env = crate::identity::build_envelope(
+            crate::messages::MessageType::OpaqueEvent,
+            "node-573-classical",
+            "node-dest",
+            &serde_json::json!({ "kind": 7, "payload": "eA==" }),
+            None,
+        )
+        .expect("build_envelope");
+        let err = crate::identity::sign_envelope(&signer, &mut env)
+            .await
+            .expect_err("classical-only must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has no ML-DSA-65 (PQC) half"),
+            "the refusal must name the missing half — CIRISConformance keys an \
+             imperative xfail on this exact token: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_derived_pubkey_is_the_one_the_signer_signs_with() {
+        // Closes the register/sign loop: a harness registers this pubkey in
+        // `federation_keys` and signs with the same seed. If these two ever
+        // disagree the only symptom is a verify refusal at the far end with
+        // nothing in it pointing here.
+        use base64::Engine as _;
+        let pqc_seed = [9u8; 32];
+        let derived =
+            super::PyEdge::derive_ml_dsa_65_pubkey_base64(&pqc_seed).expect("derive the pubkey");
+        let signer =
+            super::software_hybrid_signer("node-573", &[7u8; 32], Some(pqc_seed)).expect("signer");
+        let actual = base64::engine::general_purpose::STANDARD.encode(
+            futures::executor::block_on(signer.pqc.as_ref().expect("pqc half").public_key())
+                .expect("public_key"),
+        );
+        assert_eq!(
+            derived, actual,
+            "derive_ml_dsa_65_pubkey_base64 must yield the key the signer signs \
+             with, or the registered row cannot verify the envelope"
+        );
+    }
 
     /// Stub transport — exercises the [`EdgeBuilder`] build path
     /// without binding a real socket. Used by
