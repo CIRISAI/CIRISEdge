@@ -2585,6 +2585,13 @@ async fn run_chat_legs(occ: &Occurrence) {
                  peer stops at owner_of => None (CIRISEdge#568)"
             );
         }
+        // CIRISEdge#568 — the retry-queue gauges alongside the stopwatch
+        // (leviculum#63). A slow convergence with a flat queue and one with
+        // `dropped_total` climbing are different bugs that read identically
+        // as elapsed_ms; recording both is what makes the next run a
+        // measurement instead of another inference.
+        let (retry_queued, retry_queue_cap, retry_dropped_total) =
+            occ.transport.retry_queue_gauges();
         rep.ran(
             "ladder.owner_binding_converged",
             ok,
@@ -2595,6 +2602,9 @@ async fn run_chat_legs(occ: &Occurrence) {
                 "expected_owner": peer_owner,
                 "resolved_owner": resolved,
                 "elapsed_ms": elapsed_ms,
+                "retry_queued": retry_queued,
+                "retry_queue_cap": retry_queue_cap,
+                "retry_dropped_total": retry_dropped_total,
             }),
         );
     }

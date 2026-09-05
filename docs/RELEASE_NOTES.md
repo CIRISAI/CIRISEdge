@@ -1,66 +1,101 @@
 # CIRISEdge Release Notes
 
-# v20.3.0 — the pyo3 envelope helper signs hybrid (CIRISEdge#573)
+# v20.3.0 — adopt persist v41.1.0 + leviculum v0.25.0; the dial outlives its round (#568); the pyo3 envelope helper signs hybrid (#573)
 
-**2026-09-04** — Additive: one new optional argument and one new static method.
-No existing call signature changes.
+**2026-09-05** — Additive at every public surface. Two substrate adopts, one
+transport fix, one FFI fix.
 
-## The defect
+## Adopts
 
-`Edge.build_signed_inbound_envelope(...)` exists so a harness can hand
-`dispatch_inbound_bytes` a verifiable envelope without reverse-engineering the
-wire format. Since **v19.0.0** it could not build a single envelope on the wheel
-that ships it:
+**CIRISPersist v41.0.0 → v41.1.0.** All four ABI constants unchanged, verify
+stays v14.2.0, so the `ciris-persist>=41,<42` wheel floor holds. The fix
+(#807) is `list_widening_candidates` offering an announced node's owner-binding
+as a widening candidate forever, reporting `awaiting_actor = 1` on every
+announced node. **Edge drives none of the affected APIs** — taken for currency.
 
-```
-RuntimeError: build_signed_inbound_envelope: sign_envelope failed: … signer
-node-… has no ML-DSA-65 (PQC) half — every signature is the FULL Ed25519 +
-ML-DSA-65 hybrid, no fallback (CIRISEdge#425)
-```
+**leviculum v0.24.0+ciris.1 → v0.25.0+ciris.1.** Three things matter here:
 
-v19.0.0 made every signature the full hybrid — correctly — and this surface was
-not moved with it. It hard-coded `None` for the PQC half, and its doc claimed
-that was fine because *"software-only signers don't carry a PQC half, and the
-conformance intake-gate test runs under the verify pipeline's `Ed25519Fallback`
-policy where the PQC field is optional."* Both halves of that sentence were
-false on this wheel: the verify policy no longer decides whether a PQC half is
-required — the signer does, and it refuses at source.
+- **leviculum#64 unbreaks our own wheels.** The upstream catch-up (+92) brought
+  a BLE interface declaring `bluer`/`dbus` unconditionally; both pull
+  `libdbus-sys`, which builds on neither macOS nor Windows. leviculum's own
+  changelog names the consumer: *"CIRISEdge's darwin and win_amd64 wheels
+  resolve this crate as a git dependency and would have failed at build
+  time."* The deps are now target-gated.
+- **leviculum#63 gives us the instrument for #568** (below).
+- **leviculum#52** documents that `seal` retires the old key for inbound, so
+  sealing with no dwell after `activate` strands in-flight traffic. Nothing in
+  the library imposes the dwell. Edge drives rotation; worth an audit, not
+  changed here.
 
-The Rust twin the doc names as its counterpart
-(`tests/trust_short_circuit.rs::FedKey::local_signer`) **had** been moved. That
-is why nothing here caught it: the two codepaths the doc calls identical had
-silently stopped being identical, and the only caller of this one is Python.
+## CIRISEdge#568 — a round no longer destroys the link it paid for
 
-Surfaced by CIRISConformance#91 — `test_230_intake_gate` (3 tests) and
-`test_520_wire_vocabulary::test_tier1_and_opaque_variants_accepted` were
-undrivable at edge ≥ v19 and carry an imperative xfail keyed on the exact
-`has no ML-DSA-65 (PQC) half` token until a wheel with this ships.
+The first fix for #568 (v20.2.0) addressed the missing-signer race. Re-measured
+on the two-node ladder, the number did not move: **181 s and 210 s**. The
+owner's key was on the peer at 31 s, so the key was never the bottleneck. This
+is a second, independent mechanism.
 
-## The fix
+**What it is.** The scheduler abandons a round at `DEFAULT_ROUND_TIMEOUT`
+(10 s). A peer with a known path is allowed `LINK_ESTABLISH_TIMEOUT` (30 s) to
+establish. The dial ran **inline inside the round's future**, so a cold dial
+could never finish inside the round that started it — that is arithmetic, not
+load — and abandoning the round **dropped the half-established link**. Every
+retry began cold; the peer converged only when it dialled us. The observed
+shape matches exactly: first Attestation round to a fresh peer times out at
++10 s, next completed round lands ~150 s later — five 30 s cadence ticks.
 
-`build_signed_inbound_envelope` takes an optional `pqc_seed_bytes` (32 bytes,
-ML-DSA-65). Given, it builds the PQC half and signs the full hybrid; the
-`signing_key_id` and both seeds stay the caller's.
+This is the #532 establish:identify gap one layer up. #532 stopped N
+coordinators discarding *each other's* links; nothing stopped a round
+discarding *its own*.
 
-The seed is **taken, not derived** from `seed_bytes`. A convention — "same
-seed", "seed with byte 0 flipped" — has to be known identically by whoever
-REGISTERS the ML-DSA pubkey and whoever SIGNS with it, and when the two
-disagree the only symptom is a verify refusal at the far end with nothing in it
-pointing at the cause. This codebase has already paid for that twice.
+**The fix.** The dial runs in a spawned task holding a cloneable `DialCtx`, so
+abandoning a round abandons the **wait**, not the **link**. The task runs to
+completion and publishes into `reusable_dialed_link` — `dial_and_identify`'s
+existing "PUBLISH LAST" step — so the next round takes the fast reuse path
+instead of dialling cold again.
 
-`Edge.derive_ml_dsa_65_pubkey_base64(pqc_seed_bytes)` (new, static) returns the
-matching `pubkey_ml_dsa_65_base64` for the `federation_keys` row, from the same
-code that does the signing — so registering and signing cannot drift.
+`DialCtx` is a context struct rather than a `Weak<Self>` because
+`ReticulumTransport::new` returns `Self`: a self-handle would need installing
+at every construction site, and a site that forgot would silently lose the
+detach. The dial-gate permit is acquired **inside** the task, since a permit
+held by the caller would be released on cancellation while the dial it gates
+still ran — leaving #532's single-flight property true only for callers that
+survive.
 
-`pqc_seed_bytes` is left **optional** so the classical-only refusal stays
-reachable and loud: omitting it fails at `sign_envelope` naming the missing
-half, which is the correct answer and not a silent downgrade.
+**Measurement, not inference.** `ladder.owner_binding_converged` now records
+leviculum#63's `retry_queued` / `retry_queue_cap` / `retry_dropped_total`
+beside `elapsed_ms`. A slow convergence with a flat retry queue and one with
+`dropped_total` climbing are different bugs that read identically as a
+stopwatch value — leviculum reported that exact pattern from the live canonical
+(*"the retry queue climbed past its warning threshold and began discarding
+traffic while the log read as quiet"*). The next run distinguishes them.
 
-Signer construction moved into `software_hybrid_signer` so the regression tests
-drive the function the wheel calls rather than a copy of it — the copy drifting
-is the whole bug. Three tests: hybrid signature present, classical-only refuses
-with the token conformance keys its xfail on, and the derived pubkey equals the
-one the signer signs with.
+**What is not claimed:** that the 181/210 s numbers are now fixed. The unit
+tests pin the mechanism; only a mesh run measures the outcome. One run each was
+not a regression call in either direction, and it is not a fix call either.
+
+## CIRISEdge#573 — the pyo3 envelope helper signs hybrid
+
+`Edge.build_signed_inbound_envelope` hard-coded `None` for the PQC half, so
+since **v19.0.0** — when every signature became the full hybrid — it could not
+build a single envelope on the wheel that ships it. Its doc justified the
+omission with two claims that were both false on this wheel.
+
+Nothing here caught it because the Rust twin the doc names as its counterpart
+(`tests/trust_short_circuit.rs::FedKey::local_signer`) *had* been moved to
+hybrid. The two codepaths the doc calls identical had silently diverged, and
+the only caller of the broken one is Python.
+
+`pqc_seed_bytes` (optional, 32 bytes) now builds the PQC half. The seed is
+**taken, not derived** from `seed_bytes`: a derivation convention has to be
+known identically by whoever REGISTERS the ML-DSA pubkey and whoever SIGNS with
+it, and when they disagree the only symptom is a verify refusal at the far end
+with nothing pointing at the cause. `Edge.derive_ml_dsa_65_pubkey_base64` gives
+the matching `federation_keys` pubkey from the same code that signs.
+
+The argument stays optional so the classical-only refusal remains reachable and
+loud. Surfaced by CIRISConformance#91; unblocks `test_230_intake_gate` and
+`test_520_wire_vocabulary::test_tier1_and_opaque_variants_accepted`, whose
+xfails are keyed on the exact refusal token rather than blanket markers.
 
 ---
 
