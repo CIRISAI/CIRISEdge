@@ -1498,6 +1498,11 @@ impl PyEdge {
     /// re-sent verbatim, and the queue is capped by count (1024) with no time
     /// bound — it drains as the interface unblocks and no faster.
     ///
+    /// **Two clocks.** `install → activate` waits on key DISTRIBUTION (the
+    /// 300 s convergence window; activating early only degrades stragglers).
+    /// `activate → seal` waits on packet DRAIN (this 120 s dwell; failure is
+    /// silent). They measure different things — do not set them equal.
+    ///
     /// The dwell is PER-NODE, from that node's own activate; a fleet need not
     /// seal in lockstep. With no better number, wait
     /// [`Self::default_ifac_rotation_dwell_ms`] (120 000) after every node's

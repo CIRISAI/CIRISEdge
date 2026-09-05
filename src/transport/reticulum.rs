@@ -307,16 +307,23 @@ const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 /// nothing about when the sender masks.)
 ///
 /// What the window IS bounded by is retry-queue residency, and that has **no
-/// time bound at all**: leviculum masks before enqueueing, re-sends queued
-/// bytes verbatim, caps the queue by COUNT (1024), and drains it only as fast
-/// as the interface unblocks. A packet enqueued before a peer's `activate` on
-/// a saturated LoRa link can sit old-masked for a long time. There is no
-/// principled upper bound to derive a number from, which is why this is a
-/// conservative choice and not a derivation — and it reuses the resource
-/// transfer timeout because that is already this file's committed answer to
-/// "how long can traffic legitimately remain in flight", not because the two
+/// time bound at all**. The queue is a bare `VecDeque<Vec<u8>>` with no age,
+/// TTL, or expiry on any entry; `drain_retry_queues` is head-of-line and
+/// rate-gated by the interface's `next_slot_ms` (airtime pacing on LoRa). A
+/// packet leaves only by successful send, cap-overflow eviction of the OLDEST
+/// (cap 1024), interface disconnect, or interface removal — nothing times it
+/// out. So the cap bounds DEPTH, not time: a packet stuck at the front of a
+/// quiet link leaves only once 1024 more arrive behind it, which is
+/// arbitrarily long. Residency is bounded by neither a clock nor any
+/// deterministic quantity, so there is no principled number to derive.
+///
+/// This is therefore a conservative choice and not a derivation. It reuses
+/// the resource transfer timeout because that is the longest window this
+/// file already treats as survivable in-flight — not because the two
 /// mechanisms are the same. 10 s was proposed; 10 s is shorter than every
 /// in-flight window this file already asserts (5 s / 30 s / 30 s / 120 s).
+/// Not to be confused with [`crate::scope_lifecycle::DEFAULT_CONVERGENCE_WINDOW`]
+/// (300 s), the install→activate DISTRIBUTION clock; see `ifac_seal_rotation`.
 ///
 /// This is the SAFE default, not the right number for every rotation. An
 /// operator ejecting a compromised member should override it downward on
@@ -3231,6 +3238,22 @@ impl ReticulumTransport {
     /// reading is a reasonable proxy. It is NOT a measurement of what this
     /// node's seal will reject: a local zero while one congested peer still
     /// holds 800 old-masked packets is a green light that means nothing.
+    ///
+    /// **Two clocks, do not harmonize them.** A rotation has two dwells that
+    /// measure different things, and this repo carries a constant for each:
+    ///
+    /// - `install → activate` is bounded by key DISTRIBUTION — the membership
+    ///   clock, [`crate::scope_lifecycle::DEFAULT_CONVERGENCE_WINDOW`] (300 s).
+    ///   Activating early is not a safety failure: upstream keeps the old key
+    ///   accept-only, so a straggler's outbound still lands while its inbound
+    ///   degrades until it upgrades.
+    /// - `activate → seal` is bounded by packet DRAIN — this clock,
+    ///   [`DEFAULT_IFAC_ROTATION_DWELL`] (120 s), and the only one whose
+    ///   failure is silent.
+    ///
+    /// The pre-fix prose collapsed both into "the convergence window", which
+    /// is how the hazard was mis-framed. A later cleanup that notices two
+    /// dwell constants and makes them equal would reintroduce it.
     ///
     /// **The dwell is per-node**, measured from THAT node's own `activate`. A
     /// node's seal affects only its own inbound, so a fleet need not seal in

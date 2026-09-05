@@ -123,6 +123,17 @@ shorter than every in-flight window edge already asserts. It is the *safe*
 default: ejecting a compromised member is a reason to go lower on purpose and
 accept the drops.
 
+**Two clocks, not to be harmonized.** `install → activate` waits on key
+*distribution* — `DEFAULT_CONVERGENCE_WINDOW` (300 s); activating early only
+degrades stragglers, since upstream keeps the old key accept-only.
+`activate → seal` waits on packet *drain* — `DEFAULT_IFAC_ROTATION_DWELL`
+(120 s), the only one whose failure is silent. The pre-fix prose collapsed both
+into "the convergence window"; a later cleanup equalising the two constants
+would reintroduce the hazard. Retry-queue residency, the drain's long pole, is
+bounded by neither a clock nor any deterministic quantity: no TTL, head-of-line,
+airtime-paced, and the 1024 cap bounds *depth* — a packet at the front of a
+quiet link leaves only once 1024 arrive behind it.
+
 **No `seal_after_drain` helper, deliberately.** It would have to invent a
 policy for the queue never draining, and both answers belong to the operator:
 block forever and the member being excluded stays admitted indefinitely; time
