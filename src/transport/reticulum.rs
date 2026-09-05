@@ -3145,8 +3145,38 @@ impl ReticulumTransport {
 
     /// CIRISEdge#492 — phase 3: SEAL the rotation — drop the old IFAC code. Any
     /// member that never re-keyed is now excluded (readmission requires a fresh
-    /// grant + re-key). Call after the convergence window. Returns the number of
-    /// interfaces affected.
+    /// grant + re-key). Returns the number of interfaces affected.
+    ///
+    /// # Leave a dwell after `ifac_activate_next` (leviculum#52)
+    ///
+    /// This used to say "call after the convergence window", which named the
+    /// wrong hazard. That window is about MEMBERSHIP — every member holding the
+    /// new key. Sealing also retires the old key for INBOUND, so it rejects
+    /// packets already on the wire under the old mask, and those were sent by
+    /// the members that DID re-key. An operator who waited for membership
+    /// convergence and sealed still strands traffic; upstream measured a
+    /// zero-dwell rotation losing its packet in ~50% of runs, with the peer's
+    /// `drops_ifac` incrementing exactly once each time.
+    ///
+    /// `install` and `activate` are make-before-break and cannot lose a packet.
+    /// **Only sealing breaks**, and nothing in leviculum imposes the dwell —
+    /// each phase is an explicit call so the cutover moment stays the
+    /// operator's.
+    ///
+    /// **What must drain, and what edge can see.** Four things carry the
+    /// retired mask: this node's retry queue, its socket buffer, bytes in
+    /// flight, and the peer's receive buffer. Edge can observe exactly one —
+    /// [`Self::retry_queue_gauges`]'s `retry_queued`. Reaching zero is
+    /// NECESSARY, not sufficient: it proves only that this node holds nothing
+    /// further masked with the retired key. Its worth is collapsing the wait
+    /// from "however long anything could take" to one link-latency of slack,
+    /// which is a number a deployment can defend per medium (LoRa and TCP
+    /// differ by orders of magnitude). leviculum's own harness uses 500 ms and
+    /// explicitly disclaims it as a loopback floor, not a deployment value.
+    ///
+    /// **The dwell is per-node**, measured from THAT node's own `activate`. A
+    /// node's seal affects only its own inbound, so a fleet need not seal in
+    /// lockstep — but no node may seal early relative to its own activate.
     #[must_use]
     pub fn ifac_seal_rotation(&self) -> usize {
         self.node.ifac_seal_rotation()

@@ -1466,8 +1466,57 @@ impl PyEdge {
 
     /// CIRISEdge#492 — IFAC rotation phase 3 (seal): drop the OLD code. A member
     /// that never re-keyed is now excluded (readmission = fresh grant + re-key).
-    /// Call after the convergence window. Returns the number of interfaces
-    /// affected.
+    /// Returns the number of interfaces affected.
+    ///
+    /// **Leave a dwell after `ifac_activate_next` (leviculum#52).** This used to
+    /// say "call after the convergence window", which named the wrong hazard:
+    /// that window is about MEMBERSHIP, and sealing also retires the old key for
+    /// INBOUND — rejecting packets already on the wire under the old mask, sent
+    /// by the members that DID re-key. Waiting for membership convergence and
+    /// then sealing still strands traffic. Upstream measured a zero-dwell
+    /// rotation losing its packet in ~50% of runs.
+    ///
+    /// `install` and `activate` are make-before-break and cannot lose a packet;
+    /// only sealing breaks. Nothing imposes the dwell — the cutover moment is
+    /// deliberately yours.
+    ///
+    /// Poll [`Self::retry_queue_gauges`] until `retry_queued` is 0, then wait
+    /// one worst-case link RTT. Zero is NECESSARY, not sufficient: it covers
+    /// this node's retry queue and says nothing about its socket buffer, bytes
+    /// in flight, or the peer's receive buffer. leviculum's harness uses 500 ms
+    /// and disclaims it as a loopback floor.
+    ///
+    /// The dwell is PER-NODE, from that node's own activate; a fleet need not
+    /// seal in lockstep.
+    /// CIRISEdge#568 / leviculum#63 — `(retry_queued, retry_queue_cap,
+    /// retry_dropped_total)` for this node's transport.
+    ///
+    /// Exposed because [`Self::ifac_seal_rotation`] tells the operator to wait
+    /// for the retry queue to drain, and until now this number existed only
+    /// inside Rust — so the operator holding the one call that can strand
+    /// traffic had no way to observe the one thing edge can actually see, and
+    /// had to guess the whole window blind.
+    ///
+    /// Also the attribution signal for a slow replication round: a round that
+    /// took 150 s with a flat queue and one that took 150 s while
+    /// `retry_dropped_total` climbed are different bugs with the same stopwatch
+    /// reading.
+    fn retry_queue_gauges(&self) -> PyResult<(usize, usize, u64)> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err("retry_queue_gauges: edge has no Reticulum transport")
+            })?;
+            Ok(transport.retry_queue_gauges())
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            Err(PyRuntimeError::new_err(
+                "retry_queue_gauges: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
     fn ifac_seal_rotation(&self) -> PyResult<usize> {
         #[cfg(feature = "_reticulum-module")]
         {
