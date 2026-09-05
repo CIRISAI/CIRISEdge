@@ -97,21 +97,31 @@ docstrings now name the drain hazard as distinct from membership, state that
 install/activate are make-before-break and only seal breaks, and quote the
 upstream evidence.
 
-**The one observable never reached Python.** Four things carry the retired
-mask — this node's retry queue, its socket buffer, bytes in flight, and the
-peer's receive buffer — and edge observes exactly one, `retry_queued`. That
-gauge had a single caller, the mesh harness; the operator holding the one call
-that can strand traffic could not see the one thing edge can. `retry_queue_gauges`
-is now on `PyEdge`, documented as **necessary, not sufficient**.
+**Seal breaks inbound only, so the gauge points the other way.** leviculum
+consults the alternate key on the inbound path alone (`verify_ifac`);
+`apply_ifac` never reads it. A node's seal rejects old-masked traffic arriving
+*from peers* — upstream's failing run showed `drops_ifac` at the relay,
+rejecting a member's in-flight output. `retry_queued` counts *this* node's
+**outbound** backlog, so reaching zero licenses this node's **peers** to seal,
+not this node. The true precondition — every peer's `retry_queued` is zero —
+is not observable from any one node. Under lockstep rotation (the only mode
+edge supports, since nothing sequences the phases) each node polling its own
+gauge to zero approximates it. The gauge is now on `PyEdge` and documented as
+a **fleet proxy, never a measurement of what this node's own seal will
+reject**. The retry queue is the long pole: packets are masked before
+enqueueing, re-sent verbatim, count-capped (1024) with no time bound.
 
-**A default, derived rather than chosen.** `DEFAULT_IFAC_ROTATION_DWELL` =
-`RESOURCE_TRANSFER_TIMEOUT` (120 s), exported as
-`default_ifac_rotation_dwell_ms()`. Edge already asserts a resource transfer
-can legitimately be in flight for two minutes, and since leviculum#62 a single
-delivery spans many segments over that window under the key being retired. 10 s
-was proposed; 10 s is shorter than all four of edge's own in-flight windows. It
-is the *safe* default: ejecting a compromised member is a reason to go lower on
-purpose and accept the drops.
+**A default — a conservative choice, not a derivation.**
+`DEFAULT_IFAC_ROTATION_DWELL` = `RESOURCE_TRANSFER_TIMEOUT` (120 s), exported
+as `default_ifac_rotation_dwell_ms()`. The drain window is bounded by peers'
+retry-queue residency, which has no time bound, so there is no principled
+number to derive; 120 s reuses edge's committed answer to how long traffic can
+legitimately remain in flight. (An earlier draft justified it by transfer
+duration and leviculum#62 — wrong: old-masked bytes stop being generated at
+`activate`, and #62 is receiver-side reassembly.) 10 s was proposed; 10 s is
+shorter than every in-flight window edge already asserts. It is the *safe*
+default: ejecting a compromised member is a reason to go lower on purpose and
+accept the drops.
 
 **No `seal_after_drain` helper, deliberately.** It would have to invent a
 policy for the queue never draining, and both answers belong to the operator:

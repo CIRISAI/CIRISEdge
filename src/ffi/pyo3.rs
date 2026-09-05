@@ -1480,25 +1480,37 @@ impl PyEdge {
     /// only sealing breaks. Nothing imposes the dwell — the cutover moment is
     /// deliberately yours.
     ///
-    /// Poll [`Self::retry_queue_gauges`] until `retry_queued` is 0, then wait
-    /// one worst-case link RTT. Zero is NECESSARY, not sufficient: it covers
-    /// this node's retry queue and says nothing about its socket buffer, bytes
-    /// in flight, or the peer's receive buffer. leviculum's harness uses 500 ms
-    /// and disclaims it as a loopback floor.
+    /// **Seal breaks INBOUND only.** leviculum consults the alternate key on
+    /// the inbound path alone; outbound never reads it. What your seal rejects
+    /// is old-masked traffic arriving FROM PEERS — upstream's failing run
+    /// showed `drops_ifac` at the relay, rejecting a member's in-flight output.
+    ///
+    /// **So [`Self::retry_queue_gauges`] points the other way.** It counts THIS
+    /// node's OUTBOUND backlog. Reaching 0 licenses your PEERS to seal, not
+    /// you. The true precondition for you sealing is "every peer's
+    /// `retry_queued` is 0", which you cannot observe from here. Under
+    /// lockstep rotation, every node polling its own gauge to 0 approximates
+    /// that; treat your local reading as a fleet proxy, never as a measurement
+    /// of what your seal will reject. A local 0 while one congested peer still
+    /// holds 800 old-masked packets is a green light that means nothing.
+    ///
+    /// The retry queue is the long pole: packets are masked BEFORE enqueueing,
+    /// re-sent verbatim, and the queue is capped by count (1024) with no time
+    /// bound — it drains as the interface unblocks and no faster.
     ///
     /// The dwell is PER-NODE, from that node's own activate; a fleet need not
-    /// seal in lockstep.
-    ///
-    /// With no better number, wait [`Self::default_ifac_rotation_dwell_ms`]
-    /// (120 000 — the resource-transfer timeout) after `retry_queued` hits 0.
+    /// seal in lockstep. With no better number, wait
+    /// [`Self::default_ifac_rotation_dwell_ms`] (120 000) after every node's
+    /// `retry_queued` has hit 0. leviculum's 500 ms is a loopback floor.
     /// CIRISEdge#568 / leviculum#63 — `(retry_queued, retry_queue_cap,
     /// retry_dropped_total)` for this node's transport.
     ///
     /// Exposed because [`Self::ifac_seal_rotation`] tells the operator to wait
     /// for the retry queue to drain, and until now this number existed only
-    /// inside Rust — so the operator holding the one call that can strand
-    /// traffic had no way to observe the one thing edge can actually see, and
-    /// had to guess the whole window blind.
+    /// inside Rust. **Direction matters:** this is THIS node's OUTBOUND
+    /// backlog. Zero here is what this node's PEERS need before they seal; it
+    /// is a fleet proxy, not a measurement of what this node's own seal will
+    /// reject. See `ifac_seal_rotation`.
     ///
     /// Also the attribution signal for a slow replication round: a round that
     /// took 150 s with a flat queue and one that took 150 s while
@@ -1521,10 +1533,13 @@ impl PyEdge {
     }
 
     /// leviculum#52 — the default dwell between `ifac_activate_next` and
-    /// `ifac_seal_rotation`, in milliseconds. Anchored to edge's
-    /// resource-transfer timeout (120 s): the longest thing edge itself
-    /// considers legitimately in flight, and since leviculum#62 a single
-    /// logical delivery can span that whole window under the key being retired.
+    /// `ifac_seal_rotation`, in milliseconds. A conservative choice, not a
+    /// derivation: the drain window is bounded by peers' retry-queue
+    /// residency, which has no time bound (count-capped, drains as the
+    /// interface unblocks). It reuses edge's resource-transfer timeout (120 s)
+    /// because that is already edge's committed answer to how long traffic can
+    /// legitimately remain in flight — not because a transfer's duration is the
+    /// drain window; old-masked bytes stop being generated at `activate`.
     ///
     /// The SAFE default, not the right number for every rotation — ejecting a
     /// compromised member is a reason to go lower on purpose and accept the

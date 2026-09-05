@@ -297,13 +297,26 @@ const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 /// number. **Anchored to [`RESOURCE_TRANSFER_TIMEOUT`], not chosen.**
 ///
 /// Sealing retires the old IFAC key for inbound, so it rejects any packet still
-/// masked with it — and the longest thing edge itself considers legitimately
-/// in flight is a resource transfer, which it allows two minutes before calling
-/// dead. Since leviculum#62 a resource is one logical delivery spanning many
-/// segments over that whole window, all masked with the key being retired. A
-/// dwell shorter than this guillotines a transfer edge still considers
-/// healthy: 10 s was proposed, and 10 s is shorter than all four of this file's
-/// in-flight windows (5 s / 30 s / 30 s / 120 s).
+/// masked with it that arrives from a peer. Old-masked bytes stop being
+/// GENERATED at each peer's `activate` — every packet dispatched after it is
+/// new-masked, and a receiver accepts those because it installed the new key
+/// in phase 1. So the drain window is not the duration of any transfer; a
+/// resource straddling `activate` is simply part old-masked and part new. (An
+/// earlier draft of this comment claimed leviculum#62 made a whole transfer
+/// old-masked at once. It does not — #62 is receiver-side reassembly and says
+/// nothing about when the sender masks.)
+///
+/// What the window IS bounded by is retry-queue residency, and that has **no
+/// time bound at all**: leviculum masks before enqueueing, re-sends queued
+/// bytes verbatim, caps the queue by COUNT (1024), and drains it only as fast
+/// as the interface unblocks. A packet enqueued before a peer's `activate` on
+/// a saturated LoRa link can sit old-masked for a long time. There is no
+/// principled upper bound to derive a number from, which is why this is a
+/// conservative choice and not a derivation — and it reuses the resource
+/// transfer timeout because that is already this file's committed answer to
+/// "how long can traffic legitimately remain in flight", not because the two
+/// mechanisms are the same. 10 s was proposed; 10 s is shorter than every
+/// in-flight window this file already asserts (5 s / 30 s / 30 s / 120 s).
 ///
 /// This is the SAFE default, not the right number for every rotation. An
 /// operator ejecting a compromised member should override it downward on
@@ -2439,6 +2452,11 @@ impl ReticulumTransport {
     /// numbers need to be on the artifact: a round that took 150 s with a flat
     /// retry queue and one that took 150 s while `dropped_total` climbed are
     /// different bugs with the same stopwatch reading.
+    ///
+    /// **Direction, for rotation callers:** this is THIS node's OUTBOUND
+    /// backlog. Zero here says this node has nothing further old-masked to
+    /// send — which is what its PEERS need to know before they seal, not what
+    /// this node needs to know before it seals. See [`Self::ifac_seal_rotation`].
     #[must_use]
     pub fn retry_queue_gauges(&self) -> (usize, usize, u64) {
         let s = self.node.plane_stats();
@@ -3186,23 +3204,41 @@ impl ReticulumTransport {
     /// each phase is an explicit call so the cutover moment stays the
     /// operator's.
     ///
-    /// **What must drain, and what edge can see.** Four things carry the
-    /// retired mask: this node's retry queue, its socket buffer, bytes in
-    /// flight, and the peer's receive buffer. Edge can observe exactly one —
-    /// [`Self::retry_queue_gauges`]'s `retry_queued`. Reaching zero is
-    /// NECESSARY, not sufficient: it proves only that this node holds nothing
-    /// further masked with the retired key. Its worth is collapsing the wait
-    /// from "however long anything could take" to one link-latency of slack,
-    /// which is a number a deployment can defend per medium (LoRa and TCP
-    /// differ by orders of magnitude). leviculum's own harness uses 500 ms and
-    /// explicitly disclaims it as a loopback floor, not a deployment value.
+    /// **Which direction seal breaks — read this before trusting any gauge.**
+    /// `seal` drops the alternate key, and the alternate is consulted in
+    /// exactly one place in leviculum: `verify_ifac`, the INBOUND path.
+    /// `apply_ifac` (outbound) never reads it. So sealing changes only what
+    /// THIS node accepts; what it rejects is old-masked traffic **arriving
+    /// from peers**. Upstream's failing run showed `drops_ifac` at the
+    /// *relay* — the relay's seal rejecting a member's in-flight outbound.
+    ///
+    /// **What must drain.** Four things carry the retired mask: each peer's
+    /// retry queue, its socket buffer, bytes in flight, and this node's own
+    /// receive buffer. The retry queue is the long pole: leviculum masks
+    /// BEFORE enqueueing and re-sends the queued bytes verbatim, so a packet
+    /// enqueued before a peer's `activate` stays old-masked for its whole
+    /// residency — and residency has no time bound, only a count cap (1024).
+    /// It drains as fast as the interface unblocks and no faster.
+    ///
+    /// **What edge can see, and what it is a proxy for.**
+    /// [`Self::retry_queue_gauges`]'s `retry_queued` counts THIS node's
+    /// OUTBOUND backlog. Reaching zero therefore licenses this node's PEERS
+    /// to seal — not this node. The true precondition for this node sealing
+    /// is "every peer's `retry_queued` is zero", which edge cannot observe.
+    /// Under operator-driven lockstep rotation — the only mode edge supports,
+    /// since nothing here sequences the phases — every node polling its own
+    /// gauge to zero approximates that fleet-wide condition, and the local
+    /// reading is a reasonable proxy. It is NOT a measurement of what this
+    /// node's seal will reject: a local zero while one congested peer still
+    /// holds 800 old-masked packets is a green light that means nothing.
     ///
     /// **The dwell is per-node**, measured from THAT node's own `activate`. A
     /// node's seal affects only its own inbound, so a fleet need not seal in
     /// lockstep — but no node may seal early relative to its own activate.
     ///
-    /// With no better number, wait [`DEFAULT_IFAC_ROTATION_DWELL`] (= the
-    /// resource-transfer timeout, 120 s) after `retry_queued` reaches zero.
+    /// With no better number, wait [`DEFAULT_IFAC_ROTATION_DWELL`] (120 s)
+    /// after every node's `retry_queued` has reached zero. leviculum's own
+    /// harness uses 500 ms and explicitly disclaims it as a loopback floor.
     #[must_use]
     pub fn ifac_seal_rotation(&self) -> usize {
         self.node.ifac_seal_rotation()
