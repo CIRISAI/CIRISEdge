@@ -292,6 +292,29 @@ fn effective_control_channel_capacity(
 /// complete after the link is up.
 const RESOURCE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// leviculum#52 — the dwell an operator should leave between
+/// `ifac_activate_next` and `ifac_seal_rotation` when they have no better
+/// number. **Anchored to [`RESOURCE_TRANSFER_TIMEOUT`], not chosen.**
+///
+/// Sealing retires the old IFAC key for inbound, so it rejects any packet still
+/// masked with it — and the longest thing edge itself considers legitimately
+/// in flight is a resource transfer, which it allows two minutes before calling
+/// dead. Since leviculum#62 a resource is one logical delivery spanning many
+/// segments over that whole window, all masked with the key being retired. A
+/// dwell shorter than this guillotines a transfer edge still considers
+/// healthy: 10 s was proposed, and 10 s is shorter than all four of this file's
+/// in-flight windows (5 s / 30 s / 30 s / 120 s).
+///
+/// This is the SAFE default, not the right number for every rotation. An
+/// operator ejecting a compromised member should override it downward on
+/// purpose, accepting the drops — that is a security decision that depends on
+/// why the rotation is happening, which is exactly why it is a constant to
+/// deviate from and not a helper that decides for them. leviculum's own 500 ms
+/// is a loopback floor upstream explicitly disclaims as a deployment value;
+/// nobody in the ecosystem ships a number, because upstream Reticulum's IFAC
+/// is static config with no rotation ceremony at all.
+pub const DEFAULT_IFAC_ROTATION_DWELL: Duration = RESOURCE_TRANSFER_TIMEOUT;
+
 /// CIRISEdge#353 — the classified outcome of shipping a resource on a link.
 /// `Busy` is the retryable one-transfer-per-link collision
 /// (`ResourceError::TransferInProgress`); `Other` is any other send failure.
@@ -3177,6 +3200,9 @@ impl ReticulumTransport {
     /// **The dwell is per-node**, measured from THAT node's own `activate`. A
     /// node's seal affects only its own inbound, so a fleet need not seal in
     /// lockstep — but no node may seal early relative to its own activate.
+    ///
+    /// With no better number, wait [`DEFAULT_IFAC_ROTATION_DWELL`] (= the
+    /// resource-transfer timeout, 120 s) after `retry_queued` reaches zero.
     #[must_use]
     pub fn ifac_seal_rotation(&self) -> usize {
         self.node.ifac_seal_rotation()

@@ -1,17 +1,20 @@
 # CIRISEdge Release Notes
 
-# v20.3.0 — adopt persist v41.1.0 + leviculum v0.25.0; the dial outlives its round (#568); the pyo3 envelope helper signs hybrid (#573)
+# v20.3.0 — adopt persist v41.2.0 + leviculum v0.25.0; the dial outlives its round (#568); the pyo3 envelope helper signs hybrid (#573); the rotation seal names its hazard (leviculum#52)
 
 **2026-09-05** — Additive at every public surface. Two substrate adopts, one
 transport fix, one FFI fix.
 
 ## Adopts
 
-**CIRISPersist v41.0.0 → v41.1.0.** All four ABI constants unchanged, verify
-stays v14.2.0, so the `ciris-persist>=41,<42` wheel floor holds. The fix
-(#807) is `list_widening_candidates` offering an announced node's owner-binding
-as a widening candidate forever, reporting `awaiting_actor = 1` on every
-announced node. **Edge drives none of the affected APIs** — taken for currency.
+**CIRISPersist v41.0.0 → v41.2.0.** Two minors, both currency for edge. All
+four ABI constants unchanged across both, verify stays v14.2.0, so the
+`ciris-persist>=41,<42` wheel floor holds. v41.1.0 (#807) fixes
+`list_widening_candidates` offering an announced node's owner-binding as a
+widening candidate forever. v41.2.0 (#810) adds `rejected` to the mirrored
+CIRISLens `TaskStatus` vocabulary with a SQLite V136 rebuild. **Edge drives
+none of the affected APIs** — no `TaskStatus`, no lens tables, none of the
+lens features enabled.
 
 **leviculum v0.24.0+ciris.1 → v0.25.0+ciris.1.** Three things matter here:
 
@@ -22,10 +25,7 @@ announced node. **Edge drives none of the affected APIs** — taken for currency
   resolve this crate as a git dependency and would have failed at build
   time."* The deps are now target-gated.
 - **leviculum#63 gives us the instrument for #568** (below).
-- **leviculum#52** documents that `seal` retires the old key for inbound, so
-  sealing with no dwell after `activate` strands in-flight traffic. Nothing in
-  the library imposes the dwell. Edge drives rotation; worth an audit, not
-  changed here.
+- **leviculum#52** is addressed below.
 
 ## CIRISEdge#568 — a round no longer destroys the link it paid for
 
@@ -72,6 +72,62 @@ traffic while the log read as quiet"*). The next run distinguishes them.
 **What is not claimed:** that the 181/210 s numbers are now fixed. The unit
 tests pin the mechanism; only a mesh run measures the outcome. One run each was
 not a regression call in either direction, and it is not a fix call either.
+
+## leviculum#52 — the rotation seal docstring named the wrong hazard
+
+Audited against leviculum's finding that `seal` retires the old IFAC key for
+inbound, so sealing with no dwell after `activate` strands in-flight traffic
+(~50% packet loss on a zero-dwell rotation upstream, `drops_ifac` incrementing
+exactly once each time).
+
+**Edge is exposed as the API surface, not as a driver.** It wraps and
+re-exports the three phases (`ifac_install_next` / `ifac_activate_next` /
+`ifac_seal_rotation`), and **nothing in edge sequences them** — no
+`activate → seal` pair in `src/`, `tests/` or `src/bin/`. Edge cannot commit
+the defect itself; it hands it to the operator. Two things it told that
+operator were wrong.
+
+**The docstring named the wrong hazard.** Both seal wrappers said "call after
+the convergence window". That window is about *membership* — every member
+holding the new key. Sealing also retires the old key for *inbound*, so it
+rejects packets already on the wire under the old mask, sent by the members
+that **did** re-key. An operator who followed the instruction correctly still
+stranded traffic. Worse than no guidance, because it read as complete. Both
+docstrings now name the drain hazard as distinct from membership, state that
+install/activate are make-before-break and only seal breaks, and quote the
+upstream evidence.
+
+**The one observable never reached Python.** Four things carry the retired
+mask — this node's retry queue, its socket buffer, bytes in flight, and the
+peer's receive buffer — and edge observes exactly one, `retry_queued`. That
+gauge had a single caller, the mesh harness; the operator holding the one call
+that can strand traffic could not see the one thing edge can. `retry_queue_gauges`
+is now on `PyEdge`, documented as **necessary, not sufficient**.
+
+**A default, derived rather than chosen.** `DEFAULT_IFAC_ROTATION_DWELL` =
+`RESOURCE_TRANSFER_TIMEOUT` (120 s), exported as
+`default_ifac_rotation_dwell_ms()`. Edge already asserts a resource transfer
+can legitimately be in flight for two minutes, and since leviculum#62 a single
+delivery spans many segments over that window under the key being retired. 10 s
+was proposed; 10 s is shorter than all four of edge's own in-flight windows. It
+is the *safe* default: ejecting a compromised member is a reason to go lower on
+purpose and accept the drops.
+
+**No `seal_after_drain` helper, deliberately.** It would have to invent a
+policy for the queue never draining, and both answers belong to the operator:
+block forever and the member being excluded stays admitted indefinitely; time
+out and seal anyway and the hazard returns, buried in a function whose name
+promises it cannot happen.
+
+**No test, stated plainly.** Nothing in edge sequences the IFAC trio, so there
+is zero coverage and nothing to regress from. `scope.rotation` and
+`conformance.rotation_frame_loss` drive the MLS epoch advance and the
+scope-address table, not IFAC. Per upstream the natural test is a ~50% flake; a
+test worth having is a soak.
+
+Upstream Reticulum's IFAC is static config with no rotation ceremony, so there
+is no prior art and no ecosystem number to borrow — leviculum's 500 ms is a
+loopback floor it disclaims as a deployment value.
 
 ## CIRISEdge#573 — the pyo3 envelope helper signs hybrid
 

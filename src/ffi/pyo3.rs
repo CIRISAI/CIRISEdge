@@ -1488,6 +1488,9 @@ impl PyEdge {
     ///
     /// The dwell is PER-NODE, from that node's own activate; a fleet need not
     /// seal in lockstep.
+    ///
+    /// With no better number, wait [`Self::default_ifac_rotation_dwell_ms`]
+    /// (120 000 — the resource-transfer timeout) after `retry_queued` hits 0.
     /// CIRISEdge#568 / leviculum#63 — `(retry_queued, retry_queue_cap,
     /// retry_dropped_total)` for this node's transport.
     ///
@@ -1515,6 +1518,22 @@ impl PyEdge {
                 "retry_queue_gauges: requires the _reticulum-module feature",
             ))
         }
+    }
+
+    /// leviculum#52 — the default dwell between `ifac_activate_next` and
+    /// `ifac_seal_rotation`, in milliseconds. Anchored to edge's
+    /// resource-transfer timeout (120 s): the longest thing edge itself
+    /// considers legitimately in flight, and since leviculum#62 a single
+    /// logical delivery can span that whole window under the key being retired.
+    ///
+    /// The SAFE default, not the right number for every rotation — ejecting a
+    /// compromised member is a reason to go lower on purpose and accept the
+    /// drops. See `ifac_seal_rotation` for what must drain and what edge can
+    /// observe of it.
+    #[staticmethod]
+    fn default_ifac_rotation_dwell_ms() -> u64 {
+        u64::try_from(crate::transport::reticulum::DEFAULT_IFAC_ROTATION_DWELL.as_millis())
+            .unwrap_or(u64::MAX)
     }
 
     fn ifac_seal_rotation(&self) -> PyResult<usize> {
