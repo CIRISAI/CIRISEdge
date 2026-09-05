@@ -1,5 +1,145 @@
 # CIRISEdge Release Notes
 
+# v20.2.1 — republish v20.2.0's artifacts past a stale registry guard
+
+**2026-09-04** — No code change. v20.2.0 is byte-identical in behaviour; this
+tag exists because **v20.2.0 shipped with no artifacts and no GitHub Release**.
+
+## What happened
+
+The v20.2.0 tag run's `Generate + sign build manifest` job failed its pre-flight:
+
+```
+##[error]No deployed stewards in registry response (AV-28 ephemeral-mode guard)
+```
+
+That skipped the tag-gated artifact upload, so no release was created at all.
+Every other edge-side job on that tag was green — all five feature combos, the
+network gauntlet, test-anchor, clippy + fmt, every mobile lane, all four wheels,
+the XCFramework, bench, cargo-deny, pin-skew and the uniffi drift gate.
+
+**The registry was healthy.** `/v1/steward-key` has moved to the CEG 0.2 accord
+bundle and no longer returns `stewards` in any form:
+
+```json
+{"bundle": {"holders": [3], "authorizations": [2], "serve_nodes": [1],
+            "consensus_protocol": "quorum:2/3", "family_key_id": "humanity-accord"},
+ "bundle_fingerprint": "sha256:12d7fc…", "charter_root_key_id": "humanity-accord",
+ "served_by": {"node_key_id": "75c29fcc…", "accepts_this_root": false}}
+```
+
+There is no `deployed` flag anywhere, so the guard's `data.get("stewards", [])`
+produced `[]` and hard-refused a registry carrying a full 2-of-3 quorum. This is
+the second time this response has moved out from under that guard; the first
+move (v0.8.1 singleton → per-install list) is recorded in the step's own comment.
+Both times the failure mode was a silent mis-parse presenting as a security
+refusal.
+
+The tag could not be rebuilt in place: a tag run uses the workflow file at the
+tag's ref, so re-running v20.2.0 re-runs the same stale guard — and a published
+tag is not moved. This tag carries the same code with a guard that reads the
+current shape.
+
+## The guard, rewritten (PR #571)
+
+AV-28's intent is unchanged: refuse to sign a release manifest against a registry
+with no real root. Under the bundle shape that means holders present **and the
+bundle's own declared quorum actually met** — parsed from `consensus_protocol`
+and checked, never assumed, because a bundle carrying one signature under
+`quorum:2/3` is exactly the ephemeral state the guard exists to catch. An
+unparseable protocol refuses rather than guessing a threshold. The v0.8.x shape
+still works so a registry rollback cannot red the lane, and an unrecognised
+*third* shape fails closed naming the keys it saw.
+
+Verified against the live registry response plus seven fault injections: quorum
+not met, no holders, no charter root, unparseable protocol, both old-shape arms,
+and an unknown shape. Live passes and emits `A1,B1,C1`; every degraded case
+refuses.
+
+`served_by.accepts_this_root` is surfaced as a warning and deliberately does not
+gate — `false` is normal for an unauthenticated read.
+
+## Unrelated, still red
+
+The six `cohabitation / conformance` cells fail on PyPI retention:
+`ciris-server==0.5.176` has aged off the index. That is a CIRISConformance
+matrix pin and reds every sibling repo's tag run, not just edge's.
+
+Downstream is unaffected; Rust consumers pinning v20.2.0 lose nothing by staying
+there.
+
+---
+
+# v20.2.0 — persist v41 write-origin doors, the #568 announce race, the fedcode v3 edge half
+
+**2026-09-04** — Adopts CIRISPersist v41.0.0 and CIRISVerify v14.2.0. A MINOR:
+v20.1.1 was never adopted downstream (CIRISServer was on v18.14.0), so no
+consumer held the meaning anything here changes.
+
+## persist v41 — origin-aware write budgets (CIRISEdge#569, CIRISPersist#804)
+
+`put_attestation_with_origin` is the one required trait method, and edge
+implements `FederationDirectory` nowhere, so no call site broke. All four ABI
+constants are unchanged (`DIRECTORY_ABI_VERSION` stays 5) and
+`ENVELOPE_VOCABULARY_SHA256` did not move — **the pyproject wheel floor still
+moves to `>=41,<42`**, because a major always moves it: that line means "the
+wheel co-resident in this process is the crate edge linked", independent of ABI.
+
+Origin is a property of the **call**, not of the row: the AV-76 quota runs at
+tier 0, ahead of any signature check, so `attesting_key_id` is only a claim
+there. Metering the node's own emissions as a stranger's is what #804 measured
+at 652 of 900 chat sends refused.
+
+| site | door |
+|---|---|
+| `bridge::apply_attestation` | `put_attestation_synced` when attributed, unchanged otherwise |
+| `realtime_av_alm/delivered.rs` | `put_attestation_authored` |
+| `edge_node.rs` ×4 (owner binding, consent grant, both chat puts) | `put_attestation_authored` |
+
+`source_peer` was reaching the #425 choke as a **trace field** and being dropped
+before the door; it is now threaded through `dispatch_apply`. Edge vouches for
+exactly what persist asks for and no more — *which identity its transport
+authenticated* — and persist bounds the privilege itself via `shares_cohort_with`
+against its own rosters, so routing a stranger through the privileged door cannot
+widen their budget.
+
+The chat/share path needed no change: persist's `assemble_and_put` and
+`widen_audience` already take the authored door.
+
+Doors are tested by the budget they **select**
+(`peer_quota_observation().tracked_peers`), never by a refusal count — a refusal
+count measures the burst window's refill.
+
+## CIRISEdge#568 — the announce race
+
+A node's announce bundle rides two planes with no ordering between them, so an
+owner→node binding was routinely delivered a round before the owner key that
+verifies it: **33 s one direction, 90 s (three rounds) the other**, the largest
+single item in a 3 min 33 s claim-to-message timeline.
+
+The recovery machinery already existed and was off by one line —
+`should_note_missing_signer` gated on the Key plane's retention, and
+`ServeTier::None`, what every ordinary claimed node runs at, is `Bodies`. It was
+dead in precisely the common case and live only for conferred mesh servers.
+
+Retention was never the predicate. `HashFirst` means "never arrives"; `Bodies`
+means "arrives, at a latency nobody bounded". Both are the same fact about the
+row — *it named a key this node does not hold* — so the predicate is now that
+fact and the function is deleted rather than left returning a constant.
+
+`ladder.owner_binding_converged` puts the number on the mesh artifact per
+direction; the race was produced on every run and observed by nothing, because
+every ladder leg read the peer's owner from the roster.
+
+## fedcode v3 — the edge half (CIRISVerify#272)
+
+`CodeAdmission` now carries `ml_dsa_65_pubkey_sha256` and is `#[non_exhaustive]`.
+Without it the code's commitment died at edge's boundary and
+`ContactResolution::ReadyFromCode` could not produce a conformant hybrid
+registration. Review notes filed as CIRISVerify#274.
+
+---
+
 # v20.1.1 — republish v20.1.0's artifacts on a locked dependency graph
 
 **2026-09-03** — No code change. v20.1.0 is byte-identical in behaviour; this
