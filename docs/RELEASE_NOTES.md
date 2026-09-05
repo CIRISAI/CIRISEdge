@@ -1,5 +1,69 @@
 # CIRISEdge Release Notes
 
+# v20.3.0 — the pyo3 envelope helper signs hybrid (CIRISEdge#573)
+
+**2026-09-04** — Additive: one new optional argument and one new static method.
+No existing call signature changes.
+
+## The defect
+
+`Edge.build_signed_inbound_envelope(...)` exists so a harness can hand
+`dispatch_inbound_bytes` a verifiable envelope without reverse-engineering the
+wire format. Since **v19.0.0** it could not build a single envelope on the wheel
+that ships it:
+
+```
+RuntimeError: build_signed_inbound_envelope: sign_envelope failed: … signer
+node-… has no ML-DSA-65 (PQC) half — every signature is the FULL Ed25519 +
+ML-DSA-65 hybrid, no fallback (CIRISEdge#425)
+```
+
+v19.0.0 made every signature the full hybrid — correctly — and this surface was
+not moved with it. It hard-coded `None` for the PQC half, and its doc claimed
+that was fine because *"software-only signers don't carry a PQC half, and the
+conformance intake-gate test runs under the verify pipeline's `Ed25519Fallback`
+policy where the PQC field is optional."* Both halves of that sentence were
+false on this wheel: the verify policy no longer decides whether a PQC half is
+required — the signer does, and it refuses at source.
+
+The Rust twin the doc names as its counterpart
+(`tests/trust_short_circuit.rs::FedKey::local_signer`) **had** been moved. That
+is why nothing here caught it: the two codepaths the doc calls identical had
+silently stopped being identical, and the only caller of this one is Python.
+
+Surfaced by CIRISConformance#91 — `test_230_intake_gate` (3 tests) and
+`test_520_wire_vocabulary::test_tier1_and_opaque_variants_accepted` were
+undrivable at edge ≥ v19 and carry an imperative xfail keyed on the exact
+`has no ML-DSA-65 (PQC) half` token until a wheel with this ships.
+
+## The fix
+
+`build_signed_inbound_envelope` takes an optional `pqc_seed_bytes` (32 bytes,
+ML-DSA-65). Given, it builds the PQC half and signs the full hybrid; the
+`signing_key_id` and both seeds stay the caller's.
+
+The seed is **taken, not derived** from `seed_bytes`. A convention — "same
+seed", "seed with byte 0 flipped" — has to be known identically by whoever
+REGISTERS the ML-DSA pubkey and whoever SIGNS with it, and when the two
+disagree the only symptom is a verify refusal at the far end with nothing in it
+pointing at the cause. This codebase has already paid for that twice.
+
+`Edge.derive_ml_dsa_65_pubkey_base64(pqc_seed_bytes)` (new, static) returns the
+matching `pubkey_ml_dsa_65_base64` for the `federation_keys` row, from the same
+code that does the signing — so registering and signing cannot drift.
+
+`pqc_seed_bytes` is left **optional** so the classical-only refusal stays
+reachable and loud: omitting it fails at `sign_envelope` naming the missing
+half, which is the correct answer and not a silent downgrade.
+
+Signer construction moved into `software_hybrid_signer` so the regression tests
+drive the function the wheel calls rather than a copy of it — the copy drifting
+is the whole bug. Three tests: hybrid signature present, classical-only refuses
+with the token conformance keys its xfail on, and the derived pubkey equals the
+one the signer signs with.
+
+---
+
 # v20.2.1 — republish v20.2.0's artifacts past a stale registry guard
 
 **2026-09-04** — No code change. v20.2.0 is byte-identical in behaviour; this
