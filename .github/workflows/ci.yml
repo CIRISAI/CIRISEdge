@@ -2063,10 +2063,32 @@ jobs:
                       fail(f"unparseable consensus_protocol {proto!r}")
               else:
                   fail(f"unrecognised consensus_protocol {proto!r} — refusing to guess a quorum")
+              # CIRISEdge#575 — REPORT, not gate, while the trust root moves.
+              #
+              # This was a hard failure, matching what the guard is for. It is
+              # downgraded to match CIRISPersist#809, whose reasoning applies
+              # here unchanged: CIRISRegistry v3.0.0 went live 2026-09-04 and
+              # holders and authorizations move during that migration, so a tag
+              # run blocked on a mid-migration count is a release blocked on
+              # somebody else's deploy window. Edge has already lost one release
+              # (v20.2.0, no artifacts at all) to a registry state it does not
+              # control, and that is the risk being weighed against.
+              #
+              # Say plainly what it costs, because a check that cannot fail is a
+              # report: for the length of the transition this leg CANNOT catch a
+              # registry serving a bundle whose quorum has collapsed. What still
+              # fails in that case is the registration step below — this leg is
+              # early warning, and this half of it is warning only.
+              #
+              # Restore it when the root settles; CIRISEdge#575 tracks that, and
+              # the two repos should restore together rather than drift again.
               if len(signed_by) < need:
-                  fail(
-                      f"accord bundle has {len(signed_by)} authorization(s) "
-                      f"under {proto} — quorum not met"
+                  print(
+                      f"::warning::accord bundle has {len(signed_by)} "
+                      f"authorization(s) under {proto} — quorum NOT met. Not "
+                      f"gating while the trust root transitions (CIRISEdge#575 / "
+                      f"CIRISPersist#809)",
+                      file=sys.stderr,
                   )
               root = data.get("charter_root_key_id")
               if not root:
