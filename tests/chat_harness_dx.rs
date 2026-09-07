@@ -65,16 +65,14 @@ fn the_stranger_contact_surface_matches_the_guide() {
     let mut pubkey = [0u8; 32];
     pubkey[0] = 77;
     let key_id = ciris_verify_core::fedcode::derive_key_id("stranger", &pubkey);
-    let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-        kind: ciris_verify_core::fedcode::FedKind::User,
-        key_id: key_id.clone(),
-        pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
-        transport_hint: Some("https://example.invalid".into()),
-        alias_hint: None,
-        group_key_id: None,
-        owned_nodes: Vec::new(),
-        ml_dsa_65_pubkey_sha256: None,
-    })
+    let code = ciris_verify_core::fedcode::encode(
+        &ciris_verify_core::fedcode::FedCode::new(
+            ciris_verify_core::fedcode::FedKind::User,
+            key_id.clone(),
+            base64::engine::general_purpose::STANDARD.encode(pubkey),
+        )
+        .with_transport_hint("https://example.invalid"),
+    )
     .expect("encode");
 
     // §6: classification never demotes a code to an identifier.
@@ -90,16 +88,11 @@ fn the_stranger_contact_surface_matches_the_guide() {
     );
 
     // §6: a forged code is refused, and the guide says do not admit it.
-    let forged = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-        kind: ciris_verify_core::fedcode::FedKind::User,
+    let forged = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode::new(
+        ciris_verify_core::fedcode::FedKind::User,
         key_id,
-        pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode([0xAA_u8; 32]),
-        transport_hint: None,
-        alias_hint: None,
-        group_key_id: None,
-        owned_nodes: Vec::new(),
-        ml_dsa_65_pubkey_sha256: None,
-    })
+        base64::engine::general_purpose::STANDARD.encode([0xAA_u8; 32]),
+    ))
     .expect("a forgery encodes fine — the CRC cannot see authorship");
     assert!(
         matches!(
