@@ -365,13 +365,14 @@ pub struct CodeAdmission {
     /// commitment support is inert at exactly the layer that needs it and
     /// [`ContactResolution::ReadyFromCode`] stays unreachable in practice.
     ///
-    /// **How to use it, in one line:** call
-    /// [`ciris_verify_core::fedcode::verify_pulled_ml_dsa_65_pubkey`] with
-    /// this [`CodeAdmission`]'s source code (or a reconstructed [`FedCode`])
-    /// and the pulled key, and register only on `Ok`. That check FAILS CLOSED
-    /// when the commitment is absent — a pulled PQC key with nothing to bind
-    /// it to must not be admitted, so a v1/v2 code is not a hybrid
-    /// registration path at all.
+    /// **How to use it (verify ≥ v15.0.0):** build the registration input
+    /// with [`ciris_verify_core::fedcode::AdmittedHybridKey::admit`], passing
+    /// a [`FedCode`] carrying this commitment and the pulled key. That is the
+    /// ONLY constructor of `AdmittedHybridKey`, so an unchecked registration
+    /// input cannot exist to be passed anywhere — the class fix CIRISVerify#274
+    /// asked for, replacing the free function the host merely had to remember
+    /// to call. It FAILS CLOSED when the commitment is absent: a v1/v2 code is
+    /// not a hybrid registration path at all.
     ///
     /// **Trust level, stated plainly** (verify's own words): a fedcode is
     /// unsigned, so this commitment inherits exactly the trust of the code
@@ -1584,16 +1585,15 @@ mod tests {
         pubkey[31] = u8::try_from(label.len()).unwrap_or(0);
 
         let key_id = ciris_verify_core::fedcode::derive_key_id(label, &pubkey);
-        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-            kind,
-            key_id: key_id.clone(),
-            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
-            transport_hint: Some("https://example.invalid".to_string()),
-            alias_hint: Some("Frank".to_string()),
-            group_key_id: None,
-            owned_nodes: Vec::new(),
-            ml_dsa_65_pubkey_sha256: None,
-        })
+        let code = ciris_verify_core::fedcode::encode(
+            &ciris_verify_core::fedcode::FedCode::new(
+                kind,
+                key_id.clone(),
+                base64::engine::general_purpose::STANDARD.encode(pubkey),
+            )
+            .with_transport_hint("https://example.invalid".to_string())
+            .with_alias_hint("Frank".to_string()),
+        )
         .expect("encode");
         (code, key_id)
     }
@@ -1691,16 +1691,11 @@ mod tests {
             // The id DERIVES correctly from these bytes, so the binding check
             // alone would pass it. Only the length check catches it.
             let key_id = ciris_verify_core::fedcode::derive_key_id("shorty", &bytes);
-            let hand_crafted = ciris_verify_core::fedcode::FedCode {
-                kind: ciris_verify_core::fedcode::FedKind::User,
+            let hand_crafted = ciris_verify_core::fedcode::FedCode::new(
+                ciris_verify_core::fedcode::FedKind::User,
                 key_id,
-                pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                transport_hint: None,
-                alias_hint: None,
-                group_key_id: None,
-                owned_nodes: Vec::new(),
-                ml_dsa_65_pubkey_sha256: None,
-            };
+                base64::engine::general_purpose::STANDARD.encode(&bytes),
+            );
             match super::verify_code_binds_its_key(&hand_crafted) {
                 Err(LadderStall::MalformedCode { detail }) => {
                     assert!(detail.contains("32"), "state the contract: {detail}");
@@ -1762,17 +1757,14 @@ mod tests {
 
         // The attacker's own key, presented under the victim's address.
         let attacker_pubkey = [0xAAu8; 32];
-        let forged = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-            kind: ciris_verify_core::fedcode::FedKind::User,
-            key_id: victim_key_id.clone(),
-            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD
-                .encode(attacker_pubkey),
-            transport_hint: None,
-            alias_hint: Some("Totally The Victim".to_string()),
-            group_key_id: None,
-            owned_nodes: Vec::new(),
-            ml_dsa_65_pubkey_sha256: None,
-        })
+        let forged = ciris_verify_core::fedcode::encode(
+            &ciris_verify_core::fedcode::FedCode::new(
+                ciris_verify_core::fedcode::FedKind::User,
+                victim_key_id.clone(),
+                base64::engine::general_purpose::STANDARD.encode(attacker_pubkey),
+            )
+            .with_alias_hint("Totally The Victim".to_string()),
+        )
         .expect("a forgery encodes perfectly well — that is the point");
 
         // It decodes cleanly. The CRC is fine. Only the BINDING catches it.
@@ -1867,19 +1859,17 @@ mod tests {
         let mut pubkey = [0u8; 32];
         pubkey[0] = 31;
         let key_id = ciris_verify_core::fedcode::derive_key_id("v3person", &pubkey);
-        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-            kind: ciris_verify_core::fedcode::FedKind::User,
-            key_id: key_id.clone(),
-            pubkey_ed25519_base64: b64.encode(pubkey),
-            transport_hint: None,
-            alias_hint: None,
-            group_key_id: None,
-            owned_nodes: vec![ciris_verify_core::fedcode::OwnedNode {
-                key_id: "their-laptop-abc234def5".to_string(),
-                transport_pubkey_ed25519_base64: b64.encode([9u8; 32]),
-            }],
-            ml_dsa_65_pubkey_sha256: None,
-        })
+        let code = ciris_verify_core::fedcode::encode(
+            &ciris_verify_core::fedcode::FedCode::new(
+                ciris_verify_core::fedcode::FedKind::User,
+                key_id.clone(),
+                b64.encode(pubkey),
+            )
+            .with_owned_nodes(vec![ciris_verify_core::fedcode::OwnedNode::new(
+                "their-laptop-abc234def5",
+                b64.encode([9u8; 32]),
+            )]),
+        )
         .expect("encode");
 
         let empty = FakeLens {
@@ -1936,16 +1926,14 @@ mod tests {
             let mut pubkey = [0u8; 32];
             pubkey[0] = u8::try_from(wire.len()).unwrap_or(1);
             let key_id = ciris_verify_core::fedcode::derive_key_id(wire, &pubkey);
-            let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-                kind,
-                key_id: key_id.clone(),
-                pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
-                transport_hint: Some("https://example.invalid".into()),
-                alias_hint: None,
-                group_key_id: None,
-                owned_nodes: Vec::new(),
-                ml_dsa_65_pubkey_sha256: None,
-            })
+            let code = ciris_verify_core::fedcode::encode(
+                &ciris_verify_core::fedcode::FedCode::new(
+                    kind,
+                    key_id.clone(),
+                    base64::engine::general_purpose::STANDARD.encode(pubkey),
+                )
+                .with_transport_hint("https://example.invalid"),
+            )
             .expect("encode");
 
             match super::resolve_contact(&empty, &code).await {
@@ -1999,16 +1987,11 @@ mod tests {
         let mut pubkey = [0u8; 32];
         pubkey[0] = 21;
         let key_id = ciris_verify_core::fedcode::derive_key_id("selfcontained", &pubkey);
-        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-            kind: ciris_verify_core::fedcode::FedKind::User,
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode::new(
+            ciris_verify_core::fedcode::FedKind::User,
             key_id,
-            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
-            transport_hint: None,
-            alias_hint: None,
-            group_key_id: None,
-            owned_nodes: Vec::new(),
-            ml_dsa_65_pubkey_sha256: None,
-        })
+            base64::engine::general_purpose::STANDARD.encode(pubkey),
+        ))
         .expect("encode");
 
         let lens = CountingLens {
@@ -2048,16 +2031,14 @@ mod tests {
         let mut pubkey = [0u8; 32];
         pubkey[0] = 3;
         let key_id = ciris_verify_core::fedcode::derive_key_id("book-club", &pubkey);
-        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-            kind: ciris_verify_core::fedcode::FedKind::Community,
-            key_id: key_id.clone(),
-            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
-            transport_hint: None,
-            alias_hint: None,
-            group_key_id: Some(key_id.clone()),
-            owned_nodes: Vec::new(),
-            ml_dsa_65_pubkey_sha256: None,
-        })
+        let code = ciris_verify_core::fedcode::encode(
+            &ciris_verify_core::fedcode::FedCode::new(
+                ciris_verify_core::fedcode::FedKind::Community,
+                key_id.clone(),
+                base64::engine::general_purpose::STANDARD.encode(pubkey),
+            )
+            .with_group_key_id(key_id.clone()),
+        )
         .expect("encode");
 
         let empty = FakeLens {
@@ -2093,16 +2074,11 @@ mod tests {
         lens.nodes
             .insert(key_id.clone(), vec!["frank-laptop-bbb".into()]);
 
-        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-            kind: ciris_verify_core::fedcode::FedKind::User,
-            key_id: key_id.clone(),
-            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
-            transport_hint: None,
-            alias_hint: None,
-            group_key_id: None,
-            owned_nodes: Vec::new(),
-            ml_dsa_65_pubkey_sha256: None,
-        })
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode::new(
+            ciris_verify_core::fedcode::FedKind::User,
+            key_id.clone(),
+            base64::engine::general_purpose::STANDARD.encode(pubkey),
+        ))
         .expect("encode");
 
         match super::resolve_contact(&lens, &code).await {
@@ -2131,16 +2107,11 @@ mod tests {
         let mut lens = frank();
         lens.types.insert(key_id.clone(), "steward".into());
 
-        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-            kind: ciris_verify_core::fedcode::FedKind::User,
-            key_id: key_id.clone(),
-            pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
-            transport_hint: None,
-            alias_hint: None,
-            group_key_id: None,
-            owned_nodes: Vec::new(),
-            ml_dsa_65_pubkey_sha256: None,
-        })
+        let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode::new(
+            ciris_verify_core::fedcode::FedKind::User,
+            key_id.clone(),
+            base64::engine::general_purpose::STANDARD.encode(pubkey),
+        ))
         .expect("encode");
 
         match super::resolve_contact(&lens, &code).await {

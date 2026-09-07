@@ -502,16 +502,14 @@ fn r12_fedcode_is_self_contained_and_binding_checked() {
     let mut pubkey = [0u8; 32];
     pubkey[0] = 42;
     let key_id = ciris_verify_core::fedcode::derive_key_id("offgrid", &pubkey);
-    let code = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-        kind: ciris_verify_core::fedcode::FedKind::User,
-        key_id: key_id.clone(),
-        pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode(pubkey),
-        transport_hint: Some("https://example.invalid".into()),
-        alias_hint: None,
-        group_key_id: None,
-        owned_nodes: Vec::new(),
-        ml_dsa_65_pubkey_sha256: None,
-    })
+    let code = ciris_verify_core::fedcode::encode(
+        &ciris_verify_core::fedcode::FedCode::new(
+            ciris_verify_core::fedcode::FedKind::User,
+            key_id.clone(),
+            base64::engine::general_purpose::STANDARD.encode(pubkey),
+        )
+        .with_transport_hint("https://example.invalid"),
+    )
     .expect("encode");
     let parsed = crate::contact::parse_contact_input(&code).expect("a good code decodes");
     let admission = parsed
@@ -525,16 +523,11 @@ fn r12_fedcode_is_self_contained_and_binding_checked() {
 
     // And a forged claim over a different key is refused (the CRC cannot catch
     // authorship; only the derivation binding can).
-    let forged = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode {
-        kind: ciris_verify_core::fedcode::FedKind::User,
+    let forged = ciris_verify_core::fedcode::encode(&ciris_verify_core::fedcode::FedCode::new(
+        ciris_verify_core::fedcode::FedKind::User,
         key_id,
-        pubkey_ed25519_base64: base64::engine::general_purpose::STANDARD.encode([0xAA_u8; 32]),
-        transport_hint: None,
-        alias_hint: None,
-        group_key_id: None,
-        owned_nodes: Vec::new(),
-        ml_dsa_65_pubkey_sha256: None,
-    })
+        base64::engine::general_purpose::STANDARD.encode([0xAA_u8; 32]),
+    ))
     .expect("a forgery encodes fine");
     assert!(
         matches!(

@@ -1,5 +1,82 @@
 # CIRISEdge Release Notes
 
+# v21.0.0 — adopt CIRISPersist v42.0.0 + CIRISVerify v15.0.0
+
+**2026-09-07** — A MAJOR, because it amends a held contract: CIRISServer is on
+v20.3.0 (CIRISServer#545 closed), and this cut moves the wheel floor to
+`ciris-persist>=42,<43` and re-pins the whole CIRISVerify graph to v15. A
+consumer holding persist 41 or verify 14 in the same process cannot take it
+without moving too.
+
+## What persist v42.0.0 refuses that v41 admitted — and whether edge is exposed
+
+persist numbered this MAJOR for two refusals of previously-valid input plus
+the verify re-pin. Edge was checked against each; every dimension edge emits
+and every roster edge authors was read, not assumed.
+
+**CIRISPersist#811 — an agent member whose only incoming edge is a plain
+(unmarked) conferral is no longer steward-bound; its community is refused at
+the write gate.** Edge is **not exposed in production.** Edge's only authored
+community is the pair chat room (`chat::pair_community`), which rosters the
+two *owners* — users, as `founder` — never agents; and persist's rule exempts
+node members outright ("a node cannot accept for itself, so any delegation
+naming it is still custody"). Edge calls none of `is_steward_bound`,
+`steward_bindings_of` or `live_delegation_granters`, so the predicate/fold
+drift the changelog describes never ran in edge. The residual risk was test
+fixtures rostering an agent under a plain `delegates_to`; the full suite ran
+against v42 and **none reddened** — nothing needed fixing.
+
+**CIRISPersist#814 part 3 — `config:admission` / `config:transport` rows above
+`self` are refused.** Not exposed: edge names no `config:*` dimension anywhere.
+
+**CIRISPersist#815 — dimensions are case-sensitive, per segment.** Not exposed:
+every dimension edge emits is lowercase (`chat:message:v1`,
+`chat:key_package:v1`, `chat:welcome:v1`, `capacity:relay_delivery:v1`,
+`ownership:responsible_party:node:v1`). Confirmed by execution, not inspection:
+`chat_message_federates` and `chat_two_person_community` drive real admission
+of every `chat:` row against v42 and pass.
+
+All four persist ABI constants are unchanged, so the floor moves for the
+major alone.
+
+## CIRISVerify v15.0.0 — the break is `#[non_exhaustive]`, and it's the one edge asked for
+
+The v14.2.0 → v15.0.0 diff is *additive* in code — `FedCode::new(kind, key_id,
+pubkey)` with `with_transport_hint` / `with_alias_hint` / `with_group_key_id` /
+`with_owned_nodes` / `with_ml_dsa_65_pubkey_sha256`, `OwnedNode::new(key_id,
+transport_pubkey)`, and `AdmittedHybridKey::admit(&code, pulled)`. The MAJOR
+is that `FedCode` **and `OwnedNode`** are now `#[non_exhaustive]`, which
+reddens every struct literal of either. Edge had thirteen `FedCode` literals
+(`contact.rs` ×9, `role_matrix_gauntlet.rs` ×2, `tests/chat_harness_dx.rs`
+×2) and one `OwnedNode`; all now use the constructors. Worth knowing for the
+next such bump: `cargo check --lib` did not catch any of them — every literal
+was in test code, and only `--all-targets` compiles that. Both changes are exactly what CIRISVerify#274
+asked for after v14.2.0 broke twelve of those same literals in a *minor*.
+
+`AdmittedHybridKey::admit` is now the **only** constructor of a hybrid
+registration input, and it fails closed when the code carries no commitment —
+so an unchecked input cannot exist to be passed anywhere. `CodeAdmission`'s
+doc points hosts there instead of at the free function they merely had to
+remember to call.
+
+All three verify crates (`ciris-verify-core`, `ciris-keyring`, `ciris-crypto`)
+move to v15.0.0 in lockstep, matching persist v42's own pin; `cargo tree -i`
+shows one copy of each.
+
+## Verification
+
+The persist tag was verified from the remote to deref to the exact tree this
+was built and tested against (`refs/tags/v42.0.0^{}` → `13aa634`) before the
+pin flipped from rev to tag. clippy `-D warnings` clean on pyo3-full
+`--all-targets`; **1461 lib + 1867 integration tests (67 binaries)**, every
+cargo exit captured; `cargo tree -i` shows one copy each of persist 42.0.0 and
+the verify trio 15.0.0.
+
+## Nothing else moved
+
+leviculum stays v0.25.0+ciris.1. No public edge API changed shape; the break
+is entirely the floor and the linked substrate graph.
+
 # v20.3.0 — adopt persist v41.2.0 + leviculum v0.25.0; the dial outlives its round (#568); the pyo3 envelope helper signs hybrid (#573); the rotation seal names its hazard (leviculum#52)
 
 **2026-09-05** — Additive at every public surface. Two substrate adopts, one
