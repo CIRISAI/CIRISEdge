@@ -1,5 +1,46 @@
 # CIRISEdge Release Notes
 
+# v21.1.0 — adopt CIRISPersist v42.1.0
+
+**2026-09-08** — Currency, and a read-path speedup edge actually uses. A
+MINOR: same major, all four ABI constants unchanged, verify stays v15.0.0, the
+`>=42,<43` floor holds.
+
+**CIRISPersist#818 — a dimension-prefix filter compares bytes.** SQLite's
+`LIKE` is case-insensitive for ASCII, so `list_scores` / `list_attestations`
+returned different row sets depending on the backend underneath, and sqlite
+was the wrong one under CC 3.1.7 R3 (a dimension is a case-sensitive byte
+string, enforced at the write door since v42.0.0). Edge emits only lowercase
+dimensions, so no edge read returned a wrong row — but the predicate is now
+correct on every backend, which is the property edge relies on.
+
+**CIRISPersist#817 — dimension reads were O(rows the node authored).** Both
+dimension axes compiled to a per-row `json_extract`, so a read for one
+dimension parsed every row its attester ever wrote. V137 indexes the generated
+`dimension` column that V106 added and nothing used; no table rebuild. **This
+one reaches edge directly:** `messages_in_room` and the chat readers filter by
+`chat:*` dimension, and now they are index-served instead of a corpus scan.
+Pinned upstream by an `EXPLAIN` plan assertion, not a timing.
+
+**CIRISEdge#579 — the cohabitation lane now carries the verify pin.** All six
+cohab cells on the v21.0.0 tag run died at pip-install with
+`ResolutionImpossible` — *"ciris-persist 42.0.0 depends on ciris-verify<16
+and >=15.0.0; the user requested ciris-verify==14.2.0"* — before a single test
+ran. Edge's `extract-substrate-pins` job deliberately omitted a verify
+override, on reasoning that was true and still wrong: persist pins the right
+`ciris-verify` transitively, but the conformance matrix carries its own
+explicit `ciris-verify==14.2.0`, which the override never touched, and an
+explicit pin beats a transitive range. The first persist firewall to cross a
+verify major exposed it. The job now emits `ciris-verify>=15,<16` derived from
+the `ciris-keyring` Cargo tag — persist's own firewall shape, a plain PyPI spec
+(the Python project is not at the repo root), and no conflict with
+ciris-server, whose wheel carries no `ciris-verify` dependency. The v21.0.0
+release itself was unaffected: 15 assets, manifest and upload green.
+
+Verified: the tag derefs to `00bc08e`; one copy each; clippy `-D warnings`
+clean on pyo3-full `--all-targets`; lib + integration suites, cargo exits
+captured.
+
 # v21.0.0 — adopt CIRISPersist v42.0.0 + CIRISVerify v15.0.0
 
 **2026-09-07** — A MAJOR, because it amends a held contract: CIRISServer is on
