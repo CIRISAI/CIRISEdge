@@ -2345,21 +2345,38 @@ jobs:
                   raise SystemExit(f'no tag found for {crate} in Cargo.toml')
               return m.group(1)
           persist = find_tag('ciris-persist')
+          verify_major = int(find_tag('ciris-keyring').split('.')[0])
           pins = {
               # CIRISEdge is git-tag-only and persist stopped PyPI-publishing at
               # v30.4.0, so build persist from the git tag edge pins in Cargo.toml.
               #
-              # VERIFY is intentionally NOT pinned here — edge consumes verify THROUGH
-              # persist. persist's own pyproject says it: `pip install ciris-persist`
-              # pulls the whole verify+persist stack (its Requires-Dist includes the
-              # matching `ciris-verify` PyPI package), so a separate override is both
-              # unnecessary AND wrong: the CIRISVerify Python project lives at
-              # `bindings/python`, not the repo root, so a `git+…/CIRISVerify` override
-              # fails "does not appear to be a Python project" (v16.0.1 tag run). The
-              # Rust crate tag (v13.x) is also NOT the Python package version — persist
-              # pins the right `ciris-verify` transitively. ciris-server (a PyPI
-              # package) rounds out the cohabiting set via the harness's base pin.
+              # VERIFY IS PINNED HERE, as a RANGE, since v21.1.0 (CIRISEdge#579).
+              #
+              # It was deliberately omitted before, on reasoning that is true
+              # and was still wrong: edge consumes verify THROUGH persist, and
+              # persist's wheel Requires-Dist pins the matching `ciris-verify`
+              # transitively — so an override looked unnecessary. What that
+              # missed is that the conformance matrix carries its OWN explicit
+              # `ciris-verify==X.Y.Z` in `stack`, which this override never
+              # touched, and an explicit user pin beats a transitive range. The
+              # first time persist's firewall crossed a verify MAJOR (v42.0.0:
+              # `ciris-verify>=15,<16`) while the matrix still said 14.2.0, every
+              # cohab cell on the v21.0.0 tag died at pip-install with
+              # ResolutionImpossible — before a single test ran.
+              #
+              # The override is the MAJOR range derived from the ciris-keyring
+              # Cargo tag, not an exact version: it mirrors persist's own
+              # firewall shape, so a verify patch published ahead of edge's Cargo
+              # pin still resolves. It is a plain PyPI spec, not `git+…`, because
+              # the CIRISVerify Python project lives at `bindings/python`, not
+              # the repo root (the v16.0.1 lesson recorded here before). The
+              # Rust tag and the PyPI version now move together
+              # (`scripts/bump-version.sh` bumps the workspace and the Python
+              # package in one step), so the tag's major IS the wheel's major.
+              # ciris-server's wheel carries no `ciris-verify` dependency at all
+              # (only `ciris-client`), so this cannot create a third conflict.
               'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@v{persist}',
+              'ciris-verify': f'ciris-verify>={verify_major},<{verify_major + 1}',
           }
           print(f'json={json.dumps(pins)}')
           PYEOF
