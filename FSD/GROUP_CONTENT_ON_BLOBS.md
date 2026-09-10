@@ -1,10 +1,12 @@
 # FSD: Group Content on Blobs — CIRISEdge
 
-**Status:** DESIGN — on paper, not implemented. CIRISEdge#586 is the first
-consumer; the design is deliberately not chat's.
+**Status:** **LOCKED** — every open question answered on CIRISPersist#836.
+Not implemented; CIRISEdge#586 is the first consumer, and the design is
+deliberately not chat's.
 
-**Substrate:** CIRISPersist v44.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §11–§12),
-CIRISVerify v15.1.0 (`aes_gcm::{encrypt_aad, decrypt_aad}`).
+**Substrate:** CIRISPersist **v44.1.0** (`FSD/BLOB_ENCRYPTION_AT_REST.md`
+§11–§12, §12.9–§12.10, I41–I42), CIRISVerify v15.1.0
+(`aes_gcm::{encrypt_aad, decrypt_aad}`).
 
 ---
 
@@ -144,38 +146,64 @@ Three properties of persist's implementation drive everything below:
 3. **`Some(aad)` at a plaintext tier is refused**, not ignored. Commons
    content must pass `None`.
 
-### 5.1 The preimage
+### 5.1 The preimage — LOCKED
 
 ```
-AAD = "ciris.edge.blob.aad.v1" ‖ 0x00
-    ‖ lp(community_key_id)
-    ‖ lp(author_key_id)
-    ‖ lp(asserted_at)           // STORED form — see §5.2
-    ‖ be_u64(epoch)
-    ‖ lp(field)
+caller_aad = "ciris.edge.blob.aad.v1" ‖ 0x00
+           ‖ lp(author_key_id)
+           ‖ lp(asserted_at)          // STORED form — see §5.2
+           ‖ lp(field)
 ```
 
 where `lp(x)` = `be_u32(len(x)) ‖ x`.
 
-Each element earns its place:
-
-- **domain string + `0x00`** — this preimage is never confusable with another
-  protocol's, and the NUL means the version can never run into the first
-  field.
-- **`community_key_id`** — a ciphertext cannot move between communities.
+- **domain string + `0x00`** — never confusable with another protocol's
+  preimage, and the NUL means the version can never run into the first field.
 - **`author_key_id`** — a member cannot re-attribute another member's content
-  to themselves. This is the substitution #830 named.
-- **`asserted_at`** — a ciphertext cannot be replayed onto a later row by the
-  same author in the same community.
-- **`epoch`** — binds to the DEK generation, so a ciphertext cannot be
-  carried across a rotation and presented as current.
+  to themselves. The substitution CIRISPersist#830 named.
+- **`asserted_at`** — a ciphertext cannot be replayed onto a different row by
+  the same author.
 - **`field`** — two blobs in one row (a message body and its attachment)
   cannot be swapped for each other.
 
 **Length-prefixing is not decoration.** Plain concatenation makes
-`("ab","c")` and `("a","bc")` the same preimage, which would let a crafted
-`community_key_id` absorb the author's. Every variable-length element is
-length-prefixed for that reason alone.
+`("ab","c")` and `("a","bc")` the same preimage. persist frames this same
+preimage the same way for the same reason (§5.5).
+
+### 5.1.1 Why `community_key_id` and `epoch` are NOT in it
+
+An earlier draft included both. **CIRISPersist#836 Q1 answered that they come
+out**, and the reasoning is worth keeping because it is not obvious.
+
+They are already bound *cryptographically by the blob itself*: the DEK is per
+`(community, epoch)` and the blob row records both, so putting them in the
+AAD adds no binding the ciphertext does not already have — it only adds two
+more ways for a legitimate operation to break a read.
+
+And they are exactly the two members a legitimate **cross-community
+widening** changes.
+
+### 5.1.2 Widening — the premise of the old open question was wrong
+
+That draft asserted `widen_audience` breaks an AAD over
+`(author, asserted_at)` because the widened row carries a different instant.
+**It does not.** A widening carries `asserted_at` **verbatim** —
+`check_widening` compares it like any other body member and `build_widening`
+sets it from the prior — and the placement's own instant is the separate
+signed member `widened_at` (persist v40.0.0). So a reader rebuilding the AAD
+from a widened row computes the same preimage as from the original.
+
+The rule that follows:
+
+- **Widening within one community's DEK is a no-op on the blob.** Same sha,
+  same AAD, nothing to do.
+- **Widening to commons, or to a community the DEK does not cover, is a
+  re-seal.** A `CommunityDek` ciphertext has no business under another tier
+  or another DEK. The widened row references the *new* sha — with the *same*
+  `(author, asserted_at, field)` AAD, because those did not change.
+
+Blob-bearing rows are widenable. The draft's "must not be widened" rule is
+withdrawn.
 
 ### 5.2 The reconstruction rule, and the trap under it
 
@@ -205,23 +233,53 @@ Anything a later, legitimate operation rewrites:
 - **Anything from the transport or the reader.** The AAD must be identical
   for every authorized reader on every node.
 
-### 5.4 DAG binding, stated honestly
+### 5.4 DAG binding — persist frames the preimage and binds position
 
-persist passes the **same** `aad` to every chunk and to the manifest. It does
-*not* derive a per-chunk `(manifest_sha, index)` binding — that was
-considered and deferred, because the manifest sha does not exist at
-chunk-write time.
+**As of persist v44.1.0 (#838) this is enforced by the substrate**, not left
+to the reader's good behaviour. The preimage in §5.1 is the *caller's* half;
+persist wraps it:
 
-The consequence, stated rather than glossed: **within one DAG, a chunk can be
-moved to another index and still open.** Across DAGs it cannot, because the
-AAD differs. Reordering within a sealed DAG is detected by the manifest —
-the chunk shas are listed in order and the manifest is itself sealed — so the
-gap is closed at the manifest layer, not the chunk layer. Edge must therefore
-**never trust a chunk it opened without checking the manifest's order**, and
-`read_blob_range_as` is the door that does that. Hand-assembling chunks is
-out of contract.
+```
+chunk_aad = "ciris-persist:chunk:v1" ‖ u64_be(len(caller_aad)) ‖ caller_aad
+                                     ‖ u64_be(len(stream_id))  ‖ stream_id
+                                     ‖ u64_be(seq)
+```
 
----
+Two consequences for this design:
+
+- **A chunk moved to another index does not open.** The gap the v44.0.0 draft
+  recorded — one `aad` for every chunk, so intra-DAG reordering was invisible
+  to the crypto — is closed.
+- **Edge's preimage goes in unchanged, and is length-delimited from the
+  position bytes**, so it cannot collide with them. Edge never constructs
+  `chunk_aad` itself; it passes `caller_aad` and persist frames it.
+
+The sealed v2 manifest carries `stream_id` and each chunk's `seq`, which is
+what a reader needs to rebuild a chunk's AAD.
+
+**Hand-assembling chunks is out of contract — permanently, not "not yet".**
+persist was explicit on this: the manifest stays the contract and
+`read_blob_range_as` stays the in-contract assembly; #838 makes the contract
+enforce itself rather than merely stating it. A sealed stream chunk also no
+longer opens by its sha alone — the door is
+`read_stream_chunk_as(stream_id, seq, viewer_key_id, aad)`.
+
+### 5.5 `stream_id` — the caller's to make unique, the substrate's to defend
+
+Since persist v44.1.0 (#837) a stream **belongs to its first append**:
+`federation_streams` records `(cohort_scope, community_key_id, owner_key_id)`
+and every later append is compared against it. An append naming a different
+cohort or community is refused **at that chunk**, storing nothing.
+
+- **Derivation:** `<writer derived key id>-<ULID or 128-bit random>`. A
+  content hash is not available before the content exists, which is why the
+  id cannot be derived from what it names.
+- **Uniqueness is still edge's to guarantee**; what the substrate guarantees
+  is that a collision is *refused at the second chunk* rather than silently
+  interleaving two writers' chunks until the seal catches it.
+- **The `MAX_CHUNKS_PER_EPOCH` budget is safe by construction** — a foreign
+  writer cannot append at all, so no member can spend another's budget by
+  guessing an id.
 
 ## 6. Lifecycle — what an epoch does to content
 
@@ -246,8 +304,19 @@ that ignores them has not used the substrate.
   `Tombstone` / `MonotonicSupersede` project at their plane's
   `tombstone_ceiling` regardless of scope — but only if that ceiling is at
   least as wide as shards can travel. persist calls that "a gate, not a
-  convention", and edge is the side that fountains the shards. See open
-  question 4.
+  convention", and edge is the side that fountains the shards.
+
+  **The decided value: `Global` for `CommunityDek` blob shards until
+  CIRISEdge#581 lands, then `Cohort`.** `Cohort` is the right ceiling *once
+  shards stay in the cohort* — and today they do not, because edge has a
+  serve gate and no store gate, so the converger can push a shard to a node
+  outside the community. A `Cohort`-ceiling tombstone does not reach that
+  node, and the violation is silent. persist exposes `crypto_tier` on every
+  blob row and every `holds_bytes` announcement, so the ceiling choice keys
+  off the tier without a new primitive.
+
+  This makes #581 a **prerequisite for narrowing the ceiling**, not only for
+  claiming recall — the wide ceiling is the interim cost of not having it.
 
   What a private application seal opts out of is therefore not "recall" in
   the absolute — it is *persist's* half of it, which is the half that is
@@ -271,15 +340,23 @@ that reveals the content.
 
 | member | why |
 |---|---|
-| `community_key_id` | which community; AAD input |
+| `community_key_id` | which community to read as; NOT an AAD input (§5.1.1) |
 | `content_sha256` | the at-rest sha to read |
-| `content_field` | which field this blob is; AAD input |
-| `epoch` | the bound DEK generation; AAD input |
+| `content_field` | which field this blob is; **AAD input** |
 | `media_type` | so a reader knows what it got before opening it |
-| `chunked` | whether to expect a DAG (range reads available) |
+| `stream_id` | present iff chunked — the DAG's stream (§5.5) |
 
-`author_key_id` and `asserted_at` are already envelope members and are not
-duplicated.
+`author_key_id` and `asserted_at` are already envelope members and are the
+other two **AAD inputs**; they are not duplicated.
+
+The **epoch is deliberately absent**. It is recorded on the blob row's own
+binding, it is not an AAD input, and carrying it on the referencing row would
+create a second copy that a rotation can make stale. A reader asks the blob,
+not the pointer.
+
+Whether the content is chunked is answered by `stream_id`'s presence rather
+than by a separate boolean — one fact, one member, no way for the two to
+disagree.
 
 `FIELD_BODY` / `FIELD_SEALED` / `SEAL_ALG` and the `RoomKey` body-key
 derivation are **retired** by this design, not kept as a fallback. A fallback
@@ -316,7 +393,9 @@ discipline.
 
 | # | invariant |
 |---|---|
-| **G1** | A ciphertext moved to a row with a different `author_key_id`, `asserted_at`, `community_key_id`, `epoch`, or `field` does not open. |
+| **G1** | A ciphertext moved to a row with a different `author_key_id`, `asserted_at`, or `field` does not open. |
+| **G1b** | A ciphertext survives a widening: a row widened within its community's DEK opens the SAME blob, and a widening that crosses the DEK re-seals and references the new sha. |
+| **G1c** | A sealed chunk moved to another `seq` does not open (persist's frame, #838) — asserted at edge's boundary so a substrate regression is caught here rather than inferred. |
 | **G2** | The AAD preimage is never empty, and the write path refuses to seal with an empty one rather than silently sealing unbound. |
 | **G3** | A row written with a sub-resolution `asserted_at` reads back correctly — i.e. the writer truncated before sealing. |
 | **G4** | Commons-tier content passes `None`, and passing `Some` is refused at the door rather than sealing something unreadable. |
@@ -332,49 +411,34 @@ failure, and the one most likely to be written by accident here.
 
 ---
 
-## 10. Open questions
+## 10. Resolved questions
 
-Questions 2, 4 and 5 are filed as **CIRISPersist#836** and block locking this
-design. Questions 1 and 6 are edge's own and are answered inline.
+All four blocking questions were answered on **CIRISPersist#836**; two became
+persist work and shipped in **v44.1.0**.
 
-1. **Does `field` need to be in the AAD when a row carries exactly one blob?**
-   It costs nothing and closes G8 by construction. Kept unconditionally so
-   there is one preimage rather than two.
-2. **What is the `stream_id` for a live A/V recording**, and who guarantees
-   its uniqueness across a community? The DAG doors key on it, and edge has
-   no allocator for it today.
-3. ~~Backfill under which epoch~~ — **answered by the source, not open.** The
-   community cascade re-seals under the CURRENT epoch when the epoch moves
-   under a write and returns `EpochNotCurrent` only after exhausting retries,
-   so sealing under a historical epoch is not expressible. Backfill uses
-   current-at-backfill because nothing else is available.
+| # | question | resolution |
+|---|---|---|
+| Q1 | AAD vs `widen_audience` | **Premise was wrong.** A widening carries `asserted_at` verbatim; `widened_at` is a separate member. `(author, asserted_at, field)` is stable across every widening. Community and epoch come OUT (§5.1.1, §5.1.2). |
+| Q2 | `stream_id` namespace | **Shipped, #837.** A stream belongs to its first append; collisions refuse at the second chunk. Uniqueness stays edge's; derivation is `<writer key id>-<ULID>` (§5.5). |
+| Q3 | per-chunk binding | **Shipped, #838.** persist frames the caller AAD with `(stream_id, seq)`. Hand-assembly is out of contract permanently, not "not yet" (§5.4). |
+| Q4 | tombstone ceiling width | **Edge's, and unchanged.** `Global` for `CommunityDek` shards until CIRISEdge#581 lands the store gate, then `Cohort` (§6). |
+| — | backfill epoch | Answered from source before filing: not expressible; current-at-backfill only. |
+| — | reach of a destroy | Answered from source: node-local, and travelled copies are the tombstone plane's. |
 
-   The consequence is worth stating rather than discovering: a message
-   authored under epoch 3 and backfilled under epoch 12 becomes recallable
-   only by destroying epoch 12 — which also reaches everything else sealed
-   under 12. Backfill therefore **coarsens recall granularity**, and doing it
-   one community at a time (§8 step 3) is what keeps that blast radius
-   legible.
-4. **Is edge's `FountainContent` tombstone ceiling wide enough for
-   `CommunityDek` blobs?** §10.6 makes ceiling width a gate: narrower than
-   the copy set and a retraction "silently un-revokes". Edge fountains the
-   shards, so edge is where this is checkable — and nothing checks it today.
+### 10.1 Edge's own, answered here
 
-5. **An AAD over `(author, asserted_at)` does not survive `widen_audience`.**
-   Widening writes a NEW row that supersedes and leaves the prior, so the
-   widened row carries a different `asserted_at` — and a reader rebuilding
-   the AAD from *it* gets a different preimage and the blob does not open.
+- **`field` in the AAD when a row carries one blob.** Kept unconditionally so
+  there is one preimage rather than two.
+- **Does the A/V path write through these doors?** Live frames are
+  point-to-point under a transit key and are *not* at-rest content; the
+  recording is. The boundary is: anything that outlives the session goes
+  through these doors, anything that does not stays on the transit path.
 
-   Three possible resolutions, and this design cannot pick one alone:
-   crossing a tier boundary always re-writes the content (likely correct for
-   `community` → commons, since the tier changes anyway); the AAD binds to
-   the ORIGINATING row's identity, carried forward as an explicit envelope
-   member on every superseding row; or widening within one tier is simply not
-   supported for blob-bearing rows. **Until this is settled, blob-bearing
-   rows must not be widened.**
+### 10.2 One standing offer, not taken
 
-6. **Does the A/V path (`realtime_av_*`) write through these doors**, or does
-   it keep its own transit sealing for live frames and only use blobs for the
-   recording? Live frames are point-to-point under a transit key and are not
-   at-rest content; the recording plainly is. Stated here because the
-   boundary between them is currently implicit.
+persist offered to make it an I-level gate at `serve_blob*` — refusing to
+serve a `CommunityDek` shard to a peer whose declared ceiling is narrower
+than the tier requires. Not taken **yet**, and the reason is that it would
+be persist enforcing a value only edge can compute; the honest place for it
+is CIRISEdge#581, which is where the copy set is known. If #581's store gate
+turns out not to reach the converger's push path, revisit it.
