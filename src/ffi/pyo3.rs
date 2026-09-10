@@ -6908,9 +6908,21 @@ pub fn init_edge_runtime(
         if edge_arc.transports().is_empty() {
             None
         } else {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            // CIRISEdge#583 — the fold's thread budget. `2` stays the
+            // built-in worker count (CIRISServer#577 measured this runtime
+            // flat at 2 across core counts); what the budget adds is a
+            // ceiling on the blocking pool, which no edge runtime has ever
+            // set and which persist v43.1.0 dispatches every SQL call onto.
+            let budget = crate::runtime_budget::RuntimeBudget::from_env(2);
+            tracing::info!(
+                worker_threads = budget.worker_threads,
+                max_blocking_threads = budget.max_blocking_threads,
+                "init_edge_runtime: edge-side transport runtime thread budget",
+            );
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            let rt = budget
+                .configure(&mut builder)
                 .enable_all()
-                .worker_threads(2)
                 .thread_name("ciris-edge-transport")
                 .build()
                 .map_err(|e| {
