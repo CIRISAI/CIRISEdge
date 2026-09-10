@@ -160,7 +160,19 @@ impl RuntimeBudget {
 /// silently become a thread budget, and warning is the only way an
 /// operator finds out the export did nothing.
 fn read_env(key: &str) -> Option<usize> {
-    let raw = env::var(key).ok()?;
+    parse_budget(key, env::var(key).ok().as_deref())
+}
+
+/// The parse, split out from the lookup.
+///
+/// Not merely for tidiness: edge is `#![deny(unsafe_code)]` unless
+/// `ffi-uniffi` is on, and since Rust 2024 `env::set_var` is `unsafe` — so
+/// a test that reached for the real environment would not compile on most
+/// of edge's feature lanes. Taking the raw value as an argument tests the
+/// same logic against the exact strings an operator can export, with no
+/// global state and no cross-test raciness.
+fn parse_budget(key: &str, raw: Option<&str>) -> Option<usize> {
+    let raw = raw?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -246,28 +258,23 @@ mod tests {
     }
 
     /// Exercises the real parser, not `resolve` with a hand-made `None`.
-    /// `read_env` takes its key as an argument precisely so this can use
-    /// names no other test or the ambient environment will collide with —
-    /// the process environment is global and these tests run in parallel.
     #[test]
-    fn read_env_treats_junk_and_emptiness_as_unset() {
-        let key = "CIRIS_TEST_RUNTIME_BUDGET_JUNK";
-        for junk in ["", "   ", "four", "2.5", "-1", "1e3", "8x"] {
-            // SAFETY: a key private to this test; no other test reads it.
-            unsafe { env::set_var(key, junk) };
-            assert_eq!(read_env(key), None, "{junk:?} must not become a budget");
+    fn the_parser_treats_junk_and_emptiness_as_unset() {
+        let key = "CIRIS_RUNTIME_WORKERS";
+        for junk in ["", "   ", "four", "2.5", "-1", "1e3", "8x", "0x10"] {
+            assert_eq!(
+                parse_budget(key, Some(junk)),
+                None,
+                "{junk:?} must not become a thread budget",
+            );
         }
 
-        // ...and a real value still parses, surrounding whitespace included,
-        // because an export in a deployment script often carries it.
-        for (raw, want) in [("6", 6), (" 6 ", 6), ("0", 0)] {
-            // SAFETY: as above.
-            unsafe { env::set_var(key, raw) };
-            assert_eq!(read_env(key), Some(want), "{raw:?}");
+        // A real value parses, surrounding whitespace included — an export
+        // in a deployment script often carries it.
+        for (raw, want) in [("6", 6), (" 6 ", 6), ("\t8\n", 8), ("0", 0)] {
+            assert_eq!(parse_budget(key, Some(raw)), Some(want), "{raw:?}");
         }
 
-        // SAFETY: as above.
-        unsafe { env::remove_var(key) };
-        assert_eq!(read_env(key), None, "an absent variable is unset");
+        assert_eq!(parse_budget(key, None), None, "an absent variable is unset");
     }
 }
