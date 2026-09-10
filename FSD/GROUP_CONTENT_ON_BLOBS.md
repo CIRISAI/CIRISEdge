@@ -232,10 +232,26 @@ that ignores them has not used the substrate.
   seals under. Existing content stays readable under its bound epoch, which
   is why `community_dek_bind_blob_epoch` exists and why the epoch is in the
   AAD.
-- **Destroying an epoch is recall**, and it is the strongest guarantee in the
-  stack: the DEK is gone and the bytes are unopenable everywhere, including
-  on nodes that never cooperate. This is what a private application seal
-  would silently opt out of.
+- **Destroying an epoch is recall, and its reach is narrower than it sounds.**
+  persist's §11.4 is explicit and this design must not overstate it:
+  `destroyed` means *persist's* copies of the key material are gone and
+  persist will never serve that content again. The destroy precondition is
+  **node-local** — "no object sealed under this epoch" means *on this node*,
+  because persist cannot know what peers hold. And a recipient who already
+  recovered the DEK from a delivered wrap keeps it; no key-management scheme
+  can undo that.
+
+  Recall of copies that already travelled is the **tombstone plane's** job
+  (§10.6), not destroy's. That plane reaches every holder because
+  `Tombstone` / `MonotonicSupersede` project at their plane's
+  `tombstone_ceiling` regardless of scope — but only if that ceiling is at
+  least as wide as shards can travel. persist calls that "a gate, not a
+  convention", and edge is the side that fountains the shards. See open
+  question 4.
+
+  What a private application seal opts out of is therefore not "recall" in
+  the absolute — it is *persist's* half of it, which is the half that is
+  actually enforceable.
 - **Eviction retracts what it announced.** A swept blob answers `Evicted` to
   an authorized reader — "swept", not "never ours". Edge's serve path maps
   that to a miss on the wire (CIRISEdge#587), because the peer's correct
@@ -305,7 +321,7 @@ discipline.
 | **G3** | A row written with a sub-resolution `asserted_at` reads back correctly — i.e. the writer truncated before sealing. |
 | **G4** | Commons-tier content passes `None`, and passing `Some` is refused at the door rather than sealing something unreadable. |
 | **G5** | A relay that holds neither DEK nor grant can still transfer and verify every chunk, and can open none of them. |
-| **G6** | Destroying an epoch makes content sealed under it unopenable through every read door, with no path that bypasses it. |
+| **G6** | Destroying an epoch makes content sealed under it unopenable **through every persist read door on this node**, with no path that bypasses it. Deliberately not "unopenable everywhere": that is the tombstone plane's reach, not this one's, and asserting it here would be the precondition-that-cannot-be-checked persist's §11.4 warns about. |
 | **G7** | A range read returns the plaintext range requested, never a ciphertext substring. |
 | **G8** | Two blobs in one row cannot be exchanged for one another. |
 
@@ -318,17 +334,46 @@ failure, and the one most likely to be written by accident here.
 
 ## 10. Open questions
 
+Questions 2, 4 and 5 are filed as **CIRISPersist#836** and block locking this
+design. Questions 1 and 6 are edge's own and are answered inline.
+
 1. **Does `field` need to be in the AAD when a row carries exactly one blob?**
    It costs nothing and closes G8 by construction. Kept unconditionally so
    there is one preimage rather than two.
 2. **What is the `stream_id` for a live A/V recording**, and who guarantees
    its uniqueness across a community? The DAG doors key on it, and edge has
    no allocator for it today.
-3. **Backfill under which epoch** — the epoch current at backfill, or the one
-   current when the message was authored? Current-at-backfill is simpler and
-   is what §8 assumes; authored-epoch preserves recall semantics more exactly
-   and needs the old epoch to still be enabled.
-4. **Does the A/V path (`realtime_av_*`) write through these doors**, or does
+3. ~~Backfill under which epoch~~ — **answered by the source, not open.** The
+   community cascade re-seals under the CURRENT epoch when the epoch moves
+   under a write and returns `EpochNotCurrent` only after exhausting retries,
+   so sealing under a historical epoch is not expressible. Backfill uses
+   current-at-backfill because nothing else is available.
+
+   The consequence is worth stating rather than discovering: a message
+   authored under epoch 3 and backfilled under epoch 12 becomes recallable
+   only by destroying epoch 12 — which also reaches everything else sealed
+   under 12. Backfill therefore **coarsens recall granularity**, and doing it
+   one community at a time (§8 step 3) is what keeps that blast radius
+   legible.
+4. **Is edge's `FountainContent` tombstone ceiling wide enough for
+   `CommunityDek` blobs?** §10.6 makes ceiling width a gate: narrower than
+   the copy set and a retraction "silently un-revokes". Edge fountains the
+   shards, so edge is where this is checkable — and nothing checks it today.
+
+5. **An AAD over `(author, asserted_at)` does not survive `widen_audience`.**
+   Widening writes a NEW row that supersedes and leaves the prior, so the
+   widened row carries a different `asserted_at` — and a reader rebuilding
+   the AAD from *it* gets a different preimage and the blob does not open.
+
+   Three possible resolutions, and this design cannot pick one alone:
+   crossing a tier boundary always re-writes the content (likely correct for
+   `community` → commons, since the tier changes anyway); the AAD binds to
+   the ORIGINATING row's identity, carried forward as an explicit envelope
+   member on every superseding row; or widening within one tier is simply not
+   supported for blob-bearing rows. **Until this is settled, blob-bearing
+   rows must not be widened.**
+
+6. **Does the A/V path (`realtime_av_*`) write through these doors**, or does
    it keep its own transit sealing for live frames and only use blobs for the
    recording? Live frames are point-to-point under a transit key and are not
    at-rest content; the recording plainly is. Stated here because the
