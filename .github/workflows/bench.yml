@@ -129,6 +129,15 @@ jobs:
       # needed: none of the benched targets enable the `codec-*` features.
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -489,6 +498,15 @@ jobs:
         # libsqlite3-dev: persist's sqlite backend links it. valgrind: the
         # Callgrind engine iai-callgrind drives (the whole point of this lane).
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev valgrind
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1

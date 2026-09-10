@@ -122,6 +122,15 @@ jobs:
       # cross-wheel SIGSEGV CIRISEdge#50 hit at v0.19.5).
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
       - uses: dtolnay/rust-toolchain@1.97.0
       # CIRISEdge#229 — canonical layered cache restore (verify →
       # persist → edge) via the local composite at
@@ -218,6 +227,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: ./.github/actions/ciriscache
         id: cachekey
@@ -283,6 +301,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: ./.github/actions/ciriscache
         id: cachekey
@@ -1228,6 +1255,15 @@ jobs:
       # only libsqlite3-dev remains as a system build dep.
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy, rustfmt
@@ -1307,6 +1343,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: ./.github/actions/ciriscache
         with:
@@ -1392,6 +1437,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
       - uses: dtolnay/rust-toolchain@1.97.0
       - name: Set up sccache (compiler cache over GHA)
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -1539,6 +1593,15 @@ jobs:
       - name: install libsqlite3-dev (sqlite build dep)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
       # v8.1.x (CIRISPersist#328) — the Windows-only vcpkg static-OpenSSL
       # install step is GONE. The Windows wheel now builds with
       # `pyo3-sqlite` (persist's postgres-free PyEngine variant), so
@@ -1849,6 +1912,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: install libsqlite3-dev (sqlite build dep)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        # CIRISEdge#502 — bounded, because an apt-mirror stall is silent.
+        # Twice this step has wedged a lane with zero output (PR #501 for
+        # 2h20m; the v17.4.0 cut for ~3h) while the identical step on other
+        # runners finished normally. Without a bound it runs to the job's 6h
+        # default, and the cost is not the wall clock: the job never FAILS,
+        # so `gh run rerun --failed` does not apply and the whole run must be
+        # CANCELLED — taking every healthy check with it. A timeout converts
+        # a silent hang into a failed step that reruns alone.
+        timeout-minutes: 5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable

@@ -4590,9 +4590,43 @@ impl Edge {
             }
         }
 
+        // CIRISEdge#578 — ABORT the listeners, do not join them.
+        //
+        // `Transport::listen` has no shutdown parameter and no
+        // implementation returns on its own: `ReticulumTransport::listen`
+        // owns the node's event loop and runs until the process dies. The
+        // outbound dispatcher and the blackhole pruner each hold a
+        // `shutdown_rx` clone and stop on their own, which is why their
+        // "shutdown signal received" lines appear — and then this join
+        // waited forever on tasks that were never told to stop.
+        //
+        // Measured downstream (CIRISServer#568): a standalone server took
+        // SIGTERM, drained its read API in under a millisecond, logged
+        // every loop's shutdown, logged edge's own — and was still alive
+        // eight minutes later with 38 threads, still admitting RNS
+        // announces, until `kill -9`. In the mesh harness the same shape
+        // ends `docker stop` with exit 137 after the 30 s grace period.
+        //
+        // Aborting is correct rather than merely expedient: we are past
+        // the shutdown signal, the inbound sender has been dropped, and a
+        // frame still in flight has nowhere to be delivered. The
+        // alternative — threading a shutdown receiver through
+        // `Transport::listen` — changes a trait with ten implementors and
+        // is a cut of its own (a cooperative path could also drain
+        // in-flight frames, which this deliberately does not).
+        //
+        // `JoinHandle::abort` is not synchronous: awaiting after it is what
+        // makes shutdown observable rather than merely requested.
+        for t in &tasks {
+            t.abort();
+        }
         for t in tasks {
+            // `Err(JoinError::Cancelled)` is the expected outcome here, and
+            // a listener that had already exited on its own resolves `Ok`.
+            // Neither is a failure of shutdown.
             let _ = t.await;
         }
+        tracing::info!("edge: transport listeners stopped; run() returning");
         Ok(())
     }
 
@@ -9429,6 +9463,77 @@ mod ephemeral_correlation_tests {
     }
 
     /// No responder → the awaited reply times out, surfaces as
+    /// CIRISEdge#578 — `run()` RETURNS after its shutdown signal.
+    ///
+    /// The regression: `Transport::listen` has no shutdown parameter and no
+    /// implementation returns on its own, so the final `for t in tasks {
+    /// t.await }` waited forever on listeners nobody had told to stop.
+    /// `run()` logged "shutdown signal received" and then never returned —
+    /// downstream, a server that had drained everything else stayed alive
+    /// with 38 threads until `kill -9` (CIRISServer#568).
+    ///
+    /// `NeverReturns` reproduces the real shape exactly: a `listen` that
+    /// parks forever, which is what every production transport does. A test
+    /// transport whose `listen` returned immediately would pass against the
+    /// BUG — the join it hangs on would find nothing to wait for — so the
+    /// parking is the whole fixture.
+    ///
+    /// The assertion is a timeout rather than a bare await: without one, a
+    /// regression does not fail this test, it hangs the suite.
+    #[tokio::test]
+    async fn run_returns_after_shutdown_even_though_listen_never_does() {
+        struct NeverReturns;
+
+        #[async_trait::async_trait]
+        impl Transport for NeverReturns {
+            fn id(&self) -> crate::transport::TransportId {
+                crate::transport::TransportId("never-returns")
+            }
+            async fn send(
+                &self,
+                _destination_key_id: &str,
+                _envelope_bytes: &[u8],
+            ) -> Result<crate::transport::TransportSendOutcome, crate::transport::TransportError>
+            {
+                Ok(crate::transport::TransportSendOutcome::Delivered)
+            }
+            async fn listen(
+                &self,
+                _sink: mpsc::Sender<InboundFrame>,
+            ) -> Result<(), crate::transport::TransportError> {
+                // What ReticulumTransport::listen does: own the event loop
+                // and never come back.
+                std::future::pending::<()>().await;
+                unreachable!("pending() never resolves")
+            }
+        }
+
+        let (edge, _tmp) = build_edge("edge-578-shutdown", Arc::new(NeverReturns), 100).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move { edge.run(shutdown_rx).await });
+
+        // Let the listeners actually get spawned and parked before signalling,
+        // so this exercises the join path rather than a race that skips it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        shutdown_tx.send(true).expect("shutdown signal sent");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+
+        let Ok(joined) = outcome else {
+            panic!(
+                "CIRISEdge#578 regression: run() did not return within 5s of its \
+                 shutdown signal — the transport listeners are being joined \
+                 instead of aborted"
+            );
+        };
+        let ran = joined.expect("run() task itself must not panic");
+        assert!(
+            ran.is_ok(),
+            "run() returned an error after shutdown: {ran:?}"
+        );
+    }
+
     /// `Unreachable`, and the pending entry is retired (no leak).
     #[tokio::test]
     async fn typed_send_timeout_removes_pending_waiter() {
