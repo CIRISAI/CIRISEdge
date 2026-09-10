@@ -528,7 +528,8 @@ pub struct ChunkManifestLite {
 
 impl ChunkManifestLite {
     /// Construct from a persist `ChunkManifest` by projecting away the
-    /// `v` field and (since persist v44.0.0 / #832) `chunk_tier`.
+    /// `v` field, `chunk_tier` (persist v44.0.0 / #832), and `stream_id`
+    /// plus each chunk's `seq` (persist v44.1.0 / #838).
     /// Available only when the manifest is provided as a typed value.
     ///
     /// Dropping `chunk_tier` is correct rather than lossy for this view:
@@ -1594,15 +1595,22 @@ mod tests {
                 ChunkRef {
                     sha: [1u8; 32],
                     size: 100,
+                    // persist v44.1.0 (#838) — the chunk's position in its
+                    // stream. The READER rebuilds a position-bound AAD from
+                    // this and the manifest's `stream_id`; edge's scheduler
+                    // never decrypts, so it projects both away.
+                    seq: Some(0),
                 },
                 ChunkRef {
                     sha: [2u8; 32],
                     size: 200,
+                    seq: Some(1),
                 },
             ],
             chunk_tier: Some(
                 ciris_persist::federation::types::cohort_scope::CryptoTier::CommunityDek,
             ),
+            stream_id: Some("writer-abc-01JBQ".into()),
         };
         let lite = ChunkManifestLite::from_persist(&sealed);
         assert_eq!(
@@ -1633,6 +1641,7 @@ mod tests {
                     total_size: 0,
                     chunks: vec![],
                     chunk_tier: None,
+                    stream_id: None,
                 }
             ))),
             Err(ChunkSourceRefusal::PolicyDenied)
