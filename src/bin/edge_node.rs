@@ -4838,11 +4838,11 @@ fn main() -> std::process::ExitCode {
     }
     //
     // Reticulum needs a genuine multi-thread runtime.
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-    {
+    // CIRISEdge#583 — same budget as the embedded fold; `4` stays this
+    // binary's built-in worker count.
+    let budget = ciris_edge::runtime_budget::RuntimeBudget::from_env(4);
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    let rt = match budget.configure(&mut builder).enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("{{\"fatal\":\"tokio runtime: {e}\"}}");

@@ -64,6 +64,7 @@ pub mod invite_gate;
 pub mod rate_limit;
 #[cfg(test)]
 mod role_matrix_gauntlet;
+pub mod runtime_budget;
 // v6.1.0 (CIRISEdge#175, FSD §3.3) — announce-suppression policy
 // + edge-side registry mirroring the recommended Leviculum
 // `AnnounceControl` extension shape.
