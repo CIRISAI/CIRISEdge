@@ -71,6 +71,25 @@ pub enum AvDispatcherError {
     /// so it cannot type the underlying cause.
     #[error("transport send failed: {0}")]
     SendFailed(String),
+    /// CIRISEdge#591 / leviculum#66 — the link REFUSED the bytes because it
+    /// is applying backpressure (leviculum's `Busy` / `PacingDelay`, which
+    /// is Reticulum's `Channel.is_ready_to_send()` surfaced as an error).
+    ///
+    /// **This is not a failure and must not be handled as one.** Nothing
+    /// was handed to the transport, nothing was lost, and nothing is wrong
+    /// with the frame — the caller is expected to defer via
+    /// [`crate::transport::av_backpressure::PeerBackoff`] rather than
+    /// retry at rate or drop. Conflating it with [`Self::SendFailed`] is
+    /// how a producer ends up generating into a peer that is shedding
+    /// everything it sends, which is the field failure #591 opens with.
+    ///
+    /// Carries no timing deliberately. leviculum's `PacingDelay` reports a
+    /// `ready_at_ms` on ITS monotonic clock, and edge has no access to that
+    /// clock's `now` — comparing it against edge's own `Instant` would be a
+    /// cross-clock bug that reads as a tuning problem. The schedule is
+    /// edge's, computed from Reticulum's curve.
+    #[error("link is applying backpressure (leviculum#66); defer, do not retry at rate")]
+    Congested,
     /// A caller-supplied [`AvLinkReceiver::recv`] failed.
     #[error("transport recv failed: {0}")]
     RecvFailed(String),
@@ -117,8 +136,15 @@ pub enum AvRole {
 /// hold a heterogeneous roster of `Box<dyn AvLinkSender>`.
 #[async_trait::async_trait]
 pub trait AvLinkSender: Send + Sync + 'static {
-    /// Enqueue `bytes` onto the outbound link. Returns
-    /// [`AvDispatcherError::SendFailed`] on transport error.
+    /// Enqueue `bytes` onto the outbound link.
+    ///
+    /// Returns [`AvDispatcherError::SendFailed`] on transport error, and
+    /// [`AvDispatcherError::Congested`] when the link refused the bytes
+    /// under backpressure — a distinction the caller MUST preserve
+    /// (CIRISEdge#591). An implementation over a transport that offers both
+    /// a refusing and an absorbing send is required to use the refusing
+    /// one: absorbing the condition here makes it unobservable to every
+    /// layer above, which is exactly the defect leviculum#66 documents.
     async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError>;
 }
 
