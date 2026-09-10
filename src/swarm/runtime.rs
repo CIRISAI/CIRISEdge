@@ -108,8 +108,9 @@ use super::persist_fountain_evict::{
 use super::scope::{HoldingAnnounce, HoldingsPublishGate};
 use crate::holonomic::fountain_defaults::{recommended_policy, FountainPolicy};
 use crate::holonomic::swarm_rarity::{
-    compute_rarity_score, should_eject_with_diversity, ConsentState, EjectionVerdict,
-    FountainHoldingClaim, RarityScore,
+    claim_weight, compute_rarity_score, should_eject_with_diversity, ConsentState, EjectionVerdict,
+    FountainHoldingClaim, HoldingClaimVerification, RarityScore,
+    HOLDING_WEIGHT_POSSESSION_VERIFIED,
 };
 use crate::identity::{build_envelope, sign_envelope, LocalSigner};
 use crate::messages::MessageType;
@@ -161,6 +162,16 @@ pub struct ObservedClaim {
     /// Local wall-clock at which the claim was observed. Drives the
     /// TTL prune on the converger tick.
     pub observed_at: std::time::Instant,
+    /// CIRISEdge#582 — WHAT WAS ACTUALLY PROVEN about this claim, recorded
+    /// at admission rather than assumed at use.
+    ///
+    /// A holding claim is a peer asserting it holds bytes. Signing one is
+    /// cheap and requires holding nothing, so the count of claimants is
+    /// not evidence of the number of copies — and that count is what
+    /// authorises DELETION. Storing the verification state next to the
+    /// claim is what lets the eviction path weigh a claim by what backs
+    /// it (see [`ObservedClaims::weighted_holder_equivalents`]).
+    pub verification: HoldingClaimVerification,
 }
 
 /// Configuration for the swarm orchestration runtime. All fields are
@@ -432,10 +443,17 @@ pub struct ObservedClaims {
 }
 
 impl ObservedClaims {
-    fn upsert(&mut self, claim: FountainHoldingClaim) {
+    /// A later observation from the same peer for the same content
+    /// replaces the prior entry wholesale, `verification` included. That
+    /// is deliberate: verification is a statement about the observation,
+    /// not a property the peer accrues, and carrying a stale
+    /// `PossessionVerified` forward past its challenge would be exactly
+    /// the unearned confidence CIRISEdge#582 is about.
+    fn upsert(&mut self, claim: FountainHoldingClaim, verification: HoldingClaimVerification) {
         let entry = ObservedClaim {
             observed_at: std::time::Instant::now(),
             claim,
+            verification,
         };
         self.inner
             .entry(entry.claim.content_id.clone())
@@ -460,16 +478,66 @@ impl ObservedClaims {
         dropped
     }
 
+    /// Raw claimant count — how many distinct peers have SAID they hold
+    /// this content, with no regard for whether anything backs the claim.
+    ///
+    /// CIRISEdge#582: this must not reach the eviction decision. It is
+    /// retained for telemetry and for the tests that contrast it with
+    /// [`Self::weighted_holder_equivalents`], which is what deletion is
+    /// allowed to consult.
     fn distinct_holders(&self, content_id: &str) -> u32 {
         self.inner
             .get(content_id)
             .map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX))
     }
 
+    /// CIRISEdge#582 — the holder count that may authorise a DELETE.
+    ///
+    /// Each distinct peer contributes [`claim_weight`] of the verification
+    /// state its claim was admitted under: possession-verified 2,
+    /// signature-only 1, unverified 0. The sum is then divided by
+    /// [`HOLDING_WEIGHT_POSSESSION_VERIFIED`] to return the answer in the
+    /// same unit the policy's thresholds are written in — holders, not
+    /// half-holders — so callers compare against `target_holders` without
+    /// rescaling it.
+    ///
+    /// **The division floors, and that direction is the point.** The two
+    /// errors are not symmetric: under-counting holders retains bytes that
+    /// did not need retaining, while over-counting deletes real copies and
+    /// compounds, because every eviction lowers the true holder count
+    /// while an inflated claim count stays put. Where this is uncertain it
+    /// fails toward retention.
+    ///
+    /// Today every admitted claim is [`HoldingClaimVerification::SignatureOnly`]
+    /// — nothing yet issues a possession challenge — so this returns half
+    /// the raw claimant count, which is precisely the intended effect: it
+    /// doubles the number of Sybil identities a forced-eviction attack
+    /// must stand up.
+    fn weighted_holder_equivalents(&self, content_id: &str) -> u32 {
+        let weight: u32 = self.inner.get(content_id).map_or(0, |m| {
+            m.values()
+                .map(|c| claim_weight(c.verification))
+                .fold(0u32, u32::saturating_add)
+        });
+        weight / HOLDING_WEIGHT_POSSESSION_VERIFIED
+    }
+
+    /// Claims that carry weight — i.e. everything except
+    /// [`HoldingClaimVerification::Unverified`], which by definition has
+    /// an invalid or missing signature.
+    ///
+    /// CIRISEdge#582 item 3: an unverified remote claim must never be the
+    /// sole justification for a delete. Rarity is computed over claimant
+    /// sets, and MORE claimants reads as LESS rare, which pushes toward
+    /// eviction — so letting weightless claims into this set would let a
+    /// liar deflate rarity even after the count gate stopped counting it.
     fn all_claims_for(&self, content_id: &str) -> Vec<FountainHoldingClaim> {
-        self.inner
-            .get(content_id)
-            .map_or_else(Vec::new, |m| m.values().map(|c| c.claim.clone()).collect())
+        self.inner.get(content_id).map_or_else(Vec::new, |m| {
+            m.values()
+                .filter(|c| claim_weight(c.verification) > 0)
+                .map(|c| c.claim.clone())
+                .collect()
+        })
     }
 
     fn content_ids(&self) -> Vec<String> {
@@ -675,8 +743,21 @@ impl FountainSwarmRuntime {
     /// replaces the prior entry (the substrate's `observed_at_unix_ms`
     /// field carries the producer's own staleness window; the
     /// runtime's TTL prune is a local liveness signal).
-    pub async fn register_observed_claim(&self, claim: FountainHoldingClaim) {
-        self.observed.write().await.upsert(claim);
+    /// CIRISEdge#582 — `verification` is what the CALLER proved, and it is
+    /// required rather than defaulted.
+    ///
+    /// The admission path is the only place that knows what gates a claim
+    /// actually cleared, and a default here would have every caller
+    /// silently asserting the most convenient answer. Edge's dispatch
+    /// passes [`HoldingClaimVerification::SignatureOnly`]: the claim is
+    /// past the AV-9 verify gate, so the signature is real, and nothing in
+    /// the protocol yet challenges possession.
+    pub async fn register_observed_claim(
+        &self,
+        claim: FountainHoldingClaim,
+        verification: HoldingClaimVerification,
+    ) {
+        self.observed.write().await.upsert(claim, verification);
     }
 
     /// Shared observed-claims map for tests + telemetry. Cheap clone
@@ -1197,10 +1278,36 @@ async fn converger_tick(
 
     for (content_id, diversity_score) in ordered {
         let snapshot = observed.read().await;
-        let observed_count = snapshot.distinct_holders(&content_id);
+        // CIRISEdge#582 — WEIGHTED, not raw. This number authorises a
+        // delete, and a raw claimant count is a number any peer can
+        // inflate for the price of a signature.
+        let observed_count = snapshot.weighted_holder_equivalents(&content_id);
+        let raw_claimants = snapshot.distinct_holders(&content_id);
         let all_claims = snapshot.all_claims_for(&content_id);
         drop(snapshot);
+        if raw_claimants != observed_count {
+            tracing::debug!(
+                content_id = %content_id,
+                raw_claimants,
+                weighted_holder_equivalents = observed_count,
+                "converger: eviction is weighing claims by what backs them (CIRISEdge#582)",
+            );
+        }
 
+        // CIRISEdge#582 sibling — this hardcode is NOT fixable by changing
+        // the constant, and it is worth writing down why. The only other
+        // honest value here is `ConsentState::Unknown`, which this module
+        // defines as evict-eligible REGARDLESS of rarity (the fail-secure
+        // privacy direction). Substituting it would make every piece of
+        // content on every node evict-eligible at once — mass deletion,
+        // which is the precise harm #582 exists to prevent. `Active` is
+        // the retention-favouring choice and stays until revocation is
+        // actually signalled. What is missing is the wire: no
+        // `register_revocation` exists on this runtime, only a comment
+        // promising one. Consent and holder-count fail secure in OPPOSITE
+        // directions, and closing this needs the revocation envelope, not
+        // a different literal.
+        //
         // Determine consent state. v5.2.0 defaults to Active —
         // revocation routing rides the inbound dispatch path
         // (when a `consent:state:revoked` envelope arrives, edge
@@ -1525,19 +1632,15 @@ mod tests {
             None,
         );
 
-        rt.register_observed_claim(FountainHoldingClaim::new(
-            "bob",
-            "c-x",
-            vec![1, 2],
-            1_700_000_000,
-        ))
+        rt.register_observed_claim(
+            FountainHoldingClaim::new("bob", "c-x", vec![1, 2], 1_700_000_000),
+            HoldingClaimVerification::SignatureOnly,
+        )
         .await;
-        rt.register_observed_claim(FountainHoldingClaim::new(
-            "carol",
-            "c-x",
-            vec![1, 3],
-            1_700_000_000,
-        ))
+        rt.register_observed_claim(
+            FountainHoldingClaim::new("carol", "c-x", vec![1, 3], 1_700_000_000),
+            HoldingClaimVerification::SignatureOnly,
+        )
         .await;
         let map = rt.observed_handle();
         let g = map.read().await;
@@ -1550,8 +1653,13 @@ mod tests {
 
     #[tokio::test]
     async fn converger_fires_eject_above_target_when_observed_holders_exceed_threshold() {
-        // 35 holders + local symbol "common" (rarity >= target/2=15)
-        // → EjectToTier per the substrate's threshold math.
+        // CIRISEdge#582 — 70 SIGNATURE-ONLY holders. The threshold is
+        // still target+grace=34, but the count that reaches it is now
+        // weighted: a signature-only claim is worth half a holder, so 70
+        // claims are 35 holder-equivalents and the converger ejects. The
+        // 35 raw claims this test used to publish are now 17 and do NOT
+        // eject — see `the_pre_582_eviction_trigger_count_no_longer_evicts`,
+        // which pins exactly that.
         let local_content_id = "c-popular";
         let holdings: Arc<dyn FountainHoldingsSource> =
             Arc::new(VecHoldings(vec![HeldFountainContent {
@@ -1574,17 +1682,19 @@ mod tests {
             "alice".to_string(),
             Some(sink),
         );
-        // Publish 35 distinct peer claims for symbol_id=1 — every
-        // peer holds symbol 1, so the local symbol is "common"
-        // (rarity score = 35 > target/2=15) and observed_count=35
+        // Every peer holds symbol 1, so the local symbol is "common"
+        // (rarity score = 70 > target/2=15) and the WEIGHTED count of 35
         // is above target+grace=34, so the converger should eject.
-        for i in 0..35 {
-            rt.register_observed_claim(FountainHoldingClaim::new(
-                format!("peer-{i}"),
-                local_content_id,
-                vec![1],
-                1_700_000_000,
-            ))
+        for i in 0..70 {
+            rt.register_observed_claim(
+                FountainHoldingClaim::new(
+                    format!("peer-{i}"),
+                    local_content_id,
+                    vec![1],
+                    1_700_000_000,
+                ),
+                HoldingClaimVerification::SignatureOnly,
+            )
             .await;
         }
         // Wait a couple of converger ticks.
@@ -1617,9 +1727,134 @@ mod tests {
         );
     }
 
+    /// CIRISEdge#582 regression guard — the exact attack, at the exact
+    /// count that used to work.
+    ///
+    /// 35 signed claims was the pre-#582 eviction trigger (target 30 +
+    /// 15% grace = 34). Signing a `FountainHoldingClaim` requires holding
+    /// nothing, so 35 Sybil identities under one operator could make every
+    /// honest node delete a real copy of content none of them had. The
+    /// same 35 claims are now 17 holder-equivalents and authorise nothing.
+    #[tokio::test]
+    async fn the_pre_582_eviction_trigger_count_no_longer_evicts() {
+        let local_content_id = "c-sybil-target";
+        let holdings: Arc<dyn FountainHoldingsSource> =
+            Arc::new(VecHoldings(vec![HeldFountainContent {
+                content_id: local_content_id.into(),
+                corpus_kind: "fountain-corpus".into(),
+                symbol_ids: vec![1],
+            }]));
+        let tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
+        let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<SwarmEvent>();
+        let sink: SwarmRuntimeEventSink = Arc::new(move |ev| {
+            let _ = sink_tx.send(ev);
+        });
+        let rt = FountainSwarmRuntime::start(
+            fast_config(),
+            holdings,
+            test_directory(),
+            tx,
+            cohort,
+            "alice".to_string(),
+            Some(sink),
+        );
+        for i in 0..35 {
+            rt.register_observed_claim(
+                FountainHoldingClaim::new(
+                    format!("sybil-{i}"),
+                    local_content_id,
+                    vec![1],
+                    1_700_000_000,
+                ),
+                HoldingClaimVerification::SignatureOnly,
+            )
+            .await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let mut rt = rt;
+        rt.shutdown().await;
+
+        while let Ok(ev) = sink_rx.try_recv() {
+            if let SwarmEvent::EjectedToTier { content_id, .. } = ev {
+                assert_ne!(
+                    content_id, local_content_id,
+                    "35 signature-only claims must not authorise a delete (CIRISEdge#582)",
+                );
+            }
+        }
+    }
+
+    /// The weighting is per DISTINCT PEER, and a claim with no valid
+    /// signature contributes nothing at all rather than a little.
+    #[test]
+    fn weighted_holder_equivalents_counts_what_backs_a_claim() {
+        use HoldingClaimVerification::{PossessionVerified, SignatureOnly, Unverified};
+        let mut claims = ObservedClaims::default();
+        let add = |claims: &mut ObservedClaims, peer: &str, v| {
+            claims.upsert(FountainHoldingClaim::new(peer, "c", vec![1], 1), v);
+        };
+
+        // Four peers who merely said so are two holder-equivalents.
+        for i in 0..4 {
+            add(&mut claims, &format!("sig-{i}"), SignatureOnly);
+        }
+        assert_eq!(claims.distinct_holders("c"), 4, "four peers did claim");
+        assert_eq!(claims.weighted_holder_equivalents("c"), 2);
+
+        // A peer that proved possession is worth a whole holder.
+        add(&mut claims, "proved", PossessionVerified);
+        assert_eq!(claims.weighted_holder_equivalents("c"), 3);
+
+        // Unverified adds nothing — not a fraction, nothing — and is
+        // excluded from the claim set rarity is computed over, so it
+        // cannot deflate rarity toward eviction either.
+        add(&mut claims, "liar", Unverified);
+        assert_eq!(
+            claims.distinct_holders("c"),
+            6,
+            "the liar is still observed"
+        );
+        assert_eq!(
+            claims.weighted_holder_equivalents("c"),
+            3,
+            "but counts for nothing"
+        );
+        assert_eq!(
+            claims.all_claims_for("c").len(),
+            5,
+            "an unverified claim must not reach the rarity computation",
+        );
+    }
+
+    /// Re-observing a peer replaces its verification rather than keeping
+    /// the strongest ever seen — a possession proof must not outlive the
+    /// observation that earned it.
+    #[test]
+    fn a_later_observation_does_not_inherit_an_earlier_possession_proof() {
+        let mut claims = ObservedClaims::default();
+        let claim = || FountainHoldingClaim::new("p", "c", vec![1], 1);
+        claims.upsert(claim(), HoldingClaimVerification::PossessionVerified);
+        assert_eq!(claims.weighted_holder_equivalents("c"), 1);
+        claims.upsert(claim(), HoldingClaimVerification::SignatureOnly);
+        assert_eq!(
+            claims.weighted_holder_equivalents("c"),
+            0,
+            "the downgrade must take effect: 1 signature-only peer floors to 0",
+        );
+    }
+
     #[tokio::test]
     async fn converger_emits_repair_needed_when_below_min_viable() {
-        // 2 holders < min_viable=5 → RepairNeeded telemetry.
+        // 2 signature-only claims = 1 holder-equivalent < min_viable=5 →
+        // RepairNeeded telemetry.
+        //
+        // CIRISEdge#582 — repair reads the same weighted count eviction
+        // does, and deliberately. A lying holder attacks availability from
+        // BOTH ends: an inflated count forces eviction, and it also
+        // SUPPRESSES the repair that would have replaced the copies. One
+        // discount closes both, and under-counting here merely repairs
+        // something that did not need it.
         let content_id = "c-rare";
         let holdings: Arc<dyn FountainHoldingsSource> =
             Arc::new(VecHoldings(vec![HeldFountainContent {
@@ -1643,12 +1878,10 @@ mod tests {
             Some(sink),
         );
         for i in 0..2 {
-            rt.register_observed_claim(FountainHoldingClaim::new(
-                format!("peer-{i}"),
-                content_id,
-                vec![7],
-                1_700_000_000,
-            ))
+            rt.register_observed_claim(
+                FountainHoldingClaim::new(format!("peer-{i}"), content_id, vec![7], 1_700_000_000),
+                HoldingClaimVerification::SignatureOnly,
+            )
             .await;
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1662,19 +1895,23 @@ mod tests {
                 min_viable,
             } = ev
             {
-                if cid == content_id && observed_holders == 2 && min_viable == DEFAULT_MIN_VIABLE {
+                if cid == content_id && observed_holders == 1 && min_viable == DEFAULT_MIN_VIABLE {
                     saw_repair = true;
                 }
             }
         }
-        assert!(saw_repair, "expected RepairNeeded(c-rare, 2, 5)");
+        assert!(
+            saw_repair,
+            "expected RepairNeeded(c-rare, 1, 5) — two signature-only claims are \
+             one holder-equivalent",
+        );
     }
 
     #[tokio::test]
     async fn observed_claims_prune_when_ttl_elapsed() {
         let mut claims = ObservedClaims::default();
         let claim = FountainHoldingClaim::new("p", "c", vec![1], 1_700_000_000);
-        claims.upsert(claim);
+        claims.upsert(claim, HoldingClaimVerification::SignatureOnly);
         assert_eq!(claims.distinct_holders("c"), 1);
         // TTL=0 → every claim is "expired" instantly.
         let dropped = claims.prune_expired(Duration::from_secs(0));
@@ -1685,8 +1922,14 @@ mod tests {
     #[tokio::test]
     async fn observed_claims_dedupe_per_peer_content() {
         let mut claims = ObservedClaims::default();
-        claims.upsert(FountainHoldingClaim::new("p", "c", vec![1], 1));
-        claims.upsert(FountainHoldingClaim::new("p", "c", vec![1, 2], 2));
+        claims.upsert(
+            FountainHoldingClaim::new("p", "c", vec![1], 1),
+            HoldingClaimVerification::SignatureOnly,
+        );
+        claims.upsert(
+            FountainHoldingClaim::new("p", "c", vec![1, 2], 2),
+            HoldingClaimVerification::SignatureOnly,
+        );
         // Same (peer, content) → upsert keeps the latest claim only.
         assert_eq!(claims.distinct_holders("c"), 1);
         let all = claims.all_claims_for("c");
@@ -2160,12 +2403,10 @@ mod tests {
             options,
         );
         for i in 0..holders {
-            rt.register_observed_claim(FountainHoldingClaim::new(
-                format!("peer-{i}"),
-                content_id,
-                vec![7],
-                1_700_000_000,
-            ))
+            rt.register_observed_claim(
+                FountainHoldingClaim::new(format!("peer-{i}"), content_id, vec![7], 1_700_000_000),
+                HoldingClaimVerification::SignatureOnly,
+            )
             .await;
         }
         (rt, sink_rx)
