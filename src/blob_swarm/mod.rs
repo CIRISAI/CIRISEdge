@@ -471,8 +471,22 @@ pub fn serve_result_to_chunk(
             Err(ChunkSourceRefusal::PolicyDenied)
         }
 
-        // The ONE arm that is not a refusal.
-        Err(BlobError::NotHeld { .. }) => Ok(None),
+        // The two arms that are not refusals. Both mean "we do not have
+        // these bytes", and both should send the peer to another holder.
+        //
+        // persist v44.0.0 (#833) split `Evicted` out of `NotHeld` so an
+        // OPERATOR can tell "swept by the retention sweep" from "never
+        // ours / wrong handle". That distinction is real and worth keeping
+        // on persist's side; it does not survive onto this wire, because
+        // edge's `MissReason` vocabulary has one word for "not here" and
+        // the peer's correct action is identical either way.
+        //
+        // Mapping it explicitly rather than leaving it to the fail-closed
+        // wildcard, which is where it landed on arrival: `PolicyDenied`
+        // would tell the peer this node HAS the bytes and is declining to
+        // serve them, which is false and sends it hunting differently than
+        // it should. Failing closed kept it safe; it did not make it true.
+        Err(BlobError::NotHeld { .. } | BlobError::Evicted { .. }) => Ok(None),
 
         // Capacity: clears when the host disk recovers, never on retry.
         Err(BlobError::DiskPressureProxyRefused { .. }) => Err(ChunkSourceRefusal::DiskPressure),
@@ -513,9 +527,17 @@ pub struct ChunkManifestLite {
 }
 
 impl ChunkManifestLite {
-    /// Construct from a persist `ChunkManifest` by projecting away
-    /// the `v` field. Available only when the manifest is provided
-    /// as a typed value.
+    /// Construct from a persist `ChunkManifest` by projecting away the
+    /// `v` field and (since persist v44.0.0 / #832) `chunk_tier`.
+    /// Available only when the manifest is provided as a typed value.
+    ///
+    /// Dropping `chunk_tier` is correct rather than lossy for this view:
+    /// the scheduler fetches chunks by sha and hands the bytes to the
+    /// consumer's verifier without reading them, so a sealed DAG is
+    /// relayed exactly like a plaintext one — persist's "a relay carries
+    /// what it cannot read". Nothing in the scheduler may branch on the
+    /// tier, and persist says the same on its side: the reader dispatches
+    /// on the ROW's `crypto_tier` column, never on this field.
     #[must_use]
     pub fn from_persist(manifest: &ciris_persist::federation::ChunkManifest) -> Self {
         Self {
@@ -1458,10 +1480,22 @@ mod tests {
 
         let sha = "ab".repeat(32);
         let cases: Vec<(BlobError, Mapped)> = vec![
-            // The one miss.
+            // The two misses.
             (
                 BlobError::NotHeld {
                     sha256_hex: sha.clone(),
+                },
+                Ok(None),
+            ),
+            // persist v44.0.0 (#833). Arrived as a new variant and was
+            // absorbed by the fail-closed wildcard exactly as designed —
+            // safe on arrival, then made precise.
+            (
+                BlobError::Evicted {
+                    sha256_hex: sha.clone(),
+                    community_key_id: "c".into(),
+                    epoch: 3,
+                    evicted_at: chrono::Utc::now(),
                 },
                 Ok(None),
             ),
@@ -1534,6 +1568,52 @@ mod tests {
         }
     }
 
+    /// persist v44.0.0 (#832) — a SEALED v2 DAG passes edge's structural
+    /// validator unchanged, and the reason is worth pinning because the
+    /// release note reads like it should not.
+    ///
+    /// v44 warns that "a consumer that checks total size against ROW BYTES
+    /// breaks". Edge does not: `ChunkManifestLite::validate` checks
+    /// `total_size == sum(ChunkRef::size)`, and in a v2 manifest BOTH are
+    /// plaintext — the `sha` addresses a ciphertext row of
+    /// `size + AT_REST_ENVELOPE_OVERHEAD` bytes, but the `size` field
+    /// itself is the plaintext length. The invariant edge checks is the one
+    /// that survived.
+    ///
+    /// If persist ever makes `size` the stored length, this test fails and
+    /// the scheduler needs the overhead term. That is the whole point of
+    /// asserting it here rather than trusting the prose.
+    #[test]
+    fn a_sealed_v2_manifest_still_satisfies_edges_structural_check() {
+        use ciris_persist::federation::{ChunkManifest, ChunkRef};
+
+        let sealed = ChunkManifest {
+            v: ciris_persist::federation::CHUNK_MANIFEST_VERSION_SEALED,
+            total_size: 300,
+            chunks: vec![
+                ChunkRef {
+                    sha: [1u8; 32],
+                    size: 100,
+                },
+                ChunkRef {
+                    sha: [2u8; 32],
+                    size: 200,
+                },
+            ],
+            chunk_tier: Some(
+                ciris_persist::federation::types::cohort_scope::CryptoTier::CommunityDek,
+            ),
+        };
+        let lite = ChunkManifestLite::from_persist(&sealed);
+        assert_eq!(
+            lite.validate(),
+            Ok(()),
+            "v2 sizes are PLAINTEXT, so total_size == sum(sizes) still holds",
+        );
+        assert_eq!(lite.total_size, 300);
+        assert_eq!(lite.chunks.len(), 2);
+    }
+
     #[test]
     fn an_inline_body_is_the_only_servable_chunk_body() {
         use ciris_persist::federation::BlobBody;
@@ -1552,6 +1632,7 @@ mod tests {
                     v: ciris_persist::federation::CHUNK_MANIFEST_VERSION,
                     total_size: 0,
                     chunks: vec![],
+                    chunk_tier: None,
                 }
             ))),
             Err(ChunkSourceRefusal::PolicyDenied)

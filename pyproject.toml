@@ -100,7 +100,7 @@ classifiers = [
 # MAJOR always moves it: the constraint this line expresses is "the wheel in
 # this process is the same crate edge linked", and 40.x and 41.x are not.
 dependencies = [
-    "ciris-persist>=43,<44",
+    "ciris-persist>=44,<45",
 ]
 dynamic = ["version"]
 
