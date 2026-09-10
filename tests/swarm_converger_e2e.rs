@@ -29,7 +29,7 @@ use std::time::Duration;
 use ciris_edge::holonomic::fountain_defaults::recommended_policy;
 use ciris_edge::holonomic::swarm_rarity::{
     should_eject_above_target, should_eject_with_diversity, ConsentState, EjectionVerdict,
-    FountainHoldingClaim, RarityScore,
+    FountainHoldingClaim, HoldingClaimVerification, RarityScore,
 };
 use ciris_edge::messages::{EdgeEnvelope, MessageType, SchemaVersion};
 use ciris_edge::swarm::{
@@ -353,12 +353,10 @@ async fn runtime_round_trip_with_published_claim_via_register_observed_claim() {
         None,
     );
 
-    rt.register_observed_claim(FountainHoldingClaim::new(
-        "bob",
-        "shard-X",
-        vec![1, 2, 3],
-        1_700_000_000,
-    ))
+    rt.register_observed_claim(
+        FountainHoldingClaim::new("bob", "shard-X", vec![1, 2, 3], 1_700_000_000),
+        HoldingClaimVerification::SignatureOnly,
+    )
     .await;
 
     let observed = rt.observed_handle();
