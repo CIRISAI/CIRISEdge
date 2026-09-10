@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "22.0.0"
+version = "23.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1095,8 +1095,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "43.0.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v43.0.0#170cc8926cce197707f73b7ad29778fae7cee59f"
+version = "43.1.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v43.1.0#9707ed854c30737db82d6aca29310979c4c37578"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
