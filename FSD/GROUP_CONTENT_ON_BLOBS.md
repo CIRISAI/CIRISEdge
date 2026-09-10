@@ -318,6 +318,14 @@ that ignores them has not used the substrate.
   This makes #581 a **prerequisite for narrowing the ceiling**, not only for
   claiming recall — the wide ceiling is the interim cost of not having it.
 
+  **Status:** the gate itself now exists
+  ([`blob_swarm::store_gate`](../src/blob_swarm/store_gate.rs)) and is wired
+  into the swarm's fetch path ahead of any byte transfer. It is UNARMED by
+  default and says so once per process, because arming it changes what a
+  running deployment accepts. Narrowing the ceiling to `Cohort` waits on the
+  gate being armed in the field AND on the converger's push path being
+  covered, not merely on the gate compiling.
+
   What a private application seal opts out of is therefore not "recall" in
   the absolute — it is *persist's* half of it, which is the half that is
   actually enforceable.
