@@ -6314,7 +6314,19 @@ async fn dispatch_inbound(
                 // post-AV-9 claim.
                 converged_claims.observe(&claim);
                 if let Some(runtime) = swarm_runtime {
-                    runtime.register_observed_claim(claim).await;
+                    // CIRISEdge#582 — SignatureOnly, and precisely that. We
+                    // are past the AV-9 verify gate, so the claim's hybrid
+                    // signature is real; nothing here or anywhere else in
+                    // the protocol has asked this peer to prove it holds
+                    // the bytes. Naming the weaker state is what keeps a
+                    // signature from being counted as possession on the one
+                    // path that deletes.
+                    runtime
+                        .register_observed_claim(
+                            claim,
+                            crate::holonomic::swarm_rarity::HoldingClaimVerification::SignatureOnly,
+                        )
+                        .await;
                 }
             }
             Err(e) => {

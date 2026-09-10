@@ -2009,6 +2009,10 @@ pub struct ReticulumTransport {
     /// `None` until installed: every scope-native lookup then declines and
     /// the federation-scope paths are unaffected.
     scope_addresses: OnceLock<Arc<ScopeAddressTable>>,
+    /// CIRISEdge#591 / leviculum#66 — per-interface circuit-breaker series,
+    /// fed by `NodeEvent::PeerCongested`. Read via
+    /// [`Self::congestion_gauges`].
+    congestion: Arc<crate::transport::av_backpressure::CongestionRegistry>,
     /// CIRISEdge#169 — the LXMF propagation serve node, when this node has
     /// been configured to carry third-party mail. `None` (the default) means
     /// the `RequestReceived` arm declines every propagation request.
@@ -2464,6 +2468,31 @@ impl ReticulumTransport {
     /// backlog. Zero here says this node has nothing further old-masked to
     /// send — which is what its PEERS need to know before they seal, not what
     /// this node needs to know before it seals. See [`Self::ifac_seal_rotation`].
+    /// CIRISEdge#591 — per-interface congestion series: `(interface_id,
+    /// circuit_open, shed_packets, open_transitions)`.
+    ///
+    /// leviculum#66 names the one question it cannot answer from its own
+    /// side — whether the circuit sits open continuously or oscillates —
+    /// because that decides whether the cooldown ladder is tuned right and
+    /// only a consumer holding the series can tell. `open_transitions` is
+    /// what makes the two distinguishable: a snapshot of `circuit_open`
+    /// alone reads a hundred short outages exactly like one long one.
+    #[must_use]
+    pub fn congestion_gauges(&self) -> Vec<(usize, bool, u64, u64)> {
+        self.congestion
+            .snapshot()
+            .into_iter()
+            .map(|(id, c)| (id, c.circuit_open, c.shed_packets, c.open_transitions))
+            .collect()
+    }
+
+    /// CIRISEdge#591 — is leviculum currently shedding on ANY interface?
+    /// The cheap question to ask before generating speculative traffic.
+    #[must_use]
+    pub fn is_shedding(&self) -> bool {
+        self.congestion.any_congested()
+    }
+
     #[must_use]
     pub fn retry_queue_gauges(&self) -> (usize, usize, u64) {
         let s = self.node.plane_stats();
@@ -3036,6 +3065,7 @@ impl ReticulumTransport {
             local_transport_pubkey,
             local_identity: identity.clone(),
             scope_addresses: OnceLock::new(),
+            congestion: Arc::new(crate::transport::av_backpressure::CongestionRegistry::default()),
             #[cfg(feature = "lxmf")]
             lxmf_serve: OnceLock::new(),
             local_attestation,
@@ -5798,6 +5828,7 @@ impl Transport for ReticulumTransport {
                         scope_addresses: &self.scope_addresses,
                         #[cfg(feature = "lxmf")]
                         lxmf_serve: &self.lxmf_serve,
+                        congestion: &self.congestion,
                     };
                     handle_event(event, &ctx).await;
 
@@ -6171,6 +6202,10 @@ struct EventCtx<'a> {
     /// sub-protocol's state (the `EventCtx` field pattern).
     #[cfg(feature = "lxmf")]
     lxmf_serve: &'a OnceLock<Arc<crate::transport::lxmf_serve::LxmfServeNode>>,
+    /// CIRISEdge#591 — where `NodeEvent::PeerCongested` is recorded, so the
+    /// node-level "are we shedding" question has an answer that came from
+    /// leviculum rather than from inference.
+    congestion: &'a crate::transport::av_backpressure::CongestionRegistry,
 }
 
 /// CIRISEdge#424 — the classified result of attributing an inbound frame's link to
@@ -7221,6 +7256,44 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                      is undersized for this deployment — raise it via \
                      ReticulumTransportConfig::control_channel_capacity or \
                      CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY (CIRISEdge#508)"
+                );
+            }
+        }
+        // CIRISEdge#591 item 4 / leviculum#66 — the PUSHED congestion notice.
+        //
+        // Until v0.26.0 a producer could only infer that a peer was shedding,
+        // from timeouts, after the fact. This arm is the push half: leviculum
+        // classes it Control precisely so it survives the load that produced
+        // it, which makes it better evidence than anything edge could infer.
+        //
+        // Granularity note, stated rather than papered over: this is
+        // per-INTERFACE, and edge's A/V backoff is per-LINK. The registry
+        // below records the interface verdict so the node-level "are we
+        // shedding" question has an answer that did not come from guessing;
+        // the per-link pacing still comes from that link's own `try_send`
+        // refusals, which are exact. Narrowing interface -> link needs a
+        // mapping leviculum does not expose today.
+        NodeEvent::PeerCongested {
+            interface_id,
+            congested,
+            shed_packets,
+        } => {
+            ctx.congestion.record(interface_id, congested, shed_packets);
+            if congested {
+                tracing::warn!(
+                    interface_id,
+                    shed_packets,
+                    "leviculum opened the outbound circuit on this interface: traffic to \
+                     the peer is being SHED, not queued. Producers on this node should \
+                     stop generating for it rather than retry at rate — a packet sent \
+                     now is discarded before it is masked (leviculum#66)"
+                );
+            } else {
+                tracing::info!(
+                    interface_id,
+                    shed_packets,
+                    "leviculum closed the outbound circuit on this interface: traffic is \
+                     flowing again (leviculum#66)"
                 );
             }
         }

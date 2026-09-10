@@ -1537,6 +1537,61 @@ impl PyEdge {
         }
     }
 
+    /// CIRISEdge#591 / leviculum#66 — per-interface circuit-breaker series:
+    /// `[(interface_id, circuit_open, shed_packets, open_transitions), ...]`.
+    ///
+    /// leviculum#66 names the one question it cannot answer from its own
+    /// side: does a peer's circuit sit open continuously, or oscillate? That
+    /// decides whether the cooldown ladder is tuned right, and only a
+    /// consumer holding the series can say — which is why this is exposed to
+    /// the embedded host rather than kept inside the Rust transport.
+    ///
+    /// `open_transitions` is the field that makes the two distinguishable. A
+    /// snapshot of `circuit_open` alone reads a hundred short outages exactly
+    /// like one long one, and those call for opposite fixes: flapping means
+    /// the cooldown ladder is too eager, a sustained open means the peer
+    /// downstream is genuinely not draining.
+    ///
+    /// Pairs with `is_shedding()` for the cheap "should I generate at all"
+    /// check on a hot path.
+    fn congestion_gauges(&self) -> PyResult<Vec<(usize, bool, u64, u64)>> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err("congestion_gauges: edge has no Reticulum transport")
+            })?;
+            Ok(transport.congestion_gauges())
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            Err(PyRuntimeError::new_err(
+                "congestion_gauges: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
+    /// CIRISEdge#591 — is leviculum currently SHEDDING on any interface?
+    ///
+    /// True means packets to at least one peer are being discarded before
+    /// they are even masked. A producer that keeps generating into that is
+    /// doing work that will be thrown away — this is the check to make
+    /// before enqueueing speculative traffic, not after a timeout.
+    fn is_shedding(&self) -> PyResult<bool> {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let transport = self.inner.reticulum_transport().ok_or_else(|| {
+                PyRuntimeError::new_err("is_shedding: edge has no Reticulum transport")
+            })?;
+            Ok(transport.is_shedding())
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            Err(PyRuntimeError::new_err(
+                "is_shedding: requires the _reticulum-module feature",
+            ))
+        }
+    }
+
     /// leviculum#52 — the default dwell between `ifac_activate_next` and
     /// `ifac_seal_rotation`, in milliseconds. A conservative choice, not a
     /// derivation: the drain window is bounded by peers' retry-queue
@@ -6908,9 +6963,21 @@ pub fn init_edge_runtime(
         if edge_arc.transports().is_empty() {
             None
         } else {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            // CIRISEdge#583 — the fold's thread budget. `2` stays the
+            // built-in worker count (CIRISServer#577 measured this runtime
+            // flat at 2 across core counts); what the budget adds is a
+            // ceiling on the blocking pool, which no edge runtime has ever
+            // set and which persist v43.1.0 dispatches every SQL call onto.
+            let budget = crate::runtime_budget::RuntimeBudget::from_env(2);
+            tracing::info!(
+                worker_threads = budget.worker_threads,
+                max_blocking_threads = budget.max_blocking_threads,
+                "init_edge_runtime: edge-side transport runtime thread budget",
+            );
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            let rt = budget
+                .configure(&mut builder)
                 .enable_all()
-                .worker_threads(2)
                 .thread_name("ciris-edge-transport")
                 .build()
                 .map_err(|e| {

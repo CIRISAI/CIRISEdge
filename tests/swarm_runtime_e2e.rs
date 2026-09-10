@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use ciris_edge::holonomic::swarm_rarity::FountainHoldingClaim;
+use ciris_edge::holonomic::swarm_rarity::{FountainHoldingClaim, HoldingClaimVerification};
 use ciris_edge::swarm::{
     FountainHoldingsSource, FountainSwarmRuntime, HeldFountainContent, NoopFountainHoldingsSource,
     SwarmRuntimeConfig,
@@ -135,12 +135,10 @@ async fn two_peer_publish_and_observe_roundtrip() {
     // `register_observed_claim` on the verified body. We do that
     // directly here (the wire-level MessageType wiring lands in a
     // follow-up cut once the discriminator is approved).
-    bob.register_observed_claim(FountainHoldingClaim::new(
-        "alice",
-        "shard-X",
-        vec![1, 2, 3],
-        1_700_000_000,
-    ))
+    bob.register_observed_claim(
+        FountainHoldingClaim::new("alice", "shard-X", vec![1, 2, 3], 1_700_000_000),
+        HoldingClaimVerification::SignatureOnly,
+    )
     .await;
 
     // Let bob's converger run.

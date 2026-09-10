@@ -817,17 +817,37 @@ mod leviculum_link {
 
     #[async_trait::async_trait]
     impl AvLinkSender for LeviculumAvSender {
+        /// CIRISEdge#591 item 1 — `try_send`, never the absorbing `send`.
+        ///
+        /// This is the A/V path, edge's highest-rate producer, and until
+        /// v22.1.0 it called `LinkHandle::send()` — which loops with sleeps
+        /// until `Busy` / `PacingDelay` clear. Backpressure was therefore
+        /// absorbed one layer below the dispatcher and could not reach the
+        /// agents generating the frames, so they kept generating into a
+        /// peer that was discarding everything. leviculum#66 measured that
+        /// on the canonical: one peer of 130 took all 34,390 dropped
+        /// packets in 24 h, ~24/s sustained, with no idle hour.
+        ///
+        /// `try_send` refuses instead, and the refusal is mapped to
+        /// [`AvDispatcherError::Congested`] rather than `SendFailed` so the
+        /// caller can tell "defer this" from "this went wrong".
         async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
-            self.node
-                .link_handle(&self.link_id)
-                .send(bytes)
-                .await
-                .map_err(|e| {
-                    AvDispatcherError::SendFailed(format!(
-                        "leviculum link {:?} send failed: {e}",
-                        self.link_id
-                    ))
-                })
+            use leviculum_core::SendError;
+            use leviculum_std::error::Error as LevError;
+
+            match self.node.link_handle(&self.link_id).try_send(bytes).await {
+                Ok(()) => Ok(()),
+                // The two backpressure arms. `PacingDelay`'s `ready_at_ms`
+                // is on leviculum's clock and is deliberately dropped here
+                // — see `AvDispatcherError::Congested`.
+                Err(LevError::Send(SendError::Busy | SendError::PacingDelay { .. })) => {
+                    Err(AvDispatcherError::Congested)
+                }
+                Err(e) => Err(AvDispatcherError::SendFailed(format!(
+                    "leviculum link {:?} send failed: {e}",
+                    self.link_id
+                ))),
+            }
         }
     }
 
