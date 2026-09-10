@@ -311,8 +311,9 @@ mod manifest_and_transform_pin_tests {
 }
 
 pub use blob_swarm::{
-    BlobChunkSource, BlobChunkVerifier, ChunkManifestLite, ChunkSourceRefusal, ChunkVerifyError,
-    PeerState, SwarmConfig, SwarmError, SwarmScheduler,
+    serve_result_to_chunk, BlobChunkSource, BlobChunkVerifier, ChunkManifestLite,
+    ChunkSourceRefusal, ChunkVerifyError, PeerState, PersistBlobChunkSource, SwarmConfig,
+    SwarmError, SwarmScheduler,
 };
 pub use cohort_scope::{CohortScope, CohortScopeEnforcement, CryptoTier};
 // v6.0.0 (CIRISEdge#175) — scope-native privacy surface re-exports.

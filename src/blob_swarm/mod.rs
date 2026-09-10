@@ -299,21 +299,36 @@ pub trait BlobChunkVerifier: Send + Sync {
     }
 }
 
+pub mod persist_source;
+pub use persist_source::PersistBlobChunkSource;
+
 /// Server-side hook: trait edge consults when an inbound
 /// [`crate::MessageType::BlobChunkFetch`] envelope arrives, asking
 /// "do you hold this blob's chunk; if so, what bytes?"
 ///
-/// Implementations wrap persist's `BlobStorage`:
-/// - `has_blob(blob_sha256)` -> existence check
-/// - if present: parse the `ChunkManifest`, find the chunk by SHA,
-///   compute its byte range, return `get_blob_range(blob_sha,
-///   start, end)`
-/// - if absent: `Ok(None)` -> edge emits `BlobChunkMiss(NotHeld)`
+/// Implementations wrap persist's **gated** peer-serve door —
+/// `Engine::serve_blob_to_peer`, translated by
+/// [`serve_result_to_chunk`], which encodes the whole mapping including
+/// `Ok(None)` -> edge emits `BlobChunkMiss(NotHeld)`.
+///
+/// CIRISEdge#587: do NOT reach for `BlobStorage::has_blob` +
+/// `get_blob_range` here, which is what this doc recommended before the
+/// gates existed. Those doors are ungated, so an adapter built on them
+/// serves content that persist's disk-pressure shedding and quarantine
+/// would have refused — one chunk at a time, every chunk succeeding,
+/// nothing red.
 ///
 /// `Send + Sync + 'static`-bounded so it can live behind an
-/// `Arc<dyn BlobChunkSource>` on Edge. Async-by-default shape: the
-/// impl can be sync (just `block_on`s a runtime handle) or true
-/// async, depending on how the consumer wires persist.
+/// `Arc<dyn BlobChunkSource>` on Edge.
+///
+/// v22.0.0 (CIRISEdge#587) — the methods are `async`. They were sync,
+/// and the guidance here was that a sync impl could "just `block_on` a
+/// runtime handle": that advice **panics**. The responder calls this
+/// from inside edge's tokio runtime, and `Handle::block_on` from within
+/// a runtime thread aborts with "Cannot block the current thread from
+/// within a runtime". Persist's serve door is async, so the seam is
+/// async — no impl has to reach for a blocking bridge to cross it.
+#[async_trait::async_trait]
 pub trait BlobChunkSource: Send + Sync + 'static {
     /// Look up `(blob_sha256, chunk_sha256)` in this peer's local
     /// store and return:
@@ -322,10 +337,19 @@ pub trait BlobChunkSource: Send + Sync + 'static {
     ///   `BlobChunkMiss::NotHeld`)
     /// - `Err(reason)` for a hard refusal that maps to one of
     ///   `Withdrawn` / `Revoked` / `PolicyDenied`
-    fn read_chunk(
+    ///
+    /// `requesting_peer_key_id` is the `signing_key_id` off the verified
+    /// `BlobChunkFetch` envelope — WHO is asking. v22.0.0 (CIRISEdge#587)
+    /// added it because persist's gated serve door takes the requesting
+    /// peer, and a seam that cannot name the requester forces every impl
+    /// to hand that door a placeholder. Persist ignores the argument
+    /// today; the signature says it will not always, and the truth is
+    /// cheaper to carry now than to retrofit once callers pass `""`.
+    async fn read_chunk(
         &self,
         blob_sha256: [u8; 32],
         chunk_sha256: [u8; 32],
+        requesting_peer_key_id: &str,
     ) -> Result<Option<Vec<u8>>, ChunkSourceRefusal>;
 
     /// CIRISEdge#499 — the SCOPE this blob's content lives in, so the
@@ -348,7 +372,7 @@ pub trait BlobChunkSource: Send + Sync + 'static {
     /// address table MUST override this or its blob plane fails closed —
     /// which is the correct order of operations: derive addresses only
     /// once you can say what they are for.
-    fn chunk_scope(&self, _blob_sha256: [u8; 32]) -> Option<ContentScope> {
+    async fn chunk_scope(&self, _blob_sha256: [u8; 32]) -> Option<ContentScope> {
         None
     }
 }
@@ -381,6 +405,95 @@ impl ChunkSourceRefusal {
             Self::Revoked => crate::messages::MissReason::Revoked,
             Self::PolicyDenied => crate::messages::MissReason::PolicyDenied,
             Self::DiskPressure => crate::messages::MissReason::DiskPressure,
+        }
+    }
+}
+
+/// CIRISEdge#587 — the canonical translation of persist's **gated**
+/// peer-serve door onto the [`BlobChunkSource::read_chunk`] contract.
+///
+/// A `BlobChunkSource` implementation that holds a `ciris_persist::Engine`
+/// serves through `Engine::serve_blob_to_peer` — **never** through
+/// `BlobStorage::get_blob` / `get_blob_range` directly — because that door
+/// is where persist's two serve-side policy gates live:
+///
+/// - **proxy shedding** under disk pressure
+///   (`BlobError::DiskPressureProxyRefused`), a PERMANENT signal telling
+///   the peer to fetch from another holder rather than retry here; and
+/// - **quarantine** (`BlobError::QuarantineWithheld`), refused when ANY
+///   local holder of the bytes is withheld.
+///
+/// Serving raw bypasses both, and the trap persist flagged is specific: an
+/// adapter that consults only the pressure verdict hands a quarantined blob
+/// to a peer one chunk at a time, with every chunk succeeding and nothing
+/// red. This function exists so that mapping is written ONCE, here, instead
+/// of hand-rolled per consumer — edge owns the wire vocabulary
+/// ([`crate::MissReason`]), so edge owns the translation into it.
+///
+/// **Fail-closed by construction.** Exactly one arm is a miss — `NotHeld`
+/// becomes `Ok(None)`, which the responder answers as
+/// `BlobChunkMiss::NotHeld`. Every arm this function does not recognise,
+/// *including variants persist adds after this was written*, becomes
+/// [`ChunkSourceRefusal::PolicyDenied`]. Persist will add gates to this
+/// path again; the default for an unknown gate is to refuse.
+///
+/// ```no_run
+/// # use ciris_edge::blob_swarm::{serve_result_to_chunk, ChunkSourceRefusal};
+/// # async fn ex(
+/// #     engine: &ciris_persist::Engine,
+/// #     sha: [u8; 32],
+/// #     peer_key_id: &str,
+/// # ) -> Result<Option<Vec<u8>>, ChunkSourceRefusal> {
+/// serve_result_to_chunk(engine.serve_blob_to_peer(&sha, peer_key_id).await)
+/// # }
+/// ```
+pub fn serve_result_to_chunk(
+    served: Result<ciris_persist::federation::BlobBody, ciris_persist::federation::BlobError>,
+) -> Result<Option<Vec<u8>>, ChunkSourceRefusal> {
+    use ciris_persist::federation::{BlobBody, BlobError};
+
+    match served {
+        Ok(BlobBody::Inline(bytes)) => Ok(Some(bytes)),
+
+        // The chunk-fetch responder hands a peer BYTES. A body that is a
+        // pointer (`External`) or a DAG root (`ChunkDag`) is not chunk
+        // bytes: edge never dereferences an external URI on a peer's
+        // behalf (MEDIA_SHARING.md §2.6), and a manifest is the root, not
+        // a leaf. Refuse rather than answer `NotHeld` — we DO hold
+        // something for this SHA, so a miss would send the peer hunting
+        // for a holder that will tell it the same thing.
+        Ok(other) => {
+            tracing::warn!(
+                body = ?core::mem::discriminant(&other),
+                "blob_swarm: gated serve yielded a non-inline body on the chunk path; \
+                 refusing (fail-closed)"
+            );
+            Err(ChunkSourceRefusal::PolicyDenied)
+        }
+
+        // The ONE arm that is not a refusal.
+        Err(BlobError::NotHeld { .. }) => Ok(None),
+
+        // Capacity: clears when the host disk recovers, never on retry.
+        Err(BlobError::DiskPressureProxyRefused { .. }) => Err(ChunkSourceRefusal::DiskPressure),
+
+        // Policy: will NOT clear on its own. Distinct from pressure in
+        // kind, but edge's wire vocabulary has one word for both policy
+        // arms, so both land on `PolicyDenied`.
+        Err(BlobError::QuarantineWithheld { .. } | BlobError::NotGranted { .. }) => {
+            Err(ChunkSourceRefusal::PolicyDenied)
+        }
+
+        // Fail closed. `BlobError` is not `#[non_exhaustive]` today, so a
+        // persist variant that is REMOVED or RENAMED breaks this match at
+        // compile time (see `every_persist_serve_refusal_is_mapped`), and a
+        // variant that is ADDED lands here and refuses.
+        Err(other) => {
+            tracing::warn!(
+                error = %other,
+                "blob_swarm: unrecognised persist serve refusal; failing closed as PolicyDenied"
+            );
+            Err(ChunkSourceRefusal::PolicyDenied)
         }
     }
 }
@@ -1329,6 +1442,131 @@ mod tests {
         assert_eq!(
             ChunkSourceRefusal::PolicyDenied.to_miss_reason(),
             crate::messages::MissReason::PolicyDenied
+        );
+    }
+
+    // ── CIRISEdge#587: the gated-serve translation ──────────────────
+
+    /// Every refusal persist's serve path can raise is mapped
+    /// deliberately, and the exhaustive construction below is the canary:
+    /// if persist RENAMES or REMOVES one of these variants this test stops
+    /// compiling, which is louder than a wildcard silently absorbing it.
+    #[test]
+    fn every_persist_serve_refusal_is_mapped() {
+        use ciris_persist::federation::BlobError;
+        type Mapped = Result<Option<Vec<u8>>, ChunkSourceRefusal>;
+
+        let sha = "ab".repeat(32);
+        let cases: Vec<(BlobError, Mapped)> = vec![
+            // The one miss.
+            (
+                BlobError::NotHeld {
+                    sha256_hex: sha.clone(),
+                },
+                Ok(None),
+            ),
+            // Capacity — clears when the disk recovers.
+            (
+                BlobError::DiskPressureProxyRefused {
+                    operation: "serve",
+                    tier: "stop",
+                },
+                Err(ChunkSourceRefusal::DiskPressure),
+            ),
+            // Policy — does not clear on its own.
+            (
+                BlobError::QuarantineWithheld {
+                    key_id: "held-key".into(),
+                },
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+            (
+                BlobError::NotGranted {
+                    sha256_hex: sha.clone(),
+                    viewer_key_id: "viewer".into(),
+                },
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+            // Everything else fails closed.
+            (
+                BlobError::HashMismatch {
+                    expected_hex: sha.clone(),
+                    got_hex: sha.clone(),
+                },
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+            (
+                BlobError::InlineSizeExceeded { size: 2, cap: 1 },
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+            (
+                BlobError::InvalidArgument("bad".into()),
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+            (
+                BlobError::AttestationEmissionFailed("fk".into()),
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+            (
+                BlobError::TrustBelowThreshold {
+                    key_id: "k".into(),
+                    score: 0.1,
+                    threshold: 0.5,
+                },
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+            (
+                BlobError::EpochNotCurrent {
+                    community_key_id: "c".into(),
+                    epoch: 1,
+                },
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+            (
+                BlobError::Backend("db gone".into()),
+                Err(ChunkSourceRefusal::PolicyDenied),
+            ),
+        ];
+
+        for (err, want) in cases {
+            let label = err.to_string();
+            assert_eq!(serve_result_to_chunk(Err(err)), want, "mapping for {label}");
+        }
+    }
+
+    #[test]
+    fn an_inline_body_is_the_only_servable_chunk_body() {
+        use ciris_persist::federation::BlobBody;
+
+        assert_eq!(
+            serve_result_to_chunk(Ok(BlobBody::Inline(b"manifest bytes".to_vec()))),
+            Ok(Some(b"manifest bytes".to_vec()))
+        );
+
+        // A DAG root is not a leaf: refuse, do NOT report a miss. A miss
+        // would send the peer hunting for another holder over bytes we
+        // are simply not serving on this path.
+        assert_eq!(
+            serve_result_to_chunk(Ok(BlobBody::ChunkDag(
+                ciris_persist::federation::ChunkManifest {
+                    v: ciris_persist::federation::CHUNK_MANIFEST_VERSION,
+                    total_size: 0,
+                    chunks: vec![],
+                }
+            ))),
+            Err(ChunkSourceRefusal::PolicyDenied)
+        );
+    }
+
+    /// The gates are only worth having if a refusal reaches the peer as a
+    /// refusal. `DiskPressure` and `PolicyDenied` must stay distinguishable
+    /// on the wire: the first says "ask another holder, this clears", the
+    /// second says "not from us".
+    #[test]
+    fn the_two_gates_stay_distinguishable_on_the_wire() {
+        assert_ne!(
+            ChunkSourceRefusal::DiskPressure.to_miss_reason(),
+            ChunkSourceRefusal::PolicyDenied.to_miss_reason()
         );
     }
 }

@@ -5703,7 +5703,7 @@ async fn dispatch_inbound(
                 // same verdict.
                 let scope_native = blob_scope_router.is_scope_native();
                 let content_scope = if scope_native {
-                    source.chunk_scope(req.blob_sha256)
+                    source.chunk_scope(req.blob_sha256).await
                 } else {
                     None
                 };
@@ -5777,7 +5777,14 @@ async fn dispatch_inbound(
                         }
                     }
                 } else {
-                    match source.read_chunk(req.blob_sha256, req.chunk_sha256) {
+                    // CIRISEdge#587 — the verified envelope's signer IS the
+                    // requesting peer; hand it to the source so a
+                    // persist-backed impl can name the requester at
+                    // `serve_blob_to_peer` instead of passing a placeholder.
+                    match source
+                        .read_chunk(req.blob_sha256, req.chunk_sha256, &envelope.signing_key_id)
+                        .await
+                    {
                         Ok(Some(bytes)) => {
                             // AV-13 size gate on outbound: refuse to
                             // emit a chunk that exceeds the ceiling
