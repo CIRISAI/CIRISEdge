@@ -72,6 +72,7 @@ pub mod realtime_av_relay;
 /// [`realtime_av_dispatcher::AvLinkReceiver`] traits — no leviculum /
 /// reticulum-core dependency, so it compiles for HTTP and Reticulum
 /// alike and stays ungated.
+pub mod av_backpressure;
 pub mod realtime_av_dispatcher;
 
 /// Realtime A/V mesh integrating runtime — "the spine" (CIRISEdge#155,
