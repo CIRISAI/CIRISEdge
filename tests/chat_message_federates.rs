@@ -117,10 +117,6 @@ struct World {
     bob: ciris_edge::identity::LocalSigner,
     bob_node: ciris_edge::identity::LocalSigner,
     room: String,
-    /// Alice's copy of the room key.
-    key_a: RoomKey,
-    /// Bob's copy — what the far end opens with.
-    key_b: RoomKey,
 }
 
 impl World {
@@ -150,25 +146,6 @@ impl World {
             .find(|a| a.attestation_id == id)
             .unwrap_or_else(|| panic!("row {id} by {by} is stored"))
     }
-}
-
-/// The in-process handshake: the room key as both people hold it.
-async fn mls_pair(room: &str) -> (RoomKey, RoomKey) {
-    let a = CohortGroup::create(store("alice"), room, "alice-fed", 16)
-        .await
-        .expect("create");
-    let (material, kp) = mint_cohort_key_material("bob-fed").expect("mint");
-    let kp = key_package_from_bytes(&key_package_to_bytes(kp).expect("kp bytes"))
-        .expect("kp round-trips through the byte codec");
-    let commit = a.add_member("bob-fed", kp).await.expect("add bob");
-    let welcome = commit.welcome().expect("welcome").to_vec();
-    let b = CohortGroup::join(store("bob"), room, material, &welcome, 16)
-        .await
-        .expect("join");
-    (
-        RoomKey::of(&a).await.unwrap(),
-        RoomKey::of(&b).await.unwrap(),
-    )
 }
 
 async fn world() -> World {
@@ -202,7 +179,6 @@ async fn world() -> World {
     )
     .await
     .expect("the pair room is admitted");
-    let (key_a, key_b) = mls_pair(&room).await;
     World {
         dir,
         alice,
@@ -210,17 +186,21 @@ async fn world() -> World {
         bob,
         bob_node,
         room,
-        key_a,
-        key_b,
     }
 }
 
-/// Author a message as Alice (sealed under her room key, signed at write)
-/// and store it.
+/// Author a message as Alice — content to the room's BLOB STORE, row signed
+/// at write — and store the row.
 async fn authored(w: &World, body: &str) -> ciris_persist::federation::Attestation {
-    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", body, ts(), &w.key_a)
+    let store = content_store(w).await;
+    let (msg, sealed) = chat::chat_message_attestation(&w.alice, "bob-fed", body, ts(), &store)
         .await
         .unwrap();
+    assert!(
+        sealed.fully_readable(),
+        "a room member was excluded at write and could never read this: {:?}",
+        sealed.excluded,
+    );
     w.dir
         .put_attestation(SignedAttestation {
             attestation: msg.clone(),
@@ -259,7 +239,8 @@ fn both_ends_derive_the_same_room_and_opposite_roles() {
 #[allow(clippy::too_many_lines)]
 async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
     let w = world().await;
-    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", BODY, ts(), &w.key_a)
+    let store = content_store(&w).await;
+    let (msg, _) = chat::chat_message_attestation(&w.alice, "bob-fed", BODY, ts(), &store)
         .await
         .expect("build message");
 
@@ -282,10 +263,14 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
          message rather than send it"
     );
     assert_eq!(msg.tier, "local");
-    // The wire carries CIPHERTEXT and a seal header, never the text.
+    // The wire carries a POINTER, never the text — the content itself never
+    // touches the row.
     let wire = serde_json::to_string(&msg.attestation_envelope).unwrap();
     assert!(!wire.contains(BODY), "PLAINTEXT ON THE WIRE: {wire}");
-    assert!(msg.attestation_envelope.get(chat::FIELD_SEALED).is_some());
+    assert!(
+        msg.attestation_envelope.get(chat::FIELD_CONTENT).is_some(),
+        "the row must carry the blob pointer",
+    );
     w.dir
         .put_attestation(SignedAttestation {
             attestation: msg.clone(),
@@ -395,9 +380,15 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
 
     // Read back the way BOB would: by room, off the plane, opened with HIS
     // key — ONE message, the widening; the `self` copy is folded away.
-    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &w.room, &w.key_b)
-        .await
-        .expect("read the room");
+    let seen = chat::messages_in_room(
+        &*w.dir,
+        &["alice-fed".to_string()],
+        &w.room,
+        &content_store(&w).await,
+        &format!("{}-occ", w.bob.key_id),
+    )
+    .await
+    .expect("read the room");
     assert_eq!(seen.len(), 1, "one message in the room: {seen:?}");
     let m = &seen[0];
     assert_eq!(
@@ -412,7 +403,11 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         "the row on the wire"
     );
     assert_eq!(m.widens.as_deref(), Some(msg.attestation_id.as_str()));
-    assert_eq!(m.epoch, Some(w.key_b.epoch()));
+    // No `epoch` on a ChatMessage any more: it meant "the MLS epoch the body
+    // was sealed at", and the body seal is gone. Content's epoch is the
+    // community DEK's, recorded on the BLOB row — a reader asks the blob,
+    // not the pointer, precisely so a rotation cannot leave a stale copy on
+    // the row (CIRISEdge#586 §7).
 }
 
 /// **The MLS handshake rides the room.** Bob's KeyPackage and Alice's
@@ -492,75 +487,19 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
         .await
         .unwrap();
 
-    // Same key on both sides: what Alice seals, Bob opens.
-    let key_a = RoomKey::of(&a).await.unwrap();
-    let key_b = RoomKey::of(&b).await.unwrap();
-    let at = "2026-05-01T00:00:00.000Z";
-    let (ct, sealed) = chat::seal_body(&key_a, &room, "alice-fed", at, "hi").unwrap();
+    // Both sides now hold the room's record secret at the same epoch.
+    //
+    // The old assertion here was "what Alice seals, Bob opens", through the
+    // inline body seal. That seal is gone (CIRISEdge#586) — content lives in
+    // the group's blob store and its binding is the AAD, exercised by
+    // `a_pointer_copied_onto_another_authors_row_does_not_open` with a
+    // positive control. What this test still proves, and is the only test
+    // that does, is that the HANDSHAKE converges: both ends derived the same
+    // group at the same epoch.
     assert_eq!(
-        chat::open_body(&key_b, &room, "alice-fed", at, &ct, &sealed).unwrap(),
-        "hi"
-    );
-}
-
-/// **The wrong key, a rotated epoch, or a ciphertext lifted onto another row
-/// does not open** — and the widened row, which is all a peer receives, DOES.
-#[tokio::test]
-async fn a_wrong_key_epoch_or_context_does_not_open_the_body() {
-    let w = world().await;
-    let at = "2026-05-01T00:00:00.000Z";
-    let (ct, sealed) = chat::seal_body(&w.key_a, &w.room, "alice-fed", at, BODY).unwrap();
-
-    let stranger = RoomKey::from_parts([7u8; 32], w.key_a.epoch());
-    let err = chat::open_body(&stranger, &w.room, "alice-fed", at, &ct, &sealed).unwrap_err();
-    assert!(err.contains("open failed"), "{err}");
-
-    let rotated = RoomKey::from_parts([0u8; 32], w.key_a.epoch() + 1);
-    let err = chat::open_body(&rotated, &w.room, "alice-fed", at, &ct, &sealed).unwrap_err();
-    assert!(err.contains("rotated"), "{err}");
-
-    // Same key, but the ciphertext lifted onto another author's row, another
-    // room, or the SAME author's row at a different instant (the binding
-    // persist v40.0.0 made possible by carrying the claim's instant verbatim).
-    let err = chat::open_body(&w.key_b, &w.room, "bob-fed", at, &ct, &sealed).unwrap_err();
-    assert!(err.contains("open failed"), "{err}");
-    let err = chat::open_body(&w.key_b, "another-room", "alice-fed", at, &ct, &sealed).unwrap_err();
-    assert!(err.contains("open failed"), "{err}");
-    let err = chat::open_body(
-        &w.key_b,
-        &w.room,
-        "alice-fed",
-        "2026-05-01T00:00:01.000Z",
-        &ct,
-        &sealed,
-    )
-    .unwrap_err();
-    assert!(err.contains("open failed"), "{err}");
-
-    // And the reader reports it rather than dropping it or lying: the
-    // widened row, read with a stranger's key, is there and Unopened.
-    let msg = authored(&w, "secret").await;
-    share(
-        &*w.dir,
-        &msg,
-        w.room_with(),
-        CrossingBasis::ProducerAuthority,
-        w.signers(),
-    )
-    .await
-    .unwrap();
-    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &w.room, &stranger)
-        .await
-        .unwrap();
-    assert_eq!(seen.len(), 1, "{seen:?}");
-    assert!(
-        matches!(seen[0].body, Body::Unopened { .. }),
-        "{:?}",
-        seen[0].body
-    );
-    assert!(
-        seen[0].widens.is_some(),
-        "the row a peer holds is the widening"
+        RoomKey::of(&a).await.unwrap().epoch(),
+        RoomKey::of(&b).await.unwrap().epoch(),
+        "both ends must land on the same MLS epoch",
     );
 }
 
@@ -609,9 +548,15 @@ async fn a_widening_carries_the_claims_instant_and_records_its_own() {
     );
 
     // Which is exactly what lets the far end open the row it actually gets.
-    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &w.room, &w.key_b)
-        .await
-        .unwrap();
+    let seen = chat::messages_in_room(
+        &*w.dir,
+        &["alice-fed".to_string()],
+        &w.room,
+        &content_store(&w).await,
+        &format!("{}-occ", w.bob.key_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(seen.len(), 1, "{seen:?}");
     assert_eq!(seen[0].body, Body::Text("when was this said".to_owned()));
     assert_eq!(seen[0].widens.as_deref(), Some(msg.attestation_id.as_str()));
@@ -626,10 +571,13 @@ async fn a_widening_carries_the_claims_instant_and_records_its_own() {
 async fn a_forged_on_behalf_of_claim_projects_the_attester() {
     let w = world().await;
     // Bob emits into the room, claiming to speak for Alice.
-    let mut row =
-        chat::chat_message_attestation(&w.bob, "alice-fed", "not alice's words", ts(), &w.key_b)
+    let mut row = {
+        let store = content_store(&w).await;
+        chat::chat_message_attestation(&w.bob, "alice-fed", "not alice's words", ts(), &store)
             .await
-            .unwrap();
+            .unwrap()
+            .0
+    };
     // A real forger signs the lie: the claim goes INSIDE the envelope and the
     // row is re-signed, so it is byte-consistent and persist admits it.
     // (Mutating after signing is refused by `PromotionMovedThePreimage` —
@@ -647,7 +595,7 @@ async fn a_forged_on_behalf_of_claim_projects_the_attester() {
     row.scrub_signature_classical = c;
     row.scrub_signature_pqc = q;
 
-    let m = chat::ChatMessage::from_row(&row, &w.room, &w.key_b).expect("a chat row");
+    let m = chat::ChatMessage::from_row(&row, &w.room).expect("a chat row");
     assert_eq!(
         m.author_key_id, "bob-fed",
         "attribution is the ATTESTER — a producer-asserted member cannot outrank the \
@@ -677,9 +625,15 @@ async fn a_forged_on_behalf_of_claim_projects_the_attester() {
     )
     .await
     .unwrap();
-    let seen = chat::messages_in_room(&*w.dir, &["bob-fed".to_string()], &w.room, &w.key_b)
-        .await
-        .unwrap();
+    let seen = chat::messages_in_room(
+        &*w.dir,
+        &["bob-fed".to_string()],
+        &w.room,
+        &content_store(&w).await,
+        &format!("{}-occ", w.bob.key_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(seen.len(), 1, "{seen:?}");
     assert_eq!(
         seen[0].author_key_id, "bob-fed",
@@ -707,9 +661,15 @@ async fn a_message_for_another_room_does_not_appear_here() {
     .unwrap();
 
     let other_room = chat::pair_community_key_id("alice-fed", "carol-fed");
-    let seen = chat::messages_in_room(&*w.dir, &["alice-fed".to_string()], &other_room, &w.key_b)
-        .await
-        .unwrap();
+    let seen = chat::messages_in_room(
+        &*w.dir,
+        &["alice-fed".to_string()],
+        &other_room,
+        &content_store(&w).await,
+        &format!("{}-occ", w.bob.key_id),
+    )
+    .await
+    .unwrap();
     assert!(seen.is_empty(), "wrong room must not match: {seen:?}");
 }
 
@@ -899,9 +859,13 @@ async fn share_places_then_reports_already_there() {
 #[tokio::test]
 async fn the_share_plan_is_decided_before_any_directory_and_refuses_a_narrowing() {
     let w = world().await;
-    let msg = chat::chat_message_attestation(&w.alice, "bob-fed", "x", ts(), &w.key_a)
-        .await
-        .unwrap();
+    let msg = {
+        let store = content_store(&w).await;
+        chat::chat_message_attestation(&w.alice, "bob-fed", "x", ts(), &store)
+            .await
+            .unwrap()
+            .0
+    };
     let room = w.room_with().audience();
 
     assert_eq!(
@@ -1102,9 +1066,13 @@ async fn the_nine_axes_are_stated_and_verified_at_the_crossing() {
 #[tokio::test]
 async fn custody_is_the_actors_or_it_waits() {
     let w = world().await;
-    let signed = chat::chat_message_attestation(&w.alice, "bob-fed", "c", ts(), &w.key_a)
-        .await
-        .unwrap();
+    let signed = {
+        let store = content_store(&w).await;
+        chat::chat_message_attestation(&w.alice, "bob-fed", "c", ts(), &store)
+            .await
+            .unwrap()
+            .0
+    };
     let mut deferred = signed.clone();
     deferred.scrub_signature_classical.clear();
     deferred.scrub_signature_pqc = None;
@@ -1270,11 +1238,27 @@ async fn a_classical_only_signer_is_refused_not_downgraded() {
         .await
         .unwrap_err();
     assert!(err.contains("no fallback"), "{err}");
+    // …and through the chat writer, where the refusal must come from the
+    // SIGNING step.
+    //
+    // The signer has to be alice's identity minus its PQC half, not a
+    // stranger's: content is sealed BEFORE the row is signed, and the seal
+    // resolves the room as a real community. A stranger's key derives a
+    // room that does not exist, so the call would fail at the community
+    // lookup and never reach the signature check — passing while proving
+    // nothing about classical-only signing.
     let w = world().await;
-    let err = chat::chat_message_attestation(&half, "bob-fed", "x", ts(), &w.key_a)
+    let store = content_store(&w).await;
+    let alice_classical: Arc<dyn HardwareSigner> =
+        Arc::new(Ed25519SoftwareSigner::from_bytes(&[1u8; 32], "alice-fed").unwrap());
+    let alice_half = ciris_edge::identity::LocalSigner::new("alice-fed", alice_classical, None);
+    let err = chat::chat_message_attestation(&alice_half, "bob-fed", "x", ts(), &store)
         .await
         .unwrap_err();
-    assert!(err.contains("ML-DSA-65"), "{err}");
+    assert!(
+        err.contains("ML-DSA-65"),
+        "the refusal must name the missing PQC half, not a missing room: {err}",
+    );
 }
 
 // ─── CIRISEdge#586: content in the group store, end to end ────────────
@@ -1425,7 +1409,7 @@ async fn a_chat_message_stores_its_content_as_a_group_blob_and_reads_back() {
     let text = "the delivery model, proven";
 
     let (row, sealed) =
-        ciris_edge::chat::chat_message_blob_attestation(&w.alice, "bob-fed", text, ts(), &store)
+        ciris_edge::chat::chat_message_attestation(&w.alice, "bob-fed", text, ts(), &store)
             .await
             .expect("author a blob-backed chat message");
 
@@ -1435,10 +1419,11 @@ async fn a_chat_message_stores_its_content_as_a_group_blob_and_reads_back() {
         env.get(ciris_edge::chat::FIELD_CONTENT).is_some(),
         "the row must carry the content pointer",
     );
+    // There is no inline shape left to carry: the seal was deleted, not
+    // deprecated (CIRISEdge#586). The pointer is the only content member.
     assert!(
-        env.get(ciris_edge::chat::FIELD_BODY).is_none()
-            && env.get(ciris_edge::chat::FIELD_SEALED).is_none(),
-        "a blob-backed row carries NO inline body — one shape or the other",
+        env.get("body").is_none() && env.get("sealed").is_none(),
+        "a chat row carries a pointer and nothing that could open without one",
     );
 
     // Who can read it is reported, not left to be discovered later.
@@ -1449,7 +1434,7 @@ async fn a_chat_message_stores_its_content_as_a_group_blob_and_reads_back() {
     );
 
     // Read it back with NO room key.
-    let mut msg = ChatMessage::from_row_any(&row, &w.room, None).expect("recognise the chat row");
+    let mut msg = ChatMessage::from_row(&row, &w.room).expect("recognise the chat row");
     assert!(
         matches!(msg.body, Body::Pointer(_)),
         "recognition must not need the store: {:?}",
@@ -1481,7 +1466,7 @@ async fn a_pointer_copied_onto_another_authors_row_does_not_open() {
     let w = world().await;
     let store = content_store(&w).await;
 
-    let (alice_row, _) = ciris_edge::chat::chat_message_blob_attestation(
+    let (alice_row, _) = ciris_edge::chat::chat_message_attestation(
         &w.alice,
         "bob-fed",
         "alice's words",
@@ -1510,8 +1495,7 @@ async fn a_pointer_copied_onto_another_authors_row_does_not_open() {
         e
     };
 
-    let mut msg =
-        ChatMessage::from_row_any(&stolen, &w.room, None).expect("recognise the stolen row");
+    let mut msg = ChatMessage::from_row(&stolen, &w.room).expect("recognise the stolen row");
     msg.resolve_content(&store, &format!("{}-occ", w.bob.key_id))
         .await;
 
