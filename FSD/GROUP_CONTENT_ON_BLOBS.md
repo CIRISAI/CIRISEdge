@@ -426,8 +426,8 @@ them.
 Each one falsifiable through a door a consumer holds, per persist's §11.10
 discipline.
 
-**Six of the ten have live witnesses today; four do not, and saying which is
-the point of the column.** An invariant nothing asserts is a sentence, not a
+**Eight of the twelve have live witnesses today; four do not, and saying
+which is the point of the column.** An invariant nothing asserts is a sentence, not a
 guarantee — and the four unwitnessed ones all describe the CHUNKED and
 LIFECYCLE paths, which edge has not built: there is no chunked write, no
 range read, and no epoch destroy on edge's side yet. They are listed because
@@ -446,6 +446,8 @@ they hold now.
 | **G6** | Destroying an epoch makes content sealed under it unopenable **through every persist read door on this node**, with no path that bypasses it. Deliberately not "unopenable everywhere": that is the tombstone plane's reach, not this one's, and asserting it here would be the precondition-that-cannot-be-checked persist's §11.4 warns about. | ❌ none — edge has no epoch-destroy path |
 | **G7** | A range read returns the plaintext range requested, never a ciphertext substring. | ❌ none — no range read on edge yet |
 | **G8** | Two blobs in one row cannot be exchanged for one another. | ✅ `each_field_binds_distinctly` + `a_pointer_to_another_field_rebuilds_a_different_binding` |
+| **G9** | **A blob with no signed attestation saying what it is cannot be fetched or admitted.** `holds_bytes` is possession and is refused BY NAME — it is signed, it references the blob, and its `cohort_scope` column reads `federation`, so a projection that merely mapped the column would classify every blob on the node as commons. | ✅ `a_holds_bytes_row_is_possession_and_never_meaning` + `holds_bytes_says_possession_and_never_meaning` (cross-node) |
+| **G10** | A signed row grants meaning only to the blob it NAMES — a legitimate row cannot be paired with other bytes. | ✅ `a_row_about_other_content_cannot_lend_these_bytes_its_scope` |
 
 **G3 needs a witness with sub-resolution precision.** A test using an
 already-truncated timestamp passes whether or not the writer truncates, which

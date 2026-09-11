@@ -7,13 +7,30 @@
 //!    persist's one write door and comes back as a row pointer;
 //! 2. **pointer → open** — a reader rebuilding the binding from the row gets
 //!    the bytes back;
-//! 3. **the substitution fails** — a ciphertext lifted onto a different
-//!    author's row does NOT open, which is the whole reason the AAD exists.
+//! 3. **the doors behave as documented at the COMMONS tier** — a plaintext
+//!    write refuses an AAD, an absent pointer is a typed `NotHeld`, and
+//!    identical bytes seal to one address.
 //!
-//! Point 3 is the one worth having a live substrate for. The preimage's
-//! shape is pinned by unit tests; what those cannot show is that persist
-//! actually folds it into the GCM tag, and that a mismatch surfaces as a
-//! crypto failure rather than silently returning someone else's plaintext.
+//! # What this file does NOT prove, and where that lives
+//!
+//! **Every seal here is `cohort_scope: federation`, i.e. plaintext.** The
+//! fixture is a bare substrate with a registered signing key and no
+//! community, and `resolve_write_tier` refuses a `community` write naming a
+//! community the directory does not know — so the encrypted tier is out of
+//! reach here by construction.
+//!
+//! That matters because the AAD binds nothing at plaintext: there is no GCM
+//! tag to fold it into, and persist REFUSES an AAD at that tier rather than
+//! ignoring it. An earlier version of this header claimed the file proved
+//! "a ciphertext lifted onto a different author's row does not open". It
+//! could not: `commons_content_is_not_bound_to_its_author_and_says_so`
+//! below asserts the OPPOSITE, correctly, because commons content is
+//! public by construction.
+//!
+//! The substitution proof needs a real community and a real
+//! `CommunityDek` write, and lives in
+//! `chat_message_federates::a_pointer_copied_onto_another_authors_row_does_not_open`,
+//! with a positive control so it cannot pass by everything failing.
 
 #![cfg(feature = "transport-reticulum")]
 
