@@ -213,6 +213,18 @@ pub enum SwarmError {
     /// `Withdrawn` / `Revoked` federation-wide gone signals.
     #[error("substrate error during chunk verify-and-store: {0}")]
     Substrate(String),
+    /// CIRISEdge#581 — the store gate refused these bytes BEFORE any moved.
+    /// Carries which axis refused, because the three have different
+    /// remedies: join the community, get blessed, or grant consent.
+    #[error("store gate refused blob {blob_sha} on axis {axis}: {refusal:?}")]
+    StoreRefused {
+        /// Hex blob sha the fetch targeted.
+        blob_sha: String,
+        /// 1 provenance / 2 scope / 3 consent / 0 unclassifiable.
+        axis: u8,
+        /// The typed reason.
+        refusal: store_gate::StoreRefusal,
+    },
     /// A federation-tier `Withdrawn` or `Revoked` response was
     /// observed — the blob is gone federation-wide. The scheduler
     /// aborts immediately on the first such response (retrying
@@ -298,6 +310,12 @@ pub trait BlobChunkVerifier: Send + Sync {
         Ok(())
     }
 }
+
+pub mod store_gate;
+pub use store_gate::{
+    admit_blob_store, AudienceStanding, ConsentDisposition, OperatorStoreConsent, SenderStanding,
+    StoreAdmission, StoreRefusal,
+};
 
 pub mod persist_source;
 pub use persist_source::PersistBlobChunkSource;
@@ -528,7 +546,8 @@ pub struct ChunkManifestLite {
 
 impl ChunkManifestLite {
     /// Construct from a persist `ChunkManifest` by projecting away the
-    /// `v` field and (since persist v44.0.0 / #832) `chunk_tier`.
+    /// `v` field, `chunk_tier` (persist v44.0.0 / #832), and `stream_id`
+    /// plus each chunk's `seq` (persist v44.1.0 / #838).
     /// Available only when the manifest is provided as a typed value.
     ///
     /// Dropping `chunk_tier` is correct rather than lossy for this view:
@@ -586,6 +605,31 @@ enum FetchResultBody {
     Error(#[allow(dead_code)] String),
 }
 
+/// CIRISEdge#581 — one process-lifetime WARN when the store gate is not
+/// armed.
+///
+/// The default is UNARMED and that is deliberate: arming it changes what a
+/// running deployment accepts, and flipping that silently under existing
+/// operators would be its own defect. But #581 is explicit that until the
+/// gate is armed the projection rule "no one ever stores anything they did
+/// not consent to store" does not hold — so an unarmed node says so, once,
+/// rather than letting the absence pass for compliance.
+static STORE_GATE_UNARMED_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn warn_store_gate_unarmed() {
+    if !STORE_GATE_UNARMED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "blob STORE gate UNARMED — no BlobStorePolicy is installed, so this \
+             node accepts whatever it fetches without checking provenance, \
+             audience or operator consent (CIRISEdge#581). The three projection \
+             rules are not enforced on this node. Arming is an OPERATOR OPT-IN: \
+             install a policy via SwarmScheduler::with_store_policy. Warned once \
+             per process."
+        );
+    }
+}
+
 /// The driver. Holds an [`Arc<crate::Edge>`] handle (for issuing the
 /// per-chunk fetches) + the verifier-and-store hook. Construct
 /// per-fetch via [`SwarmScheduler::new`].
@@ -593,11 +637,18 @@ pub struct SwarmScheduler {
     edge: Arc<crate::Edge>,
     verifier: Arc<dyn BlobChunkVerifier>,
     config: SwarmConfig,
+    /// CIRISEdge#581 — the store gate's fact resolver. `None` leaves the
+    /// gate UNARMED, which is the pre-#581 behaviour and is warned about
+    /// once per process (see [`warn_store_gate_unarmed`]).
+    store_policy: Option<Arc<dyn store_gate::BlobStorePolicy>>,
 }
 
 impl SwarmScheduler {
     /// Construct a new scheduler. Consumers typically call this once
     /// per blob fetch — peer state is fetch-scoped, not long-lived.
+    ///
+    /// The store gate is UNARMED on a scheduler built this way; install a
+    /// policy with [`Self::with_store_policy`] to arm it.
     pub fn new(
         edge: Arc<crate::Edge>,
         verifier: Arc<dyn BlobChunkVerifier>,
@@ -607,7 +658,21 @@ impl SwarmScheduler {
             edge,
             verifier,
             config,
+            store_policy: None,
         }
+    }
+
+    /// CIRISEdge#581 — arm the store gate.
+    ///
+    /// Without this, the scheduler accepts whatever it fetched, which is
+    /// the state #581 describes: the rule "no one ever stores anything they
+    /// did not consent to store" is a property of nothing, because the
+    /// decision point does not exist. With it, every fetch is judged on
+    /// three axes BEFORE a byte moves.
+    #[must_use]
+    pub fn with_store_policy(mut self, policy: Arc<dyn store_gate::BlobStorePolicy>) -> Self {
+        self.store_policy = Some(policy);
+        self
     }
 
     /// Test constructor: identical to `new` but takes ownership of
@@ -620,6 +685,77 @@ impl SwarmScheduler {
         config: SwarmConfig,
     ) -> Self {
         Self::new(edge, verifier, config)
+    }
+
+    /// CIRISEdge#581 — evaluate the store gate for this fetch.
+    ///
+    /// Ordered BEFORE any byte moves, which is the whole point: a gate that
+    /// runs after the transfer has already spent the disk and the bandwidth
+    /// it was meant to protect, and on the announce path it has already
+    /// published that we hold the content.
+    async fn store_admission(
+        &self,
+        blob_sha256: [u8; 32],
+        content_scope: Option<&ContentScope>,
+        holders: &[String],
+    ) -> Result<(), SwarmError> {
+        let Some(policy) = self.store_policy.as_ref() else {
+            warn_store_gate_unarmed();
+            return Ok(());
+        };
+
+        // Fail-closed on an unclassifiable blob, exactly as the serve gate
+        // does — before any axis, because none can be evaluated.
+        let Some(content) = content_scope else {
+            return Err(SwarmError::StoreRefused {
+                blob_sha: hex::encode(blob_sha256),
+                axis: 0,
+                refusal: store_gate::StoreRefusal::ScopeUndeterminable,
+            });
+        };
+
+        // Axis 1 is about WHO would cause us to store. On a pull that is the
+        // holder set we are about to ask; the STRONGEST standing among them
+        // is the right reading, because one authorised holder is enough to
+        // make the transfer legitimate — and if none is authorised, no
+        // amount of them is.
+        let mut best = store_gate::SenderStanding::Undeterminable;
+        for h in holders {
+            let s = policy.sender_standing(h, content).await;
+            if store_gate::admit_blob_store(
+                Some(content),
+                s,
+                store_gate::AudienceStanding::In,
+                &store_gate::OperatorStoreConsent {
+                    commons: store_gate::ConsentDisposition::Announce,
+                    community: store_gate::ConsentDisposition::Announce,
+                    family: store_gate::ConsentDisposition::Announce,
+                    own: store_gate::ConsentDisposition::Announce,
+                },
+            )
+            .is_admitted()
+            {
+                best = s;
+                break;
+            }
+            if best == store_gate::SenderStanding::Undeterminable {
+                best = s;
+            }
+        }
+
+        let audience = policy.audience_standing(content).await;
+        let verdict =
+            store_gate::admit_blob_store(Some(content), best, audience, &policy.consent());
+
+        match verdict {
+            store_gate::StoreAdmission::StoreAndAnnounce
+            | store_gate::StoreAdmission::StoreLocalOnly => Ok(()),
+            store_gate::StoreAdmission::Refuse(refusal) => Err(SwarmError::StoreRefused {
+                blob_sha: hex::encode(blob_sha256),
+                axis: refusal.axis(),
+                refusal,
+            }),
+        }
     }
 
     /// Drive a swarm fetch of `blob_sha256`, given the chunk
@@ -689,6 +825,13 @@ impl SwarmScheduler {
         content_scope: Option<ContentScope>,
     ) -> Result<Vec<u8>, SwarmError> {
         let blob_hex = hex::encode(blob_sha256);
+
+        // CIRISEdge#581 — the store gate, BEFORE a byte moves. A gate that
+        // ran after the transfer would have already spent the disk and the
+        // bandwidth it exists to protect, and on the announce path would
+        // already have published that we hold the content.
+        self.store_admission(blob_sha256, content_scope.as_ref(), &holders)
+            .await?;
 
         manifest
             .validate()
@@ -1594,15 +1737,22 @@ mod tests {
                 ChunkRef {
                     sha: [1u8; 32],
                     size: 100,
+                    // persist v44.1.0 (#838) — the chunk's position in its
+                    // stream. The READER rebuilds a position-bound AAD from
+                    // this and the manifest's `stream_id`; edge's scheduler
+                    // never decrypts, so it projects both away.
+                    seq: Some(0),
                 },
                 ChunkRef {
                     sha: [2u8; 32],
                     size: 200,
+                    seq: Some(1),
                 },
             ],
             chunk_tier: Some(
                 ciris_persist::federation::types::cohort_scope::CryptoTier::CommunityDek,
             ),
+            stream_id: Some("writer-abc-01JBQ".into()),
         };
         let lite = ChunkManifestLite::from_persist(&sealed);
         assert_eq!(
@@ -1633,6 +1783,7 @@ mod tests {
                     total_size: 0,
                     chunks: vec![],
                     chunk_tier: None,
+                    stream_id: None,
                 }
             ))),
             Err(ChunkSourceRefusal::PolicyDenied)
