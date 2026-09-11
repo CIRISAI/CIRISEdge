@@ -744,15 +744,35 @@ impl SwarmScheduler {
             });
         };
 
-        // Axis 1 is about WHO would cause us to store. On a pull that is the
-        // holder set we are about to ask; the STRONGEST standing among them
-        // is the right reading, because one authorised holder is enough to
-        // make the transfer legitimate — and if none is authorised, no
-        // amount of them is.
-        let mut best = store_gate::SenderStanding::Undeterminable;
+        // Axis 1 is about WHO would cause us to store, and the holder set is
+        // the answer ONLY if every member of it is authorised.
+        //
+        // The first cut took the STRONGEST standing among holders, reasoning
+        // that one authorised holder makes the transfer legitimate. It does
+        // not, for a reason the review made concrete: the standing is never
+        // bound to the peer the bytes actually arrive from. `holders` is
+        // caller-supplied and unauthenticated (the pyo3 entry takes a bare
+        // `Vec<String>` from Python), nothing proves any of them holds the
+        // blob, and the scheduler may never contact the authorised one. So
+        // `["<any allowlisted CI key id>", "mallory-1", "mallory-2"]` — and
+        // that key id is public roster data — passed axis 1 while every byte
+        // came from Mallory.
+        //
+        // The bytes are hash-pinned, so this was never byte injection. What
+        // it cost is the allowlist's meaning: a name to QUOTE rather than a
+        // party to TRANSACT with. Requiring every holder to be authorised
+        // restores that, and is the reading that matches what axis 1 claims
+        // to be about.
+        //
+        // The FIRST unauthorised holder decides the refusal, so the reason
+        // names a real observed standing rather than a reduction over the
+        // set — `Undeterminable` (the directory failed) and `VerifiedOnly`
+        // (signed but not blessed) have different remedies and must not be
+        // collapsed.
+        let mut worst: Option<store_gate::SenderStanding> = None;
         for h in holders {
             let s = policy.sender_standing(h, content).await;
-            if store_gate::admit_blob_store(
+            let authorised = store_gate::admit_blob_store(
                 Some(content),
                 s,
                 store_gate::AudienceStanding::In,
@@ -763,19 +783,27 @@ impl SwarmScheduler {
                     own: store_gate::ConsentDisposition::Announce,
                 },
             )
-            .is_admitted()
-            {
-                best = s;
+            .is_admitted();
+            if !authorised {
+                worst = Some(s);
                 break;
             }
-            if best == store_gate::SenderStanding::Undeterminable {
-                best = s;
-            }
         }
+        // An EMPTY holder set authorises nothing: there is no peer to
+        // transact with, so there is no sender to approve.
+        let sender = match worst {
+            Some(s) => s,
+            None if holders.is_empty() => store_gate::SenderStanding::Undeterminable,
+            None => store_gate::SenderStanding::Allowlisted,
+        };
+        // `Allowlisted` above is a stand-in meaning "every holder cleared
+        // axis 1 for this scope"; the real per-holder verdicts were checked
+        // in the loop. Re-running the gate below with it re-applies axes 2
+        // and 3, which is what this call is for.
 
         let audience = policy.audience_standing(content).await;
         let verdict =
-            store_gate::admit_blob_store(Some(content), best, audience, &policy.consent());
+            store_gate::admit_blob_store(Some(content), sender, audience, &policy.consent());
 
         // Matching the verdict directly rather than round-tripping through
         // `disposition()` — the refusal carries its reason, and an Option

@@ -101,9 +101,23 @@ impl PersistBlobStorePolicy {
     /// one of them is a refusal we can explain.
     async fn cohorts_of(&self, key_id: &str) -> Option<(HashSet<String>, HashSet<String>)> {
         let dir = &*self.directory;
+        // The **_active** views, not the plain ones.
+        //
+        // `list_{families,communities}_for_member` are persist's FULL-HISTORY
+        // accessors — they carry no revocation filter. Reading them makes
+        // membership permanent: a member ejected from a community keeps
+        // standing on axis 1 forever, and a community THIS node has left
+        // still reads as `In` on axis 2, which with the default
+        // `community: Announce` means storing and advertising content for a
+        // community we are no longer in.
+        //
+        // That directly contradicts this module's own rule — "'Current'
+        // matters: membership is read now, not remembered" — which is the
+        // kind of gap that only shows up when someone is removed and
+        // nothing changes.
         match (
-            dir.list_families_for_member(key_id).await,
-            dir.list_communities_for_member(key_id).await,
+            dir.list_families_for_member_active(key_id).await,
+            dir.list_communities_for_member_active(key_id).await,
         ) {
             (Ok(families), Ok(communities)) => Some((
                 families.into_iter().map(|f| f.family_key_id).collect(),
