@@ -442,6 +442,35 @@ pub async fn chat_message_attestation(
         .await
         .map_err(|e| format!("seal chat content: {e}"))?;
 
+    // CIRISEdge#599 — REFUSE a write nobody can read.
+    //
+    // The DEK cascade wraps per active identity OCCURRENCE, so a room whose
+    // members have none resolves to no wrap targets and seals with
+    // `granted: []`. Every layer below reports success: the blob is written,
+    // the row is valid, the pointer resolves — and the read returns
+    // `Body::Unopened`, on the author's own node, forever.
+    //
+    // `readable_by_nobody()` has named that state since the store landed and
+    // nothing called it. Writing content no key can open is not a degraded
+    // write, it is a lost message that looks like a sent one, so it fails
+    // HERE — where the caller still has the plaintext — rather than at some
+    // reader's screen.
+    //
+    // Not folded into `excluded`: persist can only exclude occurrences it
+    // ENUMERATED, so a member with no occurrence at all is absent from both
+    // lists (CIRISPersist#843). `excluded` would say "one phone cannot read
+    // this" about a message nobody can read.
+    if sealed.readable_by_nobody() {
+        return Err(format!(
+            "chat content sealed under the room's DEK with NO grants — nobody can \
+             read it, including you. The cascade wraps per active identity \
+             OCCURRENCE, so this means no member of {room} has one registered on \
+             this node. Provision it (ciris_edge::content_occurrence, or \
+             Engine::self_at_login for an app+agent identity) before sending \
+             (CIRISEdge#599)"
+        ));
+    }
+
     let mut members = serde_json::Map::new();
     members.insert(
         FIELD_CONTENT.to_owned(),

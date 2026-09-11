@@ -1268,6 +1268,15 @@ async fn a_classical_only_signer_is_refused_not_downgraded() {
 /// are looking at one database — which is what makes this the delivery
 /// model rather than two halves that happen to agree.
 async fn content_store(w: &World) -> ciris_edge::group_content::PersistGroupContentStore {
+    content_store_maybe_provisioned(w, true).await
+}
+
+/// [`content_store`] with provisioning made OPTIONAL, so one test can be the
+/// stock node — the state CIRISEdge#599 was measured in.
+async fn content_store_maybe_provisioned(
+    w: &World,
+    provision: bool,
+) -> ciris_edge::group_content::PersistGroupContentStore {
     use ciris_persist::federation::FederationDirectory as _;
 
     let signer: std::sync::Arc<dyn ciris_keyring::HardwareSigner> = w.alice_node.classical.clone();
@@ -1331,11 +1340,17 @@ async fn content_store(w: &World) -> ciris_edge::group_content::PersistGroupCont
     // grants to nobody: readable by no one, including its author. That is
     // what `SealedContent::readable_by_nobody` names, and it is why the
     // roster machinery is the membership machinery rather than a lookup.
-    for (member, signer_for) in [
-        (w.alice.key_id.clone(), &w.alice),
-        (w.bob.key_id.clone(), &w.bob),
-    ] {
-        put_kex_occurrence(&w.dir, &member, signer_for).await;
+    // The seeds are the ones `signer()` built these identities from — the
+    // content keypair derives from the SAME seed as the signing key, which
+    // is the whole point of `SelfEncKeys`: no second key to provision, keep
+    // coherent, or lose.
+    if provision {
+        for (member, signer_for, seed) in [
+            (w.alice.key_id.clone(), &w.alice, 1u8),
+            (w.bob.key_id.clone(), &w.bob, 3u8),
+        ] {
+            put_kex_occurrence(&w.dir, &member, signer_for, &[seed; 32]).await;
+        }
     }
 
     ciris_edge::group_content::PersistGroupContentStore::from_shared(
@@ -1345,24 +1360,34 @@ async fn content_store(w: &World) -> ciris_edge::group_content::PersistGroupCont
     )
 }
 
-/// Give `identity` a content-tier KEX occurrence with real hybrid KEM
-/// pubkeys, through the trusted-local door.
+/// Give `identity` a content-tier KEX occurrence — **through the same door
+/// production uses**.
 ///
-/// `put_identity_occurrence_local` is the right door here and not a
-/// shortcut: persist documents it for exactly this shape — a content-only
-/// DEK-cascade KEX target, locally produced, never peer-received — so it
-/// bypasses the signature gate that exists to stop a peer forging someone
-/// else's content keys.
+/// # CIRISEdge#599 — why this goes through `content_occurrence`
+///
+/// This fixture used to register the occurrence itself and mint the content
+/// keypair with `generate_ephemeral_keypair` / `ml_kem::generate_keypair`.
+/// It worked, and that was the problem: nothing in production performed the
+/// equivalent, so the suite proved the feature works **given a precondition
+/// nothing met**, and a stock node sealed community content with
+/// `granted: []` — readable by nobody, including its author.
+///
+/// Routing the fixture through `content_occurrence::ensure_content_occurrence`
+/// with `enc_pubkeys_from_seed` means every content test in this file now
+/// exercises the production provisioning path and the production derivation.
+/// A regression there reddens the whole suite instead of nothing.
+///
+/// The occurrence key stays DISTINCT from the identity key — a device acting
+/// for a person, which is the shape the grants are wrapped for — and is
+/// registered first because the column is an FK onto `federation_keys`.
 async fn put_kex_occurrence(
     dir: &Arc<SqliteBackend>,
     identity: &str,
     signer_for: &ciris_edge::identity::LocalSigner,
+    seed: &[u8; 32],
 ) {
     use ciris_persist::federation::FederationDirectory as _;
 
-    // The occurrence's OWN key_id is an FK onto `federation_keys` — an
-    // occurrence is a key that acts for an identity, not a bare label — so
-    // it is registered before it can be pointed at.
     let occurrence = format!("{identity}-occ");
     dir.put_public_key(SignedKeyRecord {
         record: record(&occurrence, signer_for, signer_for, "node").await,
@@ -1370,27 +1395,31 @@ async fn put_kex_occurrence(
     .await
     .expect("register the occurrence key");
 
-    let (_, x_pub) = ciris_crypto::x25519::generate_ephemeral_keypair().expect("x25519");
-    let (_, kem_pub) = ciris_crypto::ml_kem::generate_keypair().expect("ml-kem-768");
-
-    dir.put_identity_occurrence_local(ciris_persist::federation::types::IdentityOccurrence {
-        identity_key_id: identity.to_owned(),
-        occurrence_key_id: occurrence,
-        device_class: "server".to_owned(),
-        hardware_attestation: None,
-        asserted_at: ts(),
-        valid_until: None,
-        encryption_pubkeys: Some(ciris_persist::federation::types::EncryptionPubkeys {
-            x25519_base64: b64(&x_pub),
-            ml_kem_768_base64: b64(&kem_pub),
-        }),
-        // Content-only: no reticulum transport, which is precisely the shape
-        // the trusted-local door is documented for.
-        transport_binding: None,
-        persist_row_hash: String::new(),
-    })
+    // The SAME derivation `SelfEncKeys::enc_pubkeys` performs inside custody,
+    // over the same input — deterministic, so this fixture's keys are the
+    // keys a real node with this seed would present.
+    let enc = ciris_edge::content_occurrence::enc_pubkeys_from_seed(seed)
+        .expect("derive content-enc pubkeys");
+    let outcome = ciris_edge::content_occurrence::ensure_content_occurrence(
+        &**dir,
+        identity,
+        &occurrence,
+        "server",
+        enc,
+    )
     .await
-    .expect("register a KEX occurrence");
+    .expect("provision the content occurrence");
+    // `Created` on the first store, `AlreadyCurrent` on a second one built
+    // over the same world — both fine, and the idempotence is the point.
+    //
+    // `Drifted` is the arm that matters: it would mean the derivation stopped
+    // being deterministic from the seed, which on a real node silently
+    // orphans every grant already wrapped to the old keys.
+    assert_ne!(
+        outcome,
+        ciris_edge::content_occurrence::Provisioned::Drifted,
+        "{identity}: the content keypair is no longer deterministic from its seed",
+    );
 }
 
 /// **The delivery model, proven at the chat layer.**
@@ -1511,4 +1540,77 @@ async fn a_pointer_copied_onto_another_authors_row_does_not_open() {
         ),
         other => panic!("a pointer on another author's row MUST NOT open — got {other:?}"),
     }
+}
+
+/// **CIRISEdge#599 — a write nobody can read is refused, loudly, at the door.**
+///
+/// The stock-node state: the room exists, the roster is right, the signers
+/// are real, and no member has a content occurrence. The DEK cascade then
+/// enumerates no wrap targets and seals with `granted: []`.
+///
+/// Every layer below reports success — the blob is written, the row would be
+/// valid, the pointer would resolve — and the only symptom is
+/// `Body::Unopened` on the author's own screen, forever. That is what
+/// CIRISServer measured, and what 31 of their 33 chat tests stayed green
+/// through.
+///
+/// So it fails HERE, while the caller still holds the plaintext, and the
+/// message names the remedy rather than the symptom.
+#[tokio::test]
+async fn a_message_no_key_could_open_is_refused_before_it_is_sent() {
+    let w = world().await;
+    let store = content_store_maybe_provisioned(&w, false).await;
+
+    let err = ciris_edge::chat::chat_message_attestation(
+        &w.alice,
+        "bob-fed",
+        "words nobody could read",
+        ts(),
+        &store,
+    )
+    .await
+    .expect_err("a message sealed to nobody must not be reported as sent");
+
+    // Name the REASON, not merely that it failed — a seal error and a
+    // grant-to-nobody are different findings with different remedies, and a
+    // test that accepts any error would pass on the wrong one.
+    assert!(
+        err.contains("NO grants") && err.contains("OCCURRENCE"),
+        "the refusal must say the content was granted to nobody and why — got: {err}",
+    );
+    assert!(
+        err.contains("599"),
+        "and point at the provisioning it needs — got: {err}",
+    );
+}
+
+/// The positive control for the test above, and the proof that provisioning
+/// is what makes the difference: the SAME world, the SAME message, with the
+/// occurrences registered.
+///
+/// Without this, the refusal test would pass on a world where chat was
+/// broken for some unrelated reason.
+#[tokio::test]
+async fn the_same_message_sends_once_the_occurrences_are_provisioned() {
+    let w = world().await;
+    let store = content_store_maybe_provisioned(&w, true).await;
+
+    let (_row, sealed) = ciris_edge::chat::chat_message_attestation(
+        &w.alice,
+        "bob-fed",
+        "words nobody could read",
+        ts(),
+        &store,
+    )
+    .await
+    .expect("provisioned, so the cascade has wrap targets");
+
+    assert!(
+        !sealed.readable_by_nobody(),
+        "the state the door refuses must be the state provisioning removes",
+    );
+    assert!(
+        !sealed.granted.is_empty(),
+        "and the grant set must be non-empty: {sealed:?}",
+    );
 }
