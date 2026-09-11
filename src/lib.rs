@@ -59,6 +59,7 @@ pub mod contact;
 pub mod debug;
 pub mod delivery_mode;
 pub mod detector;
+pub mod group_content;
 /// CIRISEdge#554 — the receiver-side budget on unsolicited contact requests.
 pub mod invite_gate;
 pub mod rate_limit;

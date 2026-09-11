@@ -399,18 +399,26 @@ at all — which is the point: after it, the room key has no readers.
 Each one falsifiable through a door a consumer holds, per persist's §11.10
 discipline.
 
-| # | invariant |
-|---|---|
-| **G1** | A ciphertext moved to a row with a different `author_key_id`, `asserted_at`, or `field` does not open. |
-| **G1b** | A ciphertext survives a widening: a row widened within its community's DEK opens the SAME blob, and a widening that crosses the DEK re-seals and references the new sha. |
-| **G1c** | A sealed chunk moved to another `seq` does not open (persist's frame, #838) — asserted at edge's boundary so a substrate regression is caught here rather than inferred. |
-| **G2** | The AAD preimage is never empty, and the write path refuses to seal with an empty one rather than silently sealing unbound. |
-| **G3** | A row written with a sub-resolution `asserted_at` reads back correctly — i.e. the writer truncated before sealing. |
-| **G4** | Commons-tier content passes `None`, and passing `Some` is refused at the door rather than sealing something unreadable. |
-| **G5** | A relay that holds neither DEK nor grant can still transfer and verify every chunk, and can open none of them. |
-| **G6** | Destroying an epoch makes content sealed under it unopenable **through every persist read door on this node**, with no path that bypasses it. Deliberately not "unopenable everywhere": that is the tombstone plane's reach, not this one's, and asserting it here would be the precondition-that-cannot-be-checked persist's §11.4 warns about. |
-| **G7** | A range read returns the plaintext range requested, never a ciphertext substring. |
-| **G8** | Two blobs in one row cannot be exchanged for one another. |
+**Six of the ten have live witnesses today; four do not, and saying which is
+the point of the column.** An invariant nothing asserts is a sentence, not a
+guarantee — and the four unwitnessed ones all describe the CHUNKED and
+LIFECYCLE paths, which edge has not built: there is no chunked write, no
+range read, and no epoch destroy on edge's side yet. They are listed because
+they are the contract those paths must meet when they arrive, not because
+they hold now.
+
+| # | invariant | witness |
+|---|---|---|
+| **G1** | A ciphertext moved to a row with a different `author_key_id`, `asserted_at`, or `field` does not open. | ✅ `a_pointer_copied_onto_another_authors_row_does_not_open` |
+| **G1b** | A ciphertext survives a widening: a row widened within its community's DEK opens the SAME blob, and a widening that crosses the DEK re-seals and references the new sha. | ✅ `a_widening_reproduces_the_same_binding` |
+| **G1c** | A sealed chunk moved to another `seq` does not open (persist's frame, #838) — asserted at edge's boundary so a substrate regression is caught here rather than inferred. | ❌ none — no chunked write path on edge yet |
+| **G2** | The AAD preimage is never empty — structurally UNREACHABLE rather than refused at a door. The domain separator alone guarantees it, so there is no empty case for a check to catch and no way for a caller to route around one. (An earlier wording promised a refusal; the implementation is stronger, and a doc claiming a gate that does not exist is worse than one claiming less.) | ✅ `the_preimage_is_never_empty_even_with_empty_inputs` |
+| **G3** | A row written with a sub-resolution `asserted_at` reads back correctly — i.e. the writer truncated before sealing. | ✅ `a_sub_millisecond_instant_binds_to_its_stored_rendering` |
+| **G4** | Commons-tier content passes `None`, and passing `Some` is refused at the door rather than sealing something unreadable. | ✅ `commons_content_round_trips_through_the_one_write_door` |
+| **G5** | A relay that holds neither DEK nor grant can still transfer and verify every chunk, and can open none of them. | ❌ none — needs a relay fixture holding neither DEK nor grant |
+| **G6** | Destroying an epoch makes content sealed under it unopenable **through every persist read door on this node**, with no path that bypasses it. Deliberately not "unopenable everywhere": that is the tombstone plane's reach, not this one's, and asserting it here would be the precondition-that-cannot-be-checked persist's §11.4 warns about. | ❌ none — edge has no epoch-destroy path |
+| **G7** | A range read returns the plaintext range requested, never a ciphertext substring. | ❌ none — no range read on edge yet |
+| **G8** | Two blobs in one row cannot be exchanged for one another. | ✅ `each_field_binds_distinctly` + `a_pointer_to_another_field_rebuilds_a_different_binding` |
 
 **G3 needs a witness with sub-resolution precision.** A test using an
 already-truncated timestamp passes whether or not the writer truncates, which

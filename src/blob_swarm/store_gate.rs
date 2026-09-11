@@ -100,6 +100,19 @@ impl StoreAdmission {
         matches!(self, Self::StoreAndAnnounce)
     }
 
+    /// The write door this admission allows, or `None` if it refused.
+    ///
+    /// This is what the caller must CARRY to the write. A caller that only
+    /// asks `is_admitted()` has silently chosen to announce.
+    #[must_use]
+    pub fn disposition(&self) -> Option<StoreDisposition> {
+        match self {
+            Self::StoreAndAnnounce => Some(StoreDisposition::Announce),
+            Self::StoreLocalOnly => Some(StoreDisposition::LocalOnly),
+            Self::Refuse(_) => None,
+        }
+    }
+
     /// Which axis refused, if this is a refusal. See [`StoreRefusal::axis`].
     #[must_use]
     pub fn axis_of_refusal(&self) -> Option<u8> {
@@ -108,6 +121,26 @@ impl StoreAdmission {
             _ => None,
         }
     }
+}
+
+/// CIRISEdge#581 — which of persist's two write doors admitted content may
+/// go through.
+///
+/// Extracted from [`StoreAdmission`] so the verdict can be CARRIED to the
+/// write rather than collapsed into a boolean at the gate. The first cut of
+/// this gate computed the trichotomy and then returned `Result<(), _>`,
+/// which discarded the announce bit entirely — `StoreLocalOnly` was
+/// unenforced, and `self`/`family` content was announced despite the whole
+/// point of those scopes being that it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreDisposition {
+    /// persist's `put_blob*` — store AND emit `holds_bytes:sha256:*`, so
+    /// `list_holders` names this node and the swarm can fetch from it.
+    Announce,
+    /// persist's `store_blob_local` — store and publish NOTHING. The bytes
+    /// are readable locally and the substrate makes no claim that this node
+    /// holds them.
+    LocalOnly,
 }
 
 /// Which rule refused, and enough to act on it.

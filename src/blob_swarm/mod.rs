@@ -296,11 +296,23 @@ pub trait BlobChunkVerifier: Send + Sync {
     /// Implementations MAY persist incrementally or buffer in-memory
     /// until [`Self::finalize`] is called — the scheduler's
     /// observable contract is just the per-chunk pass/fail signal.
+    ///
+    /// CIRISEdge#581 — `disposition` says WHICH of persist's two write doors
+    /// this chunk may go through, and it is a parameter rather than an
+    /// implementation choice because **storing is announcing**: `put_blob`
+    /// auto-emits `holds_bytes:sha256:*` and `list_holders` then names this
+    /// node, while `store_blob_local` publishes nothing.
+    ///
+    /// An implementation MUST honour it. Ignoring it and always announcing
+    /// defeats `self`/`family` invisibility — those scopes suppress
+    /// `holds_bytes` structurally — and overrides an operator who agreed to
+    /// hold a class but not to advertise holding it.
     fn verify_and_store(
         &self,
         blob_sha256: [u8; 32],
         chunk_sha256: [u8; 32],
         bytes: &[u8],
+        disposition: store_gate::StoreDisposition,
     ) -> Result<(), ChunkVerifyError>;
 
     /// Called once every chunk in the manifest has been verified.
@@ -311,10 +323,12 @@ pub trait BlobChunkVerifier: Send + Sync {
     }
 }
 
+pub mod persist_store_policy;
+pub use persist_store_policy::PersistBlobStorePolicy;
 pub mod store_gate;
 pub use store_gate::{
     admit_blob_store, AudienceStanding, ConsentDisposition, OperatorStoreConsent, SenderStanding,
-    StoreAdmission, StoreRefusal,
+    StoreAdmission, StoreDisposition, StoreRefusal,
 };
 
 pub mod persist_source;
@@ -698,15 +712,31 @@ impl SwarmScheduler {
         blob_sha256: [u8; 32],
         content_scope: Option<&ContentScope>,
         holders: &[String],
-    ) -> Result<(), SwarmError> {
+    ) -> Result<store_gate::StoreDisposition, SwarmError> {
         let Some(policy) = self.store_policy.as_ref() else {
             warn_store_gate_unarmed();
-            return Ok(());
+            // Unarmed = pre-#581 behaviour, which announced. Saying so
+            // explicitly rather than defaulting is what keeps the unarmed
+            // path from looking like a policy decision.
+            return Ok(store_gate::StoreDisposition::Announce);
         };
 
         // Fail-closed on an unclassifiable blob, exactly as the serve gate
         // does — before any axis, because none can be evaluated.
+        //
+        // The overwhelmingly likely cause is a caller on `fetch_blob`, which
+        // names no scope and therefore cannot be gated. Say so: a bare
+        // `ScopeUndeterminable` sends an operator hunting through three axes
+        // for a refusal that came before all of them.
         let Some(content) = content_scope else {
+            tracing::warn!(
+                blob = %hex::encode(blob_sha256),
+                "store gate REFUSED a fetch with no content scope. A caller that \
+                 cannot name the scope cannot be gated, and guessing `public` is \
+                 the one default this stack must never adopt — call \
+                 `fetch_blob_scoped` with the blob's ContentScope instead of \
+                 `fetch_blob` (CIRISEdge#581)"
+            );
             return Err(SwarmError::StoreRefused {
                 blob_sha: hex::encode(blob_sha256),
                 axis: 0,
@@ -747,9 +777,17 @@ impl SwarmScheduler {
         let verdict =
             store_gate::admit_blob_store(Some(content), best, audience, &policy.consent());
 
+        // Matching the verdict directly rather than round-tripping through
+        // `disposition()` — the refusal carries its reason, and an Option
+        // would throw that away exactly as the first cut threw away the
+        // announce bit.
         match verdict {
-            store_gate::StoreAdmission::StoreAndAnnounce
-            | store_gate::StoreAdmission::StoreLocalOnly => Ok(()),
+            store_gate::StoreAdmission::StoreAndAnnounce => {
+                Ok(store_gate::StoreDisposition::Announce)
+            }
+            store_gate::StoreAdmission::StoreLocalOnly => {
+                Ok(store_gate::StoreDisposition::LocalOnly)
+            }
             store_gate::StoreAdmission::Refuse(refusal) => Err(SwarmError::StoreRefused {
                 blob_sha: hex::encode(blob_sha256),
                 axis: refusal.axis(),
@@ -761,6 +799,22 @@ impl SwarmScheduler {
     /// Drive a swarm fetch of `blob_sha256`, given the chunk
     /// manifest + the federation key_ids of every holder. Returns
     /// the assembled blob bytes.
+    ///
+    /// # CIRISEdge#581 — this entry point CANNOT be gated
+    ///
+    /// It names no content scope, and the store gate's first act is to
+    /// refuse content it cannot classify. So on a node with a
+    /// [`BlobStorePolicy`](store_gate::BlobStorePolicy) installed, **every
+    /// call here refuses** with [`StoreRefusal::ScopeUndeterminable`].
+    ///
+    /// That is the correct verdict and a useless one, so the refusal says
+    /// which call to make instead rather than leaving an operator to infer
+    /// it from a taxonomy. Use [`Self::fetch_blob_scoped`], which is the
+    /// same fetch with the one input the gate needs.
+    ///
+    /// The alternative — exempting this path — would make the gate
+    /// bypassable by calling the older function, which is the one thing a
+    /// store gate must never be.
     ///
     /// # Caller responsibilities (v3.4.0-pre1)
     ///
@@ -830,7 +884,11 @@ impl SwarmScheduler {
         // ran after the transfer would have already spent the disk and the
         // bandwidth it exists to protect, and on the announce path would
         // already have published that we hold the content.
-        self.store_admission(blob_sha256, content_scope.as_ref(), &holders)
+        //
+        // The verdict is CARRIED, not discarded: it decides which of
+        // persist's two write doors every chunk of this fetch goes through.
+        let disposition = self
+            .store_admission(blob_sha256, content_scope.as_ref(), &holders)
             .await?;
 
         manifest
@@ -961,10 +1019,12 @@ impl SwarmScheduler {
                         continue;
                     }
 
-                    match self
-                        .verifier
-                        .verify_and_store(blob_sha256, outcome.chunk_sha, &bytes)
-                    {
+                    match self.verifier.verify_and_store(
+                        blob_sha256,
+                        outcome.chunk_sha,
+                        &bytes,
+                        disposition,
+                    ) {
                         Ok(()) => {
                             chunk_bytes.insert(outcome.chunk_sha, bytes);
                         }

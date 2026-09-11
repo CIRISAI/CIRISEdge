@@ -1276,3 +1276,254 @@ async fn a_classical_only_signer_is_refused_not_downgraded() {
         .unwrap_err();
     assert!(err.contains("ML-DSA-65"), "{err}");
 }
+
+// ─── CIRISEdge#586: content in the group store, end to end ────────────
+
+/// A `GroupContentStore` over the SAME substrate this world already uses,
+/// so a row written through the blob door and the row plane that carries it
+/// are looking at one database — which is what makes this the delivery
+/// model rather than two halves that happen to agree.
+async fn content_store(w: &World) -> ciris_edge::group_content::PersistGroupContentStore {
+    use ciris_persist::federation::FederationDirectory as _;
+
+    let signer: std::sync::Arc<dyn ciris_keyring::HardwareSigner> = w.alice_node.classical.clone();
+
+    // The seal emits a `holds_bytes` attestation, whose FK is onto the key
+    // persist DERIVES for this signer — `derive_key_id(alias, pubkey)` — not
+    // onto the friendly name the world registers it under. In production
+    // those are the same value because the derived id IS how a key id is
+    // minted; in this world they are not, so the derived one is registered
+    // here. Computing it the way persist does rather than assuming the
+    // friendly name works is the difference between this passing and an
+    // opaque "FOREIGN KEY constraint failed" from inside the door.
+    let pubkey = signer.public_key().await.expect("pubkey");
+    let derived = ciris_verify_core::fedcode::derive_key_id(signer.current_alias(), &pubkey);
+    let pqc_b64 = {
+        b64(&w
+            .alice_node
+            .pqc
+            .as_ref()
+            .expect("node pqc")
+            .public_key()
+            .await
+            .expect("pqc pubkey"))
+    };
+    let envelope = serde_json::json!({ "key_id": derived });
+    let canonical = serde_json::to_vec(&envelope).expect("serialize");
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&canonical);
+    let sig = signer.sign(digest.as_slice()).await.expect("self-sign");
+    w.dir
+        .put_public_key(ciris_persist::prelude::SignedKeyRecord {
+            record: ciris_persist::prelude::KeyRecord {
+                key_id: derived.clone(),
+                pubkey_ed25519_base64: b64(&pubkey),
+                pubkey_ml_dsa_65_base64: Some(pqc_b64),
+                algorithm: "hybrid".to_string(),
+                identity_type: "node".to_string(),
+                identity_ref: derived.clone(),
+                valid_from: ts(),
+                valid_until: None,
+                registration_envelope: envelope,
+                original_content_hash: hex::encode(digest),
+                scrub_signature_classical: b64(&sig),
+                scrub_signature_pqc: None,
+                scrub_key_id: derived,
+                scrub_timestamp: ts(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("register the engine's derived signing key");
+
+    // The DEK cascade wraps the content key to every ACTIVE OCCURRENCE of
+    // every roster member — `resolve_community_members` →
+    // `list_identity_occurrences_active` → `encryption_pubkeys`. A room whose
+    // members have no occurrence resolves to nobody, and the seal then
+    // grants to nobody: readable by no one, including its author. That is
+    // what `SealedContent::readable_by_nobody` names, and it is why the
+    // roster machinery is the membership machinery rather than a lookup.
+    for (member, signer_for) in [
+        (w.alice.key_id.clone(), &w.alice),
+        (w.bob.key_id.clone(), &w.bob),
+    ] {
+        put_kex_occurrence(&w.dir, &member, signer_for).await;
+    }
+
+    ciris_edge::group_content::PersistGroupContentStore::from_shared(
+        ciris_persist::BackendDispatch::Sqlite(w.dir.clone()),
+        signer,
+    )
+}
+
+/// Give `identity` a content-tier KEX occurrence with real hybrid KEM
+/// pubkeys, through the trusted-local door.
+///
+/// `put_identity_occurrence_local` is the right door here and not a
+/// shortcut: persist documents it for exactly this shape — a content-only
+/// DEK-cascade KEX target, locally produced, never peer-received — so it
+/// bypasses the signature gate that exists to stop a peer forging someone
+/// else's content keys.
+async fn put_kex_occurrence(
+    dir: &Arc<SqliteBackend>,
+    identity: &str,
+    signer_for: &ciris_edge::identity::LocalSigner,
+) {
+    use ciris_persist::federation::FederationDirectory as _;
+
+    // The occurrence's OWN key_id is an FK onto `federation_keys` — an
+    // occurrence is a key that acts for an identity, not a bare label — so
+    // it is registered before it can be pointed at.
+    let occurrence = format!("{identity}-occ");
+    dir.put_public_key(SignedKeyRecord {
+        record: record(&occurrence, signer_for, signer_for, "node").await,
+    })
+    .await
+    .expect("register the occurrence key");
+
+    let (_, x_pub) = ciris_crypto::x25519::generate_ephemeral_keypair().expect("x25519");
+    let (_, kem_pub) = ciris_crypto::ml_kem::generate_keypair().expect("ml-kem-768");
+
+    dir.put_identity_occurrence_local(ciris_persist::federation::types::IdentityOccurrence {
+        identity_key_id: identity.to_owned(),
+        occurrence_key_id: occurrence,
+        device_class: "server".to_owned(),
+        hardware_attestation: None,
+        asserted_at: ts(),
+        valid_until: None,
+        encryption_pubkeys: Some(ciris_persist::federation::types::EncryptionPubkeys {
+            x25519_base64: b64(&x_pub),
+            ml_kem_768_base64: b64(&kem_pub),
+        }),
+        // Content-only: no reticulum transport, which is precisely the shape
+        // the trusted-local door is documented for.
+        transport_binding: None,
+        persist_row_hash: String::new(),
+    })
+    .await
+    .expect("register a KEX occurrence");
+}
+
+/// **The delivery model, proven at the chat layer.**
+///
+/// Alice writes a message whose content goes to the room's blob store; the
+/// row carries only a pointer. A reader recognises the row WITHOUT a room
+/// key — there is none, which is what the migration accomplishes — and
+/// opens the content by rebuilding the binding from the row's own attester
+/// and instant.
+#[tokio::test]
+async fn a_chat_message_stores_its_content_as_a_group_blob_and_reads_back() {
+    use ciris_edge::chat::{Body, ChatMessage};
+
+    let w = world().await;
+    let store = content_store(&w).await;
+    let text = "the delivery model, proven";
+
+    let (row, sealed) =
+        ciris_edge::chat::chat_message_blob_attestation(&w.alice, "bob-fed", text, ts(), &store)
+            .await
+            .expect("author a blob-backed chat message");
+
+    // The row carries a pointer and NO inline body.
+    let env = &row.attestation_envelope;
+    assert!(
+        env.get(ciris_edge::chat::FIELD_CONTENT).is_some(),
+        "the row must carry the content pointer",
+    );
+    assert!(
+        env.get(ciris_edge::chat::FIELD_BODY).is_none()
+            && env.get(ciris_edge::chat::FIELD_SEALED).is_none(),
+        "a blob-backed row carries NO inline body — one shape or the other",
+    );
+
+    // Who can read it is reported, not left to be discovered later.
+    assert!(
+        sealed.fully_readable(),
+        "a member was excluded at write and could never read this: {:?}",
+        sealed.excluded,
+    );
+
+    // Read it back with NO room key.
+    let mut msg = ChatMessage::from_row_any(&row, &w.room, None).expect("recognise the chat row");
+    assert!(
+        matches!(msg.body, Body::Pointer(_)),
+        "recognition must not need the store: {:?}",
+        msg.body,
+    );
+
+    // The reader's OCCURRENCE key — grants are wrapped per occurrence, so
+    // the identity key would be refused as NotGranted despite full
+    // membership.
+    msg.resolve_content(&store, &format!("{}-occ", w.alice.key_id))
+        .await;
+    assert_eq!(
+        msg.body,
+        Body::Text(text.to_owned()),
+        "content must open from the row's own author and instant alone",
+    );
+}
+
+/// The substitution the AAD exists to prevent, at the chat layer: the same
+/// pointer on a row attributed to a DIFFERENT author does not open.
+///
+/// This is the property that let chat retire its own seal. Without it, every
+/// member of the room holds the DEK and could re-attribute anyone's message
+/// to themselves simply by copying the pointer.
+#[tokio::test]
+async fn a_pointer_copied_onto_another_authors_row_does_not_open() {
+    use ciris_edge::chat::{Body, ChatMessage};
+
+    let w = world().await;
+    let store = content_store(&w).await;
+
+    let (alice_row, _) = ciris_edge::chat::chat_message_blob_attestation(
+        &w.alice,
+        "bob-fed",
+        "alice's words",
+        ts(),
+        &store,
+    )
+    .await
+    .expect("alice authors");
+
+    // Bob copies Alice's pointer onto a row he attests himself, at the same
+    // instant — every other input identical, so the AUTHOR is the only
+    // difference and the test cannot pass for another reason.
+    let pointer = alice_row
+        .attestation_envelope
+        .get(ciris_edge::chat::FIELD_CONTENT)
+        .expect("pointer")
+        .clone();
+    let mut stolen = alice_row.clone();
+    stolen.attestation_id = "att-bob-stolen".to_owned();
+    stolen.attesting_key_id = w.bob.key_id.clone();
+    stolen.attestation_envelope = {
+        let mut e = alice_row.attestation_envelope.clone();
+        e.as_object_mut()
+            .expect("object")
+            .insert(ciris_edge::chat::FIELD_CONTENT.to_owned(), pointer);
+        e
+    };
+
+    let mut msg =
+        ChatMessage::from_row_any(&stolen, &w.room, None).expect("recognise the stolen row");
+    msg.resolve_content(&store, &format!("{}-occ", w.bob.key_id))
+        .await;
+
+    match msg.body {
+        Body::Unopened { reason } => assert!(
+            // Name the ARM, not merely that a reason exists. `NotGranted`
+            // here would mean the grant failed rather than the binding —
+            // green for the wrong reason, and indistinguishable without
+            // this.
+            reason.contains("rebuilt AAD") || reason.contains("seal did not open"),
+            "the refusal must be the SEAL failing to open, not a grant or \
+             lookup problem — got: {reason}",
+        ),
+        other => panic!("a pointer on another author's row MUST NOT open — got {other:?}"),
+    }
+}

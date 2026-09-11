@@ -3063,6 +3063,14 @@ impl crate::blob_swarm::BlobChunkVerifier for DefaultPyChunkVerifier {
         _blob_sha256: [u8; 32],
         chunk_sha256: [u8; 32],
         bytes: &[u8],
+        // CIRISEdge#581 — ignored here, and only because this verifier
+        // STORES NOTHING: it hash-checks and hands the bytes back to the
+        // Python caller. With no write, there is no door to choose between.
+        //
+        // A verifier that DOES persist must honour this — announcing content
+        // an operator asked to hold quietly, or announcing `self`/`family`
+        // content at all, is the failure the disposition exists to prevent.
+        _disposition: crate::blob_swarm::StoreDisposition,
     ) -> Result<(), crate::blob_swarm::ChunkVerifyError> {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
