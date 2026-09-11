@@ -53,27 +53,58 @@
 //! the enum is edge's, so the compiler can hold the invariant directly:
 //! **a new way to withhold cannot enter this codebase anonymously.**
 //!
-//! # Boundary: this attributes the SERVE side only
+//! # Both directions of a flow, and the one gap that remains
 //!
-//! Edge has two refusal mechanisms and they are not the same thing:
+//! Edge refuses in three places, and they are not the same thing:
 //!
 //! - **Serve / emit** refusals go through [`WithholdReason`] and
-//!   `EdgeMetrics::inc_withhold` — a counted, attributed ledger. That is
-//!   what this module maps.
-//! - **Inbound / transport** refusals go through
+//!   `EdgeMetrics::inc_withhold` — a counted, attributed ledger.
+//!   [`parameter_of`] maps it.
+//! - **Accept / store** refusals go through
+//!   [`StoreRefusal`](crate::blob_swarm::StoreRefusal) and
+//!   [`MeaningRefusal`](crate::blob_swarm::MeaningRefusal) — edge
+//!   declining to take content IN. [`parameter_of_store_refusal`] and
+//!   [`parameter_of_meaning_refusal`] map those, each exhaustive and
+//!   wildcard-free over an enum that is edge's own, so the same compile
+//!   error holds: **a new way to refuse content cannot enter this
+//!   codebase anonymously either.**
+//! - **Inbound / transport** drops go through
 //!   `ReticulumTransport::drop_inbound` — a throttled WARN with a string
-//!   reason tag (CIRISEdge#425). It is log-only, carries no
-//!   [`WithholdReason`], and is therefore **not attributed here**.
+//!   reason tag (CIRISEdge#425). It is log-only, carries no typed
+//!   reason, and is therefore **still not attributed here.**
 //!
-//! That asymmetry is real and is not an oversight to paper over: an
-//! inbound drop is edge declining to *accept* a frame it cannot
-//! attribute, which is a question about the Sender parameter, while
-//! everything below is edge declining to *make* a flow. The compile-time
-//! guard covers the second and says nothing about the first.
+//! # Why the accept side is the same five parameters
 //!
-//! Stated so the coverage is not overread. Typing the inbound reasons
-//! would extend the guard across both, and is the obvious next
-//! improvement rather than a defect being hidden.
+//! It reads at first like a different question — the serve side asks
+//! *may I send this*, the accept side *may I hold this* — and the
+//! temptation is a second vocabulary for it. There isn't one. Appropriate
+//! flow is a property of the FLOW, and both ends evaluate the same five
+//! parameters from their own position:
+//!
+//! | axis | the accept-side question | parameter |
+//! |---|---|---|
+//! | meaning | what IS this, and who says so | Information type · Sender |
+//! | 1 provenance | may this sender place content of this kind here | Sender |
+//! | 2 scope | are we in the audience it declares | Recipient |
+//! | 3 consent | did this operator agree to hold this class at all | Transmission principle |
+//!
+//! Axis 3 is the one worth naming: an operator declining to hold a class
+//! of content is not a statement about the sender or the audience, it is
+//! this node's own **rule of carriage** — the retain-with-limits
+//! parameter, the same one the LXMF propagation terms land on below. A
+//! node that had no way to say "not on my disk" would be enforcing
+//! everybody's norms except its own.
+//!
+//! # Where the darknet half lands
+//!
+//! The `self` and `family` scopes are the derived group plane (CC 5.4.6):
+//! persist suppresses `holds_bytes` for them structurally, so holding
+//! that content publishes nothing. That is why
+//! [`StoreAdmission::StoreLocalOnly`](crate::blob_swarm::StoreAdmission)
+//! exists as a distinct verdict rather than a flag — *accept* and
+//! *announce* are two different flows, with two different recipients, and
+//! collapsing them is exactly how "can hold" quietly becomes "does
+//! advertise".
 //!
 //! # What this module is NOT
 //!
@@ -83,6 +114,7 @@
 //! it — the precise defect class this repo has spent the last several
 //! releases removing.
 
+use crate::blob_swarm::{MeaningRefusal, StoreRefusal};
 use crate::observability::WithholdReason;
 
 /// One of the five parameters an information-flow norm is defined over
@@ -338,6 +370,174 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
     }
 }
 
+/// Which commitment a **meaning** refusal defends — the invariant that a
+/// blob with no signed attestation saying what it is, is an invalid state.
+///
+/// **Exhaustive, no wildcard, on purpose.** [`MeaningRefusal`] is edge's own
+/// enum and is not `#[non_exhaustive]`, so a new way to refuse meaning
+/// without attributing it here does not compile.
+#[must_use]
+pub fn parameter_of_meaning_refusal(refusal: &MeaningRefusal) -> CiParameter {
+    match refusal {
+        // ── Sender ──────────────────────────────────────────────────
+        // "Every claim has a named cryptographic source." A row with an
+        // empty signature column, or a signature naming nobody, is a claim
+        // with no source — the same commitment the E3 unattributed-frame
+        // drop keeps, asked of a row instead of a frame.
+        MeaningRefusal::Unsigned => CiParameter::Sender,
+
+        // ── Information type ────────────────────────────────────────
+        // Both of these are edge saying "nothing here tells me WHAT these
+        // bytes are", which is the information-type parameter and not the
+        // recipient one — and the distinction decides the remedy. A
+        // `holds_bytes` row is a well-formed, signed, correctly-scoped
+        // claim; what it claims is POSSESSION. Reading it as an
+        // information type would classify every blob on the node as
+        // commons content, because that is the cohort its column carries.
+        //
+        // `DoesNotReference` is the same gap from the other side: a row
+        // that states an information type, for other bytes.
+        MeaningRefusal::PossessionIsNotMeaning | MeaningRefusal::DoesNotReference { .. } => {
+            CiParameter::InformationType
+        }
+
+        // ── Recipient ───────────────────────────────────────────────
+        // `cohort_scope` IS the recipient axis. A scope token edge cannot
+        // map, and a scoped row that names no group, are both audiences
+        // edge cannot bound — and an unbounded audience is the one thing
+        // a recipient gate must never default. Two variants because the
+        // remedies differ (teach edge the scope vs. fix the producer),
+        // one parameter because both leave the same question unanswered.
+        MeaningRefusal::UnknownScope { .. } | MeaningRefusal::GroupWithoutId { .. } => {
+            CiParameter::Recipient
+        }
+    }
+}
+
+/// Which commitment a **store** refusal defends — the accept side of the
+/// same five parameters.
+///
+/// **Exhaustive, no wildcard, on purpose**, for the reason
+/// [`parameter_of`] is: [`StoreRefusal`] is edge's own enum, so the
+/// compiler holds the invariant that a new store-gate refusal cannot enter
+/// anonymously.
+#[must_use]
+// Grouped by REASONING, not by value — see the note on `parameter_of`.
+#[allow(clippy::match_same_arms)]
+pub fn parameter_of_store_refusal(refusal: &StoreRefusal) -> CiParameter {
+    match refusal {
+        // ── Information type ────────────────────────────────────────
+        // Pre-axis. The caller named no [`BlobMeaning`] at all, so edge
+        // has no statement of what the bytes are — and every other axis
+        // takes that as an input.
+        //
+        // Filed under information type rather than recipient, though the
+        // variant is spelled "scope": the projection refuses in order, and
+        // signed / not-possession / references-this-blob all fail BEFORE
+        // the scope is read. What is missing here is the row, not the
+        // cohort on it.
+        //
+        // [`BlobMeaning`]: crate::blob_swarm::BlobMeaning
+        StoreRefusal::ScopeUndeterminable => CiParameter::InformationType,
+
+        // ── Sender ──────────────────────────────────────────────────
+        // Axis 1. Norms are sender-indexed: a community's content may be
+        // placed by its current members, commons content by the blessed
+        // allowlist. A VERIFIED sender who is not an appropriate sender
+        // for this content in this context fails the sender parameter —
+        // which is the whole point of the axis, and the CIRISEdge#564
+        // lesson stated in CI's vocabulary: verification establishes the
+        // source, it does not establish that the source is appropriate.
+        StoreRefusal::SenderNotApprovedForTier { .. }
+        | StoreRefusal::SenderUndeterminable { .. } => CiParameter::Sender,
+
+        // ── Recipient ───────────────────────────────────────────────
+        // Axis 2, evaluated from the receiving end: WE are the recipient,
+        // and the content names an audience we are not in (or one we
+        // cannot resolve ourselves into). Accepting anyway would place a
+        // claim outside the context it was made in — the same commitment
+        // the serve side keeps by not sending it.
+        StoreRefusal::NotInAudience { .. } | StoreRefusal::AudienceUndeterminable { .. } => {
+            CiParameter::Recipient
+        }
+
+        // ── Transmission principle ──────────────────────────────────
+        // Axis 3, and the only one no peer and no roster can overrule in
+        // either direction. This is the node's own rule of carriage —
+        // retain-with-limits, the parameter CIRIS calls the decisive
+        // differentiator — and it is deliberately NOT a claim about the
+        // sender or the audience: #581's own example is a blessed runner
+        // whose content clears axes 1 and 2 and is still refused because
+        // the operator never agreed to host public blobs.
+        StoreRefusal::OperatorDeclined { .. } => CiParameter::TransmissionPrinciple,
+    }
+}
+
+/// An **acceptance** decision, in commitment terms — the accept-side twin
+/// of [`Delivery`].
+///
+/// Two verdicts rather than a bool for the same reason the store gate
+/// returns a trichotomy: *hold* and *hold and announce* are different
+/// flows with different recipients, and a value that collapsed them would
+/// make the `self` / `family` scopes' structural invisibility (CC 5.4.6)
+/// invisible to the audit trail too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Acceptance {
+    /// The bytes were accepted and a holder attestation was published.
+    StoredAndAnnounced,
+    /// The bytes were accepted and NOTHING was published about holding
+    /// them.
+    StoredSilently,
+    /// Edge declined to take the content in. Carries the axis that
+    /// refused AND the commitment that refusal defends.
+    Refused {
+        /// The gate that refused — edge's mechanism vocabulary.
+        refusal: StoreRefusal,
+        /// The commitment it defends.
+        parameter: CiParameter,
+    },
+}
+
+impl Acceptance {
+    /// Build a refusal, attributing it automatically. There is no way to
+    /// construct a `Refused` whose parameter disagrees with its refusal.
+    #[must_use]
+    pub fn refused(refusal: StoreRefusal) -> Self {
+        let parameter = parameter_of_store_refusal(&refusal);
+        Self::Refused { refusal, parameter }
+    }
+
+    /// Whether the bytes were accepted at all.
+    #[must_use]
+    pub fn accepted(&self) -> bool {
+        matches!(self, Self::StoredAndAnnounced | Self::StoredSilently)
+    }
+
+    /// One line, in the commitment's vocabulary.
+    #[must_use]
+    pub fn explain(&self) -> String {
+        match self {
+            Self::StoredAndAnnounced => {
+                "accepted and announced: the flow conformed on every evaluated parameter, and \
+                 this node published that it holds the content"
+                    .into()
+            }
+            Self::StoredSilently => {
+                "accepted, unannounced: the flow conformed, and holding it publishes nothing — \
+                 the scope suppresses the holder claim, or the operator consented to hold but \
+                 not to advertise"
+                    .into()
+            }
+            Self::Refused { refusal, parameter } => format!(
+                "refused [{}] to keep the commitment that {} (axis {})",
+                parameter.as_str(),
+                parameter.commitment(),
+                refusal.axis(),
+            ),
+        }
+    }
+}
+
 /// A delivery decision, in commitment terms.
 ///
 /// The value a serve path can hand an operator, an audit log, or a
@@ -397,6 +597,137 @@ impl Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accept side is attributed on the same five parameters, and a
+    /// refusal cannot disagree with its own attribution.
+    ///
+    /// Totality is the compiler's (both enums are edge's own and neither
+    /// is `#[non_exhaustive]`, so the wildcard-free matches must stay
+    /// exhaustive). What this pins is that every axis is REACHABLE and
+    /// that the mapping is the intended one — a match can be exhaustive
+    /// and still send every arm to one parameter.
+    #[test]
+    fn the_accept_side_maps_each_axis_to_its_own_parameter() {
+        let kind = "cohort";
+        let cases = [
+            (
+                StoreRefusal::ScopeUndeterminable,
+                CiParameter::InformationType,
+                0u8,
+            ),
+            (
+                StoreRefusal::SenderNotApprovedForTier {
+                    content_kind: kind,
+                    sender: crate::blob_swarm::SenderStanding::VerifiedOnly,
+                },
+                CiParameter::Sender,
+                1,
+            ),
+            (
+                StoreRefusal::SenderUndeterminable { content_kind: kind },
+                CiParameter::Sender,
+                1,
+            ),
+            (
+                StoreRefusal::NotInAudience { content_kind: kind },
+                CiParameter::Recipient,
+                2,
+            ),
+            (
+                StoreRefusal::AudienceUndeterminable { content_kind: kind },
+                CiParameter::Recipient,
+                2,
+            ),
+            (
+                StoreRefusal::OperatorDeclined { content_kind: kind },
+                CiParameter::TransmissionPrinciple,
+                3,
+            ),
+        ];
+        for (refusal, want, axis) in cases {
+            assert_eq!(
+                parameter_of_store_refusal(&refusal),
+                want,
+                "{refusal:?} must defend {want:?}",
+            );
+            assert_eq!(refusal.axis(), axis, "{refusal:?}");
+            // The constructor cannot produce a disagreeing pair.
+            match Acceptance::refused(refusal.clone()) {
+                Acceptance::Refused { parameter, .. } => assert_eq!(parameter, want),
+                other => panic!("a refusal must not read as accepted: {other:?}"),
+            }
+            assert!(!Acceptance::refused(refusal).accepted());
+        }
+    }
+
+    /// The three axes must not collapse onto one parameter — if they did,
+    /// the attribution would be decoration. Four distinct parameters
+    /// across the accept side, including the pre-axis arm.
+    #[test]
+    fn the_accept_side_is_not_one_parameter_wearing_four_names() {
+        let kind = "cohort";
+        let mut seen: Vec<CiParameter> = [
+            StoreRefusal::ScopeUndeterminable,
+            StoreRefusal::SenderUndeterminable { content_kind: kind },
+            StoreRefusal::NotInAudience { content_kind: kind },
+            StoreRefusal::OperatorDeclined { content_kind: kind },
+        ]
+        .iter()
+        .map(parameter_of_store_refusal)
+        .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "the axes collapsed: {seen:?}");
+    }
+
+    /// A meaning refusal is attributed too, and the possession/meaning
+    /// distinction lands on INFORMATION TYPE rather than recipient — the
+    /// attribution that decides where an operator is sent.
+    #[test]
+    fn a_possession_claim_fails_the_information_type_parameter() {
+        assert_eq!(
+            parameter_of_meaning_refusal(&MeaningRefusal::PossessionIsNotMeaning),
+            CiParameter::InformationType,
+            "a holds_bytes row is well-formed, signed and correctly scoped; what \
+             it does not carry is an information TYPE",
+        );
+        assert_eq!(
+            parameter_of_meaning_refusal(&MeaningRefusal::Unsigned),
+            CiParameter::Sender,
+        );
+        assert_eq!(
+            parameter_of_meaning_refusal(&MeaningRefusal::UnknownScope {
+                scope: "galactic".into()
+            }),
+            CiParameter::Recipient,
+        );
+        assert_eq!(
+            parameter_of_meaning_refusal(&MeaningRefusal::GroupWithoutId {
+                scope: "community".into()
+            }),
+            CiParameter::Recipient,
+        );
+        assert_eq!(
+            parameter_of_meaning_refusal(&MeaningRefusal::DoesNotReference {
+                sha256_hex: String::new()
+            }),
+            CiParameter::InformationType,
+        );
+    }
+
+    /// `StoreLocalOnly` is a distinct verdict from `StoreAndAnnounce` in
+    /// the explanation too — CC 5.4.6's derived group plane is only
+    /// invisible if the audit trail says so as well.
+    #[test]
+    fn holding_and_announcing_explain_as_different_flows() {
+        let held = Acceptance::StoredSilently.explain();
+        let announced = Acceptance::StoredAndAnnounced.explain();
+        assert!(held.contains("publishes nothing"), "{held}");
+        assert!(announced.contains("published"), "{announced}");
+        assert_ne!(held, announced);
+        assert!(Acceptance::StoredSilently.accepted());
+        assert!(Acceptance::StoredAndAnnounced.accepted());
+    }
 
     /// Every refusal edge can produce is attributed. The compiler
     /// already guarantees totality — this pins that the mapping is

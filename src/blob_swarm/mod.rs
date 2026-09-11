@@ -323,6 +323,9 @@ pub trait BlobChunkVerifier: Send + Sync {
     }
 }
 
+pub mod meaning;
+pub use meaning::{BlobMeaning, MeaningRefusal};
+
 pub mod persist_store_policy;
 pub use persist_store_policy::PersistBlobStorePolicy;
 pub mod store_gate;
@@ -710,7 +713,7 @@ impl SwarmScheduler {
     async fn store_admission(
         &self,
         blob_sha256: [u8; 32],
-        content_scope: Option<&ContentScope>,
+        meaning: Option<&meaning::BlobMeaning>,
         holders: &[String],
     ) -> Result<store_gate::StoreDisposition, SwarmError> {
         let Some(policy) = self.store_policy.as_ref() else {
@@ -728,14 +731,17 @@ impl SwarmScheduler {
         // names no scope and therefore cannot be gated. Say so: a bare
         // `ScopeUndeterminable` sends an operator hunting through three axes
         // for a refusal that came before all of them.
-        let Some(content) = content_scope else {
+        let Some(meaning) = meaning else {
             tracing::warn!(
                 blob = %hex::encode(blob_sha256),
-                "store gate REFUSED a fetch with no content scope. A caller that \
-                 cannot name the scope cannot be gated, and guessing `public` is \
-                 the one default this stack must never adopt — call \
-                 `fetch_blob_scoped` with the blob's ContentScope instead of \
-                 `fetch_blob` (CIRISEdge#581)"
+                "store gate REFUSED a fetch for a blob with no MEANING. Bytes \
+                 do not describe themselves: what says what a blob is, is the \
+                 signed attestation that references it, and without one there \
+                 is no audience to be in or out of — guessing `public` is the \
+                 one default this stack must never adopt. Call \
+                 `fetch_blob_scoped` with the BlobMeaning projected from that \
+                 row (`BlobMeaning::project`) instead of `fetch_blob` \
+                 (CIRISEdge#581/#586)"
             );
             return Err(SwarmError::StoreRefused {
                 blob_sha: hex::encode(blob_sha256),
@@ -744,16 +750,36 @@ impl SwarmScheduler {
             });
         };
 
-        // Axis 1 is about WHO would cause us to store. On a pull that is the
-        // holder set we are about to ask; the STRONGEST standing among them
-        // is the right reading, because one authorised holder is enough to
-        // make the transfer legitimate — and if none is authorised, no
-        // amount of them is.
-        let mut best = store_gate::SenderStanding::Undeterminable;
+        // Axis 1 is about WHO would cause us to store, and the holder set is
+        // the answer ONLY if every member of it is authorised.
+        //
+        // The first cut took the STRONGEST standing among holders, reasoning
+        // that one authorised holder makes the transfer legitimate. It does
+        // not, for a reason the review made concrete: the standing is never
+        // bound to the peer the bytes actually arrive from. `holders` is
+        // caller-supplied and unauthenticated (the pyo3 entry takes a bare
+        // `Vec<String>` from Python), nothing proves any of them holds the
+        // blob, and the scheduler may never contact the authorised one. So
+        // `["<any allowlisted CI key id>", "mallory-1", "mallory-2"]` — and
+        // that key id is public roster data — passed axis 1 while every byte
+        // came from Mallory.
+        //
+        // The bytes are hash-pinned, so this was never byte injection. What
+        // it cost is the allowlist's meaning: a name to QUOTE rather than a
+        // party to TRANSACT with. Requiring every holder to be authorised
+        // restores that, and is the reading that matches what axis 1 claims
+        // to be about.
+        //
+        // The FIRST unauthorised holder decides the refusal, so the reason
+        // names a real observed standing rather than a reduction over the
+        // set — `Undeterminable` (the directory failed) and `VerifiedOnly`
+        // (signed but not blessed) have different remedies and must not be
+        // collapsed.
+        let mut worst: Option<store_gate::SenderStanding> = None;
         for h in holders {
-            let s = policy.sender_standing(h, content).await;
-            if store_gate::admit_blob_store(
-                Some(content),
+            let s = policy.sender_standing(h, meaning.scope()).await;
+            let authorised = store_gate::admit_blob_store(
+                meaning,
                 s,
                 store_gate::AudienceStanding::In,
                 &store_gate::OperatorStoreConsent {
@@ -763,19 +789,26 @@ impl SwarmScheduler {
                     own: store_gate::ConsentDisposition::Announce,
                 },
             )
-            .is_admitted()
-            {
-                best = s;
+            .is_admitted();
+            if !authorised {
+                worst = Some(s);
                 break;
             }
-            if best == store_gate::SenderStanding::Undeterminable {
-                best = s;
-            }
         }
+        // An EMPTY holder set authorises nothing: there is no peer to
+        // transact with, so there is no sender to approve.
+        let sender = match worst {
+            Some(s) => s,
+            None if holders.is_empty() => store_gate::SenderStanding::Undeterminable,
+            None => store_gate::SenderStanding::Allowlisted,
+        };
+        // `Allowlisted` above is a stand-in meaning "every holder cleared
+        // axis 1 for this scope"; the real per-holder verdicts were checked
+        // in the loop. Re-running the gate below with it re-applies axes 2
+        // and 3, which is what this call is for.
 
-        let audience = policy.audience_standing(content).await;
-        let verdict =
-            store_gate::admit_blob_store(Some(content), best, audience, &policy.consent());
+        let audience = policy.audience_standing(meaning.scope()).await;
+        let verdict = store_gate::admit_blob_store(meaning, sender, audience, &policy.consent());
 
         // Matching the verdict directly rather than round-tripping through
         // `disposition()` — the refusal carries its reason, and an Option
@@ -850,9 +883,12 @@ impl SwarmScheduler {
     /// CIRISEdge#499 — drive a swarm fetch of a blob whose content scope is
     /// KNOWN, requesting every chunk at the address that scope requires.
     ///
-    /// `content_scope` is the blob's declared scope (from the persist-backed
-    /// consumer that owns content classification — edge never infers it), or
-    /// `None` when it could not be determined.
+    /// `meaning` is what the blob IS, projected from the signed attestation
+    /// that references it ([`BlobMeaning::project`](meaning::BlobMeaning::project)) —
+    /// never a scope the caller composed. `None` says no such row was found,
+    /// which the store gate refuses: a blob nobody has said anything about
+    /// is not content we lack context on, it is content we have no reason to
+    /// touch.
     ///
     /// Routing happens ONCE, up front, for every holder, and BEFORE a single
     /// byte moves. That ordering is the point: a per-dispatch resolution could
@@ -876,7 +912,7 @@ impl SwarmScheduler {
         blob_sha256: [u8; 32],
         manifest: ChunkManifestLite,
         holders: Vec<String>,
-        content_scope: Option<ContentScope>,
+        meaning: Option<meaning::BlobMeaning>,
     ) -> Result<Vec<u8>, SwarmError> {
         let blob_hex = hex::encode(blob_sha256);
 
@@ -888,7 +924,7 @@ impl SwarmScheduler {
         // The verdict is CARRIED, not discarded: it decides which of
         // persist's two write doors every chunk of this fetch goes through.
         let disposition = self
-            .store_admission(blob_sha256, content_scope.as_ref(), &holders)
+            .store_admission(blob_sha256, meaning.as_ref(), &holders)
             .await?;
 
         manifest
@@ -903,12 +939,16 @@ impl SwarmScheduler {
         // The router reads its table from the transport, so "is this node
         // scope-native" has one source of truth (see `Edge::blob_scope_router`).
         let scope_router = self.edge.blob_scope_router();
-        let routes =
-            resolve_holder_routes(&scope_router, content_scope.as_ref(), &holders, &blob_hex)
-                .map_err(|reason| SwarmError::ScopeUnroutable {
-                    blob_sha: blob_hex.clone(),
-                    reason,
-                })?;
+        let routes = resolve_holder_routes(
+            &scope_router,
+            meaning.as_ref().map(meaning::BlobMeaning::scope),
+            &holders,
+            &blob_hex,
+        )
+        .map_err(|reason| SwarmError::ScopeUnroutable {
+            blob_sha: blob_hex.clone(),
+            reason,
+        })?;
 
         // Per-peer state, fetch-scoped. Keyed on the routable holders only —
         // an unroutable holder is not a candidate, so `pick_peer` can never

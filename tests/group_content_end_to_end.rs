@@ -7,13 +7,30 @@
 //!    persist's one write door and comes back as a row pointer;
 //! 2. **pointer → open** — a reader rebuilding the binding from the row gets
 //!    the bytes back;
-//! 3. **the substitution fails** — a ciphertext lifted onto a different
-//!    author's row does NOT open, which is the whole reason the AAD exists.
+//! 3. **the doors behave as documented at the COMMONS tier** — a plaintext
+//!    write refuses an AAD, an absent pointer is a typed `NotHeld`, and
+//!    identical bytes seal to one address.
 //!
-//! Point 3 is the one worth having a live substrate for. The preimage's
-//! shape is pinned by unit tests; what those cannot show is that persist
-//! actually folds it into the GCM tag, and that a mismatch surfaces as a
-//! crypto failure rather than silently returning someone else's plaintext.
+//! # What this file does NOT prove, and where that lives
+//!
+//! **Every seal here is `cohort_scope: federation`, i.e. plaintext.** The
+//! fixture is a bare substrate with a registered signing key and no
+//! community, and `resolve_write_tier` refuses a `community` write naming a
+//! community the directory does not know — so the encrypted tier is out of
+//! reach here by construction.
+//!
+//! That matters because the AAD binds nothing at plaintext: there is no GCM
+//! tag to fold it into, and persist REFUSES an AAD at that tier rather than
+//! ignoring it. An earlier version of this header claimed the file proved
+//! "a ciphertext lifted onto a different author's row does not open". It
+//! could not: `commons_content_is_not_bound_to_its_author_and_says_so`
+//! below asserts the OPPOSITE, correctly, because commons content is
+//! public by construction.
+//!
+//! The substitution proof needs a real community and a real
+//! `CommunityDek` write, and lives in
+//! `chat_message_federates::a_pointer_copied_onto_another_authors_row_does_not_open`,
+//! with a positive control so it cannot pass by everything failing.
 
 #![cfg(feature = "transport-reticulum")]
 
@@ -112,7 +129,11 @@ async fn store() -> PersistGroupContentStore {
         .expect("register the signing key");
 
     let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(ed);
-    PersistGroupContentStore::from_shared(ciris_persist::BackendDispatch::Sqlite(backend), signer)
+    PersistGroupContentStore::from_shared(
+        ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+        backend,
+        signer,
+    )
 }
 
 fn instant() -> chrono::DateTime<chrono::Utc> {
@@ -214,9 +235,21 @@ async fn a_pointer_survives_the_wire_and_still_opens() {
     assert_eq!(got, body);
 }
 
-/// A reader that rebuilds the binding from the WRONG row does not get the
-/// content — even holding the correct pointer, and even at a tier where the
-/// bytes are not encrypted at all.
+/// At a PLAINTEXT tier the author is not bound, and this test exists to say
+/// so out loud.
+///
+/// It cannot fail independently — `open()` passes `aad_arg = None` for a
+/// plaintext row, so `author_key_id` is dead on that path and substituting
+/// a different author changes no byte the code reads. Kept anyway, because
+/// the FACT is load-bearing for the design: commons blobs have no
+/// cryptographic binding to their author, which is exactly why the
+/// attestation-level invariant (a blob needs a signed claim of what it is)
+/// matters most on the lightnet, and why group content is written at
+/// `community` where the AAD does bind.
+///
+/// Its counterpart — the binding actually refusing — lives in
+/// `chat_message_federates.rs`, at the encrypted tier, with a positive
+/// control. That is the half that can fail.
 ///
 /// At the commons tier there is no AAD, so this documents the honest
 /// boundary: the AAD is what stops re-attribution, and a plaintext tier has
@@ -285,10 +318,18 @@ async fn an_unknown_pointer_is_not_held_rather_than_a_bare_error() {
     );
 }
 
-/// The seal is content-addressed: the same bytes at the same scope produce
-/// the same pointer, which is what makes dedup and holder-discovery work.
+/// Content-addressing holds **at the commons tier**, which is what makes
+/// dedup and holder-discovery work for public blobs.
+///
+/// Scoped deliberately. At `CommunityDek` — the tier group content actually
+/// writes at — the address is the SHA of the `AtRestEnvelope`
+/// (`magic ‖ nonce ‖ ciphertext`) with a **fresh random nonce per write**,
+/// so the same plaintext seals to a DIFFERENT address every time. A test
+/// claiming "identical content, one address" without that qualifier would
+/// stay green while dedup was broken for every encrypted caller, because
+/// the fixture only ever exercises plaintext.
 #[tokio::test]
-async fn identical_content_seals_to_one_address() {
+async fn identical_commons_content_seals_to_one_address() {
     let s = store().await;
     let mk = |author: &'static str| async move {
         store()

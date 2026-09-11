@@ -229,19 +229,45 @@ mod tests {
         assert_eq!(aad, want, "the locked preimage must not move");
     }
 
-    /// Trap 3. Without length prefixes these two collide, and a crafted
-    /// author id could absorb the instant.
+    /// Trap 3, asserted at the FRAMING rather than through a pair that
+    /// happens to differ anyway.
+    ///
+    /// The first version compared two preimages that varied only the author
+    /// with the instant and field fixed — and since the rendered instant is
+    /// always exactly 24 bytes, those differ under plain concatenation too.
+    /// Deleting the length prefix from `push_lp` left it green.
+    ///
+    /// So: assert the prefix bytes are actually there, and assert the named
+    /// collision at the framing level where it is reachable.
     #[test]
-    fn length_prefixes_keep_adjacent_fields_from_merging() {
-        let a = content_aad("ab", t(0), ContentField::Body);
-        let b = content_aad("a", t(0), ContentField::Body);
-        assert_ne!(a, b);
+    fn length_prefixes_are_present_and_disambiguate() {
+        let aad = content_aad("author-key", t(0), ContentField::Body);
+        // domain(23) ‖ be_u32(10) ‖ "author-key" ‖ …
+        assert_eq!(
+            &aad[AAD_DOMAIN.len()..AAD_DOMAIN.len() + 4],
+            &10u32.to_be_bytes(),
+            "the author field must carry its length prefix",
+        );
 
-        // The classic collision, constructed directly: a concatenation that
-        // would be identical is not.
-        let lhs = content_aad("xy", t(0), ContentField::Body);
-        let rhs = content_aad("x", t(0), ContentField::Body);
-        assert_ne!(lhs[..], rhs[..]);
+        // The collision the prefix exists to prevent, at the level it can
+        // actually occur: ("ab","c") and ("a","bc") concatenate identically
+        // and MUST frame differently.
+        let mut lhs = Vec::new();
+        push_lp(&mut lhs, b"ab");
+        push_lp(&mut lhs, b"c");
+        let mut rhs = Vec::new();
+        push_lp(&mut rhs, b"a");
+        push_lp(&mut rhs, b"bc");
+        assert_eq!(
+            [lhs.len(), rhs.len()],
+            [11, 11],
+            "both frame to the same LENGTH, so only the prefixes separate them",
+        );
+        assert_ne!(
+            lhs, rhs,
+            "without the length prefix these are both `abc` and a crafted \
+             author id absorbs the next field",
+        );
     }
 
     /// Trap 1, and the test that would pass for the wrong reason if written
@@ -297,17 +323,51 @@ mod tests {
 
     /// The design's §5.1.2: a widening carries `asserted_at` verbatim and
     /// changes neither author nor field, so the SAME blob opens from the
-    /// widened row. Pinned here because the draft asserted the opposite and
-    /// was wrong.
+    /// widened row.
+    ///
+    /// The first version of this test compared `content_aad` against itself
+    /// with IDENTICAL literals — it asserted the function is pure and
+    /// nothing about widening, because the two members a widening actually
+    /// changes (`community_key_id`, `epoch`) are not parameters of
+    /// `content_aad` and so could not vary.
+    ///
+    /// The real statement is at the pointer level: two pointers differing
+    /// in `community_key_id` and `tier` — exactly what a cross-community
+    /// widening changes — must still produce the same preimage. That can
+    /// fail, and it fails the moment anyone puts community or epoch back in.
     #[test]
     fn a_widening_reproduces_the_same_binding() {
-        let original = content_aad("alice", t(789_000_000), ContentField::Body);
-        // A widened row: same author, same asserted_at (carried verbatim —
-        // the placement's own instant is the separate `widened_at` member),
-        // same field. Only community and epoch could differ, and neither is
-        // in the preimage.
-        let widened = content_aad("alice", t(789_000_000), ContentField::Body);
-        assert_eq!(original, widened);
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        let at = t(789_000_000);
+
+        let before = BlobPointer {
+            community_key_id: "community-a".into(),
+            tier: CryptoTier::CommunityDek,
+            content_sha256: "ab".repeat(32),
+            content_field: ContentField::Body,
+            media_type: None,
+            stream_id: None,
+        };
+        let after_widening = BlobPointer {
+            community_key_id: "community-b".into(),
+            tier: CryptoTier::Plaintext,
+            ..before.clone()
+        };
+
+        let mk = |p: &BlobPointer| {
+            crate::group_content::aad_for_open(&crate::group_content::OpenRequest {
+                pointer: p,
+                author_key_id: "alice",
+                asserted_at: at,
+                viewer_key_id: "anyone",
+            })
+        };
+        assert_eq!(
+            mk(&before),
+            mk(&after_widening),
+            "community and epoch are NOT in the preimage — a widening that \
+             changes them must still open the same blob",
+        );
     }
 
     #[test]

@@ -61,6 +61,7 @@
 //! [`SenderStanding::VerifiedOnly`] is a distinct input and is never
 //! sufficient on its own.
 
+use super::meaning::BlobMeaning;
 use super::scope::ContentScope;
 use crate::CohortScope;
 
@@ -344,18 +345,33 @@ fn sender_authorised(scope: &CohortScope, sender: SenderStanding) -> bool {
 /// (directory membership, allowlist) belong to the caller, so the rule
 /// itself is testable at the exact points the field produces.
 ///
+/// # The scope axis takes a [`BlobMeaning`], not a [`ContentScope`]
+///
+/// The first cut took `Option<&ContentScope>` — the caller's own statement
+/// about what the bytes are. Axis 2 asks *are we in the audience this
+/// content declares*, and an unsigned statement about bytes declares
+/// nothing; `None` then made "I did not say" a routine input to a security
+/// decision.
+///
+/// A [`BlobMeaning`] can only be obtained by projecting a signed
+/// attestation that names this blob
+/// ([`BlobMeaning::project`](super::meaning::BlobMeaning::project)), so the
+/// unclassifiable case cannot reach this function: it is refused at
+/// projection, by name, where the row that failed is still in hand. The
+/// `None` arm and its `ScopeUndeterminable` refusal moved out to the
+/// scheduler boundary, which is the only place a caller can still decline
+/// to name the content at all.
+///
+/// [`ContentScope`]: super::scope::ContentScope
+///
 /// Returns the disposition, never a bare bool — see [`StoreAdmission`].
 pub fn admit_blob_store(
-    content: Option<&ContentScope>,
+    content: &BlobMeaning,
     sender: SenderStanding,
     audience: AudienceStanding,
     operator: &OperatorStoreConsent,
 ) -> StoreAdmission {
-    // Fail-closed before any axis: we cannot judge what we cannot classify.
-    let Some(content) = content else {
-        return StoreAdmission::Refuse(StoreRefusal::ScopeUndeterminable);
-    };
-    let scope = content.cohort_scope();
+    let scope = content.scope().cohort_scope();
     let content_kind = scope.kind_token();
 
     // ── Axis 1 — TRUST. Cheapest and most fundamental; a sender with no
@@ -404,17 +420,18 @@ pub fn admit_blob_store(
 mod tests {
     use super::*;
 
-    fn public() -> ContentScope {
-        ContentScope::Federation
+    use super::super::meaning::fixture;
+
+    const SHA: [u8; 32] = [4u8; 32];
+
+    /// Every fixture here goes through `BlobMeaning::project`, so a gate
+    /// test cannot be proved with a scope no signed row would ever yield.
+    fn public() -> BlobMeaning {
+        fixture::commons(&SHA)
     }
 
-    fn community() -> ContentScope {
-        ContentScope::Group {
-            scope: CohortScope::Cohort {
-                cohort_id: "c-1".into(),
-            },
-            group_id: "g-1".into(),
-        }
+    fn community() -> BlobMeaning {
+        fixture::community(&SHA)
     }
 
     fn permissive() -> OperatorStoreConsent {
@@ -426,28 +443,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn undeterminable_scope_refuses_before_any_axis_runs() {
-        // Even with every other input maximally permissive.
-        let a = admit_blob_store(
-            None,
-            SenderStanding::Allowlisted,
-            AudienceStanding::In,
-            &permissive(),
-        );
-        assert_eq!(
-            a,
-            StoreAdmission::Refuse(StoreRefusal::ScopeUndeterminable),
-            "we cannot judge what we cannot classify",
-        );
-        assert!(!a.is_admitted());
-    }
-
     /// The load-bearing case of axis 1, and the whole reason the axis exists.
     #[test]
     fn a_verified_signature_is_not_authorization() {
         let a = admit_blob_store(
-            Some(&public()),
+            &public(),
             SenderStanding::VerifiedOnly,
             AudienceStanding::In,
             &permissive(),
@@ -470,11 +470,11 @@ mod tests {
             SenderStanding::OwnNode,
             SenderStanding::VerifiedOnly,
         ] {
-            let a = admit_blob_store(Some(&public()), s, AudienceStanding::In, &permissive());
+            let a = admit_blob_store(&public(), s, AudienceStanding::In, &permissive());
             assert!(!a.is_admitted(), "{s:?} must not place commons content");
         }
         assert!(admit_blob_store(
-            Some(&public()),
+            &public(),
             SenderStanding::Allowlisted,
             AudienceStanding::In,
             &permissive(),
@@ -486,7 +486,7 @@ mod tests {
     fn a_community_member_cannot_place_commons_and_vice_versa() {
         // Being blessed for the commons says nothing about a community.
         let a = admit_blob_store(
-            Some(&community()),
+            &community(),
             SenderStanding::Allowlisted,
             AudienceStanding::In,
             &permissive(),
@@ -508,21 +508,18 @@ mod tests {
         // Axis 1 alone.
         let mut c = ok.2;
         assert!(
-            !admit_blob_store(Some(&community()), SenderStanding::VerifiedOnly, ok.1, &c)
-                .is_admitted()
+            !admit_blob_store(&community(), SenderStanding::VerifiedOnly, ok.1, &c).is_admitted()
         );
 
         // Axis 2 alone.
-        assert!(
-            !admit_blob_store(Some(&community()), ok.0, AudienceStanding::Out, &c).is_admitted()
-        );
+        assert!(!admit_blob_store(&community(), ok.0, AudienceStanding::Out, &c).is_admitted());
 
         // Axis 3 alone.
         c.community = ConsentDisposition::Decline;
-        assert!(!admit_blob_store(Some(&community()), ok.0, ok.1, &c).is_admitted());
+        assert!(!admit_blob_store(&community(), ok.0, ok.1, &c).is_admitted());
 
         // All three together.
-        assert!(admit_blob_store(Some(&community()), ok.0, ok.1, &ok.2).is_admitted());
+        assert!(admit_blob_store(&community(), ok.0, ok.1, &ok.2).is_admitted());
     }
 
     /// #581's own example: a blessed runner's manifest satisfies axes 1 and
@@ -533,7 +530,7 @@ mod tests {
         c.commons = ConsentDisposition::Decline;
         assert_eq!(
             admit_blob_store(
-                Some(&public()),
+                &public(),
                 SenderStanding::Allowlisted,
                 AudienceStanding::In,
                 &c,
@@ -549,7 +546,7 @@ mod tests {
     #[test]
     fn both_fail_closed_arms_refuse_rather_than_default_open() {
         let a = admit_blob_store(
-            Some(&community()),
+            &community(),
             SenderStanding::Undeterminable,
             AudienceStanding::In,
             &permissive(),
@@ -557,7 +554,7 @@ mod tests {
         assert_eq!(a.axis_of_refusal(), Some(1));
 
         let b = admit_blob_store(
-            Some(&community()),
+            &community(),
             SenderStanding::MemberOfJoinedGroup,
             AudienceStanding::Undeterminable,
             &permissive(),
@@ -573,7 +570,7 @@ mod tests {
         let mut c = permissive();
         c.community = ConsentDisposition::LocalOnly;
         let a = admit_blob_store(
-            Some(&community()),
+            &community(),
             SenderStanding::MemberOfJoinedGroup,
             AudienceStanding::In,
             &c,
@@ -594,16 +591,12 @@ mod tests {
             ..permissive()
         };
         for scope in [CohortScope::Family, CohortScope::SelfOnly] {
-            let content = ContentScope::Group {
-                scope: scope.clone(),
-                group_id: "g".into(),
-            };
-            let sender = if scope == CohortScope::SelfOnly {
-                SenderStanding::OwnNode
+            let (content, sender) = if scope == CohortScope::SelfOnly {
+                (fixture::own(&SHA), SenderStanding::OwnNode)
             } else {
-                SenderStanding::MemberOfJoinedGroup
+                (fixture::family(&SHA), SenderStanding::MemberOfJoinedGroup)
             };
-            let a = admit_blob_store(Some(&content), sender, AudienceStanding::In, &c);
+            let a = admit_blob_store(&content, sender, AudienceStanding::In, &c);
             assert_eq!(
                 a,
                 StoreAdmission::StoreLocalOnly,
@@ -619,7 +612,7 @@ mod tests {
         assert_eq!(d.commons, ConsentDisposition::Decline);
         assert_eq!(
             admit_blob_store(
-                Some(&public()),
+                &public(),
                 SenderStanding::Allowlisted,
                 AudienceStanding::In,
                 &d,
@@ -637,19 +630,19 @@ mod tests {
         // and a single PolicyDenied would make them indistinguishable.
         let axes: Vec<u8> = [
             admit_blob_store(
-                Some(&community()),
+                &community(),
                 SenderStanding::VerifiedOnly,
                 AudienceStanding::In,
                 &permissive(),
             ),
             admit_blob_store(
-                Some(&community()),
+                &community(),
                 SenderStanding::MemberOfJoinedGroup,
                 AudienceStanding::Out,
                 &permissive(),
             ),
             admit_blob_store(
-                Some(&community()),
+                &community(),
                 SenderStanding::MemberOfJoinedGroup,
                 AudienceStanding::In,
                 &OperatorStoreConsent {
@@ -699,7 +692,10 @@ pub trait BlobStorePolicy: Send + Sync + 'static {
 
 #[cfg(test)]
 mod seam_tests {
+    use super::super::meaning::fixture;
     use super::*;
+
+    const SHA: [u8; 32] = [4u8; 32];
 
     /// A policy that answers whatever it was built with — the shape a
     /// persist-backed consumer implements, minus the directory walks.
@@ -722,8 +718,11 @@ mod seam_tests {
         }
     }
 
-    fn commons() -> ContentScope {
-        ContentScope::Federation
+    /// The commons meaning, and the scope projected out of it — the policy
+    /// trait is asked about a `ContentScope` because that is all a roster
+    /// walk needs, while the GATE is handed the whole projection.
+    fn commons() -> BlobMeaning {
+        fixture::commons(&SHA)
     }
 
     /// The default trait method must be the conservative one, so an
@@ -744,9 +743,9 @@ mod seam_tests {
         }
         let p = MinimalPolicy;
         let verdict = admit_blob_store(
-            Some(&commons()),
-            p.sender_standing("k", &commons()).await,
-            p.audience_standing(&commons()).await,
+            &commons(),
+            p.sender_standing("k", commons().scope()).await,
+            p.audience_standing(commons().scope()).await,
             &p.consent(),
         );
         assert_eq!(
@@ -795,9 +794,9 @@ mod seam_tests {
                 },
             };
             let verdict = admit_blob_store(
-                Some(&commons()),
-                p.sender_standing("holder-1", &commons()).await,
-                p.audience_standing(&commons()).await,
+                &commons(),
+                p.sender_standing("holder-1", commons().scope()).await,
+                p.audience_standing(commons().scope()).await,
                 &p.consent(),
             );
             assert_eq!(

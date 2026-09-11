@@ -32,6 +32,10 @@ use super::BlobPointer;
 /// Seals and opens group content against a persist substrate.
 pub struct PersistGroupContentStore {
     engine: ciris_persist::Engine,
+    /// Held so the seal can ASK persist which tier a write resolves to
+    /// rather than predicting it — the resolution depends on directory
+    /// state, not just the scope label.
+    directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
 }
 
 impl std::fmt::Debug for PersistGroupContentStore {
@@ -45,18 +49,29 @@ impl std::fmt::Debug for PersistGroupContentStore {
 impl PersistGroupContentStore {
     /// Wrap an `Engine` the caller already holds (cohabitation).
     #[must_use]
-    pub fn new(engine: ciris_persist::Engine) -> Self {
-        Self { engine }
+    pub fn new(
+        engine: ciris_persist::Engine,
+        directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
+    ) -> Self {
+        Self { engine, directory }
     }
 
     /// Build over a backend + signer the caller already opened (sovereign).
     /// Shares the connection pool; runs no migrations.
     #[must_use]
+    /// `directory` is the same substrate `backend` wraps — passed rather
+    /// than destructured out of `BackendDispatch`, whose arms are cargo-
+    /// feature-gated on persist's side and so cannot be matched
+    /// exhaustively from here without edge mirroring those features.
     pub fn from_shared(
         backend: ciris_persist::BackendDispatch,
+        directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
         signer: Arc<dyn ciris_keyring::HardwareSigner>,
     ) -> Self {
-        Self::new(ciris_persist::Engine::from_shared(backend, signer))
+        Self::new(
+            ciris_persist::Engine::from_shared(backend, signer),
+            directory,
+        )
     }
 }
 
@@ -72,6 +87,22 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
         // error and never as NotGranted. Preserving that is the difference
         // between "you may not read this" and "this did not open" — two
         // findings with nothing in common.
+        //
+        // # This arm string-matches persist's PROSE, and that is a known cost
+        //
+        // `BlobError` has no typed variant for "the AEAD tag did not verify"
+        // (CIRISPersist#842 asks for one), so the only signal available is
+        // the message. A reword upstream would silently drop every AAD
+        // mismatch into `Substrate` — the failure would still be a failure,
+        // but the distinction this function exists to preserve would be
+        // gone, with nothing red.
+        //
+        // It is not left to luck. `chat_message_federates::
+        // a_pointer_copied_onto_another_authors_row_does_not_open` performs
+        // a REAL substitution against a real community DEK and asserts on
+        // `SealMismatch`'s own wording, so a persist reword turns that test
+        // red rather than degrading this arm quietly. Do not "simplify" the
+        // match without checking that witness still binds.
         B::Backend(msg) if msg.contains("decrypt") || msg.contains("seal") => {
             GroupContentError::SealMismatch { sha256_hex }
         }
@@ -84,16 +115,27 @@ impl GroupContentStore for PersistGroupContentStore {
     async fn seal(&self, req: SealRequest<'_>) -> Result<SealedContent, GroupContentError> {
         // An AAD binds a ciphertext to its row. A PLAINTEXT tier has no
         // ciphertext to bind, and persist REFUSES `Some(aad)` there rather
-        // than ignoring it — so passing one unconditionally would make every
-        // commons write fail.
+        // than ignoring it — so this has to be right BEFORE the call.
         //
-        // The classifier is persist's own `crypto_tier`, not a mapping
-        // rebuilt here: edge names the scope and persist decides the tier
-        // (§11.1), and a second copy of that decision would be a second
-        // thing to keep in step.
+        // ASK persist; do not predict. An earlier version called the pure
+        // `crypto_tier(cohort_scope, None)` under a comment claiming it was
+        // "persist's own classifier, not a mapping rebuilt here". It WAS
+        // rebuilt: the write door uses `resolve_write_tier`, which consults
+        // the DIRECTORY, and an authorized infrastructure community at
+        // `cohort_scope: community` resolves to Plaintext regardless of the
+        // label. Edge predicted CommunityDek, sent an AAD, and every write
+        // to such a community was refused.
+        //
+        // `resolve_write_tier` is the door's own resolver and is public, so
+        // there is no reason to approximate it.
         let aad = aad_for_seal(&req);
-        let tier =
-            ciris_persist::federation::types::cohort_scope::crypto_tier(req.cohort_scope, None);
+        let tier = ciris_persist::federation::at_rest_cascade::resolve_write_tier(
+            &*self.directory,
+            req.cohort_scope,
+            req.community_key_id,
+        )
+        .await
+        .map_err(|e| map_err(String::new(), &e))?;
         let aad_arg = match tier {
             ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext => None,
             _ => Some(aad.as_slice()),
@@ -188,7 +230,8 @@ mod tests {
         ed.import_key(&[7u8; 32]).expect("import test key");
         let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(ed);
         PersistGroupContentStore::from_shared(
-            ciris_persist::BackendDispatch::Sqlite(backend),
+            ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+            backend,
             signer,
         )
     }

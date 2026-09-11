@@ -374,33 +374,60 @@ the gates that were only ever green because the fallback caught them.
 
 ---
 
-## 8. Migration
+## 8. Migration — there is none, and that is the point
 
-Ordered so that each step is independently reversible until the last one.
+The first draft sequenced four steps: read-new-write-old, write-new for new
+rooms, **backfill**, retire the inline seal. Review established that step 3
+**has no executable mechanism**, and the two blockers are worth keeping
+because they are what makes the no-backfill answer correct rather than lazy.
 
-1. **Read-new-write-old.** Teach readers to resolve a blob pointer, while
-   writers still seal inline. No behaviour change; proves the read path.
-2. **Write-new for new rooms only.** New content goes to blobs; existing rooms
-   are untouched. The two shapes coexist, distinguished by which members the
-   row carries.
-3. **Backfill.** Existing sealed bodies are opened under the room key and
-   re-written as blobs, one community at a time, under the epoch current at
-   backfill time.
-4. **Retire the inline seal.** Delete `body_key`, `seal_body`, `open_body`,
-   and the room-key derivation. Only now does the fallback go.
+**(a) Backfill needs a past epoch's room key, and no door returns one.**
+`open_body` refuses any epoch but the key's own, and `RoomKey::of` derives
+from `CohortGroup::record_secret()` — the MLS exporter at the group's
+**current** epoch. Snapshots are retained for `DEFAULT_RETAINED_EPOCHS = 4`,
+so inside that window the bytes are on disk; but `CohortGroup::load` reads
+`HEAD_SLOT` and the epoch is not a parameter, deliberately ("never a silent
+downgrade to an older epoch"). Past the window `group_state_delete` has run
+and the secret is gone in principle. So: unreachable, then absent.
 
-Step 3 is the only irreversible one and the only one that needs the room key
-at all — which is the point: after it, the room key has no readers.
+**(b) The pointer must land on a row only the AUTHOR can sign.** Mutating a
+signed envelope invalidates it, so a backfill is a new authored row plus a
+supersession, and chat signs at write with the actor's hybrid key. A node
+can therefore backfill its own owner's messages and **nobody else's** — my
+copy of a conversation is half my rows and half the other party's widenings,
+and I cannot re-author theirs. A room would reach a steady state that is
+permanently half-migrated per participant, which is the opposite of what a
+migration converges to.
 
----
+### The resolution
+
+**This code has no users and no rooms have history**, so there is nothing to
+migrate. Blobs are simply the shape group content takes; the inline seal is
+not a legacy to be drained, it is a path that never carried anything.
+
+That makes the plan one step: **write content as blobs**. The inline seal
+(`seal_body` / `open_body` / `RoomKey` body derivation) stays only as long
+as it takes to remove its callers, and it is deleted rather than deprecated
+— a fallback that can still open content is a second confidentiality
+boundary.
+
+### If a deployment ever DOES have history
+
+The two blockers above are why "migrate it" is not an available answer, so
+say the true thing instead: **old inline rooms stay inline and readable, and
+new content is blob-backed.** The reader already handles both shapes, and
+`from_row_any` takes the room key as an `Option` precisely so a node can
+read a mixed room. What must never happen is deleting `open_body` while any
+inline row exists — that would not migrate those messages, it would destroy
+them.
 
 ## 9. Invariants
 
 Each one falsifiable through a door a consumer holds, per persist's §11.10
 discipline.
 
-**Six of the ten have live witnesses today; four do not, and saying which is
-the point of the column.** An invariant nothing asserts is a sentence, not a
+**Eight of the twelve have live witnesses today; four do not, and saying
+which is the point of the column.** An invariant nothing asserts is a sentence, not a
 guarantee — and the four unwitnessed ones all describe the CHUNKED and
 LIFECYCLE paths, which edge has not built: there is no chunked write, no
 range read, and no epoch destroy on edge's side yet. They are listed because
@@ -419,6 +446,8 @@ they hold now.
 | **G6** | Destroying an epoch makes content sealed under it unopenable **through every persist read door on this node**, with no path that bypasses it. Deliberately not "unopenable everywhere": that is the tombstone plane's reach, not this one's, and asserting it here would be the precondition-that-cannot-be-checked persist's §11.4 warns about. | ❌ none — edge has no epoch-destroy path |
 | **G7** | A range read returns the plaintext range requested, never a ciphertext substring. | ❌ none — no range read on edge yet |
 | **G8** | Two blobs in one row cannot be exchanged for one another. | ✅ `each_field_binds_distinctly` + `a_pointer_to_another_field_rebuilds_a_different_binding` |
+| **G9** | **A blob with no signed attestation saying what it is cannot be fetched or admitted.** `holds_bytes` is possession and is refused BY NAME — it is signed, it references the blob, and its `cohort_scope` column reads `federation`, so a projection that merely mapped the column would classify every blob on the node as commons. | ✅ `a_holds_bytes_row_is_possession_and_never_meaning` + `holds_bytes_says_possession_and_never_meaning` (cross-node) |
+| **G10** | A signed row grants meaning only to the blob it NAMES — a legitimate row cannot be paired with other bytes. | ✅ `a_row_about_other_content_cannot_lend_these_bytes_its_scope` |
 
 **G3 needs a witness with sub-resolution precision.** A test using an
 already-truncated timestamp passes whether or not the writer truncates, which

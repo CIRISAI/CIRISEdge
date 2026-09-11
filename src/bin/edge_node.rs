@@ -2801,20 +2801,40 @@ async fn run_chat_legs(occ: &Occurrence) {
     // ── send_message ─────────────────────────────────────────────────
     if i_send {
         let sent = async {
-            let msg = chat::chat_message_attestation(
+            // CIRISEdge#586 — content goes to the room's BLOB STORE and the
+            // row carries a pointer. The store is an Engine VIEW over the
+            // substrate this node already opened (`Engine::from_shared`
+            // runs no migrations and shares the pool), so a mesh node gets
+            // group content without a second connection.
+            let content_store = ciris_edge::group_content::PersistGroupContentStore::from_shared(
+                ciris_persist::BackendDispatch::Sqlite(occ.directory.clone()),
+                occ.directory.clone(),
+                occ.owner_signer.classical.clone(),
+            );
+            let (msg, sealed_content) = chat::chat_message_attestation(
                 &occ.owner_signer,
                 &peer_owner,
                 CHAT_BODY,
                 chrono::Utc::now(),
-                &key,
+                &content_store,
             )
             .await?;
+            // Who can actually READ this. persist excludes a member with no
+            // usable encryption pubkeys fail-secure, and the seal result is
+            // the only place that fact exists — a mesh leg that ignored it
+            // would report a delivered message nobody could open.
+            if !sealed_content.fully_readable() {
+                return Err(format!(
+                    "content sealed but not readable by every member: excluded={:?}                      granted={:?}",
+                    sealed_content.excluded, sealed_content.granted
+                ));
+            }
             // The wire never carries the plaintext — checked at the source.
             let wire = serde_json::to_string(&msg.attestation_envelope).unwrap_or_default();
             if wire.contains(CHAT_BODY) {
                 return Err("PLAINTEXT ON THE WIRE: the envelope contains the body".to_owned());
             }
-            let sealed = msg.attestation_envelope.get(chat::FIELD_SEALED).cloned();
+            let sealed = msg.attestation_envelope.get(chat::FIELD_CONTENT).cloned();
             let crossing = {
                 use ciris_edge::replication::attestation_bind::{share, CrossingBasis, With};
                 // persist v41.0.0 (#804) — authored: this leg sealed and
@@ -2879,12 +2899,31 @@ async fn run_chat_legs(occ: &Occurrence) {
     // Receiver: kick rounds toward the sender until the WIDENING — the
     // `supersedes` their share wrote at `community` — is here, then OPEN it.
     let senders = vec![peer_owner.clone()];
+    // The receiver's own content store — the same substrate, viewed as an
+    // Engine. Built once outside the poll so a convergence loop does not
+    // rebuild it on every tick.
+    let reader_store = ciris_edge::group_content::PersistGroupContentStore::from_shared(
+        ciris_persist::BackendDispatch::Sqlite(occ.directory.clone()),
+        occ.directory.clone(),
+        occ.owner_signer.classical.clone(),
+    );
+    // The DEK is wrapped per active OCCURRENCE, so a reader presents its
+    // occurrence key — an identity key is refused as NotGranted even for a
+    // full member (CIRISEdge#586).
+    let viewer = format!("{}-occ", occ.owner_signer.key_id);
     let outcome = occ
         .replication
         .sync_and_await(&peer_node, budget, || async {
-            chat::messages_in_room(dir, &senders, &room, &key)
+            // The predicate is "the WIDENING arrived", which is a question
+            // about the ROW. Recognising a row needs no content, so this
+            // deliberately does not resolve pointers on every poll tick.
+            chat::rows_in_room(dir, &senders, &room)
                 .await
-                .is_ok_and(|m| m.iter().any(|x| x.widens.is_some()))
+                .is_ok_and(|rows| {
+                    rows.iter().any(|a| {
+                        chat::ChatMessage::from_row(a, &room).is_some_and(|m| m.widens.is_some())
+                    })
+                })
         })
         .await
         .unwrap_or_else(|e| {
@@ -2894,7 +2933,7 @@ async fn run_chat_legs(occ: &Occurrence) {
                 checks: 0,
             }
         });
-    let seen = chat::messages_in_room(dir, &senders, &room, &key)
+    let seen = chat::messages_in_room(dir, &senders, &room, &reader_store, &viewer)
         .await
         .unwrap_or_default();
     let opened = seen.iter().any(|m| {
@@ -2952,7 +2991,9 @@ async fn run_chat_legs(occ: &Occurrence) {
                 "author": m.author_key_id,
                 "attested_by": m.attesting_key_id,
                 "body": format!("{:?}", m.body),
-                "epoch": m.epoch,
+                // No `epoch` on a message: it meant the MLS body-seal epoch,
+                // and the body seal is gone. Content's epoch belongs to the
+                // community DEK and is recorded on the BLOB row (CIRISEdge#586).
             })).collect::<Vec<_>>(),
             "expected_author": peer_owner,
             "expected_attested_by": peer_owner,
