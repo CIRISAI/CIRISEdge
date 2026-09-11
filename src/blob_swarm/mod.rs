@@ -311,6 +311,8 @@ pub trait BlobChunkVerifier: Send + Sync {
     }
 }
 
+pub mod persist_store_policy;
+pub use persist_store_policy::PersistBlobStorePolicy;
 pub mod store_gate;
 pub use store_gate::{
     admit_blob_store, AudienceStanding, ConsentDisposition, OperatorStoreConsent, SenderStanding,
