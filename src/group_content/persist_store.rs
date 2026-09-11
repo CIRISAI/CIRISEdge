@@ -112,8 +112,12 @@ impl GroupContentStore for PersistGroupContentStore {
             .map_err(|e| map_err(String::new(), &e))?;
 
         Ok(SealedContent {
+            // persist RESOLVED this; we do not re-derive it. Re-deriving
+            // from the scope drops the directory axis the door applied.
+            tier: out.tier,
             pointer: BlobPointer {
                 community_key_id: req.community_key_id.unwrap_or_default().to_owned(),
+                tier: out.tier,
                 content_sha256: hex::encode(out.at_rest_sha256),
                 content_field: req.field,
                 media_type: req.media_type.map(ToOwned::to_owned),
@@ -130,6 +134,7 @@ impl GroupContentStore for PersistGroupContentStore {
     }
 
     async fn open(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError> {
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
         let sha_hex = req.pointer.content_sha256.clone();
         let raw = hex::decode(&sha_hex)
             .map_err(|e| GroupContentError::Substrate(format!("pointer sha is not hex: {e}")))?;
@@ -137,18 +142,27 @@ impl GroupContentStore for PersistGroupContentStore {
             .try_into()
             .map_err(|_| GroupContentError::Substrate("pointer sha is not 32 bytes".to_owned()))?;
 
-        // Symmetric with the seal: a plaintext row was sealed with no AAD,
-        // so opening it must present none. The pointer's community tells us
-        // which case we are in — an empty community is a commons write.
+        // Ask the ROW what tier it is, exactly as persist's own read door
+        // does. Not the pointer, and not the scope label.
         //
-        // Getting this backwards fails at READ time with a crypto error on
-        // content that is not even encrypted, which is about as confusing a
-        // diagnostic as this stack can produce.
+        // The first cut inferred it from `pointer.community_key_id.is_empty()`
+        // while SEAL inferred it from `crypto_tier(cohort_scope, None)` — two
+        // different questions of two different inputs, neither of which is
+        // what persist records. They diverge on a commons scope carrying a
+        // community id: the write succeeds AAD-free, the read then presents
+        // an AAD, and persist refuses it. Content written and permanently
+        // unreadable, with the only signal arriving at read time.
+        //
+        // persist's read door says why this is the right source: the tier is
+        // "the tier the WRITE DOOR RESOLVED and recorded — never re-derived
+        // here from the scope, which would drop the directory axis the door
+        // applied."
+        let tier = req.pointer.tier;
+
         let aad = aad_for_open(&req);
-        let aad_arg = if req.pointer.community_key_id.is_empty() {
-            None
-        } else {
-            Some(aad.as_slice())
+        let aad_arg = match tier {
+            CryptoTier::Plaintext => None,
+            CryptoTier::InvisibleEncrypted | CryptoTier::CommunityDek => Some(aad.as_slice()),
         };
         self.engine
             .read_blob_as(&sha, req.viewer_key_id, aad_arg)
@@ -186,6 +200,7 @@ mod tests {
     fn absent_pointer() -> BlobPointer {
         BlobPointer {
             community_key_id: "community-1".into(),
+            tier: ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
             content_sha256: "ab".repeat(32),
             content_field: ContentField::Body,
             media_type: None,

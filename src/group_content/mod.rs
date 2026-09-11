@@ -150,8 +150,25 @@ pub fn content_aad(
 /// not the pointer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobPointer {
-    /// Which community to read as. NOT an AAD input — see the module docs.
+    /// Which community to read as. NOT an AAD input — see the module docs,
+    /// and NOT a tier discriminator either; that is [`Self::tier`].
     pub community_key_id: String,
+    /// **The tier persist RESOLVED at write**, recorded so a reader knows
+    /// whether to present an AAD without re-deriving anything.
+    ///
+    /// This exists because the first cut asked two different questions:
+    /// seal computed `crypto_tier(cohort_scope, None)` and open inferred
+    /// from `community_key_id.is_empty()`. Neither is what persist records,
+    /// and they diverge — a commons scope carrying a community id writes
+    /// AAD-free and then reads with an AAD, which persist refuses. Content
+    /// written and permanently unreadable, signalled only at read time.
+    ///
+    /// A wrong value here can only cause a FAILED read, never a leak: if the
+    /// content was sealed under an AAD and this claims plaintext, the GCM
+    /// tag rejects the open; if it claims encrypted for plaintext content,
+    /// persist refuses the AAD at the door.
+    #[serde(default = "tier_plaintext")]
+    pub tier: ciris_persist::federation::types::cohort_scope::CryptoTier,
     /// Hex-encoded at-rest SHA-256 to read.
     pub content_sha256: String,
     /// Which blob within the row this is. An AAD input.
@@ -163,6 +180,13 @@ pub struct BlobPointer {
     /// "is this chunked" — one fact, one member, no way for two to disagree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_id: Option<String>,
+}
+
+/// Serde default for [`BlobPointer::tier`] — a pointer written before the
+/// field existed described commons content, which is the only shape edge
+/// had shipped.
+fn tier_plaintext() -> ciris_persist::federation::types::cohort_scope::CryptoTier {
+    ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext
 }
 
 impl BlobPointer {
@@ -290,6 +314,7 @@ mod tests {
     fn a_pointer_answers_chunkedness_from_one_member() {
         let whole = BlobPointer {
             community_key_id: "c".into(),
+            tier: ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
             content_sha256: "ab".repeat(32),
             content_field: ContentField::Body,
             media_type: Some("text/plain".into()),
@@ -310,6 +335,7 @@ mod tests {
     fn the_pointer_carries_no_epoch_and_no_duplicate_author() {
         let p = BlobPointer {
             community_key_id: "c".into(),
+            tier: ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
             content_sha256: "ab".repeat(32),
             content_field: ContentField::Body,
             media_type: None,
@@ -328,6 +354,7 @@ mod tests {
     fn a_pointer_round_trips() {
         let p = BlobPointer {
             community_key_id: "community-1".into(),
+            tier: ciris_persist::federation::types::cohort_scope::CryptoTier::CommunityDek,
             content_sha256: "cd".repeat(32),
             content_field: ContentField::Attachment,
             media_type: Some("video/mp4".into()),

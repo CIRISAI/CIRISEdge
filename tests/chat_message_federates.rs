@@ -1516,9 +1516,13 @@ async fn a_pointer_copied_onto_another_authors_row_does_not_open() {
 
     match msg.body {
         Body::Unopened { reason } => assert!(
-            !reason.is_empty(),
-            "a refusal must say why, or an operator cannot tell a stolen \
-             pointer from a rotated epoch",
+            // Name the ARM, not merely that a reason exists. `NotGranted`
+            // here would mean the grant failed rather than the binding —
+            // green for the wrong reason, and indistinguishable without
+            // this.
+            reason.contains("rebuilt AAD") || reason.contains("seal did not open"),
+            "the refusal must be the SEAL failing to open, not a grant or \
+             lookup problem — got: {reason}",
         ),
         other => panic!("a pointer on another author's row MUST NOT open — got {other:?}"),
     }

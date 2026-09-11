@@ -89,7 +89,23 @@ pub struct SealRequest<'a> {
 pub struct SealedContent {
     /// Goes on the row in place of the content.
     pub pointer: BlobPointer,
-    /// The community epoch this sealed under, for encrypted tiers.
+    /// **The tier persist RESOLVED for this write**, returned by the door
+    /// rather than inferred by us.
+    ///
+    /// Carrying it closes a bug this type shipped with: `fully_readable`
+    /// used `epoch.is_some()` as "was this encrypted", and persist returns
+    /// `epoch: None` for `InvisibleEncrypted` (`self` / `family`) — only
+    /// `CommunityDek` carries one. So the false-green guard covered one of
+    /// the two encrypted tiers and the other stayed armed.
+    ///
+    /// The authoritative value was in the result all along. Re-deriving a
+    /// tier from the scope label also drops the directory axis persist
+    /// applies (an infrastructure community resolves plaintext whatever its
+    /// scope says), which is why the door returns this and why nothing here
+    /// should compute it.
+    pub tier: ciris_persist::federation::types::cohort_scope::CryptoTier,
+    /// The community epoch this sealed under. `CommunityDek` only —
+    /// **not** a tier discriminator; use [`Self::tier`].
     pub epoch: Option<u64>,
     /// Occurrence key_ids that hold a grant — the people who can read it.
     pub granted: Vec<String>,
@@ -115,16 +131,27 @@ impl SealedContent {
     /// content is then unreadable by everyone, including its author, and the
     /// API reported it as fine.
     ///
-    /// `epoch.is_some()` is what says "this went to an encrypted tier".
-    /// Commons content has no epoch and no grants and is readable by anyone,
-    /// so the grant clause correctly does not apply to it.
+    /// Commons content has no grants and is readable by anyone, so the
+    /// grant clause correctly does not apply to it.
     #[must_use]
     pub fn fully_readable(&self) -> bool {
         if !self.excluded.is_empty() {
             return false;
         }
-        // Encrypted tier with an empty grant set = nobody can read it.
-        !(self.epoch.is_some() && self.granted.is_empty())
+        // Any ENCRYPTED tier with an empty grant set = nobody can read it.
+        // `tier`, not `epoch`: `InvisibleEncrypted` is encrypted and carries
+        // no epoch, and using the epoch left that tier unguarded.
+        !(self.is_encrypted() && self.granted.is_empty())
+    }
+
+    /// Whether persist sealed this under a DEK at all.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        matches!(
+            self.tier,
+            CryptoTier::InvisibleEncrypted | CryptoTier::CommunityDek
+        )
     }
 
     /// `true` when this went to an encrypted tier and NOBODY holds a grant —
@@ -136,7 +163,7 @@ impl SealedContent {
     /// registered, so there was nothing to wrap the DEK to.
     #[must_use]
     pub fn readable_by_nobody(&self) -> bool {
-        self.epoch.is_some() && self.granted.is_empty()
+        self.is_encrypted() && self.granted.is_empty()
     }
 }
 
@@ -219,6 +246,7 @@ mod tests {
     fn pointer(field: ContentField) -> BlobPointer {
         BlobPointer {
             community_key_id: "community-1".into(),
+            tier: ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
             content_sha256: "ab".repeat(32),
             content_field: field,
             media_type: None,
@@ -295,6 +323,9 @@ mod tests {
     fn an_encrypted_seal_that_granted_to_nobody_is_not_fully_readable() {
         let orphan = SealedContent {
             pointer: pointer(ContentField::Body),
+            // CommunityDek AND InvisibleEncrypted must both be caught; the
+            // epoch-based guard missed the latter entirely.
+            tier: ciris_persist::federation::types::cohort_scope::CryptoTier::CommunityDek,
             epoch: Some(7),
             granted: vec![],
             excluded: vec![],
@@ -306,9 +337,10 @@ mod tests {
         );
         assert!(orphan.readable_by_nobody());
 
-        // Commons content has no epoch and no grants and is readable by all,
-        // so the same emptiness must NOT read as a failure there.
+        // Commons content has no grants and is readable by all, so the same
+        // emptiness must NOT read as a failure there.
         let commons = SealedContent {
+            tier: ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
             epoch: None,
             ..orphan
         };
@@ -320,6 +352,7 @@ mod tests {
     fn fully_readable_is_false_when_anyone_was_excluded() {
         let base = SealedContent {
             pointer: pointer(ContentField::Body),
+            tier: ciris_persist::federation::types::cohort_scope::CryptoTier::CommunityDek,
             epoch: Some(3),
             granted: vec!["alice".into(), "bob".into()],
             excluded: vec![],

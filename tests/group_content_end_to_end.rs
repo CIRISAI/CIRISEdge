@@ -264,6 +264,7 @@ async fn an_unknown_pointer_is_not_held_rather_than_a_bare_error() {
     let s = store().await;
     let p = BlobPointer {
         community_key_id: String::new(),
+        tier: ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
         content_sha256: "ab".repeat(32),
         content_field: ContentField::Body,
         media_type: None,

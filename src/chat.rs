@@ -961,7 +961,26 @@ impl ChatMessage {
             return Some(Self::from_parts(a, env, body, None));
         }
 
-        let body_wire = env.get(FIELD_BODY).and_then(serde_json::Value::as_str)?;
+        // A recognised chat row in this room that carries NEITHER a content
+        // pointer nor a string body. Reported, not dropped.
+        //
+        // This returned `None` until the review caught it, and `None` is
+        // discarded by `messages_in_room`'s `filter_map` — so the message
+        // vanished from the room with no reason recorded anywhere, and the
+        // operator's signal was "they never replied" rather than an error.
+        // The dimension and the room already proved this IS a chat message;
+        // by that point the only honest answers are the text or why not.
+        let Some(body_wire) = env.get(FIELD_BODY).and_then(serde_json::Value::as_str) else {
+            return Some(Self::from_parts(
+                a,
+                env,
+                Body::Unopened {
+                    reason: "row carries neither a `content` pointer nor a string `body`                              — a reader older than CIRISEdge#586 sees this for every                              blob-backed message"
+                        .to_owned(),
+                },
+                None,
+            ));
+        };
         // The CLAIM's instant — on a widening this is the prior's, carried
         // verbatim (persist v40.0.0), so both rows open with one key.
         let asserted_at_wire = env
