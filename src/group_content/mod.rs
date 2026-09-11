@@ -53,6 +53,15 @@
 //!    id could absorb the instant. persist frames this same preimage the
 //!    same way, for the same reason.
 
+pub mod persist_store;
+pub mod store;
+
+pub use persist_store::PersistGroupContentStore;
+pub use store::{
+    aad_for_open, aad_for_seal, GroupContentError, GroupContentStore, OpenRequest, SealRequest,
+    SealedContent,
+};
+
 use serde::{Deserialize, Serialize};
 
 /// Domain separator. Never confusable with another protocol's preimage, and
