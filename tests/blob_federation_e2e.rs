@@ -592,3 +592,131 @@ async fn a_pointer_to_bytes_that_were_never_written_is_a_miss() {
         .expect_err("nothing was ever written at that address");
     assert!(matches!(err, GroupContentError::NotHeld { .. }), "{err:?}");
 }
+
+// ─── CIRISEdge#599: a node that seeded no fixture ─────────────────────
+
+/// **The acceptance test for CIRISEdge#599**, and the one shape the rest of
+/// the suite structurally cannot provide.
+///
+/// Every other chat/content test calls `put_kex_occurrence` for each member
+/// before sealing. That fixture IS the bug: production never performed it, so
+/// the suite proved the feature works given a precondition nothing met, and a
+/// stock node sealed community content with `granted: []` — readable by
+/// nobody, including its author (measured by CIRISServer, #590).
+///
+/// So this test provisions the way a NODE does — `content_occurrence`, from
+/// the identity's own seed — and asserts the cascade then has a wrap target.
+/// If provisioning regresses, this is the test that reddens.
+#[tokio::test]
+async fn a_node_provisions_its_own_content_occurrence_and_the_cascade_finds_it() {
+    use ciris_edge::content_occurrence::{ensure_content_occurrence, Provisioned};
+    use ciris_persist::federation::FederationDirectory as _;
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let node_a = node(&[&alice], &alice).await;
+
+    // Before: the identity has no occurrence, so the DEK cascade would
+    // enumerate NOTHING for it — not "exclude", enumerate nothing, which is
+    // why `excluded` never warned.
+    assert!(
+        node_a
+            .dir
+            .list_identity_occurrences_active(&alice.key_id)
+            .await
+            .expect("list")
+            .is_empty(),
+        "precondition: a stock node has provisioned no occurrence",
+    );
+
+    let enc = ciris_edge::content_occurrence::enc_pubkeys_from_seed(&[0x11; 32])
+        .expect("derive content-enc pubkeys from the identity seed");
+
+    // The occurrence key is a REGISTERED key — the column is an FK, and the
+    // pre-#599 `format!("{}-occ", …)` viewer key named a row nothing created.
+    let created = ensure_content_occurrence(
+        &*node_a.dir,
+        &alice.key_id,
+        &alice.key_id,
+        "server",
+        enc.clone(),
+    )
+    .await
+    .expect("provision");
+    assert_eq!(created, Provisioned::Created);
+
+    let occs = node_a
+        .dir
+        .list_identity_occurrences_active(&alice.key_id)
+        .await
+        .expect("list");
+    assert_eq!(occs.len(), 1, "the cascade now has exactly one wrap target");
+    assert_eq!(
+        occs[0].encryption_pubkeys.as_ref(),
+        Some(&enc),
+        "and it carries the content-KEM halves the cascade needs — an \
+         occurrence WITHOUT them is `excluded`, which is a different bug",
+    );
+
+    // Idempotent: a restart must not mint a second occurrence or rewrap.
+    assert_eq!(
+        ensure_content_occurrence(&*node_a.dir, &alice.key_id, &alice.key_id, "server", enc)
+            .await
+            .expect("re-provision"),
+        Provisioned::AlreadyCurrent,
+    );
+}
+
+/// The derivation is DETERMINISTIC from the seed — which is what lets a
+/// restored node keep the grants already wrapped to it, and what makes
+/// `Provisioned::Drifted` mean "the seed changed" rather than "we re-rolled".
+#[tokio::test]
+async fn content_enc_pubkeys_are_deterministic_and_seed_bound() {
+    use ciris_edge::content_occurrence::enc_pubkeys_from_seed;
+
+    let a1 = enc_pubkeys_from_seed(&[0x11; 32]).expect("derive");
+    let a2 = enc_pubkeys_from_seed(&[0x11; 32]).expect("derive again");
+    assert_eq!(a1, a2, "same seed must give the same keypair on every open");
+
+    let b = enc_pubkeys_from_seed(&[0x22; 32]).expect("derive other");
+    assert_ne!(a1, b, "a different identity must not share content keys");
+}
+
+/// A seed change is reported, never silently overwritten: the grants already
+/// wrapped to the old keys would be orphaned, turning readable content
+/// unreadable, and that is an operator's call.
+#[tokio::test]
+async fn a_changed_seed_reports_drift_rather_than_rewriting_the_occurrence() {
+    use ciris_edge::content_occurrence::{
+        enc_pubkeys_from_seed, ensure_content_occurrence, Provisioned,
+    };
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let node_a = node(&[&alice], &alice).await;
+
+    assert_eq!(
+        ensure_content_occurrence(
+            &*node_a.dir,
+            &alice.key_id,
+            &alice.key_id,
+            "server",
+            enc_pubkeys_from_seed(&[0x11; 32]).expect("derive"),
+        )
+        .await
+        .expect("first provision"),
+        Provisioned::Created,
+    );
+
+    assert_eq!(
+        ensure_content_occurrence(
+            &*node_a.dir,
+            &alice.key_id,
+            &alice.key_id,
+            "server",
+            enc_pubkeys_from_seed(&[0x99; 32]).expect("derive"),
+        )
+        .await
+        .expect("second provision"),
+        Provisioned::Drifted,
+        "a different seed must be REPORTED, not written over",
+    );
+}

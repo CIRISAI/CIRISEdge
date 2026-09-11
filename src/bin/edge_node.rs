@@ -1810,6 +1810,37 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         emit_owner_binding(&directory, &owner_key_id, &owner_signer, subject).await?;
     }
 
+    // CIRISEdge#599 — this node as a CONTENT OCCURRENCE of its owner.
+    //
+    // Without it the community-DEK cascade has no wrap target for the owner
+    // on this node, so every community write seals with `granted: []` —
+    // readable by nobody, including its author — and the failure is silent
+    // at every layer: the write succeeds, the row is valid, the pointer
+    // resolves, and the read returns `Body::Unopened`.
+    //
+    // The occurrence key is THIS NODE'S federation key, and the enc keypair
+    // derives from THIS NODE'S seed. Both halves of that matter:
+    //
+    //  * the node key is already registered, so the `federation_keys` FK the
+    //    occurrence column carries is satisfied by construction — where the
+    //    old `format!("{}-occ", …)` viewer key named a row nothing created;
+    //  * the node must hold the PRIVATE half to decrypt, and it holds its
+    //    own seed. Deriving from the OWNER's seed would work only on a
+    //    harness that happens to hold the human's key, which is precisely
+    //    the thing a real node never does.
+    match ciris_edge::content_occurrence::provision_from_seed(
+        &*directory,
+        &owner_key_id,
+        &cfg.node_id,
+        "server",
+        &fed.seed,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(e) => return Err(format!("provision this node's content occurrence: {e}")),
+    }
+
     let roster = read_roster(&cfg.mesh_dir);
 
     // ── This node's DIRECTED consent grants ──────────────────────────
@@ -2910,7 +2941,12 @@ async fn run_chat_legs(occ: &Occurrence) {
     // The DEK is wrapped per active OCCURRENCE, so a reader presents its
     // occurrence key — an identity key is refused as NotGranted even for a
     // full member (CIRISEdge#586).
-    let viewer = format!("{}-occ", occ.owner_signer.key_id);
+    //
+    // That occurrence is THIS NODE (registered at start-up, CIRISEdge#599).
+    // This used to be `format!("{}-occ", owner)`, a string naming a row
+    // nothing created — so the read was `NotGranted` on every node that had
+    // not seeded a test fixture, which is every real node.
+    let viewer = occ.cfg.node_id.clone();
     let outcome = occ
         .replication
         .sync_and_await(&peer_node, budget, || async {

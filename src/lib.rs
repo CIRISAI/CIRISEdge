@@ -55,6 +55,7 @@ pub mod cohort_scope;
 /// CIRISEdge#552/#554 — the contact ladder: announce → discover → request →
 /// consent → chat, with one greppable log shape per rung.
 pub mod contact;
+pub mod content_occurrence;
 #[cfg(feature = "debug-tools")]
 pub mod debug;
 pub mod delivery_mode;
