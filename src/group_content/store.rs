@@ -105,10 +105,38 @@ pub struct SealedContent {
 }
 
 impl SealedContent {
-    /// `true` when every intended recipient can read this.
+    /// `true` when every intended recipient can read this — **and at least
+    /// one can**.
+    ///
+    /// The second clause is not pedantry; it was a real false green. An
+    /// earlier version returned `self.excluded.is_empty()` alone, and at an
+    /// encrypted tier where the roster resolved to NO occurrences that is
+    /// trivially true: nobody was dropped because nobody was found. The
+    /// content is then unreadable by everyone, including its author, and the
+    /// API reported it as fine.
+    ///
+    /// `epoch.is_some()` is what says "this went to an encrypted tier".
+    /// Commons content has no epoch and no grants and is readable by anyone,
+    /// so the grant clause correctly does not apply to it.
     #[must_use]
     pub fn fully_readable(&self) -> bool {
-        self.excluded.is_empty()
+        if !self.excluded.is_empty() {
+            return false;
+        }
+        // Encrypted tier with an empty grant set = nobody can read it.
+        !(self.epoch.is_some() && self.granted.is_empty())
+    }
+
+    /// `true` when this went to an encrypted tier and NOBODY holds a grant —
+    /// content that is sealed and unreadable by every party including its
+    /// author.
+    ///
+    /// Worth its own name because the remedy is specific and is not
+    /// "retry": the community's members have no `encryption_pubkeys`
+    /// registered, so there was nothing to wrap the DEK to.
+    #[must_use]
+    pub fn readable_by_nobody(&self) -> bool {
+        self.epoch.is_some() && self.granted.is_empty()
     }
 }
 
@@ -121,7 +149,19 @@ pub struct OpenRequest<'a> {
     pub author_key_id: &'a str,
     /// The row's instant — an AAD input.
     pub asserted_at: chrono::DateTime<chrono::Utc>,
-    /// Who is reading. persist authorizes against this before it decrypts.
+    /// Who is reading — **the reader's OCCURRENCE key id, not their identity
+    /// key id.**
+    ///
+    /// This trips everyone once. The DEK cascade wraps the content key per
+    /// ACTIVE OCCURRENCE (`resolve_community_members` →
+    /// `list_identity_occurrences_active` → `encryption_pubkeys`), and
+    /// authorization is `community_dek_has_member_grant(community, epoch,
+    /// viewer)` against those same occurrence ids. Passing an identity key
+    /// here returns [`GroupContentError::NotGranted`] even for a full member
+    /// of the room — a refusal that looks like a permissions problem and is
+    /// actually a wrong-handle problem.
+    ///
+    /// [`SealedContent::granted`] lists exactly the ids that work.
     pub viewer_key_id: &'a str,
 }
 
@@ -246,6 +286,34 @@ mod tests {
             })
         };
         assert_ne!(mk(&body), mk(&att));
+    }
+
+    /// The false green this API shipped with for exactly one commit: an
+    /// encrypted seal that granted to NOBODY reported itself fully readable,
+    /// because no one was excluded — no one was found.
+    #[test]
+    fn an_encrypted_seal_that_granted_to_nobody_is_not_fully_readable() {
+        let orphan = SealedContent {
+            pointer: pointer(ContentField::Body),
+            epoch: Some(7),
+            granted: vec![],
+            excluded: vec![],
+        };
+        assert!(
+            !orphan.fully_readable(),
+            "nobody was excluded because nobody was FOUND — the content is \
+             unreadable by everyone including its author",
+        );
+        assert!(orphan.readable_by_nobody());
+
+        // Commons content has no epoch and no grants and is readable by all,
+        // so the same emptiness must NOT read as a failure there.
+        let commons = SealedContent {
+            epoch: None,
+            ..orphan
+        };
+        assert!(commons.fully_readable());
+        assert!(!commons.readable_by_nobody());
     }
 
     #[test]

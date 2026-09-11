@@ -143,6 +143,14 @@ pub const FIELD_BODY: &str = "body";
 pub const FIELD_CONTENT_TYPE: &str = "content_type";
 /// The seal header: `{ alg, epoch, nonce }` — how [`FIELD_BODY`] opens.
 pub const FIELD_SEALED: &str = "sealed";
+/// CIRISEdge#586 — the blob pointer that REPLACES [`FIELD_BODY`] +
+/// [`FIELD_SEALED`] once a room's content lives in the group's blob store.
+///
+/// A row carries one shape or the other, never both. The reader recognises
+/// whichever it finds, which is what makes the migration reversible up to
+/// the point content is actually backfilled (`FSD/GROUP_CONTENT_ON_BLOBS.md`
+/// §8).
+pub const FIELD_CONTENT: &str = "content";
 /// The MLS handshake payload on a KeyPackage / Welcome row: base64 bytes.
 pub const FIELD_MLS_BYTES: &str = "mls_bytes";
 /// On a Welcome row: the group epoch the Welcome joins the joiner at.
@@ -561,6 +569,77 @@ pub async fn chat_message_attestation(
     chat_row(author, &room, CHAT_MESSAGE_DIMENSION, members, asserted_at).await
 }
 
+/// CIRISEdge#586 — build a chat message whose content lives in the GROUP'S
+/// BLOB STORE rather than sealed inline.
+///
+/// The blob-native twin of [`chat_message_attestation`], and the shape the
+/// migration moves toward (`FSD/GROUP_CONTENT_ON_BLOBS.md` §8 step 2). The
+/// row carries a [`BlobPointer`](crate::group_content::BlobPointer) under
+/// [`FIELD_CONTENT`] and no inline body at all.
+///
+/// # Why this is not just tidier
+///
+/// Content sealed under a key persist cannot derive is content persist
+/// cannot **recall**: an epoch destroy sweeps the DEK, and bytes sealed
+/// outside that cascade survive it. A right-to-be-forgotten guarantee a
+/// layer above can silently opt out of is not a guarantee. This is the call
+/// that puts chat inside the cascade.
+///
+/// # The instant is bound once, and shared
+///
+/// The AAD is built from the SAME rendered instant the row carries, which is
+/// why `asserted_at` is truncated here before either is derived. A row whose
+/// column and whose AAD disagree produces content that never opens, and
+/// produces it silently.
+///
+/// # Errors
+/// Sealing (including a member excluded for carrying no encryption pubkeys
+/// — reported, never silently dropped), canonicalization or signing failure.
+pub async fn chat_message_blob_attestation(
+    author: &crate::identity::LocalSigner,
+    recipient_key_id: &str,
+    body: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    store: &dyn crate::group_content::GroupContentStore,
+) -> Result<(Attestation, crate::group_content::SealedContent), String> {
+    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
+    let room = pair_community_key_id(&author.key_id, recipient_key_id);
+
+    // One truncation, feeding both the row's column and the AAD. Deriving
+    // them separately is how they drift.
+    let at = truncate_to_substrate_resolution(asserted_at);
+
+    let sealed = store
+        .seal(crate::group_content::SealRequest {
+            cohort_scope: ciris_persist::federation::types::cohort_scope::COMMUNITY,
+            community_key_id: Some(&room),
+            author_key_id: &author.key_id,
+            asserted_at: at,
+            field: crate::group_content::ContentField::Body,
+            plaintext: body.as_bytes(),
+            media_type: Some("text/plain"),
+        })
+        .await
+        .map_err(|e| format!("seal chat content: {e}"))?;
+
+    let mut members = serde_json::Map::new();
+    members.insert(
+        FIELD_CONTENT.to_owned(),
+        serde_json::to_value(&sealed.pointer).map_err(|e| format!("pointer: {e}"))?,
+    );
+    members.insert(
+        FIELD_CONTENT_TYPE.to_owned(),
+        serde_json::json!("text/plain"),
+    );
+
+    let row = chat_row(author, &room, CHAT_MESSAGE_DIMENSION, members, at).await?;
+    // `sealed` is returned rather than dropped so the caller can see
+    // `excluded` — who, of this room, cannot read what was just written.
+    // persist: "a caller that ignores this is ignoring who cannot read what
+    // it just wrote."
+    Ok((row, sealed))
+}
+
 /// Step 1 of the handshake: the JOINER's KeyPackage for the room, as a row
 /// the joiner signs. `key_package` is the wire form
 /// ([`key_package_to_bytes`](crate::mls::cohort_group::key_package_to_bytes)).
@@ -793,8 +872,17 @@ pub async fn welcome_from(
 /// A message body as read back: opened text, or why it did not open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
-    /// Opened with the room's key.
+    /// Opened — from the inline seal, or from the group's blob store.
     Text(String),
+    /// CIRISEdge#586 — the row points at group-store content that has not
+    /// been fetched yet.
+    ///
+    /// Reading a blob is async and may touch the network; recognising the
+    /// row is neither. Keeping them apart is what lets [`ChatMessage::from_row`]
+    /// stay synchronous and total — a caller that only wants to list a room
+    /// never pays for content it is not going to show, and a caller that
+    /// does calls [`ChatMessage::resolve_content`].
+    Pointer(crate::group_content::BlobPointer),
     /// Sealed, and this key does not open it (rotated epoch, foreign
     /// algorithm, tampered, or not a member's key) — or not sealed at all,
     /// which a community row must never be.
@@ -839,11 +927,40 @@ impl ChatMessage {
     /// the row is not a chat message in that room.
     #[must_use]
     pub fn from_row(a: &Attestation, room: &str, key: &RoomKey) -> Option<Self> {
+        Self::from_row_any(a, room, Some(key))
+    }
+
+    /// CIRISEdge#586 — recognise a chat row in `room` whether it carries a
+    /// blob pointer or an inline seal.
+    ///
+    /// `key` is `Option` because a migrated room **has no room key** — that
+    /// is what the migration accomplishes, not an oversight. A caller
+    /// reading a room that has moved to the group store passes `None` and
+    /// resolves content with [`Self::resolve_content`]; one reading a room
+    /// that has not passes the key as before.
+    #[must_use]
+    pub fn from_row_any(a: &Attestation, room: &str, key: Option<&RoomKey>) -> Option<Self> {
         use ciris_persist::federation::envelope::paths;
         if dimension_of(a) != Some(CHAT_MESSAGE_DIMENSION) || room_of(a).as_deref() != Some(room) {
             return None;
         }
         let env = &a.attestation_envelope;
+
+        // CIRISEdge#586 — the blob-pointer shape, recognised before the
+        // inline one. A row carries one or the other; checking this first
+        // means a migrated room never falls back to looking for an inline
+        // body that is deliberately absent.
+        if let Some(raw) = env.get(FIELD_CONTENT) {
+            let body =
+                match serde_json::from_value::<crate::group_content::BlobPointer>(raw.clone()) {
+                    Ok(pointer) => Body::Pointer(pointer),
+                    Err(e) => Body::Unopened {
+                        reason: format!("row carries an unreadable `content` pointer: {e}"),
+                    },
+                };
+            return Some(Self::from_parts(a, env, body, None));
+        }
+
         let body_wire = env.get(FIELD_BODY).and_then(serde_json::Value::as_str)?;
         // The CLAIM's instant — on a widening this is the prior's, carried
         // verbatim (persist v40.0.0), so both rows open with one key.
@@ -852,12 +969,19 @@ impl ChatMessage {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let sealed = env.get(FIELD_SEALED);
-        let body = match sealed {
-            None => Body::Unopened {
+        let body = match (sealed, key) {
+            (None, _) => Body::Unopened {
                 reason: "the row carries no `sealed` header — a community row must be sealed"
                     .to_owned(),
             },
-            Some(sealed) => match open_body(
+            // An inline row in a room read without a key. Not an error the
+            // caller can fix by retrying: it names the shape mismatch so a
+            // half-migrated room is diagnosable rather than merely empty.
+            (Some(_), None) => Body::Unopened {
+                reason: "the row carries an INLINE sealed body but no room key was supplied                          — this room has not migrated to the group store (CIRISEdge#586)"
+                    .to_owned(),
+            },
+            (Some(sealed), Some(key)) => match open_body(
                 key,
                 room,
                 &a.attesting_key_id,
@@ -869,7 +993,27 @@ impl ChatMessage {
                 Err(reason) => Body::Unopened { reason },
             },
         };
-        Some(Self {
+        Some(Self::from_parts(
+            a,
+            env,
+            body,
+            sealed
+                .and_then(|s| s.get("epoch"))
+                .and_then(serde_json::Value::as_u64),
+        ))
+    }
+
+    /// The members both row shapes share. Factored so the inline path and
+    /// the blob path cannot drift on attribution — which is the one field
+    /// here that has already been got wrong once (CIRISEdge#564).
+    fn from_parts(
+        a: &Attestation,
+        env: &serde_json::Value,
+        body: Body,
+        epoch: Option<u64>,
+    ) -> Self {
+        use ciris_persist::federation::envelope::paths;
+        Self {
             attestation_id: a.attestation_id.clone(),
             // CIRISEdge#564 — the ATTESTER, always. persist established this
             // key by verifying the hybrid signature against its registered
@@ -888,9 +1032,54 @@ impl ChatMessage {
                 .get(paths::REFERENCES_ATTESTATION_ID)
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
-            epoch: sealed
-                .and_then(|s| s.get("epoch"))
-                .and_then(serde_json::Value::as_u64),
-        })
+            epoch,
+        }
+    }
+
+    /// CIRISEdge#586 — fetch and open the content a [`Body::Pointer`] names.
+    ///
+    /// A no-op on any other body, so a caller can hand it every message in a
+    /// room without first sorting them by shape.
+    ///
+    /// **The binding inputs come off THIS row**, never from the caller: the
+    /// attester and the row's own instant. That is the symmetry the whole
+    /// contract rests on — a reader that can rebuild those two values from
+    /// the row gets the content, and one that cannot is not going to be
+    /// rescued by holding a key.
+    ///
+    /// `viewer_key_id` is the reader's **occurrence** key id, not their
+    /// identity key id — see
+    /// [`OpenRequest::viewer_key_id`](crate::group_content::OpenRequest).
+    /// An identity key produces a `NotGranted` that reads like a
+    /// permissions failure and is really a wrong-handle one.
+    ///
+    /// # Errors
+    /// Never — a failure to open becomes [`Body::Unopened`] with the reason,
+    /// because one unreadable message must not fail a room's whole read.
+    pub async fn resolve_content(
+        &mut self,
+        store: &dyn crate::group_content::GroupContentStore,
+        viewer_key_id: &str,
+    ) {
+        let Body::Pointer(pointer) = &self.body else {
+            return;
+        };
+        let req = crate::group_content::OpenRequest {
+            pointer,
+            author_key_id: &self.attesting_key_id,
+            asserted_at: self.asserted_at,
+            viewer_key_id,
+        };
+        self.body = match store.open(req).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Body::Text(text),
+                Err(e) => Body::Unopened {
+                    reason: format!("content is not UTF-8: {e}"),
+                },
+            },
+            Err(e) => Body::Unopened {
+                reason: e.to_string(),
+            },
+        };
     }
 }
