@@ -1356,6 +1356,7 @@ async fn content_store(w: &World) -> ciris_edge::group_content::PersistGroupCont
 
     ciris_edge::group_content::PersistGroupContentStore::from_shared(
         ciris_persist::BackendDispatch::Sqlite(w.dir.clone()),
+        w.dir.clone(),
         signer,
     )
 }

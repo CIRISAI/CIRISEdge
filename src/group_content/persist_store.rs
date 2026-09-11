@@ -32,6 +32,10 @@ use super::BlobPointer;
 /// Seals and opens group content against a persist substrate.
 pub struct PersistGroupContentStore {
     engine: ciris_persist::Engine,
+    /// Held so the seal can ASK persist which tier a write resolves to
+    /// rather than predicting it — the resolution depends on directory
+    /// state, not just the scope label.
+    directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
 }
 
 impl std::fmt::Debug for PersistGroupContentStore {
@@ -45,18 +49,29 @@ impl std::fmt::Debug for PersistGroupContentStore {
 impl PersistGroupContentStore {
     /// Wrap an `Engine` the caller already holds (cohabitation).
     #[must_use]
-    pub fn new(engine: ciris_persist::Engine) -> Self {
-        Self { engine }
+    pub fn new(
+        engine: ciris_persist::Engine,
+        directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
+    ) -> Self {
+        Self { engine, directory }
     }
 
     /// Build over a backend + signer the caller already opened (sovereign).
     /// Shares the connection pool; runs no migrations.
     #[must_use]
+    /// `directory` is the same substrate `backend` wraps — passed rather
+    /// than destructured out of `BackendDispatch`, whose arms are cargo-
+    /// feature-gated on persist's side and so cannot be matched
+    /// exhaustively from here without edge mirroring those features.
     pub fn from_shared(
         backend: ciris_persist::BackendDispatch,
+        directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
         signer: Arc<dyn ciris_keyring::HardwareSigner>,
     ) -> Self {
-        Self::new(ciris_persist::Engine::from_shared(backend, signer))
+        Self::new(
+            ciris_persist::Engine::from_shared(backend, signer),
+            directory,
+        )
     }
 }
 
@@ -84,16 +99,27 @@ impl GroupContentStore for PersistGroupContentStore {
     async fn seal(&self, req: SealRequest<'_>) -> Result<SealedContent, GroupContentError> {
         // An AAD binds a ciphertext to its row. A PLAINTEXT tier has no
         // ciphertext to bind, and persist REFUSES `Some(aad)` there rather
-        // than ignoring it — so passing one unconditionally would make every
-        // commons write fail.
+        // than ignoring it — so this has to be right BEFORE the call.
         //
-        // The classifier is persist's own `crypto_tier`, not a mapping
-        // rebuilt here: edge names the scope and persist decides the tier
-        // (§11.1), and a second copy of that decision would be a second
-        // thing to keep in step.
+        // ASK persist; do not predict. An earlier version called the pure
+        // `crypto_tier(cohort_scope, None)` under a comment claiming it was
+        // "persist's own classifier, not a mapping rebuilt here". It WAS
+        // rebuilt: the write door uses `resolve_write_tier`, which consults
+        // the DIRECTORY, and an authorized infrastructure community at
+        // `cohort_scope: community` resolves to Plaintext regardless of the
+        // label. Edge predicted CommunityDek, sent an AAD, and every write
+        // to such a community was refused.
+        //
+        // `resolve_write_tier` is the door's own resolver and is public, so
+        // there is no reason to approximate it.
         let aad = aad_for_seal(&req);
-        let tier =
-            ciris_persist::federation::types::cohort_scope::crypto_tier(req.cohort_scope, None);
+        let tier = ciris_persist::federation::at_rest_cascade::resolve_write_tier(
+            &*self.directory,
+            req.cohort_scope,
+            req.community_key_id,
+        )
+        .await
+        .map_err(|e| map_err(String::new(), &e))?;
         let aad_arg = match tier {
             ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext => None,
             _ => Some(aad.as_slice()),
@@ -188,7 +214,8 @@ mod tests {
         ed.import_key(&[7u8; 32]).expect("import test key");
         let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(ed);
         PersistGroupContentStore::from_shared(
-            ciris_persist::BackendDispatch::Sqlite(backend),
+            ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+            backend,
             signer,
         )
     }

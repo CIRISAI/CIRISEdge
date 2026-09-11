@@ -168,6 +168,7 @@ async fn node(idents: &[&Ident], signer: &Ident) -> Node {
     );
     let store = PersistGroupContentStore::from_shared(
         ciris_persist::BackendDispatch::Sqlite(dir.clone()),
+        dir.clone(),
         hw,
     );
     Node { dir, store }
