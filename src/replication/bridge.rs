@@ -1088,8 +1088,9 @@ struct AttestationSweepCtx {
 /// once per sweep per key: the PRINCIPAL behind a key (a person is their own;
 /// a node's or agent's is its owner — persist's `admission_identity_for_writer`,
 /// the same spelling AV-45 uses for a writer) and the cohorts an identity
-/// belongs to (persist's `list_families_for_member` /
-/// `list_communities_for_member`, the §4.3 predicate's own fan-out reads).
+/// belongs to (persist's `list_families_for_member_active` /
+/// `list_communities_for_member_active` — the ACTIVE views, so a revoked
+/// member leaves the audience; CIRISEdge#597).
 /// `None` is "unresolved", and the gate fails closed on it.
 #[derive(Default)]
 struct AudienceMemo {
@@ -5375,15 +5376,38 @@ impl FederationDirectoryReplicationBridge {
         false
     }
 
-    /// The cohorts `id` belongs to, memoized — persist's own membership reads.
+    /// The cohorts `id` belongs to **right now**, memoized — persist's own
+    /// membership reads.
+    ///
+    /// # CIRISEdge#597 — the ACTIVE views, not the full-history ones
+    ///
+    /// persist ships `list_*_for_member` and `list_*_for_member_active`, and
+    /// the difference is exactly revocation: the plain form returns every
+    /// cohort `id` was EVER in, the `_active` form drops the ones a
+    /// `membership_revocation` with `effective_at <= now` removed them from.
+    ///
+    /// This gate asks one question — *is this peer in the row's audience* —
+    /// and the plain form answers a different one. It answers it wrong in
+    /// one direction only, OPEN: a member removed from a community kept
+    /// receiving that community's rows indefinitely, on the advertise path
+    /// and the direct-fetch twin alike, with nothing booked as withheld
+    /// because the gate ran and returned "member".
+    ///
+    /// The blob plane hit the same finding at CIRISEdge#581
+    /// (`PersistBlobStorePolicy`) and moved to `_active` there; this is the
+    /// row-plane half.
+    ///
+    /// The extra read per cohort is bounded by DISTINCT PEERS PER SWEEP, not
+    /// by rows, because this is memoized — which is why the correct view is
+    /// affordable here and was worth checking before assuming it was not.
     async fn cohorts_of(&self, id: &str, memo: &mut AudienceMemo) -> Option<CohortsOf> {
         if let Some(hit) = memo.cohorts.get(id) {
             return hit.clone();
         }
         let dir = &*self.directory;
         let out = match (
-            dir.list_families_for_member(id).await,
-            dir.list_communities_for_member(id).await,
+            dir.list_families_for_member_active(id).await,
+            dir.list_communities_for_member_active(id).await,
         ) {
             (Ok(families), Ok(communities)) => Some(CohortsOf {
                 families: families.into_iter().map(|f| f.family_key_id).collect(),
@@ -15535,6 +15559,91 @@ pub(crate) mod tests {
             .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some("node-carol"))
             .await
             .is_none());
+    }
+
+    /// **CIRISEdge#597 — a revoked member leaves the audience.**
+    ///
+    /// The same room, the same row, the same peer as the test above. The
+    /// only difference is a membership revocation whose `effective_at` has
+    /// passed, and after it the row must stop being offered.
+    ///
+    /// This is the witness the gate lacked, and the reason it lacked one is
+    /// the shape of the bug: `cohorts_of` read persist's FULL-HISTORY
+    /// membership views, so a removed member still tested as a member. The
+    /// gate ran, returned "in the audience", and booked no withhold — a
+    /// default-open answer that looks exactly like a correct one. Every
+    /// existing audience test passed, because none of them revoked anybody.
+    #[tokio::test]
+    async fn a_revoked_member_stops_receiving_the_rooms_rows() {
+        let backend = audience_backend().await;
+        let mut room = crate::chat::pair_community("person-alice", "person-bob", Utc::now());
+        room.community_key_id = "chat-room".to_owned();
+        backend
+            .put_community(sign_community_fixture("room-authority", room))
+            .await
+            .expect("seed room");
+        let bridge = audience_bridge(&backend);
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &id,
+            "person-alice",
+            "person-alice",
+            "scores",
+            "community",
+            serde_json::json!({
+                "dimension": "chat:message:v1",
+                "community_key_id": "chat-room",
+                "body": "for the room",
+            }),
+        )
+        .await;
+        let hash = hash_of(&backend, &id).await;
+
+        // Positive control FIRST: without it, a test that only asserts the
+        // withhold passes when the row was never offered to anybody.
+        assert!(
+            is_offered(&bridge, "node-bob", hash).await,
+            "precondition: a current member's node receives the room's rows",
+        );
+
+        let now = Utc::now();
+        backend
+            .put_community_membership_revocation(sign_community_membership_revocation_fixture(
+                "room-authority",
+                CommunityMembershipRevocation {
+                    community_key_id: "chat-room".to_owned(),
+                    removed_identity_key_id: "person-bob".to_owned(),
+                    removed_at: now,
+                    // Already in force — the `_active` filter is
+                    // `effective_at <= now`.
+                    effective_at: now - chrono::Duration::seconds(1),
+                    reason: Some("left the room".to_owned()),
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect("record the removal");
+
+        // A FRESH bridge: the audience memo is per-sweep, and reusing the
+        // one that already resolved `person-bob` would prove the cache
+        // rather than the gate.
+        let bridge = audience_bridge(&backend);
+        assert!(
+            !is_offered(&bridge, "node-bob", hash).await,
+            "a removed member's node must stop receiving the room's rows — \
+             revocation of membership is revocation of delivery (#597)",
+        );
+        // The fetch twin must agree; the two disagreeing is the v18.2.0
+        // lesson and would leave the row reachable by asking directly.
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some("node-bob"))
+                .await
+                .is_none(),
+            "the direct-fetch twin must agree with the advertise",
+        );
     }
 
     /// A `community` row that names NO community cannot be membership-tested
