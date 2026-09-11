@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789137327477,
+  "lastUpdate": 1789148991292,
   "repoUrl": "https://github.com/CIRISAI/CIRISEdge",
   "entries": {
     "ciris-edge transport / A-V-mesh / replication benchmarks": [
@@ -207563,6 +207563,2370 @@ window.BENCHMARK_DATA = {
             "name": "fountain_reconstruction/encode_n20_k6",
             "value": 840,
             "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain/reconstruction/avail80pct_x100000",
+            "value": 84514,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain/reconstruction/avail85pct_x100000",
+            "value": 95738,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain/reconstruction/avail90pct_x100000",
+            "value": 99508,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain/reconstruction/avail95pct_x100000",
+            "value": 99988,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/antientropy_rounds_loss2pct_mean_x1000",
+            "value": 1015,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/reassembly_delivery_ratio_loss3pct_x100000",
+            "value": 100000,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/convergence_rounds/N1_x1000",
+            "value": 1050,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/convergence_rounds/N8_x1000",
+            "value": 1000,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/convergence_rounds/N32_x1000",
+            "value": 1050,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/convergence_rounds/N128_x1000",
+            "value": 1025,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m1_rtt_stretch_p95_x1000",
+            "value": 1000,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m2_reparent_p99_ms",
+            "value": 1997,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m8_continuity_first_delivery_loss5pct_x100000",
+            "value": 99989,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth/N10",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth_bound/N10",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth/N100",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth_bound/N100",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth/N1000",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth_bound/N1000",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss0pct_x100000",
+            "value": 100000,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss5pct_x100000",
+            "value": 99988,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss10pct_x100000",
+            "value": 99899,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss15pct_x100000",
+            "value": 99673,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss20pct_x100000",
+            "value": 99207,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn0pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn5pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn10pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn15pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn20pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cf13fcfed81a79ca642ccf66012bd6e2f525a203",
+          "message": "feat(586,581,597)!: chat is blob-native, blobs carry meaning, and revocation revokes delivery (#596)\n\n* test(586): a cross-node blob harness — two substrates, and the state no test could see\n\nEvery blob test before this ran on ONE substrate.\n`chat_message_federates.rs` opens a single `FederationDirectorySqlite` and\nhas both Alice and Bob read from it — so \"Bob opens Alice's content\" was Bob\nreading Alice's blob, in Alice's store. That proves the row shapes and the\ncryptography and nothing whatsoever about transfer.\n\nThe state every federated blob actually passes through — **the peer holds\nthe row and not the bytes** — was therefore structurally untestable, and\nuntested. This harness runs two real substrates that share only what a test\nhands over.\n\n## What it pins\n\n- **A peer with only the pointer reads NOT-HELD, not NotGranted.** The\n  distinction is the whole diagnostic: not-held sends a peer to fetch,\n  not-granted sends an operator hunting a permissions problem that does not\n  exist. The same read on the authoring node succeeds, so the failure is\n  about WHERE the bytes are and nothing else.\n- **Once the bytes arrive, the SAME pointer opens on the far node**, and the\n  address agrees across substrates — without which a peer cannot recognise\n  what it was sent.\n- **A pointer to bytes never written is a miss**, which is the boundary of\n  what content-addressing gives: it makes substitution detectable and says\n  nothing about whether the referent should exist.\n\n## And it states the invariant the model does not yet enforce\n\n> A blob with no signed attestation of WHAT IT IS is an invalid state.\n\nDug into the model. There are exactly two signed artifacts around a blob and\n**both are possession claims**:\n\n- `holds_bytes:sha256:*`, auto-emitted by `put_blob`, is literally\n  `{\"kind\":\"holds_bytes\",\"evidence_refs\":[\"<sha>\"]}` with\n  `attesting_key_id == attested_key_id`. No media type, no dimension, no\n  author of the content, no reference to any row.\n- `FountainHoldingClaim` is `{peer_id, content_id, symbol_ids, at}`, and\n  `content_id` is documented as opaque.\n\nSo both discovery paths carry possession and never meaning, and nothing\nrequires a referencing attestation before bytes are stored or fetched —\n`fetch_blob_scoped` takes the scope as a PARAMETER, an unsigned local claim\nunbound to the bytes, and the store gate's audience axis judges on it.\n\nThe invalid state is therefore not \"unsigned\" — `holds_bytes` is signed. It\nis **\"no claim of meaning\"**, which is the sharper invariant and the one\nworth enforcing.\n\n`holds_bytes_says_possession_and_never_meaning` documents the CURRENT\nbehaviour deliberately rather than asserting the desired one, and says so:\nwhen the invariant lands, that test is the one that must change, and it\nalready names what it is waiting for.\n\nNote the primitive already exists — a signed row carrying a `BlobPointer` IS\nthe content claim, with sha, field, media type, author, instant and\nsignature. What is missing is the rule that a blob without one is invalid,\nwhich makes this a tightening rather than a new mechanism.\n\n## One fixture trap worth recording\n\nThe store must be built from the SAME key the directory registered, not\nmerely one with a matching alias: `derive_key_id(alias, pubkey)` means a\ndifferent key under the same alias produces a different id, and the holder\nattestation's FK then points at a row that does not exist — surfacing as an\nopaque \"FOREIGN KEY constraint failed\" from inside `put_blob_scoped`.\n\nGate: blob_federation_e2e 4 passed; fmt + clippy -D warnings clean.\n\nRefs #586, #581.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n* fix(581): read ACTIVE membership, and require every holder to be authorised\n\nThree more review findings, each verified against persist's source before\nbeing acted on.\n\n## F3 — HIGH — membership was read from FULL HISTORY, so revocation never took\n\n`persist_store_policy` called `list_{families,communities}_for_member`.\npersist documents those as the full-history accessors — no revocation\nfilter — and ships `*_for_member_active` (\"communities the member is\nCURRENTLY an active member of\") for the filtered view.\n\nSo the module's own rule — \"'Current' matters: membership is read now, not\nremembered\" — was contradicted by the line under it. A member ejected from a\ncommunity kept standing on axis 1 forever; and a community THIS node had\nLEFT still read as `In` on axis 2, which with the default\n`community: Announce` means storing and advertising content for a community\nwe are no longer in. The kind of gap that only surfaces when someone is\nremoved and nothing changes.\n\nNow reads the `_active` views.\n\n**This is wider than the store gate and is filed separately**: edge uses the\n`_active` variants NOWHERE. `replication::bridge::cohorts_of` — which backs\n`audience_withholds`, the SERVE-side audience gate — reads the same\nfull-history lists, so a revoked member plausibly keeps receiving\ncommunity-scoped rows in shipped code. Not fixed here: that is the row\nplane, it is load-bearing for the #396/#462 consent fan-out, and it deserves\nits own change and its own verification rather than a drive-by.\n\n## Q2 — HIGH — \"strongest standing among holders\" laundered the set\n\nAxis 1 took the strongest standing among holders, reasoning that one\nauthorised holder makes a transfer legitimate. It does not, because **the\nstanding was never bound to the peer the bytes arrive from**: `holders` is\ncaller-supplied and unauthenticated (the pyo3 entry takes a bare\n`Vec<String>` from Python), nothing proves any of them holds the blob, and\nthe scheduler may never contact the authorised one.\n\nSo `[\"<any allowlisted CI key id>\", \"mallory-1\", \"mallory-2\"]` — and that key\nid is public roster data — passed axis 1 while every byte came from Mallory.\nThe bytes are hash-pinned, so this was never injection. What it cost is the\nallowlist's meaning: **a name to QUOTE rather than a party to TRANSACT\nwith.**\n\nEvery holder must now be authorised, and the FIRST unauthorised one decides\nthe refusal — so the reason names a real observed standing instead of a\nreduction over the set. `Undeterminable` (the directory failed) and\n`VerifiedOnly` (signed but not blessed) have different remedies and must not\ncollapse into each other. An empty holder set authorises nothing.\n\n## Two of my own tests asserted nothing\n\n- `a_widening_reproduces_the_same_binding` compared `content_aad` against\n  itself with IDENTICAL literals. It asserted the function is pure and\n  nothing about widening — the two members a widening changes are not even\n  parameters of `content_aad`. Now stated where it can fail: two pointers\n  differing in `community_key_id` AND `tier` must produce the same preimage,\n  which breaks the moment anyone puts community or epoch back in.\n- `length_prefixes_keep_adjacent_fields_from_merging` stayed green with the\n  length prefix DELETED, because both halves varied only the author while\n  the instant renders to a fixed 24 bytes — so they differ under plain\n  concatenation anyway. Now asserts the prefix bytes are present, and pins\n  the real collision at the `push_lp` level where (\"ab\",\"c\") and (\"a\",\"bc\")\n  are actually reachable.\n\nGate: lib 1572 passed / 0 failed; blob_swarm_scheduler 6;\nblob_federation_e2e 4; chat_message_federates 24; fmt + clippy clean.\n\nRefs #581, #586.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n* fix(586): ask persist for the write tier, and delete the backfill that cannot run\n\n## The seal was still predicting the tier\n\nThe read side was fixed last commit; the write side was not, and the comment\nabove it claimed otherwise — \"the classifier is persist's own `crypto_tier`,\nnot a mapping rebuilt here\". It WAS rebuilt. persist's write door uses\n`resolve_write_tier`, which consults the DIRECTORY, and an authorized\ninfrastructure community at `cohort_scope: community` resolves to Plaintext\nregardless of the label. Edge predicted `CommunityDek`, sent an AAD, and\npersist refused every write to such a community.\n\n`resolve_write_tier` is public. The store now holds the directory and calls\nit. There was never a reason to approximate a resolver the door exports.\n\n`from_shared` takes the directory explicitly rather than destructuring\n`BackendDispatch`, whose arms are cargo-feature-gated on persist's side and\ncannot be matched exhaustively from here without edge mirroring those\nfeatures.\n\n## §8's backfill had no executable mechanism — so it is gone\n\nTwo independent blockers, both design-level:\n\n**(a) No door returns a past epoch's room key.** `open_body` refuses any\nepoch but the key's own; `RoomKey::of` derives from `record_secret()`, the\nMLS exporter at the CURRENT epoch. Snapshots are retained for\n`DEFAULT_RETAINED_EPOCHS = 4`, so inside that window the bytes are on disk —\nbut `CohortGroup::load` reads `HEAD_SLOT` and the epoch is not a parameter,\ndeliberately (\"never a silent downgrade to an older epoch\"). Past the window\n`group_state_delete` has run. Unreachable, then absent.\n\n**(b) Only the AUTHOR can sign the superseding row.** Mutating a signed\nenvelope invalidates it, so a backfill is a new authored row plus a\nsupersession, and chat signs at write with the actor's hybrid key. A node\ncan backfill its own owner's messages and NOBODY else's — my copy of a\nconversation is half my rows and half the other party's widenings. A room\nwould settle permanently half-migrated per participant, which is the\nopposite of what a migration converges to. Step 4 would then delete\n`open_body` and take the other person's messages with it.\n\n**This code has no users and no room has history**, so there is nothing to\nmigrate: blobs are simply the shape group content takes, and the inline seal\nis not a legacy to drain but a path that never carried anything. The plan is\none step — write content as blobs — and the inline seal is deleted rather\nthan deprecated once its callers are gone.\n\nThe blockers stay documented, because they are what makes \"no backfill\" the\nright answer rather than a shrug, and because a deployment that ever DOES\nhave history needs the true statement: old inline rooms stay inline and\nreadable, new content is blob-backed, and `open_body` must never be deleted\nwhile an inline row exists — that would not migrate those messages, it would\ndestroy them.\n\n## Two tests that overclaimed\n\n- `identical_content_seals_to_one_address` asserted content-addressing as a\n  general property while only ever exercising plaintext. At `CommunityDek` —\n  the tier group content actually uses — the address is the SHA of the\n  envelope, with a fresh random nonce per write, so the same plaintext seals\n  to a DIFFERENT address each time. Renamed and scoped to commons, so it\n  cannot stay green while dedup is broken for every encrypted caller.\n- `commons_content_is_not_bound_to_its_author_and_says_so` cannot fail\n  independently — `open()` passes no AAD at a plaintext tier, so the author\n  is dead on that path. Kept, with the doc now saying it documents a FACT\n  rather than guarding a behaviour, and naming its counterpart in\n  `chat_message_federates.rs` as the half that can fail.\n\nGate: lib 1572 passed / 0 failed; group_content_end_to_end 5;\nblob_federation_e2e 4; chat_message_federates 24; fmt + clippy clean.\n\nRefs #586.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n* feat(586)!: chat writes to native blob storage — the inline seal is deleted\n\nChat now uses the group's blob store as its only content path. Per the plan,\nwith no deployment carrying history there is nothing to migrate: blobs are\nsimply the shape group content takes, and the inline seal was a path that\nnever carried anything.\n\n## Deleted, not deprecated\n\n`seal_body`, `open_body`, `RoomKey::body_key`, and `FIELD_BODY` /\n`FIELD_SEALED` / `SEAL_ALG` / `SEAL_KDF_INFO` are gone. A second path that\ncan still produce openable content is a second confidentiality boundary, and\nkeeping one \"just in case\" is how content ends up sealed under a key persist\ncannot derive — which is content persist cannot RECALL.\n\n## The writer\n\n`chat_message_attestation` takes a `GroupContentStore` instead of a\n`RoomKey`, seals content at `community` scope, and puts a `BlobPointer` on\nthe row under `FIELD_CONTENT`. It returns the `SealedContent` alongside the\nrow so a caller can see `excluded` — the members who, having no usable\nencryption pubkeys, cannot read what was just written. That is the only\nplace that fact exists.\n\n## The reader\n\n`ChatMessage::from_row` takes NO room key. Recognising a row needs no key\nand touches no store, so listing a room never pays for content it will not\nshow; `resolve_content` fetches when the caller wants the text.\n`messages_in_room` resolves every pointer at the end, sequentially — a\nroom's worth of concurrent opens would burst the blocking pool the thread\nbudget (#583) exists to bound — and a failure becomes `Body::Unopened` with\nits reason rather than failing the room.\n\n`ChatMessage::epoch` is REMOVED. It meant \"the MLS epoch the body was sealed\nat\", and that concept no longer exists: content's epoch is the community\nDEK's and is recorded on the BLOB row. A copy on the chat row would be one a\nrotation can make stale.\n\n## The mesh binary\n\n`edge_node` builds its store with `Engine::from_shared` over the substrate it\nalready opened — no second connection, no migrations — and refuses to report\na delivered message that `fully_readable()` says nobody can open.\n\nIts convergence poll now asks `rows_in_room` (newly public) rather than\n`messages_in_room`: the predicate is \"has the WIDENING landed\", which is a\nquestion about the row, and resolving every pointer on every tick would\nfetch content to answer a question about arrival.\n\nThe reader presents its OCCURRENCE key — grants are wrapped per occurrence,\nso an identity key is refused as `NotGranted` even for a full member.\n\n## Two tests changed for real reasons\n\n- The MLS handshake test asserted \"what Alice seals, Bob opens\" through the\n  inline seal. That seal is gone; what the test uniquely proves is that the\n  handshake CONVERGES, so it now asserts both ends land on the same epoch.\n  The binding property it used to cover is exercised by\n  `a_pointer_copied_onto_another_authors_row_does_not_open`, with a positive\n  control.\n- `a_classical_only_signer_is_refused_not_downgraded` used a stranger's\n  signer, which derives a room that does not exist — so after this change it\n  failed at the COMMUNITY lookup, before reaching the signature check, and\n  would have passed while proving nothing. It now uses alice's identity\n  minus its PQC half, so the refusal is the one the test names.\n\n`a_wrong_key_epoch_or_context_does_not_open_the_body` is deleted: it tested\n`seal_body`/`open_body` directly, and those are gone.\n\nGate: lib 1572 passed / 0 failed; chat_message_federates 23;\nchat_two_person_community 9; chat_harness_dx 5; group_content_end_to_end 5;\nblob_federation_e2e 4; edge_node compiles under its required features; fmt +\nclippy -D warnings clean.\n\nCloses the wiring half of #586.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n* feat(581)!: a blob's scope is PROJECTED from the row that says what it is\n\n> \"Blobs always have an attestation envelope that says what it is, or else\n> we have no reason to touch it. No blobs without CEG envelopes/attestations\n> signed by someone — that is an invalid state.\"\n\n## What was wrong with the model\n\n`ContentScope` was a PARAMETER. A caller said \"this blob is community\ncontent of room R\" and the store gate believed it, because there was nothing\nelse to believe. Axis 2 asks *are we in the audience this content declares* —\nand an unsigned statement about bytes declares nothing. `Option<&ContentScope>`\nthen made \"I did not say\" a routine input to a security decision.\n\nSame class as CIRISEdge#564, where a signature proving authorship of a\nSTRING was read as authorship of the MESSAGE. Worse here: there was no\nsignature in the frame at all.\n\n## The fix\n\nBytes do not describe themselves; a sha is an address, not a claim. What says\nwhat a blob IS is the attestation that REFERENCES it — signed, naming the\nblob's sha in its envelope, carrying in its columns the cohort its author\nplaced it in.\n\n`BlobMeaning::project(row, sha)` is now the only way to obtain the scope the\nstore gate accepts, and `admit_blob_store` takes `&BlobMeaning`. The gate can\nno longer be handed a scope somebody composed: the type it consumes cannot be\nbuilt without a row that says the thing. The `None` arm moved out to the\nscheduler boundary — the one place a caller can still decline to name the\ncontent — where the log line now says what is missing and how to get it.\n\nEdge rows are bound before signing: the columns are mirrored INTO the\nenvelope and the canonicalized envelope is what gets signed, with the\n`BlobPointer` as a member. So for a row whose signature verifies, the triple\n`(content_sha256, cohort_scope, community_key_id)` is exactly what the author\nasserted, under one signature. That is the cryptographic root axis 2 lacked.\n\n## `holds_bytes` is possession, and possession is not meaning\n\nThe one distinction the module exists to make, and the sharpest edge of it:\npersist's `put_blob_scoped` AUTO-EMITS a `holds_bytes:sha256:*` row, so every\nstored blob already has a signed attestation pointing at it. It is signed, it\ngenuinely references the blob, and its `cohort_scope` column genuinely reads\n`federation`.\n\nSo a projection that merely mapped the column would classify EVERY BLOB ON\nTHE NODE as commons content — the one default this stack must never adopt,\narrived at by accident. It is refused by name instead, checked on both the\ntype prefix and the envelope `kind` because persist stamps one and a peer\nsends the other.\n\nThe test builds its fixture from persist's OWN `holds_bytes_attestation_row`\nand asserts both properties that make the refusal load-bearing before\nasserting the refusal — so if persist ever stops emitting that shape, the\ntest says so rather than passing vacuously.\n\n## Projection rules\n\n1. signed by someone — signature AND key id, since either alone names nobody\n   or backs nothing (structural; verifying against a pubkey needs a directory\n   and belongs to admission, which is why this stays pure);\n2. not a possession claim;\n3. references THIS blob — a `BlobPointer` among the envelope's TOP-LEVEL\n   members, or an `evidence_refs` entry. Top-level only: recursing would let\n   a row grant meaning to bytes it merely quoted, and \"somewhere in this JSON\n   there is a matching hash\" is not a declaration about content;\n4. a scope edge can name, and a group id for every scope that needs one.\n\nThe pointer is found by PARSING, not by key spelling, so a file / video / log\nrow that names its pointer field something else gets the invariant without\nthis function changing.\n\nScope comes from the COLUMN, not the envelope's row mirror, though both are\nsigned: the column is what the substrate filters and replicates on, and on a\nrow that has not been through admission the mirror is free to disagree with\nthe field that actually decides where the row goes.\n\n## Also in this commit\n\n- `tests/blob_federation_e2e.rs` gains the cross-node statement: the ROW\n  carries the meaning and travels without the bytes; a community row places\n  its blob in the community it names; a row about other content cannot lend\n  these bytes its scope. The existing possession test no longer ends with a\n  to-do — it now asserts the refusal it was written to anticipate.\n- `FSD/GROUP_CONTENT_ON_BLOBS.md` gains G9/G10 with their witnesses.\n- `tests/group_content_end_to_end.rs` header no longer claims to prove the\n  AAD substitution. Every seal in that file is commons/plaintext — the\n  fixture has no community, so `resolve_write_tier` puts the encrypted tier\n  out of reach — and one of its own tests asserts the opposite, correctly.\n  The header now says where the real proof lives.\n\nGate: lib 1587 passed / 0 failed (full pre-commit feature set);\nblob_federation_e2e 7; group_content_end_to_end 5; chat_message_federates 23;\nchat_two_person_community 9; blob_swarm_scheduler 6; blob_serve_gated 2;\nfmt + clippy -D warnings clean.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n* fix(597): a revoked member leaves the audience — the row plane reads ACTIVE membership\n\n`ReplicationBridge::cohorts_of`, the read behind the CC 5.2 audience gate,\nused persist's FULL-HISTORY membership views:\n\n    dir.list_families_for_member(id)\n    dir.list_communities_for_member(id)\n\npersist ships an `_active` pair beside them and the difference is exactly\nrevocation — `_active` drops cohorts a `membership_revocation` with\n`effective_at <= now` removed the member from.\n\nThis gate asks one question: *is this peer in the row's audience.* The\nfull-history form answers a different one, and answers it wrong in one\ndirection only — OPEN. A member removed from a community kept receiving that\ncommunity's rows indefinitely, on the advertise path and on the direct-fetch\ntwin, with nothing booked as withheld: the gate RAN and returned \"member\".\n\nThat is why it survived: a default-open answer from a gate that executed\nlooks identical to a correct one, in the logs and in the ledger.\n\n## The same finding, the other plane\n\nCIRISEdge#581 hit this on the blob plane — `PersistBlobStorePolicy` read\n`list_*_for_member` for provenance and moved to `_active`. This is the row-\nplane half. `list_*_for_member` (non-active) now has no caller in edge;\n`cohort_set_with_owners` reads an operator-configured node set, not a\npersist roster, and is unaffected.\n\n## The witness, and why there wasn't one\n\n`a_revoked_member_stops_receiving_the_rooms_rows` — same room, same row, same\npeer as the test beside it, with one revocation in between. It asserts the\npositive control FIRST, because a test that only asserts the withhold passes\nwhen the row was never offered to anybody, and it builds a FRESH bridge after\nthe revocation: the audience memo is per-sweep, and reusing the one that\nalready resolved the peer would prove the cache rather than the gate.\n\nVerified against the pre-fix code: the test fails there, at the line it\nnames. Every existing audience test passed before and after, because none of\nthem revoked anybody — which is the whole reason the gap lasted.\n\nCost: one revocation read per cohort, bounded by DISTINCT PEERS PER SWEEP\nrather than by rows, because `cohorts_of` is memoized.\n\nGate: lib 1352 passed / 0 failed; replication::bridge 147; fmt + clippy -D\nwarnings clean.\n\nCloses #597.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n* feat: attribute the ACCEPT side to its CI parameter, with the same compile-time guard\n\n`contextual_integrity.rs` mapped every serve-side `WithholdReason` to the\nNissenbaum parameter it defends, exhaustively and without a wildcard, so a\nnew way to withhold cannot enter the codebase anonymously. Its own boundary\nsection named the gap: \"typing the inbound reasons would extend the guard\nacross both, and is the obvious next improvement rather than a defect being\nhidden.\"\n\n`StoreRefusal` and `MeaningRefusal` are edge's own enums and neither is\n`#[non_exhaustive]`, so the same guard is available for them —\n`parameter_of_store_refusal` and `parameter_of_meaning_refusal`, both\nwildcard-free. A new way to refuse content COMING IN now fails the build\nunless it says which promise it keeps.\n\n## The accept side is the same five parameters\n\nIt reads like a different question — serve asks *may I send this*, accept\nasks *may I hold this* — and the tempting answer is a second vocabulary.\nThere isn't one: appropriate flow is a property of the FLOW, and both ends\nevaluate the same five from their own position.\n\n| axis | the accept-side question | parameter |\n|---|---|---|\n| meaning | what IS this, and who says so | Information type · Sender |\n| 1 provenance | may this sender place content of this kind here | Sender |\n| 2 scope | are we in the audience it declares | Recipient |\n| 3 consent | did this operator agree to hold this class at all | Transmission principle |\n\nTwo attributions are load-bearing rather than obvious:\n\n**`PossessionIsNotMeaning` is INFORMATION TYPE, not recipient.** A\n`holds_bytes` row is well-formed, signed, and correctly scoped; what it\nclaims is possession. Filing it under recipient would say edge could not\nplace the audience, when what actually happened is that nothing said what the\nbytes ARE — and it would send an operator to the roster instead of to the\nmissing content row.\n\n**`OperatorDeclined` is TRANSMISSION PRINCIPLE.** Axis 3 is the node's own\nrule of carriage — retain-with-limits, the parameter CIRIS calls the decisive\ndifferentiator — and deliberately not a claim about the sender or the\naudience: #581's own example is a blessed runner whose content clears axes 1\nand 2 and is still refused because the operator never agreed to host public\nblobs. A node with no way to say \"not on my disk\" would be enforcing\neverybody's norms except its own.\n\n`ScopeUndeterminable` is INFORMATION TYPE despite its spelling: the\nprojection refuses in order, and signed / not-possession / references-this-\nblob all fail BEFORE the scope is read. What is missing is the row, not the\ncohort on it.\n\n## `Acceptance`, and the darknet half\n\nThe accept-side twin of `Delivery`, with THREE verdicts rather than a bool\nfor the reason the store gate returns a trichotomy: `self` and `family`\nsuppress `holds_bytes` structurally (CC 5.4.6's derived group plane), so\n*hold* and *hold and announce* are different flows with different recipients.\nA value that collapsed them would make that invisibility invisible to the\naudit trail too — and `explain()` says which one happened in the commitment's\nown words.\n\nThe one remaining gap is stated rather than papered over: transport\n`drop_inbound` still carries a string tag and no typed reason, so it is still\nunattributed.\n\nGate: lib 1356 passed / 0 failed; contextual_integrity 7; fmt + clippy -D\nwarnings clean.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n* fix(581): the principal hop (F4), the echo that was not a principal (F7), and the group arms' first witness\n\nThree findings from the #581 review, all on `PersistBlobStorePolicy`, all on\narms that had **no test at all** — which is the connective tissue between\nthem.\n\n## F4 — the rosters name persons, the wire keys are nodes\n\n`cohorts_of` asked persist's roster about the key it was handed. On this path\nthat key is a NODE key or an identity OCCURRENCE, and\n`list_communities_for_member_active(<node key>)` returns nothing for a node\nwhose OWNER is a full member.\n\nSo the store gate refused every real community blob, for every real member,\nforever. It fails CLOSED, which is why it produced no security finding — and\nwould have produced no bug report either, because the only symptom is an\noperator turning the gate off, which is the worst outcome available.\n\n`bridge::peer_in_cohort` has carried this shape since CIRISEdge#523 (\"the\nroster names persons, the peer is a node\"), so the fix is the same question\nwith the same hop, not a second membership rule: ask about the key AND its\nprincipal, union the results. Added BESIDE the direct test, never in place of\nit, so a person's own key still resolves.\n\n## F7 — `admission_identity_for_writer` does not fail on an unknown key\n\nIts last line is `Ok(writer.to_owned())`: a key that is neither an identity\noccurrence nor an owned node is its own principal. That is right for persist\n(a PERSON is their own principal, and the door cannot tell which case it is\nin) and wrong to read as a resolution here.\n\nThe first cut returned `Option<String>` and so could not tell them apart. Its\n`SelfOnly` arm compared two echoes and was safe only because two different\nkey ids are two different strings — **the undeterminable arm the module docs\npromise never ran**. A gate documented as fail-closed that is actually\ncorrect-by-string-inequality is one rename away from being neither.\n\n`principal_of` now returns a three-state `Principal`: `Resolved` (an\noccurrence's identity, a node's owner, or a key the directory KNOWS standing\nfor itself), `Unknown` (the door echoed a key the directory has never seen),\n`Unresolvable` (the walk errored). Only the first is an answer. The\n`SelfOnly` arm's refusal is now the documented one.\n\n## The coverage that let both survive\n\n`sender_standing`'s `Public` arm never touches the directory, so the existing\ntests ran against an empty in-memory one — and the group arms had zero\ncoverage. `directory_tests` is their first: a real SQLite directory with a\nperson, the node they own, an unrelated node, a live owner binding, and a\nroom the person founded.\n\nSeeding it turned up two preconditions worth recording, since both fail from\ndeep inside persist with a message about something else:\n\n- the owner binding and the community BOTH need the full hybrid signature —\n  persist verifies the federation tier under `HybridPolicy::Strict`, and a\n  key registered with a PQC pubkey plus a classical-only row is refused as\n  `verify_hybrid_pqc_fields_mismatch`. `hybrid_sign` spells AV-33's binding\n  (`canonical ‖ ed25519_sig`) the way `identity::sign_bound_hybrid` does.\n- the roster's `role` is persist's `MEMBER_ROLE_FOUNDER` constant, never a\n  local `\"founder\"` literal — an invented spelling makes a fixture green\n  against a predicate the field does not run.\n\nBoth new witnesses were verified against the pre-fix code: each fails there,\nat the line it names. The three tests that pass either way are the negative\ncontrols, and they say so.\n\nGate: lib 1361 passed / 0 failed; blob_swarm::persist_store_policy 8; fmt +\nclippy -D warnings clean.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n* docs(586): name the string-match on persist's prose, and its witness\n\n`PersistGroupContentStore::map_err` tells an AAD mismatch from an\nauthorization failure by matching persist's Backend MESSAGE, because\n`BlobError` has no typed arm for \"the AEAD tag did not verify\". A reword\nupstream — not a behaviour change, just clearer wording — would silently drop\nevery seal failure into `Substrate`, with nothing red: the failure is still a\nfailure, and what disappears is the distinction between \"you may not read\nthis\" and \"this did not open\", which send a reader to opposite places.\n\nIt is not left to luck, and now the code says so:\n`a_pointer_copied_onto_another_authors_row_does_not_open` performs a real\nsubstitution against a real community DEK and asserts on `SealMismatch`'s own\nwording, so a reword turns that test red rather than degrading this arm\nquietly. The comment names the witness so nobody \"simplifies\" the match\nwithout checking it still binds.\n\nFiled CIRISPersist#842 to remove the fragility with a typed\n`SealDidNotOpen { sha256_hex }` arm and a `kind()` token.\n\nGate: chat_message_federates 23 passed; fmt + clippy -D warnings clean.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VwiEskMDuGzsHQ7dnBMQaT\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-09-11T10:59:17-05:00",
+          "tree_id": "0dde47b52b7fe7df543e08f48d99eeb35efdcb7a",
+          "url": "https://github.com/CIRISAI/CIRISEdge/commit/cf13fcfed81a79ca642ccf66012bd6e2f525a203"
+        },
+        "date": 1789148988161,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "envelope_verify_single/256",
+            "value": 90,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_single/1024",
+            "value": 208,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_single/4096",
+            "value": 673,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_single/16384",
+            "value": 2598,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_single/65536",
+            "value": 10553,
+            "range": "± 269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_bulk/1k_256B",
+            "value": 92586,
+            "range": "± 447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/256",
+            "value": 139,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/1024",
+            "value": 176,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/4096",
+            "value": 241,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/16384",
+            "value": 454,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/65536",
+            "value": 1435,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch_inbound/OpaqueEvent",
+            "value": 114,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch_inbound/FederationAnnouncement",
+            "value": 70,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch_inbound/ContentFetch",
+            "value": 71,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch_inbound/StewardDirective",
+            "value": 67,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/256",
+            "value": 44543,
+            "range": "± 728",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/1024",
+            "value": 44704,
+            "range": "± 436",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/4096",
+            "value": 47269,
+            "range": "± 652",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/16384",
+            "value": 56449,
+            "range": "± 342",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/65536",
+            "value": 91996,
+            "range": "± 838",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/256",
+            "value": 5766,
+            "range": "± 136",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/1024",
+            "value": 5742,
+            "range": "± 143",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/4096",
+            "value": 5568,
+            "range": "± 192",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/16384",
+            "value": 5892,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/65536",
+            "value": 7269,
+            "range": "± 140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_inbound_contention/inbound_drain/quiescent",
+            "value": 3963694,
+            "range": "± 76773",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_inbound_contention/inbound_drain/while_sending",
+            "value": 4530502,
+            "range": "± 118268",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/2",
+            "value": 126,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/8",
+            "value": 541,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/16",
+            "value": 1104,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/32",
+            "value": 2234,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/64",
+            "value": 4443,
+            "range": "± 192",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/128",
+            "value": 8828,
+            "range": "± 93",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/200",
+            "value": 13446,
+            "range": "± 148",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/2",
+            "value": 230,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/8",
+            "value": 921,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/16",
+            "value": 1844,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/32",
+            "value": 3688,
+            "range": "± 75",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/64",
+            "value": 7630,
+            "range": "± 120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/128",
+            "value": 14759,
+            "range": "± 194",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/200",
+            "value": 24030,
+            "range": "± 358",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/2",
+            "value": 685,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/8",
+            "value": 2761,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/16",
+            "value": 5524,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/32",
+            "value": 10999,
+            "range": "± 182",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/64",
+            "value": 22588,
+            "range": "± 612",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/128",
+            "value": 44963,
+            "range": "± 996",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/200",
+            "value": 70310,
+            "range": "± 1757",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/2",
+            "value": 2653,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/8",
+            "value": 10537,
+            "range": "± 283",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/16",
+            "value": 20948,
+            "range": "± 569",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/32",
+            "value": 42370,
+            "range": "± 732",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/64",
+            "value": 85434,
+            "range": "± 1602",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/128",
+            "value": 169527,
+            "range": "± 2720",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/200",
+            "value": 263759,
+            "range": "± 4894",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/2",
+            "value": 104,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/8",
+            "value": 314,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/16",
+            "value": 589,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/32",
+            "value": 1164,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/64",
+            "value": 2266,
+            "range": "± 62",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/128",
+            "value": 4559,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/200",
+            "value": 6653,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/2",
+            "value": 181,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/8",
+            "value": 533,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/16",
+            "value": 1008,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/32",
+            "value": 1954,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/64",
+            "value": 3647,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/128",
+            "value": 7572,
+            "range": "± 91",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/200",
+            "value": 11319,
+            "range": "± 231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/2",
+            "value": 469,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/8",
+            "value": 1364,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/16",
+            "value": 2555,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/32",
+            "value": 4869,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/64",
+            "value": 9622,
+            "range": "± 100",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/128",
+            "value": 19027,
+            "range": "± 283",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/200",
+            "value": 29773,
+            "range": "± 345",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/2",
+            "value": 2101,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/8",
+            "value": 6344,
+            "range": "± 245",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/16",
+            "value": 11883,
+            "range": "± 138",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/32",
+            "value": 23094,
+            "range": "± 292",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/64",
+            "value": 45534,
+            "range": "± 799",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/128",
+            "value": 89833,
+            "range": "± 1114",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/200",
+            "value": 140559,
+            "range": "± 1884",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/2",
+            "value": 134,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/8",
+            "value": 450,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/16",
+            "value": 914,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/32",
+            "value": 1897,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/64",
+            "value": 4131,
+            "range": "± 119",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/128",
+            "value": 9918,
+            "range": "± 100",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/200",
+            "value": 18071,
+            "range": "± 439",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/2",
+            "value": 210,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/8",
+            "value": 676,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/16",
+            "value": 1360,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/32",
+            "value": 2746,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/64",
+            "value": 5599,
+            "range": "± 71",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/128",
+            "value": 13021,
+            "range": "± 283",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/200",
+            "value": 23385,
+            "range": "± 183",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/2",
+            "value": 546,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/8",
+            "value": 1673,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/16",
+            "value": 3201,
+            "range": "± 103",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/32",
+            "value": 6304,
+            "range": "± 219",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/64",
+            "value": 12817,
+            "range": "± 187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/128",
+            "value": 27314,
+            "range": "± 327",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/200",
+            "value": 41694,
+            "range": "± 979",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/2",
+            "value": 2152,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/8",
+            "value": 6538,
+            "range": "± 225",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/16",
+            "value": 12305,
+            "range": "± 151",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/32",
+            "value": 24008,
+            "range": "± 288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/64",
+            "value": 47897,
+            "range": "± 598",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/128",
+            "value": 96057,
+            "range": "± 1175",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/200",
+            "value": 153422,
+            "range": "± 7537",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/2",
+            "value": 331,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/8",
+            "value": 1066,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/16",
+            "value": 2045,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/32",
+            "value": 4449,
+            "range": "± 55",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/64",
+            "value": 9818,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/128",
+            "value": 24484,
+            "range": "± 393",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/200",
+            "value": 45779,
+            "range": "± 383",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/2",
+            "value": 502,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/8",
+            "value": 1539,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/16",
+            "value": 2933,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/32",
+            "value": 6071,
+            "range": "± 133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/64",
+            "value": 13071,
+            "range": "± 350",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/128",
+            "value": 31204,
+            "range": "± 1049",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/200",
+            "value": 55650,
+            "range": "± 722",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/2",
+            "value": 1308,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/8",
+            "value": 3669,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/16",
+            "value": 6882,
+            "range": "± 98",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/32",
+            "value": 13462,
+            "range": "± 182",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/64",
+            "value": 27550,
+            "range": "± 482",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/128",
+            "value": 59805,
+            "range": "± 845",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/200",
+            "value": 98168,
+            "range": "± 1637",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/2",
+            "value": 5028,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/8",
+            "value": 13823,
+            "range": "± 227",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/16",
+            "value": 25593,
+            "range": "± 459",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/32",
+            "value": 50432,
+            "range": "± 1549",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/64",
+            "value": 98468,
+            "range": "± 1461",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/128",
+            "value": 199062,
+            "range": "± 3740",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/200",
+            "value": 318964,
+            "range": "± 8912",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/2",
+            "value": 728,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/8",
+            "value": 2276,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/16",
+            "value": 4424,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/32",
+            "value": 9863,
+            "range": "± 161",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/64",
+            "value": 21326,
+            "range": "± 218",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/128",
+            "value": 54092,
+            "range": "± 1353",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/200",
+            "value": 102866,
+            "range": "± 1368",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/2",
+            "value": 1116,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/8",
+            "value": 3235,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/16",
+            "value": 6180,
+            "range": "± 55",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/32",
+            "value": 12897,
+            "range": "± 204",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/64",
+            "value": 27957,
+            "range": "± 341",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/128",
+            "value": 66385,
+            "range": "± 785",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/200",
+            "value": 120642,
+            "range": "± 2416",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/2",
+            "value": 2837,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/8",
+            "value": 7650,
+            "range": "± 113",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/16",
+            "value": 14179,
+            "range": "± 181",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/32",
+            "value": 28050,
+            "range": "± 349",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/64",
+            "value": 57032,
+            "range": "± 774",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/128",
+            "value": 124218,
+            "range": "± 1269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/200",
+            "value": 194918,
+            "range": "± 4742",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/2",
+            "value": 10767,
+            "range": "± 295",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/8",
+            "value": 28521,
+            "range": "± 862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/16",
+            "value": 52060,
+            "range": "± 711",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/32",
+            "value": 99864,
+            "range": "± 4337",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/64",
+            "value": 197588,
+            "range": "± 2457",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/128",
+            "value": 401382,
+            "range": "± 4364",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/200",
+            "value": 646971,
+            "range": "± 13109",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/2",
+            "value": 118,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/8",
+            "value": 572,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/32",
+            "value": 2322,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/128",
+            "value": 9498,
+            "range": "± 262",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/500",
+            "value": 40590,
+            "range": "± 371",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/2",
+            "value": 365,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/8",
+            "value": 1508,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/32",
+            "value": 6003,
+            "range": "± 107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/128",
+            "value": 24014,
+            "range": "± 481",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/500",
+            "value": 296954,
+            "range": "± 2715",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/2",
+            "value": 1440,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/8",
+            "value": 5805,
+            "range": "± 151",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/32",
+            "value": 24320,
+            "range": "± 462",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/128",
+            "value": 263377,
+            "range": "± 4613",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/500",
+            "value": 1043393,
+            "range": "± 17111",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/2",
+            "value": 130,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/2",
+            "value": 12,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/2",
+            "value": 72,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/8",
+            "value": 552,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/8",
+            "value": 42,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/8",
+            "value": 298,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/32",
+            "value": 2239,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/32",
+            "value": 188,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/32",
+            "value": 1232,
+            "range": "± 16",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/128",
+            "value": 9353,
+            "range": "± 257",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/128",
+            "value": 856,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/128",
+            "value": 5138,
+            "range": "± 107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/500",
+            "value": 39911,
+            "range": "± 1248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/500",
+            "value": 3441,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/500",
+            "value": 20957,
+            "range": "± 211",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/2",
+            "value": 359,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/2",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/2",
+            "value": 183,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/8",
+            "value": 1517,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/8",
+            "value": 42,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/8",
+            "value": 716,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/32",
+            "value": 5926,
+            "range": "± 89",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/32",
+            "value": 189,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/32",
+            "value": 3068,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/128",
+            "value": 25721,
+            "range": "± 494",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/128",
+            "value": 856,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/128",
+            "value": 12668,
+            "range": "± 410",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/500",
+            "value": 296775,
+            "range": "± 5924",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/500",
+            "value": 3438,
+            "range": "± 87",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/500",
+            "value": 56929,
+            "range": "± 1586",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/2",
+            "value": 1432,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/2",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/2",
+            "value": 718,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/8",
+            "value": 5715,
+            "range": "± 54",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/8",
+            "value": 47,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/8",
+            "value": 2459,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/32",
+            "value": 20600,
+            "range": "± 161",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/32",
+            "value": 186,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/32",
+            "value": 9994,
+            "range": "± 185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/128",
+            "value": 245852,
+            "range": "± 2236",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/128",
+            "value": 858,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/128",
+            "value": 121894,
+            "range": "± 3221",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/500",
+            "value": 983741,
+            "range": "± 28078",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/500",
+            "value": 3446,
+            "range": "± 65",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/500",
+            "value": 522667,
+            "range": "± 9858",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/2",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/8",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/32",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/128",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/500",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/2",
+            "value": 236,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/2",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/2",
+            "value": 126,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/2",
+            "value": 118,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/8",
+            "value": 935,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/8",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/8",
+            "value": 549,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/8",
+            "value": 469,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/32",
+            "value": 3785,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/32",
+            "value": 61,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/32",
+            "value": 2284,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/32",
+            "value": 1879,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/128",
+            "value": 15045,
+            "range": "± 235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/128",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/128",
+            "value": 9440,
+            "range": "± 147",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/128",
+            "value": 7555,
+            "range": "± 112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/500",
+            "value": 58870,
+            "range": "± 702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/500",
+            "value": 61,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/500",
+            "value": 40240,
+            "range": "± 941",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/500",
+            "value": 29400,
+            "range": "± 269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/2",
+            "value": 678,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/2",
+            "value": 167,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/2",
+            "value": 359,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/2",
+            "value": 331,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/8",
+            "value": 2723,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/8",
+            "value": 168,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/8",
+            "value": 1493,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/8",
+            "value": 1326,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/32",
+            "value": 10809,
+            "range": "± 146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/32",
+            "value": 168,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/32",
+            "value": 5999,
+            "range": "± 107",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/32",
+            "value": 5294,
+            "range": "± 64",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/128",
+            "value": 43562,
+            "range": "± 758",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/128",
+            "value": 169,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/128",
+            "value": 26208,
+            "range": "± 373",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/128",
+            "value": 21157,
+            "range": "± 229",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/500",
+            "value": 173702,
+            "range": "± 2834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/500",
+            "value": 168,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/500",
+            "value": 296728,
+            "range": "± 5672",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/500",
+            "value": 73455,
+            "range": "± 640",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/2",
+            "value": 2783,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/2",
+            "value": 701,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/2",
+            "value": 1409,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/2",
+            "value": 1391,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/8",
+            "value": 11191,
+            "range": "± 196",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/8",
+            "value": 707,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/8",
+            "value": 5705,
+            "range": "± 95",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/8",
+            "value": 5585,
+            "range": "± 203",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/32",
+            "value": 44805,
+            "range": "± 1317",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/32",
+            "value": 702,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/32",
+            "value": 23767,
+            "range": "± 300",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/32",
+            "value": 22317,
+            "range": "± 228",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/128",
+            "value": 179030,
+            "range": "± 2365",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/128",
+            "value": 717,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/128",
+            "value": 263928,
+            "range": "± 4438",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/128",
+            "value": 91348,
+            "range": "± 2807",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/500",
+            "value": 705313,
+            "range": "± 13479",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/500",
+            "value": 706,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/500",
+            "value": 1053194,
+            "range": "± 41335",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/500",
+            "value": 349440,
+            "range": "± 4197",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_400kbps/N_8",
+            "value": 399,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_400kbps/N_32",
+            "value": 1810,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_400kbps/N_128",
+            "value": 6636,
+            "range": "± 80",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_400kbps/N_500",
+            "value": 27603,
+            "range": "± 447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_2500kbps/N_8",
+            "value": 1002,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_2500kbps/N_32",
+            "value": 4185,
+            "range": "± 91",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_2500kbps/N_128",
+            "value": 16761,
+            "range": "± 263",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_2500kbps/N_500",
+            "value": 201540,
+            "range": "± 2574",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_5000kbps/N_8",
+            "value": 1951,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_5000kbps/N_32",
+            "value": 7821,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_5000kbps/N_128",
+            "value": 34754,
+            "range": "± 465",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_5000kbps/N_500",
+            "value": 369368,
+            "range": "± 6941",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_32/S_1",
+            "value": 4066,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_32/S_4",
+            "value": 16236,
+            "range": "± 231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_32/S_16",
+            "value": 65671,
+            "range": "± 653",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_32/S_64",
+            "value": 266366,
+            "range": "± 6657",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_100/S_1",
+            "value": 13019,
+            "range": "± 302",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_100/S_4",
+            "value": 52119,
+            "range": "± 547",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_100/S_16",
+            "value": 202533,
+            "range": "± 2150",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_100/S_64",
+            "value": 804726,
+            "range": "± 9324",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_uncapped/layer_BASE/64",
+            "value": 8253,
+            "range": "± 120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_blinking_dot/layer_BASE/64",
+            "value": 8258,
+            "range": "± 119",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_mixed_50_50/layer_BASE/64",
+            "value": 8262,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_uncapped/layer_mid_1_1_1/64",
+            "value": 8230,
+            "range": "± 77",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_blinking_dot/layer_mid_1_1_1/64",
+            "value": 432,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_mixed_50_50/layer_mid_1_1_1/64",
+            "value": 4395,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_uncapped/layer_high_2_2_2/64",
+            "value": 8264,
+            "range": "± 153",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_blinking_dot/layer_high_2_2_2/64",
+            "value": 427,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_mixed_50_50/layer_high_2_2_2/64",
+            "value": 4397,
+            "range": "± 83",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/2",
+            "value": 5807,
+            "range": "± 198",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/2",
+            "value": 5844,
+            "range": "± 57",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/8",
+            "value": 24088,
+            "range": "± 322",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/8",
+            "value": 24118,
+            "range": "± 421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/32",
+            "value": 97578,
+            "range": "± 920",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/32",
+            "value": 97155,
+            "range": "± 1663",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/128",
+            "value": 393111,
+            "range": "± 9049",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/128",
+            "value": 388980,
+            "range": "± 4626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/512",
+            "value": 1567419,
+            "range": "± 24671",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/512",
+            "value": 1553610,
+            "range": "± 38483",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/2048",
+            "value": 6262117,
+            "range": "± 184627",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/2048",
+            "value": 6274230,
+            "range": "± 63353",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/2",
+            "value": 119112,
+            "range": "± 1416",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/2",
+            "value": 54074,
+            "range": "± 689",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/8",
+            "value": 183353,
+            "range": "± 2995",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/8",
+            "value": 127285,
+            "range": "± 2498",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/32",
+            "value": 399906,
+            "range": "± 8216",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/32",
+            "value": 322981,
+            "range": "± 7685",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/128",
+            "value": 1127826,
+            "range": "± 30979",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/128",
+            "value": 977859,
+            "range": "± 44626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/512",
+            "value": 4073521,
+            "range": "± 131507",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/512",
+            "value": 3623400,
+            "range": "± 141642",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/2048",
+            "value": 15592528,
+            "range": "± 296510",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/2048",
+            "value": 13656909,
+            "range": "± 396758",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_round_trip_correctness/full_64KiB_frame",
+            "value": 2894,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_multi_parent_dedup/dual_parent_64KiB_frame",
+            "value": 3790,
+            "range": "± 83",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_degraded_quality/subscribed_substreams/1",
+            "value": 1358,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_degraded_quality/subscribed_substreams/2",
+            "value": 1874,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_degraded_quality/subscribed_substreams/3",
+            "value": 2416,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_degraded_quality/subscribed_substreams/4",
+            "value": 2918,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_planner_picks_distinct_parents/plan_4_substreams",
+            "value": 99,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_inner_seal_4x",
+            "value": 823,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_outer_seal_4x",
+            "value": 727,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_dedup_observe_4x",
+            "value": 25,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_aead_open_4x",
+            "value": 1165,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_reassemble_4x",
+            "value": 95,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain_reconstruction/decode/m20",
+            "value": 1457,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain_reconstruction/decode/m23",
+            "value": 1616,
+            "range": "± 86",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain_reconstruction/decode/m26",
+            "value": 542,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain_reconstruction/encode_n20_k6",
+            "value": 1034,
+            "range": "± 47",
             "unit": "ns/iter"
           },
           {
