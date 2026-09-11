@@ -176,17 +176,25 @@ struct TestVerifier {
     /// Strikes per chunk-SHA so a test can introspect what mismatches
     /// occurred. Keyed by chunk SHA.
     mismatches: Arc<StdMutex<Vec<[u8; 32]>>>,
+    /// CIRISEdge#581 — what the store gate told the write to do, per chunk.
+    dispositions: Arc<StdMutex<Vec<ciris_edge::blob_swarm::StoreDisposition>>>,
 }
 
 impl TestVerifier {
     fn new() -> Self {
         Self {
             mismatches: Arc::new(StdMutex::new(Vec::new())),
+            dispositions: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
     fn mismatches(&self) -> Vec<[u8; 32]> {
         self.mismatches.lock().unwrap().clone()
+    }
+
+    /// What the store gate told the write to do, per chunk.
+    fn seen_dispositions(&self) -> Vec<ciris_edge::blob_swarm::StoreDisposition> {
+        self.dispositions.lock().unwrap().clone()
     }
 }
 
@@ -196,7 +204,13 @@ impl BlobChunkVerifier for TestVerifier {
         _blob_sha256: [u8; 32],
         chunk_sha256: [u8; 32],
         bytes: &[u8],
+        disposition: ciris_edge::blob_swarm::StoreDisposition,
     ) -> Result<(), ChunkVerifyError> {
+        // CIRISEdge#581 — record what the gate decided, so a test can prove
+        // the verdict REACHES the write. The first cut computed the
+        // trichotomy and discarded it, and nothing noticed because nothing
+        // observed it here.
+        self.dispositions.lock().unwrap().push(disposition);
         let actual = sha256(bytes);
         if actual != chunk_sha256 {
             self.mismatches.lock().unwrap().push(chunk_sha256);
@@ -564,4 +578,97 @@ async fn invalid_manifest_rejected_early() {
         Err(SwarmError::InvalidManifest(_, _)) => {}
         other => panic!("expected InvalidManifest, got {other:?}"),
     }
+}
+
+// ─── CIRISEdge#581 — the store verdict must REACH the write ───────────
+
+/// **The regression guard for the bug the review found.**
+///
+/// The first cut of the store gate computed a trichotomy —
+/// store-and-announce / store-local-only / refuse — and then returned
+/// `Result<(), _>`, throwing the announce bit away. `may_announce()` was
+/// called nowhere, `BlobChunkVerifier` had no parameter to receive it, and
+/// nothing noticed because nothing OBSERVED the verdict at the write.
+///
+/// An operator setting `LocalOnly` — "carry the community's rows, do not
+/// advertise that I hold them" — got them advertised anyway, and `self` /
+/// `family` content was announced despite structural invisibility being the
+/// entire purpose of those scopes.
+///
+/// This asserts the verdict arrives, per chunk. It fails if the parameter is
+/// dropped again.
+#[tokio::test]
+async fn the_store_verdict_reaches_every_chunk_write() {
+    use ciris_edge::blob_swarm::StoreDisposition;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let me = FedKey::new("me", 1);
+    let h1 = FedKey::new("holder-1", 2);
+    let edge = build_edge(&tmp, &me, &[&h1]).await;
+
+    let (manifest, chunks) = make_chunks(3, 64);
+    let blob_sha = sha256(&chunks.concat());
+    let chunks_by_sha: std::collections::HashMap<[u8; 32], Vec<u8>> = manifest
+        .chunks
+        .iter()
+        .zip(chunks.iter())
+        .map(|((sha, _), bytes)| (*sha, bytes.clone()))
+        .collect();
+
+    let verifier = Arc::new(TestVerifier::new());
+    let scheduler = SwarmScheduler::new(
+        edge.clone(),
+        verifier.clone(),
+        SwarmConfig {
+            per_request_timeout: Duration::from_secs(5),
+            ..SwarmConfig::default()
+        },
+    );
+
+    let holders = vec![h1.key_id.clone()];
+    let manifest_for_scheduler = manifest.clone();
+    let scheduler_handle = tokio::spawn(async move {
+        scheduler
+            .fetch_blob(blob_sha, manifest_for_scheduler, holders)
+            .await
+    });
+
+    let chunks_for_pump = chunks_by_sha.clone();
+    let edge_pump = edge.clone();
+    let manifest_pump = manifest.clone();
+    let pump_handle = tokio::spawn(async move {
+        pump_responses(
+            &edge_pump,
+            blob_sha,
+            &manifest_pump,
+            std::time::Instant::now() + Duration::from_secs(10),
+            move |_, chunk_sha| {
+                let bytes = chunks_for_pump.get(&chunk_sha).cloned()?;
+                Some((ChunkResult::Bytes(bytes), Box::new(|| ())))
+            },
+        )
+        .await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(15), scheduler_handle)
+        .await
+        .expect("scheduler did not complete in time")
+        .expect("scheduler task panicked")
+        .expect("fetch succeeded");
+    pump_handle.abort();
+
+    let seen = verifier.seen_dispositions();
+    assert_eq!(
+        seen.len(),
+        chunks.len(),
+        "every chunk write must carry a verdict, not just the first",
+    );
+    // No policy installed here, so the gate is UNARMED and the pre-#581
+    // behaviour — announce — is what should arrive. Asserting the value
+    // rather than merely its presence is what makes this catch a parameter
+    // that is threaded but always hard-coded.
+    assert!(
+        seen.iter().all(|d| *d == StoreDisposition::Announce),
+        "an unarmed gate must report Announce (pre-#581 behaviour), got {seen:?}",
+    );
 }
