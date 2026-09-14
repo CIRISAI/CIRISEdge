@@ -408,11 +408,27 @@ async fn a_peer_holding_only_the_pointer_reads_not_held_not_not_granted() {
 
 /// Transfer closes it: once node B holds the bytes, the SAME pointer opens.
 ///
-/// The bytes move as opaque content — B never sees Alice's signer, and
-/// re-seals nothing. That is the transfer model: a relay carries what it did
-/// not author.
+/// **A COMMONS blob opens on any node, because no key is involved.**
+///
+/// # What this proves, and what it does NOT
+///
+/// It proves one real thing: content addressing agrees across independent
+/// substrates, so a peer recognises what it was sent and the row needs no
+/// rewriting.
+///
+/// It proves **nothing about keys**, and the name it used to carry —
+/// `once_the_bytes_arrive_the_same_pointer_opens_on_the_far_node` — implied
+/// otherwise. Its doc comment claimed "B never sees Alice's signer, and
+/// re-seals nothing", which the body contradicts on the next line: B calls
+/// `seal` with the PLAINTEXT. At `cohort_scope: federation` that is a
+/// plaintext write, so the open below succeeds because there is no
+/// ciphertext, no DEK and no grant anywhere in it.
+///
+/// The encrypted case is the one that matters and it does not work:
+/// see [`a_far_node_holding_the_bytes_still_cannot_open_them`] and
+/// CIRISPersist#848.
 #[tokio::test]
-async fn once_the_bytes_arrive_the_same_pointer_opens_on_the_far_node() {
+async fn a_commons_blob_opens_on_any_node_because_no_key_is_involved() {
     let alice = Ident::new("alice-fed", 0x11);
     let bob = Ident::new("bob-fed", 0x22);
     let node_a = node(&[&alice, &bob], &alice).await;
@@ -433,8 +449,11 @@ async fn once_the_bytes_arrive_the_same_pointer_opens_on_the_far_node() {
         .await
         .expect("seal on A");
 
-    // B receives the bytes and stores them under the SAME address. Commons
-    // tier, so this is the shape a public blob actually transfers in.
+    // B writes the same PLAINTEXT and lands on the same address. This is a
+    // re-seal, not a transfer — honest only because the commons tier stores
+    // bytes verbatim, so "same input, same address" is the whole claim. An
+    // encrypted tier would mint a fresh nonce here and a DIFFERENT address,
+    // which is exactly why this shape cannot be reused to test that tier.
     let resealed = node_b
         .store
         .seal(SealRequest {
@@ -464,7 +483,7 @@ async fn once_the_bytes_arrive_the_same_pointer_opens_on_the_far_node() {
             viewer_key_id: &bob.key_id,
         })
         .await
-        .expect("B opens the transferred content with A's pointer");
+        .expect("commons content carries no key, so any node opens it");
     assert_eq!(got, body);
 }
 
@@ -718,5 +737,195 @@ async fn a_changed_seed_reports_drift_rather_than_rewriting_the_occurrence() {
         .expect("second provision"),
         Provisioned::Drifted,
         "a different seed must be REPORTED, not written over",
+    );
+}
+
+// ─── CIRISPersist#848: the bytes cross, the KEY does not ──────────────
+
+/// A community both identities are members of, with content occurrences for
+/// each — everything the DEK cascade needs to produce a non-empty grant set.
+async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
+    use ciris_persist::federation::types::{Community, CommunityMember, SignedCommunity};
+    use ciris_persist::federation::FederationDirectory as _;
+
+    let founder = members[0];
+    let community = Community {
+        community_key_id: room.to_owned(),
+        community_name: "The Room".to_owned(),
+        members: members
+            .iter()
+            .map(|m| CommunityMember {
+                key_id: m.key_id.clone(),
+                joined_at: ts(),
+                role: Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
+            })
+            .collect(),
+        founded_at: ts(),
+        consensus_protocol: "founder_only".to_owned(),
+        policy_blob: None,
+        persist_row_hash: String::new(),
+    };
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
+        .expect("canonicalize the room");
+    // The FULL hybrid: persist verifies the federation tier under
+    // `HybridPolicy::Strict`, and a registered PQC pubkey with a
+    // classical-only row is refused as `verify_hybrid_pqc_fields_mismatch`.
+    let ed_sig = founder.ed.sign(&canonical).await.expect("ed sign");
+    let pqc_sig = {
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&ed_sig);
+        ciris_keyring::PqcSigner::sign(&founder.pqc, &bound)
+            .await
+            .expect("pqc sign")
+    };
+    node.dir
+        .put_community(SignedCommunity {
+            community,
+            authority_key_id: founder.key_id.clone(),
+            scrub_signature_classical: B64.encode(&ed_sig),
+            scrub_signature_pqc: Some(B64.encode(&pqc_sig)),
+        })
+        .await
+        .expect("seed the room");
+
+    // Without these the cascade enumerates no wrap targets and seals to
+    // nobody — CIRISEdge#599, a different failure from the one under test.
+    for m in members {
+        let occ = format!("{}-occ", m.key_id);
+        node.dir
+            .put_public_key(SignedKeyRecord {
+                record: m.record().await,
+            })
+            .await
+            .ok();
+        let mut rec = m.record().await;
+        rec.key_id = occ.clone();
+        rec.identity_ref = occ.clone();
+        rec.scrub_key_id = occ.clone();
+        rec.identity_type = "node".to_string();
+        node.dir
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("register the occurrence key");
+        let enc = ciris_edge::content_occurrence::enc_pubkeys_from_seed(&[m.seed; 32])
+            .expect("derive content-enc pubkeys");
+        let outcome = ciris_edge::content_occurrence::ensure_content_occurrence(
+            &*node.dir, &m.key_id, &occ, "server", enc,
+        )
+        .await
+        .expect("provision the content occurrence");
+        assert_ne!(
+            outcome,
+            ciris_edge::content_occurrence::Provisioned::Drifted,
+            "{}: content keys must stay deterministic from the seed",
+            m.key_id,
+        );
+    }
+}
+
+/// **CIRISPersist#848 — CHARACTERIZATION PIN, and the state of the feature.**
+///
+/// This asserts a DEFECT, deliberately, so that fixing it turns this test
+/// RED and forces the assertion to be inverted. An `#[ignore]` would rot
+/// silently; a pin fails the moment reality changes.
+///
+/// # What it pins
+///
+/// The DEK cascade writes per-epoch member wraps into the **author node's
+/// local tables**. Nothing carries them across the mesh: edge's replication
+/// vocabulary is eleven `EnvelopeKind`s and **none of them is a grant**
+/// (`Key`, `Attestation`, `Revocation`, `IdentityOccurrence`, `Family`,
+/// `Community`, three revocation kinds, `LocationProof`, `Organization`).
+///
+/// So a member's node can hold the row, hold the bytes, hold a registered
+/// occurrence with valid content-KEM keys, and still not open the content —
+/// because the wrap addressed to that occurrence exists only where it was
+/// minted. `NotGranted` here is persist answering **correctly**; the gap is
+/// that the key was never transported.
+///
+/// # Why this had no witness before
+///
+/// The only cross-node open test in this file sealed at the COMMONS tier and
+/// had the far node re-seal the plaintext, so no key was ever involved — see
+/// [`a_commons_blob_opens_on_any_node_because_no_key_is_involved`]. persist's
+/// own I51 witness ran on one backend, where the author's cascade had
+/// granted the viewer. Neither side exercised a grant crossing a wire.
+///
+/// # When #848 lands
+///
+/// Invert this: the far node must OPEN. Keep the shape — the value is that
+/// node B's substrate never ran the cascade that minted the wrap.
+#[tokio::test]
+async fn a_far_node_holding_the_bytes_still_cannot_open_them() {
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let room = "room-alice-bob";
+
+    let node_a = node(&[&alice, &bob], &alice).await;
+    let node_b = node(&[&alice, &bob], &bob).await;
+    // The SAME roster on both, which is what "federated" means. Only the
+    // grants differ, and only because they cannot travel.
+    seed_room(&node_a, room, &[&alice, &bob]).await;
+    seed_room(&node_b, room, &[&alice, &bob]).await;
+
+    let sealed = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(room),
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: b"a message for the room",
+            media_type: Some("text/plain"),
+        })
+        .await
+        .expect("seal at the community tier");
+
+    // Precondition: the cascade DID produce grants — on the author's node.
+    // Without this the test would pass on the #599 grant-to-nobody state,
+    // which is a different defect with a different remedy.
+    assert!(
+        !sealed.granted.is_empty(),
+        "precondition: the author's cascade must have wrapped to someone — got {sealed:?}",
+    );
+    assert!(
+        sealed.tier != ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
+        "precondition: this must be a SEALED tier or the test proves nothing",
+    );
+
+    // Alice's own node opens it, as the occurrence the wrap addressed.
+    let here = node_a
+        .store
+        .open(OpenRequest {
+            pointer: &sealed.pointer,
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            viewer_key_id: &format!("{}-occ", alice.key_id),
+        })
+        .await;
+    assert!(
+        here.is_ok(),
+        "positive control: the AUTHOR's node holds the wrap it minted — {here:?}",
+    );
+
+    // Bob's node: same roster, same registered occurrence, no wrap.
+    let there = node_b
+        .store
+        .open(OpenRequest {
+            pointer: &sealed.pointer,
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            viewer_key_id: &format!("{}-occ", bob.key_id),
+        })
+        .await;
+    assert!(
+        matches!(
+            there,
+            Err(GroupContentError::NotGranted { .. } | GroupContentError::NotHeld { .. })
+        ),
+        "PIN (CIRISPersist#848): a far node cannot open community content — \
+         it has neither the bytes nor the wrap. When #848 lands this must \
+         become an OPEN and this assertion inverts. Got: {there:?}",
     );
 }
