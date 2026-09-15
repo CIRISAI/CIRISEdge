@@ -2099,14 +2099,26 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                 engine: Some(engine.clone()),
                 ..Default::default()
             },
-            // THE SELF-PUBLISH SET — the three identities this node speaks
-            // for. Built by the library helper so the harness and the server
+            // THE SELF-PUBLISH SET — the identities this node speaks for.
+            // Built by the library helper so the harness and the server
             // construct it the same way.
+            //
+            // CIRISPersist#848 — `me` (the engine's derived signing key) is a
+            // FOURTH entry, and it is load-bearing: the IdentityOccurrence
+            // plane advertises rows by OCCURRENCE key id (`list_identity_
+            // occurrences_page` filters on `occurrence_key_id ∈ publish set`),
+            // so the engine occurrence `provision_engine_occurrence` registered
+            // never leaves this node unless `me` is here. Without it every
+            // peer refuses this node's key_grant sets as
+            // `signer_not_active_member` — the minter is not an occurrence
+            // its roster fold can see — and no member opens anything. The Key
+            // plane advertises `me`'s record for the same reason.
             Some({
                 let publish = [
                     cfg.node_id.as_str(),
                     agent_key_id.as_str(),
                     owner_key_id.as_str(),
+                    me.as_str(),
                 ];
                 tracing::info!(
                     node = %cfg.node_id,
@@ -2114,7 +2126,8 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                     "self-publish set installed — these identities' Key / \
                      IdentityOccurrence / TransportDestination rows are advertised \
                      to peers. TransportDestination is the transport hint peers \
-                     need for #393 item 2"
+                     need for #393 item 2; the engine key is what carries this \
+                     node's occurrence, and with it its key_grant sets (#848)"
                 );
                 ciris_edge::replication::self_publish_set(publish)
             }),
